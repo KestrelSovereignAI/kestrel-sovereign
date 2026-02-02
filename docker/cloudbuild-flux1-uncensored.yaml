@@ -1,0 +1,50 @@
+# Cloud Build configuration for FLUX.1-dev with Uncensored LoRA support
+# Builds and pushes to gcr.io/YOUR_PROJECT_ID/kestrel-lora-flux1
+#
+# This uses FLUX.1-dev (not FLUX.2-dev) to enable:
+#   - enhanceaiteam/Flux-Uncensored-V2 LoRA for NSFW content
+#   - Multi-LoRA support (character + uncensored)
+#
+# Usage:
+#   cd ./
+#   gcloud builds submit --config=docker/cloudbuild-flux1-uncensored.yaml .
+#
+# Tags:
+#   :v1 - Initial FLUX.1-dev with uncensored LoRA support
+#   :latest - Always points to latest stable build
+
+steps:
+  # Build the FLUX.1 uncensored image with versioned tag
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '-t'
+      - 'gcr.io/YOUR_PROJECT_ID/kestrel-lora-flux1:v1'
+      - '-t'
+      - 'gcr.io/YOUR_PROJECT_ID/kestrel-lora-flux1:latest'
+      - '-f'
+      - 'docker/Dockerfile.flux1-uncensored'
+      - '.'
+    timeout: 3600s  # 1 hour for large image
+
+  # Push versioned tag first (this is the one we explicitly reference)
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'push'
+      - 'gcr.io/YOUR_PROJECT_ID/kestrel-lora-flux1:v1'
+
+  # Push latest tag
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'push'
+      - 'gcr.io/YOUR_PROJECT_ID/kestrel-lora-flux1:latest'
+
+images:
+  - 'gcr.io/YOUR_PROJECT_ID/kestrel-lora-flux1:v1'
+  - 'gcr.io/YOUR_PROJECT_ID/kestrel-lora-flux1:latest'
+
+options:
+  machineType: 'E2_HIGHCPU_32'  # Faster build
+  diskSizeGb: 200  # Large disk for CUDA image
+
+timeout: 7200s  # 2 hour total timeout

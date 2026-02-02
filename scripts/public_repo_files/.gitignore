@@ -1,0 +1,119 @@
+# Environment and secrets
+.env
+.env.*
+!.env.example
+!.env.test.example
+
+# Credentials
+credentials/
+*.json
+!package.json
+!package-lock.json
+*.pem
+*.key
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+.venv/
+.venv2/
+venv/
+ENV/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.settings/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+.hypothesis/
+playwright-report/
+test-results/
+
+# Node
+node_modules/
+npm-debug.log
+yarn-error.log
+
+# Data and caches
+agent_data/
+agent_data_test/
+agent_dbs/
+storage_cache/
+trained_loras/
+generated_images/
+logs/
+feedback/
+*.db
+*.sqlite
+*.capsule
+
+# Runtime
+*.pid
+*.log
+.kestrel/
+kestrel_config/
+kestrel_types/
+trusted_agents/
+
+# Build artifacts
+*.egg-info/
+.eggs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+docker-compose.override.yml
+
+# Temporary
+tmp/
+temp/
+*.tmp
+*.bak
+
+# Archives
+archive/
+
+# Private directories (should not exist in public repo)
+gabriel_workspace/
+docs/business/
+docs/legal/
+docs/outreach/
+docs/plans/
+docs/planning/

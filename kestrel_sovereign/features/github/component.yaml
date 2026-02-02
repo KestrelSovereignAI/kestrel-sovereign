@@ -1,0 +1,26 @@
+name: github
+description: Access GitHub repositories, read source code, and analyze the agent's own codebase
+version: 1.0.0
+entry_point: feature.py
+
+tools:
+  - read_github_file
+  - list_github_files
+  - search_github_code
+  - get_code_definition
+  - list_code_definitions
+  - get_self_repo_info
+  - list_source_components
+  - get_component_source
+  - invalidate_github_cache
+
+files:
+  - feature.py
+  - models.py
+  - client.py
+  - cache.py
+  - ast_analyzer.py
+
+dependencies:
+  - httpx
+  - pyyaml

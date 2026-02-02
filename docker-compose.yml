@@ -1,0 +1,29 @@
+services:
+  kestrel_app:
+    image: kestrel-app-native
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "7777:7777"
+    depends_on:
+      - ipfs
+    environment:
+      - KESTREL_ENV=test
+      - IPFS_API_URL=${IPFS_API_URL:-http://ipfs:5001}
+      - KESTREL_DB_PATH=/usr/src/app/kestrel.db
+      - KESTREL_IDENTITY_PATH=/usr/src/app/kestrel_did.json
+    volumes:
+      - ./agent_data:/app/agent_data
+
+  ipfs:
+    image: ipfs/go-ipfs:latest
+    ports:
+      - "${IPFS_SWARM_PORT:-4001}:4001"
+      - "127.0.0.1:${IPFS_API_PORT:-8889}:5001"
+      - "127.0.0.1:${IPFS_GATEWAY_PORT:-8890}:8080"
+    volumes:
+      - ipfs_data:/data/ipfs
+
+volumes:
+  ipfs_data: 

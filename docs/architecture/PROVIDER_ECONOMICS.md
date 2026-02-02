@@ -1,0 +1,315 @@
+# Provider Economics: Middleman Architecture & Revenue Strategy
+
+**Version:** 1.0
+**Date:** December 2025
+**Status:** Strategy Document
+
+## Overview
+
+Kestrel/Kestrel operates as a **provider middleman**, enabling users to either bring their own cloud credentials (sovereignty) or use platform-managed infrastructure (convenience). This architecture creates two distinct revenue streams:
+
+1. **Referral Revenue**: Commission from providers when users sign up via our links (Direct Mode)
+2. **Margin Revenue**: Markup on provider costs when we manage infrastructure (Managed Mode)
+
+## Architecture: Two Modes
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                    USER CHOICE                          │
+├─────────────────────────┬───────────────────────────────┤
+│   DIRECT (Sovereign)    │    MANAGED (Kestrel Platform)   │
+├─────────────────────────┼───────────────────────────────┤
+│ User's own API key      │ Kestrel-provided credentials  │
+│ User pays provider      │ User pays Kestrel (markup)    │
+│ Referral link used      │ Kestrel absorbs provider cost │
+│ Kestrel earns 3-10%     │ Kestrel earns margin (20-40%) │
+│ True sovereignty        │ Convenience, no cloud hassle  │
+│ User controls billing   │ Single bill from Kestrel      │
+└─────────────────────────┴───────────────────────────────┘
+```
+
+### Direct Mode (Sovereignty First)
+
+- User brings their own API keys (RunPod, OpenAI, etc.)
+- User pays provider directly
+- Kestrel provides referral-tagged signup URLs
+- Revenue: 3-10% referral commission from providers
+- **Value proposition**: True data sovereignty, no platform lock-in
+
+### Managed Mode (Convenience First)
+
+- Kestrel provides all infrastructure
+- User pays single subscription to Kestrel
+- Kestrel pays providers at wholesale rates
+- Revenue: 20-40% margin on provider costs
+- **Value proposition**: No cloud accounts needed, simplified billing
+
+## Provider Analysis
+
+### RunPod (GPU Compute) - PRIMARY OPPORTUNITY
+
+**Referral Program Details:**
+| Tier | Commission | Duration | Requirements |
+|------|------------|----------|--------------|
+| Standard Referral | 3% Pod + 5% Serverless | 6 months | None |
+| Affiliate Program | 10% all spend (cash) | Lifetime | 25+ referred users |
+| Template Creator | 1% compute | Lifetime | Publish template |
+| Hub Maintainer | Up to 7% compute | Monthly tiers | Maintain repos |
+
+**Key Details:**
+- Both referrer AND referred get $5-500 random bonus after first $10 load
+- Pre-June 2025 referrals: Lifetime 3%/5% (grandfathered)
+- Affiliate payouts via PartnerStack (PayPal or Stripe)
+- Payments verified and paid monthly (e.g., February → March 13th)
+
+**Configuration:**
+```bash
+# Add to .env
+RUNPOD_REFERRAL_CODE=your_referral_code_here
+```
+
+**Integration Points:**
+- `features/runpod/runpod_manager.py` - Direct vs Managed provider selection
+- `features/runpod/feature.py` - User-facing GPU management tools
+
+### Lighthouse (Filecoin/IPFS Storage) - ALREADY INTEGRATED
+
+**Current Implementation:**
+- File: `storage/providers/lighthouse_provider.py` (589 lines)
+- Pricing: $0.05/GB/month (our charge) vs $0.00005/GB (Filecoin cost)
+- Margin: ~99.9% on monthly storage (extreme, but fair for convenience)
+
+**Partnership Model:**
+- NFT.Storage uses referral link model (% of first storage purchase)
+- No formal public affiliate program found
+- Consider direct partnership outreach for volume terms
+
+**Configuration:**
+```bash
+# Add to .env
+LIGHTHOUSE_API_KEY=your_api_key_here
+```
+
+### Lambda Labs (Enterprise GPU) - FORMAL PARTNER PROGRAM
+
+**Partner Program:**
+- Official page: https://lambda.ai/partners
+- For VARs (Value Added Resellers), MSPs, and technology partners
+- NVIDIA Partner of the Year 4 years running
+- Requires formal partnership application
+
+**Strategic Value:**
+- Enterprise GPU market ($1.5B+ raised)
+- Multi-billion dollar Microsoft partnership (November 2025)
+- Access to NVIDIA GB300 NVL72 systems
+
+**Next Steps:**
+- Apply via partner portal once enterprise customers identified
+- Negotiate volume discounts and revenue share
+
+### Replicate (ML Models) - PAY-PER-USE, PORTABLE WEIGHTS
+
+**Current Status:**
+- No affiliate/partner program publicly available
+- Pay-per-prediction and pay-per-training pricing model
+- FLUX.1 only (NOT FLUX.2) - see limitations below
+
+**Training Pricing (FLUX.1-dev LoRA):**
+| Model | Cost | Duration | Output |
+|-------|------|----------|--------|
+| `ostris/flux-dev-lora-trainer` | ~$2-5 per run | ~15-20 min | .safetensors weights |
+
+**Generation Pricing (FLUX Models):**
+| Model | Cost per Image | Speed | Quality | License |
+|-------|---------------|-------|---------|---------|
+| `flux-schnell` | ~$0.003 | Fast | Good | Apache 2.0 |
+| `flux-dev` | ~$0.025 | Medium | High | Non-commercial |
+| `flux-1.1-pro` | ~$0.04 | Fast | Excellent | Commercial |
+
+**Key Limitations:**
+- ⚠️ **CENSORED**: Replicate applies content safety filters to all generation
+- ⚠️ **FLUX.1 Only**: Training uses FLUX.1-dev, not FLUX.2
+- ✅ **Portable Weights**: LoRA .safetensors can be downloaded and used elsewhere
+
+**Cross-Provider Strategy:**
+```
+Train on Replicate (~$3)  →  Download weights  →  Generate on RunPod (uncensored)
+   (cheap, serverless)          (portable)           (FLUX.2-dev, no filters)
+```
+
+**Integration Points:**
+- `features/training/adapters/replicate_adapter.py` - Training + generation
+- `features/training/factory.py` - Provider capabilities and routing
+- `kestrel/image_generation.py` - FLUX.1-schnell for quick generation
+
+**Recommendation:**
+- Use for **cost-effective training** ($2-5 vs $5-10 on Vertex)
+- Use for **safe content generation** (filtered output acceptable)
+- For **uncensored generation**: download weights, use RunPod
+- Monitor for affiliate program launch
+
+### Modal Labs (Serverless GPU) - NO PUBLIC PROGRAM
+
+**Current Status:**
+- No affiliate program found
+- Pay-per-CPU-cycle billing model
+- $80M raised (September 2025)
+
+**Recommendation:**
+- Lower priority (no revenue opportunity currently)
+- Consider for compute routing optimization
+
+### OpenAI / Anthropic / Google (LLM Providers)
+
+**Status:**
+- No referral programs for API usage
+- Volume discounts available for enterprise
+- Revenue only via Managed Mode markup
+
+**Strategy:**
+- Focus on margin revenue (20-40% markup)
+- Negotiate enterprise volume discounts when applicable
+
+## Revenue Calculations
+
+### Per-User Monthly Revenue (Estimated)
+
+| Provider | User Spend | Direct Mode (Referral) | Managed Mode (Margin) |
+|----------|------------|------------------------|------------------------|
+| RunPod H100 | $50/mo | $2.50-5.00 (5-10%) | $10-20 (20-40%) |
+| Replicate Training | $10/mo | $0 (no program) | $2-4 (20-40%) |
+| Replicate Generation | $5/mo | $0 (no program) | $1-2 (20-40%) |
+| Lighthouse Storage | $5/mo | ~$0.50 (est.) | $4.50 (90% margin) |
+| OpenAI API | $20/mo | $0 (no program) | $4-8 (20-40%) |
+| Anthropic API | $15/mo | $0 (no program) | $3-6 (20-40%) |
+
+### Aggregate Revenue Projections
+
+#### Conservative (100 users)
+| Source | Users | Monthly/User | Total |
+|--------|-------|--------------|-------|
+| RunPod Referral (Direct) | 30 | $3.50 | $105 |
+| RunPod Managed Margin | 20 | $15.00 | $300 |
+| Lighthouse Margin | 50 | $4.50 | $225 |
+| LLM Managed Margin | 70 | $6.00 | $420 |
+| **Monthly Total** | | | **$1,050** |
+
+#### At Scale (1,000 users)
+| Source | Monthly Total |
+|--------|---------------|
+| Provider Revenue | $10,500 |
+| Subscription Revenue | $15,000 (avg $15/user) |
+| **Combined** | **$25,500/month** |
+
+#### Enterprise Scale (10,000 users)
+| Source | Monthly Total |
+|--------|---------------|
+| Provider Revenue | $105,000 |
+| Subscription Revenue | $150,000 |
+| **Combined** | **$255,000/month** |
+
+## Implementation Roadmap
+
+### Phase 1: Documentation (Current)
+- [x] Create PROVIDER_ECONOMICS.md (this document)
+- [ ] Update BUSINESS_PLAN_V2.md with provider revenue stream
+- [ ] Update AGENT_ECONOMICS.md with provider economics
+- [ ] Update PLAN_RUNPOD_INTEGRATION.md with referral section
+
+### Phase 2: Basic Integration (Future)
+- [ ] Add `RUNPOD_REFERRAL_CODE` usage in feature.py
+- [ ] Generate referral URLs for Direct Mode users
+- [ ] Track referral signups for affiliate qualification
+
+### Phase 3: Provider Base Class (Future)
+- [ ] Create `ReferralCapable` mixin in providers/base.py
+- [ ] Standardize referral URL generation across providers
+- [ ] Add referral tracking to user database
+
+### Phase 4: Usage & Billing (Future)
+- [ ] Implement usage tracking per provider
+- [ ] Create billing system for Managed Mode
+- [ ] Build revenue dashboard for visibility
+
+### Phase 5: Optimization (Future)
+- [ ] Apply for RunPod affiliate program (10% cash at 25+ users)
+- [ ] Negotiate Lighthouse partnership terms
+- [ ] Evaluate Lambda Labs VAR partnership
+
+## Configuration Reference
+
+### Environment Variables
+
+```bash
+# Provider API Keys
+RUNPOD_API_KEY=rp_...              # Direct Mode: user's key
+RUNPOD_REFERRAL_CODE=...           # Referral tracking code
+LIGHTHOUSE_API_KEY=...             # Storage provider key
+OPENAI_API_KEY=sk-...              # LLM provider key
+ANTHROPIC_API_KEY=sk-ant-...       # LLM provider key
+
+# Managed Mode Keys (Platform-owned)
+KESTREL_RUNPOD_KEY=rp_...          # Platform GPU key
+KESTREL_OPENAI_KEY=sk-...          # Platform LLM key
+
+# Pricing Configuration
+GPU_MARKUP_PERCENT=30              # Managed mode margin
+LLM_MARKUP_PERCENT=25              # Managed mode margin
+STORAGE_COST_PER_GB=0.05           # Monthly storage rate
+```
+
+### Feature Pattern
+
+```python
+class ProviderFeature(Feature):
+    """Base pattern for provider-backed features."""
+
+    # Mode support
+    supports_direct_mode: bool = True      # User brings own key
+    supports_managed_mode: bool = True     # Use platform credentials
+
+    # Referral configuration
+    referral_code: Optional[str] = None    # From env var
+    referral_base_url: Optional[str] = None
+
+    def get_signup_url(self, user_id: str) -> str:
+        """Generate referral-tagged signup URL for Direct Mode."""
+        if not self.referral_code:
+            return self.referral_base_url
+        return f"{self.referral_base_url}?ref={self.referral_code}"
+
+    def get_usage_cost(self, operation: str, mode: str) -> Decimal:
+        """Return cost with markup for Managed Mode."""
+        base_cost = self._get_base_cost(operation)
+        if mode == "managed":
+            return base_cost * Decimal("1.30")  # 30% markup
+        return base_cost  # Direct mode: user pays provider
+```
+
+## Strategic Considerations
+
+### Why Both Modes?
+
+1. **Sovereignty Users**: Privacy-first users want full control. They'll use their own keys and we earn referral revenue (smaller margin, higher trust).
+
+2. **Convenience Users**: Most users want simplicity. They'll pay a premium for managed infrastructure (higher margin, better experience).
+
+3. **Revenue Diversification**: Two revenue streams reduce risk. If referral programs change, margin revenue continues.
+
+### Competitive Positioning
+
+- **vs. Pure SaaS** (Character.AI, Replika): We offer sovereignty option they can't match
+- **vs. Self-Hosted** (Ollama, LocalAI): We offer convenience they can't match
+- **vs. Cloud Providers** (RunPod, Lambda): We offer integrated AI experience they don't focus on
+
+### Future Opportunities
+
+1. **RunPod Affiliate**: Apply at 25+ referred users for 10% lifetime cash commission
+2. **Lighthouse Partnership**: Negotiate direct terms for volume discounts
+3. **Lambda Labs VAR**: Formal reseller agreement for enterprise GPU
+4. **Template Revenue**: Publish RunPod templates (1% ongoing compute revenue)
+5. **Hub Revenue**: Maintain RunPod Hub repos (up to 7% compute revenue)
+
+---
+
+*This document defines Kestrel's provider economics strategy. Implementation details are tracked in the respective provider integration documents.*

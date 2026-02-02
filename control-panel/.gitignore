@@ -1,0 +1,8 @@
+# Logs
+*.log
+
+# Temporary env files
+.env.*
+
+# Runtime directories
+run_*/

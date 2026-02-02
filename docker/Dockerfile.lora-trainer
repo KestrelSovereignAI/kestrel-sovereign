@@ -1,0 +1,149 @@
+# Dockerfile for LoRA Training - Optimized Multi-Stage Build
+# FLUX.1-dev + Training Server for RunPod RTX 3090 deployment
+# Target size: ~12-14GB
+#
+# Architecture:
+# 1. Stage 1 (builder): CUDA devel image builds Python wheels
+# 2. Stage 2 (runtime): CUDA runtime image installs pre-built wheels
+#
+# Key optimizations:
+# - Multi-stage build (devel for building, runtime for final)
+# - --no-cache-dir on all pip installs
+# - Uses network volume for model caching (/workspace)
+# - Model pre-warming at startup to avoid CloudFlare 524 timeouts
+
+# ==== STAGE 1: Builder ====
+FROM nvidia/cuda:12.1.1-devel-ubuntu22.04 AS builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=UTC
+
+WORKDIR /build
+
+# Install Python 3.12 and build tools
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    software-properties-common \
+    && add-apt-repository ppa:deadsnakes/ppa -y \
+    && apt-get update && apt-get install -y --no-install-recommends \
+    python3.12 \
+    python3.12-dev \
+    python3.12-venv \
+    curl \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set python3.12 as default
+RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1 \
+    && update-alternatives --install /usr/bin/python python /usr/bin/python3.12 1
+
+# Install pip
+RUN curl -sS https://bootstrap.pypa.io/get-pip.py | python3.12
+
+# Install all dependencies in builder with PINNED VERSIONS
+# PyTorch 2.4.0 + TorchVision 0.19.0 are compatible with CUDA 12.1
+RUN pip install --no-cache-dir \
+    torch==2.4.0 \
+    torchvision==0.19.0 \
+    torchaudio==2.4.0 \
+    --index-url https://download.pytorch.org/whl/cu121
+
+# Install Pillow (required for vision components)
+RUN pip install --no-cache-dir Pillow
+
+# Install FLUX.2 dependencies
+# IMPORTANT: diffusers from main pulls compatible transformers (FLUX.2 needs Mistral3)
+# Don't pin transformers version - let diffusers handle it
+RUN pip install --no-cache-dir \
+    "git+https://github.com/huggingface/diffusers.git@main" \
+    accelerate \
+    safetensors \
+    peft \
+    bitsandbytes \
+    huggingface_hub \
+    xformers==0.0.27.post2 \
+    httpx \
+    numpy \
+    scipy \
+    tqdm \
+    toml \
+    fastapi \
+    uvicorn \
+    sentencepiece
+
+# CRITICAL: Verify ALL imports work before finalizing builder stage
+RUN python3 -c "\
+import torch; \
+import torchvision; \
+from diffusers import Flux2Pipeline; \
+print(f'torch: {torch.__version__}'); \
+print(f'torchvision: {torchvision.__version__}'); \
+import transformers; \
+print(f'transformers: {transformers.__version__}'); \
+print('Flux2Pipeline: OK'); \
+print('✅ All imports verified for FLUX.2'); \
+"
+
+# ==== STAGE 2: Runtime ====
+FROM nvidia/cuda:12.1.1-runtime-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=UTC
+ENV PYTHONUNBUFFERED=1
+ENV CUDA_VISIBLE_DEVICES=0
+
+WORKDIR /app
+
+# Install Python 3.12 runtime only (no -dev packages)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    software-properties-common \
+    && add-apt-repository ppa:deadsnakes/ppa -y \
+    && apt-get update && apt-get install -y --no-install-recommends \
+    python3.12 \
+    python3.12-venv \
+    curl \
+    libgl1 \
+    libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender1 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set python3.12 as default
+RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1 \
+    && update-alternatives --install /usr/bin/python python /usr/bin/python3.12 1
+
+# Install pip
+RUN curl -sS https://bootstrap.pypa.io/get-pip.py | python3.12
+
+# Copy installed packages from builder
+COPY --from=builder /usr/local/lib/python3.12/dist-packages /usr/local/lib/python3.12/dist-packages
+COPY --from=builder /usr/local/bin /usr/local/bin
+
+# Copy training server script
+COPY docker/train_lora.py /app/train_lora.py
+COPY docker/training_config.toml /app/training_config.toml
+
+# Make scripts executable
+RUN chmod +x /app/train_lora.py
+
+# Create minimal local directories (models cached on network volume)
+RUN mkdir -p /app/training_data /app/output
+
+# Environment for training - use network volume paths
+# These will be overridden by runpod_config.toml env vars
+ENV HF_HOME=/workspace/huggingface
+ENV TRANSFORMERS_CACHE=/workspace/huggingface
+ENV TORCH_HOME=/workspace/huggingface
+
+# HF_TOKEN is passed via env at runtime (not baked in)
+ENV HF_TOKEN=""
+
+# Expose API port for status/health
+EXPOSE 8000
+
+# Health check - increased start period for model preloading
+HEALTHCHECK --interval=30s --timeout=30s --start-period=600s --retries=3 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+# Default command runs training server with model pre-warming
+CMD ["python3", "/app/train_lora.py", "--server"]

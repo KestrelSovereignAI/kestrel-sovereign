@@ -1,0 +1,91 @@
+# Dockerfile for LoRA Training using SimpleTuner
+# FLUX.2-dev training on RunPod A100 80GB
+#
+# SimpleTuner is the community-standard FLUX.2 training toolkit
+# - Properly handles FLUX.2 architecture (Mistral-3 text encoder)
+# - Memory optimizations (int8/int4 quantization)
+# - Tested and maintained by the community
+#
+# Usage:
+#   1. Build: gcloud builds submit --config=cloudbuild-simpletuner.yaml
+#   2. Deploy on RunPod with A100 80GB
+#   3. API server listens on port 8000
+
+FROM nvidia/cuda:12.1.1-devel-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=UTC
+ENV PYTHONUNBUFFERED=1
+
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    software-properties-common \
+    && add-apt-repository ppa:deadsnakes/ppa -y \
+    && apt-get update && apt-get install -y --no-install-recommends \
+    python3.12 \
+    python3.12-dev \
+    python3.12-venv \
+    python3-pip \
+    curl \
+    git \
+    libgl1 \
+    libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set python3.12 as default (SimpleTuner requires 3.12+)
+RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1 \
+    && update-alternatives --install /usr/bin/python python /usr/bin/python3.12 1
+
+# Install pip and upgrade setuptools (Python 3.12 removed distutils)
+RUN curl -sS https://bootstrap.pypa.io/get-pip.py | python3.12 \
+    && pip install --upgrade setuptools
+
+# Install SimpleTuner with CUDA support
+# This provides CLI commands: simpletuner, simpletuner-train, simpletuner-configure
+# Let SimpleTuner install its own PyTorch/CUDA dependencies - don't pre-install torch
+RUN pip install --no-cache-dir "simpletuner[cuda]"
+
+# Install additional dependencies for our API wrapper
+# optimum-quanto: for int8 quantization during inference (same as training)
+# diffusers: Use stable release (0.36.0) - dev versions have breaking API changes
+# See docs/architecture/RUNPOD_LORA_TRAINING.md for training details
+RUN pip install --no-cache-dir \
+    fastapi \
+    uvicorn \
+    httpx \
+    python-multipart \
+    aiofiles \
+    google-cloud-storage \
+    optimum-quanto \
+    "diffusers==0.36.0"
+
+# Copy our API wrapper that calls SimpleTuner
+COPY docker/simpletuner_api.py /app/simpletuner_api.py
+
+# Create directories for caches and data
+# Paths are configured at runtime by simpletuner_api.py based on environment
+RUN mkdir -p /app/datasets /app/output /app/config /app/huggingface
+
+# Default environment - works for Vertex AI, overridden for RunPod at runtime
+# DO NOT symlink /tmp - Vertex AI needs standard /tmp to exist
+ENV HF_HOME=/app/huggingface
+ENV TRANSFORMERS_CACHE=/app/huggingface
+ENV TORCH_HOME=/app/huggingface
+
+# SimpleTuner logging - DEBUG for verbose output in debug.log
+ENV SIMPLETUNER_LOG_LEVEL=DEBUG
+
+# HF_TOKEN passed at runtime
+ENV HF_TOKEN=""
+
+# Expose API port
+EXPOSE 8000
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=30s --start-period=300s --retries=3 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+# Run API server
+CMD ["python3", "/app/simpletuner_api.py"]

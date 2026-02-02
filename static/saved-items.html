@@ -1,0 +1,738 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
+    <title>Saved Items - Kestrel</title>
+    <style>
+        :root {
+            --font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            --font-mono: 'Monaco', 'Menlo', 'Consolas', monospace;
+            --bg-primary: #f8fafc;
+            --bg-secondary: #ffffff;
+            --bg-tertiary: #f1f5f9;
+            --text-primary: #0f172a;
+            --text-secondary: #475569;
+            --text-tertiary: #94a3b8;
+            --border-color: #e2e8f0;
+            --accent-color: #3b82f6;
+            --accent-hover: #2563eb;
+            --success: #22c55e;
+            --warning: #f59e0b;
+            --error: #ef4444;
+            --card-shadow: 0 1px 3px rgba(0,0,0,0.1);
+        }
+
+        @media (prefers-color-scheme: dark) {
+            :root {
+                --bg-primary: #0f172a;
+                --bg-secondary: #1e293b;
+                --bg-tertiary: #334155;
+                --text-primary: #f8fafc;
+                --text-secondary: #cbd5e1;
+                --text-tertiary: #64748b;
+                --border-color: #334155;
+                --accent-color: #60a5fa;
+                --accent-hover: #3b82f6;
+                --card-shadow: 0 1px 3px rgba(0,0,0,0.3);
+            }
+        }
+
+        * { box-sizing: border-box; }
+
+        body {
+            font-family: var(--font-family);
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            margin: 0;
+            padding: 0;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 2rem;
+        }
+
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 2rem;
+            padding-bottom: 1rem;
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        header h1 {
+            margin: 0;
+            font-size: 1.75rem;
+        }
+
+        .header-actions {
+            display: flex;
+            gap: 0.75rem;
+        }
+
+        .btn {
+            padding: 0.5rem 1rem;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 0.875rem;
+            font-weight: 500;
+            transition: all 0.2s;
+            text-decoration: none;
+        }
+
+        .btn-primary {
+            background: var(--accent-color);
+            color: white;
+        }
+
+        .btn-primary:hover {
+            background: var(--accent-hover);
+        }
+
+        .btn-secondary {
+            background: var(--bg-tertiary);
+            color: var(--text-primary);
+        }
+
+        .btn-secondary:hover {
+            background: var(--border-color);
+        }
+
+        .stats-bar {
+            display: flex;
+            gap: 1rem;
+            margin-bottom: 1.5rem;
+            flex-wrap: wrap;
+        }
+
+        .stat-card {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 1rem 1.5rem;
+            min-width: 120px;
+        }
+
+        .stat-card .value {
+            font-size: 1.5rem;
+            font-weight: 600;
+            color: var(--accent-color);
+        }
+
+        .stat-card .label {
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .controls {
+            display: flex;
+            gap: 1rem;
+            margin-bottom: 1.5rem;
+            flex-wrap: wrap;
+            align-items: center;
+        }
+
+        .search-box {
+            flex: 1;
+            min-width: 250px;
+            position: relative;
+        }
+
+        .search-box input {
+            width: 100%;
+            padding: 0.75rem 1rem 0.75rem 2.5rem;
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            background: var(--bg-secondary);
+            color: var(--text-primary);
+            font-size: 0.9rem;
+        }
+
+        .search-box input:focus {
+            outline: none;
+            border-color: var(--accent-color);
+        }
+
+        .search-box::before {
+            content: "🔍";
+            position: absolute;
+            left: 0.75rem;
+            top: 50%;
+            transform: translateY(-50%);
+        }
+
+        select {
+            padding: 0.75rem 1rem;
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            background: var(--bg-secondary);
+            color: var(--text-primary);
+            cursor: pointer;
+        }
+
+        .items-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+            gap: 1rem;
+        }
+
+        .item-card {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            padding: 1.25rem;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .item-card:hover {
+            box-shadow: var(--card-shadow);
+            border-color: var(--accent-color);
+        }
+
+        .item-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            margin-bottom: 0.75rem;
+        }
+
+        .item-name {
+            font-weight: 600;
+            font-size: 1rem;
+            margin: 0;
+            flex: 1;
+        }
+
+        .item-type {
+            font-size: 0.7rem;
+            padding: 0.2rem 0.5rem;
+            border-radius: 4px;
+            background: var(--bg-tertiary);
+            color: var(--text-secondary);
+            text-transform: uppercase;
+        }
+
+        .item-type.stash { background: #dbeafe; color: #1e40af; }
+        .item-type.file { background: #dcfce7; color: #166534; }
+        .item-type.excerpt { background: #fef3c7; color: #92400e; }
+        .item-type.structured { background: #f3e8ff; color: #6b21a8; }
+
+        @media (prefers-color-scheme: dark) {
+            .item-type.stash { background: #1e3a5f; color: #93c5fd; }
+            .item-type.file { background: #14532d; color: #86efac; }
+            .item-type.excerpt { background: #78350f; color: #fcd34d; }
+            .item-type.structured { background: #581c87; color: #d8b4fe; }
+        }
+
+        .item-summary {
+            font-size: 0.875rem;
+            color: var(--text-secondary);
+            line-height: 1.5;
+            margin-bottom: 0.75rem;
+            display: -webkit-box;
+            -webkit-line-clamp: 2;
+            -webkit-box-orient: vertical;
+            overflow: hidden;
+        }
+
+        .item-meta {
+            display: flex;
+            gap: 1rem;
+            font-size: 0.75rem;
+            color: var(--text-tertiary);
+        }
+
+        .item-tags {
+            display: flex;
+            gap: 0.5rem;
+            flex-wrap: wrap;
+            margin-top: 0.5rem;
+        }
+
+        .tag {
+            font-size: 0.7rem;
+            padding: 0.15rem 0.5rem;
+            border-radius: 4px;
+            background: var(--accent-color);
+            color: white;
+        }
+
+        .ipfs-badge {
+            font-size: 0.7rem;
+            padding: 0.15rem 0.5rem;
+            border-radius: 4px;
+            background: var(--success);
+            color: white;
+        }
+
+        /* Modal styles */
+        .modal {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0,0,0,0.5);
+            z-index: 1000;
+            justify-content: center;
+            align-items: center;
+        }
+
+        .modal.active {
+            display: flex;
+        }
+
+        .modal-content {
+            background: var(--bg-secondary);
+            border-radius: 12px;
+            max-width: 700px;
+            width: 90%;
+            max-height: 80vh;
+            overflow-y: auto;
+            padding: 1.5rem;
+        }
+
+        .modal-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 1rem;
+            padding-bottom: 1rem;
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        .modal-header h2 {
+            margin: 0;
+        }
+
+        .modal-close {
+            background: none;
+            border: none;
+            font-size: 1.5rem;
+            cursor: pointer;
+            color: var(--text-secondary);
+        }
+
+        .modal-body {
+            line-height: 1.6;
+        }
+
+        .detail-row {
+            display: flex;
+            margin-bottom: 0.75rem;
+        }
+
+        .detail-label {
+            width: 120px;
+            font-weight: 500;
+            color: var(--text-secondary);
+        }
+
+        .detail-value {
+            flex: 1;
+        }
+
+        .content-preview {
+            background: var(--bg-tertiary);
+            border-radius: 8px;
+            padding: 1rem;
+            font-family: var(--font-mono);
+            font-size: 0.85rem;
+            white-space: pre-wrap;
+            word-break: break-word;
+            max-height: 300px;
+            overflow-y: auto;
+        }
+
+        .loading {
+            text-align: center;
+            padding: 3rem;
+            color: var(--text-secondary);
+        }
+
+        .empty-state {
+            text-align: center;
+            padding: 3rem;
+            color: var(--text-secondary);
+        }
+
+        .schemas-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+            gap: 1rem;
+            margin-top: 1rem;
+        }
+
+        .schema-card {
+            background: var(--bg-tertiary);
+            border-radius: 8px;
+            padding: 1rem;
+            cursor: pointer;
+        }
+
+        .schema-card:hover {
+            background: var(--border-color);
+        }
+
+        .schema-card h4 {
+            margin: 0 0 0.5rem 0;
+        }
+
+        .schema-card p {
+            margin: 0;
+            font-size: 0.8rem;
+            color: var(--text-secondary);
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>Saved Items</h1>
+            <div class="header-actions">
+                <a href="/" class="btn btn-secondary">Back to Console</a>
+                <button class="btn btn-primary" onclick="showSchemasModal()">+ New Structured Item</button>
+            </div>
+        </header>
+
+        <div class="stats-bar" id="stats-bar">
+            <div class="stat-card">
+                <div class="value" id="stat-total">-</div>
+                <div class="label">Total Items</div>
+            </div>
+            <div class="stat-card">
+                <div class="value" id="stat-ipfs">-</div>
+                <div class="label">On IPFS</div>
+            </div>
+            <div class="stat-card">
+                <div class="value" id="stat-embedded">-</div>
+                <div class="label">With Embeddings</div>
+            </div>
+        </div>
+
+        <div class="controls">
+            <div class="search-box">
+                <input type="text" id="search-input" placeholder="Search items...">
+            </div>
+            <select id="type-filter">
+                <option value="">All Types</option>
+                <option value="stash">Stashes</option>
+                <option value="file">Files</option>
+                <option value="excerpt">Excerpts</option>
+                <option value="structured">Structured</option>
+            </select>
+            <select id="tag-filter">
+                <option value="">All Tags</option>
+            </select>
+            <button class="btn btn-secondary" onclick="loadItems()">Refresh</button>
+        </div>
+
+        <div class="items-grid" id="items-grid">
+            <div class="loading">Loading saved items...</div>
+        </div>
+    </div>
+
+    <!-- Item Detail Modal -->
+    <div class="modal" id="item-modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2 id="modal-title">Item Details</h2>
+                <button class="modal-close" onclick="closeModal()">&times;</button>
+            </div>
+            <div class="modal-body" id="modal-body">
+                <!-- Filled dynamically -->
+            </div>
+            <div style="margin-top: 1rem; display: flex; gap: 0.5rem; justify-content: flex-end;">
+                <button class="btn btn-secondary" id="btn-pin-ipfs" onclick="pinToIpfs()">Pin to IPFS</button>
+                <button class="btn btn-secondary" style="background: var(--error); color: white;" onclick="deleteItem()">Delete</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Schemas Modal -->
+    <div class="modal" id="schemas-modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2>Create Structured Item</h2>
+                <button class="modal-close" onclick="closeSchemasModal()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <p style="margin-bottom: 1rem; color: var(--text-secondary);">
+                    Select a schema type to create a new structured item:
+                </p>
+                <div class="schemas-grid" id="schemas-grid">
+                    <!-- Filled dynamically -->
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let currentItem = null;
+        let allTags = [];
+        let schemas = [];
+
+        // API helper
+        async function api(path, options = {}) {
+            const response = await fetch(`/api/saved-items${path}`, {
+                ...options,
+                headers: {
+                    'Content-Type': 'application/json',
+                    ...options.headers
+                }
+            });
+            if (!response.ok) {
+                const error = await response.json();
+                throw new Error(error.detail || 'API error');
+            }
+            return response.json();
+        }
+
+        // Load stats
+        async function loadStats() {
+            try {
+                const stats = await api('/stats');
+                document.getElementById('stat-total').textContent = stats.total_items || 0;
+                document.getElementById('stat-ipfs').textContent = stats.with_ipfs || 0;
+                document.getElementById('stat-embedded').textContent = stats.with_embedding || 0;
+                schemas = stats.available_schemas || [];
+            } catch (e) {
+                console.error('Failed to load stats:', e);
+            }
+        }
+
+        // Load tags
+        async function loadTags() {
+            try {
+                const result = await api('/tags');
+                allTags = result.tags || [];
+                const select = document.getElementById('tag-filter');
+                select.innerHTML = '<option value="">All Tags</option>';
+                allTags.forEach(tag => {
+                    select.innerHTML += `<option value="${tag}">${tag}</option>`;
+                });
+            } catch (e) {
+                console.error('Failed to load tags:', e);
+            }
+        }
+
+        // Load items
+        async function loadItems() {
+            const grid = document.getElementById('items-grid');
+            grid.innerHTML = '<div class="loading">Loading...</div>';
+
+            try {
+                const typeFilter = document.getElementById('type-filter').value;
+                const tagFilter = document.getElementById('tag-filter').value;
+                const search = document.getElementById('search-input').value;
+
+                let items = [];
+
+                if (search) {
+                    // Use semantic search
+                    const result = await api('/search', {
+                        method: 'POST',
+                        body: JSON.stringify({ query: search, item_type: typeFilter || null, limit: 50 })
+                    });
+                    items = result.results.map(r => r.item);
+                } else if (tagFilter) {
+                    const result = await api(`/by-tag/${encodeURIComponent(tagFilter)}?item_type=${typeFilter || ''}`);
+                    items = result.items;
+                } else {
+                    const result = await api(`?item_type=${typeFilter || ''}&limit=100`);
+                    items = result.items;
+                }
+
+                if (items.length === 0) {
+                    grid.innerHTML = '<div class="empty-state">No items found</div>';
+                    return;
+                }
+
+                grid.innerHTML = items.map(item => `
+                    <div class="item-card" onclick="showItem('${item.id}')">
+                        <div class="item-header">
+                            <h3 class="item-name">${escapeHtml(item.name)}</h3>
+                            <span class="item-type ${item.item_type}">${item.item_type}</span>
+                        </div>
+                        <p class="item-summary">${escapeHtml(item.summary || item.content?.substring(0, 150) || '')}</p>
+                        <div class="item-meta">
+                            <span>${formatDate(item.created_at)}</span>
+                            ${item.schema_id ? `<span>📋 ${item.schema_id}</span>` : ''}
+                            ${item.ipfs_cid ? '<span class="ipfs-badge">IPFS</span>' : ''}
+                        </div>
+                        ${item.tags && item.tags.length > 0 ? `
+                            <div class="item-tags">
+                                ${item.tags.slice(0, 3).map(t => `<span class="tag">${escapeHtml(t)}</span>`).join('')}
+                                ${item.tags.length > 3 ? `<span style="color: var(--text-tertiary);">+${item.tags.length - 3}</span>` : ''}
+                            </div>
+                        ` : ''}
+                    </div>
+                `).join('');
+            } catch (e) {
+                grid.innerHTML = `<div class="empty-state">Error: ${e.message}</div>`;
+            }
+        }
+
+        // Show item detail
+        async function showItem(id) {
+            try {
+                const result = await api(`/${id}`);
+                currentItem = result.item;
+
+                document.getElementById('modal-title').textContent = currentItem.name;
+
+                let contentPreview = currentItem.content;
+                try {
+                    // Try to pretty-print JSON
+                    const parsed = JSON.parse(currentItem.content);
+                    contentPreview = JSON.stringify(parsed, null, 2);
+                } catch {}
+
+                document.getElementById('modal-body').innerHTML = `
+                    <div class="detail-row">
+                        <span class="detail-label">Type</span>
+                        <span class="detail-value"><span class="item-type ${currentItem.item_type}">${currentItem.item_type}</span></span>
+                    </div>
+                    ${currentItem.schema_id ? `
+                        <div class="detail-row">
+                            <span class="detail-label">Schema</span>
+                            <span class="detail-value">${currentItem.schema_id}</span>
+                        </div>
+                    ` : ''}
+                    <div class="detail-row">
+                        <span class="detail-label">Created</span>
+                        <span class="detail-value">${formatDate(currentItem.created_at)}</span>
+                    </div>
+                    ${currentItem.ipfs_cid ? `
+                        <div class="detail-row">
+                            <span class="detail-label">IPFS CID</span>
+                            <span class="detail-value" style="font-family: var(--font-mono); font-size: 0.8rem;">${currentItem.ipfs_cid}</span>
+                        </div>
+                    ` : ''}
+                    ${currentItem.tags && currentItem.tags.length > 0 ? `
+                        <div class="detail-row">
+                            <span class="detail-label">Tags</span>
+                            <span class="detail-value">
+                                <div class="item-tags">${currentItem.tags.map(t => `<span class="tag">${escapeHtml(t)}</span>`).join('')}</div>
+                            </span>
+                        </div>
+                    ` : ''}
+                    <div class="detail-row">
+                        <span class="detail-label">Summary</span>
+                        <span class="detail-value">${escapeHtml(currentItem.summary || 'No summary')}</span>
+                    </div>
+                    <div style="margin-top: 1rem;">
+                        <strong>Content:</strong>
+                        <div class="content-preview">${escapeHtml(contentPreview)}</div>
+                    </div>
+                `;
+
+                document.getElementById('btn-pin-ipfs').style.display = currentItem.ipfs_cid ? 'none' : 'inline-block';
+                document.getElementById('item-modal').classList.add('active');
+            } catch (e) {
+                alert('Failed to load item: ' + e.message);
+            }
+        }
+
+        function closeModal() {
+            document.getElementById('item-modal').classList.remove('active');
+            currentItem = null;
+        }
+
+        async function pinToIpfs() {
+            if (!currentItem) return;
+            try {
+                const result = await api(`/${currentItem.id}/pin`, { method: 'POST' });
+                alert(result.message || 'Pinned to IPFS');
+                showItem(currentItem.id);
+                loadStats();
+            } catch (e) {
+                alert('Failed to pin: ' + e.message);
+            }
+        }
+
+        async function deleteItem() {
+            if (!currentItem || !confirm('Delete this item?')) return;
+            try {
+                await api(`/${currentItem.id}`, { method: 'DELETE' });
+                closeModal();
+                loadItems();
+                loadStats();
+            } catch (e) {
+                alert('Failed to delete: ' + e.message);
+            }
+        }
+
+        // Schemas modal
+        async function showSchemasModal() {
+            const grid = document.getElementById('schemas-grid');
+
+            if (schemas.length === 0) {
+                try {
+                    const result = await api('/schemas');
+                    schemas = result.schemas || [];
+                } catch (e) {
+                    grid.innerHTML = '<div class="empty-state">Failed to load schemas</div>';
+                    document.getElementById('schemas-modal').classList.add('active');
+                    return;
+                }
+            }
+
+            grid.innerHTML = schemas.map(s => `
+                <div class="schema-card" onclick="alert('Schema form coming soon! Use API: POST /api/saved-items/structured')">
+                    <h4>${s.name}</h4>
+                    <p>${s.description}</p>
+                </div>
+            `).join('');
+
+            document.getElementById('schemas-modal').classList.add('active');
+        }
+
+        function closeSchemasModal() {
+            document.getElementById('schemas-modal').classList.remove('active');
+        }
+
+        // Utility functions
+        function escapeHtml(str) {
+            if (!str) return '';
+            return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        }
+
+        function formatDate(isoStr) {
+            if (!isoStr) return '-';
+            const d = new Date(isoStr);
+            return d.toLocaleDateString() + ' ' + d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        }
+
+        // Event listeners
+        document.getElementById('type-filter').addEventListener('change', loadItems);
+        document.getElementById('tag-filter').addEventListener('change', loadItems);
+        document.getElementById('search-input').addEventListener('keyup', (e) => {
+            if (e.key === 'Enter') loadItems();
+        });
+
+        // Close modals on outside click
+        document.querySelectorAll('.modal').forEach(modal => {
+            modal.addEventListener('click', (e) => {
+                if (e.target === modal) {
+                    modal.classList.remove('active');
+                }
+            });
+        });
+
+        // Init
+        loadStats();
+        loadTags();
+        loadItems();
+    </script>
+</body>
+</html>

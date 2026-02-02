@@ -1,0 +1,15 @@
+name: tasks
+description: Monitor and manage A2A background tasks - check status, list tasks, get artifacts, and cancel operations
+version: 1.0.0
+entry_point: feature.py
+
+tools:
+  - get_task_status
+  - list_tasks
+  - get_task_artifacts
+  - cancel_task
+
+files:
+  - feature.py
+
+dependencies: []

@@ -1,0 +1,110 @@
+name: Feature Request
+description: Request a new feature or enhancement (structured for agent processing)
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## Feature Request
+        Please fill out this form to help agents understand and implement your request.
+        The more detail you provide, the better the agent can work autonomously.
+
+  - type: input
+    id: summary
+    attributes:
+      label: One-line Summary
+      description: Brief description of what you want (will become issue title)
+      placeholder: "Add dark mode toggle to settings page"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: scope
+    attributes:
+      label: Scope
+      description: How big is this change?
+      options:
+        - Small (single file, < 50 lines)
+        - Medium (2-5 files, < 200 lines)
+        - Large (multiple components, > 200 lines)
+        - Unknown (needs investigation)
+    validations:
+      required: true
+
+  - type: dropdown
+    id: type
+    attributes:
+      label: Type of Change
+      options:
+        - New feature
+        - Enhancement to existing feature
+        - Refactoring
+        - Performance improvement
+        - Developer experience
+        - Documentation
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Detailed Description
+      description: What should this feature do? Be specific.
+      placeholder: |
+        Describe the feature in detail:
+        - What problem does it solve?
+        - What should happen when a user interacts with it?
+        - Any specific requirements or constraints?
+    validations:
+      required: true
+
+  - type: textarea
+    id: affected-files
+    attributes:
+      label: Affected Files/Components
+      description: If you know which files or components this touches, list them
+      placeholder: |
+        - src/components/Settings.tsx
+        - src/styles/theme.css
+
+  - type: dropdown
+    id: breaking-change
+    attributes:
+      label: Breaking Change?
+      description: Will this change break existing functionality or APIs?
+      options:
+        - "No"
+        - "Yes - minor (deprecation warning)"
+        - "Yes - major (requires migration)"
+        - "Unknown"
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance-criteria
+    attributes:
+      label: Acceptance Criteria
+      description: How do we know this is done? List specific criteria.
+      placeholder: |
+        - [ ] Toggle appears in settings
+        - [ ] Theme persists across sessions
+        - [ ] All components respect theme
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional Context
+      description: Any other information that helps (screenshots, links, related issues)
+
+  - type: checkboxes
+    id: agent-ready
+    attributes:
+      label: Agent Processing
+      description: Confirm this issue is ready for autonomous agent processing
+      options:
+        - label: This issue has enough detail for an agent to work autonomously
+          required: true
+        - label: I understand an agent may ask clarifying questions via issue comments
+          required: true

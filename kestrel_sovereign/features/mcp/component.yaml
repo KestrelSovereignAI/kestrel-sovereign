@@ -1,0 +1,20 @@
+name: mcp
+description: Model Context Protocol (MCP) server management - gateway mode for 311+ servers, direct container management
+version: 1.0.0
+entry_point: feature.py
+
+tools:
+  - start_mcp_gateway
+  - stop_mcp_gateway
+  - search_mcp_servers
+  - list_enabled_servers
+  - call_mcp_tool
+  - load_mcp_server
+  - unload_mcp_server
+
+files:
+  - feature.py
+  - registry.py
+
+dependencies:
+  - docker

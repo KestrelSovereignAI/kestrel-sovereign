@@ -1,0 +1,16 @@
+name: keys
+description: Manage external service API keys - add, remove, list, and rotate keys with secure storage
+version: 1.0.0
+entry_point: feature.py
+
+tools:
+  - add_service_key
+  - remove_service_key
+  - list_service_keys
+  - get_key_usage
+  - set_key_quota
+
+files:
+  - feature.py
+
+dependencies: []

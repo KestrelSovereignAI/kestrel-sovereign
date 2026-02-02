@@ -1,0 +1,441 @@
+/**
+ * Kestrel Sovereign Console - UI Components
+ * Modal, Toast, and common utilities
+ */
+
+// ============================================================================
+// Animation Styles
+// ============================================================================
+
+const styleSheet = document.createElement('style');
+styleSheet.textContent = `
+    @keyframes modalFadeIn {
+        from { opacity: 0; }
+        to { opacity: 1; }
+    }
+    @keyframes modalSlideIn {
+        from { opacity: 0; transform: scale(0.95) translateY(-10px); }
+        to { opacity: 1; transform: scale(1) translateY(0); }
+    }
+    @keyframes toastSlideIn {
+        from { opacity: 0; transform: translateX(100%); }
+        to { opacity: 1; transform: translateX(0); }
+    }
+    @keyframes toastSlideOut {
+        from { opacity: 1; transform: translateX(0); }
+        to { opacity: 0; transform: translateX(100%); }
+    }
+    .modal-btn:hover {
+        filter: brightness(1.1);
+    }
+`;
+document.head.appendChild(styleSheet);
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+export const PRIVACY_MODES = {
+    ephemeral: { icon: '\u{1F512}', label: 'EPHEMERAL', color: '#dc2626', description: 'Nothing stored, local LLM only' },
+    isolated: { icon: '\u{1F510}', label: 'ISOLATED', color: '#ea580c', description: 'Temporary storage, deleted on session end' },
+    anonymous: { icon: '\u{1F3AD}', label: 'ANONYMOUS', color: '#ca8a04', description: 'Stored without PII, encrypted backups' },
+    normal: { icon: '\u{1F4DD}', label: 'NORMAL', color: '#16a34a', description: 'Standard persistence with all features' },
+    public: { icon: '\u{1F310}', label: 'PUBLIC', color: '#2563eb', description: 'Can be shared and exported publicly' },
+};
+
+// Commands are loaded dynamically from /api/commands
+// This is a fallback list used until the API responds
+export let AGENT_COMMANDS = [
+    { cmd: '!help', description: 'Show available commands' },
+    { cmd: '!model', description: 'Show current model' },
+    { cmd: '!model-set', description: 'Set model', args: '<provider/model>' },
+];
+
+/**
+ * Load commands dynamically from /api/commands endpoint.
+ * Called on module init and can be called to refresh.
+ */
+export async function loadCommands() {
+    try {
+        const response = await fetch('/api/commands');
+        if (response.ok) {
+            const data = await response.json();
+            if (data.commands && data.commands.length > 0) {
+                AGENT_COMMANDS = data.commands;
+                console.log(`Loaded ${data.count} commands from API`);
+            }
+        }
+    } catch (e) {
+        console.warn('Failed to load commands from API, using fallback:', e);
+    }
+}
+
+// Load commands on module init
+loadCommands();
+
+// ============================================================================
+// State
+// ============================================================================
+
+export const state = {
+    currentPanel: 'identity',
+    identity: null,
+    constitution: null,
+    memories: null,
+    exports: null,
+    storage: null,
+    wallet: null,
+    privacyMode: 'normal',
+    isWaiting: false,
+    conversations: [],
+    currentSessionId: null,
+    showDecrypted: true,
+    encryptedAtRest: false,
+    useStreaming: true,
+    selectedModel: null,
+};
+
+// ============================================================================
+// Toast Notifications
+// ============================================================================
+
+export const Toast = {
+    _container: null,
+
+    _getContainer() {
+        if (!this._container) {
+            this._container = document.createElement('div');
+            this._container.id = 'toast-container';
+            this._container.style.cssText = `
+                position: fixed;
+                bottom: 1.5rem;
+                right: 1.5rem;
+                display: flex;
+                flex-direction: column;
+                gap: 0.75rem;
+                z-index: 3000;
+                max-width: 400px;
+            `;
+            document.body.appendChild(this._container);
+        }
+        return this._container;
+    },
+
+    show(message, type = 'info', duration = 4000) {
+        const container = this._getContainer();
+        const toast = document.createElement('div');
+
+        const colors = {
+            success: { bg: '#059669', icon: '✓' },
+            error: { bg: '#dc2626', icon: '✕' },
+            warning: { bg: '#d97706', icon: '⚠' },
+            info: { bg: '#2563eb', icon: 'ℹ' }
+        };
+        const { bg, icon } = colors[type] || colors.info;
+
+        toast.className = 'toast-item';
+        toast.style.cssText = `
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            padding: 0.875rem 1.25rem;
+            background: ${bg};
+            color: white;
+            border-radius: 10px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.25);
+            font-size: 0.9rem;
+            font-weight: 500;
+            animation: toastSlideIn 0.3s ease-out;
+            cursor: pointer;
+        `;
+
+        toast.innerHTML = `
+            <span style="font-size: 1.1rem;">${icon}</span>
+            <span style="flex: 1;">${message}</span>
+            <button style="
+                background: rgba(255,255,255,0.2);
+                border: none;
+                border-radius: 4px;
+                color: white;
+                padding: 0.25rem 0.5rem;
+                cursor: pointer;
+                font-size: 0.8rem;
+            ">&times;</button>
+        `;
+
+        toast.addEventListener('click', () => this._removeToast(toast));
+        container.appendChild(toast);
+
+        if (duration > 0) {
+            setTimeout(() => this._removeToast(toast), duration);
+        }
+    },
+
+    _removeToast(toast) {
+        if (!toast || !toast.parentNode) return;
+        toast.style.animation = 'toastSlideOut 0.2s ease-in forwards';
+        setTimeout(() => toast.remove(), 200);
+    },
+
+    success(message, duration) { this.show(message, 'success', duration); },
+    error(message, duration) { this.show(message, 'error', duration); },
+    warning(message, duration) { this.show(message, 'warning', duration); },
+    info(message, duration) { this.show(message, 'info', duration); }
+};
+
+// ============================================================================
+// Modal System
+// ============================================================================
+
+export const Modal = {
+    _currentModal: null,
+    _resolvePromise: null,
+
+    show(options) {
+        this.hide();
+        const { title, content, buttons = [], onClose } = options;
+
+        const overlay = document.createElement('div');
+        overlay.id = 'modal-overlay';
+        overlay.className = 'modal-overlay';
+        overlay.style.cssText = `
+            position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+            background: rgba(0,0,0,0.6); z-index: 2000;
+            display: flex; align-items: center; justify-content: center;
+            padding: 1rem; backdrop-filter: blur(4px);
+            animation: modalFadeIn 0.2s ease-out;
+        `;
+
+        const modal = document.createElement('div');
+        modal.className = 'modal-container';
+        modal.style.cssText = `
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            border-radius: 16px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            max-width: 480px;
+            width: 100%;
+            max-height: 90vh;
+            overflow: hidden;
+            animation: modalSlideIn 0.2s ease-out;
+        `;
+
+        modal.innerHTML = `
+            <div class="modal-header" style="
+                padding: 1rem 1.5rem;
+                border-bottom: 1px solid var(--border-color);
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+            ">
+                <h3 style="margin: 0; font-size: 1.125rem; font-weight: 600;">${title}</h3>
+                <button class="modal-close-btn" style="
+                    background: none;
+                    border: none;
+                    font-size: 1.5rem;
+                    cursor: pointer;
+                    color: var(--text-secondary);
+                    padding: 0;
+                    line-height: 1;
+                    transition: color 0.2s;
+                ">&times;</button>
+            </div>
+            <div class="modal-body" style="padding: 1.5rem;">
+                ${content}
+            </div>
+            ${buttons.length > 0 ? `
+                <div class="modal-footer" style="
+                    padding: 1rem 1.5rem;
+                    border-top: 1px solid var(--border-color);
+                    display: flex;
+                    justify-content: flex-end;
+                    gap: 0.75rem;
+                ">
+                    ${buttons.map((btn, i) => `
+                        <button class="modal-btn modal-btn-${btn.type || 'secondary'}" data-btn-index="${i}" style="
+                            padding: 0.625rem 1.25rem;
+                            border: none;
+                            border-radius: 8px;
+                            font-size: 0.875rem;
+                            font-weight: 500;
+                            cursor: pointer;
+                            transition: all 0.2s;
+                            ${btn.type === 'primary' ? 'background: var(--accent-color); color: white;' : ''}
+                            ${btn.type === 'danger' ? 'background: var(--error); color: white;' : ''}
+                            ${btn.type === 'secondary' || !btn.type ? 'background: var(--bg-tertiary); color: var(--text-primary);' : ''}
+                        ">${btn.label}</button>
+                    `).join('')}
+                </div>
+            ` : ''}
+        `;
+
+        modal.querySelector('.modal-close-btn').addEventListener('click', () => {
+            this.hide();
+            if (onClose) onClose();
+        });
+
+        overlay.addEventListener('click', (e) => {
+            if (e.target === overlay) {
+                this.hide();
+                if (onClose) onClose();
+            }
+        });
+
+        modal.querySelectorAll('.modal-btn').forEach(btn => {
+            btn.addEventListener('click', () => {
+                const index = parseInt(btn.dataset.btnIndex);
+                if (buttons[index] && buttons[index].onClick) {
+                    buttons[index].onClick();
+                }
+            });
+        });
+
+        const escHandler = (e) => {
+            if (e.key === 'Escape') {
+                this.hide();
+                if (onClose) onClose();
+                document.removeEventListener('keydown', escHandler);
+            }
+        };
+        document.addEventListener('keydown', escHandler);
+
+        overlay.appendChild(modal);
+        document.body.appendChild(overlay);
+        this._currentModal = overlay;
+
+        const firstInput = modal.querySelector('input, select, textarea');
+        if (firstInput) setTimeout(() => firstInput.focus(), 50);
+    },
+
+    hide() {
+        if (this._currentModal) {
+            this._currentModal.remove();
+            this._currentModal = null;
+        }
+        if (this._resolvePromise) {
+            this._resolvePromise(null);
+            this._resolvePromise = null;
+        }
+    },
+
+    confirm(title, message) {
+        return new Promise((resolve) => {
+            this.show({
+                title,
+                content: `<p style="margin: 0; color: var(--text-secondary); line-height: 1.6;">${message}</p>`,
+                buttons: [
+                    { label: 'Cancel', type: 'secondary', onClick: () => { this.hide(); resolve(false); } },
+                    { label: 'Confirm', type: 'primary', onClick: () => { this.hide(); resolve(true); } }
+                ],
+                onClose: () => resolve(false)
+            });
+        });
+    },
+
+    prompt(title, placeholder = '', defaultValue = '') {
+        return new Promise((resolve) => {
+            const inputId = 'modal-prompt-input-' + Date.now();
+            this.show({
+                title,
+                content: `
+                    <input type="text" id="${inputId}"
+                        placeholder="${placeholder}"
+                        value="${defaultValue}"
+                        style="
+                            width: 100%;
+                            padding: 0.75rem 1rem;
+                            border: 1px solid var(--border-color);
+                            border-radius: 8px;
+                            font-size: 1rem;
+                            background: var(--bg-primary);
+                            color: var(--text-primary);
+                            outline: none;
+                            transition: border-color 0.2s;
+                        "
+                        onfocus="this.style.borderColor='var(--accent-color)'"
+                        onblur="this.style.borderColor='var(--border-color)'"
+                    />
+                `,
+                buttons: [
+                    { label: 'Cancel', type: 'secondary', onClick: () => { this.hide(); resolve(null); } },
+                    { label: 'OK', type: 'primary', onClick: () => {
+                        const value = document.getElementById(inputId)?.value || '';
+                        this.hide();
+                        resolve(value);
+                    }}
+                ],
+                onClose: () => resolve(null)
+            });
+
+            setTimeout(() => {
+                const input = document.getElementById(inputId);
+                if (input) {
+                    input.addEventListener('keydown', (e) => {
+                        if (e.key === 'Enter') {
+                            this.hide();
+                            resolve(input.value);
+                        }
+                    });
+                }
+            }, 50);
+        });
+    }
+};
+
+// ============================================================================
+// Utility Functions
+// ============================================================================
+
+export function formatBytes(bytes, decimals = 2) {
+    if (bytes === 0 || bytes === null || bytes === undefined) return '0 B';
+    const k = 1024;
+    const dm = decimals < 0 ? 0 : decimals;
+    const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
+}
+
+export function truncate(str, maxLength = 30) {
+    if (!str || str.length <= maxLength) return str;
+    return str.slice(0, maxLength - 3) + '...';
+}
+
+export async function copyToClipboard(text, showNotification = true) {
+    try {
+        await navigator.clipboard.writeText(text);
+        if (showNotification) {
+            Toast.success('Copied to clipboard');
+        }
+        return true;
+    } catch (e) {
+        if (showNotification) {
+            Toast.error('Failed to copy to clipboard');
+        }
+        return false;
+    }
+}
+
+export function showLoading(elementId) {
+    const el = document.getElementById(elementId);
+    if (el) el.innerHTML = '<div class="loading">Loading</div>';
+}
+
+export function showError(elementId, message) {
+    const el = document.getElementById(elementId);
+    if (el) el.innerHTML = `<div style="color: var(--error); padding: 1rem;">${message}</div>`;
+}
+
+export function escapeHtml(text) {
+    if (!text) return '';
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+}
+
+export function truncateId(id) {
+    if (!id || id.length <= 12) return id;
+    return id.slice(0, 6) + '...' + id.slice(-4);
+}
+
+// Make utilities globally available for onclick handlers
+window.copyToClipboard = copyToClipboard;

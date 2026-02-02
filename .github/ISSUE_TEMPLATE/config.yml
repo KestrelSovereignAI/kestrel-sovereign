@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Discussion / Questions
+    url: https://github.com/KestrelSovereignAI/kestrel-sovereign/discussions
+    about: Ask questions or discuss ideas before creating an issue
+  - name: Documentation
+    url: https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/main/README.md
+    about: Check the documentation first

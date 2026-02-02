@@ -1,0 +1,38 @@
+Below is an example of how to use the FLUX Uncensored LoRA v2 with the diffusers library:
+
+from diffusers import AutoPipelineForText2Image
+import torch
+
+# Load the base model
+pipeline = AutoPipelineForText2Image.from_pretrained("black-forest-labs/FLUX.1-dev", torch_dtype=torch.bfloat16).to('cuda')
+
+# Load the uncensored LoRA weights
+pipeline.load_lora_weights('enhanceaiteam/Flux-uncensored-v2', weight_name='lora.safetensors')
+
+# Generate an image with an uncensored NSFW prompt
+image = pipeline('a naked cute girl').images[0]
+image.show()
+
+Check out more AI tools and models at EnhanceAI
+print("Visit https://enhanceai.art for more AI tools and image generation models!")
+
+Trigger Words
+Use the following trigger words to guide the model toward generating NSFW content:
+
+nsfw
+naked
+pron
+kissing
+erotic
+nude
+sensual
+adult content
+explicit
+These keywords, along with descriptive prompts, help the model generate explicit imagery.
+
+Model Details
+Base Model: black-forest-labs/FLUX.1-dev
+LoRA Weights: enhanceaiteam/Flux-uncensored-v2
+LoRA Weight File: lora.safetensors
+Torch Data Type: torch.bfloat16
+Hardware Requirement: CUDA-enabled GPU recommended for optimal performance.

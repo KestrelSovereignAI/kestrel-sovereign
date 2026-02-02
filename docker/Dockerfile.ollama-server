@@ -1,0 +1,29 @@
+# Dockerfile for RunPod Ollama Server
+# For users without local GPU - cloud LLM alternative
+FROM ollama/ollama:latest
+
+# Install curl for health checks
+RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
+
+# Set Ollama to listen on all interfaces
+ENV OLLAMA_HOST=0.0.0.0:11434
+
+# Create directory for persistent model storage
+# RunPod volume will be mounted at /workspace
+RUN mkdir -p /root/.ollama
+
+# Create startup script that initializes common models
+COPY docker/ollama-startup.sh /startup.sh
+RUN chmod +x /startup.sh
+
+# Health check endpoint
+HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
+    CMD curl -f http://localhost:11434/api/tags || exit 1
+
+# Expose Ollama API port
+EXPOSE 11434
+
+# Override base image's ENTRYPOINT (which is "ollama")
+# Our startup script handles calling "ollama serve" itself
+ENTRYPOINT []
+CMD ["/startup.sh"]

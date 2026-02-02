@@ -1,0 +1,123 @@
+version: '3.8'
+
+services:
+  # Main development container
+  app:
+    build:
+      context: ..
+      dockerfile: .devcontainer/Dockerfile.devcontainer
+    volumes:
+      # Mount workspace
+      - ..:/workspace:cached
+      # Named volumes for persistent data
+      - kestrel-venv:/workspace/.venv_kestrel
+      - kestrel-agent-data:/workspace/agent_data
+      - kestrel-logs:/workspace/kestrel/logs
+      # Docker socket for docker-in-docker
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - devcontainer
+    environment:
+      - PYTHONUNBUFFERED=1
+      - PYTHONPATH=/workspace:/workspace/kestrel
+      - KESTREL_DB_PATH=/workspace/agent_data
+      - DATABASE_URL=postgresql://kestrel_user:kestrel_password@postgres:5432/kestrel
+      - REDIS_URL=redis://:redis_password_2024@redis:6379
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - TAVILY_API_KEY=${TAVILY_API_KEY:-}
+      - REPLICATE_API_TOKEN=${REPLICATE_API_TOKEN:-}
+    command: sleep infinity
+    user: vscode
+
+  # PostgreSQL with pgvector
+  postgres:
+    image: pgvector/pgvector:pg15
+    container_name: kestrel-dev-postgres
+    environment:
+      POSTGRES_DB: kestrel
+      POSTGRES_USER: kestrel_user
+      POSTGRES_PASSWORD: kestrel_password
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ../kestrel/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ports:
+      - "5433:5432"
+    networks:
+      - devcontainer
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kestrel_user -d kestrel"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  # Redis
+  redis:
+    image: redis:7-alpine
+    container_name: kestrel-dev-redis
+    command: >
+      redis-server
+      --requirepass redis_password_2024
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+      --save 60 1000
+    volumes:
+      - redis-data:/data
+    ports:
+      - "6380:6379"
+    networks:
+      - devcontainer
+    healthcheck:
+      test: ["CMD", "redis-cli", "--no-auth-warning", "-a", "redis_password_2024", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+  # Ollama (optional - for local LLM)
+  ollama:
+    image: ollama/ollama:latest
+    container_name: kestrel-dev-ollama
+    volumes:
+      - ollama-data:/root/.ollama
+    ports:
+      - "11434:11434"
+    networks:
+      - devcontainer
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    # Remove GPU requirement if not available
+    profiles:
+      - gpu
+
+volumes:
+  kestrel-venv:
+    driver: local
+  kestrel-agent-data:
+    driver: local
+  kestrel-logs:
+    driver: local
+  postgres-data:
+    driver: local
+  redis-data:
+    driver: local
+  ollama-data:
+    driver: local
+
+networks:
+  devcontainer:
+    driver: bridge

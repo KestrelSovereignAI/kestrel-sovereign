@@ -1,0 +1,3 @@
+This directory contains documents describing the specific, human-led applications that are built upon the Kestrel agent's core architecture. These use cases provide the "why" for the technical features and serve as concrete examples of the project's vision in action.
+
+- **PATIENT_CONTROLLED_HEALTH_RECORDS.md:** Details the vision for an agent that empowers patients with true sovereignty over their personal health data, allowing them to control, share, and even monetize it securely. 

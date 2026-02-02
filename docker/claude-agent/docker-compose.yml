@@ -1,0 +1,65 @@
+# Claude Code Agent Orchestration
+#
+# Usage:
+#   # Export tokens first
+#   eval $(./export-token.sh)
+#   export GITHUB_TOKEN=ghp_...
+#
+#   # Run single agent
+#   docker compose run --rm agent claim --repo owner/repo --issue 42
+#
+#   # Or use the helper script
+#   ./run-agent.sh claim --repo owner/repo --issue 42
+
+services:
+  agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN}
+      - GITHUB_TOKEN=${GITHUB_TOKEN}
+      - GIT_EMAIL=${GIT_EMAIL:-agent@kestrel.local}
+      - GIT_NAME=${GIT_NAME:-Kestrel Agent}
+    volumes:
+      # Mount project code read-write
+      - ../../:/home/agent/workspace:rw
+    working_dir: /home/agent/workspace
+    # Default command - override with docker compose run
+    command: ["uv", "run", "kestrel-github", "--help"]
+
+    # Security settings
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_RAW  # Needed for some git operations
+
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 4G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+
+  # Parallel agent variant - for running multiple agents
+  agent-parallel:
+    extends:
+      service: agent
+    volumes:
+      # Each parallel agent gets its own worktree copy
+      # Use with: docker compose run -e WORKTREE_ID=issue-42 agent-parallel ...
+      - agent-worktrees:/home/agent/worktrees:rw
+      - ../../:/home/agent/workspace:ro  # Read-only base repo
+    environment:
+      - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN}
+      - GITHUB_TOKEN=${GITHUB_TOKEN}
+      - WORKTREE_ID=${WORKTREE_ID:-default}
+
+volumes:
+  agent-worktrees:
+    driver: local

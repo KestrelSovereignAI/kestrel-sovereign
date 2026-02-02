@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Kestrel Control Panel</title>
+    <style>
+        :root {
+            --bg: #0a0a0f;
+            --card: #12121a;
+            --border: #2a2a3a;
+            --text: #e0e0e0;
+            --text-dim: #808090;
+            --accent: #6366f1;
+            --green: #22c55e;
+            --red: #ef4444;
+            --orange: #f59e0b;
+        }
+        
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            min-height: 100vh;
+            padding: 2rem;
+        }
+        
+        header {
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+            margin-bottom: 2rem;
+        }
+        
+        header h1 {
+            font-size: 1.5rem;
+            font-weight: 600;
+        }
+        
+        header .logo {
+            font-size: 2rem;
+        }
+        
+        .agents-grid {
+            display: grid;
+            gap: 1rem;
+            max-width: 800px;
+        }
+        
+        .agent-card {
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 1.25rem;
+            display: grid;
+            grid-template-columns: auto 1fr auto;
+            gap: 1rem;
+            align-items: center;
+        }
+        
+        .agent-avatar {
+            width: 48px;
+            height: 48px;
+            background: var(--border);
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.5rem;
+        }
+        
+        .agent-info h2 {
+            font-size: 1.1rem;
+            font-weight: 600;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+        
+        .agent-info .did {
+            font-family: 'SF Mono', Monaco, monospace;
+            font-size: 0.75rem;
+            color: var(--text-dim);
+            margin-top: 0.25rem;
+        }
+        
+        .agent-info .status {
+            font-size: 0.8rem;
+            margin-top: 0.5rem;
+        }
+        
+        .badge {
+            font-size: 0.65rem;
+            padding: 0.2rem 0.5rem;
+            border-radius: 4px;
+            text-transform: uppercase;
+            font-weight: 600;
+        }
+        
+        .badge.test {
+            background: var(--orange);
+            color: #000;
+        }
+        
+        .badge.graduated {
+            background: var(--green);
+            color: #000;
+        }
+        
+        .status.running {
+            color: var(--green);
+        }
+        
+        .status.stopped {
+            color: var(--text-dim);
+        }
+        
+        .agent-actions {
+            display: flex;
+            gap: 0.5rem;
+        }
+        
+        button {
+            padding: 0.5rem 1rem;
+            border-radius: 6px;
+            border: none;
+            font-size: 0.85rem;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.15s;
+        }
+        
+        button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+        
+        button.primary {
+            background: var(--accent);
+            color: white;
+        }
+        
+        button.primary:hover:not(:disabled) {
+            filter: brightness(1.1);
+        }
+        
+        button.secondary {
+            background: var(--border);
+            color: var(--text);
+        }
+        
+        button.secondary:hover:not(:disabled) {
+            background: #3a3a4a;
+        }
+        
+        button.danger {
+            background: var(--red);
+            color: white;
+        }
+        
+        a.chat-link {
+            color: var(--accent);
+            text-decoration: none;
+            font-size: 0.85rem;
+        }
+        
+        a.chat-link:hover {
+            text-decoration: underline;
+        }
+        
+        .loading {
+            text-align: center;
+            padding: 2rem;
+            color: var(--text-dim);
+        }
+        
+        .error {
+            background: rgba(239, 68, 68, 0.1);
+            border: 1px solid var(--red);
+            color: var(--red);
+            padding: 1rem;
+            border-radius: 8px;
+            margin-bottom: 1rem;
+        }
+        
+        .refresh-btn {
+            margin-left: auto;
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <span class="logo">🦅</span>
+        <h1>Kestrel Control Panel</h1>
+        <button class="secondary refresh-btn" onclick="loadAgents()">↻ Refresh</button>
+    </header>
+    
+    <div id="error" class="error" style="display: none;"></div>
+    
+    <div id="agents" class="agents-grid">
+        <div class="loading">Loading agents...</div>
+    </div>
+    
+    <script>
+        const agentsContainer = document.getElementById('agents');
+        const errorDiv = document.getElementById('error');
+        
+        function showError(msg) {
+            errorDiv.textContent = msg;
+            errorDiv.style.display = 'block';
+            setTimeout(() => errorDiv.style.display = 'none', 5000);
+        }
+        
+        function truncateDid(did) {
+            if (!did || did.length < 30) return did;
+            return did.slice(0, 25) + '...' + did.slice(-8);
+        }
+        
+        function renderAgent(agent) {
+            const emoji = agent.name === 'Emma' ? '🪶' : 
+                          agent.name === 'Claw' ? '🦅' : '🤖';
+            
+            const statusBadge = agent.is_test 
+                ? `<span class="badge test">Test${agent.test_cycle ? ` (${agent.test_cycle.slice(0, 8)})` : ''}</span>`
+                : '<span class="badge graduated">Graduated</span>';
+            
+            const statusText = agent.running
+                ? `<span class="status running">● Running on port ${agent.port}</span>`
+                : '<span class="status stopped">○ Stopped</span>';
+            
+            const actions = agent.running
+                ? `
+                    <a href="http://localhost:${agent.port}" target="_blank" class="chat-link">Open Chat →</a>
+                    <button class="danger" onclick="stopAgent('${agent.id}')">Stop</button>
+                `
+                : `<button class="primary" onclick="startAgent('${agent.id}')">Start</button>`;
+            
+            return `
+                <div class="agent-card" data-agent-id="${agent.id}">
+                    <div class="agent-avatar">${emoji}</div>
+                    <div class="agent-info">
+                        <h2>${agent.name} ${statusBadge}</h2>
+                        <div class="did">${truncateDid(agent.did)}</div>
+                        <div>${statusText}</div>
+                    </div>
+                    <div class="agent-actions">
+                        ${actions}
+                    </div>
+                </div>
+            `;
+        }
+        
+        async function loadAgents() {
+            try {
+                const res = await fetch('/api/agents');
+                if (!res.ok) throw new Error('Failed to load agents');
+                
+                const agents = await res.json();
+                
+                if (agents.length === 0) {
+                    agentsContainer.innerHTML = '<div class="loading">No agents found in agent_data/</div>';
+                    return;
+                }
+                
+                agentsContainer.innerHTML = agents.map(renderAgent).join('');
+            } catch (e) {
+                showError(e.message);
+                agentsContainer.innerHTML = '<div class="loading">Failed to load agents</div>';
+            }
+        }
+        
+        async function startAgent(agentId) {
+            const btn = event.target;
+            btn.disabled = true;
+            btn.textContent = 'Starting...';
+            
+            try {
+                const res = await fetch(`/api/agents/${agentId}/start`, { method: 'POST' });
+                if (!res.ok) {
+                    const data = await res.json();
+                    throw new Error(data.detail || 'Failed to start agent');
+                }
+                
+                // Give it a moment to initialize
+                await new Promise(r => setTimeout(r, 2000));
+                await loadAgents();
+            } catch (e) {
+                showError(e.message);
+                btn.disabled = false;
+                btn.textContent = 'Start';
+            }
+        }
+        
+        async function stopAgent(agentId) {
+            const btn = event.target;
+            btn.disabled = true;
+            btn.textContent = 'Stopping...';
+            
+            try {
+                const res = await fetch(`/api/agents/${agentId}/stop`, { method: 'POST' });
+                if (!res.ok) {
+                    const data = await res.json();
+                    throw new Error(data.detail || 'Failed to stop agent');
+                }
+                await loadAgents();
+            } catch (e) {
+                showError(e.message);
+                btn.disabled = false;
+                btn.textContent = 'Stop';
+            }
+        }
+        
+        // Initial load
+        loadAgents();
+        
+        // Auto-refresh every 10 seconds
+        setInterval(loadAgents, 10000);
+    </script>
+</body>
+</html>

@@ -1,0 +1,95 @@
+# Dockerfile for Kestrel Agent - GPU-Enabled
+# Includes CUDA support for GPU-accelerated LLM inference
+FROM --platform=linux/amd64 nvidia/cuda:11.8.0-runtime-ubuntu20.04
+
+# Set environment variables
+ENV KESTREL_DB_PATH=/app/kestrel.db
+ENV KESTREL_IDENTITY_PATH=/app/kestrel_did.json
+ENV KESTREL_ENV=production
+ENV PYTHONUNBUFFERED=1
+ENV OLLAMA_HOST=0.0.0.0:11434
+ENV CUDA_VISIBLE_DEVICES=0
+ENV PATH="/usr/local/bin:$PATH"
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=UTC
+
+WORKDIR /app
+
+# Install Python 3.11 from source since Ubuntu 20.04 doesn't have it
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    libssl-dev \
+    zlib1g-dev \
+    libncurses5-dev \
+    libncursesw5-dev \
+    libreadline-dev \
+    libsqlite3-dev \
+    libgdbm-dev \
+    libdb5.3-dev \
+    libbz2-dev \
+    libexpat1-dev \
+    liblzma-dev \
+    tk-dev \
+    libffi-dev \
+    wget \
+    && wget https://www.python.org/ftp/python/3.11.9/Python-3.11.9.tgz \
+    && tar -xf Python-3.11.9.tgz \
+    && cd Python-3.11.9 \
+    && ./configure --enable-optimizations \
+    && make -j$(nproc) \
+    && make altinstall \
+    && cd .. \
+    && rm -rf Python-3.11.9* \
+    && ln -s /usr/local/bin/python3.11 /usr/local/bin/python3 \
+    && ln -s /usr/local/bin/python3.11 /usr/bin/python3 \
+    && ln -s /usr/local/bin/pip3.11 /usr/local/bin/pip3 \
+    && ln -s /usr/local/bin/pip3.11 /usr/bin/pip3
+
+# Install Ollama (GPU-enabled)
+RUN apt-get update && apt-get install -y curl && curl -fsSL https://ollama.ai/install.sh | sh
+
+# Install uv
+RUN /usr/local/bin/pip3 install uv
+
+# Copy application source code
+COPY . .
+
+# Make startup script executable
+RUN chmod +x /app/docker_entrypoint.sh
+
+# Create the virtual environment
+RUN uv venv /app/.venv
+
+# Install the project
+RUN uv pip install --python /app/.venv/bin/python .
+
+# Create directory for agent data
+RUN mkdir -p /app/agent_data
+
+# Create GPU-enabled startup script
+RUN echo '#!/bin/bash\n\
+# Start Ollama with GPU support\n\
+ollama serve &\n\
+OLLAMA_PID=$!\n\
+\n\
+# Wait for Ollama to be ready\n\
+sleep 10\n\
+\n\
+# Pull GPU-optimized model\n\
+ollama pull llama2:13b || ollama pull llama2 || echo "Model pull failed"\n\
+\n\
+# Start the Kestrel agent\n\
+/app/docker_entrypoint.sh\n\
+\n\
+# Cleanup\n\
+kill $OLLAMA_PID' > /app/start_gpu.sh && chmod +x /app/start_gpu.sh
+
+# Expose ports
+EXPOSE 8888 11434
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD curl -f http://localhost:8888/health || exit 1
+
+# Run with GPU support
+CMD ["/app/start_gpu.sh"]

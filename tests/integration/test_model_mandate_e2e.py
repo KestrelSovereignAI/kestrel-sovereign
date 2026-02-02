@@ -1,0 +1,256 @@
+"""
+Integration tests for model mandate command and API.
+
+Tests the !model-mandate command and /api/models endpoint.
+Uses TestClient for API tests - no running server required.
+"""
+import pytest
+from typing import Dict, Any
+from fastapi.testclient import TestClient
+
+
+class TestModelMandateMethods:
+    """Tests for LLMService model mandate methods (no server needed)."""
+
+    @pytest.fixture
+    def llm_service(self):
+        """Create an LLMService instance."""
+        from kestrel_sovereign.llm.service import LLMService
+        return LLMService()
+
+    def test_get_current_mandate_returns_structure(self, llm_service):
+        """get_current_mandate() returns expected structure."""
+        mandate = llm_service.get_current_mandate()
+
+        assert "preference" in mandate
+        assert "model" in mandate["preference"]
+        assert "provider" in mandate["preference"]
+        assert "fallbacks" in mandate
+        assert "banned" in mandate
+        assert "mandates" in mandate
+        assert isinstance(mandate["fallbacks"], list)
+        assert isinstance(mandate["banned"], list)
+        assert isinstance(mandate["mandates"], dict)
+
+    def test_get_current_mandate_loads_toml_defaults(self, llm_service):
+        """get_current_mandate() loads defaults from model_mandate.toml."""
+        mandate = llm_service.get_current_mandate()
+
+        # Should have a default preferred model from TOML
+        # The exact value depends on model_mandate.toml content
+        # Just verify the structure is populated
+        assert mandate["preference"] is not None
+
+    def test_set_model_preference(self, llm_service):
+        """set_model_preference() changes preference."""
+        llm_service.set_model_preference("test-model-123", "test-provider")
+
+        mandate = llm_service.get_current_mandate()
+        assert mandate["preference"]["model"] == "test-model-123"
+        assert mandate["preference"]["provider"] == "test-provider"
+
+    def test_set_model_preference_without_provider(self, llm_service):
+        """set_model_preference() works without provider."""
+        llm_service.set_model_preference("solo-model")
+
+        mandate = llm_service.get_current_mandate()
+        assert mandate["preference"]["model"] == "solo-model"
+        assert mandate["preference"]["provider"] is None
+
+    def test_add_fallback_model(self, llm_service):
+        """add_fallback_model() adds to fallback list."""
+        llm_service.add_fallback_model("fallback-1", "provider-a")
+        llm_service.add_fallback_model("fallback-2", "provider-b")
+
+        mandate = llm_service.get_current_mandate()
+        assert len(mandate["fallbacks"]) == 2
+        assert {"model": "fallback-1", "provider": "provider-a"} in mandate["fallbacks"]
+        assert {"model": "fallback-2", "provider": "provider-b"} in mandate["fallbacks"]
+
+    def test_add_fallback_model_no_duplicates(self, llm_service):
+        """add_fallback_model() prevents duplicates."""
+        llm_service.add_fallback_model("same-model", "same-provider")
+        llm_service.add_fallback_model("same-model", "same-provider")
+
+        mandate = llm_service.get_current_mandate()
+        assert len(mandate["fallbacks"]) == 1
+
+    def test_clear_mandate_resets_preference(self, llm_service):
+        """clear_mandate() resets to TOML defaults."""
+        # Set custom preference
+        llm_service.set_model_preference("custom-model")
+        llm_service.add_fallback_model("custom-fallback")
+
+        # Verify it was set
+        mandate = llm_service.get_current_mandate()
+        assert mandate["preference"]["model"] == "custom-model"
+        assert len(mandate["fallbacks"]) == 1
+
+        # Clear it
+        llm_service.clear_mandate()
+
+        # Verify it was cleared
+        mandate = llm_service.get_current_mandate()
+        assert mandate["preference"]["model"] != "custom-model"
+        assert len(mandate["fallbacks"]) == 0
+
+
+class TestModelDiscoveryAPI:
+    """Tests for /api/models endpoint using TestClient."""
+
+    @pytest.fixture
+    def client(self):
+        """TestClient with mock agent for API testing."""
+        from server import app
+        from unittest.mock import MagicMock
+        from kestrel_sovereign.llm.service import LLMService
+
+        # Create mock agent with real LLMService
+        mock_agent = MagicMock()
+        mock_agent.agent_id = "did:test:model_mandate"
+        mock_agent.llm_service = LLMService()
+        mock_agent.storage = None
+
+        # Mock discover_all_models to return sample data
+        async def mock_discover(*args, **kwargs):
+            from kestrel_sovereign.llm.model_metadata import ModelInfo
+            return [
+                ModelInfo(id="gpt-4", provider="openai", display_name="GPT-4", is_featured=True),
+                ModelInfo(id="llama3.2:3b", provider="ollama", display_name="Llama 3.2"),
+            ]
+
+        mock_agent.llm_service.discover_all_models = mock_discover
+
+        app.state.agent = mock_agent
+
+        with TestClient(app) as client:
+            yield client
+
+    def test_api_models_returns_by_provider(self, client):
+        """GET /api/models returns by_provider grouped format."""
+        response = client.get("/api/models")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert "by_provider" in data
+        assert isinstance(data["by_provider"], dict)
+
+    def test_api_models_returns_all_list(self, client):
+        """GET /api/models returns all models list."""
+        response = client.get("/api/models")
+
+        data = response.json()
+        assert "all" in data
+        assert isinstance(data["all"], list)
+
+    def test_api_models_has_default(self, client):
+        """GET /api/models includes default model."""
+        response = client.get("/api/models")
+
+        data = response.json()
+        assert "default" in data
+
+    def test_api_models_has_featured(self, client):
+        """GET /api/models returns featured models."""
+        response = client.get("/api/models")
+
+        data = response.json()
+        assert "featured" in data
+        assert isinstance(data["featured"], list)
+
+    def test_api_models_model_structure(self, client):
+        """Models have required fields."""
+        response = client.get("/api/models")
+
+        data = response.json()
+        if data["all"]:
+            for model in data["all"]:
+                assert "id" in model
+                assert "provider" in model
+
+
+class TestAuthKeyEndpoint:
+    """Tests for /api/auth/key bootstrap endpoint using TestClient."""
+
+    @pytest.fixture
+    def client(self):
+        """TestClient with mock agent."""
+        from server import app
+        from unittest.mock import MagicMock
+
+        mock_agent = MagicMock()
+        mock_agent.agent_id = "did:test:auth_key"
+        mock_agent.storage = None
+
+        app.state.agent = mock_agent
+
+        with TestClient(app) as client:
+            yield client
+
+    def test_auth_key_rejects_non_localhost(self, client):
+        """GET /api/auth/key rejects non-localhost requests (TestClient appears as 'testclient')."""
+        response = client.get("/api/auth/key")
+
+        # TestClient appears as "testclient" not "127.0.0.1", so should be rejected
+        # This is correct security behavior - auth key bootstrap only from localhost
+        assert response.status_code == 403
+        assert "localhost" in response.json()["detail"].lower()
+
+
+class TestProtectedEndpointsRequireAuth:
+    """Tests that protected endpoints require authentication using TestClient."""
+
+    @pytest.fixture
+    def client(self):
+        """TestClient with mock agent."""
+        from server import app
+        from unittest.mock import MagicMock, AsyncMock
+
+        mock_agent = MagicMock()
+        mock_agent.agent_id = "did:test:auth_test"
+        mock_agent.storage = MagicMock()
+        mock_agent.storage.get_conversations = AsyncMock(return_value=[])
+        mock_agent.storage.sovereign_adapter = None
+
+        app.state.agent = mock_agent
+
+        with TestClient(app) as client:
+            yield client
+
+    def test_memories_requires_auth(self, client):
+        """GET /api/memories requires API key."""
+        response = client.get("/api/memories")
+
+        # Should be 401 without auth
+        assert response.status_code == 401
+
+    def test_sovereignty_requires_auth(self, client):
+        """GET /api/sovereignty/exports requires API key."""
+        response = client.get("/api/sovereignty/exports")
+
+        # Should be 401 without auth
+        assert response.status_code == 401
+
+    def test_agent_invoke_requires_auth(self, client):
+        """POST /agent/invoke requires API key."""
+        response = client.post("/agent/invoke", json={"input": "test"})
+
+        # Should be 401 without auth
+        assert response.status_code == 401
+
+    def test_health_is_public(self, client):
+        """GET /health is public."""
+        response = client.get("/health")
+        assert response.status_code == 200
+
+    def test_models_is_public(self, client):
+        """GET /api/models is public (though may return 503 if agent not fully initialized)."""
+        response = client.get("/api/models")
+        # Should not be 401 (public endpoint)
+        assert response.status_code != 401
+
+    def test_identity_is_public(self, client):
+        """GET /api/identity is public."""
+        response = client.get("/api/identity")
+        # May return 200 or 503 if agent not fully initialized, but not 401
+        assert response.status_code != 401

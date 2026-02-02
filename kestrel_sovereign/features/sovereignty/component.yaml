@@ -1,0 +1,16 @@
+name: sovereignty
+description: Manage data sovereignty - export agent state to IPFS/Filecoin, restore from backups, and check sovereignty status
+version: 1.0.0
+entry_point: feature.py
+
+tools:
+  - export_sovereignty
+  - import_sovereignty
+  - get_sovereignty_status
+  - list_sovereignty_exports
+
+files:
+  - feature.py
+
+dependencies:
+  - filecoin_adapter

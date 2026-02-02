@@ -1,0 +1,33 @@
+name: compute
+description: Secure script execution with write-sign-review-execute pattern for bash and Python scripts
+version: 1.0.0
+entry_point: feature.py
+
+tools:
+  - write_script
+  - run_script
+  - list_scripts
+  - get_script
+  - delete_script
+  - get_execution_history
+  - analyze_script_security
+  - sign_script
+  - verify_script_signature
+  - get_script_output
+
+files:
+  - feature.py
+  - models.py
+  - script_store.py
+  - script_signer.py
+  - script_analyzer.py
+  - destructive_policy.py
+  - executors/__init__.py
+  - executors/base.py
+  - executors/docker_executor.py
+  - executors/uv_executor.py
+  - executors/local_executor.py
+
+dependencies:
+  - docker
+  - cryptography

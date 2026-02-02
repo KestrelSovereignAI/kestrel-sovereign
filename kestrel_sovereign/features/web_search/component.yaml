@@ -1,0 +1,14 @@
+name: web_search
+description: Search the web for current information - news, facts, documentation, and real-time data
+version: 1.0.0
+entry_point: feature.py
+
+tools:
+  - web_search
+
+files:
+  - feature.py
+  - tool.py
+
+dependencies:
+  - httpx
