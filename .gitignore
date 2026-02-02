@@ -1,0 +1,163 @@
+# Environment and secrets
+.env
+.env.*
+!.env.example
+!.env.test.example
+
+# Credentials
+credentials/
+*.json
+!package.json
+!package-lock.json
+*.pem
+*.key
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+.venv/
+.venv2/
+venv/
+ENV/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.settings/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+.hypothesis/
+playwright-report/
+test-results/
+
+# Node
+node_modules/
+npm-debug.log
+yarn-error.log
+
+# Data and caches
+agent_data/
+agent_data_test/
+agent_dbs/
+storage_cache/
+trained_loras/
+generated_images/
+logs/
+feedback/
+*.db
+*.sqlite
+*.capsule
+
+# Runtime
+*.pid
+*.log
+.kestrel/
+trusted_agents/
+
+# Build artifacts
+*.egg-info/
+.eggs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+docker-compose.override.yml
+
+# Temporary
+tmp/
+temp/
+*.tmp
+*.bak
+
+# Archives
+archive/
+docs/archive/
+
+# Private directories (should not exist in public repo)
+gabriel_workspace/
+docs/business/
+docs/legal/
+docs/outreach/
+docs/plans/
+docs/planning/
+docs/strategy/
+docs/vision/
+docs/corporate/
+docs/development/DEEP_CONV.md
+docs/architecture/economics/work_sessions/
+
+# Claude Code local settings
+.claude/settings.local.json
+*.code-workspace
+
+# Config files with real infrastructure IDs (use .example versions)
+runpod_config.toml
+kestrel_sovereign/runpod_config.toml
+vastai_config.toml
+kestrel_sovereign/vastai_config.toml
+llm_config.toml
+kestrel_sovereign/llm_config.toml
+
+# Control panel env files
+control-panel/.env*
+control-panel/run_*/
+
+# Council sessions (internal strategy discussions)
+data/council_sessions/
+kestrel_sovereign/data/council_sessions/
+
+# Business templates with PII
+docs/templates/BUSINESS_OVERVIEW_TEMPLATE.md
+
+# Development scripts with hardcoded paths/IDs
+scripts/create_pod_*.py
+scripts/grab_*_pod.py
+scripts/monitor_*_gpu.py
+scripts/create_persistent_*.py
+scripts/check_runpod_*.py
+scripts/train_*_runpod.py
+scripts/debug_text_encoder.py
+scripts/quick_lora_test.py
+scripts/run_lora_consistency_test.py
+scripts/simple_consistency_test.py
+scripts/verify_trigger_word.py
+
+# E2E tests with local paths
+tests/e2e/simpletuner/local-lora-training.spec.js
+tests/e2e/simpletuner/playwright.config.cjs

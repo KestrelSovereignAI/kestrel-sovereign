@@ -1,0 +1,102 @@
+# Development container for Kestrel Sovereign
+FROM mcr.microsoft.com/devcontainers/python:3.11
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    # PostgreSQL client
+    postgresql-client \
+    libpq-dev \
+    # Redis client
+    redis-tools \
+    # Build tools
+    build-essential \
+    gcc \
+    g++ \
+    make \
+    cmake \
+    # Network tools
+    curl \
+    wget \
+    netcat-openbsd \
+    # Git and version control
+    git \
+    git-lfs \
+    # Text editors
+    vim \
+    nano \
+    # Utilities
+    jq \
+    httpie \
+    tree \
+    htop \
+    # Docker CLI (for docker-in-docker)
+    docker.io \
+    docker-compose \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install uv (fast Python package manager)
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+
+# Install global Python tools
+RUN pip install --no-cache-dir \
+    ipython \
+    jupyterlab \
+    black \
+    pylint \
+    mypy \
+    pytest \
+    pytest-asyncio \
+    pytest-cov \
+    httpx
+
+# Install Node.js tools for frontend work
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y nodejs \
+    && npm install -g --force \
+        npm@latest \
+        yarn \
+        pnpm \
+        playwright
+
+# Create workspace directory
+WORKDIR /workspace
+
+# Set up non-root user (vscode)
+ARG USERNAME=vscode
+ARG USER_UID=1000
+ARG USER_GID=$USER_UID
+
+# Create the user if it doesn't exist
+RUN if ! id -u $USERNAME > /dev/null 2>&1; then \
+        groupadd --gid $USER_GID $USERNAME \
+        && useradd --uid $USER_UID --gid $USER_GID -m $USERNAME \
+        && apt-get update \
+        && apt-get install -y sudo \
+        && echo $USERNAME ALL=\(root\) NOPASSWD:ALL > /etc/sudoers.d/$USERNAME \
+        && chmod 0440 /etc/sudoers.d/$USERNAME; \
+    fi
+
+# Add user to docker group for docker-in-docker
+RUN usermod -aG docker $USERNAME
+
+# Set up shell environment
+RUN echo 'export PS1="\[\e[36m\]kestrel-dev\[\e[m\] \[\e[33m\]\w\[\e[m\] \[\e[32m\]\\$\[\e[m\] "' >> /home/$USERNAME/.bashrc \
+    && echo 'alias ll="ls -lah"' >> /home/$USERNAME/.bashrc \
+    && echo 'alias k="cd /workspace"' >> /home/$USERNAME/.bashrc \
+    && echo 'alias f="cd /workspace/kestrel"' >> /home/$USERNAME/.bashrc \
+    && echo 'alias pytest="pytest -x"' >> /home/$USERNAME/.bashrc
+
+# Create directories for persistent data
+RUN mkdir -p \
+    /workspace/agent_data \
+    /workspace/kestrel/logs \
+    /workspace/.venv_kestrel \
+    && chown -R $USERNAME:$USERNAME /workspace
+
+# Switch to non-root user
+USER $USERNAME
+
+# Install Python dependencies when container starts
+# (actual installation happens in postCreateCommand)
+
+CMD ["/bin/bash"]

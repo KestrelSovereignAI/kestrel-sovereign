@@ -1,0 +1,17 @@
+name: privacy
+description: Manage privacy modes - ephemeral, isolated, anonymous, normal, and public with PII detection
+version: 1.0.0
+entry_point: feature.py
+
+tools:
+  - set_privacy_mode
+  - get_privacy_status
+  - promote_isolated_session
+  - clear_ephemeral_session
+
+files:
+  - feature.py
+  - pii_detector.py
+
+dependencies:
+  - spacy

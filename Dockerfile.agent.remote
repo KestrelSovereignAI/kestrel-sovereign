@@ -1,0 +1,51 @@
+# Dockerfile for Kestrel Agent - Remote LLM Dependencies
+# Uses external LLM services (OpenAI, etc.) - smaller image (~500MB vs 32GB)
+# Installs base dependencies only (no [local] extras like torch, spacy, chromadb)
+ARG TARGETARCH
+FROM --platform=linux/${TARGETARCH} python:3.11-slim
+
+# Set environment variables for configuration
+ENV KESTREL_DB_PATH=/app/kestrel_prime.db
+ENV KESTREL_IDENTITY_PATH=/app/kestrel_did.json
+ENV KESTREL_ENV=production
+ENV PYTHONUNBUFFERED=1
+
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install uv
+RUN pip install uv
+
+# Copy application source code
+COPY . .
+
+# Make startup script executable
+RUN chmod +x /app/start_agent.sh
+
+# Create the virtual environment
+RUN uv venv /app/.venv
+
+# Install base dependencies only (no [local] extras - keeps image small)
+RUN uv pip install --python /app/.venv/bin/python .
+
+# Create directory for agent data
+RUN mkdir -p /app/agent_data
+
+# Create a non-root user
+RUN useradd -m -u 1000 kestrel && \
+    chown -R kestrel:kestrel /app
+USER kestrel
+
+# Expose the port
+EXPOSE 8888
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:8888/health || exit 1
+
+# Run the startup script
+CMD ["/app/start_agent.sh"]

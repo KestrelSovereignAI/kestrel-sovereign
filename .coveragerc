@@ -1,0 +1,66 @@
+[run]
+# Source directories to measure
+source =
+    kestrel_agent
+    storage
+    llm
+    features
+    tools
+    a2a
+    services
+
+# Files and directories to omit
+omit =
+    */tests/*
+    */.venv*/*
+    */archive/*
+    */__pycache__/*
+    */migrations/*
+    */conftest.py
+    setup.py
+    docs/*
+
+# Enable branch coverage
+branch = True
+
+# Parallel mode for running tests in parallel
+parallel = True
+
+[report]
+# Minimum coverage percentage (fail if below)
+fail_under = 80
+
+# Show missing lines in report
+show_missing = True
+
+# Exclude lines from coverage
+exclude_lines =
+    # Don't complain about missing debug-only code
+    pragma: no cover
+
+    # Don't complain if tests don't hit defensive assertions
+    raise AssertionError
+    raise NotImplementedError
+
+    # Don't complain if non-runnable code isn't run
+    if __name__ == .__main__.:
+
+    # Don't require coverage for abstract methods
+    @abstractmethod
+
+    # Don't require coverage for type checking blocks
+    if TYPE_CHECKING:
+
+    # Don't require coverage for protocol definitions
+    @overload
+
+# Precision of coverage percentage
+precision = 2
+
+[html]
+# Output directory for HTML report
+directory = coverage_html_report
+
+[xml]
+# Output file for XML report (for CI integration)
+output = coverage.xml

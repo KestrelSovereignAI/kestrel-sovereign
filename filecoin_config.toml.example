@@ -1,0 +1,14 @@
+[lotus]
+# URL for the Lotus node's JSON-RPC endpoint.
+# Default is for a local node.
+rpc_url = "http://127.0.0.1:1234/rpc/v0"
+
+# Authentication token for the Lotus node.
+# To get a token, run: lotus auth create-token --perm admin
+# Leave empty if no token is required.
+token = ""
+
+[ipfs]
+# URL for the IPFS node's API.
+# Default is for a local node.
+api_url = "http://127.0.0.1:5001" 

@@ -1,0 +1,46 @@
+# Cloud Build configuration for Ollama GPU server image
+# Builds and pushes to gcr.io/YOUR_PROJECT_ID/kestrel-ollama
+#
+# Usage:
+#   cd ./
+#   gcloud builds submit --config=docker/cloudbuild-ollama.yaml .
+#
+# Deploy to RunPod:
+#   Uses profile [profiles.ollama] in runpod_config.toml
+#   Network volume: YOUR_VOLUME_ID (create in RunPod console)
+
+steps:
+  # Build the Ollama server image
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '-t'
+      - 'gcr.io/YOUR_PROJECT_ID/kestrel-ollama:v1'
+      - '-t'
+      - 'gcr.io/YOUR_PROJECT_ID/kestrel-ollama:latest'
+      - '-f'
+      - 'docker/Dockerfile.ollama-server'
+      - '.'
+    timeout: 1800s  # 30 minutes
+
+  # Push versioned tag
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'push'
+      - 'gcr.io/YOUR_PROJECT_ID/kestrel-ollama:v1'
+
+  # Push latest tag
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'push'
+      - 'gcr.io/YOUR_PROJECT_ID/kestrel-ollama:latest'
+
+images:
+  - 'gcr.io/YOUR_PROJECT_ID/kestrel-ollama:v1'
+  - 'gcr.io/YOUR_PROJECT_ID/kestrel-ollama:latest'
+
+options:
+  machineType: 'E2_HIGHCPU_8'
+  diskSizeGb: 50
+
+timeout: 3600s  # 1 hour total timeout

@@ -1,0 +1,17 @@
+name: security
+description: Security operations including message signing, verification, and key management
+version: 1.0.0
+entry_point: feature.py
+
+tools:
+  - sign_message
+  - verify_signature
+  - get_signing_keys
+  - rotate_keys
+
+files:
+  - feature.py
+  - key_manager.py
+
+dependencies:
+  - cryptography

@@ -1,0 +1,53 @@
+# Example configuration for RunPodManager. Copy to runpod_config.toml and adjust values for your account.
+
+[manager]
+mode = "direct"                # direct (RunPod API) or managed (platform API)
+default_ttl_seconds = 1800
+max_ttl_seconds = 3600
+poll_interval_seconds = 10
+readiness_timeout_seconds = 600
+cloud_type = "COMMUNITY"
+
+[profiles.llm]
+name = "H100 Single - LLM"
+task_type = "llm"
+gpu_type_id = "NVIDIA_H100"
+image_name = "runpod/kestrel-llm:latest"
+container_disk_gb = 40
+volume_gb = 0
+ports = ["8000/http"]
+inference_port = 8000
+inference_protocol = "http"
+inference_base_path = "/v1"
+image_invoke_path = "/v1/completions"
+default_model = "llama-3-70b-instruct"
+pod_type = "h100-single"
+max_context_window = 32768
+vram_gb = 80
+cost_per_hr = 4.75
+readiness_timeout_seconds = 900
+
+[profiles.llm.env]
+  HF_TOKEN = "${HF_TOKEN}"
+  KESTREL_PROFILE = "llm"
+
+[profiles.image]
+name = "A100 - Image"
+task_type = "image"
+gpu_type_id = "NVIDIA_A100"
+image_name = "runpod/kestrel-flux:latest"
+container_disk_gb = 80
+volume_gb = 0
+ports = ["9000/http"]
+inference_port = 9000
+inference_protocol = "http"
+inference_base_path = "/invoke"
+image_invoke_path = "/invoke"
+default_model = "flux-dev"
+pod_type = "a100-single"
+max_context_window = 4096
+vram_gb = 40
+cost_per_hr = 2.8
+
+[profiles.image.env]
+  KESTREL_PROFILE = "image"

@@ -1,0 +1,19 @@
+name: memory
+description: Search and recall conversation history, RAG documents, and consolidated memory episodes with human-like retrieval
+version: 1.0.0
+entry_point: feature.py
+
+tools:
+  - search_memory
+  - recall_recent
+  - search_documents
+  - search_case_law
+  - get_episodes
+  - memory_status
+  - recall_emotional
+  - full_history_search
+
+files:
+  - feature.py
+
+dependencies: []

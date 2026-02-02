@@ -1,0 +1,34 @@
+# Ignore the virtual environment directory
+.venv_kestrel
+
+# Ignore local env files (contains secrets)
+.env
+.env.local
+.env.*.local
+
+# Ignore credentials
+credentials/
+
+# Ignore test data
+agent_data/
+test_files/
+
+# Ignore local databases
+*.db
+*.db-shm
+*.db-wal
+
+# Ignore logs
+logs/
+
+# Ignore cache
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Ignore git
+.git/
+
+# Ignore IDE
+.vscode/
+.idea/

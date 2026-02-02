@@ -1,0 +1,18 @@
+name: runpod
+description: RunPod GPU orchestration - start/stop on-demand GPU pods, check status, view logs, route LLM traffic
+version: 1.0.0
+entry_point: feature.py
+
+tools:
+  - start_gpu_pod
+  - stop_gpu_pod
+  - get_pod_status
+  - get_pod_logs
+  - route_to_gpu
+
+files:
+  - feature.py
+  - runpod_manager.py
+
+dependencies:
+  - requests

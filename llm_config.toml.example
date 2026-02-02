@@ -1,0 +1,36 @@
+# Example LLM provider configuration for Kestrel.
+#
+# 1. Copy this file to "llm_config.toml".
+# 2. Fill in your API keys and desired models.
+# 3. The 'provider_priority' list determines the fallback order.
+
+# Define the order in which the agent should try to use providers.
+# Ollama first for privacy and cost, OpenAI as fallback for complex reasoning
+provider_priority = ["ollama", "openai"]
+
+[ollama]
+# Local Ollama instance - install from https://ollama.ai
+host = "http://localhost:11434"
+model = "llama3.2:3b"  # Or phi3, llama3.1:8b, etc.
+
+[openai]
+# Get your API key from https://platform.openai.com/api-keys
+# Set environment variable: export OPENAI_API_KEY="your-key-here"
+api_key = "sk-YOUR_API_KEY_HERE"
+model = "gpt-5"
+
+# Optional: Anthropic Claude support
+#[anthropic]
+#api_key = "sk-ant-YOUR_API_KEY_HERE"
+#model = "claude-3-5-sonnet-20241022"
+
+# Optional: Additional Ollama models for specific tasks
+#[ollama_large]
+#host = "http://localhost:11434"
+#model = "llama3.1:70b"  # For complex reasoning tasks
+
+[ensemble]
+# The number of agent instances to run in the ensemble.
+# Default is 1 (single-instance mode).
+# A value > 1 enables ensemble mode for consensus-based responses.
+size = 1 

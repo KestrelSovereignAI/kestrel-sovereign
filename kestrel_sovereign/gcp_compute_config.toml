@@ -1,0 +1,172 @@
+# GCP Compute Engine GPU instance configuration for Kestrel
+# Copy and adjust values for your account.
+#
+# Key advantages over Vast.ai/RunPod:
+# - Enterprise-grade reliability
+# - Persistent Disk for model caching (survives instance termination)
+# - Spot instances for 60-90% cost savings
+# - Shared GCP project (kestel-469222)
+#
+# Authentication:
+# - Set GOOGLE_APPLICATION_CREDENTIALS to service account JSON path
+# - Or set GCP_SERVICE_ACCOUNT_KEY to inline JSON
+# - Or use Application Default Credentials (when running on GCP)
+
+[manager]
+# GCP project - set via GCP_PROJECT_ID env var or here
+project_id = "kestel-469222"
+default_zone = "us-central1-a"
+default_region = "us-central1"
+default_ttl_seconds = 3600
+max_ttl_seconds = 7200
+poll_interval_seconds = 15
+readiness_timeout_seconds = 600
+
+# Prefer spot instances for cost savings (60-90% off)
+# Spot instances can be preempted with 30s notice
+prefer_spot = true
+
+# SSH key for instance access
+ssh_key_file = "~/.ssh/kestrel_gcp"
+ssh_user = "kestrel"
+
+# Container startup settings
+container_startup_timeout_seconds = 300
+health_check_interval_seconds = 10
+
+# ============================================================================
+# Persistent Disk Configuration
+# ============================================================================
+# Persistent Disks survive instance termination
+# Much faster than re-downloading models each time
+
+[persistent_disk]
+name = "kestrel-flux-models"
+size_gb = 200
+type = "pd-ssd"  # pd-standard (HDD) or pd-ssd
+zone = "us-central1-a"
+mount_path = "/workspace"
+
+# Disk layout:
+# /workspace/
+#   huggingface/           # HF cache (~25GB for FLUX.2-dev)
+#   lora_output/           # Trained LoRAs (~10GB per model)
+#   training_data/         # Temp training images
+#   models/                # Additional model files
+
+# ============================================================================
+# GPU Profiles
+# ============================================================================
+# Each profile defines instance requirements for a specific task type.
+# Machine types: https://cloud.google.com/compute/docs/gpus
+
+[profiles.training]
+name = "A100 40GB - FLUX.2 LoRA Training"
+task_type = "training"
+machine_type = "a2-highgpu-1g"
+gpu_type = "nvidia-tesla-a100"
+gpu_count = 1
+boot_disk_size_gb = 100
+boot_disk_type = "pd-ssd"
+image_name = "gcr.io/kestel-469222/kestrel-lora:latest"
+persistent_disk = "kestrel-flux-models"
+inference_port = 8000
+inference_protocol = "http"
+inference_base_path = ""
+default_model = "flux2-dev"
+cost_per_hr_on_demand = 3.67
+cost_per_hr_spot = 1.10
+readiness_timeout_seconds = 600
+
+[profiles.training.env]
+HF_HOME = "/workspace/huggingface"
+HF_TOKEN = "${HF_TOKEN}"
+KESTREL_PROFILE = "training"
+
+[profiles.training-a100-80gb]
+name = "A100 80GB - FLUX.2 LoRA Training (Large)"
+task_type = "training"
+machine_type = "a2-ultragpu-1g"
+gpu_type = "nvidia-a100-80gb"
+gpu_count = 1
+boot_disk_size_gb = 100
+boot_disk_type = "pd-ssd"
+image_name = "gcr.io/kestel-469222/kestrel-lora:latest"
+persistent_disk = "kestrel-flux-models"
+inference_port = 8000
+inference_protocol = "http"
+inference_base_path = ""
+default_model = "flux2-dev"
+cost_per_hr_on_demand = 5.12
+cost_per_hr_spot = 1.54
+readiness_timeout_seconds = 600
+
+[profiles.training-a100-80gb.env]
+HF_HOME = "/workspace/huggingface"
+HF_TOKEN = "${HF_TOKEN}"
+KESTREL_PROFILE = "training"
+
+[profiles.inference]
+name = "L4 24GB - Fast Inference"
+task_type = "inference"
+machine_type = "g2-standard-4"
+gpu_type = "nvidia-l4"
+gpu_count = 1
+boot_disk_size_gb = 100
+boot_disk_type = "pd-balanced"
+image_name = "gcr.io/kestel-469222/kestrel-lora:latest"
+persistent_disk = "kestrel-flux-models"
+inference_port = 8000
+inference_protocol = "http"
+inference_base_path = ""
+default_model = "flux2-dev"
+cost_per_hr_on_demand = 0.70
+cost_per_hr_spot = 0.21
+readiness_timeout_seconds = 300
+
+[profiles.inference.env]
+HF_HOME = "/workspace/huggingface"
+KESTREL_PROFILE = "inference"
+
+[profiles.ollama]
+name = "L4 24GB - Ollama Server"
+task_type = "llm"
+machine_type = "g2-standard-4"
+gpu_type = "nvidia-l4"
+gpu_count = 1
+boot_disk_size_gb = 100
+boot_disk_type = "pd-balanced"
+image_name = "gcr.io/kestel-469222/kestrel-ollama:latest"
+persistent_disk = "kestrel-ollama-models"
+inference_port = 11434
+inference_protocol = "http"
+inference_base_path = "/api"
+default_model = "qwen2.5:7b"
+cost_per_hr_on_demand = 0.70
+cost_per_hr_spot = 0.21
+readiness_timeout_seconds = 300
+
+[profiles.ollama.env]
+OLLAMA_HOST = "0.0.0.0:11434"
+OLLAMA_MODELS = "/workspace/ollama_models"
+KESTREL_PROFILE = "ollama"
+
+# Budget Profile - T4 for testing
+[profiles.budget]
+name = "T4 16GB - Budget Testing"
+task_type = "test"
+machine_type = "n1-standard-4"
+gpu_type = "nvidia-tesla-t4"
+gpu_count = 1
+boot_disk_size_gb = 100
+boot_disk_type = "pd-standard"
+image_name = "gcr.io/kestel-469222/kestrel-lora:latest"
+inference_port = 8000
+inference_protocol = "http"
+inference_base_path = ""
+cost_per_hr_on_demand = 0.35
+cost_per_hr_spot = 0.11
+readiness_timeout_seconds = 180
+
+[profiles.budget.env]
+KESTREL_PROFILE = "budget"

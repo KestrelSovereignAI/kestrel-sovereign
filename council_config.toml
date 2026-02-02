@@ -1,0 +1,94 @@
+# Constitutional Council Configuration
+#
+# The council is model-agnostic - configure any foundation models you have access to.
+# Each member brings a different perspective based on their training and design.
+
+[council]
+min_members = 3          # Minimum members required for a valid council
+max_rounds = 5           # Maximum deliberation rounds before forcing verdict
+consensus_rule = "unanimous"  # "unanimous", "supermajority", "majority", or "quorum"
+
+# =============================================================================
+# Council Members
+# =============================================================================
+# Add members for each foundation model you want on the council.
+# Supported providers: anthropic, openai, google, vertex_ai, ollama, xai, groq
+#
+# Roles are advisory - they guide the model's focus during deliberation:
+# - constitutional_reviewer: Focus on governance and ethical implications
+# - security_analyst: Focus on security risks and attack vectors
+# - technical_reviewer: Focus on code quality and architecture
+# - risk_assessor: Focus on risks, edge cases, and failure modes
+# - user_advocate: Focus on user impact and sovereignty
+
+# -----------------------------------------------------------------------------
+# Claude - Constitutional Reasoning
+# Requires: ANTHROPIC_API_KEY environment variable
+# -----------------------------------------------------------------------------
+[[council.members]]
+name = "Claude"
+provider = "anthropic"
+model = "claude-opus-4-5-20251101"
+role = "constitutional_reviewer"
+
+# -----------------------------------------------------------------------------
+# GPT - Broad Analysis
+# Requires: OPENAI_API_KEY environment variable
+# -----------------------------------------------------------------------------
+[[council.members]]
+name = "GPT"
+provider = "openai"
+model = "gpt-5.2"
+role = "security_analyst"
+
+# -----------------------------------------------------------------------------
+# Gemini via Vertex AI - Technical Review
+# Requires: GCP credentials (GOOGLE_APPLICATION_CREDENTIALS or ADC)
+# Project: YOUR_PROJECT_ID
+# -----------------------------------------------------------------------------
+[[council.members]]
+name = "Gemini"
+provider = "vertex_ai"
+model = "gemini-3-pro-preview"
+role = "technical_reviewer"
+
+# =============================================================================
+# Alternative Configurations
+# =============================================================================
+# Uncomment these to use different models or providers.
+
+# --- Vertex AI (hosts multiple models with one credential) ---
+# Requires: GCP credentials (GOOGLE_APPLICATION_CREDENTIALS)
+#
+# [[council.members]]
+# name = "Claude-Vertex"
+# provider = "vertex_ai"
+# model = "claude-3-opus@20240229"
+# role = "constitutional_reviewer"
+
+# --- Local/Open Source via Ollama ---
+# Requires: Ollama running locally
+#
+# [[council.members]]
+# name = "Llama"
+# provider = "ollama"
+# model = "llama3.3:70b"
+# role = "technical_reviewer"
+
+# --- xAI Grok ---
+# Requires: XAI_API_KEY environment variable
+#
+# [[council.members]]
+# name = "Grok"
+# provider = "xai"
+# model = "grok-2"
+# role = "risk_assessor"
+
+# --- Fast inference via Groq ---
+# Requires: GROQ_API_KEY environment variable
+#
+# [[council.members]]
+# name = "Mixtral"
+# provider = "groq"
+# model = "mixtral-8x7b-32768"
+# role = "user_advocate"

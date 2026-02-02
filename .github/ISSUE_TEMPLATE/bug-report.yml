@@ -1,0 +1,111 @@
+name: Bug Report
+description: Report a bug for agent investigation and fix
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## Bug Report
+        Help agents understand and fix this bug by providing detailed information.
+
+  - type: input
+    id: summary
+    attributes:
+      label: One-line Summary
+      description: Brief description of the bug
+      placeholder: "Login fails when password contains special characters"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: severity
+    attributes:
+      label: Severity
+      options:
+        - Critical (system unusable, data loss)
+        - High (major feature broken)
+        - Medium (feature impaired but workaround exists)
+        - Low (minor issue, cosmetic)
+    validations:
+      required: true
+
+  - type: textarea
+    id: current-behavior
+    attributes:
+      label: Current Behavior
+      description: What happens now? Include error messages if any.
+      placeholder: |
+        When I click login with password "p@ss!word":
+        - Error message: "Invalid credentials"
+        - Console shows: TypeError at auth.py:42
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected-behavior
+    attributes:
+      label: Expected Behavior
+      description: What should happen instead?
+      placeholder: "User should be logged in successfully"
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to Reproduce
+      description: How can an agent reproduce this bug?
+      placeholder: |
+        1. Go to /login
+        2. Enter username "testuser"
+        3. Enter password "p@ss!word"
+        4. Click "Login"
+        5. See error
+    validations:
+      required: true
+
+  - type: textarea
+    id: affected-files
+    attributes:
+      label: Suspected Files/Components
+      description: If you have any idea where the bug might be, list files
+      placeholder: |
+        - kestrel_sovereign/auth/login.py
+        - tests/test_auth.py
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant Logs/Stack Trace
+      description: Paste any error logs or stack traces
+      render: shell
+
+  - type: dropdown
+    id: reproducibility
+    attributes:
+      label: Reproducibility
+      options:
+        - Always (100%)
+        - Often (> 50%)
+        - Sometimes (< 50%)
+        - Rare (< 10%)
+        - Unable to reproduce consistently
+    validations:
+      required: true
+
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, Python version, relevant dependencies
+      placeholder: "macOS 14.0, Python 3.11, FastAPI 0.104"
+
+  - type: checkboxes
+    id: agent-ready
+    attributes:
+      label: Agent Processing
+      options:
+        - label: This bug report has enough detail for an agent to investigate
+          required: true
+        - label: I can verify the fix when a PR is created
+          required: true

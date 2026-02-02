@@ -1,0 +1,122 @@
+# Dockerfile for Kestrel Sovereign Agent - Isolated Local Execution
+#
+# This image provides cryptographic isolation between the agent and the host.
+#
+# SECURITY: Use Docker Secrets instead of environment variables for the key.
+# Environment variables are visible via `docker inspect` - secrets are not.
+#
+# Recommended Usage (Docker Secrets):
+#   # Create a secrets file
+#   echo "your-fernet-key" > ~/.kestrel/secrets/data_key
+#   chmod 600 ~/.kestrel/secrets/data_key
+#
+#   # Run with mounted secret
+#   docker build -f docker/Dockerfile.sovereign -t kestrel-sovereign .
+#   docker run -it \
+#     -v ~/.kestrel/secrets/data_key:/run/secrets/kestrel_data_key:ro \
+#     -v ~/emma_data:/data \
+#     kestrel-sovereign
+#
+# Docker Swarm Usage:
+#   echo "your-fernet-key" | docker secret create kestrel_data_key -
+#   docker service create --secret kestrel_data_key kestrel-sovereign
+#
+# Alternative (file path):
+#   docker run -it \
+#     -e KESTREL_DATA_KEY_FILE=/run/secrets/kestrel_data_key \
+#     -v /path/to/keyfile:/run/secrets/kestrel_data_key:ro \
+#     -v ~/emma_data:/data \
+#     kestrel-sovereign
+#
+# Legacy (NOT RECOMMENDED - visible via docker inspect):
+#   docker run -it \
+#     -e KESTREL_DATA_KEY="$KESTREL_DATA_KEY" \
+#     -v ~/emma_data:/data \
+#     kestrel-sovereign
+#
+FROM python:3.11-slim
+
+LABEL maintainer="Kestrel AI"
+LABEL description="Isolated sovereign agent container"
+
+# Non-root user for security
+ARG UID=1000
+ARG GID=1000
+
+WORKDIR /app
+
+# Install minimal system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install uv for fast package management
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+
+# Copy only what's needed for the agent (no dev tools, no tests)
+COPY pyproject.toml uv.lock ./
+COPY storage/ ./storage/
+COPY llm/ ./llm/
+COPY hooks/ ./hooks/
+COPY agent/ ./agent/
+COPY features/ ./features/
+COPY tools/ ./tools/
+COPY extensions/ ./extensions/
+COPY a2a/ ./a2a/
+COPY security/ ./security/
+COPY prompts/ ./prompts/
+COPY docs/principles/ ./docs/principles/
+COPY kestrel_agent.py .
+COPY command_handler.py .
+COPY inception_service.py .
+COPY retirement_service.py .
+COPY ephemeral_session.py .
+COPY privacy.py .
+COPY config.py .
+COPY main.py .
+COPY llm_config.toml .
+
+# Install Python dependencies
+RUN uv pip install --system --no-cache \
+    cryptography>=41.0.0 \
+    aiosqlite>=0.19.0 \
+    httpx>=0.25.0 \
+    pydantic>=2.0.0 \
+    python-dotenv>=1.0.0 \
+    toml>=0.10.0 \
+    rank-bm25>=0.2.2 \
+    sentence-transformers>=2.2.0 \
+    spacy>=3.7.0 \
+    eth-account>=0.10.0 \
+    web3>=6.0.0 \
+    openai>=1.0.0 \
+    anthropic>=0.18.0 \
+    tiktoken>=0.5.0 \
+    tenacity>=8.2.0
+
+# Download spaCy model for PII detection
+RUN python -m spacy download en_core_web_sm
+
+# Create non-root user
+RUN groupadd -g $GID kestrel && \
+    useradd -u $UID -g $GID -m -s /bin/bash kestrel
+
+# Create data directory (will be mounted)
+RUN mkdir -p /data && chown kestrel:kestrel /data
+
+# Set environment
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONPATH=/app
+ENV KESTREL_DB_PATH=/data
+
+# Switch to non-root user
+USER kestrel
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
+    CMD python -c "import sys; sys.exit(0)"
+
+# Default: interactive chat mode
+# Override with: docker run ... kestrel-sovereign python inception_service.py --name Emma --output /data
+ENTRYPOINT ["python"]
+CMD ["main.py", "/data/kestrel_prime.db"]

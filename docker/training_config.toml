@@ -1,0 +1,56 @@
+# LoRA Training Configuration for Sovereign Selfies
+# Used by train_lora.py on RunPod
+#
+# Parameters derived from:
+# - docs/research/Training LoRA on the FLUX 2 [dev] Diffusion Model.pdf
+# - HuggingFace Diffusers FLUX LoRA guide
+# - Community best practices (FluxGym, SimpleTuner, AI-Toolkit)
+
+[training]
+# Base model for training - FLUX.2-dev (December 2025)
+# FLUX.2 is the next generation with better quality and NO built-in safety filters when self-hosted
+# Requires ~90GB VRAM for full model, but FP8 quantization brings it to ~64GB
+# RTX 4090 (24GB) can run with aggressive quantization + CPU offload
+base_model = "black-forest-labs/FLUX.2-dev"
+
+# Training parameters (from PDF research)
+learning_rate = 1e-4          # PDF recommends 1e-4 as solid default
+num_train_epochs = 100        # Not used when max_train_steps is set
+train_batch_size = 1          # Always 1 on consumer GPUs (PDF)
+gradient_accumulation_steps = 4  # PDF: "accumulate 2-4 steps on 24GB GPU"
+max_train_steps = 1500        # PDF: 1000-3000 typical, 1500 for single-image training
+lr_scheduler = "constant"
+lr_warmup_steps = 0
+
+# Memory optimizations (CRITICAL for RTX 4090)
+gradient_checkpointing = true    # Reduces memory by recomputing activations
+cache_latents = true             # Pre-encode images to free VAE memory
+mixed_precision = "bf16"         # bfloat16 training
+use_8bit_adam = true             # 8-bit optimizer for memory savings
+enable_cpu_offload = true        # Offload weights to CPU when not needed
+
+# LoRA parameters
+lora_rank = 16                # PDF: 16-32 common, 16 for 24GB GPUs
+lora_alpha = 16               # Typically same as rank
+target_modules = ["to_q", "to_k", "to_v", "to_out.0"]
+
+# Image processing
+# CRITICAL: PDF says 1024px for FLUX.2, NOT 512!
+resolution = 1024             # PDF: "high-resolution 1024×1024 training images are beneficial"
+center_crop = true
+random_flip = true
+
+# Data augmentation for single-image training
+num_augmentations = 15        # PDF: "15-20 images for character LoRA"
+
+# Output
+output_format = "safetensors"
+save_precision = "fp16"
+
+[server]
+# API server configuration
+host = "0.0.0.0"
+port = 8000
+
+# Readiness check - model must be loaded before accepting training jobs
+startup_timeout_seconds = 600   # 10 minutes for first-run model download

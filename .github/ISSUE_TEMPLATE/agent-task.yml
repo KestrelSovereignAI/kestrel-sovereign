@@ -1,0 +1,114 @@
+name: Agent Task
+description: Direct task for autonomous agent (pre-clarified, ready to execute)
+labels: ["enhancement", "agent-ready"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## Agent Task
+        This template is for tasks that are already well-defined and ready for
+        autonomous agent execution. Use Feature Request if you need clarification first.
+
+  - type: input
+    id: title
+    attributes:
+      label: Task Title
+      placeholder: "Add rate limiting to API endpoints"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: priority
+    attributes:
+      label: Priority
+      options:
+        - P0 - Critical (do immediately)
+        - P1 - High (this sprint)
+        - P2 - Medium (next sprint)
+        - P3 - Low (backlog)
+    validations:
+      required: true
+
+  - type: dropdown
+    id: estimated-effort
+    attributes:
+      label: Estimated Effort
+      options:
+        - XS (< 1 hour)
+        - S (1-4 hours)
+        - M (4-8 hours)
+        - L (1-2 days)
+        - XL (> 2 days, consider breaking down)
+    validations:
+      required: true
+
+  - type: textarea
+    id: task-description
+    attributes:
+      label: Task Description
+      description: Clear, actionable description of what needs to be done
+      placeholder: |
+        Add rate limiting using slowapi:
+        1. Install slowapi dependency
+        2. Configure rate limiter in server.py
+        3. Apply @limiter.limit("10/minute") to sensitive endpoints
+        4. Add 429 response handling
+    validations:
+      required: true
+
+  - type: textarea
+    id: files-to-modify
+    attributes:
+      label: Files to Modify
+      description: List specific files that need changes
+      placeholder: |
+        - kestrel_sovereign/server.py (add limiter setup)
+        - kestrel_sovereign/endpoints/auth.py (add decorators)
+        - pyproject.toml (add slowapi dependency)
+    validations:
+      required: true
+
+  - type: textarea
+    id: implementation-notes
+    attributes:
+      label: Implementation Notes
+      description: Any specific guidance, patterns to follow, or constraints
+      placeholder: |
+        - Follow existing middleware pattern in server.py
+        - Use Redis backend if REDIS_URL is set, else memory
+        - Don't rate limit health check endpoints
+
+  - type: textarea
+    id: test-requirements
+    attributes:
+      label: Test Requirements
+      description: What tests should be added or pass?
+      placeholder: |
+        - Add test_rate_limiting.py
+        - Test 429 response after limit exceeded
+        - Test limit reset after window
+
+  - type: textarea
+    id: done-criteria
+    attributes:
+      label: Definition of Done
+      description: Checklist for completion
+      placeholder: |
+        - [ ] Rate limiter configured
+        - [ ] Sensitive endpoints protected
+        - [ ] Tests pass
+        - [ ] No regressions in existing tests
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: confirmations
+    attributes:
+      label: Confirmations
+      options:
+        - label: This task is fully specified and ready for autonomous execution
+          required: true
+        - label: No blocking dependencies on other issues
+          required: true
+        - label: Acceptance criteria are testable
+          required: true

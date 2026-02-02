@@ -1,0 +1,51 @@
+# Cloud Build configuration for SimpleTuner FLUX.2 training image
+# Builds and pushes to gcr.io/YOUR_PROJECT_ID/kestrel-lora
+#
+# Usage:
+#   cd ./
+#   gcloud builds submit --config=docker/cloudbuild-simpletuner.yaml .
+#
+# Tags:
+#   :v7 - Use Flux2Pipeline for FLUX.2-dev (not FluxPipeline which is for FLUX.1)
+#   :v6 - Wrong fix: FluxPipeline is for FLUX.1, not FLUX.2
+#   :v5 - Use stable diffusers==0.36.0 instead of git dev version (fixes API incompatibility)
+#   :v4 - Fixed asyncio lock bug in async generation (threading lock for background tasks)
+#   :v3 - Added quantized model disk caching for fast restarts
+#   :v2 - Fixed version using /workspace for all paths (no fallbacks)
+#   :latest - Always points to latest stable build
+
+steps:
+  # Build the SimpleTuner image with versioned tag
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '-t'
+      - 'gcr.io/YOUR_PROJECT_ID/kestrel-lora:v8'
+      - '-t'
+      - 'gcr.io/YOUR_PROJECT_ID/kestrel-lora:latest'
+      - '-f'
+      - 'docker/Dockerfile.simpletuner'
+      - '.'
+    timeout: 3600s  # 1 hour for large image
+
+  # Push versioned tag first (this is the one we explicitly reference)
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'push'
+      - 'gcr.io/YOUR_PROJECT_ID/kestrel-lora:v8'
+
+  # Push latest tag
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'push'
+      - 'gcr.io/YOUR_PROJECT_ID/kestrel-lora:latest'
+
+images:
+  - 'gcr.io/YOUR_PROJECT_ID/kestrel-lora:v8'
+  - 'gcr.io/YOUR_PROJECT_ID/kestrel-lora:latest'
+
+options:
+  machineType: 'E2_HIGHCPU_32'  # Faster build
+  diskSizeGb: 200  # Large disk for CUDA image
+
+timeout: 7200s  # 2 hour total timeout

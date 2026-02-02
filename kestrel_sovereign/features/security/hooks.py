@@ -1,0 +1,229 @@
+"""
+Kestrel Security - Security Hook Implementation.
+
+This module provides the SecurityHook that intercepts tool execution
+and enforces permission policies.
+"""
+
+import json
+import logging
+from typing import Optional
+
+from kestrel_sovereign.hooks import Hook, HookEvent, HookInput, HookOutput
+from kestrel_sovereign.features.security.permissions import PermissionLevel, PermissionStore
+from kestrel_sovereign.features.security.approval_queue import ApprovalQueue
+
+logger = logging.getLogger(__name__)
+
+
+class SecurityHook(Hook):
+    """
+    PreToolUse hook that checks permissions and queues for approval.
+
+    This hook runs before any tool execution and:
+    1. Checks the permission level for the tool
+    2. Allows/denies based on stored policy
+    3. Queues for user approval if level is ASK
+    4. Logs the decision to the audit log
+
+    Example:
+        hook = SecurityHook(permission_store, approval_queue)
+        manager.register(hook)
+
+        # Now all tool executions go through the security check
+    """
+
+    def __init__(
+        self,
+        permission_store: PermissionStore,
+        approval_queue: ApprovalQueue,
+        priority: int = 10,  # Run early in hook chain
+    ):
+        """
+        Initialize the security hook.
+
+        Args:
+            permission_store: Store for permission policies
+            approval_queue: Queue for pending approvals
+            priority: Hook priority (default 10, runs early)
+        """
+        super().__init__(
+            name="security_guard",
+            events=[HookEvent.PRE_TOOL_USE, HookEvent.PRE_SUBAGENT_CALL],
+            priority=priority,
+        )
+        self.permission_store = permission_store
+        self.approval_queue = approval_queue
+
+    async def execute(self, input: HookInput) -> HookOutput:
+        """
+        Check permissions and enforce policy.
+
+        Args:
+            input: HookInput with tool/feature context
+
+        Returns:
+            HookOutput with permission decision
+        """
+        feature_name = input.feature_name or "unknown"
+        tool_name = input.tool_name or "unknown"
+
+        logger.debug(f"Security check: {feature_name}.{tool_name}")
+
+        # Get current permission level
+        level = await self.permission_store.get_permission(feature_name, tool_name)
+
+        # Prepare args summary for audit log (truncate for privacy)
+        args_summary = self._summarize_args(input.tool_input)
+
+        if level == PermissionLevel.ALLOW:
+            await self.permission_store.log_decision(
+                feature_name=feature_name,
+                tool_name=tool_name,
+                action="tool_execution",
+                decision="auto_allowed",
+                args_summary=args_summary,
+            )
+            logger.debug(f"Auto-allowed: {feature_name}.{tool_name}")
+            return HookOutput.allow(f"Auto-approved: {feature_name}.{tool_name}")
+
+        if level == PermissionLevel.DENY:
+            await self.permission_store.log_decision(
+                feature_name=feature_name,
+                tool_name=tool_name,
+                action="tool_execution",
+                decision="auto_denied",
+                args_summary=args_summary,
+            )
+            logger.info(f"Auto-denied: {feature_name}.{tool_name}")
+            return HookOutput.deny(f"Blocked by policy: {feature_name}.{tool_name}")
+
+        if level in (PermissionLevel.ASK, PermissionLevel.SESSION):
+            # Queue for approval and wait
+            logger.info(f"Requesting approval: {feature_name}.{tool_name}")
+
+            approved, scope = await self.approval_queue.request_approval(
+                feature_name=feature_name,
+                tool_name=tool_name,
+                tool_args=input.tool_input or {},
+            )
+
+            if not approved:
+                await self.permission_store.log_decision(
+                    feature_name=feature_name,
+                    tool_name=tool_name,
+                    action="tool_execution",
+                    decision="user_denied" if scope != "timeout" else "timeout",
+                    user_choice=scope,
+                    args_summary=args_summary,
+                )
+                logger.info(f"User denied or timeout: {feature_name}.{tool_name}")
+                return HookOutput.deny(f"User denied: {feature_name}.{tool_name}")
+
+            # Save permission based on user's scope choice
+            if scope == "always":
+                await self.permission_store.set_permission(
+                    feature_name,
+                    tool_name,
+                    PermissionLevel.ALLOW,
+                    scope="always",
+                    reason="User approved with 'always' scope",
+                )
+            elif scope == "session":
+                await self.permission_store.set_permission(
+                    feature_name,
+                    tool_name,
+                    PermissionLevel.ALLOW,
+                    scope="session",
+                    reason="User approved for this session",
+                )
+            # "once" = no persistence, just allow this execution
+
+            await self.permission_store.log_decision(
+                feature_name=feature_name,
+                tool_name=tool_name,
+                action="tool_execution",
+                decision="user_approved",
+                user_choice=scope,
+                args_summary=args_summary,
+            )
+
+            logger.info(f"User approved ({scope}): {feature_name}.{tool_name}")
+            return HookOutput.allow(f"User approved: {scope}")
+
+        # Fallback: allow
+        return HookOutput.allow()
+
+    def _summarize_args(
+        self,
+        args: Optional[dict],
+        max_length: int = 200,
+    ) -> Optional[str]:
+        """
+        Create a privacy-safe summary of tool arguments.
+
+        Args:
+            args: Tool arguments dictionary
+            max_length: Maximum summary length
+
+        Returns:
+            Truncated JSON string or None
+        """
+        if not args:
+            return None
+
+        try:
+            # Mask potentially sensitive values
+            masked = self._mask_sensitive(args)
+            summary = json.dumps(masked, default=str)
+
+            if len(summary) > max_length:
+                return summary[: max_length - 3] + "..."
+            return summary
+
+        except Exception:
+            return "(args could not be summarized)"
+
+    def _mask_sensitive(self, data: dict) -> dict:
+        """
+        Mask potentially sensitive values in arguments.
+
+        Args:
+            data: Dictionary to mask
+
+        Returns:
+            Dictionary with sensitive values masked
+        """
+        sensitive_keys = {
+            "password",
+            "secret",
+            "token",
+            "key",
+            "api_key",
+            "private_key",
+            "credit_card",
+            "ssn",
+            "social_security",
+        }
+
+        result = {}
+        for key, value in data.items():
+            key_lower = key.lower()
+
+            # Mask sensitive keys
+            if any(s in key_lower for s in sensitive_keys):
+                result[key] = "***MASKED***"
+            elif isinstance(value, dict):
+                result[key] = self._mask_sensitive(value)
+            elif isinstance(value, list):
+                result[key] = [
+                    self._mask_sensitive(item) if isinstance(item, dict) else item
+                    for item in value
+                ]
+            else:
+                result[key] = value
+
+        return result
+
+    def __repr__(self) -> str:
+        return f"SecurityHook(name={self.name}, priority={self.priority})"

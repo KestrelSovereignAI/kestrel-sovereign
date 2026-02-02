@@ -1,0 +1,35 @@
+# Cloud Build ignore file
+# Note: This file is used by gcloud builds submit
+
+# Always ignore these
+.venv_kestrel/
+.venv/
+*.pyc
+__pycache__/
+.git/
+.DS_Store
+
+# Development/test artifacts
+playwright-report/
+test-results/
+node_modules/
+*.db
+*.capsule
+agent_data/
+
+# Archive (historical docs, not needed for builds)
+archive/
+
+# Include files that may be gitignored but needed for build
+!llm_config.toml
+
+# Only uncomment these for LoRA trainer builds which don't need full Kestrel
+# storage/
+# llm/
+# features/
+# tools/
+# extensions/
+# static/
+# docs/
+# prompts/
+# tests/

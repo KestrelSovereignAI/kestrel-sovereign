@@ -1,0 +1,17 @@
+name: visual_identity
+description: Companion image generation - avatars, selfies, LoRA training for character consistency, scene variations
+version: 1.0.0
+entry_point: feature.py
+
+tools:
+  - generate_avatar
+  - generate_selfie
+  - get_avatar
+  - train_lora
+  - get_lora_status
+
+files:
+  - feature.py
+
+dependencies:
+  - replicate

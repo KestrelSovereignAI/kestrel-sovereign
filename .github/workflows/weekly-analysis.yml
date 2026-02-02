@@ -1,0 +1,102 @@
+name: Weekly Test Analysis
+
+on:
+  schedule:
+    - cron: '0 9 * * 1'  # Every Monday at 9am UTC
+  workflow_dispatch:  # Manual trigger
+
+env:
+  PYTHON_VERSION: "3.13"
+  KESTREL_FEEDBACK_DB: "/tmp/test_feedback.db"
+  KESTREL_AGENT_NAME: "weekly-analysis"
+  KESTREL_AUDIT_MODE: "skip"
+
+jobs:
+  full-test-suite:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg15
+        env:
+          POSTGRES_USER: kestrel_user
+          POSTGRES_PASSWORD: kestrel_password
+          POSTGRES_DB: kestrel
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6380:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgresql://kestrel_user:kestrel_password@localhost:5433/kestrel
+      REDIS_URL: redis://localhost:6380
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Set up Python
+        run: uv python install ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Run full test suite with feedback
+        run: uv run python run_tests.py --ci --feedback
+        continue-on-error: true
+        env:
+          KESTREL_FEEDBACK_DB: ${{ env.KESTREL_FEEDBACK_DB }}
+          DATABASE_URL: ${{ env.DATABASE_URL }}
+          REDIS_URL: ${{ env.REDIS_URL }}
+
+      - name: Upload feedback artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: weekly-test-feedback
+          path: /tmp/test_feedback.db
+          if-no-files-found: ignore
+
+  create-issues:
+    runs-on: ubuntu-latest
+    needs: full-test-suite
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Set up Python
+        run: uv python install ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Download feedback artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: weekly-test-feedback
+          path: /tmp/
+        continue-on-error: true
+
+      - name: Create issues for patterns
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          KESTREL_FEEDBACK_DB: /tmp/test_feedback.db
+        run: |
+          if [ -f /tmp/test_feedback.db ]; then
+            uv run python scripts/ci/create_issues.py
+          else
+            echo "No feedback database found, skipping issue creation"
+          fi

@@ -1,0 +1,89 @@
+# Dockerfile for FLUX.1-dev with Uncensored LoRA Support
+# For generating NSFW/explicit content with character LoRAs
+#
+# Key differences from FLUX.2 Dockerfile:
+# - Uses FLUX.1-dev (black-forest-labs/FLUX.1-dev)
+# - Pre-downloads enhanceaiteam/Flux-Uncensored-V2 LoRA
+# - Uses FluxPipeline instead of Flux2Pipeline
+#
+# Usage:
+#   1. Build: docker build -f docker/Dockerfile.flux1-uncensored -t flux1-uncensored .
+#   2. Deploy on RunPod/Vertex AI with A100 80GB
+#   3. API server listens on port 8000
+
+FROM nvidia/cuda:12.1.1-devel-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=UTC
+ENV PYTHONUNBUFFERED=1
+
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    software-properties-common \
+    && add-apt-repository ppa:deadsnakes/ppa -y \
+    && apt-get update && apt-get install -y --no-install-recommends \
+    python3.12 \
+    python3.12-dev \
+    python3.12-venv \
+    python3-pip \
+    curl \
+    git \
+    libgl1 \
+    libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set python3.12 as default
+RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1 \
+    && update-alternatives --install /usr/bin/python python /usr/bin/python3.12 1
+
+# Install pip and upgrade setuptools
+RUN curl -sS https://bootstrap.pypa.io/get-pip.py | python3.12 \
+    && pip install --upgrade setuptools
+
+# Install SimpleTuner with CUDA support (for training)
+RUN pip install --no-cache-dir "simpletuner[cuda]"
+
+# Install additional dependencies for our API wrapper
+# Note: Using diffusers 0.31.0 for FLUX.1-dev compatibility
+RUN pip install --no-cache-dir \
+    fastapi \
+    uvicorn \
+    httpx \
+    python-multipart \
+    aiofiles \
+    google-cloud-storage \
+    optimum-quanto \
+    "diffusers>=0.31.0" \
+    huggingface_hub
+
+# Copy our FLUX.1 API wrapper
+COPY docker/simpletuner_flux1_api.py /app/simpletuner_api.py
+
+# Create directories for caches and data
+RUN mkdir -p /app/datasets /app/output /app/config /app/huggingface /app/loras
+
+# Default environment
+ENV HF_HOME=/app/huggingface
+ENV TRANSFORMERS_CACHE=/app/huggingface
+ENV TORCH_HOME=/app/huggingface
+
+# SimpleTuner logging
+ENV SIMPLETUNER_LOG_LEVEL=DEBUG
+
+# HF_TOKEN passed at runtime for gated models
+ENV HF_TOKEN=""
+
+# Enable uncensored mode by default
+ENV FLUX_UNCENSORED=true
+
+# Expose API port
+EXPOSE 8000
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=30s --start-period=300s --retries=3 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+# Run API server
+CMD ["python3", "/app/simpletuner_api.py"]
