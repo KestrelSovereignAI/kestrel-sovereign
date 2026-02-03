@@ -124,6 +124,9 @@ class CommandHandler:
 
         # Task management
         self._command_handlers["!tasks"] = self._cmd_tasks
+        
+        # Continue from stopped request
+        self._command_handlers["!continue"] = self._cmd_continue
     
     async def handle(self, user_input: str) -> Optional[str]:
         """
@@ -603,3 +606,13 @@ Sharing:
         except Exception as e:
             logger.error(f"Error listing tasks: {e}")
             return f"❌ Error listing tasks: {e}"
+
+    async def _cmd_continue(self, user_input: str) -> str:
+        """
+        Handle !continue command - continue from where a stopped request left off.
+        
+        This sends a continuation prompt to the LLM to resume the previous response.
+        """
+        # This is a special command - we return None to let the agent handle it
+        # by sending a continuation request to the LLM
+        return None  # Signal to process_input to continue the conversation
