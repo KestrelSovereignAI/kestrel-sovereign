@@ -539,9 +539,13 @@ Expected Duration: {expected_duration}
 
         # Handle explicit commands first (using the CommandHandler)
         if user_input.startswith("!"):
-            response = await self.command_handler.handle(user_input)
-            if response:
-                return response
+            # Special handling for !continue - replace with continuation prompt
+            if user_input.strip().lower() == "!continue":
+                user_input = "Please continue from where you left off."
+            else:
+                response = await self.command_handler.handle(user_input)
+                if response:
+                    return response
 
         # Store user input according to privacy mode
         # Pass session_id to link this message to the resumed session

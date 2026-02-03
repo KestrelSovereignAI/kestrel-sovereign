@@ -80,7 +80,7 @@ async def stream_agent_response(request: Request):
                 ):
                     # Check if request was cancelled
                     if agent.is_request_cancelled(request_id):
-                        yield "\n\n⏹️ *Request cancelled by user*"
+                        yield "\n\n---\n⏹️ **Request stopped**\n\nType `!continue` to resume from where I left off, or start a new message."
                         break
                     yield chunk
             except Exception as e:
