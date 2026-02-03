@@ -308,5 +308,8 @@ class TestRealStreaming:
         # Tool should have been executed
         mock_feature.execute_as_subagent.assert_called_once()
 
-        # Should have streamed the final response
-        assert "".join(chunks) == "Final streamed response"
+        # Should have streamed the final response (with tool status prefix)
+        full_output = "".join(chunks)
+        assert "Final streamed response" in full_output
+        # Tool status messages are also streamed
+        assert "test_tool" in full_output
