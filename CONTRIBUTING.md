@@ -44,8 +44,8 @@ By submitting a pull request, you agree that your contributions are made under t
 
 ```bash
 # Clone the repository
-git clone https://github.com/Kestrel-Sovereign-AI/kestrel.git
-cd kestrel
+git clone https://github.com/KestrelSovereignAI/kestrel-sovereign.git
+cd kestrel-sovereign
 
 # Create virtual environment
 python -m venv .venv

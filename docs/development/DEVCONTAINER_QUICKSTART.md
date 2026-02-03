@@ -27,8 +27,8 @@ A fully configured development environment with:
 
 3. **Project cloned locally**
    ```bash
-   git clone https://github.com/Kestrel-Sovereign-AI/kestrel.git
-   cd kestrel
+   git clone https://github.com/KestrelSovereignAI/kestrel-sovereign.git
+   cd kestrel-sovereign
    ```
 
 ## 🚀 Quick Start (3 Steps)
