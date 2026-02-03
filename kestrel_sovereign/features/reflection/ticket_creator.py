@@ -34,7 +34,7 @@ class TicketCreator:
     variable, defaulting to "Kestrel-Sovereign-AI/kestrel".
     """
 
-    DEFAULT_REPO = "Kestrel-Sovereign-AI/kestrel"
+    DEFAULT_REPO = "KestrelSovereignAI/kestrel-sovereign"
 
     def __init__(self, github_client: "GitHubClient"):
         """Initialize the ticket creator.

@@ -362,7 +362,7 @@ class TestGitHubFeature:
     
     def test_resolve_repo_self(self, feature):
         result = feature._resolve_repo("self")
-        assert result == "Kestrel-Sovereign-AI/kestrel"
+        assert result == "KestrelSovereignAI/kestrel-sovereign"
     
     def test_resolve_repo_other(self, feature):
         result = feature._resolve_repo("other/repo")
@@ -391,7 +391,7 @@ class TestGitHubFeature:
             content="cached content",
             sha="abc",
             size=14,
-            repo="Kestrel-Sovereign-AI/kestrel",
+            repo="KestrelSovereignAI/kestrel-sovereign",
             ref="main",
         )
         await feature.cache.set(content)

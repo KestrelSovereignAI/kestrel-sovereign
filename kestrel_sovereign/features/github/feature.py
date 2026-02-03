@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 
 # Configuration
-GITHUB_SELF_REPO = os.getenv("GITHUB_SELF_REPO", "Kestrel-Sovereign-AI/kestrel")
+GITHUB_SELF_REPO = os.getenv("GITHUB_SELF_REPO", "KestrelSovereignAI/kestrel-sovereign")
 GITHUB_DEFAULT_BRANCH = os.getenv("GITHUB_DEFAULT_BRANCH", "main")
 
 
