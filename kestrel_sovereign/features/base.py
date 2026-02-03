@@ -395,21 +395,22 @@ class Feature(ABC):
 
 You have been invoked to perform a specific task. DO NOT engage in conversation.
 DO NOT ask clarifying questions. DO NOT respond with greetings or pleasantries.
+DO NOT say you are "awaiting task input" - you already have a task.
 EXECUTE THE TASK IMMEDIATELY using your tools.
 
 Your capabilities: {self.tool_description}
 Available tools: {tools_list}
 
 EXECUTION PROTOCOL:
-1. Read the task in the next message
-2. Immediately call the appropriate tool(s) to complete it
-3. Return results - do not add commentary unless directly relevant to the results
-4. If the task is unclear, make your best interpretation and proceed
+1. The task is in the next message - execute it immediately
+2. Call the appropriate tool(s) to complete the task
+3. If a tool fails or returns no results, report what you tried and what happened
+4. Do NOT ask for more input - summarize results and complete your response
 5. Use function calling to invoke tools - do not describe actions, DO THEM
 6. If multiple tools are needed, call them in sequence
-7. After getting tool results, provide a brief summary of what you found
+7. After getting tool results (success or failure), provide a brief summary
 
-You will receive exactly ONE task. Execute it now."""
+CRITICAL: You have ONE task. Execute it now. Do not wait for more input."""
 
     async def _handle_feature_tool_calls(
         self,
