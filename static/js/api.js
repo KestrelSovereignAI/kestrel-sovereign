@@ -226,6 +226,12 @@ const API = {
         method: 'POST',
         body: JSON.stringify({ input, model, session_id: sessionId })
     }),
+    
+    /**
+     * Stop the current agent request/streaming.
+     * @returns {Promise<Object>} Result with success and cancelled status
+     */
+    stop: () => API.request('/agent/stop', { method: 'POST' }),
     /**
      * Get available LLM models
      * @param {Object} options - Query options
@@ -243,6 +249,18 @@ const API = {
         const queryString = params.toString();
         return API.request(`/api/models${queryString ? '?' + queryString : ''}`);
     },
+    
+    // Current AbortController for cancellable streaming
+    _streamAbortController: null,
+    
+    /**
+     * Get the current AbortController for streaming.
+     * Used by chat.js to abort requests when stop is clicked.
+     */
+    getStreamAbortController() {
+        return this._streamAbortController;
+    },
+    
     streamInvoke: async function*(input, model = null, sessionId = null) {
         // Rewrite endpoint for multi-agent mode
         const url = rewriteEndpoint('/agent/stream');
@@ -256,27 +274,47 @@ const API = {
             headers['X-API-Key'] = API._apiKey;
         }
 
-        const response = await fetch(url, {
-            method: 'POST',
-            headers,
-            body: JSON.stringify({ input, model, session_id: sessionId })
-        });
+        // Create AbortController for this request
+        API._streamAbortController = new AbortController();
+        const signal = API._streamAbortController.signal;
 
-        // Handle 401 Unauthorized
-        if (response.status === 401) {
-            console.warn('Streaming auth failed - clearing cached key');
-            sessionStorage.removeItem('kestrel_api_key');
-            API._apiKey = null;
-            throw new Error('Authentication failed - please refresh the page');
-        }
+        try {
+            const response = await fetch(url, {
+                method: 'POST',
+                headers,
+                body: JSON.stringify({ input, model, session_id: sessionId }),
+                signal
+            });
 
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        const reader = response.body.getReader();
-        const decoder = new TextDecoder();
-        while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            yield decoder.decode(value, { stream: true });
+            // Handle 401 Unauthorized
+            if (response.status === 401) {
+                console.warn('Streaming auth failed - clearing cached key');
+                sessionStorage.removeItem('kestrel_api_key');
+                API._apiKey = null;
+                throw new Error('Authentication failed - please refresh the page');
+            }
+
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder();
+            
+            try {
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    yield decoder.decode(value, { stream: true });
+                }
+            } finally {
+                reader.releaseLock();
+            }
+        } catch (e) {
+            if (e.name === 'AbortError') {
+                console.log('Stream aborted by user');
+                return; // Don't throw - just end the generator
+            }
+            throw e;
+        } finally {
+            API._streamAbortController = null;
         }
     },
 

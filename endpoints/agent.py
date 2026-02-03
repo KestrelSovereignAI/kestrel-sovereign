@@ -49,6 +49,8 @@ async def stream_agent_response(request: Request):
     Returns text chunks as they are generated.
     Optionally accepts 'session_id' to load context from a specific conversation.
     """
+    import uuid
+    
     if not hasattr(request.app.state, 'agent') or not request.app.state.agent:
         raise HTTPException(status_code=503, detail="Agent not initialized.")
 
@@ -63,6 +65,10 @@ async def stream_agent_response(request: Request):
             raise HTTPException(status_code=400, detail="Input not provided.")
 
         agent = request.app.state.agent
+        
+        # Generate unique request ID for cancellation tracking
+        request_id = str(uuid.uuid4())
+        agent._current_request_id = request_id
 
         async def generate():
             try:
@@ -72,10 +78,17 @@ async def stream_agent_response(request: Request):
                     session_id=session_id,
                     audit_before_streaming=audit_before_streaming
                 ):
+                    # Check if request was cancelled
+                    if agent.is_request_cancelled(request_id):
+                        yield "\n\n⏹️ *Request cancelled by user*"
+                        break
                     yield chunk
             except Exception as e:
                 logger.error(f"Streaming error: {e}", exc_info=True)
                 yield f"\n\nError: {str(e)}"
+            finally:
+                # Cleanup request tracking
+                agent._cleanup_cancelled_request(request_id)
 
         return StreamingResponse(
             generate(),
@@ -85,6 +98,28 @@ async def stream_agent_response(request: Request):
     except Exception as e:
         logger.error(f"Error setting up stream: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Error setting up stream.")
+
+
+@router.post("/stop")
+async def stop_agent_request(request: Request):
+    """
+    Stop the current agent request/streaming.
+    Used by the stop button in the UI.
+    """
+    if not hasattr(request.app.state, 'agent') or not request.app.state.agent:
+        raise HTTPException(status_code=503, detail="Agent not initialized.")
+
+    try:
+        agent = request.app.state.agent
+        cancelled = agent.cancel_current_request()
+        return {
+            "success": True,
+            "cancelled": cancelled,
+            "message": "Request cancelled" if cancelled else "No active request to cancel"
+        }
+    except Exception as e:
+        logger.error(f"Error stopping agent: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Error stopping agent.")
 
 
 @router.get("/info")
