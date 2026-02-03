@@ -10,7 +10,7 @@ The GitHub Feature allows the Kestrel agent to access and analyze code from GitH
 ## Scope
 
 - **Repositories**: Any accessible repo (public or private with token)
-- **Self Alias**: `self` → `Kestrel-Sovereign-AI/kestrel` (configurable per deployment)
+- **Self Alias**: `self` → `KestrelSovereignAI/kestrel-sovereign` (configurable per deployment)
 - **Freshness**: Cached with configurable TTL (default: 1 hour)
 - **Depth**: Advanced features including AST parsing, symbol lookup, call graphs
 - **Auth**: GitHub Personal Access Token for private repos and higher rate limits
@@ -30,7 +30,7 @@ The GitHub Feature allows the Kestrel agent to access and analyze code from GitH
 │  │ • rate_limiting │  │ • invalidate()  │  │ • inheritance   │ │
 │  └─────────────────┘  └─────────────────┘  └─────────────────┘ │
 │                                                                  │
-│  "self" alias ──────────────────────────▶ Kestrel-Sovereign-AI/kestrel     │
+│  "self" alias ──────────────────────────▶ KestrelSovereignAI/kestrel-sovereign     │
 │                                                                  │
 │  Tools:                                                          │
 │  • read_github_file      • get_function_definition              │
@@ -49,10 +49,10 @@ The GitHub Feature allows the Kestrel agent to access and analyze code from GitH
 # Resolves to configured repo
 read_github_file("self", "features/base.py")
 # Equivalent to:
-read_github_file("Kestrel-Sovereign-AI/kestrel", "features/base.py")
+read_github_file("KestrelSovereignAI/kestrel-sovereign", "features/base.py")
 
 # Kestrel agents could configure differently:
-# GITHUB_SELF_REPO=Kestrel-Sovereign-AI/kestrel
+# GITHUB_SELF_REPO=KestrelSovereignAI/kestrel-sovereign
 ```
 
 ### 2. Flexible Repo Specification
@@ -89,7 +89,7 @@ Handles all GitHub API interactions with proper authentication and rate limiting
 class GitHubClient:
     """Client for GitHub API with caching and rate limit awareness."""
     
-    def __init__(self, token: str, repo: str = "Kestrel-Sovereign-AI/kestrel"):
+    def __init__(self, token: str, repo: str = "KestrelSovereignAI/kestrel-sovereign"):
         self.token = token
         self.repo = repo
         self.base_url = f"https://api.github.com/repos/{repo}"
@@ -557,7 +557,7 @@ features/github/
 ```python
 # Environment variables
 GITHUB_TOKEN=ghp_xxxxxxxxxxxx  # Personal Access Token with repo scope
-GITHUB_SELF_REPO=Kestrel-Sovereign-AI/kestrel  # What "self" resolves to
+GITHUB_SELF_REPO=KestrelSovereignAI/kestrel-sovereign  # What "self" resolves to
 GITHUB_DEFAULT_BRANCH=main  # Default branch
 GITHUB_CACHE_TTL=3600  # Cache TTL in seconds (1 hour)
 

@@ -7,7 +7,7 @@
 ## Contact
 
 - **Email**: unclesaurus@proton.me
-- **GitHub**: https://github.com/Kestrel-Sovereign-AI
+- **GitHub**: https://github.com/KestrelSovereignAI
 - **Website**: https://kestrelsovereign.com
 
 ## Philosophy

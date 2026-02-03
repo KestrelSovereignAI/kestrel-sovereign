@@ -31,7 +31,7 @@ class TicketCreator:
     All issue creation requires constitutional approval before execution.
 
     The target repository is configured via GITHUB_SELF_REPO environment
-    variable, defaulting to "Kestrel-Sovereign-AI/kestrel".
+    variable, defaulting to "KestrelSovereignAI/kestrel-sovereign".
     """
 
     DEFAULT_REPO = "KestrelSovereignAI/kestrel-sovereign"

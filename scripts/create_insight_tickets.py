@@ -49,7 +49,7 @@ async def main():
         sys.exit(1)
 
     # Get target repo
-    repo = os.getenv("GITHUB_SELF_REPO", "Kestrel-Sovereign-AI/kestrel")
+    repo = os.getenv("GITHUB_SELF_REPO", "KestrelSovereignAI/kestrel-sovereign")
     print(f"Target repository: {repo}")
 
     # Import required modules

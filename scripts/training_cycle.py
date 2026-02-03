@@ -22,7 +22,7 @@ Usage:
 
 Environment Variables:
     GITHUB_PAT or GITHUB_TOKEN - Required for ticket creation
-    GITHUB_SELF_REPO - Target repo (default: Kestrel-Sovereign-AI/kestrel)
+    GITHUB_SELF_REPO - Target repo (default: KestrelSovereignAI/kestrel-sovereign)
 """
 
 import argparse
@@ -371,7 +371,7 @@ async def run_training_cycle(
 
     # Check GitHub token if creating tickets
     github_token = os.getenv("GITHUB_PAT") or os.getenv("GITHUB_TOKEN")
-    repo = os.getenv("GITHUB_SELF_REPO", "Kestrel-Sovereign-AI/kestrel")
+    repo = os.getenv("GITHUB_SELF_REPO", "KestrelSovereignAI/kestrel-sovereign")
 
     if create_tickets and not github_token:
         logger.error("GITHUB_PAT or GITHUB_TOKEN required for ticket creation")

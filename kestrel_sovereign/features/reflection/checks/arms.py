@@ -241,7 +241,7 @@ class ArmsChecker(HealthChecker):
                 # Verify we got valid data (could be string or dict)
                 if result:
                     if isinstance(result, str):
-                        # Feature returns formatted string like "# Agent Source Repository\n**Repository:** Kestrel-Sovereign-AI/kestrel"
+                        # Feature returns formatted string like "# Agent Source Repository\n**Repository:** KestrelSovereignAI/kestrel-sovereign"
                         if "Repository" in result or "kestrel" in result.lower():
                             check.status = CheckStatus.PASS
                             check.message = "GitHub API working"
