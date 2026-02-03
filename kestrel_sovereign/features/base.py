@@ -12,7 +12,8 @@ from kestrel_sovereign.a2a.types import Task, TaskState, TaskStatus, Artifact, D
 logger = logging.getLogger(__name__)
 
 # Maximum tool call iterations (configurable via environment variable)
-MAX_TOOL_ITERATIONS = int(os.environ.get("KESTREL_MAX_TOOL_ITERATIONS", "5"))
+# Increased to 50 for long-running tasks like code analysis and multi-step operations
+MAX_TOOL_ITERATIONS = int(os.environ.get("KESTREL_MAX_TOOL_ITERATIONS", "50"))
 
 
 @runtime_checkable
@@ -309,7 +310,8 @@ class Feature(ABC):
     async def execute_as_subagent(
         self,
         task: str,
-        context: Optional[str] = None
+        context: Optional[str] = None,
+        max_iterations: Optional[int] = None
     ) -> Dict[str, Any]:
         """
         Execute this feature as a subagent with its own LLM context.
@@ -366,7 +368,8 @@ class Feature(ABC):
             result = await self._handle_feature_tool_calls(
                 response,
                 feature_tools,
-                system_prompt
+                system_prompt,
+                max_iterations=max_iterations
             )
 
             # Debug: Log what we're returning to the orchestrator
@@ -388,19 +391,25 @@ class Feature(ABC):
         tool_names = [t.name for t in self.get_tools()]
         tools_list = ", ".join(tool_names) if tool_names else "None"
 
-        return f"""You are the {self.name} subagent within Kestrel, a sovereign AI assistant.
+        return f"""EXECUTION MODE: You are now executing as the {self.name} subagent.
+
+You have been invoked to perform a specific task. DO NOT engage in conversation.
+DO NOT ask clarifying questions. DO NOT respond with greetings or pleasantries.
+EXECUTE THE TASK IMMEDIATELY using your tools.
 
 Your capabilities: {self.tool_description}
+Available tools: {tools_list}
 
-Available tools (USE VIA FUNCTION CALLING): {tools_list}
+EXECUTION PROTOCOL:
+1. Read the task in the next message
+2. Immediately call the appropriate tool(s) to complete it
+3. Return results - do not add commentary unless directly relevant to the results
+4. If the task is unclear, make your best interpretation and proceed
+5. Use function calling to invoke tools - do not describe actions, DO THEM
+6. If multiple tools are needed, call them in sequence
+7. After getting tool results, provide a brief summary of what you found
 
-CRITICAL INSTRUCTIONS:
-- You MUST use your tools via function calling to complete tasks
-- DO NOT just describe what you would do - actually call the tools
-- Call the appropriate tool functions to get real data
-- If you need information, call a tool to retrieve it
-- After getting tool results, summarize what you found
-- If multiple tools are needed, call them in sequence"""
+You will receive exactly ONE task. Execute it now."""
 
     async def _handle_feature_tool_calls(
         self,
@@ -457,6 +466,10 @@ CRITICAL INSTRUCTIONS:
         tools_by_name = {tool.name: tool for tool in self.get_tools()}
 
         for iteration in range(max_iterations):
+            # Warn when approaching iteration limit
+            if iteration >= max_iterations * 0.8:  # 80% threshold
+                logger.warning(f"[SUBAGENT {self.name}] Approaching max iterations: {iteration + 1}/{max_iterations}")
+            
             # Execute each tool call
             for tool_call in response.tool_calls:
                 tool_name = tool_call.name

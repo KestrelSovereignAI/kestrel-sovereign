@@ -50,7 +50,8 @@ SYSTEM_PROMPT_FILE = PROMPTS_DIR / "system_prompt.md"
 USER_PROMPT_FILE = PROMPTS_DIR / "user_prompt.md"
 
 # Maximum tool call iterations (configurable via environment variable)
-MAX_TOOL_ITERATIONS = int(os.environ.get("KESTREL_MAX_TOOL_ITERATIONS", "5"))
+# Increased to 50 for long-running tasks like code analysis and multi-step operations
+MAX_TOOL_ITERATIONS = int(os.environ.get("KESTREL_MAX_TOOL_ITERATIONS", "50"))
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -866,6 +867,10 @@ Expected Duration: {expected_duration}
         features_by_tool_name = {f.tool_name: f for f in self.features.values()}
 
         for iteration in range(max_iterations):
+            # Warn when approaching iteration limit
+            if iteration >= max_iterations * 0.8:  # 80% threshold
+                logging.warning(f"[ORCHESTRATOR] Approaching max iterations: {iteration + 1}/{max_iterations}")
+            
             # Execute each tool call by dispatching to features
             for tool_call in response.tool_calls:
                 tool_name = tool_call.name
