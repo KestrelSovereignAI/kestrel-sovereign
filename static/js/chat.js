@@ -45,6 +45,10 @@ export function initChat() {
     // Event listeners
     sendButton?.addEventListener('click', sendMessage);
 
+    // Stop button for cancelling requests
+    const stopButton = document.getElementById('stop-button');
+    stopButton?.addEventListener('click', stopRequest);
+
     // Input events for autocomplete
     messageInput?.addEventListener('input', handleInput);
     messageInput?.addEventListener('keydown', handleKeydown);
@@ -226,6 +230,36 @@ function showThinking(show) {
     }
     if (messageInput) messageInput.disabled = show;
     if (sendButton) sendButton.disabled = show;
+}
+
+// ============================================================================
+// Stop Request
+// ============================================================================
+
+/**
+ * Stop the current streaming request.
+ * Called when user clicks the Stop button.
+ */
+async function stopRequest() {
+    console.log('Stop button clicked');
+    
+    // Abort client-side fetch using API's AbortController
+    const abortController = API.getStreamAbortController();
+    if (abortController) {
+        abortController.abort();
+    }
+    
+    // Tell server to stop processing
+    try {
+        const result = await API.stop();
+        console.log('Stop result:', result);
+    } catch (e) {
+        console.error('Error stopping request:', e);
+    }
+    
+    // Reset UI state
+    state.isWaiting = false;
+    showThinking(false);
 }
 
 // ============================================================================

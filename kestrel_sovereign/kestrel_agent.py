@@ -134,6 +134,10 @@ class KestrelAgent(ConstitutionMixin, StreamingMixin, BackupMixin, SleepMixin):
         # Pending task completion notifications (for background tasks)
         self._pending_task_notifications: List[str] = []
 
+        # Cancellation tracking for stop button functionality
+        self._current_request_id: Optional[str] = None
+        self._cancelled_requests: set = set()
+
         # Session state
         self._session_briefed = False
         self._safe_mode = False
@@ -1384,6 +1388,34 @@ Expected Duration: {expected_duration}
         notifications = self._pending_task_notifications.copy()
         self._pending_task_notifications.clear()
         return notifications
+
+    # =========================================================================
+    # Request Cancellation (Stop Button Support)
+    # =========================================================================
+
+    def cancel_current_request(self) -> bool:
+        """
+        Cancel the current streaming request.
+        
+        Returns:
+            True if a request was cancelled, False if no request was active.
+        """
+        if self._current_request_id:
+            self._cancelled_requests.add(self._current_request_id)
+            logging.info(f"Cancelled request: {self._current_request_id}")
+            return True
+        return False
+
+    def is_request_cancelled(self, request_id: Optional[str] = None) -> bool:
+        """Check if a request has been cancelled."""
+        rid = request_id or self._current_request_id
+        return rid in self._cancelled_requests if rid else False
+
+    def _cleanup_cancelled_request(self, request_id: str):
+        """Remove a request from the cancelled set after it's been handled."""
+        self._cancelled_requests.discard(request_id)
+        if self._current_request_id == request_id:
+            self._current_request_id = None
 
     async def shutdown(self):
         """Properly clean up all agent resources including async MCP connections."""
