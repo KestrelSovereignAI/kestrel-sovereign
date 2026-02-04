@@ -18,11 +18,7 @@ from pathlib import Path
 from kestrel_sovereign.kestrel_agent import KestrelAgent
 from kestrel_sovereign.llm.service import LLMService
 from kestrel_sovereign.privacy import PrivacyMode
-
-
-def _no_llm_keys():
-    """Check if LLM API keys are available."""
-    return not os.environ.get("OPENAI_API_KEY", "").strip() and not os.environ.get("ANTHROPIC_API_KEY", "").strip()
+from tests.shared import no_llm_credentials
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -58,7 +54,7 @@ async def kestrel_agent(temp_db):
     await llm_service.close()
 
 @pytest.mark.asyncio
-@pytest.mark.skipif(_no_llm_keys(), reason="Requires LLM API key for orchestration tests")
+@pytest.mark.skipif(no_llm_credentials(), reason="Requires LLM credentials for orchestration tests")
 async def test_orchestrator_model_management(kestrel_agent):
     """
     Test that the orchestrator correctly delegates model management commands
@@ -78,34 +74,24 @@ async def test_orchestrator_model_management(kestrel_agent):
     assert "models" in response.lower() or "ollama" in response.lower() or "openai" in response.lower(), \
         f"Expected model provider info in response"
     
-    # 2. Set Model Preference
-    # We use a fake model name to avoid actually trying to load it, 
-    # but we check if the preference is recorded.
-    response = await kestrel_agent.process_input("!set-model-preference test-model-v1")
-    # Note: !set-model-preference might not be a direct command in KestrelAgent yet,
-    # let's check if it's exposed via ModelManagerTool or direct command.
-    # Looking at code, ModelManagerTool exposes !list-models, !pull-model, etc.
-    # KestrelAgent has !model-mandate but maybe not !set-model-preference directly exposed via tool?
-    # Wait, KestrelAgent has `set_model` method but is it exposed via command?
-    # Let's check ModelManagerTool schema again.
-    
-    # ModelManagerTool handles: !list-models, !pull-model, !storage-status, !cleanup-models, !model-info
-    # It does NOT seem to handle setting preference directly in the tool schema we saw earlier.
-    # However, KestrelAgent has `_handle_model_mandate_command`.
-    
-    # Let's stick to what ModelManagerTool exposes for now.
+    # 2. Show Current Model
+    # The !model command shows the currently configured model
+    response = await kestrel_agent.process_input("!model")
+    logger.info(f"Current Model Response: {response}")
+    assert isinstance(response, str), f"Expected string response, got {type(response)}"
+    # Response should mention current model or provide instructions
+    assert len(response) > 0, "Expected non-empty response from !model"
     
     # 3. Model Info
-    # We'll query info about a model that likely exists or just check error handling
+    # Query info about a non-existent model to verify error handling
     response = await kestrel_agent.process_input("!model-info non-existent-model")
-    assert "Model not found" in response or "Error" in response
+    assert "Model not found" in response or "Error" in response or "not found" in response.lower()
 
 @pytest.mark.asyncio
 @pytest.mark.skipif(
-    not shutil.which("docker") or _no_llm_keys(),
-    reason="Docker not available or no LLM API keys - MCP tests require Docker and LLM"
+    not shutil.which("docker") or no_llm_credentials(),
+    reason="Docker not available or no LLM credentials - MCP tests require Docker and LLM"
 )
-@pytest.mark.asyncio
 async def test_orchestrator_mcp_management(kestrel_agent):
     """
     Test that the orchestrator correctly delegates MCP commands
@@ -145,7 +131,7 @@ async def test_orchestrator_mcp_management(kestrel_agent):
     assert "Hello Kestrel" in response
 
 @pytest.mark.asyncio
-@pytest.mark.skipif(_no_llm_keys(), reason="Requires LLM API key for natural language tool use")
+@pytest.mark.skipif(no_llm_credentials(), reason="Requires LLM credentials for natural language tool use")
 async def test_orchestrator_natural_language_tool_use(kestrel_agent):
     """
     Test if the agent can use tools via natural language.

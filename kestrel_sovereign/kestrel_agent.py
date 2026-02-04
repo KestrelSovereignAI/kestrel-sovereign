@@ -1263,9 +1263,19 @@ Expected Duration: {expected_duration}
         """
         Get the current LLM model being used by this agent.
 
+        Respects the mandate preference if set (via !model-set or UI selection).
+
         Returns:
             Current model ID (provider/model format)
         """
+        # First check if there's a mandate preference (set via !model-set or UI)
+        pref = self.llm_service.get_model_preference()
+        if pref.get("model"):
+            provider = pref.get("provider", "")
+            model = pref.get("model")
+            return f"{provider}/{model}" if provider else model
+
+        # Fall back to first provider's default
         if self.llm_service.providers:
             first = self.llm_service.providers[0]
             provider = first.get('name', '')

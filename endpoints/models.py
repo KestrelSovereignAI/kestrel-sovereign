@@ -506,7 +506,11 @@ async def list_agent_models(
 
 @router.get("/api/model/current")
 async def get_current_model(request: Request):
-    """Get the currently active model for UI sync."""
+    """Get the currently active model for UI sync.
+    
+    Returns the model/provider from mandate preference if set,
+    otherwise falls back to the first provider's default model.
+    """
     if not hasattr(request.app.state, 'agent') or not request.app.state.agent:
         raise HTTPException(status_code=503, detail="Agent not initialized.")
 
@@ -517,25 +521,11 @@ async def get_current_model(request: Request):
 
         if hasattr(agent, 'llm_service') and agent.llm_service:
             llm_service = agent.llm_service
-            mandate = llm_service.get_current_mandate()
-
-            pref = mandate.get('preference', {})
-            provider = pref.get('provider')
+            
+            # First check mandate preference (set via !model-set or UI)
+            pref = llm_service.get_model_preference()
             model_name = pref.get('model')
-
-            provider_names = [p.get('name') for p in llm_service.providers]
-            if model_name in provider_names:
-                for p in llm_service.providers:
-                    if p.get('name') == model_name:
-                        provider = model_name
-                        model_name = p.get('model')
-                        break
-
-            if provider and not model_name:
-                for p in llm_service.providers:
-                    if p.get('name') == provider:
-                        model_name = p.get('model')
-                        break
+            provider = pref.get('provider')
 
             # If no mandate preference, use the first provider (what actually gets used)
             if not model_name and llm_service.providers:

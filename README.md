@@ -101,6 +101,30 @@ kestrel/
 - **Decentralized Storage**: Filecoin/IPFS integration for vendor independence
 - **Agent Economics**: Autonomous economic contracts using cryptographic payments
 
+## ⚠️ Known Limitations (v0.1.8 Beta)
+
+### ✅ Working & Production-Ready:
+- **Constitutional AI** - Genesis audits, hierarchical permissions, approval queues
+- **DID-based Identity** - `did:pkh` format, portable agent identity
+- **5-Level Privacy Modes** - EPHEMERAL → ISOLATED → ANONYMOUS → NORMAL → PUBLIC
+- **Multi-LLM Support** - Anthropic, OpenAI, Gemini, Ollama, OpenRouter, xAI, Groq
+- **Agent Economics** - Multi-currency wallets (FIL, USDC, USDT, ETH)
+- **A2A Protocol** - JSON-RPC 2.0 for agent-to-agent communication
+- **Enhanced Storage** - SQLite/PostgreSQL with FTS, knowledge graphs, RAG pipeline
+
+### ⚠️ Work-in-Progress:
+- **DID Verification Layer** - Identity generation works, verification incomplete
+- **E2E Test Stability** - Some integration tests are occasionally flaky
+- **API Stability** - APIs may change before v1.0 (we'll document breaking changes)
+
+### ❌ Not Implemented (Use OpenClaw Instead):
+- **Multi-Channel Messaging** - WhatsApp, Telegram, Discord, Slack integration
+- **Voice Interaction** - Wake word detection, TTS
+- **Browser Automation** - Chrome/Chromium control
+- **Visual Workspaces** - A2UI canvas, live reload
+
+**Bottom Line**: Kestrel is ready for developers building privacy-first, economically-independent AI agents. Not ready for production apps or general consumer use.
+
 ## 📚 Documentation
 
 Detailed documentation is available in the `docs/` directory:

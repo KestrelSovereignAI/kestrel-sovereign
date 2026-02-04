@@ -171,11 +171,14 @@ Use `!constitution article <N>` for specific articles, or `!constitution search 
         # Take the most recent messages first
         recent = history[-max_messages:] if len(history) > max_messages else history
 
+        # Build from NEWEST to OLDEST to preserve most recent context
+        # Then reverse to get chronological order
         formatted = []
         total_tokens = 0
         MESSAGE_OVERHEAD = 4  # Tokens per message for structure
 
-        for msg in recent:
+        # Iterate in reverse (newest first) to prioritize recent messages
+        for msg in reversed(recent):
             role = msg.get('role', 'user')
             content = msg.get('content', '')
 
@@ -191,7 +194,8 @@ Use `!constitution article <N>` for specific articles, or `!constitution search 
                     content += " [truncated]"
                     msg_tokens = self.counter.count(content) + MESSAGE_OVERHEAD
                 else:
-                    break
+                    # Skip older messages to preserve newer ones
+                    continue
 
             # Normalize role names for OpenAI API
             if role not in ('user', 'assistant', 'system'):
@@ -202,6 +206,9 @@ Use `!constitution article <N>` for specific articles, or `!constitution search 
                 'content': content
             })
             total_tokens += msg_tokens
+
+        # Reverse to restore chronological order
+        formatted.reverse()
 
         logger.debug(
             f"Formatted {len(formatted)}/{len(recent)} messages, "
