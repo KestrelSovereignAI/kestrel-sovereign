@@ -34,6 +34,7 @@ from kestrel_sovereign.agent.sleep import SleepMixin
 from kestrel_sovereign.storage.memory_consolidator import MemoryConsolidator
 from kestrel_sovereign.storage.memory_system import MemorySystem
 from kestrel_sovereign.hooks import HooksManager, HookEvent, HookInput, HookOutput
+from kestrel_sovereign.bootstrap import BootstrapService, BootstrapState
 
 # Optional ollama import (not available in remote-only containers)
 try:
@@ -334,6 +335,16 @@ class KestrelAgent(ConstitutionMixin, StreamingMixin, BackupMixin, SleepMixin):
                 memory_retriever=self.memory_system.retriever,
             )
 
+            # Initialize bootstrap service for first-time agent wake-up
+            self.bootstrap_service = BootstrapService(
+                db=self._raw_storage.db,
+                agent_id=self.agent_id,
+                agent_name=self._agent_name,
+                llm_service=self.llm_service,
+                agent_data_path=agent_data_dir,
+            )
+            logging.info("BootstrapService initialized")
+
             # Cache the features prompt (built once at session start)
             self._cached_features_prompt = self._build_features_prompt_section()
 
@@ -505,6 +516,93 @@ Expected Duration: {expected_duration}
         from datetime import datetime, timezone
         return datetime.now(timezone.utc).isoformat()
 
+    async def _handle_bootstrap(self, user_input: str, session_id: str = None) -> Optional[str]:
+        """
+        Handle bootstrap/discovery flow for first-time agent wake-up.
+
+        Returns:
+            Response string if in bootstrap mode, None if should continue to normal processing
+        """
+        state = await self.bootstrap_service.get_bootstrap_state()
+
+        if state == BootstrapState.PENDING:
+            # First ever message - send wake-up greeting
+            await self.bootstrap_service.set_bootstrap_state(BootstrapState.DISCOVERY)
+            wake_up_msg = await self.bootstrap_service.generate_wake_up_message()
+
+            # Store the wake-up message in conversation history
+            await self.privacy_agent.add_conversation("assistant", wake_up_msg, session_id=session_id)
+
+            logging.info(f"[BOOTSTRAP] Agent waking up - entering discovery mode")
+            return wake_up_msg
+
+        elif state == BootstrapState.DISCOVERY:
+            # In discovery mode - process through discovery conversation
+            response, is_complete, wants_avatar = await self.bootstrap_service.process_discovery_message(user_input)
+
+            # Store user message and response in conversation history
+            await self.privacy_agent.add_conversation("user", user_input, session_id=session_id)
+            await self.privacy_agent.add_conversation("assistant", response, session_id=session_id)
+
+            if is_complete:
+                if wants_avatar:
+                    # User provided avatar description - try to generate
+                    await self.bootstrap_service.set_bootstrap_state(BootstrapState.AVATAR)
+                    completion_msg = await self.bootstrap_service.complete_bootstrap(avatar_description=user_input)
+
+                    # Try to generate avatar using visual identity feature
+                    visual_identity = self.features.get("VisualIdentityFeature")
+                    if visual_identity:
+                        try:
+                            avatar_result = await visual_identity.generate_avatar(user_input)
+                            completion_msg += f"\n\n{avatar_result}"
+                        except Exception as e:
+                            logging.warning(f"Failed to generate avatar: {e}")
+                            completion_msg += "\n\n(Avatar generation had an issue - you can try again with !avatar)"
+
+                    await self.privacy_agent.add_conversation("assistant", completion_msg, session_id=session_id)
+                    await self.bootstrap_service.set_bootstrap_state(BootstrapState.COMPLETE)
+                    # Reload SOUL.md into context builder
+                    if hasattr(self, 'context_builder'):
+                        self.context_builder._load_soul_md()
+                    logging.info(f"[BOOTSTRAP] Discovery complete with avatar")
+                    return completion_msg
+                else:
+                    # Discovery complete without avatar
+                    completion_msg = await self.bootstrap_service.complete_bootstrap()
+                    await self.privacy_agent.add_conversation("assistant", completion_msg, session_id=session_id)
+                    await self.bootstrap_service.set_bootstrap_state(BootstrapState.COMPLETE)
+                    # Reload SOUL.md into context builder
+                    if hasattr(self, 'context_builder'):
+                        self.context_builder._load_soul_md()
+                    logging.info(f"[BOOTSTRAP] Discovery complete")
+                    return completion_msg
+
+            logging.info(f"[BOOTSTRAP] Discovery continuing...")
+            return response
+
+        elif state == BootstrapState.AVATAR:
+            # Waiting for avatar description (fallback state)
+            if user_input.lower() in ["skip", "no", "later"]:
+                completion_msg = await self.bootstrap_service.complete_bootstrap()
+                await self.bootstrap_service.set_bootstrap_state(BootstrapState.COMPLETE)
+                return completion_msg
+            else:
+                # Generate avatar
+                visual_identity = self.features.get("VisualIdentityFeature")
+                if visual_identity:
+                    try:
+                        avatar_result = await visual_identity.generate_avatar(user_input)
+                        await self.bootstrap_service.set_bootstrap_state(BootstrapState.COMPLETE)
+                        return f"Avatar generated!\n\n{avatar_result}\n\nI'm ready to help. What would you like to work on?"
+                    except Exception as e:
+                        logging.warning(f"Failed to generate avatar: {e}")
+                        await self.bootstrap_service.set_bootstrap_state(BootstrapState.COMPLETE)
+                        return "Avatar generation had an issue, but we can try again later with !avatar. I'm ready to help!"
+
+        # State is COMPLETE or unknown - proceed to normal processing
+        return None
+
     async def process_input(self, user_input: str, model_override: str = None, session_id: str = None) -> str:
         """
         Processes user input by consulting the constitution, retrieving context,
@@ -536,6 +634,17 @@ Expected Duration: {expected_duration}
                     "Use !safe-mode to check status or !verify-constitution to re-verify.\\n\\n"
                     "Normal operation will resume once integrity is restored."
                 )
+
+        # BOOTSTRAP CHECK: Handle first-time agent wake-up and discovery
+        if self.bootstrap_service and await self.bootstrap_service.is_bootstrap_needed():
+            # Allow bootstrap commands to pass through
+            bootstrap_commands = ["!skip-discovery", "!restart-discovery", "!bootstrap-status"]
+            if user_input.startswith("!") and user_input.split()[0] in bootstrap_commands:
+                pass  # Let command handler process these
+            else:
+                bootstrap_response = await self._handle_bootstrap(user_input, session_id)
+                if bootstrap_response:
+                    return bootstrap_response
 
         # Handle explicit commands first (using the CommandHandler)
         if user_input.startswith("!"):

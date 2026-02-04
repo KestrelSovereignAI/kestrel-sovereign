@@ -408,6 +408,7 @@ async def create_kestrel_identity_async(
         "constitution_hash": constitution_hash,
         "initialBalance": "1000.0",
         "agent_name": agent_name,
+        "bootstrap_state": "pending",  # Agent needs to complete wake-up discovery
     }
 
     # Add test instance metadata if applicable
