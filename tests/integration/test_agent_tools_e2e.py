@@ -80,6 +80,11 @@ async def kestrel_agent(llm_service, temp_db):
     # Initialize async storage
     await agent.initialize()
 
+    # Skip bootstrap for test agents - mark as complete
+    if agent.bootstrap_service:
+        from kestrel_sovereign.bootstrap import BootstrapState
+        await agent.bootstrap_service.set_bootstrap_state(BootstrapState.COMPLETE)
+
     yield agent
 
     # Async cleanup for MCP and other resources

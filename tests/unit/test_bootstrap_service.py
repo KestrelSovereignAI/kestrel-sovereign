@@ -50,6 +50,10 @@ class MockLLMService:
 
         return MockResponse()
 
+    async def generate_with_messages(self, messages, **kwargs):
+        """Mock generate_with_messages (same as generate)."""
+        return await self.generate(messages)
+
 
 @pytest.fixture
 def mock_db():

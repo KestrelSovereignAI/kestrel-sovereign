@@ -9,9 +9,9 @@ dependencies = [
     "uvicorn==0.35.0",
     "pydantic==2.11.7",
     # HTTP clients
-    "aiohttp>=3.12.14",
+    "aiohttp>=3.13.3",
     "httpx>=0.27.0",
-    "requests==2.32.4",
+    "requests>=2.32.5",
     # Cloud LLM providers
     "openai==1.93.2",
     # Ollama client (lightweight API client, connects to host Ollama)
@@ -47,7 +47,7 @@ dependencies = [
     # BM25 for hybrid search
     "rank_bm25>=0.2.2",
     # MCP protocol
-    "mcp>=0.1.0",
+    "mcp>=1.26.0",
     "trio>=0.32.0",
     # Web scraping (lightweight)
     "beautifulsoup4==4.13.4",
@@ -58,7 +58,7 @@ dependencies = [
     "charset-normalizer==3.4.2",
     "idna==3.10",
     "packaging==24.1",
-    "urllib3==2.5.0",
+    "urllib3>=2.5.0",
     "pygments==2.19.2",
     "pluggy==1.6.0",
     "iniconfig==2.1.0",
@@ -108,8 +108,8 @@ local = [
     "sentence-transformers==3.0.1",
     "spacy>=3.7.0",
     "chromadb==1.0.15",
-    "langchain==0.3.26",
-    "langchain-community==0.3.27",
+    "langchain>=0.3.31",
+    "langchain-community>=0.3.31",
     "numpy==2.3.1",
 ]
 # Full installation (everything)

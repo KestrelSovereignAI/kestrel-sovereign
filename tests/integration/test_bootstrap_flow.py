@@ -35,6 +35,10 @@ class MockLLMService:
             return MockLLMResponse(response)
         return MockLLMResponse("Default response")
 
+    async def generate_with_messages(self, messages, **kwargs):
+        """Return next response from the list (same as generate)."""
+        return await self.generate(messages)
+
 
 @pytest.fixture
 def temp_dir():

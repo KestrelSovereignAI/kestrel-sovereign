@@ -46,6 +46,10 @@ async def kestrel_agent(temp_db):
     # Initialize async storage
     await agent.initialize()
 
+    # Skip bootstrap for test agents
+    from tests.integration.conftest import complete_bootstrap
+    await complete_bootstrap(agent)
+
     yield agent
 
     # Async cleanup for MCP and other resources
