@@ -60,6 +60,10 @@ class ContextBuilder:
         self._soul_content: Optional[str] = None
         
         # Load SOUL.md if it exists
+        self._load_soul_md()
+
+    def _load_soul_md(self) -> None:
+        """Load or reload SOUL.md from the agent data directory."""
         if self.agent_data_path:
             soul_path = self.agent_data_path / "SOUL.md"
             if soul_path.exists():
@@ -68,6 +72,9 @@ class ContextBuilder:
                     logger.info(f"Loaded SOUL.md from {soul_path}")
                 except Exception as e:
                     logger.warning(f"Failed to load SOUL.md: {e}")
+            else:
+                self._soul_content = None
+                logger.debug(f"No SOUL.md found at {soul_path}")
 
     async def retrieve_context(self, query: str) -> str:
         """
