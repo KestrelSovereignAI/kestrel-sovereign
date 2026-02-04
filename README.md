@@ -8,45 +8,69 @@ Kestrel is a framework for creating autonomous AI agents with cryptographic iden
 
 ### Prerequisites
 - Python 3.11+
-- uv (for package management)
-- Ollama (for local LLM inference)
+- [uv](https://docs.astral.sh/uv/) (for package management)
+- [Ollama](https://ollama.ai) (for local LLM inference)
 
 ### Installation
 
-1. **Clone and setup environment:**
 ```bash
+# 1. Clone and setup
 git clone https://github.com/KestrelSovereignAI/kestrel-sovereign.git
 cd kestrel-sovereign
-uv sync  # Creates venv and installs dependencies
-```
+uv sync
 
-2. **Install and start Ollama:**
-```bash
-# Install Ollama from https://ollama.ai
+# 2. Start Ollama (in a separate terminal)
 ollama serve
-ollama pull llama3.2:3b  # Or your preferred model
-```
+ollama pull llama3.2:3b
 
-3. **Configure LLM providers:**
-```bash
+# 3. Configure LLM
 cp llm_config.toml.example llm_config.toml
-# Edit llm_config.toml with your preferred models and API keys
+
+# 4. Health check (verify prerequisites)
+uv run kestrel health
+
+# 5. Create your agent
+uv run kestrel create --output-dir ./my_agent
+
+# 6. Start the server
+uv run kestrel start --agent-dir ./my_agent
 ```
 
-4. **Run the health check:**
+Your agent is now running at `http://localhost:8888`.
+
+### CLI Commands (Cross-Platform)
+
+All commands work on Windows, macOS, and Linux:
+
 ```bash
-uv run python kestrel_sovereign/health_check.py
+uv run python kestrel_cli.py health         # Check prerequisites
+uv run python kestrel_cli.py create         # Create a new agent  
+uv run python kestrel_cli.py start          # Start the server
+uv run python kestrel_cli.py status         # Check if running
+uv run python kestrel_cli.py stop           # Stop the server
+uv run python kestrel_cli.py chat           # CLI chat interface
 ```
 
-5. **Create your first agent:**
+Or after `uv sync`, use the shorter form:
+
 ```bash
-uv run python kestrel_sovereign/inception_service.py
+uv run kestrel health
+uv run kestrel create
+uv run kestrel start
+# etc.
 ```
 
-6. **Chat with your agent:**
+### Alternative: Direct Commands
+
 ```bash
-uv run python main.py kestrel_prime.db
+# Start server directly (set KESTREL_DB_PATH first)
+KESTREL_DB_PATH=./my_agent uv run python server.py
+
+# CLI chat (no server needed)
+uv run python main.py ./my_agent
 ```
+
+> **Note:** `main.py` expects a **directory** containing `kestrel_prime.db`, not the database file itself.
 
 ## 🏗️ Architecture Overview
 
