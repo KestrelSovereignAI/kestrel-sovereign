@@ -9,7 +9,7 @@ Kestrel is a framework for creating autonomous AI agents with cryptographic iden
 ### Prerequisites
 - Python 3.11-3.13 (3.14 not yet supported due to tiktoken)
 - [uv](https://docs.astral.sh/uv/) (for package management)
-- [Ollama](https://ollama.ai) (for local LLM inference)
+- [Ollama](https://ollama.ai) (optional - for local LLM inference without API keys)
 
 ### Install uv
 
@@ -34,11 +34,11 @@ git clone https://github.com/KestrelSovereignAI/kestrel-sovereign.git
 cd kestrel-sovereign
 uv sync  # Creates .venv and installs all dependencies
 
-# 2. Start Ollama (in a separate terminal)
+# 2. (Optional) Start Ollama for local models - skip if using cloud APIs
 ollama serve
 ollama pull llama3.2:3b
 
-# 3. Configure LLM
+# 3. Configure LLM - edit with your API keys or Ollama settings
 cp llm_config.toml.example llm_config.toml
 
 # 4. Health check (verify prerequisites)
