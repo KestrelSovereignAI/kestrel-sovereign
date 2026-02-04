@@ -7,7 +7,7 @@ Kestrel is a framework for creating autonomous AI agents with cryptographic iden
 ## 🚀 Quick Start
 
 ### Prerequisites
-- Python 3.11+
+- Python 3.11-3.13 (3.14 not yet supported due to tiktoken)
 - [uv](https://docs.astral.sh/uv/) (for package management)
 - [Ollama](https://ollama.ai) (for local LLM inference)
 
@@ -52,6 +52,10 @@ uv run kestrel start --agent-dir ./my_agent
 ```
 
 Your agent is now running at `http://localhost:8888`.
+
+> **Port conflict?** If you already have another Kestrel agent (or other service) running on port 8888, add `--port 8899` to the start command.
+
+> **Test it:** Visit `http://localhost:8888/health` in your browser, or connect [Open WebUI](https://github.com/open-webui/open-webui) to the OpenAI-compatible endpoint at `/v1/chat/completions`.
 
 ### CLI Commands (Cross-Platform)
 

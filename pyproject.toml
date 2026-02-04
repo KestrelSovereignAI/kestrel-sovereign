@@ -2,7 +2,7 @@
 name = "kestrel_sovereign"
 version = "0.1.8"
 description = "Kestrel Sovereign AI Agent Framework - Constitutional AI with cryptographic identity"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.14"
 dependencies = [
     # Core web framework
     "fastapi==0.116.0",
