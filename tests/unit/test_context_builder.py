@@ -132,9 +132,42 @@ class TestContextBuilder:
         # Only max_tokens is enforced (max_chars is a fallback parameter not used for truncation)
         result = context_builder.format_conversation_history(history, max_tokens=600)
 
-        # Should include only first message (500 tokens + overhead) since second would exceed 600
+        # Should include only 1-2 messages within token budget
         assert len(result) >= 1
         assert len(result) <= 2  # At most 2 messages with truncation
+
+    def test_format_conversation_history_preserves_most_recent_on_truncation(self, context_builder):
+        """
+        REGRESSION TEST: When truncating due to token limits, preserve MOST RECENT messages.
+        
+        This is critical for conversation coherence - the user's latest question
+        and the agent's recent responses must be in context, even if older
+        messages are dropped.
+        
+        Bug fixed: Previously iterated oldest-to-newest and stopped when budget
+        exhausted, dropping the most recent (most important) messages.
+        """
+        # Create 10 messages with identifiable content
+        history = [
+            {"role": "user", "content": f"Message {i}: " + "x " * 100}  # ~100 tokens each
+            for i in range(10)
+        ]
+        
+        # Budget for only ~3 messages (300 tokens + overhead)
+        result = context_builder.format_conversation_history(history, max_tokens=400)
+        
+        # Should keep the MOST RECENT messages (7, 8, 9), not oldest (0, 1, 2)
+        assert len(result) >= 2, f"Should fit at least 2 messages, got {len(result)}"
+        
+        # The LAST message in result should be the most recent from history
+        last_content = result[-1]["content"]
+        assert "Message 9" in last_content, \
+            f"Most recent message (Message 9) should be preserved, got: {last_content[:50]}"
+        
+        # The oldest messages should be dropped
+        all_content = " ".join(m["content"] for m in result)
+        assert "Message 0" not in all_content, \
+            "Oldest message (Message 0) should be dropped when truncating"
 
     def test_format_conversation_history_normalizes_roles(self, context_builder):
         """Test that non-standard roles are normalized."""

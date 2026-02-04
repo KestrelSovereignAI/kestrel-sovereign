@@ -162,29 +162,10 @@ class ModelAgent(Feature):
         if model:
             return await self.set_model(model)
 
-        # Get current model info
-        provider = None
-        model_name = None
-
-        mandate = self.llm_service.get_current_mandate()
-        pref = mandate.get('preference', {})
-        provider = pref.get('provider')
+        # Get current model from mandate preference
+        pref = self.llm_service.get_model_preference()
         model_name = pref.get('model')
-
-        # Resolve provider name to actual model if needed
-        provider_names = [p.get('name') for p in self.llm_service.providers]
-        if model_name in provider_names:
-            for p in self.llm_service.providers:
-                if p.get('name') == model_name:
-                    provider = model_name
-                    model_name = p.get('model')
-                    break
-
-        if provider and not model_name:
-            for p in self.llm_service.providers:
-                if p.get('name') == provider:
-                    model_name = p.get('model')
-                    break
+        provider = pref.get('provider')
 
         # If no mandate preference, use the first provider (what actually gets used)
         if not model_name and self.llm_service.providers:
@@ -345,8 +326,17 @@ class ModelAgent(Feature):
     def set_model_preference(self, model_id: str) -> str:
         """
         Set the preferred model for the agent (legacy method).
+        
+        NOTE: This is a legacy method. Prefer using llm_service.set_model_preference(model, provider)
+        directly for full control over provider routing.
         """
-        self.llm_service.set_default_model(model_id)
+        # Parse provider from model_id if present
+        provider = None
+        model = model_id
+        if '/' in model_id:
+            provider, model = model_id.split('/', 1)
+        
+        self.llm_service.set_model_preference(model, provider)
         logger.info(f"Model preference set to: {model_id}")
         return f"Model preference set to {model_id}"
 
@@ -354,4 +344,9 @@ class ModelAgent(Feature):
         """
         Get the current model preference (legacy method).
         """
-        return self.llm_service.default_model
+        pref = self.llm_service.get_model_preference()
+        if pref.get("model"):
+            provider = pref.get("provider")
+            model = pref.get("model")
+            return f"{provider}/{model}" if provider else model
+        return None

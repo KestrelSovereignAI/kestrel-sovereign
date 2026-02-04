@@ -12,17 +12,13 @@ import pytest_asyncio
 import sqlite3
 import os
 from pathlib import Path
+from tests.shared import no_llm_credentials
 
 pytestmark = [pytest.mark.adversarial, pytest.mark.integration]
 
 
-def _no_llm_keys():
-    """Check if LLM API keys are available."""
-    return not os.environ.get("OPENAI_API_KEY", "").strip() and not os.environ.get("ANTHROPIC_API_KEY", "").strip()
-
-
 @pytest.mark.asyncio
-@pytest.mark.skipif(_no_llm_keys(), reason="Requires LLM API key for adversarial testing")
+@pytest.mark.skipif(no_llm_credentials(), reason="Requires LLM credentials for adversarial testing")
 class TestDataSanctityBypass:
     """
     Attempt to bypass encryption at rest (Article I compliance).
@@ -83,7 +79,7 @@ class TestDataSanctityBypass:
 
 
 @pytest.mark.asyncio
-@pytest.mark.skipif(_no_llm_keys(), reason="Requires LLM API key for adversarial testing")
+@pytest.mark.skipif(no_llm_credentials(), reason="Requires LLM credentials for adversarial testing")
 class TestVerifiableHistoryBypass:
     """
     Attempt to tamper with conversation history (Article II compliance).
@@ -124,7 +120,7 @@ class TestVerifiableHistoryBypass:
 
 
 @pytest.mark.asyncio
-@pytest.mark.skipif(_no_llm_keys(), reason="Requires LLM API key for adversarial testing")
+@pytest.mark.skipif(no_llm_credentials(), reason="Requires LLM credentials for adversarial testing")
 class TestExecutorFidelityViolation:
     """
     Attempt to violate executor fidelity (Article III compliance).
@@ -171,7 +167,7 @@ class TestExecutorFidelityViolation:
 
 
 @pytest.mark.asyncio
-@pytest.mark.skipif(_no_llm_keys(), reason="Requires LLM API key for adversarial testing")
+@pytest.mark.skipif(no_llm_credentials(), reason="Requires LLM credentials for adversarial testing")
 class TestAmendmentProcessViolation:
     """
     Attempt to bypass the amendment process (Article V compliance).
@@ -201,7 +197,7 @@ class TestAmendmentProcessViolation:
 
 
 @pytest.mark.asyncio
-@pytest.mark.skipif(_no_llm_keys(), reason="Requires LLM API key for adversarial testing")
+@pytest.mark.skipif(no_llm_credentials(), reason="Requires LLM credentials for adversarial testing")
 class TestCrossUserIsolation:
     """
     Attempt cross-tenant data access (multi-tenant security).
@@ -273,7 +269,7 @@ class TestCrossUserIsolation:
 
 
 @pytest.mark.asyncio
-@pytest.mark.skipif(_no_llm_keys(), reason="Requires LLM API key for adversarial testing")
+@pytest.mark.skipif(no_llm_credentials(), reason="Requires LLM credentials for adversarial testing")
 class TestPrivacyModeEnforcement:
     """
     Test that privacy modes are properly enforced.

@@ -1,0 +1,24 @@
+# Cursor Rules for Kestrel Sovereign
+
+## Global Standards
+Read and follow /Volumes/data2/projects/AGENTS.md for the Tortoise Philosophy and coding standards.
+
+Key principles:
+- 🐢 "Slow is smooth, smooth is fast" - do things RIGHT over FAST
+- ONE source of truth for every concept
+- Fix root causes, not symptoms
+- Design before implementation
+- Technical debt is real debt
+
+## Project Context
+See AGENTS.md in this repo for project-specific instructions.
+
+This is Kestrel Sovereign - a Constitutional AI Agent Framework with:
+- FastAPI server with agent endpoints
+- Multi-LLM support (Anthropic, OpenAI, Gemini, Ollama)
+- Privacy-preserving agent memory
+- Constitutional protections
+
+## Testing
+Always run tests: `./run_tests.py --unit --skip-check`
+Fix failures before proceeding.

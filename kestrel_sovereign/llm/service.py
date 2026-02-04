@@ -134,6 +134,36 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin):
         # Set via set_metering_callback() after initialization
         self._metering_callback = None
 
+    def set_model_preference(self, model: str, provider: Optional[str] = None) -> None:
+        """Set the mandated model preference for this session.
+        
+        When set, the LLM service will use ONLY the specified provider (if given)
+        and model, without falling back to other providers with incompatible models.
+        
+        Args:
+            model: The model name to use (e.g., "gpt-5-mini", "claude-sonnet-4-5")
+            provider: Optional provider name (e.g., "openai", "anthropic"). 
+                     If specified, only this provider will be used.
+        """
+        self._mandate_preference = {"model": model, "provider": provider}
+        if provider:
+            logger.info(f"Model preference set to: {model} (provider: {provider})")
+        else:
+            logger.info(f"Model preference set to: {model} (provider: auto-detect)")
+
+    def clear_model_preference(self) -> None:
+        """Clear any mandated model preference, returning to default behavior."""
+        self._mandate_preference = {"model": None, "provider": None}
+        logger.info("Model preference cleared, using default provider order")
+
+    def get_model_preference(self) -> Dict[str, Optional[str]]:
+        """Get the current model preference.
+        
+        Returns:
+            Dict with 'model' and 'provider' keys, values may be None.
+        """
+        return self._mandate_preference.copy()
+
     def _convert_providers_format(self, provider_infos: List[ProviderInfo]) -> List[Dict[str, Any]]:
         """Convert ProviderInfo objects to legacy dictionary format.
 
@@ -1019,13 +1049,17 @@ No other text or formatting.
             if pref_model:
                 target_model = pref_model
                 if pref_provider:
-                    # Reorder providers to try the preferred one first
+                    # When provider is explicitly set, ONLY use that provider
+                    # Don't fall back to others - they won't have the same model
                     for p in providers:
                         if p["name"] == pref_provider:
                             target_provider = p
                             break
                     if target_provider:
-                        providers = [target_provider] + [p for p in providers if p != target_provider]
+                        providers = [target_provider]
+                        logger.info(f"Model mandate set: using only {pref_provider} with {pref_model}")
+                    else:
+                        logger.warning(f"Mandated provider '{pref_provider}' not found in available providers")
 
         for provider in providers:
             try:
@@ -1273,13 +1307,18 @@ No other text or formatting.
             if pref_model:
                 target_model = pref_model
                 if pref_provider:
-                    # Reorder providers to try the preferred one first
+                    # When provider is explicitly set, ONLY use that provider
+                    # Don't fall back to others - they won't have the same model
                     for p in providers:
                         if p["name"] == pref_provider:
                             target_provider = p
                             break
                     if target_provider:
-                        providers = [target_provider] + [p for p in providers if p != target_provider]
+                        # Use ONLY the specified provider - no fallbacks with wrong model
+                        providers = [target_provider]
+                        logger.info(f"Model mandate set: using only {pref_provider} with {pref_model}")
+                    else:
+                        logger.warning(f"Mandated provider '{pref_provider}' not found in available providers")
 
         last_error = None
         for provider in providers:
