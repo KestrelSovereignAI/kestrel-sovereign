@@ -11,13 +11,28 @@ Kestrel is a framework for creating autonomous AI agents with cryptographic iden
 - [uv](https://docs.astral.sh/uv/) (for package management)
 - [Ollama](https://ollama.ai) (for local LLM inference)
 
+### Install uv
+
+If you don't have `uv` installed:
+
+```bash
+# macOS/Linux
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Windows (PowerShell)
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+
+# Or with pip
+pip install uv
+```
+
 ### Installation
 
 ```bash
 # 1. Clone and setup
 git clone https://github.com/KestrelSovereignAI/kestrel-sovereign.git
 cd kestrel-sovereign
-uv sync
+uv sync  # Creates .venv and installs all dependencies
 
 # 2. Start Ollama (in a separate terminal)
 ollama serve
