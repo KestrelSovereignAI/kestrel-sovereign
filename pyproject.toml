@@ -5,9 +5,9 @@ description = "Kestrel Sovereign AI Agent Framework - Constitutional AI with cry
 requires-python = ">=3.11,<3.14"
 dependencies = [
     # Core web framework
-    "fastapi==0.116.0",
+    "fastapi==0.128.1",
     "uvicorn==0.35.0",
-    "pydantic==2.11.7",
+    "pydantic==2.12.5",
     # HTTP clients
     "aiohttp>=3.13.3",
     "httpx>=0.27.0",
@@ -20,8 +20,8 @@ dependencies = [
     "aiosqlite>=0.21.0",
     "asyncpg>=0.30.0",
     "psycopg2-binary>=2.9.10",
-    # Cryptography
-    "cryptography==45.0.5",
+    # Cryptography (version constrained by runpod dependency)
+    "cryptography>=45.0.5,<46.0.0",
     "pycryptodome==3.23.0",
     # Auth and security
     "python-jose>=3.5.0",
@@ -54,9 +54,9 @@ dependencies = [
     # Graph operations (lightweight)
     "networkx==3.5",
     # Misc
-    "certifi==2025.7.14",
-    "charset-normalizer==3.4.2",
-    "idna==3.10",
+    "certifi==2026.1.4",
+    "charset-normalizer==3.4.4",
+    "idna==3.11",
     "packaging==24.1",
     "urllib3>=2.5.0",
     "pygments==2.19.2",
