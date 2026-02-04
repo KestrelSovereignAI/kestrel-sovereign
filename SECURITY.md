@@ -4,7 +4,7 @@
 
 Please report security vulnerabilities privately via email to:
 
-**unclesaurus@proton.me**
+**security@kestrelsovereign.com**
 
 Do NOT create public GitHub issues for security vulnerabilities.
 

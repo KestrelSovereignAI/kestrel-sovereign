@@ -116,10 +116,11 @@ export async function loadIdentity() {
             navName.textContent = identity.name;
         }
 
-        // Avatar: use stored image if available, fallback to emoji
+        // Avatar: use stored image if available, fallback to kestrel logo
+        const defaultAvatarSvg = `<img src="/static/favicon.svg" alt="Kestrel" class="identity-avatar-img" style="padding: 8px; background: #fff; border-radius: 12px;">`;
         const avatarHtml = avatarUrl
-            ? `<img src="${avatarUrl}" alt="Avatar" class="identity-avatar-img" onerror="this.parentElement.innerHTML='\\u{1F985}'">`
-            : `<span class="identity-avatar-emoji">\u{1F985}</span>`;
+            ? `<img src="${avatarUrl}" alt="Avatar" class="identity-avatar-img" onerror="this.parentElement.innerHTML='${defaultAvatarSvg.replace(/'/g, "\\'")}';">`
+            : defaultAvatarSvg;
 
         const card = document.getElementById('identity-card');
         card.innerHTML = `

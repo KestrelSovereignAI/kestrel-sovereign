@@ -10,7 +10,7 @@ By participating in this project, you agree to abide by our [Code of Conduct](CO
 
 ### Reporting Issues
 
-- **Security vulnerabilities**: Please report security issues privately via email to unclesaurus@proton.me. Do not create public issues for security vulnerabilities. See [SECURITY.md](SECURITY.md) for details.
+- **Security vulnerabilities**: Please report security issues privately via email to security@kestrelsovereign.com. Do not create public issues for security vulnerabilities. See [SECURITY.md](SECURITY.md) for details.
 - **Bugs**: Open an issue on GitHub with a clear description, steps to reproduce, and expected vs actual behavior.
 - **Feature requests**: Open an issue describing the feature and its use case.
 
@@ -119,15 +119,15 @@ Look for issues labeled `good first issue` for beginner-friendly tasks.
 
 - **GitHub Discussions**: For questions and community discussion
 - **GitHub Issues**: For bugs and feature requests
-- **Email**: unclesaurus@proton.me for private matters
+- **Email**: hello@kestrelsovereign.com for private matters
 
 ## Recognition
 
 Contributors are recognized in our release notes. Significant contributors may be invited to join the project's governance.
 
-## Pseudonymous Contributions
+## Contributor Identity
 
-Following the project's values, we welcome and support pseudonymous contributions. You don't need to use your real name - your code speaks for itself.
+We welcome contributions from anyone. You may use any identity you're comfortable with - your code is judged on merit.
 
 ---
 
