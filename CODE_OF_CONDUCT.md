@@ -23,7 +23,7 @@ Examples of unacceptable behavior:
 
 ## Enforcement
 
-Instances of unacceptable behavior may be reported to unclesaurus@proton.me.
+Instances of unacceptable behavior may be reported to conduct@kestrelsovereign.com.
 All complaints will be reviewed and investigated promptly and fairly.
 
 ## Attribution

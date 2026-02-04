@@ -142,7 +142,7 @@ The "buy-out" is like **buying a leased car at the end of the lease**. Instead o
 - **Before Buy-Out:** Like using a library computer (pay per minute)
 - **After Buy-Out:** Like owning your personal laptop (pay once, use forever)
 
-**UncleSaurus's Vision:** This creates a sustainable business model where users can choose their level of commitment.
+**Design Philosophy:** This creates a sustainable business model where users can choose their level of commitment.
 
 ---
 
