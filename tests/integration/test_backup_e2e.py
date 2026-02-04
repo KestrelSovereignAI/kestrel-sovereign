@@ -43,6 +43,10 @@ async def async_client(monkeypatch):
 
         # Use LifespanManager to properly handle app startup/shutdown
         async with LifespanManager(app) as manager:
+            # Skip bootstrap for test agents
+            from tests.integration.conftest import complete_bootstrap
+            await complete_bootstrap(app.state.agent)
+
             transport = ASGITransport(app=manager.app)
             async with AsyncClient(transport=transport, base_url="http://test") as client:
                 yield client

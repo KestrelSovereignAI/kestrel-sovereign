@@ -131,6 +131,10 @@ async def test_agent_command_integration(temp_db, llm_service, monkeypatch):
         agent = KestrelAgent("did:test:agent", storage_path=temp_db, llm_service=llm_service)
         await agent.initialize()
 
+        # Skip bootstrap for test agents
+        from tests.integration.conftest import complete_bootstrap
+        await complete_bootstrap(agent)
+
         # Inject a secret for testing using monkeypatch
         monkeypatch.setenv("KESTREL_DATA_KEY", "test-agent-secret")
 
