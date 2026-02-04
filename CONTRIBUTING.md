@@ -125,10 +125,6 @@ Look for issues labeled `good first issue` for beginner-friendly tasks.
 
 Contributors are recognized in our release notes. Significant contributors may be invited to join the project's governance.
 
-## Contributor Identity
-
-We welcome contributions from anyone. You may use any identity you're comfortable with - your code is judged on merit.
-
 ---
 
 Thank you for helping make Kestrel better!
