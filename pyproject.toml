@@ -118,6 +118,7 @@ full = [
 ]
 
 [project.scripts]
+kestrel = "kestrel_cli:main"
 kestrel-github = "kestrel_sovereign.github_processor.cli:main"
 
 [dependency-groups]
