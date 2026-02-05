@@ -45,15 +45,15 @@ cp llm_config.toml.example llm_config.toml
 uv run kestrel health
 
 # 5. Create your agent
-uv run kestrel create --name Claw --output-dir ./agent_data/claw
+uv run kestrel create --name MyAgent --output-dir ./agent_data/myagent
 
 # 6. Start your agent
-uv run kestrel start ./agent_data/claw
+uv run kestrel start ./agent_data/myagent
 ```
 
 Your agent is now running at `http://localhost:8888`.
 
-> **Port conflict?** Each agent has its own config. Edit `agent_data/claw/kestrel.toml` to change the port, or use `--port 8899` on the command line.
+> **Port conflict?** Each agent has its own config. Edit `agent_data/myagent/kestrel.toml` to change the port, or use `--port 8899` on the command line.
 
 > **Test it:** Visit `http://localhost:8888/health` in your browser, or connect [Open WebUI](https://github.com/open-webui/open-webui) to the OpenAI-compatible endpoint at `/v1/chat/completions`.
 
@@ -77,9 +77,9 @@ uv run kestrel config ./agent_data/myagent  # Show agent config
 Each agent can have a `kestrel.toml` config file in its directory:
 
 ```toml
-# agent_data/claw/kestrel.toml
+# agent_data/myagent/kestrel.toml
 [agent]
-name = "Claw"
+name = "MyAgent"
 port = 8888
 host = "0.0.0.0"
 log_level = "INFO"
@@ -87,9 +87,9 @@ log_level = "INFO"
 
 Create or edit config:
 ```bash
-uv run kestrel config ./agent_data/claw --init           # Create config
-uv run kestrel config ./agent_data/claw --set-port 8899  # Change port
-uv run kestrel config ./agent_data/claw --set-name Claw  # Change name
+uv run kestrel config ./agent_data/myagent --init           # Create config
+uv run kestrel config ./agent_data/myagent --set-port 8899  # Change port
+uv run kestrel config ./agent_data/myagent --set-name MyAgent  # Change name
 ```
 
 ### Running Multiple Agents
@@ -97,9 +97,9 @@ uv run kestrel config ./agent_data/claw --set-name Claw  # Change name
 Each agent runs on its own port. Create configs for each:
 
 ```bash
-# Agent 1: Claw on port 8888
-uv run kestrel create --name Claw --output-dir ./agent_data/claw --port 8888
-uv run kestrel start ./agent_data/claw
+# Agent 1: Alpha on port 8888
+uv run kestrel create --name Alpha --output-dir ./agent_data/alpha --port 8888
+uv run kestrel start ./agent_data/alpha
 
 # Agent 2: Helper on port 8889
 uv run kestrel create --name Helper --output-dir ./agent_data/helper --port 8889
@@ -113,10 +113,10 @@ uv run kestrel status
 
 ```bash
 # Start server directly (set KESTREL_DB_PATH first)
-KESTREL_DB_PATH=./agent_data/claw uv run uvicorn server:app --port 8888
+KESTREL_DB_PATH=./agent_data/myagent uv run uvicorn server:app --port 8888
 
 # CLI chat (no server needed)
-uv run python main.py ./agent_data/claw
+uv run python main.py ./agent_data/myagent
 ```
 
 > **Note:** `main.py` expects a **directory** containing `kestrel_prime.db`, not the database file itself.
