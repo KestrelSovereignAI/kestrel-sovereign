@@ -24,7 +24,7 @@ dependencies = [
     "cryptography>=45.0.5,<46.0.0",
     "pycryptodome==3.23.0",
     # Auth and security
-    "python-jose>=3.5.0",
+    "python-jose[cryptography]>=3.5.0",
     "slowapi>=0.1.9",
     "itsdangerous>=2.2.0",
     # Redis for caching
