@@ -122,7 +122,7 @@ async def test_import_with_wrong_key_fails(temp_db):
 
 
 @pytest.mark.asyncio
-async def test_agent_command_import(temp_db, llm_service):
+async def test_agent_command_import(temp_db, llm_service, skip_bootstrap):
     """
     Test the user-facing !import-sovereignty command.
 
@@ -133,6 +133,9 @@ async def test_agent_command_import(temp_db, llm_service):
     # Use new KestrelAgent API: storage_path instead of storage object
     agent = KestrelAgent("did:test:import_cmd", storage_path=temp_db, llm_service=llm_service)
     await agent.initialize()
+
+    # Skip bootstrap to test commands directly
+    await skip_bootstrap(agent)
 
     # Use unique marker to avoid collision with any system messages
     unique_marker = f"SOVEREIGNTY_TEST_{uuid.uuid4().hex[:8]}"

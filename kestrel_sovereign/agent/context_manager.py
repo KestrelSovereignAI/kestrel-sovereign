@@ -220,10 +220,11 @@ class ContextManager:
                         budget.use("rag", rag_tokens)
                         system_prompt = (
                             f"{system_prompt}\n\n"
-                            f"--- RELEVANT DOCUMENTS ---\n{rag_context}\n"
+                            f"--- RELEVANT DOCUMENTS (from indexed files, not current conversation) ---\n"
+                            f"{rag_context}\n"
                             f"--- END DOCUMENTS ---"
                         )
-                        rag_chunks = rag_context.count("[Document")
+                        rag_chunks = rag_context.count("[Document") or rag_context.count("Source:")
                         logger.debug(f"Added {rag_chunks} RAG chunks to context")
             except Exception as e:
                 logger.warning(f"RAG retrieval failed: {e}")

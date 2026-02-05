@@ -93,20 +93,38 @@ class MemoryManager:
             if not memories:
                 return None
 
-            # Format for context
-            parts = ["--- RELEVANT MEMORIES ---"]
+            # Format for context with timestamps for temporal awareness
+            parts = ["--- RELEVANT MEMORIES (from past conversations) ---"]
+            parts.append("NOTE: These are retrieved from earlier conversations, not the current session.\n")
             for i, mem in enumerate(memories, 1):
                 content = mem.get("content", "")
                 meta = mem.get("metadata", {})
+                created_at = mem.get("created_at", "unknown")
+
+                # Format timestamp to be human readable
+                if created_at and created_at != "unknown":
+                    try:
+                        from datetime import datetime
+                        if isinstance(created_at, str):
+                            # Try common formats
+                            for fmt in ['%Y-%m-%d %H:%M:%S', '%Y-%m-%dT%H:%M:%S', '%Y-%m-%d %H:%M:%S.%f']:
+                                try:
+                                    dt = datetime.strptime(created_at, fmt)
+                                    created_at = dt.strftime("%Y-%m-%d %H:%M")
+                                    break
+                                except ValueError:
+                                    continue
+                    except Exception:
+                        pass  # Keep original format
 
                 # Truncate long memories
                 if len(content) > 200:
                     content = content[:200] + "..."
 
                 parts.append(
-                    f"[Memory {i}] {content}\n"
-                    f"  (Importance: {meta.get('importance', 0.5):.1f}, "
-                    f"Emotion: {meta.get('emotional_valence', 0):.1f})"
+                    f"[Memory {i}] ({created_at}) {content}\n"
+                    f"  Importance: {meta.get('importance', 0.5):.1f}, "
+                    f"Emotion: {meta.get('emotional_valence', 0):.1f}"
                 )
             parts.append("--- END MEMORIES ---")
 

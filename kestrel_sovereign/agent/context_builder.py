@@ -91,10 +91,16 @@ class ContextBuilder:
         # 1. Search document chunks (RAG)
         try:
             rag_results = await self.storage.search_chunks(query)
-            context_parts = [
-                f"Source: {res.get('document_name') or res.get('file_hash', 'unknown')}\nContent: {res['content']}"
-                for res in rag_results
-            ]
+            context_parts = []
+            for res in rag_results:
+                doc_name = res.get('document_name') or res.get('file_hash', 'unknown')
+                content = res.get('content', '')
+                # Include timestamp if available for temporal awareness
+                created_at = res.get('created_at', '')
+                timestamp_note = f" (indexed: {created_at})" if created_at else ""
+                context_parts.append(
+                    f"Source: {doc_name}{timestamp_note}\nContent: {content}"
+                )
         except Exception as e:
             logger.error(f"Error during RAG search: {e}")
             context_parts = ["Error retrieving document context."]
