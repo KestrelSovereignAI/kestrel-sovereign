@@ -382,16 +382,20 @@ class AsyncConversationStore:
     async def search_history(self, query: str, limit: int = 20) -> List[Dict[str, Any]]:
         """Search conversation history.
 
-        NOTE: When encryption is enabled, search operates on encrypted content,
-        so it will not find matches in encrypted messages. For encrypted data,
-        use get_full_history() and filter client-side.
+        Fetches and decrypts messages, then filters client-side.
+        This approach works correctly with encrypted storage.
         """
+        # Fetch all messages (up to 5000) and search client-side after decryption
+        # SQL LIKE doesn't work on encrypted content, so we must decrypt first
         rows = await self.db.fetchall(
             "SELECT id, role, content, metadata FROM conversation_history "
-            "WHERE agent_id = ? AND content LIKE ? ORDER BY id DESC LIMIT ?",
-            (self.agent_id, f"%{query}%", limit)
+            "WHERE agent_id = ? ORDER BY id DESC LIMIT 5000",
+            (self.agent_id,)
         )
+
+        query_lower = query.lower()
         results = []
+
         for row in rows:
             row_id = row[0]
             meta = json.loads(row[3]) if row[3] else None
@@ -404,15 +408,21 @@ class AsyncConversationStore:
                 except Exception as e:
                     logger.warning(f"Migration failed for message {row_id} in search_history: {e}")
 
-            cleaned_meta = remove_enc_flag(meta)
-            if cleaned_meta:
-                cleaned_meta.pop('key_version', None)
+            # Client-side search on decrypted content
+            if query_lower in content.lower():
+                cleaned_meta = remove_enc_flag(meta)
+                if cleaned_meta:
+                    cleaned_meta.pop('key_version', None)
 
-            results.append({
-                'role': row[1],
-                'content': content,
-                'metadata': cleaned_meta if cleaned_meta else None
-            })
+                results.append({
+                    'role': row[1],
+                    'content': content,
+                    'metadata': cleaned_meta if cleaned_meta else None
+                })
+
+                if len(results) >= limit:
+                    break
+
         return results
 
     async def clear_history(self) -> None:

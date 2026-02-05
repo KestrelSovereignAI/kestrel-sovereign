@@ -70,7 +70,7 @@ class MemoryFeature(Feature):
 
     @tool(
         name="search_memory",
-        description="Quick database search of conversation history. NOTE: This searches encrypted content and will likely return no results. Use full_history_search instead for reliable memory recall.",
+        description="Search conversation history for matching content. Decrypts and searches all messages client-side for reliable results.",
         category=ToolCategory.MEMORY,
         command_prefix="!memory search"
     )
@@ -78,25 +78,33 @@ class MemoryFeature(Feature):
         """
         Search conversation history for matching content.
 
-        Note: With encryption enabled, this searches encrypted content which
-        won't match unless using get_full_history() with client-side filtering.
+        Uses client-side decryption and search to work reliably with encrypted storage.
 
         Args:
             query: Search term or phrase to find in past conversations
             limit: Maximum number of results to return (default 10)
         """
         try:
-            conv_store = self._get_conversation_store()
-            if not conv_store:
-                return {"success": False, "error": "Conversation store not available"}
+            # Get full decrypted history and search client-side
+            # This works with encryption because we decrypt before searching
+            all_history = await self.storage.get_conversation_history(limit=5000)
 
-            results = await conv_store.search_history(query, limit)
+            # Search through decrypted content
+            query_lower = query.lower()
+            matches = []
+            for msg in all_history:
+                content = msg.get("content", "")
+                if query_lower in content.lower():
+                    matches.append(msg)
+                    if len(matches) >= limit:
+                        break
+
             return {
                 "success": True,
-                "results": results,
-                "count": len(results),
+                "results": matches,
+                "count": len(matches),
                 "query": query,
-                "note": "Results are decrypted if encryption is enabled"
+                "total_searched": len(all_history)
             }
         except Exception as e:
             logger.error(f"search_memory failed: {e}")
