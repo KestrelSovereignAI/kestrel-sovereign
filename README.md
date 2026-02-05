@@ -45,48 +45,78 @@ cp llm_config.toml.example llm_config.toml
 uv run kestrel health
 
 # 5. Create your agent
-uv run kestrel create --output-dir ./my_agent
+uv run kestrel create --name Claw --output-dir ./agent_data/claw
 
-# 6. Start the server
-uv run kestrel start --agent-dir ./my_agent
+# 6. Start your agent
+uv run kestrel start ./agent_data/claw
 ```
 
 Your agent is now running at `http://localhost:8888`.
 
-> **Port conflict?** If you already have another Kestrel agent (or other service) running on port 8888, add `--port 8899` to the start command.
+> **Port conflict?** Each agent has its own config. Edit `agent_data/claw/kestrel.toml` to change the port, or use `--port 8899` on the command line.
 
 > **Test it:** Visit `http://localhost:8888/health` in your browser, or connect [Open WebUI](https://github.com/open-webui/open-webui) to the OpenAI-compatible endpoint at `/v1/chat/completions`.
 
 ### CLI Commands (Cross-Platform)
 
-All commands work on Windows, macOS, and Linux:
+All commands work on Windows, macOS, and Linux. Pass the agent directory as an argument:
 
 ```bash
-uv run python kestrel_cli.py health         # Check prerequisites
-uv run python kestrel_cli.py create         # Create a new agent  
-uv run python kestrel_cli.py start          # Start the server
-uv run python kestrel_cli.py status         # Check if running
-uv run python kestrel_cli.py stop           # Stop the server
-uv run python kestrel_cli.py chat           # CLI chat interface
+uv run kestrel health                       # Check prerequisites
+uv run kestrel create --name MyAgent        # Create a new agent
+uv run kestrel start ./agent_data/myagent   # Start an agent
+uv run kestrel stop ./agent_data/myagent    # Stop an agent
+uv run kestrel status                       # Show all running agents
+uv run kestrel list                         # List available agents
+uv run kestrel chat ./agent_data/myagent    # CLI chat interface
+uv run kestrel config ./agent_data/myagent  # Show agent config
 ```
 
-Or after `uv sync`, use the shorter form:
+### Per-Agent Configuration
+
+Each agent can have a `kestrel.toml` config file in its directory:
+
+```toml
+# agent_data/claw/kestrel.toml
+[agent]
+name = "Claw"
+port = 8888
+host = "0.0.0.0"
+log_level = "INFO"
+```
+
+Create or edit config:
+```bash
+uv run kestrel config ./agent_data/claw --init           # Create config
+uv run kestrel config ./agent_data/claw --set-port 8899  # Change port
+uv run kestrel config ./agent_data/claw --set-name Claw  # Change name
+```
+
+### Running Multiple Agents
+
+Each agent runs on its own port. Create configs for each:
 
 ```bash
-uv run kestrel health
-uv run kestrel create
-uv run kestrel start
-# etc.
+# Agent 1: Claw on port 8888
+uv run kestrel create --name Claw --output-dir ./agent_data/claw --port 8888
+uv run kestrel start ./agent_data/claw
+
+# Agent 2: Helper on port 8889
+uv run kestrel create --name Helper --output-dir ./agent_data/helper --port 8889
+uv run kestrel start ./agent_data/helper
+
+# Check status of all agents
+uv run kestrel status
 ```
 
 ### Alternative: Direct Commands
 
 ```bash
 # Start server directly (set KESTREL_DB_PATH first)
-KESTREL_DB_PATH=./my_agent uv run python server.py
+KESTREL_DB_PATH=./agent_data/claw uv run uvicorn server:app --port 8888
 
 # CLI chat (no server needed)
-uv run python main.py ./my_agent
+uv run python main.py ./agent_data/claw
 ```
 
 > **Note:** `main.py` expects a **directory** containing `kestrel_prime.db`, not the database file itself.
@@ -319,12 +349,15 @@ Point Open WebUI or any OpenAI client at your server (http://localhost:7777). Us
 
 | File | Purpose |
 |------|---------|
+| `kestrel_cli.py` | Main CLI entry point |
 | `main.py` | Interactive chat interface |
-| `kestrel_agent.py` | Core agent logic |
-| `storage/__init__.py` | High-level storage facade |
+| `server.py` | FastAPI server |
 | `llm_config.toml` | LLM provider configuration |
-| `inception_service.py` | New agent creation |
-| `test_*.py` | Test suites |
+| `kestrel_sovereign/kestrel_agent.py` | Core agent logic |
+| `kestrel_sovereign/agent_config.py` | Per-agent config loader |
+| `kestrel_sovereign/inception_service.py` | New agent creation |
+| `agent_data/<name>/kestrel.toml` | Per-agent configuration |
+| `agent_data/<name>/kestrel_prime.db` | Agent database |
 | `docs/**/*.md` | Detailed documentation |
 
 ## Architecture
