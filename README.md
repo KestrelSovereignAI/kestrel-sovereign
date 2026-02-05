@@ -248,8 +248,21 @@ priority = 2
 ```
 
 ### Environment Variables
-- `KESTREL_DB_PATH`: Custom database location (default: `./`)
+
+See `.env.example` for a complete list. Key variables:
+
+**LLM Providers:**
+- `OPENROUTER_API_KEY`: OpenRouter API key (recommended - access to multiple providers)
 - `OPENAI_API_KEY`: OpenAI API key for cloud models
+- `ANTHROPIC_API_KEY`: Anthropic API key for Claude models
+
+**Storage:**
+- `KESTREL_DB_PATH`: Custom database location (default: `./agent_data`)
+- `KESTREL_DATA_KEY`: Fernet encryption key for data at rest
+
+**GitHub Integration:**
+- `GITHUB_TOKEN`: Personal access token for GitHub features
+- `GITHUB_SELF_REPO`: Agent's source repository (default: `KestrelSovereignAI/kestrel-sovereign`)
 
 ## 🚢 Deployment
 
