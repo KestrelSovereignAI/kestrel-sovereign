@@ -55,6 +55,38 @@ REFLECTION_INTERVAL = 86400  # Daily reflection (24 hours)
 # =============================================================================
 
 SESSION_CACHE_TTL = 3600  # Session cache lifetime (1 hour)
+LLM_CACHE_TTL_SECONDS = 300  # Model discovery cache lifetime (5 minutes)
+STORAGE_CACHE_TTL_SECONDS = 60  # Storage info cache lifetime (1 minute)
+
+# =============================================================================
+# LLM RETRY CONFIGURATION
+# =============================================================================
+
+LLM_RETRY_MAX_DELAY_SECONDS = 60.0  # Maximum delay between retries
+
+# =============================================================================
+# SSE AND STREAMING
+# =============================================================================
+
+SSE_PING_INTERVAL_SECONDS = 15  # Server-sent events ping interval
+
+# =============================================================================
+# SESSION MANAGEMENT
+# =============================================================================
+
+SESSION_GAP_MINUTES = 30  # Gap between messages to start a new session
+
+# =============================================================================
+# SOVEREIGNTY
+# =============================================================================
+
+MAX_SOVEREIGNTY_PREVIEW_SIZE = 10000  # Max file preview size in bytes
+
+# =============================================================================
+# CLAUDE MAX
+# =============================================================================
+
+CLAUDE_MAX_TIMEOUT_SECONDS = 120  # Request timeout for Claude Max adapter
 
 # =============================================================================
 # TRAINING CONSTANTS
