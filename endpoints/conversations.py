@@ -4,6 +4,7 @@ from datetime import datetime
 import json
 import logging
 
+from kestrel_sovereign.kestrel_config.constants import SESSION_GAP_MINUTES
 from kestrel_sovereign.storage.encryption import get_fernet, get_agent_fernet, decrypt_string
 
 logger = logging.getLogger(__name__)
@@ -65,7 +66,6 @@ async def list_conversations(request: Request, limit: int = 50, decrypt: bool = 
         if not rows:
             return {"conversations": [], "total": 0, "encrypted_at_rest": encrypted_at_rest}
 
-        SESSION_GAP_MINUTES = 30
         sessions = []
         current_session = None
 
@@ -211,7 +211,6 @@ async def get_conversation(request: Request, session_id: str, limit: int = 100, 
             LIMIT ?
         """, (agent_id, start_time, limit * 2))
 
-        SESSION_GAP_MINUTES = 30
         messages = []
         last_timestamp = None
         is_first_message = True
