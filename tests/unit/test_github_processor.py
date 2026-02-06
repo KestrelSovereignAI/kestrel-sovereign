@@ -1,11 +1,8 @@
-"""Integration tests for GitHub Ticket Processor.
+"""Tests for AutoClaude (formerly kestrel_sovereign.github_processor).
 
-These tests require:
-- GITHUB_TOKEN environment variable
-- ANTHROPIC_API_KEY environment variable
-- A test repository with appropriate permissions
+These test the autoclaude package which is now a standalone dependency.
 
-Run with: pytest tests/integration/test_github_processor.py -v
+Run with: pytest tests/unit/test_github_processor.py -v
 """
 
 import os
@@ -14,8 +11,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from kestrel_sovereign.github_processor.config import GitHubProcessorConfig
-from kestrel_sovereign.github_processor.models import (
+from autoclaude.config import AutoClaudeConfig
+from autoclaude.models import (
     CIStatus,
     IssueComment,
     IssueContext,
@@ -24,22 +21,19 @@ from kestrel_sovereign.github_processor.models import (
 )
 
 
-class TestGitHubProcessorConfig:
+class TestAutoClaudeConfig:
     """Tests for configuration."""
 
     def test_config_defaults(self):
-        """Test default configuration values."""
-        config = GitHubProcessorConfig()
+        config = AutoClaudeConfig()
 
         assert config.bot_assignee == "claude-bot"
-        assert config.model == "claude-opus-4-5-20251101"
         assert config.max_turns == 50
         assert config.dry_run is False
 
     def test_config_validation_missing_token(self):
-        """Test validation fails without GitHub token."""
         with patch.dict(os.environ, {"GITHUB_TOKEN": "", "ANTHROPIC_API_KEY": "test"}):
-            config = GitHubProcessorConfig(
+            config = AutoClaudeConfig(
                 github_token="",
                 anthropic_api_key="test",
                 repo="owner/repo",
@@ -49,8 +43,7 @@ class TestGitHubProcessorConfig:
             assert "GITHUB_TOKEN" in str(errors)
 
     def test_config_validation_missing_repo(self):
-        """Test validation fails without repo."""
-        config = GitHubProcessorConfig(
+        config = AutoClaudeConfig(
             github_token="test",
             anthropic_api_key="test",
             repo="",
@@ -60,8 +53,7 @@ class TestGitHubProcessorConfig:
         assert "repo" in str(errors).lower()
 
     def test_config_validation_invalid_repo_format(self):
-        """Test validation fails with invalid repo format."""
-        config = GitHubProcessorConfig(
+        config = AutoClaudeConfig(
             github_token="test",
             anthropic_api_key="test",
             repo="invalid-repo-format",
@@ -71,8 +63,7 @@ class TestGitHubProcessorConfig:
         assert "owner/repo" in str(errors)
 
     def test_config_repo_parts(self):
-        """Test repo owner/name extraction."""
-        config = GitHubProcessorConfig(repo="myorg/myrepo")
+        config = AutoClaudeConfig(repo="myorg/myrepo")
 
         assert config.repo_owner == "myorg"
         assert config.repo_name == "myrepo"
@@ -82,7 +73,6 @@ class TestIssueContext:
     """Tests for IssueContext model."""
 
     def test_format_for_prompt_basic(self):
-        """Test basic prompt formatting."""
         context = IssueContext(
             number=42,
             title="Fix authentication bug",
@@ -103,7 +93,6 @@ class TestIssueContext:
         assert "bug, high-priority" in prompt
 
     def test_format_for_prompt_with_comments(self):
-        """Test prompt formatting with comments."""
         context = IssueContext(
             number=42,
             title="Test issue",
@@ -131,7 +120,6 @@ class TestIssueContext:
         assert "Have you tried X?" in prompt
 
     def test_format_for_prompt_with_files(self):
-        """Test prompt formatting with referenced files."""
         context = IssueContext(
             number=42,
             title="Test issue",
@@ -157,7 +145,6 @@ class TestProcessingResult:
     """Tests for ProcessingResult model."""
 
     def test_summary_completed(self):
-        """Test summary for completed result."""
         result = ProcessingResult(
             issue_number=42,
             status=ProcessingStatus.COMPLETED,
@@ -175,7 +162,6 @@ class TestProcessingResult:
         assert "Commits: 2" in summary
 
     def test_summary_blocked(self):
-        """Test summary for blocked result."""
         result = ProcessingResult(
             issue_number=42,
             status=ProcessingStatus.BLOCKED,
@@ -193,7 +179,6 @@ class TestCIStatus:
     """Tests for CIStatus model."""
 
     def test_is_pending(self):
-        """Test pending status detection."""
         status = CIStatus(conclusion=None, status="in_progress")
         assert status.is_pending is True
 
@@ -204,7 +189,6 @@ class TestCIStatus:
         assert status.is_pending is False
 
     def test_is_success(self):
-        """Test success detection."""
         status = CIStatus(conclusion="success", status="completed")
         assert status.is_success is True
 
@@ -212,7 +196,6 @@ class TestCIStatus:
         assert status.is_success is False
 
     def test_is_failure(self):
-        """Test failure detection."""
         status = CIStatus(conclusion="failure", status="completed")
         assert status.is_failure is True
 
@@ -223,7 +206,6 @@ class TestCIStatus:
         assert status.is_failure is False
 
     def test_failure_summary(self):
-        """Test failure summary generation."""
         status = CIStatus(
             conclusion="failure",
             status="completed",
@@ -245,18 +227,16 @@ class TestCIStatus:
 
         assert "pytest" in summary
         assert "3 tests failed" in summary
-        assert "lint" not in summary  # Successful check not included
+        assert "lint" not in summary
 
 
 class TestGitHubClientExtraction:
     """Tests for extraction methods in GitHubClient."""
 
     def test_extract_file_references(self):
-        """Test file reference extraction."""
-        # Import here to avoid import errors when GitHub not configured
-        from kestrel_sovereign.github_processor.github_client import GitHubClient
+        from autoclaude.github_client import GitHubClient
 
-        config = GitHubProcessorConfig(
+        config = AutoClaudeConfig(
             github_token="test",
             anthropic_api_key="test",
             repo="owner/repo",
@@ -290,10 +270,9 @@ class TestGitHubClientExtraction:
         assert "tests/test_auth.py" in files
 
     def test_extract_error_messages(self):
-        """Test error message extraction."""
-        from kestrel_sovereign.github_processor.github_client import GitHubClient
+        from autoclaude.github_client import GitHubClient
 
-        config = GitHubProcessorConfig(
+        config = AutoClaudeConfig(
             github_token="test",
             anthropic_api_key="test",
             repo="owner/repo",
@@ -332,42 +311,31 @@ ValueError: Invalid token
     not os.environ.get("GITHUB_TOKEN") or not os.environ.get("ANTHROPIC_API_KEY"),
     reason="Requires GITHUB_TOKEN and ANTHROPIC_API_KEY",
 )
-class TestGitHubProcessorE2E:
-    """End-to-end tests requiring real credentials.
-
-    These tests are skipped by default. To run them:
-    1. Set GITHUB_TOKEN and ANTHROPIC_API_KEY environment variables
-    2. Create a test issue in your repository
-    3. Run: pytest tests/integration/test_github_processor.py -v -k E2E
-    """
+class TestAutoClaudeE2E:
+    """End-to-end tests requiring real credentials."""
 
     @pytest.fixture
     def config(self):
-        """Create test configuration."""
-        return GitHubProcessorConfig(
+        return AutoClaudeConfig(
             repo=os.environ.get("TEST_GITHUB_REPO", "your-org/your-repo"),
-            dry_run=True,  # Always dry run in tests
+            dry_run=True,
         )
 
     @pytest.mark.asyncio
     async def test_fetch_assigned_issues(self, config):
-        """Test fetching assigned issues."""
-        from kestrel_sovereign.github_processor.github_client import GitHubClient
+        from autoclaude.github_client import GitHubClient
 
         client = GitHubClient(config)
         issues = client.get_assigned_issues()
 
-        # Just verify we can connect and fetch
         assert isinstance(issues, list)
 
     @pytest.mark.asyncio
     async def test_build_issue_context(self, config):
-        """Test building issue context."""
-        from kestrel_sovereign.github_processor.github_client import GitHubClient
+        from autoclaude.github_client import GitHubClient
 
         client = GitHubClient(config)
 
-        # Get first open issue
         issues = list(client.repo.get_issues(state="open"))
         if not issues:
             pytest.skip("No open issues in test repo")

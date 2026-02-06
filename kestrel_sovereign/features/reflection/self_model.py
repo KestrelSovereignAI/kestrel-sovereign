@@ -357,7 +357,7 @@ class SelfModelManager:
                 INSERT OR REPLACE INTO agent_metadata (agent_id, key, value, updated_at)
                 VALUES (?, ?, ?, ?)
                 """,
-                (self.agent_did, self.MODEL_POINTER_KEY, value, datetime.now(timezone.utc).isoformat()),
+                (self.agent_did, self.MODEL_POINTER_KEY, value, datetime.now(timezone.utc)),
             )
         except Exception as e:
             logger.error(f"Failed to update model pointer: {e}")

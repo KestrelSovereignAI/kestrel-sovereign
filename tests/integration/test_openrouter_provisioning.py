@@ -28,119 +28,116 @@ def unique_agent_name():
     return f"test-agent-{uuid.uuid4().hex[:8]}"
 
 
-@pytest.mark.asyncio
-async def test_create_and_delete_key(unique_agent_name):
-    """Test creating and deleting an agent key."""
+@pytest.fixture
+async def provisioning_service():
+    """Create and cleanup a provisioning service."""
     from kestrel_sovereign.features.llm_keys import OpenRouterProvisioningService
 
     service = OpenRouterProvisioningService()
+    created_hashes = []
 
-    try:
-        # Create key
-        key_info = await service.create_agent_key(
-            agent_name=unique_agent_name,
-            limit_usd=1.0,
-            limit_reset="monthly",
-        )
+    class TrackedService:
+        """Wrapper that tracks created keys for guaranteed cleanup."""
 
-        assert key_info.key.startswith("sk-or-v1-")
-        assert key_info.key_hash
-        assert key_info.name == unique_agent_name
-        assert key_info.limit_cents == 100
-        assert key_info.limit_reset == "monthly"
+        def __getattr__(self, name):
+            return getattr(service, name)
 
-        # Verify we can get usage
-        usage = await service.get_key_usage(key_info.key_hash)
-        assert usage.limit_cents == 100
-        assert usage.limit_remaining_cents == 100  # No usage yet
+        async def create_agent_key(self, **kwargs):
+            key_info = await service.create_agent_key(**kwargs)
+            created_hashes.append(key_info.key_hash)
+            return key_info
 
-        # Delete key
-        deleted = await service.delete_key(key_info.key_hash)
-        assert deleted
+    yield TrackedService()
 
-    finally:
-        await service.close()
+    # Always clean up ALL keys created during this test
+    for key_hash in created_hashes:
+        try:
+            await service.delete_key(key_hash)
+        except Exception:
+            pass
+    await service.close()
 
 
 @pytest.mark.asyncio
-async def test_key_can_make_inference(unique_agent_name):
+async def test_create_and_delete_key(unique_agent_name, provisioning_service):
+    """Test creating and deleting an agent key."""
+    key_info = await provisioning_service.create_agent_key(
+        agent_name=unique_agent_name,
+        limit_usd=0.10,
+        limit_reset="monthly",
+    )
+
+    assert key_info.key.startswith("sk-or-v1-")
+    assert key_info.key_hash
+    assert key_info.name == unique_agent_name
+    assert key_info.limit_cents == 10
+    assert key_info.limit_reset == "monthly"
+
+    # Verify we can get usage
+    usage = await provisioning_service.get_key_usage(key_info.key_hash)
+    assert usage.limit_cents == 10
+    assert usage.limit_remaining_cents == 10  # No usage yet
+
+    # Explicit delete (fixture will also clean up if this fails)
+    deleted = await provisioning_service.delete_key(key_info.key_hash)
+    assert deleted
+
+
+@pytest.mark.asyncio
+async def test_key_can_make_inference(unique_agent_name, provisioning_service):
     """Test that created key can actually make LLM requests."""
     import httpx
-    from kestrel_sovereign.features.llm_keys import OpenRouterProvisioningService
 
-    service = OpenRouterProvisioningService()
+    key_info = await provisioning_service.create_agent_key(
+        agent_name=unique_agent_name,
+        limit_usd=0.10,
+        limit_reset="monthly",
+    )
 
-    try:
-        # Create key with small limit
-        key_info = await service.create_agent_key(
-            agent_name=unique_agent_name,
-            limit_usd=0.10,  # 10 cents
-            limit_reset="monthly",
+    # Use the key to make a real inference request
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {key_info.key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": "deepseek/deepseek-chat-v3.1",  # Cheap model
+                "messages": [{"role": "user", "content": "Say 'test' only"}],
+                "max_tokens": 5,
+            },
+            timeout=30.0,
         )
 
-        # Use the key to make a real inference request
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                "https://openrouter.ai/api/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {key_info.key}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": "deepseek/deepseek-chat-v3.1",  # Cheap model
-                    "messages": [{"role": "user", "content": "Say 'test' only"}],
-                    "max_tokens": 5,
-                },
-                timeout=30.0,
-            )
+        assert response.status_code == 200
+        data = response.json()
+        assert "choices" in data
+        assert len(data["choices"]) > 0
 
-            assert response.status_code == 200
-            data = response.json()
-            assert "choices" in data
-            assert len(data["choices"]) > 0
-
-        # Verify usage was tracked
-        usage = await service.get_key_usage(key_info.key_hash)
-        # Free model may not count toward usage, but API should work
-        assert usage.key_hash == key_info.key_hash
-
-        # Cleanup
-        await service.delete_key(key_info.key_hash)
-
-    finally:
-        await service.close()
+    # Verify usage was tracked
+    usage = await provisioning_service.get_key_usage(key_info.key_hash)
+    assert usage.key_hash == key_info.key_hash
 
 
 @pytest.mark.asyncio
-async def test_update_key_limit(unique_agent_name):
+async def test_update_key_limit(unique_agent_name, provisioning_service):
     """Test updating a key's spending limit."""
-    from kestrel_sovereign.features.llm_keys import OpenRouterProvisioningService
+    key_info = await provisioning_service.create_agent_key(
+        agent_name=unique_agent_name,
+        limit_usd=0.10,
+    )
 
-    service = OpenRouterProvisioningService()
+    assert key_info.limit_cents == 10
 
-    try:
-        # Create key with initial limit
-        key_info = await service.create_agent_key(
-            agent_name=unique_agent_name,
-            limit_usd=1.0,
-        )
+    # Update limit
+    updated_usage = await provisioning_service.update_key_limit(
+        key_hash=key_info.key_hash,
+        limit_usd=5.0,
+    )
 
-        assert key_info.limit_cents == 100
-
-        # Update limit
-        updated_usage = await service.update_key_limit(
-            key_hash=key_info.key_hash,
-            limit_usd=5.0,
-        )
-
-        assert updated_usage.limit_cents == 500
-        assert updated_usage.limit_remaining_cents == 500
-
-        # Cleanup
-        await service.delete_key(key_info.key_hash)
-
-    finally:
-        await service.close()
+    assert updated_usage.limit_cents == 500
+    assert updated_usage.limit_remaining_cents == 500
 
 
 @pytest.mark.asyncio
@@ -152,23 +149,22 @@ async def test_convenience_functions(unique_agent_name):
         delete_agent_key,
     )
 
-    # Create via convenience function
     key_info = await provision_agent_key(
         agent_name=unique_agent_name,
-        limit_usd=2.0,
+        limit_usd=0.10,
         limit_reset="weekly",
     )
 
-    assert key_info.key.startswith("sk-or-v1-")
-    assert key_info.limit_cents == 200
+    try:
+        assert key_info.key.startswith("sk-or-v1-")
+        assert key_info.limit_cents == 10
 
-    # Get usage via convenience function
-    usage = await get_agent_usage(key_info.key_hash)
-    assert usage.limit_cents == 200
-
-    # Delete via convenience function
-    deleted = await delete_agent_key(key_info.key_hash)
-    assert deleted
+        # Get usage via convenience function
+        usage = await get_agent_usage(key_info.key_hash)
+        assert usage.limit_cents == 10
+    finally:
+        # Always clean up
+        await delete_agent_key(key_info.key_hash)
 
 
 @pytest.mark.asyncio

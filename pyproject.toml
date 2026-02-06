@@ -96,9 +96,8 @@ dependencies = [
     "peft>=0.18.1",
     "sendgrid>=6.12.4",
     "twilio>=9.9.1",
-    # GitHub Ticket Processor
-    "claude-agent-sdk>=0.1.0",
-    "PyGithub>=2.1.0",
+    # GitHub Ticket Processor (standalone package)
+    "autoclaude @ git+https://github.com/UncleSaurus/autoclaude.git",
 ]
 
 [project.optional-dependencies]
@@ -119,7 +118,7 @@ full = [
 
 [project.scripts]
 kestrel = "kestrel_cli:main"
-kestrel-github = "kestrel_sovereign.github_processor.cli:main"
+kestrel-github = "autoclaude.cli:main"
 
 [dependency-groups]
 dev = [
@@ -151,6 +150,9 @@ markers = [
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["kestrel_sovereign"]

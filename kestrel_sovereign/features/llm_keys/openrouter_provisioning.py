@@ -153,7 +153,7 @@ class OpenRouterProvisioningService:
     async def create_agent_key(
         self,
         agent_name: str,
-        limit_usd: float = 1.0,
+        limit_usd: float = 0.10,
         limit_reset: Optional[Literal["daily", "weekly", "monthly"]] = "monthly",
     ) -> AgentKeyInfo:
         """
@@ -344,7 +344,7 @@ class OpenRouterProvisioningService:
 
 async def provision_agent_key(
     agent_name: str,
-    limit_usd: float = 1.0,
+    limit_usd: float = 0.10,
     limit_reset: str = "monthly",
 ) -> AgentKeyInfo:
     """

@@ -282,6 +282,16 @@ wheels = [
 ]
 
 [[package]]
+name = "autoclaude"
+version = "0.1.0"
+source = { git = "https://github.com/UncleSaurus/autoclaude.git#2ee410aeeaeb63f57eb14c74799726b421efff35" }
+dependencies = [
+    { name = "claude-agent-sdk" },
+    { name = "pygithub" },
+    { name = "python-dotenv" },
+]
+
+[[package]]
 name = "backoff"
 version = "2.2.1"
 source = { registry = "https://pypi.org/simple" }
@@ -2296,10 +2306,10 @@ dependencies = [
     { name = "anthropic" },
     { name = "asgi-lifespan" },
     { name = "asyncpg" },
+    { name = "autoclaude" },
     { name = "beautifulsoup4" },
     { name = "certifi" },
     { name = "charset-normalizer" },
-    { name = "claude-agent-sdk" },
     { name = "cryptography" },
     { name = "diffusers" },
     { name = "docker" },
@@ -2328,7 +2338,6 @@ dependencies = [
     { name = "psycopg2-binary" },
     { name = "pycryptodome" },
     { name = "pydantic" },
-    { name = "pygithub" },
     { name = "pygments" },
     { name = "pytest-asyncio" },
     { name = "pytest-timeout" },
@@ -2393,11 +2402,11 @@ requires-dist = [
     { name = "anthropic", specifier = ">=0.75.0" },
     { name = "asgi-lifespan", specifier = ">=2.1.0" },
     { name = "asyncpg", specifier = ">=0.30.0" },
+    { name = "autoclaude", git = "https://github.com/UncleSaurus/autoclaude.git" },
     { name = "beautifulsoup4", specifier = "==4.13.4" },
     { name = "certifi", specifier = "==2026.1.4" },
     { name = "charset-normalizer", specifier = "==3.4.4" },
     { name = "chromadb", marker = "extra == 'local'", specifier = "==1.0.15" },
-    { name = "claude-agent-sdk", specifier = ">=0.1.0" },
     { name = "cryptography", specifier = ">=45.0.5,<46.0.0" },
     { name = "diffusers", specifier = ">=0.36.0" },
     { name = "docker", specifier = ">=7.1.0" },
@@ -2431,7 +2440,6 @@ requires-dist = [
     { name = "psycopg2-binary", specifier = ">=2.9.10" },
     { name = "pycryptodome", specifier = "==3.23.0" },
     { name = "pydantic", specifier = "==2.12.5" },
-    { name = "pygithub", specifier = ">=2.1.0" },
     { name = "pygments", specifier = "==2.19.2" },
     { name = "pytest-asyncio", specifier = ">=1.1.0" },
     { name = "pytest-timeout", specifier = ">=2.3.1" },

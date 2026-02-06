@@ -46,40 +46,25 @@ cd tests/e2e && npx playwright test
 
 Run tests in order: Unit → Integration → E2E. Fix failures before moving up.
 
-## GitHub Ticket Processor
+## AutoClaude (GitHub Issue Processor)
 
-Autonomous GitHub issue processing with clarification workflow. See full documentation: [`kestrel_sovereign/github_processor/README.md`](kestrel_sovereign/github_processor/README.md)
+Autonomous GitHub issue processing is handled by the standalone [`autoclaude`](https://github.com/UncleSaurus/autoclaude) package. Installed as a dependency.
 
 ### Quick Start
 
 ```bash
 # Process a specific issue
+autoclaude claim --repo owner/repo --issue 42
+
+# Multi-iteration for complex issues
+autoclaude claim --repo owner/repo --issue 42 --max-iterations 5
+
+# PRD batch mode
+autoclaude batch --prd prd.json
+
+# Legacy alias still works
 uv run kestrel-github claim --repo owner/repo --issue 42
-
-# Process all 'enhancement' issues
-uv run kestrel-github claim --repo owner/repo --label enhancement
-
-# Skip clarification phase
-uv run kestrel-github claim --repo owner/repo --issue 42 --skip-clarification
 ```
-
-### Workflow
-
-1. **Clarification Phase** - Agent analyzes issue, posts checkbox questions if unclear
-2. **Implementation Phase** - Agent implements changes autonomously
-3. **CI Phase** - Push, wait for CI, auto-fix failures (up to 3 retries)
-4. **PR Phase** - Create pull request linked to issue
-
-### Labels
-
-| Label | Meaning |
-|-------|---------|
-| `agent-analyzing` | Reviewing issue for clarity |
-| `agent-clarifying` | Posted questions, waiting for answers |
-| `agent-ready` | Skip clarification (pre-approved) |
-| `agent-claimed` | Actively implementing |
-| `agent-blocked` | Needs human help |
-| `agent-complete` | PR ready for review |
 
 ### Environment Variables
 

@@ -121,7 +121,8 @@ class BootstrapService:
     async def set_bootstrap_state(self, state: BootstrapState) -> None:
         """Update the bootstrap state in agent_metadata."""
         try:
-            now = datetime.now(timezone.utc).isoformat()
+            now = datetime.now(timezone.utc)
+            now_str = now.isoformat()
             await self.db.execute(
                 """
                 INSERT OR REPLACE INTO agent_metadata (agent_id, key, value, updated_at)
@@ -137,7 +138,7 @@ class BootstrapService:
                     INSERT OR REPLACE INTO agent_metadata (agent_id, key, value, updated_at)
                     VALUES (?, ?, ?, ?)
                     """,
-                    (self.agent_id, self.BOOTSTRAP_STARTED_KEY, now, now),
+                    (self.agent_id, self.BOOTSTRAP_STARTED_KEY, now_str, now),
                 )
             elif state == BootstrapState.COMPLETE:
                 await self.db.execute(
@@ -145,7 +146,7 @@ class BootstrapService:
                     INSERT OR REPLACE INTO agent_metadata (agent_id, key, value, updated_at)
                     VALUES (?, ?, ?, ?)
                     """,
-                    (self.agent_id, self.BOOTSTRAP_COMPLETED_KEY, now, now),
+                    (self.agent_id, self.BOOTSTRAP_COMPLETED_KEY, now_str, now),
                 )
         except Exception as e:
             logger.error(f"Failed to set bootstrap state: {e}")
@@ -183,7 +184,7 @@ And how do you like to work together - quick and direct, or more room to think t
     async def _save_discovery_history(self, history: List[Dict[str, str]]) -> None:
         """Save the discovery conversation history."""
         try:
-            now = datetime.now(timezone.utc).isoformat()
+            now = datetime.now(timezone.utc)
             await self.db.execute(
                 """
                 INSERT OR REPLACE INTO agent_metadata (agent_id, key, value, updated_at)
@@ -197,7 +198,7 @@ And how do you like to work together - quick and direct, or more room to think t
     async def _save_user_name(self, name: str) -> None:
         """Save the discovered user name."""
         try:
-            now = datetime.now(timezone.utc).isoformat()
+            now = datetime.now(timezone.utc)
             await self.db.execute(
                 """
                 INSERT OR REPLACE INTO agent_metadata (agent_id, key, value, updated_at)

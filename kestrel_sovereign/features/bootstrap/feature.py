@@ -167,7 +167,7 @@ class BootstrapFeature(Feature):
         try:
             # Update in agent metadata table
             from datetime import datetime, timezone
-            now = datetime.now(timezone.utc).isoformat()
+            now = datetime.now(timezone.utc)
 
             await self.agent._raw_storage.db.execute(
                 """

@@ -24,7 +24,8 @@ ADVANCED MODE:
 
 import logging
 from contextlib import asynccontextmanager
-from typing import Any, AsyncIterator, List, Optional, Sequence
+from datetime import datetime
+from typing import Any, AsyncIterator, List, Optional, Sequence, Tuple
 
 from .interface import (
     ConnectionError,
@@ -202,12 +203,27 @@ class PostgresBackend(DatabaseBackend):
         """Convert SQLite-style ? placeholders to PostgreSQL $N style."""
         converted, _ = sqlite_to_postgres(query)
         return converted
-    
+
+    @staticmethod
+    def _strip_tz(params: Params) -> Tuple[Any, ...]:
+        """Strip timezone info from datetime params.
+
+        The schema uses TIMESTAMP (naive), not TIMESTAMPTZ. asyncpg
+        raises errors when mixing offset-naive and offset-aware datetimes,
+        so we strip tzinfo from any aware datetime params.
+        """
+        return tuple(
+            p.replace(tzinfo=None) if isinstance(p, datetime) and p.tzinfo is not None
+            else p
+            for p in params
+        )
+
     async def execute(self, query: str, params: Params = ()) -> int:
         """Execute a write query."""
         pool = self._ensure_connected()
         pg_query = self._convert_query(query)
-        
+        params = self._strip_tz(params)
+
         try:
             # Use transaction connection if in transaction
             if self._transaction_conn:
@@ -229,7 +245,8 @@ class PostgresBackend(DatabaseBackend):
         """Execute query with multiple parameter sets."""
         pool = self._ensure_connected()
         pg_query = self._convert_query(query)
-        
+        params_list = [self._strip_tz(p) for p in params_list]
+
         try:
             if self._transaction_conn:
                 await self._transaction_conn.executemany(pg_query, params_list)
@@ -245,7 +262,8 @@ class PostgresBackend(DatabaseBackend):
         """Fetch a single row."""
         pool = self._ensure_connected()
         pg_query = self._convert_query(query)
-        
+        params = self._strip_tz(params)
+
         try:
             if self._transaction_conn:
                 row = await self._transaction_conn.fetchrow(pg_query, *params)
@@ -263,7 +281,8 @@ class PostgresBackend(DatabaseBackend):
         """Fetch all rows."""
         pool = self._ensure_connected()
         pg_query = self._convert_query(query)
-        
+        params = self._strip_tz(params)
+
         try:
             if self._transaction_conn:
                 rows = await self._transaction_conn.fetch(pg_query, *params)
@@ -279,7 +298,8 @@ class PostgresBackend(DatabaseBackend):
         """Fetch a single value."""
         pool = self._ensure_connected()
         pg_query = self._convert_query(query)
-        
+        params = self._strip_tz(params)
+
         try:
             if self._transaction_conn:
                 return await self._transaction_conn.fetchval(pg_query, *params)

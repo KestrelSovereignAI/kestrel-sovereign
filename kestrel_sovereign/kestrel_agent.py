@@ -147,14 +147,23 @@ class KestrelAgent(ConstitutionMixin, StreamingMixin, BackupMixin, SleepMixin):
         """Async initialization of storage and features."""
         if self._raw_storage is None:
             # Initialize async storage based on backend type
-            if self._db_backend.lower() == "postgres" and self._database_url:
-                # PostgreSQL backend
-                self._raw_storage = AsyncStorage(
-                    backend="postgres",
-                    dsn=self._database_url,
-                    agent_id=self.did  # Use DID for multi-tenant isolation
-                )
-                logging.info(f"Using PostgreSQL backend for Kestrel storage (agent: {self.did})")
+            if self._db_backend.lower() == "postgres" and (self.pg_pool or self._database_url):
+                # PostgreSQL backend - reuse shared pool if available
+                if self.pg_pool:
+                    from kestrel_sovereign.storage.db.postgres import PostgresBackend
+                    pg_backend = PostgresBackend.from_pool(self.pg_pool)
+                    self._raw_storage = AsyncStorage(
+                        backend=pg_backend,
+                        agent_id=self.did
+                    )
+                    logging.info(f"Using shared PostgreSQL pool for Kestrel storage (agent: {self.did})")
+                else:
+                    self._raw_storage = AsyncStorage(
+                        backend="postgres",
+                        dsn=self._database_url,
+                        agent_id=self.did
+                    )
+                    logging.info(f"Using PostgreSQL backend for Kestrel storage (agent: {self.did})")
             else:
                 # SQLite backend (default) - agent_id optional since each agent has own DB
                 self._raw_storage = AsyncStorage(self.storage_path, agent_id=self.did)
