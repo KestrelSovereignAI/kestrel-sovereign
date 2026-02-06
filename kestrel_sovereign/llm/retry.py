@@ -9,12 +9,14 @@ import logging
 import random
 from typing import Any, Callable, TypeVar
 
+from kestrel_sovereign.kestrel_config.constants import LLM_RETRY_MAX_DELAY_SECONDS
+
 logger = logging.getLogger(__name__)
 
 # Retry configuration
 MAX_RETRIES = 5
 BASE_DELAY = 1.0  # seconds
-MAX_DELAY = 60.0  # seconds
+MAX_DELAY = LLM_RETRY_MAX_DELAY_SECONDS
 
 # HTTP status codes that warrant retry
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
