@@ -47,10 +47,10 @@ async def test_llm_service_use_agent_key():
         db_path = f"{tmp_dir}/test_agent.db"
         db = await AsyncDatabase.sqlite(db_path)
 
-        # Provision a test key
         provisioning = OpenRouterProvisioningService()
         agent_name = f"test-key-{uuid.uuid4().hex[:8]}"
         agent_did = f"did:pkh:eip155:1:0x{uuid.uuid4().hex[:40]}"
+        key_info = None
 
         try:
             key_info = await provisioning.create_agent_key(
@@ -83,13 +83,14 @@ async def test_llm_service_use_agent_key():
                     break
 
             assert openrouter_provider is not None
-            # The client should now use the agent's key (we can't easily verify the key itself,
-            # but we can verify the client was replaced by checking it's a new instance)
-
-            # Cleanup
-            await provisioning.delete_key(key_info.key_hash)
 
         finally:
+            # Always clean up the OpenRouter key
+            if key_info:
+                try:
+                    await provisioning.delete_key(key_info.key_hash)
+                except Exception:
+                    pass
             await provisioning.close()
             await db.close()
 
@@ -113,12 +114,12 @@ async def test_agent_uses_own_key_for_inference():
         if not credentials.openrouter_key_hash:
             pytest.skip("OpenRouter key was not provisioned during inception")
 
-        # Get the agent's key from storage
         from kestrel_sovereign.storage.async_database import AsyncDatabase
         from kestrel_sovereign.security.service_key_storage import ServiceKeyStorage
 
         db_path = f"{tmp_dir}/kestrel_prime.db"
         db = await AsyncDatabase.sqlite(db_path)
+        provisioning = OpenRouterProvisioningService()
 
         try:
             # Agent-scoped key storage
@@ -145,14 +146,13 @@ async def test_agent_uses_own_key_for_inference():
                 data = response.json()
                 assert "choices" in data
 
-            # Clean up the OpenRouter key
-            provisioning = OpenRouterProvisioningService()
+        finally:
+            # Always clean up the OpenRouter key
             try:
                 await provisioning.delete_key(credentials.openrouter_key_hash)
-            finally:
-                await provisioning.close()
-
-        finally:
+            except Exception:
+                pass
+            await provisioning.close()
             await db.close()
 
 
@@ -218,21 +218,22 @@ async def test_kestrel_agent_activates_key_on_initialize():
             await agent.initialize()
 
             # The agent should now be using its own key
-            # We verify by checking the provider was updated
             openrouter_provider = None
             for p in llm_service.providers:
                 if p["name"] == "openrouter":
                     openrouter_provider = p
                     break
 
-            # If we got here without errors, the key was activated
             assert openrouter_provider is not None
 
-            # Cleanup
             close_result = agent.close()
             if close_result is not None:
                 await close_result
-            await provisioning.delete_key(credentials.openrouter_key_hash)
 
         finally:
+            # Always clean up the OpenRouter key
+            try:
+                await provisioning.delete_key(credentials.openrouter_key_hash)
+            except Exception:
+                pass
             await provisioning.close()

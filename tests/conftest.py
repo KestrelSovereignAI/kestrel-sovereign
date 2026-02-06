@@ -402,6 +402,9 @@ async def async_kestrel_agent(temp_dir: Path, monkeypatch):
     test_encryption_key = "test-master-key-for-encryption-32chars!"
     monkeypatch.setenv("KESTREL_DATA_KEY", test_encryption_key)
 
+    # Prevent real OpenRouter key creation during tests - keys leak and cost money
+    monkeypatch.delenv("OPENROUTER_MANAGEMENT_API_KEY", raising=False)
+
     # Create agent identity (use async version since we're in async context)
     await create_kestrel_identity_async(str(temp_dir), "docs/principles/KESTREL_CONSTITUTION.md")
 

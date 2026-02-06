@@ -435,10 +435,11 @@ async def create_kestrel_identity_async(
         from kestrel_sovereign.features.llm_keys import OpenRouterProvisioningService
         provisioning = OpenRouterProvisioningService()
 
-        # Create a key with $1 initial limit, reset monthly
+        # Create a key with small initial limit, reset monthly
+        # Agents start with $0.10 - increase via update_key_limit after verification
         openrouter_key_info = await provisioning.create_agent_key(
             agent_name=agent_name.lower().replace(" ", "-"),
-            limit_usd=1.0,
+            limit_usd=0.10,
             limit_reset="monthly",
         )
         await provisioning.close()

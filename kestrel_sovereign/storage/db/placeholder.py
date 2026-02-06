@@ -109,13 +109,16 @@ def sqlite_to_postgres(query: str) -> Tuple[str, int]:
             # Determine primary key based on known tables
             # graph_nodes: node_id
             # graph_edges: (source_id, target_id, label) composite
-            if table_name.lower() == 'graph_nodes':
-                pk_columns = ['node_id']
-            elif table_name.lower() == 'graph_edges':
-                pk_columns = ['source_id', 'target_id', 'label']
-            else:
-                # Default: assume first column is PK
-                pk_columns = [columns[0]] if columns else []
+            # agent_metadata: (agent_id, key) composite
+            known_pks = {
+                'graph_nodes': ['node_id'],
+                'graph_edges': ['source_id', 'target_id', 'label'],
+                'agent_metadata': ['agent_id', 'key'],
+            }
+            pk_columns = known_pks.get(
+                table_name.lower(),
+                [columns[0]] if columns else []
+            )
 
             # Build the update clause for non-PK columns
             update_columns = [c for c in columns if c not in pk_columns]

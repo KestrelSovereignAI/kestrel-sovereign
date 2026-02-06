@@ -137,6 +137,7 @@ async def test_openrouter_with_agent_key():
     # Create a temporary key
     service = OpenRouterProvisioningService()
     agent_name = f"test-inference-{uuid.uuid4().hex[:8]}"
+    key_info = None
 
     try:
         key_info = await service.create_agent_key(
@@ -166,8 +167,11 @@ async def test_openrouter_with_agent_key():
             assert "choices" in data
             assert len(data["choices"]) > 0
 
-        # Cleanup
-        await service.delete_key(key_info.key_hash)
-
     finally:
+        # Always clean up the key, even if assertions fail
+        if key_info:
+            try:
+                await service.delete_key(key_info.key_hash)
+            except Exception:
+                pass
         await service.close()
