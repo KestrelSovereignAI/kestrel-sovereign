@@ -189,8 +189,9 @@ def get_fernet() -> Optional[Fernet]:
         # Try using key directly as Fernet key
         Fernet(key)  # Validate
         return Fernet(key)
-    except Exception:
+    except Exception as e:
         # Derive Fernet key from passphrase using SHA-256
+        logger.debug(f"Key is not a raw Fernet key, deriving from passphrase: {e}")
         digest = hashlib.sha256(key.encode('utf-8')).digest()
         fernet_key = base64.urlsafe_b64encode(digest)
         return Fernet(fernet_key)
@@ -215,8 +216,9 @@ def get_master_key_bytes() -> Optional[bytes]:
         key_bytes = key.encode() if isinstance(key, str) else key
         Fernet(key_bytes)  # Validate it's a valid Fernet key
         return key_bytes
-    except Exception:
+    except Exception as e:
         # Derive from passphrase via SHA-256
+        logger.debug(f"Key is not a raw Fernet key, deriving bytes from passphrase: {e}")
         digest = hashlib.sha256(key.encode('utf-8')).digest()
         return base64.urlsafe_b64encode(digest)
 
