@@ -507,8 +507,8 @@ class IdentityExporter:
                 return SubstrateType.OLLAMA_LOCAL.value
             elif "openrouter" in provider.lower():
                 return SubstrateType.OPENROUTER.value
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Substrate detection failed: {e}")
 
         return SubstrateType.UNKNOWN.value
 
