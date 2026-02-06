@@ -7,6 +7,8 @@ import time
 import os
 import logging
 
+from kestrel_sovereign.kestrel_config.constants import MAX_SOVEREIGNTY_PREVIEW_SIZE
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api", tags=["sovereignty"])
@@ -236,7 +238,7 @@ async def download_sovereignty_file(request: Request, filename: str):
 
 
 @router.get("/sovereignty/files/{filename}/preview")
-async def preview_sovereignty_file(request: Request, filename: str, max_size: int = 10000):
+async def preview_sovereignty_file(request: Request, filename: str, max_size: int = MAX_SOVEREIGNTY_PREVIEW_SIZE):
     """Get a preview of a file's content."""
     if ".." in filename or "/" in filename or "\\" in filename:
         raise HTTPException(status_code=400, detail="Invalid filename.")

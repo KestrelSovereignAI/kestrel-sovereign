@@ -33,6 +33,7 @@ from pydantic import BaseModel
 
 from .adapter import LLMAdapter, LLMResponse, ToolCall
 from .model_metadata import ModelInfo, ModelCategory
+from kestrel_sovereign.kestrel_config.constants import CLAUDE_MAX_TIMEOUT_SECONDS
 
 logger = logging.getLogger(__name__)
 
@@ -65,7 +66,7 @@ class ClaudeMaxAdapter(LLMAdapter):
     def __init__(
         self,
         model: str = None,
-        timeout: int = 120,
+        timeout: int = CLAUDE_MAX_TIMEOUT_SECONDS,
         **kwargs
     ):
         """

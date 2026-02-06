@@ -4,6 +4,8 @@ from fastapi.responses import StreamingResponse
 from typing import Optional
 import logging
 
+from kestrel_sovereign.kestrel_config.constants import SSE_PING_INTERVAL_SECONDS
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/agent", tags=["agent"])
@@ -244,7 +246,7 @@ async def notifications_sse(request: Request):
         # Send initial connection event
         yield f"event: connected\ndata: {json.dumps({'status': 'connected'})}\n\n"
 
-        ping_interval = 15  # seconds
+        ping_interval = SSE_PING_INTERVAL_SECONDS
         poll_interval = 0.5  # Check for notifications every 500ms
         last_ping = asyncio.get_event_loop().time()
 
