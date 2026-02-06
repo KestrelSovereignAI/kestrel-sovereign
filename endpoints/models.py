@@ -5,6 +5,7 @@ import aiohttp
 import time
 import logging
 
+from kestrel_sovereign.kestrel_config.defaults import get_ipfs_api_url
 from kestrel_sovereign.llm.model_metadata import ModelCategory
 
 logger = logging.getLogger(__name__)
@@ -77,7 +78,7 @@ async def get_ipfs_status(request: Request):
         "pinned_content": [],
     }
 
-    local_api_url = "http://localhost:8889/api/v0"
+    local_api_url = get_ipfs_api_url() + "/api/v0"
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as session:
             async with session.post(f"{local_api_url}/id") as resp:
