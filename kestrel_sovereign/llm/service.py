@@ -13,6 +13,8 @@ import json
 import os
 import time
 from dataclasses import dataclass, field
+
+from kestrel_sovereign.kestrel_config.constants import LLM_CACHE_TTL_SECONDS, STORAGE_CACHE_TTL_SECONDS
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import List, Dict, Any, Optional, Union, Type, AsyncIterator, TYPE_CHECKING
@@ -103,12 +105,12 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin):
         # Model discovery cache
         self._model_cache = None
         self._cache_timestamp = None
-        self._cache_ttl = 300  # 5 minutes
+        self._cache_ttl = LLM_CACHE_TTL_SECONDS
 
         # Storage info cache
         self._storage_cache = None
         self._storage_cache_timestamp = None
-        self._storage_cache_ttl = 60  # 1 minute
+        self._storage_cache_ttl = STORAGE_CACHE_TTL_SECONDS
 
         # Database for model usage tracking (uses abstract data layer)
         self._init_usage_tracking(database_url)
