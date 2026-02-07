@@ -76,8 +76,10 @@ RUNPOD_REFERRAL_CODE=your_referral_code_here
 
 **Current Implementation:**
 - File: `storage/providers/lighthouse_provider.py` (589 lines)
-- Pricing: $0.05/GB/month (our charge) vs $0.00005/GB (Filecoin cost)
-- Margin: ~99.9% on monthly storage (extreme, but fair for convenience)
+- Hot IPFS pricing: $0.05/GB/month (our charge, matches Lighthouse hot tier)
+- Perpetual pricing: ~$2-5/GB one-time (Lighthouse endowment pool)
+- Raw Filecoin deal: ~$0.00005/GB (not viable alone - requires manual renewal)
+- Margin on hot storage: minimal (pass-through pricing)
 
 **Partnership Model:**
 - NFT.Storage uses referral link model (% of first storage purchase)

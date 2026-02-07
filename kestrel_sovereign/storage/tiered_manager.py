@@ -447,8 +447,8 @@ class TieredStorageManager:
                 if isinstance(provider, CryostasisCapable):
                     return await provider.calculate_cryostasis_cost(state_size_bytes)
 
-        # Default fallback
-        return Decimal("0.02")
+        # Default fallback (enough for ~1GB perpetual via Lighthouse endowment pool)
+        return Decimal("5.00")
 
 
 def create_default_manager(

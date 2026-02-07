@@ -278,7 +278,7 @@ class MockCryostasisProvider(MockStorageProvider, CryostasisCapable):
 
     async def calculate_cryostasis_cost(self, size_bytes: int) -> Decimal:
         size_gb = Decimal(size_bytes) / Decimal(1024 * 1024 * 1024)
-        return size_gb * Decimal("0.00005") + Decimal("0.01")
+        return size_gb * Decimal("4.00") + Decimal("0.50")
 
 
 # =============================================================================
@@ -407,9 +407,9 @@ class TestCryostasisCapable:
         # 1 GB
         cost = await provider.calculate_cryostasis_cost(1024 * 1024 * 1024)
 
-        # Should be ~$0.00005/GB + $0.01 buffer
-        assert cost > Decimal("0.01")
-        assert cost < Decimal("0.02")
+        # Should be ~$4.00/GB perpetual + $0.50 buffer
+        assert cost > Decimal("4.00")
+        assert cost < Decimal("5.00")
 
 
 # =============================================================================

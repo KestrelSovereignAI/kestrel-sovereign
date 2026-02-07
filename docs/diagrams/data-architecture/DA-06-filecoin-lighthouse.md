@@ -39,12 +39,15 @@ graph TD
         IPFS["IPFS pinning"]
         FILECOIN["Automatic Filecoin deals"]
         RETRIEVAL["Fast retrieval gateway"]
+        KAVACH["Kavach threshold encryption"]
+        X402["x402 pay-per-use uploads"]
     end
 
     subgraph benefit["Benefits"]
         B1["No node management"]
-        B2["Automatic deal renewal"]
+        B2["Automatic deal renewal via endowment pool"]
         B3["Single API for both"]
+        B4["NFT/token-gated access control"]
     end
 
     lighthouse --> benefit
@@ -56,26 +59,45 @@ graph TD
 
 ---
 
-## Slide 3: Pricing
+## Slide 3: Pricing (Updated Feb 2026)
 
-| Storage Type | Cost | Duration |
-|--------------|------|----------|
-| IPFS (hot) | $0.05/GB/month | Until unpinned |
-| Filecoin (cold) | $0.00005/GB/month | Permanent (renewable) |
-| Lighthouse combo | ~$0.05/GB/month | Hot + cold backup |
+| Storage Type | Cost | Duration | Notes |
+|--------------|------|----------|-------|
+| IPFS hot (Lighthouse) | $0.05/GB/month | Until unpinned | Fast retrieval |
+| Raw Filecoin deal | ~$0.00005/GB | Per deal (~1yr) | Must manually renew |
+| Lighthouse perpetual | ~$2-5/GB one-time | Forever | Endowment pool auto-renews |
+
+**Lighthouse Lifetime Plans:**
+
+| Plan | Price | Storage |
+|------|-------|---------|
+| Free | $0 | 5 GB |
+| Beacon | $20 | 5 GB |
+| Navigator | $100 | 25 GB |
+| Harbor | $500 | 150 GB |
 
 ```mermaid
 graph LR
     SIZE["1 GB"] --> COST1["$0.05/month hot"]
-    SIZE --> COST2["$0.0006/year permanent"]
+    SIZE --> COST2["~$4 one-time perpetual"]
 
-    DECADE["10 years permanent"] --> TOTAL["$0.006 total"]
+    subgraph endowment["How Perpetual Works"]
+        PAY["You pay ~$4/GB"] --> SPLIT["Split"]
+        SPLIT --> DEAL["Part → current Filecoin deal"]
+        SPLIT --> POOL["Part → endowment pool"]
+        POOL --> RENEW["Pool auto-renews deals forever"]
+        POOL --> GROW["Pool grows via FIL staking"]
+    end
 
     style COST2 fill:#145a32,stroke:#58d68d
-    style TOTAL fill:#7d6608,stroke:#f4d03f
+    style POOL fill:#7d6608,stroke:#f4d03f
 ```
 
-**Permanent storage for pennies.**
+**Pay once, stored forever.** The endowment pool funds perpetual renewal.
+
+> **Note:** Raw Filecoin deal cost (~$0.00005/GB) is misleadingly cheap.
+> Lighthouse charges ~$2-5/GB to fund the endowment pool that auto-renews
+> deals in perpetuity. This is the real cost of "permanent" storage.
 
 ---
 
@@ -115,11 +137,79 @@ stateDiagram-v2
     Expired --> [*]
 ```
 
-**Renewable.** Lighthouse auto-renews if funded.
+**Renewable.** Lighthouse auto-renews via endowment pool.
 
 ---
 
-## Slide 6: Multi-Currency Payment
+## Slide 6: Kavach Threshold Encryption
+
+```mermaid
+graph TD
+    subgraph kavach["Kavach Encryption"]
+        ENCRYPT["Agent encrypts data"]
+        SHARD["Key split into N shards<br/>(BLS threshold cryptography)"]
+        DIST["Shards distributed<br/>across nodes"]
+    end
+
+    subgraph decrypt["Decryption"]
+        GATHER["Gather T-of-N shards"]
+        RECON["Reconstruct key"]
+        ACCESS["Decrypt data"]
+    end
+
+    subgraph gate["Access Control"]
+        NFT["NFT ownership check"]
+        TOKEN["Token balance check"]
+        PASSKEY["Passkey verification"]
+        ZKTLS["zkTLS attestation"]
+    end
+
+    kavach --> decrypt
+    gate -->|"Must pass to get shards"| decrypt
+
+    style kavach fill:#512e5f,stroke:#af7ac5
+    style gate fill:#7d6608,stroke:#f4d03f
+```
+
+**No single point of failure.** Lighthouse never holds the full key.
+
+Supported gating: ERC721/ERC1155 NFTs, ERC20 tokens, passkeys, zkTLS.
+Chains: EVM, Solana, Cosmos, Coreum, Radix.
+
+> **Kestrel implication:** Kavach replaces our current Fernet encryption
+> (which stores keys locally in `cache_dir/key_{hash}.key`). With Kavach,
+> cryostasis recovery doesn't depend on a local key file or env var -
+> access is tied to the agent's wallet/DID on-chain.
+
+---
+
+## Slide 7: x402 Pay-Per-Use
+
+```mermaid
+sequenceDiagram
+    participant A as Agent
+    participant L as Lighthouse
+    participant F as x402 Facilitator
+
+    A->>L: HTTP request (upload file)
+    L-->>A: 402 Payment Required + price
+    A->>A: Sign payment (USDC on Base)
+    A->>L: Retry with X-PAYMENT header
+    L->>F: Verify & settle payment
+    F-->>L: Payment confirmed
+    L-->>A: 200 OK + CID
+```
+
+x402 is a [Coinbase-developed protocol](https://github.com/coinbase/x402) using
+HTTP 402 for micropayments. Agents can pay per-upload without pre-purchasing plans.
+
+> **Kestrel implication:** Enables autonomous agent storage payments.
+> Agent wallet signs USDC on Base → file stored → no API key quotas needed.
+> This is the path to Phase 3 (Autonomous Renewal) in our roadmap.
+
+---
+
+## Slide 8: Multi-Currency Payment
 
 ```mermaid
 graph TD
@@ -146,7 +236,7 @@ graph TD
 
 ---
 
-## Slide 7: No Vendor Lock-in
+## Slide 9: No Vendor Lock-in
 
 ```mermaid
 graph TD
@@ -172,7 +262,7 @@ graph TD
 
 ---
 
-## Slide 8: Economic Incentives
+## Slide 10: Economic Incentives
 
 ```mermaid
 graph TD

@@ -41,7 +41,7 @@ For detailed coverage of the storage system, see the [data-architecture/](data-a
 | [DA-04-multi-tenant-cloud.md](data-architecture/DA-04-multi-tenant-cloud.md) | Kestrel PostgreSQL multi-tenancy | ~8 |
 | [DA-05-ipfs-sovereignty.md](data-architecture/DA-05-ipfs-sovereignty.md) | IPFS sharding, convergent encryption | ~10 |
 | [DA-06-filecoin-lighthouse.md](data-architecture/DA-06-filecoin-lighthouse.md) | Permanent storage via Lighthouse | ~8 |
-| [DA-07-cryostasis.md](data-architecture/DA-07-cryostasis.md) | Agent dormancy when wallet < $0.02 | ~8 |
+| [DA-07-cryostasis.md](data-architecture/DA-07-cryostasis.md) | Agent dormancy when wallet < $5.00 | ~8 |
 | [DA-08-privacy-encryption.md](data-architecture/DA-08-privacy-encryption.md) | Encryption at rest, PII scrubbing | ~6 |
 
 ## Color Palette

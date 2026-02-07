@@ -6,14 +6,29 @@ Supports direct on-chain payments (FIL, USDC, USDT) for true agent sovereignty.
 
 Lighthouse provides:
 - IPFS pinning (hot access, dedicated gateways)
-- Filecoin deals (permanent archive, ~$0.00005/GB one-time)
-- Pay-per-use OR lifetime plans
+- Filecoin deals via endowment pool (perpetual archive, ~$2-5/GB one-time)
+- Pay-per-use (x402 protocol) OR lifetime plans
+- Kavach threshold encryption (BLS key sharding, NFT-gated access)
 - No Lotus node required
+
+Pricing (as of Feb 2026):
+- Free tier: 5 GB
+- Lifetime plans: $20/5GB, $100/25GB, $500/150GB (~$4/GB perpetual)
+- Raw Filecoin deal cost is ~$0.00005/GB but Lighthouse charges $2-5/GB
+  to fund the endowment pool that auto-renews deals in perpetuity.
+
+Note on Python SDK:
+- lighthouseweb3 v0.1.1 (May 2023) only supports upload(). Unmaintained.
+- For encryption/token-gating/deal status, use REST API directly.
+- Migration to Kavach threshold encryption is recommended over local Fernet
+  keys to eliminate the single-point-of-failure in cryostasis key recovery.
 
 References:
 - Docs: https://docs.lighthouse.storage/
 - Python SDK: https://pypi.org/project/lighthouseweb3/
-- GitHub: https://github.com/lighthouse-web3/lighthouse-python-sdk
+- Kavach encryption: https://github.com/lighthouse-web3/encryption-sdk
+- x402 protocol: https://github.com/coinbase/x402
+- Endowment pool: https://www.lighthouse.storage/blogs/Discover%20How%20the%20Endowment%20Pool%20Makes%20Your%20Data%20Immortal
 """
 
 import hashlib
@@ -48,9 +63,13 @@ except ImportError:
 
 
 # Pricing constants (USD)
-LIGHTHOUSE_COST_PER_GB_MONTHLY = Decimal("0.05")  # Our charge to users
-LIGHTHOUSE_FILECOIN_COST_PER_GB = Decimal("0.00005")  # One-time permanent storage
-CRYOSTASIS_BUFFER_USD = Decimal("0.01")  # Safety buffer for cryostasis
+# Lighthouse perpetual storage costs $2-5/GB one-time (funds endowment pool).
+# Raw Filecoin deal cost is ~$0.00005/GB but that doesn't include the
+# endowment buffer that keeps deals renewed forever.
+LIGHTHOUSE_COST_PER_GB_MONTHLY = Decimal("0.05")  # Hot IPFS pinning (monthly)
+LIGHTHOUSE_PERPETUAL_COST_PER_GB = Decimal("4.00")  # One-time perpetual via endowment pool
+LIGHTHOUSE_RAW_FILECOIN_COST_PER_GB = Decimal("0.00005")  # Raw deal cost (no endowment)
+CRYOSTASIS_BUFFER_USD = Decimal("0.50")  # Safety buffer for cryostasis archival
 
 
 class LighthouseProvider(StorageProvider, CryostasisCapable, MultiCurrencyPayment):
@@ -346,7 +365,8 @@ class LighthouseProvider(StorageProvider, CryostasisCapable, MultiCurrencyPaymen
             "total_size_bytes": total_size,
             "total_size_gb": total_size / (1024 * 1024 * 1024),
             "cost_per_gb_monthly": str(LIGHTHOUSE_COST_PER_GB_MONTHLY),
-            "filecoin_cost_per_gb": str(LIGHTHOUSE_FILECOIN_COST_PER_GB),
+            "perpetual_cost_per_gb": str(LIGHTHOUSE_PERPETUAL_COST_PER_GB),
+            "raw_filecoin_cost_per_gb": str(LIGHTHOUSE_RAW_FILECOIN_COST_PER_GB),
         }
 
     async def estimate_cost(self, size_bytes: int) -> Decimal:
@@ -438,7 +458,7 @@ class LighthouseProvider(StorageProvider, CryostasisCapable, MultiCurrencyPaymen
             Cryostasis trigger threshold in USD
         """
         size_gb = Decimal(size_bytes) / Decimal(1024 * 1024 * 1024)
-        filecoin_cost = size_gb * LIGHTHOUSE_FILECOIN_COST_PER_GB
+        filecoin_cost = size_gb * LIGHTHOUSE_PERPETUAL_COST_PER_GB
         return filecoin_cost + CRYOSTASIS_BUFFER_USD
 
     # =========================================================================

@@ -47,7 +47,7 @@ graph TD
 | [DA-04-multi-tenant-cloud.md](DA-04-multi-tenant-cloud.md) | Kestrel PostgreSQL, row-level security | ~8 |
 | [DA-05-ipfs-sovereignty.md](DA-05-ipfs-sovereignty.md) | IPFS sharding, convergent encryption, Merkle forest | ~10 |
 | [DA-06-filecoin-lighthouse.md](DA-06-filecoin-lighthouse.md) | Permanent storage, deal lifecycle, pricing | ~8 |
-| [DA-07-cryostasis.md](DA-07-cryostasis.md) | Agent dormancy, $0.02 trigger, wake-up flow | ~8 |
+| [DA-07-cryostasis.md](DA-07-cryostasis.md) | Agent dormancy, $5.00 trigger, wake-up flow | ~8 |
 | [DA-08-privacy-encryption.md](DA-08-privacy-encryption.md) | Encryption at rest, PII scrubbing, privacy modes | ~6 |
 | [DA-09-browser-mobile.md](DA-09-browser-mobile.md) | Browser IndexedDB, native mobile SQLite, hybrid model | ~10 |
 | [DA-10-sqlite-first-sync.md](DA-10-sqlite-first-sync.md) | SQLite-first architecture with sync layer | ~8 |
@@ -80,7 +80,7 @@ When an agent's wallet balance drops below $0.02 USD:
 3. Agent enters dormancy (no compute costs)
 4. Wakes up when user deposits funds
 
-**Cost**: Decades of storage for pennies (~$0.00005/GB permanent)
+**Cost**: ~$4/GB one-time via Lighthouse perpetual storage (endowment pool auto-renews)
 
 ---
 

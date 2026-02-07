@@ -231,7 +231,7 @@ class ManagedModeContract:
 | Provider | Direct Mode (Referral) | Managed Mode (Margin) |
 |----------|------------------------|------------------------|
 | RunPod H100 | 3-10% of user spend | 20-40% markup |
-| Lighthouse Storage | ~% of first purchase | ~90% ($0.05 vs $0.00005/GB) |
+| Lighthouse Storage | ~% of first purchase | Pass-through ($0.05/GB hot, ~$4/GB perpetual) |
 | OpenAI/Anthropic | None | 20-40% markup |
 | Lambda Labs | Partnership TBD | Enterprise margins |
 
