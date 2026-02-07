@@ -705,7 +705,7 @@ class ContextFeature(Feature):
 
     @tool(
         name="recursive_query",
-        description="Query a subset of context using a cheaper model (RLM-inspired sub-LM call). Use for exploring large context sections without using main model quota.",
+        description="Query a subset of context using a cheaper model (RLM-inspired sub-LM call). Use for exploring large context sections, compressed originals, or excluded messages without using main model quota.",
         category=ToolCategory.MEMORY,
         command_prefix="!context query"
     )
@@ -718,11 +718,11 @@ class ContextFeature(Feature):
         """
         Query context subset using recursive sub-LM call.
 
-        This allows exploring stashed or excluded context using a
+        This allows exploring stashed, excluded, or compressed context using a
         cheaper model, preserving main model quota for important work.
 
         Args:
-            context_source: Source - "stash:name", "excluded", "last_N"
+            context_source: Source - "stash:name", "excluded", "compressed:ID", "summary:ID", "last_N"
             query: Question to ask about the context
             use_cheap_model: Use cheaper model for query (default: True)
         """
@@ -758,6 +758,39 @@ class ContextFeature(Feature):
                 else:
                     return {"success": False, "error": "Conversation store not available"}
 
+            elif context_source.startswith("compressed:") or context_source.startswith("summary:"):
+                # View original messages that were compressed/summarized
+                try:
+                    marker_id = context_source.split(":", 1)[1]
+                    conv_store = self.context_manager._get_conversation_store()
+                    if not conv_store:
+                        return {"success": False, "error": "Conversation store not available"}
+
+                    # Get the compression/summary marker
+                    marker_messages = await conv_store.get_messages_by_ids([int(marker_id)])
+                    if not marker_messages:
+                        return {"success": False, "error": f"Marker message {marker_id} not found"}
+
+                    marker = marker_messages[0]
+                    meta = marker.get("metadata", {})
+                    original_ids = meta.get("original_message_ids", [])
+
+                    if not original_ids:
+                        return {"success": False, "error": f"No original message IDs found in marker {marker_id}"}
+
+                    # Get the original messages
+                    original_messages = await conv_store.get_messages_by_ids(original_ids)
+                    if not original_messages:
+                        return {"success": False, "error": "Original messages not found"}
+
+                    context_text = "\n".join([
+                        f"{m.get('role', 'user').upper()}: {m.get('content', '')}"
+                        for m in original_messages
+                    ])[:10000]
+
+                except (ValueError, IndexError) as e:
+                    return {"success": False, "error": f"Invalid format: {context_source} - {str(e)}"}
+
             elif context_source.startswith("last_"):
                 try:
                     n = int(context_source.split("_")[1])
@@ -774,7 +807,7 @@ class ContextFeature(Feature):
             else:
                 return {
                     "success": False,
-                    "error": f"Invalid source: {context_source}. Use 'stash:name', 'excluded', or 'last_N'"
+                    "error": f"Invalid source: {context_source}. Use 'stash:name', 'excluded', 'compressed:ID', 'summary:ID', or 'last_N'"
                 }
 
             if not context_text:
