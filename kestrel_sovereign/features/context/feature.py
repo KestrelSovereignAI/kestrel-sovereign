@@ -766,8 +766,15 @@ class ContextFeature(Feature):
                     if not conv_store:
                         return {"success": False, "error": "Conversation store not available"}
 
+                    # Try to parse as int, but fall back to string for UUID/string IDs
+                    try:
+                        marker_id_parsed = int(marker_id)
+                    except ValueError:
+                        # Keep as string for UUID or other string-based IDs
+                        marker_id_parsed = marker_id
+
                     # Get the compression/summary marker
-                    marker_messages = await conv_store.get_messages_by_ids([int(marker_id)])
+                    marker_messages = await conv_store.get_messages_by_ids([marker_id_parsed])
                     if not marker_messages:
                         return {"success": False, "error": f"Marker message {marker_id} not found"}
 
@@ -788,7 +795,7 @@ class ContextFeature(Feature):
                         for m in original_messages
                     ])[:10000]
 
-                except (ValueError, IndexError) as e:
+                except (IndexError, KeyError) as e:
                     return {"success": False, "error": f"Invalid format: {context_source} - {str(e)}"}
 
             elif context_source.startswith("last_"):
