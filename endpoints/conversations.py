@@ -1,5 +1,6 @@
 """Conversation and session endpoints."""
 from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import PlainTextResponse
 from datetime import datetime
 import json
 import logging
@@ -371,12 +372,16 @@ async def get_conversation_transcript(request: Request, session_id: str, decrypt
 
         start_time = start_row[0]
 
-        # Get all messages in this session
+        # Get messages starting from session_id
+        # Note: We fetch more than needed and rely on session boundary detection
+        # (time gaps > SESSION_GAP_MINUTES or new_session markers) to stop at the right point
+        # This approach matches the existing /conversations/{session_id} endpoint logic
         rows = await storage.db.fetchall("""
             SELECT id, role, content, metadata, created_at
             FROM conversation_history
             WHERE agent_id = ? AND created_at >= ?
             ORDER BY created_at ASC
+            LIMIT 1000
         """, (agent_id, start_time))
 
         if not rows:
@@ -430,9 +435,8 @@ async def get_conversation_transcript(request: Request, session_id: str, decrypt
             if meta and meta.get('new_session') and message_count > 0:
                 break
 
-            # Check for time gap
+            # Check for time gap (session boundary detection)
             if last_timestamp:
-                from kestrel_sovereign.kestrel_config.constants import SESSION_GAP_MINUTES
                 gap_minutes = (timestamp - last_timestamp).total_seconds() / 60
                 if gap_minutes > SESSION_GAP_MINUTES:
                     break
@@ -446,7 +450,6 @@ async def get_conversation_transcript(request: Request, session_id: str, decrypt
             display_content = content
             is_encrypted = False
             if meta and meta.get('enc') and decrypt:
-                from kestrel_sovereign.storage.encryption import get_agent_fernet, decrypt_string
                 fernet = get_agent_fernet(agent_id) if agent_id else None
                 if fernet:
                     try:
@@ -502,7 +505,6 @@ async def get_conversation_transcript(request: Request, session_id: str, decrypt
         transcript = "\n".join(transcript_lines)
 
         # Return as markdown
-        from fastapi.responses import PlainTextResponse
         return PlainTextResponse(
             content=transcript,
             media_type="text/markdown",

@@ -155,16 +155,21 @@ SUMMARY:"""
 
             # Store the compression in the database
             # Create a summary message that replaces the compressed portion
+            # Note: Transcript reference is in metadata only, not in content (LLM context)
             compression_marker = {
                 "role": "system",
-                "content": f"[COMPRESSED CONTEXT - {len(messages_to_compress)} messages summarized]\n\n{summary_text}\n\n_Full transcript: messages {first_id}-{last_id}_",
+                "content": f"[COMPRESSED CONTEXT - {len(messages_to_compress)} messages summarized]\n\n{summary_text}",
                 "metadata": {
                     "type": "compression",
                     "messages_compressed": len(messages_to_compress),
                     "tokens_before": tokens_before,
                     "tokens_after": tokens_after,
                     "compressed_at": datetime.now(timezone.utc).isoformat(),
-                    "original_message_ids": original_message_ids
+                    "original_message_ids": original_message_ids,
+                    "message_range": {
+                        "first": first_id,
+                        "last": last_id
+                    }
                 }
             }
 
@@ -180,8 +185,14 @@ SUMMARY:"""
 
                 # Get the ID of the compression marker we just created
                 # We need this to populate summarized_into on original messages
-                recent = await conv_store.get_full_history_with_ids()
-                compression_marker_id = recent[-1]["id"] if recent else None
+                # Query for just the last ID instead of full history (performance fix)
+                compression_marker_id = None
+                if hasattr(conv_store, 'db'):
+                    row = await conv_store.db.fetchone(
+                        "SELECT id FROM conversation_history WHERE agent_id = ? ORDER BY id DESC LIMIT 1",
+                        (conv_store.agent_id,)
+                    )
+                    compression_marker_id = row[0] if row else None
 
                 # Mark original messages as excluded and link to compression marker
                 if compression_marker_id and original_message_ids:
@@ -687,6 +698,7 @@ SUMMARY:"""
             last_id = original_message_ids[-1] if original_message_ids else None
 
             # Create summary message with transcript reference
+            # Note: Transcript reference is in metadata only, not in content (LLM context)
             now = datetime.now(timezone.utc).isoformat()
             summary_meta = {
                 "type": "context_summary",
@@ -694,19 +706,29 @@ SUMMARY:"""
                 "original_message_ids": original_message_ids,
                 "tokens_before": tokens_before,
                 "tokens_after": tokens_after,
-                "created_at": now
+                "created_at": now,
+                "message_range": {
+                    "first": first_id,
+                    "last": last_id
+                }
             }
 
             # Add summary to conversation
             await conv_store.add_conversation(
                 role="system",
-                content=f"[SUMMARY of {len(summarizable)} messages]\n\n{summary_text}\n\n_Full transcript: messages {first_id}-{last_id}_",
+                content=f"[SUMMARY of {len(summarizable)} messages]\n\n{summary_text}",
                 metadata=summary_meta
             )
 
             # Get the ID of the summary marker we just created
-            recent = await conv_store.get_full_history_with_ids()
-            summary_marker_id = recent[-1]["id"] if recent else None
+            # Query for just the last ID instead of full history (performance fix)
+            summary_marker_id = None
+            if hasattr(conv_store, 'db'):
+                row = await conv_store.db.fetchone(
+                    "SELECT id FROM conversation_history WHERE agent_id = ? ORDER BY id DESC LIMIT 1",
+                    (conv_store.agent_id,)
+                )
+                summary_marker_id = row[0] if row else None
 
             # Mark original messages as summarized and link to summary marker
             summary_update = {
