@@ -166,16 +166,17 @@ user_archive_{user_id}_{timestamp}.tar.gz  → Lighthouse → Filecoin CID
 └── checksums.sha256        # Integrity verification
 ```
 
-### Cost Model (from DA-07-cryostasis.md)
+### Cost Model (from DA-07-cryostasis.md, updated Feb 2026)
 
-| Storage Size | Duration | Cost |
-|--------------|----------|------|
-| 10 MB | 1 year | $0.00006 |
-| 100 MB | 1 year | $0.0006 |
-| 1 GB | 10 years | $0.06 |
-| 1 GB | 100 years | $0.60 |
+**Lighthouse Perpetual (pay once, stored forever via endowment pool):**
 
-**$0.02 cryostasis trigger**: Enough to archive, not enough to run.
+| Storage Size | Cost (one-time) | Duration |
+|--------------|-----------------|----------|
+| 10 MB | ~$0.04 | Forever |
+| 100 MB | ~$0.40 | Forever |
+| 1 GB | ~$4.00 | Forever |
+
+**$5.00 cryostasis trigger**: Enough for perpetual archival of typical agent state.
 
 ### Archive Manifest Schema
 

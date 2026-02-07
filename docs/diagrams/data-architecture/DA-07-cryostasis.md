@@ -37,23 +37,23 @@ graph TD
 
 ---
 
-## Slide 2: The $0.02 Trigger
+## Slide 2: The Cryostasis Trigger
 
 ```mermaid
 graph TD
     subgraph monitor["Balance Monitor"]
-        BAL["Wallet balance: $0.05"]
+        BAL["Wallet balance: $10"]
         CHECK["Check every hour"]
     end
 
     subgraph threshold["Threshold"]
-        TRIG["Balance < $0.02 USD"]
-        WARN["Warn at $0.10"]
+        TRIG["Balance < $5.00 USD"]
+        WARN["Warn at $10.00"]
     end
 
     subgraph action["Automatic Action"]
         A1["Initiate cryostasis"]
-        A2["Archive to Filecoin"]
+        A2["Archive to Lighthouse perpetual"]
         A3["Enter dormancy"]
     end
 
@@ -63,26 +63,26 @@ graph TD
     style action fill:#512e5f,stroke:#af7ac5
 ```
 
-**$0.02 threshold.** Enough to pay for archival, not enough to run.
+**$5.00 threshold.** Enough to pay for perpetual archival via Lighthouse endowment pool.
 
 ---
 
-## Slide 3: Why $0.02?
+## Slide 3: Why $5.00?
 
 ```mermaid
 graph LR
-    subgraph costs["Cost Breakdown"]
-        ARCHIVE["Archive to Filecoin:<br/>~$0.00005/GB"]
-        DEAL["Deal overhead:<br/>~$0.01"]
-        BUFFER["Safety buffer:<br/>~$0.01"]
+    subgraph costs["Cost Breakdown (Lighthouse Perpetual)"]
+        ARCHIVE["Perpetual storage:<br/>~$4/GB via endowment pool"]
+        BUFFER["Safety buffer:<br/>~$0.50"]
+        OVERHEAD["Transaction overhead:<br/>~$0.50"]
     end
 
     subgraph total["Total"]
-        SUM["$0.02 covers<br/>archival + buffer"]
+        SUM["~$5.00 covers<br/>perpetual archival<br/>for typical agent"]
     end
 
-    subgraph storage["What $0.02 Stores"]
-        YEARS["10 years+<br/>of agent memory"]
+    subgraph storage["What $5.00 Stores"]
+        SIZE["~1 GB perpetually<br/>(typical agent: 10-100 MB)"]
     end
 
     costs --> total --> storage
@@ -91,7 +91,12 @@ graph LR
     style storage fill:#145a32,stroke:#58d68d
 ```
 
-**Pennies for decades.** Filecoin is ridiculously cheap.
+**Dollars, not pennies.** But still one-time for forever.
+
+> **Note:** Raw Filecoin deals cost ~$0.00005/GB, but require manual renewal.
+> Lighthouse perpetual storage costs ~$2-5/GB because it funds an endowment
+> pool that auto-renews deals in perpetuity. For cryostasis (must survive
+> indefinitely), we use the perpetual rate.
 
 ---
 
@@ -170,7 +175,7 @@ graph TD
 
     subgraph cost["Cost"]
         ZERO["$0.00/month<br/>No running costs"]
-        FILECOIN["~$0.00005/GB/month<br/>Already paid"]
+        FILECOIN["~$4/GB one-time<br/>Already paid via endowment"]
     end
 
     dormant --> preserved --> cost
@@ -190,7 +195,7 @@ graph TD
 graph TD
     subgraph trigger["Wake-Up Triggers"]
         DEPOSIT["💵 User deposits funds"]
-        THRESHOLD["Balance ≥ $0.10"]
+        THRESHOLD["Balance ≥ $10.00"]
     end
 
     subgraph restore["Restore Process"]
@@ -226,9 +231,9 @@ sequenceDiagram
     participant L as Lighthouse
     participant A as Agent
 
-    U->>W: Deposit $1.00
+    U->>W: Deposit $20.00
     W->>M: Balance update
-    M->>M: Balance ≥ $0.10?
+    M->>M: Balance ≥ $10.00?
     M->>M: Yes! Initiate wake-up
 
     M->>L: Fetch archived CID
@@ -244,24 +249,40 @@ sequenceDiagram
 
 ## Slide 9: Cost Analysis
 
-| Scenario | Storage | Duration | Cost |
-|----------|---------|----------|------|
-| Small agent | 10 MB | 1 year | $0.00006 |
-| Medium agent | 100 MB | 1 year | $0.0006 |
-| Large agent | 1 GB | 1 year | $0.006 |
-| Large agent | 1 GB | 10 years | $0.06 |
-| Large agent | 1 GB | 100 years | $0.60 |
+**Lighthouse Perpetual (endowment pool - pay once, stored forever):**
+
+| Scenario | Storage | Cost (one-time) | Duration |
+|----------|---------|-----------------|----------|
+| Small agent | 10 MB | ~$0.04 | Forever |
+| Medium agent | 100 MB | ~$0.40 | Forever |
+| Large agent | 1 GB | ~$4.00 | Forever |
+
+**Raw Filecoin deals (manual renewal required):**
+
+| Scenario | Storage | Cost/year | Notes |
+|----------|---------|-----------|-------|
+| Small agent | 10 MB | ~$0.0000005 | Must renew manually |
+| Medium agent | 100 MB | ~$0.000005 | Must renew manually |
+| Large agent | 1 GB | ~$0.00005 | Must renew manually |
 
 ```mermaid
 graph LR
-    DECADE["10 years"] --> COST1["$0.06"]
-    CENTURY["100 years"] --> COST2["$0.60"]
+    subgraph perpetual["Lighthouse Perpetual"]
+        P1["1 GB"] --> P2["$4.00 once"]
+        P2 --> P3["Stored forever"]
+    end
 
-    style DECADE fill:#145a32,stroke:#58d68d
-    style CENTURY fill:#7d6608,stroke:#f4d03f
+    subgraph raw["Raw Filecoin"]
+        R1["1 GB"] --> R2["$0.00005/deal"]
+        R2 --> R3["Must renew every ~1 year"]
+    end
+
+    style perpetual fill:#145a32,stroke:#58d68d
+    style raw fill:#7d6608,stroke:#f4d03f
 ```
 
-**Decades for pennies.** Centuries for dollars.
+**Perpetual costs more upfront but is the only viable option for cryostasis**
+(dormant agents can't renew their own deals).
 
 ---
 
@@ -276,8 +297,8 @@ graph LR
     end
 
     subgraph auto["Automatic"]
-        A1["Auto-archive at $0.02"]
-        A2["Auto-wake at $0.10"]
+        A1["Auto-archive at $5.00"]
+        A2["Auto-wake at $10.00"]
     end
 
     commands --> auto

@@ -208,7 +208,7 @@ graph TD
 | 200 messages | 18.5 KB | Tiny storage footprint |
 | Export time | 0.005s | Near-instant |
 | IPFS cost | $0 | Free hot storage |
-| Filecoin cost | $0.00005/GB | Decades for pennies |
+| Lighthouse perpetual | ~$4/GB one-time | Stored forever via endowment pool |
 | Sync interval | 5 min | Near real-time |
 | Offline capability | ∞ | Works forever offline |
 
@@ -216,7 +216,7 @@ graph TD
 graph LR
     SIZE["18.5 KB<br/>200 messages"] --> CHEAP["Essentially free"]
     SPEED["0.005s<br/>Export time"] --> FAST["Instant backup"]
-    COST["$0.00005/GB<br/>Filecoin"] --> FOREVER["Decades for pennies"]
+    COST["~$4/GB one-time<br/>Lighthouse perpetual"] --> FOREVER["Pay once, stored forever"]
 
     style CHEAP fill:#145a32,stroke:#58d68d
     style FAST fill:#1a5276,stroke:#85c1e9
