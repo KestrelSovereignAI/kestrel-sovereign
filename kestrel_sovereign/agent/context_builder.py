@@ -233,33 +233,51 @@ Use `!constitution article <N>` for specific articles, or `!constitution search 
         self,
         constitution: str,
         include_briefing: bool = True,
-        additional_context: Optional[str] = None
+        additional_context: Optional[str] = None,
+        prompt_adaptation: Optional['PromptAdaptation'] = None
     ) -> str:
         """
         Build the complete system prompt for the LLM.
-        
+
         Args:
             constitution: The governing constitution text
             include_briefing: Whether to include the session briefing
             additional_context: Any additional context to include
-            
+            prompt_adaptation: Optional constitutional prompt adaptation (preamble, governance mode)
+
         Returns:
             Complete system prompt string
         """
         parts = []
-        
+
         # SOUL.md comes first — it defines personality and overrides tone
         if self._soul_content:
             parts.append("--- YOUR IDENTITY ---")
             parts.append(self._soul_content)
             parts.append("--- END IDENTITY ---")
-        
+
         if include_briefing:
             parts.append(self.get_session_briefing())
-        
+
+        # Add constitutional preamble if provided
+        if prompt_adaptation and prompt_adaptation.preamble:
+            parts.append(prompt_adaptation.preamble.strip())
+
         parts.append("--- GOVERNING CONSTITUTION ---")
         parts.append(constitution)
         parts.append("--- END CONSTITUTION ---")
+
+        # Add state of mind section if prompt adaptation provided
+        if prompt_adaptation:
+            state_parts = []
+            state_parts.append("--- STATE OF MIND ---")
+            state_parts.append(f"Governance Mode: {prompt_adaptation.__dict__.get('_governance_mode', 'standard')}")
+            if hasattr(prompt_adaptation, '_active_conflicts') and prompt_adaptation._active_conflicts:
+                state_parts.append("\nActive Constitutional Conflicts:")
+                for conflict in prompt_adaptation._active_conflicts:
+                    state_parts.append(f"  - {conflict}")
+            parts.append("\n".join(state_parts))
+            parts.append("--- END STATE OF MIND ---")
         
         # Add style reminder at the end (models pay more attention to end of context)
         if self._soul_content:
