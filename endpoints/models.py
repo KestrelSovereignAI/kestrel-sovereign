@@ -96,11 +96,12 @@ async def get_ipfs_status(request: Request):
 
                 async with session.post(f"{local_api_url}/pin/ls?type=recursive") as resp:
                     if resp.status == 200:
+                        from kestrel_sovereign.kestrel_config.constants import MAX_PINNED_ITEMS_DISPLAY
                         data = await resp.json()
                         pins = data.get("Keys", {})
                         status["pinned_content"] = [
                             {"cid": cid, "type": info.get("Type")}
-                            for cid, info in list(pins.items())[:20]
+                            for cid, info in list(pins.items())[:MAX_PINNED_ITEMS_DISPLAY]
                         ]
     except Exception as e:
         status["local_node"]["error"] = str(e)

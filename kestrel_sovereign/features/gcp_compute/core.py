@@ -15,7 +15,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from kestrel_sovereign.config import load_config
-from kestrel_sovereign.kestrel_config.constants import HTTP_TIMEOUT_SHORT
+from kestrel_sovereign.kestrel_config.constants import (
+    HTTP_TIMEOUT_SHORT,
+    GCP_OPERATION_POLL_INTERVAL,
+)
 
 from .models import (
     GCPComputeManagerError,
@@ -385,7 +388,7 @@ class GCPComputeEngineManagerCore:
                         )
                     return
 
-                await asyncio.sleep(5)
+                await asyncio.sleep(GCP_OPERATION_POLL_INTERVAL)
 
             raise GCPComputeManagerError(f"Operation {operation_name} timed out")
 

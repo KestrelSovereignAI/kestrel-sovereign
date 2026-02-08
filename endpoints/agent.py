@@ -331,6 +331,7 @@ async def get_context_status(
 
         from kestrel_sovereign.agent.token_counter import get_token_counter
         from kestrel_sovereign.agent.token_budget import RESPONSE_RESERVE
+        from kestrel_sovereign.kestrel_config.constants import MAX_CONVERSATION_HISTORY_LIMIT
 
         # 1. Get CURRENT model (respects mandate/preference system)
         current_model = agent.get_current_model()
@@ -340,7 +341,7 @@ async def get_context_status(
         context_limit = counter.get_context_limit()
 
         # 3. Get conversation history for the specified session and count actual tokens
-        history = await agent.storage.get_conversation_history(limit=10000, session_id=session_id)
+        history = await agent.storage.get_conversation_history(limit=MAX_CONVERSATION_HISTORY_LIMIT, session_id=session_id)
         message_count = len(history)
 
         total_tokens = sum(
