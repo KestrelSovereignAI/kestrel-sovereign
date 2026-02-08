@@ -33,16 +33,6 @@ class ModelMandateMixin:
             "mandates": self.mandate_config.get("mandates", {})
         }
 
-    def set_model_preference(self, model_name: str, provider: Optional[str] = None):
-        """Set the preferred model for this session."""
-        self._mandate_preference = {"model": model_name, "provider": provider}
-
-        if "defaults" not in self.mandate_config:
-            self.mandate_config["defaults"] = {}
-        self.mandate_config["defaults"]["preferred"] = model_name
-
-        logger.info(f"Model preference set to: {model_name}" +
-                    (f" (provider: {provider})" if provider else ""))
 
     def add_fallback_model(self, model_name: str, provider: Optional[str] = None):
         """Add a model to the fallback list."""
