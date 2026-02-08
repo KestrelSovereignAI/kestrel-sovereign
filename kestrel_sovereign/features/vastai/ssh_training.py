@@ -115,6 +115,8 @@ class VastAISSHTrainingMixin:
         Returns:
             Job ID (companion_id used as job ID)
         """
+        from kestrel_sovereign.kestrel_config.constants import DEFAULT_TRAINING_BATCH_SIZE
+
         job_id = companion_id
 
         # Create training data directory structure
@@ -137,7 +139,7 @@ keep_tokens = 1
 
 [[datasets]]
 resolution = 1024
-batch_size = 1
+batch_size = {DEFAULT_TRAINING_BATCH_SIZE}
 
 [[datasets.subsets]]
 image_dir = '/workspace/training_data/{job_id}'

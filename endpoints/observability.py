@@ -100,12 +100,13 @@ async def get_observability_summary(
 
     try:
         from datetime import timedelta
+        from kestrel_sovereign.kestrel_config.constants import DEFAULT_OBSERVABILITY_LIMIT
         since = datetime.utcnow() - timedelta(minutes=minutes)
 
         # Query recent events
         events = await obs_store.query_events(
             since=since,
-            limit=1000,
+            limit=DEFAULT_OBSERVABILITY_LIMIT,
         )
 
         # Count by event type

@@ -32,6 +32,8 @@ from typing import Dict, List, Optional
 
 import httpx
 
+from kestrel_sovereign.kestrel_config.constants import REPLICATE_POLL_INTERVAL_SECONDS
+
 from ..types import (
     TrainingJob,
     TrainingStatus,
@@ -218,7 +220,7 @@ class ReplicateTrainingAdapter:
                 elif training.status == "canceled":
                     raise RuntimeError("Training was canceled")
 
-                await asyncio.sleep(30)
+                await asyncio.sleep(REPLICATE_POLL_INTERVAL_SECONDS)
 
             # Step 5: Get trained model version
             model_version = training.output.get("version") if training.output else None
