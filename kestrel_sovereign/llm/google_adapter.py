@@ -312,6 +312,7 @@ class GoogleAdapter(LLMAdapter):
                     display_name=display_name,
                     category=category,
                     description=description,
+                    context_limit=getattr(model, 'input_token_limit', None),
                     supports_vision=supports_vision,
                     supports_tools="gemini" in lower_id,  # Only Gemini models support tools
                     supports_streaming=True,
