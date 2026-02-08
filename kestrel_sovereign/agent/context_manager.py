@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     from kestrel_sovereign.storage import AsyncStorage
     from kestrel_sovereign.storage.memory_consolidator import MemoryConsolidator
     from kestrel_sovereign.storage.memory_retriever import MemoryRetriever
+    from kestrel_sovereign.llm.service import LLMService
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +77,7 @@ class ContextManager:
         agent_id: Optional[str] = None,
         consolidator: Optional["MemoryConsolidator"] = None,
         memory_retriever: Optional["MemoryRetriever"] = None,
+        llm_service: Optional["LLMService"] = None,
     ):
         """
         Initialize the context manager.
@@ -86,12 +88,14 @@ class ContextManager:
             agent_id: Agent ID for scoped queries
             consolidator: MemoryConsolidator for episode access
             memory_retriever: MemoryRetriever for emotional memory access
+            llm_service: Optional LLM service for constitutional awareness
         """
         self.storage = storage
         self.model = model
         self.agent_id = agent_id
         self.consolidator = consolidator
         self.memory_retriever = memory_retriever
+        self.llm_service = llm_service
 
         # Initialize sub-components
         self.counter = get_token_counter(model)
@@ -163,10 +167,22 @@ class ContextManager:
         # Create adaptive budget
         budget = create_budget(self.model, message_count, adaptive=True)
 
+        # Get constitutional awareness (state of mind includes prompt adaptation)
+        prompt_adaptation = None
+        state_of_mind = None
+        if self.llm_service and hasattr(self.llm_service, 'get_state_of_mind'):
+            try:
+                state_of_mind = self.llm_service.get_state_of_mind()
+                prompt_adaptation = state_of_mind.prompt_adaptation
+            except Exception as e:
+                logger.warning(f"Failed to get constitutional state of mind: {e}")
+
         # 1. Build system prompt
         system_prompt = self.context_builder.build_system_prompt(
             constitution=constitution,
-            include_briefing=include_briefing
+            include_briefing=include_briefing,
+            prompt_adaptation=prompt_adaptation,
+            state_of_mind=state_of_mind
         )
         system_tokens = self.counter.count(system_prompt)
         budget.use("system", system_tokens)
@@ -273,9 +289,21 @@ class ContextManager:
         In EPHEMERAL mode, no history or memories are retrieved.
         Only the system prompt and constitution are included.
         """
+        # Get constitutional awareness (state of mind includes prompt adaptation)
+        prompt_adaptation = None
+        state_of_mind = None
+        if self.llm_service and hasattr(self.llm_service, 'get_state_of_mind'):
+            try:
+                state_of_mind = self.llm_service.get_state_of_mind()
+                prompt_adaptation = state_of_mind.prompt_adaptation
+            except Exception as e:
+                logger.warning(f"Failed to get constitutional state of mind: {e}")
+
         system_prompt = self.context_builder.build_system_prompt(
             constitution=constitution,
-            include_briefing=include_briefing
+            include_briefing=include_briefing,
+            prompt_adaptation=prompt_adaptation,
+            state_of_mind=state_of_mind
         )
 
         # Add ephemeral mode notice
