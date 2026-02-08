@@ -49,6 +49,7 @@ from kestrel_sovereign.storage.providers.base import (
     StorageTier,
 )
 from kestrel_sovereign.kestrel_config.constants import HTTP_TIMEOUT_MEDIUM
+from kestrel_sovereign.kestrel_config.defaults import get_lighthouse_gateway_url
 
 logger = logging.getLogger(__name__)
 
@@ -275,7 +276,7 @@ class LighthouseProvider(StorageProvider, CryostasisCapable, MultiCurrencyPaymen
             # Download from Lighthouse IPFS gateway
             logger.info(f"📡 Downloading from Lighthouse: {cid}")
             import requests
-            gateway_url = f"https://gateway.lighthouse.storage/ipfs/{cid}"
+            gateway_url = f"{get_lighthouse_gateway_url()}/{cid}"
             response = requests.get(gateway_url, timeout=HTTP_TIMEOUT_MEDIUM)
             response.raise_for_status()
             content = response.content

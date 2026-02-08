@@ -31,6 +31,7 @@ from kestrel_sovereign.kestrel_config.constants import (
     HTTP_TIMEOUT_DOWNLOAD,
     HTTP_TIMEOUT_MODEL_PULL,
 )
+from kestrel_sovereign.kestrel_config.defaults import get_lighthouse_gateway_url
 
 logging.basicConfig(
     level=logging.INFO,
@@ -1702,7 +1703,7 @@ class BaseSimpleTunerAPI:
             num_inference_steps: int = Form(28),
             guidance_scale: float = Form(4.0),
             lora_ipfs_cid: Optional[str] = Form(None),
-            ipfs_gateway: str = Form("https://gateway.lighthouse.storage/ipfs"),
+            ipfs_gateway: Optional[str] = Form(None),
         ):
             """Start async image generation."""
             job_id = str(uuid.uuid4())
@@ -1723,6 +1724,9 @@ class BaseSimpleTunerAPI:
                 try:
                     self._generation_jobs[job_id]["status"] = "loading_model"
 
+                    # Use canonical gateway URL if not provided
+                    gateway_url = ipfs_gateway or get_lighthouse_gateway_url()
+
                     # Resolve LoRA path - IPFS takes priority
                     if lora_ipfs_cid:
                         # Download from IPFS gateway
@@ -1731,7 +1735,7 @@ class BaseSimpleTunerAPI:
                         os.makedirs(local_lora_dir, exist_ok=True)
                         local_lora_file = f"{local_lora_dir}/pytorch_lora_weights.safetensors"
 
-                        ipfs_url = f"{ipfs_gateway}/{lora_ipfs_cid}"
+                        ipfs_url = f"{gateway_url}/{lora_ipfs_cid}"
                         logger.info(f"Downloading LoRA from IPFS: {ipfs_url}")
 
                         response = req_lib.get(ipfs_url, timeout=HTTP_TIMEOUT_DOWNLOAD, stream=True)
@@ -1980,8 +1984,8 @@ def run_main(api_class, description: str):
     parser.add_argument(
         "--ipfs-gateway",
         type=str,
-        default="https://gateway.lighthouse.storage/ipfs",
-        help="IPFS gateway URL (default: https://gateway.lighthouse.storage/ipfs)"
+        default=None,
+        help=f"IPFS gateway URL (default: {get_lighthouse_gateway_url()})"
     )
     parser.add_argument(
         "--prompt",

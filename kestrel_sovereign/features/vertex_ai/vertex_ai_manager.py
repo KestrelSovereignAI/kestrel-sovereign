@@ -49,6 +49,7 @@ from kestrel_sovereign.kestrel_config.constants import (
     HTTP_TIMEOUT_DOWNLOAD,
     POLL_INTERVAL_DEFAULT,
 )
+from kestrel_sovereign.kestrel_config.defaults import get_lighthouse_gateway_url
 
 logger = logging.getLogger(__name__)
 
@@ -447,7 +448,7 @@ class VertexAIManager:
         output_gcs_prefix: str,
         lora_gcs_path: Optional[str] = None,
         lora_ipfs_cid: Optional[str] = None,
-        ipfs_gateway: str = "https://gateway.lighthouse.storage/ipfs",
+        ipfs_gateway: Optional[str] = None,
         num_outputs: int = 1,
         width: int = 1024,
         height: int = 1024,
