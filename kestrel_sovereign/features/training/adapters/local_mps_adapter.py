@@ -212,6 +212,8 @@ class LocalMPSTrainingAdapter(TrainingProvider):
             # Build training command using diffusers script
             training_script = self.diffusers_path / "examples/text_to_image/train_text_to_image_lora_sdxl.py"
 
+            from kestrel_sovereign.kestrel_config.constants import DEFAULT_TRAINING_BATCH_SIZE
+
             cmd = [
                 str(self.diffusers_path / ".venv/bin/python3"),
                 str(training_script),
@@ -219,7 +221,7 @@ class LocalMPSTrainingAdapter(TrainingProvider):
                 f"--train_data_dir={dataset_dir}",
                 "--caption_column=text",
                 f"--resolution={resolution}",
-                "--train_batch_size=1",
+                f"--train_batch_size={DEFAULT_TRAINING_BATCH_SIZE}",
                 "--num_train_epochs=1",
                 f"--max_train_steps={steps}",
                 "--gradient_checkpointing",
