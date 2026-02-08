@@ -148,8 +148,14 @@ SUMMARY:"""
             tokens_after = counter.count(summary_text)
             tokens_saved = tokens_before - tokens_after
 
+            # Collect original message IDs for transcript reference
+            original_message_ids = [m.get("id") for m in messages_to_compress if m.get("id")]
+            first_id = original_message_ids[0] if original_message_ids else None
+            last_id = original_message_ids[-1] if original_message_ids else None
+
             # Store the compression in the database
             # Create a summary message that replaces the compressed portion
+            # Note: Transcript reference is in metadata only, not in content (LLM context)
             compression_marker = {
                 "role": "system",
                 "content": f"[COMPRESSED CONTEXT - {len(messages_to_compress)} messages summarized]\n\n{summary_text}",
@@ -158,17 +164,49 @@ SUMMARY:"""
                     "messages_compressed": len(messages_to_compress),
                     "tokens_before": tokens_before,
                     "tokens_after": tokens_after,
-                    "compressed_at": datetime.now(timezone.utc).isoformat()
+                    "compressed_at": datetime.now(timezone.utc).isoformat(),
+                    "original_message_ids": original_message_ids,
+                    "message_range": {
+                        "first": first_id,
+                        "last": last_id
+                    }
                 }
             }
 
             # Store the compression result
-            # Note: This creates a new conversation flow starting with the summary
-            if hasattr(self.storage, 'compress_conversation_history'):
-                await self.storage.compress_conversation_history(
-                    summary_message=compression_marker,
-                    preserve_from_id=messages_to_preserve[0].get("id") if messages_to_preserve else None
+            # Add the compression marker to conversation
+            conv_store = self._get_conversation_store()
+            if conv_store:
+                await conv_store.add_conversation(
+                    role="system",
+                    content=compression_marker["content"],
+                    metadata=compression_marker["metadata"]
                 )
+
+                # Get the ID of the compression marker we just created
+                # We need this to populate summarized_into on original messages
+                # Query for just the last ID instead of full history (performance fix)
+                compression_marker_id = None
+                if hasattr(conv_store, 'db'):
+                    row = await conv_store.db.fetchone(
+                        "SELECT id FROM conversation_history WHERE agent_id = ? ORDER BY id DESC LIMIT 1",
+                        (conv_store.agent_id,)
+                    )
+                    compression_marker_id = row[0] if row else None
+
+                # Mark original messages as excluded and link to compression marker
+                if compression_marker_id and original_message_ids:
+                    now = datetime.now(timezone.utc).isoformat()
+                    exclusion_metadata = {
+                        "excluded_from_context": True,
+                        "excluded_at": now,
+                        "excluded_reason": "Replaced by compression",
+                        "summarized_into": str(compression_marker_id)
+                    }
+                    await conv_store.update_messages_metadata(
+                        original_message_ids,
+                        exclusion_metadata
+                    )
 
             logger.info(
                 f"Session compressed: {len(messages_to_compress)} messages → summary, "
@@ -654,14 +692,25 @@ SUMMARY:"""
             summary_text = summary_response.strip() if isinstance(summary_response, str) else str(summary_response)
             tokens_after = counter.count(summary_text)
 
-            # Create summary message
+            # Collect original message IDs for transcript reference
+            original_message_ids = [m["id"] for m in summarizable]
+            first_id = original_message_ids[0] if original_message_ids else None
+            last_id = original_message_ids[-1] if original_message_ids else None
+
+            # Create summary message with transcript reference
+            # Note: Transcript reference is in metadata only, not in content (LLM context)
             now = datetime.now(timezone.utc).isoformat()
             summary_meta = {
                 "type": "context_summary",
-                "summarized_message_ids": [m["id"] for m in summarizable],
+                "summarized_message_ids": original_message_ids,
+                "original_message_ids": original_message_ids,
                 "tokens_before": tokens_before,
                 "tokens_after": tokens_after,
-                "created_at": now
+                "created_at": now,
+                "message_range": {
+                    "first": first_id,
+                    "last": last_id
+                }
             }
 
             # Add summary to conversation
@@ -671,15 +720,26 @@ SUMMARY:"""
                 metadata=summary_meta
             )
 
-            # Mark original messages as summarized
+            # Get the ID of the summary marker we just created
+            # Query for just the last ID instead of full history (performance fix)
+            summary_marker_id = None
+            if hasattr(conv_store, 'db'):
+                row = await conv_store.db.fetchone(
+                    "SELECT id FROM conversation_history WHERE agent_id = ? ORDER BY id DESC LIMIT 1",
+                    (conv_store.agent_id,)
+                )
+                summary_marker_id = row[0] if row else None
+
+            # Mark original messages as summarized and link to summary marker
             summary_update = {
                 "summarized": True,
                 "excluded_from_context": True,
                 "excluded_at": now,
-                "excluded_reason": "Replaced by summary"
+                "excluded_reason": "Replaced by summary",
+                "summarized_into": str(summary_marker_id) if summary_marker_id else None
             }
             await conv_store.update_messages_metadata(
-                [m["id"] for m in summarizable],
+                original_message_ids,
                 summary_update
             )
 
