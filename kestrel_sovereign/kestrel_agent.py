@@ -342,6 +342,7 @@ class KestrelAgent(ConstitutionMixin, StreamingMixin, BackupMixin, SleepMixin):
                 agent_id=self.agent_id,
                 consolidator=self.memory_consolidator,
                 memory_retriever=self.memory_system.retriever,
+                llm_service=self.llm_service,
             )
 
             # Initialize bootstrap service for first-time agent wake-up
