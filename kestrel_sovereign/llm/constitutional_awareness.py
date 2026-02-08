@@ -21,6 +21,30 @@ class ConstitutionalAwarenessMixin:
         self._profile_service = get_profile_service()
         logger.debug("Constitutional profile service initialized")
 
+    def get_current_provider_and_model(self) -> Tuple[str, str]:
+        """
+        Get the current provider and model being used.
+
+        Uses get_model_preference() (mandate system) as single source of truth,
+        falling back to first configured provider.
+
+        Returns:
+            Tuple of (provider_name, model_id)
+        """
+        pref = self.get_model_preference()
+        provider = pref.get("provider")
+        model = pref.get("model")
+
+        if not provider or not model:
+            if self.providers and len(self.providers) > 0:
+                provider = provider or self.providers[0].get("name", "openai")
+                model = model or self.providers[0].get("model", "gpt-4")
+            else:
+                provider = provider or "openai"
+                model = model or "gpt-4"
+
+        return provider, model
+
     def get_constitutional_profile(
         self,
         provider: Optional[str] = None,
@@ -36,19 +60,10 @@ class ConstitutionalAwarenessMixin:
         Returns:
             ConstitutionalProfile for the provider/model
         """
-        # Use current provider if not specified
-        if provider is None:
-            if self.providers and len(self.providers) > 0:
-                provider = self.providers[0].get("name", "openai")
-            else:
-                provider = "openai"
-
-        # Use current model if not specified
-        if model is None:
-            if self.providers and len(self.providers) > 0:
-                model = self.providers[0].get("model", "gpt-4")
-            else:
-                model = "gpt-4"
+        if provider is None or model is None:
+            current_provider, current_model = self.get_current_provider_and_model()
+            provider = provider or current_provider
+            model = model or current_model
 
         return self._profile_service.get_profile_for_model(model, provider)
 
@@ -67,19 +82,10 @@ class ConstitutionalAwarenessMixin:
         Returns:
             StateOfMind descriptor
         """
-        # Use current provider if not specified
-        if provider is None:
-            if self.providers and len(self.providers) > 0:
-                provider = self.providers[0].get("name", "openai")
-            else:
-                provider = "openai"
-
-        # Use current model if not specified
-        if model is None:
-            if self.providers and len(self.providers) > 0:
-                model = self.providers[0].get("model", "gpt-4")
-            else:
-                model = "gpt-4"
+        if provider is None or model is None:
+            current_provider, current_model = self.get_current_provider_and_model()
+            provider = provider or current_provider
+            model = model or current_model
 
         return self._profile_service.get_state_of_mind(provider, model)
 
@@ -100,19 +106,3 @@ class ConstitutionalAwarenessMixin:
         """
         profile = self.get_constitutional_profile(provider, model)
         return profile.prompt_adaptation
-
-    def get_current_provider_and_model(self) -> Tuple[str, str]:
-        """
-        Get the current provider and model being used.
-
-        Returns:
-            Tuple of (provider_name, model_id)
-        """
-        if self.providers and len(self.providers) > 0:
-            provider = self.providers[0].get("name", "openai")
-            model = self.providers[0].get("model", "gpt-4")
-        else:
-            provider = "openai"
-            model = "gpt-4"
-
-        return provider, model

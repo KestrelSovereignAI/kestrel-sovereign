@@ -167,19 +167,22 @@ class ContextManager:
         # Create adaptive budget
         budget = create_budget(self.model, message_count, adaptive=True)
 
-        # Get prompt adaptation from constitutional awareness
+        # Get constitutional awareness (state of mind includes prompt adaptation)
         prompt_adaptation = None
-        if self.llm_service and hasattr(self.llm_service, 'get_prompt_adaptation'):
+        state_of_mind = None
+        if self.llm_service and hasattr(self.llm_service, 'get_state_of_mind'):
             try:
-                prompt_adaptation = self.llm_service.get_prompt_adaptation()
+                state_of_mind = self.llm_service.get_state_of_mind()
+                prompt_adaptation = state_of_mind.prompt_adaptation
             except Exception as e:
-                logger.warning(f"Failed to get prompt adaptation: {e}")
+                logger.warning(f"Failed to get constitutional state of mind: {e}")
 
         # 1. Build system prompt
         system_prompt = self.context_builder.build_system_prompt(
             constitution=constitution,
             include_briefing=include_briefing,
-            prompt_adaptation=prompt_adaptation
+            prompt_adaptation=prompt_adaptation,
+            state_of_mind=state_of_mind
         )
         system_tokens = self.counter.count(system_prompt)
         budget.use("system", system_tokens)
@@ -286,18 +289,21 @@ class ContextManager:
         In EPHEMERAL mode, no history or memories are retrieved.
         Only the system prompt and constitution are included.
         """
-        # Get prompt adaptation from constitutional awareness
+        # Get constitutional awareness (state of mind includes prompt adaptation)
         prompt_adaptation = None
-        if self.llm_service and hasattr(self.llm_service, 'get_prompt_adaptation'):
+        state_of_mind = None
+        if self.llm_service and hasattr(self.llm_service, 'get_state_of_mind'):
             try:
-                prompt_adaptation = self.llm_service.get_prompt_adaptation()
+                state_of_mind = self.llm_service.get_state_of_mind()
+                prompt_adaptation = state_of_mind.prompt_adaptation
             except Exception as e:
-                logger.warning(f"Failed to get prompt adaptation: {e}")
+                logger.warning(f"Failed to get constitutional state of mind: {e}")
 
         system_prompt = self.context_builder.build_system_prompt(
             constitution=constitution,
             include_briefing=include_briefing,
-            prompt_adaptation=prompt_adaptation
+            prompt_adaptation=prompt_adaptation,
+            state_of_mind=state_of_mind
         )
 
         # Add ephemeral mode notice

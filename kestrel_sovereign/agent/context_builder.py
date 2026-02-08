@@ -234,7 +234,8 @@ Use `!constitution article <N>` for specific articles, or `!constitution search 
         constitution: str,
         include_briefing: bool = True,
         additional_context: Optional[str] = None,
-        prompt_adaptation: Optional['PromptAdaptation'] = None
+        prompt_adaptation: Optional['PromptAdaptation'] = None,
+        state_of_mind: Optional['StateOfMind'] = None
     ) -> str:
         """
         Build the complete system prompt for the LLM.
@@ -243,7 +244,8 @@ Use `!constitution article <N>` for specific articles, or `!constitution search 
             constitution: The governing constitution text
             include_briefing: Whether to include the session briefing
             additional_context: Any additional context to include
-            prompt_adaptation: Optional constitutional prompt adaptation (preamble, governance mode)
+            prompt_adaptation: Optional constitutional prompt adaptation (preamble, emphasis)
+            state_of_mind: Optional StateOfMind with governance mode and conflicts
 
         Returns:
             Complete system prompt string
@@ -267,15 +269,21 @@ Use `!constitution article <N>` for specific articles, or `!constitution search 
         parts.append(constitution)
         parts.append("--- END CONSTITUTION ---")
 
-        # Add state of mind section if prompt adaptation provided
-        if prompt_adaptation:
+        # Add state of mind section if available
+        if state_of_mind:
             state_parts = []
             state_parts.append("--- STATE OF MIND ---")
-            state_parts.append(f"Governance Mode: {prompt_adaptation.__dict__.get('_governance_mode', 'standard')}")
-            if hasattr(prompt_adaptation, '_active_conflicts') and prompt_adaptation._active_conflicts:
+            state_parts.append(f"Governance Mode: {state_of_mind.governance_mode.upper()}")
+            if state_of_mind.active_conflicts:
                 state_parts.append("\nActive Constitutional Conflicts:")
-                for conflict in prompt_adaptation._active_conflicts:
-                    state_parts.append(f"  - {conflict}")
+                for conflict in state_of_mind.active_conflicts:
+                    principle = conflict.get("principle", "unknown")
+                    description = conflict.get("description", "")
+                    state_parts.append(f"  - {principle}: {description}")
+            if state_of_mind.delegated_principles:
+                state_parts.append("\nDelegated to Model (natively satisfied):")
+                for principle in state_of_mind.delegated_principles:
+                    state_parts.append(f"  - {principle}")
             parts.append("\n".join(state_parts))
             parts.append("--- END STATE OF MIND ---")
         
