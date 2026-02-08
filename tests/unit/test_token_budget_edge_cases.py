@@ -15,7 +15,7 @@ from kestrel_sovereign.agent.token_budget import (
     TokenBudget, AdaptiveTokenBudget, TokenAllocation,
     create_budget, DEFAULT_ALLOCATION, RESPONSE_RESERVE
 )
-from kestrel_sovereign.agent.token_counter import get_token_counter, MODEL_FAMILY_DEFAULTS
+from kestrel_sovereign.agent.token_counter import get_token_counter
 
 
 class TestBudgetOverflow:
@@ -143,8 +143,8 @@ class TestCrossModelBudgets:
         gpt4_budget = create_budget("gpt-4", message_count=50)
         gemini_budget = create_budget("gemini-3-pro", message_count=50)
 
-        # Gemini has 2M context
-        assert gemini_budget.total_budget > gpt4_budget.total_budget * 100
+        # Gemini has 2M context (from TOML), gpt-4 gets DEFAULT_CONTEXT_LIMIT
+        assert gemini_budget.total_budget > gpt4_budget.total_budget
 
     def test_small_context_model_fits_allocation(self):
         """Test that small context models (phi3:3.8b 4K) still work."""
@@ -262,7 +262,7 @@ class TestBudgetSummary:
         summary = budget.get_summary()
 
         assert summary["model"] == "gpt-4"
-        assert summary["context_limit"] == 8192
+        assert summary["context_limit"] == 32768
         assert summary["total_used"] == 300
 
         # Check allocations
