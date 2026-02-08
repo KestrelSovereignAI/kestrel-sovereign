@@ -6,12 +6,14 @@ with fallback estimation for Ollama and other models.
 
 Context limits are sourced from (in priority order):
 1. Discovered limits (from API discovery at runtime)
-2. ModelCatalogService (model_catalog.toml overrides)
-3. Family pattern defaults (prefix-based)
+2. Cached limits (persisted from previous discovery runs)
+3. ModelCatalogService (model_catalog.toml overrides)
 4. DEFAULT_CONTEXT_LIMIT fallback
 """
 
+import json
 import logging
+from pathlib import Path
 from typing import Optional, List, Dict, Any
 
 logger = logging.getLogger(__name__)
@@ -43,11 +45,45 @@ except ImportError:
 # --- Discovered limits registry (populated by model_discovery at runtime) ---
 _discovered_context_limits: Dict[str, int] = {}
 
+# --- Persistent cache of discovered limits ---
+CACHE_FILE = Path.home() / ".kestrel" / "discovered_context_limits.json"
+_cached_limits: Optional[Dict[str, int]] = None  # None = not loaded yet
+
+
+def _load_cached_limits() -> Dict[str, int]:
+    """Load cached context limits from disk. Lazy, one-time read."""
+    global _cached_limits
+    if _cached_limits is not None:
+        return _cached_limits
+    _cached_limits = {}
+    try:
+        if CACHE_FILE.exists():
+            _cached_limits = json.loads(CACHE_FILE.read_text())
+            logger.info(f"Loaded {len(_cached_limits)} cached context limits from {CACHE_FILE}")
+    except Exception as e:
+        logger.warning(f"Failed to load cached context limits: {e}")
+    return _cached_limits
+
+
+def _persist_cache() -> None:
+    """Write discovered limits to disk for cold starts."""
+    try:
+        CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        # Merge with existing cache (preserve entries from providers not discovered this run)
+        existing = _load_cached_limits()
+        merged = {**existing, **_discovered_context_limits}
+        CACHE_FILE.write_text(json.dumps(merged, indent=2, sort_keys=True))
+        logger.debug(f"Persisted {len(merged)} context limits to {CACHE_FILE}")
+    except Exception as e:
+        logger.warning(f"Failed to persist context limits cache: {e}")
+
+
 def register_discovered_limits(models: list) -> None:
-    """Register context limits from discovered models.
+    """Register context limits from discovered models and persist to cache.
 
     Called by model_discovery after API discovery completes.
-    Models with a non-None context_limit populate this registry.
+    Models with a non-None context_limit populate the in-memory registry
+    and are written to ~/.kestrel/discovered_context_limits.json.
     """
     for model in models:
         ctx = getattr(model, 'context_limit', None)
@@ -55,31 +91,8 @@ def register_discovered_limits(models: list) -> None:
             _discovered_context_limits[model.id] = ctx
     if _discovered_context_limits:
         logger.info(f"Registered {len(_discovered_context_limits)} discovered context limits")
+        _persist_cache()
 
-
-# Family-based pattern defaults (more specific prefixes first)
-MODEL_FAMILY_DEFAULTS = [
-    ("claude-opus-4-5", 1000000),
-    ("claude-", 200000),
-    ("gpt-5.1", 256000),
-    ("gpt-4o", 128000),
-    ("gpt-4-turbo", 128000),
-    ("gpt-5", 128000),
-    ("gpt-4", 8192),
-    ("gpt-3.5", 16385),
-    ("gemini-3", 2000000),
-    ("gemini-2.5", 1000000),
-    ("gemini-2", 1000000),
-    ("gemini-", 1000000),
-    ("llama", 128000),
-    ("qwen", 32768),
-    ("mistral", 32768),
-    ("mixtral", 32768),
-    ("deepseek", 128000),
-    ("phi", 16384),
-    ("grok", 128000),
-    ("gpt-oss", 32768),
-]
 
 DEFAULT_CONTEXT_LIMIT = 32768
 
@@ -176,30 +189,28 @@ class TokenCounter:
         Get the context window limit for the current model.
 
         Sources (in order of priority):
-        1. Discovered limits (from API discovery at runtime)
-        2. ModelCatalogService (model_catalog.toml overrides)
-        3. Family pattern defaults (prefix-based)
+        1. Discovered limits (from API discovery this session)
+        2. Cached limits (from previous discovery runs on disk)
+        3. ModelCatalogService (model_catalog.toml overrides)
         4. DEFAULT_CONTEXT_LIMIT fallback
 
         Returns:
             Maximum tokens allowed in context
         """
-        # 1. Discovered limits (populated by API discovery)
+        # 1. Discovered limits (populated by API discovery this session)
         if self.model in _discovered_context_limits:
             return _discovered_context_limits[self.model]
 
-        # 2. Catalog TOML overrides
+        # 2. Cached limits (from previous discovery runs)
+        cached = _load_cached_limits()
+        if self.model in cached:
+            return cached[self.model]
+
+        # 3. Catalog TOML overrides
         catalog = _get_catalog_service()
         if catalog is not None:
             limit = catalog.get_context_limit(self.model)
             if limit is not None:
-                return limit
-
-        # 3. Family pattern defaults (prefix match)
-        model_lower = self.model.lower()
-        base_model = self.model.split(":")[0].lower()
-        for prefix, limit in MODEL_FAMILY_DEFAULTS:
-            if model_lower.startswith(prefix) or base_model.startswith(prefix) or prefix in model_lower:
                 return limit
 
         logger.warning(f"Unknown model {self.model}, using default context limit {DEFAULT_CONTEXT_LIMIT}")

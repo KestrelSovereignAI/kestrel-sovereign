@@ -90,15 +90,14 @@ openai = ["whisper-1", "tts-1", "tts-1-hd"]
 openai = ["babbage-002", "davinci-002"]
 
 # Context window overrides (tokens) - Used by token budget allocation
-# Only list models whose limits DIFFER from family defaults in token_counter.py.
-# Most models are covered by family patterns (claude-* -> 200K, gemini-* -> 1M, etc.)
-# and by API discovery (Google, Vertex AI, OpenRouter return limits automatically).
+# Most limits come from API discovery (cached to ~/.kestrel/discovered_context_limits.json).
+# Only list models here when the API doesn't report limits or reports wrong values.
 [context_limits]
-"gpt-4-32k" = 32768          # gpt-4 family default is 8192
-"gpt-5-nano" = 32000         # gpt-5 family default is 128000
-"claude-opus-4-5-20251101" = 1000000  # claude- family default is 200000
-"gemini-3-pro" = 2000000     # gemini- family default is 1000000
-"phi3:3.8b" = 4096           # phi family default is 16384
-"gemma2:9b" = 8192           # no family match, explicit override
-"qwen2.5:14b" = 128000       # qwen family default is 32768
-"meta-llama/Llama-3.1-8B-Instruct" = 128000  # slash in name, won't match llama prefix
+"gpt-4-32k" = 32768
+"gpt-5-nano" = 32000
+"claude-opus-4-5-20251101" = 1000000
+"gemini-3-pro" = 2000000
+"phi3:3.8b" = 4096
+"gemma2:9b" = 8192
+"qwen2.5:14b" = 128000
+"meta-llama/Llama-3.1-8B-Instruct" = 128000
