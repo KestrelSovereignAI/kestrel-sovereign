@@ -45,6 +45,7 @@ from kestrel_sovereign.kestrel_config.constants import (
     TRAINING_GENERATION_TIMEOUT,
     TRAINING_POLL_INTERVAL_FAST,
 )
+from kestrel_sovereign.kestrel_config.defaults import get_lighthouse_gateway_url
 
 logger = logging.getLogger(__name__)
 
@@ -455,7 +456,7 @@ class RunPodTrainingAdapter:
         config: GenerationConfig,
         session=None,
         lora_ipfs_cid: Optional[str] = None,
-        ipfs_gateway: str = "https://gateway.lighthouse.storage/ipfs",
+        ipfs_gateway: Optional[str] = None,
         flux_version: Optional[str] = None,  # Reserved for future container selection
     ) -> GenerationResult:
         """
@@ -510,6 +511,9 @@ class RunPodTrainingAdapter:
             base_url = session.backend_base_url.rstrip("/")
             logger.info(f"Using RunPod backend: {base_url}")
 
+            # Use canonical gateway URL if not provided
+            gateway_url = ipfs_gateway or get_lighthouse_gateway_url()
+
             # Step 1: Start async generation
             async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_DEFAULT) as client:
                 form_data = {
@@ -526,7 +530,7 @@ class RunPodTrainingAdapter:
                 # Add IPFS parameters if CID provided
                 if lora_ipfs_cid:
                     form_data["lora_ipfs_cid"] = lora_ipfs_cid
-                    form_data["ipfs_gateway"] = ipfs_gateway
+                    form_data["ipfs_gateway"] = gateway_url
 
                 logger.info(f"Starting async generation: {config.prompt[:50]}...")
                 response = await client.post(
@@ -700,7 +704,7 @@ class RunPodTrainingAdapter:
         trigger_word: str = "TOK",
         session=None,
         lora_ipfs_cid: Optional[str] = None,
-        ipfs_gateway: str = "https://gateway.lighthouse.storage/ipfs",
+        ipfs_gateway: Optional[str] = None,
     ) -> list[str]:
         """
         Simplified generation interface - returns list of base64 images.

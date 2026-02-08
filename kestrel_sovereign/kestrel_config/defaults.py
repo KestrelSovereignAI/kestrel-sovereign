@@ -38,6 +38,16 @@ def get_lighthouse_api_url() -> str:
     return os.getenv("LIGHTHOUSE_API_URL", "https://node.lighthouse.storage")
 
 
+def get_openrouter_api_base() -> str:
+    """Get OpenRouter API base URL."""
+    return os.getenv("OPENROUTER_API_BASE", "https://openrouter.ai/api/v1")
+
+
+def get_lighthouse_gateway_url() -> str:
+    """Get Lighthouse IPFS gateway URL."""
+    return os.getenv("LIGHTHOUSE_GATEWAY_URL", "https://gateway.lighthouse.storage/ipfs")
+
+
 # =============================================================================
 # Service Configuration
 # =============================================================================

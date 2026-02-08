@@ -31,10 +31,9 @@ from typing import Optional, Literal
 import httpx
 
 from kestrel_sovereign.kestrel_config.constants import HTTP_TIMEOUT_DEFAULT
+from kestrel_sovereign.kestrel_config.defaults import get_openrouter_api_base
 
 logger = logging.getLogger(__name__)
-
-OPENROUTER_API_BASE = "https://openrouter.ai/api/v1"
 
 
 @dataclass
@@ -135,7 +134,7 @@ class OpenRouterProvisioningService:
         """Get or create the HTTP client."""
         if self._client is None or self._client.is_closed:
             self._client = httpx.AsyncClient(
-                base_url=OPENROUTER_API_BASE,
+                base_url=get_openrouter_api_base(),
                 headers={
                     "Authorization": f"Bearer {self.management_key}",
                     "Content-Type": "application/json",
