@@ -1,5 +1,6 @@
 """Conversation and session endpoints."""
 from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import PlainTextResponse
 from datetime import datetime
 import json
 import logging
@@ -339,3 +340,181 @@ async def start_new_conversation(request: Request):
     except Exception as e:
         logger.error(f"Error starting new conversation: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Error starting new conversation.")
+
+
+@router.get("/conversations/{session_id}/transcript")
+async def get_conversation_transcript(request: Request, session_id: str, decrypt: bool = True):
+    """Get a human-readable markdown transcript for a conversation session."""
+    if not hasattr(request.app.state, 'agent') or not request.app.state.agent:
+        raise HTTPException(status_code=503, detail="Agent not initialized.")
+
+    try:
+        agent = request.app.state.agent
+        storage = agent.storage
+
+        # Get agent_id for multi-tenant isolation
+        agent_id = getattr(storage, 'agent_id', '') or getattr(storage._storage, 'agent_id', '')
+
+        # Check if encryption is enabled
+        encrypted_at_rest = False
+        conv_store = getattr(storage, 'conversation', None) or getattr(getattr(storage, '_storage', None), 'conversation', None)
+        if conv_store and hasattr(conv_store, 'encryption_enabled'):
+            encrypted_at_rest = conv_store.encryption_enabled
+
+        # Get the session start time
+        start_row = await storage.db.fetchone(
+            "SELECT created_at FROM conversation_history WHERE id = ? AND agent_id = ?",
+            (session_id, agent_id)
+        )
+
+        if not start_row:
+            raise HTTPException(status_code=404, detail="Session not found.")
+
+        start_time = start_row[0]
+
+        # Get messages starting from session_id
+        # Note: We fetch more than needed and rely on session boundary detection
+        # (time gaps > SESSION_GAP_MINUTES or new_session markers) to stop at the right point
+        # This approach matches the existing /conversations/{session_id} endpoint logic
+        rows = await storage.db.fetchall("""
+            SELECT id, role, content, metadata, created_at
+            FROM conversation_history
+            WHERE agent_id = ? AND created_at >= ?
+            ORDER BY created_at ASC
+            LIMIT 1000
+        """, (agent_id, start_time))
+
+        if not rows:
+            raise HTTPException(status_code=404, detail="No messages found in session.")
+
+        # Build markdown transcript
+        transcript_lines = [
+            f"# Conversation Transcript - Session {session_id}",
+            f"## {start_time}",
+            ""
+        ]
+
+        if encrypted_at_rest:
+            transcript_lines.append("_Note: This conversation was encrypted at rest._")
+            transcript_lines.append("")
+
+        last_timestamp = None
+        message_count = 0
+
+        for row in rows:
+            msg_id, role, content, metadata_json, created_at = row[0], row[1], row[2], row[3], row[4]
+
+            # Parse timestamp
+            try:
+                if isinstance(created_at, str):
+                    timestamp = None
+                    for fmt in ['%Y-%m-%d %H:%M:%S', '%Y-%m-%dT%H:%M:%S', '%Y-%m-%d %H:%M:%S.%f']:
+                        try:
+                            timestamp = datetime.strptime(created_at, fmt)
+                            break
+                        except ValueError:
+                            continue
+                    if timestamp is None:
+                        timestamp = datetime.now()
+                elif created_at is not None:
+                    timestamp = created_at
+                else:
+                    timestamp = datetime.now()
+            except (TypeError, ValueError):
+                timestamp = datetime.now()
+
+            # Parse metadata
+            meta = None
+            if metadata_json:
+                try:
+                    meta = json.loads(metadata_json)
+                except json.JSONDecodeError:
+                    pass
+
+            # Check for session boundary
+            if meta and meta.get('new_session') and message_count > 0:
+                break
+
+            # Check for time gap (session boundary detection)
+            if last_timestamp:
+                gap_minutes = (timestamp - last_timestamp).total_seconds() / 60
+                if gap_minutes > SESSION_GAP_MINUTES:
+                    break
+
+            # Skip session markers
+            if meta and meta.get('type') == 'session_marker':
+                last_timestamp = timestamp
+                continue
+
+            # Decrypt content if needed
+            display_content = content
+            is_encrypted = False
+            if meta and meta.get('enc') and decrypt:
+                fernet = get_agent_fernet(agent_id) if agent_id else None
+                if fernet:
+                    try:
+                        display_content = decrypt_string(content, meta, fernet)
+                    except Exception:
+                        is_encrypted = True
+
+            # Format role for display
+            role_display = {
+                "user": "**User**",
+                "assistant": "**Assistant**",
+                "system": "_System_"
+            }.get(role, f"**{role.capitalize()}**")
+
+            # Add message to transcript
+            time_str = timestamp.strftime("%H:%M:%S")
+            transcript_lines.append(f"### [{time_str}] {role_display}")
+
+            if is_encrypted:
+                transcript_lines.append("_[Encrypted content - decryption failed]_")
+            else:
+                # Add metadata annotations if present
+                annotations = []
+                if meta:
+                    if meta.get('type') in ('compression', 'context_summary'):
+                        annotations.append(f"Type: {meta.get('type')}")
+                    if meta.get('original_message_ids'):
+                        orig_ids = meta.get('original_message_ids')
+                        first = orig_ids[0] if orig_ids else None
+                        last = orig_ids[-1] if orig_ids else None
+                        if first and last:
+                            annotations.append(f"Original messages: {first}-{last}")
+                    if meta.get('excluded_from_context'):
+                        annotations.append("Excluded from context")
+                    if meta.get('summarized_into'):
+                        annotations.append(f"Summarized into message #{meta.get('summarized_into')}")
+
+                if annotations:
+                    transcript_lines.append(f"_({', '.join(annotations)})_")
+
+                transcript_lines.append(display_content)
+
+            transcript_lines.append("")
+
+            last_timestamp = timestamp
+            message_count += 1
+
+        # Add footer
+        transcript_lines.append("---")
+        transcript_lines.append(f"_Generated: {datetime.now().isoformat()}_")
+        transcript_lines.append(f"_Total messages: {message_count}_")
+
+        transcript = "\n".join(transcript_lines)
+
+        # Return as markdown
+        return PlainTextResponse(
+            content=transcript,
+            media_type="text/markdown",
+            headers={
+                "Content-Disposition": f'inline; filename="transcript_{session_id}.md"'
+            }
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error generating transcript for session {session_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Error generating transcript.")
