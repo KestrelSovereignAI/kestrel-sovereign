@@ -103,6 +103,10 @@ class ModelDiscoveryMixin:
         # Enrich models with catalog data
         all_models = catalog.enrich_models(all_models)
 
+        # Register discovered context limits into TokenCounter
+        from kestrel_sovereign.agent.token_counter import register_discovered_limits
+        register_discovered_limits(all_models)
+
         # Cache results
         self._model_cache = all_models
         self._cache_timestamp = time.time()
