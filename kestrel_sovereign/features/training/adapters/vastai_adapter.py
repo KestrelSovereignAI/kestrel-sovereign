@@ -33,6 +33,7 @@ from ..types import (
     TrainingState,
     TrainingStatus,
 )
+from kestrel_sovereign.kestrel_config.defaults import get_lighthouse_gateway_url
 
 logger = logging.getLogger(__name__)
 
@@ -413,7 +414,7 @@ class VastAITrainingAdapter:
         config: GenerationConfig,
         session=None,
         lora_ipfs_cid: Optional[str] = None,
-        ipfs_gateway: str = "https://gateway.lighthouse.storage/ipfs",
+        ipfs_gateway: Optional[str] = None,
         flux_version: Optional[str] = None,  # Reserved for future container selection
     ) -> GenerationResult:
         """
@@ -473,6 +474,9 @@ class VastAITrainingAdapter:
 
             logger.info(f"Using Vast.ai backend: {session.backend_base_url}")
 
+            # Use canonical gateway URL if not provided
+            gateway_url = ipfs_gateway or get_lighthouse_gateway_url()
+
             # Generate via HTTP API
             result = await manager.generate_image_http(
                 session=session,
@@ -485,7 +489,7 @@ class VastAITrainingAdapter:
                 num_inference_steps=config.num_inference_steps,
                 guidance_scale=config.guidance_scale,
                 lora_ipfs_cid=lora_ipfs_cid,
-                ipfs_gateway=ipfs_gateway,
+                ipfs_gateway=gateway_url,
             )
 
             total_elapsed = (datetime.now(timezone.utc) - start_time).total_seconds()
@@ -511,7 +515,7 @@ class VastAITrainingAdapter:
         trigger_word: str = "TOK",
         session=None,
         lora_ipfs_cid: Optional[str] = None,
-        ipfs_gateway: str = "https://gateway.lighthouse.storage/ipfs",
+        ipfs_gateway: Optional[str] = None,
     ) -> list[str]:
         """
         Simplified generation interface - returns list of base64 images.

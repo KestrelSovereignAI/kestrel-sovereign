@@ -29,6 +29,7 @@ from .adapter import LLMResponse
 from .openai_adapter import OpenAIAdapter
 from .model_metadata import ModelInfo, ModelCategory
 from kestrel_sovereign.kestrel_config.constants import HTTP_TIMEOUT_DEFAULT
+from kestrel_sovereign.kestrel_config.defaults import get_openrouter_api_base
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +50,7 @@ class OpenRouterAdapter(OpenAIAdapter):
 
     def __init__(self):
         self.name = "openrouter"
-        self.base_url = "https://openrouter.ai/api/v1"
+        self.base_url = get_openrouter_api_base()
 
         # Get API key
         self.api_key = os.environ.get("OPENROUTER_API_KEY")

@@ -15,6 +15,7 @@ from typing import Optional
 from fastapi import APIRouter, BackgroundTasks, Form, HTTPException
 
 from kestrel_sovereign.kestrel_config.constants import HTTP_TIMEOUT_DOWNLOAD
+from kestrel_sovereign.kestrel_config.defaults import get_lighthouse_gateway_url
 from .. import config as app_config
 from ..inference import (
     QUANTIZED_CACHE_DIR,
@@ -131,7 +132,7 @@ async def generate_image_async(
     num_inference_steps: int = Form(28),
     guidance_scale: float = Form(4.0),
     lora_ipfs_cid: Optional[str] = Form(None),
-    ipfs_gateway: str = Form("https://gateway.lighthouse.storage/ipfs"),
+    ipfs_gateway: Optional[str] = Form(None),
 ):
     """
     Start async image generation. Returns job_id immediately.

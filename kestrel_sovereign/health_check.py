@@ -4,6 +4,7 @@ import sqlite3
 import sys
 
 from kestrel_sovereign.kestrel_config.constants import HTTP_TIMEOUT_SHORT
+from kestrel_sovereign.kestrel_config.defaults import get_ollama_url
 
 def run_health_check():
     """
@@ -27,14 +28,15 @@ def run_health_check():
 
     # Check Ollama
     try:
-        resp = requests.get('http://localhost:11434/api/tags', timeout=HTTP_TIMEOUT_SHORT)
+        ollama_url = get_ollama_url()
+        resp = requests.get(f'{ollama_url}/api/tags', timeout=HTTP_TIMEOUT_SHORT)
         if resp.status_code == 200:
             models = resp.json().get('models', [])
             print(f"Ollama: ✅ Running ({len(models)} models)")
         else:
             print(f"Ollama: ❌ Responded with status {resp.status_code}")
     except requests.exceptions.RequestException:
-        print('Ollama: ❌ Not responding at http://localhost:11434')
+        print(f'Ollama: ❌ Not responding at {ollama_url}')
 
     # Check config
     config_exists = os.path.exists('llm_config.toml')
