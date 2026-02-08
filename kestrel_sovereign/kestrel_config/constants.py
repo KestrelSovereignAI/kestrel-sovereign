@@ -50,6 +50,15 @@ POLL_INTERVAL_DEFAULT = 30  # Default polling interval
 POLL_INTERVAL_MINUTE = 60  # Poll every minute
 REFLECTION_INTERVAL = 86400  # Daily reflection (24 hours)
 
+# Specific service polling intervals
+VASTAI_POLL_INTERVAL_SECONDS = 30  # Vast.ai training status polling
+REPLICATE_POLL_INTERVAL_SECONDS = 30  # Replicate training status polling
+TRAINING_POLL_INTERVAL_SECONDS = 30  # Generic training protocol polling
+RUNPOD_STATUS_POLL_INTERVAL = 5  # RunPod pod status polling
+RUNPOD_URL_POLL_INTERVAL = 5  # RunPod backend URL polling
+GCP_OPERATION_POLL_INTERVAL = 5  # GCP compute operation polling
+MCP_CONNECTION_RETRY_DELAY = 0.5  # MCP container connection retry delay
+
 # =============================================================================
 # CACHE AND SESSION TTLs (in seconds)
 # =============================================================================
@@ -103,6 +112,7 @@ TRAINING_POLL_INTERVAL_FAST = 10  # Fast polling for generation status
 # Training parameters
 DEFAULT_TRAINING_STEPS = 1000  # Default number of training steps
 DEFAULT_IMAGE_SIZE = 1024  # Default image dimensions for training
+DEFAULT_TRAINING_BATCH_SIZE = 1  # Default batch size for training
 
 # =============================================================================
 # RATE LIMITS (requests per time period)
@@ -117,6 +127,7 @@ LOGIN_RATE_LIMIT = 10  # Login attempts per 5 minutes
 
 SESSION_CONNECT_TIMEOUT_SHORT = 10  # Quick MCP session connection
 SESSION_CONNECT_TIMEOUT_DEFAULT = 15  # Standard MCP session connection
+MCP_MAX_CONNECTION_ATTEMPTS = 10  # Maximum container connection attempts
 
 # =============================================================================
 # APPROVAL AND USER INTERACTION TIMEOUTS
@@ -130,6 +141,14 @@ APPROVAL_TIMEOUT_SHORT = 60  # Short approval timeout (1 minute)
 # =============================================================================
 
 SUBPROCESS_TIMEOUT_SHORT = 5  # Quick subprocess checks (docker info, etc.)
+
+# =============================================================================
+# QUERY AND DISPLAY LIMITS
+# =============================================================================
+
+MAX_CONVERSATION_HISTORY_LIMIT = 10000  # Maximum conversation history items to retrieve
+DEFAULT_OBSERVABILITY_LIMIT = 1000  # Default limit for observability events
+MAX_PINNED_ITEMS_DISPLAY = 20  # Maximum pinned IPFS items to display
 
 # =============================================================================
 # IMAGE AND MEDIA

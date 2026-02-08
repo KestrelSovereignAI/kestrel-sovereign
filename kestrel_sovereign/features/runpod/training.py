@@ -17,6 +17,7 @@ from kestrel_sovereign.kestrel_config.constants import (
     POD_READY_TIMEOUT,
     BACKEND_URL_TIMEOUT,
     BACKEND_URL_TIMEOUT_SHORT,
+    RUNPOD_STATUS_POLL_INTERVAL,
 )
 from .models import GPUProfile, PodStatus, RunPodManagerError, RunPodSession
 from .providers import DirectRunPodProvider
@@ -311,7 +312,7 @@ class RunPodTrainingMixin:
                 return
 
             logger.debug(f"Pod {session.pod_id} status: {status}, waiting...")
-            await asyncio.sleep(5)
+            await asyncio.sleep(RUNPOD_STATUS_POLL_INTERVAL)
 
         raise RunPodManagerError(f"Pod {session.pod_id} did not become ready within {timeout}s")
 
@@ -331,7 +332,7 @@ class RunPodTrainingMixin:
                 return
 
             logger.debug(f"Waiting for backend URL on pod {session.pod_id}...")
-            await asyncio.sleep(5)
+            await asyncio.sleep(RUNPOD_STATUS_POLL_INTERVAL)
 
         logger.warning(f"Pod {session.pod_id} has no backend URL after {timeout}s")
 

@@ -13,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from kestrel_sovereign.config import load_config
+from kestrel_sovereign.kestrel_config.constants import RUNPOD_URL_POLL_INTERVAL
 
 from .models import GPUProfile, PodStatus, RunPodManagerError, RunPodSession
 from .providers import DirectRunPodProvider, ManagedRunPodProvider, GPUProvider
@@ -351,7 +352,7 @@ class RunPodManagerCore:
                     return
             # Refresh to get updated port info
             await self.get_status(refresh=True)
-            await asyncio.sleep(5)  # Shorter interval for URL polling
+            await asyncio.sleep(RUNPOD_URL_POLL_INTERVAL)  # Shorter interval for URL polling
 
         logger.warning("RunPod session %s ready but no backend URL after 120s", session.pod_id)
         # Don't raise error - let caller handle missing URL if needed
