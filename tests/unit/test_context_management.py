@@ -16,7 +16,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 # Import components to test
 from kestrel_sovereign.agent.token_counter import (
     TokenCounter, get_token_counter, TIKTOKEN_AVAILABLE,
-    MODEL_CONTEXT_LIMITS, CHARS_PER_TOKEN_ESTIMATE
+    CHARS_PER_TOKEN_ESTIMATE
 )
 from kestrel_sovereign.agent.token_budget import (
     TokenBudget, AdaptiveTokenBudget, TokenAllocation,
@@ -61,17 +61,17 @@ class TestTokenCounter:
         # Should be content tokens + overhead per message + priming
         assert count > 0
 
-    def test_get_context_limit_known_model(self):
-        """Test getting context limit for known model."""
+    def test_get_context_limit_undiscovered_model(self):
+        """Test getting context limit for model not yet discovered returns default."""
         counter = get_token_counter("gpt-4")
         limit = counter.get_context_limit()
-        assert limit == 8192
+        assert limit == 32768  # DEFAULT_CONTEXT_LIMIT (no cache, no discovery)
 
     def test_get_context_limit_unknown_model(self):
         """Test getting context limit for unknown model returns default."""
         counter = get_token_counter("unknown-model-xyz")
         limit = counter.get_context_limit()
-        assert limit == 8192  # Default
+        assert limit == 32768  # Default (raised from 8192)
 
     def test_truncate_to_tokens(self):
         """Test truncating text to fit token limit."""
@@ -108,7 +108,7 @@ class TestTokenBudget:
         """Test that TokenBudget initializes with correct allocations."""
         budget = TokenBudget("gpt-4")
         assert budget.model == "gpt-4"
-        assert budget.context_limit == 8192
+        assert budget.context_limit == 32768
         assert budget.response_reserve == RESPONSE_RESERVE
 
     def test_budget_allocations(self):
