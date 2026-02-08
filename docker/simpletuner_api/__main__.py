@@ -96,8 +96,8 @@ def main():
     parser.add_argument(
         "--ipfs-gateway",
         type=str,
-        default="https://gateway.lighthouse.storage/ipfs",
-        help="IPFS gateway URL (default: https://gateway.lighthouse.storage/ipfs)"
+        default=None,
+        help="IPFS gateway URL (uses get_lighthouse_gateway_url() if not specified)"
     )
     parser.add_argument(
         "--prompt",

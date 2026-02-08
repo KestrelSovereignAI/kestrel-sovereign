@@ -31,6 +31,7 @@ from ..protocol import (
     DownloadError,
     GenerationError,
 )
+from kestrel_sovereign.kestrel_config.defaults import get_lighthouse_gateway_url
 
 logger = logging.getLogger(__name__)
 
@@ -241,7 +242,7 @@ class VertexAITrainingAdapter:
         config: GenerationConfig,
         session=None,  # Ignored for serverless - kept for interface compatibility
         lora_ipfs_cid: Optional[str] = None,
-        ipfs_gateway: str = "https://gateway.lighthouse.storage/ipfs",
+        ipfs_gateway: Optional[str] = None,
         flux_version: Optional[str] = None,
     ) -> GenerationResult:
         """
@@ -294,6 +295,9 @@ class VertexAITrainingAdapter:
                     provider=self.provider_name,
                 )
 
+            # Use canonical gateway URL if not provided
+            gateway_url = ipfs_gateway or get_lighthouse_gateway_url()
+
             # Generate output path
             timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
             job_uuid = str(uuid.uuid4())[:8]
@@ -315,7 +319,7 @@ class VertexAITrainingAdapter:
             job_info = await manager.submit_generation_job(
                 lora_gcs_path=None if lora_ipfs_cid else (config.lora_path if config.lora_path.startswith("gs://") else None),
                 lora_ipfs_cid=lora_ipfs_cid,
-                ipfs_gateway=ipfs_gateway,
+                ipfs_gateway=gateway_url,
                 prompt=config.prompt,
                 trigger_word=config.trigger_word,
                 output_gcs_prefix=output_gcs,

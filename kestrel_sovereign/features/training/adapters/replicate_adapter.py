@@ -53,6 +53,7 @@ from kestrel_sovereign.kestrel_config.constants import (
     HTTP_TIMEOUT_MEDIUM,
     HTTP_TIMEOUT_DOWNLOAD,
 )
+from kestrel_sovereign.kestrel_config.defaults import get_lighthouse_gateway_url
 
 logger = logging.getLogger(__name__)
 
@@ -481,7 +482,7 @@ class ReplicateTrainingAdapter:
         config: GenerationConfig,
         session=None,  # Ignored for serverless - kept for interface compatibility
         lora_ipfs_cid: Optional[str] = None,  # DEPRECATED: Use config.lora_path instead
-        ipfs_gateway: str = "https://gateway.lighthouse.storage/ipfs",  # DEPRECATED
+        ipfs_gateway: Optional[str] = None,  # DEPRECATED
         flux_version: Optional[str] = None,  # Not used - Replicate manages container
     ) -> GenerationResult:
         """
