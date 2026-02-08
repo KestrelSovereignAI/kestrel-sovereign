@@ -63,6 +63,20 @@ class ConstitutionalProfileService:
     by provider/model. Follows ModelCatalogService pattern (lazy-load singleton).
     """
 
+    # Maps llm_config.toml provider names to constitutional profile keys.
+    # Multiple providers may share the same constitutional profile
+    # (e.g., claude_max and anthropic both use Anthropic's published constitution).
+    PROVIDER_ALIASES: Dict[str, str] = {
+        "claude_max": "anthropic",
+        "openai_mini": "openai",
+        "vertex_ai": "google",
+        "gemini": "google",
+        "azure_openai": "openai",
+        "runpod": "ollama",  # RunPod typically runs open models
+        "together": "ollama",  # Together AI runs open models
+        "fireworks": "ollama",  # Fireworks runs open models
+    }
+
     def __init__(self, config_path: Optional[Path] = None):
         """
         Initialize the profile service.
@@ -127,20 +141,25 @@ class ConstitutionalProfileService:
         if not self._loaded:
             self.load()
 
+    def _resolve_provider(self, provider: str) -> str:
+        """Resolve provider aliases to canonical profile keys."""
+        return self.PROVIDER_ALIASES.get(provider, provider)
+
     def get_profile(self, provider: str) -> ConstitutionalProfile:
         """
         Get constitutional profile for a provider.
 
         Args:
-            provider: Provider name (e.g., "anthropic", "openai")
+            provider: Provider name (e.g., "anthropic", "openai", "claude_max")
 
         Returns:
             ConstitutionalProfile for the provider, or a default profile if not found
         """
         self._ensure_loaded()
 
-        if provider in self._profiles:
-            return self._profiles[provider]
+        canonical = self._resolve_provider(provider)
+        if canonical in self._profiles:
+            return self._profiles[canonical]
 
         # Return sensible default for unknown providers
         logger.warning(f"No constitutional profile for provider '{provider}', using default")
