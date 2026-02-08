@@ -4,12 +4,16 @@ Token counting for context management.
 Uses tiktoken for accurate OpenAI model token counts,
 with fallback estimation for Ollama and other models.
 
-Context limits are sourced from:
-1. ModelCatalogService (model_catalog.toml) - primary source
-2. MODEL_CONTEXT_LIMITS dict - fallback for unconfigured models
+Context limits are sourced from (in priority order):
+1. Discovered limits (from API discovery at runtime)
+2. Cached limits (persisted from previous discovery runs)
+3. ModelCatalogService (model_catalog.toml overrides)
+4. DEFAULT_CONTEXT_LIMIT fallback
 """
 
+import json
 import logging
+from pathlib import Path
 from typing import Optional, List, Dict, Any
 
 logger = logging.getLogger(__name__)
@@ -38,41 +42,59 @@ except ImportError:
     logger.warning("tiktoken not available, using character-based estimation")
 
 
-# Known model context windows (tokens)
-MODEL_CONTEXT_LIMITS = {
-    # OpenAI models
-    "gpt-4": 8192,
-    "gpt-4-32k": 32768,
-    "gpt-4-turbo": 128000,
-    "gpt-4-turbo-preview": 128000,
-    "gpt-4o": 128000,
-    "gpt-4o-mini": 128000,
-    "gpt-5": 128000,
-    "gpt-5-mini": 128000,
-    "gpt-3.5-turbo": 16385,
-    "gpt-3.5-turbo-16k": 16385,
-    # Anthropic models (for reference, though we use OpenAI-style counting)
-    "claude-3-opus": 200000,
-    "claude-3-sonnet": 200000,
-    "claude-3-haiku": 200000,
-    "claude-3.5-sonnet": 200000,
-    # Ollama models (approximate)
-    "llama3.2:3b": 8192,
-    "llama3.2:1b": 8192,
-    "llama3.1:8b": 8192,
-    "llama3.1:70b": 8192,
-    "mistral:7b": 8192,
-    "mixtral:8x7b": 32768,
-    "qwen2.5:0.5b": 8192,
-    "qwen2.5:3b": 8192,
-    "qwen2.5:7b": 8192,
-    "phi3:3.8b": 4096,
-    "gemma2:9b": 8192,
-    "deepseek-coder:6.7b": 8192,
-}
+# --- Discovered limits registry (populated by model_discovery at runtime) ---
+_discovered_context_limits: Dict[str, int] = {}
 
-# Default context window if model not found
-DEFAULT_CONTEXT_LIMIT = 8192
+# --- Persistent cache of discovered limits ---
+CACHE_FILE = Path.home() / ".kestrel" / "discovered_context_limits.json"
+_cached_limits: Optional[Dict[str, int]] = None  # None = not loaded yet
+
+
+def _load_cached_limits() -> Dict[str, int]:
+    """Load cached context limits from disk. Lazy, one-time read."""
+    global _cached_limits
+    if _cached_limits is not None:
+        return _cached_limits
+    _cached_limits = {}
+    try:
+        if CACHE_FILE.exists():
+            _cached_limits = json.loads(CACHE_FILE.read_text())
+            logger.info(f"Loaded {len(_cached_limits)} cached context limits from {CACHE_FILE}")
+    except Exception as e:
+        logger.warning(f"Failed to load cached context limits: {e}")
+    return _cached_limits
+
+
+def _persist_cache() -> None:
+    """Write discovered limits to disk for cold starts."""
+    try:
+        CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        # Merge with existing cache (preserve entries from providers not discovered this run)
+        existing = _load_cached_limits()
+        merged = {**existing, **_discovered_context_limits}
+        CACHE_FILE.write_text(json.dumps(merged, indent=2, sort_keys=True))
+        logger.debug(f"Persisted {len(merged)} context limits to {CACHE_FILE}")
+    except Exception as e:
+        logger.warning(f"Failed to persist context limits cache: {e}")
+
+
+def register_discovered_limits(models: list) -> None:
+    """Register context limits from discovered models and persist to cache.
+
+    Called by model_discovery after API discovery completes.
+    Models with a non-None context_limit populate the in-memory registry
+    and are written to ~/.kestrel/discovered_context_limits.json.
+    """
+    for model in models:
+        ctx = getattr(model, 'context_limit', None)
+        if ctx:
+            _discovered_context_limits[model.id] = ctx
+    if _discovered_context_limits:
+        logger.info(f"Registered {len(_discovered_context_limits)} discovered context limits")
+        _persist_cache()
+
+
+DEFAULT_CONTEXT_LIMIT = 32768
 
 # Characters per token estimate for non-tiktoken models
 CHARS_PER_TOKEN_ESTIMATE = 4
@@ -167,37 +189,31 @@ class TokenCounter:
         Get the context window limit for the current model.
 
         Sources (in order of priority):
-        1. ModelCatalogService (model_catalog.toml) - authoritative source
-        2. MODEL_CONTEXT_LIMITS dict - fallback for unconfigured models
-        3. DEFAULT_CONTEXT_LIMIT - final fallback
+        1. Discovered limits (from API discovery this session)
+        2. Cached limits (from previous discovery runs on disk)
+        3. ModelCatalogService (model_catalog.toml overrides)
+        4. DEFAULT_CONTEXT_LIMIT fallback
 
         Returns:
             Maximum tokens allowed in context
         """
-        # 1. Try catalog service first (authoritative source)
+        # 1. Discovered limits (populated by API discovery this session)
+        if self.model in _discovered_context_limits:
+            return _discovered_context_limits[self.model]
+
+        # 2. Cached limits (from previous discovery runs)
+        cached = _load_cached_limits()
+        if self.model in cached:
+            return cached[self.model]
+
+        # 3. Catalog TOML overrides
         catalog = _get_catalog_service()
         if catalog is not None:
             limit = catalog.get_context_limit(self.model)
             if limit is not None:
                 return limit
 
-        # 2. Fallback to hardcoded limits
-        # Try exact match first
-        if self.model in MODEL_CONTEXT_LIMITS:
-            return MODEL_CONTEXT_LIMITS[self.model]
-
-        # Try base model name (before :)
-        base_model = self.model.split(":")[0]
-        if base_model in MODEL_CONTEXT_LIMITS:
-            return MODEL_CONTEXT_LIMITS[base_model]
-
-        # Try partial match
-        model_lower = self.model.lower()
-        for known_model, limit in MODEL_CONTEXT_LIMITS.items():
-            if known_model in model_lower or model_lower in known_model:
-                return limit
-
-        logger.warning(f"Unknown model {self.model}, using default context limit")
+        logger.warning(f"Unknown model {self.model}, using default context limit {DEFAULT_CONTEXT_LIMIT}")
         return DEFAULT_CONTEXT_LIMIT
 
     def truncate_to_tokens(self, text: str, max_tokens: int) -> str:
