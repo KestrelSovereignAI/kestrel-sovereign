@@ -122,6 +122,8 @@ class GCPSSHTrainingMixin:
         Returns:
             Job ID (companion_id)
         """
+        from kestrel_sovereign.kestrel_config.constants import DEFAULT_TRAINING_BATCH_SIZE
+
         job_id = companion_id
         mount_path = self.disk_config.get("mount_path", "/workspace")
 
@@ -145,7 +147,7 @@ keep_tokens = 1
 
 [[datasets]]
 resolution = 1024
-batch_size = 1
+batch_size = {DEFAULT_TRAINING_BATCH_SIZE}
 
 [[datasets.subsets]]
 image_dir = '{mount_path}/training_data/{job_id}'

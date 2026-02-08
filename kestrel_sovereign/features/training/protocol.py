@@ -9,6 +9,7 @@ All providers expose the same interface; session management is hidden internally
 
 Usage:
     from kestrel_sovereign.features.training import TrainingProviderFactory, TrainingConfig
+    from kestrel_sovereign.kestrel_config.constants import TRAINING_POLL_INTERVAL_SECONDS
 
     # Get default provider (auto-detected from environment)
     provider = TrainingProviderFactory.get_default_provider()
@@ -28,7 +29,7 @@ Usage:
         status = await provider.get_status(job.job_id)
         if status.state.is_terminal():
             break
-        await asyncio.sleep(30)
+        await asyncio.sleep(TRAINING_POLL_INTERVAL_SECONDS)
 
     # Download weights
     if status.state == TrainingState.COMPLETED:

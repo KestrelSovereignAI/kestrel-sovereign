@@ -378,15 +378,17 @@ class MCPToolManager:
                 except Exception as e:
                     logger.error(f"Error stopping session task for {container_name}: {e}")
             
+            from kestrel_sovereign.kestrel_config.constants import MCP_MAX_CONNECTION_ATTEMPTS, MCP_CONNECTION_RETRY_DELAY
+
             container = tool_info["container"]
             try:
                 container.stop()
                 container.remove(force=True)
                 # Wait for container to be fully removed
-                for _ in range(10):
+                for _ in range(MCP_MAX_CONNECTION_ATTEMPTS):
                     try:
                         self.docker_client.containers.get(container_name)
-                        await asyncio.sleep(0.5)
+                        await asyncio.sleep(MCP_CONNECTION_RETRY_DELAY)
                     except NotFound:
                         break
             except NotFound:

@@ -17,6 +17,8 @@ Usage:
 
 from typing import Any, Dict, Optional
 
+from kestrel_sovereign.kestrel_config.constants import VASTAI_POLL_INTERVAL_SECONDS
+
 from .core import VastAIManagerCore
 from .http_api import VastAIHTTPAPIMixin
 from .ssh_training import VastAISSHTrainingMixin
@@ -54,7 +56,7 @@ class VastAIManager(
             status = await manager.poll_training_status_http(session, job_id)
             if status["status"] == "completed":
                 break
-            await asyncio.sleep(30)
+            await asyncio.sleep(VASTAI_POLL_INTERVAL_SECONDS)
 
         # Download trained LoRA
         lora_data = await manager.download_lora_http(session, job_id)
