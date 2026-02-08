@@ -8,6 +8,8 @@ import logging
 from typing import List, Optional
 import numpy as np
 
+from kestrel_sovereign.kestrel_config.defaults import get_ollama_url
+
 logger = logging.getLogger(__name__)
 
 # Optional ollama import
@@ -32,17 +34,17 @@ class EmbeddingService:
     def __init__(
         self,
         model: str = DEFAULT_MODEL,
-        base_url: str = "http://localhost:11434"
+        base_url: Optional[str] = None
     ):
         """
         Initialize the embedding service.
 
         Args:
             model: Ollama embedding model to use
-            base_url: Ollama server URL
+            base_url: Ollama server URL (defaults to get_ollama_url())
         """
         self.model = model
-        self.base_url = base_url
+        self.base_url = base_url or get_ollama_url()
         self._client = None
         self._async_client = None
 
@@ -229,14 +231,14 @@ _default_service: Optional[EmbeddingService] = None
 
 def get_embedding_service(
     model: str = EmbeddingService.DEFAULT_MODEL,
-    base_url: str = "http://localhost:11434"
+    base_url: Optional[str] = None
 ) -> EmbeddingService:
     """
     Get or create the default embedding service.
 
     Args:
         model: Model to use (only used on first call)
-        base_url: Ollama URL (only used on first call)
+        base_url: Ollama URL (defaults to get_ollama_url(), only used on first call)
 
     Returns:
         EmbeddingService instance

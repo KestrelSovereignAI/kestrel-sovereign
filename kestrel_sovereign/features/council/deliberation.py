@@ -19,6 +19,8 @@ import re
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
+from kestrel_sovereign.kestrel_config.defaults import get_ollama_url
+
 from .models import (
     CouncilMember,
     CouncilSession,
@@ -269,7 +271,9 @@ async def _get_adapter_for_provider(
         import ollama
         from kestrel_sovereign.llm.ollama_adapter import OllamaAdapter
 
-        host = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+        # Use get_ollama_url() for canonical URL resolution
+        # Support legacy OLLAMA_HOST env var for backwards compatibility
+        host = os.environ.get("OLLAMA_HOST") or get_ollama_url()
         client = ollama.AsyncClient(host=host)
         adapter = OllamaAdapter()
         return client, adapter

@@ -11,6 +11,8 @@ from dataclasses import dataclass
 
 import openai
 
+from kestrel_sovereign.kestrel_config.defaults import get_ollama_url, get_openrouter_api_base
+
 try:
     import ollama
 except ImportError:
@@ -147,7 +149,9 @@ class ProviderRegistry:
         if ollama is None:
             raise ImportError("ollama package not installed.")
 
-        host = os.environ.get("OLLAMA_HOST", provider_config.get("host", "http://localhost:11434"))
+        # Use get_ollama_url() for canonical URL resolution
+        # Support legacy OLLAMA_HOST env var for backwards compatibility
+        host = os.environ.get("OLLAMA_HOST") or provider_config.get("host") or get_ollama_url()
         model = os.environ.get("OLLAMA_MODEL", provider_config.get("model", "llama3.2"))
         provider_config["host"] = host
         provider_config["model"] = model
@@ -285,7 +289,7 @@ class ProviderRegistry:
         if not api_key:
             raise ValueError("OpenRouter API key not found (set OPENROUTER_API_KEY).")
 
-        base_url = provider_config.get("base_url", "https://openrouter.ai/api/v1")
+        base_url = provider_config.get("base_url") or get_openrouter_api_base()
         model = os.environ.get("OPENROUTER_MODEL", provider_config.get("model", "anthropic/claude-3.5-sonnet"))
         provider_config["model"] = model
 
