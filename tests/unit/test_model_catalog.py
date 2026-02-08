@@ -346,15 +346,16 @@ openai = ["gpt-5.1"]
         assert enriched.context_limit == 256000
 
     def test_real_config_has_context_limits(self):
-        """Test that real config file has context limits."""
+        """Test that real config file has context limit overrides."""
         service = ModelCatalogService()
         service.load()
 
-        # Check some known models
-        assert service.get_context_limit("gpt-4") == 8192
-        assert service.get_context_limit("gpt-5") == 128000
+        # Check models that are genuine overrides in model_catalog.toml
         assert service.get_context_limit("claude-opus-4-5-20251101") == 1000000
         assert service.get_context_limit("gemini-3-pro") == 2000000
+        assert service.get_context_limit("gpt-4-32k") == 32768
+        # Models removed from TOML (covered by family patterns) return None
+        assert service.get_context_limit("gpt-4") is None
 
 
 class TestTokenCounterCatalogIntegration:

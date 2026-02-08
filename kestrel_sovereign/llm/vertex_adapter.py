@@ -580,6 +580,7 @@ class VertexAIAdapter(LLMAdapter):
                     display_name=display_name,
                     category=category,
                     description=description,
+                    context_limit=getattr(model, 'input_token_limit', None),
                     supports_vision=any(x in lower_id for x in ["gemini", "vision"]),
                     supports_tools=True,
                     supports_streaming=True,

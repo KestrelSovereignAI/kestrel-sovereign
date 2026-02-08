@@ -89,61 +89,16 @@ openai = ["whisper-1", "tts-1", "tts-1-hd"]
 [hidden]
 openai = ["babbage-002", "davinci-002"]
 
-# Context window limits (tokens) - Used by token budget allocation
-# If not specified here, TokenCounter falls back to hardcoded defaults
+# Context window overrides (tokens) - Used by token budget allocation
+# Only list models whose limits DIFFER from family defaults in token_counter.py.
+# Most models are covered by family patterns (claude-* -> 200K, gemini-* -> 1M, etc.)
+# and by API discovery (Google, Vertex AI, OpenRouter return limits automatically).
 [context_limits]
-# OpenAI models
-"gpt-4" = 8192
-"gpt-4-32k" = 32768
-"gpt-4-turbo" = 128000
-"gpt-4-turbo-preview" = 128000
-"gpt-4o" = 128000
-"gpt-4o-mini" = 128000
-"gpt-5" = 128000
-"gpt-5-mini" = 128000
-"gpt-5-nano" = 32000
-"gpt-5.1" = 256000
-"gpt-3.5-turbo" = 16385
-"gpt-3.5-turbo-16k" = 16385
-
-# Anthropic models
-"claude-3-opus" = 200000
-"claude-3-sonnet" = 200000
-"claude-3-haiku" = 200000
-"claude-3.5-sonnet" = 200000
-"claude-sonnet-4-5-20250929" = 200000
-"claude-haiku-4-5-20251001" = 200000
-"claude-opus-4-5-20251101" = 1000000
-
-# Google/Vertex AI models
-"gemini-3-pro" = 2000000
-"gemini-2.5-flash" = 1000000
-"gemini-2.5-pro" = 1000000
-"gemini-2.0-flash-exp" = 1000000
-
-# Ollama models (approximate)
-"llama3.2" = 128000
-"llama3.2:3b" = 128000
-"llama3.2:1b" = 128000
-"llama3.1:8b" = 128000
-"llama3.1:70b" = 128000
-"mistral:7b" = 32768
-"mixtral:8x7b" = 32768
-"qwen2.5:0.5b" = 32768
-"qwen2.5:3b" = 32768
-"qwen2.5:7b" = 32768
-"qwen2.5:14b" = 128000
-"phi3:3.8b" = 4096
-"phi4" = 16384
-"gemma2:9b" = 8192
-"deepseek-coder:6.7b" = 16384
-"deepseek-r1:14b" = 128000
-"gpt-oss:20b" = 32768
-
-# RunPod models
-"meta-llama/Llama-3.1-8B-Instruct" = 128000
-
-# xAI models
-"grok-4-1-fast-non-reasoning" = 128000
-
-# OpenRouter: context limits come from API response (context_length field)
+"gpt-4-32k" = 32768          # gpt-4 family default is 8192
+"gpt-5-nano" = 32000         # gpt-5 family default is 128000
+"claude-opus-4-5-20251101" = 1000000  # claude- family default is 200000
+"gemini-3-pro" = 2000000     # gemini- family default is 1000000
+"phi3:3.8b" = 4096           # phi family default is 16384
+"gemma2:9b" = 8192           # no family match, explicit override
+"qwen2.5:14b" = 128000       # qwen family default is 32768
+"meta-llama/Llama-3.1-8B-Instruct" = 128000  # slash in name, won't match llama prefix
