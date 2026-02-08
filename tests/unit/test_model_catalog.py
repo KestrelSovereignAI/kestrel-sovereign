@@ -354,7 +354,7 @@ openai = ["gpt-5.1"]
         assert service.get_context_limit("claude-opus-4-5-20251101") == 1000000
         assert service.get_context_limit("gemini-3-pro") == 2000000
         assert service.get_context_limit("gpt-4-32k") == 32768
-        # Models removed from TOML (covered by family patterns) return None
+        # Models not in TOML return None (limits come from discovery cache instead)
         assert service.get_context_limit("gpt-4") is None
 
 
@@ -371,15 +371,14 @@ class TestTokenCounterCatalogIntegration:
         # Gemini-3-pro has 2M context in catalog
         assert limit == 2000000
 
-    def test_token_counter_fallback_to_hardcoded(self):
-        """Test that TokenCounter falls back to hardcoded limits."""
+    def test_token_counter_uses_catalog_override(self):
+        """Test that TokenCounter uses catalog TOML overrides."""
         from kestrel_sovereign.agent.token_counter import get_token_counter
 
-        # This model might not be in catalog but is in hardcoded dict
+        # phi3:3.8b has an explicit override in model_catalog.toml
         counter = get_token_counter("phi3:3.8b")
         limit = counter.get_context_limit()
-        # Should get either from catalog or hardcoded (4096)
-        assert limit > 0
+        assert limit == 4096
 
     def test_token_counter_default_for_unknown(self):
         """Test that unknown models get default limit."""
