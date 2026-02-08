@@ -15,7 +15,7 @@ from kestrel_sovereign.agent.token_budget import (
     TokenBudget, AdaptiveTokenBudget, TokenAllocation,
     create_budget, DEFAULT_ALLOCATION, RESPONSE_RESERVE
 )
-from kestrel_sovereign.agent.token_counter import get_token_counter, MODEL_CONTEXT_LIMITS
+from kestrel_sovereign.agent.token_counter import get_token_counter, MODEL_FAMILY_DEFAULTS
 
 
 class TestBudgetOverflow:

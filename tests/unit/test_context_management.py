@@ -16,7 +16,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 # Import components to test
 from kestrel_sovereign.agent.token_counter import (
     TokenCounter, get_token_counter, TIKTOKEN_AVAILABLE,
-    MODEL_CONTEXT_LIMITS, CHARS_PER_TOKEN_ESTIMATE
+    MODEL_FAMILY_DEFAULTS, CHARS_PER_TOKEN_ESTIMATE
 )
 from kestrel_sovereign.agent.token_budget import (
     TokenBudget, AdaptiveTokenBudget, TokenAllocation,
@@ -71,7 +71,7 @@ class TestTokenCounter:
         """Test getting context limit for unknown model returns default."""
         counter = get_token_counter("unknown-model-xyz")
         limit = counter.get_context_limit()
-        assert limit == 8192  # Default
+        assert limit == 32768  # Default (raised from 8192)
 
     def test_truncate_to_tokens(self):
         """Test truncating text to fit token limit."""
