@@ -4,9 +4,11 @@ Token counting for context management.
 Uses tiktoken for accurate OpenAI model token counts,
 with fallback estimation for Ollama and other models.
 
-Context limits are sourced from:
-1. ModelCatalogService (model_catalog.toml) - primary source
-2. MODEL_CONTEXT_LIMITS dict - fallback for unconfigured models
+Context limits are sourced from (in priority order):
+1. Discovered limits (from API discovery at runtime)
+2. ModelCatalogService (model_catalog.toml overrides)
+3. Family pattern defaults (prefix-based)
+4. DEFAULT_CONTEXT_LIMIT fallback
 """
 
 import logging
@@ -38,41 +40,48 @@ except ImportError:
     logger.warning("tiktoken not available, using character-based estimation")
 
 
-# Known model context windows (tokens)
-MODEL_CONTEXT_LIMITS = {
-    # OpenAI models
-    "gpt-4": 8192,
-    "gpt-4-32k": 32768,
-    "gpt-4-turbo": 128000,
-    "gpt-4-turbo-preview": 128000,
-    "gpt-4o": 128000,
-    "gpt-4o-mini": 128000,
-    "gpt-5": 128000,
-    "gpt-5-mini": 128000,
-    "gpt-3.5-turbo": 16385,
-    "gpt-3.5-turbo-16k": 16385,
-    # Anthropic models (for reference, though we use OpenAI-style counting)
-    "claude-3-opus": 200000,
-    "claude-3-sonnet": 200000,
-    "claude-3-haiku": 200000,
-    "claude-3.5-sonnet": 200000,
-    # Ollama models (approximate)
-    "llama3.2:3b": 8192,
-    "llama3.2:1b": 8192,
-    "llama3.1:8b": 8192,
-    "llama3.1:70b": 8192,
-    "mistral:7b": 8192,
-    "mixtral:8x7b": 32768,
-    "qwen2.5:0.5b": 8192,
-    "qwen2.5:3b": 8192,
-    "qwen2.5:7b": 8192,
-    "phi3:3.8b": 4096,
-    "gemma2:9b": 8192,
-    "deepseek-coder:6.7b": 8192,
-}
+# --- Discovered limits registry (populated by model_discovery at runtime) ---
+_discovered_context_limits: Dict[str, int] = {}
 
-# Default context window if model not found
-DEFAULT_CONTEXT_LIMIT = 8192
+def register_discovered_limits(models: list) -> None:
+    """Register context limits from discovered models.
+
+    Called by model_discovery after API discovery completes.
+    Models with a non-None context_limit populate this registry.
+    """
+    for model in models:
+        ctx = getattr(model, 'context_limit', None)
+        if ctx:
+            _discovered_context_limits[model.id] = ctx
+    if _discovered_context_limits:
+        logger.info(f"Registered {len(_discovered_context_limits)} discovered context limits")
+
+
+# Family-based pattern defaults (more specific prefixes first)
+MODEL_FAMILY_DEFAULTS = [
+    ("claude-opus-4-5", 1000000),
+    ("claude-", 200000),
+    ("gpt-5.1", 256000),
+    ("gpt-4o", 128000),
+    ("gpt-4-turbo", 128000),
+    ("gpt-5", 128000),
+    ("gpt-4", 8192),
+    ("gpt-3.5", 16385),
+    ("gemini-3", 2000000),
+    ("gemini-2.5", 1000000),
+    ("gemini-2", 1000000),
+    ("gemini-", 1000000),
+    ("llama", 128000),
+    ("qwen", 32768),
+    ("mistral", 32768),
+    ("mixtral", 32768),
+    ("deepseek", 128000),
+    ("phi", 16384),
+    ("grok", 128000),
+    ("gpt-oss", 32768),
+]
+
+DEFAULT_CONTEXT_LIMIT = 32768
 
 # Characters per token estimate for non-tiktoken models
 CHARS_PER_TOKEN_ESTIMATE = 4
@@ -167,37 +176,33 @@ class TokenCounter:
         Get the context window limit for the current model.
 
         Sources (in order of priority):
-        1. ModelCatalogService (model_catalog.toml) - authoritative source
-        2. MODEL_CONTEXT_LIMITS dict - fallback for unconfigured models
-        3. DEFAULT_CONTEXT_LIMIT - final fallback
+        1. Discovered limits (from API discovery at runtime)
+        2. ModelCatalogService (model_catalog.toml overrides)
+        3. Family pattern defaults (prefix-based)
+        4. DEFAULT_CONTEXT_LIMIT fallback
 
         Returns:
             Maximum tokens allowed in context
         """
-        # 1. Try catalog service first (authoritative source)
+        # 1. Discovered limits (populated by API discovery)
+        if self.model in _discovered_context_limits:
+            return _discovered_context_limits[self.model]
+
+        # 2. Catalog TOML overrides
         catalog = _get_catalog_service()
         if catalog is not None:
             limit = catalog.get_context_limit(self.model)
             if limit is not None:
                 return limit
 
-        # 2. Fallback to hardcoded limits
-        # Try exact match first
-        if self.model in MODEL_CONTEXT_LIMITS:
-            return MODEL_CONTEXT_LIMITS[self.model]
-
-        # Try base model name (before :)
-        base_model = self.model.split(":")[0]
-        if base_model in MODEL_CONTEXT_LIMITS:
-            return MODEL_CONTEXT_LIMITS[base_model]
-
-        # Try partial match
+        # 3. Family pattern defaults (prefix match)
         model_lower = self.model.lower()
-        for known_model, limit in MODEL_CONTEXT_LIMITS.items():
-            if known_model in model_lower or model_lower in known_model:
+        base_model = self.model.split(":")[0].lower()
+        for prefix, limit in MODEL_FAMILY_DEFAULTS:
+            if model_lower.startswith(prefix) or base_model.startswith(prefix) or prefix in model_lower:
                 return limit
 
-        logger.warning(f"Unknown model {self.model}, using default context limit")
+        logger.warning(f"Unknown model {self.model}, using default context limit {DEFAULT_CONTEXT_LIMIT}")
         return DEFAULT_CONTEXT_LIMIT
 
     def truncate_to_tokens(self, text: str, max_tokens: int) -> str:
