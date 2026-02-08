@@ -41,6 +41,7 @@ from .model_discovery import ModelDiscoveryMixin
 from .mandate import ModelMandateMixin
 from .usage_tracking import UsageTrackingMixin
 from .streaming import StreamingMixin
+from .constitutional_awareness import ConstitutionalAwarenessMixin
 from kestrel_sovereign.kestrel_config.constants import (
     HTTP_TIMEOUT_MEDIUM,
     CLIENT_CLOSE_TIMEOUT,
@@ -75,7 +76,7 @@ class LLMServiceError(LLMError):
     """Raised when LLM service cannot fulfill a request."""
 
 
-class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, StreamingMixin):
+class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, StreamingMixin, ConstitutionalAwarenessMixin):
     """Unified LLM service with provider fallback and remote GPU support."""
 
     def __init__(self, config_path: str = "llm_config.toml", database_url: Optional[str] = None):
@@ -115,6 +116,9 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
 
         # Database for model usage tracking (uses abstract data layer)
         self._init_usage_tracking(database_url)
+
+        # Constitutional profile service
+        self._init_constitutional_profiles()
 
         # Runtime mandate state
         self._mandate_preference = {"model": None, "provider": None}
