@@ -307,7 +307,7 @@ class AnthropicAdapter(LLMAdapter):
             )
 
         except Exception as e:
-            logger.error(f"Anthropic API error: {e}")
+            logger.error(f"Anthropic API error: {e}", exc_info=True)
             raise
 
     async def get_streaming_response(
@@ -426,7 +426,7 @@ class AnthropicAdapter(LLMAdapter):
                     yield text
 
         except Exception as e:
-            logger.error(f"Anthropic streaming error: {e}")
+            logger.error(f"Anthropic streaming error: {e}", exc_info=True)
             raise
 
     async def get_streaming_response_with_tools(
@@ -674,7 +674,7 @@ class AnthropicAdapter(LLMAdapter):
                     yield text_content
 
         except Exception as e:
-            logger.error(f"Anthropic streaming with tools failed: {e}")
+            logger.error(f"Anthropic streaming with tools failed: {e}", exc_info=True)
             raise
 
     async def continue_with_tool_results(
@@ -769,6 +769,9 @@ class AnthropicAdapter(LLMAdapter):
         except httpx.HTTPStatusError as e:
             logger.error(f"Anthropic API HTTP error: {e.response.status_code} - {e.response.text}")
             return []
+        except httpx.RequestError as e:
+            logger.error(f"Anthropic API connection error: {e}")
+            return []
         except Exception as e:
-            logger.error(f"Failed to list Anthropic models: {e}")
+            logger.error(f"Failed to list Anthropic models: {e}", exc_info=True)
             return []
