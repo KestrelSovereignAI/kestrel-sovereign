@@ -13,6 +13,7 @@ Gateway mode is recommended as it provides access to all servers regardless
 of their native transport protocol.
 """
 
+import asyncio
 import logging
 import json
 from typing import Dict, Any, List, Optional, TYPE_CHECKING
@@ -55,8 +56,14 @@ class MCPAgent(Feature):
             self.manager = MCPToolManager()
             self.gateway_manager: Optional["MCPGatewayManager"] = None
             logger.info("MCPAgent initialized.")
-        except Exception as e:
+        except RuntimeError as e:
+            # Docker not available - expected in some environments
             logger.warning(f"MCPAgent initialization failed (likely Docker unavailable): {e}")
+            logger.info("MCPAgent disabled - Docker tools will not be available")
+            self.manager = None
+            self.gateway_manager = None
+        except Exception as e:
+            logger.warning(f"Unexpected error initializing MCPAgent: {e}", exc_info=True)
             logger.info("MCPAgent disabled - Docker tools will not be available")
             self.manager = None
             self.gateway_manager = None
@@ -80,8 +87,11 @@ class MCPAgent(Feature):
             tools = await self.manager.connect_to_tool(container_name)
             tool_names = [t.name for t in tools]
             return f"✅ Loaded {image_name} as {container_name}. Tools: {', '.join(tool_names)}"
-        except Exception as e:
+        except (TimeoutError, RuntimeError, ValueError) as e:
             logger.error(f"Failed to load tool {image_name}: {e}")
+            return f"❌ Failed to load MCP tool: {str(e)}"
+        except Exception as e:
+            logger.error(f"Unexpected error loading tool {image_name}: {e}", exc_info=True)
             return f"❌ Failed to load MCP tool: {str(e)}"
 
     @tool(
@@ -122,8 +132,11 @@ class MCPAgent(Feature):
         try:
             await self.manager.stop_tool(container_name)
             return f"✅ Unloaded {container_name}"
+        except ValueError as e:
+            logger.error(f"Tool not found: {container_name}")
+            return f"❌ Failed to unload tool: {str(e)}"
         except Exception as e:
-            logger.error(f"Failed to unload tool {container_name}: {e}")
+            logger.error(f"Failed to unload tool {container_name}: {e}", exc_info=True)
             return f"❌ Failed to unload tool: {str(e)}"
 
     @tool(
@@ -142,8 +155,11 @@ class MCPAgent(Feature):
         try:
             result = await self.manager.call_tool(container_name, tool_name, args)
             return f"Result:\n{result}"
+        except ValueError as e:
+            logger.error(f"Tool not found or invalid arguments: {e}")
+            return f"❌ Tool execution failed: {str(e)}"
         except Exception as e:
-            logger.error(f"Tool execution failed: {e}")
+            logger.error(f"Tool execution failed: {e}", exc_info=True)
             return f"❌ Tool execution failed: {str(e)}"
 
     @tool(
@@ -263,6 +279,7 @@ class MCPAgent(Feature):
         try:
             # Lazy import
             from .manager import MCPGatewayManager
+            from .gateway import DockerMCPGatewayError, DockerMCPNotInstalledError
 
             # Stop existing gateway if running
             if self.gateway_manager and self.gateway_manager.is_connected:
@@ -284,8 +301,14 @@ class MCPAgent(Feature):
                 + "\n\nUse `!mcp-gateway-call <tool> <args>` to call tools."
             )
 
+        except (DockerMCPGatewayError, DockerMCPNotInstalledError) as e:
+            logger.error(f"Gateway error: {e}")
+            return f"❌ Failed to start gateway: {str(e)}"
+        except asyncio.TimeoutError as e:
+            logger.error(f"Timeout starting gateway: {e}")
+            return f"❌ Failed to start gateway: Connection timeout"
         except Exception as e:
-            logger.error(f"Failed to start gateway: {e}")
+            logger.error(f"Unexpected error starting gateway: {e}", exc_info=True)
             return f"❌ Failed to start gateway: {str(e)}"
 
     @tool(
@@ -308,8 +331,11 @@ class MCPAgent(Feature):
             await self.gateway_manager.stop()
             self.gateway_manager = None
             return "✅ Gateway stopped."
+        except asyncio.CancelledError:
+            logger.info("Gateway stop cancelled")
+            return "⚠️ Gateway stop cancelled"
         except Exception as e:
-            logger.error(f"Failed to stop gateway: {e}")
+            logger.error(f"Failed to stop gateway: {e}", exc_info=True)
             return f"❌ Failed to stop gateway: {str(e)}"
 
     @tool(
@@ -341,8 +367,11 @@ class MCPAgent(Feature):
                 return f"**{tool_name}** result:\n\n{text}"
             return f"**{tool_name}** result:\n\n{str(result)}"
 
-        except Exception as e:
+        except (ValueError, RuntimeError) as e:
             logger.error(f"Gateway tool call failed: {e}")
+            return f"❌ Tool call failed: {str(e)}"
+        except Exception as e:
+            logger.error(f"Gateway tool call failed: {e}", exc_info=True)
             return f"❌ Tool call failed: {str(e)}"
 
     @tool(
@@ -400,8 +429,14 @@ class MCPAgent(Feature):
                 f"✅ Enabled {server_name}\n\n"
                 f"**Total tools:** {len(tool_names)}"
             )
-        except Exception as e:
+        except (ValueError, RuntimeError) as e:
             logger.error(f"Failed to enable server: {e}")
+            return f"❌ Failed to enable {server_name}: {str(e)}"
+        except asyncio.TimeoutError as e:
+            logger.error(f"Timeout enabling server: {e}")
+            return f"❌ Failed to enable {server_name}: Connection timeout"
+        except Exception as e:
+            logger.error(f"Unexpected error enabling server: {e}", exc_info=True)
             return f"❌ Failed to enable {server_name}: {str(e)}"
 
     @tool(
@@ -457,8 +492,10 @@ class MCPAgent(Feature):
         if self.gateway_manager and self.gateway_manager.is_connected:
             try:
                 await self.gateway_manager.stop()
+            except asyncio.CancelledError:
+                logger.info("Gateway stop cancelled during shutdown")
             except Exception as e:
-                logger.warning(f"Error stopping gateway: {e}")
+                logger.warning(f"Error stopping gateway: {e}", exc_info=True)
             self.gateway_manager = None
 
         # Stop container-based tools
