@@ -5,12 +5,15 @@ Preloads all necessary context files into Claude's initial prompt.
 """
 
 import json
+import logging
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from datetime import datetime
+
+logger = logging.getLogger(__name__)
 
 
 class KestrelContextLoader:
@@ -45,8 +48,8 @@ def __init__(self, project_path: str = "."):
                 content = path.read_text()
                 self.files_loaded.append(filepath)
                 return content
-            except Exception as e:
-                print(f"⚠️  Error reading {filepath}: {e}", file=sys.stderr)
+            except OSError as e:
+                logger.warning(f"Error reading {filepath}: {e}")
         return None
     
     def load_context(self) -> Dict[str, str]:
@@ -100,7 +103,8 @@ def __init__(self, project_path: str = "."):
                 if 'mcpServers' in config:
                     print(f"🔧 Found MCP configuration with {len(config['mcpServers'])} servers", file=sys.stderr)
                     return config
-            except json.JSONDecodeError:
+            except json.JSONDecodeError as e:
+                logger.warning(f"Invalid JSON block in AGENTS.md: {e}")
                 continue
         
         return None

@@ -126,7 +126,7 @@ class KeyResolutionService:
                     logger.debug(f"Resolved key for {provider} from agent storage")
                     return key
             except Exception as e:
-                logger.debug(f"Storage key lookup for {provider}: {e}")
+                logger.warning(f"Storage key lookup failed for {provider}: {e}")
 
         # Fall back to environment variables
         env_var_map = {
