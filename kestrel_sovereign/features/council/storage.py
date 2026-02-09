@@ -296,9 +296,43 @@ class CouncilStorage:
 _default_storage: Optional[CouncilStorage] = None
 
 
-def get_storage() -> CouncilStorage:
-    """Get the default council storage instance."""
+def get_storage(
+    data_dir: Optional[Path] = None,
+    graph_store: Optional[Any] = None
+) -> CouncilStorage:
+    """
+    Get the default council storage instance.
+
+    Args:
+        data_dir: Directory for JSON session files (only used on first call)
+        graph_store: Optional knowledge graph store (only used on first call)
+
+    Returns:
+        CouncilStorage instance
+    """
     global _default_storage
     if _default_storage is None:
-        _default_storage = CouncilStorage()
+        _default_storage = CouncilStorage(data_dir=data_dir, graph_store=graph_store)
+    else:
+        # Warn if trying to initialize with different params
+        normalized_data_dir = data_dir or DATA_DIR
+        if (_default_storage.data_dir != normalized_data_dir or
+            _default_storage.graph_store != graph_store):
+            logger.warning(
+                f"Attempted to re-initialize council storage with different params. "
+                f"Existing: data_dir={_default_storage.data_dir}, graph_store={_default_storage.graph_store}. "
+                f"Requested: data_dir={normalized_data_dir}, graph_store={graph_store}. "
+                f"Ignoring new params and returning existing instance."
+            )
     return _default_storage
+
+
+def reset_storage() -> None:
+    """
+    Reset the default council storage singleton.
+
+    This is primarily for testing purposes to allow re-initialization
+    with different parameters.
+    """
+    global _default_storage
+    _default_storage = None
