@@ -146,8 +146,7 @@ def handle_observability_errors(func: Callable) -> Callable:
         try:
             return await func(*args, **kwargs)
         except Exception as e:
-            # Log at debug level to avoid spam in normal operations
-            logger.debug(f"Observability operation failed in {func.__name__}: {e}")
+            logger.warning(f"Observability operation failed in {func.__name__}: {e}")
             return None  # Return None to indicate failure without raising
 
     @wraps(func)
@@ -155,7 +154,7 @@ def handle_observability_errors(func: Callable) -> Callable:
         try:
             return func(*args, **kwargs)
         except Exception as e:
-            logger.debug(f"Observability operation failed in {func.__name__}: {e}")
+            logger.warning(f"Observability operation failed in {func.__name__}: {e}")
             return None
 
     # Return appropriate wrapper based on function type
