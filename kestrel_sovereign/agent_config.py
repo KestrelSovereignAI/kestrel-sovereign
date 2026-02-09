@@ -16,8 +16,11 @@ log_level = "INFO"
 The CLI reads this config and uses it for start/stop/status commands.
 """
 
+import logging
 import os
 import toml
+
+logger = logging.getLogger(__name__)
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Optional
@@ -83,8 +86,10 @@ class AgentConfig:
                 config.log_level = server.get("log_level", config.log_level)
                 config.auto_reload = server.get("auto_reload", config.auto_reload)
 
+            except toml.TomlDecodeError as e:
+                logger.error(f"Invalid TOML in {config_path}: {e}")
             except Exception as e:
-                print(f"Warning: Failed to load {config_path}: {e}")
+                logger.warning(f"Failed to load {config_path}: {e}")
 
         return config
 
