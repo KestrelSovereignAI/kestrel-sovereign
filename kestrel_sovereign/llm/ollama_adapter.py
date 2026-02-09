@@ -147,8 +147,10 @@ class OllamaAdapter(LLMAdapter):
                     validated = response_format.model_validate_json(content)
                     # Return as JSON string for consistency with other adapters
                     content = validated.model_dump_json()
-                except Exception as e:
+                except (json.JSONDecodeError, ValueError) as e:
                     logger.warning(f"Ollama structured output validation failed: {e}")
+                except Exception as e:
+                    logger.error(f"Unexpected error during Ollama structured output validation: {e}", exc_info=True)
                     # Return raw content if validation fails
 
             # Parse tool calls if present (Ollama returns them in message.tool_calls)
@@ -208,8 +210,11 @@ class OllamaAdapter(LLMAdapter):
                 total_tokens=total_tokens,
             )
 
+        except ollama.ResponseError as e:
+            logger.error(f"Ollama API error: {e}")
+            raise
         except Exception as e:
-            logger.error(f"Ollama adapter failed: {e}")
+            logger.error(f"Ollama adapter failed: {e}", exc_info=True)
             raise
 
     async def get_streaming_response(
@@ -291,11 +296,16 @@ class OllamaAdapter(LLMAdapter):
                 try:
                     response_format.model_validate_json(response_accum)
                     logger.info("Ollama streaming structured output validated successfully")
-                except Exception as e:
+                except (json.JSONDecodeError, ValueError) as e:
                     logger.warning(f"Ollama streaming structured output validation failed: {e}")
+                except Exception as e:
+                    logger.error(f"Unexpected error during Ollama streaming structured output validation: {e}", exc_info=True)
 
+        except ollama.ResponseError as e:
+            logger.error(f"Ollama streaming API error: {e}")
+            raise
         except Exception as e:
-            logger.error(f"Ollama streaming failed: {e}")
+            logger.error(f"Ollama streaming failed: {e}", exc_info=True)
             raise
 
     async def get_streaming_response_with_tools(
@@ -369,8 +379,11 @@ class OllamaAdapter(LLMAdapter):
             ):
                 yield chunk
 
+        except ollama.ResponseError as e:
+            logger.error(f"Ollama streaming with tools API error: {e}")
+            raise
         except Exception as e:
-            logger.error(f"Ollama streaming with tools failed: {e}")
+            logger.error(f"Ollama streaming with tools failed: {e}", exc_info=True)
             raise
 
     async def continue_with_tool_results(
@@ -496,6 +509,9 @@ class OllamaAdapter(LLMAdapter):
             logger.info(f"Ollama returned {len(models)} local models")
             return models
 
+        except ollama.ResponseError as e:
+            logger.error(f"Ollama API error while listing models: {e}")
+            return []
         except Exception as e:
-            logger.error(f"Failed to list Ollama models: {e}")
+            logger.error(f"Failed to list Ollama models: {e}", exc_info=True)
             return []
