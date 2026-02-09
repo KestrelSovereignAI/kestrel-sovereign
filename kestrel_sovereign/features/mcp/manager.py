@@ -21,7 +21,7 @@ from typing import Dict, Any, List, Optional
 from mcp.client.sse import sse_client
 from mcp.client.session import ClientSession
 from docker.models.containers import Container
-from docker.errors import NotFound
+from docker.errors import NotFound, DockerException, APIError, ImageNotFound
 
 from kestrel_sovereign.kestrel_config.constants import (
     SESSION_CONNECT_TIMEOUT_SHORT,
@@ -51,8 +51,11 @@ class MCPToolManager:
             self.docker_client.ping()
             self.active_tools: Dict[str, Dict[str, Any]] = {}
             logger.info("MCPToolManager initialized with Docker connection")
-        except Exception as e:
+        except docker.errors.DockerException as e:
             logger.warning(f"Docker connection failed: {e}")
+            raise RuntimeError(f"Docker not available for MCP tools: {e}")
+        except Exception as e:
+            logger.error(f"Unexpected error initializing Docker: {e}", exc_info=True)
             raise RuntimeError(f"Docker not available for MCP tools: {e}")
         # active_tools structure:
         # {
@@ -157,8 +160,10 @@ class MCPToolManager:
                 raise RuntimeError(f"Container {container_name} not found")
             except (TimeoutError, RuntimeError):
                 raise
+            except docker.errors.DockerException as e:
+                logger.debug(f"Health check attempt {attempt} failed (Docker error): {e}")
             except Exception as e:
-                logger.debug(f"Health check attempt {attempt} failed: {e}")
+                logger.debug(f"Health check attempt {attempt} failed: {e}", exc_info=True)
             
             await asyncio.sleep(delay)
             delay = min(delay * HEALTHCHECK_BACKOFF_FACTOR, HEALTHCHECK_MAX_DELAY)
@@ -199,7 +204,10 @@ class MCPToolManager:
                     # SSE endpoints return 200 and start streaming
                     # We just need to verify we can connect and get a response
                     return resp.status == 200
-        except Exception:
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            return False
+        except Exception as e:
+            logger.debug(f"Unexpected error checking SSE readiness: {e}", exc_info=True)
             return False
 
     async def start_tool_container(self, image_name: str, container_name: str = None, command: List[str] = None, environment: Dict[str, str] = None, volumes: Dict[str, Dict[str, str]] = None) -> str:
@@ -228,8 +236,10 @@ class MCPToolManager:
                     logger.info(f"Container {container_name} exists but not running (status={container.status}). Removing and recreating...")
                     try:
                         container.remove(force=True)
-                    except Exception as e:
+                    except docker.errors.APIError as e:
                         logger.warning(f"Error removing stale container: {e}")
+                    except Exception as e:
+                        logger.warning(f"Unexpected error removing stale container: {e}", exc_info=True)
             except NotFound:
                 pass
 
@@ -270,11 +280,19 @@ class MCPToolManager:
                 container = self.docker_client.containers.get(container_name)
                 logs = container.logs(tail=50).decode('utf-8', errors='replace')
                 logger.error(f"Container logs:\n{logs}")
+            except docker.errors.DockerException as log_err:
+                logger.debug(f"Could not retrieve container logs (Docker error): {log_err}")
             except Exception as log_err:
-                logger.debug(f"Could not retrieve container logs: {log_err}")
+                logger.debug(f"Could not retrieve container logs: {log_err}", exc_info=True)
+            raise
+        except docker.errors.ImageNotFound as e:
+            logger.error(f"Docker image not found: {image_name}")
+            raise
+        except docker.errors.APIError as e:
+            logger.error(f"Docker API error starting container: {e}")
             raise
         except Exception as e:
-            logger.error(f"Failed to start tool container {image_name}: {e}")
+            logger.error(f"Failed to start tool container {image_name}: {e}", exc_info=True)
             raise
 
     async def _run_session_loop(self, url: str, session_future: asyncio.Future):
@@ -298,8 +316,13 @@ class MCPToolManager:
             if not session_future.done():
                 session_future.set_exception(eg)
             raise
+        except aiohttp.ClientError as e:
+            logger.error(f"HTTP client error in session loop for {url}: {e}")
+            if not session_future.done():
+                session_future.set_exception(e)
+            raise
         except Exception as e:
-            logger.error(f"Error in session loop for {url}: {e}")
+            logger.error(f"Error in session loop for {url}: {e}", exc_info=True)
             if not session_future.done():
                 session_future.set_exception(e)
             raise
@@ -332,23 +355,31 @@ class MCPToolManager:
             
             try:
                 session = await asyncio.wait_for(session_future, timeout=SESSION_CONNECT_TIMEOUT_SHORT)
-                
+
                 # List tools
                 result = await session.list_tools()
                 tools = result.tools
-                
+
                 self.active_tools[container_name] = {
                     "container": container,
                     "session": session,
                     "task": task,
                     "tools": tools
                 }
-                
+
                 logger.info(f"Connected to {container_name}. Found {len(tools)} tools.")
                 return tools
 
+            except asyncio.TimeoutError as e:
+                logger.error(f"Timeout connecting to tool {container_name}: {e}")
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                raise
             except Exception as e:
-                logger.error(f"Failed to connect to tool {container_name}: {e}")
+                logger.error(f"Failed to connect to tool {container_name}: {e}", exc_info=True)
                 task.cancel()
                 try:
                     await task
@@ -356,8 +387,14 @@ class MCPToolManager:
                     pass
                 raise
 
+        except docker.errors.NotFound as e:
+            logger.error(f"Container {container_name} not found: {e}")
+            raise
+        except docker.errors.APIError as e:
+            logger.error(f"Docker API error connecting to {container_name}: {e}")
+            raise
         except Exception as e:
-            logger.error(f"Failed to connect to tool {container_name}: {e}")
+            logger.error(f"Failed to connect to tool {container_name}: {e}", exc_info=True)
             raise
 
     async def stop_tool(self, container_name: str):
@@ -376,7 +413,7 @@ class MCPToolManager:
                 except asyncio.CancelledError:
                     pass
                 except Exception as e:
-                    logger.error(f"Error stopping session task for {container_name}: {e}")
+                    logger.error(f"Error stopping session task for {container_name}: {e}", exc_info=True)
             
             from kestrel_sovereign.kestrel_config.constants import MCP_MAX_CONNECTION_ATTEMPTS, MCP_CONNECTION_RETRY_DELAY
 
@@ -393,8 +430,10 @@ class MCPToolManager:
                         break
             except NotFound:
                 pass  # Already removed
+            except docker.errors.APIError as e:
+                logger.warning(f"Docker API error stopping container {container_name}: {e}")
             except Exception as e:
-                logger.warning(f"Error stopping container {container_name}: {e}")
+                logger.warning(f"Error stopping container {container_name}: {e}", exc_info=True)
             
             del self.active_tools[container_name]
             logger.info(f"Stopped tool {container_name}")
@@ -435,8 +474,10 @@ class MCPToolManager:
         if self.docker_client:
             try:
                 self.docker_client.close()
+            except docker.errors.DockerException as e:
+                logger.warning(f"Docker error closing client: {e}")
             except Exception as e:
-                logger.warning(f"Error closing Docker client: {e}")
+                logger.warning(f"Error closing Docker client: {e}", exc_info=True)
             self.docker_client = None
 
 
@@ -520,8 +561,13 @@ class MCPGatewayManager:
             except asyncio.CancelledError:
                 logger.info("Gateway session cancelled")
                 raise
+            except aiohttp.ClientError as e:
+                logger.error(f"Gateway session HTTP error: {e}")
+                if not session_future.done():
+                    session_future.set_exception(e)
+                raise
             except Exception as e:
-                logger.error(f"Gateway session error: {e}")
+                logger.error(f"Gateway session error: {e}", exc_info=True)
                 if not session_future.done():
                     session_future.set_exception(e)
                 raise
@@ -547,7 +593,16 @@ class MCPGatewayManager:
                 except asyncio.CancelledError:
                     pass
             raise DockerMCPGatewayError("Timeout connecting to gateway")
+        except (aiohttp.ClientError, DockerMCPGatewayError) as e:
+            if self._session_task:
+                self._session_task.cancel()
+                try:
+                    await self._session_task
+                except asyncio.CancelledError:
+                    pass
+            raise
         except Exception as e:
+            logger.error(f"Unexpected error connecting to gateway: {e}", exc_info=True)
             if self._session_task:
                 self._session_task.cancel()
                 try:
