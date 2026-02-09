@@ -185,8 +185,12 @@ class MCPRegistry:
 
             logger.info(f"Loaded {len(self.servers)} MCP servers from catalog")
 
+        except (OSError, IOError) as e:
+            logger.error(f"Failed to read MCP catalog file: {e}")
+        except tomllib.TOMLDecodeError as e:
+            logger.error(f"Failed to parse MCP catalog TOML: {e}")
         except Exception as e:
-            logger.error(f"Failed to load MCP catalog: {e}")
+            logger.error(f"Failed to load MCP catalog: {e}", exc_info=True)
 
     def _parse_server_entry(self, name: str, data: Dict[str, Any]) -> MCPServerEntry:
         """Parse a server entry from TOML data."""
@@ -358,8 +362,10 @@ def check_docker_mcp_available() -> bool:
             timeout=SSH_COMMAND_TIMEOUT_SHORT
         )
         return result.returncode == 0
-    except Exception:
-        # Catch all exceptions - subprocess can fail in various ways
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return False
+    except Exception as e:
+        logger.debug(f"Unexpected error checking Docker MCP availability: {e}", exc_info=True)
         return False
 
 
@@ -427,8 +433,17 @@ async def list_docker_catalog_servers() -> List[Dict[str, str]]:
 
         return servers
 
-    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
-        logger.warning(f"Error listing Docker MCP catalog: {e}")
+    except subprocess.TimeoutExpired as e:
+        logger.warning(f"Timeout listing Docker MCP catalog: {e}")
+        return []
+    except FileNotFoundError as e:
+        logger.warning(f"Docker command not found: {e}")
+        return []
+    except OSError as e:
+        logger.warning(f"OS error listing Docker MCP catalog: {e}")
+        return []
+    except Exception as e:
+        logger.warning(f"Unexpected error listing Docker MCP catalog: {e}", exc_info=True)
         return []
 
 
@@ -463,7 +478,10 @@ async def list_enabled_docker_servers() -> List[str]:
 
         return servers
 
-    except (subprocess.TimeoutExpired, FileNotFoundError):
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return []
+    except Exception as e:
+        logger.debug(f"Unexpected error listing enabled Docker servers: {e}", exc_info=True)
         return []
 
 
@@ -528,6 +546,9 @@ def format_docker_catalog_summary() -> str:
 
         return f"Docker MCP: {server_count} servers available, {enabled_count} enabled"
 
-    except Exception as e:
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
         logger.warning(f"Error getting Docker MCP summary: {e}")
+        return "Docker MCP status unknown"
+    except Exception as e:
+        logger.warning(f"Unexpected error getting Docker MCP summary: {e}", exc_info=True)
         return "Docker MCP status unknown"
