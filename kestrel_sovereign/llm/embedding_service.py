@@ -246,4 +246,26 @@ def get_embedding_service(
     global _default_service
     if _default_service is None:
         _default_service = EmbeddingService(model=model, base_url=base_url)
+    else:
+        # Warn if trying to initialize with different params
+        normalized_base_url = base_url or get_ollama_url()
+        if (_default_service.model != model or
+            _default_service.base_url != normalized_base_url):
+            logger.warning(
+                f"Attempted to re-initialize embedding service with different params. "
+                f"Existing: model={_default_service.model}, base_url={_default_service.base_url}. "
+                f"Requested: model={model}, base_url={normalized_base_url}. "
+                f"Ignoring new params and returning existing instance."
+            )
     return _default_service
+
+
+def reset_embedding_service() -> None:
+    """
+    Reset the default embedding service singleton.
+
+    This is primarily for testing purposes to allow re-initialization
+    with different parameters.
+    """
+    global _default_service
+    _default_service = None
