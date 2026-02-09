@@ -48,7 +48,7 @@ class HooksManager:
 
         if not result.continue_execution:
             # Hook blocked execution
-            print(f"Blocked: {result.stop_reason}")
+            logger.warning(f"Blocked: {result.stop_reason}")
     """
 
     def __init__(self):
