@@ -182,7 +182,7 @@ class GoogleAdapter(LLMAdapter):
             )
 
         except Exception as e:
-            logger.error(f"Google Gemini API error: {e}")
+            logger.error(f"Google Gemini API error: {e}", exc_info=True)
             raise
 
     async def get_streaming_response(
@@ -222,7 +222,7 @@ class GoogleAdapter(LLMAdapter):
                     yield chunk.text
 
         except Exception as e:
-            logger.error(f"Google Gemini streaming error: {e}")
+            logger.error(f"Google Gemini streaming error: {e}", exc_info=True)
             raise
 
     async def continue_with_tool_results(
@@ -322,5 +322,5 @@ class GoogleAdapter(LLMAdapter):
             return models
 
         except Exception as e:
-            logger.error(f"Failed to list Google models: {e}")
+            logger.error(f"Failed to list Google models: {e}", exc_info=True)
             return []
