@@ -332,6 +332,8 @@ class GCPComputeEngineManagerCore:
             )
             logger.info(f"Persistent disk {disk_name} exists ({disk.size_gb}GB)")
             return True
+        except ImportError as e:
+            raise GCPComputeManagerError(f"google-cloud-compute not installed: {e}") from e
         except Exception as e:
             if "404" not in str(e) and "not found" not in str(e).lower():
                 raise GCPComputeManagerError(f"Failed to check disk: {e}") from e
@@ -359,6 +361,8 @@ class GCPComputeEngineManagerCore:
             logger.info(f"Created persistent disk {disk_name}")
             return True
 
+        except ImportError as e:
+            raise GCPComputeManagerError(f"google-cloud-compute not installed: {e}") from e
         except Exception as e:
             raise GCPComputeManagerError(f"Failed to create disk: {e}") from e
 
@@ -448,8 +452,11 @@ class GCPComputeEngineManagerCore:
 
             return None
 
+        except ImportError as e:
+            logger.error(f"google-cloud-compute not installed: {e}", exc_info=True)
+            return None
         except Exception as e:
-            logger.warning(f"Error finding existing instance: {e}")
+            logger.warning(f"Error finding existing instance: {e}", exc_info=True)
             return None
 
     async def _adopt_existing_instance(
@@ -687,6 +694,10 @@ class GCPComputeEngineManagerCore:
                     if ni.access_configs:
                         external_ip = ni.access_configs[0].nat_i_p
 
+            except ImportError as e:
+                raise GCPComputeManagerError(f"google-cloud-compute not installed: {e}") from e
+            except OSError as e:
+                raise GCPComputeManagerError(f"Failed to read SSH key: {e}") from e
             except Exception as e:
                 raise GCPComputeManagerError(f"Failed to create instance: {e}") from e
 
@@ -765,11 +776,15 @@ class GCPComputeEngineManagerCore:
                                         f"Instance {session.instance_name} is ready"
                                     )
                                     return
-                        except Exception:
-                            pass  # Container not ready yet
+                        except (OSError, ConnectionError) as e:
+                            logger.debug(f"Container not ready yet: {e}")
+                        except Exception as e:
+                            logger.debug(f"Unexpected error checking container readiness: {e}", exc_info=True)
 
+            except ImportError as e:
+                logger.error(f"google-cloud-compute not installed: {e}", exc_info=True)
             except Exception as e:
-                logger.warning(f"Error checking instance status: {e}")
+                logger.warning(f"Error checking instance status: {e}", exc_info=True)
 
             await asyncio.sleep(self.poll_interval)
 
@@ -809,8 +824,11 @@ class GCPComputeEngineManagerCore:
                         self._session.external_ip = ni.access_configs[0].nat_i_p
                         self._session.ssh_host = self._session.external_ip
 
+            except ImportError as e:
+                logger.error(f"google-cloud-compute not installed: {e}", exc_info=True)
+                self._session.status = InstanceStatus.ERROR
             except Exception as e:
-                logger.error(f"Failed to refresh status: {e}")
+                logger.error(f"Failed to refresh status: {e}", exc_info=True)
                 self._session.status = InstanceStatus.ERROR
 
         return self._session.to_dict()
@@ -844,8 +862,11 @@ class GCPComputeEngineManagerCore:
                 session.status = InstanceStatus.TERMINATED
                 logger.info(f"Deleted instance {session.instance_name}")
 
+            except ImportError as e:
+                logger.error(f"google-cloud-compute not installed: {e}", exc_info=True)
+                session.status = InstanceStatus.ERROR
             except Exception as e:
-                logger.error(f"Failed to delete instance: {e}")
+                logger.error(f"Failed to delete instance: {e}", exc_info=True)
                 session.status = InstanceStatus.ERROR
 
             self._session = None
@@ -877,8 +898,11 @@ class GCPComputeEngineManagerCore:
             if self._session and self._session.instance_name == session.instance_name:
                 self._session = None
 
+        except ImportError as e:
+            logger.error(f"google-cloud-compute not installed: {e}", exc_info=True)
+            session.status = InstanceStatus.ERROR
         except Exception as e:
-            logger.error(f"Failed to terminate session: {e}")
+            logger.error(f"Failed to terminate session: {e}", exc_info=True)
             session.status = InstanceStatus.ERROR
 
     async def list_instances(self) -> List[Dict[str, Any]]:
@@ -906,8 +930,11 @@ class GCPComputeEngineManagerCore:
 
             return instances
 
+        except ImportError as e:
+            logger.error(f"google-cloud-compute not installed: {e}", exc_info=True)
+            return []
         except Exception as e:
-            logger.error(f"Failed to list instances: {e}")
+            logger.error(f"Failed to list instances: {e}", exc_info=True)
             return []
 
     async def list_disks(self) -> List[Dict[str, Any]]:
@@ -935,6 +962,9 @@ class GCPComputeEngineManagerCore:
 
             return disks
 
+        except ImportError as e:
+            logger.error(f"google-cloud-compute not installed: {e}", exc_info=True)
+            return []
         except Exception as e:
-            logger.error(f"Failed to list disks: {e}")
+            logger.error(f"Failed to list disks: {e}", exc_info=True)
             return []
