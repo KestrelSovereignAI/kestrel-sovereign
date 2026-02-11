@@ -157,8 +157,12 @@ async def _gather_git_changes(
             if stdout and len(stdout) < 5000:  # Only include if not too large
                 changes.append(f"# {filepath}\n{stdout.decode().strip()}")
 
+    except FileNotFoundError as e:
+        logger.error(f"Git command not found: {e}", exc_info=True)
+    except subprocess.SubprocessError as e:
+        logger.error(f"Git subprocess error: {e}", exc_info=True)
     except Exception as e:
-        logger.error(f"Git gathering failed: {e}")
+        logger.error(f"Git gathering failed: {e}", exc_info=True)
 
     return changes, commits
 
@@ -190,8 +194,10 @@ async def _gather_test_results() -> Dict[str, Any]:
                 with open(cache_file) as f:
                     failed_data = json.load(f)
                     failed_count = len(failed_data) if failed_data else 0
-            except Exception:
-                pass
+            except (OSError, json.JSONDecodeError) as e:
+                logger.debug(f"Failed to read pytest lastfailed cache: {e}")
+            except Exception as e:
+                logger.debug(f"Unexpected error reading pytest cache: {e}", exc_info=True)
 
         return {
             "total": total_tests,
@@ -200,8 +206,20 @@ async def _gather_test_results() -> Dict[str, Any]:
             "summary": f"{total_tests} tests collected",
         }
 
+    except FileNotFoundError as e:
+        logger.error(f"uv or pytest not found: {e}", exc_info=True)
+        return {"total": 0, "passed": 0, "failed": 0, "error": str(e)}
+    except subprocess.SubprocessError as e:
+        logger.error(f"Test subprocess error: {e}", exc_info=True)
+        return {"total": 0, "passed": 0, "failed": 0, "error": str(e)}
+    except OSError as e:
+        logger.error(f"Failed to read pytest cache: {e}", exc_info=True)
+        return {"total": 0, "passed": 0, "failed": 0, "error": str(e)}
+    except json.JSONDecodeError as e:
+        logger.error(f"Failed to parse pytest cache: {e}", exc_info=True)
+        return {"total": 0, "passed": 0, "failed": 0, "error": str(e)}
     except Exception as e:
-        logger.error(f"Test gathering failed: {e}")
+        logger.error(f"Test gathering failed: {e}", exc_info=True)
         return {"total": 0, "passed": 0, "failed": 0, "error": str(e)}
 
 
@@ -223,8 +241,10 @@ async def _gather_security_assessment(target: str) -> str:
                 assessment_parts.append(content[summary_start:summary_end])
             else:
                 assessment_parts.append(content[:2000])  # First 2000 chars
+        except OSError as e:
+            logger.warning(f"Could not read security review: {e}", exc_info=True)
         except Exception as e:
-            logger.warning(f"Could not read security review: {e}")
+            logger.warning(f"Could not read security review: {e}", exc_info=True)
 
     # Check for general security review
     general_review = PROJECT_ROOT / "docs" / "CRITICAL_CODE_REVIEW.md"
@@ -245,8 +265,10 @@ async def _gather_security_assessment(target: str) -> str:
                         key_lines.append(line)
                 if key_lines:
                     assessment_parts.append("\n".join(key_lines[:20]))
+        except OSError as e:
+            logger.warning(f"Could not read critical review: {e}", exc_info=True)
         except Exception as e:
-            logger.warning(f"Could not read critical review: {e}")
+            logger.warning(f"Could not read critical review: {e}", exc_info=True)
 
     # Check recent security-related commits
     try:
@@ -261,8 +283,12 @@ async def _gather_security_assessment(target: str) -> str:
             assessment_parts.append(
                 "Recent security commits:\n" + stdout.decode().strip()
             )
-    except Exception:
-        pass
+    except FileNotFoundError as e:
+        logger.debug(f"Git command not found: {e}")
+    except subprocess.SubprocessError as e:
+        logger.debug(f"Git subprocess error: {e}")
+    except Exception as e:
+        logger.debug(f"Unexpected error gathering security commits: {e}", exc_info=True)
 
     return "\n\n".join(assessment_parts) if assessment_parts else "No security assessment available."
 
@@ -299,8 +325,10 @@ async def _gather_architecture_docs(
                         if i > 5 and line.strip() == "":
                             break
                     docs.append("\n".join(summary_lines))
+            except OSError as e:
+                logger.warning(f"Could not read {doc_path}: {e}", exc_info=True)
             except Exception as e:
-                logger.warning(f"Could not read {doc_path}: {e}")
+                logger.warning(f"Could not read {doc_path}: {e}", exc_info=True)
 
     return docs, source_files
 
@@ -326,8 +354,10 @@ async def _gather_risks(target: str) -> List[str]:
                         in_risk_section = False
                     elif line.strip().startswith("- "):
                         risks.append(line.strip()[2:])
+        except OSError as e:
+            logger.warning(f"Could not read PROJECT_STATUS.md: {e}", exc_info=True)
         except Exception as e:
-            logger.warning(f"Could not read PROJECT_STATUS.md: {e}")
+            logger.warning(f"Could not read PROJECT_STATUS.md: {e}", exc_info=True)
 
     # Check specific review for risks
     review_path = PROJECT_ROOT / "docs" / "reviews" / f"{target.upper()}_REVIEW.md"
@@ -341,8 +371,10 @@ async def _gather_risks(target: str) -> List[str]:
                 for line in lines:
                     if "risk" in line.lower() and len(line) < 200:
                         risks.append(line.strip())
-        except Exception:
-            pass
+        except OSError as e:
+            logger.debug(f"Could not read review file: {e}")
+        except Exception as e:
+            logger.debug(f"Unexpected error reading review: {e}", exc_info=True)
 
     # Deduplicate
     return list(dict.fromkeys(risks))[:10]  # Max 10 risks
@@ -364,8 +396,12 @@ async def _gather_previous_decisions() -> List[str]:
                         f"{session.get('question', 'Unknown')[:100]} -> "
                         f"{session.get('outcome', 'Unknown')}"
                     )
+        except OSError as e:
+            logger.warning(f"Could not read previous sessions: {e}", exc_info=True)
+        except json.JSONDecodeError as e:
+            logger.warning(f"Failed to parse session JSON: {e}", exc_info=True)
         except Exception as e:
-            logger.warning(f"Could not read previous sessions: {e}")
+            logger.warning(f"Could not read previous sessions: {e}", exc_info=True)
 
     return decisions
 
