@@ -26,6 +26,13 @@ DEFAULT_CODE_ROOT = os.environ.get(
     str(Path(__file__).parent.parent.parent.parent)  # Up to kestrel-sovereign/
 )
 
+# Timeout constants (in seconds)
+CODE_REVIEW_TIMEOUT = 300  # 5 minutes for user approval of code changes
+TEST_SUITE_TIMEOUT = 300   # 5 minutes for running test suite
+LINT_TIMEOUT = 60          # 1 minute for linting operations
+GIT_OPERATION_TIMEOUT = 30  # 30 seconds for git commands (diff, commit, rollback)
+GIT_QUICK_TIMEOUT = 10     # 10 seconds for quick git commands (rev-parse)
+
 
 class CodeEditFeature(Feature):
     """Feature for self-modification of source code.
@@ -100,7 +107,7 @@ class CodeEditFeature(Feature):
                 feature_name="code_edit",
                 tool_name=action,
                 tool_args=details,
-                timeout=300,  # 5 minutes for code review
+                timeout=CODE_REVIEW_TIMEOUT,
             )
             return approved
         except (TimeoutError, asyncio.TimeoutError) as e:
@@ -346,7 +353,7 @@ class CodeEditFeature(Feature):
                 cwd=self.code_root,
                 capture_output=True,
                 text=True,
-                timeout=30,
+                timeout=GIT_OPERATION_TIMEOUT,
             )
             
             if result.returncode != 0:
@@ -408,7 +415,7 @@ class CodeEditFeature(Feature):
                 [GIT_PATH, "add", str(resolved)],
                 cwd=self.code_root,
                 check=True,
-                timeout=30,
+                timeout=GIT_OPERATION_TIMEOUT,
             )
             
             # Commit
@@ -417,7 +424,7 @@ class CodeEditFeature(Feature):
                 cwd=self.code_root,
                 capture_output=True,
                 text=True,
-                timeout=30,
+                timeout=GIT_OPERATION_TIMEOUT,
             )
             
             if result.returncode != 0:
@@ -431,7 +438,7 @@ class CodeEditFeature(Feature):
                 cwd=self.code_root,
                 capture_output=True,
                 text=True,
-                timeout=10,
+                timeout=GIT_QUICK_TIMEOUT,
             )
             
             commit_hash = hash_result.stdout.strip()[:8]
@@ -568,7 +575,7 @@ class CodeEditFeature(Feature):
                 cwd=self.code_root,
                 capture_output=True,
                 text=True,
-                timeout=300,  # 5 minute timeout
+                timeout=TEST_SUITE_TIMEOUT,
                 env={**os.environ, "PYTHONPATH": str(self.code_root)},
             )
             
@@ -613,7 +620,7 @@ class CodeEditFeature(Feature):
                 cwd=self.code_root,
                 capture_output=True,
                 text=True,
-                timeout=60,
+                timeout=LINT_TIMEOUT,
                 env={**os.environ, "PYTHONPATH": str(self.code_root)},
             )
             
@@ -750,7 +757,7 @@ class CodeEditFeature(Feature):
                 cwd=self.code_root,
                 capture_output=True,
                 text=True,
-                timeout=30,
+                timeout=GIT_OPERATION_TIMEOUT,
             )
             
             if result.returncode != 0:
