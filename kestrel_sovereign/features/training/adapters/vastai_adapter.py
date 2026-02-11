@@ -14,6 +14,8 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
+import httpx
+
 from ..protocol import (
     TrainingProvider,
     TrainingProviderError,
@@ -85,7 +87,10 @@ class VastAITrainingAdapter:
             manager = self._get_manager()
             # VastAI requires VASTAI_API_KEY
             return manager is not None and manager.api_key is not None
+        except (ProviderNotAvailableError, ImportError):
+            return False
         except Exception:
+            logger.debug("Vast.ai availability check failed", exc_info=True)
             return False
 
     async def start_training(
@@ -181,8 +186,11 @@ class VastAITrainingAdapter:
 
         except TrainingProviderError:
             raise
+        except (httpx.HTTPError, ConnectionError, TimeoutError) as e:
+            logger.error(f"Vast.ai training connection error: {e}")
+            raise TrainingSubmissionError(f"Failed to start Vast.ai training: {e}")
         except Exception as e:
-            logger.error(f"Vast.ai training submission failed: {e}")
+            logger.error(f"Vast.ai training submission failed: {e}", exc_info=True)
             raise TrainingSubmissionError(f"Failed to start Vast.ai training: {e}")
 
     async def _submit_training_when_ready(
@@ -223,8 +231,13 @@ class VastAITrainingAdapter:
                 self._active_jobs[job_id]["started_at"] = datetime.now(timezone.utc)
                 logger.info(f"[{job_id}] Training submitted: {training_job_id}")
 
+        except (httpx.HTTPError, ConnectionError, TimeoutError) as e:
+            logger.error(f"[{job_id}] Background training network error: {e}")
+            if job_id in self._active_jobs:
+                self._active_jobs[job_id]["state"] = "failed"
+                self._active_jobs[job_id]["error"] = str(e)
         except Exception as e:
-            logger.error(f"[{job_id}] Background training submission failed: {e}")
+            logger.error(f"[{job_id}] Background training submission failed: {e}", exc_info=True)
             if job_id in self._active_jobs:
                 self._active_jobs[job_id]["state"] = "failed"
                 self._active_jobs[job_id]["error"] = str(e)
@@ -309,8 +322,14 @@ class VastAITrainingAdapter:
 
         except TrainingProviderError:
             raise
+        except (httpx.HTTPError, ConnectionError, TimeoutError) as e:
+            logger.error(f"Vast.ai training status network error: {e}")
+            raise TrainingStatusError(f"Status check failed: {e}")
+        except (KeyError, ValueError) as e:
+            logger.error(f"Vast.ai training status parse error: {e}")
+            raise TrainingStatusError(f"Status check failed: {e}")
         except Exception as e:
-            logger.error(f"Failed to get Vast.ai training status: {e}")
+            logger.error(f"Failed to get Vast.ai training status: {e}", exc_info=True)
             raise TrainingStatusError(f"Status check failed: {e}")
 
     async def download_weights(self, job_id: str) -> Optional[bytes]:
@@ -344,8 +363,11 @@ class VastAITrainingAdapter:
 
         except TrainingProviderError:
             raise
+        except (httpx.HTTPError, ConnectionError, TimeoutError) as e:
+            logger.error(f"Vast.ai LoRA download network error: {e}")
+            raise DownloadError(f"Download failed: {e}")
         except Exception as e:
-            logger.error(f"Failed to download Vast.ai LoRA weights: {e}")
+            logger.error(f"Failed to download Vast.ai LoRA weights: {e}", exc_info=True)
             raise DownloadError(f"Download failed: {e}")
 
     async def cancel(self, job_id: str) -> bool:
@@ -377,8 +399,11 @@ class VastAITrainingAdapter:
             logger.info(f"Cancelled Vast.ai training job {job_id}")
             return True
 
-        except Exception as e:
+        except (httpx.HTTPError, ConnectionError, TimeoutError) as e:
             logger.error(f"Failed to cancel Vast.ai training: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"Failed to cancel Vast.ai training: {e}", exc_info=True)
             return False
 
     async def cleanup(self, job_id: str) -> None:
@@ -406,8 +431,10 @@ class VastAITrainingAdapter:
             # Clean up tracking
             del self._active_jobs[job_id]
 
-        except Exception as e:
+        except (httpx.HTTPError, ConnectionError, TimeoutError) as e:
             logger.warning(f"Failed to cleanup Vast.ai session: {e}")
+        except Exception as e:
+            logger.warning(f"Failed to cleanup Vast.ai session: {e}", exc_info=True)
 
     async def generate_image(
         self,
@@ -504,8 +531,14 @@ class VastAITrainingAdapter:
 
         except GenerationError:
             raise
+        except (httpx.HTTPError, ConnectionError, TimeoutError) as e:
+            logger.error(f"Vast.ai generation connection error: {e}")
+            raise GenerationError(f"Generation failed: {e}")
+        except (KeyError, ValueError) as e:
+            logger.error(f"Vast.ai generation response error: {e}")
+            raise GenerationError(f"Generation failed: {e}")
         except Exception as e:
-            logger.error(f"Vast.ai generation failed: {e}")
+            logger.error(f"Vast.ai generation failed: {e}", exc_info=True)
             raise GenerationError(f"Generation failed: {e}")
 
     async def generate_image_simple(
