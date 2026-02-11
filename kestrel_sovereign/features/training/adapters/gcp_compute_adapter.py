@@ -8,6 +8,7 @@ management.
 
 import asyncio
 import logging
+import subprocess
 import uuid
 from datetime import datetime, timezone
 from typing import Optional
@@ -80,7 +81,10 @@ class GCPComputeTrainingAdapter:
             manager = self._get_manager()
             # Check for required credentials
             return manager is not None and manager._credentials is not None
+        except (ProviderNotAvailableError, ImportError):
+            return False
         except Exception:
+            logger.debug("GCP Compute availability check failed", exc_info=True)
             return False
 
     async def start_training(
@@ -164,8 +168,14 @@ class GCPComputeTrainingAdapter:
 
         except TrainingProviderError:
             raise
+        except (subprocess.SubprocessError, OSError) as e:
+            logger.error(f"GCP Compute training system error: {e}")
+            raise TrainingSubmissionError(f"Failed to start GCP training: {e}")
+        except (ConnectionError, TimeoutError) as e:
+            logger.error(f"GCP Compute training connection error: {e}")
+            raise TrainingSubmissionError(f"Failed to start GCP training: {e}")
         except Exception as e:
-            logger.error(f"GCP Compute training submission failed: {e}")
+            logger.error(f"GCP Compute training submission failed: {e}", exc_info=True)
             raise TrainingSubmissionError(f"Failed to start GCP training: {e}")
 
     async def _submit_training_when_ready(
@@ -225,8 +235,18 @@ class GCPComputeTrainingAdapter:
                 self._active_jobs[job_id]["started_at"] = datetime.now(timezone.utc)
                 logger.info(f"[{job_id}] Training submitted successfully")
 
+        except (subprocess.SubprocessError, OSError) as e:
+            logger.error(f"[{job_id}] Background training system error: {e}")
+            if job_id in self._active_jobs:
+                self._active_jobs[job_id]["state"] = "failed"
+                self._active_jobs[job_id]["error"] = str(e)
+        except (ConnectionError, TimeoutError) as e:
+            logger.error(f"[{job_id}] Background training connection error: {e}")
+            if job_id in self._active_jobs:
+                self._active_jobs[job_id]["state"] = "failed"
+                self._active_jobs[job_id]["error"] = str(e)
         except Exception as e:
-            logger.error(f"[{job_id}] Background training submission failed: {e}")
+            logger.error(f"[{job_id}] Background training submission failed: {e}", exc_info=True)
             if job_id in self._active_jobs:
                 self._active_jobs[job_id]["state"] = "failed"
                 self._active_jobs[job_id]["error"] = str(e)
@@ -301,8 +321,14 @@ class GCPComputeTrainingAdapter:
 
         except TrainingProviderError:
             raise
+        except (subprocess.SubprocessError, OSError) as e:
+            logger.error(f"GCP training status system error: {e}")
+            raise TrainingStatusError(f"Status check failed: {e}")
+        except (KeyError, ValueError) as e:
+            logger.error(f"GCP training status parse error: {e}")
+            raise TrainingStatusError(f"Status check failed: {e}")
         except Exception as e:
-            logger.error(f"Failed to get GCP training status: {e}")
+            logger.error(f"Failed to get GCP training status: {e}", exc_info=True)
             raise TrainingStatusError(f"Status check failed: {e}")
 
     async def download_weights(self, job_id: str) -> Optional[bytes]:
@@ -334,8 +360,11 @@ class GCPComputeTrainingAdapter:
 
         except TrainingProviderError:
             raise
+        except (subprocess.SubprocessError, OSError) as e:
+            logger.error(f"GCP LoRA download system error: {e}")
+            raise DownloadError(f"Download failed: {e}")
         except Exception as e:
-            logger.error(f"Failed to download GCP LoRA weights: {e}")
+            logger.error(f"Failed to download GCP LoRA weights: {e}", exc_info=True)
             raise DownloadError(f"Download failed: {e}")
 
     async def cancel(self, job_id: str) -> bool:
@@ -366,8 +395,11 @@ class GCPComputeTrainingAdapter:
 
             return True
 
-        except Exception as e:
+        except (subprocess.SubprocessError, OSError, ConnectionError, TimeoutError) as e:
             logger.error(f"Failed to cancel GCP training: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"Failed to cancel GCP training: {e}", exc_info=True)
             return False
 
     async def cleanup(self, job_id: str) -> None:
@@ -394,5 +426,7 @@ class GCPComputeTrainingAdapter:
             # Clean up tracking
             del self._active_jobs[job_id]
 
-        except Exception as e:
+        except (subprocess.SubprocessError, OSError, ConnectionError, TimeoutError) as e:
             logger.warning(f"Failed to cleanup GCP session: {e}")
+        except Exception as e:
+            logger.warning(f"Failed to cleanup GCP session: {e}", exc_info=True)
