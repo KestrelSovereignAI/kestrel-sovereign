@@ -8,6 +8,7 @@ These methods execute commands directly on GPU instances via SSH.
 import asyncio
 import logging
 import os
+import shlex
 from typing import Any, Dict, Optional
 
 from kestrel_sovereign.kestrel_config.constants import (
@@ -121,18 +122,18 @@ class VastAISSHTrainingMixin:
 
         # Create training data directory structure
         setup_cmd = f"""
-mkdir -p /workspace/training_data/{job_id}
+mkdir -p /workspace/training_data/{shlex.quote(job_id)}
 mkdir -p /workspace/lora_output
 
 # Download training image
-cd /workspace/training_data/{job_id}
-wget -q -O image_001.png '{image_url}'
+cd /workspace/training_data/{shlex.quote(job_id)}
+wget -q -O image_001.png {shlex.quote(image_url)}
 
 # Create caption file with trigger word
-echo '{trigger_word}' > image_001.txt
+echo {shlex.quote(trigger_word)} > image_001.txt
 
 # Create dataset config
-cat > /workspace/training_data/dataset_{job_id}.toml << 'DATASET_EOF'
+cat > /workspace/training_data/dataset_{shlex.quote(job_id)}.toml << 'DATASET_EOF'
 [general]
 caption_extension = '.txt'
 keep_tokens = 1
@@ -142,7 +143,7 @@ resolution = 1024
 batch_size = {DEFAULT_TRAINING_BATCH_SIZE}
 
 [[datasets.subsets]]
-image_dir = '/workspace/training_data/{job_id}'
+image_dir = '/workspace/training_data/{shlex.quote(job_id)}'
 caption_extension = '.txt'
 num_repeats = {num_repeats}
 DATASET_EOF
@@ -161,9 +162,9 @@ nohup python sd-scripts/flux_train_network.py \\
     --clip_l /workspace/models/flux1-dev/text_encoder/model.safetensors \\
     --t5xxl /workspace/models/text_encoders/t5xxl_fp16.safetensors \\
     --ae /workspace/models/flux1-dev/ae.safetensors \\
-    --dataset_config /workspace/training_data/dataset_{job_id}.toml \\
+    --dataset_config /workspace/training_data/dataset_{shlex.quote(job_id)}.toml \\
     --output_dir /workspace/lora_output \\
-    --output_name {job_id} \\
+    --output_name {shlex.quote(job_id)} \\
     --network_module networks.lora_flux \\
     --network_dim {network_dim} \\
     --network_train_unet_only \\
@@ -179,10 +180,10 @@ nohup python sd-scripts/flux_train_network.py \\
     --guidance_scale 1.0 \\
     --gradient_checkpointing \\
     --seed 42 \\
-    > /tmp/training_{job_id}.log 2>&1 &
+    > /tmp/training_{shlex.quote(job_id)}.log 2>&1 &
 
-echo $! > /tmp/training_{job_id}.pid
-echo "Training started with PID $(cat /tmp/training_{job_id}.pid)"
+echo $! > /tmp/training_{shlex.quote(job_id)}.pid
+echo "Training started with PID $(cat /tmp/training_{shlex.quote(job_id)}.pid)"
 """
 
         logger.info(f"Starting LoRA training for {job_id}")
@@ -208,20 +209,20 @@ echo "Training started with PID $(cat /tmp/training_{job_id}.pid)"
         """
         # Check if process is still running
         check_cmd = f"""
-if [ -f /tmp/training_{job_id}.pid ]; then
-    PID=$(cat /tmp/training_{job_id}.pid)
+if [ -f /tmp/training_{shlex.quote(job_id)}.pid ]; then
+    PID=$(cat /tmp/training_{shlex.quote(job_id)}.pid)
     if ps -p $PID > /dev/null 2>&1; then
         echo "RUNNING"
         # Extract progress from log if available
-        tail -5 /tmp/training_{job_id}.log 2>/dev/null | grep -oP '\\d+%' | tail -1 || echo "0%"
+        tail -5 /tmp/training_{shlex.quote(job_id)}.log 2>/dev/null | grep -oP '\\d+%' | tail -1 || echo "0%"
     else
         # Process finished - check if output exists
-        if [ -f /workspace/lora_output/{job_id}.safetensors ]; then
+        if [ -f /workspace/lora_output/{shlex.quote(job_id)}.safetensors ]; then
             echo "COMPLETED"
-            ls -la /workspace/lora_output/{job_id}.safetensors
+            ls -la /workspace/lora_output/{shlex.quote(job_id)}.safetensors
         else
             echo "FAILED"
-            tail -20 /tmp/training_{job_id}.log 2>/dev/null
+            tail -20 /tmp/training_{shlex.quote(job_id)}.log 2>/dev/null
         fi
     fi
 else
@@ -279,7 +280,7 @@ fi
         if not session.ssh_host or not session.ssh_port:
             raise VastAIManagerError("SSH not available for download")
 
-        remote_path = f"/workspace/lora_output/{job_id}.safetensors"
+        remote_path = f"/workspace/lora_output/{shlex.quote(job_id)}.safetensors"
 
         # Download via SCP
         with tempfile.NamedTemporaryFile(delete=False, suffix=".safetensors") as f:
@@ -363,16 +364,16 @@ fi
 cd /opt/workspace-internal/kohya_ss
 source /venv/main/bin/activate
 
-mkdir -p {output_dir}
+mkdir -p {shlex.quote(output_dir)}
 
 python sd-scripts/flux_minimal_inference.py \\
     --ckpt /workspace/models/flux1-dev/flux1-dev.safetensors \\
     --clip_l /workspace/models/flux1-dev/text_encoder/model.safetensors \\
     --t5xxl /workspace/models/text_encoders/t5xxl_fp16.safetensors \\
     --ae /workspace/models/flux1-dev/ae.safetensors \\
-    --lora {lora_path} \\
-    --prompt '{prompt}' \\
-    --output {output_dir}/output.png \\
+    --lora {shlex.quote(lora_path)} \\
+    --prompt {shlex.quote(prompt)} \\
+    --output {shlex.quote(output_dir)}/output.png \\
     --width {width} \\
     --height {height} \\
     --steps {steps} \\
@@ -381,7 +382,7 @@ python sd-scripts/flux_minimal_inference.py \\
     2>&1
 
 # List generated files
-ls -la {output_dir}/*.png 2>/dev/null | head -5
+ls -la {shlex.quote(output_dir)}/*.png 2>/dev/null | head -5
 """
 
         logger.info(f"Generating with LoRA: {lora_path[:50]}...")
@@ -396,12 +397,12 @@ ls -la {output_dir}/*.png 2>/dev/null | head -5
         for i in range(num_outputs):
             try:
                 # Find the generated file
-                list_cmd = f"ls -t {output_dir}/*.png 2>/dev/null | head -1"
+                list_cmd = f"ls -t {shlex.quote(output_dir)}/*.png 2>/dev/null | head -1"
                 img_path = (await self.run_ssh_command(list_cmd, session, timeout=SSH_COMMAND_TIMEOUT_SHORT)).strip()
 
                 if img_path:
                     # Read and encode image
-                    read_cmd = f"base64 {img_path}"
+                    read_cmd = f"base64 {shlex.quote(img_path)}"
                     img_b64 = await self.run_ssh_command(read_cmd, session, timeout=SSH_COMMAND_TIMEOUT_MEDIUM)
 
                     # Return as data URL
