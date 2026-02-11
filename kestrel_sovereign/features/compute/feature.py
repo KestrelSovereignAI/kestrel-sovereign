@@ -187,7 +187,9 @@ class ComputeFeature(Feature):
                 timeout=SUBPROCESS_TIMEOUT_SHORT,
             )
             return result.returncode == 0
-        except Exception:
+        except subprocess.TimeoutExpired:
+            return False
+        except (subprocess.SubprocessError, FileNotFoundError, OSError):
             return False
     
     async def shutdown(self):
@@ -444,10 +446,15 @@ class ComputeFeature(Feature):
                     response += "\n... [truncated]"
             
             return response
-            
+
+        except (OSError, ValueError, TypeError) as e:
+            script.state = ScriptState.FAILED
+            await self.script_store.update(script)
+            return f"❌ Execution failed: {str(e)}"
         except Exception as e:
             script.state = ScriptState.FAILED
             await self.script_store.update(script)
+            logger.error(f"Unexpected execution failure: {e}", exc_info=True)
             return f"❌ Execution failed: {str(e)}"
     
     async def _execute_script(
@@ -695,7 +702,10 @@ class ComputeFeature(Feature):
             return f"Error: Trash item not found: {trash_path}"
         except FileExistsError as e:
             return f"Error: {e}"
+        except (PermissionError, OSError) as e:
+            return f"Error restoring file: {e}"
         except Exception as e:
+            logger.error(f"Unexpected error restoring file: {e}", exc_info=True)
             return f"Error restoring file: {e}"
     
     @tool(
