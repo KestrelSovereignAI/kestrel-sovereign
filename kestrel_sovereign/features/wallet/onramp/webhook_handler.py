@@ -60,14 +60,19 @@ class StripeWebhookHandler:
 
         Args:
             onramp: StripeOnRamp instance for session updates
+
+        Raises:
+            ValueError: If STRIPE_WEBHOOK_SECRET is not configured
         """
         self.onramp = onramp
         self.webhook_secret = os.environ.get("STRIPE_WEBHOOK_SECRET")
 
         if not self.webhook_secret:
-            logger.warning(
-                "STRIPE_WEBHOOK_SECRET not set. Webhook signature "
-                "verification will be skipped (INSECURE)."
+            raise ValueError(
+                "STRIPE_WEBHOOK_SECRET must be set. Webhook handler cannot "
+                "process events without signature verification. Set the "
+                "STRIPE_WEBHOOK_SECRET environment variable to enable secure "
+                "webhook processing."
             )
 
         # Callback for when a deposit completes successfully
@@ -137,25 +142,19 @@ class StripeWebhookHandler:
         try:
             import stripe
 
-            if self.webhook_secret and signature:
-                # Verify signature (recommended for production)
-                event = stripe.Webhook.construct_event(
-                    payload, signature, self.webhook_secret
-                )
-                return event
-            else:
-                # Parse without verification (dev mode only)
-                import json
+            if not signature:
+                logger.error("Missing Stripe-Signature header")
+                return None
 
-                logger.warning("Processing webhook without signature verification")
-                return json.loads(payload)
+            # Verify signature (mandatory for security)
+            event = stripe.Webhook.construct_event(
+                payload, signature, self.webhook_secret
+            )
+            return event
 
-        except ImportError:
-            # Stripe not installed, parse as JSON
-            import json
-
-            logger.warning("stripe package not installed, parsing as raw JSON")
-            return json.loads(payload)
+        except ImportError as e:
+            logger.error(f"stripe package not installed: {e}")
+            return None
 
         except stripe.error.SignatureVerificationError as e:
             logger.error(f"Webhook signature verification failed: {e}")
