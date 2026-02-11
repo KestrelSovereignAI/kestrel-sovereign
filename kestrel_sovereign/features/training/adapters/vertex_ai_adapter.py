@@ -119,7 +119,14 @@ class VertexAITrainingAdapter:
             logger.info(f"Started Vertex AI training job: {job.job_id} (vertex: {vertex_job.job_id})")
             return job
 
+        except (ConnectionError, TimeoutError) as e:
+            raise TrainingSubmissionError(
+                f"Failed to submit Vertex AI job: {e}",
+                provider=self.provider_name,
+                details={"companion_id": companion_id}
+            )
         except Exception as e:
+            logger.error(f"Vertex AI training submission failed: {e}", exc_info=True)
             raise TrainingSubmissionError(
                 f"Failed to submit Vertex AI job: {e}",
                 provider=self.provider_name,
@@ -167,8 +174,24 @@ class VertexAITrainingAdapter:
                 provider_details=status,
             )
 
+        except (ConnectionError, TimeoutError) as e:
+            logger.error(f"Vertex AI status connection error: {e}")
+            return TrainingStatus(
+                job_id=job_id,
+                state=job.state,
+                progress=0.0,
+                error=str(e),
+            )
+        except (KeyError, ValueError) as e:
+            logger.error(f"Vertex AI status parse error: {e}")
+            return TrainingStatus(
+                job_id=job_id,
+                state=job.state,
+                progress=0.0,
+                error=str(e),
+            )
         except Exception as e:
-            logger.error(f"Failed to get Vertex AI job status: {e}")
+            logger.error(f"Failed to get Vertex AI job status: {e}", exc_info=True)
             return TrainingStatus(
                 job_id=job_id,
                 state=job.state,
@@ -194,7 +217,14 @@ class VertexAITrainingAdapter:
 
             return weights
 
+        except (ConnectionError, TimeoutError, OSError) as e:
+            raise DownloadError(
+                f"Failed to download LoRA: {e}",
+                provider=self.provider_name,
+                details={"job_id": job_id}
+            )
         except Exception as e:
+            logger.error(f"Failed to download Vertex AI LoRA: {e}", exc_info=True)
             raise DownloadError(
                 f"Failed to download LoRA: {e}",
                 provider=self.provider_name,
@@ -218,8 +248,11 @@ class VertexAITrainingAdapter:
 
             return result
 
-        except Exception as e:
+        except (ConnectionError, TimeoutError) as e:
             logger.error(f"Failed to cancel Vertex AI job: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"Failed to cancel Vertex AI job: {e}", exc_info=True)
             return False
 
     async def cleanup(self, job_id: str) -> None:
@@ -373,8 +406,10 @@ class VertexAITrainingAdapter:
                     b64 = base64.b64encode(image_bytes).decode()
                     images.append(f"data:image/png;base64,{b64}")
                     logger.info(f"Downloaded image {i}: {len(image_bytes)} bytes")
-                except Exception as e:
+                except (ConnectionError, TimeoutError, OSError) as e:
                     logger.warning(f"Failed to download image {i}: {e}")
+                except Exception as e:
+                    logger.warning(f"Failed to download image {i}: {e}", exc_info=True)
 
             if not images:
                 return GenerationResult(
@@ -395,8 +430,20 @@ class VertexAITrainingAdapter:
 
         except GenerationError:
             raise
+        except (ConnectionError, TimeoutError) as e:
+            logger.error(f"Vertex AI generation connection error: {e}")
+            raise GenerationError(
+                f"Generation failed: {e}",
+                provider=self.provider_name,
+            )
+        except (KeyError, ValueError) as e:
+            logger.error(f"Vertex AI generation response error: {e}")
+            raise GenerationError(
+                f"Generation failed: {e}",
+                provider=self.provider_name,
+            )
         except Exception as e:
-            logger.error(f"Vertex AI generation failed: {e}")
+            logger.error(f"Vertex AI generation failed: {e}", exc_info=True)
             raise GenerationError(
                 f"Generation failed: {e}",
                 provider=self.provider_name,
