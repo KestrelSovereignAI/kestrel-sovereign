@@ -157,8 +157,11 @@ class GCPComputeFeature(Feature):
                         metadata={"provider": "gcp", "instance": result.get("instance_name")},
                     )
                     result["llm_routing"] = "enabled"
+                except (KeyError, ValueError, TypeError) as e:
+                    logger.warning(f"Invalid LLM routing parameters: {e}", exc_info=True)
+                    result["llm_routing"] = f"failed: {e}"
                 except Exception as e:
-                    logger.warning(f"Failed to register with LLM router: {e}")
+                    logger.warning(f"Failed to register with LLM router: {e}", exc_info=True)
                     result["llm_routing"] = f"failed: {e}"
 
             return {"success": True, **result}
@@ -173,8 +176,10 @@ class GCPComputeFeature(Feature):
             if self.llm_service:
                 try:
                     self.llm_service.clear_remote_backend()
+                except (KeyError, ValueError, TypeError) as e:
+                    logger.warning(f"Invalid LLM routing state: {e}", exc_info=True)
                 except Exception as e:
-                    logger.warning(f"Failed to unregister from LLM router: {e}")
+                    logger.warning(f"Failed to unregister from LLM router: {e}", exc_info=True)
 
             result = await self.manager.stop_session()
             return {"success": True, **result}
@@ -191,7 +196,10 @@ class GCPComputeFeature(Feature):
                 "instances": instances,
                 "count": len(instances),
             }
+        except (KeyError, ValueError) as e:
+            return {"success": False, "error": f"Invalid instance data: {e}"}
         except Exception as e:
+            logger.error(f"Unexpected error listing instances: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
 
     async def _list_disks(self) -> Dict[str, Any]:
@@ -203,7 +211,10 @@ class GCPComputeFeature(Feature):
                 "disks": disks,
                 "count": len(disks),
             }
+        except (KeyError, ValueError) as e:
+            return {"success": False, "error": f"Invalid disk data: {e}"}
         except Exception as e:
+            logger.error(f"Unexpected error listing disks: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
 
     def _coerce_optional_int(self, value: str) -> Optional[int]:
