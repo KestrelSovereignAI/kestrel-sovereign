@@ -95,8 +95,10 @@ class DockerExecutor(BaseExecutor):
                 timeout=SUBPROCESS_TIMEOUT_SHORT,
             )
             return result.returncode == 0
-            
-        except Exception:
+
+        except subprocess.TimeoutExpired:
+            return False
+        except (subprocess.SubprocessError, FileNotFoundError, OSError):
             return False
     
     def _get_docker_path(self) -> Optional[str]:
@@ -243,7 +245,7 @@ class DockerExecutor(BaseExecutor):
                         stderr=asyncio.subprocess.DEVNULL,
                     )
                     await kill_process.wait()
-                except Exception as e:
+                except (subprocess.SubprocessError, FileNotFoundError, OSError, asyncio.CancelledError) as e:
                     logger.debug(f"Failed to kill container {container_name} on timeout: {e}")
                 raise ExecutionTimeoutError(script.id, script.timeout_seconds)
             
@@ -280,10 +282,40 @@ class DockerExecutor(BaseExecutor):
             
         except ExecutionTimeoutError:
             raise
-        except Exception as e:
+        except (subprocess.SubprocessError, FileNotFoundError, OSError) as e:
             logger.error(f"Docker execution failed: {e}")
             completed_at = datetime.now()
-            
+
+            return ExecutionRecord(
+                id=execution_id,
+                script_id=script.id,
+                started_at=started_at,
+                completed_at=completed_at,
+                exit_code=-1,
+                stdout="",
+                stderr=str(e),
+                executor="docker",
+                workdir=tmpdir,
+            )
+        except (UnicodeDecodeError, ValueError) as e:
+            logger.error(f"Docker execution failed due to encoding/value error: {e}")
+            completed_at = datetime.now()
+
+            return ExecutionRecord(
+                id=execution_id,
+                script_id=script.id,
+                started_at=started_at,
+                completed_at=completed_at,
+                exit_code=-1,
+                stdout="",
+                stderr=str(e),
+                executor="docker",
+                workdir=tmpdir,
+            )
+        except Exception as e:
+            logger.error(f"Docker execution failed: {e}", exc_info=True)
+            completed_at = datetime.now()
+
             return ExecutionRecord(
                 id=execution_id,
                 script_id=script.id,
@@ -300,7 +332,7 @@ class DockerExecutor(BaseExecutor):
             # Clean up temporary directory
             try:
                 shutil.rmtree(tmpdir)
-            except Exception as e:
+            except (PermissionError, OSError) as e:
                 logger.warning(f"Failed to clean up temp dir {tmpdir}: {e}")
             
             # Ensure container is removed (in case --rm didn't work)
@@ -311,7 +343,7 @@ class DockerExecutor(BaseExecutor):
                     stderr=asyncio.subprocess.DEVNULL,
                 )
                 await rm_process.wait()
-            except Exception as e:
+            except (subprocess.SubprocessError, FileNotFoundError, OSError, asyncio.CancelledError) as e:
                 logger.debug(f"Failed to remove container {container_name}: {e}")
     
     async def pull_image(self, language: str) -> bool:
@@ -340,8 +372,11 @@ class DockerExecutor(BaseExecutor):
             )
             await process.wait()
             return process.returncode == 0
-        except Exception as e:
+        except (subprocess.SubprocessError, FileNotFoundError, OSError, asyncio.CancelledError) as e:
             logger.error(f"Failed to pull image {image}: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"Failed to pull image {image}: {e}", exc_info=True)
             return False
     
     async def cleanup(self) -> None:
@@ -371,6 +406,8 @@ class DockerExecutor(BaseExecutor):
                 )
                 await rm_process.wait()
                 logger.info(f"Cleaned up {len(container_ids)} orphaned containers")
-                
-        except Exception as e:
+
+        except (subprocess.SubprocessError, FileNotFoundError, OSError, asyncio.CancelledError) as e:
             logger.warning(f"Container cleanup failed: {e}")
+        except Exception as e:
+            logger.warning(f"Container cleanup failed: {e}", exc_info=True)
