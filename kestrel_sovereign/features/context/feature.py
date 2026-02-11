@@ -76,8 +76,11 @@ class ContextFeature(Feature):
         try:
             status = await self.context_manager.get_status()
             return status
-        except Exception as e:
+        except (AttributeError, TypeError, ValueError) as e:
             logger.error(f"context_status failed: {e}")
+            return {"success": False, "error": str(e)}
+        except Exception as e:
+            logger.error(f"context_status failed: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
 
     @tool(
@@ -142,8 +145,11 @@ class ContextFeature(Feature):
 
             return result
 
-        except Exception as e:
+        except (AttributeError, TypeError, ValueError, KeyError) as e:
             logger.error(f"summarize_section failed: {e}")
+            return {"success": False, "error": str(e)}
+        except Exception as e:
+            logger.error(f"summarize_section failed: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
 
     @tool(
@@ -212,8 +218,11 @@ class ContextFeature(Feature):
 
             return result
 
-        except Exception as e:
+        except (AttributeError, TypeError, ValueError, KeyError, IndexError) as e:
             logger.error(f"mark_content failed: {e}")
+            return {"success": False, "error": str(e)}
+        except Exception as e:
+            logger.error(f"mark_content failed: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
 
     @tool(
@@ -266,8 +275,11 @@ class ContextFeature(Feature):
 
             return result
 
-        except Exception as e:
+        except (AttributeError, TypeError, ValueError) as e:
             logger.error(f"compress_context failed: {e}")
+            return {"success": False, "error": str(e)}
+        except Exception as e:
+            logger.error(f"compress_context failed: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
 
     @tool(
@@ -339,8 +351,11 @@ class ContextFeature(Feature):
 
             return result
 
-        except Exception as e:
+        except (AttributeError, TypeError, ValueError, KeyError, IndexError) as e:
             logger.error(f"exclude_from_context failed: {e}")
+            return {"success": False, "error": str(e)}
+        except Exception as e:
+            logger.error(f"exclude_from_context failed: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
 
     @tool(
@@ -404,8 +419,14 @@ class ContextFeature(Feature):
 
             return result
 
-        except Exception as e:
+        except ValueError as e:
             logger.error(f"restore_excluded failed: {e}")
+            return {"success": False, "error": str(e)}
+        except (AttributeError, TypeError, KeyError) as e:
+            logger.error(f"restore_excluded failed: {e}")
+            return {"success": False, "error": str(e)}
+        except Exception as e:
+            logger.error(f"restore_excluded failed: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
 
     # =========================================================================
@@ -461,8 +482,14 @@ class ContextFeature(Feature):
 
             return result
 
-        except Exception as e:
+        except ValueError as e:
             logger.error(f"context_stash failed: {e}")
+            return {"success": False, "error": str(e)}
+        except (AttributeError, TypeError, IndexError) as e:
+            logger.error(f"context_stash failed: {e}")
+            return {"success": False, "error": str(e)}
+        except Exception as e:
+            logger.error(f"context_stash failed: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
 
     @tool(
@@ -489,8 +516,11 @@ class ContextFeature(Feature):
                 stash_id=stash_id if stash_id else None
             )
             return result
-        except Exception as e:
+        except (AttributeError, TypeError, ValueError, KeyError) as e:
             logger.error(f"context_stash_pop failed: {e}")
+            return {"success": False, "error": str(e)}
+        except Exception as e:
+            logger.error(f"context_stash_pop failed: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
 
     @tool(
@@ -517,8 +547,11 @@ class ContextFeature(Feature):
                 stash_id=stash_id if stash_id else None
             )
             return result
-        except Exception as e:
+        except (AttributeError, TypeError, ValueError, KeyError) as e:
             logger.error(f"context_stash_apply failed: {e}")
+            return {"success": False, "error": str(e)}
+        except Exception as e:
+            logger.error(f"context_stash_apply failed: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
 
     @tool(
@@ -543,8 +576,11 @@ class ContextFeature(Feature):
         try:
             result = await self.context_manager.stash_list()
             return result
-        except Exception as e:
+        except (AttributeError, TypeError) as e:
             logger.error(f"context_stash_list failed: {e}")
+            return {"success": False, "error": str(e)}
+        except Exception as e:
+            logger.error(f"context_stash_list failed: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
 
     @tool(
@@ -573,8 +609,11 @@ class ContextFeature(Feature):
                 stash_id=stash_id if stash_id else None
             )
             return result
-        except Exception as e:
+        except (AttributeError, TypeError, ValueError, KeyError) as e:
             logger.error(f"context_stash_drop failed: {e}")
+            return {"success": False, "error": str(e)}
+        except Exception as e:
+            logger.error(f"context_stash_drop failed: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
 
     @tool(
@@ -615,8 +654,11 @@ class ContextFeature(Feature):
                 tags=tags_list
             )
             return result
-        except Exception as e:
+        except (AttributeError, TypeError, ValueError, KeyError) as e:
             logger.error(f"context_stash_save failed: {e}")
+            return {"success": False, "error": str(e)}
+        except Exception as e:
+            logger.error(f"context_stash_save failed: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
 
     @tool(
@@ -649,8 +691,11 @@ class ContextFeature(Feature):
                 max_chars=max_chars
             )
             return result
-        except Exception as e:
+        except (AttributeError, TypeError, ValueError, KeyError) as e:
             logger.error(f"context_stash_peek failed: {e}")
+            return {"success": False, "error": str(e)}
+        except Exception as e:
+            logger.error(f"context_stash_peek failed: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
 
     # =========================================================================
@@ -699,8 +744,11 @@ class ContextFeature(Feature):
                 max_depth=max_depth
             )
             return result
-        except Exception as e:
+        except (AttributeError, TypeError, ValueError) as e:
             logger.error(f"hierarchical_compress failed: {e}")
+            return {"success": False, "error": str(e)}
+        except Exception as e:
+            logger.error(f"hierarchical_compress failed: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
 
     @tool(
@@ -851,6 +899,15 @@ ANSWER:"""
                 "context_chars": len(context_text)
             }
 
-        except Exception as e:
+        except ValueError as e:
             logger.error(f"recursive_query failed: {e}")
+            return {"success": False, "error": str(e)}
+        except (IndexError, KeyError) as e:
+            logger.error(f"recursive_query failed: {e}")
+            return {"success": False, "error": str(e)}
+        except (AttributeError, TypeError) as e:
+            logger.error(f"recursive_query failed: {e}")
+            return {"success": False, "error": str(e)}
+        except Exception as e:
+            logger.error(f"recursive_query failed: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
