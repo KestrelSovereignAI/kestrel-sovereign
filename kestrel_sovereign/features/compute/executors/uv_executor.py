@@ -64,7 +64,7 @@ class UvExecutor(BaseExecutor):
         try:
             path = self._get_uv_path()
             return path is not None
-        except Exception:
+        except (FileNotFoundError, OSError, PermissionError):
             return False
     
     def _get_uv_path(self) -> Optional[str]:
@@ -179,7 +179,7 @@ class UvExecutor(BaseExecutor):
                 try:
                     process.kill()
                     await process.wait()
-                except Exception as e:
+                except (ProcessLookupError, OSError, asyncio.CancelledError) as e:
                     logger.debug(f"Failed to kill process on timeout: {e}")
                 raise ExecutionTimeoutError(script.id, script.timeout_seconds)
             
@@ -215,10 +215,40 @@ class UvExecutor(BaseExecutor):
             
         except ExecutionTimeoutError:
             raise
-        except Exception as e:
+        except (subprocess.SubprocessError, FileNotFoundError, OSError) as e:
             logger.error(f"Script execution failed: {e}")
             completed_at = datetime.now()
-            
+
+            return ExecutionRecord(
+                id=execution_id,
+                script_id=script.id,
+                started_at=started_at,
+                completed_at=completed_at,
+                exit_code=-1,
+                stdout="",
+                stderr=str(e),
+                executor="uv",
+                workdir=tmpdir,
+            )
+        except (UnicodeDecodeError, ValueError) as e:
+            logger.error(f"Script execution failed due to encoding/value error: {e}")
+            completed_at = datetime.now()
+
+            return ExecutionRecord(
+                id=execution_id,
+                script_id=script.id,
+                started_at=started_at,
+                completed_at=completed_at,
+                exit_code=-1,
+                stdout="",
+                stderr=str(e),
+                executor="uv",
+                workdir=tmpdir,
+            )
+        except Exception as e:
+            logger.error(f"Script execution failed: {e}", exc_info=True)
+            completed_at = datetime.now()
+
             return ExecutionRecord(
                 id=execution_id,
                 script_id=script.id,
@@ -235,5 +265,5 @@ class UvExecutor(BaseExecutor):
             # Clean up temporary directory
             try:
                 shutil.rmtree(tmpdir)
-            except Exception as e:
+            except (PermissionError, OSError) as e:
                 logger.warning(f"Failed to clean up temp dir {tmpdir}: {e}")
