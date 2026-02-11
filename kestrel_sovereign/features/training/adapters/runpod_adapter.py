@@ -113,7 +113,10 @@ class RunPodTrainingAdapter:
             # Try to get manager (validates configuration)
             manager = self._get_manager()
             return manager is not None
+        except (ProviderNotAvailableError, ImportError):
+            return False
         except Exception:
+            logger.debug("RunPod availability check failed", exc_info=True)
             return False
 
     async def start_training(
@@ -206,8 +209,14 @@ class RunPodTrainingAdapter:
 
         except TrainingProviderError:
             raise
+        except httpx.HTTPError as e:
+            logger.error(f"RunPod training HTTP error: {e}")
+            raise TrainingSubmissionError(f"Failed to start RunPod training: {e}")
+        except (ConnectionError, TimeoutError) as e:
+            logger.error(f"RunPod training connection error: {e}")
+            raise TrainingSubmissionError(f"Failed to start RunPod training: {e}")
         except Exception as e:
-            logger.error(f"RunPod training submission failed: {e}")
+            logger.error(f"RunPod training submission failed: {e}", exc_info=True)
             raise TrainingSubmissionError(f"Failed to start RunPod training: {e}")
 
     async def _submit_training_when_ready(
@@ -244,8 +253,13 @@ class RunPodTrainingAdapter:
                 self._active_jobs[job_id]["started_at"] = datetime.now(timezone.utc)
                 logger.info(f"[{job_id}] Training submitted: {training_job_id}")
 
+        except (httpx.HTTPError, ConnectionError, TimeoutError) as e:
+            logger.error(f"[{job_id}] Background training network error: {e}")
+            if job_id in self._active_jobs:
+                self._active_jobs[job_id]["state"] = "failed"
+                self._active_jobs[job_id]["error"] = str(e)
         except Exception as e:
-            logger.error(f"[{job_id}] Background training submission failed: {e}")
+            logger.error(f"[{job_id}] Background training submission failed: {e}", exc_info=True)
             if job_id in self._active_jobs:
                 self._active_jobs[job_id]["state"] = "failed"
                 self._active_jobs[job_id]["error"] = str(e)
@@ -334,8 +348,14 @@ class RunPodTrainingAdapter:
 
         except TrainingProviderError:
             raise
+        except (httpx.HTTPError, ConnectionError, TimeoutError) as e:
+            logger.error(f"RunPod training status network error: {e}")
+            raise TrainingStatusError(f"Status check failed: {e}")
+        except (KeyError, ValueError) as e:
+            logger.error(f"RunPod training status parse error: {e}")
+            raise TrainingStatusError(f"Status check failed: {e}")
         except Exception as e:
-            logger.error(f"Failed to get RunPod training status: {e}")
+            logger.error(f"Failed to get RunPod training status: {e}", exc_info=True)
             raise TrainingStatusError(f"Status check failed: {e}")
 
     async def download_weights(self, job_id: str) -> Optional[bytes]:
@@ -371,8 +391,11 @@ class RunPodTrainingAdapter:
 
         except TrainingProviderError:
             raise
+        except (httpx.HTTPError, ConnectionError, TimeoutError) as e:
+            logger.error(f"RunPod LoRA download network error: {e}")
+            raise DownloadError(f"Download failed: {e}")
         except Exception as e:
-            logger.error(f"Failed to download RunPod LoRA weights: {e}")
+            logger.error(f"Failed to download RunPod LoRA weights: {e}", exc_info=True)
             raise DownloadError(f"Download failed: {e}")
 
     async def cancel(self, job_id: str) -> bool:
@@ -405,8 +428,11 @@ class RunPodTrainingAdapter:
             logger.info(f"Cancelled RunPod training job {job_id}")
             return True
 
-        except Exception as e:
+        except (httpx.HTTPError, ConnectionError, TimeoutError) as e:
             logger.error(f"Failed to cancel RunPod training: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"Failed to cancel RunPod training: {e}", exc_info=True)
             return False
 
     async def cleanup(self, job_id: str) -> None:
@@ -448,8 +474,10 @@ class RunPodTrainingAdapter:
             # Clean up tracking
             del self._active_jobs[job_id]
 
-        except Exception as e:
+        except (httpx.HTTPError, ConnectionError, TimeoutError) as e:
             logger.warning(f"Failed to cleanup RunPod session: {e}")
+        except Exception as e:
+            logger.warning(f"Failed to cleanup RunPod session: {e}", exc_info=True)
 
     async def generate_image(
         self,
@@ -602,8 +630,14 @@ class RunPodTrainingAdapter:
 
         except GenerationError:
             raise
+        except httpx.HTTPError as e:
+            logger.error(f"RunPod generation HTTP error: {e}")
+            raise GenerationError(f"Generation failed: {e}")
+        except (ConnectionError, TimeoutError) as e:
+            logger.error(f"RunPod generation connection error: {e}")
+            raise GenerationError(f"Generation failed: {e}")
         except Exception as e:
-            logger.error(f"RunPod generation failed: {e}")
+            logger.error(f"RunPod generation failed: {e}", exc_info=True)
             raise GenerationError(f"Generation failed: {e}")
 
     async def is_training_in_progress(self, session=None) -> Optional[dict]:
@@ -631,8 +665,11 @@ class RunPodTrainingAdapter:
                 return None
 
             return await manager.get_current_job(session)
-        except Exception as e:
+        except (httpx.HTTPError, ConnectionError, TimeoutError) as e:
             logger.warning(f"Failed to check training status: {e}")
+            return None
+        except Exception as e:
+            logger.warning(f"Failed to check training status: {e}", exc_info=True)
             return None
 
     async def cancel_training(self, job_id: str) -> dict:
