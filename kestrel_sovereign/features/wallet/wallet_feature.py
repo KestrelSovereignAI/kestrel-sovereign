@@ -556,8 +556,11 @@ Use `!wallet-sync` to sync with on-chain balance."""
 
         except ValueError as e:
             return f"❌ {e}"
+        except (ImportError, OSError) as e:
+            logger.error(f"Failed to generate address: {e}", exc_info=True)
+            return f"❌ Failed to generate address: {e}"
         except Exception as e:
-            logger.error(f"Failed to generate address: {e}")
+            logger.error(f"Failed to generate address: {e}", exc_info=True)
             return f"❌ Failed to generate address: {e}"
 
     @tool(
@@ -621,8 +624,14 @@ Or manually set with an existing address."""
 
             return "\n".join(lines)
 
+        except (ConnectionError, TimeoutError) as e:
+            logger.error(f"Sync failed (network error): {e}", exc_info=True)
+            return f"❌ Sync failed: {e}"
+        except (KeyError, ValueError, TypeError) as e:
+            logger.error(f"Sync failed (data parsing error): {e}", exc_info=True)
+            return f"❌ Sync failed: {e}"
         except Exception as e:
-            logger.error(f"Sync failed: {e}")
+            logger.error(f"Sync failed: {e}", exc_info=True)
             return f"❌ Sync failed: {e}"
 
     @tool(
@@ -709,7 +718,7 @@ Use `!wallet-sync` to sync on-chain balance with wallet."""
             # Parse amount
             try:
                 amount_decimal = Decimal(amount)
-            except Exception:
+            except (ValueError, InvalidOperation):
                 return f"❌ Invalid amount: {amount}"
 
             if amount_decimal <= 0:
@@ -766,8 +775,17 @@ Use `!wallet-sync` to sync on-chain balance with wallet."""
             else:
                 return f"❌ Transaction failed: {result.error}"
 
+        except ValueError as e:
+            logger.error(f"wallet_send failed (validation error): {e}", exc_info=True)
+            return f"❌ Transaction failed: {e}"
+        except (ConnectionError, TimeoutError) as e:
+            logger.error(f"wallet_send failed (network error): {e}", exc_info=True)
+            return f"❌ Transaction failed: {e}"
+        except (ImportError, OSError) as e:
+            logger.error(f"wallet_send failed (system error): {e}", exc_info=True)
+            return f"❌ Transaction failed: {e}"
         except Exception as e:
-            logger.error(f"wallet_send failed: {e}")
+            logger.error(f"wallet_send failed: {e}", exc_info=True)
             return f"❌ Transaction failed: {e}"
 
     @tool(
@@ -811,7 +829,7 @@ Use `!wallet-sync` to sync on-chain balance with wallet."""
             # Parse amount
             try:
                 amount_decimal = Decimal(amount)
-            except Exception:
+            except (ValueError, InvalidOperation):
                 return f"❌ Invalid amount: {amount}"
 
             if amount_decimal <= 0:
@@ -878,8 +896,17 @@ Use `!wallet-sync` to sync on-chain balance with wallet."""
             else:
                 return f"❌ Token transfer failed: {result.error}"
 
+        except ValueError as e:
+            logger.error(f"wallet_send_token failed (validation error): {e}", exc_info=True)
+            return f"❌ Token transfer failed: {e}"
+        except (ConnectionError, TimeoutError) as e:
+            logger.error(f"wallet_send_token failed (network error): {e}", exc_info=True)
+            return f"❌ Token transfer failed: {e}"
+        except (ImportError, OSError) as e:
+            logger.error(f"wallet_send_token failed (system error): {e}", exc_info=True)
+            return f"❌ Token transfer failed: {e}"
         except Exception as e:
-            logger.error(f"wallet_send_token failed: {e}")
+            logger.error(f"wallet_send_token failed: {e}", exc_info=True)
             return f"❌ Token transfer failed: {e}"
 
     @tool(
@@ -1005,6 +1032,12 @@ Use `!wallet-sync` to sync on-chain balance with wallet."""
 
             return "\n".join(lines)
 
+        except (ImportError, OSError) as e:
+            logger.error(f"wallet_tx_history failed (system error): {e}", exc_info=True)
+            return f"❌ Failed to get transaction history: {e}"
+        except (KeyError, ValueError, AttributeError) as e:
+            logger.error(f"wallet_tx_history failed (data error): {e}", exc_info=True)
+            return f"❌ Failed to get transaction history: {e}"
         except Exception as e:
-            logger.error(f"wallet_tx_history failed: {e}")
+            logger.error(f"wallet_tx_history failed: {e}", exc_info=True)
             return f"❌ Failed to get transaction history: {e}"
