@@ -106,8 +106,11 @@ class MemoryFeature(Feature):
                 "query": query,
                 "total_searched": len(all_history)
             }
-        except Exception as e:
+        except (AttributeError, TypeError, KeyError) as e:
             logger.error(f"search_memory failed: {e}")
+            return {"success": False, "error": str(e)}
+        except Exception as e:
+            logger.error(f"search_memory failed: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
 
     @tool(
@@ -130,8 +133,11 @@ class MemoryFeature(Feature):
                 "messages": history,
                 "count": len(history)
             }
-        except Exception as e:
+        except (AttributeError, TypeError) as e:
             logger.error(f"recall_recent failed: {e}")
+            return {"success": False, "error": str(e)}
+        except Exception as e:
+            logger.error(f"recall_recent failed: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
 
     @tool(
@@ -165,8 +171,11 @@ class MemoryFeature(Feature):
                 "count": len(formatted),
                 "query": query
             }
-        except Exception as e:
+        except (AttributeError, TypeError, KeyError) as e:
             logger.error(f"search_documents failed: {e}")
+            return {"success": False, "error": str(e)}
+        except Exception as e:
+            logger.error(f"search_documents failed: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
 
     @tool(
@@ -199,8 +208,11 @@ class MemoryFeature(Feature):
                     "error": "Case law search not available",
                     "note": "This feature requires audit history to be enabled"
                 }
-        except Exception as e:
+        except (AttributeError, TypeError, KeyError) as e:
             logger.error(f"search_case_law failed: {e}")
+            return {"success": False, "error": str(e)}
+        except Exception as e:
+            logger.error(f"search_case_law failed: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
 
     @tool(
@@ -231,8 +243,11 @@ class MemoryFeature(Feature):
                 "episodes": episodes,
                 "count": len(episodes)
             }
-        except Exception as e:
+        except (AttributeError, TypeError) as e:
             logger.error(f"get_episodes failed: {e}")
+            return {"success": False, "error": str(e)}
+        except Exception as e:
+            logger.error(f"get_episodes failed: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
 
     @tool(
@@ -291,8 +306,11 @@ class MemoryFeature(Feature):
                 "consolidator_available": self.consolidator is not None,
                 "rag": rag_stats
             }
-        except Exception as e:
+        except (AttributeError, TypeError, KeyError) as e:
             logger.error(f"memory_status failed: {e}")
+            return {"success": False, "error": str(e)}
+        except Exception as e:
+            logger.error(f"memory_status failed: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
 
     @tool(
@@ -375,8 +393,11 @@ class MemoryFeature(Feature):
                 "mood_context": mood,
                 "note": "Retrieved using human-like memory weighting"
             }
-        except Exception as e:
+        except (AttributeError, TypeError, KeyError, ValueError) as e:
             logger.error(f"recall_emotional failed: {e}")
+            return {"success": False, "error": str(e)}
+        except Exception as e:
+            logger.error(f"recall_emotional failed: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
 
     @tool(
@@ -417,8 +438,11 @@ class MemoryFeature(Feature):
                 "query": query,
                 "total_searched": len(all_history)
             }
-        except Exception as e:
+        except (AttributeError, TypeError, KeyError) as e:
             logger.error(f"full_history_search failed: {e}")
+            return {"success": False, "error": str(e)}
+        except Exception as e:
+            logger.error(f"full_history_search failed: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
 
     @tool(
@@ -464,6 +488,9 @@ class MemoryFeature(Feature):
                 "deleted": deleted,
                 "pattern": pattern
             }
-        except Exception as e:
+        except (AttributeError, TypeError, KeyError) as e:
             logger.error(f"delete_messages failed: {e}")
+            return {"success": False, "error": str(e)}
+        except Exception as e:
+            logger.error(f"delete_messages failed: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
