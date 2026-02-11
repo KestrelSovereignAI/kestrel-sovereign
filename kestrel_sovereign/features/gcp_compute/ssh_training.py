@@ -8,6 +8,7 @@ for GCP Compute Engine instances.
 import asyncio
 import logging
 import os
+import shlex
 import tempfile
 from typing import Any, Dict, Optional
 
@@ -129,18 +130,18 @@ class GCPSSHTrainingMixin:
 
         # Create training data directory structure
         setup_cmd = f"""
-mkdir -p {mount_path}/training_data/{job_id}
+mkdir -p {mount_path}/training_data/{shlex.quote(job_id)}
 mkdir -p {mount_path}/lora_output
 
 # Download training image
-cd {mount_path}/training_data/{job_id}
-wget -q -O image_001.png '{image_url}'
+cd {mount_path}/training_data/{shlex.quote(job_id)}
+wget -q -O image_001.png {shlex.quote(image_url)}
 
 # Create caption file with trigger word
-echo '{trigger_word}' > image_001.txt
+echo {shlex.quote(trigger_word)} > image_001.txt
 
 # Create dataset config
-cat > {mount_path}/training_data/dataset_{job_id}.toml << 'DATASET_EOF'
+cat > {mount_path}/training_data/dataset_{shlex.quote(job_id)}.toml << 'DATASET_EOF'
 [general]
 caption_extension = '.txt'
 keep_tokens = 1
@@ -150,7 +151,7 @@ resolution = 1024
 batch_size = {DEFAULT_TRAINING_BATCH_SIZE}
 
 [[datasets.subsets]]
-image_dir = '{mount_path}/training_data/{job_id}'
+image_dir = '{mount_path}/training_data/{shlex.quote(job_id)}'
 caption_extension = '.txt'
 num_repeats = {num_repeats}
 DATASET_EOF
@@ -168,9 +169,9 @@ nohup python train_lora.py \\
     --clip_l {mount_path}/models/flux1-dev/text_encoder/model.safetensors \\
     --t5xxl {mount_path}/models/text_encoders/t5xxl_fp16.safetensors \\
     --ae {mount_path}/models/flux1-dev/ae.safetensors \\
-    --dataset_config {mount_path}/training_data/dataset_{job_id}.toml \\
+    --dataset_config {mount_path}/training_data/dataset_{shlex.quote(job_id)}.toml \\
     --output_dir {mount_path}/lora_output \\
-    --output_name {job_id} \\
+    --output_name {shlex.quote(job_id)} \\
     --network_module networks.lora_flux \\
     --network_dim {network_dim} \\
     --network_train_unet_only \\
@@ -186,10 +187,10 @@ nohup python train_lora.py \\
     --guidance_scale 1.0 \\
     --gradient_checkpointing \\
     --seed 42 \\
-    > /tmp/training_{job_id}.log 2>&1 &
+    > /tmp/training_{shlex.quote(job_id)}.log 2>&1 &
 
-echo $! > /tmp/training_{job_id}.pid
-echo "Training started with PID $(cat /tmp/training_{job_id}.pid)"
+echo $! > /tmp/training_{shlex.quote(job_id)}.pid
+echo "Training started with PID $(cat /tmp/training_{shlex.quote(job_id)}.pid)"
 '
 """
 
@@ -218,18 +219,18 @@ echo "Training started with PID $(cat /tmp/training_{job_id}.pid)"
 
         check_cmd = f"""
 docker exec kestrel-workload bash -c '
-if [ -f /tmp/training_{job_id}.pid ]; then
-    PID=$(cat /tmp/training_{job_id}.pid)
+if [ -f /tmp/training_{shlex.quote(job_id)}.pid ]; then
+    PID=$(cat /tmp/training_{shlex.quote(job_id)}.pid)
     if ps -p $PID > /dev/null 2>&1; then
         echo "RUNNING"
-        tail -5 /tmp/training_{job_id}.log 2>/dev/null | grep -oP "\\d+%" | tail -1 || echo "0%"
+        tail -5 /tmp/training_{shlex.quote(job_id)}.log 2>/dev/null | grep -oP "\\d+%" | tail -1 || echo "0%"
     else
-        if [ -f {mount_path}/lora_output/{job_id}.safetensors ]; then
+        if [ -f {mount_path}/lora_output/{shlex.quote(job_id)}.safetensors ]; then
             echo "COMPLETED"
-            ls -la {mount_path}/lora_output/{job_id}.safetensors
+            ls -la {mount_path}/lora_output/{shlex.quote(job_id)}.safetensors
         else
             echo "FAILED"
-            tail -20 /tmp/training_{job_id}.log 2>/dev/null
+            tail -20 /tmp/training_{shlex.quote(job_id)}.log 2>/dev/null
         fi
     fi
 else
@@ -287,7 +288,7 @@ fi
             raise GCPComputeManagerError("SSH not available for download")
 
         mount_path = self.disk_config.get("mount_path", "/workspace")
-        remote_path = f"{mount_path}/lora_output/{job_id}.safetensors"
+        remote_path = f"{mount_path}/lora_output/{shlex.quote(job_id)}.safetensors"
 
         # Download via SCP
         with tempfile.NamedTemporaryFile(delete=False, suffix=".safetensors") as f:
@@ -372,16 +373,16 @@ fi
 
         gen_cmd = f"""
 docker exec kestrel-workload bash -c '
-mkdir -p {output_dir}
+mkdir -p {shlex.quote(output_dir)}
 
 python generate_image.py \\
     --ckpt {mount_path}/models/flux1-dev/flux1-dev.safetensors \\
     --clip_l {mount_path}/models/flux1-dev/text_encoder/model.safetensors \\
     --t5xxl {mount_path}/models/text_encoders/t5xxl_fp16.safetensors \\
     --ae {mount_path}/models/flux1-dev/ae.safetensors \\
-    --lora {lora_path} \\
-    --prompt "{prompt}" \\
-    --output {output_dir}/output.png \\
+    --lora {shlex.quote(lora_path)} \\
+    --prompt {shlex.quote(prompt)} \\
+    --output {shlex.quote(output_dir)}/output.png \\
     --width {width} \\
     --height {height} \\
     --steps {steps} \\
@@ -390,9 +391,9 @@ python generate_image.py \\
     2>&1
 
 # Encode output to base64
-if [ -f {output_dir}/output.png ]; then
+if [ -f {shlex.quote(output_dir)}/output.png ]; then
     echo "BASE64_START"
-    base64 {output_dir}/output.png
+    base64 {shlex.quote(output_dir)}/output.png
     echo "BASE64_END"
 fi
 '
