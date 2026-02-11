@@ -194,8 +194,14 @@ class FilecoinTestnetAdapter:
             logger.debug(f"Balance for {address}: {fil} FIL")
             return fil
 
+        except httpx.HTTPError as e:
+            logger.error(f"Failed to get balance for {address} (HTTP error): {e}", exc_info=True)
+            raise
+        except (ValueError, KeyError, TypeError) as e:
+            logger.error(f"Failed to get balance for {address} (data parsing error): {e}", exc_info=True)
+            raise
         except Exception as e:
-            logger.error(f"Failed to get balance for {address}: {e}")
+            logger.error(f"Failed to get balance for {address}: {e}", exc_info=True)
             raise
 
     async def get_balance_atto(self, address: Optional[str] = None) -> int:
@@ -302,8 +308,14 @@ class FilecoinTestnetAdapter:
                 "gas_premium": Decimal(result.get("GasPremium", "0")) / Decimal("1e18"),
             }
 
+        except httpx.HTTPError as e:
+            logger.error(f"Failed to estimate gas (HTTP error): {e}", exc_info=True)
+            raise
+        except (ValueError, KeyError, TypeError) as e:
+            logger.error(f"Failed to estimate gas (data parsing error): {e}", exc_info=True)
+            raise
         except Exception as e:
-            logger.error(f"Failed to estimate gas: {e}")
+            logger.error(f"Failed to estimate gas: {e}", exc_info=True)
             raise
 
     # =========================================================================
@@ -325,8 +337,14 @@ class FilecoinTestnetAdapter:
                 {"/": tx_cid}
             ])
             return result
+        except httpx.HTTPError as e:
+            logger.error(f"Failed to get transaction {tx_cid} (HTTP error): {e}", exc_info=True)
+            return None
+        except (ValueError, KeyError, TypeError) as e:
+            logger.error(f"Failed to get transaction {tx_cid} (data parsing error): {e}", exc_info=True)
+            return None
         except Exception as e:
-            logger.error(f"Failed to get transaction {tx_cid}: {e}")
+            logger.error(f"Failed to get transaction {tx_cid}: {e}", exc_info=True)
             return None
 
     async def wait_for_confirmation(
@@ -365,8 +383,14 @@ class FilecoinTestnetAdapter:
         except asyncio.TimeoutError:
             logger.warning(f"Timeout waiting for transaction {tx_cid}")
             return False
+        except httpx.HTTPError as e:
+            logger.error(f"Error waiting for transaction {tx_cid} (HTTP error): {e}", exc_info=True)
+            return False
+        except (ValueError, KeyError, TypeError) as e:
+            logger.error(f"Error waiting for transaction {tx_cid} (data parsing error): {e}", exc_info=True)
+            return False
         except Exception as e:
-            logger.error(f"Error waiting for transaction {tx_cid}: {e}")
+            logger.error(f"Error waiting for transaction {tx_cid}: {e}", exc_info=True)
             return False
 
     # =========================================================================
@@ -389,6 +413,8 @@ class FilecoinTestnetAdapter:
         try:
             await self.get_chain_head()
             return True
+        except (httpx.HTTPError, ConnectionError, TimeoutError):
+            return False
         except Exception:
             return False
 
