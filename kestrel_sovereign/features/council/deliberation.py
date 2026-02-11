@@ -19,7 +19,11 @@ import re
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
-from kestrel_sovereign.kestrel_config.defaults import get_ollama_url
+from kestrel_sovereign.kestrel_config.defaults import (
+    get_ollama_url,
+    get_xai_api_url,
+    get_groq_api_url,
+)
 
 from .models import (
     CouncilMember,
@@ -288,7 +292,7 @@ async def _get_adapter_for_provider(
 
         client = openai.AsyncOpenAI(
             api_key=api_key,
-            base_url="https://api.x.ai/v1"
+            base_url=get_xai_api_url()
         )
         adapter = OpenAIAdapter()
         return client, adapter
@@ -303,7 +307,7 @@ async def _get_adapter_for_provider(
 
         client = openai.AsyncOpenAI(
             api_key=api_key,
-            base_url="https://api.groq.com/openai/v1"
+            base_url=get_groq_api_url()
         )
         adapter = OpenAIAdapter()
         return client, adapter
