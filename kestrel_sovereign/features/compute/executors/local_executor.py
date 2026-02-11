@@ -137,7 +137,7 @@ class LocalExecutor(BaseExecutor):
                 try:
                     process.kill()
                     await process.wait()
-                except Exception as e:
+                except (ProcessLookupError, OSError, asyncio.CancelledError) as e:
                     logger.debug(f"Failed to kill process on timeout: {e}")
                 raise ExecutionTimeoutError(script.id, script.timeout_seconds)
             
@@ -173,10 +173,40 @@ class LocalExecutor(BaseExecutor):
             
         except ExecutionTimeoutError:
             raise
-        except Exception as e:
+        except (subprocess.SubprocessError, FileNotFoundError, OSError) as e:
             logger.error(f"Local execution failed: {e}")
             completed_at = datetime.now()
-            
+
+            return ExecutionRecord(
+                id=execution_id,
+                script_id=script.id,
+                started_at=started_at,
+                completed_at=completed_at,
+                exit_code=-1,
+                stdout="",
+                stderr=str(e),
+                executor="local",
+                workdir=tmpdir,
+            )
+        except (UnicodeDecodeError, ValueError) as e:
+            logger.error(f"Local execution failed due to encoding/value error: {e}")
+            completed_at = datetime.now()
+
+            return ExecutionRecord(
+                id=execution_id,
+                script_id=script.id,
+                started_at=started_at,
+                completed_at=completed_at,
+                exit_code=-1,
+                stdout="",
+                stderr=str(e),
+                executor="local",
+                workdir=tmpdir,
+            )
+        except Exception as e:
+            logger.error(f"Local execution failed: {e}", exc_info=True)
+            completed_at = datetime.now()
+
             return ExecutionRecord(
                 id=execution_id,
                 script_id=script.id,
@@ -193,5 +223,5 @@ class LocalExecutor(BaseExecutor):
             # Clean up temporary directory
             try:
                 shutil.rmtree(tmpdir)
-            except Exception as e:
+            except (PermissionError, OSError) as e:
                 logger.warning(f"Failed to clean up temp dir {tmpdir}: {e}")

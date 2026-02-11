@@ -103,8 +103,14 @@ class CodeEditFeature(Feature):
                 timeout=300,  # 5 minutes for code review
             )
             return approved
+        except (TimeoutError, asyncio.TimeoutError) as e:
+            logger.error(f"Approval request timed out: {e}")
+            return False
+        except (AttributeError, TypeError, ValueError) as e:
+            logger.error(f"Approval request failed due to invalid arguments: {e}")
+            return False
         except Exception as e:
-            logger.error(f"Approval request failed: {e}")
+            logger.error(f"Approval request failed: {e}", exc_info=True)
             return False
     
     # ============== Read Operations (No Approval Required) ==============
@@ -157,8 +163,14 @@ class CodeEditFeature(Feature):
                 "total_lines": len(resolved.read_text().split('\n')),
                 "shown_lines": len(lines),
             }
-        except Exception as e:
+        except (FileNotFoundError, PermissionError, OSError) as e:
             logger.error(f"Error reading file: {e}")
+            return {"success": False, "error": str(e)}
+        except (UnicodeDecodeError, ValueError) as e:
+            logger.error(f"Error decoding file content: {e}")
+            return {"success": False, "error": str(e)}
+        except Exception as e:
+            logger.error(f"Error reading file: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
     
     @tool(
@@ -202,7 +214,7 @@ class CodeEditFeature(Feature):
                                 "line": i,
                                 "content": line.strip()[:200],
                             })
-                except Exception:
+                except (UnicodeDecodeError, PermissionError, OSError):
                     continue  # Skip files that can't be read
             
             return {
@@ -211,8 +223,14 @@ class CodeEditFeature(Feature):
                 "matches": matches[:50],  # Limit results
                 "total_matches": len(matches),
             }
-        except Exception as e:
+        except (FileNotFoundError, PermissionError, OSError) as e:
             logger.error(f"Error searching: {e}")
+            return {"success": False, "error": str(e)}
+        except ValueError as e:
+            logger.error(f"Invalid search parameters: {e}")
+            return {"success": False, "error": str(e)}
+        except Exception as e:
+            logger.error(f"Error searching: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
     
     # ============== Write Operations (Require Approval) ==============
@@ -295,8 +313,14 @@ class CodeEditFeature(Feature):
                 "chars_removed": len(old_text),
                 "chars_added": len(new_text),
             }
-        except Exception as e:
+        except (FileNotFoundError, PermissionError, OSError) as e:
             logger.error(f"Error editing file: {e}")
+            return {"success": False, "error": str(e)}
+        except (UnicodeDecodeError, ValueError) as e:
+            logger.error(f"Error processing file content: {e}")
+            return {"success": False, "error": str(e)}
+        except Exception as e:
+            logger.error(f"Error editing file: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
     
     @tool(
@@ -333,8 +357,14 @@ class CodeEditFeature(Feature):
                 "diff": result.stdout or "(no changes)",
                 "has_changes": bool(result.stdout.strip()),
             }
-        except Exception as e:
+        except subprocess.TimeoutExpired as e:
+            logger.error(f"Git diff timed out: {e}")
+            return {"success": False, "error": "Git diff operation timed out"}
+        except (subprocess.SubprocessError, FileNotFoundError, OSError) as e:
             logger.error(f"Error getting diff: {e}")
+            return {"success": False, "error": str(e)}
+        except Exception as e:
+            logger.error(f"Error getting diff: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
     
     @tool(
@@ -415,8 +445,14 @@ class CodeEditFeature(Feature):
             }
         except subprocess.CalledProcessError as e:
             return {"success": False, "error": str(e)}
-        except Exception as e:
+        except subprocess.TimeoutExpired as e:
+            logger.error(f"Git commit timed out: {e}")
+            return {"success": False, "error": "Git commit operation timed out"}
+        except (subprocess.SubprocessError, FileNotFoundError, OSError) as e:
             logger.error(f"Error committing: {e}")
+            return {"success": False, "error": str(e)}
+        except Exception as e:
+            logger.error(f"Error committing: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
     
     @tool(
@@ -463,8 +499,11 @@ class CodeEditFeature(Feature):
                 "message": "Restart signaled. Server will restart when possible.",
                 "reason": reason,
             }
-        except Exception as e:
+        except (PermissionError, OSError) as e:
             logger.error(f"Error signaling restart: {e}")
+            return {"success": False, "error": str(e)}
+        except Exception as e:
+            logger.error(f"Error signaling restart: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
     
     @property
@@ -544,8 +583,11 @@ class CodeEditFeature(Feature):
             }
         except subprocess.TimeoutExpired:
             return {"success": False, "error": "Test timeout (5 minutes)"}
-        except Exception as e:
+        except (subprocess.SubprocessError, FileNotFoundError, OSError) as e:
             logger.error(f"Error running tests: {e}")
+            return {"success": False, "error": str(e)}
+        except Exception as e:
+            logger.error(f"Error running tests: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
     
     @tool(
@@ -583,8 +625,14 @@ class CodeEditFeature(Feature):
                 "output": result.stdout[-2000:] if result.stdout else "(no issues)",
                 "issue_count": result.stdout.count("\n") if result.stdout else 0,
             }
-        except Exception as e:
+        except subprocess.TimeoutExpired as e:
+            logger.error(f"Linting timed out: {e}")
+            return {"success": False, "error": "Linting operation timed out"}
+        except (subprocess.SubprocessError, FileNotFoundError, OSError) as e:
             logger.error(f"Error linting: {e}")
+            return {"success": False, "error": str(e)}
+        except Exception as e:
+            logger.error(f"Error linting: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
     
     @tool(
@@ -647,8 +695,14 @@ class CodeEditFeature(Feature):
                 "lines": len(recent),
                 "content": '\n'.join(recent),
             }
-        except Exception as e:
+        except (FileNotFoundError, PermissionError, OSError) as e:
             logger.error(f"Error reading logs: {e}")
+            return {"success": False, "error": str(e)}
+        except (UnicodeDecodeError, ValueError) as e:
+            logger.error(f"Error processing log content: {e}")
+            return {"success": False, "error": str(e)}
+        except Exception as e:
+            logger.error(f"Error reading logs: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
     
     @tool(
@@ -709,6 +763,12 @@ class CodeEditFeature(Feature):
                 "message": f"Rolled back to {commit}",
                 "output": result.stdout,
             }
-        except Exception as e:
+        except subprocess.TimeoutExpired as e:
+            logger.error(f"Git rollback timed out: {e}")
+            return {"success": False, "error": "Git rollback operation timed out"}
+        except (subprocess.SubprocessError, FileNotFoundError, OSError) as e:
             logger.error(f"Error rolling back: {e}")
+            return {"success": False, "error": str(e)}
+        except Exception as e:
+            logger.error(f"Error rolling back: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
