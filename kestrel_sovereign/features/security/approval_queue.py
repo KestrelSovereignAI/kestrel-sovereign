@@ -155,8 +155,12 @@ class ApprovalQueue:
         if self._on_request_added:
             try:
                 await self._on_request_added(request)
+            except (ConnectionError, TimeoutError) as e:
+                logger.warning(f"Failed to notify UI of approval request (network error): {e}", exc_info=True)
+            except (TypeError, AttributeError) as e:
+                logger.warning(f"Failed to notify UI of approval request (callback error): {e}", exc_info=True)
             except Exception as e:
-                logger.warning(f"Failed to notify UI of approval request: {e}")
+                logger.warning(f"Failed to notify UI of approval request: {e}", exc_info=True)
 
         # Wait for user decision or timeout
         try:
