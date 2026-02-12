@@ -165,10 +165,24 @@ class FilecoinKeyManager:
             from kestrel_sovereign.security.key_storage import SecureKeyStorage
             self._secure_storage = SecureKeyStorage(storage_dir=self.storage_dir)
             logger.info("FilecoinKeyManager using encrypted key storage")
+        except ImportError as e:
+            logger.warning(
+                f"SecureKeyStorage not available (import error): {e}. "
+                "Keys will not be persisted securely."
+            )
+            self._secure_storage = None
+        except (OSError, ValueError) as e:
+            logger.warning(
+                f"SecureKeyStorage not available (initialization error): {e}. "
+                "Keys will not be persisted securely.",
+                exc_info=True
+            )
+            self._secure_storage = None
         except Exception as e:
             logger.warning(
                 f"SecureKeyStorage not available: {e}. "
-                "Keys will not be persisted securely."
+                "Keys will not be persisted securely.",
+                exc_info=True
             )
             self._secure_storage = None
 
@@ -249,8 +263,14 @@ class FilecoinKeyManager:
             private_key = self._secure_storage.load_private_key(key_id)
             public_key = private_key.public_key()
             return _derive_f1_address(public_key, self.network)
+        except (OSError, ValueError) as e:
+            logger.error(f"Failed to load Filecoin key for {agent_id} (storage/decryption error): {e}", exc_info=True)
+            return None
+        except (TypeError, AttributeError) as e:
+            logger.error(f"Failed to load Filecoin key for {agent_id} (key format error): {e}", exc_info=True)
+            return None
         except Exception as e:
-            logger.error(f"Failed to load Filecoin key for {agent_id}: {e}")
+            logger.error(f"Failed to load Filecoin key for {agent_id}: {e}", exc_info=True)
             return None
 
     def has_address(self, agent_id: str) -> bool:
@@ -288,8 +308,14 @@ class FilecoinKeyManager:
                 encoding=Encoding.X962,
                 format=PublicFormat.UncompressedPoint
             )
+        except (OSError, ValueError) as e:
+            logger.error(f"Failed to get public key for {agent_id} (storage/decryption error): {e}", exc_info=True)
+            return None
+        except (TypeError, AttributeError) as e:
+            logger.error(f"Failed to get public key for {agent_id} (key format error): {e}", exc_info=True)
+            return None
         except Exception as e:
-            logger.error(f"Failed to get public key for {agent_id}: {e}")
+            logger.error(f"Failed to get public key for {agent_id}: {e}", exc_info=True)
             return None
 
     def get_explorer_url(self, address: str) -> str:

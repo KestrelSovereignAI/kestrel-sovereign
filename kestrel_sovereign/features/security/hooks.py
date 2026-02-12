@@ -181,7 +181,11 @@ class SecurityHook(Hook):
                 return summary[: max_length - 3] + "..."
             return summary
 
-        except Exception:
+        except (TypeError, ValueError) as e:
+            logger.debug(f"Failed to summarize args (type/value error): {e}")
+            return "(args could not be summarized)"
+        except Exception as e:
+            logger.debug(f"Failed to summarize args: {e}", exc_info=True)
             return "(args could not be summarized)"
 
     def _mask_sensitive(self, data: dict) -> dict:
