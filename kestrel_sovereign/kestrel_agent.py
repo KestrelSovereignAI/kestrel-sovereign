@@ -64,8 +64,11 @@ def _load_prompt_file(filepath: Path, fallback: str = "") -> str:
             return filepath.read_text(encoding="utf-8").strip()
         logging.warning(f"Prompt file not found: {filepath}, using fallback")
         return fallback
-    except Exception as e:
+    except (OSError, UnicodeDecodeError) as e:
         logging.error(f"Error loading prompt file {filepath}: {e}")
+        return fallback
+    except Exception as e:
+        logging.error(f"Error loading prompt file {filepath}: {e}", exc_info=True)
         return fallback
 
 
@@ -231,8 +234,10 @@ class KestrelAgent(ConstitutionMixin, StreamingMixin, BackupMixin, SleepMixin):
                     else:
                         self.lighthouse_provider = None
                         logging.warning("LighthouseProvider not available despite API key")
-                except Exception as e:
+                except (ImportError, AttributeError, TypeError, ConnectionError) as e:
                     logging.warning(f"Failed to initialize LighthouseProvider: {e}")
+                except Exception as e:
+                    logging.warning(f"Failed to initialize LighthouseProvider: {e}", exc_info=True)
 
             # Auto-discover and register features from features/ directory
             # Features can be disabled via KESTREL_DISABLED_FEATURES env var
@@ -293,8 +298,10 @@ class KestrelAgent(ConstitutionMixin, StreamingMixin, BackupMixin, SleepMixin):
                     )
                     if key_activated:
                         logging.info(f"Agent using own OpenRouter key (hash: {openrouter_key_hash[:16]}...)")
-                except Exception as e:
+                except (KeyError, ValueError, AttributeError, ConnectionError) as e:
                     logging.warning(f"Could not activate agent OpenRouter key: {e}")
+                except Exception as e:
+                    logging.warning(f"Could not activate agent OpenRouter key: {e}", exc_info=True)
 
             initial_balance_str = agent_node.properties.get("initialBalance", "100.0")
             logging.info(f"Creating WalletAgent with db_path={self.storage_path}")
@@ -566,8 +573,11 @@ Expected Duration: {expected_duration}
                         try:
                             avatar_result = await visual_identity.generate_avatar(user_input)
                             completion_msg += f"\n\n{avatar_result}"
-                        except Exception as e:
+                        except (ConnectionError, TimeoutError, ValueError, KeyError, AttributeError) as e:
                             logging.warning(f"Failed to generate avatar: {e}")
+                            completion_msg += "\n\n(Avatar generation had an issue - you can try again with !avatar)"
+                        except Exception as e:
+                            logging.warning(f"Failed to generate avatar: {e}", exc_info=True)
                             completion_msg += "\n\n(Avatar generation had an issue - you can try again with !avatar)"
 
                     await self.privacy_agent.add_conversation("assistant", completion_msg, session_id=session_id)
@@ -605,8 +615,12 @@ Expected Duration: {expected_duration}
                         avatar_result = await visual_identity.generate_avatar(user_input)
                         await self.bootstrap_service.set_bootstrap_state(BootstrapState.COMPLETE)
                         return f"Avatar generated!\n\n{avatar_result}\n\nI'm ready to help. What would you like to work on?"
-                    except Exception as e:
+                    except (ConnectionError, TimeoutError, ValueError, KeyError, AttributeError) as e:
                         logging.warning(f"Failed to generate avatar: {e}")
+                        await self.bootstrap_service.set_bootstrap_state(BootstrapState.COMPLETE)
+                        return "Avatar generation had an issue, but we can try again later with !avatar. I'm ready to help!"
+                    except Exception as e:
+                        logging.warning(f"Failed to generate avatar: {e}", exc_info=True)
                         await self.bootstrap_service.set_bootstrap_state(BootstrapState.COMPLETE)
                         return "Avatar generation had an issue, but we can try again later with !avatar. I'm ready to help!"
 
@@ -745,8 +759,10 @@ Expected Duration: {expected_duration}
                 prefix = self.extension.get_system_prompt_prefix()
                 if prefix:
                     system_prompt = f"{prefix}\n{system_prompt}"
+            except (AttributeError, TypeError, ValueError) as e:
+                logging.warning(f"Failed to get extension system prompt prefix: {e}")
             except Exception as e:
-                logger.warning(f"Failed to get extension system prompt prefix: {e}")
+                logging.warning(f"Failed to get extension system prompt prefix: {e}", exc_info=True)
 
         # Determine model: user override > solvency check > default
         effective_model = model_override
@@ -872,8 +888,11 @@ Expected Duration: {expected_duration}
                 tool_def = feature.to_orchestrator_tool()
                 tools.append(tool_def)
                 logging.info(f"[AGENTIC] Added tool: {feature.tool_name}")
-            except Exception as e:
+            except (AttributeError, TypeError, KeyError, ValueError) as e:
                 logging.error(f"[AGENTIC] FAILED to build tool for {feature.name}: {e}")
+                failed_features.append({"name": feature.name, "error": str(e)})
+            except Exception as e:
+                logging.error(f"[AGENTIC] FAILED to build tool for {feature.name}: {e}", exc_info=True)
                 failed_features.append({"name": feature.name, "error": str(e)})
 
         # Log summary
@@ -915,8 +934,10 @@ Expected Duration: {expected_duration}
                             sections.append(f"- `{cmd_prefix}` - {tool.schema.description}")
                         else:
                             sections.append(f"- {tool.name}: {tool.schema.description}")
-            except Exception as e:
+            except (AttributeError, TypeError, KeyError) as e:
                 logging.warning(f"Failed to build prompt section for feature {feature.name}: {e}")
+            except Exception as e:
+                logging.warning(f"Failed to build prompt section for feature {feature.name}: {e}", exc_info=True)
 
         sections.append("\n\n**CRITICAL:** When asked about your subagents, capabilities, or available tools, LIST the features above by name. They ARE your active subagents. Never say 'no active subagents' - that is incorrect.")
         return "\n".join(sections)
@@ -1037,8 +1058,20 @@ Expected Duration: {expected_duration}
                             success=True,
                             duration_ms=dispatch_duration,
                         )
-                    except Exception as e:
+                    except (ConnectionError, TimeoutError, ValueError, KeyError, TypeError, AttributeError) as e:
                         logging.error(f"Feature {tool_name} execution failed: {e}")
+                        result = {"success": False, "error": str(e)}
+
+                        # Log failure
+                        dispatch_duration = int((time.time() - dispatch_start) * 1000)
+                        await self.observability_store.log_tool_response(
+                            event_id=dispatch_event_id,
+                            success=False,
+                            duration_ms=dispatch_duration,
+                            error_message=str(e),
+                        )
+                    except Exception as e:
+                        logging.error(f"Feature {tool_name} execution failed: {e}", exc_info=True)
                         result = {"success": False, "error": str(e)}
 
                         # Log failure
@@ -1212,8 +1245,20 @@ Expected Duration: {expected_duration}
                         )
                         # Stream tool completion indicator to user
                         yield f"✓ {tool_name} complete ({dispatch_duration}ms)\n"
-                    except Exception as e:
+                    except (ConnectionError, TimeoutError, ValueError, KeyError, TypeError, AttributeError) as e:
                         logging.error(f"Feature {tool_name} execution failed: {e}")
+                        result = {"success": False, "error": str(e)}
+                        dispatch_duration = int((time.time() - dispatch_start) * 1000)
+                        await self.observability_store.log_tool_response(
+                            event_id=dispatch_event_id,
+                            success=False,
+                            duration_ms=dispatch_duration,
+                            error_message=str(e),
+                        )
+                        # Stream tool error indicator to user
+                        yield f"❌ {tool_name} failed: {str(e)[:100]}\n"
+                    except Exception as e:
+                        logging.error(f"Feature {tool_name} execution failed: {e}", exc_info=True)
                         result = {"success": False, "error": str(e)}
                         dispatch_duration = int((time.time() - dispatch_start) * 1000)
                         await self.observability_store.log_tool_response(
@@ -1322,16 +1367,16 @@ Expected Duration: {expected_duration}
         This is a simplified, local version of the "Genesis Factory" concept.
         """
         from kestrel_sovereign.inception_service import generate_kestrel_identity, save_kestrel_identity
-        
+
         # Generate a new identity
         try:
             new_agent_did_doc, new_agent_keys = generate_kestrel_identity()
-            
+
             # Save the identity to the trusted directory
             identity_path = os.path.join(TRUSTED_AGENTS_DIR, f"{agent_name}.pem")
             os.makedirs(TRUSTED_AGENTS_DIR, exist_ok=True)
             save_kestrel_identity(new_agent_did_doc, new_agent_keys, Path(identity_path))
-            
+
             # Create a node for the new agent in the current agent's knowledge graph
             # to represent the "knows" relationship.
             new_agent_node = GraphNode(
@@ -1345,11 +1390,13 @@ Expected Duration: {expected_duration}
                 }
             )
             self.storage.graph_store.add_node(new_agent_node)
-            
+
             return f"Created trusted agent '{agent_name}' with DID: {new_agent_did_doc['id']}"
-            
-        except Exception as e:
+        except (OSError, ValueError, KeyError, TypeError) as e:
             logging.error(f"Failed to create trusted agent: {e}")
+            return f"Error creating trusted agent: {str(e)}"
+        except Exception as e:
+            logging.error(f"Failed to create trusted agent: {e}", exc_info=True)
             return f"Error creating trusted agent: {str(e)}"
 
     # anchor_memory_state is provided by BackupMixin
@@ -1409,41 +1456,43 @@ Expected Duration: {expected_duration}
         """
         try:
             balance = self.wallet.get_balance()
-            
+
             # Green Zone: Rich (> 10 FIL)
             if balance > Decimal("10.0"):
                 if self._current_model_preference != "NORMAL":
                     logging.info(f"Solvency Check: Balance {balance} FIL. Operating in NORMAL mode.")
                     self._current_model_preference = "NORMAL"
                 return None # No override, use default/mandated models
-                
+
             # Yellow Zone: Economy (> 1 FIL)
             elif balance > Decimal("1.0"):
                 if self._current_model_preference != "ECONOMY":
                     logging.warning(f"Solvency Check: Balance {balance} FIL. Switching to ECONOMY mode (Local Models).")
                     self._current_model_preference = "ECONOMY"
-                
+
                 # Try to get the configured local model, default to 'llama3'
                 economy_model = "llama3"
                 if hasattr(self.llm_service, 'config'):
                     economy_model = self.llm_service.config.get("ollama", {}).get("model", "llama3")
                 return economy_model
-                
+
             # Red Zone: Critical (< 1 FIL)
             else:
                 if self._current_model_preference != "CRITICAL":
                     logging.error(f"Solvency Check: Balance {balance} FIL. CRITICAL SOLVENCY. Forced to minimal model.")
                     self._current_model_preference = "CRITICAL"
                 # In a full implementation, this would trigger hibernation
-                
+
                 # Try to get the configured local model, default to 'llama3'
                 economy_model = "llama3"
                 if hasattr(self.llm_service, 'config'):
                     economy_model = self.llm_service.config.get("ollama", {}).get("model", "llama3")
                 return economy_model
-                
-        except Exception as e:
+        except (ValueError, AttributeError, KeyError, TypeError) as e:
             logging.error(f"Solvency check failed: {e}")
+            return None
+        except Exception as e:
+            logging.error(f"Solvency check failed: {e}", exc_info=True)
             return None
 
     def close(self):
@@ -1464,8 +1513,10 @@ Expected Duration: {expected_duration}
         for listener in self._event_listeners:
             try:
                 await listener(event_type, data)
-            except Exception as e:
+            except (TypeError, AttributeError, ConnectionError) as e:
                 logging.warning(f"Failed to emit event to listener: {e}")
+            except Exception as e:
+                logging.warning(f"Failed to emit event to listener: {e}", exc_info=True)
 
     def add_event_listener(self, listener) -> None:
         """Add an event listener for SSE notifications."""
@@ -1557,15 +1608,19 @@ Expected Duration: {expected_duration}
         if security_feature and hasattr(security_feature, 'shutdown'):
             try:
                 await security_feature.shutdown()
-            except Exception as e:
+            except (AttributeError, TypeError, ConnectionError) as e:
                 logging.warning(f"Error during security shutdown: {e}")
+            except Exception as e:
+                logging.warning(f"Error during security shutdown: {e}", exc_info=True)
 
         # Shutdown MCP agent if it exists
         if self.mcp_agent and hasattr(self.mcp_agent, 'shutdown'):
             try:
                 await self.mcp_agent.shutdown()
-            except Exception as e:
+            except (AttributeError, TypeError, ConnectionError) as e:
                 logging.warning(f"Error during MCP shutdown: {e}")
+            except Exception as e:
+                logging.warning(f"Error during MCP shutdown: {e}", exc_info=True)
 
         # Close LLM service async clients
         if self.llm_service and hasattr(self.llm_service, 'close'):
@@ -1573,8 +1628,10 @@ Expected Duration: {expected_duration}
                 await self.llm_service.close()
             except asyncio.CancelledError:
                 logging.debug("LLM service close cancelled")
-            except Exception as e:
+            except (AttributeError, TypeError, ConnectionError) as e:
                 logging.warning(f"Error closing LLM service: {e}")
+            except Exception as e:
+                logging.warning(f"Error closing LLM service: {e}", exc_info=True)
 
         # Close TaskManager stores (critical for preventing thread leaks)
         if self.task_manager and hasattr(self.task_manager, 'close'):
@@ -1582,8 +1639,10 @@ Expected Duration: {expected_duration}
                 await self.task_manager.close()
             except asyncio.CancelledError:
                 logging.debug("TaskManager close cancelled")
-            except Exception as e:
+            except (AttributeError, TypeError, ConnectionError) as e:
                 logging.warning(f"Error closing TaskManager: {e}")
+            except Exception as e:
+                logging.warning(f"Error closing TaskManager: {e}", exc_info=True)
 
         # Close storage
         if hasattr(self.storage, 'close'):
@@ -1591,7 +1650,9 @@ Expected Duration: {expected_duration}
                 await self.storage.close()
             except asyncio.CancelledError:
                 logging.debug("Storage close cancelled")
-            except Exception as e:
+            except (AttributeError, TypeError, ConnectionError, OSError) as e:
                 logging.warning(f"Error closing storage: {e}")
+            except Exception as e:
+                logging.warning(f"Error closing storage: {e}", exc_info=True)
 
         logging.info("Kestrel Agent async shutdown complete.")
