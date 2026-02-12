@@ -267,8 +267,22 @@ class ERC20Adapter:
 
             return result
 
-        except Exception as e:
+        except (ConnectionError, TimeoutError) as e:
             logger.error(f"Token transfer failed: {e}")
+            return TransactionResult(
+                success=False,
+                error=str(e),
+                network=self.network,
+            )
+        except (ValueError, TypeError, KeyError) as e:
+            logger.error(f"Token transfer failed: {e}")
+            return TransactionResult(
+                success=False,
+                error=str(e),
+                network=self.network,
+            )
+        except Exception as e:
+            logger.error(f"Token transfer failed: {e}", exc_info=True)
             return TransactionResult(
                 success=False,
                 error=str(e),
@@ -338,8 +352,14 @@ class ERC20Adapter:
                 decimals=decimals,
                 network=self.network,
             )
-        except Exception as e:
+        except (ConnectionError, TimeoutError) as e:
             logger.warning(f"Failed to get token info for {token_address}: {e}")
+            return None
+        except (ValueError, TypeError) as e:
+            logger.warning(f"Failed to get token info for {token_address}: {e}")
+            return None
+        except Exception as e:
+            logger.warning(f"Failed to get token info for {token_address}: {e}", exc_info=True)
             return None
 
     def list_available_tokens(self) -> list[TokenInfo]:

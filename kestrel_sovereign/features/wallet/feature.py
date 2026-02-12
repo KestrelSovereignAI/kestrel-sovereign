@@ -514,8 +514,10 @@ class WalletAgent:
                     (self.agent_id, self._filecoin_address)
                 )
                 await db.commit()
-        except Exception as e:
+        except (OSError, IOError) as e:
             logger.error(f"Failed to save Filecoin address: {e}")
+        except Exception as e:
+            logger.error(f"Failed to save Filecoin address: {e}", exc_info=True)
 
     async def _load_filecoin_address_from_db(self) -> bool:
         """Load Filecoin address from database."""
@@ -537,8 +539,10 @@ class WalletAgent:
                 if row and row[0]:
                     self._filecoin_address = row[0]
                     return True
-        except Exception as e:
+        except (OSError, IOError) as e:
             logger.warning(f"Failed to load Filecoin address: {e}")
+        except Exception as e:
+            logger.warning(f"Failed to load Filecoin address: {e}", exc_info=True)
         return False
 
     async def sync_on_chain_balance(self) -> bool:
@@ -624,8 +628,14 @@ class WalletAgent:
             self._last_sync = datetime.now(timezone.utc)
             return True
 
-        except Exception as e:
+        except (ConnectionError, TimeoutError, OSError) as e:
             logger.error(f"Failed to sync on-chain balance: {e}")
+            return False
+        except (ValueError, TypeError, KeyError) as e:
+            logger.error(f"Failed to sync on-chain balance: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"Failed to sync on-chain balance: {e}", exc_info=True)
             return False
 
     async def get_on_chain_balance(self) -> Optional[Decimal]:
@@ -647,8 +657,11 @@ class WalletAgent:
 
         try:
             return await self._filecoin_adapter.get_balance()
-        except Exception as e:
+        except (ConnectionError, TimeoutError, OSError) as e:
             logger.error(f"Failed to query on-chain balance: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"Failed to query on-chain balance: {e}", exc_info=True)
             return None
 
     # =========================================================================
@@ -747,8 +760,10 @@ class WalletAgent:
                             for r in rows
                         ]
                         return True
-        except Exception as e:
+        except (OSError, IOError) as e:
             logger.warning(f"Failed to load wallet state: {e}")
+        except Exception as e:
+            logger.warning(f"Failed to load wallet state: {e}", exc_info=True)
         return False
 
     async def _save_to_db(self) -> bool:
@@ -801,8 +816,11 @@ class WalletAgent:
 
                 await db.commit()
                 return True
-        except Exception as e:
+        except (OSError, IOError) as e:
             logger.error(f"Failed to save wallet state: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"Failed to save wallet state: {e}", exc_info=True)
             return False
 
     async def _record_transaction(
@@ -839,8 +857,10 @@ class WalletAgent:
                     (self.agent_id, tx_type, currency.value, str(amount), memo, str(new_balance))
                 )
                 await db.commit()
-        except Exception as e:
+        except (OSError, IOError) as e:
             logger.error(f"Failed to record transaction: {e}")
+        except Exception as e:
+            logger.error(f"Failed to record transaction: {e}", exc_info=True)
 
     def _get_timestamp(self) -> str:
         """Get current timestamp in ISO format."""
