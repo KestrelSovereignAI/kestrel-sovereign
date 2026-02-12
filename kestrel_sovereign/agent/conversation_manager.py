@@ -58,8 +58,14 @@ class ConversationManager:
             else:
                 logger.warning("No conversation history method available")
                 return []
+        except (ConnectionError, TimeoutError) as e:
+            logger.error(f"Storage connection error while fetching conversation history: {e}", exc_info=True)
+            return []
+        except (KeyError, ValueError, TypeError) as e:
+            logger.error(f"Data error while fetching conversation history: {e}", exc_info=True)
+            return []
         except Exception as e:
-            logger.error(f"Failed to get conversation history: {e}")
+            logger.error(f"Failed to get conversation history: {e}", exc_info=True)
             return []
 
     async def compress_session(
@@ -223,8 +229,22 @@ SUMMARY:"""
                 "summary_preview": summary_text[:200] + "..." if len(summary_text) > 200 else summary_text
             }
 
+        except (ConnectionError, TimeoutError) as e:
+            logger.error(f"Network error during session compression: {e}", exc_info=True)
+            return {
+                "success": False,
+                "reason": f"Network error during compression: {str(e)}",
+                "message_count": message_count
+            }
+        except (KeyError, ValueError, TypeError) as e:
+            logger.error(f"Data error during session compression: {e}", exc_info=True)
+            return {
+                "success": False,
+                "reason": f"Data error during compression: {str(e)}",
+                "message_count": message_count
+            }
         except Exception as e:
-            logger.error(f"Session compression failed: {e}")
+            logger.error(f"Session compression failed: {e}", exc_info=True)
             return {
                 "success": False,
                 "reason": f"Compression failed: {str(e)}",
@@ -760,8 +780,14 @@ SUMMARY:"""
                 "summary_preview": summary_text[:200] + "..." if len(summary_text) > 200 else summary_text
             }
 
+        except (ConnectionError, TimeoutError) as e:
+            logger.error(f"Network error during message summarization: {e}", exc_info=True)
+            return {"success": False, "error": f"Network error: {str(e)}"}
+        except (KeyError, ValueError, TypeError) as e:
+            logger.error(f"Data error during message summarization: {e}", exc_info=True)
+            return {"success": False, "error": f"Data error: {str(e)}"}
         except Exception as e:
-            logger.error(f"Summarization failed: {e}")
+            logger.error(f"Summarization failed: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
 
     async def _log_context_audit(
