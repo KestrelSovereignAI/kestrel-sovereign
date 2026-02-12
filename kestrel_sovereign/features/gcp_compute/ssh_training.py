@@ -129,19 +129,20 @@ class GCPSSHTrainingMixin:
         mount_path = self.disk_config.get("mount_path", "/workspace")
 
         # Create training data directory structure
+        mount_path_quoted = shlex.quote(mount_path)
         setup_cmd = f"""
-mkdir -p {mount_path}/training_data/{shlex.quote(job_id)}
-mkdir -p {mount_path}/lora_output
+mkdir -p {mount_path_quoted}/training_data/{shlex.quote(job_id)}
+mkdir -p {mount_path_quoted}/lora_output
 
 # Download training image
-cd {mount_path}/training_data/{shlex.quote(job_id)}
+cd {mount_path_quoted}/training_data/{shlex.quote(job_id)}
 wget -q -O image_001.png {shlex.quote(image_url)}
 
 # Create caption file with trigger word
 echo {shlex.quote(trigger_word)} > image_001.txt
 
 # Create dataset config
-cat > {mount_path}/training_data/dataset_{shlex.quote(job_id)}.toml << 'DATASET_EOF'
+cat > {mount_path_quoted}/training_data/dataset_{shlex.quote(job_id)}.toml << 'DATASET_EOF'
 [general]
 caption_extension = '.txt'
 keep_tokens = 1
@@ -161,16 +162,17 @@ DATASET_EOF
         await self.run_ssh_command(setup_cmd, session, timeout=SSH_COMMAND_TIMEOUT_SETUP)
 
         # Submit training job via docker exec
+        mount_path_quoted = shlex.quote(mount_path)
         train_cmd = f"""
 docker exec kestrel-workload bash -c '
 cd /workspace
 nohup python train_lora.py \\
-    --pretrained_model_name_or_path {mount_path}/models/flux1-dev/flux1-dev.safetensors \\
-    --clip_l {mount_path}/models/flux1-dev/text_encoder/model.safetensors \\
-    --t5xxl {mount_path}/models/text_encoders/t5xxl_fp16.safetensors \\
-    --ae {mount_path}/models/flux1-dev/ae.safetensors \\
-    --dataset_config {mount_path}/training_data/dataset_{shlex.quote(job_id)}.toml \\
-    --output_dir {mount_path}/lora_output \\
+    --pretrained_model_name_or_path {mount_path_quoted}/models/flux1-dev/flux1-dev.safetensors \\
+    --clip_l {mount_path_quoted}/models/flux1-dev/text_encoder/model.safetensors \\
+    --t5xxl {mount_path_quoted}/models/text_encoders/t5xxl_fp16.safetensors \\
+    --ae {mount_path_quoted}/models/flux1-dev/ae.safetensors \\
+    --dataset_config {mount_path_quoted}/training_data/dataset_{shlex.quote(job_id)}.toml \\
+    --output_dir {mount_path_quoted}/lora_output \\
     --output_name {shlex.quote(job_id)} \\
     --network_module networks.lora_flux \\
     --network_dim {network_dim} \\
@@ -216,6 +218,7 @@ echo "Training started with PID $(cat /tmp/training_{shlex.quote(job_id)}.pid)"
             {"status": str, "progress": float, "error": str}
         """
         mount_path = self.disk_config.get("mount_path", "/workspace")
+        mount_path_quoted = shlex.quote(mount_path)
 
         check_cmd = f"""
 docker exec kestrel-workload bash -c '
@@ -225,9 +228,9 @@ if [ -f /tmp/training_{shlex.quote(job_id)}.pid ]; then
         echo "RUNNING"
         tail -5 /tmp/training_{shlex.quote(job_id)}.log 2>/dev/null | grep -oP "\\d+%" | tail -1 || echo "0%"
     else
-        if [ -f {mount_path}/lora_output/{shlex.quote(job_id)}.safetensors ]; then
+        if [ -f {mount_path_quoted}/lora_output/{shlex.quote(job_id)}.safetensors ]; then
             echo "COMPLETED"
-            ls -la {mount_path}/lora_output/{shlex.quote(job_id)}.safetensors
+            ls -la {mount_path_quoted}/lora_output/{shlex.quote(job_id)}.safetensors
         else
             echo "FAILED"
             tail -20 /tmp/training_{shlex.quote(job_id)}.log 2>/dev/null
@@ -296,8 +299,8 @@ fi
 
         scp_cmd = (
             f"scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "
-            f"-i {self.ssh_key_file} "
-            f"{self.ssh_user}@{session.ssh_host}:{remote_path} {local_path}"
+            f"-i {shlex.quote(self.ssh_key_file)} "
+            f"{shlex.quote(self.ssh_user)}@{shlex.quote(session.ssh_host)}:{remote_path} {shlex.quote(local_path)}"
         )
 
         try:
@@ -362,6 +365,7 @@ fi
             seed = random.randint(0, 2**32 - 1)
 
         mount_path = self.disk_config.get("mount_path", "/workspace")
+        mount_path_quoted = shlex.quote(mount_path)
 
         # Ensure lora_path is absolute
         if not lora_path.startswith("/"):
@@ -376,10 +380,10 @@ docker exec kestrel-workload bash -c '
 mkdir -p {shlex.quote(output_dir)}
 
 python generate_image.py \\
-    --ckpt {mount_path}/models/flux1-dev/flux1-dev.safetensors \\
-    --clip_l {mount_path}/models/flux1-dev/text_encoder/model.safetensors \\
-    --t5xxl {mount_path}/models/text_encoders/t5xxl_fp16.safetensors \\
-    --ae {mount_path}/models/flux1-dev/ae.safetensors \\
+    --ckpt {mount_path_quoted}/models/flux1-dev/flux1-dev.safetensors \\
+    --clip_l {mount_path_quoted}/models/flux1-dev/text_encoder/model.safetensors \\
+    --t5xxl {mount_path_quoted}/models/text_encoders/t5xxl_fp16.safetensors \\
+    --ae {mount_path_quoted}/models/flux1-dev/ae.safetensors \\
     --lora {shlex.quote(lora_path)} \\
     --prompt {shlex.quote(prompt)} \\
     --output {shlex.quote(output_dir)}/output.png \\
