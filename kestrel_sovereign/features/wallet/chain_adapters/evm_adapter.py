@@ -52,8 +52,11 @@ class EVMAdapter(ChainAdapter):
         """Check connection to the RPC endpoint."""
         try:
             return self.w3.is_connected()
-        except Exception as e:
+        except (ConnectionError, TimeoutError, OSError) as e:
             logger.error(f"Connection check failed: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"Connection check failed: {e}", exc_info=True)
             return False
 
     async def get_balance(self, address: str) -> Decimal:
@@ -90,8 +93,11 @@ class EVMAdapter(ChainAdapter):
             gas_limit = self.w3.eth.estimate_gas(tx_dict)
             # Add 20% buffer for safety
             gas_limit = int(gas_limit * 1.2)
-        except Exception as e:
+        except (ConnectionError, TimeoutError, ValueError) as e:
             logger.warning(f"Gas estimation failed, using default: {e}")
+            gas_limit = 21000 if not request.data else 100000
+        except Exception as e:
+            logger.warning(f"Gas estimation failed, using default: {e}", exc_info=True)
             gas_limit = 21000 if not request.data else 100000
 
         # Get current gas prices
@@ -118,8 +124,16 @@ class EVMAdapter(ChainAdapter):
                     gas_limit=gas_limit,
                     gas_price_wei=gas_price,
                 )
-        except Exception as e:
+        except (ConnectionError, TimeoutError, ValueError, KeyError) as e:
             logger.warning(f"Gas price fetch failed: {e}")
+            # Fallback to legacy
+            gas_price = self.w3.eth.gas_price
+            return GasEstimate(
+                gas_limit=gas_limit,
+                gas_price_wei=gas_price,
+            )
+        except Exception as e:
+            logger.warning(f"Gas price fetch failed: {e}", exc_info=True)
             # Fallback to legacy
             gas_price = self.w3.eth.gas_price
             return GasEstimate(
@@ -219,8 +233,22 @@ class EVMAdapter(ChainAdapter):
                 network=self.network,
             )
 
-        except Exception as e:
+        except (ConnectionError, TimeoutError) as e:
             logger.error(f"Transaction failed: {e}")
+            return TransactionResult(
+                success=False,
+                error=str(e),
+                network=self.network,
+            )
+        except (ValueError, TypeError, KeyError) as e:
+            logger.error(f"Transaction failed: {e}")
+            return TransactionResult(
+                success=False,
+                error=str(e),
+                network=self.network,
+            )
+        except Exception as e:
+            logger.error(f"Transaction failed: {e}", exc_info=True)
             return TransactionResult(
                 success=False,
                 error=str(e),
@@ -250,6 +278,8 @@ class EVMAdapter(ChainAdapter):
             # Web3 checksum validation
             Web3.to_checksum_address(address)
             return True
+        except (ValueError, TypeError):
+            return False
         except Exception:
             return False
 
@@ -296,6 +326,20 @@ class EVMAdapter(ChainAdapter):
                 success=False,
                 tx_hash=tx_hash,
                 error="Transaction not found",
+                network=self.network,
+            )
+        except TimeoutError as e:
+            return TransactionResult(
+                success=False,
+                tx_hash=tx_hash,
+                error=str(e),
+                network=self.network,
+            )
+        except (ConnectionError, ValueError) as e:
+            return TransactionResult(
+                success=False,
+                tx_hash=tx_hash,
+                error=str(e),
                 network=self.network,
             )
         except Exception as e:
