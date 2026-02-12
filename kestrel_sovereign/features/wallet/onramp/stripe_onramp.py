@@ -233,8 +233,16 @@ class StripeOnRamp:
                 logger.warning("stripe package not installed")
                 session.redirect_url = self._generate_demo_url(session)
 
-            except Exception as e:
+            except (ConnectionError, TimeoutError) as e:
                 logger.error(f"Failed to create Stripe session: {e}")
+                # Fall back to demo mode
+                session.redirect_url = self._generate_demo_url(session)
+            except (ValueError, TypeError, KeyError) as e:
+                logger.error(f"Failed to create Stripe session: {e}")
+                # Fall back to demo mode
+                session.redirect_url = self._generate_demo_url(session)
+            except Exception as e:
+                logger.error(f"Failed to create Stripe session: {e}", exc_info=True)
                 # Fall back to demo mode
                 session.redirect_url = self._generate_demo_url(session)
         else:

@@ -322,10 +322,21 @@ class TransactionManager:
 
             return result
 
+        except (ConnectionError, TimeoutError, OSError) as e:
+            audit.status = "failed"
+            audit.error = str(e)
+            await self._record_transaction(audit)
+            raise
+        except (ValueError, TypeError, KeyError) as e:
+            audit.status = "failed"
+            audit.error = str(e)
+            await self._record_transaction(audit)
+            raise
         except Exception as e:
             audit.status = "failed"
             audit.error = str(e)
             await self._record_transaction(audit)
+            logger.error(f"Transaction failed: {e}", exc_info=True)
             raise
 
     async def send_token(
@@ -410,10 +421,21 @@ class TransactionManager:
 
             return result
 
+        except (ConnectionError, TimeoutError, OSError) as e:
+            audit.status = "failed"
+            audit.error = str(e)
+            await self._record_transaction(audit)
+            raise
+        except (ValueError, TypeError, KeyError) as e:
+            audit.status = "failed"
+            audit.error = str(e)
+            await self._record_transaction(audit)
+            raise
         except Exception as e:
             audit.status = "failed"
             audit.error = str(e)
             await self._record_transaction(audit)
+            logger.error(f"Token transaction failed: {e}", exc_info=True)
             raise
 
     async def get_balance(
