@@ -114,7 +114,8 @@ class MemoryManager:
                                     break
                                 except ValueError:
                                     continue
-                    except Exception:
+                    except (ValueError, TypeError) as e:
+                        logger.debug(f"Timestamp parsing error for {created_at}: {e}")
                         pass  # Keep original format
 
                 # Truncate long memories
@@ -130,8 +131,14 @@ class MemoryManager:
 
             return "\n".join(parts)
 
+        except (ConnectionError, TimeoutError) as e:
+            logger.error(f"Storage connection error during memory retrieval: {e}", exc_info=True)
+            return None
+        except (KeyError, ValueError, TypeError) as e:
+            logger.error(f"Data error during memory retrieval: {e}", exc_info=True)
+            return None
         except Exception as e:
-            logger.error(f"Memory retrieval failed: {e}")
+            logger.error(f"Memory retrieval failed: {e}", exc_info=True)
             return None
 
     async def check_episode_needed(self, session_messages: int = 0) -> bool:
@@ -563,8 +570,16 @@ class MemoryManager:
             }
 
         except ImportError as e:
+            logger.error(f"SavedItemsStore import failed: {e}", exc_info=True)
             return {"success": False, "error": f"SavedItemsStore not available: {e}"}
+        except (ConnectionError, TimeoutError) as e:
+            logger.error(f"Storage connection error during stash save: {e}", exc_info=True)
+            return {"success": False, "error": f"Storage error: {str(e)}"}
+        except (KeyError, ValueError, TypeError) as e:
+            logger.error(f"Data error during stash save: {e}", exc_info=True)
+            return {"success": False, "error": f"Data error: {str(e)}"}
         except Exception as e:
+            logger.error(f"Stash save failed: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
 
     async def stash_peek(
@@ -770,8 +785,14 @@ class MemoryManager:
                 "summary_preview": final_summary[:300] + "..." if len(final_summary) > 300 else final_summary
             }
 
+        except (ConnectionError, TimeoutError) as e:
+            logger.error(f"Network error during hierarchical compression: {e}", exc_info=True)
+            return {"success": False, "error": f"Network error: {str(e)}"}
+        except (KeyError, ValueError, TypeError) as e:
+            logger.error(f"Data error during hierarchical compression: {e}", exc_info=True)
+            return {"success": False, "error": f"Data error: {str(e)}"}
         except Exception as e:
-            logger.error(f"Hierarchical compression failed: {e}")
+            logger.error(f"Hierarchical compression failed: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
 
     def _build_message_chunks(
