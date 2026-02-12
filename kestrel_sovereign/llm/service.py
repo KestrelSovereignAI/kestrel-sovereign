@@ -12,6 +12,7 @@ import re
 import json
 import os
 import time
+import asyncio
 from dataclasses import dataclass, field
 
 from kestrel_sovereign.kestrel_config.constants import LLM_CACHE_TTL_SECONDS, STORAGE_CACHE_TTL_SECONDS
@@ -20,6 +21,7 @@ from enum import Enum
 from typing import List, Dict, Any, Optional, Union, Type, TYPE_CHECKING
 
 import openai
+import httpx
 
 if TYPE_CHECKING:
     from kestrel_sovereign.storage.async_database import AsyncDatabase
@@ -559,8 +561,14 @@ No other text or formatting.
         except LLMProviderError as e:
             logger.error(f"Audit provider failed: {e}")
             return {"risk_level": 3, "reasoning": f"Audit provider failed: {e}"}
+        except (ValueError, KeyError, AttributeError, TypeError) as e:
+            logger.error(f"Data validation error in audit: {e}", exc_info=True)
+            return {"risk_level": 3, "reasoning": f"Audit failed: {e}"}
+        except (openai.APIError, openai.APIConnectionError, httpx.HTTPError, ConnectionError, TimeoutError) as e:
+            logger.error(f"Network/API error in audit: {e}", exc_info=True)
+            return {"risk_level": 3, "reasoning": f"Audit failed: {e}"}
         except Exception as e:
-            logger.error(f"Unexpected audit error: {e}")
+            logger.error(f"Unexpected audit error: {e}", exc_info=True)
             return {"risk_level": 3, "reasoning": f"Audit failed: {e}"}
 
     async def get_response(
@@ -675,8 +683,14 @@ No other text or formatting.
                         if provider["name"] == "ollama":
                             provider_for_model = provider
                             break
+                except (RuntimeError, ValueError, ConnectionError, TimeoutError) as e:
+                    logger.error(f"Auto-pull failed: {e}", exc_info=True)
+                    raise ValueError(f"Model '{model_id}' not found and auto-pull failed: {e}")
+                except (openai.APIError, httpx.HTTPError) as e:
+                    logger.error(f"Auto-pull network error: {e}", exc_info=True)
+                    raise ValueError(f"Model '{model_id}' not found and auto-pull failed: {e}")
                 except Exception as e:
-                    logger.error(f"Auto-pull failed: {e}")
+                    logger.error(f"Auto-pull failed: {e}", exc_info=True)
                     raise ValueError(f"Model '{model_id}' not found and auto-pull failed: {e}")
 
             if not provider_for_model:
@@ -701,8 +715,17 @@ No other text or formatting.
             logger.info(f"Success from {model_id}")
             return response
 
+        except (openai.APIError, openai.APIConnectionError, openai.RateLimitError, openai.AuthenticationError) as e:
+            logger.error(f"Model {model_id} API error: {e}", exc_info=True)
+            raise RuntimeError(f"Model {model_id} failed: {e}")
+        except (httpx.HTTPError, ConnectionError, TimeoutError, asyncio.TimeoutError) as e:
+            logger.error(f"Model {model_id} network error: {e}", exc_info=True)
+            raise RuntimeError(f"Model {model_id} failed: {e}")
+        except (KeyError, AttributeError, TypeError) as e:
+            logger.error(f"Model {model_id} data error: {e}", exc_info=True)
+            raise RuntimeError(f"Model {model_id} failed: {e}")
         except Exception as e:
-            logger.error(f"Model {model_id} failed: {e}")
+            logger.error(f"Model {model_id} failed: {e}", exc_info=True)
             raise RuntimeError(f"Model {model_id} failed: {e}")
 
     # get_streaming_response is provided by StreamingMixin
@@ -738,8 +761,10 @@ No other text or formatting.
                         pass
             except (ConnectionError, OSError) as e:
                 logger.debug(f"Connection error closing {provider.get('name')} client: {e}")
+            except (RuntimeError, AttributeError) as e:
+                logger.warning(f"Error closing {provider.get('name')} client: {e}", exc_info=True)
             except Exception as e:
-                logger.warning(f"Unexpected error closing {provider.get('name')} client: {e}")
+                logger.warning(f"Unexpected error closing {provider.get('name')} client: {e}", exc_info=True)
 
         # Close remote GPU client if active
         if self._remote_client:
@@ -747,8 +772,10 @@ No other text or formatting.
                 await asyncio.wait_for(self._remote_client.close(), timeout=CLIENT_CLOSE_TIMEOUT)
             except (asyncio.TimeoutError, asyncio.CancelledError, ConnectionError, OSError):
                 pass
+            except (RuntimeError, AttributeError) as e:
+                logger.debug(f"Error closing remote client: {e}", exc_info=True)
             except Exception as e:
-                logger.debug(f"Error closing remote client: {e}")
+                logger.debug(f"Error closing remote client: {e}", exc_info=True)
             finally:
                 self._remote_client = None
 
@@ -877,9 +904,21 @@ No other text or formatting.
                 if isinstance(response, LLMResponse):
                     return response.content or ""
                 return response
+            except (openai.APIError, openai.APIConnectionError, openai.RateLimitError, openai.AuthenticationError) as exc:
+                self._last_remote_error = str(exc)
+                logger.warning(f"Remote GPU API error: {exc}, falling back to providers", exc_info=True)
+                self._deactivate_remote_backend(reason=str(exc))
+            except (httpx.HTTPError, ConnectionError, TimeoutError, asyncio.TimeoutError) as exc:
+                self._last_remote_error = str(exc)
+                logger.warning(f"Remote GPU network error: {exc}, falling back to providers", exc_info=True)
+                self._deactivate_remote_backend(reason=str(exc))
+            except LLMServiceError as exc:
+                self._last_remote_error = str(exc)
+                logger.warning(f"Remote GPU service error: {exc}, falling back to providers", exc_info=True)
+                self._deactivate_remote_backend(reason=str(exc))
             except Exception as exc:
                 self._last_remote_error = str(exc)
-                logger.warning(f"Remote GPU failed: {exc}, falling back to providers")
+                logger.warning(f"Remote GPU failed: {exc}, falling back to providers", exc_info=True)
                 self._deactivate_remote_backend(reason=str(exc))
 
         # Fall back to standard provider chain
@@ -930,9 +969,21 @@ No other text or formatting.
                 if isinstance(response, LLMResponse):
                     return response.content or ""
                 return response
+            except (openai.APIError, openai.APIConnectionError, openai.RateLimitError, openai.AuthenticationError) as exc:
+                self._last_remote_error = str(exc)
+                logger.warning(f"Remote GPU API error: {exc}, falling back", exc_info=True)
+                self._deactivate_remote_backend(reason=str(exc))
+            except (httpx.HTTPError, ConnectionError, TimeoutError, asyncio.TimeoutError) as exc:
+                self._last_remote_error = str(exc)
+                logger.warning(f"Remote GPU network error: {exc}, falling back", exc_info=True)
+                self._deactivate_remote_backend(reason=str(exc))
+            except LLMServiceError as exc:
+                self._last_remote_error = str(exc)
+                logger.warning(f"Remote GPU service error: {exc}, falling back", exc_info=True)
+                self._deactivate_remote_backend(reason=str(exc))
             except Exception as exc:
                 self._last_remote_error = str(exc)
-                logger.warning(f"Remote GPU failed: {exc}, falling back")
+                logger.warning(f"Remote GPU failed: {exc}, falling back", exc_info=True)
                 self._deactivate_remote_backend(reason=str(exc))
 
         # Fall back to standard providers
@@ -990,8 +1041,17 @@ No other text or formatting.
                 if isinstance(response, LLMResponse):
                     return response.content or ""
                 return response
+            except (openai.APIError, openai.APIConnectionError, openai.RateLimitError, openai.AuthenticationError) as e:
+                logger.warning(f"Provider {provider['name']} API error: {e}", exc_info=True)
+                continue
+            except (httpx.HTTPError, ConnectionError, TimeoutError, asyncio.TimeoutError) as e:
+                logger.warning(f"Provider {provider['name']} network error: {e}", exc_info=True)
+                continue
+            except LLMProviderError as e:
+                logger.warning(f"Provider {provider['name']} failed: {e}", exc_info=True)
+                continue
             except Exception as e:
-                logger.warning(f"Provider {provider['name']} failed: {e}")
+                logger.warning(f"Provider {provider['name']} failed: {e}", exc_info=True)
                 continue
 
         raise LLMServiceError("All providers failed for generate_with_messages")
