@@ -48,6 +48,16 @@ def get_lighthouse_gateway_url() -> str:
     return os.getenv("LIGHTHOUSE_GATEWAY_URL", "https://gateway.lighthouse.storage/ipfs")
 
 
+def get_xai_api_url() -> str:
+    """Get xAI API base URL."""
+    return os.getenv("XAI_API_URL", "https://api.x.ai/v1")
+
+
+def get_groq_api_url() -> str:
+    """Get Groq API base URL."""
+    return os.getenv("GROQ_API_URL", "https://api.groq.com/openai/v1")
+
+
 # =============================================================================
 # Service Configuration
 # =============================================================================
