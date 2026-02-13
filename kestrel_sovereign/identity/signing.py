@@ -169,22 +169,76 @@ def verify_package_signature(
         return False, "Invalid signature"
     except FileNotFoundError:
         # Try to verify using public key from DID document
-        return _verify_with_did_document(package)
+        return _verify_with_did_document(package, storage_dir)
     except Exception as e:
         return False, f"Verification failed: {e}"
 
 
-def _verify_with_did_document(package: AgentIdentityPackage) -> Tuple[bool, str]:
+def _verify_with_did_document(
+    package: AgentIdentityPackage,
+    storage_dir: Optional[Path] = None,
+) -> Tuple[bool, str]:
     """
     Verify signature using only the public key from DID document.
 
     This is useful when importing a package from another source where
     we don't have the private key, but we can verify the signature
-    using the public key embedded in the package's DID.
+    using the public key embedded in the DID document.
+
+    Tries two sources for the public key:
+    1. Local DID document file ({key_id}.json) if previously imported
+    2. Could be extended for DID resolution in the future
     """
-    # TODO: Implement verification using public key from DID resolution
-    # For now, this is a placeholder for future DID resolution integration
-    return False, "Remote DID verification not yet implemented"
+    import json
+
+    try:
+        key_id = get_key_id(package.did)
+
+        # Try loading the DID document from local storage
+        if storage_dir is None:
+            from kestrel_sovereign.storage import get_default_agent_data_dir
+            storage_dir = Path(get_default_agent_data_dir())
+        else:
+            storage_dir = Path(storage_dir)
+
+        did_path = storage_dir / f"{key_id}.json"
+        if not did_path.exists():
+            return False, f"DID document not found at {did_path} - cannot verify without public key"
+
+        with open(did_path, 'r') as f:
+            did_document = json.load(f)
+
+        # Extract publicKeyHex from the DID document
+        public_keys = did_document.get("publicKey", [])
+        if not public_keys:
+            return False, "DID document has no publicKey entries"
+
+        public_key_hex = public_keys[0].get("publicKeyHex")
+        if not public_key_hex:
+            return False, "DID document publicKey entry has no publicKeyHex"
+
+        # Reconstruct EC public key from the uncompressed hex
+        public_key_bytes = bytes.fromhex(public_key_hex)
+        public_key = ec.EllipticCurvePublicKey.from_encoded_point(
+            ec.SECP256K1(), public_key_bytes
+        )
+
+        # Verify the signature
+        signature_bytes = bytes.fromhex(package.signature)
+        public_key.verify(
+            signature_bytes,
+            package.content_hash.encode('utf-8'),
+            ec.ECDSA(hashes.SHA256())
+        )
+
+        return True, "Signature valid (verified via DID document)"
+
+    except InvalidSignature:
+        return False, "Invalid signature (DID document verification)"
+    except (ValueError, KeyError, IndexError) as e:
+        return False, f"DID document parsing failed: {e}"
+    except Exception as e:
+        return False, f"DID document verification failed: {e}"
 
 
 async def sign_and_export(
