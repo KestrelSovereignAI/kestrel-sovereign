@@ -220,26 +220,24 @@ class AsyncConversationStore:
 
         SESSION_GAP_MINUTES = 30
 
-        # Get the start time of this session
+        # Get the start time of this session (if session_id is a message ID)
         start_row = await self.db.fetchone(
             "SELECT created_at FROM conversation_history WHERE id = ? AND agent_id = ?",
             (session_id, self.agent_id)
         )
-        if not start_row:
-            logger.warning(f"Session {session_id} not found for agent {self.agent_id}")
-            return []
 
-        start_time = start_row[0]
-
-        # Get all messages from that point forward
-        all_rows = await self.db.fetchall(
-            """SELECT id, role, content, metadata, created_at
-               FROM conversation_history
-               WHERE agent_id = ? AND created_at >= ?
-               ORDER BY created_at ASC
-               LIMIT ?""",
-            (self.agent_id, start_time, limit * 2)  # Fetch extra in case of filtering
-        )
+        # If session_id is a message ID, get messages from that timestamp forward
+        all_rows = []
+        if start_row:
+            start_time = start_row[0]
+            all_rows = await self.db.fetchall(
+                """SELECT id, role, content, metadata, created_at
+                   FROM conversation_history
+                   WHERE agent_id = ? AND created_at >= ?
+                   ORDER BY created_at ASC
+                   LIMIT ?""",
+                (self.agent_id, start_time, limit * 2)  # Fetch extra in case of filtering
+            )
 
         # Also get messages that explicitly belong to this session (resumed conversations)
         # These are messages with session_id in metadata that may come after a time gap
