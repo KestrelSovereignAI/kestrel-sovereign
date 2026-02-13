@@ -39,6 +39,8 @@ async def invoke_agent(request: Request):
             session_id=session_id
         )
         return {"response": response}
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error invoking agent: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="An internal error occurred.")
