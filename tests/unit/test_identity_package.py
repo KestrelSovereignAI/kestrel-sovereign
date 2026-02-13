@@ -307,3 +307,137 @@ class TestHelperFunctions:
         )
         hash_value = create_package_hash(package)
         assert len(hash_value) == 64
+
+
+class TestDIDDocumentVerification:
+    """Tests for DID document-based signature verification."""
+
+    def test_sign_and_verify_via_did_document(self, tmp_path):
+        """Test full round-trip: sign with private key, verify with DID document only."""
+        from cryptography.hazmat.primitives.asymmetric import ec
+        from cryptography.hazmat.primitives.serialization import (
+            Encoding, PublicFormat, NoEncryption, PrivateFormat,
+        )
+        from kestrel_sovereign.identity.signing import (
+            sign_package, verify_package_signature, _verify_with_did_document,
+        )
+
+        # Generate a fresh secp256k1 key pair
+        private_key = ec.generate_private_key(ec.SECP256K1())
+        public_key = private_key.public_key()
+
+        # Derive Ethereum-style address from public key
+        public_key_bytes = public_key.public_bytes(
+            Encoding.X962, PublicFormat.UncompressedPoint
+        )
+        public_key_hex = public_key_bytes.hex()
+
+        import hashlib
+        address = "0x" + hashlib.sha3_256(public_key_bytes[1:]).hexdigest()[-40:]
+        did = f"did:pkh:eip155:1:{address}"
+        key_id = f"kestrel_{address}"
+
+        # Save private key as PEM (for signing)
+        pem_data = private_key.private_bytes(
+            Encoding.PEM, PrivateFormat.PKCS8, NoEncryption()
+        )
+        (tmp_path / f"{key_id}.pem").write_bytes(pem_data)
+
+        # Save DID document with publicKeyHex (for verification)
+        did_document = {
+            "@context": "https://w3id.org/did/v1",
+            "id": did,
+            "publicKey": [{
+                "id": f"{did}#keys-1",
+                "type": "EcdsaSecp256k1VerificationKey2019",
+                "controller": did,
+                "publicKeyHex": public_key_hex
+            }],
+        }
+        import json
+        (tmp_path / f"{key_id}.json").write_text(json.dumps(did_document))
+
+        # Create and sign a package
+        package = AgentIdentityPackage(
+            did=did,
+            agent_name="TestAgent",
+            created_at="2026-01-01T00:00:00Z",
+            constitution_hash="abc123",
+            constitution_text="test constitution",
+        )
+        signed = sign_package(package, storage_dir=tmp_path)
+        assert signed.signature
+        assert signed.content_hash
+
+        # Verify using private key path (normal flow) — should pass
+        is_valid, msg = verify_package_signature(signed, storage_dir=tmp_path)
+        assert is_valid, f"Normal verification failed: {msg}"
+
+        # Now delete the private key to simulate remote verification
+        (tmp_path / f"{key_id}.pem").unlink()
+
+        # Verify using DID document only — this exercises the new code
+        is_valid, msg = _verify_with_did_document(signed, storage_dir=tmp_path)
+        assert is_valid, f"DID document verification failed: {msg}"
+        assert "DID document" in msg
+
+    def test_did_document_verify_tampered_package(self, tmp_path):
+        """Tampered package should fail DID document verification."""
+        from cryptography.hazmat.primitives.asymmetric import ec
+        from cryptography.hazmat.primitives.serialization import (
+            Encoding, PublicFormat, NoEncryption, PrivateFormat,
+        )
+        from kestrel_sovereign.identity.signing import (
+            sign_package, _verify_with_did_document,
+        )
+
+        private_key = ec.generate_private_key(ec.SECP256K1())
+        public_key = private_key.public_key()
+        public_key_bytes = public_key.public_bytes(
+            Encoding.X962, PublicFormat.UncompressedPoint
+        )
+
+        import hashlib
+        address = "0x" + hashlib.sha3_256(public_key_bytes[1:]).hexdigest()[-40:]
+        did = f"did:pkh:eip155:1:{address}"
+        key_id = f"kestrel_{address}"
+
+        # Save key and DID doc
+        (tmp_path / f"{key_id}.pem").write_bytes(
+            private_key.private_bytes(Encoding.PEM, PrivateFormat.PKCS8, NoEncryption())
+        )
+        import json
+        (tmp_path / f"{key_id}.json").write_text(json.dumps({
+            "@context": "https://w3id.org/did/v1",
+            "id": did,
+            "publicKey": [{"publicKeyHex": public_key_bytes.hex()}],
+        }))
+
+        package = AgentIdentityPackage(
+            did=did, agent_name="Test", created_at="2026-01-01",
+            constitution_hash="abc", constitution_text="test",
+        )
+        signed = sign_package(package, storage_dir=tmp_path)
+
+        # Tamper with the package
+        signed.agent_name = "TAMPERED"
+
+        # DID document verification should fail (hash mismatch caught upstream,
+        # but if we bypass that, the signature itself won't match)
+        signed.content_hash = signed.compute_content_hash()  # recompute for tampered data
+        is_valid, msg = _verify_with_did_document(signed, storage_dir=tmp_path)
+        assert not is_valid, "Tampered package should fail verification"
+
+    def test_did_document_missing(self, tmp_path):
+        """Missing DID document should return clear error."""
+        from kestrel_sovereign.identity.signing import _verify_with_did_document
+
+        package = AgentIdentityPackage(
+            did="did:pkh:eip155:1:0xdeadbeef",
+            agent_name="Test", created_at="2026-01-01",
+            constitution_hash="abc", constitution_text="test",
+            signature="aabb", content_hash="ccdd",
+        )
+        is_valid, msg = _verify_with_did_document(package, storage_dir=tmp_path)
+        assert not is_valid
+        assert "not found" in msg
