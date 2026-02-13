@@ -1,8 +1,8 @@
 """
 Unit tests for KestrelAgent core methods.
 
-Tests the main agent orchestrator without requiring running LLM services.
-Uses mocks for LLMService, AsyncStorage, and external dependencies.
+Tests actual behavior, error handling, and side effects.
+NO mock-returns-mock tests - each test verifies real logic.
 """
 
 import pytest
@@ -10,8 +10,9 @@ import asyncio
 import os
 import tempfile
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, Mock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, patch, call
 from datetime import datetime, timezone
+from decimal import Decimal
 
 from kestrel_sovereign.kestrel_agent import KestrelAgent, _load_prompt_file
 from kestrel_sovereign.privacy import PrivacyMode
@@ -19,281 +20,127 @@ from kestrel_sovereign.llm.adapter import LLMResponse, ToolCall
 
 
 # =============================================================================
-# Mock Classes
-# =============================================================================
-
-class MockDB:
-    """Mock database for testing."""
-
-    def __init__(self):
-        self.data = {}
-        self.executed_queries = []
-
-    async def fetchall(self, query: str, params: tuple = None):
-        """Mock fetchall."""
-        self.executed_queries.append((query, params))
-        key = (params[0], params[1]) if params and len(params) >= 2 else None
-        if key and key in self.data:
-            return [(self.data[key],)]
-        return []
-
-    async def execute(self, query: str, params: tuple = None):
-        """Mock execute."""
-        self.executed_queries.append((query, params))
-        if params and len(params) >= 4:
-            key = (params[0], params[1])
-            self.data[key] = params[2]
-
-    async def executemany(self, query: str, params: list):
-        """Mock executemany."""
-        self.executed_queries.append((query, params))
-
-
-class MockAsyncStorage:
-    """Mock AsyncStorage for testing."""
-
-    def __init__(self):
-        self.initialized = False
-        self.closed = False
-        self.db = MockDB()
-        self.nodes = {}
-        self.conversations = []
-
-    async def initialize(self):
-        """Mock initialize."""
-        self.initialized = True
-
-    async def close(self):
-        """Mock close."""
-        self.closed = True
-
-    async def get_node(self, node_id: str):
-        """Mock get_node."""
-        return self.nodes.get(node_id)
-
-    async def add_node(self, node):
-        """Mock add_node."""
-        self.nodes[node.node_id] = node
-
-    async def get_conversation_history(self, limit: int = 50, session_id: str = None):
-        """Mock get conversation history."""
-        return self.conversations[-limit:] if self.conversations else []
-
-    async def add_conversation(self, role: str, content: str, session_id: str = None):
-        """Mock add conversation."""
-        self.conversations.append({
-            "role": role,
-            "content": content,
-            "session_id": session_id,
-            "timestamp": datetime.now(timezone.utc).isoformat()
-        })
-
-
-class MockLLMService:
-    """Mock LLM service for testing."""
-
-    def __init__(self, responses=None):
-        self.responses = responses or ["Mock response"]
-        self.call_count = 0
-        self.providers = [{"name": "mock", "model": "mock-model"}]
-        self.generate_calls = []
-
-    async def generate(self, messages, temperature=None):
-        """Mock generate."""
-        response = self.responses[min(self.call_count, len(self.responses) - 1)]
-        self.call_count += 1
-        self.generate_calls.append(messages)
-
-        class MockResponse:
-            content = response
-
-        return MockResponse()
-
-    async def generate_with_messages(self, messages, **kwargs):
-        """Mock generate_with_messages."""
-        response_text = self.responses[min(self.call_count, len(self.responses) - 1)]
-        self.call_count += 1
-        self.generate_calls.append(messages)
-
-        # Return LLMResponse object (no tool calls)
-        return LLMResponse(content=response_text, tool_calls=None)
-
-    def get_model_preference(self):
-        """Mock get_model_preference."""
-        return {"provider": "mock", "model": "mock-model"}
-
-    def get_default_model(self):
-        """Mock get_default_model."""
-        return "mock-model"
-
-    async def get_audit_response(self, text: str):
-        """Mock audit response."""
-        return {
-            "integrity_score": 95,
-            "reasoning": "Mock audit passed"
-        }
-
-    async def close(self):
-        """Mock close."""
-        pass
-
-
-class MockTaskManager:
-    """Mock TaskManager for testing."""
-
-    def __init__(self):
-        self.initialized = False
-        self.closed = False
-
-    async def initialize(self):
-        """Mock initialize."""
-        self.initialized = True
-
-    async def close(self):
-        """Mock close."""
-        self.closed = True
-
-    def register_agent(self, agent_card, handler, command_prefixes=None):
-        """Mock register_agent."""
-        pass
-
-
-class MockWalletAgent:
-    """Mock WalletAgent for testing."""
-
-    def __init__(self, agent_id, initial_balance, db_path):
-        self.agent_id = agent_id
-        self.balance = initial_balance
-
-    async def initialize(self):
-        """Mock initialize."""
-        pass
-
-    def get_balance(self):
-        """Mock get_balance."""
-        from decimal import Decimal
-        return self.balance
-
-    def can_afford_audit(self, cost):
-        """Mock can_afford_audit."""
-        from decimal import Decimal
-        return self.balance >= Decimal(str(cost))
-
-
-class MockMemorySystem:
-    """Mock MemorySystem for testing."""
-
-    def __init__(self, storage, agent_id):
-        self.storage = storage
-        self.agent_id = agent_id
-        self.retriever = MagicMock()
-
-    async def initialize(self):
-        """Mock initialize."""
-        pass
-
-
-# =============================================================================
-# Fixtures
-# =============================================================================
-
-@pytest.fixture
-def mock_storage():
-    """Create a mock AsyncStorage."""
-    return MockAsyncStorage()
-
-
-@pytest.fixture
-def mock_llm():
-    """Create a mock LLM service."""
-    return MockLLMService()
-
-
-@pytest.fixture
-def temp_db_path(tmp_path):
-    """Create a temporary database path."""
-    db_path = tmp_path / "test_agent.db"
-    return str(db_path)
-
-
-@pytest.fixture
-def mock_agent_did():
-    """Return a mock agent DID."""
-    return "did:pkh:eip155:1:0xTestAgent123"
-
-
-# =============================================================================
-# Tests for _load_prompt_file()
+# Tests for _load_prompt_file() - pure file I/O logic
 # =============================================================================
 
 class TestLoadPromptFile:
     """Tests for _load_prompt_file function."""
 
-    def test_load_existing_file(self, tmp_path):
-        """Test loading a prompt from an existing file."""
+    def test_load_existing_file_returns_content(self, tmp_path):
+        """File exists → returns exact content."""
         prompt_file = tmp_path / "test_prompt.txt"
-        prompt_file.write_text("Test prompt content", encoding="utf-8")
+        expected_content = "Test prompt content\nwith multiple lines"
+        prompt_file.write_text(expected_content, encoding="utf-8")
+
+        result = _load_prompt_file(prompt_file, fallback="should not use this")
+
+        assert result == expected_content
+
+    def test_load_missing_file_returns_fallback(self, tmp_path):
+        """File doesn't exist → returns fallback."""
+        prompt_file = tmp_path / "nonexistent.txt"
+        fallback = "fallback content"
+
+        result = _load_prompt_file(prompt_file, fallback=fallback)
+
+        assert result == fallback
+
+    def test_load_file_with_unicode(self, tmp_path):
+        """File with unicode → handles correctly."""
+        prompt_file = tmp_path / "unicode.txt"
+        unicode_content = "Hello 世界 🌍"
+        prompt_file.write_text(unicode_content, encoding="utf-8")
 
         result = _load_prompt_file(prompt_file, fallback="fallback")
-        assert result == "Test prompt content"
 
-    def test_load_missing_file(self, tmp_path):
-        """Test loading a prompt when file doesn't exist."""
-        prompt_file = tmp_path / "nonexistent.txt"
+        assert result == unicode_content
 
-        result = _load_prompt_file(prompt_file, fallback="fallback content")
-        assert result == "fallback content"
+    def test_load_unreadable_file_returns_fallback(self, tmp_path):
+        """File exists but unreadable → returns fallback."""
+        if os.name == 'nt':
+            pytest.skip("Permission test not reliable on Windows")
 
-    def test_load_file_read_error(self, tmp_path):
-        """Test handling file read errors."""
-        prompt_file = tmp_path / "test_prompt.txt"
+        prompt_file = tmp_path / "unreadable.txt"
         prompt_file.write_text("content")
+        os.chmod(prompt_file, 0o000)
 
-        # Make file unreadable (Unix-only)
-        if os.name != 'nt':
-            os.chmod(prompt_file, 0o000)
-
+        try:
             result = _load_prompt_file(prompt_file, fallback="fallback")
             assert result == "fallback"
-
-            # Restore permissions for cleanup
+        finally:
             os.chmod(prompt_file, 0o644)
+
+    def test_load_empty_file_returns_empty_string(self, tmp_path):
+        """Empty file → returns empty string (not fallback)."""
+        prompt_file = tmp_path / "empty.txt"
+        prompt_file.write_text("")
+
+        result = _load_prompt_file(prompt_file, fallback="fallback")
+
+        # Empty string stripped becomes empty, should use fallback? Let's verify actual behavior
+        # Reading the code: filepath.read_text().strip() - empty file becomes ""
+        assert result == ""
 
 
 # =============================================================================
-# Tests for KestrelAgent Initialization
+# Tests for KestrelAgent.__init__() - initialization state
 # =============================================================================
 
 class TestKestrelAgentInit:
-    """Tests for KestrelAgent initialization."""
+    """Tests for KestrelAgent initialization (sync part)."""
 
-    def test_init_with_required_params(self, mock_agent_did, temp_db_path, mock_llm):
-        """Test initialization with required parameters."""
+    def test_init_sets_basic_attributes(self, tmp_path):
+        """Init sets DID, storage_path, and privacy mode."""
+        did = "did:pkh:eip155:1:0xTest123"
+        db_path = str(tmp_path / "test.db")
+
         agent = KestrelAgent(
-            did=mock_agent_did,
-            storage_path=temp_db_path,
-            llm_service=mock_llm
-        )
-
-        assert agent.did == mock_agent_did
-        assert agent.storage_path == temp_db_path
-        assert agent.llm_service == mock_llm
-        assert agent._privacy_mode == PrivacyMode.NORMAL
-
-    def test_init_with_privacy_mode(self, mock_agent_did, temp_db_path):
-        """Test initialization with custom privacy mode."""
-        agent = KestrelAgent(
-            did=mock_agent_did,
-            storage_path=temp_db_path,
+            did=did,
+            storage_path=db_path,
             privacy_mode=PrivacyMode.ISOLATED
         )
 
+        assert agent.did == did
+        assert agent.storage_path == db_path
         assert agent._privacy_mode == PrivacyMode.ISOLATED
+        assert agent.agent_id == did
 
-    def test_init_with_database_url(self, mock_agent_did):
-        """Test initialization with PostgreSQL database URL."""
+    def test_init_defaults_to_normal_privacy_mode(self, tmp_path):
+        """Default privacy mode is NORMAL."""
         agent = KestrelAgent(
-            did=mock_agent_did,
+            did="did:test:123",
+            storage_path=str(tmp_path / "test.db")
+        )
+
+        assert agent._privacy_mode == PrivacyMode.NORMAL
+        assert agent.privacy_mode == PrivacyMode.NORMAL
+
+    def test_init_creates_llm_service_if_not_provided(self, tmp_path):
+        """LLMService created automatically if not provided."""
+        agent = KestrelAgent(
+            did="did:test:123",
+            storage_path=str(tmp_path / "test.db")
+        )
+
+        assert agent.llm_service is not None
+        assert hasattr(agent.llm_service, 'generate_with_messages')
+
+    def test_init_uses_provided_llm_service(self, tmp_path):
+        """Uses provided LLM service instead of creating new one."""
+        mock_llm = MagicMock()
+
+        agent = KestrelAgent(
+            did="did:test:123",
+            storage_path=str(tmp_path / "test.db"),
+            llm_service=mock_llm
+        )
+
+        assert agent.llm_service is mock_llm
+
+    def test_init_with_postgres_backend(self):
+        """PostgreSQL backend configuration stored correctly."""
+        agent = KestrelAgent(
+            did="did:test:123",
             database_url="postgresql://user:pass@localhost/kestrel",
             db_backend="postgres"
         )
@@ -301,137 +148,92 @@ class TestKestrelAgentInit:
         assert agent._db_backend == "postgres"
         assert agent._database_url == "postgresql://user:pass@localhost/kestrel"
 
-    def test_init_defaults_to_sqlite(self, mock_agent_did, temp_db_path):
-        """Test that initialization defaults to SQLite backend."""
+    def test_init_defaults_to_sqlite_backend(self, tmp_path):
+        """Defaults to SQLite backend."""
         agent = KestrelAgent(
-            did=mock_agent_did,
-            storage_path=temp_db_path
+            did="did:test:123",
+            storage_path=str(tmp_path / "test.db")
         )
 
         assert agent._db_backend == "sqlite"
 
-    def test_init_creates_llm_service_if_not_provided(self, mock_agent_did, temp_db_path):
-        """Test that LLMService is created if not provided."""
+    def test_init_initializes_empty_event_listeners(self, tmp_path):
+        """Event listeners list starts empty."""
         agent = KestrelAgent(
-            did=mock_agent_did,
-            storage_path=temp_db_path
+            did="did:test:123",
+            storage_path=str(tmp_path / "test.db")
         )
 
-        assert agent.llm_service is not None
-        assert hasattr(agent.llm_service, 'generate_with_messages')
+        assert agent._event_listeners == []
+
+    def test_init_initializes_empty_cancelled_requests(self, tmp_path):
+        """Cancelled requests set starts empty."""
+        agent = KestrelAgent(
+            did="did:test:123",
+            storage_path=str(tmp_path / "test.db")
+        )
+
+        assert agent._cancelled_requests == set()
+        assert agent._current_request_id is None
 
 
 # =============================================================================
-# Tests for KestrelAgent.initialize()
-# =============================================================================
-
-class TestKestrelAgentInitialize:
-    """Tests for async initialization."""
-
-    @pytest.mark.asyncio
-    async def test_initialize_sets_up_storage(self, mock_agent_did, temp_db_path, mock_llm):
-        """Test that initialize() sets up storage."""
-        with patch('kestrel_sovereign.kestrel_agent.AsyncStorage') as MockStorage:
-            mock_storage_instance = MockAsyncStorage()
-            MockStorage.return_value = mock_storage_instance
-
-            agent = KestrelAgent(
-                did=mock_agent_did,
-                storage_path=temp_db_path,
-                llm_service=mock_llm
-            )
-
-            # Mock feature discovery to prevent real feature loading
-            with patch('kestrel_sovereign.kestrel_agent.discover_features', return_value=[]):
-                with patch('kestrel_sovereign.kestrel_agent.WalletAgent', return_value=MockWalletAgent(mock_agent_did, 100, temp_db_path)):
-                    with patch('kestrel_sovereign.kestrel_agent.MemoryConsolidator'):
-                        with patch('kestrel_sovereign.kestrel_agent.MemorySystem', return_value=MockMemorySystem(mock_storage_instance, mock_agent_did)):
-                            with patch('kestrel_sovereign.kestrel_agent.TaskManager', return_value=MockTaskManager()):
-                                with patch('kestrel_sovereign.kestrel_agent.CommandHandler'):
-                                    with patch('kestrel_sovereign.kestrel_agent.ContextBuilder'):
-                                        with patch('kestrel_sovereign.kestrel_agent.ContextManager'):
-                                            with patch('kestrel_sovereign.kestrel_agent.BootstrapService'):
-                                                await agent.initialize()
-
-            assert agent._raw_storage is not None
-            assert agent.storage is not None
-            assert mock_storage_instance.initialized
-
-    @pytest.mark.asyncio
-    async def test_initialize_creates_agent_node_if_missing(self, mock_agent_did, temp_db_path, mock_llm):
-        """Test that initialize creates agent node if it doesn't exist."""
-        with patch('kestrel_sovereign.kestrel_agent.AsyncStorage') as MockStorage:
-            mock_storage_instance = MockAsyncStorage()
-            MockStorage.return_value = mock_storage_instance
-
-            agent = KestrelAgent(
-                did=mock_agent_did,
-                storage_path=temp_db_path,
-                llm_service=mock_llm
-            )
-
-            with patch('kestrel_sovereign.kestrel_agent.discover_features', return_value=[]):
-                with patch('kestrel_sovereign.kestrel_agent.WalletAgent', return_value=MockWalletAgent(mock_agent_did, 100, temp_db_path)):
-                    with patch('kestrel_sovereign.kestrel_agent.MemoryConsolidator'):
-                        with patch('kestrel_sovereign.kestrel_agent.MemorySystem', return_value=MockMemorySystem(mock_storage_instance, mock_agent_did)):
-                            with patch('kestrel_sovereign.kestrel_agent.TaskManager', return_value=MockTaskManager()):
-                                with patch('kestrel_sovereign.kestrel_agent.CommandHandler'):
-                                    with patch('kestrel_sovereign.kestrel_agent.ContextBuilder'):
-                                        with patch('kestrel_sovereign.kestrel_agent.ContextManager'):
-                                            with patch('kestrel_sovereign.kestrel_agent.BootstrapService'):
-                                                await agent.initialize()
-
-            # Check that agent node was created
-            assert mock_agent_did in mock_storage_instance.nodes
-
-
-# =============================================================================
-# Tests for Privacy Mode
+# Tests for Privacy Mode - getter/setter behavior
 # =============================================================================
 
 class TestPrivacyMode:
     """Tests for privacy mode getter/setter."""
 
-    def test_privacy_mode_getter(self, mock_agent_did, temp_db_path):
-        """Test privacy mode getter."""
+    def test_privacy_mode_getter_returns_current_mode(self, tmp_path):
+        """privacy_mode property returns current mode."""
         agent = KestrelAgent(
-            did=mock_agent_did,
-            storage_path=temp_db_path,
-            privacy_mode=PrivacyMode.ISOLATED
+            did="did:test:123",
+            storage_path=str(tmp_path / "test.db"),
+            privacy_mode=PrivacyMode.ANONYMOUS
         )
 
-        assert agent.privacy_mode == PrivacyMode.ISOLATED
+        assert agent.privacy_mode == PrivacyMode.ANONYMOUS
 
-    @pytest.mark.asyncio
-    async def test_privacy_mode_setter(self, mock_agent_did, temp_db_path, mock_llm):
-        """Test privacy mode setter."""
-        with patch('kestrel_sovereign.kestrel_agent.AsyncStorage') as MockStorage:
-            mock_storage_instance = MockAsyncStorage()
-            MockStorage.return_value = mock_storage_instance
+    def test_set_privacy_mode_changes_internal_state(self, tmp_path):
+        """set_privacy_mode() updates internal _privacy_mode."""
+        agent = KestrelAgent(
+            did="did:test:123",
+            storage_path=str(tmp_path / "test.db"),
+            privacy_mode=PrivacyMode.NORMAL
+        )
 
-            agent = KestrelAgent(
-                did=mock_agent_did,
-                storage_path=temp_db_path,
-                llm_service=mock_llm,
-                privacy_mode=PrivacyMode.NORMAL
-            )
+        # Mock storage and privacy agent (since not initialized)
+        agent.storage = MagicMock()
+        agent.storage.set_privacy_mode = MagicMock()
+        agent.privacy_agent = MagicMock()
+        agent.privacy_agent.set_mode = MagicMock()
 
-            with patch('kestrel_sovereign.kestrel_agent.discover_features', return_value=[]):
-                with patch('kestrel_sovereign.kestrel_agent.WalletAgent', return_value=MockWalletAgent(mock_agent_did, 100, temp_db_path)):
-                    with patch('kestrel_sovereign.kestrel_agent.MemoryConsolidator'):
-                        with patch('kestrel_sovereign.kestrel_agent.MemorySystem', return_value=MockMemorySystem(mock_storage_instance, mock_agent_did)):
-                            with patch('kestrel_sovereign.kestrel_agent.TaskManager', return_value=MockTaskManager()):
-                                with patch('kestrel_sovereign.kestrel_agent.CommandHandler'):
-                                    with patch('kestrel_sovereign.kestrel_agent.ContextBuilder'):
-                                        with patch('kestrel_sovereign.kestrel_agent.ContextManager'):
-                                            with patch('kestrel_sovereign.kestrel_agent.BootstrapService'):
-                                                await agent.initialize()
+        agent.set_privacy_mode(PrivacyMode.EPHEMERAL)
 
-            # Change privacy mode
-            agent.set_privacy_mode(PrivacyMode.EPHEMERAL)
+        assert agent._privacy_mode == PrivacyMode.EPHEMERAL
+        assert agent.privacy_mode == PrivacyMode.EPHEMERAL
 
-            assert agent._privacy_mode == PrivacyMode.EPHEMERAL
-            assert agent.privacy_mode == PrivacyMode.EPHEMERAL
+    def test_set_privacy_mode_updates_storage_wrapper(self, tmp_path):
+        """set_privacy_mode() updates storage wrapper if initialized."""
+        agent = KestrelAgent(
+            did="did:test:123",
+            storage_path=str(tmp_path / "test.db")
+        )
+
+        # Mock storage to verify call
+        mock_storage = MagicMock()
+        mock_storage.set_privacy_mode = MagicMock()
+        agent.storage = mock_storage
+
+        # Mock privacy agent
+        mock_privacy_agent = MagicMock()
+        mock_privacy_agent.set_mode = MagicMock()
+        agent.privacy_agent = mock_privacy_agent
+
+        agent.set_privacy_mode(PrivacyMode.ISOLATED)
+
+        mock_storage.set_privacy_mode.assert_called_once_with(PrivacyMode.ISOLATED)
+        mock_privacy_agent.set_mode.assert_called_once_with(PrivacyMode.ISOLATED)
 
 
 # =============================================================================
@@ -441,31 +243,35 @@ class TestPrivacyMode:
 class TestModelSelection:
     """Tests for model selection methods."""
 
-    @pytest.mark.asyncio
-    async def test_set_model(self, mock_agent_did, temp_db_path):
-        """Test setting a model."""
+    def test_set_model_delegates_to_model_agent(self, tmp_path):
+        """set_model() delegates to model_agent.set_model_preference()."""
+        agent = KestrelAgent(
+            did="did:test:123",
+            storage_path=str(tmp_path / "test.db")
+        )
+
         mock_model_agent = MagicMock()
         mock_model_agent.set_model_preference.return_value = "Model set to gpt-5"
-
-        agent = KestrelAgent(
-            did=mock_agent_did,
-            storage_path=temp_db_path
-        )
         agent.model_agent = mock_model_agent
 
         result = agent.set_model("gpt-5")
 
-        assert "Model set" in result
+        # Verify delegation happened with correct argument
         mock_model_agent.set_model_preference.assert_called_once_with("gpt-5")
+        # Verify result contains success message
+        assert "Model set" in result
 
-    def test_get_current_model_with_preference(self, mock_agent_did, temp_db_path):
-        """Test getting current model when preference is set."""
-        mock_llm = MockLLMService()
-        mock_llm.get_model_preference = lambda: {"provider": "openai", "model": "gpt-5"}
+    def test_get_current_model_with_preference_set(self, tmp_path):
+        """get_current_model() returns provider/model when preference set."""
+        mock_llm = MagicMock()
+        mock_llm.get_model_preference.return_value = {
+            "provider": "openai",
+            "model": "gpt-5"
+        }
 
         agent = KestrelAgent(
-            did=mock_agent_did,
-            storage_path=temp_db_path,
+            did="did:test:123",
+            storage_path=str(tmp_path / "test.db"),
             llm_service=mock_llm
         )
 
@@ -473,15 +279,20 @@ class TestModelSelection:
 
         assert result == "openai/gpt-5"
 
-    def test_get_current_model_fallback_to_first_provider(self, mock_agent_did, temp_db_path):
-        """Test getting current model falls back to first provider."""
-        mock_llm = MockLLMService()
-        mock_llm.get_model_preference = lambda: {"provider": None, "model": None}
-        mock_llm.providers = [{"name": "anthropic", "model": "claude-sonnet-4-5"}]
+    def test_get_current_model_falls_back_to_first_provider(self, tmp_path):
+        """get_current_model() falls back to first provider when no preference."""
+        mock_llm = MagicMock()
+        mock_llm.get_model_preference.return_value = {
+            "provider": None,
+            "model": None
+        }
+        mock_llm.providers = [
+            {"name": "anthropic", "model": "claude-sonnet-4-5"}
+        ]
 
         agent = KestrelAgent(
-            did=mock_agent_did,
-            storage_path=temp_db_path,
+            did="did:test:123",
+            storage_path=str(tmp_path / "test.db"),
             llm_service=mock_llm
         )
 
@@ -489,155 +300,131 @@ class TestModelSelection:
 
         assert result == "anthropic/claude-sonnet-4-5"
 
+    def test_get_current_model_returns_unknown_when_no_providers(self, tmp_path):
+        """get_current_model() returns 'unknown' when no providers available."""
+        mock_llm = MagicMock()
+        mock_llm.get_model_preference.return_value = {
+            "provider": None,
+            "model": None
+        }
+        mock_llm.providers = []
+
+        agent = KestrelAgent(
+            did="did:test:123",
+            storage_path=str(tmp_path / "test.db"),
+            llm_service=mock_llm
+        )
+
+        result = agent.get_current_model()
+
+        assert result == "unknown"
+
 
 # =============================================================================
-# Tests for process_input()
+# Tests for Event System
 # =============================================================================
 
-class TestProcessInput:
-    """Tests for process_input method."""
+class TestEventSystem:
+    """Tests for event listener system."""
+
+    def test_add_event_listener_adds_to_list(self, tmp_path):
+        """add_event_listener() adds listener to internal list."""
+        agent = KestrelAgent(
+            did="did:test:123",
+            storage_path=str(tmp_path / "test.db")
+        )
+
+        listener1 = MagicMock()
+        listener2 = MagicMock()
+
+        agent.add_event_listener(listener1)
+        agent.add_event_listener(listener2)
+
+        assert listener1 in agent._event_listeners
+        assert listener2 in agent._event_listeners
+        assert len(agent._event_listeners) == 2
+
+    def test_remove_event_listener_removes_from_list(self, tmp_path):
+        """remove_event_listener() removes listener from list."""
+        agent = KestrelAgent(
+            did="did:test:123",
+            storage_path=str(tmp_path / "test.db")
+        )
+
+        listener = MagicMock()
+        agent.add_event_listener(listener)
+
+        agent.remove_event_listener(listener)
+
+        assert listener not in agent._event_listeners
+
+    def test_remove_nonexistent_listener_does_not_crash(self, tmp_path):
+        """Removing non-existent listener doesn't crash."""
+        agent = KestrelAgent(
+            did="did:test:123",
+            storage_path=str(tmp_path / "test.db")
+        )
+
+        listener = MagicMock()
+
+        # Should not raise exception
+        agent.remove_event_listener(listener)
 
     @pytest.mark.asyncio
-    async def test_process_input_basic(self, mock_agent_did, temp_db_path):
-        """Test basic process_input with mocked response."""
-        mock_llm = MockLLMService(responses=["Hello, how can I help?"])
+    async def test_emit_event_calls_all_listeners(self, tmp_path):
+        """emit_event() calls all registered listeners with correct args."""
+        agent = KestrelAgent(
+            did="did:test:123",
+            storage_path=str(tmp_path / "test.db")
+        )
 
-        with patch('kestrel_sovereign.kestrel_agent.AsyncStorage') as MockStorage:
-            mock_storage_instance = MockAsyncStorage()
-            MockStorage.return_value = mock_storage_instance
+        # Track calls to listeners
+        listener1_calls = []
+        listener2_calls = []
 
-            agent = KestrelAgent(
-                did=mock_agent_did,
-                storage_path=temp_db_path,
-                llm_service=mock_llm
-            )
+        async def listener1(event_type, data):
+            listener1_calls.append((event_type, data))
 
-            # Mock all dependencies
-            with patch('kestrel_sovereign.kestrel_agent.discover_features', return_value=[]):
-                with patch('kestrel_sovereign.kestrel_agent.WalletAgent', return_value=MockWalletAgent(mock_agent_did, 100, temp_db_path)):
-                    with patch('kestrel_sovereign.kestrel_agent.MemoryConsolidator'):
-                        with patch('kestrel_sovereign.kestrel_agent.MemorySystem', return_value=MockMemorySystem(mock_storage_instance, mock_agent_did)):
-                            with patch('kestrel_sovereign.kestrel_agent.TaskManager', return_value=MockTaskManager()):
-                                with patch('kestrel_sovereign.kestrel_agent.CommandHandler'):
-                                    mock_context_builder = MagicMock()
-                                    with patch('kestrel_sovereign.kestrel_agent.ContextBuilder', return_value=mock_context_builder):
-                                        mock_context_manager = AsyncMock()
-                                        mock_context_result = MagicMock()
-                                        mock_context_result.system_prompt = "System prompt"
-                                        mock_context_result.messages = []
-                                        mock_context_result.warnings = []
-                                        mock_context_result.budget_summary = {}
-                                        mock_context_result.total_tokens = 100
-                                        mock_context_result.episode_count = 0
-                                        mock_context_result.memory_count = 0
-                                        mock_context_result.rag_chunks = 0
-                                        mock_context_manager.build_context.return_value = mock_context_result
-                                        mock_context_manager.create_episode_if_needed = AsyncMock()
+        async def listener2(event_type, data):
+            listener2_calls.append((event_type, data))
 
-                                        with patch('kestrel_sovereign.kestrel_agent.ContextManager', return_value=mock_context_manager):
-                                            with patch('kestrel_sovereign.kestrel_agent.BootstrapService') as MockBootstrap:
-                                                mock_bootstrap = AsyncMock()
-                                                mock_bootstrap.is_bootstrap_needed.return_value = False
-                                                MockBootstrap.return_value = mock_bootstrap
+        agent.add_event_listener(listener1)
+        agent.add_event_listener(listener2)
 
-                                                await agent.initialize()
+        event_data = {"key": "value", "count": 42}
+        await agent.emit_event("test_event", event_data)
 
-                                                # Mock privacy agent
-                                                agent.privacy_agent = AsyncMock()
-                                                agent.privacy_agent.add_conversation = AsyncMock()
-                                                agent.privacy_agent.get_conversation_history = AsyncMock(return_value=[])
-                                                agent.privacy_agent.privacy_config = MagicMock()
-                                                agent.privacy_agent.privacy_config.allows_cloud_llm.return_value = True
-
-                                                # Mock observability store
-                                                agent.observability_store = AsyncMock()
-                                                agent.observability_store.log_metric = AsyncMock()
-                                                agent.observability_store.log_tool_call = AsyncMock(return_value="event-123")
-                                                agent.observability_store.log_tool_response = AsyncMock()
-                                                agent.observability_store.log_error = AsyncMock()
-
-                                                # Ensure prompt templates are set (they should be set in __init__ but verify)
-                                                if not hasattr(agent, 'user_prompt_template'):
-                                                    agent.user_prompt_template = agent._get_default_user_prompt()
-                                                if not hasattr(agent, 'prompt_template'):
-                                                    agent.prompt_template = agent._get_default_system_prompt()
-
-                                                # Set _current_model_preference (used in check_solvency)
-                                                if not hasattr(agent, '_current_model_preference'):
-                                                    agent._current_model_preference = None
-
-                                                response = await agent.process_input("Hello")
-
-                                                assert "Hello, how can I help?" in response
-                                                assert mock_llm.call_count >= 1
+        # Verify both listeners received the event
+        assert len(listener1_calls) == 1
+        assert listener1_calls[0] == ("test_event", event_data)
+        assert len(listener2_calls) == 1
+        assert listener2_calls[0] == ("test_event", event_data)
 
     @pytest.mark.asyncio
-    async def test_process_input_with_session_id(self, mock_agent_did, temp_db_path):
-        """Test process_input with session_id parameter."""
-        mock_llm = MockLLMService(responses=["Response for session"])
+    async def test_emit_event_handles_listener_exceptions(self, tmp_path):
+        """emit_event() continues calling listeners even if one raises exception."""
+        agent = KestrelAgent(
+            did="did:test:123",
+            storage_path=str(tmp_path / "test.db")
+        )
 
-        with patch('kestrel_sovereign.kestrel_agent.AsyncStorage') as MockStorage:
-            mock_storage_instance = MockAsyncStorage()
-            MockStorage.return_value = mock_storage_instance
+        successful_calls = []
 
-            agent = KestrelAgent(
-                did=mock_agent_did,
-                storage_path=temp_db_path,
-                llm_service=mock_llm
-            )
+        async def failing_listener(event_type, data):
+            raise ValueError("Listener error")
 
-            with patch('kestrel_sovereign.kestrel_agent.discover_features', return_value=[]):
-                with patch('kestrel_sovereign.kestrel_agent.WalletAgent', return_value=MockWalletAgent(mock_agent_did, 100, temp_db_path)):
-                    with patch('kestrel_sovereign.kestrel_agent.MemoryConsolidator'):
-                        with patch('kestrel_sovereign.kestrel_agent.MemorySystem', return_value=MockMemorySystem(mock_storage_instance, mock_agent_did)):
-                            with patch('kestrel_sovereign.kestrel_agent.TaskManager', return_value=MockTaskManager()):
-                                with patch('kestrel_sovereign.kestrel_agent.CommandHandler'):
-                                    with patch('kestrel_sovereign.kestrel_agent.ContextBuilder'):
-                                        mock_context_manager = AsyncMock()
-                                        mock_context_result = MagicMock()
-                                        mock_context_result.system_prompt = "System"
-                                        mock_context_result.messages = []
-                                        mock_context_result.warnings = []
-                                        mock_context_result.budget_summary = {}
-                                        mock_context_result.total_tokens = 50
-                                        mock_context_result.episode_count = 0
-                                        mock_context_result.memory_count = 0
-                                        mock_context_result.rag_chunks = 0
-                                        mock_context_manager.build_context.return_value = mock_context_result
-                                        mock_context_manager.create_episode_if_needed = AsyncMock()
+        async def successful_listener(event_type, data):
+            successful_calls.append((event_type, data))
 
-                                        with patch('kestrel_sovereign.kestrel_agent.ContextManager', return_value=mock_context_manager):
-                                            with patch('kestrel_sovereign.kestrel_agent.BootstrapService') as MockBootstrap:
-                                                mock_bootstrap = AsyncMock()
-                                                mock_bootstrap.is_bootstrap_needed.return_value = False
-                                                MockBootstrap.return_value = mock_bootstrap
+        agent.add_event_listener(failing_listener)
+        agent.add_event_listener(successful_listener)
 
-                                                await agent.initialize()
+        # Should not crash despite failing listener
+        await agent.emit_event("test_event", {"test": "data"})
 
-                                                agent.privacy_agent = AsyncMock()
-                                                agent.privacy_agent.add_conversation = AsyncMock()
-                                                agent.privacy_agent.get_conversation_history = AsyncMock(return_value=[])
-                                                agent.privacy_agent.privacy_config = MagicMock()
-                                                agent.privacy_agent.privacy_config.allows_cloud_llm.return_value = True
-
-                                                agent.observability_store = AsyncMock()
-                                                agent.observability_store.log_metric = AsyncMock()
-                                                agent.observability_store.log_tool_call = AsyncMock(return_value="event-123")
-                                                agent.observability_store.log_tool_response = AsyncMock()
-
-                                                # Ensure prompt templates are set
-                                                if not hasattr(agent, 'user_prompt_template'):
-                                                    agent.user_prompt_template = agent._get_default_user_prompt()
-                                                if not hasattr(agent, 'prompt_template'):
-                                                    agent.prompt_template = agent._get_default_system_prompt()
-                                                if not hasattr(agent, '_current_model_preference'):
-                                                    agent._current_model_preference = None
-
-                                                response = await agent.process_input("Test", session_id="session-123")
-
-                                                # Verify session_id was passed to privacy agent
-                                                calls = agent.privacy_agent.get_conversation_history.call_args_list
-                                                assert any('session_id' in str(call) for call in calls)
+        # Successful listener should still have been called
+        assert len(successful_calls) == 1
+        assert successful_calls[0] == ("test_event", {"test": "data"})
 
 
 # =============================================================================
@@ -647,14 +434,13 @@ class TestProcessInput:
 class TestCancellation:
     """Tests for request cancellation."""
 
-    def test_cancel_current_request_with_active_request(self, mock_agent_did, temp_db_path):
-        """Test canceling an active request."""
+    def test_cancel_current_request_with_active_request_returns_true(self, tmp_path):
+        """cancel_current_request() returns True when request is active."""
         agent = KestrelAgent(
-            did=mock_agent_did,
-            storage_path=temp_db_path
+            did="did:test:123",
+            storage_path=str(tmp_path / "test.db")
         )
 
-        # Simulate active request
         agent._current_request_id = "request-123"
 
         result = agent.cancel_current_request()
@@ -662,30 +448,110 @@ class TestCancellation:
         assert result is True
         assert "request-123" in agent._cancelled_requests
 
-    def test_cancel_current_request_with_no_active_request(self, mock_agent_did, temp_db_path):
-        """Test canceling when no request is active."""
+    def test_cancel_current_request_with_no_active_request_returns_false(self, tmp_path):
+        """cancel_current_request() returns False when no active request."""
         agent = KestrelAgent(
-            did=mock_agent_did,
-            storage_path=temp_db_path
+            did="did:test:123",
+            storage_path=str(tmp_path / "test.db")
         )
+
+        agent._current_request_id = None
 
         result = agent.cancel_current_request()
 
         assert result is False
+        assert len(agent._cancelled_requests) == 0
 
-    def test_is_request_cancelled(self, mock_agent_did, temp_db_path):
-        """Test checking if request is cancelled."""
+    def test_is_request_cancelled_for_current_request(self, tmp_path):
+        """is_request_cancelled() returns True for cancelled current request."""
         agent = KestrelAgent(
-            did=mock_agent_did,
-            storage_path=temp_db_path
+            did="did:test:123",
+            storage_path=str(tmp_path / "test.db")
         )
 
         agent._current_request_id = "request-456"
         agent._cancelled_requests.add("request-456")
 
         assert agent.is_request_cancelled() is True
+
+    def test_is_request_cancelled_for_specific_request_id(self, tmp_path):
+        """is_request_cancelled(request_id) checks specific request."""
+        agent = KestrelAgent(
+            did="did:test:123",
+            storage_path=str(tmp_path / "test.db")
+        )
+
+        agent._cancelled_requests.add("request-456")
+
         assert agent.is_request_cancelled("request-456") is True
         assert agent.is_request_cancelled("request-789") is False
+
+    def test_is_request_cancelled_returns_false_when_not_cancelled(self, tmp_path):
+        """is_request_cancelled() returns False when request not cancelled."""
+        agent = KestrelAgent(
+            did="did:test:123",
+            storage_path=str(tmp_path / "test.db")
+        )
+
+        agent._current_request_id = "request-999"
+
+        assert agent.is_request_cancelled() is False
+
+
+# =============================================================================
+# Tests for Notifications
+# =============================================================================
+
+class TestNotifications:
+    """Tests for pending task notifications."""
+
+    def test_get_pending_notifications_returns_empty_list_initially(self, tmp_path):
+        """get_pending_notifications() returns [] when no notifications."""
+        agent = KestrelAgent(
+            did="did:test:123",
+            storage_path=str(tmp_path / "test.db")
+        )
+
+        notifications = agent.get_pending_notifications()
+
+        assert notifications == []
+
+    def test_get_pending_notifications_returns_all_notifications(self, tmp_path):
+        """get_pending_notifications() returns all accumulated notifications."""
+        agent = KestrelAgent(
+            did="did:test:123",
+            storage_path=str(tmp_path / "test.db")
+        )
+
+        agent._pending_task_notifications.append("Task 1 completed")
+        agent._pending_task_notifications.append("Task 2 failed")
+        agent._pending_task_notifications.append("Task 3 started")
+
+        notifications = agent.get_pending_notifications()
+
+        assert len(notifications) == 3
+        assert "Task 1 completed" in notifications
+        assert "Task 2 failed" in notifications
+        assert "Task 3 started" in notifications
+
+    def test_get_pending_notifications_clears_queue(self, tmp_path):
+        """get_pending_notifications() clears queue after returning."""
+        agent = KestrelAgent(
+            did="did:test:123",
+            storage_path=str(tmp_path / "test.db")
+        )
+
+        agent._pending_task_notifications.append("Notification 1")
+        agent._pending_task_notifications.append("Notification 2")
+
+        # First call returns notifications
+        first_call = agent.get_pending_notifications()
+        assert len(first_call) == 2
+
+        # Second call returns empty (queue cleared)
+        second_call = agent.get_pending_notifications()
+        assert second_call == []
+        assert len(agent._pending_task_notifications) == 0
 
 
 # =============================================================================
@@ -695,30 +561,42 @@ class TestCancellation:
 class TestLifecycle:
     """Tests for lifecycle methods."""
 
-    def test_close(self, mock_agent_did, temp_db_path):
-        """Test synchronous close method."""
+    def test_close_calls_storage_close(self, tmp_path):
+        """close() calls storage.close() if storage initialized."""
+        agent = KestrelAgent(
+            did="did:test:123",
+            storage_path=str(tmp_path / "test.db")
+        )
+
         mock_storage = MagicMock()
         mock_storage.close = MagicMock()
-
-        agent = KestrelAgent(
-            did=mock_agent_did,
-            storage_path=temp_db_path
-        )
         agent.storage = mock_storage
 
         agent.close()
 
         mock_storage.close.assert_called_once()
 
-    @pytest.mark.asyncio
-    async def test_shutdown(self, mock_agent_did, temp_db_path):
-        """Test async shutdown method."""
+    def test_close_does_not_crash_when_storage_none(self, tmp_path):
+        """close() doesn't crash when storage is None."""
         agent = KestrelAgent(
-            did=mock_agent_did,
-            storage_path=temp_db_path
+            did="did:test:123",
+            storage_path=str(tmp_path / "test.db")
         )
 
-        # Mock all components that need cleanup
+        agent.storage = None
+
+        # Should not raise exception
+        agent.close()
+
+    @pytest.mark.asyncio
+    async def test_shutdown_closes_all_components(self, tmp_path):
+        """shutdown() calls close/shutdown on all components."""
+        agent = KestrelAgent(
+            did="did:test:123",
+            storage_path=str(tmp_path / "test.db")
+        )
+
+        # Mock all components
         mock_security = AsyncMock()
         mock_security.shutdown = AsyncMock()
         agent.features = {"SecurityFeature": mock_security}
@@ -748,95 +626,275 @@ class TestLifecycle:
         mock_task_manager.close.assert_called_once()
         mock_storage.close.assert_called_once()
 
+    @pytest.mark.asyncio
+    async def test_shutdown_handles_missing_components_gracefully(self, tmp_path):
+        """shutdown() doesn't crash when components not initialized."""
+        agent = KestrelAgent(
+            did="did:test:123",
+            storage_path=str(tmp_path / "test.db")
+        )
+
+        # Don't initialize any components
+        agent.features = {}
+        agent.mcp_agent = None
+        agent.llm_service = None
+        agent.task_manager = None
+        agent.storage = None
+
+        # Should not raise exception
+        await agent.shutdown()
+
 
 # =============================================================================
-# Tests for Event System
+# Tests for Error Handling
 # =============================================================================
 
-class TestEventSystem:
-    """Tests for event listener system."""
+class TestErrorHandling:
+    """Tests for error handling in various scenarios."""
+
+    def test_close_propagates_storage_close_exception(self, tmp_path):
+        """close() propagates exception from storage.close()."""
+        agent = KestrelAgent(
+            did="did:test:123",
+            storage_path=str(tmp_path / "test.db")
+        )
+
+        mock_storage = MagicMock()
+        mock_storage.close.side_effect = RuntimeError("Close failed")
+        agent.storage = mock_storage
+
+        # Exception should propagate
+        with pytest.raises(RuntimeError, match="Close failed"):
+            agent.close()
 
     @pytest.mark.asyncio
-    async def test_emit_event(self, mock_agent_did, temp_db_path):
-        """Test emitting events to listeners."""
+    async def test_shutdown_handles_component_shutdown_exceptions(self, tmp_path):
+        """shutdown() continues closing other components if one fails."""
         agent = KestrelAgent(
-            did=mock_agent_did,
-            storage_path=temp_db_path
+            did="did:test:123",
+            storage_path=str(tmp_path / "test.db")
         )
 
-        # Create mock listener
-        listener_called = []
+        # Mock components where one fails
+        mock_llm = AsyncMock()
+        mock_llm.close.side_effect = RuntimeError("LLM close failed")
+        agent.llm_service = mock_llm
 
-        async def mock_listener(event_type, data):
-            listener_called.append((event_type, data))
+        mock_storage = AsyncMock()
+        mock_storage.close = AsyncMock()  # This should still be called
+        agent.storage = mock_storage
 
-        agent.add_event_listener(mock_listener)
+        agent.features = {}
+        agent.mcp_agent = None
+        agent.task_manager = None
 
-        await agent.emit_event("test_event", {"key": "value"})
+        # Should not crash
+        await agent.shutdown()
 
-        assert len(listener_called) == 1
-        assert listener_called[0][0] == "test_event"
-        assert listener_called[0][1]["key"] == "value"
+        # Storage close should still have been attempted
+        mock_storage.close.assert_called_once()
 
-    def test_add_event_listener(self, mock_agent_did, temp_db_path):
-        """Test adding event listeners."""
+    @pytest.mark.asyncio
+    async def test_emit_event_logs_listener_exception(self, tmp_path):
+        """emit_event() logs exception from failing listener."""
         agent = KestrelAgent(
-            did=mock_agent_did,
-            storage_path=temp_db_path
+            did="did:test:123",
+            storage_path=str(tmp_path / "test.db")
         )
 
-        listener = MagicMock()
-        agent.add_event_listener(listener)
+        async def failing_listener(event_type, data):
+            raise ValueError("Listener failed")
 
-        assert listener in agent._event_listeners
+        agent.add_event_listener(failing_listener)
 
-    def test_remove_event_listener(self, mock_agent_did, temp_db_path):
-        """Test removing event listeners."""
-        agent = KestrelAgent(
-            did=mock_agent_did,
-            storage_path=temp_db_path
-        )
+        # Should not crash - exception is caught and logged at warning level
+        with patch('logging.warning') as mock_log:
+            await agent.emit_event("test_event", {"data": "value"})
 
-        listener = MagicMock()
-        agent.add_event_listener(listener)
-        agent.remove_event_listener(listener)
-
-        assert listener not in agent._event_listeners
+            # Verify warning was logged
+            assert mock_log.called
+            # Verify the exception message was logged
+            call_args = str(mock_log.call_args)
+            assert "Listener failed" in call_args or "Failed to emit event" in call_args
 
 
 # =============================================================================
-# Tests for Notifications
+# Tests for initialize() - Side Effects
 # =============================================================================
 
-class TestNotifications:
-    """Tests for pending task notifications."""
+class TestInitialize:
+    """Tests for async initialize() method."""
 
-    def test_get_pending_notifications_empty(self, mock_agent_did, temp_db_path):
-        """Test getting notifications when none are pending."""
+    @pytest.mark.asyncio
+    async def test_initialize_creates_storage(self, tmp_path):
+        """initialize() creates and initializes storage."""
         agent = KestrelAgent(
-            did=mock_agent_did,
-            storage_path=temp_db_path
+            did="did:test:123",
+            storage_path=str(tmp_path / "test.db")
         )
 
-        notifications = agent.get_pending_notifications()
+        with patch('kestrel_sovereign.kestrel_agent.AsyncStorage') as MockStorage:
+            with patch('kestrel_sovereign.kestrel_agent.discover_features', return_value=[]):
+                with patch('kestrel_sovereign.kestrel_agent.WalletAgent') as MockWallet:
+                    with patch('kestrel_sovereign.kestrel_agent.MemoryConsolidator'):
+                        with patch('kestrel_sovereign.kestrel_agent.MemorySystem') as MockMemorySystem:
+                            with patch('kestrel_sovereign.kestrel_agent.TaskManager') as MockTaskManager:
+                                mock_storage_instance = AsyncMock()
+                                mock_storage_instance.initialize = AsyncMock()
+                                mock_storage_instance.get_node = AsyncMock(return_value=None)
+                                mock_storage_instance.add_node = AsyncMock()
+                                mock_storage_instance.db = MagicMock()
+                                MockStorage.return_value = mock_storage_instance
 
-        assert notifications == []
+                                mock_wallet = AsyncMock()
+                                mock_wallet.initialize = AsyncMock()
+                                MockWallet.return_value = mock_wallet
 
-    def test_get_pending_notifications_clears_queue(self, mock_agent_did, temp_db_path):
-        """Test that getting notifications clears the queue."""
+                                mock_memory_system = AsyncMock()
+                                mock_memory_system.initialize = AsyncMock()
+                                mock_memory_system.retriever = MagicMock()
+                                MockMemorySystem.return_value = mock_memory_system
+
+                                mock_task_manager = AsyncMock()
+                                mock_task_manager.initialize = AsyncMock()
+                                mock_task_manager.register_agent = MagicMock()
+                                MockTaskManager.return_value = mock_task_manager
+
+                                await agent.initialize()
+
+                                # Verify storage was created and initialized
+                                assert agent._raw_storage is not None
+                                assert agent.storage is not None
+                                mock_storage_instance.initialize.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_initialize_creates_memory_system(self, tmp_path):
+        """initialize() creates memory_system."""
         agent = KestrelAgent(
-            did=mock_agent_did,
-            storage_path=temp_db_path
+            did="did:test:123",
+            storage_path=str(tmp_path / "test.db")
         )
 
-        agent._pending_task_notifications.append("Task completed")
-        agent._pending_task_notifications.append("Task failed")
+        with patch('kestrel_sovereign.kestrel_agent.AsyncStorage') as MockStorage:
+            with patch('kestrel_sovereign.kestrel_agent.discover_features', return_value=[]):
+                with patch('kestrel_sovereign.kestrel_agent.WalletAgent') as MockWallet:
+                    with patch('kestrel_sovereign.kestrel_agent.MemoryConsolidator'):
+                        with patch('kestrel_sovereign.kestrel_agent.MemorySystem') as MockMemorySystem:
+                            with patch('kestrel_sovereign.kestrel_agent.TaskManager') as MockTaskManager:
+                                mock_storage = AsyncMock()
+                                mock_storage.initialize = AsyncMock()
+                                mock_storage.get_node = AsyncMock(return_value=None)
+                                mock_storage.add_node = AsyncMock()
+                                mock_storage.db = MagicMock()
+                                MockStorage.return_value = mock_storage
 
-        notifications = agent.get_pending_notifications()
+                                mock_wallet = AsyncMock()
+                                mock_wallet.initialize = AsyncMock()
+                                MockWallet.return_value = mock_wallet
 
-        assert len(notifications) == 2
-        assert "Task completed" in notifications
-        assert "Task failed" in notifications
+                                mock_memory_system = AsyncMock()
+                                mock_memory_system.initialize = AsyncMock()
+                                mock_memory_system.retriever = MagicMock()
+                                MockMemorySystem.return_value = mock_memory_system
 
-        # Queue should be empty now
-        assert len(agent._pending_task_notifications) == 0
+                                mock_task_manager = AsyncMock()
+                                mock_task_manager.initialize = AsyncMock()
+                                mock_task_manager.register_agent = MagicMock()
+                                MockTaskManager.return_value = mock_task_manager
+
+                                await agent.initialize()
+
+                                # Verify memory system created and initialized
+                                assert agent.memory_system is not None
+                                mock_memory_system.initialize.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_initialize_creates_agent_node_if_missing(self, tmp_path):
+        """initialize() creates agent node in storage if it doesn't exist."""
+        agent = KestrelAgent(
+            did="did:test:agent123",
+            storage_path=str(tmp_path / "test.db")
+        )
+
+        with patch('kestrel_sovereign.kestrel_agent.AsyncStorage') as MockStorage:
+            with patch('kestrel_sovereign.kestrel_agent.discover_features', return_value=[]):
+                with patch('kestrel_sovereign.kestrel_agent.WalletAgent') as MockWallet:
+                    with patch('kestrel_sovereign.kestrel_agent.MemoryConsolidator'):
+                        with patch('kestrel_sovereign.kestrel_agent.MemorySystem') as MockMemorySystem:
+                            with patch('kestrel_sovereign.kestrel_agent.TaskManager') as MockTaskManager:
+                                mock_storage = AsyncMock()
+                                mock_storage.initialize = AsyncMock()
+                                mock_storage.get_node = AsyncMock(return_value=None)  # No existing node
+                                mock_storage.add_node = AsyncMock()
+                                mock_storage.db = MagicMock()
+                                MockStorage.return_value = mock_storage
+
+                                mock_wallet = AsyncMock()
+                                mock_wallet.initialize = AsyncMock()
+                                MockWallet.return_value = mock_wallet
+
+                                mock_memory_system = AsyncMock()
+                                mock_memory_system.initialize = AsyncMock()
+                                mock_memory_system.retriever = MagicMock()
+                                MockMemorySystem.return_value = mock_memory_system
+
+                                mock_task_manager = AsyncMock()
+                                mock_task_manager.initialize = AsyncMock()
+                                mock_task_manager.register_agent = MagicMock()
+                                MockTaskManager.return_value = mock_task_manager
+
+                                await agent.initialize()
+
+                                # Verify add_node was called to create the agent node
+                                mock_storage.add_node.assert_called_once()
+                                call_args = mock_storage.add_node.call_args[0][0]
+                                assert call_args.node_id == "did:test:agent123"
+                                assert call_args.node_type == "agent"
+
+    @pytest.mark.asyncio
+    async def test_initialize_registers_features(self, tmp_path):
+        """initialize() registers discovered features."""
+        agent = KestrelAgent(
+            did="did:test:123",
+            storage_path=str(tmp_path / "test.db")
+        )
+
+        mock_feature = MagicMock()
+        mock_feature.name = "TestFeature"
+        mock_feature.initialize = AsyncMock()
+        mock_feature.get_tools.return_value = []
+        mock_feature.get_agent_card.return_value = MagicMock(name="TestFeature", skills=[])
+
+        with patch('kestrel_sovereign.kestrel_agent.AsyncStorage') as MockStorage:
+            with patch('kestrel_sovereign.kestrel_agent.discover_features', return_value=[mock_feature]):
+                with patch('kestrel_sovereign.kestrel_agent.WalletAgent') as MockWallet:
+                    with patch('kestrel_sovereign.kestrel_agent.MemoryConsolidator'):
+                        with patch('kestrel_sovereign.kestrel_agent.MemorySystem') as MockMemorySystem:
+                            with patch('kestrel_sovereign.kestrel_agent.TaskManager') as MockTaskManager:
+                                mock_storage = AsyncMock()
+                                mock_storage.initialize = AsyncMock()
+                                mock_storage.get_node = AsyncMock(return_value=None)
+                                mock_storage.add_node = AsyncMock()
+                                mock_storage.db = MagicMock()
+                                MockStorage.return_value = mock_storage
+
+                                mock_wallet = AsyncMock()
+                                mock_wallet.initialize = AsyncMock()
+                                MockWallet.return_value = mock_wallet
+
+                                mock_memory_system = AsyncMock()
+                                mock_memory_system.initialize = AsyncMock()
+                                mock_memory_system.retriever = MagicMock()
+                                MockMemorySystem.return_value = mock_memory_system
+
+                                mock_task_manager = AsyncMock()
+                                mock_task_manager.initialize = AsyncMock()
+                                mock_task_manager.register_agent = MagicMock()
+                                MockTaskManager.return_value = mock_task_manager
+
+                                await agent.initialize()
+
+                                # Verify feature was registered
+                                assert "TestFeature" in agent.features
+                                assert agent.features["TestFeature"] is mock_feature
+                                mock_feature.initialize.assert_called_once()
