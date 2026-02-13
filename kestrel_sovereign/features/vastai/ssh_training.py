@@ -64,8 +64,8 @@ class VastAISSHTrainingMixin:
 
         ssh_cmd = (
             f"ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 "
-            f"-p {session.ssh_port} root@{session.ssh_host} "
-            f'"{command}"'
+            f"-p {shlex.quote(str(session.ssh_port))} root@{shlex.quote(session.ssh_host)} "
+            f"{shlex.quote(command)}"
         )
 
         try:
@@ -287,8 +287,8 @@ fi
             local_path = f.name
 
         scp_cmd = (
-            f"scp -o StrictHostKeyChecking=no -P {session.ssh_port} "
-            f"root@{session.ssh_host}:{remote_path} {local_path}"
+            f"scp -o StrictHostKeyChecking=no -P {shlex.quote(str(session.ssh_port))} "
+            f"root@{shlex.quote(session.ssh_host)}:{remote_path} {shlex.quote(local_path)}"
         )
 
         try:
