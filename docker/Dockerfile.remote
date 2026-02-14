@@ -14,6 +14,7 @@ WORKDIR /app
 # Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
+    git \
     && rm -rf /var/lib/apt/lists/*
 
 # Install uv
@@ -30,7 +31,7 @@ RUN uv venv /app/.venv
 
 # Install the project (excluding local LLM dependencies)
 RUN uv pip install --python /app/.venv/bin/python . && \
-    uv pip uninstall --python /app/.venv/bin/python ollama -y || true
+    (uv pip uninstall --python /app/.venv/bin/python ollama -y || true)
 
 # Create directory for agent data if it doesn't exist
 RUN mkdir -p /app/agent_data

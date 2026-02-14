@@ -1,5 +1,6 @@
 # Ignore the virtual environment directory
 .venv_kestrel
+.venv
 
 # Ignore local env files (contains secrets)
 .env
