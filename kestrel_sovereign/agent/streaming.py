@@ -36,6 +36,9 @@ class StreamingMixin:
             audit_before_streaming: Whether to audit before streaming
             session_id: Optional session ID to load conversation context from a specific session
         """
+        # CONSTITUTION AUDIT CHECK: Trigger periodic integrity audits
+        await self._maybe_audit()
+
         # Commands are not streamable - delegate to non-streaming handler
         if user_input.startswith("!"):
             result = await self.process_input(user_input, model_override, session_id=session_id)

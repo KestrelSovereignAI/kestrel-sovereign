@@ -3,10 +3,52 @@ import logging
 import hashlib
 import os
 from typing import Tuple
+from datetime import datetime, timezone
 
 
 class ConstitutionMixin:
     """Mixin class providing constitution verification methods."""
+
+    AUDIT_INTERVAL = int(os.environ.get("KESTREL_AUDIT_INTERVAL", "100"))
+
+    def _init_constitution_audit_tracking(self):
+        """Initialize constitution audit tracking. Called by KestrelAgent.__init__."""
+        self._interaction_count = 0
+        self._last_audit_time = datetime.now(timezone.utc)
+
+    async def _maybe_audit(self):
+        """
+        Check if an audit is due and trigger it if needed.
+
+        Audits are triggered when:
+        - Interaction count reaches AUDIT_INTERVAL (default 100), OR
+        - 24 hours have elapsed since the last audit
+
+        Called from process_input() and process_input_streaming().
+        """
+        # Lazy initialization for backward compatibility
+        if not hasattr(self, '_interaction_count') or not hasattr(self, '_last_audit_time'):
+            self._init_constitution_audit_tracking()
+
+        self._interaction_count += 1
+        hours_since_audit = (datetime.now(timezone.utc) - self._last_audit_time).total_seconds() / 3600
+
+        if self._interaction_count >= self.AUDIT_INTERVAL or hours_since_audit >= 24:
+            logging.info(
+                f"Constitution audit triggered: "
+                f"interactions={self._interaction_count}, hours={hours_since_audit:.1f}"
+            )
+            is_valid, message = await self._verify_constitution_integrity()
+
+            if not is_valid:
+                # Constitution integrity failure - enter safe mode
+                await self.enter_safe_mode(f"Constitution audit failed: {message}")
+            else:
+                logging.info(f"Constitution audit passed: {message}")
+
+            # Reset counters
+            self._interaction_count = 0
+            self._last_audit_time = datetime.now(timezone.utc)
 
     async def _verify_constitution_integrity(self) -> Tuple[bool, str]:
         """
