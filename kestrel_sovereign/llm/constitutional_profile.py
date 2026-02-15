@@ -17,8 +17,11 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-# Default config path
+# Default config path (individual file for backward compat)
 DEFAULT_PROFILES_PATH = Path(__file__).parent.parent / "constitutional_profiles.toml"
+
+# Unified config path (preferred)
+UNIFIED_CONFIG_PATH = Path("kestrel.toml")
 
 
 @dataclass
@@ -91,16 +94,51 @@ class ConstitutionalProfileService:
         self._loaded = False
 
     def load(self) -> None:
-        """Load configuration from TOML file."""
-        if not self.config_path.exists():
-            logger.warning(f"Constitutional profiles not found at {self.config_path}, using defaults")
-            self._loaded = True
-            return
+        """Load configuration from TOML file.
+
+        Tries unified kestrel.toml first, falls back to constitutional_profiles.toml.
+        """
+        config_source = None
+
+        # Try unified config first
+        if UNIFIED_CONFIG_PATH.exists():
+            try:
+                with open(UNIFIED_CONFIG_PATH, "rb") as f:
+                    unified_data = tomllib.load(f)
+
+                # Extract constitution section
+                if "constitution" in unified_data:
+                    self._config = unified_data["constitution"]
+                    config_source = "kestrel.toml"
+                    logger.debug("Loading constitutional profiles from unified kestrel.toml")
+            except Exception as e:
+                logger.warning(f"Error loading from unified config, falling back: {e}")
+
+        # Fall back to individual file if unified config not found/failed
+        if not config_source:
+            if not self.config_path.exists():
+                logger.warning(f"Constitutional profiles not found at {self.config_path}, using defaults")
+                self._loaded = True
+                return
+
+            try:
+                with open(self.config_path, "rb") as f:
+                    self._config = tomllib.load(f)
+                config_source = str(self.config_path)
+
+                # Log deprecation warning if unified config exists
+                if UNIFIED_CONFIG_PATH.exists():
+                    logger.warning(
+                        "DEPRECATION: Loading from 'constitutional_profiles.toml' directly. "
+                        "Consider migrating to unified 'kestrel.toml' configuration. "
+                        "Individual config files will be removed in a future version."
+                    )
+            except Exception as e:
+                logger.error(f"Failed to load constitutional profiles: {e}")
+                self._loaded = True
+                return
 
         try:
-            with open(self.config_path, "rb") as f:
-                self._config = tomllib.load(f)
-
             # Parse profiles
             profiles_config = self._config.get("profiles", {})
             for provider, config in profiles_config.items():
@@ -110,10 +148,10 @@ class ConstitutionalProfileService:
             self._model_overrides = self._config.get("model_overrides", {})
 
             self._loaded = True
-            logger.info(f"Loaded {len(self._profiles)} constitutional profiles from {self.config_path}")
+            logger.info(f"Loaded {len(self._profiles)} constitutional profiles from {config_source}")
 
         except Exception as e:
-            logger.error(f"Failed to load constitutional profiles: {e}")
+            logger.error(f"Failed to parse constitutional profiles: {e}")
             self._loaded = True  # Mark as loaded to avoid retry loops
 
     def _parse_profile(self, name: str, config: Dict) -> ConstitutionalProfile:
