@@ -5,7 +5,7 @@
 # - Enterprise-grade reliability
 # - Persistent Disk for model caching (survives instance termination)
 # - Spot instances for 60-90% cost savings
-# - Shared GCP project (kestel-469222)
+# - Shared GCP project (set via GCP_PROJECT_ID env var)
 #
 # Authentication:
 # - Set GOOGLE_APPLICATION_CREDENTIALS to service account JSON path
@@ -14,7 +14,7 @@
 
 [manager]
 # GCP project - set via GCP_PROJECT_ID env var or here
-project_id = "kestel-469222"
+project_id = "${GCP_PROJECT_ID}"
 default_zone = "us-central1-a"
 default_region = "us-central1"
 default_ttl_seconds = 3600
@@ -68,7 +68,7 @@ gpu_type = "nvidia-tesla-a100"
 gpu_count = 1
 boot_disk_size_gb = 100
 boot_disk_type = "pd-ssd"
-image_name = "gcr.io/kestel-469222/kestrel-lora:latest"
+image_name = "gcr.io/${GCP_PROJECT_ID}/kestrel-lora:latest"
 persistent_disk = "kestrel-flux-models"
 inference_port = 8000
 inference_protocol = "http"
@@ -91,7 +91,7 @@ gpu_type = "nvidia-a100-80gb"
 gpu_count = 1
 boot_disk_size_gb = 100
 boot_disk_type = "pd-ssd"
-image_name = "gcr.io/kestel-469222/kestrel-lora:latest"
+image_name = "gcr.io/${GCP_PROJECT_ID}/kestrel-lora:latest"
 persistent_disk = "kestrel-flux-models"
 inference_port = 8000
 inference_protocol = "http"
@@ -114,7 +114,7 @@ gpu_type = "nvidia-l4"
 gpu_count = 1
 boot_disk_size_gb = 100
 boot_disk_type = "pd-balanced"
-image_name = "gcr.io/kestel-469222/kestrel-lora:latest"
+image_name = "gcr.io/${GCP_PROJECT_ID}/kestrel-lora:latest"
 persistent_disk = "kestrel-flux-models"
 inference_port = 8000
 inference_protocol = "http"
@@ -136,7 +136,7 @@ gpu_type = "nvidia-l4"
 gpu_count = 1
 boot_disk_size_gb = 100
 boot_disk_type = "pd-balanced"
-image_name = "gcr.io/kestel-469222/kestrel-ollama:latest"
+image_name = "gcr.io/${GCP_PROJECT_ID}/kestrel-ollama:latest"
 persistent_disk = "kestrel-ollama-models"
 inference_port = 11434
 inference_protocol = "http"
@@ -160,7 +160,7 @@ gpu_type = "nvidia-tesla-t4"
 gpu_count = 1
 boot_disk_size_gb = 100
 boot_disk_type = "pd-standard"
-image_name = "gcr.io/kestel-469222/kestrel-lora:latest"
+image_name = "gcr.io/${GCP_PROJECT_ID}/kestrel-lora:latest"
 inference_port = 8000
 inference_protocol = "http"
 inference_base_path = ""
