@@ -4,6 +4,9 @@ Deploy Feature.
 Self-deployment functionality for Kestrel agents to containerized cloud platforms.
 """
 
+from .core import DeployManagerCore
+from .feature import DeployFeature
+from .manager import DeployManager
 from .models import (
     DeployStatus,
     DeployProviderType,
@@ -18,4 +21,7 @@ __all__ = [
     "DeploymentProfile",
     "DeploymentSession",
     "DeployManagerError",
+    "DeployManagerCore",
+    "DeployManager",
+    "DeployFeature",
 ]
