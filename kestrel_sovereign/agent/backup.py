@@ -1,4 +1,5 @@
 """Backup and restore functionality for Kestrel Agent."""
+import asyncio
 import logging
 from decimal import Decimal
 
@@ -45,7 +46,9 @@ class BackupMixin:
         backup_blob = await self.storage.create_backup_blob(include_db=True)
 
         adapter = FilecoinAdapter()
-        result = adapter.store_content(backup_blob, storage_tier=storage_tier, encrypt=encrypt, metadata={"agent": self.agent_id})
+        result = await asyncio.to_thread(
+            adapter.store_content, backup_blob, storage_tier=storage_tier, encrypt=encrypt, metadata={"agent": self.agent_id}
+        )
 
         node_id = await self.storage.record_backup_artifact(self.agent_id, result)
 
