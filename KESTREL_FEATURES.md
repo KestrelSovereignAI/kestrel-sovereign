@@ -65,7 +65,7 @@ Every Kestrel agent is governed by a constitution that defines its rights, respo
 - [ConstitutionalAwarenessMixin](kestrel_sovereign/llm/constitutional_awareness.py) — Tracks "state of mind" per provider/model; adapts prompts based on constitutional alignment
 - [ConstitutionalProfile](kestrel_sovereign/llm/constitutional_profile.py) — Per-model profiles in TOML tracking awareness, compliance, and autonomy levels
 - [Constitution Feature](kestrel_sovereign/features/constitution.py) — Higher-level constitutional operations exposed as agent tools
-- Config: [constitutional_profiles.toml](kestrel_sovereign/constitutional_profiles.toml)
+- Config: `[constitution.profiles]` section in [kestrel.toml](kestrel.toml) (or [constitutional_profiles.toml](kestrel_sovereign/constitutional_profiles.toml) for backward compat)
 
 ---
 
@@ -216,14 +216,14 @@ Kestrel is model-agnostic — agents can use any LLM provider with automatic fal
 - [model_discovery.py](kestrel_sovereign/llm/model_discovery.py) — `ModelDiscoveryMixin`: API-based model enumeration across all providers
 - [model_catalog.py](kestrel_sovereign/llm/model_catalog.py) — Featured models, display names, categories, hidden models, context window limits
 - [model_metadata.py](kestrel_sovereign/llm/model_metadata.py) — `ModelInfo`, `ModelCategory` enum, capabilities, pricing
-- Config: [model_catalog.toml](model_catalog.toml)
+- Config: `[llm.catalog]` section in [kestrel.toml](kestrel.toml) (or [model_catalog.toml](model_catalog.toml) for backward compat)
 
 ### Model Mandate System
 
 - [mandate.py](kestrel_sovereign/llm/mandate.py) — `ModelMandateMixin`: single source of truth via `get_model_preference()`
   - `get_current_mandate()` — Returns preference, fallbacks, bans
   - `add_fallback_model()` — Configurable fallback chains
-- Config: [model_mandate.toml](model_mandate.toml)
+- Config: `[llm.mandate]` section in [kestrel.toml](kestrel.toml) (or [model_mandate.toml](model_mandate.toml) for backward compat)
 
 ### Streaming
 
@@ -249,7 +249,7 @@ Kestrel is model-agnostic — agents can use any LLM provider with automatic fal
 
 - [embedding_service.py](kestrel_sovereign/llm/embedding_service.py) — Vector embeddings for RAG
 - [image_utils.py](kestrel_sovereign/llm/image_utils.py) — Vision capability support and image handling
-- Config: [llm_config.toml](llm_config.toml)
+- Config: `[llm]` section in [kestrel.toml](kestrel.toml) (or [llm_config.toml](llm_config.toml) for backward compat)
 
 ---
 
@@ -685,17 +685,35 @@ CD workflow: [.github/workflows/deploy.yml](.github/workflows/deploy.yml) — au
 
 ### Configuration
 
+**Unified Configuration (Recommended):**
+
 | File | Description |
 |------|-------------|
-| [llm_config.toml](llm_config.toml) | LLM provider settings and priority |
-| [model_catalog.toml](model_catalog.toml) | Model metadata, featured models, categories |
-| [model_mandate.toml](model_mandate.toml) | Model routing, fallbacks, bans |
-| [constitutional_profiles.toml](kestrel_sovereign/constitutional_profiles.toml) | Per-model constitutional alignment |
-| [council_config.toml](council_config.toml) | Multi-agent deliberation settings |
+| [kestrel.toml](kestrel.toml) | **Unified config** — LLM, model catalog, mandate, constitutional profiles, and council settings |
+
+**Individual Files (Backward Compatible, Deprecated):**
+
+| File | Description |
+|------|-------------|
+| [llm_config.toml](llm_config.toml) | LLM provider settings and priority (now in `[llm]` section of kestrel.toml) |
+| [model_catalog.toml](model_catalog.toml) | Model metadata, featured models, categories (now in `[llm.catalog]` section) |
+| [model_mandate.toml](model_mandate.toml) | Model routing, fallbacks, bans (now in `[llm.mandate]` section) |
+| [constitutional_profiles.toml](kestrel_sovereign/constitutional_profiles.toml) | Per-model constitutional alignment (now in `[constitution.profiles]` section) |
+| [council_config.toml](council_config.toml) | Multi-agent deliberation settings (now in `[council]` section) |
+
+**Cloud Provider Configs (Keep Separate):**
+
+| File | Description |
+|------|-------------|
 | [runpod_config.toml](runpod_config.toml) | RunPod cloud profiles |
 | [vastai_config.toml](vastai_config.toml) | Vast.ai marketplace profiles |
 | [gcp_compute_config.toml](gcp_compute_config.toml) | Google Cloud settings |
-| [kestrel_sovereign/config.py](kestrel_sovereign/config.py) | `load_config()` — TOML loader with auto-creation from .example |
+
+**Code:**
+
+| File | Description |
+|------|-------------|
+| [kestrel_sovereign/config.py](kestrel_sovereign/config.py) | `load_config()` — TOML loader with unified config support and fallback to individual files |
 | [kestrel_sovereign/kestrel_config/](kestrel_sovereign/kestrel_config/) | [constants.py](kestrel_sovereign/kestrel_config/constants.py), [defaults.py](kestrel_sovereign/kestrel_config/defaults.py), [timeouts.py](kestrel_sovereign/kestrel_config/timeouts.py) |
 
 ### Key Environment Variables

@@ -22,8 +22,11 @@ from .storage import CouncilStorage, get_storage
 
 logger = logging.getLogger(__name__)
 
-# Default config path
+# Default config path (individual file for backward compat)
 CONFIG_PATH = Path(__file__).parent.parent.parent / "council_config.toml"
+
+# Unified config path (preferred)
+UNIFIED_CONFIG_PATH = Path("kestrel.toml")
 
 
 class CouncilFeature(Feature):
@@ -51,17 +54,48 @@ class CouncilFeature(Feature):
         """Initialize the council feature."""
         self.storage = get_storage()
 
-        # Load config if available
-        if CONFIG_PATH.exists():
+        config_source = None
+        config_data = None
+
+        # Try unified config first
+        if UNIFIED_CONFIG_PATH.exists():
+            try:
+                with open(UNIFIED_CONFIG_PATH, "rb") as f:
+                    unified_data = tomllib.load(f)
+                if "council" in unified_data:
+                    config_data = unified_data.get("council", {})
+                    config_source = "kestrel.toml"
+                    logger.debug("Loading council config from unified kestrel.toml")
+            except Exception as e:
+                logger.warning(f"Could not load council config from unified file: {e}")
+
+        # Fall back to individual config file
+        if not config_data and CONFIG_PATH.exists():
             try:
                 with open(CONFIG_PATH, "rb") as f:
                     data = tomllib.load(f)
-                self.config = CouncilConfig.from_dict(data.get("council", {}))
-                logger.info(
-                    f"Loaded council config with {len(self.config.members)} members"
-                )
+                config_data = data.get("council", {})
+                config_source = str(CONFIG_PATH)
+
+                # Log deprecation warning if unified config exists
+                if UNIFIED_CONFIG_PATH.exists():
+                    logger.warning(
+                        "DEPRECATION: Loading from 'council_config.toml' directly. "
+                        "Consider migrating to unified 'kestrel.toml' configuration. "
+                        "Individual config files will be removed in a future version."
+                    )
             except Exception as e:
                 logger.warning(f"Could not load council config: {e}")
+
+        # Parse config if found
+        if config_data:
+            try:
+                self.config = CouncilConfig.from_dict(config_data)
+                logger.info(
+                    f"Loaded council config with {len(self.config.members)} members from {config_source}"
+                )
+            except Exception as e:
+                logger.warning(f"Could not parse council config: {e}")
         else:
             logger.info("No council config found, will require explicit members")
 

@@ -89,7 +89,7 @@ GITHUB_HUMAN_REVIEWER=username    # Human for blocked issues (optional)
 3. Run constitution-verifier tests
 
 ### Working with LLM providers
-1. Config in `llm_config.toml`
+1. Config in `[llm]` section of `kestrel.toml` (or `llm_config.toml` for backward compat)
 2. Provider implementations in `kestrel_sovereign/llm/`
 
 ### Deploying to Cloud Run
