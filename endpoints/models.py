@@ -13,6 +13,27 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=["models"])
 
 
+@router.get("/api/agents")
+async def get_agents(request: Request):
+    """
+    Get list of agents (A2A agent cards).
+    For now, returns only the current agent as a single-item array.
+    UI is structurally ready for multiple agents.
+    """
+    if not hasattr(request.app.state, 'agent') or not request.app.state.agent:
+        raise HTTPException(status_code=503, detail="Agent not initialized.")
+
+    try:
+        agent = request.app.state.agent
+        agent_card = await agent.get_agent_card()
+
+        # Return as array (single-item for now, multiple agents in future)
+        return {"agents": [agent_card.model_dump()]}
+    except Exception as e:
+        logger.error(f"Error getting agents: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Error retrieving agents.")
+
+
 @router.get("/api/identity")
 async def get_identity(request: Request):
     """Get agent identity information including avatar."""
@@ -29,8 +50,12 @@ async def get_identity(request: Request):
         avatar_hash = agent_node.properties.get("avatar_hash") if agent_node else None
         avatar_url = f"/api/files/{avatar_hash}" if avatar_hash else None
 
+        # Get agent name from node properties
+        agent_name = agent_node.properties.get("name", "Kestrel Agent") if agent_node else "Kestrel Agent"
+
         return {
             "did": agent.agent_id,
+            "name": agent_name,
             "node_type": agent_node.node_type if agent_node else "agent",
             "created_at": agent_node.properties.get("created_at") if agent_node else None,
             "constitution_hash": agent_node.properties.get("constitution_hash") if agent_node else None,
