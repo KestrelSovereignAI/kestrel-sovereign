@@ -1,0 +1,64 @@
+# Deploy Configuration for Kestrel Self-Deployment
+#
+# This file configures deployment profiles for agents to deploy themselves
+# to cloud platforms like Cloud Run, Azure Container Apps, etc.
+#
+# Copy to deploy_config.toml and configure for your environment.
+
+[manager]
+default_provider = "cloudrun"
+gcp_project_id = "your-gcp-project-id"
+image_name = "kestrel"
+build_strategy = "prebuilt"      # prebuilt | local | cloudbuild
+health_check_timeout_seconds = 120
+health_check_path = "/health"
+
+# Development Profile - Cloud Run (scales to zero)
+[profiles.dev]
+name = "Cloud Run Development"
+provider = "cloudrun"
+service_name = "kestrel-dev"
+region = "us-central1"
+min_instances = 0
+max_instances = 10
+memory = "2Gi"
+cpu = 2
+port = 8080
+timeout = 300
+concurrency = 80
+
+[profiles.dev.env_vars]
+KESTREL_ENV = "development"
+KESTREL_DB_BACKEND = "sqlite"
+KESTREL_DB_PATH = "/app/agent_data"
+
+[profiles.dev.secrets]
+# Secrets are mounted from GCP Secret Manager
+# Format: secret-name:version
+OPENAI_API_KEY = "kestrel-openai-key:latest"
+KESTREL_API_KEY = "kestrel-api-key:latest"
+KESTREL_DATA_KEY = "kestrel-data-key:latest"
+
+# Production Profile - Cloud Run (always warm, auto-scales)
+[profiles.prod]
+name = "Cloud Run Production"
+provider = "cloudrun"
+service_name = "kestrel-prod"
+region = "us-central1"
+min_instances = 1
+max_instances = 100
+memory = "2Gi"
+cpu = 2
+port = 8080
+timeout = 300
+concurrency = 80
+
+[profiles.prod.env_vars]
+KESTREL_ENV = "production"
+KESTREL_DB_BACKEND = "sqlite"
+KESTREL_DB_PATH = "/app/agent_data"
+
+[profiles.prod.secrets]
+OPENAI_API_KEY = "kestrel-openai-key:latest"
+KESTREL_API_KEY = "kestrel-api-key:latest"
+KESTREL_DATA_KEY = "kestrel-data-key:latest"
