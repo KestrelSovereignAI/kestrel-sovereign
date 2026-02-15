@@ -1,0 +1,154 @@
+name: Deploy to Cloud Run
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - prod
+
+env:
+  PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+  REGION: us-central1
+  IMAGE_NAME: kestrel
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for GCR
+        run: gcloud auth configure-docker --quiet
+
+      - name: Determine tag
+        id: tag
+        run: |
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            echo "tag=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+          else
+            echo "tag=dev-$(echo ${{ github.sha }} | cut -c1-7)" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build and push Docker image
+        run: |
+          docker build \
+            -f docker/Dockerfile.cloudrun \
+            -t gcr.io/${{ env.PROJECT_ID }}/${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.tag }} \
+            -t gcr.io/${{ env.PROJECT_ID }}/${{ env.IMAGE_NAME }}:latest \
+            .
+          docker push gcr.io/${{ env.PROJECT_ID }}/${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.tag }}
+          docker push gcr.io/${{ env.PROJECT_ID }}/${{ env.IMAGE_NAME }}:latest
+
+  deploy-dev:
+    runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Deploy to Cloud Run (dev)
+        uses: google-github-actions/deploy-cloudrun@v2
+        with:
+          service: kestrel-dev
+          image: gcr.io/${{ env.PROJECT_ID }}/${{ env.IMAGE_NAME }}:latest
+          region: ${{ env.REGION }}
+          flags: >-
+            --memory=2Gi
+            --cpu=2
+            --port=8080
+            --min-instances=0
+            --max-instances=10
+            --timeout=300
+            --concurrency=80
+            --allow-unauthenticated
+          secrets: |
+            OPENAI_API_KEY=kestrel-openai-key:latest
+            KESTREL_API_KEY=kestrel-api-key:latest
+            KESTREL_DATA_KEY=kestrel-data-key:latest
+          env_vars: |
+            KESTREL_ENV=development
+            KESTREL_DB_BACKEND=sqlite
+            KESTREL_DB_PATH=/app/agent_data
+
+      - name: Show dev URL
+        run: |
+          echo "Dev deployment complete!"
+          gcloud run services describe kestrel-dev \
+            --region=${{ env.REGION }} \
+            --format='value(status.url)'
+
+  deploy-prod:
+    runs-on: ubuntu-latest
+    needs: build
+    # Only deploy to prod on version tags or manual prod dispatch
+    if: >-
+      github.ref_type == 'tag' ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'prod')
+    permissions:
+      contents: read
+      id-token: write
+    environment: production
+
+    steps:
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Deploy to Cloud Run (prod)
+        uses: google-github-actions/deploy-cloudrun@v2
+        with:
+          service: kestrel-prod
+          image: gcr.io/${{ env.PROJECT_ID }}/${{ env.IMAGE_NAME }}:latest
+          region: ${{ env.REGION }}
+          flags: >-
+            --memory=2Gi
+            --cpu=2
+            --port=8080
+            --min-instances=1
+            --max-instances=100
+            --timeout=300
+            --concurrency=80
+            --allow-unauthenticated
+          secrets: |
+            OPENAI_API_KEY=kestrel-openai-key:latest
+            KESTREL_API_KEY=kestrel-api-key:latest
+            KESTREL_DATA_KEY=kestrel-data-key:latest
+          env_vars: |
+            KESTREL_ENV=production
+            KESTREL_DB_BACKEND=sqlite
+            KESTREL_DB_PATH=/app/agent_data
+
+      - name: Show prod URL
+        run: |
+          echo "Prod deployment complete!"
+          gcloud run services describe kestrel-prod \
+            --region=${{ env.REGION }} \
+            --format='value(status.url)'

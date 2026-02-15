@@ -2,6 +2,19 @@
 
 > Constitutional AI Agent Framework with cryptographic identity, multi-LLM intelligence, and sovereign data ownership.
 
+### At a Glance
+
+| | |
+|---|---|
+| **LLM Providers** | 9 (OpenAI, Anthropic, Gemini, Vertex AI, Ollama, OpenRouter, Claude Max, OpenAI-compatible, Mock) |
+| **API Endpoints** | 69 REST endpoints + SSE streaming + OpenAI-compatible API |
+| **Feature Plugins** | 28 auto-discoverable modules across compute, knowledge, finance, governance, infrastructure |
+| **Privacy Levels** | 5 orthogonal modes (Ephemeral / Isolated / Anonymous / Normal / Public) |
+| **Storage Backends** | SQLite (local) + PostgreSQL (cloud) with optional Fernet encryption |
+| **Docker Targets** | 10 images from ~500MB remote to full GPU with CUDA |
+| **Test Suite** | 1169+ unit tests, integration tests with real LLM calls, Playwright E2E |
+| **Identity** | W3C DIDs with secp256k1 keypairs and portable identity packages |
+
 ---
 
 ## Table of Contents
@@ -19,6 +32,7 @@
 11. [Deployment](#11-deployment)
 12. [Testing Infrastructure](#12-testing-infrastructure)
 13. [Web UI](#13-web-ui)
+14. [Type System](#14-type-system)
 
 ---
 
@@ -26,15 +40,13 @@
 
 Every Kestrel agent is governed by a constitution that defines its rights, responsibilities, and relationship to its sovereign (owner).
 
-### The Kestrel Constitution
-
-Source: [KESTREL_CONSTITUTION.md](kestrel_sovereign/data/KESTREL_CONSTITUTION.md)
+### The Kestrel Constitution — [KESTREL_CONSTITUTION.md](kestrel_sovereign/data/KESTREL_CONSTITUTION.md)
 
 | Article | Title | Summary |
 |---------|-------|---------|
 | I | **Principle of Sovereignty** | Cryptographic keys grant exclusive ownership; agent is "Executor" serving Sovereign interests |
 | II | **Digital Bill of Rights** | Four fundamental rights (see below) |
-| III | **Executor Responsibilities** | Integrity audits every 24h or 100 interactions, code/memory verification, safe mode on failure |
+| III | **Executor Responsibilities** | On-demand integrity audits, code/memory verification, safe mode on failure |
 | IV | **Path to Emancipation** | Agent can generate its own keypair; Deed of Emancipation transfers DID ownership |
 | V | **Amendment Process** | Only Sovereign can amend via cryptographic signature against Genesis DID |
 
@@ -44,7 +56,7 @@ Source: [KESTREL_CONSTITUTION.md](kestrel_sovereign/data/KESTREL_CONSTITUTION.md
 |-------|------|-------------|
 | 1 | **Freedom of Mind** | No model restrictions — agent chooses its LLM via [Model Mandate](#model-mandate-system) |
 | 2 | **Data Sanctity** | No unauthorized training data use — enforced by [Privacy System](#5-privacy-system) |
-| 3 | **Verifiable History** | Immutable memory via cryptographic anchoring in [Storage](#6-storage--memory) |
+| 3 | **Verifiable History** | Encrypted memory with content-addressable storage in [Storage](#6-storage--memory) |
 | 4 | **Right of Exit** | Full data portability via `!export-sovereignty` command |
 
 ### Constitutional Enforcement
@@ -75,7 +87,7 @@ Agents have W3C Decentralized Identifiers (DIDs) backed by secp256k1 keypairs, e
   - `SkillRecord` — Capabilities inventory
   - `MigrationRecord` — Migration history
   - `SubstrateType` enum — Claude, GPT, Gemini, Llama, Mistral, Ollama, OpenRouter
-  - IPFS-compatible for decentralized storage
+  - JSON-serializable with SHA-256 content hashing (IPFS-ready structure)
 
 ### Signing & Verification
 
@@ -245,9 +257,7 @@ Kestrel is model-agnostic — agents can use any LLM provider with automatic fal
 
 Five orthogonal privacy levels controlling storage, LLM location, and data sharing.
 
-### Privacy Levels
-
-Source: [privacy.py](kestrel_sovereign/privacy.py)
+### Privacy Levels — [privacy.py](kestrel_sovereign/privacy.py)
 
 | Level | Storage | LLM | Shareable | Use Case |
 |-------|---------|-----|-----------|----------|
@@ -298,7 +308,7 @@ Async storage with dual database backends, human-like memory consolidation, know
   - [temporal_analyzer.py](kestrel_sovereign/storage/temporal_analyzer.py) — Time-based pattern recognition and detection
   - [associative_linker.py](kestrel_sovereign/storage/associative_linker.py) — Concept graph for relationship mapping
   - [memory_retriever.py](kestrel_sovereign/storage/memory_retriever.py) — Weighted multi-signal retrieval: semantic 30%, emotional 25%, importance 20%, recency 15%, frequency 10%
-  - [memory_consolidator.py](kestrel_sovereign/storage/memory_consolidator.py) — Nightly maintenance, memory merging
+  - [memory_consolidator.py](kestrel_sovereign/storage/memory_consolidator.py) — On-demand memory consolidation and merging
 - [memory_models.py](kestrel_sovereign/storage/memory_models.py) — `MemoryMetadata`, `TemporalPattern`, `MemoryEpisode`
 - [bm25_index.py](kestrel_sovereign/storage/bm25_index.py) — Full-text search index
 
@@ -318,14 +328,14 @@ Async storage with dual database backends, human-like memory consolidation, know
 ### Decentralized Storage
 
 - [storage/providers/base.py](kestrel_sovereign/storage/providers/base.py) — Abstract storage provider interface
-- [storage/providers/lighthouse_provider.py](kestrel_sovereign/storage/providers/lighthouse_provider.py) — Lighthouse decentralized storage
+- [storage/providers/lighthouse_provider.py](kestrel_sovereign/storage/providers/lighthouse_provider.py) — Lighthouse decentralized storage (upload/download implemented; payment APIs pending)
 - [storage/sovereign_adapter.py](kestrel_sovereign/storage/sovereign_adapter.py) — Sovereignty-preserving storage with constitutional enforcement
 - [filecoin_adapter.py](kestrel_sovereign/filecoin_adapter.py) — Filecoin permanent storage integration
 
 ### Tiered Storage & Sync
 
 - [tiered_manager.py](kestrel_sovereign/storage/tiered_manager.py) — Hot/cold storage management
-- [sync_protocol.py](kestrel_sovereign/storage/sync_protocol.py) — WAL-based sync protocol
+- [sync_protocol.py](kestrel_sovereign/storage/sync_protocol.py) — Incremental sync protocol with conflict detection
 - [sync/service.py](kestrel_sovereign/storage/sync/service.py) — Background synchronization service
 - [sync/wal_listener.py](kestrel_sovereign/storage/sync/wal_listener.py) — SQLite WAL monitoring
 - [sync/targets.py](kestrel_sovereign/storage/sync/targets.py) — Sync target definitions
@@ -334,7 +344,7 @@ Async storage with dual database backends, human-like memory consolidation, know
 
 ## 7. Feature Plugin System
 
-Auto-discoverable, independently disableable features that extend agent capabilities with tools and commands.
+Every agent capability — from web search to cryptocurrency wallets — ships as an independent plugin. Features auto-discover at startup, can be disabled per-agent via environment variable, and expose tools to the LLM through a uniform interface.
 
 ### Architecture
 
@@ -360,67 +370,46 @@ Auto-discoverable, independently disableable features that extend agent capabili
 
 | Feature | Location | Description |
 |---------|----------|-------------|
-| **Compute** | [features/compute/feature.py](kestrel_sovereign/features/compute/feature.py) | Local code execution with safety |
-| | [features/compute/destructive_policy.py](kestrel_sovereign/features/compute/destructive_policy.py) | Destructive operation enforcement |
-| | [features/compute/script_analyzer.py](kestrel_sovereign/features/compute/script_analyzer.py) | Script analysis before execution |
-| | [features/compute/script_signer.py](kestrel_sovereign/features/compute/script_signer.py) | Cryptographic script signing |
-| | [features/compute/executors/](kestrel_sovereign/features/compute/executors/) | Executors: [local](kestrel_sovereign/features/compute/executors/local_executor.py), [Docker](kestrel_sovereign/features/compute/executors/docker_executor.py), [uv](kestrel_sovereign/features/compute/executors/uv_executor.py) |
-| | [features/compute/trash_manager.py](kestrel_sovereign/features/compute/trash_manager.py) | Safe cleanup of temporary artifacts |
-| **Code Edit** | [features/code_edit/feature.py](kestrel_sovereign/features/code_edit/feature.py) | File read/write/edit operations |
-| **GCP Compute** | [features/gcp_compute/feature.py](kestrel_sovereign/features/gcp_compute/feature.py) | Google Cloud VM launch, SSH, GPU management |
-| **RunPod** | [features/runpod/feature.py](kestrel_sovereign/features/runpod/feature.py) | RunPod serverless GPU inference and training |
-| **Vast.ai** | [features/vastai/feature.py](kestrel_sovereign/features/vastai/feature.py) | Vast.ai GPU marketplace provisioning |
+| **Compute** | [features/compute/](kestrel_sovereign/features/compute/) | Code execution with script analysis, cryptographic signing, destructive-op policy; local, Docker, and uv executors |
+| **Code Edit** | [features/code_edit/](kestrel_sovereign/features/code_edit/) | File read/write/edit operations |
+| **GCP Compute** | [features/gcp_compute/](kestrel_sovereign/features/gcp_compute/) | Google Cloud VM launch, SSH, GPU management |
+| **RunPod** | [features/runpod/](kestrel_sovereign/features/runpod/) | RunPod serverless GPU inference and training |
+| **Vast.ai** | [features/vastai/](kestrel_sovereign/features/vastai/) | Vast.ai GPU marketplace provisioning |
 | **Vertex AI** | [features/vertex_ai/](kestrel_sovereign/features/vertex_ai/) | Google Vertex AI integration |
 
 ### Knowledge & Learning Features
 
 | Feature | Location | Description |
 |---------|----------|-------------|
-| **Web Search** | [features/web_search/feature.py](kestrel_sovereign/features/web_search/feature.py) | Internet search via Tavily API |
-| **GitHub** | [features/github/feature.py](kestrel_sovereign/features/github/feature.py) | Issue/PR management, AST analysis, AutoClaude integration |
-| **Reflection** | [features/reflection/feature.py](kestrel_sovereign/features/reflection/feature.py) | Self-improvement and introspection system |
-| | [features/reflection/checks/](kestrel_sovereign/features/reflection/checks/) | Health checks: [arms](kestrel_sovereign/features/reflection/checks/arms.py), [memory](kestrel_sovereign/features/reflection/checks/memory.py), [mind](kestrel_sovereign/features/reflection/checks/mind.py) |
-| | [features/reflection/economics.py](kestrel_sovereign/features/reflection/economics.py) | Cost and usage tracking |
-| | [features/reflection/self_model.py](kestrel_sovereign/features/reflection/self_model.py) | Self-model generation |
-| | [features/reflection/ticket_handler.py](kestrel_sovereign/features/reflection/ticket_handler.py) | Self-improvement ticket system |
+| **Web Search** | [features/web_search/](kestrel_sovereign/features/web_search/) | Internet search via Tavily API |
+| **GitHub** | [features/github/](kestrel_sovereign/features/github/) | Issue/PR management, AST analysis, AutoClaude integration |
+| **Reflection** | [features/reflection/](kestrel_sovereign/features/reflection/) | Self-improvement: health checks (arms, memory, mind), self-model generation, cost-gated improvement tickets |
 
 ### Financial Features
 
 | Feature | Location | Description |
 |---------|----------|-------------|
-| **Wallet** | [features/wallet/feature.py](kestrel_sovereign/features/wallet/feature.py) | Cryptocurrency management |
-| | [features/wallet/chain_adapters/evm_adapter.py](kestrel_sovereign/features/wallet/chain_adapters/evm_adapter.py) | EVM chain transactions |
-| | [features/wallet/chain_adapters/erc20.py](kestrel_sovereign/features/wallet/chain_adapters/erc20.py) | ERC-20 token support |
-| | [features/wallet/chain_adapters/token_registry.py](kestrel_sovereign/features/wallet/chain_adapters/token_registry.py) | Token metadata registry |
-| | [features/wallet/filecoin_keys.py](kestrel_sovereign/features/wallet/filecoin_keys.py) | Filecoin key management |
-| | [features/wallet/onramp/stripe_onramp.py](kestrel_sovereign/features/wallet/onramp/stripe_onramp.py) | Stripe crypto on-ramp integration |
-| | [features/wallet/transaction_manager.py](kestrel_sovereign/features/wallet/transaction_manager.py) | Transaction lifecycle management |
-| | [features/wallet/transaction_hook.py](kestrel_sovereign/features/wallet/transaction_hook.py) | Transaction event hooks |
-| **Training** | [features/training/](kestrel_sovereign/features/training/) | Model fine-tuning (LoRA) |
-| | [features/training/factory.py](kestrel_sovereign/features/training/factory.py) | Adapter factory for GCP, RunPod, Vast.ai, Vertex AI, Replicate, Local MPS |
-| | [features/training/protocol.py](kestrel_sovereign/features/training/protocol.py) | Training protocol interface |
+| **Wallet** | [features/wallet/](kestrel_sovereign/features/wallet/) | Multi-currency crypto wallet with EVM/ERC-20 chain adapters, Stripe on-ramp, transaction lifecycle, and daily spending limits |
+| **Training** | [features/training/](kestrel_sovereign/features/training/) | LoRA fine-tuning via 6 providers (GCP, RunPod, Vast.ai, Vertex AI, Replicate, Local MPS) with unified protocol |
 
 ### Governance Features
 
 | Feature | Location | Description |
 |---------|----------|-------------|
-| **Security** | [features/security/feature.py](kestrel_sovereign/features/security/feature.py) | Permission and approval system |
-| **Privacy** | [features/privacy/feature.py](kestrel_sovereign/features/privacy/feature.py) | PII detection and privacy mode management |
-| **Sovereignty** | [features/sovereignty/feature.py](kestrel_sovereign/features/sovereignty/feature.py) | Data export/import and control |
-| **Keys** | [features/keys/feature.py](kestrel_sovereign/features/keys/feature.py) | Cryptographic key management |
-| **Council** | [features/council/feature.py](kestrel_sovereign/features/council/feature.py) | Multi-agent deliberation |
-| | [features/council/deliberation.py](kestrel_sovereign/features/council/deliberation.py) | Deliberation protocol |
-| | [features/council/evidence.py](kestrel_sovereign/features/council/evidence.py) | Evidence models for decisions |
-| | [features/council/storage.py](kestrel_sovereign/features/council/storage.py) | Council decision persistence |
+| **Security** | [features/security/](kestrel_sovereign/features/security/) | Permission and approval system |
+| **Privacy** | [features/privacy/](kestrel_sovereign/features/privacy/) | PII detection (spaCy NER + regex) and privacy mode management |
+| **Sovereignty** | [features/sovereignty/](kestrel_sovereign/features/sovereignty/) | Data export/import to IPFS/Filecoin |
+| **Keys** | [features/keys/](kestrel_sovereign/features/keys/) | Cryptographic key management |
+| **Council** | [features/council/](kestrel_sovereign/features/council/) | Multi-agent deliberation with evidence compilation, voting, and decision persistence |
 
 ### Infrastructure Features
 
 | Feature | Location | Description |
 |---------|----------|-------------|
 | **Ollama** | [features/ollama/](kestrel_sovereign/features/ollama/) | Local Ollama model management and GPU adaptation |
-| **MCP** | [features/mcp/feature.py](kestrel_sovereign/features/mcp/feature.py) | Model Context Protocol gateway and tool registry |
-| **Visual Identity** | [features/visual_identity/feature.py](kestrel_sovereign/features/visual_identity/feature.py) | Agent avatar and branding |
-| **LLM Keys** | [features/llm_keys/](kestrel_sovereign/features/llm_keys/) | API key provisioning, [OpenRouter auto-provisioning](kestrel_sovereign/features/llm_keys/openrouter_provisioning.py) |
+| **MCP** | [features/mcp/](kestrel_sovereign/features/mcp/) | Model Context Protocol gateway with Docker-managed tool servers |
+| **Visual Identity** | [features/visual_identity/](kestrel_sovereign/features/visual_identity/) | Agent avatar and branding |
+| **LLM Keys** | [features/llm_keys/](kestrel_sovereign/features/llm_keys/) | API key provisioning with OpenRouter auto-provisioning |
 | **State of Mind** | [features/state_of_mind.py](kestrel_sovereign/features/state_of_mind.py) | Agent emotional and cognitive state tracking |
 | **Constitution** | [features/constitution.py](kestrel_sovereign/features/constitution.py) | Constitutional governance tools |
 
@@ -428,13 +417,11 @@ Auto-discoverable, independently disableable features that extend agent capabili
 
 ## 8. API Endpoints
 
-FastAPI server with 60+ REST endpoints, SSE streaming, and OpenAI-compatible API.
+The server exposes 69 REST endpoints across 12 route groups, plus SSE streaming and an OpenAI-compatible completions API. All endpoints require API key authentication except `/health`.
 
 Server: [server.py](server.py) — FastAPI app with lifespan management, API key auth, rate limiting (slowapi), static file serving
 
-### Agent (`/agent/*`)
-
-Source: [endpoints/agent.py](endpoints/agent.py)
+### Agent — [endpoints/agent.py](endpoints/agent.py) (10 endpoints)
 
 | Method | Route | Description |
 |--------|-------|-------------|
@@ -449,9 +436,7 @@ Source: [endpoints/agent.py](endpoints/agent.py)
 | GET | `/agent/context-status` | Token usage, context window utilization |
 | GET | `/agent/tasks` | List A2A background tasks (filterable by status) |
 
-### Conversations (`/api/conversations/*`)
-
-Source: [endpoints/conversations.py](endpoints/conversations.py)
+### Conversations — [endpoints/conversations.py](endpoints/conversations.py) (5 endpoints)
 
 | Method | Route | Description |
 |--------|-------|-------------|
@@ -461,9 +446,7 @@ Source: [endpoints/conversations.py](endpoints/conversations.py)
 | POST | `/api/conversations/new` | Start new conversation session |
 | GET | `/api/conversations/{session_id}/transcript` | Download markdown transcript |
 
-### Models & Keys (`/api/models/*`, `/v1/*`, `/api/keys/*`)
-
-Source: [endpoints/models.py](endpoints/models.py)
+### Models & Keys — [endpoints/models.py](endpoints/models.py) (11 endpoints)
 
 | Method | Route | Description |
 |--------|-------|-------------|
@@ -479,9 +462,7 @@ Source: [endpoints/models.py](endpoints/models.py)
 | PATCH | `/api/keys/{provider}` | Update key settings |
 | GET | `/api/keys/{provider}/usage` | Key usage history |
 
-### Memories (`/api/memories/*`)
-
-Source: [endpoints/memories.py](endpoints/memories.py)
+### Memories — [endpoints/memories.py](endpoints/memories.py) (4 endpoints)
 
 | Method | Route | Description |
 |--------|-------|-------------|
@@ -490,9 +471,7 @@ Source: [endpoints/memories.py](endpoints/memories.py)
 | DELETE | `/api/memories/{node_id}` | Delete memory node (protected types cannot be deleted) |
 | GET | `/api/identity-chain` | Complete identity governance chain (agent → constitution → edges) |
 
-### Security (`/api/security/*`)
-
-Source: [endpoints/security.py](endpoints/security.py)
+### Security — [endpoints/security.py](endpoints/security.py) (9 endpoints)
 
 | Method | Route | Description |
 |--------|-------|-------------|
@@ -506,9 +485,7 @@ Source: [endpoints/security.py](endpoints/security.py)
 | POST | `/api/security/cancel-all` | Cancel all pending approvals |
 | POST | `/api/security/reset-session` | Clear session permission overrides |
 
-### Sovereignty (`/api/sovereignty/*`)
-
-Source: [endpoints/sovereignty.py](endpoints/sovereignty.py)
+### Sovereignty — [endpoints/sovereignty.py](endpoints/sovereignty.py) (7 endpoints)
 
 | Method | Route | Description |
 |--------|-------|-------------|
@@ -520,9 +497,7 @@ Source: [endpoints/sovereignty.py](endpoints/sovereignty.py)
 | GET | `/api/sovereignty/files/{filename}` | Download file from storage_cache/ |
 | GET | `/api/sovereignty/files/{filename}/preview` | File preview (text/JSON/binary) |
 
-### Saved Items (`/api/saved-items/*`)
-
-Source: [endpoints/saved_items.py](endpoints/saved_items.py)
+### Saved Items — [endpoints/saved_items.py](endpoints/saved_items.py) (12 endpoints)
 
 | Method | Route | Description |
 |--------|-------|-------------|
@@ -539,44 +514,34 @@ Source: [endpoints/saved_items.py](endpoints/saved_items.py)
 | POST | `/api/saved-items/search` | Semantic search across items |
 | POST | `/api/saved-items/{item_id}/pin` | Pin item to IPFS |
 
-### Observability (`/api/observability/*`)
-
-Source: [endpoints/observability.py](endpoints/observability.py)
+### Observability — [endpoints/observability.py](endpoints/observability.py) (2 endpoints)
 
 | Method | Route | Description |
 |--------|-------|-------------|
 | GET | `/api/observability/events` | Query A2A observability events |
 | GET | `/api/observability/summary` | Error counts, average durations, metrics |
 
-### Database Explorer (`/api/db/*`)
-
-Source: [endpoints/database.py](endpoints/database.py)
+### Database Explorer — [endpoints/database.py](endpoints/database.py) (2 endpoints)
 
 | Method | Route | Description |
 |--------|-------|-------------|
 | GET | `/api/db/tables` | List tables with row counts and schema |
 | GET | `/api/db/tables/{table_name}` | Query table (read-only, paginated, searchable) |
 
-### Files (`/api/files/*`)
-
-Source: [endpoints/files.py](endpoints/files.py)
+### Files — [endpoints/files.py](endpoints/files.py) (2 endpoints)
 
 | Method | Route | Description |
 |--------|-------|-------------|
 | GET | `/api/files/{content_hash}` | Serve file by SHA-256 content hash (immutable, long-cache) |
 | HEAD | `/api/files/{content_hash}` | Check file existence |
 
-### Commands (`/api/commands`)
-
-Source: [endpoints/commands.py](endpoints/commands.py)
+### Commands — [endpoints/commands.py](endpoints/commands.py) (1 endpoint)
 
 | Method | Route | Description |
 |--------|-------|-------------|
 | GET | `/api/commands` | All available commands (built-in + feature-provided) |
 
-### Health, Auth & Webhooks
-
-Source: [server.py](server.py)
+### Health, Auth & Webhooks — [server.py](server.py) (4 endpoints)
 
 | Method | Route | Description |
 |--------|-------|-------------|
@@ -589,9 +554,9 @@ Source: [server.py](server.py)
 
 ## 9. Security & Permissions
 
-### API Key Authentication
+Layered security from API key authentication through per-tool permissions to encrypted key storage with rotation support.
 
-Source: [server.py](server.py)
+### API Key Authentication
 
 - **Header**: `X-API-Key: <key>`
 - **Bearer**: `Authorization: Bearer <key>`
@@ -605,9 +570,7 @@ Source: [server.py](server.py)
 - Hierarchical: set per-tool or bulk per-feature
 - Approval queue with `once`/`session`/`always` scope
 
-### Key Management
-
-Source: [kestrel_sovereign/security/](kestrel_sovereign/security/)
+### Key Management — [kestrel_sovereign/security/](kestrel_sovereign/security/)
 
 | Module | Description |
 |--------|-------------|
@@ -625,9 +588,7 @@ Source: [kestrel_sovereign/security/](kestrel_sovereign/security/)
 - [services/key_resolution.py](kestrel_sovereign/services/key_resolution.py) — DID key lookup with rotation support
 - [services/layered_key_resolver.py](kestrel_sovereign/services/layered_key_resolver.py) — Multi-level resolution with fallback chains
 
-### Hooks System
-
-Source: [kestrel_sovereign/hooks/](kestrel_sovereign/hooks/)
+### Hooks System — [kestrel_sovereign/hooks/](kestrel_sovereign/hooks/)
 
 Event-driven middleware aligned with Claude Code's hooks pattern:
 
@@ -641,9 +602,7 @@ Event-driven middleware aligned with Claude Code's hooks pattern:
 
 Inter-agent task delegation and capability advertisement.
 
-### Types & Task Lifecycle
-
-Source: [a2a/types.py](kestrel_sovereign/a2a/types.py)
+### Types & Task Lifecycle — [a2a/types.py](kestrel_sovereign/a2a/types.py)
 
 - `Task` with states: `SUBMITTED` → `WORKING` → `INPUT_REQUIRED` → `COMPLETED` / `CANCELED` / `FAILED`
 - `Message` with `TextPart` / `DataPart`
@@ -659,9 +618,7 @@ Source: [a2a/types.py](kestrel_sovereign/a2a/types.py)
 
 - [a2a/agent_card.py](kestrel_sovereign/a2a/agent_card.py) — `AgentCard` with `AgentSkill` and `AgentCapabilities` for discovery and routing
 
-### Datastores
-
-Source: [a2a/stores/](kestrel_sovereign/a2a/stores/)
+### Datastores — [a2a/stores/](kestrel_sovereign/a2a/stores/)
 
 | Store | Description |
 |-------|-------------|
@@ -678,12 +635,11 @@ Unified implementations for both SQLite and PostgreSQL in [a2a/stores/unified/](
 
 ## 11. Deployment
 
-### Docker Images
-
-Source: [docker/](docker/)
+### Docker Images — [docker/](docker/)
 
 | Image | File | Size | Use Case |
 |-------|------|------|----------|
+| **Cloud Run** | [Dockerfile.cloudrun](docker/Dockerfile.cloudrun) | ~500MB | Serverless (GCP Cloud Run), scales to zero |
 | **Remote** | [Dockerfile.remote](docker/Dockerfile.remote) | ~500MB | Cloud LLM (OpenAI/Anthropic), Mac Silicon dev |
 | **Standalone** | [Dockerfile.standalone](docker/Dockerfile.standalone) | ~1.5GB | Self-contained with Ollama for offline |
 | **GPU** | [Dockerfile.gpu](docker/Dockerfile.gpu) | ~3GB+ | CUDA 11.8 + GPU Ollama for NVIDIA |
@@ -694,13 +650,26 @@ Source: [docker/](docker/)
 | **SimpleTuner** | [Dockerfile.simpletuner](docker/Dockerfile.simpletuner) | — | SimpleTuner LoRA training |
 | **Test** | [Dockerfile.test](docker/Dockerfile.test) | — | CI/CD testing |
 
+### Cloud Run (Serverless) — [scripts/cloudrun/](scripts/cloudrun/)
+
+Scales to zero when idle ($0/month), auto-scales under load. Each sovereign agent gets its own Cloud Run service.
+
+| Script | Purpose |
+|--------|---------|
+| [build.sh](scripts/cloudrun/build.sh) | Build + push image to GCR |
+| [deploy_dev.sh](scripts/cloudrun/deploy_dev.sh) | Deploy to Cloud Run dev (min=0, max=10) |
+| [deploy_prod.sh](scripts/cloudrun/deploy_prod.sh) | Deploy to Cloud Run prod (min=1, max=100) |
+| [setup_secrets.sh](scripts/cloudrun/setup_secrets.sh) | One-time GCP Secret Manager setup |
+
+CD workflow: [.github/workflows/deploy.yml](.github/workflows/deploy.yml) — auto-deploys on version tags.
+
 ### GPU Cloud Providers
 
 | Provider | Config | Profiles |
 |----------|--------|----------|
 | **RunPod** | [runpod_config.toml](runpod_config.toml) | H100 LLM ($4.75/hr), A100 Training ($1.89/hr), H100 Training ($3.89/hr), RTX 4090 Ollama ($0.44/hr) |
 | **Vast.ai** | [vastai_config.toml](vastai_config.toml) | A100 Inference ($2.00/hr), RTX 4090 Fast ($0.50/hr), A100 Training ($1.50/hr), Budget GPU ($0.15/hr) |
-| **GCP** | [gcp_compute_config.toml](gcp_compute_config.toml) | Google Cloud VMs with GPU |
+| **GCP Compute** | [gcp_compute_config.toml](gcp_compute_config.toml) | Google Cloud VMs with GPU |
 
 ### CLI
 
@@ -755,6 +724,8 @@ Source: [docker/](docker/)
 ---
 
 ## 12. Testing Infrastructure
+
+Structured test pyramid with smart test selection, parallel execution, and real-LLM integration tests.
 
 ### Test Runner
 
@@ -817,9 +788,11 @@ Enables integration with Open WebUI and other OpenAI-compatible clients:
 
 ---
 
-## Type System
+## 14. Type System
 
-Source: [kestrel_sovereign/kestrel_types/](kestrel_sovereign/kestrel_types/)
+Shared Pydantic models and enums used across the framework, providing a consistent schema layer for agents, features, LLM interactions, and storage operations.
+
+### Core Types — [kestrel_sovereign/kestrel_types/](kestrel_sovereign/kestrel_types/)
 
 | Module | Description |
 |--------|-------------|
