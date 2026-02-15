@@ -68,6 +68,9 @@ dependencies = [
     "google-genai>=1.0.0",
     # Google Cloud Compute Engine (for GPU instances)
     "google-cloud-compute>=1.15.0",
+    # Google Cloud Run (for serverless deployment)
+    "google-cloud-run>=0.10.0",
+    "google-cloud-logging>=3.5.0",
     # RunPod for GPU cloud
     "runpod>=1.8.1",
     # Vast.ai for GPU cloud (alternative to RunPod)
