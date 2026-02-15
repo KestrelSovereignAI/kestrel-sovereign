@@ -124,7 +124,8 @@ class TestStreamingAudit:
         """Test that commands fall back to non-streaming processing."""
         from kestrel_sovereign.agent.streaming import StreamingMixin
 
-        # Mock process_input for commands
+        # Mock _maybe_audit and process_input for commands
+        mock_agent._maybe_audit = AsyncMock()
         mock_agent.process_input = AsyncMock(return_value="Command executed successfully")
         mock_agent.process_input_streaming = StreamingMixin.process_input_streaming.__get__(mock_agent)
 
@@ -132,6 +133,9 @@ class TestStreamingAudit:
         chunks = []
         async for chunk in mock_agent.process_input_streaming("!help"):
             chunks.append(chunk)
+
+        # Should have called _maybe_audit
+        mock_agent._maybe_audit.assert_called_once()
 
         # Should have used process_input, not streaming
         mock_agent.process_input.assert_called_once_with("!help", None, session_id=None)

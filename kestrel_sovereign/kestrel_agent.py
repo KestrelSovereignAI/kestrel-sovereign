@@ -145,6 +145,9 @@ class KestrelAgent(ConstitutionMixin, StreamingMixin, BackupMixin, SleepMixin):
         # Session state
         self._session_briefed = False
         self._safe_mode = False
+
+        # Initialize constitution audit tracking
+        self._init_constitution_audit_tracking()
     
     async def initialize(self) -> None:
         """Async initialization of storage and features."""
@@ -638,6 +641,9 @@ Expected Duration: {expected_duration}
             session_id: Optional session ID to load conversation context from a specific session
         """
         logging.info(f"[AGENTIC] process_input called with: {user_input[:100]}...")
+
+        # CONSTITUTION AUDIT CHECK: Trigger periodic integrity audits
+        await self._maybe_audit()
 
         # SAFE MODE CHECK: If in safe mode, only allow diagnostic commands
         if self._safe_mode:
