@@ -284,11 +284,12 @@ wheels = [
 [[package]]
 name = "autoclaude"
 version = "0.1.0"
-source = { git = "https://github.com/UncleSaurus/autoclaude.git#2ee410aeeaeb63f57eb14c74799726b421efff35" }
+source = { git = "https://github.com/UncleSaurus/autoclaude.git#b44accaa0cb144997cc3f7929796b25b6b5e88dc" }
 dependencies = [
     { name = "claude-agent-sdk" },
     { name = "pygithub" },
     { name = "python-dotenv" },
+    { name = "pyyaml" },
 ]
 
 [[package]]
