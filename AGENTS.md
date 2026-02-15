@@ -12,14 +12,16 @@ Kestrel Sovereign is a Constitutional AI Agent Framework with cryptographic iden
 - Privacy-preserving agent memory
 - Constitutional protections
 - GPU cloud deployment (RunPod, Vast.ai, GCP)
+- Cloud Run serverless deployment (scales to zero)
 
 ## Key Directories
 
 - `kestrel_sovereign/` - Main package
 - `endpoints/` - FastAPI route handlers
 - `tests/` - Test suite (pytest)
-- `docker/` - Docker configurations
+- `docker/` - Docker configurations (10 Dockerfile variants)
 - `scripts/` - Utility scripts
+- `scripts/cloudrun/` - Cloud Run build/deploy scripts
 
 ## Running Tests
 
@@ -89,6 +91,12 @@ GITHUB_HUMAN_REVIEWER=username    # Human for blocked issues (optional)
 ### Working with LLM providers
 1. Config in `llm_config.toml`
 2. Provider implementations in `kestrel_sovereign/llm/`
+
+### Deploying to Cloud Run
+1. One-time: `scripts/cloudrun/setup_secrets.sh` (creates GCP Secret Manager entries)
+2. Build: `scripts/cloudrun/build.sh` (builds + pushes to GCR)
+3. Deploy: `scripts/cloudrun/deploy_dev.sh` or `scripts/cloudrun/deploy_prod.sh`
+4. Or push a `v*` tag to trigger `.github/workflows/deploy.yml` automatically
 
 ---
 

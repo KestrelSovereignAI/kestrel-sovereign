@@ -266,14 +266,40 @@ See `.env.example` for a complete list. Key variables:
 
 ## 🚢 Deployment
 
-Kestrel supports containerized deployment:
+Kestrel supports multiple deployment targets. See [KESTREL_FEATURES.md](KESTREL_FEATURES.md#11-deployment) for the full catalog.
+
+### Cloud Run (Serverless)
+
+Scales to zero when idle ($0/month), auto-scales under load. Each sovereign agent gets its own service.
 
 ```bash
-# Build Docker image
-docker build -t kestrel .
+# One-time: set up GCP secrets from .env
+scripts/cloudrun/setup_secrets.sh
 
-# Run with custom database path
-docker run -e KESTREL_DB_PATH=/data -v ./data:/data kestrel
+# Build and push to GCR
+scripts/cloudrun/build.sh
+
+# Deploy to dev (scales to zero) or prod (always warm)
+scripts/cloudrun/deploy_dev.sh
+scripts/cloudrun/deploy_prod.sh
+```
+
+Auto-deploys on version tags via [GitHub Actions](.github/workflows/deploy.yml).
+
+### Docker (Local)
+
+```bash
+# Remote LLM — smallest image (~500MB)
+docker build -f docker/Dockerfile.remote -t kestrel .
+docker run -p 8888:8888 -e OPENAI_API_KEY=... kestrel
+
+# Standalone with Ollama (no API keys needed)
+docker build -f docker/Dockerfile.standalone -t kestrel-standalone .
+docker run -p 8888:8888 kestrel-standalone
+
+# GPU with CUDA
+docker build -f docker/Dockerfile.gpu -t kestrel-gpu .
+docker run --gpus all -p 8888:8888 kestrel-gpu
 ```
 
 ## 🔐 Backups and Storage Tiers

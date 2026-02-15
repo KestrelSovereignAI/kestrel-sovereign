@@ -1,0 +1,53 @@
+# Dockerfile for Kestrel Agent — Cloud Run
+# Optimized for serverless: non-root, port 8080, no interactive shell
+ARG TARGETARCH
+FROM ghcr.io/astral-sh/uv:latest AS uv
+FROM --platform=linux/${TARGETARCH} python:3.11-slim
+
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy uv from official image (faster than pip install uv)
+COPY --from=uv /uv /usr/local/bin/uv
+
+# Copy application source code
+COPY . .
+
+# Make entrypoint executable
+RUN chmod +x /app/docker/cloudrun_entrypoint.sh
+
+# Create the virtual environment and install
+RUN uv venv /app/.venv && \
+    uv pip install --python /app/.venv/bin/python . && \
+    (uv pip uninstall --python /app/.venv/bin/python ollama || true)
+
+# Create directories for agent data
+RUN mkdir -p /app/agent_data
+
+# Create non-root user and set permissions
+RUN useradd -m -u 1000 kestrel && \
+    chown -R kestrel:kestrel /app
+
+# Switch to non-root user
+USER kestrel
+
+# Environment
+ENV PYTHONUNBUFFERED=1
+ENV KESTREL_ENV=production
+ENV KESTREL_DB_PATH=/app/agent_data
+ENV PORT=8080
+
+# Cloud Run injects PORT env var
+EXPOSE 8080
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
+    CMD curl -f http://localhost:${PORT}/health || exit 1
+
+# Bootstrap identity on first start, then run uvicorn
+CMD ["/app/docker/cloudrun_entrypoint.sh"]
