@@ -9,6 +9,7 @@ Provides unified transaction signing for all EVM-compatible chains:
 Uses EIP-1559 transaction format where supported.
 """
 
+import os
 import logging
 from decimal import Decimal
 from typing import Optional
@@ -27,6 +28,17 @@ from .base import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Hard-coded mainnet chain IDs that are ALWAYS blocked unless explicitly enabled
+# This cannot be overridden by configuration alone
+MAINNET_CHAIN_IDS = {
+    1,       # Ethereum Mainnet
+    56,      # BSC Mainnet
+    137,     # Polygon Mainnet
+    42161,   # Arbitrum One
+    10,      # Optimism Mainnet
+    314,     # Filecoin Mainnet
+}
 
 
 class EVMAdapter(ChainAdapter):
@@ -154,6 +166,17 @@ class EVMAdapter(ChainAdapter):
         Returns:
             Transaction result with hash or error
         """
+        # CRITICAL SECURITY CHECK: Block mainnet transactions unless explicitly allowed
+        if self.config.chain_id in MAINNET_CHAIN_IDS and not os.environ.get("KESTREL_ALLOW_MAINNET"):
+            return TransactionResult(
+                success=False,
+                error=(
+                    f"Mainnet transactions blocked (chain_id={self.config.chain_id}). "
+                    f"Set KESTREL_ALLOW_MAINNET=1 to enable."
+                ),
+                network=self.network,
+            )
+
         try:
             # Derive address from private key
             account = Account.from_key(private_key)
