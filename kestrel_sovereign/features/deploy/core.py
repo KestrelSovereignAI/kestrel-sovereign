@@ -21,6 +21,7 @@ from .models import (
     DeployProviderType,
     DeployStatus,
 )
+from .providers.azure_container import AzureContainerProvider
 from .providers.base import DeployProvider
 from .providers.cloudrun import CloudRunProvider
 
@@ -164,7 +165,7 @@ class DeployManagerCore:
         if provider_type == DeployProviderType.CLOUD_RUN:
             provider = CloudRunProvider(project_id=self.gcp_project_id)
         elif provider_type == DeployProviderType.AZURE_CONTAINER_APPS:
-            raise DeployManagerError("Azure Container Apps provider not yet implemented")
+            provider = AzureContainerProvider()
         else:
             raise DeployManagerError(f"Unknown provider type: {provider_type}")
 

@@ -195,16 +195,18 @@ class TestDeployManagerCoreProvider:
 
         assert provider1 is provider2
 
-    def test_get_azure_provider_not_implemented(self, sample_config):
-        """Test Azure provider raises not implemented."""
-        from kestrel_sovereign.features.deploy.models import DeployManagerError
+    def test_get_azure_provider_stub(self, sample_config):
+        """Test Azure provider stub instantiation."""
+        from kestrel_sovereign.features.deploy.providers import AzureContainerProvider
 
         manager = DeployManagerCore(config=sample_config)
 
-        with pytest.raises(DeployManagerError) as exc_info:
-            manager._get_provider(DeployProviderType.AZURE_CONTAINER_APPS)
+        # Azure provider can now be instantiated (stub exists)
+        provider = manager._get_provider(DeployProviderType.AZURE_CONTAINER_APPS)
 
-        assert "not yet implemented" in str(exc_info.value).lower()
+        # Should return AzureContainerProvider instance
+        assert isinstance(provider, AzureContainerProvider)
+        assert provider is not None
 
 
 class TestDeployManagerCoreSessions:
