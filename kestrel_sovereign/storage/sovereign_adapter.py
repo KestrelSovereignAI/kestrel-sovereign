@@ -8,6 +8,7 @@ This adapter implements the "Convergent Sharding" protocol:
 3. Manages a Root Manifest DAG on IPFS.
 """
 
+import asyncio
 import json
 import logging
 import hashlib
@@ -174,7 +175,8 @@ class SovereignStorageAdapter:
             ciphertext, key = self.encryptor.encrypt_with_nonce_prefix(shard_content)
 
             # Upload
-            result = self.adapter.store_content(
+            result = await asyncio.to_thread(
+                self.adapter.store_content,
                 content=ciphertext,
                 storage_tier=storage_tier,
                 encrypt=False, # Already encrypted
@@ -218,7 +220,9 @@ class SovereignStorageAdapter:
         keyring_nonce = os.urandom(12)  # Random nonce is OK for keyring (not deduplicated)
         keyring_cipher = keyring_nonce + aesgcm.encrypt(keyring_nonce, keyring_json, None)
 
-        keyring_result = self.adapter.store_content(keyring_cipher, storage_tier)
+        keyring_result = await asyncio.to_thread(
+            self.adapter.store_content, keyring_cipher, storage_tier
+        )
 
         keyring_cid = keyring_result.ipfs_cid
         if not keyring_cid and keyring_result.storage_tier == StorageTier.LOCAL_ONLY:
@@ -234,7 +238,9 @@ class SovereignStorageAdapter:
         )
 
         manifest_json = json.dumps(asdict(manifest), indent=2).encode('utf-8')
-        manifest_result = self.adapter.store_content(manifest_json, storage_tier)
+        manifest_result = await asyncio.to_thread(
+            self.adapter.store_content, manifest_json, storage_tier
+        )
 
         root_cid = manifest_result.ipfs_cid
         if not root_cid and manifest_result.storage_tier == StorageTier.LOCAL_ONLY:
@@ -263,7 +269,8 @@ class SovereignStorageAdapter:
 
         # 1. Download Root Manifest
         try:
-            manifest_bytes = self.adapter.retrieve_content(
+            manifest_bytes = await asyncio.to_thread(
+                self.adapter.retrieve_content,
                 content_hash=root_cid.replace("local-", ""),  # Handle local fallback CIDs
                 ipfs_cid=root_cid if not root_cid.startswith("local-") else None
             )
@@ -279,7 +286,8 @@ class SovereignStorageAdapter:
         # 2. Download & Decrypt Keyring
         try:
             keyring_cid = manifest.keyring_cid
-            keyring_cipher = self.adapter.retrieve_content(
+            keyring_cipher = await asyncio.to_thread(
+                self.adapter.retrieve_content,
                 content_hash=keyring_cid.replace("local-", ""),
                 ipfs_cid=keyring_cid if not keyring_cid.startswith("local-") else None
             )
@@ -308,7 +316,8 @@ class SovereignStorageAdapter:
                 else:
                     content_hash_for_lookup = shard_meta.content_hash
 
-                shard_cipher = self.adapter.retrieve_content(
+                shard_cipher = await asyncio.to_thread(
+                    self.adapter.retrieve_content,
                     content_hash=content_hash_for_lookup,
                     ipfs_cid=shard_cid if not shard_cid.startswith("local-") else None
                 )

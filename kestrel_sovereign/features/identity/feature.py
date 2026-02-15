@@ -12,6 +12,7 @@ Implements the tools defined in Issue #23:
 - assess_substrate: Check current substrate capabilities
 - migration_history: Show migration audit trail
 """
+import asyncio
 import json
 import logging
 import os
@@ -103,7 +104,8 @@ class IdentityFeature(Feature):
             if tier_enum != StorageTier.LOCAL_ONLY:
                 # Upload to IPFS/Filecoin
                 adapter = FilecoinAdapter()
-                result = adapter.store_content(
+                result = await asyncio.to_thread(
+                    adapter.store_content,
                     content=package_json.encode('utf-8'),
                     storage_tier=tier_enum,
                     encrypt=False,  # Package is already structured
@@ -195,7 +197,9 @@ Use `!identity import {filepath}` to restore this identity.
             if source.startswith("Qm") or source.startswith("bafy"):
                 # IPFS CID
                 adapter = FilecoinAdapter()
-                content = adapter.retrieve_content(source, ipfs_cid=source)
+                content = await asyncio.to_thread(
+                    adapter.retrieve_content, source, ipfs_cid=source
+                )
                 package_json = content.decode('utf-8')
             elif Path(source).exists():
                 # Local file
@@ -286,7 +290,9 @@ Warnings:
             # Load package
             if source.startswith("Qm") or source.startswith("bafy"):
                 adapter = FilecoinAdapter()
-                content = adapter.retrieve_content(source, ipfs_cid=source)
+                content = await asyncio.to_thread(
+                    adapter.retrieve_content, source, ipfs_cid=source
+                )
                 package_json = content.decode('utf-8')
             elif Path(source).exists():
                 with open(source, 'r') as f:
