@@ -9,7 +9,7 @@
  * - explorers.js: Chat history browser, Database explorer
  */
 
-// Identity Module - Agent selection, Navigation, Identity, Privacy, Sidebar
+// Identity Module - Agent selection, Navigation, Identity, Privacy, Agents pane, Conversations pane
 export {
     initAgentFromUrl,
     setLazyLoaders,
@@ -17,7 +17,8 @@ export {
     loadIdentity,
     loadPrivacyMode,
     updatePrivacyIndicator,
-    loadSidebar,
+    loadAgents,
+    loadConversations,
 } from './identity.js';
 
 // Memories Module - Constitution, Memories
