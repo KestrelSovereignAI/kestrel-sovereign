@@ -302,45 +302,177 @@ window.showPrivacySelector = function() {
 };
 
 // ============================================================================
-// Sidebar
+// Agents Pane (Rookery)
 // ============================================================================
 
-export async function loadSidebar() {
-    try {
-        const health = await API.health();
-        document.getElementById('agent-status').innerHTML = `
-            <div style="display: flex; align-items: center; gap: 0.5rem;">
-                <span style="width: 8px; height: 8px; border-radius: 50%; background: ${health.agent_initialized ? 'var(--success)' : 'var(--error)'};"></span>
-                <span>${health.agent_initialized ? 'Online' : 'Offline'}</span>
-            </div>
-        `;
-    } catch (e) {
-        document.getElementById('agent-status').innerHTML = '<span style="color: var(--error);">Error</span>';
-    }
+let selectedAgentId = null;
 
+export async function loadAgents() {
     try {
-        const stats = await API.getStorageStats();
-        state.storage = stats;
-        document.getElementById('storage-summary').innerHTML = `
-            <div style="font-size: 0.875rem;">
-                <div>${formatBytes(stats.database?.size_bytes || 0)}</div>
-                <div style="color: var(--text-secondary);">${stats.conversations?.count || 0} messages</div>
-            </div>
-        `;
-    } catch (e) {
-        document.getElementById('storage-summary').innerHTML = '<span style="color: var(--text-secondary);">Unavailable</span>';
-    }
+        const data = await API.getAgents();
+        const agents = data.agents || [];
 
-    try {
-        const wallet = await API.getWallet();
-        state.wallet = wallet;
-        document.getElementById('wallet-summary').innerHTML = `
-            <div style="font-size: 0.875rem;">
-                <div>${wallet.total || 0} ${wallet.currency || 'FIL'}</div>
-                <div style="color: var(--text-secondary);">Balance</div>
+        const container = document.getElementById('agents-list');
+        if (agents.length === 0) {
+            container.innerHTML = '<p style="color: var(--text-secondary); padding: 1rem; text-align: center;">No agents available</p>';
+            return;
+        }
+
+        container.innerHTML = agents.map(agent => `
+            <div class="agent-item ${selectedAgentId === agent.url ? 'selected' : ''}"
+                 data-agent-id="${agent.url}"
+                 onclick="selectAgent('${agent.url}')">
+                <span class="agent-status-dot online"></span>
+                <div class="agent-info">
+                    <div class="agent-name">${agent.name || 'Unnamed Agent'}</div>
+                    <div class="agent-description">${agent.description || 'No description'}</div>
+                </div>
             </div>
-        `;
+        `).join('');
+
+        // Auto-select first agent if none selected
+        if (!selectedAgentId && agents.length > 0) {
+            window.selectAgent(agents[0].url);
+        }
     } catch (e) {
-        document.getElementById('wallet-summary').innerHTML = '<span style="color: var(--text-secondary);">Unavailable</span>';
+        const container = document.getElementById('agents-list');
+        container.innerHTML = `<p style="color: var(--error); padding: 1rem;">Failed to load agents: ${e.message}</p>`;
     }
 }
+
+window.selectAgent = async function(agentId) {
+    selectedAgentId = agentId;
+
+    // Update selection UI
+    document.querySelectorAll('.agent-item').forEach(item => {
+        if (item.dataset.agentId === agentId) {
+            item.classList.add('selected');
+        } else {
+            item.classList.remove('selected');
+        }
+    });
+
+    // Show conversations pane
+    const conversationsPane = document.getElementById('conversations-pane');
+    conversationsPane.style.display = 'flex';
+
+    // Load conversations for selected agent
+    await loadConversations(agentId);
+};
+
+// ============================================================================
+// Conversations Pane
+// ============================================================================
+
+let activeConversationId = null;
+
+export async function loadConversations(agentId) {
+    try {
+        const data = await API.getConversations();
+        const conversations = data.conversations || [];
+
+        const container = document.getElementById('conversations-list');
+        if (conversations.length === 0) {
+            container.innerHTML = '<p style="color: var(--text-secondary); padding: 1rem; text-align: center;">No conversations yet</p>';
+            return;
+        }
+
+        container.innerHTML = conversations.map(conv => {
+            const date = new Date(conv.started_at);
+            const timeStr = date.toLocaleString();
+            return `
+                <div class="conversation-item ${activeConversationId === conv.session_id ? 'active' : ''}"
+                     data-session-id="${conv.session_id}"
+                     onclick="loadConversation('${conv.session_id}')">
+                    <div class="conversation-preview">${conv.preview || 'New conversation'}</div>
+                    <div class="conversation-time">${timeStr}</div>
+                </div>
+            `;
+        }).join('');
+    } catch (e) {
+        const container = document.getElementById('conversations-list');
+        container.innerHTML = `<p style="color: var(--error); padding: 1rem;">Failed to load conversations: ${e.message}</p>`;
+    }
+}
+
+window.loadConversation = async function(sessionId) {
+    activeConversationId = sessionId;
+
+    // Update selection UI
+    document.querySelectorAll('.conversation-item').forEach(item => {
+        if (item.dataset.sessionId === sessionId) {
+            item.classList.add('active');
+        } else {
+            item.classList.remove('active');
+        }
+    });
+
+    // Load conversation messages into chat panel
+    try {
+        const data = await API.getConversation(sessionId);
+        const messages = data.messages || [];
+
+        // Clear chat container and load messages
+        const chatContainer = document.getElementById('chat-container');
+        chatContainer.innerHTML = '';
+
+        for (const msg of messages) {
+            const messageDiv = document.createElement('div');
+            messageDiv.className = `message ${msg.role === 'user' ? 'user-message' : 'agent-message'}`;
+
+            const contentDiv = document.createElement('div');
+            contentDiv.className = 'message-content';
+            contentDiv.innerHTML = msg.content; // TODO: Apply markdown rendering
+
+            messageDiv.appendChild(contentDiv);
+            chatContainer.appendChild(messageDiv);
+        }
+
+        // Scroll to bottom
+        chatContainer.scrollTop = chatContainer.scrollHeight;
+
+        // Switch to chat panel
+        document.querySelector('[data-panel="chat"]').click();
+    } catch (e) {
+        console.error('Failed to load conversation:', e);
+    }
+};
+
+// ============================================================================
+// Pane Collapse/Expand
+// ============================================================================
+
+window.togglePane = function(paneId) {
+    const pane = document.getElementById(paneId);
+    if (pane) {
+        pane.classList.toggle('collapsed');
+    }
+};
+
+// Setup collapse buttons
+document.addEventListener('DOMContentLoaded', () => {
+    const collapseAgentsBtn = document.getElementById('collapse-agents-btn');
+    if (collapseAgentsBtn) {
+        collapseAgentsBtn.addEventListener('click', () => togglePane('agents-pane'));
+    }
+
+    const collapseConversationsBtn = document.getElementById('collapse-conversations-btn');
+    if (collapseConversationsBtn) {
+        collapseConversationsBtn.addEventListener('click', () => togglePane('conversations-pane'));
+    }
+
+    const newConversationSidebarBtn = document.getElementById('new-conversation-sidebar-btn');
+    if (newConversationSidebarBtn) {
+        newConversationSidebarBtn.addEventListener('click', async () => {
+            // Create new conversation and reload list
+            try {
+                await API.newConversation();
+                if (selectedAgentId) {
+                    await loadConversations(selectedAgentId);
+                }
+            } catch (e) {
+                console.error('Failed to create new conversation:', e);
+            }
+        });
+    }
+});
