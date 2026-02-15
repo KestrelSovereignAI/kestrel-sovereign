@@ -136,6 +136,8 @@ vastai_config.toml
 kestrel_sovereign/vastai_config.toml
 llm_config.toml
 kestrel_sovereign/llm_config.toml
+kestrel.toml
+kestrel_sovereign/kestrel.toml
 
 # Control panel env files
 control-panel/.env*
