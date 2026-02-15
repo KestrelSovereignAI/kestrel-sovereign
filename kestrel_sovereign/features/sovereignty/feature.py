@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 from typing import Dict, Any, Optional
@@ -63,7 +64,8 @@ class SovereigntyFeature(Feature):
 
         # Store via adapter
         adapter = FilecoinAdapter()
-        result = adapter.store_content(
+        result = await asyncio.to_thread(
+            adapter.store_content,
             backup_blob,
             storage_tier=tier_enum,
             encrypt=encrypt,
@@ -129,7 +131,9 @@ Size: {len(backup_blob)} bytes
                     break
             
             # Retrieve content (will decrypt if key_hash provided)
-            content = adapter.retrieve_content(cid, ipfs_cid=cid, key_hash=key_hash)
+            content = await asyncio.to_thread(
+                adapter.retrieve_content, cid, ipfs_cid=cid, key_hash=key_hash
+            )
             
             if not content:
                 return f"❌ Error: Could not retrieve content for CID {cid}"
