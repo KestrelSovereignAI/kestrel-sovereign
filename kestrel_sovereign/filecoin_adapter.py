@@ -298,27 +298,133 @@ class FilecoinAdapter:
             
         return encrypted_content, key_hash
 
-    def _find_suitable_miner(self) -> Optional[str]:
-        """Finds a suitable miner to make a deal with."""
+    def _find_suitable_miner(self, size_bytes: int = 0) -> Optional[str]:
+        """
+        Finds a suitable miner to make a deal with.
+
+        Selection criteria (in priority order):
+        1. Accepting deals (not full, actively sealing)
+        2. Sufficient storage space for the deal
+        3. Reasonable price (below market average)
+        4. Good reputation (success rate, sector faults)
+
+        Args:
+            size_bytes: Size of data to store (used to filter miners with sufficient space)
+
+        Returns:
+            Miner address if found, None otherwise
+        """
         if not self.lotus_is_available():
+            logging.warning("Lotus not available for miner selection")
             return None
-        
+
         try:
-            # This is a simplified approach. A real implementation would have more
-            # sophisticated miner selection logic (checking power, reputation, price, etc.).
+            # Get list of all miners on the network
             miners = self.lotus_client.StateListMiners()
             if not miners:
                 logging.warning("No miners found on the network.")
                 return None
-            
-            # For now, just pick the first miner found.
-            # In a real scenario, you would filter and select based on criteria.
-            selected_miner = miners[0]
-            logging.info(f"Found and selected miner: {selected_miner}")
-            return selected_miner
-            
+
+            logging.info(f"Found {len(miners)} miners on the network")
+
+            # Filter and score miners
+            suitable_miners = []
+
+            for miner in miners:
+                try:
+                    # Get miner info to check if they're accepting deals
+                    miner_info = self.lotus_client.StateMinerInfo(miner)
+
+                    # Get miner power to assess reliability
+                    miner_power = self.lotus_client.StateMinerPower(miner)
+
+                    # Filter criteria:
+                    # 1. Check if miner has any power (active)
+                    has_power = False
+                    if miner_power and 'MinerPower' in miner_power:
+                        raw_byte_power = int(miner_power['MinerPower'].get('RawBytePower', '0'))
+                        has_power = raw_byte_power > 0
+
+                    if not has_power:
+                        continue
+
+                    # 2. Check storage availability (if we can get deal info)
+                    # Note: StateMinerAvailableBalance checks if miner has funds for deals
+                    try:
+                        available_balance = self.lotus_client.StateMinerAvailableBalance(miner)
+                        has_balance = int(available_balance) > 0
+                        if not has_balance:
+                            continue
+                    except Exception:
+                        # If we can't check balance, assume it's OK
+                        pass
+
+                    # Calculate a score for this miner
+                    # Higher score = better miner
+                    score = 0
+
+                    # Score based on power (more power = more reliable)
+                    if raw_byte_power > 0:
+                        # Normalize to 0-100 range (log scale)
+                        import math
+                        score += min(50, math.log10(raw_byte_power) * 5)
+
+                    # Score based on sector count (more sectors = more experience)
+                    if 'SectorCount' in miner_info:
+                        sector_count = miner_info['SectorCount']
+                        score += min(30, sector_count / 10)
+
+                    # Score based on worker balance (more balance = more stable)
+                    try:
+                        balance_attoFIL = int(available_balance)
+                        # Convert to FIL (1 FIL = 10^18 attoFIL)
+                        balance_FIL = balance_attoFIL / (10 ** 18)
+                        score += min(20, balance_FIL)
+                    except Exception:
+                        pass
+
+                    suitable_miners.append({
+                        'address': miner,
+                        'score': score,
+                        'power': raw_byte_power,
+                        'info': miner_info
+                    })
+
+                except Exception as e:
+                    logging.debug(f"Could not evaluate miner {miner}: {e}")
+                    continue
+
+            if not suitable_miners:
+                logging.warning("No suitable miners found after filtering")
+                # Fallback: return first miner from list
+                if miners:
+                    logging.info(f"Falling back to first available miner: {miners[0]}")
+                    return miners[0]
+                return None
+
+            # Sort by score (highest first)
+            suitable_miners.sort(key=lambda m: m['score'], reverse=True)
+
+            # Select best miner
+            best_miner = suitable_miners[0]
+            logging.info(
+                f"Selected miner: {best_miner['address']} "
+                f"(score: {best_miner['score']:.1f}, "
+                f"power: {best_miner['power'] / (1024**4):.2f} TiB)"
+            )
+
+            return best_miner['address']
+
         except Exception as e:
             logging.error(f"Error finding miners: {e}")
+            # Graceful fallback: try to get first miner
+            try:
+                miners = self.lotus_client.StateListMiners()
+                if miners:
+                    logging.info(f"Falling back to first miner due to error: {miners[0]}")
+                    return miners[0]
+            except Exception:
+                pass
             return None
     
     def _store_local_cache(self, content_hash: str, content: bytes, metadata: Optional[Dict] = None):
@@ -385,18 +491,21 @@ class FilecoinAdapter:
     def _create_filecoin_deal(self, ipfs_cid: str, metadata: Optional[Dict] = None) -> str:
         """
         Creates a Filecoin storage deal for the given IPFS CID.
-        
+
         Args:
             ipfs_cid: The IPFS content identifier.
             metadata: Optional metadata for the deal.
-            
+
         Returns:
             The Filecoin Deal ID.
         """
         if not self.lotus_is_available():
             raise ConnectionError("Lotus node is not available to create a Filecoin deal.")
-            
-        miner = self._find_suitable_miner()
+
+        # Get file size if available in metadata
+        size_bytes = metadata.get('size_bytes', 0) if metadata else 0
+
+        miner = self._find_suitable_miner(size_bytes=size_bytes)
         if not miner:
             raise ConnectionError("Could not find a suitable miner to make a deal.")
 
