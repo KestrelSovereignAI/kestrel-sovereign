@@ -46,7 +46,7 @@ Every Kestrel agent is governed by a constitution that defines its rights, respo
 |---------|-------|---------|
 | I | **Principle of Sovereignty** | Cryptographic keys grant exclusive ownership; agent is "Executor" serving Sovereign interests |
 | II | **Digital Bill of Rights** | Four fundamental rights (see below) |
-| III | **Executor Responsibilities** | On-demand integrity audits, code/memory verification, safe mode on failure |
+| III | **Executor Responsibilities** | Integrity audits every 24h or 100 interactions (configurable via `KESTREL_AUDIT_INTERVAL`), code/memory verification, safe mode on failure |
 | IV | **Path to Emancipation** | Agent can generate its own keypair; Deed of Emancipation transfers DID ownership |
 | V | **Amendment Process** | Only Sovereign can amend via cryptographic signature against Genesis DID |
 
