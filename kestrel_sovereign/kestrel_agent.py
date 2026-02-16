@@ -146,6 +146,12 @@ class KestrelAgent(ConstitutionMixin, StreamingMixin, BackupMixin, SleepMixin):
         self._session_briefed = False
         self._safe_mode = False
 
+        # Dynamic tool loading: explored features get direct tool access
+        self._explored_features: dict = {}  # ordered dict (insertion order) for LRU eviction
+        self._direct_tools: dict = {}
+        self._direct_tool_defs: list = []
+        self._tool_to_feature: dict = {}  # tool_name -> feature tool_name
+
         # Initialize constitution audit tracking
         self._init_constitution_audit_tracking()
     
@@ -780,8 +786,8 @@ Expected Duration: {expected_duration}
             effective_model = await self.check_solvency()
 
         # Build feature tools for the orchestrator
-        # Each feature IS a tool that can be called as a subagent
-        feature_tools = self._build_feature_tools()
+        # Includes feature dispatch tools + any direct tools from explored features
+        feature_tools = self._build_all_tools()
 
         # Log tool availability via A2A ObservabilityStore
         tool_names = [t['function']['name'] for t in feature_tools] if feature_tools else []
@@ -911,6 +917,60 @@ Expected Duration: {expected_duration}
             logging.error(f"[AGENTIC] Failed features: {failed_features}")
 
         return tools
+
+    # --- Dynamic Tool Loading ---
+
+    MAX_DIRECT_TOOLS = 60
+
+    def _build_all_tools(self) -> list:
+        """Build combined tool list: feature dispatchers + explored individual tools."""
+        tools = self._build_feature_tools()
+        tools.extend(self._direct_tool_defs)
+        return tools
+
+    def _register_explored_feature_tools(self, feature) -> None:
+        """Register a feature's individual tools for direct calling.
+
+        After a successful subagent dispatch, the feature's @tool methods
+        become available for the orchestrator to call directly without
+        a subagent LLM hop.
+        """
+        if feature.tool_name in self._explored_features:
+            return
+        self._explored_features[feature.tool_name] = True
+        registered = 0
+        for tool in feature.get_tools():
+            if tool.name in self._direct_tools:
+                name = f"{feature.tool_name}__{tool.name}"
+            else:
+                name = tool.name
+            self._direct_tools[name] = tool
+            tool_def = tool.schema.to_openai_format()
+            tool_def["function"]["name"] = name
+            self._direct_tool_defs.append(tool_def)
+            self._tool_to_feature[name] = feature.tool_name
+            registered += 1
+        self._maybe_evict_direct_tools()
+        logging.info(
+            f"[DYNAMIC-TOOLS] Explored {feature.tool_name}, "
+            f"registered {registered} direct tools. "
+            f"Total: {len(self._direct_tools)}"
+        )
+
+    def _maybe_evict_direct_tools(self) -> None:
+        """Evict least-recently-explored feature's tools if over limit."""
+        while len(self._direct_tools) > self.MAX_DIRECT_TOOLS:
+            oldest = next(iter(self._explored_features))
+            del self._explored_features[oldest]
+            to_remove = [k for k, v in self._tool_to_feature.items() if v == oldest]
+            for name in to_remove:
+                del self._direct_tools[name]
+                del self._tool_to_feature[name]
+            self._direct_tool_defs = [
+                d for d in self._direct_tool_defs
+                if d["function"]["name"] not in to_remove
+            ]
+            logging.info(f"[DYNAMIC-TOOLS] Evicted {len(to_remove)} tools from {oldest}")
 
     def _build_features_prompt_section(self) -> str:
         """
@@ -1061,6 +1121,9 @@ Expected Duration: {expected_duration}
                             context=context
                         )
 
+                        # Register individual tools for direct calling
+                        self._register_explored_feature_tools(feature)
+
                         # Log success
                         dispatch_duration = int((time.time() - dispatch_start) * 1000)
                         await self.observability_store.log_tool_response(
@@ -1092,6 +1155,31 @@ Expected Duration: {expected_duration}
                             duration_ms=dispatch_duration,
                             error_message=str(e),
                         )
+                elif tool_name in self._direct_tools:
+                    # Direct tool execution — no subagent LLM hop
+                    try:
+                        tool = self._direct_tools[tool_name]
+                        result = await tool.execute(**args)
+
+                        dispatch_duration = int((time.time() - dispatch_start) * 1000)
+                        await self.observability_store.log_tool_response(
+                            event_id=dispatch_event_id,
+                            success=True,
+                            duration_ms=dispatch_duration,
+                        )
+                        logging.info(f"[DIRECT-TOOL] {tool_name} ({dispatch_duration}ms)")
+                    except Exception as e:
+                        logging.error(f"[DIRECT-TOOL] {tool_name} failed: {e}")
+                        result = {"success": False, "error": str(e)}
+
+                        dispatch_duration = int((time.time() - dispatch_start) * 1000)
+                        await self.observability_store.log_tool_response(
+                            event_id=dispatch_event_id,
+                            success=False,
+                            duration_ms=dispatch_duration,
+                            error_message=str(e),
+                        )
+
                 else:
                     result = {"success": False, "error": f"Unknown feature tool: {tool_name}"}
 
@@ -1120,11 +1208,12 @@ Expected Duration: {expected_duration}
                     "content": result_json
                 })
 
-            # Continue conversation with tool results
-            logging.info(f"[ORCHESTRATOR] Calling LLM with {len(messages)} messages to summarize tool results")
+            # Continue conversation with tool results (include newly explored direct tools)
+            all_tools = self._build_all_tools()
+            logging.info(f"[ORCHESTRATOR] Calling LLM with {len(messages)} messages, {len(all_tools)} tools")
             response = await self.llm_service.generate_with_messages(
                 messages=messages,
-                tools=feature_tools if feature_tools else None,
+                tools=all_tools or None,
                 force_local_only=force_local_only,
                 model_override=effective_model
             )
@@ -1248,6 +1337,9 @@ Expected Duration: {expected_duration}
                         logging.info(f"[STREAM] Dispatching to feature subagent: {tool_name}")
                         result = await feature.execute_as_subagent(task=task, context=context)
 
+                        # Register individual tools for direct calling
+                        self._register_explored_feature_tools(feature)
+
                         dispatch_duration = int((time.time() - dispatch_start) * 1000)
                         await self.observability_store.log_tool_response(
                             event_id=dispatch_event_id,
@@ -1280,6 +1372,33 @@ Expected Duration: {expected_duration}
                         )
                         # Stream tool error indicator to user
                         yield f"❌ {tool_name} failed: {str(e)[:100]}\n"
+
+                elif tool_name in self._direct_tools:
+                    # Direct tool execution — no subagent LLM hop
+                    try:
+                        tool = self._direct_tools[tool_name]
+                        result = await tool.execute(**args)
+
+                        dispatch_duration = int((time.time() - dispatch_start) * 1000)
+                        await self.observability_store.log_tool_response(
+                            event_id=dispatch_event_id,
+                            success=True,
+                            duration_ms=dispatch_duration,
+                        )
+                        yield f"⚡ {tool_name} (direct, {dispatch_duration}ms)\n"
+                    except Exception as e:
+                        logging.error(f"[DIRECT-TOOL] {tool_name} failed: {e}")
+                        result = {"success": False, "error": str(e)}
+
+                        dispatch_duration = int((time.time() - dispatch_start) * 1000)
+                        await self.observability_store.log_tool_response(
+                            event_id=dispatch_event_id,
+                            success=False,
+                            duration_ms=dispatch_duration,
+                            error_message=str(e),
+                        )
+                        yield f"❌ {tool_name} failed: {str(e)[:100]}\n"
+
                 else:
                     result = {"success": False, "error": f"Unknown feature tool: {tool_name}"}
                     dispatch_duration = int((time.time() - dispatch_start) * 1000)
@@ -1292,7 +1411,8 @@ Expected Duration: {expected_duration}
                     # Stream unknown tool indicator to user
                     yield f"❌ Unknown tool: {tool_name}\n"
 
-                result_json = json.dumps(result)
+                from kestrel_sovereign.features.base import _serialize_tool_result
+                result_json = json.dumps(_serialize_tool_result(result))
                 logging.info(f"[ORCHESTRATOR-STREAM] Tool result ({len(result_json)} chars): {result_json[:300]}...")
                 messages.append({
                     "role": "tool",
@@ -1301,10 +1421,11 @@ Expected Duration: {expected_duration}
                 })
 
             # Check if we need more tool calls with non-streaming first
-            logging.info(f"[ORCHESTRATOR-STREAM] Checking for more tool calls with {len(messages)} messages")
+            all_tools = self._build_all_tools()
+            logging.info(f"[ORCHESTRATOR-STREAM] Checking for more tool calls with {len(messages)} messages, {len(all_tools)} tools")
             response = await self.llm_service.generate_with_messages(
                 messages=messages,
-                tools=feature_tools if feature_tools else None,
+                tools=all_tools or None,
                 force_local_only=force_local_only,
                 model_override=effective_model
             )
