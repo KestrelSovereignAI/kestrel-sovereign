@@ -11,7 +11,7 @@ import {
     initNavigation,
     loadIdentity,
     loadPrivacyMode,
-    loadSidebar,
+    loadAgents,
     loadConstitution,
     loadMemories,
     loadExports,
@@ -68,7 +68,7 @@ async function init() {
     await Promise.all([
         loadIdentity(),
         loadPrivacyMode(),
-        loadSidebar(),
+        loadAgents(),
         loadModels(),
     ]);
 

@@ -1607,6 +1607,56 @@ Expected Duration: {expected_duration}
         if self._current_request_id == request_id:
             self._current_request_id = None
 
+    async def get_agent_card(self) -> "AgentCard":
+        """
+        Generate an AgentCard for this agent (for A2A discovery).
+        Returns agent identity, capabilities, and available skills.
+        """
+        from kestrel_sovereign.a2a.agent_card import AgentCard, AgentCapabilities, AgentSkill, AgentProvider
+
+        # Get agent name from storage node if available
+        agent_name = "Kestrel Agent"
+        agent_description = "Constitutional AI Agent with sovereign memory"
+
+        if self.storage:
+            try:
+                agent_node = await self.storage.get_node(self.agent_id)
+                if agent_node and agent_node.properties:
+                    agent_name = agent_node.properties.get("name", agent_name)
+                    agent_description = agent_node.properties.get("description", agent_description)
+            except Exception as e:
+                logging.warning(f"Could not load agent node for card generation: {e}")
+
+        # Build base URL - in production this would be the agent's public URL
+        # For now, use localhost
+        base_url = os.environ.get("KESTREL_BASE_URL", "http://localhost:8888")
+
+        # Collect skills from all features
+        skills = []
+        for feature in self.features.values():
+            if hasattr(feature, 'get_agent_card'):
+                feature_card = feature.get_agent_card()
+                skills.extend(feature_card.skills)
+
+        return AgentCard(
+            name=agent_name,
+            description=agent_description,
+            url=base_url,
+            version="0.1.0",
+            provider=AgentProvider(
+                organization="Kestrel Sovereign AI",
+                url="https://github.com/KestrelSovereignAI/kestrel-sovereign"
+            ),
+            capabilities=AgentCapabilities(
+                streaming=True,
+                pushNotifications=False,
+                stateTransitionHistory=True
+            ),
+            defaultInputModes=["text"],
+            defaultOutputModes=["text"],
+            skills=skills
+        )
+
     async def shutdown(self):
         """Properly clean up all agent resources including async MCP connections."""
         # Shutdown security feature if it exists

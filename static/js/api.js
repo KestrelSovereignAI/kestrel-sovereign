@@ -189,6 +189,7 @@ const API = {
     // Core endpoints
     health: () => API.request('/health'),
     getAgentInfo: () => API.request('/agent/info'),
+    getAgents: () => API.request('/api/agents'),
     getIdentity: () => API.request('/api/identity'),
     getConstitution: () => API.request('/api/constitution'),
     getPrivacyMode: () => API.request('/agent/privacy-mode'),

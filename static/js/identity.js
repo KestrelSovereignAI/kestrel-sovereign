@@ -4,7 +4,7 @@
  */
 
 import API from './api.js';
-import { state, PRIVACY_MODES, Toast, formatBytes } from './ui.js';
+import { state, PRIVACY_MODES, Toast } from './ui.js';
 
 // ============================================================================
 // Agent Selection (Multi-Agent Support)
@@ -302,45 +302,234 @@ window.showPrivacySelector = function() {
 };
 
 // ============================================================================
-// Sidebar
+// Utilities
 // ============================================================================
 
-export async function loadSidebar() {
-    try {
-        const health = await API.health();
-        document.getElementById('agent-status').innerHTML = `
-            <div style="display: flex; align-items: center; gap: 0.5rem;">
-                <span style="width: 8px; height: 8px; border-radius: 50%; background: ${health.agent_initialized ? 'var(--success)' : 'var(--error)'};"></span>
-                <span>${health.agent_initialized ? 'Online' : 'Offline'}</span>
-            </div>
-        `;
-    } catch (e) {
-        document.getElementById('agent-status').innerHTML = '<span style="color: var(--error);">Error</span>';
-    }
+function escapeHtml(str) {
+    const div = document.createElement('div');
+    div.textContent = str;
+    return div.innerHTML;
+}
 
-    try {
-        const stats = await API.getStorageStats();
-        state.storage = stats;
-        document.getElementById('storage-summary').innerHTML = `
-            <div style="font-size: 0.875rem;">
-                <div>${formatBytes(stats.database?.size_bytes || 0)}</div>
-                <div style="color: var(--text-secondary);">${stats.conversations?.count || 0} messages</div>
-            </div>
-        `;
-    } catch (e) {
-        document.getElementById('storage-summary').innerHTML = '<span style="color: var(--text-secondary);">Unavailable</span>';
-    }
+// ============================================================================
+// Agents Pane (Rookery)
+// ============================================================================
 
+let selectedAgentId = null;
+
+export async function loadAgents() {
     try {
-        const wallet = await API.getWallet();
-        state.wallet = wallet;
-        document.getElementById('wallet-summary').innerHTML = `
-            <div style="font-size: 0.875rem;">
-                <div>${wallet.total || 0} ${wallet.currency || 'FIL'}</div>
-                <div style="color: var(--text-secondary);">Balance</div>
-            </div>
-        `;
+        const data = await API.getAgents();
+        const agents = data.agents || [];
+
+        const container = document.getElementById('agents-list');
+        if (agents.length === 0) {
+            container.innerHTML = '<p style="color: var(--text-secondary); padding: 1rem; text-align: center;">No agents available</p>';
+            return;
+        }
+
+        container.innerHTML = '';
+        for (const agent of agents) {
+            const item = document.createElement('div');
+            item.className = `agent-item ${selectedAgentId === agent.id ? 'selected' : ''}`;
+            item.dataset.agentId = agent.id;
+            item.addEventListener('click', () => window.selectAgent(agent.id));
+
+            item.innerHTML = `
+                <span class="agent-status-dot ${agent.status === 'offline' ? 'offline' : 'online'}"></span>
+                <div class="agent-info">
+                    <div class="agent-name">${escapeHtml(agent.name || 'Unnamed Agent')}</div>
+                    <div class="agent-description">${escapeHtml(agent.description || 'No description')}</div>
+                </div>
+            `;
+            container.appendChild(item);
+        }
+
+        // Auto-select first agent if none selected
+        if (!selectedAgentId && agents.length > 0) {
+            window.selectAgent(agents[0].id);
+        }
     } catch (e) {
-        document.getElementById('wallet-summary').innerHTML = '<span style="color: var(--text-secondary);">Unavailable</span>';
+        const container = document.getElementById('agents-list');
+        container.innerHTML = '<p style="color: var(--error); padding: 1rem;">Failed to load agents</p>';
     }
 }
+
+window.selectAgent = async function(agentId) {
+    selectedAgentId = agentId;
+
+    // Update selection UI
+    document.querySelectorAll('.agent-item').forEach(item => {
+        item.classList.toggle('selected', item.dataset.agentId === agentId);
+    });
+
+    // Show conversations pane
+    const conversationsPane = document.getElementById('conversations-pane');
+    conversationsPane.style.display = 'flex';
+
+    // Load conversations for selected agent
+    await loadConversations(agentId);
+};
+
+// ============================================================================
+// Conversations Pane
+// ============================================================================
+
+let activeConversationId = null;
+
+export async function loadConversations(_agentId) {
+    // TODO: pass _agentId to API.getConversations() once multi-agent routing is wired
+    try {
+        const data = await API.getConversations();
+        const conversations = data.conversations || [];
+
+        const container = document.getElementById('conversations-list');
+        if (conversations.length === 0) {
+            container.innerHTML = '<p style="color: var(--text-secondary); padding: 1rem; text-align: center;">No conversations yet</p>';
+            return;
+        }
+
+        container.innerHTML = '';
+        for (const conv of conversations) {
+            const date = new Date(conv.started_at);
+            const timeStr = date.toLocaleString();
+
+            const item = document.createElement('div');
+            item.className = `conversation-item ${activeConversationId === conv.session_id ? 'active' : ''}`;
+            item.dataset.sessionId = conv.session_id;
+            item.addEventListener('click', () => window.loadConversation(conv.session_id));
+
+            const preview = document.createElement('div');
+            preview.className = 'conversation-preview';
+            preview.textContent = conv.preview || 'New conversation';
+
+            const time = document.createElement('div');
+            time.className = 'conversation-time';
+            time.textContent = timeStr;
+
+            item.appendChild(preview);
+            item.appendChild(time);
+            container.appendChild(item);
+        }
+    } catch (e) {
+        const container = document.getElementById('conversations-list');
+        container.innerHTML = '<p style="color: var(--error); padding: 1rem;">Failed to load conversations</p>';
+    }
+}
+
+window.loadConversation = async function(sessionId) {
+    activeConversationId = sessionId;
+
+    // Update selection UI
+    document.querySelectorAll('.conversation-item').forEach(item => {
+        item.classList.toggle('active', item.dataset.sessionId === sessionId);
+    });
+
+    // Load conversation messages into chat panel
+    try {
+        const data = await API.getConversation(sessionId);
+        const messages = data.messages || [];
+
+        const chatContainer = document.getElementById('chat-container');
+        chatContainer.innerHTML = '';
+
+        const renderMd = window.SharedMarkdown?.renderMarkdown;
+
+        for (const msg of messages) {
+            const messageDiv = document.createElement('div');
+            messageDiv.className = `message ${msg.role === 'user' ? 'user-message' : 'agent-message'}`;
+
+            const contentDiv = document.createElement('div');
+            contentDiv.className = 'message-content';
+
+            if (msg.role === 'assistant' && renderMd) {
+                contentDiv.innerHTML = renderMd(msg.content);
+            } else {
+                contentDiv.textContent = msg.content;
+            }
+
+            messageDiv.appendChild(contentDiv);
+            chatContainer.appendChild(messageDiv);
+        }
+
+        chatContainer.scrollTop = chatContainer.scrollHeight;
+
+        // Switch to chat panel
+        document.querySelector('[data-panel="chat"]')?.click();
+    } catch (e) {
+        console.error('Failed to load conversation:', e);
+    }
+};
+
+// ============================================================================
+// Pane Collapse/Expand + Resize
+// ============================================================================
+
+window.togglePane = function(paneId) {
+    const pane = document.getElementById(paneId);
+    if (pane) {
+        pane.classList.toggle('collapsed');
+    }
+};
+
+function initPaneResize(handleId, paneId) {
+    const handle = document.getElementById(handleId);
+    const pane = document.getElementById(paneId);
+    if (!handle || !pane) return;
+
+    let startX, startWidth;
+
+    handle.addEventListener('mousedown', (e) => {
+        startX = e.clientX;
+        startWidth = pane.offsetWidth;
+        document.body.style.cursor = 'col-resize';
+        document.body.style.userSelect = 'none';
+
+        function onMouseMove(e) {
+            const diff = e.clientX - startX;
+            const newWidth = Math.max(200, Math.min(500, startWidth + diff));
+            pane.style.width = newWidth + 'px';
+        }
+
+        function onMouseUp() {
+            document.removeEventListener('mousemove', onMouseMove);
+            document.removeEventListener('mouseup', onMouseUp);
+            document.body.style.cursor = '';
+            document.body.style.userSelect = '';
+        }
+
+        document.addEventListener('mousemove', onMouseMove);
+        document.addEventListener('mouseup', onMouseUp);
+    });
+}
+
+// Setup collapse buttons and resize handles
+document.addEventListener('DOMContentLoaded', () => {
+    const collapseAgentsBtn = document.getElementById('collapse-agents-btn');
+    if (collapseAgentsBtn) {
+        collapseAgentsBtn.addEventListener('click', () => togglePane('agents-pane'));
+    }
+
+    const collapseConversationsBtn = document.getElementById('collapse-conversations-btn');
+    if (collapseConversationsBtn) {
+        collapseConversationsBtn.addEventListener('click', () => togglePane('conversations-pane'));
+    }
+
+    const newConversationSidebarBtn = document.getElementById('new-conversation-sidebar-btn');
+    if (newConversationSidebarBtn) {
+        newConversationSidebarBtn.addEventListener('click', async () => {
+            try {
+                await API.newConversation();
+                if (selectedAgentId) {
+                    await loadConversations(selectedAgentId);
+                }
+            } catch (e) {
+                console.error('Failed to create new conversation:', e);
+            }
+        });
+    }
+
+    // Initialize resize handles
+    initPaneResize('resize-agents', 'agents-pane');
+    initPaneResize('resize-conversations', 'conversations-pane');
+});
