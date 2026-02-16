@@ -62,10 +62,10 @@ class TestTokenCounter:
         assert count > 0
 
     def test_get_context_limit_undiscovered_model(self):
-        """Test getting context limit for model not yet discovered returns default."""
+        """Test getting context limit for model in catalog uses catalog value."""
         counter = get_token_counter("gpt-4")
         limit = counter.get_context_limit()
-        assert limit == 32768  # DEFAULT_CONTEXT_LIMIT (no cache, no discovery)
+        assert limit == 8192  # From model_catalog.toml context_limits
 
     def test_get_context_limit_unknown_model(self):
         """Test getting context limit for unknown model returns default."""
@@ -108,7 +108,7 @@ class TestTokenBudget:
         """Test that TokenBudget initializes with correct allocations."""
         budget = TokenBudget("gpt-4")
         assert budget.model == "gpt-4"
-        assert budget.context_limit == 32768
+        assert budget.context_limit == 8192  # From model_catalog.toml
         assert budget.response_reserve == RESPONSE_RESERVE
 
     def test_budget_allocations(self):

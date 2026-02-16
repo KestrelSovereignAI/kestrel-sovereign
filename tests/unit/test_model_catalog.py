@@ -350,12 +350,14 @@ openai = ["gpt-5.1"]
         service = ModelCatalogService()
         service.load()
 
-        # Check models that are genuine overrides in model_catalog.toml
+        # Check models that are in model_catalog.toml context_limits
         assert service.get_context_limit("claude-opus-4-5-20251101") == 1000000
         assert service.get_context_limit("gemini-3-pro") == 2000000
         assert service.get_context_limit("gpt-4-32k") == 32768
-        # Models not in TOML return None (limits come from discovery cache instead)
-        assert service.get_context_limit("gpt-4") is None
+        assert service.get_context_limit("gpt-4") == 8192
+        assert service.get_context_limit("gpt-5-mini") == 128000
+        # Unknown models not in TOML return None
+        assert service.get_context_limit("totally-unknown-model-xyz") is None
 
 
 class TestTokenCounterCatalogIntegration:
@@ -387,3 +389,31 @@ class TestTokenCounterCatalogIntegration:
         counter = get_token_counter("completely-made-up-model-xyz")
         limit = counter.get_context_limit()
         assert limit == DEFAULT_CONTEXT_LIMIT
+
+    def test_featured_models_have_context_limits(self):
+        """Regression: all featured models must have context limits in catalog.
+
+        Prevents the bug where gpt-5-mini was featured but missing from
+        context_limits, causing model-switch to use DEFAULT_CONTEXT_LIMIT (32K)
+        and falsely reporting context overflow.
+        """
+        service = ModelCatalogService()
+        service.load()
+
+        # Every featured model should have an explicit entry in context_limits
+        featured_models = []
+        for provider, models in service._featured.items():
+            if provider == "openrouter":
+                continue  # OpenRouter limits come from API discovery
+            for model_id in models:
+                featured_models.append((provider, model_id))
+
+        missing = []
+        for provider, model_id in featured_models:
+            limit = service.get_context_limit(model_id)
+            if limit is None:
+                missing.append(f"{provider}/{model_id}")
+
+        assert not missing, (
+            f"Featured models missing from [context_limits] in model_catalog.toml: {missing}"
+        )
