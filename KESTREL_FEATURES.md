@@ -12,7 +12,7 @@
 | **Privacy Levels** | 5 orthogonal modes (Ephemeral / Isolated / Anonymous / Normal / Public) |
 | **Storage Backends** | SQLite (local) + PostgreSQL (cloud) with optional Fernet encryption |
 | **Docker Targets** | 10 images from ~500MB remote to full GPU with CUDA |
-| **Test Suite** | 1169+ unit tests, integration tests with real LLM calls, Playwright E2E |
+| **Test Suite** | 1200+ unit tests, integration tests with real LLM calls, Playwright E2E |
 | **Identity** | W3C DIDs with secp256k1 keypairs and portable identity packages |
 
 ---
@@ -328,7 +328,7 @@ Async storage with dual database backends, human-like memory consolidation, know
 ### Decentralized Storage
 
 - [storage/providers/base.py](kestrel_sovereign/storage/providers/base.py) — Abstract storage provider interface
-- [storage/providers/lighthouse_provider.py](kestrel_sovereign/storage/providers/lighthouse_provider.py) — Lighthouse decentralized storage (upload/download implemented; payment APIs pending)
+- [storage/providers/lighthouse_provider.py](kestrel_sovereign/storage/providers/lighthouse_provider.py) — Lighthouse decentralized storage with upload, download, payment, and balance APIs
 - [storage/sovereign_adapter.py](kestrel_sovereign/storage/sovereign_adapter.py) — Sovereignty-preserving storage with constitutional enforcement
 - [filecoin_adapter.py](kestrel_sovereign/filecoin_adapter.py) — Filecoin permanent storage integration
 
