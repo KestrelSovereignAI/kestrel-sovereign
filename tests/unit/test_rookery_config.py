@@ -77,7 +77,7 @@ class TestLocalAgentConfig:
             port=8801,
             autostart=True,
         )
-        assert config.data_dir == temp_agent_dir.resolve()
+        assert config.data_dir == temp_agent_dir
         assert config.port == 8801
         assert config.autostart is True
 
@@ -89,40 +89,46 @@ class TestLocalAgentConfig:
         )
         assert config.autostart is True
 
-    def test_missing_data_dir(self, tmp_path):
-        """Test validation fails for non-existent data_dir."""
-        nonexistent = tmp_path / "does_not_exist"
-        with pytest.raises(ValidationError) as exc_info:
-            LocalAgentConfig(
-                data_dir=nonexistent,
-                port=8801,
-            )
-        assert "does not exist" in str(exc_info.value)
+    def test_relative_path_preserved(self):
+        """Test that relative paths are preserved (not resolved to absolute)."""
+        config = LocalAgentConfig(
+            data_dir="agent_data/claw",
+            port=8801,
+        )
+        assert config.data_dir == Path("agent_data/claw")
+        assert not config.data_dir.is_absolute()
 
-    def test_missing_database(self, tmp_path):
-        """Test validation fails when kestrel_prime.db is missing."""
+    def test_validate_runtime_missing_dir(self, tmp_path):
+        """Test runtime validation catches non-existent data_dir."""
+        config = LocalAgentConfig(
+            data_dir=tmp_path / "does_not_exist",
+            port=8801,
+        )
+        errors = config.validate_runtime()
+        assert len(errors) == 1
+        assert "does not exist" in errors[0]
+
+    def test_validate_runtime_missing_database(self, tmp_path):
+        """Test runtime validation catches missing kestrel_prime.db."""
         agent_dir = tmp_path / "no_db"
         agent_dir.mkdir()
-        # No kestrel_prime.db created
 
-        with pytest.raises(ValidationError) as exc_info:
-            LocalAgentConfig(
-                data_dir=agent_dir,
-                port=8801,
-            )
-        assert "kestrel_prime.db" in str(exc_info.value)
+        config = LocalAgentConfig(
+            data_dir=agent_dir,
+            port=8801,
+        )
+        errors = config.validate_runtime()
+        assert len(errors) == 1
+        assert "kestrel_prime.db" in errors[0]
 
-    def test_data_dir_is_file(self, tmp_path):
-        """Test validation fails when data_dir is a file, not a directory."""
-        file_path = tmp_path / "file.txt"
-        file_path.touch()
-
-        with pytest.raises(ValidationError) as exc_info:
-            LocalAgentConfig(
-                data_dir=file_path,
-                port=8801,
-            )
-        assert "must be a directory" in str(exc_info.value)
+    def test_validate_runtime_valid(self, temp_agent_dir):
+        """Test runtime validation passes for valid agent dir."""
+        config = LocalAgentConfig(
+            data_dir=temp_agent_dir,
+            port=8801,
+        )
+        errors = config.validate_runtime()
+        assert len(errors) == 0
 
     def test_port_validation(self, temp_agent_dir):
         """Test port validation."""
@@ -414,12 +420,9 @@ class TestRookeryConfigLoad:
         agent.mkdir()
         (agent / "kestrel_prime.db").touch()
 
-        # Try to load non-existent config
+        # Try to load non-existent config — auto_discover scans relative to config parent
         config_path = tmp_path / "rookery.toml"
-
-        with pytest.MonkeyPatch.context() as mp:
-            mp.chdir(tmp_path)
-            config = RookeryConfig.load(config_path, auto_discover_fallback=True)
+        config = RookeryConfig.load(config_path, auto_discover_fallback=True)
 
         assert "discovered" in config.agents
 
