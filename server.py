@@ -58,7 +58,7 @@ async def verify_api_key(
     """
     if request.url.path == "/health":
         return True
-    if request.url.path.startswith("/static"):
+    if SERVE_UI and request.url.path.startswith("/static"):
         return True
 
     expected_key = get_api_key()
@@ -142,12 +142,13 @@ limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
-# Mount static files
-app.mount("/static", StaticFiles(directory="static"), name="static")
-# Also mount subdirectories at root level for relative path access from index.html
-app.mount("/js", StaticFiles(directory="static/js"), name="js")
-app.mount("/shared", StaticFiles(directory="static/shared"), name="shared")
-app.mount("/utils", StaticFiles(directory="static/utils"), name="utils")
+# Mount static files (disabled when running behind Kestrel Host)
+SERVE_UI = os.environ.get("KESTREL_SERVE_UI", "true").lower() == "true"
+if SERVE_UI:
+    app.mount("/static", StaticFiles(directory="static"), name="static")
+    app.mount("/js", StaticFiles(directory="static/js"), name="js")
+    app.mount("/shared", StaticFiles(directory="static/shared"), name="shared")
+    app.mount("/utils", StaticFiles(directory="static/utils"), name="utils")
 
 # Include routers
 from endpoints import (
@@ -181,9 +182,8 @@ app.include_router(saved_items_router)
 async def auth_middleware(request: Request, call_next):
     """Global authentication middleware."""
     public_paths = ["/health", "/", "/api/auth/key", "/api/models", "/api/model/current", "/api/identity", "/api/commands", "/favicon.ico", "/webhooks/stripe/crypto"]
-    # Allow static files and their subdirectories (js/, shared/, utils/)
     static_prefixes = ["/static", "/api/files/", "/js/", "/shared/", "/utils/"]
-    if request.url.path in public_paths or any(request.url.path.startswith(p) for p in static_prefixes):
+    if request.url.path in public_paths or (SERVE_UI and any(request.url.path.startswith(p) for p in static_prefixes)):
         response = await call_next(request)
         return response
 
@@ -217,15 +217,16 @@ async def auth_middleware(request: Request, call_next):
         return JSONResponse(content={"detail": "Authentication failed"}, status_code=401)
 
 
-@app.get("/", response_class=HTMLResponse)
-async def read_root(request: Request):
-    """Serve the main web UI."""
-    try:
-        with open("static/index.html") as f:
-            return HTMLResponse(content=f.read(), status_code=200)
-    except FileNotFoundError:
-        logger.error("static/index.html not found.")
-        raise HTTPException(status_code=404, detail="Index file not found.")
+if SERVE_UI:
+    @app.get("/", response_class=HTMLResponse)
+    async def read_root(request: Request):
+        """Serve the main web UI."""
+        try:
+            with open("static/index.html") as f:
+                return HTMLResponse(content=f.read(), status_code=200)
+        except FileNotFoundError:
+            logger.error("static/index.html not found.")
+            raise HTTPException(status_code=404, detail="Index file not found.")
 
 
 @app.get("/api/auth/key")
