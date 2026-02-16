@@ -120,7 +120,7 @@ full = [
 ]
 
 [project.scripts]
-kestrel = "kestrel_cli:main"
+kestrel = "kestrel_sovereign.cli:main"
 kestrel-github = "autoclaude.cli:main"
 
 [dependency-groups]
