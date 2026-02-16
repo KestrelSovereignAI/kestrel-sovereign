@@ -1,0 +1,104 @@
+# Kestrel Rookery Configuration Example
+#
+# The rookery is the registry of agents managed by a single Kestrel Host.
+# Each agent is self-contained in its own directory with its own DID,
+# database, keys, and configuration.
+#
+# Copy this file to "rookery.toml" and customize with your agents.
+
+# =============================================================================
+# Host Configuration
+# =============================================================================
+# The host manages all agents and provides a unified UI/API
+
+[host]
+# Port for the host UI/API (default: 8888)
+port = 8888
+
+# Interface to bind to
+# - "0.0.0.0" = all interfaces (accessible from network)
+# - "127.0.0.1" = localhost only (more secure)
+bind = "0.0.0.0"
+
+
+# =============================================================================
+# Local Agents
+# =============================================================================
+# Local agents are managed by this host. Each agent has:
+# - data_dir: Path to agent's directory (contains kestrel_prime.db)
+# - port: Unique port for this agent's API
+# - autostart: Whether to start when the host starts (default: true)
+
+[agents.claw]
+# Path to agent's data directory (relative or absolute)
+data_dir = "agent_data/claw"
+
+# Port for this agent's API (must be unique)
+port = 8801
+
+# Start this agent when the host starts (default: true)
+autostart = true
+
+[agents.testbot]
+data_dir = "agent_data/testbot"
+port = 8802
+
+# Manual start only (won't auto-start with host)
+autostart = false
+
+[agents.helper]
+data_dir = "agent_data/helper"
+port = 8803
+autostart = true
+
+
+# =============================================================================
+# Remote Agents
+# =============================================================================
+# Remote agents are NOT managed by this host - they run elsewhere.
+# Use this to federate with other Kestrel hosts.
+#
+# Remote agents only need a URL - the host will discover their capabilities
+# via the A2A (Agent-to-Agent) protocol.
+
+[agents.remote-agent]
+# URL of the remote agent's API endpoint
+url = "https://remote-kestrel.example.com"
+
+[agents.friend-agent]
+url = "https://friend-kestrel.example.com"
+
+
+# =============================================================================
+# Notes
+# =============================================================================
+#
+# 1. Auto-Discovery:
+#    If no rookery.toml exists, Kestrel will auto-discover agents by scanning
+#    agent_data/*/ subdirectories and assigning ports sequentially from 8801.
+#
+# 2. Port Conflicts:
+#    Each local agent must have a unique port. The config validator will
+#    detect and reject port conflicts.
+#
+# 3. Creating New Agents:
+#    Use the CLI to create new agents:
+#      uv run kestrel create --name MyAgent --output-dir agent_data/myagent
+#
+#    Then add them to this config:
+#      [agents.myagent]
+#      data_dir = "agent_data/myagent"
+#      port = 8804
+#      autostart = true
+#
+# 4. Remote Agents:
+#    Remote agents are included for future federation support.
+#    Implementation is local-only for now.
+#
+# 5. Data Directory Structure:
+#    Each agent directory must contain:
+#    - kestrel_prime.db (SQLite database)
+#    - agent-signing-key.pem (DID signing key)
+#    - agent-encryption-key.pem (DID encryption key)
+#    - kestrel.toml (agent-specific config, optional)
+#
