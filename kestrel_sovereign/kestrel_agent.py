@@ -1106,8 +1106,9 @@ Expected Duration: {expected_duration}
                         metadata={"tool_name": tool_name, "available": list(features_by_tool_name.keys())}
                     )
 
-                # Add tool result to messages
-                result_json = json.dumps(result)
+                # Add tool result to messages (serialize dataclasses, enums, etc.)
+                from kestrel_sovereign.features.base import _serialize_tool_result
+                result_json = json.dumps(_serialize_tool_result(result))
                 logging.info(f"[ORCHESTRATOR] Adding tool result to messages ({len(result_json)} chars): {result_json[:300]}...")
                 messages.append({
                     "role": "tool",

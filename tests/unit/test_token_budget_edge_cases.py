@@ -262,7 +262,7 @@ class TestBudgetSummary:
         summary = budget.get_summary()
 
         assert summary["model"] == "gpt-4"
-        assert summary["context_limit"] == 32768
+        assert summary["context_limit"] == 8192  # From model_catalog.toml
         assert summary["total_used"] == 300
 
         # Check allocations
