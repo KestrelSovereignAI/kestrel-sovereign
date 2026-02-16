@@ -146,29 +146,6 @@
             overflow: hidden;
         }
 
-        /* Sidebar - Legacy (deprecated, replaced by panes) */
-        .sidebar {
-            width: 280px;
-            background: var(--bg-secondary);
-            border-right: 1px solid var(--border-color);
-            display: flex;
-            flex-direction: column;
-            overflow-y: auto;
-        }
-
-        .sidebar-section {
-            padding: 1rem;
-            border-bottom: 1px solid var(--border-color);
-        }
-
-        .sidebar-section h3 {
-            margin: 0 0 0.75rem 0;
-            font-size: 0.75rem;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-            color: var(--text-tertiary);
-        }
-
         /* Pane Sidebars (Agents + Conversations) */
         .pane-sidebar {
             width: 280px;
@@ -353,6 +330,27 @@
 
         .conversation-item.active .conversation-time {
             color: rgba(255, 255, 255, 0.8);
+        }
+
+        /* Pane Resize Handles */
+        .resize-handle {
+            width: 4px;
+            cursor: col-resize;
+            background: transparent;
+            position: absolute;
+            right: 0;
+            top: 0;
+            bottom: 0;
+            z-index: 10;
+            transition: background 0.15s;
+        }
+
+        .resize-handle:hover {
+            background: var(--accent-color);
+        }
+
+        .pane-sidebar {
+            position: relative;
         }
 
         /* Content panels */
@@ -847,6 +845,7 @@
             <div id="agents-list" class="pane-content">
                 <div class="loading">Loading agents...</div>
             </div>
+            <div id="resize-agents" class="resize-handle"></div>
         </aside>
 
         <!-- Conversations Pane -->
@@ -859,6 +858,7 @@
             <div id="conversations-list" class="pane-content">
                 <p style="color: var(--text-secondary); padding: 1rem; text-align: center;">Select an agent to view conversations</p>
             </div>
+            <div id="resize-conversations" class="resize-handle"></div>
         </aside>
 
         <!-- Identity Panel -->
