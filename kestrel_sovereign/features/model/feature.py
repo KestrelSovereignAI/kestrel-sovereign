@@ -236,9 +236,9 @@ class ModelAgent(Feature):
             new_limit = new_counter.get_context_limit()
             new_budget = new_limit - 1024  # Reserve for response
 
-            # Count current history tokens
+            # Count current conversation tokens (limit=50 matches what chat actually sends)
             if hasattr(self, 'agent') and self.agent and hasattr(self.agent, 'storage'):
-                history = await self.agent.storage.get_conversation_history(limit=10000)
+                history = await self.agent.storage.get_conversation_history(limit=50)
                 total_tokens = sum(new_counter.count(m.get("content", "")) for m in history)
 
                 if total_tokens > new_budget:
