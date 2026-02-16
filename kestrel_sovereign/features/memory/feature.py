@@ -42,8 +42,9 @@ class MemoryFeature(Feature):
     async def initialize(self):
         """Initialize the memory feature with storage references."""
         self.storage = self.agent.storage
-        self.consolidator = getattr(self.agent, 'memory_consolidator', None)
-        # Memory retriever will be lazily loaded since memory_system is initialized after features
+        # Both consolidator and retriever are lazily loaded since they're
+        # initialized on the agent after feature registration
+        self._consolidator = None
         self._memory_retriever = None
         # Get agent_id through storage hierarchy
         self.agent_id = (
@@ -51,6 +52,13 @@ class MemoryFeature(Feature):
             getattr(getattr(self.storage, '_storage', None), 'agent_id', '')
         )
         logger.info(f"MemoryFeature initialized for agent: {self.agent_id[:30]}...")
+
+    @property
+    def consolidator(self):
+        """Lazy-load consolidator from agent (initialized after features)."""
+        if self._consolidator is None:
+            self._consolidator = getattr(self.agent, 'memory_consolidator', None)
+        return self._consolidator
 
     @property
     def memory_retriever(self):

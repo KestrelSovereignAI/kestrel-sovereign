@@ -408,6 +408,10 @@ class KestrelAgent(ConstitutionMixin, StreamingMixin, BackupMixin, SleepMixin):
             )
             logging.info(f"Registered A2A agent '{agent_card.name}' with {len(agent_card.skills)} skills")
 
+            # Wire task_manager into features that need it
+            if hasattr(feature, 'set_task_manager'):
+                feature.set_task_manager(self.task_manager)
+
     # Solvency State
         self._current_model_preference: Optional[str] = None
 
