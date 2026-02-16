@@ -314,3 +314,62 @@ class TestVertexAIAdapterListModels:
         if models:
             assert all(isinstance(m, ModelInfo) for m in models)
             assert all(m.provider == "vertex_ai" for m in models)
+
+
+class TestModelInfoSerialization:
+    """Regression: ModelInfo must be JSON-serializable for tool results.
+
+    The subagent tool loop calls json.dumps(result) on tool return values.
+    list_models returns List[ModelInfo] which failed with
+    'ModelInfo is not JSON serializable' before _serialize_tool_result was added.
+    """
+
+    def test_serialize_model_info_list(self):
+        """Test that a list of ModelInfo can be serialized via _serialize_tool_result."""
+        import json
+        from kestrel_sovereign.features.base import _serialize_tool_result
+
+        models = [
+            ModelInfo(id="gpt-5-mini", provider="openai", display_name="GPT-5 Mini"),
+            ModelInfo(
+                id="claude-sonnet-4-5-20250929", provider="anthropic",
+                display_name="Claude Sonnet 4.5", category=ModelCategory.EMBEDDING,
+                is_featured=True, supports_vision=True, context_limit=200000,
+            ),
+        ]
+
+        serialized = _serialize_tool_result(models)
+        # Must not raise
+        result_json = json.dumps(serialized)
+        parsed = json.loads(result_json)
+
+        assert len(parsed) == 2
+        assert parsed[0]["id"] == "gpt-5-mini"
+        assert parsed[0]["category"] == "chat"
+        assert parsed[1]["is_featured"] is True
+        assert parsed[1]["category"] == "embedding"
+        assert parsed[1]["context_limit"] == 200000
+
+    def test_serialize_nested_dict_with_model_info(self):
+        """Test serialization of dict containing ModelInfo values."""
+        import json
+        from kestrel_sovereign.features.base import _serialize_tool_result
+
+        result = {
+            "success": True,
+            "model": ModelInfo(id="gpt-5", provider="openai", display_name="GPT-5"),
+        }
+
+        serialized = _serialize_tool_result(result)
+        result_json = json.dumps(serialized)
+        parsed = json.loads(result_json)
+
+        assert parsed["success"] is True
+        assert parsed["model"]["id"] == "gpt-5"
+
+    def test_serialize_plain_dict_passthrough(self):
+        """Test that plain dicts pass through unchanged."""
+        from kestrel_sovereign.features.base import _serialize_tool_result
+
+        result = {"success": True, "message": "done", "count": 42}
+        assert _serialize_tool_result(result) == result

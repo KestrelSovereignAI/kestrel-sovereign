@@ -16,6 +16,24 @@ logger = logging.getLogger(__name__)
 MAX_TOOL_ITERATIONS = int(os.environ.get("KESTREL_MAX_TOOL_ITERATIONS", "50"))
 
 
+def _serialize_tool_result(result: Any) -> Any:
+    """Convert a tool result to a JSON-serializable format.
+
+    Handles dataclasses with to_dict(), lists, enums, and nested structures.
+    """
+    if result is None or isinstance(result, (str, int, float, bool)):
+        return result
+    if isinstance(result, dict):
+        return {k: _serialize_tool_result(v) for k, v in result.items()}
+    if isinstance(result, (list, tuple)):
+        return [_serialize_tool_result(item) for item in result]
+    if hasattr(result, 'to_dict'):
+        return result.to_dict()
+    if hasattr(result, 'value'):  # Enum
+        return result.value
+    return str(result)
+
+
 @runtime_checkable
 class TaskHandler(Protocol):
     """Protocol for A2A task handling. Features implement this."""
@@ -489,6 +507,7 @@ CRITICAL: You have ONE task. Execute it now. Do not wait for more input."""
                 if tool:
                     try:
                         result = await tool.execute(**args)
+                        result = _serialize_tool_result(result)
                         # Debug: Log tool result
                         result_str = json.dumps(result) if isinstance(result, dict) else str(result)
                         logger.info(f"[SUBAGENT-TOOL] {tool_name} result ({len(result_str)} chars): {result_str[:300]}...")
