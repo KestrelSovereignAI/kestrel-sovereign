@@ -94,7 +94,8 @@ class StreamingMixin:
             effective_model = await self.check_solvency()
 
         # Build feature tools for the orchestrator (A2A pattern)
-        feature_tools = self._build_feature_tools()
+        # Includes feature dispatch tools + any direct tools from explored features
+        feature_tools = self._build_all_tools()
 
         # Log tool availability
         tool_names = [t['function']['name'] for t in feature_tools] if feature_tools else []
