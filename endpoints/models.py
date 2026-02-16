@@ -26,9 +26,13 @@ async def get_agents(request: Request):
     try:
         agent = request.app.state.agent
         agent_card = await agent.get_agent_card()
+        card_dict = agent_card.model_dump()
+        # Add id (DID) and status for UI — not part of A2A card spec
+        card_dict["id"] = agent.agent_id
+        card_dict["status"] = "online"
 
         # Return as array (single-item for now, multiple agents in future)
-        return {"agents": [agent_card.model_dump()]}
+        return {"agents": [card_dict]}
     except Exception as e:
         logger.error(f"Error getting agents: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Error retrieving agents.")

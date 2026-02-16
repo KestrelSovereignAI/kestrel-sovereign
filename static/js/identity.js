@@ -4,7 +4,7 @@
  */
 
 import API from './api.js';
-import { state, PRIVACY_MODES, Toast, formatBytes } from './ui.js';
+import { state, PRIVACY_MODES, Toast } from './ui.js';
 
 // ============================================================================
 // Agent Selection (Multi-Agent Support)
@@ -302,6 +302,16 @@ window.showPrivacySelector = function() {
 };
 
 // ============================================================================
+// Utilities
+// ============================================================================
+
+function escapeHtml(str) {
+    const div = document.createElement('div');
+    div.textContent = str;
+    return div.innerHTML;
+}
+
+// ============================================================================
 // Agents Pane (Rookery)
 // ============================================================================
 
@@ -318,25 +328,30 @@ export async function loadAgents() {
             return;
         }
 
-        container.innerHTML = agents.map(agent => `
-            <div class="agent-item ${selectedAgentId === agent.url ? 'selected' : ''}"
-                 data-agent-id="${agent.url}"
-                 onclick="selectAgent('${agent.url}')">
-                <span class="agent-status-dot online"></span>
+        container.innerHTML = '';
+        for (const agent of agents) {
+            const item = document.createElement('div');
+            item.className = `agent-item ${selectedAgentId === agent.id ? 'selected' : ''}`;
+            item.dataset.agentId = agent.id;
+            item.addEventListener('click', () => window.selectAgent(agent.id));
+
+            item.innerHTML = `
+                <span class="agent-status-dot ${agent.status === 'offline' ? 'offline' : 'online'}"></span>
                 <div class="agent-info">
-                    <div class="agent-name">${agent.name || 'Unnamed Agent'}</div>
-                    <div class="agent-description">${agent.description || 'No description'}</div>
+                    <div class="agent-name">${escapeHtml(agent.name || 'Unnamed Agent')}</div>
+                    <div class="agent-description">${escapeHtml(agent.description || 'No description')}</div>
                 </div>
-            </div>
-        `).join('');
+            `;
+            container.appendChild(item);
+        }
 
         // Auto-select first agent if none selected
         if (!selectedAgentId && agents.length > 0) {
-            window.selectAgent(agents[0].url);
+            window.selectAgent(agents[0].id);
         }
     } catch (e) {
         const container = document.getElementById('agents-list');
-        container.innerHTML = `<p style="color: var(--error); padding: 1rem;">Failed to load agents: ${e.message}</p>`;
+        container.innerHTML = '<p style="color: var(--error); padding: 1rem;">Failed to load agents</p>';
     }
 }
 
@@ -345,11 +360,7 @@ window.selectAgent = async function(agentId) {
 
     // Update selection UI
     document.querySelectorAll('.agent-item').forEach(item => {
-        if (item.dataset.agentId === agentId) {
-            item.classList.add('selected');
-        } else {
-            item.classList.remove('selected');
-        }
+        item.classList.toggle('selected', item.dataset.agentId === agentId);
     });
 
     // Show conversations pane
@@ -366,7 +377,8 @@ window.selectAgent = async function(agentId) {
 
 let activeConversationId = null;
 
-export async function loadConversations(agentId) {
+export async function loadConversations(_agentId) {
+    // TODO: pass _agentId to API.getConversations() once multi-agent routing is wired
     try {
         const data = await API.getConversations();
         const conversations = data.conversations || [];
@@ -377,21 +389,31 @@ export async function loadConversations(agentId) {
             return;
         }
 
-        container.innerHTML = conversations.map(conv => {
+        container.innerHTML = '';
+        for (const conv of conversations) {
             const date = new Date(conv.started_at);
             const timeStr = date.toLocaleString();
-            return `
-                <div class="conversation-item ${activeConversationId === conv.session_id ? 'active' : ''}"
-                     data-session-id="${conv.session_id}"
-                     onclick="loadConversation('${conv.session_id}')">
-                    <div class="conversation-preview">${conv.preview || 'New conversation'}</div>
-                    <div class="conversation-time">${timeStr}</div>
-                </div>
-            `;
-        }).join('');
+
+            const item = document.createElement('div');
+            item.className = `conversation-item ${activeConversationId === conv.session_id ? 'active' : ''}`;
+            item.dataset.sessionId = conv.session_id;
+            item.addEventListener('click', () => window.loadConversation(conv.session_id));
+
+            const preview = document.createElement('div');
+            preview.className = 'conversation-preview';
+            preview.textContent = conv.preview || 'New conversation';
+
+            const time = document.createElement('div');
+            time.className = 'conversation-time';
+            time.textContent = timeStr;
+
+            item.appendChild(preview);
+            item.appendChild(time);
+            container.appendChild(item);
+        }
     } catch (e) {
         const container = document.getElementById('conversations-list');
-        container.innerHTML = `<p style="color: var(--error); padding: 1rem;">Failed to load conversations: ${e.message}</p>`;
+        container.innerHTML = '<p style="color: var(--error); padding: 1rem;">Failed to load conversations</p>';
     }
 }
 
@@ -400,11 +422,7 @@ window.loadConversation = async function(sessionId) {
 
     // Update selection UI
     document.querySelectorAll('.conversation-item').forEach(item => {
-        if (item.dataset.sessionId === sessionId) {
-            item.classList.add('active');
-        } else {
-            item.classList.remove('active');
-        }
+        item.classList.toggle('active', item.dataset.sessionId === sessionId);
     });
 
     // Load conversation messages into chat panel
@@ -412,9 +430,10 @@ window.loadConversation = async function(sessionId) {
         const data = await API.getConversation(sessionId);
         const messages = data.messages || [];
 
-        // Clear chat container and load messages
         const chatContainer = document.getElementById('chat-container');
         chatContainer.innerHTML = '';
+
+        const renderMd = window.SharedMarkdown?.renderMarkdown;
 
         for (const msg of messages) {
             const messageDiv = document.createElement('div');
@@ -422,24 +441,28 @@ window.loadConversation = async function(sessionId) {
 
             const contentDiv = document.createElement('div');
             contentDiv.className = 'message-content';
-            contentDiv.innerHTML = msg.content; // TODO: Apply markdown rendering
+
+            if (msg.role === 'assistant' && renderMd) {
+                contentDiv.innerHTML = renderMd(msg.content);
+            } else {
+                contentDiv.textContent = msg.content;
+            }
 
             messageDiv.appendChild(contentDiv);
             chatContainer.appendChild(messageDiv);
         }
 
-        // Scroll to bottom
         chatContainer.scrollTop = chatContainer.scrollHeight;
 
         // Switch to chat panel
-        document.querySelector('[data-panel="chat"]').click();
+        document.querySelector('[data-panel="chat"]')?.click();
     } catch (e) {
         console.error('Failed to load conversation:', e);
     }
 };
 
 // ============================================================================
-// Pane Collapse/Expand
+// Pane Collapse/Expand + Resize
 // ============================================================================
 
 window.togglePane = function(paneId) {
@@ -449,7 +472,38 @@ window.togglePane = function(paneId) {
     }
 };
 
-// Setup collapse buttons
+function initPaneResize(handleId, paneId) {
+    const handle = document.getElementById(handleId);
+    const pane = document.getElementById(paneId);
+    if (!handle || !pane) return;
+
+    let startX, startWidth;
+
+    handle.addEventListener('mousedown', (e) => {
+        startX = e.clientX;
+        startWidth = pane.offsetWidth;
+        document.body.style.cursor = 'col-resize';
+        document.body.style.userSelect = 'none';
+
+        function onMouseMove(e) {
+            const diff = e.clientX - startX;
+            const newWidth = Math.max(200, Math.min(500, startWidth + diff));
+            pane.style.width = newWidth + 'px';
+        }
+
+        function onMouseUp() {
+            document.removeEventListener('mousemove', onMouseMove);
+            document.removeEventListener('mouseup', onMouseUp);
+            document.body.style.cursor = '';
+            document.body.style.userSelect = '';
+        }
+
+        document.addEventListener('mousemove', onMouseMove);
+        document.addEventListener('mouseup', onMouseUp);
+    });
+}
+
+// Setup collapse buttons and resize handles
 document.addEventListener('DOMContentLoaded', () => {
     const collapseAgentsBtn = document.getElementById('collapse-agents-btn');
     if (collapseAgentsBtn) {
@@ -464,7 +518,6 @@ document.addEventListener('DOMContentLoaded', () => {
     const newConversationSidebarBtn = document.getElementById('new-conversation-sidebar-btn');
     if (newConversationSidebarBtn) {
         newConversationSidebarBtn.addEventListener('click', async () => {
-            // Create new conversation and reload list
             try {
                 await API.newConversation();
                 if (selectedAgentId) {
@@ -475,4 +528,8 @@ document.addEventListener('DOMContentLoaded', () => {
             }
         });
     }
+
+    // Initialize resize handles
+    initPaneResize('resize-agents', 'agents-pane');
+    initPaneResize('resize-conversations', 'conversations-pane');
 });
