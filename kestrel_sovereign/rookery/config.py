@@ -58,25 +58,32 @@ class LocalAgentConfig(BaseModel):
 
     @field_validator("data_dir", mode="before")
     @classmethod
-    def resolve_data_dir(cls, v: Union[str, Path]) -> Path:
-        """Convert string to Path and resolve relative paths."""
-        return Path(v).resolve()
+    def coerce_data_dir(cls, v: Union[str, Path]) -> Path:
+        """Convert string to Path (preserves relative paths)."""
+        return Path(v)
 
-    @field_validator("data_dir")
-    @classmethod
-    def validate_data_dir(cls, v: Path) -> Path:
-        """Validate that data_dir exists and contains kestrel_prime.db."""
-        if not v.exists():
-            raise ValueError(f"Agent data directory does not exist: {v}")
-        if not v.is_dir():
-            raise ValueError(f"Agent data_dir must be a directory: {v}")
-        db_path = v / "kestrel_prime.db"
-        if not db_path.exists():
-            raise ValueError(
-                f"Agent data directory missing kestrel_prime.db: {v}\n"
-                f"Create an agent first with: uv run kestrel create --name AgentName --output-dir {v}"
+    def validate_runtime(self) -> list[str]:
+        """Validate that data_dir exists and contains a database.
+
+        Called by the process manager before starting an agent,
+        NOT at config parse time (so you can pre-configure agents
+        before running inception).
+
+        Returns:
+            List of error messages (empty if valid).
+        """
+        errors = []
+        resolved = self.data_dir.resolve()
+        if not resolved.exists():
+            errors.append(f"Agent data directory does not exist: {resolved}")
+        elif not resolved.is_dir():
+            errors.append(f"Agent data_dir must be a directory: {resolved}")
+        elif not (resolved / "kestrel_prime.db").exists():
+            errors.append(
+                f"Agent data directory missing kestrel_prime.db: {resolved}\n"
+                f"Create an agent first with: kestrel create {self.data_dir.name}"
             )
-        return v
+        return errors
 
 
 class RemoteAgentConfig(BaseModel):
@@ -267,8 +274,10 @@ class RookeryConfig(BaseModel):
             return cls.from_file(path)
 
         if auto_discover_fallback:
-            logger.info(f"No rookery config found at {path}, auto-discovering agents...")
-            return cls.auto_discover()
+            # Scan for agents relative to the config file's parent directory
+            base_dir = path.parent / AGENT_DATA_DIR
+            logger.info(f"No rookery config found at {path}, auto-discovering agents in {base_dir}...")
+            return cls.auto_discover(base_dir)
 
         # No config and no auto-discovery
         logger.warning(f"No rookery config found at {path}")
