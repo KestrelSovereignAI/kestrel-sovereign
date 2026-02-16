@@ -1,6 +1,6 @@
 # Dynamic Tool Loading
 
-**Status:** Proposed
+**Status:** Implemented
 **Author:** Design review
 **Date:** 2026-02-16
 **Affected files:** `kestrel_sovereign/kestrel_agent.py`, `kestrel_sovereign/features/base.py`, `kestrel_sovereign/prompts/system_prompt.md`
