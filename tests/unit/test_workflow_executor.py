@@ -351,3 +351,41 @@ class TestRunWorkflow:
         assert result["results"][0]["skill"] == "list_models"
         assert result["results"][1]["feature"] == "wallet_feature"
         assert result["results"][1]["skill"] == "check_balance"
+
+
+class TestListAvailableSkills:
+    """Tests for TaskFeature.list_available_skills."""
+
+    @pytest.mark.asyncio
+    async def test_lists_all_features(self, task_feature):
+        """Returns all registered features with their skills."""
+        result = await task_feature.list_available_skills()
+
+        assert result["success"] is True
+        assert result["feature_count"] == 3
+        assert "model_agent" in result["features"]
+        assert "memory_feature" in result["features"]
+        assert "wallet_feature" in result["features"]
+
+    @pytest.mark.asyncio
+    async def test_lists_skills_per_feature(self, task_feature):
+        """Each feature includes its skill list with descriptions."""
+        result = await task_feature.list_available_skills()
+
+        model = result["features"]["model_agent"]
+        skill_names = [s["skill"] for s in model["skills"]]
+        assert "list_models" in skill_names
+        assert "get_current_model" in skill_names
+
+        # Each skill has a description
+        for skill in model["skills"]:
+            assert "description" in skill
+            assert skill["description"] is not None
+
+    @pytest.mark.asyncio
+    async def test_no_task_manager(self):
+        """Without task_manager, returns error."""
+        feature = TaskFeature(agent=None)
+        result = await feature.list_available_skills()
+        assert result["success"] is False
+        assert "not available" in result["error"]

@@ -60,6 +60,49 @@ class TaskFeature(Feature):
         logger.info("TaskFeature connected to TaskManager")
 
     @tool(
+        name="list_available_skills",
+        description=(
+            "List all available features and their skills that can be used with "
+            "run_workflow. Returns feature names, skill names, and descriptions. "
+            "Call this first to discover what skills are available before building "
+            "a workflow plan."
+        ),
+        category=ToolCategory.UTILITY,
+        command_prefix="!list-skills"
+    )
+    async def list_available_skills(self) -> Dict[str, Any]:
+        """
+        List all registered features and their individual skills.
+
+        Returns:
+            Dict with features and their skills for use with run_workflow.
+        """
+        if not self.task_manager:
+            return {
+                "success": False,
+                "error": "Task manager not available"
+            }
+
+        features = {}
+        for agent_id, (agent_card, _handler) in self.task_manager._agents.items():
+            skills = []
+            for skill in agent_card.skills:
+                skills.append({
+                    "skill": skill.id,
+                    "description": skill.description,
+                })
+            features[agent_id] = {
+                "description": agent_card.description,
+                "skills": skills,
+            }
+
+        return {
+            "success": True,
+            "feature_count": len(features),
+            "features": features,
+        }
+
+    @tool(
         name="run_workflow",
         description=(
             "Execute a multi-step plan across features. Each step runs a specific "
