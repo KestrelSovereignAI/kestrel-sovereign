@@ -21,11 +21,9 @@ import os
 import secrets
 import logging
 from pathlib import Path
-from typing import Optional
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request, Security, status
-from fastapi.security import APIKeyHeader, HTTPBearer, HTTPAuthorizationCredentials
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, JSONResponse
 from contextlib import asynccontextmanager
@@ -48,8 +46,6 @@ logger = logging.getLogger(__name__)
 
 # Security Configuration
 API_KEY_NAME = "X-API-Key"
-api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
-security = HTTPBearer(auto_error=False)
 
 
 def get_api_key() -> str:
@@ -127,19 +123,19 @@ async def auth_middleware(request: Request, call_next):
 
     # Check X-API-Key header
     header_key = request.headers.get(API_KEY_NAME)
-    if header_key and header_key == expected_key:
+    if header_key and secrets.compare_digest(header_key, expected_key):
         return await call_next(request)
 
     # Check Bearer token
     auth_header = request.headers.get("Authorization")
     if auth_header and auth_header.startswith("Bearer "):
         token = auth_header[7:]
-        if token == expected_key:
+        if secrets.compare_digest(token, expected_key):
             return await call_next(request)
 
     # Check query parameter (for SSE endpoints)
     api_key_query = request.query_params.get("api_key")
-    if api_key_query and api_key_query == expected_key:
+    if api_key_query and secrets.compare_digest(api_key_query, expected_key):
         return await call_next(request)
 
     return JSONResponse(
@@ -279,18 +275,18 @@ async def list_agents(request: Request):
 async def proxy_to_agent(request: Request, agent_id: str, path: str):
     """Proxy requests to the correct agent by alias.
 
-    Route pattern: /api/agents/{agent_id}/conversations → agent:{port}/api/conversations
+    Path is forwarded as-is to the agent. The caller includes the full path:
+        /api/agents/claw/api/conversations  → agent:8801/api/conversations
+        /api/agents/claw/v1/chat/completions → agent:8801/v1/chat/completions
+        /api/agents/claw/health             → agent:8801/health
     """
     config: RookeryConfig = request.app.state.rookery_config
     client: httpx.AsyncClient = request.app.state.http_client
 
-    # Rewrite path: the agent expects /api/... paths
-    agent_path = f"api/{path}" if not path.startswith("api/") else path
-
     return await proxy_request_streaming(
         request=request,
         agent_id=agent_id,
-        path=agent_path,
+        path=path,
         config=config,
         client=client,
     )

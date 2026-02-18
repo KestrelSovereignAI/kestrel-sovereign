@@ -181,20 +181,39 @@ def _clear_pid(pid_file: Path) -> None:
 
 def _load_env(project_dir: Path) -> dict:
     """Load .env file into an env dict copy."""
+    from dotenv import dotenv_values
+
     env = os.environ.copy()
     env_file = project_dir / ".env"
     if env_file.exists():
-        for line in env_file.read_text().splitlines():
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                key, _, value = line.partition("=")
-                env[key.strip()] = value.strip().strip('"').strip("'")
+        env.update({k: v for k, v in dotenv_values(env_file).items() if v is not None})
     return env
 
 
 # ---------------------------------------------------------------------------
-# Start / stop a single agent process
+# Start / stop processes
 # ---------------------------------------------------------------------------
+
+def _spawn_background_server(
+    cmd: list[str],
+    cwd: Path,
+    env: dict,
+    log_file: Path,
+    pid_file: Path,
+) -> int:
+    """Spawn a background uvicorn process. Returns the PID."""
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    with open(log_file, "a") as log:
+        kwargs = dict(cwd=cwd, env=env, stdout=log, stderr=subprocess.STDOUT)
+        if sys.platform == "win32":
+            kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            kwargs["start_new_session"] = True
+        process = subprocess.Popen(cmd, **kwargs)
+
+    _write_pid(pid_file, process.pid)
+    return process.pid
+
 
 def _start_agent_process(
     name: str,
@@ -227,31 +246,9 @@ def _start_agent_process(
     # Don't serve UI from individual agents when managed by host
     env["KESTREL_SERVE_UI"] = "false"
 
-    # Start the uvicorn process
-    log_file.parent.mkdir(parents=True, exist_ok=True)
-    with open(log_file, "a") as log:
-        if sys.platform == "win32":
-            process = subprocess.Popen(
-                [sys.executable, "-m", "uvicorn", "server:app",
-                 "--host", host_bind, "--port", str(port)],
-                cwd=project_dir,
-                env=env,
-                stdout=log,
-                stderr=subprocess.STDOUT,
-                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
-            )
-        else:
-            process = subprocess.Popen(
-                [sys.executable, "-m", "uvicorn", "server:app",
-                 "--host", host_bind, "--port", str(port)],
-                cwd=project_dir,
-                env=env,
-                stdout=log,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
-            )
-
-    _write_pid(pid_file, process.pid)
+    cmd = [sys.executable, "-m", "uvicorn", "server:app",
+           "--host", host_bind, "--port", str(port)]
+    _spawn_background_server(cmd, project_dir, env, log_file, pid_file)
     return 0
 
 
@@ -307,7 +304,7 @@ def cmd_start(args) -> int:
         resolved_dir = (project_dir / agent_cfg.data_dir).resolve()
 
         # Runtime validation
-        errors = agent_cfg.validate_runtime()
+        errors = agent_cfg.validate_runtime(base_dir=project_dir)
         if errors:
             for err in errors:
                 print(f"   {err}")
@@ -360,52 +357,28 @@ def cmd_start(args) -> int:
 
         env = _load_env(project_dir)
         env["PORT"] = str(rookery.host.port)
-        # The host serves the UI
-        env["KESTREL_SERVE_UI"] = "true"
-        # Use the first agent's data dir if available for the host
-        if autostart:
-            first_agent = next(iter(autostart.values()))
-            first_dir = (project_dir / first_agent.data_dir).resolve()
-            env["KESTREL_DB_PATH"] = str(first_dir)
+        # Host is NOT an agent — no DB path, no KESTREL_SERVE_UI
+        # (host.py serves static files directly)
 
         log_file = _host_log_file()
-        log_file.parent.mkdir(parents=True, exist_ok=True)
+        cmd = [sys.executable, "-m", "uvicorn", "host:app",
+               "--host", rookery.host.bind, "--port", str(rookery.host.port)]
 
         print(f"   Starting host on :{rookery.host.port}...", end="", flush=True)
-        with open(log_file, "a") as log:
-            if sys.platform == "win32":
-                process = subprocess.Popen(
-                    [sys.executable, "-m", "uvicorn", "server:app",
-                     "--host", rookery.host.bind, "--port", str(rookery.host.port)],
-                    cwd=project_dir,
-                    env=env,
-                    stdout=log,
-                    stderr=subprocess.STDOUT,
-                    creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
-                )
-            else:
-                process = subprocess.Popen(
-                    [sys.executable, "-m", "uvicorn", "server:app",
-                     "--host", rookery.host.bind, "--port", str(rookery.host.port)],
-                    cwd=project_dir,
-                    env=env,
-                    stdout=log,
-                    stderr=subprocess.STDOUT,
-                    start_new_session=True,
-                )
-        _write_pid(host_pid_file, process.pid)
+        _spawn_background_server(cmd, project_dir, env, log_file, host_pid_file)
 
         if _wait_for_health(rookery.host.port, timeout=30):
             print("          \u2705")
         else:
             print("          \u274c")
             print(f"   Check log: {log_file}")
+            return 1
 
     # Start autostart agents
     for name, cfg in autostart.items():
         resolved_dir = (project_dir / cfg.data_dir).resolve()
 
-        errors = cfg.validate_runtime()
+        errors = cfg.validate_runtime(base_dir=project_dir)
         if errors:
             print(f"   {name}: skipping ({errors[0]})")
             continue

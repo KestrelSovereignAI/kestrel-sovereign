@@ -7,7 +7,6 @@ Each agent has its own directory, DID, database, and configuration.
 
 from .config import RookeryConfig, HostConfig, LocalAgentConfig, RemoteAgentConfig
 from .proxy import (
-    proxy_request,
     proxy_request_streaming,
     resolve_agent,
     get_agent_base_url,
@@ -19,7 +18,6 @@ __all__ = [
     "HostConfig",
     "LocalAgentConfig",
     "RemoteAgentConfig",
-    "proxy_request",
     "proxy_request_streaming",
     "resolve_agent",
     "get_agent_base_url",
