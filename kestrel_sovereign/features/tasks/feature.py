@@ -1,17 +1,20 @@
 """
-Task Monitoring Feature - Agent access to A2A task status.
+Task Feature - Execute workflows and monitor background tasks.
 
 This feature allows the agent to:
-- Check status of background tasks it submitted
+- Execute multi-step workflows across features in a single tool call
+- Check status of background tasks
 - List pending/running/completed tasks
 - Get artifacts from completed tasks
 - Cancel tasks
 
 This bridges the gap between the A2A task system (HTTP endpoints)
-and the agent's tool system.
+and the agent's tool system, and provides workflow execution for
+multi-step operations.
 """
 
 import logging
+import time
 from typing import Dict, Any, Optional, List
 
 from kestrel_sovereign.features.base import Feature, tool
@@ -22,13 +25,12 @@ logger = logging.getLogger(__name__)
 
 class TaskFeature(Feature):
     """
-    Feature for monitoring and managing A2A background tasks.
+    Feature for executing workflows and managing A2A background tasks.
 
-    Gives the agent visibility into async operations like:
-    - Selfie generation
-    - LoRA training
-    - Image processing
-    - Any other A2A task
+    Gives the agent the ability to:
+    - Execute multi-step plans across features
+    - Monitor async operations (selfie generation, LoRA training, etc.)
+    - Query task status and results
     """
 
     def __init__(self, agent=None):
@@ -43,8 +45,8 @@ class TaskFeature(Feature):
     @property
     def tool_description(self) -> str:
         return (
-            "Monitor background tasks - check status of async operations, "
-            "list pending tasks, get results from completed tasks"
+            "Execute multi-step workflows and monitor background tasks - "
+            "run plans across features, check task status, get results"
         )
 
     async def initialize(self):
@@ -56,6 +58,132 @@ class TaskFeature(Feature):
         """Set the A2A task manager for querying tasks."""
         self.task_manager = task_manager
         logger.info("TaskFeature connected to TaskManager")
+
+    @tool(
+        name="run_workflow",
+        description=(
+            "Execute a multi-step plan across features. Each step runs a specific "
+            "feature skill with arguments. All steps execute sequentially and results "
+            "are returned together. Use this instead of making individual subagent calls "
+            "when you need to gather information from multiple features. "
+            "Steps format: [{\"feature\": \"feature_name\", \"skill\": \"skill_name\", \"args\": {}}]. "
+            "Feature names match the tool names shown in your available tools (e.g., model_agent, "
+            "memory_feature, wallet_feature). Skill names are the individual tool methods within "
+            "each feature (e.g., list_models, memory_status, check_balance)."
+        ),
+        category=ToolCategory.UTILITY,
+        command_prefix="!run-workflow"
+    )
+    async def run_workflow(self, steps: list) -> Dict[str, Any]:
+        """
+        Execute a multi-step workflow plan.
+
+        Args:
+            steps: List of workflow steps. Each step is an object with 'feature' (the feature's tool_name like 'model_agent'), 'skill' (the tool method name like 'list_models'), and optional 'args' (dict of arguments to pass).
+
+        Returns:
+            Consolidated results from all steps with per-step status.
+        """
+        if not self.task_manager:
+            return {
+                "success": False,
+                "error": "Task manager not available"
+            }
+
+        if not steps or not isinstance(steps, list):
+            return {
+                "success": False,
+                "error": "Steps must be a non-empty list of {feature, skill, args} objects"
+            }
+
+        workflow_start = time.time()
+        results = []
+
+        for i, step in enumerate(steps):
+            if not isinstance(step, dict):
+                results.append({
+                    "step": i,
+                    "status": "failed",
+                    "error": f"Step must be an object, got {type(step).__name__}"
+                })
+                continue
+
+            feature_name = step.get("feature")
+            skill_name = step.get("skill")
+            args = step.get("args", {})
+
+            if not feature_name or not skill_name:
+                results.append({
+                    "step": i,
+                    "status": "failed",
+                    "error": "Step requires 'feature' and 'skill' fields"
+                })
+                continue
+
+            step_start = time.time()
+            try:
+                task = await self.task_manager.execute_skill(
+                    agent_id=feature_name,
+                    skill_id=skill_name,
+                    args=args if isinstance(args, dict) else {},
+                    sync=True,
+                )
+
+                # Extract result data from task artifacts
+                result_data = None
+                if task.artifacts:
+                    for artifact in task.artifacts:
+                        if artifact.parts:
+                            for part in artifact.parts:
+                                if hasattr(part, 'data'):
+                                    result_data = part.data
+
+                step_duration = int((time.time() - step_start) * 1000)
+                results.append({
+                    "step": i,
+                    "feature": feature_name,
+                    "skill": skill_name,
+                    "status": task.status.state.value,
+                    "result": result_data,
+                    "duration_ms": step_duration,
+                })
+                logger.info(
+                    f"[WORKFLOW] Step {i}: {feature_name}.{skill_name} "
+                    f"-> {task.status.state.value} ({step_duration}ms)"
+                )
+
+            except Exception as e:
+                step_duration = int((time.time() - step_start) * 1000)
+                results.append({
+                    "step": i,
+                    "feature": feature_name,
+                    "skill": skill_name,
+                    "status": "failed",
+                    "error": str(e),
+                    "duration_ms": step_duration,
+                })
+                logger.error(
+                    f"[WORKFLOW] Step {i}: {feature_name}.{skill_name} "
+                    f"failed: {e} ({step_duration}ms)"
+                )
+
+        total_duration = int((time.time() - workflow_start) * 1000)
+        completed = sum(1 for r in results if r.get("status") == "completed")
+        failed = sum(1 for r in results if r.get("status") == "failed")
+
+        logger.info(
+            f"[WORKFLOW] Complete: {completed}/{len(steps)} succeeded, "
+            f"{failed} failed, {total_duration}ms total"
+        )
+
+        return {
+            "success": failed == 0,
+            "workflow_steps": len(steps),
+            "completed": completed,
+            "failed": failed,
+            "total_duration_ms": total_duration,
+            "results": results,
+        }
 
     @tool(
         name="check_task_status",
