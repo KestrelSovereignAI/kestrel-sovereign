@@ -62,18 +62,25 @@ class LocalAgentConfig(BaseModel):
         """Convert string to Path (preserves relative paths)."""
         return Path(v)
 
-    def validate_runtime(self) -> list[str]:
+    def validate_runtime(self, base_dir: Optional[Path] = None) -> list[str]:
         """Validate that data_dir exists and contains a database.
 
         Called by the process manager before starting an agent,
         NOT at config parse time (so you can pre-configure agents
         before running inception).
 
+        Args:
+            base_dir: Base directory to resolve relative data_dir against.
+                      If None, resolves against CWD (for backward compat).
+
         Returns:
             List of error messages (empty if valid).
         """
         errors = []
-        resolved = self.data_dir.resolve()
+        if base_dir is not None:
+            resolved = (base_dir / self.data_dir).resolve()
+        else:
+            resolved = self.data_dir.resolve()
         if not resolved.exists():
             errors.append(f"Agent data directory does not exist: {resolved}")
         elif not resolved.is_dir():
