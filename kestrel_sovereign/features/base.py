@@ -652,28 +652,38 @@ def tool(name: str, description: str, category: ToolCategory = ToolCategory.SYST
         for param_name, param in sig.parameters.items():
             if param_name == 'self':
                 continue
-                
+
             # Handle typing generics
-            from typing import get_origin
+            from typing import get_origin, get_args
             origin = get_origin(param.annotation)
+            items_schema = None
             if origin is not None:
                 param_type = type_map.get(origin, "string")
+                # For List[X], derive items schema from the type argument
+                if param_type == "array":
+                    type_args = get_args(param.annotation)
+                    if type_args:
+                        inner = type_args[0]
+                        inner_type = type_map.get(inner, None)
+                        if inner_type:
+                            items_schema = {"type": inner_type}
             else:
                 param_type = type_map.get(param.annotation, "string")
             required = param.default == inspect.Parameter.empty
-            
+
             # Get description from parsed docstring, fallback to placeholder
             param_desc = param_descriptions.get(
-                param_name, 
+                param_name,
                 f"The {param_name.replace('_', ' ')} parameter"
             )
-            
+
             parameters.append(ToolParameter(
                 name=param_name,
                 type=param_type,
                 description=param_desc,
                 required=required,
-                default=None if required else param.default
+                default=None if required else param.default,
+                items=items_schema,
             ))
             
         func._tool_schema = {
