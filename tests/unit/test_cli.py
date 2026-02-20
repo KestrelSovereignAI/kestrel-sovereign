@@ -25,16 +25,10 @@ from kestrel_sovereign.cli import (
     cmd_shell,
     cmd_health,
     cmd_config,
-    _is_port_in_use,
-    _is_process_running,
-    _read_pid,
-    _write_pid,
-    _clear_pid,
-    _host_pid_file,
-    _agent_pid_file,
-    _agent_log_file,
     _get_project_dir,
+    _host_pid_file,
 )
+from kestrel_sovereign.rookery.process_manager import ProcessManager
 
 
 # -----------------------------------------------------------------------
@@ -247,7 +241,7 @@ class TestCommandDispatch:
 
 
 # -----------------------------------------------------------------------
-# Process helper tests
+# Process helper tests (now on ProcessManager)
 # -----------------------------------------------------------------------
 
 class TestProcessHelpers:
@@ -255,54 +249,54 @@ class TestProcessHelpers:
 
     def test_read_pid_no_file(self, tmp_path):
         """Reading PID from non-existent file returns None."""
-        assert _read_pid(tmp_path / "nonexistent.pid") is None
+        assert ProcessManager.read_pid(tmp_path / "nonexistent.pid") is None
 
     def test_write_and_read_pid(self, tmp_path):
         """Write and read PID should round-trip."""
         pid_file = tmp_path / "test.pid"
-        _write_pid(pid_file, 12345)
-        assert _read_pid(pid_file) == 12345
+        ProcessManager.write_pid(pid_file, 12345)
+        assert ProcessManager.read_pid(pid_file) == 12345
 
     def test_clear_pid(self, tmp_path):
         """Clearing PID should remove the file."""
         pid_file = tmp_path / "test.pid"
-        _write_pid(pid_file, 12345)
+        ProcessManager.write_pid(pid_file, 12345)
         assert pid_file.exists()
-        _clear_pid(pid_file)
+        ProcessManager.clear_pid(pid_file)
         assert not pid_file.exists()
 
     def test_clear_pid_nonexistent(self, tmp_path):
         """Clearing non-existent PID file should not raise."""
-        _clear_pid(tmp_path / "nonexistent.pid")
+        ProcessManager.clear_pid(tmp_path / "nonexistent.pid")
 
     def test_read_pid_invalid_content(self, tmp_path):
         """Reading PID from file with invalid content returns None."""
         pid_file = tmp_path / "bad.pid"
         pid_file.write_text("not-a-number")
-        assert _read_pid(pid_file) is None
+        assert ProcessManager.read_pid(pid_file) is None
 
     def test_agent_pid_file(self, tmp_path):
         """Agent PID file should be in agent directory."""
-        pid_file = _agent_pid_file(tmp_path / "myagent")
+        pid_file = ProcessManager.agent_pid_file(tmp_path / "myagent")
         assert pid_file == tmp_path / "myagent" / "agent.pid"
 
     def test_agent_log_file(self, tmp_path):
         """Agent log file should be in agent directory."""
-        log_file = _agent_log_file(tmp_path / "myagent")
+        log_file = ProcessManager.agent_log_file(tmp_path / "myagent")
         assert log_file == tmp_path / "myagent" / "agent.log"
 
     def test_is_process_running_current(self):
         """Current process should be detected as running."""
-        assert _is_process_running(os.getpid()) is True
+        assert ProcessManager.is_process_running(os.getpid()) is True
 
     def test_is_process_running_invalid(self):
         """Non-existent PID should not be detected as running."""
-        assert _is_process_running(999999) is False
+        assert ProcessManager.is_process_running(999999) is False
 
     def test_is_port_in_use_no(self):
         """An unused port should return False."""
         # Port 0 is never in use (it's assigned dynamically)
-        assert _is_port_in_use(0) is False
+        assert ProcessManager.is_port_in_use(0) is False
 
 
 # -----------------------------------------------------------------------
