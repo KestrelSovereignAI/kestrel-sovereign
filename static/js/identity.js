@@ -315,7 +315,7 @@ function escapeHtml(str) {
 // Agents Pane (Rookery)
 // ============================================================================
 
-let selectedAgentId = null;
+let selectedAgentName = null;
 
 export async function loadAgents() {
     try {
@@ -330,13 +330,17 @@ export async function loadAgents() {
 
         container.innerHTML = '';
         for (const agent of agents) {
+            const isOnline = agent.status !== 'offline';
             const item = document.createElement('div');
-            item.className = `agent-item ${selectedAgentId === agent.id ? 'selected' : ''}`;
-            item.dataset.agentId = agent.id;
-            item.addEventListener('click', () => window.selectAgent(agent.id));
+            item.className = `agent-item${selectedAgentName === agent.name ? ' selected' : ''}${!isOnline ? ' offline' : ''}`;
+            item.dataset.agentName = agent.name;
+
+            if (isOnline) {
+                item.addEventListener('click', () => window.selectAgent(agent.name));
+            }
 
             item.innerHTML = `
-                <span class="agent-status-dot ${agent.status === 'offline' ? 'offline' : 'online'}"></span>
+                <span class="agent-status-dot ${isOnline ? 'online' : 'offline'}"></span>
                 <div class="agent-info">
                     <div class="agent-name">${escapeHtml(agent.name || 'Unnamed Agent')}</div>
                     <div class="agent-description">${escapeHtml(agent.description || 'No description')}</div>
@@ -345,9 +349,12 @@ export async function loadAgents() {
             container.appendChild(item);
         }
 
-        // Auto-select first agent if none selected
-        if (!selectedAgentId && agents.length > 0) {
-            window.selectAgent(agents[0].id);
+        // Auto-select first online agent if none selected
+        if (!selectedAgentName) {
+            const firstOnline = agents.find(a => a.status !== 'offline');
+            if (firstOnline) {
+                window.selectAgent(firstOnline.name);
+            }
         }
     } catch (e) {
         const container = document.getElementById('agents-list');
@@ -355,20 +362,30 @@ export async function loadAgents() {
     }
 }
 
-window.selectAgent = async function(agentId) {
-    selectedAgentId = agentId;
+window.selectAgent = async function(agentName) {
+    selectedAgentName = agentName;
+
+    // Set host agent routing in API layer
+    API.setHostAgent(agentName);
 
     // Update selection UI
     document.querySelectorAll('.agent-item').forEach(item => {
-        item.classList.toggle('selected', item.dataset.agentId === agentId);
+        item.classList.toggle('selected', item.dataset.agentName === agentName);
     });
+
+    // Update chat header with agent name
+    const navName = document.getElementById('nav-agent-name');
+    if (navName) navName.textContent = agentName;
 
     // Show conversations pane
     const conversationsPane = document.getElementById('conversations-pane');
     conversationsPane.style.display = 'flex';
 
+    // Reload identity from newly selected agent
+    loadIdentity();
+
     // Load conversations for selected agent
-    await loadConversations(agentId);
+    await loadConversations(agentName);
 };
 
 // ============================================================================
@@ -377,8 +394,8 @@ window.selectAgent = async function(agentId) {
 
 let activeConversationId = null;
 
-export async function loadConversations(_agentId) {
-    // TODO: pass _agentId to API.getConversations() once multi-agent routing is wired
+export async function loadConversations(_agentName) {
+    // Agent routing is handled by API.setHostAgent() — all calls auto-prefix
     try {
         const data = await API.getConversations();
         const conversations = data.conversations || [];
@@ -520,8 +537,8 @@ document.addEventListener('DOMContentLoaded', () => {
         newConversationSidebarBtn.addEventListener('click', async () => {
             try {
                 await API.newConversation();
-                if (selectedAgentId) {
-                    await loadConversations(selectedAgentId);
+                if (selectedAgentName) {
+                    await loadConversations(selectedAgentName);
                 }
             } catch (e) {
                 console.error('Failed to create new conversation:', e);
