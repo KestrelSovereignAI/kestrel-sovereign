@@ -33,6 +33,7 @@ class ToolParameter:
     required: bool = False
     default: Any = None
     enum: Optional[List[str]] = None
+    items: Optional[Dict[str, Any]] = None  # JSON Schema for array element type
 
 
 @dataclass
@@ -87,6 +88,13 @@ class ToolSchema:
                 "type": param.type,
                 "description": param.description
             }
+
+            # Add items schema for array types
+            if param.type == "array":
+                if param.items:
+                    prop_def["items"] = param.items
+                else:
+                    prop_def["items"] = {"type": "object"}
 
             # Add enum if present
             if param.enum:

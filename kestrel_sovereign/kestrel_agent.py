@@ -374,6 +374,13 @@ class KestrelAgent(ConstitutionMixin, StreamingMixin, BackupMixin, SleepMixin):
             # Cache the features prompt (built once at session start)
             self._cached_features_prompt = self._build_features_prompt_section()
 
+            # Pre-explore TaskFeature so run_workflow and list_available_skills
+            # are available as direct tools from the first turn. These are
+            # meta-tools the orchestrator should always have access to.
+            task_feature = self.features.get("TaskFeature")
+            if task_feature:
+                self._register_explored_feature_tools(task_feature)
+
     @property
     def privacy_mode(self) -> PrivacyMode:
         """Get current privacy mode."""
