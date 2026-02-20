@@ -21,8 +21,6 @@ Commands:
 
 import argparse
 import os
-import signal
-import socket
 import subprocess
 import sys
 import time
@@ -36,79 +34,16 @@ from kestrel_sovereign.rookery.config import (
     ROOKERY_CONFIG_FILENAME,
     DEFAULT_AGENT_START_PORT,
 )
+from kestrel_sovereign.rookery.process_manager import ProcessManager
 
 
 # ---------------------------------------------------------------------------
-# Process helpers
+# Helpers
 # ---------------------------------------------------------------------------
 
 def _get_project_dir() -> Path:
     """Get the project root directory (where server.py lives)."""
     return Path(__file__).parent.parent.resolve()
-
-
-def _is_port_in_use(port: int) -> bool:
-    """Check if a port is in use."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        return s.connect_ex(("localhost", port)) == 0
-
-
-def _is_process_running(pid: int) -> bool:
-    """Check if a process with the given PID is running."""
-    if sys.platform == "win32":
-        try:
-            import ctypes
-            kernel32 = ctypes.windll.kernel32
-            handle = kernel32.OpenProcess(0x1000, False, pid)
-            if handle:
-                kernel32.CloseHandle(handle)
-                return True
-            return False
-        except Exception:
-            return False
-    else:
-        try:
-            os.kill(pid, 0)
-            return True
-        except OSError:
-            return False
-
-
-def _kill_process(pid: int, force: bool = False) -> bool:
-    """Kill a process by PID. Returns True if successful."""
-    try:
-        if sys.platform == "win32":
-            subprocess.run(
-                ["taskkill", "/F", "/PID", str(pid)],
-                capture_output=True,
-                check=True,
-            )
-        else:
-            sig = signal.SIGKILL if force else signal.SIGTERM
-            os.kill(pid, sig)
-        return True
-    except (OSError, subprocess.CalledProcessError):
-        return False
-
-
-def _wait_for_health(port: int, timeout: int = 30) -> bool:
-    """Wait for server health endpoint to respond."""
-    import urllib.request
-    import urllib.error
-
-    url = f"http://localhost:{port}/health"
-    start = time.time()
-
-    while time.time() - start < timeout:
-        try:
-            with urllib.request.urlopen(url, timeout=2) as response:
-                if response.status == 200:
-                    return True
-        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError):
-            pass
-        time.sleep(0.5)
-
-    return False
 
 
 def _format_uptime(pid: int) -> str:
@@ -127,160 +62,25 @@ def _format_uptime(pid: int) -> str:
 
 
 # ---------------------------------------------------------------------------
-# PID / log file paths
+# Host PID / log file paths
 # ---------------------------------------------------------------------------
 
-def _host_pid_file() -> Path:
+def _host_pid_file(project_dir: Optional[Path] = None) -> Path:
     """PID file for the host process."""
-    logs_dir = _get_project_dir() / "logs"
+    if project_dir is None:
+        project_dir = _get_project_dir()
+    logs_dir = project_dir / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
     return logs_dir / ".host.pid"
 
 
-def _host_log_file() -> Path:
+def _host_log_file(project_dir: Optional[Path] = None) -> Path:
     """Log file for the host process."""
-    logs_dir = _get_project_dir() / "logs"
+    if project_dir is None:
+        project_dir = _get_project_dir()
+    logs_dir = project_dir / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
     return logs_dir / "host.log"
-
-
-def _agent_pid_file(agent_dir: Path) -> Path:
-    """PID file for an agent process."""
-    return agent_dir / "agent.pid"
-
-
-def _agent_log_file(agent_dir: Path) -> Path:
-    """Log file for an agent process."""
-    return agent_dir / "agent.log"
-
-
-def _read_pid(pid_file: Path) -> Optional[int]:
-    """Read PID from file, return None if not exists or invalid."""
-    if not pid_file.exists():
-        return None
-    try:
-        return int(pid_file.read_text().strip())
-    except (ValueError, OSError):
-        return None
-
-
-def _write_pid(pid_file: Path, pid: int) -> None:
-    """Write PID to file."""
-    pid_file.parent.mkdir(parents=True, exist_ok=True)
-    pid_file.write_text(str(pid))
-
-
-def _clear_pid(pid_file: Path) -> None:
-    """Remove PID file."""
-    pid_file.unlink(missing_ok=True)
-
-
-# ---------------------------------------------------------------------------
-# Load .env helper
-# ---------------------------------------------------------------------------
-
-def _load_env(project_dir: Path) -> dict:
-    """Load .env file into an env dict copy."""
-    from dotenv import dotenv_values
-
-    env = os.environ.copy()
-    env_file = project_dir / ".env"
-    if env_file.exists():
-        env.update({k: v for k, v in dotenv_values(env_file).items() if v is not None})
-    return env
-
-
-# ---------------------------------------------------------------------------
-# Start / stop processes
-# ---------------------------------------------------------------------------
-
-def _spawn_background_server(
-    cmd: list[str],
-    cwd: Path,
-    env: dict,
-    log_file: Path,
-    pid_file: Path,
-) -> int:
-    """Spawn a background uvicorn process. Returns the PID."""
-    log_file.parent.mkdir(parents=True, exist_ok=True)
-    with open(log_file, "a") as log:
-        kwargs = dict(cwd=cwd, env=env, stdout=log, stderr=subprocess.STDOUT)
-        if sys.platform == "win32":
-            kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-        else:
-            kwargs["start_new_session"] = True
-        process = subprocess.Popen(cmd, **kwargs)
-
-    _write_pid(pid_file, process.pid)
-    return process.pid
-
-
-def _start_agent_process(
-    name: str,
-    agent_dir: Path,
-    port: int,
-    host_bind: str,
-    project_dir: Path,
-) -> int:
-    """Start a single agent server process. Returns 0 on success."""
-    pid_file = _agent_pid_file(agent_dir)
-    log_file = _agent_log_file(agent_dir)
-
-    # Check if already running
-    existing_pid = _read_pid(pid_file)
-    if existing_pid and _is_process_running(existing_pid):
-        print(f"     {name} already running (PID: {existing_pid})")
-        return 0
-    elif existing_pid:
-        _clear_pid(pid_file)
-
-    # Check port
-    if _is_port_in_use(port):
-        print(f"     {name}: port {port} already in use")
-        return 1
-
-    # Build environment
-    env = _load_env(project_dir)
-    env["KESTREL_DB_PATH"] = str(agent_dir.resolve())
-    env["PORT"] = str(port)
-    # Don't serve UI from individual agents when managed by host
-    env["KESTREL_SERVE_UI"] = "false"
-
-    cmd = [sys.executable, "-m", "uvicorn", "server:app",
-           "--host", host_bind, "--port", str(port)]
-    _spawn_background_server(cmd, project_dir, env, log_file, pid_file)
-    return 0
-
-
-def _stop_process(name: str, pid_file: Path) -> int:
-    """Stop a process identified by its PID file. Returns 0 on success."""
-    pid = _read_pid(pid_file)
-    if pid is None:
-        return 0
-
-    if not _is_process_running(pid):
-        _clear_pid(pid_file)
-        return 0
-
-    print(f"   Stopping {name} (PID: {pid})...")
-
-    # Graceful shutdown
-    _kill_process(pid, force=False)
-
-    # Wait up to 5 seconds
-    for _ in range(10):
-        if not _is_process_running(pid):
-            break
-        time.sleep(0.5)
-
-    # Force kill if still running
-    if _is_process_running(pid):
-        _kill_process(pid, force=True)
-        time.sleep(0.5)
-
-    _clear_pid(pid_file)
-    print(f"   {name} stopped")
-    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -291,6 +91,7 @@ def cmd_start(args) -> int:
     """Start host and/or agents."""
     project_dir = _get_project_dir()
     rookery = RookeryConfig.load(project_dir / ROOKERY_CONFIG_FILENAME)
+    pm = ProcessManager(project_dir)
 
     if args.name:
         # Start a single agent by name
@@ -301,21 +102,15 @@ def cmd_start(args) -> int:
             return 1
 
         agent_cfg = local_agents[args.name]
-        resolved_dir = (project_dir / agent_cfg.data_dir).resolve()
-
-        # Runtime validation
-        errors = agent_cfg.validate_runtime(base_dir=project_dir)
-        if errors:
-            for err in errors:
-                print(f"   {err}")
+        print(f"   Starting {args.name} on :{agent_cfg.port}...", end="", flush=True)
+        try:
+            pm.start_agent(args.name, agent_cfg, rookery.host.bind)
+        except RuntimeError as e:
+            print(f"          \u274c")
+            print(f"   {e}")
             return 1
 
-        print(f"   Starting {args.name} on :{agent_cfg.port}...", end="", flush=True)
-        rc = _start_agent_process(
-            args.name, resolved_dir, agent_cfg.port,
-            rookery.host.bind, project_dir,
-        )
-        if rc == 0 and _wait_for_health(agent_cfg.port, timeout=30):
+        if pm.wait_for_health(agent_cfg.port, timeout=30):
             print("          \u2705")
         else:
             print("          \u274c")
@@ -343,31 +138,30 @@ def cmd_start(args) -> int:
     print()
 
     # Start host
-    host_pid_file = _host_pid_file()
-    existing_host = _read_pid(host_pid_file)
-    if existing_host and _is_process_running(existing_host):
+    host_pid_file = _host_pid_file(project_dir)
+    existing_host = pm.read_pid(host_pid_file)
+    if existing_host and pm.is_process_running(existing_host):
         print(f"   Host already running (PID: {existing_host})")
     else:
         if existing_host:
-            _clear_pid(host_pid_file)
+            pm.clear_pid(host_pid_file)
 
-        if _is_port_in_use(rookery.host.port):
+        if pm.is_port_in_use(rookery.host.port):
             print(f"   Host port {rookery.host.port} already in use")
             return 1
 
-        env = _load_env(project_dir)
+        env = pm._load_env()
         env["PORT"] = str(rookery.host.port)
         # Host is NOT an agent — no DB path, no KESTREL_SERVE_UI
-        # (host.py serves static files directly)
 
-        log_file = _host_log_file()
+        log_file = _host_log_file(project_dir)
         cmd = [sys.executable, "-m", "uvicorn", "host:app",
                "--host", rookery.host.bind, "--port", str(rookery.host.port)]
 
         print(f"   Starting host on :{rookery.host.port}...", end="", flush=True)
-        _spawn_background_server(cmd, project_dir, env, log_file, host_pid_file)
+        pm._spawn(cmd, env, log_file, host_pid_file)
 
-        if _wait_for_health(rookery.host.port, timeout=30):
+        if pm.wait_for_health(rookery.host.port, timeout=30):
             print("          \u2705")
         else:
             print("          \u274c")
@@ -376,19 +170,15 @@ def cmd_start(args) -> int:
 
     # Start autostart agents
     for name, cfg in autostart.items():
-        resolved_dir = (project_dir / cfg.data_dir).resolve()
-
-        errors = cfg.validate_runtime(base_dir=project_dir)
-        if errors:
-            print(f"   {name}: skipping ({errors[0]})")
+        print(f"   Starting {name} on :{cfg.port}...", end="", flush=True)
+        try:
+            pm.start_agent(name, cfg, rookery.host.bind)
+        except RuntimeError as e:
+            print(f"          \u274c")
+            print(f"   {e}")
             continue
 
-        print(f"   Starting {name} on :{cfg.port}...", end="", flush=True)
-        rc = _start_agent_process(
-            name, resolved_dir, cfg.port,
-            rookery.host.bind, project_dir,
-        )
-        if rc == 0 and _wait_for_health(cfg.port, timeout=30):
+        if pm.wait_for_health(cfg.port, timeout=30):
             print("          \u2705")
         else:
             print("          \u274c")
@@ -401,6 +191,7 @@ def cmd_stop(args) -> int:
     """Stop host and/or agents."""
     project_dir = _get_project_dir()
     rookery = RookeryConfig.load(project_dir / ROOKERY_CONFIG_FILENAME)
+    pm = ProcessManager(project_dir)
 
     if args.name:
         # Stop a single agent
@@ -410,17 +201,40 @@ def cmd_stop(args) -> int:
             return 1
 
         agent_cfg = local_agents[args.name]
-        resolved_dir = (project_dir / agent_cfg.data_dir).resolve()
-        return _stop_process(args.name, _agent_pid_file(resolved_dir))
+        pm.register_agent(args.name, agent_cfg)
+        ap = pm._agents.get(args.name)
+        if ap and ap.pid:
+            print(f"   Stopping {args.name} (PID: {ap.pid})...")
+            pm.stop_agent(args.name)
+            print(f"   {args.name} stopped")
+        return 0
 
     # Stop everything: agents first, then host
     print("\U0001F6D1 Stopping Kestrel Rookery...")
 
     for name, cfg in rookery.get_local_agents().items():
-        resolved_dir = (project_dir / cfg.data_dir).resolve()
-        _stop_process(name, _agent_pid_file(resolved_dir))
+        pm.register_agent(name, cfg)
+        ap = pm._agents.get(name)
+        if ap and ap.pid:
+            print(f"   Stopping {name} (PID: {ap.pid})...")
+            pm.stop_agent(name)
+            print(f"   {name} stopped")
 
-    _stop_process("host", _host_pid_file())
+    # Stop host
+    host_pid_file = _host_pid_file(project_dir)
+    host_pid = pm.read_pid(host_pid_file)
+    if host_pid and pm.is_process_running(host_pid):
+        print(f"   Stopping host (PID: {host_pid})...")
+        pm.kill_process(host_pid, force=False)
+        for _ in range(10):
+            if not pm.is_process_running(host_pid):
+                break
+            time.sleep(0.5)
+        if pm.is_process_running(host_pid):
+            pm.kill_process(host_pid, force=True)
+            time.sleep(0.5)
+        pm.clear_pid(host_pid_file)
+        print("   host stopped")
 
     print("\u2705 Rookery stopped")
     return 0
@@ -435,8 +249,8 @@ def cmd_status(args) -> int:
     print(f"  {'NAME':12} {'PORT':>6}   {'STATUS':10} {'PID':>7}   {'UPTIME':>8}")
 
     # Host status
-    host_pid = _read_pid(_host_pid_file())
-    host_running = host_pid is not None and _is_process_running(host_pid)
+    host_pid = ProcessManager.read_pid(_host_pid_file(project_dir))
+    host_running = host_pid is not None and ProcessManager.is_process_running(host_pid)
     host_status = "online" if host_running else "offline"
     host_pid_str = str(host_pid) if host_running else "-"
     host_uptime = _format_uptime(host_pid) if host_running else "-"
@@ -445,8 +259,8 @@ def cmd_status(args) -> int:
     # Agent status
     for name, cfg in rookery.get_local_agents().items():
         resolved_dir = (project_dir / cfg.data_dir).resolve()
-        pid = _read_pid(_agent_pid_file(resolved_dir))
-        running = pid is not None and _is_process_running(pid)
+        pid = ProcessManager.read_pid(ProcessManager.agent_pid_file(resolved_dir))
+        running = pid is not None and ProcessManager.is_process_running(pid)
         status_str = "online" if running else "offline"
         pid_str = str(pid) if running else "-"
         uptime = _format_uptime(pid) if running else "-"
@@ -460,7 +274,7 @@ def cmd_logs(args) -> int:
     project_dir = _get_project_dir()
 
     if args.name == "host":
-        log_file = _host_log_file()
+        log_file = _host_log_file(project_dir)
     else:
         rookery = RookeryConfig.load(project_dir / ROOKERY_CONFIG_FILENAME)
         local_agents = rookery.get_local_agents()
@@ -471,7 +285,7 @@ def cmd_logs(args) -> int:
 
         agent_cfg = local_agents[args.name]
         resolved_dir = (project_dir / agent_cfg.data_dir).resolve()
-        log_file = _agent_log_file(resolved_dir)
+        log_file = ProcessManager.agent_log_file(resolved_dir)
 
     if not log_file.exists():
         print(f"No log file found: {log_file}")

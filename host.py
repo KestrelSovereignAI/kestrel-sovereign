@@ -1,18 +1,23 @@
 #!/usr/bin/env python3
 """
-Kestrel Host - Thin FastAPI proxy + static file server.
+Kestrel Host - Thin FastAPI proxy + static file server + process manager.
 
 The host is NOT an agent. It has no DID, no memory, no LLM.
 It is pure infrastructure that:
 1. Serves the Kestrel UI (static files)
 2. Aggregates agent discovery (A2A cards)
 3. Proxies API requests to the correct agent process
+4. Manages agent process lifecycle (start/stop/status/logs)
 
 Architecture:
     Browser → localhost:8888 (host.py)
-                  ├── /static/*              → serves UI files directly
-                  ├── /api/agents            → aggregates A2A cards from all agents
-                  └── /api/agents/{id}/*     → proxies to agent on its port
+                  ├── /static/*                     → serves UI files directly
+                  ├── /api/agents                   → aggregates A2A cards from all agents
+                  ├── /api/agents/{id}/start        → start an agent process
+                  ├── /api/agents/{id}/stop         → stop an agent process
+                  ├── /api/agents/{id}/status       → agent process status
+                  ├── /api/agents/{id}/logs         → tail agent logs
+                  └── /api/agents/{id}/*            → proxies to agent on its port
 
 Key principle: No agent is privileged. The host treats all agents as equal peers.
 """
@@ -25,7 +30,7 @@ from pathlib import Path
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 
@@ -38,6 +43,7 @@ from kestrel_sovereign.rookery.proxy import (
     proxy_request_streaming,
     get_agent_base_url,
 )
+from kestrel_sovereign.rookery.process_manager import ProcessManager
 
 load_dotenv(Path(__file__).parent / ".env", override=True)
 
@@ -46,6 +52,9 @@ logger = logging.getLogger(__name__)
 
 # Security Configuration
 API_KEY_NAME = "X-API-Key"
+
+# Project directory (where host.py lives)
+PROJECT_DIR = Path(__file__).parent.resolve()
 
 
 def get_api_key() -> str:
@@ -69,12 +78,21 @@ def load_rookery_config() -> RookeryConfig:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Manage the host application lifecycle."""
+    """Manage the host application lifecycle.
+
+    On startup: load config, create ProcessManager, register agents,
+    optionally autostart agents.
+    On shutdown: stop all managed agents, close HTTP client.
+    """
     logger.info("Kestrel Host starting up...")
 
     config = load_rookery_config()
     app.state.rookery_config = config
     app.state.http_client = httpx.AsyncClient()
+
+    # Create process manager
+    pm = ProcessManager(PROJECT_DIR)
+    app.state.process_manager = pm
 
     agent_count = len(config.agents)
     local_count = len(config.get_local_agents())
@@ -83,15 +101,32 @@ async def lifespan(app: FastAPI):
         f"Rookery loaded: {agent_count} agents "
         f"({local_count} local, {remote_count} remote)"
     )
+
+    # Register all local agents with the process manager
     for name, agent_cfg in config.agents.items():
         if isinstance(agent_cfg, LocalAgentConfig):
+            pm.register_agent(name, agent_cfg)
             logger.info(f"  Agent '{name}': localhost:{agent_cfg.port}")
         elif isinstance(agent_cfg, RemoteAgentConfig):
             logger.info(f"  Agent '{name}': {agent_cfg.url}")
 
+    # Autostart agents if KESTREL_HOST_AUTOSTART is set (or not explicitly disabled)
+    autostart_disabled = os.environ.get("KESTREL_HOST_AUTOSTART", "").lower() in ("0", "false", "no")
+    if not autostart_disabled:
+        autostart_agents = config.get_autostart_agents()
+        if autostart_agents:
+            logger.info(f"Autostarting {len(autostart_agents)} agents...")
+            started = pm.start_autostart_agents(config)
+            for name, ap in started.items():
+                if pm.wait_for_health(ap.port, timeout=30):
+                    logger.info(f"  Agent '{name}' started on :{ap.port}")
+                else:
+                    logger.warning(f"  Agent '{name}' failed health check on :{ap.port}")
+
     yield
 
     logger.info("Kestrel Host shutting down...")
+    pm.stop_all()
     await app.state.http_client.aclose()
 
 
@@ -266,6 +301,107 @@ async def list_agents(request: Request):
         agents.append(agent_entry)
 
     return {"agents": agents}
+
+
+# --- Process Management Endpoints ---
+
+
+@app.post("/api/agents/{agent_id}/start")
+async def start_agent(request: Request, agent_id: str):
+    """Start an agent process.
+
+    Only works for local agents configured in rookery.toml.
+    """
+    config: RookeryConfig = request.app.state.rookery_config
+    pm: ProcessManager = request.app.state.process_manager
+
+    local_agents = config.get_local_agents()
+    if agent_id not in local_agents:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Agent '{agent_id}' not found or not a local agent",
+        )
+
+    agent_cfg = local_agents[agent_id]
+    try:
+        ap = pm.start_agent(agent_id, agent_cfg, config.host.bind)
+    except RuntimeError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+
+    # Wait briefly for the agent to become healthy
+    healthy = pm.wait_for_health(ap.port, timeout=15)
+
+    return {
+        "agent_id": agent_id,
+        "port": ap.port,
+        "pid": ap.pid,
+        "status": "running" if healthy else "starting",
+        "healthy": healthy,
+    }
+
+
+@app.post("/api/agents/{agent_id}/stop")
+async def stop_agent(request: Request, agent_id: str):
+    """Stop an agent process."""
+    config: RookeryConfig = request.app.state.rookery_config
+    pm: ProcessManager = request.app.state.process_manager
+
+    local_agents = config.get_local_agents()
+    if agent_id not in local_agents:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Agent '{agent_id}' not found or not a local agent",
+        )
+
+    pm.stop_agent(agent_id)
+    return {"agent_id": agent_id, "status": "stopped"}
+
+
+@app.get("/api/agents/{agent_id}/status")
+async def agent_process_status(request: Request, agent_id: str):
+    """Get process status for an agent."""
+    config: RookeryConfig = request.app.state.rookery_config
+    pm: ProcessManager = request.app.state.process_manager
+
+    local_agents = config.get_local_agents()
+    if agent_id not in local_agents:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Agent '{agent_id}' not found or not a local agent",
+        )
+
+    return pm.get_agent_status(agent_id)
+
+
+@app.get("/api/agents/{agent_id}/logs")
+async def agent_logs(request: Request, agent_id: str, lines: int = 50):
+    """Get recent log output for an agent.
+
+    Query params:
+        lines: Number of lines to return (default 50, max 1000)
+    """
+    config: RookeryConfig = request.app.state.rookery_config
+    pm: ProcessManager = request.app.state.process_manager
+
+    local_agents = config.get_local_agents()
+    if agent_id not in local_agents:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Agent '{agent_id}' not found or not a local agent",
+        )
+
+    lines = min(lines, 1000)
+    log_text = pm.read_logs(agent_id, lines=lines)
+    if log_text is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No log file found for agent '{agent_id}'",
+        )
+
+    return PlainTextResponse(content=log_text)
+
+
+# --- Proxy Route (must be AFTER specific routes to avoid path conflicts) ---
 
 
 @app.api_route(

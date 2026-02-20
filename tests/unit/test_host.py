@@ -7,7 +7,7 @@ Tests the host endpoints using ASGI test client with mocked agent backends.
 import os
 import pytest
 import httpx
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 
 from kestrel_sovereign.rookery.config import (
     RookeryConfig,
@@ -15,6 +15,7 @@ from kestrel_sovereign.rookery.config import (
     LocalAgentConfig,
     RemoteAgentConfig,
 )
+from kestrel_sovereign.rookery.process_manager import ProcessManager, AgentProcess
 
 
 async def make_host_app(config: RookeryConfig):
@@ -33,6 +34,14 @@ async def make_host_app(config: RookeryConfig):
 
         from asgi_lifespan import LifespanManager
         return host_module.app, LifespanManager
+
+
+# All host tests disable autostart to avoid spawning real processes
+@pytest.fixture(autouse=True)
+def disable_autostart():
+    """Disable agent autostart during host tests."""
+    with patch.dict(os.environ, {"KESTREL_HOST_AUTOSTART": "false"}):
+        yield
 
 
 class TestHealthEndpoint:
@@ -387,5 +396,231 @@ class TestProxyToAgent:
 
             assert resp.status_code == 503
             assert "offline" in resp.json()["detail"]
+        finally:
+            host_module.load_rookery_config = original_fn
+
+
+# -----------------------------------------------------------------------
+# Process Management Endpoint tests
+# -----------------------------------------------------------------------
+
+class TestProcessManagementEndpoints:
+    """Tests for POST /api/agents/{id}/start, /stop, GET /status, /logs."""
+
+    @pytest.mark.asyncio
+    async def test_start_nonexistent_agent_returns_404(self):
+        """Starting an unknown agent returns 404."""
+        test_key = "test-key"
+        config = RookeryConfig(
+            agents={
+                "claw": LocalAgentConfig(data_dir="agent_data/claw", port=9901),
+            }
+        )
+
+        import host as host_module
+        original_fn = host_module.load_rookery_config
+        host_module.load_rookery_config = lambda: config
+        try:
+            with patch.dict(os.environ, {"KESTREL_API_KEY": test_key}):
+                from asgi_lifespan import LifespanManager
+                async with LifespanManager(host_module.app) as manager:
+                    async with httpx.AsyncClient(
+                        transport=httpx.ASGITransport(app=manager.app),
+                        base_url="http://testhost",
+                    ) as client:
+                        resp = await client.post(
+                            "/api/agents/nonexistent/start",
+                            headers={"X-API-Key": test_key},
+                        )
+
+            assert resp.status_code == 404
+        finally:
+            host_module.load_rookery_config = original_fn
+
+    @pytest.mark.asyncio
+    async def test_stop_nonexistent_agent_returns_404(self):
+        """Stopping an unknown agent returns 404."""
+        test_key = "test-key"
+        config = RookeryConfig(
+            agents={
+                "claw": LocalAgentConfig(data_dir="agent_data/claw", port=9901),
+            }
+        )
+
+        import host as host_module
+        original_fn = host_module.load_rookery_config
+        host_module.load_rookery_config = lambda: config
+        try:
+            with patch.dict(os.environ, {"KESTREL_API_KEY": test_key}):
+                from asgi_lifespan import LifespanManager
+                async with LifespanManager(host_module.app) as manager:
+                    async with httpx.AsyncClient(
+                        transport=httpx.ASGITransport(app=manager.app),
+                        base_url="http://testhost",
+                    ) as client:
+                        resp = await client.post(
+                            "/api/agents/nonexistent/stop",
+                            headers={"X-API-Key": test_key},
+                        )
+
+            assert resp.status_code == 404
+        finally:
+            host_module.load_rookery_config = original_fn
+
+    @pytest.mark.asyncio
+    async def test_status_nonexistent_agent_returns_404(self):
+        """Status for unknown agent returns 404."""
+        test_key = "test-key"
+        config = RookeryConfig(
+            agents={
+                "claw": LocalAgentConfig(data_dir="agent_data/claw", port=9901),
+            }
+        )
+
+        import host as host_module
+        original_fn = host_module.load_rookery_config
+        host_module.load_rookery_config = lambda: config
+        try:
+            with patch.dict(os.environ, {"KESTREL_API_KEY": test_key}):
+                from asgi_lifespan import LifespanManager
+                async with LifespanManager(host_module.app) as manager:
+                    async with httpx.AsyncClient(
+                        transport=httpx.ASGITransport(app=manager.app),
+                        base_url="http://testhost",
+                    ) as client:
+                        resp = await client.get(
+                            "/api/agents/nonexistent/status",
+                            headers={"X-API-Key": test_key},
+                        )
+
+            assert resp.status_code == 404
+        finally:
+            host_module.load_rookery_config = original_fn
+
+    @pytest.mark.asyncio
+    async def test_logs_nonexistent_agent_returns_404(self):
+        """Logs for unknown agent returns 404."""
+        test_key = "test-key"
+        config = RookeryConfig(
+            agents={
+                "claw": LocalAgentConfig(data_dir="agent_data/claw", port=9901),
+            }
+        )
+
+        import host as host_module
+        original_fn = host_module.load_rookery_config
+        host_module.load_rookery_config = lambda: config
+        try:
+            with patch.dict(os.environ, {"KESTREL_API_KEY": test_key}):
+                from asgi_lifespan import LifespanManager
+                async with LifespanManager(host_module.app) as manager:
+                    async with httpx.AsyncClient(
+                        transport=httpx.ASGITransport(app=manager.app),
+                        base_url="http://testhost",
+                    ) as client:
+                        resp = await client.get(
+                            "/api/agents/nonexistent/logs",
+                            headers={"X-API-Key": test_key},
+                        )
+
+            assert resp.status_code == 404
+        finally:
+            host_module.load_rookery_config = original_fn
+
+    @pytest.mark.asyncio
+    async def test_status_registered_agent(self):
+        """Status for registered agent returns process info."""
+        test_key = "test-key"
+        config = RookeryConfig(
+            agents={
+                "claw": LocalAgentConfig(data_dir="agent_data/claw", port=9901),
+            }
+        )
+
+        import host as host_module
+        original_fn = host_module.load_rookery_config
+        host_module.load_rookery_config = lambda: config
+        try:
+            with patch.dict(os.environ, {"KESTREL_API_KEY": test_key}):
+                from asgi_lifespan import LifespanManager
+                async with LifespanManager(host_module.app) as manager:
+                    async with httpx.AsyncClient(
+                        transport=httpx.ASGITransport(app=manager.app),
+                        base_url="http://testhost",
+                    ) as client:
+                        resp = await client.get(
+                            "/api/agents/claw/status",
+                            headers={"X-API-Key": test_key},
+                        )
+
+            assert resp.status_code == 200
+            data = resp.json()
+            assert data["name"] == "claw"
+            assert data["port"] == 9901
+            assert data["status"] == "stopped"
+        finally:
+            host_module.load_rookery_config = original_fn
+
+    @pytest.mark.asyncio
+    async def test_stop_registered_agent(self):
+        """Stopping a registered (but not running) agent succeeds."""
+        test_key = "test-key"
+        config = RookeryConfig(
+            agents={
+                "claw": LocalAgentConfig(data_dir="agent_data/claw", port=9901),
+            }
+        )
+
+        import host as host_module
+        original_fn = host_module.load_rookery_config
+        host_module.load_rookery_config = lambda: config
+        try:
+            with patch.dict(os.environ, {"KESTREL_API_KEY": test_key}):
+                from asgi_lifespan import LifespanManager
+                async with LifespanManager(host_module.app) as manager:
+                    async with httpx.AsyncClient(
+                        transport=httpx.ASGITransport(app=manager.app),
+                        base_url="http://testhost",
+                    ) as client:
+                        resp = await client.post(
+                            "/api/agents/claw/stop",
+                            headers={"X-API-Key": test_key},
+                        )
+
+            assert resp.status_code == 200
+            data = resp.json()
+            assert data["agent_id"] == "claw"
+            assert data["status"] == "stopped"
+        finally:
+            host_module.load_rookery_config = original_fn
+
+    @pytest.mark.asyncio
+    async def test_remote_agent_not_manageable(self):
+        """Remote agents cannot be started/stopped (returns 404)."""
+        test_key = "test-key"
+        config = RookeryConfig(
+            agents={
+                "remote": RemoteAgentConfig(url="https://example.com"),
+            }
+        )
+
+        import host as host_module
+        original_fn = host_module.load_rookery_config
+        host_module.load_rookery_config = lambda: config
+        try:
+            with patch.dict(os.environ, {"KESTREL_API_KEY": test_key}):
+                from asgi_lifespan import LifespanManager
+                async with LifespanManager(host_module.app) as manager:
+                    async with httpx.AsyncClient(
+                        transport=httpx.ASGITransport(app=manager.app),
+                        base_url="http://testhost",
+                    ) as client:
+                        resp = await client.post(
+                            "/api/agents/remote/start",
+                            headers={"X-API-Key": test_key},
+                        )
+
+            assert resp.status_code == 404
+            assert "not a local agent" in resp.json()["detail"]
         finally:
             host_module.load_rookery_config = original_fn
