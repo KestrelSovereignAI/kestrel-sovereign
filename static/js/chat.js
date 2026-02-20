@@ -91,7 +91,9 @@ function connectNotifications() {
 
     try {
         // Pass API key as query parameter since EventSource can't send headers
-        notificationEventSource = new EventSource(`/agent/notifications/sse?api_key=${encodeURIComponent(apiKey)}`);
+        // Use buildAgentUrl() to apply rookery routing prefix when an agent is selected
+        const ssePath = API.buildAgentUrl('/agent/notifications/sse');
+        notificationEventSource = new EventSource(`${ssePath}?api_key=${encodeURIComponent(apiKey)}`);
 
         notificationEventSource.addEventListener('connected', (e) => {
             console.log('SSE notifications connected');
