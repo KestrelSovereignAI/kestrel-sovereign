@@ -3,13 +3,17 @@
  * Handles all HTTP communication with the backend
  */
 
-// Agent ID for multi-agent mode (set by identity.js via setAgentId)
+// Agent ID for platform multi-agent mode (set by identity.js via setAgentId)
 let currentAgentId = null;
+
+// Host agent name for rookery routing (set by sidebar agent selection)
+// When set, all per-agent API calls are prefixed with /api/agents/{name}
+let selectedHostAgent = null;
 
 /**
  * Get the API base path for the current agent.
  * In standalone mode, returns empty string.
- * In multi-agent mode, returns /api/kestrel/companions/{id}
+ * In platform multi-agent mode, returns /api/kestrel/companions/{id}
  */
 function getAgentApiBase() {
     if (currentAgentId) {
@@ -19,12 +23,37 @@ function getAgentApiBase() {
 }
 
 /**
- * Rewrites standalone Kestrel endpoints to companion-specific endpoints when in multi-agent mode.
- * When accessed with ?agent={companion_id}, routes go through /api/kestrel/companions/{id}/...
+ * Check if an endpoint is host-level (should NOT be prefixed with agent routing).
+ */
+function isHostLevelEndpoint(endpoint) {
+    // /api/agents without a sub-path (listing agents)
+    if (endpoint === '/api/agents' || endpoint.startsWith('/api/agents?')) return true;
+    // Process management endpoints: /api/agents/{id}/start|stop|status|logs
+    if (/^\/api\/agents\/[^/]+\/(start|stop|status|logs)/.test(endpoint)) return true;
+    // Auth and health are host-level
+    if (endpoint === '/api/auth/key' || endpoint.startsWith('/api/auth/')) return true;
+    if (endpoint === '/health') return true;
+    return false;
+}
+
+/**
+ * Rewrites endpoints for agent routing.
+ *
+ * Two modes:
+ * 1. Platform multi-agent (?agent=...): Rewrites to /api/kestrel/companions/{id}/...
+ * 2. Rookery host agent (sidebar selection): Prepends /api/agents/{name}/...
+ *
+ * Rookery routing is applied first (if active), then platform routing on top.
  */
 function rewriteEndpoint(endpoint) {
+    // Rookery host agent routing: prepend /api/agents/{name} for per-agent endpoints
+    if (selectedHostAgent && !isHostLevelEndpoint(endpoint)) {
+        const prefix = `/api/agents/${encodeURIComponent(selectedHostAgent)}`;
+        endpoint = `${prefix}${endpoint}`;
+    }
+
     const agentBase = getAgentApiBase();
-    if (!agentBase) return endpoint;  // Standalone mode - no rewrite
+    if (!agentBase) return endpoint;  // No platform multi-agent - done
 
     // Map standalone endpoints to companion endpoints
     const mappings = {
@@ -328,7 +357,7 @@ const API = {
     },
 
     /**
-     * Set the agent ID for multi-agent mode.
+     * Set the agent ID for platform multi-agent mode.
      * Called by identity.js after parsing the URL parameter.
      * @param {string|null} agentId - The companion/agent ID or null for standalone mode
      */
@@ -337,7 +366,7 @@ const API = {
     },
 
     /**
-     * Get the current agent ID.
+     * Get the current agent ID (platform mode).
      * @returns {string|null} The agent ID or null if in standalone mode
      */
     getAgentId() {
@@ -345,11 +374,49 @@ const API = {
     },
 
     /**
-     * Check if we're in multi-agent mode (launched with ?agent=...)
-     * @returns {boolean} True if in multi-agent mode
+     * Check if we're in platform multi-agent mode (launched with ?agent=...)
+     * @returns {boolean} True if in platform multi-agent mode
      */
     isMultiAgentMode() {
         return currentAgentId !== null;
+    },
+
+    /**
+     * Set the host agent for rookery routing.
+     * Called by identity.js when user selects an agent in the sidebar.
+     * All subsequent API calls will be routed through /api/agents/{name}/...
+     * @param {string|null} agentName - The agent name (rookery alias) or null to clear
+     */
+    setHostAgent(agentName) {
+        selectedHostAgent = agentName;
+    },
+
+    /**
+     * Get the currently selected host agent name.
+     * @returns {string|null} The agent name or null if no agent selected
+     */
+    getHostAgent() {
+        return selectedHostAgent;
+    },
+
+    /**
+     * Check if we're in rookery mode (host agent selected for routing).
+     * @returns {boolean} True if a host agent is selected
+     */
+    isRookeryMode() {
+        return selectedHostAgent !== null;
+    },
+
+    /**
+     * Build a URL with host agent prefix applied (for SSE/EventSource).
+     * @param {string} path - The endpoint path (e.g., '/agent/notifications/sse')
+     * @returns {string} The path with agent prefix if in rookery mode
+     */
+    buildAgentUrl(path) {
+        if (selectedHostAgent && !isHostLevelEndpoint(path)) {
+            return `/api/agents/${encodeURIComponent(selectedHostAgent)}${path}`;
+        }
+        return path;
     },
 
     /**
