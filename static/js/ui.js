@@ -53,25 +53,21 @@ export let AGENT_COMMANDS = [
 
 /**
  * Load commands dynamically from /api/commands endpoint.
- * Called on module init and can be called to refresh.
+ * Called after agent selection (rookery) or during standalone init.
+ * Uses API module for proper auth and agent routing.
  */
-export async function loadCommands() {
+export async function loadCommands(apiModule) {
+    if (!apiModule) return;
     try {
-        const response = await fetch('/api/commands');
-        if (response.ok) {
-            const data = await response.json();
-            if (data.commands && data.commands.length > 0) {
-                AGENT_COMMANDS = data.commands;
-                console.log(`Loaded ${data.count} commands from API`);
-            }
+        const data = await apiModule.request('/api/commands');
+        if (data.commands && data.commands.length > 0) {
+            AGENT_COMMANDS = data.commands;
+            console.log(`Loaded ${data.count} commands from API`);
         }
     } catch (e) {
-        console.warn('Failed to load commands from API, using fallback:', e);
+        // Non-critical — fallback commands are used
     }
 }
-
-// Load commands on module init
-loadCommands();
 
 // ============================================================================
 // State
