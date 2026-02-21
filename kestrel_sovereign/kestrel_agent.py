@@ -158,6 +158,36 @@ class KestrelAgent(ConstitutionMixin, StreamingMixin, BackupMixin, SleepMixin):
     async def initialize(self) -> None:
         """Async initialization of storage and features."""
         if self._raw_storage is None:
+            # Cold-start restore from Lighthouse if DB doesn't exist (ephemeral environments)
+            if (
+                os.environ.get("LIGHTHOUSE_API_KEY")
+                and self._db_backend.lower() != "postgres"
+                and self.storage_path
+                and not Path(self.storage_path).exists()
+            ):
+                try:
+                    from kestrel_sovereign.storage.sync.targets import LighthouseTarget
+
+                    agent_id = self.did or getattr(self, 'agent_id', None) or "default"
+                    state_dir = Path(self.storage_path).parent
+                    target = LighthouseTarget(
+                        api_key=os.environ["LIGHTHOUSE_API_KEY"],
+                        agent_id=agent_id,
+                        state_dir=state_dir,
+                    )
+                    result = await target.restore_snapshot(Path(self.storage_path))
+                    if result and result.success:
+                        logging.info(
+                            f"Cold-start: restored {result.bytes_synced} bytes "
+                            f"from Lighthouse (CID: {result.metadata.get('cid', 'unknown')})"
+                        )
+                    else:
+                        logging.info("Cold-start: no Lighthouse snapshot found, starting fresh")
+                except (ImportError, AttributeError, TypeError, ConnectionError) as e:
+                    logging.warning(f"Cold-start restore from Lighthouse failed: {e}")
+                except Exception as e:
+                    logging.warning(f"Cold-start restore from Lighthouse failed: {e}", exc_info=True)
+
             # Initialize async storage based on backend type
             if self._db_backend.lower() == "postgres" and (self.pg_pool or self._database_url):
                 # PostgreSQL backend - reuse shared pool if available
@@ -247,6 +277,36 @@ class KestrelAgent(ConstitutionMixin, StreamingMixin, BackupMixin, SleepMixin):
                     logging.warning(f"Failed to initialize LighthouseProvider: {e}")
                 except Exception as e:
                     logging.warning(f"Failed to initialize LighthouseProvider: {e}", exc_info=True)
+
+            # Initialize Lighthouse sync for state persistence in ephemeral environments
+            # (e.g., Cloud Run scale-to-zero). Restores state on cold start, syncs on shutdown.
+            self._sync_service = None
+            if (
+                os.environ.get("LIGHTHOUSE_API_KEY")
+                and self._db_backend.lower() != "postgres"
+            ):
+                try:
+                    from kestrel_sovereign.storage.sync.service import SyncService
+                    from kestrel_sovereign.storage.sync.targets import LighthouseTarget
+
+                    agent_id = self.did or self.agent_id or "default"
+                    state_dir = Path(self.storage_path).parent if self.storage_path else None
+                    target = LighthouseTarget(
+                        api_key=os.environ["LIGHTHOUSE_API_KEY"],
+                        agent_id=agent_id,
+                        state_dir=state_dir,
+                    )
+
+                    self._sync_service = SyncService(db_path=self.storage_path)
+                    self._sync_service.add_target(target)
+                    await self._sync_service.start()
+                    logging.info(f"Lighthouse sync service started for agent {agent_id}")
+                except (ImportError, AttributeError, TypeError, ConnectionError) as e:
+                    logging.warning(f"Failed to start Lighthouse sync: {e}")
+                    self._sync_service = None
+                except Exception as e:
+                    logging.warning(f"Failed to start Lighthouse sync: {e}", exc_info=True)
+                    self._sync_service = None
 
             # Auto-discover and register features from features/ directory
             # Features can be disabled via KESTREL_DISABLED_FEATURES env var
@@ -1832,6 +1892,19 @@ Expected Duration: {expected_duration}
                 logging.warning(f"Error closing TaskManager: {e}")
             except Exception as e:
                 logging.warning(f"Error closing TaskManager: {e}", exc_info=True)
+
+        # Flush state to Lighthouse before closing storage
+        if getattr(self, '_sync_service', None) and self._sync_service.is_running:
+            try:
+                await self._sync_service.force_snapshot()
+                await self._sync_service.stop()
+                logging.info("Lighthouse sync: final snapshot flushed")
+            except asyncio.CancelledError:
+                logging.debug("Lighthouse sync flush cancelled")
+            except (AttributeError, TypeError, ConnectionError) as e:
+                logging.warning(f"Error flushing Lighthouse sync: {e}")
+            except Exception as e:
+                logging.warning(f"Error flushing Lighthouse sync: {e}", exc_info=True)
 
         # Close storage
         if hasattr(self.storage, 'close'):

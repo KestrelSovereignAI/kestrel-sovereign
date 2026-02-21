@@ -1,0 +1,491 @@
+"""
+Unit tests for Lighthouse sync target — state persistence for ephemeral environments.
+
+Tests restore_snapshot, CID tracking, manifest upload/download, and cold-start flow.
+"""
+
+import json
+import sys
+import pytest
+from datetime import datetime, timezone
+from pathlib import Path
+from unittest.mock import AsyncMock, Mock, patch, MagicMock
+
+from kestrel_sovereign.storage.sync.targets import LighthouseTarget, SyncResult
+
+
+class TestLighthouseTargetInit:
+    """Test LighthouseTarget initialization and properties."""
+
+    def test_init_defaults(self):
+        target = LighthouseTarget(api_key="test-key", agent_id="agent-123")
+        assert target.api_key == "test-key"
+        assert target.agent_id == "agent-123"
+        assert target._state_dir is None
+        assert target._latest_cid is None
+
+    def test_init_with_state_dir(self, tmp_path):
+        target = LighthouseTarget(
+            api_key="test-key", agent_id="agent-123", state_dir=tmp_path
+        )
+        assert target._state_dir == tmp_path
+
+    def test_name_property(self):
+        target = LighthouseTarget(api_key="k", agent_id="did:key:abc")
+        assert target.name == "lighthouse://did:key:abc"
+
+    def test_manifest_path_with_state_dir(self, tmp_path):
+        target = LighthouseTarget(
+            api_key="k", agent_id="agent-1", state_dir=tmp_path
+        )
+        assert target._manifest_path == tmp_path / ".lighthouse_manifest_agent-1.json"
+
+    def test_manifest_path_without_state_dir(self):
+        target = LighthouseTarget(api_key="k", agent_id="agent-1")
+        assert target._manifest_path is None
+
+
+class TestLocalManifest:
+    """Test local manifest save/load for CID tracking."""
+
+    def test_save_and_load_manifest(self, tmp_path):
+        target = LighthouseTarget(
+            api_key="k", agent_id="test", state_dir=tmp_path
+        )
+        manifest = {
+            "agent_id": "test",
+            "snapshot_cid": "QmTest123",
+            "snapshot_size": 1024,
+        }
+        target._save_local_manifest(manifest)
+
+        loaded = target._load_local_manifest()
+        assert loaded is not None
+        assert loaded["snapshot_cid"] == "QmTest123"
+        assert loaded["snapshot_size"] == 1024
+
+    def test_load_manifest_missing(self, tmp_path):
+        target = LighthouseTarget(
+            api_key="k", agent_id="test", state_dir=tmp_path
+        )
+        assert target._load_local_manifest() is None
+
+    def test_load_manifest_corrupt(self, tmp_path):
+        target = LighthouseTarget(
+            api_key="k", agent_id="test", state_dir=tmp_path
+        )
+        # Write corrupt data
+        manifest_path = tmp_path / ".lighthouse_manifest_test.json"
+        manifest_path.write_text("not json{{{")
+
+        assert target._load_local_manifest() is None
+
+    def test_save_manifest_no_state_dir(self):
+        target = LighthouseTarget(api_key="k", agent_id="test")
+        # Should not raise — just silently skip
+        target._save_local_manifest({"cid": "test"})
+
+    def test_load_manifest_no_state_dir(self):
+        target = LighthouseTarget(api_key="k", agent_id="test")
+        assert target._load_local_manifest() is None
+
+
+class TestSyncSnapshot:
+    """Test snapshot upload with manifest tracking."""
+
+    @pytest.fixture
+    def target(self, tmp_path):
+        return LighthouseTarget(
+            api_key="test-key", agent_id="agent-1", state_dir=tmp_path
+        )
+
+    @pytest.fixture
+    def mock_lighthouse(self):
+        mock_client = Mock()
+        mock_module = MagicMock()
+        mock_module.Lighthouse.return_value = mock_client
+        with patch.dict("sys.modules", {"lighthouseweb3": mock_module}):
+            yield mock_client
+
+    @pytest.mark.asyncio
+    async def test_sync_snapshot_success(self, target, tmp_path, mock_lighthouse):
+        """Snapshot upload should return CID and save manifest."""
+        # Create a test DB file
+        db_path = tmp_path / "test.db"
+        db_path.write_bytes(b"SQLite database content")
+
+        # Mock upload responses (snapshot + manifest)
+        mock_lighthouse.upload.side_effect = [
+            {"data": {"Hash": "QmSnapshot123", "Size": "23"}},
+            {"data": {"Hash": "QmManifest456", "Size": "100"}},
+        ]
+
+        result = await target.sync_snapshot(db_path)
+
+        assert result.success is True
+        assert result.bytes_synced == 23
+        assert result.metadata["cid"] == "QmSnapshot123"
+        assert target._latest_cid == "QmSnapshot123"
+
+        # Verify manifest was saved locally
+        manifest = target._load_local_manifest()
+        assert manifest is not None
+        assert manifest["snapshot_cid"] == "QmSnapshot123"
+
+    @pytest.mark.asyncio
+    async def test_sync_snapshot_upload_failure(self, target, tmp_path, mock_lighthouse):
+        """Upload failure should return unsuccessful SyncResult."""
+        db_path = tmp_path / "test.db"
+        db_path.write_bytes(b"data")
+
+        mock_lighthouse.upload.side_effect = ConnectionError("network down")
+
+        result = await target.sync_snapshot(db_path)
+
+        assert result.success is False
+        assert "network down" in result.error
+
+    @pytest.mark.asyncio
+    async def test_sync_snapshot_no_cid_in_response(self, target, tmp_path, mock_lighthouse):
+        """Should fail cleanly if upload returns no CID."""
+        db_path = tmp_path / "test.db"
+        db_path.write_bytes(b"data")
+
+        mock_lighthouse.upload.return_value = {"data": {}}
+
+        result = await target.sync_snapshot(db_path)
+
+        assert result.success is False
+        assert "No CID" in result.error
+
+    @pytest.mark.asyncio
+    async def test_sync_snapshot_manifest_failure_nonfatal(self, target, tmp_path, mock_lighthouse):
+        """Manifest upload failure should not fail the snapshot."""
+        db_path = tmp_path / "test.db"
+        db_path.write_bytes(b"data")
+
+        # Snapshot succeeds, manifest upload fails
+        mock_lighthouse.upload.side_effect = [
+            {"data": {"Hash": "QmSnapshot123", "Size": "4"}},
+            ConnectionError("manifest upload failed"),
+        ]
+
+        result = await target.sync_snapshot(db_path)
+
+        # Snapshot should still succeed
+        assert result.success is True
+        assert result.metadata["cid"] == "QmSnapshot123"
+
+    @pytest.mark.asyncio
+    async def test_sync_snapshot_tags_correctly(self, target, tmp_path, mock_lighthouse):
+        """Upload should use agent-specific tag."""
+        db_path = tmp_path / "test.db"
+        db_path.write_bytes(b"data")
+
+        mock_lighthouse.upload.side_effect = [
+            {"data": {"Hash": "QmTest", "Size": "4"}},
+            {"data": {"Hash": "QmManifest", "Size": "50"}},
+        ]
+
+        await target.sync_snapshot(db_path)
+
+        # First call is the snapshot upload
+        first_call = mock_lighthouse.upload.call_args_list[0]
+        assert first_call.kwargs.get("tag") == "kestrel-state-agent-1"
+
+
+class TestRestoreSnapshot:
+    """Test cold-start restore from Lighthouse."""
+
+    @pytest.fixture
+    def target(self, tmp_path):
+        return LighthouseTarget(
+            api_key="test-key", agent_id="agent-1", state_dir=tmp_path
+        )
+
+    @pytest.mark.asyncio
+    async def test_restore_from_env_var(self, target, tmp_path):
+        """Should restore using LIGHTHOUSE_STATE_CID env var."""
+        dest = tmp_path / "restored.db"
+        db_content = b"restored database content"
+
+        with patch.dict("os.environ", {"LIGHTHOUSE_STATE_CID": "QmExplicit123"}):
+            with patch("kestrel_sovereign.storage.sync.targets.requests") as mock_req:
+                mock_response = Mock()
+                mock_response.status_code = 200
+                mock_response.content = db_content
+                mock_response.raise_for_status = Mock()
+                mock_req.get.return_value = mock_response
+
+                result = await target.restore_snapshot(dest)
+
+        assert result is not None
+        assert result.success is True
+        assert result.bytes_synced == len(db_content)
+        assert dest.read_bytes() == db_content
+
+    @pytest.mark.asyncio
+    async def test_restore_from_local_manifest(self, target, tmp_path):
+        """Should restore using locally saved manifest."""
+        dest = tmp_path / "restored.db"
+        db_content = b"from manifest"
+
+        # Save a local manifest
+        target._save_local_manifest({"snapshot_cid": "QmFromManifest"})
+
+        with patch("kestrel_sovereign.storage.sync.targets.requests") as mock_req:
+            mock_response = Mock()
+            mock_response.status_code = 200
+            mock_response.content = db_content
+            mock_response.raise_for_status = Mock()
+            mock_req.get.return_value = mock_response
+
+            result = await target.restore_snapshot(dest)
+
+        assert result is not None
+        assert result.success is True
+        assert result.metadata["cid"] == "QmFromManifest"
+
+    @pytest.mark.asyncio
+    async def test_restore_no_snapshot_available(self, target, tmp_path):
+        """Should return None when no snapshot exists."""
+        dest = tmp_path / "restored.db"
+
+        with patch.object(target, "_query_uploads_api", return_value=None):
+            result = await target.restore_snapshot(dest)
+
+        assert result is None
+        assert not dest.exists()
+
+    @pytest.mark.asyncio
+    async def test_restore_download_failure(self, target, tmp_path):
+        """Should return failed SyncResult on download error."""
+        dest = tmp_path / "restored.db"
+        target._save_local_manifest({"snapshot_cid": "QmBadCID"})
+
+        with patch("kestrel_sovereign.storage.sync.targets.requests") as mock_req:
+            mock_req.get.side_effect = ConnectionError("gateway unreachable")
+
+            result = await target.restore_snapshot(dest)
+
+        assert result is not None
+        assert result.success is False
+        assert "gateway unreachable" in result.error
+
+    @pytest.mark.asyncio
+    async def test_restore_creates_parent_dirs(self, target, tmp_path):
+        """Should create parent directories if they don't exist."""
+        dest = tmp_path / "nested" / "dir" / "restored.db"
+        target._save_local_manifest({"snapshot_cid": "QmNested"})
+
+        with patch("kestrel_sovereign.storage.sync.targets.requests") as mock_req:
+            mock_response = Mock()
+            mock_response.content = b"data"
+            mock_response.raise_for_status = Mock()
+            mock_req.get.return_value = mock_response
+
+            result = await target.restore_snapshot(dest)
+
+        assert result.success is True
+        assert dest.exists()
+
+    @pytest.mark.asyncio
+    async def test_restore_empty_content(self, target, tmp_path):
+        """Should return None for empty downloads."""
+        dest = tmp_path / "restored.db"
+        target._save_local_manifest({"snapshot_cid": "QmEmpty"})
+
+        with patch("kestrel_sovereign.storage.sync.targets.requests") as mock_req:
+            mock_response = Mock()
+            mock_response.content = b""
+            mock_response.raise_for_status = Mock()
+            mock_req.get.return_value = mock_response
+
+            result = await target.restore_snapshot(dest)
+
+        assert result is None
+
+
+class TestResolveCID:
+    """Test CID resolution priority chain."""
+
+    @pytest.fixture
+    def target(self, tmp_path):
+        return LighthouseTarget(
+            api_key="test-key", agent_id="agent-1", state_dir=tmp_path
+        )
+
+    @pytest.mark.asyncio
+    async def test_env_var_takes_priority(self, target):
+        """Env var should override all other sources."""
+        target._save_local_manifest({"snapshot_cid": "QmManifest"})
+        target._latest_cid = "QmMemory"
+
+        with patch.dict("os.environ", {"LIGHTHOUSE_STATE_CID": "QmEnvVar"}):
+            cid = await target._resolve_latest_cid()
+
+        assert cid == "QmEnvVar"
+
+    @pytest.mark.asyncio
+    async def test_local_manifest_second_priority(self, target):
+        """Local manifest should be used when no env var."""
+        target._save_local_manifest({"snapshot_cid": "QmManifest"})
+        target._latest_cid = "QmMemory"
+
+        cid = await target._resolve_latest_cid()
+        assert cid == "QmManifest"
+
+    @pytest.mark.asyncio
+    async def test_memory_cache_third_priority(self, target):
+        """In-memory CID should be used when no manifest."""
+        target._latest_cid = "QmMemory"
+
+        cid = await target._resolve_latest_cid()
+        assert cid == "QmMemory"
+
+    @pytest.mark.asyncio
+    async def test_uploads_api_last_resort(self, target):
+        """Should query uploads API as last resort."""
+        with patch.object(
+            target, "_query_uploads_api", return_value="QmFromAPI"
+        ) as mock_api:
+            cid = await target._resolve_latest_cid()
+
+        assert cid == "QmFromAPI"
+        mock_api.assert_called_once()
+
+
+class TestQueryUploadsAPI:
+    """Test Lighthouse uploads API querying."""
+
+    @pytest.fixture
+    def target(self):
+        return LighthouseTarget(api_key="test-key", agent_id="agent-1")
+
+    @pytest.mark.asyncio
+    async def test_finds_snapshot_by_tag(self, target):
+        """Should find latest snapshot matching agent tag."""
+        uploads = [
+            {
+                "tag": "kestrel-state-agent-1",
+                "cid": "QmOlder",
+                "createdAt": "2026-01-01T00:00:00Z",
+            },
+            {
+                "tag": "kestrel-state-agent-1",
+                "cid": "QmNewer",
+                "createdAt": "2026-02-01T00:00:00Z",
+            },
+            {
+                "tag": "kestrel-state-other-agent",
+                "cid": "QmOther",
+                "createdAt": "2026-03-01T00:00:00Z",
+            },
+        ]
+
+        with patch("kestrel_sovereign.storage.sync.targets.requests") as mock_req:
+            mock_response = Mock()
+            mock_response.status_code = 200
+            mock_response.json.return_value = {"data": uploads}
+            mock_req.get.return_value = mock_response
+
+            cid = await target._query_uploads_api()
+
+        assert cid == "QmNewer"
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_no_snapshots(self, target):
+        """Should return None if no matching uploads."""
+        with patch("kestrel_sovereign.storage.sync.targets.requests") as mock_req:
+            mock_response = Mock()
+            mock_response.status_code = 200
+            mock_response.json.return_value = {"data": []}
+            mock_req.get.return_value = mock_response
+
+            cid = await target._query_uploads_api()
+
+        assert cid is None
+
+    @pytest.mark.asyncio
+    async def test_handles_api_error(self, target):
+        """Should return None on API error."""
+        with patch("kestrel_sovereign.storage.sync.targets.requests") as mock_req:
+            mock_req.get.side_effect = ConnectionError("timeout")
+
+            cid = await target._query_uploads_api()
+
+        assert cid is None
+
+    @pytest.mark.asyncio
+    async def test_handles_non_200_response(self, target):
+        """Should return None on non-200 status."""
+        with patch("kestrel_sovereign.storage.sync.targets.requests") as mock_req:
+            mock_response = Mock()
+            mock_response.status_code = 401
+            mock_req.get.return_value = mock_response
+
+            cid = await target._query_uploads_api()
+
+        assert cid is None
+
+
+class TestSyncWAL:
+    """Test WAL sync (delegates to sync_snapshot)."""
+
+    @pytest.mark.asyncio
+    async def test_sync_wal_delegates_to_snapshot(self, tmp_path):
+        target = LighthouseTarget(
+            api_key="k", agent_id="test", state_dir=tmp_path
+        )
+        wal_path = tmp_path / "test.db-wal"
+        wal_path.write_bytes(b"wal data")
+
+        with patch.object(target, "sync_snapshot") as mock_sync:
+            mock_sync.return_value = SyncResult(
+                success=True,
+                target_name="test",
+                bytes_synced=8,
+                frames_synced=0,
+                timestamp=datetime.now(timezone.utc),
+            )
+            result = await target.sync_wal(wal_path, position=0)
+
+        mock_sync.assert_called_once_with(wal_path)
+        assert result.success is True
+
+
+class TestGetLatestPosition:
+    """Test WAL position tracking (not applicable for Lighthouse)."""
+
+    @pytest.mark.asyncio
+    async def test_returns_none(self):
+        target = LighthouseTarget(api_key="k", agent_id="test")
+        assert await target.get_latest_position() is None
+
+
+class TestHealthCheck:
+    """Test Lighthouse connectivity check."""
+
+    @pytest.mark.asyncio
+    async def test_health_check_success(self):
+        target = LighthouseTarget(api_key="test-key", agent_id="test")
+
+        mock_client = Mock()
+        mock_client.getBalance.return_value = {"data": {"dataUsed": "0"}}
+        mock_module = MagicMock()
+        mock_module.Lighthouse.return_value = mock_client
+        with patch.dict("sys.modules", {"lighthouseweb3": mock_module}):
+            result = await target.health_check()
+
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_health_check_failure(self):
+        target = LighthouseTarget(api_key="bad-key", agent_id="test")
+
+        mock_module = MagicMock()
+        mock_module.Lighthouse.return_value.getBalance.side_effect = Exception("auth failed")
+        with patch.dict("sys.modules", {"lighthouseweb3": mock_module}):
+            result = await target.health_check()
+
+        assert result is False

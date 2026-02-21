@@ -38,6 +38,7 @@ KESTREL_DB_PATH = "/app/agent_data"
 OPENAI_API_KEY = "kestrel-openai-key:latest"
 KESTREL_API_KEY = "kestrel-api-key:latest"
 KESTREL_DATA_KEY = "kestrel-data-key:latest"
+LIGHTHOUSE_API_KEY = "kestrel-lighthouse-key:latest"
 
 # Production Profile - Cloud Run (always warm, auto-scales)
 [profiles.prod]
@@ -62,6 +63,7 @@ KESTREL_DB_PATH = "/app/agent_data"
 OPENAI_API_KEY = "kestrel-openai-key:latest"
 KESTREL_API_KEY = "kestrel-api-key:latest"
 KESTREL_DATA_KEY = "kestrel-data-key:latest"
+LIGHTHOUSE_API_KEY = "kestrel-lighthouse-key:latest"
 
 # Azure Container Apps Profile (Coming Soon)
 # Uncomment and configure when Azure provider is fully implemented
