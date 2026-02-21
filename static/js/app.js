@@ -4,7 +4,7 @@
  */
 
 import API from './api.js';
-import { state } from './ui.js';
+import { state, loadCommands } from './ui.js';
 import {
     initAgentFromUrl,
     setLazyLoaders,
@@ -19,7 +19,7 @@ import {
     loadLocalFiles,
     loadIpfsStatus,
 } from './panels.js';
-import { initChat, loadModels } from './chat.js';
+import { initChat, loadModels, connectNotifications, updateContextStatus } from './chat.js';
 import { Security } from './security.js';
 import { initTasks, loadTasks } from './tasks.js';
 import { loadResources } from './resources.js';
@@ -64,13 +64,21 @@ async function init() {
     // Initialize sovereignty panel buttons (Export/Import)
     initSovereigntyButtons();
 
-    // Load initial data in parallel
-    await Promise.all([
-        loadIdentity(),
-        loadPrivacyMode(),
-        loadAgents(),
-        loadModels(),
-    ]);
+    // Load agents first — in rookery mode, selectAgent() handles loading
+    // all agent-specific data (identity, privacy, models, SSE, context).
+    await loadAgents();
+
+    // In standalone mode (no rookery agent selected), load data directly
+    if (!API.isRookeryMode()) {
+        connectNotifications();
+        await Promise.all([
+            loadIdentity(),
+            loadPrivacyMode(),
+            loadModels(),
+            loadCommands(API),
+        ]);
+        updateContextStatus();
+    }
 
     console.log('Kestrel Sovereign Console ready');
 }
