@@ -410,6 +410,14 @@ window.selectAgent = async function(agentName) {
         loadCommands(API),
         updateContextStatus(),
     ]);
+
+    // Reload the currently active panel (its cached state was cleared above)
+    const panel = state.currentPanel;
+    if (panel === 'constitution' && loadConstitution) loadConstitution();
+    if (panel === 'memories' && loadMemories) loadMemories();
+    if (panel === 'sovereignty' && loadExports) loadExports();
+    if (panel === 'tasks' && loadTasks) loadTasks();
+    if (panel === 'resources' && loadResources) loadResources();
 };
 
 // ============================================================================
