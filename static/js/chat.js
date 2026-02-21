@@ -58,11 +58,9 @@ export function initChat() {
 
     // Note: Model selector events are now handled by SharedModelSelector in loadModels()
 
-    // Connect to SSE notifications
-    connectNotifications();
-
-    // Load initial context status
-    updateContextStatus();
+    // SSE notifications and context status are loaded after agent selection:
+    // - Rookery mode: selectAgent() handles both
+    // - Standalone mode: app.js init handles both after loadAgents()
 }
 
 // ============================================================================
@@ -76,7 +74,7 @@ let notificationReconnectTimeout = null;
  * Connect to the SSE notifications endpoint for real-time task updates.
  * Automatically reconnects on disconnect with exponential backoff.
  */
-function connectNotifications() {
+export function connectNotifications() {
     if (notificationEventSource) {
         notificationEventSource.close();
     }
@@ -563,12 +561,17 @@ export async function loadModels() {
     }
 
     // Create the shared model selector instance
+    // Use API.buildAgentUrl() for proper rookery routing and pass auth headers
     sharedModelSelector = new window.SharedModelSelector({
         providerSelectId: 'provider-selector',
         modelSelectId: 'model-selector',
-        apiEndpoint: '/api/models',
-        currentModelEndpoint: '/api/model/current',
+        apiEndpoint: API.buildAgentUrl('/api/models'),
+        currentModelEndpoint: API.buildAgentUrl('/api/model/current'),
         storagePrefix: 'kestrel',
+        getAuthHeader: () => {
+            const key = API.getApiKey();
+            return key ? { 'X-API-Key': key } : {};
+        },
         onModelChange: async (provider, model) => {
             // Update state
             state.selectedModel = model;

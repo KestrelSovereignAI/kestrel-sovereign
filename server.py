@@ -23,7 +23,9 @@ from slowapi.errors import RateLimitExceeded
 from kestrel_sovereign.kestrel_config.constants import SHUTDOWN_TIMEOUT
 
 # Load environment variables from .env file
-load_dotenv(Path(__file__).parent / ".env", override=True)
+# override=False: Don't clobber env vars already set by ProcessManager
+# (e.g., KESTREL_DB_PATH is set per-agent in rookery mode)
+load_dotenv(Path(__file__).parent / ".env", override=False)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)

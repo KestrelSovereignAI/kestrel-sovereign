@@ -4,7 +4,8 @@
  */
 
 import API from './api.js';
-import { state, PRIVACY_MODES, Toast } from './ui.js';
+import { state, PRIVACY_MODES, Toast, loadCommands } from './ui.js';
+import { disconnectNotifications, connectNotifications, loadModels, updateContextStatus } from './chat.js';
 
 // ============================================================================
 // Agent Selection (Multi-Agent Support)
@@ -381,11 +382,34 @@ window.selectAgent = async function(agentName) {
     const conversationsPane = document.getElementById('conversations-pane');
     conversationsPane.style.display = 'flex';
 
-    // Reload identity from newly selected agent
-    loadIdentity();
+    // Clear chat messages — previous agent's messages shouldn't persist
+    const chatContainer = document.getElementById('chat-container');
+    if (chatContainer) {
+        chatContainer.innerHTML = '';
+    }
 
-    // Load conversations for selected agent
-    await loadConversations(agentName);
+    // Reset session and cached panel data so they reload from the new agent
+    state.currentSessionId = null;
+    state.identity = null;
+    state.constitution = null;
+    state.memories = null;
+    state.exports = null;
+    state.storage = null;
+    state.wallet = null;
+
+    // Reconnect SSE notifications to the new agent
+    disconnectNotifications();
+    connectNotifications();
+
+    // Reload all agent-specific data in parallel
+    await Promise.all([
+        loadIdentity(),
+        loadPrivacyMode(),
+        loadConversations(agentName),
+        loadModels(),
+        loadCommands(API),
+        updateContextStatus(),
+    ]);
 };
 
 // ============================================================================

@@ -69,6 +69,9 @@ node_modules/
 npm-debug.log
 yarn-error.log
 
+# Local config (like .env — user-specific, not committed)
+rookery.toml
+
 # Data and caches
 agent_data/
 agent_data_test/
