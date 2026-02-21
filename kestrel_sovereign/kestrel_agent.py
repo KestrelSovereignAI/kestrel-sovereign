@@ -33,7 +33,7 @@ from kestrel_sovereign.agent.backup import BackupMixin
 from kestrel_sovereign.agent.sleep import SleepMixin
 from kestrel_sovereign.storage.memory_consolidator import MemoryConsolidator
 from kestrel_sovereign.storage.memory_system import MemorySystem
-from kestrel_sovereign.hooks import HooksManager, HookEvent, HookInput, HookOutput
+from kestrel_sovereign.hooks import HooksManager, HookEvent, HookInput, HookOutput, PermissionDecision
 from kestrel_sovereign.bootstrap import BootstrapService, BootstrapState
 
 # Optional ollama import (not available in remote-only containers)
@@ -1079,6 +1079,80 @@ Expected Duration: {expected_duration}
         sections.append("\n\n**CRITICAL:** When asked about your subagents, capabilities, or available tools, LIST the features above by name. They ARE your active subagents. Never say 'no active subagents' - that is incorrect.")
         return "\n".join(sections)
 
+    async def _execute_tool_with_hooks(
+        self,
+        tool_name: str,
+        feature_name: str,
+        args: dict,
+        session_id: str,
+        execute_fn,
+    ) -> dict:
+        """
+        Execute a tool with PRE_TOOL_USE and POST_TOOL_USE hook enforcement.
+
+        This is the single entry point for all tool execution in the orchestrator
+        loop, ensuring security hooks (permissions, audit logging) are always
+        invoked regardless of whether the tool is a feature subagent dispatch
+        or a direct tool call.
+
+        Args:
+            tool_name: Name of the tool being called
+            feature_name: Name of the owning feature (for permission lookup)
+            args: Arguments to pass to the tool
+            session_id: Session ID for hook context
+            execute_fn: Async callable that performs the actual tool execution.
+                        Called with no arguments; should return the tool result.
+
+        Returns:
+            Tool result dict, or an error dict if permission was denied.
+        """
+        # --- PRE_TOOL_USE hooks ---
+        hook_input = HookInput(
+            session_id=session_id,
+            hook_event_name=HookEvent.PRE_TOOL_USE.value,
+            tool_name=tool_name,
+            tool_input=args,
+            feature_name=feature_name,
+        )
+
+        hook_output = await self.hooks_manager.execute_hooks(
+            HookEvent.PRE_TOOL_USE,
+            hook_input,
+        )
+
+        if hook_output.permission_decision == PermissionDecision.DENY:
+            reason = hook_output.permission_reason or "Blocked by security policy"
+            logging.info(f"[HOOKS] Tool denied: {feature_name}.{tool_name} - {reason}")
+            return {"success": False, "error": f"Permission denied: {reason}"}
+
+        # If hooks modified the input, update args (callers that need it can
+        # inspect the returned result; the execute_fn closure already captured
+        # the original args, so we pass updated_input through the result).
+        if hook_output.updated_input:
+            args = hook_output.updated_input
+
+        # --- Execute the tool ---
+        exec_start = time.time()
+        result = await execute_fn()
+        exec_duration_ms = int((time.time() - exec_start) * 1000)
+
+        # --- POST_TOOL_USE hooks (parallel, non-blocking) ---
+        post_hook_input = HookInput(
+            session_id=session_id,
+            hook_event_name=HookEvent.POST_TOOL_USE.value,
+            tool_name=tool_name,
+            tool_input=args,
+            feature_name=feature_name,
+            tool_response=result if isinstance(result, dict) else {"result": str(result)},
+            execution_time_ms=exec_duration_ms,
+        )
+        await self.hooks_manager.execute_hooks_parallel(
+            HookEvent.POST_TOOL_USE,
+            post_hook_input,
+        )
+
+        return result
+
     async def _handle_orchestrator_response(
         self,
         response: Union[str, LLMResponse],
@@ -1172,24 +1246,27 @@ Expected Duration: {expected_duration}
                 # Find the feature for this tool
                 feature = features_by_tool_name.get(tool_name)
                 if feature:
-                    try:
-                        # Execute feature as subagent (A2A pattern)
-                        # Use LLM-provided task/context, fallback to user's original message
-                        task = args.get("task", "")
-                        context = args.get("context")
+                    # Determine feature_name for hooks (class name)
+                    hook_feature_name = type(feature).__name__
 
-                        # If LLM didn't provide context, use the original user message
+                    async def _exec_feature(f=feature, a=args):
+                        task = a.get("task", "")
+                        context = a.get("context")
                         if not context and user_message:
                             context = f"User's original request: {user_message}"
+                        logging.info(f"Dispatching to feature subagent: {f.tool_name}")
+                        r = await f.execute_as_subagent(task=task, context=context)
+                        self._register_explored_feature_tools(f)
+                        return r
 
-                        logging.info(f"Dispatching to feature subagent: {tool_name}")
-                        result = await feature.execute_as_subagent(
-                            task=task,
-                            context=context
+                    try:
+                        result = await self._execute_tool_with_hooks(
+                            tool_name=tool_name,
+                            feature_name=hook_feature_name,
+                            args=args,
+                            session_id="orchestrator",
+                            execute_fn=_exec_feature,
                         )
-
-                        # Register individual tools for direct calling
-                        self._register_explored_feature_tools(feature)
 
                         # Log success
                         dispatch_duration = int((time.time() - dispatch_start) * 1000)
@@ -1202,7 +1279,6 @@ Expected Duration: {expected_duration}
                         logging.error(f"Feature {tool_name} execution failed: {e}")
                         result = {"success": False, "error": str(e)}
 
-                        # Log failure
                         dispatch_duration = int((time.time() - dispatch_start) * 1000)
                         await self.observability_store.log_tool_response(
                             event_id=dispatch_event_id,
@@ -1214,7 +1290,6 @@ Expected Duration: {expected_duration}
                         logging.error(f"Feature {tool_name} execution failed: {e}", exc_info=True)
                         result = {"success": False, "error": str(e)}
 
-                        # Log failure
                         dispatch_duration = int((time.time() - dispatch_start) * 1000)
                         await self.observability_store.log_tool_response(
                             event_id=dispatch_event_id,
@@ -1224,9 +1299,20 @@ Expected Duration: {expected_duration}
                         )
                 elif tool_name in self._direct_tools:
                     # Direct tool execution — no subagent LLM hop
+                    tool = self._direct_tools[tool_name]
+                    hook_feature_name = self._tool_to_feature.get(tool_name, tool_name)
+
+                    async def _exec_direct(t=tool, a=args):
+                        return await t.execute(**a)
+
                     try:
-                        tool = self._direct_tools[tool_name]
-                        result = await tool.execute(**args)
+                        result = await self._execute_tool_with_hooks(
+                            tool_name=tool_name,
+                            feature_name=hook_feature_name,
+                            args=args,
+                            session_id="orchestrator",
+                            execute_fn=_exec_direct,
+                        )
 
                         dispatch_duration = int((time.time() - dispatch_start) * 1000)
                         await self.observability_store.log_tool_response(
@@ -1395,17 +1481,26 @@ Expected Duration: {expected_duration}
 
                 feature = features_by_tool_name.get(tool_name)
                 if feature:
-                    try:
-                        task = args.get("task", "")
-                        context = args.get("context")
+                    hook_feature_name = type(feature).__name__
+
+                    async def _exec_feature_stream(f=feature, a=args):
+                        task = a.get("task", "")
+                        context = a.get("context")
                         if not context and user_message:
                             context = f"User's original request: {user_message}"
+                        logging.info(f"[STREAM] Dispatching to feature subagent: {f.tool_name}")
+                        r = await f.execute_as_subagent(task=task, context=context)
+                        self._register_explored_feature_tools(f)
+                        return r
 
-                        logging.info(f"[STREAM] Dispatching to feature subagent: {tool_name}")
-                        result = await feature.execute_as_subagent(task=task, context=context)
-
-                        # Register individual tools for direct calling
-                        self._register_explored_feature_tools(feature)
+                    try:
+                        result = await self._execute_tool_with_hooks(
+                            tool_name=tool_name,
+                            feature_name=hook_feature_name,
+                            args=args,
+                            session_id="orchestrator",
+                            execute_fn=_exec_feature_stream,
+                        )
 
                         dispatch_duration = int((time.time() - dispatch_start) * 1000)
                         await self.observability_store.log_tool_response(
@@ -1413,7 +1508,6 @@ Expected Duration: {expected_duration}
                             success=True,
                             duration_ms=dispatch_duration,
                         )
-                        # Stream tool completion indicator to user
                         yield f"✓ {tool_name} complete ({dispatch_duration}ms)\n"
                     except (ConnectionError, TimeoutError, ValueError, KeyError, TypeError, AttributeError) as e:
                         logging.error(f"Feature {tool_name} execution failed: {e}")
@@ -1425,7 +1519,6 @@ Expected Duration: {expected_duration}
                             duration_ms=dispatch_duration,
                             error_message=str(e),
                         )
-                        # Stream tool error indicator to user
                         yield f"❌ {tool_name} failed: {str(e)[:100]}\n"
                     except Exception as e:
                         logging.error(f"Feature {tool_name} execution failed: {e}", exc_info=True)
@@ -1437,14 +1530,24 @@ Expected Duration: {expected_duration}
                             duration_ms=dispatch_duration,
                             error_message=str(e),
                         )
-                        # Stream tool error indicator to user
                         yield f"❌ {tool_name} failed: {str(e)[:100]}\n"
 
                 elif tool_name in self._direct_tools:
                     # Direct tool execution — no subagent LLM hop
+                    tool = self._direct_tools[tool_name]
+                    hook_feature_name = self._tool_to_feature.get(tool_name, tool_name)
+
+                    async def _exec_direct_stream(t=tool, a=args):
+                        return await t.execute(**a)
+
                     try:
-                        tool = self._direct_tools[tool_name]
-                        result = await tool.execute(**args)
+                        result = await self._execute_tool_with_hooks(
+                            tool_name=tool_name,
+                            feature_name=hook_feature_name,
+                            args=args,
+                            session_id="orchestrator",
+                            execute_fn=_exec_direct_stream,
+                        )
 
                         dispatch_duration = int((time.time() - dispatch_start) * 1000)
                         await self.observability_store.log_tool_response(
@@ -1475,7 +1578,6 @@ Expected Duration: {expected_duration}
                         duration_ms=dispatch_duration,
                         error_message=f"Unknown feature tool: {tool_name}",
                     )
-                    # Stream unknown tool indicator to user
                     yield f"❌ Unknown tool: {tool_name}\n"
 
                 from kestrel_sovereign.features.base import _serialize_tool_result
