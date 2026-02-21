@@ -260,6 +260,8 @@ class TestRealStreaming:
         from kestrel_sovereign.kestrel_agent import KestrelAgent
         from kestrel_sovereign.llm.adapter import LLMResponse, ToolCall
 
+        from kestrel_sovereign.hooks import HooksManager
+
         mock_agent = MagicMock()
         mock_agent.did = "test-did"
 
@@ -269,10 +271,17 @@ class TestRealStreaming:
         mock_feature.execute_as_subagent = AsyncMock(return_value={"success": True, "data": "result"})
         mock_agent.features = {"test_feature": mock_feature}
 
+        # Hooks manager (no hooks registered = all tools allowed)
+        mock_agent.hooks_manager = HooksManager()
+
         # Mock observability
         mock_agent.observability_store = MagicMock()
         mock_agent.observability_store.log_tool_call = AsyncMock(return_value="event-1")
         mock_agent.observability_store.log_tool_response = AsyncMock()
+
+        # Direct tools lookup (empty - feature dispatch only)
+        mock_agent._direct_tools = {}
+        mock_agent._tool_to_feature = {}
 
         # Mock LLM service
         mock_agent.llm_service = MagicMock()
@@ -292,10 +301,14 @@ class TestRealStreaming:
 
         mock_agent.llm_service.stream_with_messages = mock_stream
 
-        # Bind the method
+        # Bind both the streaming handler and the hooks helper
         mock_agent._handle_orchestrator_response_streaming = (
             KestrelAgent._handle_orchestrator_response_streaming.__get__(mock_agent)
         )
+        mock_agent._execute_tool_with_hooks = (
+            KestrelAgent._execute_tool_with_hooks.__get__(mock_agent)
+        )
+        mock_agent._register_explored_feature_tools = MagicMock()
 
         # Call with the initial response that has tool calls
         chunks = []

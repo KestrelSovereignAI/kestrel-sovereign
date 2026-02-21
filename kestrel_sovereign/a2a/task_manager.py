@@ -319,29 +319,9 @@ class TaskManager:
                 await self.task_store.save(task)
                 return task
 
-            if hook_output.permission_decision == PermissionDecision.ASK:
-                # Create an input_required task for user approval
-                task = Task(
-                    id=task_id,
-                    sessionId=session_id,
-                    status=TaskStatus(
-                        state=TaskState.INPUT_REQUIRED,
-                        message=Message(
-                            role="agent",
-                            parts=[TextPart(text=f"Waiting for approval: {hook_output.permission_reason or 'User approval required'}")]
-                        )
-                    ),
-                    metadata={
-                        "skill": skill_id,
-                        "args": args,
-                        "agent_id": agent_id,
-                        "approval_id": hook_output.approval_id,
-                        "pending_approval": True,
-                    },
-                    history=[],
-                )
-                await self.task_store.save(task)
-                return task
+            # Note: SecurityHook handles ASK internally by blocking until
+            # the user responds via the approval queue, so hooks only ever
+            # return ALLOW or DENY here.  There is no need for an ASK branch.
 
             # Update args if hook modified them
             if hook_output.updated_input:
