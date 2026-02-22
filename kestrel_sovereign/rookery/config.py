@@ -212,16 +212,21 @@ class RookeryConfig(BaseModel):
         return cls(host=host, agents=agents)
 
     @classmethod
-    def auto_discover(cls, base_dir: Union[str, Path] = AGENT_DATA_DIR) -> "RookeryConfig":
+    def auto_discover(
+        cls,
+        base_dir: Union[str, Path] = AGENT_DATA_DIR,
+        include_empty: bool = False,
+    ) -> "RookeryConfig":
         """
         Auto-discover agents from agent_data/* subdirectories.
 
         This is used as a fallback when no rookery.toml exists.
-        Scans for directories containing kestrel_prime.db and assigns
-        ports sequentially starting from 8801.
+        Scans for directories containing kestrel_prime.db (or any subdirectory
+        when include_empty=True) and assigns ports sequentially starting from 8801.
 
         Args:
             base_dir: Directory to scan for agents (default: agent_data/)
+            include_empty: If True, include empty subdirectories (for fresh provisioning)
 
         Returns:
             RookeryConfig with auto-discovered agents
@@ -240,7 +245,7 @@ class RookeryConfig(BaseModel):
                 continue
 
             db_path = subdir / "kestrel_prime.db"
-            if not db_path.exists():
+            if not db_path.exists() and not include_empty:
                 continue
 
             # Found an agent directory

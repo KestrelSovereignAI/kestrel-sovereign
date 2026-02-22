@@ -100,6 +100,17 @@ def _read_key_from_file(path: str) -> Optional[str]:
     return None
 
 
+def _strip_quotes(value: str) -> str:
+    """Strip surrounding quotes from a value.
+
+    Docker's --env-file includes quotes literally, while python-dotenv strips them.
+    This ensures consistent key values regardless of how env vars are loaded.
+    """
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+        return value[1:-1]
+    return value
+
+
 def _get_data_key() -> Optional[str]:
     """
     Get the KESTREL_DATA_KEY from multiple sources in order of preference:
@@ -116,7 +127,7 @@ def _get_data_key() -> Optional[str]:
         key = _read_key_from_file(key_file)
         if key:
             logger.debug("Loaded key from KESTREL_DATA_KEY_FILE")
-            return key
+            return _strip_quotes(key)
 
     # Priority 2: Default Docker Secrets path
     docker_secret_path = "/run/secrets/kestrel_data_key"
@@ -124,7 +135,7 @@ def _get_data_key() -> Optional[str]:
         key = _read_key_from_file(docker_secret_path)
         if key:
             logger.debug("Loaded key from Docker Secret")
-            return key
+            return _strip_quotes(key)
 
     # Priority 3: Environment variable (legacy)
     env_key = os.environ.get(ENV_VAR_NAME)
@@ -135,7 +146,7 @@ def _get_data_key() -> Optional[str]:
                 "KESTREL_DATA_KEY in ENV is insecure in Docker. "
                 "Use Docker Secrets: --secret kestrel_data_key or mount to /run/secrets/"
             )
-        return env_key
+        return _strip_quotes(env_key)
 
     return None
 

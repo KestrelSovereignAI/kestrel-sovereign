@@ -267,6 +267,13 @@ class ProcessManager:
         env["PORT"] = str(config.port)
         env["KESTREL_SERVE_UI"] = "false"
 
+        # Per-agent data key: KESTREL_DATA_KEY_CLAW overrides KESTREL_DATA_KEY
+        agent_key_var = f"KESTREL_DATA_KEY_{name.upper()}"
+        agent_data_key = env.get(agent_key_var)
+        if agent_data_key:
+            env["KESTREL_DATA_KEY"] = agent_data_key
+            logger.info(f"Agent '{name}' using per-agent data key from {agent_key_var}")
+
         cmd = [
             sys.executable, "-m", "uvicorn", "server:app",
             "--host", host_bind, "--port", str(config.port),
