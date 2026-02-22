@@ -128,10 +128,10 @@ export async function loadIdentity() {
             <div class="identity-header">
                 <div class="identity-avatar">${avatarHtml}</div>
                 <div class="identity-info">
-                    <h2>${identity.name || 'Kestrel Agent'}</h2>
+                    <h2>${identity.name || 'Unnamed Agent'}</h2>
                     <div class="identity-did" title="${identity.did}">
-                        ${identity.did || 'No DID assigned'}
-                        <button onclick="copyToClipboard('${identity.did}')" style="background:none;border:none;cursor:pointer;margin-left:0.5rem;" title="Copy DID">\u{1F4CB}</button>
+                        <span class="identity-did-text">${identity.did || 'No DID assigned'}</span>
+                        <button onclick="copyToClipboard('${identity.did}')" style="background:none;border:none;cursor:pointer;flex-shrink:0;" title="Copy DID">\u{1F4CB}</button>
                     </div>
                 </div>
             </div>
