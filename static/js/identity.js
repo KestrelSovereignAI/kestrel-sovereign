@@ -122,8 +122,8 @@ export async function loadIdentity() {
                 navIcon.style.display = 'inline';
             }
         }
-        if (navName && identity.name) {
-            navName.textContent = identity.name;
+        if (navName) {
+            navName.textContent = identity.name || 'Unnamed Agent';
         }
 
         // Avatar: custom image → identicon → kestrel logo
