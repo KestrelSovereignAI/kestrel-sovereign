@@ -69,11 +69,24 @@ def get_api_key() -> str:
 
 
 def load_rookery_config() -> RookeryConfig:
-    """Load rookery configuration from file or auto-discover."""
+    """Load rookery configuration from file or auto-discover.
+
+    When running on Cloud Run or Azure Container Apps, the platform injects
+    a PORT env var. Override the host port to match so the container binds
+    to the correct port.
+    """
     config_path = os.environ.get("KESTREL_ROOKERY_CONFIG")
     if config_path:
-        return RookeryConfig.load(config_path)
-    return RookeryConfig.load()
+        config = RookeryConfig.load(config_path)
+    else:
+        config = RookeryConfig.load()
+
+    # Cloud Run / Azure Container Apps override: bind to platform-assigned port
+    cloud_port = os.environ.get("PORT")
+    if cloud_port:
+        config.host.port = int(cloud_port)
+
+    return config
 
 
 @asynccontextmanager

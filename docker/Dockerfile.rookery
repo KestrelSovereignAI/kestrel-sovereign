@@ -1,0 +1,55 @@
+# Dockerfile for Kestrel Rookery Host — Cloud Run / Azure Container Apps
+# Runs the multi-agent host (host.py) which spawns agent subprocesses.
+# Same base as Dockerfile.cloudrun but entrypoint is host:app, not server:app.
+ARG TARGETARCH
+FROM ghcr.io/astral-sh/uv:latest AS uv
+FROM --platform=linux/${TARGETARCH} python:3.11-slim
+
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy uv from official image (faster than pip install uv)
+COPY --from=uv /uv /usr/local/bin/uv
+
+# Copy application source code
+COPY . .
+
+# Make entrypoint executable
+RUN chmod +x /app/docker/rookery_entrypoint.sh
+
+# Create the virtual environment and install
+RUN uv venv /app/.venv && \
+    uv pip install --python /app/.venv/bin/python . && \
+    (uv pip uninstall --python /app/.venv/bin/python ollama || true)
+
+# Create directories for agent data (auto-discover will find subdirs)
+RUN mkdir -p /app/agent_data
+
+# Create non-root user and set permissions
+RUN useradd -m -u 1000 kestrel && \
+    chown -R kestrel:kestrel /app
+
+# Switch to non-root user
+USER kestrel
+
+# Environment
+ENV PYTHONUNBUFFERED=1
+ENV KESTREL_ENV=production
+ENV KESTREL_ROOKERY_CONFIG=/app/rookery.toml
+ENV KESTREL_HOST_AUTOSTART=true
+ENV PORT=8080
+
+# Cloud Run / ACA injects PORT env var
+EXPOSE 8080
+
+# Health check hits the host's aggregated health endpoint
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD curl -f http://localhost:${PORT}/health || exit 1
+
+# Bootstrap agent identities and start the rookery host
+CMD ["/app/docker/rookery_entrypoint.sh"]

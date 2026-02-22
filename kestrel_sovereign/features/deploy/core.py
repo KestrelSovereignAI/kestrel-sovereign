@@ -99,6 +99,14 @@ class DeployManagerCore:
                 raw_secrets = data.get("secrets", {})
                 expanded_secrets = self._expand_env_vars(raw_secrets)
 
+                # Determine default dockerfile based on deployment mode
+                deployment_mode = data.get("deployment_mode", "agent")
+                default_dockerfile = (
+                    "docker/Dockerfile.rookery"
+                    if deployment_mode == "rookery"
+                    else "docker/Dockerfile.cloudrun"
+                )
+
                 profiles[key] = DeploymentProfile(
                     provider=provider,
                     service_name=data["service_name"],
@@ -110,10 +118,12 @@ class DeployManagerCore:
                     port=int(data.get("port", 8080)),
                     timeout=int(data.get("timeout", 300)),
                     concurrency=int(data.get("concurrency", 80)),
-                    dockerfile=data.get("dockerfile", "Dockerfile.remote"),
+                    deployment_mode=deployment_mode,
+                    dockerfile=data.get("dockerfile", default_dockerfile),
                     env_vars=expanded_env,
                     secrets=expanded_secrets,
                     gcp_project_id=data.get("gcp_project_id") or self.gcp_project_id,
+                    azure_resource_group=data.get("azure_resource_group"),
                 )
 
                 logger.debug(f"Loaded profile '{key}': {provider.value} -> {data['service_name']}")

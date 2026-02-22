@@ -117,6 +117,52 @@ class TestDeploymentProfile:
         assert len(profile.secrets) == 2
         assert profile.secrets["OPENAI_API_KEY"] == "kestrel-openai-key:latest"
 
+    def test_deployment_mode_defaults(self):
+        """Test deployment_mode defaults to 'agent'."""
+        profile = DeploymentProfile(
+            provider=DeployProviderType.CLOUD_RUN,
+            service_name="kestrel-dev",
+            region="us-central1",
+        )
+        assert profile.deployment_mode == "agent"
+        assert profile.is_rookery is False
+        assert profile.dockerfile == "docker/Dockerfile.cloudrun"
+
+    def test_rookery_deployment_mode(self):
+        """Test rookery deployment mode."""
+        profile = DeploymentProfile(
+            provider=DeployProviderType.CLOUD_RUN,
+            service_name="kestrel-rookery-dev",
+            region="us-central1",
+            deployment_mode="rookery",
+            dockerfile="docker/Dockerfile.rookery",
+            memory="4Gi",
+            cpu=4,
+        )
+        assert profile.deployment_mode == "rookery"
+        assert profile.is_rookery is True
+        assert profile.dockerfile == "docker/Dockerfile.rookery"
+        assert profile.memory == "4Gi"
+        assert profile.cpu == 4
+
+    def test_session_to_dict_includes_deployment_mode(self):
+        """Test that session to_dict includes deployment_mode."""
+        profile = DeploymentProfile(
+            provider=DeployProviderType.CLOUD_RUN,
+            service_name="kestrel-rookery-dev",
+            region="us-central1",
+            deployment_mode="rookery",
+        )
+        session = DeploymentSession(
+            service_name="kestrel-rookery-dev",
+            provider=DeployProviderType.CLOUD_RUN,
+            profile=profile,
+            status=DeployStatus.ACTIVE,
+            started_at=datetime.now(timezone.utc),
+        )
+        result = session.to_dict()
+        assert result["deployment_mode"] == "rookery"
+
     def test_provider_specific_fields(self):
         """Test provider-specific fields."""
         profile_gcp = DeploymentProfile(
