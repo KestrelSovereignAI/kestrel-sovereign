@@ -125,8 +125,10 @@ class StreamingMixin:
                 return
 
             except Exception as e:
-                logger.warning(f"Streaming from {provider['name']} failed: {e}")
+                logger.error(f"Provider {provider['name']} failed: {e}")
                 last_error = e
+                # Surface failure to user via stream
+                yield f"\n[Provider {provider['name']} failed: {e}]\n"
                 continue
 
         provider_type = "local" if force_local_only else "all"
@@ -256,8 +258,9 @@ class StreamingMixin:
                     yield response.content if hasattr(response, 'content') else str(response)
                     return
             except Exception as e:
-                logger.warning(f"Streaming from {provider['name']} failed: {e}")
+                logger.error(f"Provider {provider['name']} failed: {e}")
                 last_error = e
+                yield f"\n[Provider {provider['name']} failed: {e}]\n"
                 continue
 
         raise LLMStreamingError(f"All providers failed for stream_with_messages: {last_error}")
@@ -422,8 +425,9 @@ class StreamingMixin:
                         return
 
             except Exception as e:
-                logger.warning(f"Streaming with tools from {provider['name']} failed: {e}")
+                logger.error(f"Provider {provider['name']} failed: {e}")
                 last_error = e
+                yield f"\n[Provider {provider['name']} failed: {e}]\n"
                 continue
 
         raise LLMStreamingError(f"All providers failed for stream_with_tool_detection: {last_error}")

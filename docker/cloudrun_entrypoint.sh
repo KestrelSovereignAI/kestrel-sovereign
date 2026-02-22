@@ -4,6 +4,17 @@
 
 set -e
 
+# Strip surrounding quotes from all env vars.
+# Docker's --env-file includes quotes literally, breaking API keys and secrets.
+# python-dotenv strips them natively, but Docker does not.
+while IFS='=' read -r key val; do
+    if [[ "$val" == \"*\" && "$val" == *\" ]]; then
+        export "$key"="${val:1:-1}"
+    elif [[ "$val" == \'*\' && "$val" == *\' ]]; then
+        export "$key"="${val:1:-1}"
+    fi
+done < <(env)
+
 AGENT_DIR="${KESTREL_DB_PATH:-/app/agent_data}"
 PORT="${PORT:-8080}"
 

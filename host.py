@@ -65,6 +65,9 @@ def get_api_key() -> str:
         os.environ["KESTREL_API_KEY"] = generated_key
         logger.warning("No KESTREL_HOST_API_KEY or KESTREL_API_KEY set. Generated a temporary key.")
         return generated_key
+    # Strip surrounding quotes (Docker --env-file includes them literally)
+    if len(api_key) >= 2 and api_key[0] == api_key[-1] and api_key[0] in ('"', "'"):
+        api_key = api_key[1:-1]
     return api_key
 
 
