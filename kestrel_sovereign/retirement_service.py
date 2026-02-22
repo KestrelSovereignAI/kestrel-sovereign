@@ -148,13 +148,13 @@ async def retire_agent(
         logger.warning("=" * 60)
         logger.warning("RETIRING PERMANENT AGENT")
         logger.warning("=" * 60)
-        logger.warning(f"Agent: {agent_info.get('agent_name', 'Unknown')}")
+        logger.warning(f"Agent: {agent_info.get('name', 'Unknown')}")
         logger.warning(f"Reason: {reason}")
         logger.warning("This action will archive the agent. It can be restored from backup.")
         logger.warning("=" * 60)
 
     agent_did = agent_info["agent_did"]
-    agent_name = agent_info.get("agent_name", "Unknown")
+    agent_name = agent_info.get("name", "Unknown")
     test_cycle_id = agent_info.get("test_cycle_id", "unknown")
     created_at = agent_info.get("created_at", "unknown")
 

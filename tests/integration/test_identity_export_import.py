@@ -163,7 +163,7 @@ async def populated_db(test_db):
            VALUES (?, 'agent', 'Test Agent', ?)""",
         (agent_id, json.dumps({
             "created_at": "2025-01-01T00:00:00Z",
-            "agent_name": "Test Agent",
+            "name": "Test Agent",
             "constitution_hash": "test_constitution_hash",
         }))
     )
