@@ -1042,16 +1042,16 @@ No other text or formatting.
                     return response.content or ""
                 return response
             except (openai.APIError, openai.APIConnectionError, openai.RateLimitError, openai.AuthenticationError) as e:
-                logger.warning(f"Provider {provider['name']} API error: {e}", exc_info=True)
+                logger.error(f"Provider {provider['name']} failed: {e}")
                 continue
             except (httpx.HTTPError, ConnectionError, TimeoutError, asyncio.TimeoutError) as e:
-                logger.warning(f"Provider {provider['name']} network error: {e}", exc_info=True)
+                logger.error(f"Provider {provider['name']} failed: {e}")
                 continue
             except LLMProviderError as e:
-                logger.warning(f"Provider {provider['name']} failed: {e}", exc_info=True)
+                logger.error(f"Provider {provider['name']} failed: {e}")
                 continue
             except Exception as e:
-                logger.warning(f"Provider {provider['name']} failed: {e}", exc_info=True)
+                logger.error(f"Provider {provider['name']} failed: {e}")
                 continue
 
         raise LLMServiceError("All providers failed for generate_with_messages")

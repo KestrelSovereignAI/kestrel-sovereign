@@ -14,6 +14,9 @@ credentials/
 agent_data/
 test_files/
 
+# Ignore local rookery config (auto-discovered in container)
+rookery.toml
+
 # Ignore local databases
 *.db
 *.db-shm
