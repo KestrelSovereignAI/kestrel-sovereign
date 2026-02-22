@@ -385,7 +385,7 @@
             background: var(--bg-secondary);
             border: 1px solid var(--border-color);
             border-radius: 12px;
-            padding: 1.5rem;
+            padding: 0.75rem 1rem;
             margin-bottom: 1rem;
             box-shadow: var(--card-shadow);
         }
@@ -393,18 +393,16 @@
         .identity-header {
             display: flex;
             align-items: center;
-            gap: 1rem;
-            margin-bottom: 1rem;
+            gap: 0.75rem;
         }
 
         .identity-avatar {
-            width: 120px;
-            height: 120px;
-            border-radius: 16px;
+            width: 48px;
+            height: 48px;
+            border-radius: 10px;
             display: flex;
             align-items: center;
             justify-content: center;
-            font-size: 3.5rem;
             overflow: hidden;
             flex-shrink: 0;
         }
@@ -413,53 +411,22 @@
             width: 100%;
             height: 100%;
             object-fit: contain;
-            border-radius: 16px;
-        }
-
-        .identity-avatar-emoji {
-            width: 100%;
-            height: 100%;
-            background: linear-gradient(135deg, var(--accent-color), #8b5cf6);
-            border-radius: 16px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
+            border-radius: 10px;
         }
 
         .identity-info h2 {
             margin: 0;
-            font-size: 1.25rem;
+            font-size: 1rem;
         }
 
         .identity-did {
             font-family: var(--font-mono);
             font-size: 0.75rem;
             color: var(--text-tertiary);
-            word-break: break-all;
-        }
-
-        .identity-stats {
-            display: grid;
-            grid-template-columns: repeat(3, 1fr);
-            gap: 1rem;
-            margin-top: 1rem;
-        }
-
-        .stat-item {
-            text-align: center;
-            padding: 0.75rem;
-            background: var(--bg-tertiary);
-            border-radius: 8px;
-        }
-
-        .stat-item .value {
-            font-size: 1.5rem;
-            font-weight: 600;
-        }
-
-        .stat-item .label {
-            font-size: 0.75rem;
-            color: var(--text-secondary);
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            max-width: 360px;
         }
 
         /* Constitution Panel */
