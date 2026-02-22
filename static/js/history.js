@@ -201,6 +201,11 @@ function renderConversationItem(conv) {
 }
 
 window.loadConversation = async function(sessionId) {
+    // Don't reload the conversation we're already viewing — preserves in-flight content
+    if (sessionId === state.currentSessionId) {
+        return;
+    }
+
     try {
         const data = await API.getConversation(sessionId, state.showDecrypted);
         state.currentSessionId = sessionId;
@@ -245,7 +250,16 @@ window.loadConversation = async function(sessionId) {
 
         data.messages.forEach(msg => {
             if (msg.role !== 'system') {
-                addMessageToChat(msg.role, msg.content, msg.encrypted && !state.showDecrypted, msg.id);
+                let toolHtml = '';
+                if (msg.role === 'assistant' && msg.metadata?.tool_events?.length > 0) {
+                    toolHtml = msg.metadata.tool_events.map(ev => {
+                        if (ev.type === 'start') return `<div class="tool-activity tool-start">\u{1F527} Calling ${escapeHtml(ev.tool)}...</div>`;
+                        if (ev.type === 'complete') return `<div class="tool-activity tool-done">\u2713 ${escapeHtml(ev.tool)} complete (${ev.ms}ms)</div>`;
+                        if (ev.type === 'error') return `<div class="tool-activity tool-error">\u274C ${escapeHtml(ev.tool)} failed: ${escapeHtml(ev.error || '')}</div>`;
+                        return '';
+                    }).join('');
+                }
+                addMessageToChat(msg.role, msg.content, msg.encrypted && !state.showDecrypted, msg.id, toolHtml);
             }
         });
 
@@ -341,7 +355,7 @@ window.deleteMessage = async function(messageId, messageDiv) {
     }
 };
 
-function addMessageToChat(role, content, isEncrypted = false, messageId = null) {
+function addMessageToChat(role, content, isEncrypted = false, messageId = null, toolActivityHtml = '') {
     const chatContainer = document.getElementById('chat-container');
     if (!chatContainer) return;
 
@@ -360,6 +374,14 @@ function addMessageToChat(role, content, isEncrypted = false, messageId = null) 
             window.deleteMessage(messageId, messageDiv);
         };
         messageDiv.appendChild(deleteBtn);
+    }
+
+    // Render tool activity above the message content
+    if (toolActivityHtml) {
+        const activityDiv = document.createElement('div');
+        activityDiv.className = 'tool-activity-container';
+        activityDiv.innerHTML = toolActivityHtml;
+        messageDiv.appendChild(activityDiv);
     }
 
     if (isEncrypted) {
