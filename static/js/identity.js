@@ -100,7 +100,9 @@ export async function loadIdentity() {
         const navAvatar = document.getElementById('nav-agent-avatar');
         const navName = document.getElementById('nav-agent-name');
 
-        const identiconUrl = identity.did ? generateIdenticon(identity.did, 48) : null;
+        // Use DID + name as seed so agents sharing a DID still get unique icons
+        const identiconSeed = [identity.did, identity.name].filter(Boolean).join(':');
+        const identiconUrl = identiconSeed ? generateIdenticon(identiconSeed, 48) : null;
 
         if (navAvatar && navIcon) {
             const navSrc = avatarUrl || identiconUrl;
