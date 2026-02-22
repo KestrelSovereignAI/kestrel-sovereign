@@ -420,13 +420,19 @@
         }
 
         .identity-did {
+            display: flex;
+            align-items: center;
+            gap: 0.25rem;
             font-family: var(--font-mono);
             font-size: 0.75rem;
             color: var(--text-tertiary);
+            max-width: 360px;
+        }
+
+        .identity-did-text {
             overflow: hidden;
             text-overflow: ellipsis;
             white-space: nowrap;
-            max-width: 360px;
         }
 
         /* Constitution Panel */
