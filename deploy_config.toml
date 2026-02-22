@@ -65,28 +65,115 @@ KESTREL_API_KEY = "kestrel-api-key:latest"
 KESTREL_DATA_KEY = "kestrel-data-key:latest"
 LIGHTHOUSE_API_KEY = "kestrel-lighthouse-key:latest"
 
-# Azure Container Apps Profile (Coming Soon)
-# Uncomment and configure when Azure provider is fully implemented
-# [profiles.azure-dev]
-# name = "Azure Container Apps Development"
-# provider = "azure"
-# service_name = "kestrel-dev"
-# region = "eastus2"
-# min_instances = 0          # Scale to zero when idle
-# max_instances = 10
-# memory = "2Gi"
-# cpu = 2
-# port = 8080
-# timeout = 300
-# concurrency = 80
-#
-# [profiles.azure-dev.env_vars]
-# KESTREL_ENV = "development"
-# KESTREL_DB_BACKEND = "sqlite"
-# KESTREL_DB_PATH = "/app/agent_data"
-#
-# [profiles.azure-dev.secrets]
-# # Secrets are mounted from Azure Key Vault
-# OPENAI_API_KEY = "${AZURE_OPENAI_KEY}"
-# KESTREL_API_KEY = "${AZURE_KESTREL_KEY}"
-# KESTREL_DATA_KEY = "${AZURE_DATA_KEY}"
+# =============================================================================
+# Rookery Profiles (Multi-Agent Host)
+# =============================================================================
+# Rookery profiles deploy the host (host.py) + all agents in a single container.
+# Uses docker/Dockerfile.rookery which runs the rookery host process manager.
+
+# Rookery Development - Cloud Run (scales to zero)
+[profiles.rookery-dev]
+name = "Rookery Development (Multi-Agent)"
+provider = "cloudrun"
+service_name = "kestrel-rookery-dev"
+region = "us-central1"
+deployment_mode = "rookery"
+min_instances = 0
+max_instances = 10
+memory = "4Gi"
+cpu = 4
+port = 8080
+timeout = 300
+concurrency = 80
+
+[profiles.rookery-dev.env_vars]
+KESTREL_ENV = "development"
+KESTREL_DB_BACKEND = "sqlite"
+KESTREL_HOST_AUTOSTART = "true"
+
+[profiles.rookery-dev.secrets]
+OPENAI_API_KEY = "kestrel-openai-key:latest"
+KESTREL_API_KEY = "kestrel-api-key:latest"
+KESTREL_DATA_KEY = "kestrel-data-key:latest"
+LIGHTHOUSE_API_KEY = "kestrel-lighthouse-key:latest"
+
+# Rookery Production - Cloud Run (always warm)
+[profiles.rookery-prod]
+name = "Rookery Production (Multi-Agent)"
+provider = "cloudrun"
+service_name = "kestrel-rookery-prod"
+region = "us-central1"
+deployment_mode = "rookery"
+min_instances = 1
+max_instances = 100
+memory = "4Gi"
+cpu = 4
+port = 8080
+timeout = 300
+concurrency = 80
+
+[profiles.rookery-prod.env_vars]
+KESTREL_ENV = "production"
+KESTREL_DB_BACKEND = "sqlite"
+KESTREL_HOST_AUTOSTART = "true"
+
+[profiles.rookery-prod.secrets]
+OPENAI_API_KEY = "kestrel-openai-key:latest"
+KESTREL_API_KEY = "kestrel-api-key:latest"
+KESTREL_DATA_KEY = "kestrel-data-key:latest"
+LIGHTHOUSE_API_KEY = "kestrel-lighthouse-key:latest"
+
+# =============================================================================
+# Azure Container Apps Profiles
+# =============================================================================
+
+# Azure Rookery Development (scales to zero)
+[profiles.azure-rookery-dev]
+name = "Azure Rookery Development (Multi-Agent)"
+provider = "azure"
+service_name = "kestrel-rookery-dev"
+region = "eastus2"
+deployment_mode = "rookery"
+min_instances = 0
+max_instances = 10
+memory = "4Gi"
+cpu = 4
+port = 8080
+timeout = 300
+concurrency = 80
+
+[profiles.azure-rookery-dev.env_vars]
+KESTREL_ENV = "development"
+KESTREL_DB_BACKEND = "sqlite"
+KESTREL_HOST_AUTOSTART = "true"
+
+[profiles.azure-rookery-dev.secrets]
+OPENAI_API_KEY = "${OPENAI_API_KEY}"
+KESTREL_API_KEY = "${KESTREL_API_KEY}"
+KESTREL_DATA_KEY = "${KESTREL_DATA_KEY}"
+LIGHTHOUSE_API_KEY = "${LIGHTHOUSE_API_KEY}"
+
+# Azure Single-Agent Development (scales to zero)
+[profiles.azure-dev]
+name = "Azure Container Apps Development"
+provider = "azure"
+service_name = "kestrel-dev"
+region = "eastus2"
+min_instances = 0
+max_instances = 10
+memory = "2Gi"
+cpu = 2
+port = 8080
+timeout = 300
+concurrency = 80
+
+[profiles.azure-dev.env_vars]
+KESTREL_ENV = "development"
+KESTREL_DB_BACKEND = "sqlite"
+KESTREL_DB_PATH = "/app/agent_data"
+
+[profiles.azure-dev.secrets]
+OPENAI_API_KEY = "${OPENAI_API_KEY}"
+KESTREL_API_KEY = "${KESTREL_API_KEY}"
+KESTREL_DATA_KEY = "${KESTREL_DATA_KEY}"
+LIGHTHOUSE_API_KEY = "${LIGHTHOUSE_API_KEY}"

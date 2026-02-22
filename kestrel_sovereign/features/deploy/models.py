@@ -47,7 +47,8 @@ class DeploymentProfile:
     port: int = 8080
     timeout: int = 300  # seconds
     concurrency: int = 80
-    dockerfile: str = "Dockerfile.remote"
+    deployment_mode: str = "agent"  # "agent" (single agent) or "rookery" (multi-agent host)
+    dockerfile: str = "docker/Dockerfile.cloudrun"
     env_vars: Dict[str, str] = field(default_factory=dict)
     secrets: Dict[str, str] = field(default_factory=dict)
 
@@ -59,6 +60,11 @@ class DeploymentProfile:
     def is_scale_to_zero(self) -> bool:
         """Whether this deployment scales to zero when idle."""
         return self.min_instances == 0
+
+    @property
+    def is_rookery(self) -> bool:
+        """Whether this profile deploys a multi-agent rookery host."""
+        return self.deployment_mode == "rookery"
 
 
 @dataclass
@@ -89,6 +95,7 @@ class DeploymentSession:
             "started_at": self.started_at.isoformat() if self.started_at else None,
             "last_updated": self.last_updated.isoformat() if self.last_updated else None,
             "error_message": self.error_message,
+            "deployment_mode": self.profile.deployment_mode,
             "is_scale_to_zero": self.profile.is_scale_to_zero,
             "min_instances": self.profile.min_instances,
             "max_instances": self.profile.max_instances,
