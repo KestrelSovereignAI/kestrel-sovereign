@@ -118,7 +118,7 @@ export async function loadIdentity() {
         }
 
         // Avatar: use stored image if available, fallback to kestrel logo
-        const defaultAvatarSvg = `<img src="/static/favicon.svg" alt="Kestrel" class="identity-avatar-img" style="padding: 8px; background: #fff; border-radius: 12px;">`;
+        const defaultAvatarSvg = `<img src="/static/favicon.svg" alt="Kestrel" class="identity-avatar-img" style="padding: 4px; background: #fff; border-radius: 10px;">`;
         const avatarHtml = avatarUrl
             ? `<img src="${avatarUrl}" alt="Avatar" class="identity-avatar-img" onerror="this.parentElement.innerHTML='${defaultAvatarSvg.replace(/'/g, "\\'")}';">`
             : defaultAvatarSvg;
@@ -133,20 +133,6 @@ export async function loadIdentity() {
                         ${identity.did || 'No DID assigned'}
                         <button onclick="copyToClipboard('${identity.did}')" style="background:none;border:none;cursor:pointer;margin-left:0.5rem;" title="Copy DID">\u{1F4CB}</button>
                     </div>
-                </div>
-            </div>
-            <div class="identity-stats">
-                <div class="stat-item">
-                    <div class="value">${identity.constitution_hash ? '\u{2705}' : '\u{274C}'}</div>
-                    <div class="label">Constitution</div>
-                </div>
-                <div class="stat-item">
-                    <div class="value">${identity.avatar_hash ? '\u{1F5BC}' : '\u{2796}'}</div>
-                    <div class="label">Avatar</div>
-                </div>
-                <div class="stat-item">
-                    <div class="value">${identity.initial_balance || 0}</div>
-                    <div class="label">FIL Balance</div>
                 </div>
             </div>
         `;
