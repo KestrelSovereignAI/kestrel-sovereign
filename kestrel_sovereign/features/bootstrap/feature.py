@@ -174,13 +174,13 @@ class BootstrapFeature(Feature):
                 INSERT OR REPLACE INTO agent_metadata (agent_id, key, value, updated_at)
                 VALUES (?, ?, ?, ?)
                 """,
-                (self.agent.agent_id, "agent_name", new_name, now),
+                (self.agent.agent_id, "name", new_name, now),
             )
 
             # Update agent node properties
             agent_node = await self.agent.storage.get_node(self.agent.agent_id)
             if agent_node:
-                agent_node.properties["agent_name"] = new_name
+                agent_node.properties["name"] = new_name
                 agent_node.label = new_name
                 await self.agent.storage.add_node(agent_node)
 

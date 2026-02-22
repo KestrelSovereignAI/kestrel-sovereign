@@ -407,7 +407,7 @@ async def create_kestrel_identity_async(
         "created_at": datetime.now(timezone.utc).isoformat(),
         "constitution_hash": constitution_hash,
         "initialBalance": "1000.0",
-        "agent_name": agent_name,
+        "name": agent_name,
         "bootstrap_state": "pending",  # Agent needs to complete wake-up discovery
     }
 

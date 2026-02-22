@@ -2,7 +2,6 @@
 from fastapi import APIRouter, HTTPException, Request, Query
 from typing import Optional, List
 import aiohttp
-import os
 import time
 import logging
 
@@ -56,10 +55,7 @@ async def get_identity(request: Request):
         avatar_url = f"/api/files/{avatar_hash}" if avatar_hash else None
 
         # Get agent name from node properties
-        agent_name = (
-            (agent_node.properties.get("name") if agent_node else None)
-            or os.environ.get("KESTREL_AGENT_NAME")
-        )
+        agent_name = agent_node.properties.get("name") if agent_node else None
 
         return {
             "did": agent.agent_id,
