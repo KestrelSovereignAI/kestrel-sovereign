@@ -14,6 +14,7 @@ from kestrel_sovereign.features.deploy.core import DeployManagerCore
 from kestrel_sovereign.features.deploy.feature import DeployFeature
 from kestrel_sovereign.features.deploy.manager import DeployManager
 from kestrel_sovereign.features.deploy.models import (
+    DeployManagerError,
     DeploymentProfile,
     DeployProviderType,
     DeployStatus,
@@ -195,18 +196,29 @@ class TestDeployManagerCoreProvider:
 
         assert provider1 is provider2
 
-    def test_get_azure_provider_stub(self, sample_config):
-        """Test Azure provider stub instantiation."""
-        from kestrel_sovereign.features.deploy.providers import AzureContainerProvider
+    def test_get_azure_provider_requires_credentials(self, sample_config, monkeypatch):
+        """Test Azure provider requires AZURE_SUBSCRIPTION_ID and AZURE_RESOURCE_GROUP."""
+        monkeypatch.delenv("AZURE_SUBSCRIPTION_ID", raising=False)
+        monkeypatch.delenv("AZURE_RESOURCE_GROUP", raising=False)
 
         manager = DeployManagerCore(config=sample_config)
 
-        # Azure provider can now be instantiated (stub exists)
+        with pytest.raises(DeployManagerError, match="AZURE_SUBSCRIPTION_ID"):
+            manager._get_provider(DeployProviderType.AZURE_CONTAINER_APPS)
+
+    def test_get_azure_provider_with_credentials(self, sample_config, monkeypatch):
+        """Test Azure provider instantiates with credentials set."""
+        from kestrel_sovereign.features.deploy.providers import AzureContainerProvider
+
+        monkeypatch.setenv("AZURE_SUBSCRIPTION_ID", "test-sub-id")
+        monkeypatch.setenv("AZURE_RESOURCE_GROUP", "test-rg")
+
+        manager = DeployManagerCore(config=sample_config)
         provider = manager._get_provider(DeployProviderType.AZURE_CONTAINER_APPS)
 
-        # Should return AzureContainerProvider instance
         assert isinstance(provider, AzureContainerProvider)
-        assert provider is not None
+        assert provider.subscription_id == "test-sub-id"
+        assert provider.resource_group == "test-rg"
 
 
 class TestDeployManagerCoreSessions:

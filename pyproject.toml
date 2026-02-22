@@ -71,6 +71,9 @@ dependencies = [
     # Google Cloud Run (for serverless deployment)
     "google-cloud-run>=0.10.0",
     "google-cloud-logging>=3.5.0",
+    # Azure Container Apps (for serverless deployment)
+    "azure-mgmt-appcontainers>=3.0.0",
+    "azure-identity>=1.15.0",
     # RunPod for GPU cloud
     "runpod>=1.8.1",
     # Vast.ai for GPU cloud (alternative to RunPod)
