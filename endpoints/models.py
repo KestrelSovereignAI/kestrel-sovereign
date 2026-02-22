@@ -55,7 +55,7 @@ async def get_identity(request: Request):
         avatar_url = f"/api/files/{avatar_hash}" if avatar_hash else None
 
         # Get agent name from node properties
-        agent_name = agent_node.properties.get("name", "Kestrel Agent") if agent_node else "Kestrel Agent"
+        agent_name = agent_node.properties.get("name") if agent_node else None
 
         return {
             "did": agent.agent_id,
