@@ -6,6 +6,7 @@
 import API from './api.js';
 import { state, PRIVACY_MODES, Toast, loadCommands } from './ui.js';
 import { disconnectNotifications, connectNotifications, loadModels, updateContextStatus } from './chat.js';
+import { generateIdenticon } from './identicon.js';
 
 // ============================================================================
 // Agent Selection (Multi-Agent Support)
@@ -99,13 +100,21 @@ export async function loadIdentity() {
         const navAvatar = document.getElementById('nav-agent-avatar');
         const navName = document.getElementById('nav-agent-name');
 
+        const identiconUrl = identity.did ? generateIdenticon(identity.did, 48) : null;
+
         if (navAvatar && navIcon) {
-            if (avatarUrl) {
-                navAvatar.src = avatarUrl;
+            const navSrc = avatarUrl || identiconUrl;
+            if (navSrc) {
+                navAvatar.src = navSrc;
                 navAvatar.style.display = 'block';
                 navAvatar.onerror = () => {
-                    navAvatar.style.display = 'none';
-                    navIcon.style.display = 'inline';
+                    // Custom avatar failed — fall back to identicon, then kestrel icon
+                    if (identiconUrl && navAvatar.src !== identiconUrl) {
+                        navAvatar.src = identiconUrl;
+                    } else {
+                        navAvatar.style.display = 'none';
+                        navIcon.style.display = 'inline';
+                    }
                 };
                 navIcon.style.display = 'none';
             } else {
@@ -117,11 +126,11 @@ export async function loadIdentity() {
             navName.textContent = identity.name;
         }
 
-        // Avatar: use stored image if available, fallback to kestrel logo
-        const defaultAvatarSvg = `<img src="/static/favicon.svg" alt="Kestrel" class="identity-avatar-img" style="padding: 4px; background: #fff; border-radius: 10px;">`;
+        // Avatar: custom image → identicon → kestrel logo
+        const fallbackSrc = identiconUrl || '/static/favicon.svg';
         const avatarHtml = avatarUrl
-            ? `<img src="${avatarUrl}" alt="Avatar" class="identity-avatar-img" onerror="this.parentElement.innerHTML='${defaultAvatarSvg.replace(/'/g, "\\'")}';">`
-            : defaultAvatarSvg;
+            ? `<img src="${avatarUrl}" alt="Avatar" class="identity-avatar-img" onerror="this.src='${fallbackSrc}';">`
+            : `<img src="${fallbackSrc}" alt="Identicon" class="identity-avatar-img">`;
 
         const card = document.getElementById('identity-card');
         card.innerHTML = `
