@@ -130,7 +130,7 @@ class IdentityExporter:
         package = AgentIdentityPackage(
             # Core identity
             did=self.agent_id,
-            agent_name=agent_meta.get("agent_name", "Unknown Agent"),
+            agent_name=agent_meta.get("name", "Unknown Agent"),
             created_at=agent_meta.get("created_at", datetime.now(timezone.utc).isoformat()),
             constitution_hash=constitution.get("hash", ""),
             constitution_text=constitution.get("text", ""),

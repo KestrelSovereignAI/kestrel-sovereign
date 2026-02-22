@@ -266,7 +266,6 @@ class ProcessManager:
         env["KESTREL_DB_PATH"] = str(resolved_dir)
         env["PORT"] = str(config.port)
         env["KESTREL_SERVE_UI"] = "false"
-        env["KESTREL_AGENT_NAME"] = name
 
         # Per-agent data key: KESTREL_DATA_KEY_CLAW overrides KESTREL_DATA_KEY
         agent_key_var = f"KESTREL_DATA_KEY_{name.upper()}"

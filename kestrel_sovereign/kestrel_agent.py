@@ -350,7 +350,7 @@ class KestrelAgent(ConstitutionMixin, StreamingMixin, BackupMixin, SleepMixin):
             # Check if this is a test instance and load disclosure if so
             self._is_test_instance = agent_node.properties.get("is_test_instance", False)
             self._test_cycle_id = agent_node.properties.get("test_cycle_id")
-            self._agent_name = agent_node.properties.get("agent_name", "Kestrel Agent")
+            self._agent_name = agent_node.properties.get("name", "Unnamed Agent")
 
             if self._is_test_instance:
                 logging.info(f"TEST INSTANCE detected: {self._agent_name} (cycle: {self._test_cycle_id})")
@@ -557,7 +557,7 @@ Query: {query}
 
         # Populate template variables
         disclosure = disclosure_template.format(
-            agent_name=agent_properties.get("agent_name", "Unknown Test Agent"),
+            agent_name=agent_properties.get("name", "Unknown Test Agent"),
             test_cycle_id=agent_properties.get("test_cycle_id", "unknown"),
             created_at=agent_properties.get("created_at", "unknown"),
             expected_duration=agent_properties.get("expected_duration", "unspecified")

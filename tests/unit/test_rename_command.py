@@ -114,7 +114,7 @@ class TestRenameExecution:
         # Set up the agent node
         mock_agent.storage.nodes[mock_agent.agent_id] = MockNode(
             mock_agent.agent_id,
-            properties={"agent_name": "OldName"},
+            properties={"name": "OldName"},
             label="OldName"
         )
 
@@ -133,7 +133,7 @@ class TestRenameExecution:
 
         mock_agent.storage.nodes[mock_agent.agent_id] = MockNode(
             mock_agent.agent_id,
-            properties={"agent_name": "OldName"},
+            properties={"name": "OldName"},
         )
 
         await feature.rename_agent("NewName")
@@ -151,7 +151,7 @@ class TestRenameExecution:
         mock_agent._agent_name = "OldName"
         mock_agent.storage.nodes[mock_agent.agent_id] = MockNode(
             mock_agent.agent_id,
-            properties={"agent_name": "OldName"},
+            properties={"name": "OldName"},
         )
 
         result = await feature.rename_agent("NewName")
@@ -181,7 +181,7 @@ class TestSoulMdUpdate:
 
         mock_agent.storage.nodes[mock_agent.agent_id] = MockNode(
             mock_agent.agent_id,
-            properties={"agent_name": "OldName"},
+            properties={"name": "OldName"},
         )
         mock_agent._agent_name = "OldName"
 
@@ -212,7 +212,7 @@ class TestSoulMdUpdate:
 
         mock_agent.storage.nodes[mock_agent.agent_id] = MockNode(
             mock_agent.agent_id,
-            properties={"agent_name": "OldName"},
+            properties={"name": "OldName"},
         )
         mock_agent._agent_name = "OldName"
 
@@ -235,7 +235,7 @@ class TestSoulMdUpdate:
 
         mock_agent.storage.nodes[mock_agent.agent_id] = MockNode(
             mock_agent.agent_id,
-            properties={"agent_name": "OldName"},
+            properties={"name": "OldName"},
         )
 
         result = await feature.rename_agent("NewName")
@@ -294,7 +294,7 @@ class TestRenameEdgeCases:
 
         mock_agent.storage.nodes[mock_agent.agent_id] = MockNode(
             mock_agent.agent_id,
-            properties={"agent_name": "OldName"},
+            properties={"name": "OldName"},
         )
 
         result = await feature.rename_agent("  NewName  ")
