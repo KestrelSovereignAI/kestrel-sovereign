@@ -58,7 +58,28 @@ def pytest_collection_modifyitems(config, items):
 
 
 def pytest_configure(config):
-    """Configure pytest with all plugins."""
+    """Configure pytest with all plugins and load .env for skipif conditions."""
+    # Load .env EARLY so that skipif decorators (evaluated at collection time)
+    # can see API keys like ANTHROPIC_API_KEY, OPENAI_API_KEY, etc.
+    try:
+        from dotenv import load_dotenv
+        # Try project root (relative to this conftest)
+        env_file = Path(__file__).resolve().parent.parent / ".env"
+        if not env_file.exists():
+            # In git worktrees, .env stays in the main repo — find it via git
+            import subprocess
+            result = subprocess.run(
+                ["git", "rev-parse", "--git-common-dir"],
+                capture_output=True, text=True, timeout=5
+            )
+            if result.returncode == 0:
+                git_common = Path(result.stdout.strip())
+                env_file = git_common.parent / ".env"
+        if env_file.exists():
+            load_dotenv(env_file)
+    except (ImportError, Exception):
+        pass
+
     _cleanup_configure(config)
     _feedback_configure(config)
 
