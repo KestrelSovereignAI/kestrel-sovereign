@@ -42,19 +42,27 @@ class ConversationManager:
         self.storage = storage
         self.agent_id = agent_id
 
-    async def get_conversation_history(self) -> List[Dict]:
+    async def get_conversation_history(
+        self, session_id: Optional[str] = None, limit: int = 100
+    ) -> List[Dict]:
         """Get conversation history from storage.
 
-        Note: agent_id is set on the storage object itself, not passed per-call.
-        The storage's conversation store uses self.agent_id internally.
+        Uses session-aware, limited retrieval that filters out excluded messages
+        (compressed, summarized, etc.).
+
+        Args:
+            session_id: Optional session ID to filter by specific session.
+            limit: Maximum number of messages to return.
         """
         try:
             if hasattr(self.storage, 'conversation'):
-                # AsyncConversationStore.get_full_history() uses self.agent_id internally
-                return await self.storage.conversation.get_full_history()
+                return await self.storage.conversation.get_conversation_history(
+                    limit, session_id=session_id
+                )
             elif hasattr(self.storage, 'get_conversation_history'):
-                # Fallback for other storage implementations
-                return await self.storage.get_conversation_history()
+                return await self.storage.get_conversation_history(
+                    limit, session_id=session_id
+                )
             else:
                 logger.warning("No conversation history method available")
                 return []
@@ -93,7 +101,12 @@ class ConversationManager:
         Returns:
             Dict with compression results (messages_compressed, tokens_saved, etc.)
         """
-        history = await self.get_conversation_history()
+        # Compression needs full unfiltered history to see what to compress
+        conv_store = self._get_conversation_store()
+        if conv_store:
+            history = await conv_store.get_full_history()
+        else:
+            history = await self.get_conversation_history()
         message_count = len(history)
 
         # Check if compression is needed
@@ -265,7 +278,12 @@ SUMMARY:"""
         """
         from .token_budget import create_budget
 
-        history = await self.get_conversation_history()
+        # Use full history for accurate compression assessment
+        conv_store = self._get_conversation_store()
+        if conv_store:
+            history = await conv_store.get_full_history()
+        else:
+            history = await self.get_conversation_history()
         message_count = len(history)
         budget = create_budget(model, message_count, adaptive=True)
 
