@@ -177,6 +177,10 @@ class AsyncConversationStore:
             row_id = row[0]
             meta = json.loads(row[3]) if row[3] else None
 
+            # Skip messages excluded from context (compressed, summarized, etc.)
+            if meta and meta.get("excluded_from_context"):
+                continue
+
             content, needs_migration = self._decrypt_with_fallback(row[2], meta)
 
             # Opportunistic migration to per-agent key

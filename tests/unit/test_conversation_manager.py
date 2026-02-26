@@ -41,9 +41,14 @@ class MockConversationStore:
         self.messages = []
         self.db = AsyncMock()
 
+    async def get_conversation_history(self, limit: int = 100, session_id: str = None) -> List[Dict]:
+        """Return recent messages, filtering excluded ones."""
+        result = [m for m in self.messages if not m.get("metadata", {}).get("excluded_from_context")]
+        return result[-limit:]
+
     async def get_full_history(self) -> List[Dict]:
-        """Return all messages."""
-        return [m for m in self.messages if not m.get("metadata", {}).get("excluded_from_context")]
+        """Return all messages (unfiltered, for compression)."""
+        return self.messages.copy()
 
     async def get_full_history_with_ids(self) -> List[Dict]:
         """Return all messages with IDs."""
