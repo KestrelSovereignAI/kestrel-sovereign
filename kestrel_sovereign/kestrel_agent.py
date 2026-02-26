@@ -434,12 +434,13 @@ class KestrelAgent(ConstitutionMixin, StreamingMixin, BackupMixin, SleepMixin):
             # Cache the features prompt (built once at session start)
             self._cached_features_prompt = self._build_features_prompt_section()
 
-            # Pre-explore TaskFeature so run_workflow and list_available_skills
-            # are available as direct tools from the first turn. These are
-            # meta-tools the orchestrator should always have access to.
-            task_feature = self.features.get("TaskFeature")
-            if task_feature:
-                self._register_explored_feature_tools(task_feature)
+            # Pre-explore features whose tools should be direct from turn one.
+            # TaskFeature: run_workflow, list_available_skills (meta-tools)
+            # PeersFeature: ask_agent, list_peers (inter-agent communication)
+            for feature_name in ("TaskFeature", "PeersFeature"):
+                feature = self.features.get(feature_name)
+                if feature:
+                    self._register_explored_feature_tools(feature)
 
     @property
     def privacy_mode(self) -> PrivacyMode:
@@ -968,6 +969,10 @@ Expected Duration: {expected_duration}
 
         for feature in self.features.values():
             try:
+                # Skip subagent dispatcher for pre-explored features
+                # (their individual tools are already in the direct tool list)
+                if feature.tool_name in self._explored_features:
+                    continue
                 tool_def = feature.to_orchestrator_tool()
                 tools.append(tool_def)
                 logging.info(f"[AGENTIC] Added tool: {feature.tool_name}")
