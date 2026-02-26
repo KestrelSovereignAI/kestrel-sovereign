@@ -340,7 +340,7 @@ async def start_agent(request: Request, agent_id: str):
 
     agent_cfg = local_agents[agent_id]
     try:
-        ap = pm.start_agent(agent_id, agent_cfg, config.host.bind)
+        ap = pm.start_agent(agent_id, agent_cfg, config.host.bind, config.host.port)
     except RuntimeError as e:
         raise HTTPException(status_code=409, detail=str(e))
 
