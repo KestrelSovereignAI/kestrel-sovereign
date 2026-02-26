@@ -342,6 +342,34 @@ async def start_new_conversation(request: Request):
         raise HTTPException(status_code=500, detail="Error starting new conversation.")
 
 
+@router.delete("/conversations/messages/{message_id}")
+async def delete_message(request: Request, message_id: int):
+    """Delete a single message by ID with agent_id isolation."""
+    if not hasattr(request.app.state, 'agent') or not request.app.state.agent:
+        raise HTTPException(status_code=503, detail="Agent not initialized.")
+
+    try:
+        agent = request.app.state.agent
+        storage = agent.storage
+        agent_id = getattr(storage, 'agent_id', '') or getattr(storage._storage, 'agent_id', '')
+
+        result = await storage.db.execute_commit(
+            "DELETE FROM conversation_history WHERE id = ? AND agent_id = ?",
+            (message_id, agent_id)
+        )
+
+        deleted = result.rowcount > 0 if hasattr(result, 'rowcount') else True
+        if not deleted:
+            raise HTTPException(status_code=404, detail="Message not found.")
+
+        return {"success": True, "message_id": message_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error deleting message {message_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Error deleting message.")
+
+
 @router.get("/conversations/{session_id}/transcript")
 async def get_conversation_transcript(request: Request, session_id: str, decrypt: bool = True):
     """Get a human-readable markdown transcript for a conversation session."""

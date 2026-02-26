@@ -66,14 +66,18 @@ def mock_agent_app():
 
 
 @pytest.fixture
-def integration_config():
-    """Config pointing to the mock agent's port."""
+def integration_config(tmp_path):
+    """Config pointing to the mock agent's port with a valid agent data dir."""
+    agent_dir = tmp_path / "agent_data" / "test"
+    agent_dir.mkdir(parents=True)
+    (agent_dir / "kestrel_prime.db").touch()
     return RookeryConfig(
         host=HostConfig(port=8888),
         agents={
             "test-agent": LocalAgentConfig(
-                data_dir="agent_data/test",
+                data_dir=str(agent_dir),
                 port=9950,
+                autostart=False,
             ),
         },
     )
@@ -119,7 +123,7 @@ class TestHostAgentIntegration:
                             base_url="http://testhost",
                         ) as client:
                             resp = await client.get(
-                                "/api/agents/test-agent/conversations",
+                                "/api/agents/test-agent/api/conversations",
                                 headers={"X-API-Key": test_key},
                             )
 
@@ -223,7 +227,7 @@ class TestHostAgentIntegration:
                             base_url="http://testhost",
                         ) as client:
                             resp = await client.post(
-                                "/api/agents/test-agent/agent",
+                                "/api/agents/test-agent/api/agent",
                                 json={"message": "hello"},
                                 headers={"X-API-Key": test_key},
                             )
@@ -258,7 +262,7 @@ class TestHostAgentIntegration:
                             base_url="http://testhost",
                         ) as client:
                             resp = await client.get(
-                                "/api/agents/test-agent/agent/stream",
+                                "/api/agents/test-agent/api/agent/stream",
                                 headers={"X-API-Key": test_key},
                             )
 
