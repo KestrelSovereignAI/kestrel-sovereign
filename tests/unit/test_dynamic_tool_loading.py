@@ -180,20 +180,20 @@ class TestNameCollision:
 
 class TestBuildAllTools:
 
-    def test_includes_feature_and_direct_tools(self, agent):
-        """_build_all_tools returns feature dispatch tools + direct tools."""
+    def test_explored_feature_replaces_dispatcher_with_direct_tools(self, agent):
+        """Once explored, feature dispatch tool is replaced by direct tools."""
         # Add a feature so _build_feature_tools returns something
         feature = _make_mock_feature("model_agent", [_make_mock_tool("list_models")])
         agent.features = {"ModelAgent": feature}
 
-        # Register direct tools
+        # Register direct tools (promotes tools, skips dispatcher)
         agent._register_explored_feature_tools(feature)
 
         all_tools = agent._build_all_tools()
 
-        # Should have 1 feature dispatch tool + 1 direct tool
+        # Should have only direct tools — dispatcher is skipped for explored features
         names = [t["function"]["name"] for t in all_tools]
-        assert "model_agent" in names  # feature dispatch
+        assert "model_agent" not in names  # dispatcher skipped
         assert "list_models" in names  # direct tool
 
     def test_empty_when_no_features(self, agent):
@@ -293,18 +293,17 @@ class TestEviction:
 
 class TestFeatureDispatchUnaffected:
 
-    def test_feature_dispatch_tools_preserved(self, agent):
-        """Feature dispatch tools are never affected by direct tool registration."""
+    def test_feature_dispatch_removed_after_exploration(self, agent):
+        """Feature dispatch tool is removed when direct tools are registered."""
         feature = _make_mock_feature("model_agent", [_make_mock_tool("list_models")])
         agent.features = {"ModelAgent": feature}
 
-        # Before exploration
+        # Before exploration — dispatch tool present
         tools_before = agent._build_feature_tools()
+        assert len(tools_before) == 1
+        assert tools_before[0]["function"]["name"] == "model_agent"
 
-        # After exploration
+        # After exploration — dispatch tool removed (direct tools replace it)
         agent._register_explored_feature_tools(feature)
         tools_after = agent._build_feature_tools()
-
-        # Feature dispatch tools unchanged
-        assert len(tools_before) == len(tools_after)
-        assert tools_before[0]["function"]["name"] == tools_after[0]["function"]["name"]
+        assert len(tools_after) == 0
