@@ -18,7 +18,7 @@ from pathlib import Path
 from kestrel_sovereign.kestrel_agent import KestrelAgent
 from kestrel_sovereign.llm.service import LLMService
 from kestrel_sovereign.privacy import PrivacyMode
-from tests.shared import no_llm_credentials
+from tests.shared import no_llm_credentials, no_docker
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -93,8 +93,8 @@ async def test_orchestrator_model_management(kestrel_agent):
 
 @pytest.mark.asyncio
 @pytest.mark.skipif(
-    not shutil.which("docker") or no_llm_credentials(),
-    reason="Docker not available or no LLM credentials - MCP tests require Docker and LLM"
+    no_docker() or no_llm_credentials(),
+    reason="Docker daemon not running or no LLM credentials - MCP tests require both"
 )
 async def test_orchestrator_mcp_management(kestrel_agent):
     """
