@@ -1004,6 +1004,11 @@ No other text or formatting.
                         break
                 if target_provider:
                     providers = [target_provider] + [p for p in providers if p != target_provider]
+                else:
+                    raise LLMServiceError(
+                        f"Provider '{provider_name}' not available. "
+                        f"Available: {[p['name'] for p in providers]}"
+                    )
             else:
                 target_model = model_override
         else:
