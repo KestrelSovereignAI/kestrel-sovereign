@@ -127,8 +127,10 @@ class StreamingMixin:
             except Exception as e:
                 logger.error(f"Provider {provider['name']} failed: {e}")
                 last_error = e
-                # Surface failure to user via stream
-                yield f"\n[Provider {provider['name']} failed: {e}]\n"
+                # Surface failure to user via stream (but not for structured output
+                # where error text would corrupt the JSON response)
+                if response_format is None:
+                    yield f"\n[Provider {provider['name']} failed: {e}]\n"
                 continue
 
         provider_type = "local" if force_local_only else "all"

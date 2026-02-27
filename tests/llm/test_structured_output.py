@@ -550,6 +550,11 @@ class TestServiceStreamingStructuredOutput:
         assert len(parsed.items) == 3
 
     @pytest.mark.asyncio
+    @pytest.mark.skipif(
+        not os.environ.get("ANTHROPIC_API_KEY", "").strip()
+        and not os.environ.get("ANTHROPIC_AUTH_TOKEN", "").strip(),
+        reason="anthropic not configured"
+    )
     async def test_streaming_fallback_for_non_streaming_provider(self):
         """Test that non-streaming providers fall back gracefully."""
         service = LLMService()
