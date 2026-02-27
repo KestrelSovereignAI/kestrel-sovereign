@@ -83,6 +83,16 @@ def no_llm_credentials() -> bool:
     return not has_llm_credentials()
 
 
+def no_docker() -> bool:
+    """Check if Docker daemon is unavailable (for pytest.mark.skipif)."""
+    try:
+        import docker
+        docker.from_env().ping()
+        return False
+    except Exception:
+        return True
+
+
 __all__ = [
     'registry',
     'TrackedResource',

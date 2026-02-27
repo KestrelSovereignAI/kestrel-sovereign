@@ -483,6 +483,35 @@
             padding: 0.75rem 1rem;
             border-radius: 16px;
             line-height: 1.5;
+            position: relative;
+        }
+
+        .message .msg-delete-btn {
+            display: none;
+            position: absolute;
+            top: 0.25rem;
+            right: 0.25rem;
+            background: rgba(239, 68, 68, 0.85);
+            color: white;
+            border: none;
+            border-radius: 50%;
+            width: 1.25rem;
+            height: 1.25rem;
+            font-size: 0.65rem;
+            cursor: pointer;
+            line-height: 1;
+            padding: 0;
+            z-index: 1;
+        }
+
+        .message:hover .msg-delete-btn {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .message .msg-delete-btn:hover {
+            background: #dc2626;
         }
 
         .user-message {

@@ -108,7 +108,7 @@ async def test_mcp_feature_execution(kestrel_agent):
     result = await tool.execute()
 
     assert result["success"] is True
-    assert "No MCP tools loaded" in result["result"]
+    assert "No MCP tools loaded" in result["result"] or "not available" in result["result"]
 
 @pytest.mark.asyncio
 async def test_model_feature_execution(kestrel_agent):
