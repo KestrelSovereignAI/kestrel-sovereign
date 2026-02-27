@@ -245,7 +245,7 @@ window.loadConversation = async function(sessionId) {
 
         data.messages.forEach(msg => {
             if (msg.role !== 'system') {
-                addMessageToChat(msg.role, msg.content, msg.encrypted && !state.showDecrypted);
+                addMessageToChat(msg.role, msg.content, msg.encrypted && !state.showDecrypted, msg.id);
             }
         });
 
@@ -324,12 +324,43 @@ window.toggleHistorySidebar = function() {
     }
 };
 
-function addMessageToChat(role, content, isEncrypted = false) {
+window.deleteMessage = async function(messageId, messageDiv) {
+    if (!confirm('Delete this message? This cannot be undone.')) return;
+
+    try {
+        await API.deleteMessage(messageId);
+        if (messageDiv) {
+            messageDiv.style.transition = 'opacity 0.2s, transform 0.2s';
+            messageDiv.style.opacity = '0';
+            messageDiv.style.transform = 'scale(0.95)';
+            setTimeout(() => messageDiv.remove(), 200);
+        }
+        Toast.info('Message deleted');
+    } catch (e) {
+        Toast.error(`Failed to delete message: ${e.message}`);
+    }
+};
+
+function addMessageToChat(role, content, isEncrypted = false, messageId = null) {
     const chatContainer = document.getElementById('chat-container');
     if (!chatContainer) return;
 
     const messageDiv = document.createElement('div');
     messageDiv.className = `message ${role}`;
+    if (messageId) messageDiv.dataset.messageId = messageId;
+
+    // Add hover-reveal delete button
+    if (messageId) {
+        const deleteBtn = document.createElement('button');
+        deleteBtn.className = 'msg-delete-btn';
+        deleteBtn.title = 'Delete message';
+        deleteBtn.textContent = '\u2715';
+        deleteBtn.onclick = (e) => {
+            e.stopPropagation();
+            window.deleteMessage(messageId, messageDiv);
+        };
+        messageDiv.appendChild(deleteBtn);
+    }
 
     if (isEncrypted) {
         messageDiv.style.cssText = `
