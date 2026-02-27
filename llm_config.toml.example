@@ -1,36 +1,38 @@
-# Example LLM provider configuration for Kestrel.
+# LLM provider configuration for Kestrel.
 #
-# 1. Copy this file to "llm_config.toml".
-# 2. Fill in your API keys and desired models.
-# 3. The 'provider_priority' list determines the fallback order.
+# This file configures which LLM providers are available and their fallback order.
+# API keys are stored in .env (never in this file) — use api_key_env to reference them.
+#
+# The 'provider_priority' list determines the fallback order when routing requests.
 
-# Define the order in which the agent should try to use providers.
-# Ollama first for privacy and cost, OpenAI as fallback for complex reasoning
-provider_priority = ["ollama", "openai"]
+provider_priority = ["openai", "ollama"]
 
-[ollama]
-# Local Ollama instance - install from https://ollama.ai
-host = "http://localhost:11434"
-model = "llama3.2:3b"  # Or phi3, llama3.1:8b, etc.
-
+# OpenAI (cloud) - Set OPENAI_API_KEY in .env
 [openai]
-# Get your API key from https://platform.openai.com/api-keys
-# Set environment variable: export OPENAI_API_KEY="your-key-here"
-api_key = "sk-YOUR_API_KEY_HERE"
-model = "gpt-5"
+model = "gpt-5-mini"
 
-# Optional: Anthropic Claude support
+# Ollama - Local inference for privacy mode
+# Install from https://ollama.ai, then: ollama pull llama3.2
+[ollama]
+host = "http://localhost:11434"  # Overridden by OLLAMA_HOST env var
+model = "llama3.2:latest"
+
+# --- Optional providers (uncomment and add keys to .env) ---
+
 #[anthropic]
-#api_key = "sk-ant-YOUR_API_KEY_HERE"
-#model = "claude-3-5-sonnet-20241022"
+#model = "claude-sonnet-4-5-20250514"
+#api_key_env = "ANTHROPIC_API_KEY"
 
-# Optional: Additional Ollama models for specific tasks
-#[ollama_large]
-#host = "http://localhost:11434"
-#model = "llama3.1:70b"  # For complex reasoning tasks
+#[openrouter]
+#type = "openai_compatible"
+#base_url = "https://openrouter.ai/api/v1"
+#model = "deepseek/deepseek-chat-v3.1"
 
-[ensemble]
-# The number of agent instances to run in the ensemble.
-# Default is 1 (single-instance mode).
-# A value > 1 enables ensemble mode for consensus-based responses.
-size = 1 
+#[vertex_ai]
+#model = "gemini-3-pro-preview"
+
+#[xai]
+#type = "openai_compatible"
+#base_url = "https://api.x.ai/v1"
+#model = "grok-4-1-fast-non-reasoning"
+#api_key_env = "XAI_API_KEY"

@@ -1,0 +1,101 @@
+# LLM provider configuration for Kestrel.
+#
+# 1. Copy this file to "llm_config.toml" if it doesn't exist.
+# 2. The 'provider_priority' list determines the fallback order.
+# 3. For OpenAI, set the OPENAI_API_KEY environment variable.
+
+provider_priority = ["claude_max", "openrouter", "openai", "openai_mini", "anthropic", "vertex_ai", "ollama", "runpod", "xai"]
+
+# Claude Max - Use your Claude Max subscription ($100/$200/month) for API access
+# Requires: pip install claude-agent-sdk && claude login
+# This uses subscription authentication, not API key billing
+[claude_max]
+model = "claude-sonnet-4-20250514"  # Sonnet 4 included in Max, or "claude-opus-4-5-20251101"
+
+# OpenRouter - Primary provider with crypto payments (agents can fund themselves)
+# Supports: ETH (chain_id=1), Polygon (137), Base (8453)
+# Crypto API: POST /api/v1/credits/coinbase {amount, sender, chain_id}
+# Models: deepseek-r1 $0.30/$1.20, llama-3.3-70b $0.10/$0.32, claude-3.5-sonnet $6/$30
+# Uses dedicated OpenRouterAdapter with proper model discovery
+[openrouter]
+type = "openai_compatible"
+base_url = "https://openrouter.ai/api/v1"
+model = "deepseek/deepseek-chat-v3.1"  # $0.15/$0.75 per 1M tokens - best value
+
+# OpenAI (cloud) - Primary provider for GPT-5.1
+[openai]
+model = "gpt-5.1"  # Full-size model for reliable tool calling
+
+# OpenAI mini model for auditing (lower cost, fast)
+[openai_mini]
+type = "openai_compatible"
+base_url = "https://api.openai.com/v1"
+model = "gpt-5-mini"
+api_key_env = "OPENAI_API_KEY"
+
+# Anthropic (Claude) - Constitutional reviewer and complex reasoning
+[anthropic]
+model = "claude-opus-4-5-20251101"
+api_key_env = "ANTHROPIC_API_KEY"
+
+# Vertex AI / Google AI Studio (Gemini) - Uses GOOGLE_API_KEY
+[vertex_ai]
+model = "gemini-3-pro-preview"
+
+# RunPod (OpenAI-compatible) - Alternative cloud provider
+[runpod]
+type = "openai_compatible"
+base_url = "https://api.runpod.ai/v2/vllm-2f8vdgn/openai/v1"
+model = "meta-llama/Llama-3.1-8B-Instruct"
+api_key_env = "RUNPOD_API_KEY"
+
+# Ollama - Privacy mode and local/cloud GPU fallback
+# Host is configured via OLLAMA_HOST env var:
+#   Local dev:  http://localhost:11434 (default)
+#   Cloud Run:  https://1wj2bh67ppdimv-11434.proxy.runpod.net (RunPod RTX 4090)
+# Available models on cloud: deepseek-r1:14b, phi4, qwen2.5:14b
+[ollama]
+host = "http://localhost:11434"  # Overridden by OLLAMA_HOST env var
+model = "llama3.2:latest"  # Supports tool calling (deepseek-r1:14b does not)
+
+[xai]
+type = "openai_compatible"
+base_url = "https://api.x.ai/v1"
+model = "grok-4-1-fast-non-reasoning"
+api_key_env = "XAI_API_KEY"
+
+#[azure_openai]
+#type = "openai_compatible"
+#base_url = "https://YOUR_RESOURCE.openai.azure.com"
+#model = "gpt-5"
+#api_key_env = "AZURE_OPENAI_API_KEY"
+
+[groq]
+type = "openai_compatible"
+base_url = "https://api.groq.com/openai/v1"
+model = "llama-3.1-70b-versatile"
+api_key_env = "GROQ_API_KEY"
+
+#[together]
+#type = "openai_compatible"
+#base_url = "https://api.together.xyz/v1"
+#model = "meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo"
+#api_key_env = "TOGETHER_API_KEY"
+
+#[mistral]
+#type = "openai_compatible"
+#base_url = "https://api.mistral.ai/v1"
+#model = "mistral-large-latest"
+#api_key_env = "MISTRAL_API_KEY"
+
+#[perplexity]
+#type = "openai_compatible"
+#base_url = "https://api.perplexity.ai"
+#model = "sonar-large-chat"
+#api_key_env = "PERPLEXITY_API_KEY"
+
+#[fireworks]
+#type = "openai_compatible"
+#base_url = "https://api.fireworks.ai/inference/v1"
+#model = "accounts/fireworks/models/llama-v3p1-70b-instruct"
+#api_key_env = "FIREWORKS_API_KEY"
