@@ -114,7 +114,7 @@ async def provision_emma_key() -> None:
 
             print(f"Key created successfully!")
             print(f"  - Key hash: {key_info.key_hash}")
-            print(f"  - Limit: ${key_info.limit_cents / 100:.2f}/month")
+            print(f"  - Limit: ${key_info.limit_usd:.2f}/month")
 
             # Store the key in Emma's database
             print("\nStoring key with agent-derived encryption...")

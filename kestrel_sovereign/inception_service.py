@@ -429,44 +429,11 @@ async def create_kestrel_identity_async(
     # 6. Link the agent to its constitution
     await graph.add_edge(agent_node.node_id, constitution_node.node_id, "governed_by")
 
-    # 7. Provision OpenRouter API key for this agent (if management key available)
-    openrouter_key_info = None
-    try:
-        from kestrel_sovereign.features.llm_keys import OpenRouterProvisioningService
-        provisioning = OpenRouterProvisioningService()
-
-        # Create a key with small initial limit, reset monthly
-        # Agents start with $0.10 - increase via update_key_limit after verification
-        openrouter_key_info = await provisioning.create_agent_key(
-            agent_name=agent_name.lower().replace(" ", "-"),
-            limit_usd=0.10,
-            limit_reset="monthly",
-        )
-        await provisioning.close()
-
-        # Store the key hash in agent metadata (NOT the actual key)
-        agent_properties["openrouter_key_hash"] = openrouter_key_info.key_hash
-        agent_node.properties["openrouter_key_hash"] = openrouter_key_info.key_hash
-        await graph.add_node(agent_node)  # Update node with key hash
-
-        logging.info(f"Provisioned OpenRouter API key for agent (hash: {openrouter_key_info.key_hash[:16]}...)")
-
-        # Store the API key securely using agent-scoped encryption
-        try:
-            from kestrel_sovereign.security.service_key_storage import ServiceKeyStorage
-            key_storage = ServiceKeyStorage(db, agent_did)
-            await key_storage.store_key(
-                provider_id="openrouter",
-                api_key=openrouter_key_info.key,
-                quota_limit=None,  # Quota managed by OpenRouter
-            )
-            logging.info(f"Stored OpenRouter key in ServiceKeyStorage for agent {agent_did[:20]}...")
-        except Exception as e:
-            logging.warning(f"Could not store OpenRouter key in ServiceKeyStorage: {e}")
-
-    except Exception as e:
-        # OpenRouter key provisioning is optional - don't fail agent creation
-        logging.warning(f"Could not provision OpenRouter key: {e}. Agent will use default LLM key.")
+    # 7. OpenRouter key provisioning is opt-in (not automatic at inception).
+    # Agents use the shared OPENROUTER_API_KEY by default.
+    # To provision a dedicated key, use:
+    #   from kestrel_sovereign.features.llm_keys import provision_agent_key
+    #   key_info = await provision_agent_key(agent_name, limit_usd=0.10)
 
     # 8. Index constitution for RAG (enables Constitutional RAG)
     from kestrel_sovereign.storage.async_rag_store import AsyncRAGStore
@@ -519,7 +486,7 @@ async def create_kestrel_identity_async(
         backup_prompt=backup_prompt,
         is_test_instance=is_test_instance,
         test_cycle_id=test_cycle_id,
-        openrouter_key_hash=openrouter_key_info.key_hash if openrouter_key_info else None,
+        openrouter_key_hash=None,  # Provisioned on-demand, not at inception
     )
 
 
