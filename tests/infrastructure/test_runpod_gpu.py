@@ -31,8 +31,16 @@ import os
 import time
 import requests
 import logging
+import pytest
 from dotenv import load_dotenv
-import runpod
+
+runpod = pytest.importorskip("runpod", reason="runpod package not installed")
+
+# This is a cloud infrastructure test — skip when not explicitly requested
+pytestmark = pytest.mark.skipif(
+    not os.environ.get("RUN_CLOUD_TESTS"),
+    reason="Cloud infrastructure test. Set RUN_CLOUD_TESTS=1 to enable."
+)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
