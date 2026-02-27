@@ -72,6 +72,11 @@ class StreamingMixin:
                     other_providers.append(p)
             if override_provider:
                 providers_to_use = [override_provider] + other_providers
+            else:
+                raise RuntimeError(
+                    f"Provider '{provider_name}' not available. "
+                    f"Available: {[p['name'] for p in self.providers]}"
+                )
             logger.info(f"Model override: {provider_name}/{model_name}")
 
         if force_local_only:
@@ -127,8 +132,8 @@ class StreamingMixin:
             except Exception as e:
                 logger.error(f"Provider {provider['name']} failed: {e}")
                 last_error = e
-                # Surface failure to user via stream (but not for structured output
-                # where error text would corrupt the JSON response)
+                # Surface failure to user via stream — but NOT for structured output
+                # where injected text would corrupt the JSON that the caller parses
                 if response_format is None:
                     yield f"\n[Provider {provider['name']} failed: {e}]\n"
                 continue
