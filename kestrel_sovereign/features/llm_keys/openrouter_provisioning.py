@@ -25,7 +25,6 @@ import asyncio
 import os
 import logging
 from dataclasses import dataclass
-from decimal import Decimal
 from typing import Optional, Literal
 
 import httpx
@@ -43,7 +42,7 @@ class AgentKeyInfo:
     key: str  # The actual API key (only available at creation time)
     key_hash: str  # Hash for subsequent API calls
     name: str  # Agent name/identifier
-    limit_cents: int  # Spending limit in cents
+    limit_usd: float  # Spending limit in USD (OpenRouter API uses dollars)
     limit_reset: Optional[str]  # daily, weekly, monthly, or None
 
     def to_dict(self) -> dict:
@@ -51,50 +50,39 @@ class AgentKeyInfo:
         return {
             "key_hash": self.key_hash,
             "name": self.name,
-            "limit_cents": self.limit_cents,
+            "limit_usd": self.limit_usd,
             "limit_reset": self.limit_reset,
         }
 
     @classmethod
     def from_dict(cls, data: dict, key: str = "") -> "AgentKeyInfo":
         """Deserialize from agent metadata."""
+        # Support legacy "limit_cents" key for old stored data
+        limit = data.get("limit_usd", data.get("limit_cents", 0))
         return cls(
             key=key,
             key_hash=data["key_hash"],
             name=data["name"],
-            limit_cents=data["limit_cents"],
+            limit_usd=float(limit),
             limit_reset=data.get("limit_reset"),
         )
 
 
 @dataclass
 class KeyUsage:
-    """Usage information for an agent's API key."""
+    """Usage information for an agent's API key.
+
+    All monetary values are in USD (OpenRouter API returns dollars).
+    """
 
     key_hash: str
-    limit_cents: int
-    limit_remaining_cents: int
-    usage_cents: int
-    usage_monthly_cents: int
+    limit_usd: float
+    limit_remaining_usd: float
+    usage_usd: float
+    usage_monthly_usd: float
     is_free_tier: bool
     rate_limit_requests: Optional[int]
     rate_limit_interval: Optional[str]
-
-    @property
-    def limit_usd(self) -> Decimal:
-        return Decimal(self.limit_cents) / 100
-
-    @property
-    def remaining_usd(self) -> Decimal:
-        return Decimal(self.limit_remaining_cents) / 100
-
-    @property
-    def usage_usd(self) -> Decimal:
-        return Decimal(self.usage_cents) / 100
-
-    @property
-    def usage_monthly_usd(self) -> Decimal:
-        return Decimal(self.usage_monthly_cents) / 100
 
 
 class OpenRouterProvisioningError(Exception):
@@ -160,7 +148,7 @@ class OpenRouterProvisioningService:
 
         Args:
             agent_name: Unique identifier for the agent (e.g., "emma-001")
-            limit_usd: Spending limit in USD (default $1.00)
+            limit_usd: Spending limit in USD (default $0.10)
             limit_reset: When to reset the limit (daily/weekly/monthly/None)
 
         Returns:
@@ -171,11 +159,9 @@ class OpenRouterProvisioningService:
         """
         client = await self._get_client()
 
-        limit_cents = int(limit_usd * 100)
-
         payload = {
             "name": f"kestrel-agent-{agent_name}",
-            "limit": limit_cents,
+            "limit": limit_usd,
         }
         if limit_reset:
             payload["limit_reset"] = limit_reset
@@ -194,7 +180,7 @@ class OpenRouterProvisioningService:
                     key=data["key"],
                     key_hash=data["data"]["hash"],
                     name=agent_name,
-                    limit_cents=limit_cents,
+                    limit_usd=limit_usd,
                     limit_reset=limit_reset,
                 )
 
@@ -244,10 +230,10 @@ class OpenRouterProvisioningService:
 
             return KeyUsage(
                 key_hash=key_hash,
-                limit_cents=data.get("limit", 0),
-                limit_remaining_cents=data.get("limit_remaining", 0),
-                usage_cents=data.get("usage", 0),
-                usage_monthly_cents=data.get("usage_monthly", 0),
+                limit_usd=data.get("limit", 0),
+                limit_remaining_usd=data.get("limit_remaining", 0),
+                usage_usd=data.get("usage", 0),
+                usage_monthly_usd=data.get("usage_monthly", 0),
                 is_free_tier=data.get("is_free_tier", False),
                 rate_limit_requests=data.get("rate_limit", {}).get("requests"),
                 rate_limit_interval=data.get("rate_limit", {}).get("interval"),
@@ -277,7 +263,7 @@ class OpenRouterProvisioningService:
         """
         client = await self._get_client()
 
-        payload = {"limit": int(limit_usd * 100)}
+        payload = {"limit": limit_usd}
         if limit_reset is not None:
             payload["limit_reset"] = limit_reset
 

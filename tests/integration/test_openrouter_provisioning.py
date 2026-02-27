@@ -70,13 +70,13 @@ async def test_create_and_delete_key(unique_agent_name, provisioning_service):
     assert key_info.key.startswith("sk-or-v1-")
     assert key_info.key_hash
     assert key_info.name == unique_agent_name
-    assert key_info.limit_cents == 10
+    assert key_info.limit_usd == 0.10
     assert key_info.limit_reset == "monthly"
 
     # Verify we can get usage
     usage = await provisioning_service.get_key_usage(key_info.key_hash)
-    assert usage.limit_cents == 10
-    assert usage.limit_remaining_cents == 10  # No usage yet
+    assert usage.limit_usd == 0.10
+    assert usage.limit_remaining_usd == 0.10  # No usage yet
 
     # Explicit delete (fixture will also clean up if this fails)
     deleted = await provisioning_service.delete_key(key_info.key_hash)
@@ -128,7 +128,7 @@ async def test_update_key_limit(unique_agent_name, provisioning_service):
         limit_usd=0.10,
     )
 
-    assert key_info.limit_cents == 10
+    assert key_info.limit_usd == 0.10
 
     # Update limit
     updated_usage = await provisioning_service.update_key_limit(
@@ -136,8 +136,8 @@ async def test_update_key_limit(unique_agent_name, provisioning_service):
         limit_usd=5.0,
     )
 
-    assert updated_usage.limit_cents == 500
-    assert updated_usage.limit_remaining_cents == 500
+    assert updated_usage.limit_usd == 5.0
+    assert updated_usage.limit_remaining_usd == 5.0
 
 
 @pytest.mark.asyncio
@@ -157,11 +157,11 @@ async def test_convenience_functions(unique_agent_name):
 
     try:
         assert key_info.key.startswith("sk-or-v1-")
-        assert key_info.limit_cents == 10
+        assert key_info.limit_usd == 0.10
 
         # Get usage via convenience function
         usage = await get_agent_usage(key_info.key_hash)
-        assert usage.limit_cents == 10
+        assert usage.limit_usd == 0.10
     finally:
         # Always clean up
         await delete_agent_key(key_info.key_hash)
@@ -176,7 +176,7 @@ async def test_serialization():
         key="sk-or-v1-test",
         key_hash="abc123",
         name="test-agent",
-        limit_cents=1000,
+        limit_usd=10.0,
         limit_reset="monthly",
     )
 
@@ -191,7 +191,7 @@ async def test_serialization():
     assert restored.key == ""  # Key not available after storage
     assert restored.key_hash == "abc123"
     assert restored.name == "test-agent"
-    assert restored.limit_cents == 1000
+    assert restored.limit_usd == 10.0
 
 
 @pytest.mark.asyncio

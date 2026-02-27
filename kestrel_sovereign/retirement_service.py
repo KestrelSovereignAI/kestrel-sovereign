@@ -193,6 +193,16 @@ async def retire_agent(
 
     await db.close()
 
+    # Revoke OpenRouter API key if the agent had one provisioned
+    openrouter_key_hash = agent_info.get("openrouter_key_hash")
+    if openrouter_key_hash:
+        try:
+            from kestrel_sovereign.features.llm_keys.openrouter_provisioning import delete_agent_key
+            await delete_agent_key(openrouter_key_hash)
+            logger.info(f"Revoked OpenRouter key (hash: {openrouter_key_hash[:16]}...)")
+        except Exception as e:
+            logger.warning(f"Could not revoke OpenRouter key: {e}")
+
     # Archive agent files (don't delete)
     archive_dir = _resolve_archive_dir(db_path, archive_dir)
 
