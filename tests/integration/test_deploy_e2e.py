@@ -192,15 +192,19 @@ class TestAzureProviderStub:
         assert AzureContainerProvider is not None
 
     @pytest.mark.asyncio
-    async def test_azure_provider_not_implemented(self):
-        """Test that Azure provider methods raise NotImplementedError."""
+    async def test_azure_provider_requires_sdk(self):
+        """Test that Azure provider raises DeployManagerError without azure SDK."""
         from kestrel_sovereign.features.deploy.providers import AzureContainerProvider
         from kestrel_sovereign.features.deploy.models import (
             DeploymentProfile,
+            DeployManagerError,
             DeployProviderType,
         )
 
-        provider = AzureContainerProvider()
+        provider = AzureContainerProvider(
+            subscription_id="test-sub-id",
+            resource_group="test-rg",
+        )
 
         profile = DeploymentProfile(
             provider=DeployProviderType.AZURE_CONTAINER_APPS,
@@ -208,23 +212,14 @@ class TestAzureProviderStub:
             region="eastus2",
         )
 
-        with pytest.raises(NotImplementedError, match="Azure Container Apps support coming soon"):
+        try:
+            import azure  # noqa: F401
+            pytest.skip("Azure SDK installed — stub test not applicable")
+        except ImportError:
+            pass
+
+        with pytest.raises(DeployManagerError, match="Missing dependency"):
             await provider.deploy("image:latest", "test", profile)
-
-        with pytest.raises(NotImplementedError):
-            await provider.get_status("test")
-
-        with pytest.raises(NotImplementedError):
-            await provider.teardown("test")
-
-        with pytest.raises(NotImplementedError):
-            await provider.get_logs("test")
-
-        with pytest.raises(NotImplementedError):
-            await provider.list_deployments()
-
-        with pytest.raises(NotImplementedError):
-            await provider.health_check("https://test.example.com")
 
     def test_azure_provider_in_registry(self):
         """Test that Azure provider is recognized in core registry."""

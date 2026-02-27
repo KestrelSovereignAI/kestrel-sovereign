@@ -243,6 +243,7 @@ const API = {
     getConversations: (decrypt = true) => API.request(`/api/conversations?decrypt=${decrypt}`),
     getConversation: (sessionId, decrypt = true) => API.request(`/api/conversations/${encodeURIComponent(sessionId)}?decrypt=${decrypt}`),
     newConversation: () => API.request('/api/conversations/new', { method: 'POST' }),
+    deleteMessage: (messageId) => API.request(`/api/conversations/messages/${encodeURIComponent(messageId)}`, { method: 'DELETE' }),
     // Database Explorer & IPFS Status
     getDbTables: () => API.request('/api/db/tables'),
     queryDbTable: (table, limit = 50, offset = 0, search = null) => {

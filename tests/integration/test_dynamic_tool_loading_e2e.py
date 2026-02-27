@@ -89,14 +89,15 @@ class TestExploreThenDirectFlow:
         features = {f.tool_name: f for f in agent.features.values()}
         assert "model_agent" in features, f"Expected model_agent in {list(features.keys())}"
 
-        # Before exploration: no direct tools
-        assert len(agent._direct_tools) == 0
+        # Before exploration: record existing direct tools count
+        initial_count = len(agent._direct_tools)
 
         # Register (same as what _handle_orchestrator_response does after dispatch)
         feature = features["model_agent"]
         agent._register_explored_feature_tools(feature)
 
-        # After exploration: model_agent tools are registered
+        # After exploration: model_agent tools are registered (count increased)
+        assert len(agent._direct_tools) > initial_count
         assert "model_agent" in agent._explored_features
         model_tools = [name for name, feat in agent._tool_to_feature.items() if feat == "model_agent"]
         assert len(model_tools) > 0, "Expected at least one tool registered from model_agent"
