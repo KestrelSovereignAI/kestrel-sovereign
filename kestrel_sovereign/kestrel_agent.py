@@ -1414,7 +1414,8 @@ Expected Duration: {expected_duration}
         force_local_only: bool,
         effective_model: str,
         max_iterations: int = None,
-        user_message: str = None
+        user_message: str = None,
+        tool_events: list = None,
     ):
         """
         Streaming version of _handle_orchestrator_response.
@@ -1475,6 +1476,8 @@ Expected Duration: {expected_duration}
                 args = tool_call.arguments if isinstance(tool_call.arguments, dict) else {}
 
                 # Stream tool start indicator to user
+                if tool_events is not None:
+                    tool_events.append({'type': 'start', 'tool': tool_name})
                 yield f"🔧 Calling {tool_name}...\n"
 
                 dispatch_start = time.time()
@@ -1513,6 +1516,8 @@ Expected Duration: {expected_duration}
                             success=True,
                             duration_ms=dispatch_duration,
                         )
+                        if tool_events is not None:
+                            tool_events.append({'type': 'complete', 'tool': tool_name, 'ms': dispatch_duration})
                         yield f"✓ {tool_name} complete ({dispatch_duration}ms)\n"
                     except (ConnectionError, TimeoutError, ValueError, KeyError, TypeError, AttributeError) as e:
                         logging.error(f"Feature {tool_name} execution failed: {e}")
@@ -1524,6 +1529,8 @@ Expected Duration: {expected_duration}
                             duration_ms=dispatch_duration,
                             error_message=str(e),
                         )
+                        if tool_events is not None:
+                            tool_events.append({'type': 'error', 'tool': tool_name, 'error': str(e)[:200]})
                         yield f"❌ {tool_name} failed: {str(e)[:100]}\n"
                     except Exception as e:
                         logging.error(f"Feature {tool_name} execution failed: {e}", exc_info=True)
@@ -1535,6 +1542,8 @@ Expected Duration: {expected_duration}
                             duration_ms=dispatch_duration,
                             error_message=str(e),
                         )
+                        if tool_events is not None:
+                            tool_events.append({'type': 'error', 'tool': tool_name, 'error': str(e)[:200]})
                         yield f"❌ {tool_name} failed: {str(e)[:100]}\n"
 
                 elif tool_name in self._direct_tools:
@@ -1560,6 +1569,8 @@ Expected Duration: {expected_duration}
                             success=True,
                             duration_ms=dispatch_duration,
                         )
+                        if tool_events is not None:
+                            tool_events.append({'type': 'complete', 'tool': tool_name, 'ms': dispatch_duration})
                         yield f"⚡ {tool_name} (direct, {dispatch_duration}ms)\n"
                     except Exception as e:
                         logging.error(f"[DIRECT-TOOL] {tool_name} failed: {e}")
@@ -1572,6 +1583,8 @@ Expected Duration: {expected_duration}
                             duration_ms=dispatch_duration,
                             error_message=str(e),
                         )
+                        if tool_events is not None:
+                            tool_events.append({'type': 'error', 'tool': tool_name, 'error': str(e)[:200]})
                         yield f"❌ {tool_name} failed: {str(e)[:100]}\n"
 
                 else:
@@ -1583,6 +1596,8 @@ Expected Duration: {expected_duration}
                         duration_ms=dispatch_duration,
                         error_message=f"Unknown feature tool: {tool_name}",
                     )
+                    if tool_events is not None:
+                        tool_events.append({'type': 'error', 'tool': tool_name, 'error': f'Unknown feature tool: {tool_name}'})
                     yield f"❌ Unknown tool: {tool_name}\n"
 
                 from kestrel_sovereign.features.base import _serialize_tool_result

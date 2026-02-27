@@ -191,18 +191,21 @@ class StreamingMixin:
             else:
                 # Stream tokens as they arrive from LLM after tool execution
                 tool_response_chunks = []
+                tool_events = []
                 async for chunk in self._handle_orchestrator_response_streaming(
                     response=tool_response,
                     feature_tools=feature_tools,
                     system_prompt=system_prompt,
                     force_local_only=force_local_only,
                     effective_model=effective_model,
-                    user_message=user_input
+                    user_message=user_input,
+                    tool_events=tool_events,
                 ):
                     tool_response_chunks.append(chunk)
                     yield chunk
-                # Store the full response after streaming completes
-                await self.privacy_agent.add_conversation("assistant", "".join(tool_response_chunks), session_id=session_id)
+                # Store the full response after streaming completes, with tool events in metadata
+                meta = {'tool_events': tool_events} if tool_events else None
+                await self.privacy_agent.add_conversation("assistant", "".join(tool_response_chunks), metadata=meta, session_id=session_id)
         else:
             # No tool calls - text was already streamed (unless audit_before_streaming)
             final_text = "".join(full_response)
