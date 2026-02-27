@@ -114,7 +114,7 @@ TRUSTED_AGENTS_DIR = (
 # The constitution is stored in the package's data directory for portability
 _PACKAGE_DIR = os.path.dirname(__file__)
 CONSTITUTION_PATH = os.path.join(_PACKAGE_DIR, 'data', 'KESTREL_CONSTITUTION.md')
-DEFAULT_LLM_CONFIG_PATH = os.path.join(os.path.dirname(__file__), 'llm_config.toml')
+DEFAULT_LLM_CONFIG_PATH = "llm_config.toml"  # Resolved from project root (CWD)
 
 # --- Inception Service ---
 # Ensure the directory for trusted agents' keys exists
