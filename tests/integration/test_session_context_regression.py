@@ -95,9 +95,10 @@ async def test_context_manager_falls_back_to_storage_without_history():
     ]
     mock_storage = MagicMock()
 
-    # Mock the conversation store's get_full_history method (used by context_manager)
+    # Mock the conversation store methods (context_manager uses get_conversation_history)
     mock_conversation = AsyncMock()
     mock_conversation.get_full_history = AsyncMock(return_value=storage_history)
+    mock_conversation.get_conversation_history = AsyncMock(return_value=storage_history)
     mock_storage.conversation = mock_conversation
 
     # Also mock get_conversation_history for direct calls

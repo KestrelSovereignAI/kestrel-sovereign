@@ -108,7 +108,7 @@ async def test_generate_with_messages():
 
         response = await service.generate_with_messages(
             messages=messages,
-            model_override="gpt-5-mini"
+            model_override="openai/gpt-5-mini"
         )
 
         # Assert response references prior context
