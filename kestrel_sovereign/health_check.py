@@ -40,7 +40,7 @@ def run_health_check():
 
     # Check config
     config_exists = os.path.exists('llm_config.toml')
-    print(f'LLM Config: {"✅ Found" if config_exists else "❌ Missing (run `cp llm_config.toml.example llm_config.toml`)"}')
+    print(f'LLM Config: {"✅ Found" if config_exists else "❌ Missing llm_config.toml"}')
 
     print('\n🚀 Ready to start!')
 
