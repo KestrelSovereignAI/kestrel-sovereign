@@ -341,7 +341,7 @@ class LighthouseTarget(SyncTarget):
         path = self._manifest_path
         if path and path.exists():
             try:
-                with open(path) as f:
+                with open(path, encoding="utf-8") as f:
                     return json.load(f)
             except Exception as e:
                 logger.warning(f"Failed to load local manifest: {e}")
@@ -353,7 +353,7 @@ class LighthouseTarget(SyncTarget):
         if path:
             try:
                 path.parent.mkdir(parents=True, exist_ok=True)
-                with open(path, "w") as f:
+                with open(path, "w", encoding="utf-8") as f:
                     json.dump(manifest, f, indent=2)
             except Exception as e:
                 logger.warning(f"Failed to save local manifest: {e}")

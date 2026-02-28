@@ -5,6 +5,7 @@ Implements deployment to Google Cloud Run using the google-cloud-run SDK.
 """
 
 import asyncio
+import atexit
 import logging
 import os
 import time
@@ -43,6 +44,7 @@ class CloudRunProvider(DeployProvider):
 
         self._services_client = None
         self._logging_client = None
+        self._temp_cred_file = None
         self._setup_auth()
 
     def _setup_auth(self):
@@ -64,8 +66,10 @@ class CloudRunProvider(DeployProvider):
                 mode="w", suffix=".json", delete=False
             ) as f:
                 f.write(key_json)
+                self._temp_cred_file = f.name
                 os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = f.name
                 logger.info("Using service account key from GCP_SERVICE_ACCOUNT_KEY")
+            atexit.register(self._cleanup_temp_creds)
             return
 
         # Priority 3: Project-local service account file
@@ -84,6 +88,15 @@ class CloudRunProvider(DeployProvider):
             "No explicit credentials found. Using Application Default Credentials. "
             "Set GOOGLE_APPLICATION_CREDENTIALS or place credentials/kestrel-agent-admin.json"
         )
+
+    def _cleanup_temp_creds(self):
+        """Remove temporary credentials file created from GCP_SERVICE_ACCOUNT_KEY."""
+        if self._temp_cred_file and os.path.exists(self._temp_cred_file):
+            try:
+                os.unlink(self._temp_cred_file)
+                logger.debug(f"Cleaned up temp credentials: {self._temp_cred_file}")
+            except OSError:
+                pass
 
     def _get_services_client(self):
         """Lazy-load the Cloud Run services client."""
@@ -441,7 +454,7 @@ class CloudRunProvider(DeployProvider):
                 response_time = time.time() - start_time
 
                 return {
-                    "healthy": response.status_code < 500,
+                    "healthy": 200 <= response.status_code < 400,
                     "status_code": response.status_code,
                     "response_time": response_time,
                 }

@@ -108,7 +108,7 @@ class AgentConfig:
         }
 
         self.config_file.parent.mkdir(parents=True, exist_ok=True)
-        with open(self.config_file, "w") as f:
+        with open(self.config_file, "w", encoding="utf-8") as f:
             toml.dump(data, f)
 
     def exists(self) -> bool:

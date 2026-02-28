@@ -205,7 +205,7 @@ def _verify_with_did_document(
         if not did_path.exists():
             return False, f"DID document not found at {did_path} - cannot verify without public key"
 
-        with open(did_path, 'r') as f:
+        with open(did_path, 'r', encoding='utf-8') as f:
             did_document = json.load(f)
 
         # Extract publicKeyHex from the DID document
@@ -265,7 +265,7 @@ async def sign_and_export(
 
     # Write to file if path provided
     if output_path:
-        with open(output_path, 'w') as f:
+        with open(output_path, 'w', encoding='utf-8') as f:
             f.write(json_str)
         logger.info(f"Exported signed package to {output_path}")
 

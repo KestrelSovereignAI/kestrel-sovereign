@@ -82,7 +82,7 @@ class VertexAIAdapter(LLMAdapter):
         if creds_path and os.path.exists(creds_path):
             try:
                 import json
-                with open(creds_path) as f:
+                with open(creds_path, encoding='utf-8') as f:
                     creds = json.load(f)
                     return creds.get("project_id")
             except (FileNotFoundError, json.JSONDecodeError, KeyError) as e:

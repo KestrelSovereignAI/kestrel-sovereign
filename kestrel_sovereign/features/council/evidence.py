@@ -191,7 +191,7 @@ async def _gather_test_results() -> Dict[str, Any]:
         failed_count = 0
         if cache_file.exists():
             try:
-                with open(cache_file) as f:
+                with open(cache_file, encoding="utf-8") as f:
                     failed_data = json.load(f)
                     failed_count = len(failed_data) if failed_data else 0
             except (OSError, json.JSONDecodeError) as e:
@@ -389,7 +389,7 @@ async def _gather_previous_decisions() -> List[str]:
     if sessions_dir.exists():
         try:
             for session_file in sorted(sessions_dir.glob("*.json"))[-5:]:
-                with open(session_file) as f:
+                with open(session_file, encoding="utf-8") as f:
                     session = json.load(f)
                     decisions.append(
                         f"{session.get('created_at', 'Unknown')}: "

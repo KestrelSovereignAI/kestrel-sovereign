@@ -53,14 +53,14 @@ class CouncilStorage:
         session_file = self.data_dir / f"{session.id}.json"
         session_data = session.to_dict()
 
-        with open(session_file, "w") as f:
+        with open(session_file, "w", encoding="utf-8") as f:
             json.dump(session_data, f, indent=2, default=str)
 
         logger.info(f"Saved council session {session.id} to {session_file}")
 
         # Save transcript as markdown
         transcript_file = self.data_dir / f"{session.id}.md"
-        with open(transcript_file, "w") as f:
+        with open(transcript_file, "w", encoding="utf-8") as f:
             f.write(session.to_transcript())
 
         # Optionally save to knowledge graph
@@ -77,7 +77,7 @@ class CouncilStorage:
             return None
 
         try:
-            with open(session_file) as f:
+            with open(session_file, encoding="utf-8") as f:
                 data = json.load(f)
             return self._session_from_dict(data)
         except Exception as e:
@@ -107,7 +107,7 @@ class CouncilStorage:
             reverse=True,
         )[:limit * 2]:  # Load extra in case of filtering
             try:
-                with open(session_file) as f:
+                with open(session_file, encoding="utf-8") as f:
                     data = json.load(f)
 
                 if outcome and data.get("outcome") != outcome:

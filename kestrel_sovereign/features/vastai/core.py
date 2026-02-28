@@ -511,7 +511,7 @@ class VastAIManagerCore:
                     project_root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
                     key_file = os.path.join(project_root, key_file)
 
-                with open(key_file, "r") as f:
+                with open(key_file, "r", encoding="utf-8") as f:
                     content = f.read()
                     # Compact JSON to single line
                     parsed = json.loads(content)

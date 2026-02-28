@@ -93,7 +93,7 @@ def _read_key_from_file(path: str) -> Optional[str]:
     """Read a key from a secrets file (Docker Secrets, Kubernetes Secrets, etc.)."""
     try:
         if os.path.isfile(path):
-            with open(path, 'r') as f:
+            with open(path, 'r', encoding='utf-8') as f:
                 return f.read().strip()
     except Exception as e:
         logger.warning(f"Could not read key from {path}: {e}")

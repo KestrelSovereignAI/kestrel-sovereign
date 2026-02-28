@@ -172,7 +172,7 @@ def save_kestrel_identity(did_document: dict, keys: dict, key_id: str, output_di
 
     # Always save DID document (public information)
     did_filename = output_dir / f"{key_id}.json"
-    with open(did_filename, 'w') as f:
+    with open(did_filename, 'w', encoding='utf-8') as f:
         json.dump(did_document, f, indent=2)
     logging.info(f"Saved DID document to {did_filename}")
 
@@ -232,7 +232,7 @@ def load_kestrel_identity(key_id: str, storage_dir: Optional[Path] = None) -> tu
     # Load DID document
     did_path = storage_dir / f"{key_id}.json"
     if did_path.exists():
-        with open(did_path, 'r') as f:
+        with open(did_path, 'r', encoding='utf-8') as f:
             did_document = json.load(f)
     else:
         # Try without the key_id prefix (legacy format)
@@ -451,7 +451,7 @@ async def create_kestrel_identity_async(
     try:
         us_const_path = Path(__file__).parent / "docs" / "principles" / "US_CONSTITUTION.md"
         if us_const_path.exists():
-            with open(us_const_path, "r") as f:
+            with open(us_const_path, "r", encoding="utf-8") as f:
                 us_content = f.read()
             import hashlib
             us_hash = hashlib.sha256(us_content.encode()).hexdigest()[:16]

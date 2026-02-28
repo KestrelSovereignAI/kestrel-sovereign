@@ -544,7 +544,7 @@ Query: {query}
 
         # Build disclosure text
         if disclosure_path.exists():
-            with open(disclosure_path, 'r') as f:
+            with open(disclosure_path, 'r', encoding='utf-8') as f:
                 content = f.read()
             # Extract just the disclosure text between ``` markers
             import re

@@ -187,7 +187,7 @@ class ProcessManager:
     ) -> int:
         """Spawn a background process. Returns PID."""
         log_file.parent.mkdir(parents=True, exist_ok=True)
-        with open(log_file, "a") as log:
+        with open(log_file, "a", encoding="utf-8") as log:
             kwargs = dict(
                 cwd=self.project_dir,
                 env=env,

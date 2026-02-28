@@ -465,7 +465,7 @@ class AzureContainerProvider(DeployProvider):
                 response_time = time.time() - start_time
 
                 return {
-                    "healthy": response.status_code < 500,
+                    "healthy": 200 <= response.status_code < 400,
                     "status_code": response.status_code,
                     "response_time": response_time,
                 }

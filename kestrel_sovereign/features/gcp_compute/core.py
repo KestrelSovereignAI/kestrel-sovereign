@@ -659,7 +659,7 @@ class GCPComputeEngineManagerCore:
 
                 # Add SSH key if available
                 if os.path.exists(self.ssh_key_file + ".pub"):
-                    with open(self.ssh_key_file + ".pub") as f:
+                    with open(self.ssh_key_file + ".pub", encoding="utf-8") as f:
                         ssh_key = f.read().strip()
                     instance.metadata.items.append(
                         compute_v1.Items(

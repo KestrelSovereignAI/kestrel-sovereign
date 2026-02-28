@@ -138,7 +138,7 @@ Use `!identity import {cid}` to restore this identity on another substrate.
                 filename = f"identity_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.json"
                 filepath = storage_dir / filename
 
-                with open(filepath, 'w') as f:
+                with open(filepath, 'w', encoding='utf-8') as f:
                     f.write(package_json)
 
                 return f"""Identity Export Complete
@@ -203,7 +203,7 @@ Use `!identity import {filepath}` to restore this identity.
                 package_json = content.decode('utf-8')
             elif Path(source).exists():
                 # Local file
-                with open(source, 'r') as f:
+                with open(source, 'r', encoding='utf-8') as f:
                     package_json = f.read()
             else:
                 return f"Source not found: {source}"
@@ -295,7 +295,7 @@ Warnings:
                 )
                 package_json = content.decode('utf-8')
             elif Path(source).exists():
-                with open(source, 'r') as f:
+                with open(source, 'r', encoding='utf-8') as f:
                     package_json = f.read()
             else:
                 return f"Source not found: {source}"

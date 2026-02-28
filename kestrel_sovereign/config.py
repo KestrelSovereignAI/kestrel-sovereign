@@ -39,7 +39,7 @@ def load_config(file_name: str, section: Optional[str] = None) -> Dict[str, Any]
     unified_path = Path("kestrel.toml")
     if unified_path.exists() and file_name in _UNIFIED_CONFIG_MAPPING:
         try:
-            with open(unified_path, 'r') as f:
+            with open(unified_path, 'r', encoding='utf-8') as f:
                 unified_data = toml.load(f)
 
             # Navigate to the mapped section in unified config
@@ -92,7 +92,7 @@ def load_config(file_name: str, section: Optional[str] = None) -> Dict[str, Any]
         )
 
     try:
-        with open(config_path, 'r') as f:
+        with open(config_path, 'r', encoding='utf-8') as f:
             config_data = toml.load(f)
             if section:
                 return config_data.get(section, {})
