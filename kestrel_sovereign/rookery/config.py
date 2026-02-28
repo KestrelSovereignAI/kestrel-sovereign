@@ -329,7 +329,7 @@ class RookeryConfig(BaseModel):
                 }
 
         # Save to file
-        with open(path, "w") as f:
+        with open(path, "w", encoding="utf-8") as f:
             toml.dump(data, f)
 
         logger.info(f"Saved rookery config to {path}")

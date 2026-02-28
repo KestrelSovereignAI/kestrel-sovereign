@@ -351,7 +351,7 @@ class SyncService:
         """Load sync state from file."""
         if self.state_file.exists():
             try:
-                with open(self.state_file) as f:
+                with open(self.state_file, encoding="utf-8") as f:
                     data = json.load(f)
                 self._state = SyncState.from_dict(data)
                 logger.debug(f"Loaded sync state from {self.state_file}")
@@ -365,7 +365,7 @@ class SyncService:
         """Save sync state to file."""
         if self._state:
             try:
-                with open(self.state_file, "w") as f:
+                with open(self.state_file, "w", encoding="utf-8") as f:
                     json.dump(self._state.to_dict(), f, indent=2)
                 logger.debug(f"Saved sync state to {self.state_file}")
             except Exception as e:

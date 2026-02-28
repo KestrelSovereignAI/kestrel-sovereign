@@ -199,7 +199,7 @@ class IdentityExporter:
         # Fallback: load from default location
         try:
             from kestrel_sovereign.config import CONSTITUTION_PATH
-            with open(CONSTITUTION_PATH, 'r') as f:
+            with open(CONSTITUTION_PATH, 'r', encoding='utf-8') as f:
                 text = f.read()
             computed_hash = hashlib.sha256(text.encode('utf-8')).hexdigest()
             return {"hash": computed_hash, "text": text}
@@ -244,7 +244,7 @@ class IdentityExporter:
             prompts_dir = Path(__file__).parent.parent / "prompts"
             system_prompt_path = prompts_dir / "system_prompt.md"
             if system_prompt_path.exists():
-                with open(system_prompt_path, 'r') as f:
+                with open(system_prompt_path, 'r', encoding='utf-8') as f:
                     base_prompt = f.read()
         except Exception as e:
             logger.warning(f"Could not load base system prompt: {e}")
