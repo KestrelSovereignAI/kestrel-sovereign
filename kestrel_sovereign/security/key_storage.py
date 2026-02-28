@@ -326,7 +326,7 @@ class SecureKeyStorage:
         
         # Save
         key_path = self._get_key_path(key_id)
-        with open(key_path, 'w') as f:
+        with open(key_path, 'w', encoding='utf-8') as f:
             f.write(bundle.to_json())
         
         logger.info(f"Saved encrypted private key: {key_path}")
@@ -351,7 +351,7 @@ class SecureKeyStorage:
         if not key_path.exists():
             raise FileNotFoundError(f"Encrypted key not found: {key_path}")
         
-        with open(key_path, 'r') as f:
+        with open(key_path, 'r', encoding='utf-8') as f:
             bundle = EncryptedKeyBundle.from_json(f.read())
         
         private_pem = self._decrypt_key(bundle)

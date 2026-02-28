@@ -220,7 +220,7 @@ class DeployManagerCore:
                 async with httpx.AsyncClient(timeout=10.0) as client:
                     response = await client.get(health_url)
 
-                    if response.status_code < 500:
+                    if 200 <= response.status_code < 400:
                         logger.info(f"Service is healthy (status: {response.status_code})")
                         return True
 

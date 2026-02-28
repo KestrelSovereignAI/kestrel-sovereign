@@ -227,7 +227,7 @@ if SERVE_UI:
     async def read_root(request: Request):
         """Serve the main web UI."""
         try:
-            with open("static/index.html") as f:
+            with open("static/index.html", encoding="utf-8") as f:
                 return HTMLResponse(content=f.read(), status_code=200)
         except FileNotFoundError:
             logger.error("static/index.html not found.")

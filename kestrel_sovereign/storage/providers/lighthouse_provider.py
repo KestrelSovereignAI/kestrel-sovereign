@@ -737,7 +737,7 @@ class LighthouseProvider(StorageProvider, CryostasisCapable, MultiCurrencyPaymen
         import json
 
         if self._index_file.exists():
-            with open(self._index_file, "r") as f:
+            with open(self._index_file, "r", encoding="utf-8") as f:
                 return json.load(f)
         return {}
 
@@ -745,7 +745,7 @@ class LighthouseProvider(StorageProvider, CryostasisCapable, MultiCurrencyPaymen
         """Save the local content index."""
         import json
 
-        with open(self._index_file, "w") as f:
+        with open(self._index_file, "w", encoding="utf-8") as f:
             json.dump(index, f, indent=2)
 
     async def _update_index(self, result: StorageResult) -> None:

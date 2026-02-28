@@ -55,7 +55,7 @@ class ModelMandateMixin:
     def get_active_mandate_text(self) -> str:
         """Returns the raw text of the currently active model mandate."""
         try:
-            with open("model_mandate.toml", "r") as f:
+            with open("model_mandate.toml", "r", encoding="utf-8") as f:
                 return f.read()
         except FileNotFoundError:
             return "No model_mandate.toml file found."

@@ -240,7 +240,7 @@ async def retire_agent(
 
     # Write retirement record to archive
     record_path = agent_archive_path / "RETIREMENT_RECORD.json"
-    with open(record_path, 'w') as f:
+    with open(record_path, 'w', encoding='utf-8') as f:
         json.dump({
             "agent_did": record.agent_did,
             "agent_name": record.agent_name,
@@ -293,7 +293,7 @@ async def list_retired_agents(archive_dir: Optional[str] = None) -> list[dict]:
         if agent_dir.is_dir():
             record_path = agent_dir / "RETIREMENT_RECORD.json"
             if record_path.exists():
-                with open(record_path) as f:
+                with open(record_path, encoding='utf-8') as f:
                     retired.append(json.load(f))
 
     return retired
