@@ -2,6 +2,7 @@
 Configuration constants for the Kestrel project.
 """
 import os
+import re
 import toml
 from typing import Dict, Any, Optional
 from pathlib import Path
@@ -100,6 +101,76 @@ def load_config(file_name: str, section: Optional[str] = None) -> Dict[str, Any]
     except Exception as e:
         logger.error(f"Error loading configuration from '{file_name}': {e}")
         return {}
+
+# --- Duration Parsing ---
+
+def parse_duration(value: str) -> int:
+    """Parse a human-readable duration string into seconds.
+
+    Supports: "30s", "5m", "1h", "2h30m", "90m", "1h30m15s".
+    Plain integers are treated as minutes for backward compatibility.
+
+    Returns:
+        Duration in seconds.
+
+    Raises:
+        ValueError: If the string cannot be parsed.
+    """
+    value = value.strip()
+    if not value:
+        raise ValueError("Empty duration string")
+
+    # Plain integer → minutes
+    if value.isdigit():
+        return int(value) * 60
+
+    total = 0
+    pattern = re.compile(r'(\d+)\s*([hms])', re.IGNORECASE)
+    matches = pattern.findall(value)
+    if not matches:
+        raise ValueError(f"Cannot parse duration: '{value}'")
+
+    for amount, unit in matches:
+        unit = unit.lower()
+        if unit == 'h':
+            total += int(amount) * 3600
+        elif unit == 'm':
+            total += int(amount) * 60
+        elif unit == 's':
+            total += int(amount)
+
+    return total
+
+
+def load_section(section: str) -> Dict[str, Any]:
+    """Load a top-level section from kestrel.toml.
+
+    Args:
+        section: Section name (e.g. 'heartbeat', 'bootstrap', 'agent').
+
+    Returns:
+        Dict of config values, or empty dict if section/file not found.
+    """
+    # Check agent-specific config first (KESTREL_DB_PATH/kestrel.toml)
+    db_path = os.environ.get("KESTREL_DB_PATH")
+    search_paths = []
+    if db_path:
+        search_paths.append(Path(db_path) / "kestrel.toml")
+    search_paths.append(Path("kestrel.toml"))
+
+    for config_path in search_paths:
+        if config_path.exists():
+            try:
+                with open(config_path, 'r', encoding='utf-8') as f:
+                    data = toml.load(f)
+                result = data.get(section, {})
+                if result:
+                    return result
+            except Exception as e:
+                logger.warning(f"Error reading {config_path}: {e}")
+
+    return {}
+
 
 # --- Core Paths ---
 # Trusted agent keys need to live in a writable location.
