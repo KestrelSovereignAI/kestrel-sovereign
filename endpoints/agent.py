@@ -460,3 +460,39 @@ async def list_tasks(
     except Exception as e:
         logger.error(f"Error listing tasks: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Error listing tasks.")
+
+
+# --- Heartbeat Endpoints ---
+
+
+@router.get("/heartbeat/status")
+async def heartbeat_status(request: Request):
+    """Get heartbeat system status and recent history."""
+    if not hasattr(request.app.state, 'agent') or not request.app.state.agent:
+        raise HTTPException(status_code=503, detail="Agent not initialized.")
+
+    agent = request.app.state.agent
+    runner = getattr(agent, 'heartbeat_runner', None)
+    if not runner:
+        return {"enabled": False, "message": "Heartbeat not configured"}
+
+    return runner.get_status()
+
+
+@router.post("/heartbeat/trigger")
+async def heartbeat_trigger(request: Request):
+    """Manually trigger a heartbeat check."""
+    if not hasattr(request.app.state, 'agent') or not request.app.state.agent:
+        raise HTTPException(status_code=503, detail="Agent not initialized.")
+
+    agent = request.app.state.agent
+    runner = getattr(agent, 'heartbeat_runner', None)
+    if not runner:
+        raise HTTPException(status_code=404, detail="Heartbeat not configured")
+
+    try:
+        result = await runner.run_once()
+        return result.to_dict()
+    except Exception as e:
+        logger.error(f"Heartbeat trigger error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Error triggering heartbeat.")

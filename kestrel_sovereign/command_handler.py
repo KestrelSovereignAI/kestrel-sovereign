@@ -127,6 +127,12 @@ class CommandHandler:
         
         # Continue from stopped request
         self._command_handlers["!continue"] = self._cmd_continue
+
+        # Context reload
+        self._command_handlers["!reload-context"] = self._cmd_reload_context
+
+        # Heartbeat
+        self._command_handlers["!heartbeat"] = self._cmd_heartbeat
     
     async def handle(self, user_input: str) -> Optional[str]:
         """
@@ -252,6 +258,8 @@ class CommandHandler:
             "  !status              - Show agent status",
             "  !help                - Show this help",
             "  !audit [on|off]      - Toggle or check audit status",
+            "  !reload-context      - Hot-reload bootstrap files from disk",
+            "  !heartbeat           - Trigger a manual heartbeat check",
             "",
             "Constitution:",
             "  !verify-constitution - Verify constitution integrity",
@@ -610,9 +618,45 @@ Sharing:
     async def _cmd_continue(self, user_input: str) -> str:
         """
         Handle !continue command - continue from where a stopped request left off.
-        
+
         This sends a continuation prompt to the LLM to resume the previous response.
         """
         # This is a special command - we return None to let the agent handle it
         # by sending a continuation request to the LLM
         return None  # Signal to process_input to continue the conversation
+
+    def _cmd_reload_context(self, user_input: str) -> str:
+        """Handle !reload-context — hot-reload bootstrap files from disk."""
+        try:
+            builder = getattr(self.agent, 'context_builder', None)
+            if builder is None:
+                cm = getattr(self.agent, 'context_manager', None)
+                if cm:
+                    builder = getattr(cm, 'context_builder', None)
+            if builder and hasattr(builder, 'reload_bootstrap_files'):
+                builder.reload_bootstrap_files()
+                loaded = list(builder._bootstrap_files.keys())
+                if loaded:
+                    return f"Bootstrap files reloaded: {', '.join(loaded)}"
+                return "No bootstrap files found in agent data directory."
+            return "Context builder not available."
+        except Exception as e:
+            return f"Error reloading context: {e}"
+
+    async def _cmd_heartbeat(self, user_input: str) -> str:
+        """Handle !heartbeat — trigger a manual heartbeat check."""
+        runner = getattr(self.agent, 'heartbeat_runner', None)
+        if not runner:
+            return "Heartbeat not configured. Add [heartbeat] section to kestrel.toml."
+        try:
+            result = await runner.run_once()
+            if result.status == "ok":
+                return f"Heartbeat OK ({result.duration_ms}ms)"
+            elif result.status == "alert":
+                return f"Heartbeat ALERT ({result.duration_ms}ms):\n{result.message}"
+            elif result.status == "skipped":
+                return f"Heartbeat skipped: {result.reason}"
+            else:
+                return f"Heartbeat error: {result.reason or result.message}"
+        except Exception as e:
+            return f"Heartbeat failed: {e}"
