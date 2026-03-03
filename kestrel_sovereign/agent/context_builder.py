@@ -6,11 +6,13 @@ This module handles the assembly of context for LLM prompts, including:
 - Conversation history formatting
 - Constitutional grounding
 - Session briefings
+- Bootstrap file convention (AGENTS.md, SOUL.md, TOOLS.md, etc.)
 - Token-aware truncation
 - Episode integration for long conversations
 """
 
 import logging
+from collections import OrderedDict
 from pathlib import Path
 from typing import List, Dict, Optional, Any, TYPE_CHECKING
 
@@ -22,6 +24,36 @@ if TYPE_CHECKING:
     from storage.memory_consolidator import MemoryConsolidator
 
 logger = logging.getLogger(__name__)
+
+# Bootstrap files loaded in this order (all optional).
+# SOUL.md gets special treatment (--- YOUR IDENTITY ---), others use generic wrappers.
+BOOTSTRAP_FILE_ORDER = [
+    "AGENTS.md",
+    "SOUL.md",
+    "TOOLS.md",
+    "IDENTITY.md",
+    "USER.md",
+    "HEARTBEAT.md",
+    "BOOTSTRAP.md",
+    "MEMORY.md",
+]
+
+DEFAULT_MAX_CHARS_PER_FILE = 20_000
+DEFAULT_MAX_TOTAL_CHARS = 150_000
+
+
+def truncate_bootstrap_content(content: str, max_chars: int) -> str:
+    """Truncate content keeping head (70%) and tail (20%) with a marker.
+
+    Matches the OpenClaw strategy for preserving context at both ends.
+    """
+    if len(content) <= max_chars:
+        return content
+    head_chars = int(max_chars * 0.7)
+    tail_chars = int(max_chars * 0.2)
+    head = content[:head_chars]
+    tail = content[-tail_chars:] if tail_chars > 0 else ""
+    return f"{head}\n[...truncated...]\n{tail}"
 
 
 class ContextBuilder:
@@ -57,24 +89,96 @@ class ContextBuilder:
         self.counter = get_token_counter(model)
         self.consolidator = consolidator
         self.agent_data_path = Path(agent_data_path) if agent_data_path else None
-        self._soul_content: Optional[str] = None
-        
-        # Load SOUL.md if it exists
-        self._load_soul_md()
+
+        # Bootstrap file contents: filename -> content (ordered)
+        self._bootstrap_files: OrderedDict[str, str] = OrderedDict()
+
+        # Load bootstrap config
+        self._max_chars_per_file = DEFAULT_MAX_CHARS_PER_FILE
+        self._max_total_chars = DEFAULT_MAX_TOTAL_CHARS
+        try:
+            from kestrel_sovereign.config import load_section
+            bootstrap_cfg = load_section("bootstrap")
+            if bootstrap_cfg:
+                self._max_chars_per_file = bootstrap_cfg.get(
+                    "max_chars_per_file", DEFAULT_MAX_CHARS_PER_FILE
+                )
+                self._max_total_chars = bootstrap_cfg.get(
+                    "max_total_chars", DEFAULT_MAX_TOTAL_CHARS
+                )
+        except Exception:
+            pass  # Use defaults
+
+        # Load all bootstrap files (includes SOUL.md)
+        self._load_bootstrap_files()
+
+    @property
+    def _soul_content(self) -> Optional[str]:
+        """Backward-compatible access to SOUL.md content."""
+        return self._bootstrap_files.get("SOUL.md")
+
+    @_soul_content.setter
+    def _soul_content(self, value: Optional[str]) -> None:
+        """Backward-compatible setter for SOUL.md content."""
+        if value is None:
+            self._bootstrap_files.pop("SOUL.md", None)
+        else:
+            self._bootstrap_files["SOUL.md"] = value
+
+    def _load_bootstrap_files(self) -> None:
+        """Load all recognized bootstrap files from the agent data directory.
+
+        Files are loaded in BOOTSTRAP_FILE_ORDER, each truncated to
+        max_chars_per_file, with total content capped at max_total_chars.
+        """
+        self._bootstrap_files.clear()
+        if not self.agent_data_path:
+            return
+
+        total_chars = 0
+        for filename in BOOTSTRAP_FILE_ORDER:
+            filepath = self.agent_data_path / filename
+            if not filepath.exists():
+                continue
+
+            try:
+                content = filepath.read_text(encoding="utf-8")
+                if not content.strip():
+                    continue
+
+                # Per-file truncation
+                content = truncate_bootstrap_content(content, self._max_chars_per_file)
+
+                # Total budget check
+                if total_chars + len(content) > self._max_total_chars:
+                    remaining = self._max_total_chars - total_chars
+                    if remaining > 100:
+                        content = truncate_bootstrap_content(content, remaining)
+                    else:
+                        logger.warning(
+                            f"Bootstrap budget exhausted, skipping {filename}"
+                        )
+                        break
+
+                self._bootstrap_files[filename] = content
+                total_chars += len(content)
+                logger.info(f"Loaded bootstrap file: {filename} ({len(content)} chars)")
+            except Exception as e:
+                logger.warning(f"Failed to load bootstrap file {filename}: {e}")
+
+        if self._bootstrap_files:
+            names = ", ".join(self._bootstrap_files.keys())
+            logger.info(
+                f"Bootstrap files loaded: {names} ({total_chars} total chars)"
+            )
+
+    def reload_bootstrap_files(self) -> None:
+        """Re-read all bootstrap files from disk (hot-reload)."""
+        self._load_bootstrap_files()
 
     def _load_soul_md(self) -> None:
-        """Load or reload SOUL.md from the agent data directory."""
-        if self.agent_data_path:
-            soul_path = self.agent_data_path / "SOUL.md"
-            if soul_path.exists():
-                try:
-                    self._soul_content = soul_path.read_text()
-                    logger.info(f"Loaded SOUL.md from {soul_path}")
-                except Exception as e:
-                    logger.warning(f"Failed to load SOUL.md: {e}")
-            else:
-                self._soul_content = None
-                logger.debug(f"No SOUL.md found at {soul_path}")
+        """Backward-compatible method — delegates to _load_bootstrap_files."""
+        self._load_bootstrap_files()
 
     async def retrieve_context(self, query: str) -> str:
         """
@@ -252,11 +356,23 @@ Use `!constitution article <N>` for specific articles, or `!constitution search 
         """
         parts = []
 
-        # SOUL.md comes first — it defines personality and overrides tone
-        if self._soul_content:
-            parts.append("--- YOUR IDENTITY ---")
-            parts.append(self._soul_content)
-            parts.append("--- END IDENTITY ---")
+        # Bootstrap files — injected into system prompt in order.
+        # SOUL.md gets special "YOUR IDENTITY" wrapper; others use filename-based wrappers.
+        # AGENTS.md goes first (if present), then SOUL.md, then the rest.
+        for filename, content in self._bootstrap_files.items():
+            if filename == "SOUL.md":
+                parts.append("--- YOUR IDENTITY ---")
+                parts.append(content)
+                parts.append("--- END IDENTITY ---")
+            elif filename == "HEARTBEAT.md":
+                # HEARTBEAT.md is loaded by the heartbeat runner separately;
+                # skip it in the normal system prompt to avoid duplication.
+                continue
+            else:
+                label = filename.replace(".md", "").upper()
+                parts.append(f"--- {label} ---")
+                parts.append(content)
+                parts.append(f"--- END {label} ---")
 
         if include_briefing:
             parts.append(self.get_session_briefing())
@@ -286,18 +402,18 @@ Use `!constitution article <N>` for specific articles, or `!constitution search 
                     state_parts.append(f"  - {principle}")
             parts.append("\n".join(state_parts))
             parts.append("--- END STATE OF MIND ---")
-        
+
         # Add style reminder at the end (models pay more attention to end of context)
-        if self._soul_content:
+        if self._bootstrap_files.get("SOUL.md"):
             parts.append("\n--- STYLE REMINDER (IMPORTANT) ---")
             parts.append("When answering personal questions, respond naturally in paragraphs. DO NOT use numbered lists or bullet points. Talk like a person, not a document.")
             parts.append("--- END REMINDER ---")
-        
+
         if additional_context:
             parts.append("\n--- ADDITIONAL CONTEXT ---")
             parts.append(additional_context)
             parts.append("--- END CONTEXT ---")
-        
+
         return "\n\n".join(parts)
 
     def build_rag_context(

@@ -442,6 +442,13 @@ class KestrelAgent(ConstitutionMixin, StreamingMixin, BackupMixin, SleepMixin):
                 if feature:
                     self._register_explored_feature_tools(feature)
 
+            # Initialize heartbeat system (periodic agent self-checks)
+            from kestrel_sovereign.heartbeat import HeartbeatConfig, HeartbeatRunner
+            self._heartbeat_config = HeartbeatConfig.from_config()
+            self.heartbeat_runner = HeartbeatRunner(self, self._heartbeat_config)
+            if self._heartbeat_config.enabled:
+                await self.heartbeat_runner.start()
+
     @property
     def privacy_mode(self) -> PrivacyMode:
         """Get current privacy mode."""
@@ -1974,6 +1981,13 @@ Expected Duration: {expected_duration}
 
     async def shutdown(self):
         """Properly clean up all agent resources including async MCP connections."""
+        # Stop heartbeat runner
+        if hasattr(self, 'heartbeat_runner') and self.heartbeat_runner:
+            try:
+                await self.heartbeat_runner.stop()
+            except Exception as e:
+                logging.warning(f"Error stopping heartbeat: {e}")
+
         # Shutdown security feature if it exists
         security_feature = self.features.get("SecurityFeature")
         if security_feature and hasattr(security_feature, 'shutdown'):
