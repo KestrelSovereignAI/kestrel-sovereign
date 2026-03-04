@@ -8,6 +8,7 @@ import secrets
 from typing import Optional
 from pathlib import Path
 from fastapi import FastAPI, HTTPException, Request, Security, status
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import APIKeyHeader, HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
@@ -252,6 +253,24 @@ app.add_middleware(
     max_age=7 * 24 * 3600,  # 7 days
     same_site="lax",
     https_only=os.environ.get("KESTREL_ENV", "development") == "production",
+)
+
+# CORS middleware — added last so it runs outermost (before auth/session).
+# Override defaults via KESTREL_CORS_ORIGINS (comma-separated).
+_DEFAULT_CORS_ORIGINS = [
+    "http://localhost:8080",
+    "http://127.0.0.1:8080",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+]
+_cors_env = os.environ.get("KESTREL_CORS_ORIGINS", "")
+CORS_ORIGINS = [o.strip() for o in _cors_env.split(",") if o.strip()] if _cors_env else _DEFAULT_CORS_ORIGINS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=CORS_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
