@@ -20,7 +20,7 @@ gcloud run deploy "$SERVICE_NAME" \
     --image "gcr.io/${PROJECT_ID}/${IMAGE_NAME}:latest" \
     --region "$REGION" \
     --platform managed \
-    --no-allow-unauthenticated \
+    --allow-unauthenticated \
     --memory 4Gi \
     --cpu 4 \
     --port 8080 \
@@ -28,18 +28,16 @@ gcloud run deploy "$SERVICE_NAME" \
     --max-instances 10 \
     --timeout 300 \
     --concurrency 80 \
-    --set-secrets="OPENAI_API_KEY=kestrel-openai-key:latest,KESTREL_API_KEY=kestrel-api-key:latest,KESTREL_DATA_KEY=kestrel-data-key:latest,LIGHTHOUSE_API_KEY=kestrel-lighthouse-key:latest" \
-    --set-env-vars="KESTREL_ENV=development,KESTREL_DB_BACKEND=sqlite,KESTREL_HOST_AUTOSTART=true" \
+    --set-secrets="OPENAI_API_KEY=kestrel-openai-key:latest,KESTREL_API_KEY=kestrel-api-key:latest,KESTREL_DATA_KEY=kestrel-data-key:latest,LIGHTHOUSE_API_KEY=kestrel-lighthouse-key:latest,GOOGLE_CLIENT_ID=kestrel-google-client-id:latest,GOOGLE_CLIENT_SECRET=kestrel-google-client-secret:latest,KESTREL_SESSION_SECRET=kestrel-session-secret:latest" \
+    --set-env-vars="KESTREL_ENV=development,KESTREL_DB_BACKEND=sqlite,KESTREL_HOST_AUTOSTART=true,KESTREL_ALLOWED_EMAILS=jaslogic@gmail.com\,noelschulz1981@gmail.com\,gabriela.aquino@gmail.com" \
     --project="$PROJECT_ID" \
     --quiet
 
 echo ""
 echo "Rookery DEV deployment complete!"
 echo ""
-echo "Service URL (requires Google IAM auth):"
+echo "Service URL (sign in with authorized Google account):"
 gcloud run services describe "$SERVICE_NAME" \
     --region "$REGION" \
     --project="$PROJECT_ID" \
     --format='value(status.url)'
-echo ""
-echo "Access via proxy: gcloud run services proxy $SERVICE_NAME --region=$REGION --project=$PROJECT_ID"

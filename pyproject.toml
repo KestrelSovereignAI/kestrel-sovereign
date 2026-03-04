@@ -27,6 +27,7 @@ dependencies = [
     "python-jose[cryptography]>=3.5.0",
     "slowapi>=0.1.9",
     "itsdangerous>=2.2.0",
+    "authlib>=1.3.0",
     # Redis for caching
     "redis>=6.4.0",
     # Config and utilities

@@ -87,22 +87,25 @@ jobs:
             --max-instances=10
             --timeout=300
             --concurrency=80
-            --no-allow-unauthenticated
+            --allow-unauthenticated
           secrets: |
             OPENAI_API_KEY=kestrel-openai-key:latest
             KESTREL_API_KEY=kestrel-api-key:latest
             KESTREL_DATA_KEY=kestrel-data-key:latest
+            GOOGLE_CLIENT_ID=kestrel-google-client-id:latest
+            GOOGLE_CLIENT_SECRET=kestrel-google-client-secret:latest
+            KESTREL_SESSION_SECRET=kestrel-session-secret:latest
           env_vars: |
             KESTREL_ENV=development
             KESTREL_DB_BACKEND=sqlite
             KESTREL_DB_PATH=/app/agent_data
+            KESTREL_ALLOWED_EMAILS=jaslogic@gmail.com,noelschulz1981@gmail.com,gabriela.aquino@gmail.com
 
       - name: Show dev URL
         run: |
-          echo "Dev deployment complete! (requires Google IAM auth)"
+          echo "Dev deployment complete! Sign in with authorized Google account."
           URL=$(gcloud run services describe kestrel-dev --region=${{ env.REGION }} --format='value(status.url)')
           echo "Service URL: $URL"
-          echo "Access via: gcloud run services proxy kestrel-dev --region=${{ env.REGION }}"
 
   deploy-prod:
     runs-on: ubuntu-latest
@@ -136,19 +139,22 @@ jobs:
             --max-instances=100
             --timeout=300
             --concurrency=80
-            --no-allow-unauthenticated
+            --allow-unauthenticated
           secrets: |
             OPENAI_API_KEY=kestrel-openai-key:latest
             KESTREL_API_KEY=kestrel-api-key:latest
             KESTREL_DATA_KEY=kestrel-data-key:latest
+            GOOGLE_CLIENT_ID=kestrel-google-client-id:latest
+            GOOGLE_CLIENT_SECRET=kestrel-google-client-secret:latest
+            KESTREL_SESSION_SECRET=kestrel-session-secret:latest
           env_vars: |
             KESTREL_ENV=production
             KESTREL_DB_BACKEND=sqlite
             KESTREL_DB_PATH=/app/agent_data
+            KESTREL_ALLOWED_EMAILS=jaslogic@gmail.com,noelschulz1981@gmail.com,gabriela.aquino@gmail.com
 
       - name: Show prod URL
         run: |
-          echo "Prod deployment complete! (requires Google IAM auth)"
+          echo "Prod deployment complete! Sign in with authorized Google account."
           URL=$(gcloud run services describe kestrel-prod --region=${{ env.REGION }} --format='value(status.url)')
           echo "Service URL: $URL"
-          echo "Access via: gcloud run services proxy kestrel-prod --region=${{ env.REGION }}"
