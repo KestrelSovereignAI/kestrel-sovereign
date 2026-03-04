@@ -4,6 +4,7 @@
 
 # Ignore local env files (contains secrets)
 .env
+.env.*
 .env.local
 .env.*.local
 
@@ -32,6 +33,12 @@ __pycache__/
 
 # Ignore git
 .git/
+
+# Ignore tests
+tests/
+
+# Ignore Claude agent workspace
+.claude/
 
 # Ignore IDE
 .vscode/

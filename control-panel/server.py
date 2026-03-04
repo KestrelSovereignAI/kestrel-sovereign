@@ -6,7 +6,9 @@ Discovers agents in agent_data/, manages their lifecycle, provides dashboard.
 """
 
 import json
+import logging
 import os
+import secrets
 import shutil
 import signal
 import sqlite3
@@ -15,10 +17,13 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Configuration
 KESTREL_ROOT = Path(__file__).parent.parent
@@ -30,6 +35,70 @@ app = FastAPI(title="Kestrel Control Panel")
 
 # Track running agents: {agent_id: {"port": int, "pid": int}}
 running_agents: dict[str, dict] = {}
+
+
+# --- Authentication ---
+API_KEY_NAME = "X-API-Key"
+
+
+def get_api_key() -> str:
+    """Get the API key from environment, falling back to KESTREL_API_KEY.
+
+    Checks KESTREL_CONTROL_API_KEY first (control-panel-specific),
+    then KESTREL_API_KEY (shared with main server).
+    If neither is set, generates a temporary key and logs a warning.
+    """
+    api_key = os.environ.get("KESTREL_CONTROL_API_KEY") or os.environ.get("KESTREL_API_KEY")
+    if not api_key:
+        generated_key = secrets.token_urlsafe(32)
+        os.environ["KESTREL_CONTROL_API_KEY"] = generated_key
+        logger.warning("No KESTREL_CONTROL_API_KEY or KESTREL_API_KEY set. A temporary key has been generated.")
+        logger.warning("Set KESTREL_CONTROL_API_KEY in your environment for persistence.")
+        return generated_key
+    # Strip surrounding quotes (Docker --env-file includes them literally)
+    if len(api_key) >= 2 and api_key[0] == api_key[-1] and api_key[0] in ('"', "'"):
+        api_key = api_key[1:-1]
+    return api_key
+
+
+@app.middleware("http")
+async def auth_middleware(request: Request, call_next):
+    """Authenticate all /api/ requests via API key.
+
+    Accepts:
+      - X-API-Key header
+      - Authorization: Bearer <key>
+
+    Public paths (no auth required):
+      - / (dashboard HTML)
+      - /health
+    """
+    # Public paths — no auth required
+    if request.url.path in ("/", "/health"):
+        return await call_next(request)
+
+    # Only protect /api/ endpoints
+    if not request.url.path.startswith("/api/"):
+        return await call_next(request)
+
+    expected_key = get_api_key()
+
+    # Check X-API-Key header
+    header_key = request.headers.get(API_KEY_NAME)
+    if header_key and secrets.compare_digest(header_key, expected_key):
+        return await call_next(request)
+
+    # Check Authorization: Bearer <key>
+    auth_header = request.headers.get("Authorization")
+    if auth_header and auth_header.startswith("Bearer "):
+        token = auth_header[7:]
+        if secrets.compare_digest(token, expected_key):
+            return await call_next(request)
+
+    return JSONResponse(
+        content={"detail": "Invalid or missing API Key"},
+        status_code=401,
+    )
 
 
 class AgentInfo(BaseModel):
@@ -255,8 +324,15 @@ async def get_logs(agent_id: str, lines: int = 100):
         return {"logs": "".join(all_lines[-lines:])}
 
 
+@app.get("/health")
+async def health_check():
+    """Public health check endpoint."""
+    return {"status": "ok", "service": "kestrel-control-panel"}
+
+
 if __name__ == "__main__":
     import uvicorn
-    print(f"🦅 Kestrel Control Panel starting on http://localhost:{CONTROL_PANEL_PORT}")
+    host = os.environ.get("CONTROL_PANEL_HOST", "127.0.0.1")
+    print(f"Kestrel Control Panel starting on http://{host}:{CONTROL_PANEL_PORT}")
     print(f"   Scanning agents in: {AGENT_DATA_DIR}")
-    uvicorn.run(app, host="0.0.0.0", port=CONTROL_PANEL_PORT)
+    uvicorn.run(app, host=host, port=CONTROL_PANEL_PORT)

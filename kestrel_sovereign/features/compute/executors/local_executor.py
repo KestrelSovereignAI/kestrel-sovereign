@@ -23,6 +23,13 @@ from ..destructive_policy import DestructiveOperationPolicy
 
 logger = logging.getLogger(__name__)
 
+# Allowlist of environment variables safe to pass to subprocesses.
+# Never pass API keys, tokens, encryption keys, or other secrets.
+_SAFE_ENV_VARS = {
+    "PATH", "HOME", "USER", "SHELL", "LANG", "LC_ALL", "LC_CTYPE",
+    "TMPDIR", "TERM", "TZ", "PYTHONPATH", "VIRTUAL_ENV",
+}
+
 
 class LocalExecutor(BaseExecutor):
     """
@@ -112,8 +119,9 @@ class LocalExecutor(BaseExecutor):
             script_path.write_text(safe_content)
             script_path.chmod(0o755)
             
-            # Prepare environment
-            env = {**os.environ, **script.environment}
+            # Prepare environment - only pass safe variables, never leak secrets
+            env = {k: v for k, v in os.environ.items() if k in _SAFE_ENV_VARS}
+            env.update(script.environment)
             
             logger.warning(
                 f"Executing script {script.id[:8]}... with LOCAL executor (no isolation!)"

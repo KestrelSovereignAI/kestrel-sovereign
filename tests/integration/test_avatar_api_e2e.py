@@ -186,18 +186,18 @@ class TestVisualIdentityFeatureIntegration:
 class TestFileServing:
     """Test file serving functionality"""
 
-    def test_files_endpoint_public_access(self, client: TestClient):
-        """File endpoint should be publicly accessible (no auth required)"""
+    def test_files_endpoint_requires_auth(self, client: TestClient):
+        """File endpoint requires authentication"""
         # Remove auth headers for this test
-        client.headers.pop("X-API-Key", None)
+        saved_key = client.headers.pop("X-API-Key", None)
 
-        # Should return 404 (not found) not 401 (unauthorized)
+        # Should return 401 (unauthorized) without auth
         response = client.get("/api/files/test_hash_12345")
-        # 404 = file not found (expected)
-        # 401 = unauthorized (would indicate auth required - server needs update)
-        if response.status_code == 401:
-            pytest.skip("Server not updated - /api/files/ should be public")
-        assert response.status_code == 404
+        assert response.status_code == 401
+
+        # Restore auth header for subsequent tests
+        if saved_key:
+            client.headers["X-API-Key"] = saved_key
 
     def test_file_content_type_detection(self, client: TestClient):
         """File endpoint returns correct content type"""
