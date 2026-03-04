@@ -87,7 +87,7 @@ jobs:
             --max-instances=10
             --timeout=300
             --concurrency=80
-            --allow-unauthenticated
+            --no-allow-unauthenticated
           secrets: |
             OPENAI_API_KEY=kestrel-openai-key:latest
             KESTREL_API_KEY=kestrel-api-key:latest
@@ -99,10 +99,10 @@ jobs:
 
       - name: Show dev URL
         run: |
-          echo "Dev deployment complete!"
-          gcloud run services describe kestrel-dev \
-            --region=${{ env.REGION }} \
-            --format='value(status.url)'
+          echo "Dev deployment complete! (requires Google IAM auth)"
+          URL=$(gcloud run services describe kestrel-dev --region=${{ env.REGION }} --format='value(status.url)')
+          echo "Service URL: $URL"
+          echo "Access via: gcloud run services proxy kestrel-dev --region=${{ env.REGION }}"
 
   deploy-prod:
     runs-on: ubuntu-latest
@@ -136,7 +136,7 @@ jobs:
             --max-instances=100
             --timeout=300
             --concurrency=80
-            --allow-unauthenticated
+            --no-allow-unauthenticated
           secrets: |
             OPENAI_API_KEY=kestrel-openai-key:latest
             KESTREL_API_KEY=kestrel-api-key:latest
@@ -148,7 +148,7 @@ jobs:
 
       - name: Show prod URL
         run: |
-          echo "Prod deployment complete!"
-          gcloud run services describe kestrel-prod \
-            --region=${{ env.REGION }} \
-            --format='value(status.url)'
+          echo "Prod deployment complete! (requires Google IAM auth)"
+          URL=$(gcloud run services describe kestrel-prod --region=${{ env.REGION }} --format='value(status.url)')
+          echo "Service URL: $URL"
+          echo "Access via: gcloud run services proxy kestrel-prod --region=${{ env.REGION }}"

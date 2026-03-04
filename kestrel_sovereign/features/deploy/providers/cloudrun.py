@@ -228,9 +228,6 @@ class CloudRunProvider(DeployProvider):
             # Get service URL
             service_url = result.uri
 
-            # Make service publicly accessible (allow unauthenticated)
-            await self._set_iam_policy(service_path)
-
             logger.info(f"Deployment complete: {service_url}")
 
             return {
@@ -244,41 +241,6 @@ class CloudRunProvider(DeployProvider):
         except Exception as e:
             logger.error(f"Deployment failed: {e}", exc_info=True)
             raise DeployManagerError(f"Deployment failed: {e}") from e
-
-    async def _set_iam_policy(self, service_path: str):
-        """Set IAM policy to allow unauthenticated access."""
-        try:
-            from google.iam.v1 import iam_policy_pb2, policy_pb2
-
-            client = self._get_services_client()
-
-            policy = await asyncio.to_thread(
-                client.get_iam_policy, resource=service_path
-            )
-
-            # Add allUsers as invoker
-            binding = policy_pb2.Binding(
-                role="roles/run.invoker",
-                members=["allUsers"],
-            )
-
-            # Check if binding already exists
-            existing = False
-            for b in policy.bindings:
-                if b.role == "roles/run.invoker" and "allUsers" in b.members:
-                    existing = True
-                    break
-
-            if not existing:
-                policy.bindings.append(binding)
-                request = iam_policy_pb2.SetIamPolicyRequest(
-                    resource=service_path, policy=policy
-                )
-                await asyncio.to_thread(client.set_iam_policy, request=request)
-                logger.info("Set IAM policy to allow unauthenticated access")
-
-        except Exception as e:
-            logger.warning(f"Failed to set IAM policy: {e}")
 
     async def get_status(self, service_name: str) -> Dict[str, Any]:
         """Get Cloud Run service status."""

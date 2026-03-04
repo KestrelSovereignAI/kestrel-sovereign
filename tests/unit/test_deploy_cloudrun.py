@@ -99,11 +99,6 @@ class TestCloudRunProviderDeploy:
         mock_operation.result.return_value = mock_result
         mock_client.create_service.return_value = mock_operation
 
-        # Mock IAM policy
-        mock_policy = MagicMock()
-        mock_policy.bindings = []
-        mock_client.get_iam_policy.return_value = mock_policy
-
         provider = CloudRunProvider(project_id="test-project")
         provider._services_client = mock_client
 
@@ -139,11 +134,6 @@ class TestCloudRunProviderDeploy:
         mock_operation.result.return_value = mock_result
         mock_client.update_service.return_value = mock_operation
 
-        # Mock IAM policy
-        mock_policy = MagicMock()
-        mock_policy.bindings = []
-        mock_client.get_iam_policy.return_value = mock_policy
-
         provider = CloudRunProvider(project_id="test-project")
         provider._services_client = mock_client
 
@@ -175,10 +165,6 @@ class TestCloudRunProviderDeploy:
         mock_result.latest_ready_revision = "kestrel-dev-00001-abc"
         mock_operation.result.return_value = mock_result
         mock_client.create_service.return_value = mock_operation
-
-        mock_policy = MagicMock()
-        mock_policy.bindings = []
-        mock_client.get_iam_policy.return_value = mock_policy
 
         provider = CloudRunProvider(project_id="test-project")
         provider._services_client = mock_client
