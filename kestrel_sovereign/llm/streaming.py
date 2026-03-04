@@ -135,11 +135,12 @@ class StreamingMixin:
                 # Surface failure to user via stream — but NOT for structured output
                 # where injected text would corrupt the JSON that the caller parses
                 if response_format is None:
-                    yield f"\n[Provider {provider['name']} failed: {e}]\n"
+                    yield f"\n[Provider {provider['name']} unavailable, trying next...]\n"
                 continue
 
         provider_type = "local" if force_local_only else "all"
-        raise RuntimeError(f"All {provider_type} providers failed for streaming. Last error: {last_error}")
+        logger.error(f"All {provider_type} providers failed for streaming. Last error: {last_error}")
+        raise RuntimeError(f"All {provider_type} providers failed for streaming.")
 
     async def generate_stream(
         self,
@@ -267,10 +268,11 @@ class StreamingMixin:
             except Exception as e:
                 logger.error(f"Provider {provider['name']} failed: {e}")
                 last_error = e
-                yield f"\n[Provider {provider['name']} failed: {e}]\n"
+                yield f"\n[Provider {provider['name']} unavailable, trying next...]\n"
                 continue
 
-        raise LLMStreamingError(f"All providers failed for stream_with_messages: {last_error}")
+        logger.error(f"All providers failed for stream_with_messages: {last_error}")
+        raise LLMStreamingError("All providers failed for stream_with_messages.")
 
     async def stream_with_tool_detection(
         self,
@@ -434,7 +436,8 @@ class StreamingMixin:
             except Exception as e:
                 logger.error(f"Provider {provider['name']} failed: {e}")
                 last_error = e
-                yield f"\n[Provider {provider['name']} failed: {e}]\n"
+                yield f"\n[Provider {provider['name']} unavailable, trying next...]\n"
                 continue
 
-        raise LLMStreamingError(f"All providers failed for stream_with_tool_detection: {last_error}")
+        logger.error(f"All providers failed for stream_with_tool_detection: {last_error}")
+        raise LLMStreamingError("All providers failed for stream_with_tool_detection.")

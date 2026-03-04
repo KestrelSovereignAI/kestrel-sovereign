@@ -680,6 +680,118 @@ class TestConvenienceFunctions:
 
 
 # =============================================================================
+# Local Executor Environment Filtering Tests
+# =============================================================================
+
+class TestLocalExecutorEnvFiltering:
+    """Tests for local executor environment variable filtering (issue #144)."""
+
+    def test_safe_env_vars_is_module_constant(self):
+        """Test that _SAFE_ENV_VARS is defined as a module-level constant."""
+        from kestrel_sovereign.features.compute.executors.local_executor import _SAFE_ENV_VARS
+
+        assert isinstance(_SAFE_ENV_VARS, set)
+        assert "PATH" in _SAFE_ENV_VARS
+        assert "HOME" in _SAFE_ENV_VARS
+
+    def test_safe_env_vars_excludes_secrets(self):
+        """Test that the allowlist does not include known secret variable names."""
+        from kestrel_sovereign.features.compute.executors.local_executor import _SAFE_ENV_VARS
+
+        secret_patterns = {
+            "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GITHUB_TOKEN",
+            "AWS_SECRET_ACCESS_KEY", "DATABASE_URL", "SECRET_KEY",
+            "ENCRYPTION_KEY", "API_KEY", "GCP_SERVICE_ACCOUNT",
+        }
+        for secret in secret_patterns:
+            assert secret not in _SAFE_ENV_VARS, f"{secret} must not be in _SAFE_ENV_VARS"
+
+    @pytest.mark.asyncio
+    async def test_execute_filters_host_env(self):
+        """Test that execute() does not leak host secrets to subprocesses."""
+        from kestrel_sovereign.features.compute.executors.local_executor import LocalExecutor
+
+        script = ComputeScript(
+            id="test-env-filter",
+            name="env_check",
+            language="python",
+            content='import os; print(os.environ.get("ANTHROPIC_API_KEY", "NOT_FOUND"))',
+            purpose="Verify env filtering",
+            state=ScriptState.SIGNED,
+        )
+
+        executor = LocalExecutor(require_env_flag=False)
+
+        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-ant-LEAKED"}):
+            record = await executor.execute(script)
+
+        assert "sk-ant-LEAKED" not in record.stdout
+        assert "NOT_FOUND" in record.stdout
+
+    @pytest.mark.asyncio
+    async def test_execute_passes_safe_vars(self):
+        """Test that safe vars like PATH are available to subprocesses."""
+        from kestrel_sovereign.features.compute.executors.local_executor import LocalExecutor
+
+        script = ComputeScript(
+            id="test-env-safe",
+            name="path_check",
+            language="python",
+            content='import os; print(os.environ.get("PATH", "MISSING"))',
+            purpose="Verify PATH is passed",
+            state=ScriptState.SIGNED,
+        )
+
+        executor = LocalExecutor(require_env_flag=False)
+        record = await executor.execute(script)
+
+        assert "MISSING" not in record.stdout
+        assert record.exit_code == 0
+
+    @pytest.mark.asyncio
+    async def test_script_environment_vars_passed(self):
+        """Test that script-specific environment variables are passed through."""
+        from kestrel_sovereign.features.compute.executors.local_executor import LocalExecutor
+
+        script = ComputeScript(
+            id="test-env-script",
+            name="script_env",
+            language="python",
+            content='import os; print(os.environ.get("MY_CUSTOM_VAR", "MISSING"))',
+            purpose="Verify script env passed",
+            state=ScriptState.SIGNED,
+            environment={"MY_CUSTOM_VAR": "custom_value"},
+        )
+
+        executor = LocalExecutor(require_env_flag=False)
+        record = await executor.execute(script)
+
+        assert "custom_value" in record.stdout
+        assert record.exit_code == 0
+
+    @pytest.mark.asyncio
+    async def test_script_env_overrides_safe_vars(self):
+        """Test that script environment can override safe vars."""
+        from kestrel_sovereign.features.compute.executors.local_executor import LocalExecutor
+
+        script = ComputeScript(
+            id="test-env-override",
+            name="override_check",
+            language="python",
+            content='import os; print(os.environ.get("LANG", "MISSING"))',
+            purpose="Verify script env override",
+            state=ScriptState.SIGNED,
+            environment={"LANG": "custom_lang"},
+        )
+
+        executor = LocalExecutor(require_env_flag=False)
+        record = await executor.execute(script)
+
+        assert "custom_lang" in record.stdout
+        assert record.exit_code == 0
+
+
+# =============================================================================
 # Integration Tests
 # =============================================================================
 

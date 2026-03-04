@@ -2,11 +2,13 @@
 """
 A FastAPI server to expose Kestrel agent functionality as a service.
 """
+import ipaddress
 import os
 import secrets
 from typing import Optional
 from pathlib import Path
 from fastapi import FastAPI, HTTPException, Request, Security, status
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import APIKeyHeader, HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
@@ -16,9 +18,9 @@ from main import get_agent_did_async
 from kestrel_sovereign.kestrel_agent import KestrelAgent
 from kestrel_sovereign.llm.service import LLMService
 from dotenv import load_dotenv
-from slowapi import Limiter, _rate_limit_exceeded_handler
-from slowapi.util import get_remote_address
+from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
+from kestrel_sovereign.rate_limit import limiter
 
 from kestrel_sovereign.kestrel_config.constants import SHUTDOWN_TIMEOUT
 
@@ -34,6 +36,10 @@ logger = logging.getLogger(__name__)
 API_KEY_NAME = "X-API-Key"
 api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
 security = HTTPBearer(auto_error=False)
+
+# Paths where API key query parameter auth is allowed
+# (EventSource/SSE can't send headers, so these endpoints need query param auth)
+SSE_PATHS = {"/agent/notifications/sse", "/agent/stream"}
 
 
 def get_api_key():
@@ -68,15 +74,17 @@ async def verify_api_key(
 
     expected_key = get_api_key()
 
-    if api_key_header and api_key_header == expected_key:
+    if api_key_header and secrets.compare_digest(api_key_header, expected_key):
         return True
-    if token and token.credentials == expected_key:
+    if token and secrets.compare_digest(token.credentials, expected_key):
         return True
 
-    # Support query parameter auth for SSE endpoints (EventSource can't send headers)
+    # Support query parameter auth for SSE endpoints only (EventSource can't send headers)
+    # Restricted to SSE_PATHS to avoid leaking keys in URL logs on other endpoints
     api_key_query = request.query_params.get("api_key")
-    if api_key_query and api_key_query == expected_key:
-        return True
+    if api_key_query and request.url.path in SSE_PATHS:
+        if secrets.compare_digest(api_key_query, expected_key):
+            return True
 
     raise HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
@@ -143,7 +151,6 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 # Rate limiting
-limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
@@ -195,9 +202,9 @@ async def auth_middleware(request: Request, call_next):
     1. API key (X-API-Key header, Bearer token, or query param) — for programmatic access
     2. OAuth session cookie — for browser access via Google sign-in
     """
-    public_paths = ["/health", "/api/auth/key", "/api/models", "/api/model/current", "/api/identity", "/api/commands", "/favicon.ico", "/webhooks/stripe/crypto"]
+    public_paths = ["/health", "/api/auth/key", "/favicon.ico", "/webhooks/stripe/crypto"]
     auth_paths = ["/auth/login", "/auth/callback", "/auth/logout"]
-    static_prefixes = ["/static", "/api/files/", "/js/", "/shared/", "/utils/"]
+    static_prefixes = ["/static", "/js/", "/shared/", "/utils/"]
 
     if request.url.path in public_paths or request.url.path in auth_paths:
         return await call_next(request)
@@ -209,20 +216,22 @@ async def auth_middleware(request: Request, call_next):
 
         # Check X-API-Key header
         api_key_header = request.headers.get(API_KEY_NAME)
-        if api_key_header and api_key_header == expected_key:
+        if api_key_header and secrets.compare_digest(api_key_header, expected_key):
             return await call_next(request)
 
         # Check Bearer token
         auth_header = request.headers.get("Authorization")
         if auth_header and auth_header.startswith("Bearer "):
             token = auth_header[7:]
-            if token == expected_key:
+            if secrets.compare_digest(token, expected_key):
                 return await call_next(request)
 
-        # Check query parameter (for SSE endpoints - EventSource can't send headers)
+        # Check query parameter for SSE endpoints only (EventSource can't send headers)
+        # Restricted to SSE_PATHS to avoid leaking keys in URL logs on other endpoints
         api_key_query = request.query_params.get("api_key")
-        if api_key_query and api_key_query == expected_key:
-            return await call_next(request)
+        if api_key_query and request.url.path in SSE_PATHS:
+            if secrets.compare_digest(api_key_query, expected_key):
+                return await call_next(request)
 
         # Check OAuth session cookie
         user_email = request.session.get("user_email") if hasattr(request, "session") else None
@@ -254,6 +263,24 @@ app.add_middleware(
     https_only=os.environ.get("KESTREL_ENV", "development") == "production",
 )
 
+# CORS middleware — added last so it runs outermost (before auth/session).
+# Override defaults via KESTREL_CORS_ORIGINS (comma-separated).
+_DEFAULT_CORS_ORIGINS = [
+    "http://localhost:8080",
+    "http://127.0.0.1:8080",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+]
+_cors_env = os.environ.get("KESTREL_CORS_ORIGINS", "")
+CORS_ORIGINS = [o.strip() for o in _cors_env.split(",") if o.strip()] if _cors_env else _DEFAULT_CORS_ORIGINS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=CORS_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 
 if SERVE_UI:
     @app.get("/", response_class=HTMLResponse)
@@ -267,12 +294,21 @@ if SERVE_UI:
             raise HTTPException(status_code=404, detail="Index file not found.")
 
 
+def _is_docker_network(host: str) -> bool:
+    """Check if the host IP is within Docker's internal network range (172.16.0.0/12)."""
+    try:
+        return ipaddress.ip_address(host) in ipaddress.ip_network("172.16.0.0/12")
+    except ValueError:
+        return False
+
+
 @app.get("/api/auth/key")
+@limiter.limit("5/minute")
 async def get_bootstrap_key(request: Request):
     """Return API key for initial frontend setup (localhost only)."""
     client_host = request.client.host if request.client else None
     allowed_hosts = {"127.0.0.1", "localhost", "::1", "172.17.0.1"}
-    is_docker_internal = client_host and client_host.startswith("172.")
+    is_docker_internal = client_host and _is_docker_network(client_host)
 
     if client_host not in allowed_hosts and not is_docker_internal:
         logger.warning(f"Auth key request from non-local host: {client_host}")
@@ -346,9 +382,9 @@ async def stripe_crypto_webhook(request: Request):
                 status_code=400
             )
     except Exception as e:
-        logger.error(f"Webhook error: {e}")
+        logger.error(f"Webhook error: {e}", exc_info=True)
         return JSONResponse(
-            content={"error": str(e)},
+            content={"error": "Internal server error"},
             status_code=500
         )
 

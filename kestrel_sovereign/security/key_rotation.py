@@ -25,6 +25,7 @@ from typing import Any, Dict, List, Optional
 
 from cryptography.fernet import Fernet
 
+from kestrel_sovereign.sql_utils import safe_table_name, safe_column_name
 from kestrel_sovereign.storage.encryption import DecryptionError, get_fernet, _read_key_from_file
 
 logger = logging.getLogger(__name__)
@@ -318,9 +319,14 @@ class KeyRotationService:
             async for row in cursor:
                 already_rotated.add(row[0])
 
+        # Validate identifiers for safe SQL interpolation
+        safe_tbl = safe_table_name(table)
+        safe_id_col = safe_column_name(id_column)
+        safe_content_col = safe_column_name(content_column)
+
         # Get all records
         async with self.storage.database.execute(
-            f"SELECT {id_column}, {content_column} FROM {table} WHERE {content_column} LIKE 'gAAAAA%'"
+            f"SELECT {safe_id_col}, {safe_content_col} FROM {safe_tbl} WHERE {safe_content_col} LIKE 'gAAAAA%'"
         ) as cursor:
             rows = await cursor.fetchall()
 
@@ -338,7 +344,7 @@ class KeyRotationService:
 
                 # Update record
                 await self.storage.database.execute(
-                    f"UPDATE {table} SET {content_column} = ? WHERE {id_column} = ?",
+                    f"UPDATE {safe_tbl} SET {safe_content_col} = ? WHERE {safe_id_col} = ?",
                     (new_encrypted, record_id)
                 )
 
@@ -365,8 +371,10 @@ class KeyRotationService:
 
         for table, column in [("conversations", "content"), ("files", "content")]:
             try:
+                safe_tbl = safe_table_name(table)
+                safe_col = safe_column_name(column)
                 async with self.storage.database.execute(
-                    f"SELECT COUNT(*) FROM {table} WHERE {column} LIKE 'gAAAAA%'"
+                    f"SELECT COUNT(*) FROM {safe_tbl} WHERE {safe_col} LIKE 'gAAAAA%'"
                 ) as cursor:
                     row = await cursor.fetchone()
                     if row:

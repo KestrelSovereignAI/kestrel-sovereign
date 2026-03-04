@@ -48,21 +48,14 @@ async def list_conversations(request: Request, limit: int = 50, decrypt: bool = 
         agent = request.app.state.agent
         storage = agent.storage
 
-        # Use async database query with agent_id filter for multi-tenant isolation
-        agent_id = getattr(storage, 'agent_id', '') or getattr(storage._storage, 'agent_id', '')
+        # Use privacy-aware agent_id accessor
+        agent_id = getattr(storage, 'agent_id', '')
 
-        # Check if encryption is enabled - traverse through wrappers to find conversation store
-        encrypted_at_rest = False
-        conv_store = getattr(storage, 'conversation', None) or getattr(getattr(storage, '_storage', None), 'conversation', None)
-        if conv_store and hasattr(conv_store, 'encryption_enabled'):
-            encrypted_at_rest = conv_store.encryption_enabled
+        # Check if encryption is enabled via the wrapper's safe accessor
+        encrypted_at_rest = getattr(storage, 'encryption_enabled', False)
 
-        rows = await storage.db.fetchall("""
-            SELECT id, role, content, metadata, created_at
-            FROM conversation_history
-            WHERE agent_id = ?
-            ORDER BY created_at DESC
-        """, (agent_id,))
+        # Use privacy-aware query method instead of direct storage.db access
+        rows = await storage.query_conversations(agent_id, limit=limit)
 
         if not rows:
             return {"conversations": [], "total": 0, "encrypted_at_rest": encrypted_at_rest}
@@ -185,32 +178,21 @@ async def get_conversation(request: Request, session_id: str, limit: int = 100, 
         agent = request.app.state.agent
         storage = agent.storage
 
-        # Get agent_id for multi-tenant isolation
-        agent_id = getattr(storage, 'agent_id', '') or getattr(storage._storage, 'agent_id', '')
+        # Use privacy-aware agent_id accessor
+        agent_id = getattr(storage, 'agent_id', '')
 
-        # Check if encryption is enabled
-        encrypted_at_rest = False
-        conv_store = getattr(storage, 'conversation', None) or getattr(getattr(storage, '_storage', None), 'conversation', None)
-        if conv_store and hasattr(conv_store, 'encryption_enabled'):
-            encrypted_at_rest = conv_store.encryption_enabled
+        # Check if encryption is enabled via the wrapper's safe accessor
+        encrypted_at_rest = getattr(storage, 'encryption_enabled', False)
 
-        start_row = await storage.db.fetchone(
-            "SELECT created_at FROM conversation_history WHERE id = ? AND agent_id = ?",
-            (session_id, agent_id)
-        )
+        # Use privacy-aware query methods instead of direct storage.db access
+        start_row = await storage.query_conversation_start(session_id, agent_id)
 
         if not start_row:
             raise HTTPException(status_code=404, detail="Session not found.")
 
         start_time = start_row[0]
 
-        rows = await storage.db.fetchall("""
-            SELECT id, role, content, metadata, created_at
-            FROM conversation_history
-            WHERE agent_id = ? AND created_at >= ?
-            ORDER BY created_at ASC
-            LIMIT ?
-        """, (agent_id, start_time, limit * 2))
+        rows = await storage.query_conversation_messages(agent_id, start_time, limit=limit * 2)
 
         messages = []
         last_timestamp = None
@@ -323,13 +305,9 @@ async def start_new_conversation(request: Request):
             metadata={"type": "session_marker", "new_session": True}
         )
 
-        # Get the newly created session with agent_id filter
-        agent_id = getattr(storage, 'agent_id', '') or getattr(storage._storage, 'agent_id', '')
-        row = await storage.db.fetchone("""
-            SELECT id, created_at FROM conversation_history
-            WHERE agent_id = ?
-            ORDER BY id DESC LIMIT 1
-        """, (agent_id,))
+        # Get the newly created session using privacy-aware method
+        agent_id = getattr(storage, 'agent_id', '')
+        row = await storage.query_last_conversation_row(agent_id)
 
         return {
             "success": True,
@@ -351,14 +329,10 @@ async def delete_message(request: Request, message_id: int):
     try:
         agent = request.app.state.agent
         storage = agent.storage
-        agent_id = getattr(storage, 'agent_id', '') or getattr(storage._storage, 'agent_id', '')
+        agent_id = getattr(storage, 'agent_id', '')
 
-        result = await storage.db.execute_commit(
-            "DELETE FROM conversation_history WHERE id = ? AND agent_id = ?",
-            (message_id, agent_id)
-        )
-
-        deleted = result.rowcount > 0 if hasattr(result, 'rowcount') else True
+        # Use privacy-aware delete method instead of direct storage.db access
+        deleted = await storage.delete_conversation_message(message_id, agent_id)
         if not deleted:
             raise HTTPException(status_code=404, detail="Message not found.")
 
@@ -380,37 +354,24 @@ async def get_conversation_transcript(request: Request, session_id: str, decrypt
         agent = request.app.state.agent
         storage = agent.storage
 
-        # Get agent_id for multi-tenant isolation
-        agent_id = getattr(storage, 'agent_id', '') or getattr(storage._storage, 'agent_id', '')
+        # Use privacy-aware agent_id accessor
+        agent_id = getattr(storage, 'agent_id', '')
 
-        # Check if encryption is enabled
-        encrypted_at_rest = False
-        conv_store = getattr(storage, 'conversation', None) or getattr(getattr(storage, '_storage', None), 'conversation', None)
-        if conv_store and hasattr(conv_store, 'encryption_enabled'):
-            encrypted_at_rest = conv_store.encryption_enabled
+        # Check if encryption is enabled via the wrapper's safe accessor
+        encrypted_at_rest = getattr(storage, 'encryption_enabled', False)
 
-        # Get the session start time
-        start_row = await storage.db.fetchone(
-            "SELECT created_at FROM conversation_history WHERE id = ? AND agent_id = ?",
-            (session_id, agent_id)
-        )
+        # Get the session start time using privacy-aware method
+        start_row = await storage.query_conversation_start(session_id, agent_id)
 
         if not start_row:
             raise HTTPException(status_code=404, detail="Session not found.")
 
         start_time = start_row[0]
 
-        # Get messages starting from session_id
-        # Note: We fetch more than needed and rely on session boundary detection
-        # (time gaps > SESSION_GAP_MINUTES or new_session markers) to stop at the right point
-        # This approach matches the existing /conversations/{session_id} endpoint logic
-        rows = await storage.db.fetchall("""
-            SELECT id, role, content, metadata, created_at
-            FROM conversation_history
-            WHERE agent_id = ? AND created_at >= ?
-            ORDER BY created_at ASC
-            LIMIT 1000
-        """, (agent_id, start_time))
+        # Get messages starting from session_id using privacy-aware method
+        # We fetch more than needed and rely on session boundary detection
+        # (time gaps > SESSION_GAP_MINUTES or new_session markers) to stop
+        rows = await storage.query_conversation_messages(agent_id, start_time, limit=1000)
 
         if not rows:
             raise HTTPException(status_code=404, detail="No messages found in session.")

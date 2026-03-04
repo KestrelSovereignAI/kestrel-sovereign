@@ -2,8 +2,9 @@
 Tests for the Privacy-Enforcing Storage Wrapper.
 """
 
+import warnings
 import pytest
-from unittest.mock import Mock, AsyncMock
+from unittest.mock import Mock, AsyncMock, PropertyMock
 from kestrel_sovereign.privacy import PrivacyMode
 from kestrel_sovereign.storage.privacy_wrapper import (
     PrivacyEnforcingStorage,
@@ -285,3 +286,251 @@ class TestWrapperFactory:
 
         assert isinstance(wrapper, PrivacyEnforcingStorage)
         assert wrapper.privacy_mode == PrivacyMode.ANONYMOUS
+
+
+class TestDeprecationWarnings:
+    """Tests that direct property access triggers deprecation warnings."""
+
+    @pytest.fixture
+    def mock_storage(self):
+        storage = Mock()
+        storage.db = Mock()
+        storage.conversation = Mock()
+        storage.files = Mock()
+        return storage
+
+    @pytest.fixture
+    def normal_wrapper(self, mock_storage):
+        return PrivacyEnforcingStorage(mock_storage, PrivacyMode.NORMAL)
+
+    def test_db_access_warns(self, normal_wrapper):
+        """Accessing .db should emit a DeprecationWarning."""
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            _ = normal_wrapper.db
+            assert len(w) == 1
+            assert issubclass(w[0].category, DeprecationWarning)
+            assert "db" in str(w[0].message)
+            assert "privacy" in str(w[0].message).lower()
+
+    def test_conversation_access_warns(self, normal_wrapper):
+        """Accessing .conversation should emit a DeprecationWarning."""
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            _ = normal_wrapper.conversation
+            assert len(w) == 1
+            assert issubclass(w[0].category, DeprecationWarning)
+            assert "conversation" in str(w[0].message)
+
+    def test_files_access_warns(self, normal_wrapper):
+        """Accessing .files should emit a DeprecationWarning."""
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            _ = normal_wrapper.files
+            assert len(w) == 1
+            assert issubclass(w[0].category, DeprecationWarning)
+            assert "files" in str(w[0].message)
+
+    def test_db_path_no_warning(self, normal_wrapper):
+        """Accessing .db_path should NOT emit a warning (non-sensitive)."""
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            _ = normal_wrapper.db_path
+            deprecation_warnings = [x for x in w if issubclass(x.category, DeprecationWarning)]
+            assert len(deprecation_warnings) == 0
+
+    def test_graph_no_warning(self, normal_wrapper):
+        """Accessing .graph should NOT emit a warning (structural, not PII)."""
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            _ = normal_wrapper.graph
+            deprecation_warnings = [x for x in w if issubclass(x.category, DeprecationWarning)]
+            assert len(deprecation_warnings) == 0
+
+    def test_rag_no_warning(self, normal_wrapper):
+        """Accessing .rag should NOT emit a warning (structural)."""
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            _ = normal_wrapper.rag
+            deprecation_warnings = [x for x in w if issubclass(x.category, DeprecationWarning)]
+            assert len(deprecation_warnings) == 0
+
+
+class TestPrivacyAwareQueries:
+    """Tests for privacy-aware query methods that replace direct db access."""
+
+    @pytest.fixture
+    def mock_storage(self):
+        """Create a mock storage with db sub-object."""
+        storage = Mock()
+        storage.db = Mock()
+        storage.db.fetchall = AsyncMock(return_value=[])
+        storage.db.fetchone = AsyncMock(return_value=None)
+        storage.db.execute_commit = AsyncMock(return_value=Mock(rowcount=1))
+        storage.add_conversation = AsyncMock()
+        storage.get_conversation_history = AsyncMock(return_value=[])
+        storage.conversation = Mock()
+        storage.conversation.encryption_enabled = True
+        return storage
+
+    # --- query_conversations ---
+
+    @pytest.mark.asyncio
+    async def test_query_conversations_normal_mode(self, mock_storage):
+        """NORMAL mode should query the persistent database."""
+        mock_storage.db.fetchall.return_value = [
+            (1, "user", "Hello", None, "2026-01-01 12:00:00"),
+            (2, "assistant", "Hi", None, "2026-01-01 12:00:01"),
+        ]
+        wrapper = PrivacyEnforcingStorage(mock_storage, PrivacyMode.NORMAL)
+
+        rows = await wrapper.query_conversations("agent-1")
+        assert len(rows) == 2
+        assert rows[0][1] == "user"
+        mock_storage.db.fetchall.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_query_conversations_ephemeral_returns_empty(self, mock_storage):
+        """EPHEMERAL mode should return empty list, not query db."""
+        wrapper = PrivacyEnforcingStorage(mock_storage, PrivacyMode.EPHEMERAL)
+
+        rows = await wrapper.query_conversations("agent-1")
+        assert rows == []
+        mock_storage.db.fetchall.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_query_conversations_isolated_returns_session(self, mock_storage):
+        """ISOLATED mode should return session-local data."""
+        wrapper = PrivacyEnforcingStorage(mock_storage, PrivacyMode.ISOLATED)
+
+        await wrapper.add_conversation("user", "Hello")
+        await wrapper.add_conversation("assistant", "Hi")
+
+        rows = await wrapper.query_conversations("agent-1")
+        assert len(rows) == 2
+        assert rows[0][1] == "user"
+        assert rows[1][1] == "assistant"
+        # Should NOT touch persistent storage
+        mock_storage.db.fetchall.assert_not_called()
+
+    # --- query_conversation_start ---
+
+    @pytest.mark.asyncio
+    async def test_query_conversation_start_normal(self, mock_storage):
+        """NORMAL mode should query the database for session start."""
+        mock_storage.db.fetchone.return_value = ("2026-01-01 12:00:00",)
+        wrapper = PrivacyEnforcingStorage(mock_storage, PrivacyMode.NORMAL)
+
+        result = await wrapper.query_conversation_start("1", "agent-1")
+        assert result == ("2026-01-01 12:00:00",)
+        mock_storage.db.fetchone.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_query_conversation_start_ephemeral_returns_none(self, mock_storage):
+        """EPHEMERAL mode should return None."""
+        wrapper = PrivacyEnforcingStorage(mock_storage, PrivacyMode.EPHEMERAL)
+
+        result = await wrapper.query_conversation_start("1", "agent-1")
+        assert result is None
+        mock_storage.db.fetchone.assert_not_called()
+
+    # --- query_conversation_messages ---
+
+    @pytest.mark.asyncio
+    async def test_query_conversation_messages_normal(self, mock_storage):
+        """NORMAL mode should query messages from database."""
+        mock_storage.db.fetchall.return_value = [
+            (1, "user", "Hello", None, "2026-01-01 12:00:00"),
+        ]
+        wrapper = PrivacyEnforcingStorage(mock_storage, PrivacyMode.NORMAL)
+
+        rows = await wrapper.query_conversation_messages("agent-1", "2026-01-01 12:00:00", limit=50)
+        assert len(rows) == 1
+        mock_storage.db.fetchall.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_query_conversation_messages_ephemeral_returns_empty(self, mock_storage):
+        """EPHEMERAL mode should return empty list."""
+        wrapper = PrivacyEnforcingStorage(mock_storage, PrivacyMode.EPHEMERAL)
+
+        rows = await wrapper.query_conversation_messages("agent-1", "2026-01-01 12:00:00")
+        assert rows == []
+        mock_storage.db.fetchall.assert_not_called()
+
+    # --- query_last_conversation_row ---
+
+    @pytest.mark.asyncio
+    async def test_query_last_conversation_row_normal(self, mock_storage):
+        """NORMAL mode should query for most recent row."""
+        mock_storage.db.fetchone.return_value = (42, "2026-01-01 12:00:00")
+        wrapper = PrivacyEnforcingStorage(mock_storage, PrivacyMode.NORMAL)
+
+        result = await wrapper.query_last_conversation_row("agent-1")
+        assert result == (42, "2026-01-01 12:00:00")
+
+    @pytest.mark.asyncio
+    async def test_query_last_conversation_row_ephemeral(self, mock_storage):
+        """EPHEMERAL mode should return None."""
+        wrapper = PrivacyEnforcingStorage(mock_storage, PrivacyMode.EPHEMERAL)
+
+        result = await wrapper.query_last_conversation_row("agent-1")
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_query_last_conversation_row_isolated(self, mock_storage):
+        """ISOLATED mode should return last session entry."""
+        wrapper = PrivacyEnforcingStorage(mock_storage, PrivacyMode.ISOLATED)
+
+        await wrapper.add_conversation("user", "Hello")
+        await wrapper.add_conversation("assistant", "Hi")
+
+        result = await wrapper.query_last_conversation_row("agent-1")
+        assert result is not None
+        assert result[0] == 1  # index of last entry
+
+    # --- delete_conversation_message ---
+
+    @pytest.mark.asyncio
+    async def test_delete_message_normal_mode(self, mock_storage):
+        """NORMAL mode should delete from persistent database."""
+        wrapper = PrivacyEnforcingStorage(mock_storage, PrivacyMode.NORMAL)
+
+        result = await wrapper.delete_conversation_message(42, "agent-1")
+        assert result is True
+        mock_storage.db.execute_commit.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_delete_message_ephemeral_raises(self, mock_storage):
+        """EPHEMERAL mode should raise PrivacyViolationError."""
+        wrapper = PrivacyEnforcingStorage(mock_storage, PrivacyMode.EPHEMERAL)
+
+        with pytest.raises(PrivacyViolationError):
+            await wrapper.delete_conversation_message(42, "agent-1")
+
+    @pytest.mark.asyncio
+    async def test_delete_message_isolated_removes_from_session(self, mock_storage):
+        """ISOLATED mode should remove from session storage."""
+        wrapper = PrivacyEnforcingStorage(mock_storage, PrivacyMode.ISOLATED)
+
+        await wrapper.add_conversation("user", "Hello")
+        await wrapper.add_conversation("assistant", "Hi")
+        assert len(wrapper._session_conversations) == 2
+
+        result = await wrapper.delete_conversation_message(0, "agent-1")
+        assert result is True
+        assert len(wrapper._session_conversations) == 1
+        assert wrapper._session_conversations[0]["content"] == "Hi"
+
+    # --- encryption_enabled ---
+
+    def test_encryption_enabled_returns_true(self, mock_storage):
+        """Should return encryption status from underlying conversation store."""
+        wrapper = PrivacyEnforcingStorage(mock_storage, PrivacyMode.NORMAL)
+        assert wrapper.encryption_enabled is True
+
+    def test_encryption_enabled_returns_false_when_missing(self):
+        """Should return False when conversation store has no encryption."""
+        mock_storage = Mock()
+        mock_storage.conversation = Mock(spec=[])  # No encryption_enabled attr
+        wrapper = PrivacyEnforcingStorage(mock_storage, PrivacyMode.NORMAL)
+        assert wrapper.encryption_enabled is False
