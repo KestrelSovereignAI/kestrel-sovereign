@@ -9,7 +9,7 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException, Request, Security, status
 from fastapi.security import APIKeyHeader, HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from contextlib import asynccontextmanager
 import logging
 from main import get_agent_did_async
@@ -170,6 +170,10 @@ from endpoints import (
     saved_items_router,
 )
 
+from endpoints.auth_oauth import router as auth_oauth_router, register_oauth
+app.include_router(auth_oauth_router)
+register_oauth(app)
+
 app.include_router(agent_router)
 app.include_router(conversations_router)
 app.include_router(memories_router)
@@ -185,12 +189,20 @@ app.include_router(saved_items_router)
 
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
-    """Global authentication middleware."""
-    public_paths = ["/health", "/", "/api/auth/key", "/api/models", "/api/model/current", "/api/identity", "/api/commands", "/favicon.ico", "/webhooks/stripe/crypto"]
+    """Global authentication middleware.
+
+    Accepts authentication via:
+    1. API key (X-API-Key header, Bearer token, or query param) — for programmatic access
+    2. OAuth session cookie — for browser access via Google sign-in
+    """
+    public_paths = ["/health", "/api/auth/key", "/api/models", "/api/model/current", "/api/identity", "/api/commands", "/favicon.ico", "/webhooks/stripe/crypto"]
+    auth_paths = ["/auth/login", "/auth/callback", "/auth/logout"]
     static_prefixes = ["/static", "/api/files/", "/js/", "/shared/", "/utils/"]
-    if request.url.path in public_paths or (SERVE_UI and any(request.url.path.startswith(p) for p in static_prefixes)):
-        response = await call_next(request)
-        return response
+
+    if request.url.path in public_paths or request.url.path in auth_paths:
+        return await call_next(request)
+    if SERVE_UI and any(request.url.path.startswith(p) for p in static_prefixes):
+        return await call_next(request)
 
     try:
         expected_key = get_api_key()
@@ -198,28 +210,49 @@ async def auth_middleware(request: Request, call_next):
         # Check X-API-Key header
         api_key_header = request.headers.get(API_KEY_NAME)
         if api_key_header and api_key_header == expected_key:
-            response = await call_next(request)
-            return response
+            return await call_next(request)
 
         # Check Bearer token
         auth_header = request.headers.get("Authorization")
         if auth_header and auth_header.startswith("Bearer "):
             token = auth_header[7:]
             if token == expected_key:
-                response = await call_next(request)
-                return response
+                return await call_next(request)
 
         # Check query parameter (for SSE endpoints - EventSource can't send headers)
         api_key_query = request.query_params.get("api_key")
         if api_key_query and api_key_query == expected_key:
-            response = await call_next(request)
-            return response
+            return await call_next(request)
+
+        # Check OAuth session cookie
+        user_email = request.session.get("user_email") if hasattr(request, "session") else None
+        if user_email:
+            return await call_next(request)
+
+        # No valid auth — for the root page, redirect browsers to login
+        if request.url.path == "/" and SERVE_UI:
+            accept = request.headers.get("accept", "")
+            if "text/html" in accept:
+                return RedirectResponse(url="/auth/login", status_code=302)
 
         return JSONResponse(content={"detail": "Invalid or missing API Key"}, status_code=401)
 
     except Exception as exc:
         logger.error(f"Auth error: {exc}")
         return JSONResponse(content={"detail": "Authentication failed"}, status_code=401)
+
+
+# Session middleware must be added AFTER auth_middleware so it's outermost
+# (Starlette processes middleware in reverse order of addition)
+from starlette.middleware.sessions import SessionMiddleware
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=os.environ.get("KESTREL_SESSION_SECRET") or os.environ.get("KESTREL_API_KEY", "kestrel-dev-session-key"),
+    session_cookie="kestrel_session",
+    max_age=7 * 24 * 3600,  # 7 days
+    same_site="lax",
+    https_only=os.environ.get("KESTREL_ENV", "development") == "production",
+)
 
 
 if SERVE_UI:
