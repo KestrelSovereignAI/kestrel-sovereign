@@ -18,7 +18,7 @@ gcloud run deploy "$SERVICE_NAME" \
     --image "gcr.io/${PROJECT_ID}/${IMAGE_NAME}:latest" \
     --region "$REGION" \
     --platform managed \
-    --allow-unauthenticated \
+    --no-allow-unauthenticated \
     --memory 2Gi \
     --cpu 2 \
     --port 8080 \
@@ -34,8 +34,10 @@ gcloud run deploy "$SERVICE_NAME" \
 echo ""
 echo "DEV deployment complete!"
 echo ""
-echo "Service URL:"
+echo "Service URL (requires Google IAM auth):"
 gcloud run services describe "$SERVICE_NAME" \
     --region "$REGION" \
     --project="$PROJECT_ID" \
     --format='value(status.url)'
+echo ""
+echo "Access via proxy: gcloud run services proxy $SERVICE_NAME --region=$REGION --project=$PROJECT_ID"
