@@ -144,6 +144,12 @@ APPROVAL_TIMEOUT_SHORT = 60  # Short approval timeout (1 minute)
 SUBPROCESS_TIMEOUT_SHORT = 5  # Quick subprocess checks (docker info, etc.)
 
 # =============================================================================
+# FILE STORAGE LIMITS
+# =============================================================================
+
+MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB maximum file size for store_file()
+
+# =============================================================================
 # QUERY AND DISPLAY LIMITS
 # =============================================================================
 
