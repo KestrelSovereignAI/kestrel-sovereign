@@ -14,8 +14,10 @@ This is a defense-in-depth measure - even if application code forgets to
 check privacy mode, the storage layer will enforce it.
 """
 
+import json
 import logging
-from typing import Dict, List, Optional, Any, TYPE_CHECKING, Union
+import warnings
+from typing import Dict, List, Optional, Any, Tuple, TYPE_CHECKING, Union
 from enum import Enum
 from dataclasses import dataclass
 
@@ -373,11 +375,202 @@ class PrivacyEnforcingStorage:
         """Search case law (constitutional RAG)."""
         return await self._storage.search_case_law(query, top_k)
     
-    # === Pass-through properties ===
+    @property
+    def encryption_enabled(self) -> bool:
+        """Check if conversation encryption at rest is enabled.
+
+        This provides a safe way to check encryption status without
+        accessing the conversation store directly.
+        """
+        conv_store = getattr(self._storage, 'conversation', None)
+        if conv_store and hasattr(conv_store, 'encryption_enabled'):
+            return conv_store.encryption_enabled
+        return False
+
+    # === Privacy-Aware Query Methods ===
+    #
+    # These methods provide privacy-respecting access to the database for
+    # operations that were previously done via direct storage.db access.
+    # Use these instead of accessing .db, .conversation, or .files directly.
+
+    async def query_conversations(
+        self, agent_id: str, limit: int = 50
+    ) -> List[Tuple]:
+        """
+        Query conversation history rows respecting privacy mode.
+
+        In EPHEMERAL mode, returns an empty list (no persistent data exposed).
+        In ISOLATED mode, returns session-local conversations as tuple rows.
+        In other modes, queries the persistent database.
+
+        Returns rows as tuples: (id, role, content, metadata, created_at)
+        """
+        if self._privacy_config.is_ephemeral():
+            logger.debug("query_conversations blocked: ephemeral mode returns no data")
+            return []
+
+        if self._policy.use_session_storage:
+            # Return session conversations formatted as tuple rows
+            rows = []
+            for i, conv in enumerate(self._session_conversations):
+                rows.append((
+                    i,  # synthetic id
+                    conv.get("role", ""),
+                    conv.get("content", ""),
+                    json.dumps(conv.get("metadata", {})) if conv.get("metadata") else None,
+                    conv.get("created_at", None),
+                ))
+            return rows
+
+        return await self._storage.db.fetchall("""
+            SELECT id, role, content, metadata, created_at
+            FROM conversation_history
+            WHERE agent_id = ?
+            ORDER BY created_at DESC
+        """, (agent_id,))
+
+    async def query_conversation_start(
+        self, message_id: str, agent_id: str
+    ) -> Optional[Tuple]:
+        """
+        Get the created_at timestamp for a specific message, respecting privacy.
+
+        In EPHEMERAL mode, returns None.
+        In ISOLATED mode, returns from session storage.
+        Otherwise queries the persistent database.
+
+        Returns a single-element tuple (created_at,) or None.
+        """
+        if self._privacy_config.is_ephemeral():
+            return None
+
+        if self._policy.use_session_storage:
+            try:
+                idx = int(message_id)
+                if 0 <= idx < len(self._session_conversations):
+                    return (self._session_conversations[idx].get("created_at"),)
+            except (ValueError, IndexError):
+                pass
+            return None
+
+        return await self._storage.db.fetchone(
+            "SELECT created_at FROM conversation_history WHERE id = ? AND agent_id = ?",
+            (message_id, agent_id)
+        )
+
+    async def query_conversation_messages(
+        self, agent_id: str, start_time: Any, limit: int = 100
+    ) -> List[Tuple]:
+        """
+        Get conversation messages starting from a given time, respecting privacy.
+
+        Returns rows as tuples: (id, role, content, metadata, created_at)
+        """
+        if self._privacy_config.is_ephemeral():
+            return []
+
+        if self._policy.use_session_storage:
+            rows = []
+            for i, conv in enumerate(self._session_conversations):
+                rows.append((
+                    i,
+                    conv.get("role", ""),
+                    conv.get("content", ""),
+                    json.dumps(conv.get("metadata", {})) if conv.get("metadata") else None,
+                    conv.get("created_at", None),
+                ))
+            return rows[:limit]
+
+        return await self._storage.db.fetchall("""
+            SELECT id, role, content, metadata, created_at
+            FROM conversation_history
+            WHERE agent_id = ? AND created_at >= ?
+            ORDER BY created_at ASC
+            LIMIT ?
+        """, (agent_id, start_time, limit))
+
+    async def query_last_conversation_row(
+        self, agent_id: str
+    ) -> Optional[Tuple]:
+        """
+        Get the most recent conversation row for an agent, respecting privacy.
+
+        Returns a tuple (id, created_at) or None.
+        """
+        if self._privacy_config.is_ephemeral():
+            return None
+
+        if self._policy.use_session_storage:
+            if self._session_conversations:
+                idx = len(self._session_conversations) - 1
+                return (idx, self._session_conversations[idx].get("created_at"))
+            return None
+
+        return await self._storage.db.fetchone("""
+            SELECT id, created_at FROM conversation_history
+            WHERE agent_id = ?
+            ORDER BY id DESC LIMIT 1
+        """, (agent_id,))
+
+    async def delete_conversation_message(
+        self, message_id: int, agent_id: str
+    ) -> bool:
+        """
+        Delete a conversation message by ID, respecting privacy mode.
+
+        In EPHEMERAL mode, raises PrivacyViolationError (nothing to delete).
+        In ISOLATED mode, removes from session storage.
+        Otherwise deletes from persistent database.
+
+        Returns True if a message was deleted, False if not found.
+        """
+        if self._privacy_config.is_ephemeral():
+            raise PrivacyViolationError(
+                "Cannot delete conversations in ephemeral mode (no persistent data)."
+            )
+
+        if self._policy.use_session_storage:
+            try:
+                idx = int(message_id)
+                if 0 <= idx < len(self._session_conversations):
+                    self._session_conversations.pop(idx)
+                    return True
+            except (ValueError, IndexError):
+                pass
+            return False
+
+        await self._check_write_permission("delete_conversation_message")
+        result = await self._storage.db.execute_commit(
+            "DELETE FROM conversation_history WHERE id = ? AND agent_id = ?",
+            (message_id, agent_id)
+        )
+        return result.rowcount > 0 if hasattr(result, 'rowcount') else True
+
+    # === Pass-through properties (with deprecation warnings) ===
+    #
+    # These properties expose the underlying storage objects directly,
+    # which bypasses privacy mode enforcement. They are deprecated and
+    # callers should migrate to the privacy-aware methods above.
+    # They remain for backward compatibility with internal agent code.
+
+    def _warn_direct_access(self, property_name: str) -> None:
+        """Log a deprecation warning when a raw storage property is accessed."""
+        warnings.warn(
+            f"Direct access to PrivacyEnforcingStorage.{property_name} bypasses "
+            f"privacy enforcement. Use privacy-aware methods instead "
+            f"(e.g., query_conversations, get_conversation_history).",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+        logger.warning(
+            f"Privacy bypass: direct access to .{property_name} property "
+            f"(current mode: {self._privacy_mode.value})"
+        )
 
     @property
     def db(self):
-        """Access to underlying database (for wallet, etc.)."""
+        """Access to underlying database. DEPRECATED: bypasses privacy enforcement."""
+        self._warn_direct_access("db")
         return self._storage.db
 
     @property
@@ -397,12 +590,14 @@ class PrivacyEnforcingStorage:
 
     @property
     def conversation(self):
-        """Access to conversation store."""
+        """Access to conversation store. DEPRECATED: bypasses privacy enforcement."""
+        self._warn_direct_access("conversation")
         return self._storage.conversation
 
     @property
     def files(self):
-        """Access to file store."""
+        """Access to file store. DEPRECATED: bypasses privacy enforcement."""
+        self._warn_direct_access("files")
         return self._storage.files
 
     @property
