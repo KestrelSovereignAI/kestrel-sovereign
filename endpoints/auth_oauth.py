@@ -63,7 +63,11 @@ async def login(request: Request):
     # Build the callback URL from the current request
     redirect_uri = os.environ.get("KESTREL_OAUTH_REDIRECT_URI")
     if not redirect_uri:
-        redirect_uri = str(request.url_for("callback"))
+        callback_url = request.url_for("callback")
+        # Cloud Run terminates TLS, so the app sees HTTP internally.
+        # Use X-Forwarded-Proto to build the correct HTTPS URL.
+        proto = request.headers.get("x-forwarded-proto", callback_url.scheme)
+        redirect_uri = str(callback_url.replace(scheme=proto))
 
     return await oauth.google.authorize_redirect(request, redirect_uri)
 
