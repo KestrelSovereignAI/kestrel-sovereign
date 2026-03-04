@@ -7,6 +7,7 @@ import logging
 
 from kestrel_sovereign.kestrel_config.defaults import get_ipfs_api_url
 from kestrel_sovereign.llm.model_metadata import ModelCategory
+from kestrel_sovereign.sql_utils import safe_column_name
 
 logger = logging.getLogger(__name__)
 
@@ -377,14 +378,14 @@ async def update_key(request: Request, provider: str):
         if not key_to_update:
             raise HTTPException(status_code=404, detail=f"No key found for provider '{provider}'")
 
-        # Build update query
+        # Build update query — validate column names for safe interpolation
         updates = []
         params = []
         if quota_limit is not None:
-            updates.append("quota_limit = ?")
+            updates.append(f"{safe_column_name('quota_limit')} = ?")
             params.append(quota_limit)
         if is_active is not None:
-            updates.append("is_active = ?")
+            updates.append(f"{safe_column_name('is_active')} = ?")
             params.append(1 if is_active else 0)
 
         if not updates:
