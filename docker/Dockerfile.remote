@@ -36,6 +36,13 @@ RUN uv pip install --python /app/.venv/bin/python . && \
 # Create directory for agent data if it doesn't exist
 RUN mkdir -p /app/agent_data
 
+# Create non-root user and set permissions
+RUN useradd -m -u 1000 -s /bin/bash kestrel && \
+    chown -R kestrel:kestrel /app
+
+# Switch to non-root user
+USER kestrel
+
 # Expose the port the app runs on
 EXPOSE 8888
 

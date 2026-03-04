@@ -19,6 +19,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Ollama
+# NOTE: Pin to a specific version when available for production use
 RUN curl -fsSL https://ollama.ai/install.sh | sh
 
 # Install uv
@@ -38,6 +39,13 @@ RUN uv pip install --python /app/.venv/bin/python .
 
 # Create directory for agent data
 RUN mkdir -p /app/agent_data
+
+# Create non-root user and set permissions
+RUN useradd -m -u 1000 -s /bin/bash kestrel && \
+    chown -R kestrel:kestrel /app
+
+# Switch to non-root user
+USER kestrel
 
 # Create Ollama startup script
 RUN echo '#!/bin/bash\n\
