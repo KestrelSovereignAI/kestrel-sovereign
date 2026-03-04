@@ -85,14 +85,14 @@ async def auth_middleware(request: Request, call_next):
 
     # Check X-API-Key header
     header_key = request.headers.get(API_KEY_NAME)
-    if header_key and header_key == expected_key:
+    if header_key and secrets.compare_digest(header_key, expected_key):
         return await call_next(request)
 
     # Check Authorization: Bearer <key>
     auth_header = request.headers.get("Authorization")
     if auth_header and auth_header.startswith("Bearer "):
         token = auth_header[7:]
-        if token == expected_key:
+        if secrets.compare_digest(token, expected_key):
             return await call_next(request)
 
     return JSONResponse(
