@@ -196,9 +196,9 @@ async def auth_middleware(request: Request, call_next):
     1. API key (X-API-Key header, Bearer token, or query param) — for programmatic access
     2. OAuth session cookie — for browser access via Google sign-in
     """
-    public_paths = ["/health", "/api/auth/key", "/api/models", "/api/model/current", "/api/identity", "/api/commands", "/favicon.ico", "/webhooks/stripe/crypto"]
+    public_paths = ["/health", "/api/auth/key", "/favicon.ico", "/webhooks/stripe/crypto"]
     auth_paths = ["/auth/login", "/auth/callback", "/auth/logout"]
-    static_prefixes = ["/static", "/api/files/", "/js/", "/shared/", "/utils/"]
+    static_prefixes = ["/static", "/js/", "/shared/", "/utils/"]
 
     if request.url.path in public_paths or request.url.path in auth_paths:
         return await call_next(request)
