@@ -2,6 +2,7 @@
 """
 A FastAPI server to expose Kestrel agent functionality as a service.
 """
+import ipaddress
 import os
 import secrets
 from typing import Optional
@@ -267,12 +268,20 @@ if SERVE_UI:
             raise HTTPException(status_code=404, detail="Index file not found.")
 
 
+def _is_docker_network(host: str) -> bool:
+    """Check if the host IP is within Docker's internal network range (172.16.0.0/12)."""
+    try:
+        return ipaddress.ip_address(host) in ipaddress.ip_network("172.16.0.0/12")
+    except ValueError:
+        return False
+
+
 @app.get("/api/auth/key")
 async def get_bootstrap_key(request: Request):
     """Return API key for initial frontend setup (localhost only)."""
     client_host = request.client.host if request.client else None
     allowed_hosts = {"127.0.0.1", "localhost", "::1", "172.17.0.1"}
-    is_docker_internal = client_host and client_host.startswith("172.")
+    is_docker_internal = client_host and _is_docker_network(client_host)
 
     if client_host not in allowed_hosts and not is_docker_internal:
         logger.warning(f"Auth key request from non-local host: {client_host}")
