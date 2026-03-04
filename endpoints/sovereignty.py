@@ -3,6 +3,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse
 from pathlib import Path
 import json
+import re
 import time
 import os
 import logging
@@ -14,6 +15,12 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api", tags=["sovereignty"])
 
 STORAGE_CACHE_DIR = Path(__file__).parent.parent / "storage_cache"
+
+# Allowlist of valid storage tiers for sovereignty export
+ALLOWED_TIERS = {"local", "ipfs", "filecoin"}
+
+# CID format: alphanumeric characters only (covers CIDv0 Qm... and CIDv1 bafy...)
+CID_PATTERN = re.compile(r'^[a-zA-Z0-9]+$')
 
 
 @router.get("/storage/stats")
@@ -121,6 +128,12 @@ async def trigger_sovereignty_export(request: Request):
         tier = data.get("tier", "ipfs")
         encrypt = data.get("encrypt", True)
 
+        if tier not in ALLOWED_TIERS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid tier '{tier}'. Must be one of: {', '.join(sorted(ALLOWED_TIERS))}",
+            )
+
         agent = request.app.state.agent
         cmd = f"!export-sovereignty --tier={tier}"
         if not encrypt:
@@ -128,6 +141,8 @@ async def trigger_sovereignty_export(request: Request):
 
         result = await agent.process_input(cmd)
         return {"success": True, "message": result}
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error triggering sovereignty export: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Error triggering export.")
@@ -144,6 +159,11 @@ async def trigger_sovereignty_import(request: Request):
         cid = data.get("cid")
         if not cid:
             raise HTTPException(status_code=400, detail="CID is required.")
+        if not CID_PATTERN.match(cid):
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid CID format. CID must contain only alphanumeric characters.",
+            )
 
         agent = request.app.state.agent
         cmd = f"!import-sovereignty {cid}"
