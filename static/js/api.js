@@ -116,10 +116,14 @@ const API = {
     // JWT token for authenticated requests (multi-agent mode)
     _jwtToken: null,
 
+    // True when authenticated via OAuth session cookie (no explicit key needed)
+    _oauthSession: false,
+
     /**
      * Initialize authentication.
      * - In multi-agent mode: Uses JWT token from localStorage
      * - In standalone mode: Fetches API key from /api/auth/key (localhost-only)
+     * - In OAuth mode: Session cookie handles auth automatically
      */
     async init() {
         // Check if we're in multi-agent mode (launched with ?agent=...)
@@ -150,13 +154,33 @@ const API = {
                 this._apiKey = data.key;
                 sessionStorage.setItem('kestrel_api_key', this._apiKey);
                 console.log('API key retrieved and cached');
+                return;
             } else if (resp.status === 403) {
-                console.warn('API key endpoint not accessible (non-local request)');
+                console.log('API key endpoint not accessible — checking OAuth session');
             } else {
                 console.error('Failed to get API key:', resp.status);
             }
         } catch (e) {
             console.error('Failed to initialize authentication:', e);
+        }
+
+        // No API key available — check if we have an OAuth session
+        try {
+            const meResp = await fetch('/auth/me');
+            if (meResp.ok) {
+                const user = await meResp.json();
+                this._oauthSession = true;
+                console.log(`Authenticated via OAuth: ${user.email}`);
+                return;
+            }
+        } catch (e) {
+            // OAuth check failed — will redirect to login below
+        }
+
+        // No auth available — redirect to OAuth login
+        if (!this._apiKey && !this._jwtToken && !this._oauthSession) {
+            console.warn('No authentication available — redirecting to login');
+            window.location.href = '/auth/login';
         }
     },
 
@@ -197,11 +221,17 @@ const API = {
                     this._apiKey = data.key;
                     sessionStorage.setItem('kestrel_api_key', this._apiKey);
                     console.log('API key refreshed - retrying request');
-                    // Retry the original request with new key
                     return this.request(endpoint, options, true);
                 }
             } catch (e) {
                 console.error('Failed to refresh API key:', e);
+            }
+
+            // If OAuth session, redirect to re-login
+            if (this._oauthSession) {
+                console.warn('OAuth session expired — redirecting to login');
+                window.location.href = '/auth/login';
+                return;
             }
 
             const error = await response.json().catch(() => ({ detail: 'Authentication failed' }));
