@@ -319,6 +319,7 @@ export async function loadAgents() {
     try {
         const data = await API.getAgents();
         const agents = data.agents || [];
+        const isStandalone = data.mode === 'standalone';
 
         const container = document.getElementById('agents-list');
         if (agents.length === 0) {
@@ -333,7 +334,8 @@ export async function loadAgents() {
             item.className = `agent-item${selectedAgentName === agent.name ? ' selected' : ''}${!isOnline ? ' offline' : ''}`;
             item.dataset.agentName = agent.name;
 
-            if (isOnline) {
+            // Only enable rookery agent selection in non-standalone mode
+            if (isOnline && !isStandalone) {
                 item.addEventListener('click', () => window.selectAgent(agent.name));
             }
 
@@ -347,8 +349,8 @@ export async function loadAgents() {
             container.appendChild(item);
         }
 
-        // Auto-select first online agent if none selected
-        if (!selectedAgentName) {
+        // Auto-select first online agent only in rookery mode (not standalone)
+        if (!selectedAgentName && !isStandalone) {
             const firstOnline = agents.find(a => a.status !== 'offline');
             if (firstOnline) {
                 window.selectAgent(firstOnline.name);
