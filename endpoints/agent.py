@@ -5,6 +5,7 @@ from typing import Optional
 import logging
 
 from kestrel_sovereign.kestrel_config.constants import SSE_PING_INTERVAL_SECONDS
+from kestrel_sovereign.rate_limit import limiter
 
 logger = logging.getLogger(__name__)
 
@@ -12,6 +13,7 @@ router = APIRouter(prefix="/agent", tags=["agent"])
 
 
 @router.post("/invoke")
+@limiter.limit("60/minute")
 async def invoke_agent(request: Request):
     """
     Main endpoint to interact with the Kestrel Agent.
@@ -47,6 +49,7 @@ async def invoke_agent(request: Request):
 
 
 @router.post("/stream")
+@limiter.limit("60/minute")
 async def stream_agent_response(request: Request):
     """
     Streaming endpoint for chat responses.
@@ -224,6 +227,7 @@ async def get_notifications(request: Request):
 
 
 @router.get("/notifications/sse")
+@limiter.limit("30/minute")
 async def notifications_sse(request: Request):
     """
     Server-Sent Events endpoint for real-time task notifications.

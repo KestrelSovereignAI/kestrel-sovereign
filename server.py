@@ -17,9 +17,9 @@ from main import get_agent_did_async
 from kestrel_sovereign.kestrel_agent import KestrelAgent
 from kestrel_sovereign.llm.service import LLMService
 from dotenv import load_dotenv
-from slowapi import Limiter, _rate_limit_exceeded_handler
-from slowapi.util import get_remote_address
+from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
+from kestrel_sovereign.rate_limit import limiter
 
 from kestrel_sovereign.kestrel_config.constants import SHUTDOWN_TIMEOUT
 
@@ -144,7 +144,6 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 # Rate limiting
-limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
@@ -277,6 +276,7 @@ def _is_docker_network(host: str) -> bool:
 
 
 @app.get("/api/auth/key")
+@limiter.limit("5/minute")
 async def get_bootstrap_key(request: Request):
     """Return API key for initial frontend setup (localhost only)."""
     client_host = request.client.host if request.client else None
