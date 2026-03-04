@@ -244,15 +244,17 @@ class TestMainnetBlocking:
 
     @pytest.mark.asyncio
     async def test_testnet_transactions_allowed(self, temp_storage):
-        """Testnet transactions should be allowed without env var."""
+        """Testnet transactions should not be blocked by the mainnet check."""
+        from unittest.mock import patch, MagicMock
         from kestrel_sovereign.features.wallet.chain_adapters.evm_adapter import EVMAdapter
         from kestrel_sovereign.features.wallet.chain_adapters import TransactionRequest
 
         if "KESTREL_ALLOW_MAINNET" in os.environ:
             del os.environ["KESTREL_ALLOW_MAINNET"]
 
-        # Sepolia testnet
+        # Sepolia testnet — chain_id should NOT be in MAINNET_CHAIN_IDS
         adapter = EVMAdapter(ChainNetwork.ETHEREUM_SEPOLIA)
+        assert adapter.config.chain_id not in MAINNET_CHAIN_IDS
 
         request = TransactionRequest(
             to_address="0x0000000000000000000000000000000000000000",
@@ -262,12 +264,20 @@ class TestMainnetBlocking:
 
         private_key = b'\x01' * 32
 
-        result = await adapter.send_transaction(request, private_key)
+        # Mock web3 RPC calls so we don't hit the network.
+        # We only care that send_transaction passes the mainnet blocking check.
+        mock_eth = MagicMock()
+        mock_eth.get_transaction_count.return_value = 0
+        mock_eth.gas_price = 20_000_000_000
+        mock_eth.estimate_gas.return_value = 21000
+        mock_eth.get_block.return_value = {"baseFeePerGas": None}
+        mock_eth.send_raw_transaction.return_value = b'\xab' * 32
+
+        with patch.object(adapter.w3, 'eth', mock_eth):
+            result = await adapter.send_transaction(request, private_key)
 
         # Should not fail due to mainnet blocking
-        # (may fail for other reasons like RPC connection, insufficient balance, etc.)
-        if not result.success:
-            assert "Mainnet transactions blocked" not in result.error
+        assert "Mainnet transactions blocked" not in (result.error or "")
 
 
 class TestTransactionAuditLogging:
