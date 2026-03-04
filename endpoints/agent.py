@@ -1,13 +1,22 @@
 """Agent invoke and streaming endpoints."""
+from collections import defaultdict
 from fastapi import APIRouter, HTTPException, Request, Query
 from fastapi.responses import StreamingResponse
 from typing import Optional
+import asyncio
 import logging
 
-from kestrel_sovereign.kestrel_config.constants import SSE_PING_INTERVAL_SECONDS
+from kestrel_sovereign.kestrel_config.constants import (
+    MAX_SSE_CONNECTIONS_PER_CLIENT,
+    SSE_PING_INTERVAL_SECONDS,
+)
 from kestrel_sovereign.rate_limit import limiter
 
 logger = logging.getLogger(__name__)
+
+# SSE connection tracking: maps client IP -> active connection count
+_sse_connections: dict[str, int] = defaultdict(int)
+_sse_lock = asyncio.Lock()
 
 router = APIRouter(prefix="/agent", tags=["agent"])
 
@@ -238,25 +247,37 @@ async def notifications_sse(request: Request):
         data: {"message": "...", "type": "completed|failed|canceled"}
 
     Also sends periodic keepalive pings every 15 seconds.
+
+    Connection limits: max MAX_SSE_CONNECTIONS_PER_CLIENT concurrent connections
+    per client IP to prevent resource exhaustion.
     """
-    import asyncio
     import json
 
     if not hasattr(request.app.state, 'agent') or not request.app.state.agent:
         raise HTTPException(status_code=503, detail="Agent not initialized.")
 
+    # Enforce per-client SSE connection limit
+    client_ip = request.client.host if request.client else "unknown"
+    async with _sse_lock:
+        if _sse_connections[client_ip] >= MAX_SSE_CONNECTIONS_PER_CLIENT:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Too many SSE connections (limit: {MAX_SSE_CONNECTIONS_PER_CLIENT})"
+            )
+        _sse_connections[client_ip] += 1
+
     async def event_generator():
         """Generate SSE events for task notifications."""
-        agent = request.app.state.agent
-
-        # Send initial connection event
-        yield f"event: connected\ndata: {json.dumps({'status': 'connected'})}\n\n"
-
-        ping_interval = SSE_PING_INTERVAL_SECONDS
-        poll_interval = 0.5  # Check for notifications every 500ms
-        last_ping = asyncio.get_event_loop().time()
-
         try:
+            agent = request.app.state.agent
+
+            # Send initial connection event
+            yield f"event: connected\ndata: {json.dumps({'status': 'connected'})}\n\n"
+
+            ping_interval = SSE_PING_INTERVAL_SECONDS
+            poll_interval = 0.5  # Check for notifications every 500ms
+            last_ping = asyncio.get_event_loop().time()
+
             while True:
                 # Check if client disconnected
                 if await request.is_disconnected():
@@ -296,6 +317,11 @@ async def notifications_sse(request: Request):
         except Exception as e:
             logger.error(f"SSE error: {e}", exc_info=True)
             yield f"event: error\ndata: {json.dumps({'error': 'Internal server error'})}\n\n"
+        finally:
+            async with _sse_lock:
+                _sse_connections[client_ip] -= 1
+                if _sse_connections[client_ip] <= 0:
+                    del _sse_connections[client_ip]
 
     return StreamingResponse(
         event_generator(),
