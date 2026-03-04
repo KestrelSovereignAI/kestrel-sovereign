@@ -33,7 +33,8 @@ async def get_agents(request: Request):
         card_dict["status"] = "online"
 
         # Return as array (single-item for now, multiple agents in future)
-        return {"agents": [card_dict]}
+        # mode: "standalone" tells the UI not to enable rookery routing
+        return {"agents": [card_dict], "mode": "standalone"}
     except Exception as e:
         logger.error(f"Error getting agents: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Error retrieving agents.")

@@ -81,17 +81,13 @@ export function connectNotifications() {
 
     // Get API key for authentication (EventSource can't send headers)
     const apiKey = API.getApiKey();
-    if (!apiKey) {
-        console.warn('No API key available for SSE notifications, will retry later');
-        scheduleReconnect();
-        return;
-    }
 
     try {
-        // Pass API key as query parameter since EventSource can't send headers
-        // Use buildAgentUrl() to apply rookery routing prefix when an agent is selected
+        // Pass API key as query parameter since EventSource can't send headers.
+        // In OAuth mode (no API key), the session cookie is sent automatically.
         const ssePath = API.buildAgentUrl('/agent/notifications/sse');
-        notificationEventSource = new EventSource(`${ssePath}?api_key=${encodeURIComponent(apiKey)}`);
+        const sseUrl = apiKey ? `${ssePath}?api_key=${encodeURIComponent(apiKey)}` : ssePath;
+        notificationEventSource = new EventSource(sseUrl);
 
         notificationEventSource.addEventListener('connected', (e) => {
             console.log('SSE notifications connected');
