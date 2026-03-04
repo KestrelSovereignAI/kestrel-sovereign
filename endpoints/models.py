@@ -7,6 +7,7 @@ import logging
 
 from kestrel_sovereign.kestrel_config.defaults import get_ipfs_api_url
 from kestrel_sovereign.llm.model_metadata import ModelCategory
+from kestrel_sovereign.sql_utils import safe_column_name
 
 logger = logging.getLogger(__name__)
 
@@ -133,7 +134,8 @@ async def get_ipfs_status(request: Request):
                             for cid, info in list(pins.items())[:MAX_PINNED_ITEMS_DISPLAY]
                         ]
     except Exception as e:
-        status["local_node"]["error"] = str(e)
+        logger.error(f"IPFS local node check failed: {e}")
+        status["local_node"]["error"] = "Connection failed"
 
     test_cid = "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG"
     gateways = [
@@ -152,7 +154,8 @@ async def get_ipfs_status(request: Request):
                     gw_status["available"] = resp.status == 200
                     gw_status["latency_ms"] = round(latency, 2)
             except Exception as e:
-                gw_status["error"] = str(e)
+                logger.error(f"IPFS gateway {gw['name']} check failed: {e}")
+                gw_status["error"] = "Connection failed"
             status["gateways"].append(gw_status)
 
     if hasattr(request.app.state, 'agent') and request.app.state.agent:
@@ -296,7 +299,7 @@ async def add_key(request: Request):
         raise
     except Exception as e:
         logger.error(f"Error adding key: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Error adding key: {str(e)}")
+        raise HTTPException(status_code=500, detail="Error adding key.")
 
 
 @router.delete("/api/keys/{provider}")
@@ -342,7 +345,7 @@ async def delete_key(request: Request, provider: str):
         raise
     except Exception as e:
         logger.error(f"Error deleting key: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Error deleting key: {str(e)}")
+        raise HTTPException(status_code=500, detail="Error deleting key.")
 
 
 @router.patch("/api/keys/{provider}")
@@ -377,14 +380,14 @@ async def update_key(request: Request, provider: str):
         if not key_to_update:
             raise HTTPException(status_code=404, detail=f"No key found for provider '{provider}'")
 
-        # Build update query
+        # Build update query — validate column names for safe interpolation
         updates = []
         params = []
         if quota_limit is not None:
-            updates.append("quota_limit = ?")
+            updates.append(f"{safe_column_name('quota_limit')} = ?")
             params.append(quota_limit)
         if is_active is not None:
-            updates.append("is_active = ?")
+            updates.append(f"{safe_column_name('is_active')} = ?")
             params.append(1 if is_active else 0)
 
         if not updates:
@@ -405,7 +408,7 @@ async def update_key(request: Request, provider: str):
         raise
     except Exception as e:
         logger.error(f"Error updating key: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Error updating key: {str(e)}")
+        raise HTTPException(status_code=500, detail="Error updating key.")
 
 
 @router.get("/api/keys/{provider}/usage")

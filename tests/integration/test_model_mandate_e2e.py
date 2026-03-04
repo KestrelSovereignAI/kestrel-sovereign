@@ -99,11 +99,14 @@ class TestModelDiscoveryAPI:
     """Tests for /api/models endpoint using TestClient."""
 
     @pytest.fixture
-    def client(self):
+    def client(self, monkeypatch):
         """TestClient with mock agent for API testing."""
         from server import app
         from unittest.mock import MagicMock
         from kestrel_sovereign.llm.service import LLMService
+
+        test_api_key = "test-api-key-12345"
+        monkeypatch.setenv("KESTREL_API_KEY", test_api_key)
 
         # Create mock agent with real LLMService
         mock_agent = MagicMock()
@@ -124,6 +127,7 @@ class TestModelDiscoveryAPI:
         app.state.agent = mock_agent
 
         with TestClient(app) as client:
+            client.headers.update({"X-API-Key": test_api_key})
             yield client
 
     def test_api_models_returns_by_provider(self, client):
@@ -243,14 +247,37 @@ class TestProtectedEndpointsRequireAuth:
         response = client.get("/health")
         assert response.status_code == 200
 
-    def test_models_is_public(self, client):
-        """GET /api/models is public (though may return 503 if agent not fully initialized)."""
+    def test_models_requires_auth(self, client):
+        """GET /api/models requires API key."""
         response = client.get("/api/models")
-        # Should not be 401 (public endpoint)
-        assert response.status_code != 401
 
-    def test_identity_is_public(self, client):
-        """GET /api/identity is public."""
+        # Should be 401 without auth
+        assert response.status_code == 401
+
+    def test_identity_requires_auth(self, client):
+        """GET /api/identity requires API key."""
         response = client.get("/api/identity")
-        # May return 200 or 503 if agent not fully initialized, but not 401
-        assert response.status_code != 401
+
+        # Should be 401 without auth
+        assert response.status_code == 401
+
+    def test_commands_requires_auth(self, client):
+        """GET /api/commands requires API key."""
+        response = client.get("/api/commands")
+
+        # Should be 401 without auth
+        assert response.status_code == 401
+
+    def test_model_current_requires_auth(self, client):
+        """GET /api/model/current requires API key."""
+        response = client.get("/api/model/current")
+
+        # Should be 401 without auth
+        assert response.status_code == 401
+
+    def test_files_requires_auth(self, client):
+        """GET /api/files/{hash} requires API key."""
+        response = client.get("/api/files/some_hash")
+
+        # Should be 401 without auth
+        assert response.status_code == 401

@@ -3,6 +3,8 @@ from fastapi import APIRouter, HTTPException, Request
 from pathlib import Path
 import logging
 
+from kestrel_sovereign.sql_utils import safe_table_name, safe_column_name
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/db", tags=["database"])
@@ -39,14 +41,18 @@ async def list_database_tables(request: Request):
                 continue
 
             try:
-                count_row = await storage.db.fetchone(f"SELECT COUNT(*) FROM {table_name}")
+                safe_name = safe_table_name(table_name)
+                count_row = await storage.db.fetchone(f"SELECT COUNT(*) FROM {safe_name}")
                 row_count = count_row[0] if count_row else 0
+            except ValueError:
+                logger.warning(f"Skipping table with invalid name: {table_name!r}")
+                continue
             except Exception as e:
                 logger.warning(f"Failed to count rows in table {table_name}: {e}")
                 row_count = 0
 
             try:
-                col_rows = await storage.db.fetchall(f"PRAGMA table_info({table_name})")
+                col_rows = await storage.db.fetchall(f"PRAGMA table_info({safe_name})")
                 columns = [
                     {"name": col[1], "type": col[2], "nullable": not col[3], "pk": bool(col[5])}
                     for col in col_rows
@@ -107,33 +113,37 @@ async def query_database_table(
         agent = request.app.state.agent
         storage = agent.storage
 
+        # Validate table name for safe SQL interpolation (defense-in-depth;
+        # ALLOWED_TABLES check above is the primary gate)
+        safe_name = safe_table_name(table_name)
+
         # Get column info using async query
-        col_rows = await storage.db.fetchall(f"PRAGMA table_info({table_name})")
+        col_rows = await storage.db.fetchall(f"PRAGMA table_info({safe_name})")
         columns = [col[1] for col in col_rows] if col_rows else []
 
         if search and len(search) >= 2:
             search_conditions = []
             for col in columns:
-                search_conditions.append(f"CAST({col} AS TEXT) LIKE ?")
+                search_conditions.append(f"CAST({safe_column_name(col)} AS TEXT) LIKE ?")
             where_clause = f"WHERE {' OR '.join(search_conditions)}"
             search_params = [f"%{search}%"] * len(columns)
 
             count_row = await storage.db.fetchone(
-                f"SELECT COUNT(*) FROM {table_name} {where_clause}",
+                f"SELECT COUNT(*) FROM {safe_name} {where_clause}",
                 search_params
             )
             total_rows = count_row[0] if count_row else 0
 
             rows = await storage.db.fetchall(
-                f"SELECT * FROM {table_name} {where_clause} LIMIT ? OFFSET ?",
+                f"SELECT * FROM {safe_name} {where_clause} LIMIT ? OFFSET ?",
                 search_params + [limit, offset]
             )
         else:
-            count_row = await storage.db.fetchone(f"SELECT COUNT(*) FROM {table_name}")
+            count_row = await storage.db.fetchone(f"SELECT COUNT(*) FROM {safe_name}")
             total_rows = count_row[0] if count_row else 0
 
             rows = await storage.db.fetchall(
-                f"SELECT * FROM {table_name} LIMIT ? OFFSET ?",
+                f"SELECT * FROM {safe_name} LIMIT ? OFFSET ?",
                 (limit, offset)
             )
 

@@ -78,6 +78,7 @@ LLM_RETRY_MAX_DELAY_SECONDS = 60.0  # Maximum delay between retries
 # =============================================================================
 
 SSE_PING_INTERVAL_SECONDS = 15  # Server-sent events ping interval
+MAX_SSE_CONNECTIONS_PER_CLIENT = 5  # Maximum concurrent SSE connections per client IP
 
 # =============================================================================
 # SESSION MANAGEMENT

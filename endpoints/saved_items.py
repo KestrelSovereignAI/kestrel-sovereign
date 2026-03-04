@@ -238,7 +238,7 @@ async def save_item(request: Request, body: SaveItemRequest):
             "item": item.to_dict()
         }
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail="Invalid request parameters")
     except HTTPException:
         raise
     except Exception as e:
@@ -267,7 +267,7 @@ async def save_structured_item(request: Request, body: SaveStructuredItemRequest
             "item": item.to_dict()
         }
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail="Invalid request parameters")
     except HTTPException:
         raise
     except Exception as e:
