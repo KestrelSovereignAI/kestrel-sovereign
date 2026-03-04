@@ -98,6 +98,7 @@ class IdentityImporter:
         verify_signature: bool = True,
         verify_constitution: bool = True,
         merge_mode: str = "replace",  # replace, merge, skip_existing
+        allow_unsigned: bool = False,
     ) -> ImportResult:
         """
         Import agent identity from a package.
@@ -110,6 +111,9 @@ class IdentityImporter:
                 - "replace": Clear existing data and import all
                 - "merge": Add new data, keep existing
                 - "skip_existing": Only import if no existing data
+            allow_unsigned: If True, allow importing unsigned packages.
+                Defaults to False for security. Set to True only for
+                development/testing use cases.
 
         Returns:
             ImportResult with success status and statistics
@@ -136,11 +140,20 @@ class IdentityImporter:
                 self.errors.append("Content hash verification failed")
                 return self._build_result(False, agent_id)
 
-        if verify_signature and package.signature:
-            sig_valid = await self._verify_signature(package)
-            if not sig_valid:
-                self.errors.append("DID signature verification failed")
+        if verify_signature:
+            if package.signature:
+                sig_valid = await self._verify_signature(package)
+                if not sig_valid:
+                    self.errors.append("DID signature verification failed")
+                    return self._build_result(False, agent_id)
+            elif not allow_unsigned:
+                self.errors.append(
+                    "Package is not signed (unsigned). "
+                    "Set allow_unsigned=True to import unsigned packages."
+                )
                 return self._build_result(False, agent_id)
+            else:
+                self.warnings.append("Importing unsigned package (allow_unsigned=True)")
 
         # 2. Check merge mode
         if merge_mode == "skip_existing":
@@ -217,9 +230,9 @@ class IdentityImporter:
                 return True
         except Exception as e:
             logger.warning(f"Signature verification failed: {e}")
-            self.warnings.append(f"Signature verification skipped: {str(e)}")
+            self.warnings.append(f"Signature verification failed: {str(e)}")
 
-        return True  # Non-fatal - allow import without signature
+        return False  # Reject packages with invalid/unverifiable signatures
 
     async def _check_existing_data(self, agent_id: str) -> bool:
         """Check if there's existing data for this agent."""
