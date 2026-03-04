@@ -68,14 +68,14 @@ async def verify_api_key(
 
     expected_key = get_api_key()
 
-    if api_key_header and api_key_header == expected_key:
+    if api_key_header and secrets.compare_digest(api_key_header, expected_key):
         return True
-    if token and token.credentials == expected_key:
+    if token and secrets.compare_digest(token.credentials, expected_key):
         return True
 
     # Support query parameter auth for SSE endpoints (EventSource can't send headers)
     api_key_query = request.query_params.get("api_key")
-    if api_key_query and api_key_query == expected_key:
+    if api_key_query and secrets.compare_digest(api_key_query, expected_key):
         return True
 
     raise HTTPException(
@@ -209,19 +209,19 @@ async def auth_middleware(request: Request, call_next):
 
         # Check X-API-Key header
         api_key_header = request.headers.get(API_KEY_NAME)
-        if api_key_header and api_key_header == expected_key:
+        if api_key_header and secrets.compare_digest(api_key_header, expected_key):
             return await call_next(request)
 
         # Check Bearer token
         auth_header = request.headers.get("Authorization")
         if auth_header and auth_header.startswith("Bearer "):
             token = auth_header[7:]
-            if token == expected_key:
+            if secrets.compare_digest(token, expected_key):
                 return await call_next(request)
 
         # Check query parameter (for SSE endpoints - EventSource can't send headers)
         api_key_query = request.query_params.get("api_key")
-        if api_key_query and api_key_query == expected_key:
+        if api_key_query and secrets.compare_digest(api_key_query, expected_key):
             return await call_next(request)
 
         # Check OAuth session cookie
