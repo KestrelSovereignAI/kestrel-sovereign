@@ -346,9 +346,9 @@ async def stripe_crypto_webhook(request: Request):
                 status_code=400
             )
     except Exception as e:
-        logger.error(f"Webhook error: {e}")
+        logger.error(f"Webhook error: {e}", exc_info=True)
         return JSONResponse(
-            content={"error": str(e)},
+            content={"error": "Internal server error"},
             status_code=500
         )
 

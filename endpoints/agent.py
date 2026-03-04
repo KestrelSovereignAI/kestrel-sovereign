@@ -89,7 +89,7 @@ async def stream_agent_response(request: Request):
                     yield chunk
             except Exception as e:
                 logger.error(f"Streaming error: {e}", exc_info=True)
-                yield f"\n\nError: {str(e)}"
+                yield "\n\nAn error occurred while generating the response."
             finally:
                 # Cleanup request tracking
                 agent._cleanup_cancelled_request(request_id)
@@ -291,7 +291,7 @@ async def notifications_sse(request: Request):
             logger.debug("SSE connection cancelled")
         except Exception as e:
             logger.error(f"SSE error: {e}", exc_info=True)
-            yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
+            yield f"event: error\ndata: {json.dumps({'error': 'Internal server error'})}\n\n"
 
     return StreamingResponse(
         event_generator(),

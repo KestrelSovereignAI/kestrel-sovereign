@@ -76,8 +76,8 @@ async def get_observability_events(
             }
         }
     except Exception as e:
-        logger.error(f"Error querying observability events: {e}")
-        return {"error": str(e), "events": []}
+        logger.error(f"Error querying observability events: {e}", exc_info=True)
+        return {"error": "Failed to query observability events", "events": []}
 
 
 @router.get("/api/observability/summary")
@@ -145,5 +145,5 @@ async def get_observability_summary(
             "avg_tool_duration_ms": round(avg_duration_ms, 2) if durations else None,
         }
     except Exception as e:
-        logger.error(f"Error getting observability summary: {e}")
-        return {"error": str(e)}
+        logger.error(f"Error getting observability summary: {e}", exc_info=True)
+        return {"error": "Failed to get observability summary"}
