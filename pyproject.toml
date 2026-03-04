@@ -83,17 +83,32 @@ dependencies = [
     "web3>=7.0.0",
     # Fiat on-ramp (Stripe Crypto On-Ramp)
     "stripe>=10.0.0",
-    # Testing
-    "pytest-asyncio>=1.1.0",
-    "pytest-timeout>=2.3.1",
+    # Runtime utilities
     "psutil>=7.1.3",
     "numpy>=2.3.1",
-    "asgi-lifespan>=2.1.0",
+    # LLM provider SDKs (used at runtime via dynamic import)
     "anthropic>=0.75.0",
     "google-generativeai>=0.8.6",
+    # Decentralized storage
     "lighthouseweb3>=0.1.6",
-    "google-cloud-storage>=3.4.1",
-    "safetensors>=0.7.0",
+    # Notifications (future use)
+    "sendgrid>=6.12.4",
+    "twilio>=9.9.1",
+    # GitHub Ticket Processor (pinned to specific commit for supply chain safety)
+    "autoclaude @ git+https://github.com/UncleSaurus/autoclaude.git@c55f72d87744e12c42cf46c6236f71e26d2443e6",
+]
+
+[project.optional-dependencies]
+# Test dependencies (not needed in production)
+test = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=1.1.0",
+    "pytest-timeout>=2.3.1",
+    "pytest-xdist>=3.0.0",
+    "asgi-lifespan>=2.1.0",
+]
+# ML/training dependencies (adds ~2GB+ for torch, diffusers, etc.)
+ml = [
     "torch>=2.9.1",
     "torchvision>=0.24.1",
     "torchaudio>=2.9.1",
@@ -101,13 +116,8 @@ dependencies = [
     "transformers>=4.57.1",
     "accelerate>=1.12.0",
     "peft>=0.18.1",
-    "sendgrid>=6.12.4",
-    "twilio>=9.9.1",
-    # GitHub Ticket Processor (standalone package)
-    "autoclaude @ git+https://github.com/UncleSaurus/autoclaude.git",
+    "safetensors>=0.7.0",
 ]
-
-[project.optional-dependencies]
 # Local LLM support (adds ~2GB+ for torch, sentence-transformers)
 local = [
     "ollama>=0.6.1",
@@ -118,9 +128,16 @@ local = [
     "langchain-community>=0.3.31",
     "numpy==2.3.1",
 ]
+# Cloud storage (GCS bucket access)
+cloud-storage = [
+    "google-cloud-storage>=3.4.1",
+]
 # Full installation (everything)
 full = [
     "kestrel_sovereign[local]",
+    "kestrel_sovereign[ml]",
+    "kestrel_sovereign[test]",
+    "kestrel_sovereign[cloud-storage]",
 ]
 
 [project.scripts]
@@ -129,8 +146,16 @@ kestrel-github = "autoclaude.cli:main"
 
 [dependency-groups]
 dev = [
-    "pytest",
-    "pytest-xdist",  # Parallel test execution
+    {include-group = "test"},
+]
+
+# Mirror of [project.optional-dependencies.test] for uv sync compatibility
+test = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=1.1.0",
+    "pytest-timeout>=2.3.1",
+    "pytest-xdist>=3.0.0",
+    "asgi-lifespan>=2.1.0",
 ]
 
 [tool.pytest.ini_options]
