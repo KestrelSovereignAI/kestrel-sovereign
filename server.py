@@ -37,6 +37,10 @@ API_KEY_NAME = "X-API-Key"
 api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
 security = HTTPBearer(auto_error=False)
 
+# Paths where API key query parameter auth is allowed
+# (EventSource/SSE can't send headers, so these endpoints need query param auth)
+SSE_PATHS = {"/agent/notifications/sse", "/agent/stream"}
+
 
 def get_api_key():
     """Get or generate the API key."""
@@ -75,10 +79,12 @@ async def verify_api_key(
     if token and secrets.compare_digest(token.credentials, expected_key):
         return True
 
-    # Support query parameter auth for SSE endpoints (EventSource can't send headers)
+    # Support query parameter auth for SSE endpoints only (EventSource can't send headers)
+    # Restricted to SSE_PATHS to avoid leaking keys in URL logs on other endpoints
     api_key_query = request.query_params.get("api_key")
-    if api_key_query and secrets.compare_digest(api_key_query, expected_key):
-        return True
+    if api_key_query and request.url.path in SSE_PATHS:
+        if secrets.compare_digest(api_key_query, expected_key):
+            return True
 
     raise HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
@@ -220,10 +226,12 @@ async def auth_middleware(request: Request, call_next):
             if secrets.compare_digest(token, expected_key):
                 return await call_next(request)
 
-        # Check query parameter (for SSE endpoints - EventSource can't send headers)
+        # Check query parameter for SSE endpoints only (EventSource can't send headers)
+        # Restricted to SSE_PATHS to avoid leaking keys in URL logs on other endpoints
         api_key_query = request.query_params.get("api_key")
-        if api_key_query and secrets.compare_digest(api_key_query, expected_key):
-            return await call_next(request)
+        if api_key_query and request.url.path in SSE_PATHS:
+            if secrets.compare_digest(api_key_query, expected_key):
+                return await call_next(request)
 
         # Check OAuth session cookie
         user_email = request.session.get("user_email") if hasattr(request, "session") else None
