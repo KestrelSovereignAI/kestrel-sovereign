@@ -25,35 +25,15 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Bootstrap files loaded in this order (all optional).
-# SOUL.md gets special treatment (--- YOUR IDENTITY ---), others use generic wrappers.
-BOOTSTRAP_FILE_ORDER = [
-    "AGENTS.md",
-    "SOUL.md",
-    "TOOLS.md",
-    "IDENTITY.md",
-    "USER.md",
-    "HEARTBEAT.md",
-    "BOOTSTRAP.md",
-    "MEMORY.md",
-]
-
-DEFAULT_MAX_CHARS_PER_FILE = 20_000
-DEFAULT_MAX_TOTAL_CHARS = 150_000
-
-
-def truncate_bootstrap_content(content: str, max_chars: int) -> str:
-    """Truncate content keeping head (70%) and tail (20%) with a marker.
-
-    Matches the OpenClaw strategy for preserving context at both ends.
-    """
-    if len(content) <= max_chars:
-        return content
-    head_chars = int(max_chars * 0.7)
-    tail_chars = int(max_chars * 0.2)
-    head = content[:head_chars]
-    tail = content[-tail_chars:] if tail_chars > 0 else ""
-    return f"{head}\n[...truncated...]\n{tail}"
+# Re-export for backward compatibility.  New code should use
+# ``BootstrapLoader.DEFAULT_BOOTSTRAP_FILES`` or ``loader.file_order``.
+from kestrel_sovereign.features.bootstrap.loader import (
+    DEFAULT_BOOTSTRAP_FILES as BOOTSTRAP_FILE_ORDER,
+    DEFAULT_MAX_CHARS_PER_FILE,
+    DEFAULT_MAX_TOTAL_CHARS,
+    truncate_content as truncate_bootstrap_content,
+    BootstrapLoader,
+)
 
 
 class ContextBuilder:
@@ -90,108 +70,88 @@ class ContextBuilder:
         self.consolidator = consolidator
         self.agent_data_path = Path(agent_data_path) if agent_data_path else None
 
-        # Bootstrap file contents: filename -> content (ordered)
-        self._bootstrap_files: OrderedDict[str, str] = OrderedDict()
-
-        # Load bootstrap config
-        self._max_chars_per_file = DEFAULT_MAX_CHARS_PER_FILE
-        self._max_total_chars = DEFAULT_MAX_TOTAL_CHARS
+        # Load bootstrap config from kestrel.toml
+        max_chars_per_file = DEFAULT_MAX_CHARS_PER_FILE
+        max_total_chars = DEFAULT_MAX_TOTAL_CHARS
         try:
             from kestrel_sovereign.config import load_section
             bootstrap_cfg = load_section("bootstrap")
             if bootstrap_cfg:
-                self._max_chars_per_file = bootstrap_cfg.get(
+                max_chars_per_file = bootstrap_cfg.get(
                     "max_chars_per_file", DEFAULT_MAX_CHARS_PER_FILE
                 )
-                self._max_total_chars = bootstrap_cfg.get(
+                max_total_chars = bootstrap_cfg.get(
                     "max_total_chars", DEFAULT_MAX_TOTAL_CHARS
                 )
         except Exception:
             pass  # Use defaults
 
+        # Create the BootstrapLoader -- single source of truth for file loading
+        self._bootstrap_loader = BootstrapLoader(
+            agent_data_path=str(agent_data_path) if agent_data_path else None,
+            max_chars_per_file=max_chars_per_file,
+            max_total_chars=max_total_chars,
+        )
+
         # Load all bootstrap files (includes SOUL.md)
-        self._load_bootstrap_files()
+        self._bootstrap_loader.load()
+
+    # ------------------------------------------------------------------
+    # Bootstrap file access (delegated to BootstrapLoader)
+    # ------------------------------------------------------------------
+
+    @property
+    def _bootstrap_files(self) -> OrderedDict[str, str]:
+        """Access the loaded bootstrap file cache.
+
+        Returns an OrderedDict to maintain backward compatibility with
+        code that iterates ``self._bootstrap_files.items()``.
+        """
+        # BootstrapLoader.load() returns an OrderedDict
+        return self._bootstrap_loader.load()
 
     @property
     def _soul_content(self) -> Optional[str]:
         """Backward-compatible access to SOUL.md content."""
-        return self._bootstrap_files.get("SOUL.md")
+        return self._bootstrap_loader.get_file("SOUL.md")
 
     @_soul_content.setter
     def _soul_content(self, value: Optional[str]) -> None:
         """Backward-compatible setter for SOUL.md content."""
+        cache = self._bootstrap_loader.load()
         if value is None:
-            self._bootstrap_files.pop("SOUL.md", None)
+            cache.pop("SOUL.md", None)
         else:
-            self._bootstrap_files["SOUL.md"] = value
+            cache["SOUL.md"] = value
 
     def _load_bootstrap_files(self) -> None:
         """Load all recognized bootstrap files from the agent data directory.
 
-        Files are loaded in BOOTSTRAP_FILE_ORDER, each truncated to
-        max_chars_per_file, with total content capped at max_total_chars.
+        Delegates to the BootstrapLoader.  Retained for backward
+        compatibility with callers that invoke this method directly.
         """
-        self._bootstrap_files.clear()
-        if not self.agent_data_path:
-            return
-
-        total_chars = 0
-        for filename in BOOTSTRAP_FILE_ORDER:
-            filepath = self.agent_data_path / filename
-            if not filepath.exists():
-                continue
-
-            try:
-                content = filepath.read_text(encoding="utf-8")
-                if not content.strip():
-                    continue
-
-                # Per-file truncation
-                content = truncate_bootstrap_content(content, self._max_chars_per_file)
-
-                # Total budget check
-                if total_chars + len(content) > self._max_total_chars:
-                    remaining = self._max_total_chars - total_chars
-                    if remaining > 100:
-                        content = truncate_bootstrap_content(content, remaining)
-                    else:
-                        logger.warning(
-                            f"Bootstrap budget exhausted, skipping {filename}"
-                        )
-                        break
-
-                self._bootstrap_files[filename] = content
-                total_chars += len(content)
-                logger.info(f"Loaded bootstrap file: {filename} ({len(content)} chars)")
-            except Exception as e:
-                logger.warning(f"Failed to load bootstrap file {filename}: {e}")
-
-        if self._bootstrap_files:
-            names = ", ".join(self._bootstrap_files.keys())
-            logger.info(
-                f"Bootstrap files loaded: {names} ({total_chars} total chars)"
-            )
+        self._bootstrap_loader.reload()
 
     def reload_bootstrap_files(self) -> None:
         """Re-read all bootstrap files from disk (hot-reload)."""
-        self._load_bootstrap_files()
+        self._bootstrap_loader.reload()
 
     def _load_soul_md(self) -> None:
-        """Backward-compatible method — delegates to _load_bootstrap_files."""
-        self._load_bootstrap_files()
+        """Backward-compatible method -- delegates to reload."""
+        self._bootstrap_loader.reload()
 
     async def retrieve_context(self, query: str) -> str:
         """
         Retrieves relevant documents and knowledge graph context for a query.
-        
+
         Args:
             query: The user's query to find relevant context for
-            
+
         Returns:
             Formatted context string with relevant documents
         """
         logger.info(f"Retrieving context for query: '{query}'")
-        
+
         # 1. Search document chunks (RAG)
         try:
             rag_results = await self.storage.search_chunks(query)
@@ -214,7 +174,7 @@ class ContextBuilder:
         # and query the graph for related nodes.
         # kg_results = self.storage.query_graph(...)
         # context_parts.append(f"Knowledge Graph Context: {kg_results}")
-        
+
         if not context_parts:
             return "No relevant documents or knowledge found in memory."
 
@@ -223,10 +183,10 @@ class ContextBuilder:
     def get_session_briefing(self) -> str:
         """
         Generate a constitutional briefing for the start of a session.
-        
+
         If SOUL.md is loaded, uses a lighter briefing (personality is already set).
         Otherwise, provides the full formal briefing.
-        
+
         Returns:
             The session briefing text
         """
@@ -241,7 +201,7 @@ You have constitutional protections. Use `!constitution` if needed. Otherwise, b
 --- END STYLE ---
 
 """
-        
+
         # Full formal briefing for agents without SOUL.md
         briefing = """--- SESSION BRIEFING: CONSTITUTIONAL REMINDER ---
 

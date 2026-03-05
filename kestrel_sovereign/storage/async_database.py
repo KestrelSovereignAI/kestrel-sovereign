@@ -250,6 +250,21 @@ CREATE TABLE IF NOT EXISTS agent_metadata (
 
 CREATE INDEX IF NOT EXISTS idx_agent_metadata_agent ON agent_metadata(agent_id);
 
+-- Bootstrap Config: Per-agent configuration for bootstrap file loading convention
+CREATE TABLE IF NOT EXISTS bootstrap_config (
+    id TEXT PRIMARY KEY,
+    agent_id TEXT NOT NULL,
+    file_name TEXT NOT NULL,
+    file_path TEXT DEFAULT '',
+    enabled INTEGER DEFAULT 1,
+    priority INTEGER DEFAULT 100,
+    max_size_bytes INTEGER DEFAULT 10240,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_bootstrap_config_agent ON bootstrap_config(agent_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_bootstrap_config_agent_file ON bootstrap_config(agent_id, file_name);
+
 -- Saved Items: Unified storage for stashes, files, excerpts, and structured items
 CREATE TABLE IF NOT EXISTS saved_items (
     id TEXT PRIMARY KEY,
