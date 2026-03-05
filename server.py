@@ -254,9 +254,32 @@ async def auth_middleware(request: Request, call_next):
 # Session middleware must be added AFTER auth_middleware so it's outermost
 # (Starlette processes middleware in reverse order of addition)
 from starlette.middleware.sessions import SessionMiddleware
+
+
+def _get_session_secret() -> str:
+    """Return the session signing secret.
+
+    Priority:
+        1. KESTREL_SESSION_SECRET env var (explicit session secret)
+        2. KESTREL_API_KEY env var (shared API key as fallback)
+        3. Random ephemeral secret (sessions won't survive restarts)
+
+    Note: Starlette's SessionMiddleware already sets the httponly flag on
+    session cookies, so JavaScript cannot access them.
+    """
+    secret = os.environ.get("KESTREL_SESSION_SECRET") or os.environ.get("KESTREL_API_KEY")
+    if not secret:
+        secret = secrets.token_urlsafe(32)
+        logger.warning(
+            "No KESTREL_SESSION_SECRET set — using random ephemeral secret "
+            "(sessions won't survive restarts)"
+        )
+    return secret
+
+
 app.add_middleware(
     SessionMiddleware,
-    secret_key=os.environ.get("KESTREL_SESSION_SECRET") or os.environ.get("KESTREL_API_KEY", "kestrel-dev-session-key"),
+    secret_key=_get_session_secret(),
     session_cookie="kestrel_session",
     max_age=7 * 24 * 3600,  # 7 days
     same_site="lax",

@@ -53,6 +53,13 @@ logger = logging.getLogger(__name__)
 # Security Configuration
 API_KEY_NAME = "X-API-Key"
 
+# Paths (suffixes) where API key query parameter auth is allowed.
+# EventSource/SSE connections cannot send custom headers, so these endpoints
+# need query param auth. Restricted to avoid leaking keys in URL logs.
+# The host proxies SSE requests under /api/agents/{id}/..., so we match
+# path suffixes rather than exact paths.
+SSE_PATH_SUFFIXES = ("/agent/notifications/sse", "/agent/stream")
+
 # Project directory (where host.py lives)
 PROJECT_DIR = Path(__file__).parent.resolve()
 
@@ -184,10 +191,12 @@ async def auth_middleware(request: Request, call_next):
         if secrets.compare_digest(token, expected_key):
             return await call_next(request)
 
-    # Check query parameter (for SSE endpoints)
+    # Check query parameter for SSE endpoints only (EventSource can't send headers)
+    # Restricted to SSE paths to avoid leaking keys in URL logs on other endpoints
     api_key_query = request.query_params.get("api_key")
-    if api_key_query and secrets.compare_digest(api_key_query, expected_key):
-        return await call_next(request)
+    if api_key_query and any(request.url.path.endswith(s) for s in SSE_PATH_SUFFIXES):
+        if secrets.compare_digest(api_key_query, expected_key):
+            return await call_next(request)
 
     return JSONResponse(
         content={"detail": "Invalid or missing API Key"},
