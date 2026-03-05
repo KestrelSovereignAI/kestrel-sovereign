@@ -467,6 +467,24 @@ class KestrelAgent(ConstitutionMixin, StreamingMixin, BackupMixin, SleepMixin):
         This updates both the storage wrapper and the privacy agent.
         Note: Changing to a more restrictive mode does NOT delete existing data.
         """
+        # Record agent consent before applying the change
+        consent = self.features.get("ConsentFeature") if hasattr(self, 'features') else None
+        if consent:
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    loop.create_task(consent.request_consent(
+                        "privacy_mode_change",
+                        {"from": self._privacy_mode.value, "to": mode.value},
+                    ))
+                else:
+                    loop.run_until_complete(consent.request_consent(
+                        "privacy_mode_change",
+                        {"from": self._privacy_mode.value, "to": mode.value},
+                    ))
+            except Exception:
+                pass  # Never block on consent failure
+
         self._privacy_mode = mode
         self.storage.set_privacy_mode(mode)
         self.privacy_agent.set_mode(mode)

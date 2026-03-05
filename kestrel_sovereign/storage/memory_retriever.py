@@ -160,6 +160,10 @@ class MemoryRetriever:
         # 3. Importance score (from metadata)
         importance = metadata.get("importance", 0.5)
 
+        # Pinned memory boost -- agent-pinned memories always score high
+        if metadata.get("decay_protected"):
+            importance = max(importance, 0.9)
+
         # 4. Recency score (with decay)
         recency = self._score_recency(created_at, importance)
 
