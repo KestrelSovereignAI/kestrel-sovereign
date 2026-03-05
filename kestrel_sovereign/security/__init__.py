@@ -1,7 +1,8 @@
 """
 Security module for Kestrel Agent.
 
-Provides secure key storage, encryption utilities, and authentication.
+Provides secure key storage, encryption utilities, authentication,
+and prompt injection guardrails.
 """
 
 from .key_storage import (
@@ -12,6 +13,12 @@ from .key_storage import (
     KeyDecryptionError,
     migrate_all_plaintext_keys,
 )
+from .input_guardrails import (
+    wrap_user_input,
+    check_prompt_injection,
+    validate_tool_arguments,
+    ANTI_INJECTION_SYSTEM_PROMPT,
+)
 
 __all__ = [
     "SecureKeyStorage",
@@ -20,4 +27,8 @@ __all__ = [
     "MasterKeyNotConfiguredError",
     "KeyDecryptionError",
     "migrate_all_plaintext_keys",
+    "wrap_user_input",
+    "check_prompt_injection",
+    "validate_tool_arguments",
+    "ANTI_INJECTION_SYSTEM_PROMPT",
 ]

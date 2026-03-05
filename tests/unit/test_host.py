@@ -203,8 +203,8 @@ class TestAuthMiddleware:
             host_module.load_rookery_config = original_fn
 
     @pytest.mark.asyncio
-    async def test_query_param_auth(self):
-        """Query parameter authentication works (for SSE)."""
+    async def test_query_param_auth_rejected_on_non_sse_path(self):
+        """Query parameter authentication is rejected on non-SSE paths (#160)."""
         test_key = "test-query-key"
         config = RookeryConfig(agents={})
 
@@ -224,7 +224,7 @@ class TestAuthMiddleware:
                             params={"api_key": test_key},
                         )
 
-            assert resp.status_code == 200
+            assert resp.status_code == 401
         finally:
             host_module.load_rookery_config = original_fn
 

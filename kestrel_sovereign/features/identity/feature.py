@@ -230,6 +230,7 @@ Use `!identity import {filepath}` to restore this identity.
                 package,
                 verify_signature=verify_signature,
                 merge_mode=merge_mode,
+                allow_unsigned=False,
             )
 
             if result.success:

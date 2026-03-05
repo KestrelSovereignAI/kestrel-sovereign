@@ -165,6 +165,7 @@ def save_kestrel_identity(did_document: dict, keys: dict, key_id: str, output_di
         )
         with open(pem_path, 'wb') as f:
             f.write(private_pem)
+        os.chmod(pem_path, 0o600)
         logging.info(f"Saved plaintext private key to {pem_path}")
     except Exception as e:
         logging.error(f"Failed to save private key: {e}")
