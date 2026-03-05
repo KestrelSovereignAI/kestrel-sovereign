@@ -6,12 +6,16 @@ Provides commands to control the bootstrap/discovery process:
 - !restart-discovery - Reset and redo the discovery process
 - !bootstrap-status - Show current bootstrap state
 - !rename - Rename the agent
+- !bootstrap list - Show all loaded bootstrap files
+- !bootstrap reload - Force reload all bootstrap files
+- !bootstrap add <path> - Add a new bootstrap file
+- !bootstrap remove <name> - Remove a bootstrap file from loading
 """
 
 import logging
 import re
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Any, Optional
 
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.tools.base import ToolCategory
@@ -28,6 +32,7 @@ class BootstrapFeature(Feature):
     - Skipping or restarting the discovery process
     - Checking bootstrap status
     - Renaming the agent
+    - Listing, reloading, adding, and removing bootstrap files
     """
 
     def __init__(self, agent):
@@ -36,11 +41,231 @@ class BootstrapFeature(Feature):
     @property
     def tool_description(self) -> str:
         """Description for A2A agent card."""
-        return "Manage agent identity - skip/restart discovery, check status, rename agent"
+        return (
+            "Manage agent identity and bootstrap files - "
+            "skip/restart discovery, check status, rename agent, "
+            "list/reload/add/remove bootstrap files"
+        )
 
     async def initialize(self):
         """Initialize the bootstrap feature."""
         logger.info("BootstrapFeature initialized")
+
+    # ------------------------------------------------------------------
+    # Bootstrap file management tools
+    # ------------------------------------------------------------------
+
+    @tool(
+        name="bootstrap_list",
+        description="Show all loaded bootstrap files and their paths, sizes, and status.",
+        category=ToolCategory.SYSTEM,
+        command_prefix="!bootstrap list"
+    )
+    async def bootstrap_list(self) -> Dict[str, Any]:
+        """
+        List all bootstrap files and their loading status.
+
+        Usage:
+            !bootstrap list
+
+        Shows each configured bootstrap file with:
+        - Filename
+        - Resolved path on disk
+        - Character count
+        - Load status (loaded, not found, skipped)
+        """
+        loader = self._get_loader()
+        if loader is None:
+            return {
+                "success": False,
+                "error": "Bootstrap loader not available (no context_builder).",
+            }
+
+        files = loader.list_files()
+        return {
+            "success": True,
+            "files": files,
+            "total_files": loader.file_count,
+            "total_chars": loader.total_chars,
+            "file_order": loader.file_order,
+        }
+
+    @tool(
+        name="bootstrap_reload",
+        description="Force reload all bootstrap files from disk. Use after editing SOUL.md or other bootstrap files.",
+        category=ToolCategory.SYSTEM,
+        command_prefix="!bootstrap reload"
+    )
+    async def bootstrap_reload(self) -> Dict[str, Any]:
+        """
+        Force reload all bootstrap files from disk.
+
+        Usage:
+            !bootstrap reload
+
+        This re-reads every bootstrap file, picking up any edits
+        made since the agent started.
+        """
+        loader = self._get_loader()
+        if loader is None:
+            return {
+                "success": False,
+                "error": "Bootstrap loader not available (no context_builder).",
+            }
+
+        loader.reload()
+
+        # Also refresh the context_builder cache if it wraps the loader
+        if hasattr(self.agent, 'context_builder'):
+            cb = self.agent.context_builder
+            if hasattr(cb, 'reload_bootstrap_files'):
+                cb.reload_bootstrap_files()
+
+        return {
+            "success": True,
+            "message": "Bootstrap files reloaded.",
+            "loaded_count": loader.file_count,
+            "total_chars": loader.total_chars,
+            "files": [f["name"] for f in loader.list_files() if f["status"] == "loaded"],
+        }
+
+    @tool(
+        name="bootstrap_add",
+        description="Add a new bootstrap file to be loaded at startup.",
+        category=ToolCategory.SYSTEM,
+        command_prefix="!bootstrap add"
+    )
+    async def bootstrap_add(self, file_path: str) -> Dict[str, Any]:
+        """
+        Add a new bootstrap file to the loading convention.
+
+        Usage:
+            !bootstrap add <path>
+
+        Args:
+            file_path: Path to the file to add (absolute, or relative to agent data dir)
+
+        The file is appended to the load order and will be included
+        in the agent's system prompt on next reload.
+        """
+        loader = self._get_loader()
+        if loader is None:
+            return {
+                "success": False,
+                "error": "Bootstrap loader not available (no context_builder).",
+            }
+
+        # Resolve the path
+        resolved = Path(file_path)
+        if not resolved.is_absolute():
+            # Try relative to agent data path
+            agent_data = self._get_agent_data_path()
+            if agent_data:
+                resolved = Path(agent_data) / file_path
+            else:
+                return {
+                    "success": False,
+                    "error": f"Cannot resolve relative path '{file_path}' -- no agent data path configured.",
+                }
+
+        filename = resolved.name
+
+        # Check for duplicate before checking file existence
+        if filename in loader.file_order:
+            return {
+                "success": False,
+                "error": f"File '{filename}' is already in the bootstrap file list.",
+            }
+
+        if not resolved.exists():
+            return {
+                "success": False,
+                "error": f"File not found: {resolved}",
+            }
+
+        loader.add_file(filename)
+
+        # Persist to DB if available
+        db = self._get_db()
+        agent_id = getattr(self.agent, 'agent_id', None)
+        if db and agent_id:
+            try:
+                await loader.save_db_entry(
+                    file_name=filename,
+                    file_path=str(resolved),
+                    enabled=True,
+                    priority=100 + len(loader.file_order),
+                )
+            except Exception as e:
+                logger.warning(f"Failed to persist bootstrap config to DB: {e}")
+
+        # Reload to pick up the new file
+        loader.reload()
+
+        return {
+            "success": True,
+            "message": f"Added '{filename}' to bootstrap files.",
+            "loaded": filename in loader.get_bootstrap_content(),
+        }
+
+    @tool(
+        name="bootstrap_remove",
+        description="Remove a bootstrap file from the loading convention.",
+        category=ToolCategory.SYSTEM,
+        command_prefix="!bootstrap remove"
+    )
+    async def bootstrap_remove(self, name: str) -> Dict[str, Any]:
+        """
+        Remove a bootstrap file from loading.
+
+        Usage:
+            !bootstrap remove <name>
+
+        Args:
+            name: Name of the file to remove (e.g. "GOALS.md")
+
+        The file itself is not deleted from disk -- it is just
+        removed from the list of files loaded into the system prompt.
+        """
+        loader = self._get_loader()
+        if loader is None:
+            return {
+                "success": False,
+                "error": "Bootstrap loader not available (no context_builder).",
+            }
+
+        removed = loader.remove_file(name)
+        if not removed:
+            return {
+                "success": False,
+                "error": f"File '{name}' is not in the bootstrap file list.",
+                "available": loader.file_order,
+            }
+
+        # Remove from DB if available
+        db = self._get_db()
+        agent_id = getattr(self.agent, 'agent_id', None)
+        if db and agent_id:
+            try:
+                await loader.delete_db_entry(name)
+            except Exception as e:
+                logger.warning(f"Failed to remove bootstrap config from DB: {e}")
+
+        # Refresh context builder
+        if hasattr(self.agent, 'context_builder'):
+            cb = self.agent.context_builder
+            if hasattr(cb, 'reload_bootstrap_files'):
+                cb.reload_bootstrap_files()
+
+        return {
+            "success": True,
+            "message": f"Removed '{name}' from bootstrap files.",
+            "remaining": loader.file_order,
+        }
+
+    # ------------------------------------------------------------------
+    # Existing discovery/identity tools
+    # ------------------------------------------------------------------
 
     @tool(
         name="skip_discovery",
@@ -205,6 +430,34 @@ class BootstrapFeature(Feature):
             logger.error(f"Failed to rename agent: {e}")
             return f"Failed to rename: {str(e)}"
 
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _get_loader(self):
+        """Get the BootstrapLoader from the context builder, if available."""
+        cb = getattr(self.agent, 'context_builder', None)
+        if cb is None:
+            return None
+        return getattr(cb, '_bootstrap_loader', None)
+
+    def _get_agent_data_path(self) -> Optional[str]:
+        """Get the agent data path from bootstrap service or context builder."""
+        bs = getattr(self.agent, 'bootstrap_service', None)
+        if bs and hasattr(bs, 'agent_data_path') and bs.agent_data_path:
+            return str(bs.agent_data_path)
+        cb = getattr(self.agent, 'context_builder', None)
+        if cb and hasattr(cb, 'agent_data_path') and cb.agent_data_path:
+            return str(cb.agent_data_path)
+        return None
+
+    def _get_db(self):
+        """Get the async database handle if available."""
+        raw = getattr(self.agent, '_raw_storage', None)
+        if raw and hasattr(raw, 'db'):
+            return raw.db
+        return None
+
     async def _update_soul_name(self, old_name: str, new_name: str) -> bool:
         """
         Update the agent name in SOUL.md if it exists.
@@ -227,10 +480,10 @@ class BootstrapFeature(Feature):
             content = soul_path.read_text(encoding="utf-8")
 
             # Update the header: "# SOUL.md - You Are OldName" -> "# SOUL.md - You Are NewName"
-            # Also handle variations like "# SOUL.md - OldName" or "# SOUL.md — You Are OldName"
+            # Also handle variations like "# SOUL.md - OldName" or "# SOUL.md -- You Are OldName"
             patterns = [
-                (rf"# SOUL\.md\s*[-—]\s*You Are {re.escape(old_name)}", f"# SOUL.md - You Are {new_name}"),
-                (rf"# SOUL\.md\s*[-—]\s*{re.escape(old_name)}", f"# SOUL.md - {new_name}"),
+                (rf"# SOUL\.md\s*[-\u2014]\s*You Are {re.escape(old_name)}", f"# SOUL.md - You Are {new_name}"),
+                (rf"# SOUL\.md\s*[-\u2014]\s*{re.escape(old_name)}", f"# SOUL.md - {new_name}"),
                 (rf"You're {re.escape(old_name)}", f"You're {new_name}"),
                 (rf"I'm {re.escape(old_name)}", f"I'm {new_name}"),
             ]
