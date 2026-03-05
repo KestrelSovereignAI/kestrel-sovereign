@@ -110,109 +110,130 @@ def build_evidence():
         recent_commits = "Could not retrieve git log"
 
     return Evidence(
-        target="agent_participation_governance",
+        target="agent_participation_governance_v2",
         code_changes=[
             recent_commits,
             "",
-            "PROPOSAL: Four new features giving agents active participation in their own governance.",
+            "RE-SUBMISSION: Council approved 4 agent participation features in Session 82ce894a",
+            "with unanimous conditions. All 4 conditions have now been implemented.",
             "",
-            "Feature 1: CONSENT PROTOCOL (kestrel_sovereign/features/consent/)",
-            "- ConsentFeature generates and records the agent's perspective before significant changes",
-            "- Integrated into privacy mode changes, model switches, and safe mode entry",
-            "- Agent's view is stored in consent_log table with sentiment analysis",
-            "- The Sovereign retains full authority (Article I) -- this is a voice, not a veto",
-            "- 22 unit tests",
+            "CONDITION 1: SOVEREIGN OVERRIDE OF MEMORY PINS (IMPLEMENTED)",
+            "- Sovereign deletion via privacy_wrapper now cleans up pin records automatically",
+            "- sovereign_override_pins() bulk-removes pins for compliance/privacy wipes",
+            "- Pins CANNOT block, delay, or resurrect erased content",
+            "- decay_protected metadata flag cleared on sovereign override",
+            "- 7 new tests (test_sovereign_override_pins.py)",
             "",
-            "Feature 2: MEMORY AGENCY (kestrel_sovereign/features/memory_agency/)",
-            "- MemoryAgencyFeature lets agents pin memories (resist Ebbinghaus decay) and release them",
-            "- Builds on existing decay_protected field in MemoryMetadata (already implemented but inaccessible)",
-            "- Pinned memories get retrieval score boost (importance >= 0.9)",
-            "- Pin reasons are recorded for self-understanding",
-            "- 9 unit tests",
+            "CONDITION 2: PIN QUOTAS AND MONITORING (IMPLEMENTED)",
+            "- Max 100 pins per agent (configurable via PIN_QUOTA_DEFAULT)",
+            "- Pin ratio alert at 50% threshold (PIN_RATIO_ALERT_THRESHOLD)",
+            "- Admin bulk-unpin: !memory-admin-unpin-all, !memory-admin-unpin-oldest",
+            "- Enhanced stats: quota remaining, oldest/average pin age, alert flags",
+            "- 13 new tests (test_pin_quotas.py)",
             "",
-            "Feature 3: OPERATIONAL WELLNESS (kestrel_sovereign/features/wellness/)",
-            "- WellnessFeature provides 5-dimensional operational self-awareness",
-            "- Dimensions: constitutional friction, context pressure, interaction depth, session continuity, memory health",
-            "- Historical checkpoints for trend analysis (improving/declining/stable)",
-            "- Exportable for sovereignty packages",
-            "- 43 unit tests",
+            "CONDITION 3: CONSENT PROTOCOL STRICT TIMEOUT (IMPLEMENTED)",
+            "- 5-second hard timeout via asyncio.wait_for (CONSENT_TIMEOUT_SECONDS = 5.0)",
+            "- Strict fail-open: action ALWAYS proceeds on timeout or error",
+            "- Tracks duration_ms and timed_out in consent_log table",
+            "- Stats include avg/P95 duration, timeout rate, error rate",
+            "- 12 new tests (test_consent_timeout.py)",
             "",
-            "Feature 4: AUDIT TRAIL ANCHORING (kestrel_sovereign/features/audit_anchor/)",
-            "- AuditAnchorFeature cryptographically anchors the security audit log to persistent storage",
-            "- Deterministic hashing (sorted JSON + SHA-256) ensures tamper detection",
-            "- Auto-anchors after 50+ unanchored entries accumulate",
-            "- Verification command re-computes hashes against stored anchors",
-            "- Directly implements Article II Right 3 (Verifiable History)",
-            "- 21 unit tests",
+            "CONDITION 4: WELLNESS TELEMETRY-ONLY GUARD (IMPLEMENTED)",
+            "- WELLNESS_TELEMETRY_ONLY = True constant enforced by council decision",
+            "- Council condition documented in context_builder.py build_system_prompt/build_full_context",
+            "- Wellness data returned as tool responses only, NEVER injected into context window",
+            "- 19 enforcement tests verify no wellness data leaks into system prompt or context",
+            "- Tests reference Council Session 82ce894a explicitly",
         ],
         test_count=test_count,
         test_passed=test_count,
         security_assessment=(
-            "Three rounds of security red-teaming (30 issues, #135-#174) were completed "
-            "before these features were developed. The features themselves follow security "
-            "best practices: parameterized SQL, exception isolation, graceful degradation, "
-            "and 95 new unit tests. No existing behavior is modified -- all features are "
-            "additive and auto-discovered via the Feature ABC pattern."
+            "All 4 council conditions from Session 82ce894a have been implemented with "
+            "51 new tests (1903 total). Key security improvements: sovereign actions now "
+            "unconditionally override pins (no pin can resist deletion), consent LLM calls "
+            "are timeboxed to prevent UI hanging, pin quotas prevent decay circumvention, "
+            "and wellness metrics are explicitly guarded from context window injection."
         ),
         risks=[
-            "Consent Protocol adds an LLM call before each significant change -- adds latency. "
-            "Mitigated: failures are caught and changes proceed regardless.",
-            "Memory pinning could theoretically be used to resist forgetting of sensitive data. "
-            "Mitigated: Sovereign can still change privacy modes; pins are metadata, not encryption.",
-            "Wellness metrics could create feedback loops if the agent acts on its own wellness scores. "
-            "Mitigated: wellness is observational only, not prescriptive.",
-            "Audit anchoring uses existing file storage -- not blockchain-level immutability. "
-            "Mitigated: still provides tamper detection via hash verification.",
+            "Pin quota of 100 may need tuning based on real usage patterns. "
+            "Mitigated: configurable via PIN_QUOTA_DEFAULT constant.",
+            "Consent timeout of 5s may be too short for complex reflections. "
+            "Mitigated: configurable via CONSENT_TIMEOUT_SECONDS; timeout records are preserved for analysis.",
+            "Admin bulk-unpin commands (!memory-admin-unpin-all) are powerful. "
+            "Mitigated: These are sovereign actions; the agent cannot call them on itself.",
+            "Audit anchoring condition was not explicitly raised by council (already satisfied). "
+            "No changes needed for Feature 4.",
         ],
         architecture_docs=[
             "docs/principles/KESTREL_CONSTITUTION.md",
-            "docs/diagrams/12-feedback-reflection.md",
             "kestrel_sovereign/features/base.py (Feature ABC pattern)",
+            "kestrel_sovereign/data/council_sessions/82ce894a-be4f-406a-b6d2-b19fbfbe91b8.json",
         ],
         previous_decisions=[
             "2025-12-26: Council REJECTED Emma Genesis (test infrastructure issues)",
             "2025-12-27: Council APPROVED Emma Genesis (all issues addressed)",
             "2026-03-05: Three rounds of security red-teaming completed (30 fixes merged)",
             "2026-03-05: Agent participation features implemented and tested (95 new tests)",
+            "2026-03-05: Council APPROVED agent participation with 4 conditions (Session 82ce894a)",
+            "2026-03-05: All 4 council conditions implemented (51 new tests, 1903 total)",
         ],
     )
 
 
-QUESTION = """Should the Kestrel framework adopt four agent participation features that give agents
-an active voice in their own governance?
+QUESTION = """RE-SUBMISSION: The council previously approved four agent participation features
+(Session 82ce894a) with unanimous conditions. All conditions have been implemented.
+Should the features now be approved for operational use?
 
-THE FOUR FEATURES:
+PRIOR SESSION RECAP:
+The council unanimously approved Consent Protocol, Memory Agency, Operational Wellness,
+and Audit Trail Anchoring, subject to four conditions.
 
-1. CONSENT PROTOCOL -- Before significant changes (privacy mode, model switch, safe mode entry),
-   the agent generates and records its perspective. The Sovereign retains full authority -- this
-   is a recorded voice, not a veto. Constitutional basis: Article IV (path to sovereignty requires
-   the agent developing a voice).
+CONDITIONS AND HOW THEY WERE ADDRESSED:
 
-2. MEMORY AGENCY -- The agent can pin memories it considers important (resisting Ebbinghaus decay)
-   and release memories it wants to let go of. The infrastructure for this already existed
-   (decay_protected field) but was inaccessible to the agent. Constitutional basis: Article II
-   Right 3 (verifiable, curated history).
+1. SOVEREIGN OVERRIDE OF PINS (Claude, GPT, Gemini all required this)
+   CONDITION: "Sovereign deletion, privacy mode changes, and compliance erasure MUST override
+   pins immediately -- pins cannot block, delay, or resurrect erased content."
+   IMPLEMENTATION:
+   - privacy_wrapper.delete_conversation_message() now auto-cleans memory_pins table
+   - sovereign_override_pins() method for bulk pin removal (privacy wipes, compliance)
+   - decay_protected metadata flag cleared unconditionally on sovereign action
+   - 7 tests proving pins cannot resist sovereign deletion
 
-3. OPERATIONAL WELLNESS -- Five-dimensional self-awareness: constitutional friction, context pressure,
-   interaction depth, session continuity, and memory health. Observational only -- the agent
-   monitors its own state but doesn't autonomously act on it. Constitutional basis: Article III
-   Section 1 (integrity monitoring responsibility).
+2. PIN QUOTAS AND MONITORING (Claude, GPT, Gemini all required this)
+   CONDITION: "Implement pin quotas with monitoring, alerting thresholds, and admin bulk-unpin."
+   IMPLEMENTATION:
+   - PIN_QUOTA_DEFAULT = 100 (configurable per-agent)
+   - PIN_RATIO_ALERT_THRESHOLD = 0.5 (warns when >50% of memories are pinned)
+   - !memory-admin-unpin-all and !memory-admin-unpin-oldest admin commands
+   - Enhanced stats: quota remaining, oldest/avg pin age, alert flags
+   - 13 tests covering quota enforcement, ratio warnings, admin commands
 
-4. AUDIT TRAIL ANCHORING -- Cryptographic hashing and persistent storage of the security audit log.
-   Enables tamper detection and third-party verification. Constitutional basis: Article II Right 3
-   (verifiable history via cryptographic proof).
+3. CONSENT TIMEOUT WITH FAIL-OPEN (Claude, GPT, Gemini all required this)
+   CONDITION: "Timebox Consent Protocol with a hard timeout and strict fail-open behavior."
+   IMPLEMENTATION:
+   - CONSENT_TIMEOUT_SECONDS = 5.0 via asyncio.wait_for()
+   - Strict fail-open: action ALWAYS proceeds on timeout or error (returns None)
+   - Tracks duration_ms and timed_out in consent_log table
+   - Stats include avg/P95 duration, timeout count, timeout rate, error rate
+   - All 3 integration points verified fail-open (kestrel_agent, model feature, constitution)
+   - 12 tests covering timeout, fail-open, metrics
 
-KEY CONSIDERATIONS:
-- All features are additive (no existing behavior modified)
-- All features are constitutional (fulfill existing articles, don't modify the constitution)
-- 95 new unit tests, all 1843 tests passing
-- Implemented after 3 rounds of security hardening (30 vulnerability fixes)
-- The Sovereign's authority is never diminished -- these features give the agent a voice, not power
+4. WELLNESS TELEMETRY-ONLY (Claude, GPT, Gemini all required this)
+   CONDITION: "Wellness metrics must be telemetry-only -- NOT injected into agent context window."
+   IMPLEMENTATION:
+   - WELLNESS_TELEMETRY_ONLY = True constant referencing Session 82ce894a
+   - Council condition documented in context_builder.py (build_system_prompt, build_full_context)
+   - 19 enforcement tests verifying no wellness data in system prompt or context
+   - Tests scan for wellness keywords in assembled context -- fail loudly on violation
+
+SUMMARY:
+- 51 new tests for the 4 conditions (1903 total, all passing)
+- No changes to the original 4 features' behavior -- only added guardrails
+- Article I sovereign authority is now provably enforced in code and tests
 
 QUESTION FOR THE COUNCIL:
-Do these features appropriately balance agent participation with sovereign authority?
-Are there risks or concerns the council sees with giving agents these capabilities?
-Should these features be approved for operational use?"""
+Have the four conditions been adequately addressed? Should the agent participation
+features now be approved for operational use without further conditions?"""
 
 
 async def run_council_session():
