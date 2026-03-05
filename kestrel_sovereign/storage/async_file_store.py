@@ -11,6 +11,7 @@ from typing import Dict, Optional, Any
 
 from .async_database import AsyncDatabase
 from .encryption import get_fernet, encrypt_bytes, decrypt_bytes, DecryptionError
+from kestrel_sovereign.kestrel_config.constants import MAX_FILE_SIZE
 
 
 class AsyncFileStore:
@@ -88,6 +89,11 @@ class AsyncFileStore:
     async def store_file(self, content: bytes, original_name: str,
                          metadata: Optional[Dict] = None) -> str:
         """Store a file and return its content hash."""
+        if len(content) > MAX_FILE_SIZE:
+            raise ValueError(
+                f"File size ({len(content)} bytes) exceeds maximum "
+                f"allowed size ({MAX_FILE_SIZE} bytes)"
+            )
         content_hash = hashlib.sha256(content).hexdigest()
         meta = dict(metadata) if metadata else {}
         to_store, was_encrypted = encrypt_bytes(content, self._fernet)

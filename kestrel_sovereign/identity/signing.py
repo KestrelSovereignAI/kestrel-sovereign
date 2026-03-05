@@ -276,6 +276,7 @@ def verify_and_load(
     json_str: str,
     storage_dir: Optional[Path] = None,
     require_valid_signature: bool = False,
+    allow_unsigned: bool = False,
 ) -> Tuple[AgentIdentityPackage, bool, str]:
     """
     Load and verify an identity package from JSON.
@@ -284,6 +285,8 @@ def verify_and_load(
         json_str: JSON string of the package
         storage_dir: Directory containing the agent's keys (for verification)
         require_valid_signature: If True, raise error on invalid signature
+        allow_unsigned: If True, treat unsigned packages as valid (for
+            development/testing). Defaults to False for security.
 
     Returns:
         Tuple of (package, is_valid, message)
@@ -308,7 +311,14 @@ def verify_and_load(
             raise VerificationError(message)
         return package, is_valid, message
 
-    return package, True, "Package has no signature (unsigned)"
+    # Package is unsigned
+    if allow_unsigned:
+        return package, True, "Package has no signature (unsigned, allowed)"
+
+    if require_valid_signature:
+        raise VerificationError("Package has no signature (unsigned)")
+
+    return package, False, "Package has no signature (unsigned)"
 
 
 class PackageSigner:

@@ -1,12 +1,14 @@
 """Unit tests for sovereignty endpoint input sanitization.
 
-Verifies that user-controlled values (tier, cid) are validated before
-being interpolated into command strings passed to agent.process_input().
+Verifies that user-controlled values (tier, cid, max_size) are validated
+before being interpolated into command strings passed to agent.process_input().
 """
+import inspect
 import re
 import pytest
 
-from endpoints.sovereignty import ALLOWED_TIERS, CID_PATTERN
+from endpoints.sovereignty import ALLOWED_TIERS, CID_PATTERN, preview_sovereignty_file
+from kestrel_sovereign.kestrel_config.constants import MAX_SOVEREIGNTY_PREVIEW_SIZE
 
 
 class TestTierValidation:
@@ -79,3 +81,38 @@ class TestCIDValidation:
         assert not CID_PATTERN.match("abc-123")
         assert not CID_PATTERN.match("abc_123")
         assert not CID_PATTERN.match("abc/123")
+
+
+class TestMaxSizeBounded:
+    """Tests that max_size query parameter is bounded."""
+
+    def _get_query(self):
+        """Extract the Query object from preview_sovereignty_file's max_size param."""
+        sig = inspect.signature(preview_sovereignty_file)
+        return sig.parameters["max_size"].default
+
+    def _find_metadata(self, query, cls_name):
+        """Find a metadata constraint by class name (e.g. 'Le', 'Gt')."""
+        for m in query.metadata:
+            if type(m).__name__ == cls_name:
+                return m
+        return None
+
+    def test_max_size_has_upper_bound_via_query(self):
+        """The max_size parameter uses FastAPI Query with le constraint."""
+        query = self._get_query()
+        le_constraint = self._find_metadata(query, "Le")
+        assert le_constraint is not None, "max_size should use Query() with le constraint"
+        assert le_constraint.le == MAX_SOVEREIGNTY_PREVIEW_SIZE
+
+    def test_max_size_rejects_zero_or_negative(self):
+        """The max_size parameter must be greater than 0."""
+        query = self._get_query()
+        gt_constraint = self._find_metadata(query, "Gt")
+        assert gt_constraint is not None, "max_size should use Query() with gt constraint"
+        assert gt_constraint.gt == 0
+
+    def test_max_size_default_value(self):
+        """The max_size parameter defaults to MAX_SOVEREIGNTY_PREVIEW_SIZE."""
+        query = self._get_query()
+        assert query.default == MAX_SOVEREIGNTY_PREVIEW_SIZE

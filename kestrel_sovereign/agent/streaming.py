@@ -6,6 +6,11 @@ from decimal import Decimal
 from typing import Dict, Any
 
 from kestrel_sovereign.llm.adapter import LLMResponse
+from kestrel_sovereign.security.input_guardrails import (
+    wrap_user_input,
+    check_prompt_injection,
+    ANTI_INJECTION_SYSTEM_PROMPT,
+)
 
 
 class StreamingMixin:
@@ -48,6 +53,9 @@ class StreamingMixin:
         # Store user message (linked to session for resumed conversations)
         await self.privacy_agent.add_conversation("user", user_input, session_id=session_id)
 
+        # Prompt injection detection (log-only, does not block)
+        check_prompt_injection(user_input)
+
         # Build full context using context_manager (same as process_input)
         force_local_only = not self.privacy_agent.privacy_config.allows_cloud_llm()
         privacy_mode = self.privacy_agent.privacy_mode.name
@@ -69,12 +77,15 @@ class StreamingMixin:
             conversation_history=history,
         )
 
-        # Build user prompt with context (same as process_input)
+        # Build user prompt with context, wrapping user input in boundary markers
         prompt = self.user_prompt_template.format(
             context="[Context included in system prompt]",
-            query=user_input
+            query=wrap_user_input(user_input)
         )
         system_prompt = context_result.system_prompt
+
+        # Add anti-injection instructions to system prompt
+        system_prompt = f"{system_prompt}\n{ANTI_INJECTION_SYSTEM_PROMPT}"
 
         # Add cached features section
         if self._cached_features_prompt:

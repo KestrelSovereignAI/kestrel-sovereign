@@ -35,6 +35,12 @@ from kestrel_sovereign.storage.memory_consolidator import MemoryConsolidator
 from kestrel_sovereign.storage.memory_system import MemorySystem
 from kestrel_sovereign.hooks import HooksManager, HookEvent, HookInput, HookOutput, PermissionDecision
 from kestrel_sovereign.bootstrap import BootstrapService, BootstrapState
+from kestrel_sovereign.security.input_guardrails import (
+    wrap_user_input,
+    check_prompt_injection,
+    validate_tool_arguments,
+    ANTI_INJECTION_SYSTEM_PROMPT,
+)
 
 # Optional ollama import (not available in remote-only containers)
 try:
@@ -779,6 +785,9 @@ Expected Duration: {expected_duration}
             # Log but continue - we can still process without storing
             logging.warning("DecryptionError storing user input - continuing in degraded mode")
 
+        # Prompt injection detection (log-only, does not block)
+        check_prompt_injection(user_input)
+
         # Use unified ContextManager for token-aware context assembly
         # This handles: system prompt, episodes, memories, RAG, history
         constitution = await self._get_governing_constitution()
@@ -831,15 +840,18 @@ Expected Duration: {expected_duration}
         # Log system prompt length for debugging memory access issues
         logging.debug(f"[CONTEXT] System prompt length: {len(context_result.system_prompt)} chars")
 
-        # Build user prompt with context
+        # Build user prompt with context, wrapping user input in boundary markers
         prompt = self.user_prompt_template.format(
             context="[Context included in system prompt]",
-            query=user_input
+            query=wrap_user_input(user_input)
         )
 
-        # Build system prompt with features
+        # Build system prompt with features and anti-injection defense
         force_local_only = not self.privacy_agent.privacy_config.allows_cloud_llm()
         system_prompt = context_result.system_prompt
+
+        # Add anti-injection instructions to system prompt
+        system_prompt = f"{system_prompt}\n{ANTI_INJECTION_SYSTEM_PROMPT}"
 
         # Add cached features section (built once at session start)
         if self._cached_features_prompt:
@@ -1237,15 +1249,34 @@ Expected Duration: {expected_duration}
         # Build feature lookup by tool_name
         features_by_tool_name = {f.tool_name: f for f in self.features.values()}
 
+        # Build known tool allowlist for argument validation
+        known_tools = set(features_by_tool_name.keys()) | set(self._direct_tools.keys())
+
         for iteration in range(max_iterations):
             # Warn when approaching iteration limit
             if iteration >= max_iterations * 0.8:  # 80% threshold
                 logging.warning(f"[ORCHESTRATOR] Approaching max iterations: {iteration + 1}/{max_iterations}")
-            
+
             # Execute each tool call by dispatching to features
             for tool_call in response.tool_calls:
                 tool_name = tool_call.name
                 args = tool_call.arguments if isinstance(tool_call.arguments, dict) else {}
+
+                # Validate tool arguments before execution
+                is_valid, validation_error = validate_tool_arguments(
+                    tool_name, args, known_tools=known_tools
+                )
+                if not is_valid:
+                    logging.warning(f"[ORCHESTRATOR] Tool validation failed: {validation_error}")
+                    result = {"success": False, "error": f"Tool validation failed: {validation_error}"}
+                    from kestrel_sovereign.features.base import _serialize_tool_result
+                    result_json = json.dumps(_serialize_tool_result(result))
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "content": result_json
+                    })
+                    continue
 
                 # Log tool dispatch start
                 dispatch_start = time.time()
@@ -1476,11 +1507,30 @@ Expected Duration: {expected_duration}
 
         features_by_tool_name = {f.tool_name: f for f in self.features.values()}
 
+        # Build known tool allowlist for argument validation
+        known_tools = set(features_by_tool_name.keys()) | set(self._direct_tools.keys())
+
         for iteration in range(max_iterations):
             # Execute tool calls - stream activity indicators to user
             for tool_call in response.tool_calls:
                 tool_name = tool_call.name
                 args = tool_call.arguments if isinstance(tool_call.arguments, dict) else {}
+
+                # Validate tool arguments before execution
+                is_valid, validation_error = validate_tool_arguments(
+                    tool_name, args, known_tools=known_tools
+                )
+                if not is_valid:
+                    logging.warning(f"[ORCHESTRATOR-STREAM] Tool validation failed: {validation_error}")
+                    result = {"success": False, "error": f"Tool validation failed: {validation_error}"}
+                    from kestrel_sovereign.features.base import _serialize_tool_result
+                    result_json = json.dumps(_serialize_tool_result(result))
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "content": result_json
+                    })
+                    continue
 
                 # Stream tool start indicator to user
                 if tool_events is not None:
