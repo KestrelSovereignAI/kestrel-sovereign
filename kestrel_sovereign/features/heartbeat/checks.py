@@ -1,0 +1,311 @@
+"""
+Individual health check functions for the Heartbeat Feature.
+
+Each check function returns a dict with:
+    name: str       - human-readable check name
+    status: str     - "pass", "warn", or "fail"
+    message: str    - description of the result
+    duration_ms: float - wall-clock time for the check
+
+Checks are designed to be fast and non-destructive.
+"""
+
+import logging
+import shutil
+import time
+from typing import Any, Dict
+
+logger = logging.getLogger(__name__)
+
+
+async def check_database(db) -> Dict[str, Any]:
+    """Check database connectivity with a simple query.
+
+    Args:
+        db: AsyncDatabase instance (may be None)
+
+    Returns:
+        Check result dict
+    """
+    start = time.monotonic()
+
+    if db is None:
+        return {
+            "name": "database",
+            "status": "fail",
+            "message": "No database connection available",
+            "duration_ms": _elapsed(start),
+        }
+
+    try:
+        # Simple read query to verify the connection is alive
+        row = await db.fetchone("SELECT 1")
+        if row and row[0] == 1:
+            return {
+                "name": "database",
+                "status": "pass",
+                "message": "Database connection healthy",
+                "duration_ms": _elapsed(start),
+            }
+        return {
+            "name": "database",
+            "status": "warn",
+            "message": "Database returned unexpected result",
+            "duration_ms": _elapsed(start),
+        }
+    except Exception as e:
+        return {
+            "name": "database",
+            "status": "fail",
+            "message": f"Database query failed: {e}",
+            "duration_ms": _elapsed(start),
+        }
+
+
+async def check_llm_service(agent) -> Dict[str, Any]:
+    """Verify that an LLM provider is configured and accessible.
+
+    This does NOT make an LLM call -- it only checks that the
+    service object exists and has a provider configured.
+
+    Args:
+        agent: KestrelAgent instance
+
+    Returns:
+        Check result dict
+    """
+    start = time.monotonic()
+
+    llm_service = getattr(agent, "llm_service", None)
+    if llm_service is None:
+        return {
+            "name": "llm_service",
+            "status": "fail",
+            "message": "No LLM service configured",
+            "duration_ms": _elapsed(start),
+        }
+
+    try:
+        # Check that at least one provider is available
+        provider = getattr(llm_service, "provider", None)
+        adapter = getattr(llm_service, "adapter", None)
+        model_pref = None
+        if hasattr(llm_service, "get_model_preference"):
+            model_pref = llm_service.get_model_preference()
+
+        if provider or adapter:
+            provider_name = str(provider or adapter)
+            msg = f"LLM provider available: {provider_name}"
+            if model_pref:
+                msg += f" (model: {model_pref})"
+            return {
+                "name": "llm_service",
+                "status": "pass",
+                "message": msg,
+                "duration_ms": _elapsed(start),
+            }
+
+        return {
+            "name": "llm_service",
+            "status": "warn",
+            "message": "LLM service exists but no provider/adapter found",
+            "duration_ms": _elapsed(start),
+        }
+    except Exception as e:
+        return {
+            "name": "llm_service",
+            "status": "fail",
+            "message": f"LLM service check failed: {e}",
+            "duration_ms": _elapsed(start),
+        }
+
+
+async def check_memory_system(agent) -> Dict[str, Any]:
+    """Verify that the memory retriever and consolidator are accessible.
+
+    Args:
+        agent: KestrelAgent instance
+
+    Returns:
+        Check result dict
+    """
+    start = time.monotonic()
+
+    try:
+        storage = getattr(agent, "storage", None)
+        if storage is None:
+            return {
+                "name": "memory_system",
+                "status": "fail",
+                "message": "No storage system available",
+                "duration_ms": _elapsed(start),
+            }
+
+        # Check for memory retriever
+        retriever = getattr(storage, "retriever", None) or getattr(
+            agent, "memory_retriever", None
+        )
+        # Check for memory consolidator
+        consolidator = getattr(storage, "consolidator", None) or getattr(
+            agent, "memory_consolidator", None
+        )
+
+        components = []
+        if retriever:
+            components.append("retriever")
+        if consolidator:
+            components.append("consolidator")
+
+        db = getattr(storage, "db", None)
+        if db:
+            components.append("database")
+
+        if not components:
+            return {
+                "name": "memory_system",
+                "status": "warn",
+                "message": "Storage exists but no memory components found",
+                "duration_ms": _elapsed(start),
+            }
+
+        return {
+            "name": "memory_system",
+            "status": "pass",
+            "message": f"Memory system components: {', '.join(components)}",
+            "duration_ms": _elapsed(start),
+        }
+    except Exception as e:
+        return {
+            "name": "memory_system",
+            "status": "fail",
+            "message": f"Memory system check failed: {e}",
+            "duration_ms": _elapsed(start),
+        }
+
+
+async def check_disk_space(threshold_mb: int = 100) -> Dict[str, Any]:
+    """Check available disk space on the root filesystem.
+
+    Args:
+        threshold_mb: Minimum free MB before warning (default 100)
+
+    Returns:
+        Check result dict
+    """
+    start = time.monotonic()
+
+    try:
+        usage = shutil.disk_usage("/")
+        free_mb = usage.free / (1024 * 1024)
+        total_mb = usage.total / (1024 * 1024)
+        used_pct = (usage.used / usage.total) * 100 if usage.total > 0 else 0
+
+        if free_mb < threshold_mb:
+            return {
+                "name": "disk_space",
+                "status": "warn" if free_mb > threshold_mb / 2 else "fail",
+                "message": (
+                    f"Low disk space: {free_mb:.0f}MB free "
+                    f"({used_pct:.1f}% used of {total_mb:.0f}MB)"
+                ),
+                "duration_ms": _elapsed(start),
+            }
+
+        return {
+            "name": "disk_space",
+            "status": "pass",
+            "message": (
+                f"Disk space OK: {free_mb:.0f}MB free "
+                f"({used_pct:.1f}% used of {total_mb:.0f}MB)"
+            ),
+            "duration_ms": _elapsed(start),
+        }
+    except Exception as e:
+        return {
+            "name": "disk_space",
+            "status": "fail",
+            "message": f"Disk space check failed: {e}",
+            "duration_ms": _elapsed(start),
+        }
+
+
+async def check_context_budget(agent) -> Dict[str, Any]:
+    """Check context window utilization.
+
+    Args:
+        agent: KestrelAgent instance
+
+    Returns:
+        Check result dict
+    """
+    start = time.monotonic()
+
+    try:
+        ctx = getattr(agent, "context_manager", None)
+        if ctx is not None:
+            tokens_used = getattr(ctx, "tokens_used", 0) or 0
+            tokens_max = getattr(ctx, "max_tokens", 0) or getattr(
+                ctx, "tokens_max", 0
+            ) or 0
+
+            if tokens_max > 0:
+                utilization = tokens_used / tokens_max
+                status = "pass"
+                if utilization > 0.9:
+                    status = "fail"
+                elif utilization > 0.75:
+                    status = "warn"
+
+                return {
+                    "name": "context_budget",
+                    "status": status,
+                    "message": (
+                        f"Context: {tokens_used}/{tokens_max} tokens "
+                        f"({utilization * 100:.1f}% used)"
+                    ),
+                    "duration_ms": _elapsed(start),
+                }
+
+        # Fallback: try llm_service.token_budget
+        llm = getattr(agent, "llm_service", None)
+        if llm is not None:
+            budget = getattr(llm, "token_budget", None)
+            if budget is not None:
+                used = getattr(budget, "used", 0) or 0
+                total = getattr(budget, "total", 0) or 0
+                if isinstance(used, (int, float)) and isinstance(total, (int, float)) and total > 0:
+                    utilization = used / total
+                    status = "pass"
+                    if utilization > 0.9:
+                        status = "fail"
+                    elif utilization > 0.75:
+                        status = "warn"
+
+                    return {
+                        "name": "context_budget",
+                        "status": status,
+                        "message": (
+                            f"Token budget: {used}/{total} tokens "
+                            f"({utilization * 100:.1f}% used)"
+                        ),
+                        "duration_ms": _elapsed(start),
+                    }
+
+        return {
+            "name": "context_budget",
+            "status": "pass",
+            "message": "Context budget not tracked (no context manager)",
+            "duration_ms": _elapsed(start),
+        }
+    except Exception as e:
+        return {
+            "name": "context_budget",
+            "status": "fail",
+            "message": f"Context budget check failed: {e}",
+            "duration_ms": _elapsed(start),
+        }
+
+
+def _elapsed(start: float) -> float:
+    """Return elapsed time in milliseconds since start."""
+    return round((time.monotonic() - start) * 1000, 2)

@@ -202,7 +202,7 @@ async def auth_middleware(request: Request, call_next):
     1. API key (X-API-Key header, Bearer token, or query param) — for programmatic access
     2. OAuth session cookie — for browser access via Google sign-in
     """
-    public_paths = ["/health", "/api/auth/key", "/favicon.ico", "/webhooks/stripe/crypto"]
+    public_paths = ["/health", "/health/detailed", "/api/auth/key", "/favicon.ico", "/webhooks/stripe/crypto"]
     auth_paths = ["/auth/login", "/auth/callback", "/auth/logout"]
     static_prefixes = ["/static", "/js/", "/shared/", "/utils/"]
 
@@ -350,6 +350,55 @@ def health_check(request: Request):
     if hasattr(request.app.state, 'agent') and request.app.state.agent:
         return {"status": "ok", "agent_initialized": True}
     return {"status": "ok", "agent_initialized": False}
+
+
+@app.get("/health/detailed")
+async def health_detailed(request: Request):
+    """Detailed health check using the HeartbeatFeature.
+
+    Returns individual check results for database, LLM service,
+    memory system, disk space, and context budget.
+    """
+    agent = getattr(request.app.state, 'agent', None)
+    if not agent:
+        return {"status": "unhealthy", "error": "No agent available", "checks": []}
+
+    # Find the HeartbeatFeature among the agent's features
+    features = getattr(agent, 'features', [])
+    heartbeat_feature = None
+    for feat in features:
+        if feat.__class__.__name__ == "HeartbeatFeature":
+            heartbeat_feature = feat
+            break
+
+    if not heartbeat_feature:
+        # Fallback: run checks directly without the feature
+        from kestrel_sovereign.features.heartbeat.checks import (
+            check_database, check_llm_service, check_memory_system,
+            check_disk_space, check_context_budget,
+        )
+        db = None
+        if hasattr(agent, 'storage') and agent.storage:
+            db = getattr(agent.storage, 'db', None)
+
+        checks = [
+            await check_database(db),
+            await check_llm_service(agent),
+            await check_memory_system(agent),
+            await check_disk_space(),
+            await check_context_budget(agent),
+        ]
+        statuses = [c.get("status") for c in checks]
+        if "fail" in statuses:
+            overall = "unhealthy"
+        elif "warn" in statuses:
+            overall = "degraded"
+        else:
+            overall = "healthy"
+        return {"status": overall, "checks": checks}
+
+    result = await heartbeat_feature.get_latest_heartbeat()
+    return result
 
 
 # Stripe Crypto On-Ramp webhook endpoint

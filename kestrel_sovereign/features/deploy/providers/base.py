@@ -97,3 +97,11 @@ class DeployProvider(ABC):
             Health result dict with keys: healthy, status_code, response_time
         """
         ...
+
+    def cleanup(self) -> None:
+        """
+        Clean up provider resources (temp files, credentials, etc.).
+
+        Called during explicit teardown or when the provider is no longer needed.
+        Subclasses should override to clean up provider-specific resources.
+        """

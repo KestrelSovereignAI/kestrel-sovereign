@@ -97,6 +97,23 @@ class CloudRunProvider(DeployProvider):
                 logger.debug(f"Cleaned up temp credentials: {self._temp_cred_file}")
             except OSError:
                 pass
+            self._temp_cred_file = None
+
+    def cleanup(self) -> None:
+        """
+        Clean up provider resources.
+
+        Removes temporary credential files created from inline
+        GCP_SERVICE_ACCOUNT_KEY. Safe to call multiple times.
+        """
+        self._cleanup_temp_creds()
+
+    def __del__(self):
+        """Safety net: clean up temp files if cleanup() was never called."""
+        try:
+            self._cleanup_temp_creds()
+        except Exception:
+            pass
 
     def _get_services_client(self):
         """Lazy-load the Cloud Run services client."""
