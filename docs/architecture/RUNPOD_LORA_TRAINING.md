@@ -451,7 +451,6 @@ Base URL: `https://<pod-id>-8000.proxy.runpod.net`
 | `/generate/async` | POST | **Async generation (recommended)** - returns job_id |
 | `/generate/status/{job_id}` | GET | Poll async generation status/results |
 | `/loras` | GET | List available trained LoRAs |
-| `/debug/exec` | GET | Debug command execution |
 | `/debug/logs/{job_id}` | GET | Get training logs, checkpoints, TensorBoard events |
 
 ### Async Generation (Recommended)
@@ -487,11 +486,7 @@ curl -X POST "https://rdbmipru7tqs9g-8000.proxy.runpod.net/train" \
 
 ### Issue 2: Network Volume Not Mounted
 **Symptom:** `HF_HOME=/tmp/huggingface`, models lost on restart
-**Diagnosis:**
-```bash
-curl -s "https://<pod>-8000.proxy.runpod.net/debug/exec?cmd=env%20%7C%20grep%20HF"
-curl -s "https://<pod>-8000.proxy.runpod.net/debug/exec?cmd=mount%20%7C%20grep%20workspace"
-```
+**Diagnosis:** SSH into the pod and check `env | grep HF` and `mount | grep workspace`.
 **Fix:** Pod must be created with `network_volume_id` in RunPod config
 
 ### Issue 3: "Separator is not found" Error
@@ -600,24 +595,6 @@ runpod pod resume ipjkh8tbnuz098
 ## Debugging Commands
 
 ```bash
-# Check GPU
-curl -s ".../debug/exec?cmd=nvidia-smi"
-
-# Check HF cache location
-curl -s ".../debug/exec?cmd=env%20%7C%20grep%20HF"
-
-# Check if workspace mounted
-curl -s ".../debug/exec?cmd=df%20-h%20%7C%20grep%20workspace"
-
-# Check training process
-curl -s ".../debug/exec?cmd=ps%20aux%20%7C%20grep%20train"
-
-# Check SimpleTuner debug.log (verbose output)
-curl -s ".../debug/exec?cmd=tail%20-100%20/app/debug.log"
-
-# Check for LoRA output
-curl -s ".../debug/exec?cmd=find%20/app/output%20-name%20%27*.safetensors%27"
-
 # Get full training logs via API (checkpoints, TensorBoard, debug.log)
 curl -s ".../debug/logs/{job_id}?lines=200"
 ```

@@ -7,7 +7,6 @@ Provides REST API for LoRA training management.
 import logging
 import os
 import shutil
-import subprocess
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -17,7 +16,6 @@ import aiofiles
 from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 
-from kestrel_sovereign.kestrel_config.constants import HTTP_TIMEOUT_DEFAULT
 from .. import config as app_config
 from ..training import create_simpletuner_config, run_training
 
@@ -37,23 +35,6 @@ async def health_check():
         "jobs_count": len(app_config.training_jobs),
         "workspace_path": paths["base_path"],
     }
-
-
-@router.get("/debug/exec")
-async def debug_exec(cmd: str = "which simpletuner"):
-    """Debug endpoint to execute commands and see what's available."""
-    try:
-        result = subprocess.run(
-            cmd, shell=True, capture_output=True, text=True, timeout=HTTP_TIMEOUT_DEFAULT
-        )
-        return {
-            "command": cmd,
-            "stdout": result.stdout,
-            "stderr": result.stderr,
-            "returncode": result.returncode,
-        }
-    except Exception as e:
-        return {"command": cmd, "error": str(e)}
 
 
 @router.get("/debug/logs/{job_id}")

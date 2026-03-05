@@ -243,18 +243,23 @@ async def download_sovereignty_file(request: Request, filename: str):
 
     filepath = STORAGE_CACHE_DIR / filename
 
-    if not filepath.exists():
-        raise HTTPException(status_code=404, detail="File not found.")
-
-    if not filepath.is_file():
-        raise HTTPException(status_code=400, detail="Not a file.")
-
     try:
-        filepath.resolve().relative_to(STORAGE_CACHE_DIR.resolve())
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid file path.")
+        # Resolve once with strict=True (raises OSError if path doesn't exist)
+        real_path = filepath.resolve(strict=True)
+        cache_dir = STORAGE_CACHE_DIR.resolve()
 
-    return FileResponse(path=filepath, filename=filename, media_type="application/octet-stream")
+        if not str(real_path).startswith(str(cache_dir) + os.sep):
+            raise HTTPException(status_code=400, detail="Invalid file path.")
+
+        if not real_path.is_file():
+            raise HTTPException(status_code=400, detail="Not a file.")
+
+        # Use the resolved real path for FileResponse to prevent symlink swap
+        return FileResponse(path=str(real_path), filename=filename, media_type="application/octet-stream")
+    except HTTPException:
+        raise
+    except (OSError, ValueError):
+        raise HTTPException(status_code=404, detail="File not found.")
 
 
 @router.get("/sovereignty/files/{filename}/preview")
@@ -269,22 +274,27 @@ async def preview_sovereignty_file(
 
     filepath = STORAGE_CACHE_DIR / filename
 
-    if not filepath.exists():
+    try:
+        # Resolve once with strict=True (raises OSError if path doesn't exist)
+        real_path = filepath.resolve(strict=True)
+        cache_dir = STORAGE_CACHE_DIR.resolve()
+
+        if not str(real_path).startswith(str(cache_dir) + os.sep):
+            raise HTTPException(status_code=400, detail="Invalid file path.")
+
+        if not real_path.is_file():
+            raise HTTPException(status_code=400, detail="Not a file.")
+    except HTTPException:
+        raise
+    except (OSError, ValueError):
         raise HTTPException(status_code=404, detail="File not found.")
 
-    if not filepath.is_file():
-        raise HTTPException(status_code=400, detail="Not a file.")
-
-    try:
-        filepath.resolve().relative_to(STORAGE_CACHE_DIR.resolve())
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid file path.")
-
-    stat = filepath.stat()
+    # Use the resolved real path for all subsequent operations
+    stat = real_path.stat()
     size = stat.st_size
 
     try:
-        with open(filepath, 'rb') as f:
+        with open(real_path, 'rb') as f:
             content_bytes = f.read(max_size)
 
         try:

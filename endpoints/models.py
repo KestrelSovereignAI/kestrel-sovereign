@@ -413,7 +413,7 @@ async def update_key(request: Request, provider: str):
 
 
 @router.get("/api/keys/{provider}/usage")
-async def get_key_usage(request: Request, provider: str, days: int = Query(30)):
+async def get_key_usage(request: Request, provider: str, days: int = Query(30, ge=1, le=365)):
     """Get usage history for a specific API key."""
     if not hasattr(request.app.state, 'agent') or not request.app.state.agent:
         raise HTTPException(status_code=503, detail="Agent not initialized.")

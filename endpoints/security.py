@@ -4,9 +4,11 @@ Kestrel Security API Endpoints.
 Provides REST API for managing security permissions and approval queue.
 """
 
-from fastapi import APIRouter, Request, HTTPException
+from fastapi import APIRouter, Query, Request, HTTPException
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
+
+from kestrel_sovereign.rate_limit import limiter
 
 router = APIRouter(prefix="/api/security", tags=["security"])
 
@@ -137,6 +139,7 @@ async def get_permission_tree(request: Request):
 
 
 @router.post("/permissions")
+@limiter.limit("30/minute")
 async def set_tool_permission(request: Request, data: SetPermissionRequest):
     """
     Set permission for a specific tool.
@@ -167,6 +170,7 @@ async def set_tool_permission(request: Request, data: SetPermissionRequest):
 
 
 @router.post("/permissions/feature")
+@limiter.limit("30/minute")
 async def set_feature_permission(request: Request, data: SetFeaturePermissionRequest):
     """
     Set permission for all tools in a feature (bulk update).
@@ -214,6 +218,7 @@ async def get_pending_approvals(request: Request):
 
 
 @router.post("/approve")
+@limiter.limit("30/minute")
 async def submit_approval(request: Request, data: ApprovalDecisionRequest):
     """
     Submit approval decision for a pending request.
@@ -249,19 +254,13 @@ async def submit_approval(request: Request, data: ApprovalDecisionRequest):
 
 
 @router.get("/audit", response_model=AuditLogResponse)
-async def get_audit_log(request: Request, limit: int = 50):
+async def get_audit_log(request: Request, limit: int = Query(50, ge=1, le=500)):
     """
     Get security audit log.
 
     Returns recent permission decisions and user choices.
     """
     security = get_security_feature(request)
-
-    if limit < 1 or limit > 500:
-        raise HTTPException(
-            status_code=400,
-            detail="Limit must be between 1 and 500"
-        )
 
     logs = await security.permission_store.get_audit_log(limit)
 
@@ -282,6 +281,7 @@ async def get_audit_log(request: Request, limit: int = 50):
 
 
 @router.post("/cancel/{request_id}")
+@limiter.limit("30/minute")
 async def cancel_request(request: Request, request_id: str):
     """
     Cancel a pending approval request.
@@ -300,6 +300,7 @@ async def cancel_request(request: Request, request_id: str):
 
 
 @router.post("/cancel-all")
+@limiter.limit("30/minute")
 async def cancel_all_requests(request: Request):
     """
     Cancel all pending approval requests.
@@ -312,6 +313,7 @@ async def cancel_all_requests(request: Request):
 
 
 @router.post("/reset-session")
+@limiter.limit("30/minute")
 async def reset_session_overrides(request: Request):
     """
     Clear all session-scoped permission overrides.

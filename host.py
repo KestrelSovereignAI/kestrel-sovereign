@@ -22,6 +22,7 @@ Architecture:
 Key principle: No agent is privileged. The host treats all agents as equal peers.
 """
 
+import ipaddress
 import os
 import secrets
 import logging
@@ -207,6 +208,14 @@ async def auth_middleware(request: Request, call_next):
 # --- Routes ---
 
 
+def _is_docker_network(host: str) -> bool:
+    """Check if the host IP is within Docker's internal network range (172.16.0.0/12)."""
+    try:
+        return ipaddress.ip_address(host) in ipaddress.ip_network("172.16.0.0/12")
+    except ValueError:
+        return False
+
+
 @app.get("/", response_class=HTMLResponse)
 async def serve_index():
     """Serve the main web UI."""
@@ -221,7 +230,7 @@ async def get_bootstrap_key(request: Request):
     """Return API key for initial frontend setup (localhost only)."""
     client_host = request.client.host if request.client else None
     allowed_hosts = {"127.0.0.1", "localhost", "::1", "172.17.0.1"}
-    is_docker_internal = client_host and client_host.startswith("172.")
+    is_docker_internal = client_host and _is_docker_network(client_host)
 
     if client_host not in allowed_hosts and not is_docker_internal:
         raise HTTPException(
