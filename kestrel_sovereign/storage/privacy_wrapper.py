@@ -544,7 +544,17 @@ class PrivacyEnforcingStorage:
             "DELETE FROM conversation_history WHERE id = ? AND agent_id = ?",
             (message_id, agent_id)
         )
-        return result.rowcount > 0 if hasattr(result, 'rowcount') else True
+        deleted = result.rowcount > 0 if hasattr(result, 'rowcount') else True
+
+        # Sovereign override: clean up any pins on this message.
+        # Pins CANNOT block, delay, or resurrect erased content.
+        if deleted:
+            await self._storage.db.execute_commit(
+                "DELETE FROM memory_pins WHERE message_id = ? AND agent_id = ?",
+                (message_id, agent_id)
+            )
+
+        return deleted
 
     # === Pass-through properties (with deprecation warnings) ===
     #

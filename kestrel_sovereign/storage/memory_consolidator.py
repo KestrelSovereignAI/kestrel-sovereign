@@ -419,7 +419,9 @@ class MemoryConsolidator:
             if metadata.get("archived"):
                 continue
 
-            # Skip protected
+            # decay_protected pins prevent ROUTINE archival only.
+            # Sovereign deletion (privacy wipes, compliance erasure) overrides
+            # pins unconditionally -- see MemoryAgencyFeature.sovereign_override_pins().
             if metadata.get("decay_protected"):
                 continue
 

@@ -344,6 +344,11 @@ Use `!constitution article <N>` for specific articles, or `!constitution search 
         """
         Build the complete system prompt for the LLM.
 
+        COUNCIL CONDITION: Wellness metrics are telemetry-only.
+        Do NOT add wellness data to the system prompt or context.
+        Wellness is accessible to the agent via tool calls only.
+        See: Council Session 82ce894a
+
         Args:
             constitution: The governing constitution text
             include_briefing: Whether to include the session briefing
@@ -508,6 +513,11 @@ Use `!constitution article <N>` for specific articles, or `!constitution search 
 
         Assembles all context sources (system prompt, history, episodes,
         RAG) within the model's token budget using adaptive allocation.
+
+        COUNCIL CONDITION: Wellness metrics are telemetry-only.
+        Do NOT add wellness data to any part of the context.
+        Wellness is accessible to the agent via tool calls only.
+        See: Council Session 82ce894a
 
         Args:
             query: The current user query

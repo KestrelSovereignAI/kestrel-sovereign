@@ -22,12 +22,17 @@ class ConsentRecord:
     The Sovereign retains full authority -- this is a voice, not a veto.
     The agent expresses its view, and the record captures whether the
     Sovereign proceeded and any override reason provided.
+
+    Timing fields (duration_ms, timed_out) track LLM call latency and
+    whether the consent request hit the hard timeout.
     """
     id: str
     action_type: str
     action_details: Dict[str, Any]
     agent_view: str
-    agent_sentiment: str  # positive, negative, neutral, concerned
+    agent_sentiment: str  # positive, negative, neutral, concerned, timeout
     sovereign_proceeded: bool = True
     sovereign_override_reason: Optional[str] = None
     timestamp: str = ""
+    duration_ms: Optional[float] = None
+    timed_out: bool = False
