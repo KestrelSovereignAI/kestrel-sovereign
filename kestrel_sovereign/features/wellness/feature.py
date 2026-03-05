@@ -32,14 +32,28 @@ from .metrics import (
 
 logger = logging.getLogger(__name__)
 
+# COUNCIL CONDITION: Wellness metrics are TELEMETRY-ONLY.
+# They must NEVER be injected into the agent's system prompt or context window.
+# The agent can observe its own metrics via tools, but metrics do not influence
+# LLM reasoning directly.
+# Ref: Council Session 82ce894a - unanimous condition from all 3 members.
+WELLNESS_TELEMETRY_ONLY = True  # Enforced by council decision
+
 
 class WellnessFeature(Feature):
     """
-    Agent operational wellness monitoring.
+    Agent operational wellness monitoring (TELEMETRY-ONLY).
 
     Measures health across 5 dimensions and stores checkpoints
     for historical trend analysis. Designed to give the agent
     self-awareness of its operational state.
+
+    COUNCIL CONDITION (Session 82ce894a):
+    Wellness metrics are telemetry-only by default. They are accessible
+    via tool calls (observation), but must NEVER be injected into the
+    agent's system prompt or context window. This enforces a strict
+    observation/action boundary -- the agent can read its own metrics,
+    but the metrics do not directly influence LLM reasoning.
     """
 
     @property
@@ -111,6 +125,11 @@ class WellnessFeature(Feature):
     )
     async def wellness_check(self) -> Dict[str, Any]:
         """Run all metric calculators, compute overall score, save checkpoint.
+
+        Returns wellness metrics as a tool response (telemetry-only).
+
+        COUNCIL CONDITION: This data is returned to the tool caller only.
+        It is NOT injected into the system prompt or agent context window.
 
         Returns:
             Dict with per-dimension metrics, overall score, and checkpoint id
@@ -211,6 +230,11 @@ class WellnessFeature(Feature):
     async def wellness_history(self, limit: int = 10) -> Dict[str, Any]:
         """Query wellness checkpoints ordered by created_at DESC.
 
+        Returns wellness history as a tool response (telemetry-only).
+
+        COUNCIL CONDITION: This data is returned to the tool caller only.
+        It is NOT injected into the system prompt or agent context window.
+
         Args:
             limit: Maximum number of checkpoints to return (default: 10)
 
@@ -280,6 +304,11 @@ class WellnessFeature(Feature):
     )
     async def wellness_export(self) -> Dict[str, Any]:
         """Return all wellness checkpoints for sovereignty export.
+
+        Returns wellness export as a tool response (telemetry-only).
+
+        COUNCIL CONDITION: This data is returned to the tool caller only.
+        It is NOT injected into the system prompt or agent context window.
 
         Returns:
             Dict with all checkpoints and metadata for inclusion in

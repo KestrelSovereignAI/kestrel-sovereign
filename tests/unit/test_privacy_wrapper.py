@@ -492,12 +492,20 @@ class TestPrivacyAwareQueries:
 
     @pytest.mark.asyncio
     async def test_delete_message_normal_mode(self, mock_storage):
-        """NORMAL mode should delete from persistent database."""
+        """NORMAL mode should delete from persistent database and clean up pins."""
         wrapper = PrivacyEnforcingStorage(mock_storage, PrivacyMode.NORMAL)
 
         result = await wrapper.delete_conversation_message(42, "agent-1")
         assert result is True
-        mock_storage.db.execute_commit.assert_called_once()
+        # Two execute_commit calls: one for the message deletion,
+        # one for the sovereign pin cleanup.
+        assert mock_storage.db.execute_commit.call_count == 2
+        # First call deletes from conversation_history
+        first_call = mock_storage.db.execute_commit.call_args_list[0]
+        assert "conversation_history" in first_call[0][0]
+        # Second call cleans up memory_pins
+        second_call = mock_storage.db.execute_commit.call_args_list[1]
+        assert "memory_pins" in second_call[0][0]
 
     @pytest.mark.asyncio
     async def test_delete_message_ephemeral_raises(self, mock_storage):

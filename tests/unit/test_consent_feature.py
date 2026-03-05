@@ -236,10 +236,10 @@ class TestConsentLog:
         agent.storage.db.fetchall = AsyncMock(return_value=[
             ("id1", "did:test:1", "privacy_mode_change",
              '{"from": "normal", "to": "ephemeral"}',
-             "Seems fine.", "positive", 1, None, "2026-03-05T00:00:00"),
+             "Seems fine.", "positive", 1, None, 150.0, 0, "2026-03-05T00:00:00"),
             ("id2", "did:test:1", "model_change",
              '{"from": "gpt-4", "to": "llama3"}',
-             "I have concerns about this.", "concerned", 1, None, "2026-03-05T01:00:00"),
+             "I have concerns about this.", "concerned", 1, None, 200.0, 0, "2026-03-05T01:00:00"),
         ])
 
         feature = ConsentFeature(agent)
