@@ -95,6 +95,16 @@ class SovereigntyFeature(Feature):
         )
         await self.agent.storage.add_node(receipt_node)
 
+        # Include audit anchors in sovereignty export
+        try:
+            for feature in getattr(self.agent, 'features', {}).values():
+                if type(feature).__name__ == 'AuditAnchorFeature':
+                    status = await feature.anchor_status()
+                    receipt_node.properties["audit_anchors"] = status.get("result", status)
+                    break
+        except Exception:
+            pass  # Don't fail export on anchor failure
+
         return f"""✅ Sovereignty Export Complete.
 CID: {result.ipfs_cid or result.content_hash}
 Tier: {tier_enum.value}
