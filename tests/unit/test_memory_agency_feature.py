@@ -118,10 +118,21 @@ class FakeDB:
                     ))
             return results
 
+        # SELECT pinned_at FROM memory_pins WHERE released_at IS NULL
+        if (
+            "select pinned_at from memory_pins" in sql_lower
+            and "released_at is null" in sql_lower
+        ):
+            return [
+                (p["pinned_at"],)
+                for p in self.pins.values()
+                if p["released_at"] is None
+            ]
+
         return []
 
     async def fetchval(self, sql, params=()):
-        """Handle SELECT COUNT(*) queries."""
+        """Handle SELECT COUNT(*) and aggregate queries."""
         sql_lower = sql.strip().lower()
 
         if "count(*)" in sql_lower and "conversation_history" in sql_lower:
@@ -138,12 +149,20 @@ class FakeDB:
                 return sum(1 for p in self.pins.values() if p["released_at"] is not None)
             return len(self.pins)
 
+        if "min(pinned_at)" in sql_lower:
+            active = [p["pinned_at"] for p in self.pins.values() if p["released_at"] is None]
+            return min(active) if active else None
+
+        if "max(pinned_at)" in sql_lower:
+            active = [p["pinned_at"] for p in self.pins.values() if p["released_at"] is None]
+            return max(active) if active else None
+
         return 0
 
 
 def _make_feature(fake_db, agent_id="test-agent"):
     """Create a MemoryAgencyFeature with a mocked agent and fake database."""
-    from kestrel_sovereign.features.memory_agency.feature import MemoryAgencyFeature
+    from kestrel_sovereign.features.memory_agency.feature import MemoryAgencyFeature, PIN_QUOTA_DEFAULT
 
     storage = MagicMock()
     storage.db = fake_db
@@ -155,6 +174,7 @@ def _make_feature(fake_db, agent_id="test-agent"):
     feature = MemoryAgencyFeature(agent)
     feature.storage = storage
     feature.agent_id = agent_id
+    feature.pin_quota = PIN_QUOTA_DEFAULT
     return feature
 
 
