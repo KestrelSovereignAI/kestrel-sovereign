@@ -67,6 +67,8 @@ async def login(request: Request):
         # Cloud Run terminates TLS, so the app sees HTTP internally.
         # Use X-Forwarded-Proto to build the correct HTTPS URL.
         proto = request.headers.get("x-forwarded-proto", callback_url.scheme)
+        if proto not in ("http", "https"):
+            proto = callback_url.scheme
         redirect_uri = str(callback_url.replace(scheme=proto))
 
     return await oauth.google.authorize_redirect(request, redirect_uri)

@@ -8,6 +8,8 @@ from pydantic import BaseModel, Field
 from typing import Any, Dict, List, Optional
 import logging
 
+from kestrel_sovereign.rate_limit import limiter
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/saved-items", tags=["saved-items"])
@@ -215,6 +217,7 @@ async def get_item(request: Request, item_id: str):
 
 
 @router.post("")
+@limiter.limit("30/minute")
 async def save_item(request: Request, body: SaveItemRequest):
     """Save a new item."""
     try:
@@ -247,6 +250,7 @@ async def save_item(request: Request, body: SaveItemRequest):
 
 
 @router.post("/structured")
+@limiter.limit("30/minute")
 async def save_structured_item(request: Request, body: SaveStructuredItemRequest):
     """Save a structured item with schema validation."""
     try:
@@ -276,6 +280,7 @@ async def save_structured_item(request: Request, body: SaveStructuredItemRequest
 
 
 @router.post("/search")
+@limiter.limit("30/minute")
 async def search_items(request: Request, body: SearchRequest):
     """Semantic search across saved items."""
     try:
@@ -300,6 +305,7 @@ async def search_items(request: Request, body: SearchRequest):
 
 
 @router.patch("/{item_id}")
+@limiter.limit("30/minute")
 async def update_item(request: Request, item_id: str, body: UpdateItemRequest):
     """Update an existing item."""
     try:
@@ -328,6 +334,7 @@ async def update_item(request: Request, item_id: str, body: UpdateItemRequest):
 
 
 @router.post("/{item_id}/pin")
+@limiter.limit("30/minute")
 async def pin_to_ipfs(request: Request, item_id: str):
     """Pin an existing item to IPFS."""
     try:
@@ -353,6 +360,7 @@ async def pin_to_ipfs(request: Request, item_id: str):
 
 
 @router.delete("/{item_id}")
+@limiter.limit("30/minute")
 async def delete_item(request: Request, item_id: str):
     """Delete a saved item."""
     try:
