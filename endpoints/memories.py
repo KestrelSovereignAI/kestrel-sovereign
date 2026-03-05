@@ -1,6 +1,8 @@
 """Memory and knowledge graph endpoints."""
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Query, Request
 import logging
+
+from kestrel_sovereign.rate_limit import limiter
 
 logger = logging.getLogger(__name__)
 
@@ -8,7 +10,7 @@ router = APIRouter(prefix="/api", tags=["memories"])
 
 
 @router.get("/memories")
-async def list_memories(request: Request, node_type: str = None, limit: int = 100):
+async def list_memories(request: Request, node_type: str = None, limit: int = Query(100, ge=1, le=500)):
     """List knowledge graph nodes (memories)."""
     if not hasattr(request.app.state, 'agent') or not request.app.state.agent:
         raise HTTPException(status_code=503, detail="Agent not initialized.")
@@ -151,6 +153,7 @@ async def get_identity_chain(request: Request):
 
 
 @router.delete("/memories/{node_id}")
+@limiter.limit("30/minute")
 async def delete_memory(request: Request, node_id: str):
     """Delete a memory node from the knowledge graph."""
     if not hasattr(request.app.state, 'agent') or not request.app.state.agent:

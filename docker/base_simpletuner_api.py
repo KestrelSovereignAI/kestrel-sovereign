@@ -1287,23 +1287,6 @@ class BaseSimpleTunerAPI:
                 "workspace_path": _runtime_paths["base_path"],
             }
 
-        @self.app.get("/debug/exec")
-        async def debug_exec(cmd: str = "which simpletuner"):
-            """Debug endpoint to execute commands and see what's available."""
-            import subprocess
-            try:
-                result = subprocess.run(
-                    cmd, shell=True, capture_output=True, text=True, timeout=HTTP_TIMEOUT_DEFAULT
-                )
-                return {
-                    "command": cmd,
-                    "stdout": result.stdout,
-                    "stderr": result.stderr,
-                    "returncode": result.returncode,
-                }
-            except Exception as e:
-                return {"command": cmd, "error": str(e)}
-
         @self.app.get("/debug/logs/{job_id}")
         async def get_training_logs(job_id: str, lines: int = 100):
             """Get training logs for a job."""

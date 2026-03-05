@@ -1,9 +1,11 @@
 """Conversation and session endpoints."""
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import PlainTextResponse
 from datetime import datetime
 import json
 import logging
+
+from kestrel_sovereign.rate_limit import limiter
 
 from kestrel_sovereign.kestrel_config.constants import SESSION_GAP_MINUTES
 from kestrel_sovereign.storage.encryption import get_fernet, get_agent_fernet, decrypt_string
@@ -14,7 +16,7 @@ router = APIRouter(prefix="/api", tags=["conversations"])
 
 
 @router.get("/sessions")
-async def list_sessions(request: Request, limit: int = 50):
+async def list_sessions(request: Request, limit: int = Query(50, ge=1, le=500)):
     """List conversation sessions with summary info."""
     if not hasattr(request.app.state, 'agent') or not request.app.state.agent:
         raise HTTPException(status_code=503, detail="Agent not initialized.")
@@ -39,7 +41,7 @@ async def list_sessions(request: Request, limit: int = 50):
 
 
 @router.get("/conversations")
-async def list_conversations(request: Request, limit: int = 50, decrypt: bool = True):
+async def list_conversations(request: Request, limit: int = Query(50, ge=1, le=500), decrypt: bool = True):
     """List conversation sessions grouped by date/time."""
     if not hasattr(request.app.state, 'agent') or not request.app.state.agent:
         raise HTTPException(status_code=503, detail="Agent not initialized.")
@@ -169,7 +171,7 @@ async def list_conversations(request: Request, limit: int = 50, decrypt: bool = 
 
 
 @router.get("/conversations/{session_id}")
-async def get_conversation(request: Request, session_id: str, limit: int = 100, decrypt: bool = True):
+async def get_conversation(request: Request, session_id: str, limit: int = Query(100, ge=1, le=500), decrypt: bool = True):
     """Get messages for a specific conversation session."""
     if not hasattr(request.app.state, 'agent') or not request.app.state.agent:
         raise HTTPException(status_code=503, detail="Agent not initialized.")
@@ -290,6 +292,7 @@ async def get_conversation(request: Request, session_id: str, limit: int = 100, 
 
 
 @router.post("/conversations/new")
+@limiter.limit("30/minute")
 async def start_new_conversation(request: Request):
     """Start a new conversation by adding a session marker."""
     if not hasattr(request.app.state, 'agent') or not request.app.state.agent:
@@ -321,6 +324,7 @@ async def start_new_conversation(request: Request):
 
 
 @router.delete("/conversations/messages/{message_id}")
+@limiter.limit("30/minute")
 async def delete_message(request: Request, message_id: int):
     """Delete a single message by ID with agent_id isolation."""
     if not hasattr(request.app.state, 'agent') or not request.app.state.agent:

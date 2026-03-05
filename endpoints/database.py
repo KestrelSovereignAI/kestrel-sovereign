@@ -1,5 +1,5 @@
 """Database explorer endpoints."""
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Query, Request
 from pathlib import Path
 import logging
 
@@ -95,8 +95,8 @@ async def list_database_tables(request: Request):
 async def query_database_table(
     request: Request,
     table_name: str,
-    limit: int = 50,
-    offset: int = 0,
+    limit: int = Query(50, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
     search: str = None
 ):
     """Read-only query of a specific table with pagination."""
