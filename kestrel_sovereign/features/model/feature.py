@@ -256,6 +256,19 @@ class ModelAgent(Feature):
                         )
                     }
 
+            # Record agent consent before applying the change
+            consent = self.agent.features.get("ConsentFeature") if hasattr(self.agent, 'features') else None
+            if consent:
+                try:
+                    current_pref = self.llm_service.get_model_preference()
+                    current_model = current_pref.get('model', 'unknown')
+                    await consent.request_consent(
+                        "model_change",
+                        {"from": current_model, "to": model_name, "provider": provider},
+                    )
+                except Exception:
+                    pass  # Never block on consent failure
+
             # Safe to switch
             self.llm_service.set_model_preference(model_name, provider)
             full_model = f"{provider}/{model_name}" if provider else model_name

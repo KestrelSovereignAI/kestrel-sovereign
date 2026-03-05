@@ -50,6 +50,15 @@ class ConstitutionMixin:
             self._interaction_count = 0
             self._last_audit_time = datetime.now(timezone.utc)
 
+            # Notify audit anchor feature if available
+            try:
+                for feature in getattr(self, 'features', {}).values():
+                    if type(feature).__name__ == 'AuditAnchorFeature':
+                        await feature.on_audit_complete({"is_valid": is_valid, "message": message})
+                        break
+            except Exception as e:
+                logging.warning(f"Audit anchor notification failed: {e}")
+
     async def _verify_constitution_integrity(self) -> Tuple[bool, str]:
         """
         Verify that the constitution file hasn't been tampered with.
@@ -103,6 +112,17 @@ class ConstitutionMixin:
 
     async def enter_safe_mode(self, reason: str):
         """Enter safe mode when integrity checks fail."""
+        # Record agent consent before entering safe mode
+        consent = self.features.get("ConsentFeature") if hasattr(self, 'features') else None
+        if consent:
+            try:
+                await consent.request_consent(
+                    "safe_mode_entry",
+                    {"reason": reason},
+                )
+            except Exception:
+                pass  # Never block on consent failure -- safe mode is critical
+
         self._safe_mode = True
         logging.critical(f"ENTERING SAFE MODE: {reason}")
         await self.privacy_agent.add_conversation(
