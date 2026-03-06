@@ -63,6 +63,8 @@ coverage.xml
 .hypothesis/
 playwright-report/
 test-results/
+demo-output/
+demo-report/
 
 # Node
 node_modules/
