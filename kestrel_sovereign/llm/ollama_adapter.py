@@ -425,11 +425,62 @@ class OllamaAdapter(LLMAdapter):
             tools=tools
         )
 
+    # Minimum parameter count for reliable tool calling.
+    # Models below this can chat but can't handle function calling schemas.
+    # Ollama's /api/show gives us exact param counts — no guessing.
+    MIN_TOOL_PARAMS = 7_000_000_000  # 7B
+
+    async def _check_tool_support(self, client: "ollama.AsyncClient", model_name: str) -> bool:
+        """Check if a model supports tool calling via /api/show metadata.
+
+        Two conditions must be met:
+        1. The model's template includes .Tools (knows the format)
+        2. The model has >= MIN_TOOL_PARAMS parameters (can follow instructions)
+
+        Returns:
+            True if the model can reliably handle tool calling
+        """
+        try:
+            info = await client.show(model_name)
+            # Extract template — check for .Tools presence
+            template = ""
+            if isinstance(info, dict):
+                template = info.get("template", "")
+            elif hasattr(info, "template"):
+                template = info.template or ""
+
+            has_tools_template = ".Tools" in template
+
+            # Extract parameter count
+            # The Python SDK uses 'modelinfo', the JSON API uses 'model_info'
+            param_count = 0
+            model_info = None
+            if isinstance(info, dict):
+                model_info = info.get("model_info", {}) or info.get("modelinfo", {})
+            elif hasattr(info, "modelinfo"):
+                model_info = info.modelinfo or {}
+            elif hasattr(info, "model_info"):
+                model_info = info.model_info or {}
+
+            if isinstance(model_info, dict):
+                param_count = model_info.get("general.parameter_count", 0) or 0
+
+            supports = has_tools_template and param_count >= self.MIN_TOOL_PARAMS
+            logger.debug(
+                f"Tool support for {model_name}: template={has_tools_template}, "
+                f"params={param_count:,}, supports_tools={supports}"
+            )
+            return supports
+        except Exception as e:
+            logger.warning(f"Could not check tool support for {model_name}: {e}")
+            return False
+
     async def list_models(self) -> List[ModelInfo]:
         """
         List available models from local Ollama instance.
 
-        Uses ollama.list() to discover locally available models.
+        Uses ollama.list() to discover locally available models,
+        then ollama.show() per model to detect tool calling capability.
 
         Returns:
             List of ModelInfo objects for each available model
@@ -495,13 +546,16 @@ class OllamaAdapter(LLMAdapter):
                 # Detect vision support
                 supports_vision = any(v in lower_name for v in ["vision", "llava", "llama3.2"])
 
+                # Detect tool support from API metadata (template + param count)
+                supports_tools = await self._check_tool_support(client, model_name)
+
                 models.append(ModelInfo(
                     id=model_name,
                     provider="ollama",
                     display_name=display_name,
                     category=category,
                     supports_vision=supports_vision,
-                    supports_tools=True,  # Ollama 0.4+ supports tools
+                    supports_tools=supports_tools,
                     supports_streaming=True,
                     size_gb=size_gb,
                 ))

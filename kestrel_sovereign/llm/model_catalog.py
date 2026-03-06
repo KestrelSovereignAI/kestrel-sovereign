@@ -44,6 +44,7 @@ class ModelCatalogService:
         self._categories: Dict[str, Dict[str, List[str]]] = {}
         self._hidden: Dict[str, Set[str]] = {}
         self._context_limits: Dict[str, int] = {}
+        self._tool_support: Dict[str, bool] = {}
         self._loaded = False
 
     def load(self) -> None:
@@ -77,6 +78,9 @@ class ModelCatalogService:
 
             # Parse context limits
             self._context_limits = self._config.get("context_limits", {})
+
+            # Parse tool support overrides
+            self._tool_support = self._config.get("tool_support", {})
 
             self._loaded = True
             logger.info(f"Loaded model catalog from {self.config_path}")
@@ -168,6 +172,24 @@ class ModelCatalogService:
 
         return None
 
+    def get_tool_support(self, model_id: str) -> Optional[bool]:
+        """Get tool support override for a model.
+
+        Returns:
+            True/False if explicitly configured, None if not in catalog.
+        """
+        self._ensure_loaded()
+
+        if model_id in self._tool_support:
+            return self._tool_support[model_id]
+
+        # Try base model name (before :)
+        base_model = model_id.split(":")[0]
+        if base_model in self._tool_support:
+            return self._tool_support[base_model]
+
+        return None
+
     def enrich_model(self, model: ModelInfo) -> ModelInfo:
         """
         Enrich a ModelInfo with catalog data.
@@ -195,6 +217,11 @@ class ModelCatalogService:
         context_limit = self.get_context_limit(model.id)
         if context_limit is not None:
             model.context_limit = context_limit
+
+        # Override tool support if explicitly configured (catalog wins over adapter)
+        tool_support = self.get_tool_support(model.id)
+        if tool_support is not None:
+            model.supports_tools = tool_support
 
         return model
 
