@@ -608,7 +608,18 @@ No other text or formatting.
             if not available_providers:
                 raise RuntimeError("No local providers available.")
 
+            # Clear any cloud model override — use the local provider's own model
+            if model_override and not any(
+                model_override == p["model"] for p in available_providers
+            ):
+                logger.info(f"LOCAL_ONLY: ignoring cloud model '{model_override}', using local model")
+                model_override = None
+                target_model = None
+
             logger.info(f"LOCAL_ONLY mode: {[p['name'] for p in available_providers]}")
+
+        # Strip tools if the target model can't handle them
+        tools = self._check_model_tool_support(available_providers, tools, model_override)
 
         mandated_provider = None
         if target_model:
@@ -990,6 +1001,14 @@ No other text or formatting.
         providers = self.providers
         if force_local_only:
             providers = [p for p in providers if p["name"] in ["ollama"]]
+            # Clear any cloud model override — use the local provider's own model
+            if model_override and providers and not any(
+                model_override == p["model"] for p in providers
+            ):
+                model_override = None
+
+        # Strip tools if the target model can't handle them
+        tools = self._check_model_tool_support(providers, tools, model_override)
 
         # Handle model override with provider prefix (e.g., "openai/gpt-5-mini")
         target_provider = None

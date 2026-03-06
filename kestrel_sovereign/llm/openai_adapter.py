@@ -481,6 +481,7 @@ class OpenAIAdapter(LLMAdapter):
                     provider="openai",
                     display_name=display_name,
                     category=ModelCategory.CHAT,  # Will be enriched by catalog service
+                    supports_tools=True,  # OpenAI models support tools
                     created_at=str(model.created) if hasattr(model, 'created') else None,
                 ))
 
