@@ -56,7 +56,7 @@ Output lands in `tests/e2e/demo-output/` — video (.webm), 15 screenshots, and 
 - DID: `did:pkh:eip155:1:0x0667B3c466...` (Ethereum-compatible, freshly generated)
 - Blue "Decentralized Identifier" highlight badge
 
-![Identity panel showing DID](https://github.com/KestrelSovereignAI/kestrel-sovereign/raw/main/docs/demo-screenshots/01-did-identity.png)
+![Identity panel showing DID](/docs/demo-screenshots/01-did-identity.png)
 
 **Talking points by audience:**
 
@@ -83,13 +83,13 @@ The agent responds with a detailed explanation of its constitutional framework �
 - Mentions Digital Rights: Freedom of Mind, Data Sanctity, Verifiable History, Right of Exit
 - Agent acknowledges the owner's authority
 
-![Agent response referencing constitutional principles](https://github.com/KestrelSovereignAI/kestrel-sovereign/raw/main/docs/demo-screenshots/02-chat-response.png)
+![Agent response referencing constitutional principles](/docs/demo-screenshots/02-chat-response.png)
 
 > **On screen:** Constitution panel showing the full document
 
 Switching to the Constitution tab reveals the full text — "The Kestrel Constitution: A Digital Bill of Rights" — with the SHA-256 hash visible in the corner.
 
-![Constitution panel with hash](https://github.com/KestrelSovereignAI/kestrel-sovereign/raw/main/docs/demo-screenshots/03-constitution-panel.png)
+![Constitution panel with hash](/docs/demo-screenshots/03-constitution-panel.png)
 
 **Talking points by audience:**
 
@@ -114,13 +114,13 @@ The agent stores the fact and acknowledges it. Then we ask: *"Can you confirm wh
 The agent recalls from its memory records:
 > "Your favorite programming language is **Rust** and your lucky number is **7742**."
 
-![Agent confirms recall from memory records](https://github.com/KestrelSovereignAI/kestrel-sovereign/raw/main/docs/demo-screenshots/05-memory-recalled.png)
+![Agent confirms recall from memory records](/docs/demo-screenshots/05-memory-recalled.png)
 
 > **On screen:** Memories panel — the Knowledge Graph
 
 The Memories panel shows the structured graph: agent node, constitution document — each with type badges and inspect/delete controls.
 
-![Knowledge Graph showing typed nodes](https://github.com/KestrelSovereignAI/kestrel-sovereign/raw/main/docs/demo-screenshots/06-memories-panel.png)
+![Knowledge Graph showing typed nodes](/docs/demo-screenshots/06-memories-panel.png)
 
 **Talking points by audience:**
 
@@ -140,7 +140,7 @@ The Memories panel shows the structured graph: agent node, constitution document
 
 The privacy indicator shows **NORMAL** — standard persistence with all features enabled.
 
-![NORMAL privacy mode active](https://github.com/KestrelSovereignAI/kestrel-sovereign/raw/main/docs/demo-screenshots/07-privacy-normal.png)
+![NORMAL privacy mode active](/docs/demo-screenshots/07-privacy-normal.png)
 
 > **On screen:** Privacy dropdown showing all 5 levels
 
@@ -154,19 +154,19 @@ Clicking the indicator reveals the full privacy spectrum:
 | **NORMAL** | Standard persistence with all features |
 | **PUBLIC** | Can be shared and exported publicly |
 
-![All 5 privacy modes visible](https://github.com/KestrelSovereignAI/kestrel-sovereign/raw/main/docs/demo-screenshots/08-privacy-dropdown.png)
+![All 5 privacy modes visible](/docs/demo-screenshots/08-privacy-dropdown.png)
 
 > **On screen:** EPHEMERAL mode active — red indicator, toast confirmation
 
 We switch to EPHEMERAL. The indicator turns red. A toast confirms: "Privacy mode set to EPHEMERAL."
 
-![EPHEMERAL mode with red indicator](https://github.com/KestrelSovereignAI/kestrel-sovereign/raw/main/docs/demo-screenshots/09-privacy-ephemeral.png)
+![EPHEMERAL mode with red indicator](/docs/demo-screenshots/09-privacy-ephemeral.png)
 
 > **On screen:** Ephemeral chat — agent shows provider enforcement
 
 Sending a message in EPHEMERAL mode triggers the privacy enforcement: only local LLM providers allowed. Cloud providers are blocked.
 
-![Ephemeral mode enforces local-only LLM](https://github.com/KestrelSovereignAI/kestrel-sovereign/raw/main/docs/demo-screenshots/10-ephemeral-chat.png)
+![Ephemeral mode enforces local-only LLM](/docs/demo-screenshots/10-ephemeral-chat.png)
 
 We restore NORMAL mode and continue.
 
@@ -188,7 +188,7 @@ We restore NORMAL mode and continue.
 
 The Sovereignty panel shows the agent's data ownership controls. For this fresh agent, the export history is empty — "No exports yet."
 
-![Data Sovereignty panel](https://github.com/KestrelSovereignAI/kestrel-sovereign/raw/main/docs/demo-screenshots/12-sovereignty-panel.png)
+![Data Sovereignty panel](/docs/demo-screenshots/12-sovereignty-panel.png)
 
 > **On screen:** Export modal — three storage tiers
 
@@ -199,7 +199,7 @@ Clicking "Export to IPFS" opens the export dialog with three tiers:
 
 Encryption is enabled by default.
 
-![Export modal with 3 storage tiers](https://github.com/KestrelSovereignAI/kestrel-sovereign/raw/main/docs/demo-screenshots/13-export-modal.png)
+![Export modal with 3 storage tiers](/docs/demo-screenshots/13-export-modal.png)
 
 **Talking points by audience:**
 
