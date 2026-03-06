@@ -55,7 +55,7 @@ Your agent is now running at `http://localhost:8888`.
 
 > **Port conflict?** Each agent has its own config. Edit `agent_data/myagent/kestrel.toml` to change the port, or use `--port 8899` on the command line.
 
-> **Test it:** Visit `http://localhost:8888/health` in your browser, or connect [Open WebUI](https://github.com/open-webui/open-webui) to the OpenAI-compatible endpoint at `/v1/chat/completions`.
+> **Test it:** Visit `http://localhost:8888` in your browser to open the built-in **Sovereign Console** (web UI with Chat, Identity, Constitution, Memories, and more). Or check `http://localhost:8888/health` for a quick health check.
 
 ### CLI Commands (Cross-Platform)
 
@@ -119,7 +119,26 @@ KESTREL_DB_PATH=./agent_data/myagent uv run uvicorn server:app --port 8888
 uv run python main.py ./agent_data/myagent
 ```
 
-> **Note:** `main.py` expects a **directory** containing `kestrel_prime.db`, not the database file itself.
+> **Note:** `KESTREL_DB_PATH` is a **directory** path, not a file path. The database file `kestrel_prime.db` is created inside the specified directory. For example, setting `KESTREL_DB_PATH=./agent_data/myagent` stores the database at `./agent_data/myagent/kestrel_prime.db`.
+
+## 🖥️ Web UI (Sovereign Console)
+
+Kestrel includes a built-in web interface called the **Sovereign Console**. Once your agent is running, open `http://localhost:8888` in any browser -- no additional software required.
+
+The console provides 8 tabs:
+
+| Tab | Description |
+|-----|-------------|
+| **Identity** | View the agent's DID, name, and cryptographic identity |
+| **Chat** | Converse with the agent (supports model selection, privacy modes, chat history) |
+| **Constitution** | View and audit the agent's constitutional principles |
+| **Memories** | Browse the agent's knowledge graph and stored memories |
+| **Tasks** | Monitor background tasks and activity |
+| **Sovereignty** | Manage data sovereignty, backups, and exports |
+| **Resources** | View agent resource usage and configuration |
+| **Security** | Manage permissions, audit logs, and session security |
+
+> **Alternative clients:** The server also exposes an OpenAI-compatible API at `/v1/chat/completions`, so you can connect any OpenAI-compatible client (e.g., [Open WebUI](https://github.com/open-webui/open-webui)) if you prefer.
 
 ## 🏗️ Architecture Overview
 
@@ -257,7 +276,7 @@ See `.env.example` for a complete list. Key variables:
 - `ANTHROPIC_API_KEY`: Anthropic API key for Claude models
 
 **Storage:**
-- `KESTREL_DB_PATH`: Custom database location (default: `./agent_data`)
+- `KESTREL_DB_PATH`: Directory where the agent database is stored (default: `./agent_data`). This is a **directory** path -- the database file `kestrel_prime.db` is created inside it.
 - `KESTREL_DATA_KEY`: Fernet encryption key for data at rest
 
 **GitHub Integration:**
@@ -355,12 +374,12 @@ uv run python server.py
 
 ## 🧩 OpenAI-Compatible API
 
-The server exposes minimal OpenAI-compatible endpoints:
+The server exposes OpenAI-compatible endpoints for use with third-party clients:
 
 - `GET /v1/models`
 - `POST /v1/chat/completions`
 
-Point Open WebUI or any OpenAI client at your server (http://localhost:7777). Use model from `/v1/models`.
+For most users, the built-in **Sovereign Console** at `http://localhost:8888` is the easiest way to interact with your agent (see [Web UI](#-web-ui-sovereign-console) above). If you prefer an external client, point any OpenAI-compatible tool (e.g., [Open WebUI](https://github.com/open-webui/open-webui)) at your server's `/v1/chat/completions` endpoint. Use the model name from `/v1/models`.
 
 ## 🤝 Contributing
 
