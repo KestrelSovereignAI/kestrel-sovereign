@@ -89,13 +89,16 @@ class ModelDiscoveryMixin:
                 provider_name = provider.get('name')
                 model_id = provider.get('model')
                 if model_id and model_id not in discovered_ids:
+                    # Cloud providers always support tools; only Ollama needs detection
+                    is_cloud = provider_name not in ("ollama",)
                     all_models.append(ModelInfo(
                         id=model_id,
                         provider=provider_name,
                         display_name=model_id,
                         category=ModelCategory.CHAT,
                         is_featured=True,  # Configured models are featured
-                        is_hidden=False
+                        is_hidden=False,
+                        supports_tools=is_cloud,
                     ))
                     discovered_ids.add(model_id)
                     logger.debug(f"Added configured model: {provider_name}/{model_id}")

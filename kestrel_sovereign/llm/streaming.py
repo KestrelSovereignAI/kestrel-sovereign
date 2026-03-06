@@ -36,6 +36,68 @@ class StreamingMixin:
     - _deactivate_remote_backend(reason: Optional[str]) -> None
     """
 
+    # Cloud providers always support tools — only gate local models
+    _CLOUD_PROVIDERS = frozenset({
+        "openai", "anthropic", "claude_max", "vertex_ai", "google",
+        "openrouter", "runpod", "xai", "groq", "together",
+        "mistral", "perplexity", "fireworks", "azure_openai",
+    })
+
+    def _check_model_tool_support(
+        self,
+        providers: list,
+        tools: Optional[list],
+        model_override: Optional[str] = None,
+    ) -> Optional[list]:
+        """Check if the target model supports tools; strip them if not.
+
+        Uses discovered ModelInfo from the model cache to make the decision.
+        Cloud providers always support tools. This only gates local models
+        (Ollama) where small models can't handle tool calling.
+
+        Returns:
+            The tools list (unchanged) if supported, or None if not.
+        """
+        if not tools:
+            return tools
+
+        # Determine target provider — cloud providers always support tools
+        target_provider = None
+        if providers:
+            p = providers[0]
+            target_provider = p["name"] if isinstance(p, dict) else getattr(p, "name", None)
+
+        if target_provider in self._CLOUD_PROVIDERS:
+            return tools  # Cloud providers always support tools
+
+        # Resolve which model we'll actually use
+        target_model = model_override
+        if target_model and "/" in target_model:
+            _, target_model = target_model.split("/", 1)
+        if not target_model and providers:
+            p = providers[0]
+            target_model = p["model"] if isinstance(p, dict) else getattr(p, "model", None)
+
+        if not target_model:
+            return tools  # Can't determine model, pass tools through
+
+        # Check discovered model info (exact match only — no substring matching)
+        cache = getattr(self, "_model_cache", None)
+        if not cache:
+            return tools  # No discovery data yet, pass tools through
+
+        for model_info in cache:
+            if model_info.id == target_model:
+                if not model_info.supports_tools:
+                    logger.info(
+                        f"Model {target_model} does not support tools "
+                        f"({model_info.size_gb or '?'}GB) — sending without tools"
+                    )
+                    return None
+                return tools
+
+        return tools  # Model not in cache, pass tools through
+
     async def get_streaming_response(
         self,
         system_prompt: str,
@@ -241,6 +303,11 @@ class StreamingMixin:
         providers = self.providers
         if force_local_only:
             providers = [p for p in providers if p["name"] in ["ollama"]]
+            # Clear any cloud model override — use the local provider's own model
+            if model_override and providers and not any(
+                model_override == p["model"] for p in providers
+            ):
+                model_override = None
 
         last_error = None
         for provider in providers:
@@ -344,6 +411,19 @@ class StreamingMixin:
             providers = [p for p in providers if p["name"] in ["ollama"]]
             if not providers:
                 raise LLMStreamingError("No local providers available")
+            # Clear any cloud model override — use the local provider's own model
+            if model_override and not any(
+                model_override == p["model"] or model_override.endswith("/" + p["model"])
+                for p in providers
+            ):
+                logger.info(
+                    f"LOCAL_ONLY: ignoring cloud model override '{model_override}', "
+                    f"using local model '{providers[0]['model']}'"
+                )
+                model_override = None
+
+        # Strip tools if the target model can't handle them
+        tools = self._check_model_tool_support(providers, tools, model_override)
 
         # Handle model override with provider prefix (e.g., "openai/gpt-5-mini")
         target_provider = None

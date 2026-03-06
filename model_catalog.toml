@@ -147,3 +147,11 @@ openai = ["babbage-002", "davinci-002"]
 "grok-4-1-fast-non-reasoning" = 128000
 
 # OpenRouter: context limits come from API response (context_length field)
+
+# Tool calling support overrides
+# Ollama auto-detects via /api/show (template + parameter count >= 7B).
+# Cloud providers (OpenAI, Anthropic, Vertex) always support tools.
+# Use this section to override when auto-detection is wrong.
+[tool_support]
+# "deepseek-r1:14b" = false   # Reasoning model, can't do function calling
+# "phi4" = true                # Works despite being smaller
