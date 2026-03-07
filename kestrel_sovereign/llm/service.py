@@ -447,11 +447,6 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         if cheap_providers:
             return cheap_providers[0].model
 
-        # Default to haiku if anthropic is available
-        anthropic_provider = self.provider_registry.get_provider_by_name("anthropic")
-        if anthropic_provider:
-            return "claude-3-haiku-20240307"
-
         # Return None to use default model
         return None
 
