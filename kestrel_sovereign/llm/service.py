@@ -106,10 +106,11 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
             logger.error(f"Failed to initialize providers: {e}")
             self.providers = []
 
-        # Model discovery cache
+        # Model discovery cache — pre-populate from disk if available
         self._model_cache = None
         self._cache_timestamp = None
         self._cache_ttl = LLM_CACHE_TTL_SECONDS
+        self._load_from_disk_cache()  # Immediate availability before API discovery
 
         # Storage info cache
         self._storage_cache = None
