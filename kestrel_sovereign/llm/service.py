@@ -143,15 +143,31 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         # Set via set_metering_callback() after initialization
         self._metering_callback = None
 
+        # Persistence callback for model preference (writes to database)
+        # Set via set_preference_persistence_callback() after initialization
+        self._preference_persistence_callback = None
+
+    def set_preference_persistence_callback(self, callback) -> None:
+        """Set the persistence callback for model preference.
+
+        The callback will be called with (model: str|None, provider: str|None)
+        whenever the model preference changes, so the caller can persist it.
+
+        Args:
+            callback: Async function(model, provider) to call on preference change
+        """
+        self._preference_persistence_callback = callback
+        logger.info("Model preference persistence enabled")
+
     def set_model_preference(self, model: str, provider: Optional[str] = None) -> None:
         """Set the mandated model preference for this session.
-        
+
         When set, the LLM service will use ONLY the specified provider (if given)
         and model, without falling back to other providers with incompatible models.
-        
+
         Args:
             model: The model name to use (e.g., "gpt-5-mini", "claude-sonnet-4-5")
-            provider: Optional provider name (e.g., "openai", "anthropic"). 
+            provider: Optional provider name (e.g., "openai", "anthropic").
                      If specified, only this provider will be used.
         """
         self._mandate_preference = {"model": model, "provider": provider}
@@ -160,10 +176,29 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         else:
             logger.info(f"Model preference set to: {model} (provider: auto-detect)")
 
+        # Persist to database if callback is registered
+        if self._preference_persistence_callback:
+            import asyncio
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(self._preference_persistence_callback(model, provider))
+            except RuntimeError:
+                # No running loop — skip persistence (happens in tests/sync contexts)
+                pass
+
     def clear_model_preference(self) -> None:
         """Clear any mandated model preference, returning to default behavior."""
         self._mandate_preference = {"model": None, "provider": None}
         logger.info("Model preference cleared, using default provider order")
+
+        # Persist the cleared preference
+        if self._preference_persistence_callback:
+            import asyncio
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(self._preference_persistence_callback(None, None))
+            except RuntimeError:
+                pass
 
     def get_model_preference(self) -> Dict[str, Optional[str]]:
         """Get the current model preference.

@@ -60,8 +60,8 @@ class ClaudeMaxAdapter(LLMAdapter):
     included usage instead of per-token billing.
     """
 
-    # Default model for Claude Max
-    DEFAULT_MODEL = "claude-sonnet-4-20250514"  # Sonnet 4, included in Max
+    # Fallback model if none configured — should be set via llm_config.toml instead
+    DEFAULT_MODEL = "auto"
 
     def __init__(
         self,
@@ -327,19 +327,19 @@ class ClaudeMaxAdapter(LLMAdapter):
         """
         models = [
             ModelInfo(
-                id="claude-sonnet-4-20250514",
-                name="Claude Sonnet 4",
+                id="claude-sonnet-4-6",
+                name="Claude Sonnet 4.6",
                 provider="claude_max",
                 category=ModelCategory.CHAT,
                 context_window=200000,
-                max_output_tokens=8192,
+                max_output_tokens=16384,
                 supports_tools=True,
                 supports_vision=True,
                 supports_streaming=True,
             ),
             ModelInfo(
-                id="claude-opus-4-5-20251101",
-                name="Claude Opus 4.5",
+                id="claude-opus-4-6",
+                name="Claude Opus 4.6",
                 provider="claude_max",
                 category=ModelCategory.CHAT,
                 context_window=200000,
