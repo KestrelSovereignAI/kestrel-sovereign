@@ -4,7 +4,7 @@
 # 2. The 'provider_priority' list determines the fallback order.
 # 3. For OpenAI, set the OPENAI_API_KEY environment variable.
 
-provider_priority = ["claude_max", "openrouter", "openai", "openai_mini", "anthropic", "vertex_ai", "ollama", "runpod", "xai"]
+provider_priority = ["llama_cpp", "ollama", "claude_max", "openrouter", "openai", "openai_mini", "anthropic", "vertex_ai", "runpod", "xai"]
 
 # Claude Max - Use your Claude Max subscription ($100/$200/month) for API access
 # Requires: pip install claude-agent-sdk && claude login
@@ -48,6 +48,13 @@ type = "openai_compatible"
 base_url = "https://api.runpod.ai/v2/vllm-2f8vdgn/openai/v1"
 model = "meta-llama/Llama-3.1-8B-Instruct"
 api_key_env = "RUNPOD_API_KEY"
+
+# llama.cpp - Local server (start with ~/models/start-kimi.sh)
+# Model discovery via /v1/models endpoint
+[llama_cpp]
+type = "openai_compatible"
+base_url = "http://localhost:8001/v1"
+local = true  # No API key required
 
 # Ollama - Privacy mode and local/cloud GPU fallback
 # Host is configured via OLLAMA_HOST env var:

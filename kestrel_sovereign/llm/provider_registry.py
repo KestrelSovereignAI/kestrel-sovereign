@@ -321,6 +321,7 @@ class ProviderRegistry:
         if not base_url:
             raise ValueError(f"base_url must be set for '{provider_name}'.")
 
+        is_local = provider_config.get("local", False)
         api_key_env = provider_config.get("api_key_env")
         api_key = None
         if api_key_env:
@@ -329,16 +330,21 @@ class ProviderRegistry:
             env_fallback = os.environ.get(f"{provider_name.upper()}_API_KEY")
             api_key = env_fallback or provider_config.get("api_key")
         if not api_key:
-            raise ValueError(f"API key not provided for '{provider_name}'.")
+            if is_local:
+                api_key = "local"  # Local servers don't need auth
+            else:
+                raise ValueError(f"API key not provided for '{provider_name}'.")
 
         client = openai.AsyncOpenAI(api_key=api_key, base_url=base_url)
         adapter = OpenAIAdapter()
+
+        model = provider_config.get("model", "auto")
 
         return ProviderInfo(
             name=provider_name,
             client=client,
             adapter=adapter,
-            model=provider_config["model"]
+            model=model
         )
 
     def get_provider_by_name(self, name: str) -> Optional[ProviderInfo]:
@@ -370,12 +376,17 @@ class ProviderRegistry:
         return None
 
     def get_local_providers(self) -> List[ProviderInfo]:
-        """Get all local providers (currently just Ollama).
+        """Get all local providers (Ollama, llama.cpp, etc).
 
         Returns:
             List of local providers
         """
-        return [p for p in self.providers if p.name == "ollama"]
+        local_names = {"ollama"}
+        # Check config for providers marked as local
+        for name, cfg in self.config.items():
+            if isinstance(cfg, dict) and cfg.get("local", False):
+                local_names.add(name)
+        return [p for p in self.providers if p.name in local_names]
 
     def get_providers_with_pattern(self, patterns: List[str]) -> List[ProviderInfo]:
         """Get providers whose models match any of the given patterns.
