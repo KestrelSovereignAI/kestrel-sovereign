@@ -5,10 +5,10 @@ Replaces the unmaintained lighthouseweb3 Python SDK (v0.1.1, May 2023)
 with direct REST API calls using httpx for full async support.
 
 Lighthouse REST API reference:
-- POST /api/v0/add          — Upload file (multipart)
-- GET  /api/user/uploads     — List uploads (paginated)
-- GET  /api/lighthouse/deal_status?cid=X — Filecoin deal status
-- GET  /api/user/user_data_usage — Storage quota and usage
+- Upload:  https://upload.lighthouse.storage/api/v0/add (POST multipart)
+- List:    https://api.lighthouse.storage/api/user/files_uploaded (GET, cursor)
+- Deals:   https://api.lighthouse.storage/api/lighthouse/deal_status?cid=X (no auth)
+- Balance: https://api.lighthouse.storage/api/user/user_data_usage
 - Gateway: https://gateway.lighthouse.storage/ipfs/{cid}
 """
 
@@ -23,7 +23,8 @@ logger = logging.getLogger(__name__)
 class LighthouseRestClient:
     """Async HTTP client for Lighthouse storage REST API."""
 
-    BASE_URL = "https://api.lighthouse.storage"
+    UPLOAD_URL = "https://upload.lighthouse.storage"
+    API_URL = "https://api.lighthouse.storage"
 
     def __init__(
         self,
@@ -87,7 +88,7 @@ class LighthouseRestClient:
         files = {"file": (filename, content)}
 
         response = await client.post(
-            f"{self.BASE_URL}/api/v0/add",
+            f"{self.UPLOAD_URL}/api/v0/add",
             headers=self._auth_headers,
             files=files,
             params={"tag": tag},
@@ -122,7 +123,7 @@ class LighthouseRestClient:
         files = {"file": ("export.car", car_bytes, "application/vnd.ipld.car")}
 
         response = await client.post(
-            f"{self.BASE_URL}/api/v0/add",
+            f"{self.UPLOAD_URL}/api/v0/add",
             headers=self._auth_headers,
             files=files,
             params={"tag": tag},
@@ -153,29 +154,32 @@ class LighthouseRestClient:
         response.raise_for_status()
         return response.content
 
-    async def get_uploads(self, page: int = 1) -> List[Dict[str, Any]]:
+    async def get_uploads(self, last_key: Optional[str] = None) -> Dict[str, Any]:
         """
-        List uploads with pagination.
+        List uploads with cursor pagination.
 
         Args:
-            page: Page number (1-indexed)
+            last_key: Cursor for pagination (None for first page)
 
         Returns:
-            List of upload records
+            Dict with 'fileList' (list of upload records) and 'totalFiles'
         """
         client = await self._get_client()
         response = await client.get(
-            f"{self.BASE_URL}/api/user/uploads",
+            f"{self.API_URL}/api/user/files_uploaded",
             headers=self._auth_headers,
-            params={"page": page},
+            params={"lastKey": last_key or "null"},
         )
         response.raise_for_status()
 
         data = response.json()
-        if isinstance(data, dict) and "data" in data:
-            uploads = data["data"]
-            return uploads if isinstance(uploads, list) else [uploads]
-        return data if isinstance(data, list) else []
+        # Normalize: SDK wraps as {data: {fileList: [...], totalFiles: N}}
+        if isinstance(data, dict):
+            if "fileList" in data:
+                return data
+            if "data" in data and isinstance(data["data"], dict):
+                return data["data"]
+        return {"fileList": [], "totalFiles": 0}
 
     async def get_deal_status(self, cid: str) -> Dict[str, Any]:
         """
@@ -189,8 +193,7 @@ class LighthouseRestClient:
         """
         client = await self._get_client()
         response = await client.get(
-            f"{self.BASE_URL}/api/lighthouse/deal_status",
-            headers=self._auth_headers,
+            f"{self.API_URL}/api/lighthouse/deal_status",
             params={"cid": cid},
         )
         response.raise_for_status()
@@ -205,7 +208,7 @@ class LighthouseRestClient:
         """
         client = await self._get_client()
         response = await client.get(
-            f"{self.BASE_URL}/api/user/user_data_usage",
+            f"{self.API_URL}/api/user/user_data_usage",
             headers=self._auth_headers,
         )
         response.raise_for_status()
