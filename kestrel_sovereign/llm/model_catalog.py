@@ -1,9 +1,13 @@
 """
 Model Catalog Service
 
-Manages featured models, display name overrides, and category mappings.
-Loads configuration from model_catalog.toml.
+Manages manual overrides (hidden, categories, context limits) from model_catalog.toml
+and a discovery cache (model_discovery_cache.json) for fast startup.
+
+The TOML file contains ONLY data that APIs don't provide reliably.
+Everything else comes from API discovery.
 """
+import json
 import logging
 import os
 from pathlib import Path
@@ -18,33 +22,46 @@ from .model_metadata import ModelInfo, ModelCategory
 
 logger = logging.getLogger(__name__)
 
-# Default config path
+# Default paths
 DEFAULT_CATALOG_PATH = Path(__file__).parent.parent / "model_catalog.toml"
+DEFAULT_CACHE_PATH = Path(__file__).parent.parent / "model_discovery_cache.json"
 
 
 class ModelCatalogService:
     """
     Service for managing model catalog configuration.
 
-    Loads featured models, display names, categories, and hidden lists
-    from model_catalog.toml. Enriches ModelInfo objects with this data.
+    Loads manual overrides from model_catalog.toml:
+    - hidden: models to never show
+    - categories: embedding/image/audio classification
+    - context_limits_override: context window sizes for providers that don't report them
+    - display_name_overrides: optional display name fixes
+
+    Featured status is NOT managed here — it's computed dynamically:
+    - Models configured in llm_config.toml are featured
+    - Models recently used (frecency > 0) are featured
     """
 
-    def __init__(self, config_path: Optional[Path] = None):
+    def __init__(self, config_path: Optional[Path] = None, cache_path: Optional[Path] = None):
         """
         Initialize the catalog service.
 
         Args:
             config_path: Path to model_catalog.toml (default: project root)
+            cache_path: Path to model_discovery_cache.json (default: alongside catalog)
         """
         self.config_path = config_path or DEFAULT_CATALOG_PATH
+        self.cache_path = cache_path or DEFAULT_CACHE_PATH
         self._config: Dict = {}
-        self._featured: Dict[str, Set[str]] = {}
-        self._display_names: Dict[str, str] = {}
-        self._categories: Dict[str, Dict[str, List[str]]] = {}
         self._hidden: Dict[str, Set[str]] = {}
+        self._categories: Dict[str, Dict[str, List[str]]] = {}
         self._context_limits: Dict[str, int] = {}
+        self._display_names: Dict[str, str] = {}
         self._tool_support: Dict[str, bool] = {}
+
+        # Legacy support: if old-style [featured] section exists, still load it
+        self._featured: Dict[str, Set[str]] = {}
+
         self._loaded = False
 
     def load(self) -> None:
@@ -58,29 +75,35 @@ class ModelCatalogService:
             with open(self.config_path, "rb") as f:
                 self._config = tomllib.load(f)
 
-            # Parse featured models
-            featured = self._config.get("featured", {})
-            for provider, models in featured.items():
-                self._featured[provider] = set(models)
-
-            # Parse display name overrides
-            self._display_names = self._config.get("display_names", {})
+            # Parse hidden models
+            hidden = self._config.get("hidden", {})
+            for provider, models in hidden.items():
+                self._hidden[provider] = set(models)
 
             # Parse categories
             categories = self._config.get("categories", {})
             for category, providers in categories.items():
                 self._categories[category] = providers
 
-            # Parse hidden models
-            hidden = self._config.get("hidden", {})
-            for provider, models in hidden.items():
-                self._hidden[provider] = set(models)
+            # Parse context limits — support both old and new key names
+            self._context_limits = (
+                self._config.get("context_limits_override", {})
+                or self._config.get("context_limits", {})
+            )
 
-            # Parse context limits
-            self._context_limits = self._config.get("context_limits", {})
+            # Parse display name overrides — support both old and new key names
+            self._display_names = (
+                self._config.get("display_name_overrides", {})
+                or self._config.get("display_names", {})
+            )
 
             # Parse tool support overrides
             self._tool_support = self._config.get("tool_support", {})
+
+            # Legacy: load [featured] if it exists (for backward compat)
+            featured = self._config.get("featured", {})
+            for provider, models in featured.items():
+                self._featured[provider] = set(models)
 
             self._loaded = True
             logger.info(f"Loaded model catalog from {self.config_path}")
@@ -95,7 +118,11 @@ class ModelCatalogService:
             self.load()
 
     def is_featured(self, provider: str, model_id: str) -> bool:
-        """Check if a model is in the featured list."""
+        """Check if a model is in the legacy featured list.
+
+        Note: Featured status is now computed dynamically (configured + MRU).
+        This method only checks the legacy [featured] TOML section.
+        """
         self._ensure_loaded()
         featured_set = self._featured.get(provider, set())
         return model_id in featured_set
@@ -192,14 +219,22 @@ class ModelCatalogService:
 
     def enrich_model(self, model: ModelInfo) -> ModelInfo:
         """
-        Enrich a ModelInfo with catalog data.
+        Enrich a ModelInfo with catalog overrides.
 
-        Updates is_featured, is_hidden, display_name, and context_limit.
-        Only overrides category if explicitly configured in catalog.
+        Applies: hidden, category, display_name, context_limit, tool_support.
+
+        Featured status uses OR logic: if the model was already marked featured
+        (e.g., because it's a configured provider model), that status is preserved.
+        The legacy [featured] TOML section can add featured status but never remove it.
         """
         self._ensure_loaded()
 
-        model.is_featured = self.is_featured(model.provider, model.id)
+        # Featured: OR logic — never unfeature a model that was already featured
+        if self.is_featured(model.provider, model.id):
+            model.is_featured = True
+        # If not in legacy featured list, preserve existing is_featured value
+
+        # Hidden: always apply
         model.is_hidden = self.is_hidden(model.provider, model.id)
 
         # Only override category if catalog explicitly knows about this model
@@ -230,7 +265,11 @@ class ModelCatalogService:
         return [self.enrich_model(m) for m in models]
 
     def get_featured_models(self, provider: str) -> Set[str]:
-        """Get the set of featured model IDs for a provider."""
+        """Get the set of featured model IDs for a provider.
+
+        Note: This returns from the legacy [featured] section only.
+        True featured status is now computed dynamically.
+        """
         self._ensure_loaded()
         return self._featured.get(provider, set())
 
@@ -240,6 +279,48 @@ class ModelCatalogService:
         providers = set(self._featured.keys())
         providers.update(self._hidden.keys())
         return sorted(providers)
+
+    # --- Discovery Cache ---
+
+    def write_cache(self, models: List[ModelInfo]) -> None:
+        """Write discovered models to cache file for fast startup.
+
+        Args:
+            models: List of enriched ModelInfo objects from discovery
+        """
+        try:
+            from datetime import datetime, timezone
+            cache_data = {
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+                "model_count": len(models),
+                "models": [m.to_dict() for m in models],
+            }
+            with open(self.cache_path, "w") as f:
+                json.dump(cache_data, f, indent=2, default=str)
+            logger.info(f"Wrote discovery cache: {len(models)} models to {self.cache_path}")
+        except Exception as e:
+            logger.warning(f"Failed to write discovery cache: {e}")
+
+    def load_cache(self) -> Optional[List[ModelInfo]]:
+        """Load models from discovery cache file.
+
+        Returns:
+            List of ModelInfo objects if cache exists, None otherwise
+        """
+        if not self.cache_path.exists():
+            return None
+
+        try:
+            with open(self.cache_path, "r") as f:
+                cache_data = json.load(f)
+
+            models = [ModelInfo.from_dict(m) for m in cache_data.get("models", [])]
+            generated_at = cache_data.get("generated_at", "unknown")
+            logger.info(f"Loaded discovery cache: {len(models)} models (generated: {generated_at})")
+            return models
+        except Exception as e:
+            logger.warning(f"Failed to load discovery cache: {e}")
+            return None
 
 
 # Global singleton instance
