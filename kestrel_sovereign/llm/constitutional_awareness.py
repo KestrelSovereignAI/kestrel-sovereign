@@ -38,10 +38,10 @@ class ConstitutionalAwarenessMixin:
         if not provider or not model:
             if self.providers and len(self.providers) > 0:
                 provider = provider or self.providers[0].get("name", "openai")
-                model = model or self.providers[0].get("model", "gpt-4")
+                model = model or self.providers[0].get("model", "auto")
             else:
                 provider = provider or "openai"
-                model = model or "gpt-4"
+                model = model or "auto"
 
         return provider, model
 

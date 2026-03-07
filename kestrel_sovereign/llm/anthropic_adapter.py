@@ -126,7 +126,7 @@ class AnthropicAdapter(LLMAdapter):
 
         Args:
             client: Anthropic AsyncClient instance
-            model: Model name (e.g., 'claude-sonnet-4-20250514')
+            model: Model name (e.g., 'claude-sonnet-4-6')
             messages: List of message dicts
             format: Response format (ignored for Anthropic)
             tools: Optional tools in OpenAI format (will be converted)
@@ -448,7 +448,7 @@ class AnthropicAdapter(LLMAdapter):
 
         Args:
             client: Anthropic AsyncClient
-            model: Model name (e.g., 'claude-sonnet-4-20250514')
+            model: Model name (e.g., 'claude-sonnet-4-6')
             messages: Chat messages
             tools: Optional tools in OpenAI format (will be converted)
             response_format: Optional Pydantic model (handled via tool pattern)

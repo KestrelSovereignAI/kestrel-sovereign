@@ -10,7 +10,7 @@ provider_priority = ["claude_max", "openrouter", "openai", "openai_mini", "anthr
 # Requires: pip install claude-agent-sdk && claude login
 # This uses subscription authentication, not API key billing
 [claude_max]
-model = "claude-sonnet-4-20250514"  # Sonnet 4 included in Max, or "claude-opus-4-5-20251101"
+model = "claude-sonnet-4-6"  # Sonnet 4.6 included in Max, or "claude-opus-4-6"
 
 # OpenRouter - Primary provider with crypto payments (agents can fund themselves)
 # Supports: ETH (chain_id=1), Polygon (137), Base (8453)
