@@ -65,6 +65,7 @@ playwright-report/
 test-results/
 demo-output/
 demo-report/
+docs/demo-screenshots/
 
 # Node
 node_modules/
