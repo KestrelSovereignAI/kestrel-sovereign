@@ -3,6 +3,8 @@ from fastapi import APIRouter, Request
 from typing import List, Dict, Any
 import logging
 
+from endpoints.agent_helpers import get_agent
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["commands"])
@@ -60,8 +62,11 @@ async def get_commands(request: Request) -> Dict[str, Any]:
     commands.extend(BUILTIN_COMMANDS)
 
     # Add feature commands from loaded features
-    agent = getattr(request.app.state, 'agent', None)
-    if agent and hasattr(agent, 'features'):
+    try:
+        agent = get_agent(request)
+    except Exception:
+        return commands
+    if hasattr(agent, 'features'):
         for feature_name, feature in agent.features.items():
             try:
                 tools = feature.get_tools() if hasattr(feature, 'get_tools') else []

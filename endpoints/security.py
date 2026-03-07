@@ -9,6 +9,7 @@ from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
 
 from kestrel_sovereign.rate_limit import limiter
+from endpoints.agent_helpers import get_agent
 
 router = APIRouter(prefix="/api/security", tags=["security"])
 
@@ -93,9 +94,7 @@ def get_security_feature(request: Request):
     Raises:
         HTTPException: If security feature not available
     """
-    agent = getattr(request.app.state, "agent", None)
-    if not agent:
-        raise HTTPException(status_code=503, detail="Agent not initialized")
+    agent = get_agent(request)
 
     security = agent.features.get("SecurityFeature")
     if not security:

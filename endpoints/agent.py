@@ -11,11 +11,13 @@ from kestrel_sovereign.kestrel_config.constants import (
     SSE_PING_INTERVAL_SECONDS,
 )
 from kestrel_sovereign.rate_limit import limiter
+from endpoints.agent_helpers import get_agent
 
 logger = logging.getLogger(__name__)
 
-# SSE connection tracking: maps client IP -> active connection count
-_sse_connections: dict[str, int] = defaultdict(int)
+# SSE connection tracking: maps (client_ip, agent_id) -> active connection count
+# In multi-agent mode each agent gets its own connection pool per client.
+_sse_connections: dict[tuple[str, str], int] = defaultdict(int)
 _sse_lock = asyncio.Lock()
 
 router = APIRouter(prefix="/agent", tags=["agent"])
@@ -31,9 +33,6 @@ async def invoke_agent(request: Request):
       - 'model' parameter to override the default model
       - 'session_id' to load context from a specific conversation session
     """
-    if not hasattr(request.app.state, 'agent') or not request.app.state.agent:
-        raise HTTPException(status_code=503, detail="Agent not initialized.")
-
     try:
         data = await request.json()
         user_input = data.get("input")
@@ -43,7 +42,7 @@ async def invoke_agent(request: Request):
         if user_input is None:
             raise HTTPException(status_code=400, detail="Input not provided.")
 
-        agent = request.app.state.agent
+        agent = get_agent(request)
         response = await agent.process_input(
             user_input,
             model_override=model_override,
@@ -67,9 +66,6 @@ async def stream_agent_response(request: Request):
     """
     import uuid
     
-    if not hasattr(request.app.state, 'agent') or not request.app.state.agent:
-        raise HTTPException(status_code=503, detail="Agent not initialized.")
-
     try:
         data = await request.json()
         user_input = data.get("input")
@@ -80,7 +76,7 @@ async def stream_agent_response(request: Request):
         if user_input is None:
             raise HTTPException(status_code=400, detail="Input not provided.")
 
-        agent = request.app.state.agent
+        agent = get_agent(request)
         
         # Generate unique request ID for cancellation tracking
         request_id = str(uuid.uuid4())
@@ -122,11 +118,8 @@ async def stop_agent_request(request: Request):
     Stop the current agent request/streaming.
     Used by the stop button in the UI.
     """
-    if not hasattr(request.app.state, 'agent') or not request.app.state.agent:
-        raise HTTPException(status_code=503, detail="Agent not initialized.")
-
     try:
-        agent = request.app.state.agent
+        agent = get_agent(request)
         cancelled = agent.cancel_current_request()
         return {
             "success": True,
@@ -141,11 +134,8 @@ async def stop_agent_request(request: Request):
 @router.get("/info")
 async def get_agent_info(request: Request):
     """Get agent information including DID and privacy mode."""
-    if not hasattr(request.app.state, 'agent') or not request.app.state.agent:
-        raise HTTPException(status_code=503, detail="Agent not initialized.")
-
     try:
-        agent = request.app.state.agent
+        agent = get_agent(request)
         return {
             "agent_id": agent.agent_id,
             "privacy_mode": agent.privacy_mode.value if hasattr(agent.privacy_mode, 'value') else str(agent.privacy_mode),
@@ -160,11 +150,8 @@ async def get_agent_info(request: Request):
 @router.get("/privacy-mode")
 async def get_privacy_mode(request: Request):
     """Get current privacy mode."""
-    if not hasattr(request.app.state, 'agent') or not request.app.state.agent:
-        raise HTTPException(status_code=503, detail="Agent not initialized.")
-
     try:
-        agent = request.app.state.agent
+        agent = get_agent(request)
         mode = agent.privacy_mode
         return {
             "privacy_mode": mode.value if hasattr(mode, 'value') else str(mode),
@@ -179,9 +166,6 @@ async def get_privacy_mode(request: Request):
 @router.post("/privacy-mode")
 async def set_privacy_mode(request: Request):
     """Set privacy mode."""
-    if not hasattr(request.app.state, 'agent') or not request.app.state.agent:
-        raise HTTPException(status_code=503, detail="Agent not initialized.")
-
     try:
         from kestrel_sovereign.privacy import PrivacyMode
 
@@ -197,7 +181,7 @@ async def set_privacy_mode(request: Request):
                 detail=f"Invalid privacy mode '{mode_str}'. Valid modes: {valid_modes}"
             )
 
-        agent = request.app.state.agent
+        agent = get_agent(request)
         agent.set_privacy_mode(new_mode)
 
         return {
@@ -220,11 +204,8 @@ async def get_notifications(request: Request):
     This is a polling endpoint - call it periodically to check for
     notifications about completed background tasks.
     """
-    if not hasattr(request.app.state, 'agent') or not request.app.state.agent:
-        raise HTTPException(status_code=503, detail="Agent not initialized.")
-
     try:
-        agent = request.app.state.agent
+        agent = get_agent(request)
         notifications = agent.get_pending_notifications()
         return {
             "notifications": notifications,
@@ -253,23 +234,25 @@ async def notifications_sse(request: Request):
     """
     import json
 
-    if not hasattr(request.app.state, 'agent') or not request.app.state.agent:
-        raise HTTPException(status_code=503, detail="Agent not initialized.")
+    # Validate agent is available before starting SSE stream
+    agent = get_agent(request)
 
-    # Enforce per-client SSE connection limit
+    # Enforce per-client, per-agent SSE connection limit
     client_ip = request.client.host if request.client else "unknown"
+    agent_id = getattr(agent, 'agent_id', 'default')
+    conn_key = (client_ip, agent_id)
     async with _sse_lock:
-        if _sse_connections[client_ip] >= MAX_SSE_CONNECTIONS_PER_CLIENT:
+        if _sse_connections[conn_key] >= MAX_SSE_CONNECTIONS_PER_CLIENT:
             raise HTTPException(
                 status_code=429,
                 detail=f"Too many SSE connections (limit: {MAX_SSE_CONNECTIONS_PER_CLIENT})"
             )
-        _sse_connections[client_ip] += 1
+        _sse_connections[conn_key] += 1
 
     async def event_generator():
         """Generate SSE events for task notifications."""
         try:
-            agent = request.app.state.agent
+            agent = get_agent(request)
 
             # Send initial connection event
             yield f"event: connected\ndata: {json.dumps({'status': 'connected'})}\n\n"
@@ -319,9 +302,9 @@ async def notifications_sse(request: Request):
             yield f"event: error\ndata: {json.dumps({'error': 'Internal server error'})}\n\n"
         finally:
             async with _sse_lock:
-                _sse_connections[client_ip] -= 1
-                if _sse_connections[client_ip] <= 0:
-                    del _sse_connections[client_ip]
+                _sse_connections[conn_key] -= 1
+                if _sse_connections[conn_key] <= 0:
+                    del _sse_connections[conn_key]
 
     return StreamingResponse(
         event_generator(),
@@ -355,11 +338,8 @@ async def get_context_status(
         - compression_recommended: Whether compression is recommended
         - status: healthy/normal/warning/critical
     """
-    if not hasattr(request.app.state, 'agent') or not request.app.state.agent:
-        raise HTTPException(status_code=503, detail="Agent not initialized.")
-
     try:
-        agent = request.app.state.agent
+        agent = get_agent(request)
 
         from kestrel_sovereign.agent.token_counter import get_token_counter
         from kestrel_sovereign.agent.token_budget import RESPONSE_RESERVE
@@ -427,10 +407,7 @@ async def list_tasks(
 
     Returns tasks managed by the agent's TaskManager.
     """
-    if not hasattr(request.app.state, 'agent') or not request.app.state.agent:
-        raise HTTPException(status_code=503, detail="Agent not initialized.")
-
-    agent = request.app.state.agent
+    agent = get_agent(request)
 
     # Check if agent has a task_manager
     if not hasattr(agent, 'task_manager') or not agent.task_manager:
@@ -498,10 +475,7 @@ async def list_tasks(
 @router.get("/heartbeat/status")
 async def heartbeat_status(request: Request):
     """Get heartbeat system status and recent history."""
-    if not hasattr(request.app.state, 'agent') or not request.app.state.agent:
-        raise HTTPException(status_code=503, detail="Agent not initialized.")
-
-    agent = request.app.state.agent
+    agent = get_agent(request)
     runner = getattr(agent, 'heartbeat_runner', None)
     if not runner:
         return {"enabled": False, "message": "Heartbeat not configured"}
@@ -512,10 +486,7 @@ async def heartbeat_status(request: Request):
 @router.post("/heartbeat/trigger")
 async def heartbeat_trigger(request: Request):
     """Manually trigger a heartbeat check."""
-    if not hasattr(request.app.state, 'agent') or not request.app.state.agent:
-        raise HTTPException(status_code=503, detail="Agent not initialized.")
-
-    agent = request.app.state.agent
+    agent = get_agent(request)
     runner = getattr(agent, 'heartbeat_runner', None)
     if not runner:
         raise HTTPException(status_code=404, detail="Heartbeat not configured")

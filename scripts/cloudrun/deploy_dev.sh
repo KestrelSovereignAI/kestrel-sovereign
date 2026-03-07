@@ -27,7 +27,7 @@ gcloud run deploy "$SERVICE_NAME" \
     --timeout 300 \
     --concurrency 80 \
     --set-secrets="OPENAI_API_KEY=kestrel-openai-key:latest,KESTREL_API_KEY=kestrel-api-key:latest,KESTREL_DATA_KEY=kestrel-data-key:latest,GOOGLE_CLIENT_ID=kestrel-google-client-id:latest,GOOGLE_CLIENT_SECRET=kestrel-google-client-secret:latest,KESTREL_SESSION_SECRET=kestrel-session-secret:latest" \
-    --set-env-vars="KESTREL_ENV=development,KESTREL_DB_BACKEND=sqlite,KESTREL_DB_PATH=/app/agent_data,KESTREL_ALLOWED_EMAILS=jaslogic@gmail.com\,noelschulz1981@gmail.com\,gabriela.aquino@gmail.com" \
+    --set-env-vars="KESTREL_ENV=development,KESTREL_DB_BACKEND=sqlite,KESTREL_DB_PATH=/app/agent_data,KESTREL_MULTI_AGENT=true,KESTREL_ALLOWED_EMAILS=jaslogic@gmail.com\,noelschulz1981@gmail.com\,gabriela.aquino@gmail.com" \
     --project="$PROJECT_ID" \
     --quiet
 

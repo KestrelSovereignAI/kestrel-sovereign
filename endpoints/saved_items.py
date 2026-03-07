@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional
 import logging
 
 from kestrel_sovereign.rate_limit import limiter
+from endpoints.agent_helpers import get_agent
 
 logger = logging.getLogger(__name__)
 
@@ -65,10 +66,7 @@ class SearchRequest(BaseModel):
 
 def _get_saved_items_store(request: Request):
     """Get SavedItemsStore from agent storage."""
-    if not hasattr(request.app.state, 'agent') or not request.app.state.agent:
-        raise HTTPException(status_code=503, detail="Agent not initialized.")
-
-    agent = request.app.state.agent
+    agent = get_agent(request)
     storage = agent.storage
 
     # Get the database

@@ -3,6 +3,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 import logging
 
 from kestrel_sovereign.rate_limit import limiter
+from endpoints.agent_helpers import get_agent
 
 logger = logging.getLogger(__name__)
 
@@ -12,11 +13,8 @@ router = APIRouter(prefix="/api", tags=["memories"])
 @router.get("/memories")
 async def list_memories(request: Request, node_type: str = None, limit: int = Query(100, ge=1, le=500)):
     """List knowledge graph nodes (memories)."""
-    if not hasattr(request.app.state, 'agent') or not request.app.state.agent:
-        raise HTTPException(status_code=503, detail="Agent not initialized.")
-
     try:
-        agent = request.app.state.agent
+        agent = get_agent(request)
         storage = agent.storage
 
         if node_type:
@@ -48,11 +46,8 @@ async def list_memories(request: Request, node_type: str = None, limit: int = Qu
 @router.get("/memories/{node_id}")
 async def get_memory_detail(request: Request, node_id: str):
     """Get detailed information about a memory node."""
-    if not hasattr(request.app.state, 'agent') or not request.app.state.agent:
-        raise HTTPException(status_code=503, detail="Agent not initialized.")
-
     try:
-        agent = request.app.state.agent
+        agent = get_agent(request)
         storage = agent.storage
 
         node = await storage.get_node(node_id)
@@ -104,11 +99,8 @@ async def get_memory_detail(request: Request, node_id: str):
 @router.get("/identity-chain")
 async def get_identity_chain(request: Request):
     """Get the complete identity chain for the agent."""
-    if not hasattr(request.app.state, 'agent') or not request.app.state.agent:
-        raise HTTPException(status_code=503, detail="Agent not initialized.")
-
     try:
-        agent = request.app.state.agent
+        agent = get_agent(request)
         storage = agent.storage
 
         agent_node = await storage.get_node(agent.agent_id)
@@ -156,11 +148,8 @@ async def get_identity_chain(request: Request):
 @limiter.limit("30/minute")
 async def delete_memory(request: Request, node_id: str):
     """Delete a memory node from the knowledge graph."""
-    if not hasattr(request.app.state, 'agent') or not request.app.state.agent:
-        raise HTTPException(status_code=503, detail="Agent not initialized.")
-
     try:
-        agent = request.app.state.agent
+        agent = get_agent(request)
         storage = agent.storage
 
         node = await storage.get_node(node_id)

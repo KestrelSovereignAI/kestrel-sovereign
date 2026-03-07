@@ -9,6 +9,7 @@ import os
 import logging
 
 from kestrel_sovereign.kestrel_config.constants import MAX_SOVEREIGNTY_PREVIEW_SIZE
+from endpoints.agent_helpers import get_agent
 
 logger = logging.getLogger(__name__)
 
@@ -26,11 +27,8 @@ CID_PATTERN = re.compile(r'^[a-zA-Z0-9]+$')
 @router.get("/storage/stats")
 async def get_storage_stats(request: Request):
     """Get storage statistics and breakdown."""
-    if not hasattr(request.app.state, 'agent') or not request.app.state.agent:
-        raise HTTPException(status_code=503, detail="Agent not initialized.")
-
     try:
-        agent = request.app.state.agent
+        agent = get_agent(request)
         storage = agent.storage
         db_path = storage.db_path
 
@@ -80,11 +78,8 @@ async def get_storage_stats(request: Request):
 @router.get("/sovereignty/exports")
 async def list_sovereignty_exports(request: Request):
     """List all sovereignty export receipts."""
-    if not hasattr(request.app.state, 'agent') or not request.app.state.agent:
-        raise HTTPException(status_code=503, detail="Agent not initialized.")
-
     try:
-        agent = request.app.state.agent
+        agent = get_agent(request)
         storage = agent.storage
         receipts = await storage.get_nodes_by_type("sovereignty_receipt")
         backups = await storage.get_nodes_by_type("backup_artifact")
@@ -120,9 +115,6 @@ async def list_sovereignty_exports(request: Request):
 @router.post("/sovereignty/export")
 async def trigger_sovereignty_export(request: Request):
     """Trigger a sovereignty export via the agent's !export-sovereignty command."""
-    if not hasattr(request.app.state, 'agent') or not request.app.state.agent:
-        raise HTTPException(status_code=503, detail="Agent not initialized.")
-
     try:
         data = await request.json()
         tier = data.get("tier", "ipfs")
@@ -134,7 +126,7 @@ async def trigger_sovereignty_export(request: Request):
                 detail=f"Invalid tier '{tier}'. Must be one of: {', '.join(sorted(ALLOWED_TIERS))}",
             )
 
-        agent = request.app.state.agent
+        agent = get_agent(request)
         cmd = f"!export-sovereignty --tier={tier}"
         if not encrypt:
             cmd += " --no-encrypt"
@@ -151,9 +143,6 @@ async def trigger_sovereignty_export(request: Request):
 @router.post("/sovereignty/import")
 async def trigger_sovereignty_import(request: Request):
     """Trigger a sovereignty import via the agent's !import-sovereignty command."""
-    if not hasattr(request.app.state, 'agent') or not request.app.state.agent:
-        raise HTTPException(status_code=503, detail="Agent not initialized.")
-
     try:
         data = await request.json()
         cid = data.get("cid")
@@ -165,7 +154,7 @@ async def trigger_sovereignty_import(request: Request):
                 detail="Invalid CID format. CID must contain only alphanumeric characters.",
             )
 
-        agent = request.app.state.agent
+        agent = get_agent(request)
         cmd = f"!import-sovereignty {cid}"
         result = await agent.process_input(cmd)
 
