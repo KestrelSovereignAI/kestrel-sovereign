@@ -102,7 +102,7 @@ def _mock_rest_client(upload_responses=None, download_content=None, uploads_list
         mock_client.upload = AsyncMock(return_value={"Hash": "QmDefault", "Size": "0"})
 
     mock_client.download = AsyncMock(return_value=download_content or b"")
-    mock_client.get_uploads = AsyncMock(return_value=uploads_list or [])
+    mock_client.get_uploads = AsyncMock(return_value={"fileList": uploads_list or [], "totalFiles": len(uploads_list or [])})
     mock_client.get_balance = AsyncMock(return_value=balance_data or {"data": {"dataUsed": "0"}})
     mock_client.close = AsyncMock()
 

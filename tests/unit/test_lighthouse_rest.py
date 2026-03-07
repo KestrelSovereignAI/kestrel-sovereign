@@ -75,11 +75,11 @@ class TestLighthouseRestClient:
 
     @pytest.mark.asyncio
     async def test_get_uploads(self, client, mock_response):
-        uploads = [
-            {"cid": "QmTest1", "fileName": "a.bin", "tag": "test"},
-            {"cid": "QmTest2", "fileName": "b.bin", "tag": "test"},
+        file_list = [
+            {"cid": "QmTest1", "fileName": "a.bin", "fileSizeInBytes": "100"},
+            {"cid": "QmTest2", "fileName": "b.bin", "fileSizeInBytes": "200"},
         ]
-        resp = mock_response(json_data={"data": uploads})
+        resp = mock_response(json_data={"fileList": file_list, "totalFiles": 2})
 
         with patch.object(client, "_get_client") as mock_get:
             mock_http = AsyncMock()
@@ -88,8 +88,8 @@ class TestLighthouseRestClient:
 
             result = await client.get_uploads()
 
-        assert len(result) == 2
-        assert result[0]["cid"] == "QmTest1"
+        assert result["fileList"] == file_list
+        assert result["totalFiles"] == 2
 
     @pytest.mark.asyncio
     async def test_get_deal_status(self, client, mock_response):

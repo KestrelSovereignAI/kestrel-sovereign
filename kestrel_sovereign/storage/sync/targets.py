@@ -529,9 +529,10 @@ class LighthouseTarget(SyncTarget):
             from kestrel_sovereign.storage.providers.lighthouse_rest import LighthouseRestClient
 
             client = LighthouseRestClient(api_key=self.api_key)
-            uploads = await client.get_uploads()
+            result = await client.get_uploads()
             await client.close()
 
+            uploads = result.get("fileList", [])
             if not isinstance(uploads, list):
                 return None
 
