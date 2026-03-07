@@ -6,6 +6,7 @@ Serves stored files (avatars, documents, etc.) via content-addressable hashes.
 from fastapi import APIRouter, Request, HTTPException
 from fastapi.responses import Response
 import logging
+from endpoints.agent_helpers import get_agent
 
 logger = logging.getLogger(__name__)
 
@@ -26,11 +27,8 @@ async def serve_file(content_hash: str, request: Request):
     Returns:
         File content with appropriate headers
     """
-    if not hasattr(request.app.state, 'agent') or not request.app.state.agent:
-        raise HTTPException(status_code=503, detail="Agent not initialized.")
-
     try:
-        agent = request.app.state.agent
+        agent = get_agent(request)
         storage = agent.storage
 
         if not storage or not hasattr(storage, 'files'):
@@ -74,11 +72,8 @@ async def check_file(content_hash: str, request: Request):
     Returns 200 with headers if file exists, 404 if not.
     Useful for cache validation and existence checks.
     """
-    if not hasattr(request.app.state, 'agent') or not request.app.state.agent:
-        raise HTTPException(status_code=503, detail="Agent not initialized.")
-
     try:
-        agent = request.app.state.agent
+        agent = get_agent(request)
         storage = agent.storage
 
         if not storage or not hasattr(storage, 'files'):

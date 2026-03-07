@@ -1,53 +1,146 @@
 """Model, wallet, and IPFS status endpoints."""
 from fastapi import APIRouter, HTTPException, Request, Query
+from pydantic import BaseModel, Field
 from typing import Optional, List
 import aiohttp
+import re
 import time
 import logging
 
 from kestrel_sovereign.kestrel_config.defaults import get_ipfs_api_url
 from kestrel_sovereign.llm.model_metadata import ModelCategory
 from kestrel_sovereign.sql_utils import safe_column_name
+from kestrel_sovereign.rate_limit import limiter
+from endpoints.agent_helpers import get_agent
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["models"])
 
+# Validation: agent names must be alphanumeric + hyphens/underscores, 1-64 chars
+_AGENT_NAME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9_-]{0,63}$")
+
+
+class CreateAgentRequest(BaseModel):
+    """Request body for creating a new agent."""
+    name: str = Field(..., description="Agent name (alphanumeric, hyphens, underscores)", min_length=1, max_length=64)
+
 
 @router.get("/api/agents")
 async def get_agents(request: Request):
-    """
-    Get list of agents (A2A agent cards).
-    For now, returns only the current agent as a single-item array.
-    UI is structurally ready for multiple agents.
-    """
-    if not hasattr(request.app.state, 'agent') or not request.app.state.agent:
-        raise HTTPException(status_code=503, detail="Agent not initialized.")
+    """Get list of agents (A2A agent cards).
 
+    In multi-agent mode, returns all agents with mode: "rookery".
+    In single-agent mode, returns one agent with mode: "standalone".
+    """
+    # Multi-agent mode: return all agents from AgentManager
+    agent_manager = getattr(request.app.state, 'agent_manager', None)
+    if agent_manager:
+        agents_list = []
+        for name, agent in agent_manager.list_agents().items():
+            try:
+                agent_card = await agent.get_agent_card()
+                card_dict = agent_card.model_dump()
+                card_dict["id"] = agent.agent_id
+                card_dict["name"] = name
+                card_dict["status"] = "online"
+                agents_list.append(card_dict)
+            except Exception as e:
+                logger.warning(f"Error getting agent card for '{name}': {e}")
+                agents_list.append({
+                    "id": agent.agent_id,
+                    "name": name,
+                    "status": "error",
+                })
+        return {"agents": agents_list, "mode": "rookery"}
+
+    # Single-agent mode
     try:
-        agent = request.app.state.agent
+        agent = get_agent(request)
         agent_card = await agent.get_agent_card()
         card_dict = agent_card.model_dump()
-        # Add id (DID) and status for UI — not part of A2A card spec
         card_dict["id"] = agent.agent_id
         card_dict["status"] = "online"
-
-        # Return as array (single-item for now, multiple agents in future)
-        # mode: "standalone" tells the UI not to enable rookery routing
         return {"agents": [card_dict], "mode": "standalone"}
     except Exception as e:
         logger.error(f"Error getting agents: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Error retrieving agents.")
 
 
+@router.post("/api/agents")
+@limiter.limit("5/minute")
+async def create_agent(request: Request, body: CreateAgentRequest):
+    """Create a new agent via inception.
+
+    Runs the inception service to generate a DID and database,
+    then loads the agent into the multi-agent manager.
+
+    Only available in multi-agent mode.
+    """
+    agent_manager = getattr(request.app.state, 'agent_manager', None)
+    if agent_manager is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Agent creation is only available in multi-agent mode.",
+        )
+
+    name = body.name.strip()
+    if not _AGENT_NAME_RE.match(name):
+        raise HTTPException(
+            status_code=400,
+            detail="Agent name must start with a letter and contain only letters, numbers, hyphens, or underscores.",
+        )
+
+    try:
+        agent = await agent_manager.create_agent(name)
+        return {
+            "success": True,
+            "agent": {
+                "id": agent.agent_id,
+                "name": name,
+                "status": "online",
+            },
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except Exception as e:
+        logger.error(f"Error creating agent '{name}': {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Error creating agent.")
+
+
+@router.delete("/api/agents/{agent_name}")
+@limiter.limit("10/minute")
+async def delete_agent(request: Request, agent_name: str):
+    """Remove an agent from the multi-agent manager.
+
+    Shuts down the agent but does NOT delete its data directory.
+    The agent can be re-loaded by restarting the server.
+
+    Only available in multi-agent mode.
+    """
+    agent_manager = getattr(request.app.state, 'agent_manager', None)
+    if agent_manager is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Agent management is only available in multi-agent mode.",
+        )
+
+    removed = await agent_manager.remove_agent(agent_name)
+    if not removed:
+        raise HTTPException(status_code=404, detail=f"Agent '{agent_name}' not found.")
+
+    return {
+        "success": True,
+        "name": agent_name,
+        "message": f"Agent '{agent_name}' shut down and removed.",
+    }
+
+
 @router.get("/api/identity")
 async def get_identity(request: Request):
     """Get agent identity information including avatar."""
-    if not hasattr(request.app.state, 'agent') or not request.app.state.agent:
-        raise HTTPException(status_code=503, detail="Agent not initialized.")
-
     try:
-        agent = request.app.state.agent
+        agent = get_agent(request)
         storage = agent.storage
 
         agent_node = await storage.get_node(agent.agent_id) if storage else None
@@ -76,11 +169,8 @@ async def get_identity(request: Request):
 @router.get("/api/constitution")
 async def get_constitution(request: Request):
     """Get the agent's constitution."""
-    if not hasattr(request.app.state, 'agent') or not request.app.state.agent:
-        raise HTTPException(status_code=503, detail="Agent not initialized.")
-
     try:
-        agent = request.app.state.agent
+        agent = get_agent(request)
         storage = agent.storage
 
         constitution_text = await agent._get_governing_constitution()
@@ -159,8 +249,8 @@ async def get_ipfs_status(request: Request):
                 gw_status["error"] = "Connection failed"
             status["gateways"].append(gw_status)
 
-    if hasattr(request.app.state, 'agent') and request.app.state.agent:
-        agent = request.app.state.agent
+    try:
+        agent = get_agent(request)
         if hasattr(agent, 'storage') and agent.storage:
             storage = agent.storage
             if hasattr(storage, 'sovereign_adapter') and storage.sovereign_adapter:
@@ -172,6 +262,8 @@ async def get_ipfs_status(request: Request):
                     }
                 else:
                     status["filecoin_adapter"] = {"configured": False}
+    except Exception:
+        pass  # Agent not available — skip filecoin status
 
     return status
 
@@ -179,11 +271,8 @@ async def get_ipfs_status(request: Request):
 @router.get("/api/wallet")
 async def get_wallet(request: Request):
     """Get wallet balance and transaction history."""
-    if not hasattr(request.app.state, 'agent') or not request.app.state.agent:
-        raise HTTPException(status_code=503, detail="Agent not initialized.")
-
     try:
-        agent = request.app.state.agent
+        agent = get_agent(request)
 
         if hasattr(agent, 'wallet_agent') and agent.wallet_agent:
             wallet = agent.wallet_agent
@@ -212,11 +301,8 @@ async def get_wallet(request: Request):
 @router.get("/api/keys")
 async def get_keys(request: Request):
     """Get configured API keys (no secrets exposed)."""
-    if not hasattr(request.app.state, 'agent') or not request.app.state.agent:
-        raise HTTPException(status_code=503, detail="Agent not initialized.")
-
     try:
-        agent = request.app.state.agent
+        agent = get_agent(request)
         storage = agent.storage
 
         if not storage or not hasattr(storage, 'db'):
@@ -250,9 +336,6 @@ async def get_keys(request: Request):
 @router.post("/api/keys")
 async def add_key(request: Request):
     """Add a new API key for a provider."""
-    if not hasattr(request.app.state, 'agent') or not request.app.state.agent:
-        raise HTTPException(status_code=503, detail="Agent not initialized.")
-
     try:
         body = await request.json()
         provider = body.get("provider", "").lower().strip()
@@ -264,7 +347,7 @@ async def add_key(request: Request):
         if not api_key:
             raise HTTPException(status_code=400, detail="API key is required")
 
-        agent = request.app.state.agent
+        agent = get_agent(request)
         storage = agent.storage
 
         if not storage or not hasattr(storage, 'db'):
@@ -306,11 +389,8 @@ async def add_key(request: Request):
 @router.delete("/api/keys/{provider}")
 async def delete_key(request: Request, provider: str):
     """Delete an API key for a provider."""
-    if not hasattr(request.app.state, 'agent') or not request.app.state.agent:
-        raise HTTPException(status_code=503, detail="Agent not initialized.")
-
     try:
-        agent = request.app.state.agent
+        agent = get_agent(request)
         storage = agent.storage
 
         if not storage or not hasattr(storage, 'db'):
@@ -352,15 +432,12 @@ async def delete_key(request: Request, provider: str):
 @router.patch("/api/keys/{provider}")
 async def update_key(request: Request, provider: str):
     """Update an API key's settings (quota, active status)."""
-    if not hasattr(request.app.state, 'agent') or not request.app.state.agent:
-        raise HTTPException(status_code=503, detail="Agent not initialized.")
-
     try:
         body = await request.json()
         quota_limit = body.get("quota_limit")
         is_active = body.get("is_active")
 
-        agent = request.app.state.agent
+        agent = get_agent(request)
         storage = agent.storage
 
         if not storage or not hasattr(storage, 'db'):
@@ -415,11 +492,8 @@ async def update_key(request: Request, provider: str):
 @router.get("/api/keys/{provider}/usage")
 async def get_key_usage(request: Request, provider: str, days: int = Query(30, ge=1, le=365)):
     """Get usage history for a specific API key."""
-    if not hasattr(request.app.state, 'agent') or not request.app.state.agent:
-        raise HTTPException(status_code=503, detail="Agent not initialized.")
-
     try:
-        agent = request.app.state.agent
+        agent = get_agent(request)
         storage = agent.storage
 
         if not storage or not hasattr(storage, 'db'):
@@ -476,11 +550,8 @@ async def list_agent_models(
             "default": "model-id"
         }
     """
-    if not hasattr(request.app.state, 'agent') or not request.app.state.agent:
-        raise HTTPException(status_code=503, detail="Agent not initialized.")
-
     try:
-        agent = request.app.state.agent
+        agent = get_agent(request)
         models = []
 
         # Parse category if provided
@@ -546,11 +617,8 @@ async def get_current_model(request: Request):
     Returns the model/provider from mandate preference if set,
     otherwise falls back to the first provider's default model.
     """
-    if not hasattr(request.app.state, 'agent') or not request.app.state.agent:
-        raise HTTPException(status_code=503, detail="Agent not initialized.")
-
     try:
-        agent = request.app.state.agent
+        agent = get_agent(request)
         provider = None
         model_name = None
 
@@ -591,16 +659,13 @@ async def set_current_model(request: Request):
     The provider is optional. If omitted, auto-detection is used.
     Also accepts combined format: {"model": "openai/gpt-5-mini"}.
     """
-    if not hasattr(request.app.state, 'agent') or not request.app.state.agent:
-        raise HTTPException(status_code=503, detail="Agent not initialized.")
-
     try:
         data = await request.json()
         model = data.get("model")
         if not model:
             raise HTTPException(status_code=400, detail="'model' field is required.")
 
-        agent = request.app.state.agent
+        agent = get_agent(request)
         if not hasattr(agent, 'llm_service') or not agent.llm_service:
             raise HTTPException(status_code=503, detail="LLM service not available.")
 
@@ -630,9 +695,9 @@ async def set_current_model(request: Request):
 def list_models_v1(request: Request):
     """Return a minimal models list for OpenAI-compatible clients."""
     try:
-        agent = request.app.state.agent if hasattr(request.app.state, 'agent') else None
+        agent = get_agent(request)
         model_id = "kestrel-local"
-        if agent and hasattr(agent, 'llm_service') and agent.llm_service.providers:
+        if hasattr(agent, 'llm_service') and agent.llm_service.providers:
             prov = agent.llm_service.providers[0]
             model_id = prov.get('model') or model_id
         return {"object": "list", "data": [{"id": model_id, "object": "model"}]}
@@ -649,8 +714,6 @@ async def chat_completions(request: Request):
     (e.g. "openai/gpt-5-mini"), it is passed as model_override to the agent AND
     persisted via set_model_preference so subsequent requests use the same model.
     """
-    if not hasattr(request.app.state, 'agent') or not request.app.state.agent:
-        raise HTTPException(status_code=503, detail="Agent not initialized.")
     try:
         data = await request.json()
         messages = data.get("messages", [])
@@ -659,7 +722,7 @@ async def chat_completions(request: Request):
         if not user_input:
             user_input = "\n".join([m.get("content", "") for m in messages])
 
-        agent = request.app.state.agent
+        agent = get_agent(request)
 
         # Extract model from request and pass it through to the agent
         model_from_request = data.get("model")

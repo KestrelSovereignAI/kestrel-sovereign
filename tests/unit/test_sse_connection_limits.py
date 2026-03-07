@@ -35,6 +35,7 @@ def app_with_mock_agent():
     app.include_router(router)
 
     mock_agent = MagicMock()
+    mock_agent.agent_id = "did:test:mock-agent"
     mock_agent.get_pending_notifications = MagicMock(return_value=[])
     app.state.agent = mock_agent
 
@@ -53,8 +54,10 @@ class TestSSEConnectionLimits:
     def test_sse_connection_rejected_when_at_limit(self, app_with_mock_agent):
         """SSE connections should be rejected with 429 when at the per-client limit."""
         # Pre-fill the connection tracker to simulate being at the limit.
-        # TestClient uses "testclient" as client.host by default.
-        _sse_connections["testclient"] = MAX_SSE_CONNECTIONS_PER_CLIENT
+        # TestClient uses "testclient" as client.host; mock agent has agent_id.
+        # The key is now (client_ip, agent_id).
+        agent_id = app_with_mock_agent.state.agent.agent_id
+        _sse_connections[("testclient", agent_id)] = MAX_SSE_CONNECTIONS_PER_CLIENT
 
         client = TestClient(app_with_mock_agent, raise_server_exceptions=False)
         response = client.get("/agent/notifications/sse")
@@ -65,7 +68,8 @@ class TestSSEConnectionLimits:
 
     def test_sse_connection_rejected_over_limit(self, app_with_mock_agent):
         """SSE connections should also be rejected when over the limit."""
-        _sse_connections["testclient"] = MAX_SSE_CONNECTIONS_PER_CLIENT + 10
+        agent_id = app_with_mock_agent.state.agent.agent_id
+        _sse_connections[("testclient", agent_id)] = MAX_SSE_CONNECTIONS_PER_CLIENT + 10
 
         client = TestClient(app_with_mock_agent, raise_server_exceptions=False)
         response = client.get("/agent/notifications/sse")
@@ -74,28 +78,24 @@ class TestSSEConnectionLimits:
 
     def test_different_clients_tracked_independently(self, app_with_mock_agent):
         """Connection limits for one client should not block another client."""
+        agent_id = app_with_mock_agent.state.agent.agent_id
         # Simulate one client at the limit
-        _sse_connections["192.168.1.1"] = MAX_SSE_CONNECTIONS_PER_CLIENT
+        _sse_connections[("192.168.1.1", agent_id)] = MAX_SSE_CONNECTIONS_PER_CLIENT
 
-        # A different client (testclient) is not at the limit,
-        # so the 429 should not be raised.
-        # We verify by checking the counter gets incremented (meaning
-        # the limit check passed) even though one other client is maxed.
-        assert _sse_connections.get("testclient", 0) == 0
+        # testclient has 0 connections, so it should NOT get rejected.
+        assert _sse_connections.get(("testclient", agent_id), 0) == 0
 
-        # Use 429 test pattern: testclient has 0 connections, so it
-        # should NOT get rejected. We can verify by checking the counter
-        # was incremented after the endpoint starts.
-        _sse_connections["testclient"] = MAX_SSE_CONNECTIONS_PER_CLIENT
+        # Now max out testclient too — should get rejected
+        _sse_connections[("testclient", agent_id)] = MAX_SSE_CONNECTIONS_PER_CLIENT
         client = TestClient(app_with_mock_agent, raise_server_exceptions=False)
         response = client.get("/agent/notifications/sse")
         assert response.status_code == 429
 
         # But if testclient has room, it would not be rejected
-        _sse_connections["testclient"] = 0
+        _sse_connections[("testclient", agent_id)] = 0
         # The other client being maxed should not affect testclient
-        assert _sse_connections["192.168.1.1"] == MAX_SSE_CONNECTIONS_PER_CLIENT
-        assert _sse_connections["testclient"] == 0
+        assert _sse_connections[("192.168.1.1", agent_id)] == MAX_SSE_CONNECTIONS_PER_CLIENT
+        assert _sse_connections[("testclient", agent_id)] == 0
 
     def test_agent_not_initialized_returns_503(self):
         """SSE endpoint should return 503 when agent is not initialized."""
@@ -113,49 +113,49 @@ class TestSSEConnectionLimits:
         """Verify the connection counter lifecycle: increment on connect, decrement on disconnect."""
         # Simulate what the endpoint does: increment before generator,
         # decrement in the finally block.
-        client_ip = "10.0.0.1"
+        conn_key = ("10.0.0.1", "did:test:agent")
 
-        assert _sse_connections.get(client_ip, 0) == 0
+        assert _sse_connections.get(conn_key, 0) == 0
 
         # Simulate increment (what the endpoint does before returning the generator)
         async with _sse_lock:
-            _sse_connections[client_ip] += 1
-        assert _sse_connections[client_ip] == 1
+            _sse_connections[conn_key] += 1
+        assert _sse_connections[conn_key] == 1
 
         # Simulate a second connection
         async with _sse_lock:
-            _sse_connections[client_ip] += 1
-        assert _sse_connections[client_ip] == 2
+            _sse_connections[conn_key] += 1
+        assert _sse_connections[conn_key] == 2
 
         # Simulate first disconnect (what the generator's finally block does)
         async with _sse_lock:
-            _sse_connections[client_ip] -= 1
-            if _sse_connections[client_ip] <= 0:
-                del _sse_connections[client_ip]
-        assert _sse_connections[client_ip] == 1
+            _sse_connections[conn_key] -= 1
+            if _sse_connections[conn_key] <= 0:
+                del _sse_connections[conn_key]
+        assert _sse_connections[conn_key] == 1
 
         # Simulate second disconnect
         async with _sse_lock:
-            _sse_connections[client_ip] -= 1
-            if _sse_connections[client_ip] <= 0:
-                del _sse_connections[client_ip]
-        assert client_ip not in _sse_connections
+            _sse_connections[conn_key] -= 1
+            if _sse_connections[conn_key] <= 0:
+                del _sse_connections[conn_key]
+        assert conn_key not in _sse_connections
 
     @pytest.mark.asyncio
     async def test_limit_check_is_exact_boundary(self):
         """Verify the limit check rejects at exactly MAX, not above or below."""
-        client_ip = "10.0.0.2"
+        conn_key = ("10.0.0.2", "did:test:agent")
 
         # At limit - 1: should be allowed
-        _sse_connections[client_ip] = MAX_SSE_CONNECTIONS_PER_CLIENT - 1
+        _sse_connections[conn_key] = MAX_SSE_CONNECTIONS_PER_CLIENT - 1
         async with _sse_lock:
-            allowed = _sse_connections[client_ip] < MAX_SSE_CONNECTIONS_PER_CLIENT
+            allowed = _sse_connections[conn_key] < MAX_SSE_CONNECTIONS_PER_CLIENT
         assert allowed is True
 
         # At exactly the limit: should be rejected
-        _sse_connections[client_ip] = MAX_SSE_CONNECTIONS_PER_CLIENT
+        _sse_connections[conn_key] = MAX_SSE_CONNECTIONS_PER_CLIENT
         async with _sse_lock:
-            allowed = _sse_connections[client_ip] < MAX_SSE_CONNECTIONS_PER_CLIENT
+            allowed = _sse_connections[conn_key] < MAX_SSE_CONNECTIONS_PER_CLIENT
         assert allowed is False
 
     def test_unknown_client_fallback_logic(self):
@@ -165,13 +165,15 @@ class TestSSEConnectionLimits:
         client_ip = client.host if client else "unknown"
         assert client_ip == "unknown"
 
-        # Verify "unknown" key works with the connection tracker
-        _sse_connections["unknown"] = MAX_SSE_CONNECTIONS_PER_CLIENT
-        assert _sse_connections["unknown"] >= MAX_SSE_CONNECTIONS_PER_CLIENT
+        # Verify "unknown" tuple key works with the connection tracker
+        conn_key = ("unknown", "did:test:agent")
+        _sse_connections[conn_key] = MAX_SSE_CONNECTIONS_PER_CLIENT
+        assert _sse_connections[conn_key] >= MAX_SSE_CONNECTIONS_PER_CLIENT
 
     def test_429_response_includes_limit_in_detail(self, app_with_mock_agent):
         """The 429 response detail should include the configured limit value."""
-        _sse_connections["testclient"] = MAX_SSE_CONNECTIONS_PER_CLIENT
+        agent_id = app_with_mock_agent.state.agent.agent_id
+        _sse_connections[("testclient", agent_id)] = MAX_SSE_CONNECTIONS_PER_CLIENT
 
         client = TestClient(app_with_mock_agent, raise_server_exceptions=False)
         response = client.get("/agent/notifications/sse")
@@ -185,9 +187,10 @@ class TestSSEConnectionTrackerModule:
 
     def test_sse_connections_is_defaultdict(self):
         """_sse_connections should be a defaultdict(int) for safe access."""
-        assert _sse_connections["nonexistent_key"] == 0
+        key = ("nonexistent_ip", "did:nonexistent")
+        assert _sse_connections[key] == 0
         # Clean up the key we just created
-        del _sse_connections["nonexistent_key"]
+        del _sse_connections[key]
 
     def test_sse_lock_is_asyncio_lock(self):
         """_sse_lock should be an asyncio.Lock for thread-safe access."""

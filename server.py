@@ -22,6 +22,8 @@ from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from kestrel_sovereign.rate_limit import limiter
 
+import re
+
 from kestrel_sovereign.kestrel_config.constants import SHUTDOWN_TIMEOUT
 
 # Load environment variables from .env file
@@ -98,45 +100,75 @@ async def lifespan(app: FastAPI):
     """Manage the application's lifespan."""
     import asyncio
     logger.info("Server starting up...")
-    try:
-        # Check database backend configuration
-        db_backend = os.environ.get("KESTREL_DB_BACKEND", "sqlite")
-        database_url = os.environ.get("KESTREL_DATABASE_URL")
 
-        if db_backend.lower() == "postgres" and database_url:
-            # PostgreSQL mode - for cloud deployments
-            logger.info("Using PostgreSQL backend for Kestrel")
-            storage_dir = os.environ.get("KESTREL_DB_PATH", os.getcwd())
-            db_path = os.path.join(storage_dir, "kestrel_prime.db")  # For SQLite fallback stores
-            agent_did = await get_agent_did_async(storage_dir)
-            llm_service = LLMService()
-            app.state.agent = KestrelAgent(
-                did=agent_did,
-                storage_path=db_path,
-                llm_service=llm_service,
-                database_url=database_url,
-                db_backend="postgres",
-            )
-        else:
-            # SQLite mode (default) - for local deployments
-            storage_dir = os.environ.get("KESTREL_DB_PATH", os.getcwd())
-            db_path = os.path.join(storage_dir, "kestrel_prime.db")
-            agent_did = await get_agent_did_async(storage_dir)
-            llm_service = LLMService()
-            app.state.agent = KestrelAgent(
-                did=agent_did,
-                storage_path=db_path,
-                llm_service=llm_service
-            )
-            logger.info(f"Using SQLite backend for Kestrel: {db_path}")
+    # Detect multi-agent mode
+    multi_agent_env = os.environ.get("KESTREL_MULTI_AGENT", "").lower() in ("1", "true", "yes")
+    rookery_path = Path(os.environ.get("KESTREL_ROOKERY_CONFIG", "rookery.toml"))
 
-        await app.state.agent.initialize()
-        logger.info(f"Kestrel Agent initialized and ready (backend: {db_backend})")
-    except Exception as e:
-        logger.error(f"Error during startup: {e}", exc_info=True)
+    if multi_agent_env or rookery_path.exists():
+        # --- Multi-agent mode ---
+        try:
+            from kestrel_sovereign.rookery.agent_manager import AgentManager
+            from kestrel_sovereign.rookery.config import RookeryConfig
+
+            config = RookeryConfig.load(
+                str(rookery_path) if rookery_path.exists() else None,
+                auto_discover_fallback=True,
+            )
+            manager = AgentManager(base_data_dir=Path.cwd())
+            loaded = await manager.load_from_config(config)
+            app.state.agent_manager = manager
+            app.state.agent = None  # No single default agent
+            logger.info(f"Multi-agent mode: {loaded} agent(s) loaded")
+        except Exception as e:
+            logger.error(f"Error during multi-agent startup: {e}", exc_info=True)
+            app.state.agent_manager = None
+            app.state.agent = None
+    else:
+        # --- Single-agent mode (original behavior) ---
+        app.state.agent_manager = None
+        try:
+            db_backend = os.environ.get("KESTREL_DB_BACKEND", "sqlite")
+            database_url = os.environ.get("KESTREL_DATABASE_URL")
+
+            if db_backend.lower() == "postgres" and database_url:
+                logger.info("Using PostgreSQL backend for Kestrel")
+                storage_dir = os.environ.get("KESTREL_DB_PATH", os.getcwd())
+                db_path = os.path.join(storage_dir, "kestrel_prime.db")
+                agent_did = await get_agent_did_async(storage_dir)
+                llm_service = LLMService()
+                app.state.agent = KestrelAgent(
+                    did=agent_did,
+                    storage_path=db_path,
+                    llm_service=llm_service,
+                    database_url=database_url,
+                    db_backend="postgres",
+                )
+            else:
+                storage_dir = os.environ.get("KESTREL_DB_PATH", os.getcwd())
+                db_path = os.path.join(storage_dir, "kestrel_prime.db")
+                agent_did = await get_agent_did_async(storage_dir)
+                llm_service = LLMService()
+                app.state.agent = KestrelAgent(
+                    did=agent_did,
+                    storage_path=db_path,
+                    llm_service=llm_service,
+                )
+                logger.info(f"Using SQLite backend for Kestrel: {db_path}")
+
+            await app.state.agent.initialize()
+            logger.info(f"Kestrel Agent initialized and ready (backend: {db_backend})")
+        except Exception as e:
+            logger.error(f"Error during startup: {e}", exc_info=True)
+
     yield
+
+    # Shutdown
     logger.info("Server shutting down...")
-    if hasattr(app.state, 'agent') and app.state.agent:
+    if getattr(app.state, 'agent_manager', None):
+        await app.state.agent_manager.shutdown_all()
+        logger.info("All agents shutdown complete.")
+    elif getattr(app.state, 'agent', None):
         try:
             await asyncio.wait_for(app.state.agent.shutdown(), timeout=SHUTDOWN_TIMEOUT)
             logger.info("Agent shutdown complete.")
@@ -194,6 +226,46 @@ app.include_router(observability_router)
 app.include_router(saved_items_router)
 
 
+# Regex for multi-agent path routing: /api/agents/{name}/{remaining_path}
+_AGENT_PATH_RE = re.compile(r"^/api/agents/([^/]+)/(.+)$")
+
+
+@app.middleware("http")
+async def agent_routing_middleware(request: Request, call_next):
+    """Route /api/agents/{name}/... requests to the correct in-process agent.
+
+    In multi-agent mode:
+    1. Extracts agent name from path prefix /api/agents/{name}/...
+    2. Looks up agent in AgentManager
+    3. Sets request.state.agent to the resolved agent
+    4. Rewrites request path to strip the prefix
+
+    In single-agent mode, this middleware is a no-op.
+    """
+    agent_manager = getattr(request.app.state, 'agent_manager', None)
+    if agent_manager is None:
+        return await call_next(request)
+
+    path = request.url.path
+    match = _AGENT_PATH_RE.match(path)
+    if match:
+        agent_name = match.group(1)
+        remaining_path = "/" + match.group(2)
+
+        agent = agent_manager.get_agent(agent_name)
+        if agent is None:
+            return JSONResponse(
+                status_code=404,
+                content={"detail": f"Agent '{agent_name}' not found"},
+            )
+
+        request.state.agent = agent
+        # Rewrite path so existing routers see the original endpoint path
+        request.scope["path"] = remaining_path
+
+    return await call_next(request)
+
+
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
     """Global authentication middleware.
@@ -229,7 +301,7 @@ async def auth_middleware(request: Request, call_next):
         # Check query parameter for SSE endpoints only (EventSource can't send headers)
         # Restricted to SSE_PATHS to avoid leaking keys in URL logs on other endpoints
         api_key_query = request.query_params.get("api_key")
-        if api_key_query and request.url.path in SSE_PATHS:
+        if api_key_query and any(request.url.path.endswith(p) for p in SSE_PATHS):
             if secrets.compare_digest(api_key_query, expected_key):
                 return await call_next(request)
 
@@ -347,7 +419,12 @@ async def get_bootstrap_key(request: Request):
 @app.get("/health")
 def health_check(request: Request):
     """A simple health check endpoint."""
-    if hasattr(request.app.state, 'agent') and request.app.state.agent:
+    agent = getattr(request.state, 'agent', None) or getattr(request.app.state, 'agent', None)
+    if agent:
+        return {"status": "ok", "agent_initialized": True}
+    # In multi-agent mode, check if any agents are loaded
+    manager = getattr(request.app.state, 'agent_manager', None)
+    if manager and manager.list_agents():
         return {"status": "ok", "agent_initialized": True}
     return {"status": "ok", "agent_initialized": False}
 
@@ -359,7 +436,7 @@ async def health_detailed(request: Request):
     Returns individual check results for database, LLM service,
     memory system, disk space, and context budget.
     """
-    agent = getattr(request.app.state, 'agent', None)
+    agent = getattr(request.state, 'agent', None) or getattr(request.app.state, 'agent', None)
     if not agent:
         return {"status": "unhealthy", "error": "No agent available", "checks": []}
 
