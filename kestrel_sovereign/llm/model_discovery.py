@@ -2,8 +2,8 @@
 Model Discovery Service
 
 Discovers available models from all LLM providers using their APIs.
-Enriches results with featured/hidden flags from model_catalog.toml.
-Provides caching to avoid repeated API calls.
+Enriches results with manual overrides from model_catalog.toml.
+Provides in-memory caching and disk-based cache for fast startup.
 """
 import asyncio
 import logging
@@ -136,9 +136,10 @@ class ModelDiscoveryMixin:
                         f"not found in discovery — may be deprecated"
                     )
 
-        # Cache results
+        # Cache results in memory and on disk
         self._model_cache = all_models
         self._cache_timestamp = time.time()
+        catalog.write_cache(all_models)
 
         logger.info(f"Discovered {len(all_models)} models total")
 
@@ -148,6 +149,31 @@ class ModelDiscoveryMixin:
             category=category,
             providers=providers
         )
+
+    def _load_from_disk_cache(self) -> bool:
+        """Load models from disk cache if no in-memory cache exists.
+
+        Called on first access to provide immediate model availability
+        before API discovery completes.
+
+        Returns:
+            True if cache was loaded, False otherwise
+        """
+        if self._model_cache is not None:
+            return False  # Already have in-memory data
+
+        catalog = get_catalog_service()
+        cached = catalog.load_cache()
+        if cached:
+            self._model_cache = cached
+            self._cache_timestamp = 0.0  # Expired — will refresh on next discover_all_models()
+            logger.info(f"Pre-populated {len(cached)} models from disk cache")
+
+            # Register context limits from cache
+            from kestrel_sovereign.agent.token_counter import register_discovered_limits
+            register_discovered_limits(cached)
+            return True
+        return False
 
     async def _discover_from_adapter(
         self,
