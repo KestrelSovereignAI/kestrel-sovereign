@@ -34,6 +34,10 @@ class ChainNetwork(Enum):
     POLYGON_AMOY = "polygon_amoy"  # Testnet (formerly Mumbai)
     POLYGON_MAINNET = "polygon_mainnet"
 
+    # Base (Coinbase L2) — required for x402 Lighthouse payments
+    BASE_SEPOLIA = "base_sepolia"  # Testnet
+    BASE_MAINNET = "base_mainnet"
+
     @property
     def is_testnet(self) -> bool:
         """Check if this is a testnet."""
@@ -41,6 +45,7 @@ class ChainNetwork(Enum):
             ChainNetwork.FILECOIN_CALIBRATION,
             ChainNetwork.ETHEREUM_SEPOLIA,
             ChainNetwork.POLYGON_AMOY,
+            ChainNetwork.BASE_SEPOLIA,
         )
 
     @property
@@ -58,6 +63,8 @@ class ChainNetwork(Enum):
             ChainNetwork.ETHEREUM_MAINNET: "Ethereum Mainnet",
             ChainNetwork.POLYGON_AMOY: "Polygon Amoy (Testnet)",
             ChainNetwork.POLYGON_MAINNET: "Polygon Mainnet",
+            ChainNetwork.BASE_SEPOLIA: "Base Sepolia (Testnet)",
+            ChainNetwork.BASE_MAINNET: "Base Mainnet",
         }
         return names.get(self, self.value)
 
@@ -140,6 +147,27 @@ class NetworkConfig:
                 chain_id=137,
                 native_token="MATIC",
                 explorer_url="https://polygonscan.com",
+            ),
+            ChainNetwork.BASE_SEPOLIA: cls(
+                network=ChainNetwork.BASE_SEPOLIA,
+                rpc_url=os.environ.get(
+                    "BASE_SEPOLIA_RPC",
+                    "https://sepolia.base.org",
+                ),
+                chain_id=84532,
+                native_token="ETH",
+                explorer_url="https://sepolia.basescan.org",
+                faucet_url="https://www.coinbase.com/faucets/base-ethereum-goerli-faucet",
+            ),
+            ChainNetwork.BASE_MAINNET: cls(
+                network=ChainNetwork.BASE_MAINNET,
+                rpc_url=os.environ.get(
+                    "BASE_MAINNET_RPC",
+                    "https://mainnet.base.org",
+                ),
+                chain_id=8453,
+                native_token="ETH",
+                explorer_url="https://basescan.org",
             ),
         }
         return configs[network]

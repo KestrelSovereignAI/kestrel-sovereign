@@ -17,25 +17,17 @@ Pricing (as of Feb 2026):
 - Raw Filecoin deal cost is ~$0.00005/GB but Lighthouse charges $2-5/GB
   to fund the endowment pool that auto-renews deals in perpetuity.
 
-Note on Python SDK:
-- lighthouseweb3 v0.1.1 (May 2023) only supports upload(). Unmaintained.
-- For encryption/token-gating/deal status, use REST API directly.
-- Migration to Kavach threshold encryption is recommended over local Fernet
-  keys to eliminate the single-point-of-failure in cryostasis key recovery.
-
 References:
 - Docs: https://docs.lighthouse.storage/
-- Python SDK: https://pypi.org/project/lighthouseweb3/
+- REST API: used directly via LighthouseRestClient (replaces unmaintained SDK)
 - Kavach encryption: https://github.com/lighthouse-web3/encryption-sdk
 - x402 protocol: https://github.com/coinbase/x402
 - Endowment pool: https://www.lighthouse.storage/blogs/Discover%20How%20the%20Endowment%20Pool%20Makes%20Your%20Data%20Immortal
 """
 
 import hashlib
-import io
 import logging
 import os
-import tempfile
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -48,19 +40,10 @@ from kestrel_sovereign.storage.providers.base import (
     StorageResult,
     StorageTier,
 )
-from kestrel_sovereign.kestrel_config.constants import HTTP_TIMEOUT_MEDIUM
+from kestrel_sovereign.storage.providers.lighthouse_rest import LighthouseRestClient
 from kestrel_sovereign.kestrel_config.defaults import get_lighthouse_gateway_url
 
 logger = logging.getLogger(__name__)
-
-# Try to import lighthouseweb3, gracefully degrade if not installed
-try:
-    from lighthouseweb3 import Lighthouse
-    LIGHTHOUSE_AVAILABLE = True
-except ImportError:
-    Lighthouse = None
-    LIGHTHOUSE_AVAILABLE = False
-    logger.warning("lighthouseweb3 not installed. Run: pip install lighthouseweb3")
 
 
 # Pricing constants (USD)
@@ -108,21 +91,19 @@ class LighthouseProvider(StorageProvider, CryostasisCapable, MultiCurrencyPaymen
             self.cache_dir = Path(os.environ.get("KESTREL_CACHE_DIR", "./storage_cache"))
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
-        # Initialize Lighthouse client
-        self._client: Optional["Lighthouse"] = None
+        # Initialize async REST client
+        self._client: Optional[LighthouseRestClient] = None
         self._available = False
 
-        if LIGHTHOUSE_AVAILABLE and self.api_key:
-            try:
-                self._client = Lighthouse(token=self.api_key)
-                self._available = True
-                logger.info("✅ Lighthouse provider initialized")
-            except Exception as e:
-                logger.error(f"❌ Failed to initialize Lighthouse: {e}")
-        elif not LIGHTHOUSE_AVAILABLE:
-            logger.warning("⚠️ lighthouseweb3 not installed")
+        if self.api_key:
+            self._client = LighthouseRestClient(
+                api_key=self.api_key,
+                gateway_url=get_lighthouse_gateway_url(),
+            )
+            self._available = True
+            logger.info("Lighthouse provider initialized (REST API)")
         else:
-            logger.warning("⚠️ No LIGHTHOUSE_API_KEY configured")
+            logger.warning("No LIGHTHOUSE_API_KEY configured")
 
         # Track stored content locally for list operations
         self._index_file = self.cache_dir / "lighthouse_index.json"
@@ -141,16 +122,18 @@ class LighthouseProvider(StorageProvider, CryostasisCapable, MultiCurrencyPaymen
     async def _ensure_client(self) -> bool:
         """Ensure client is initialized with current API key."""
         api_key = await self._get_api_key()
-        if api_key and LIGHTHOUSE_AVAILABLE:
+        if api_key:
             if not self._client or self.api_key != api_key:
-                try:
-                    self._client = Lighthouse(token=api_key)
-                    self.api_key = api_key
-                    self._available = True
-                    return True
-                except Exception as e:
-                    logger.error(f"Failed to initialize Lighthouse: {e}")
-                    return False
+                # Close old client if key changed
+                if self._client:
+                    await self._client.close()
+                self._client = LighthouseRestClient(
+                    api_key=api_key,
+                    gateway_url=get_lighthouse_gateway_url(),
+                )
+                self.api_key = api_key
+                self._available = True
+                return True
         return self._available
 
     @property
@@ -199,58 +182,43 @@ class LighthouseProvider(StorageProvider, CryostasisCapable, MultiCurrencyPaymen
         if encrypt:
             final_content, encryption_key_hash = await self._encrypt_content(content)
 
-        # Write to temp file for upload (Lighthouse SDK requires file path)
-        with tempfile.NamedTemporaryFile(delete=False, suffix=Path(filename).suffix) as tmp:
-            tmp.write(final_content)
-            tmp_path = tmp.name
+        # Upload to Lighthouse via REST API
+        tag = metadata.get("tag", "kestrel-storage")
+        upload_response = await self._client.upload(
+            content=final_content,
+            filename=filename,
+            tag=tag,
+        )
 
-        try:
-            # Upload to Lighthouse
-            tag = metadata.get("tag", "kestrel-storage")
-            upload_response = self._client.upload(source=tmp_path, tag=tag)
+        cid = upload_response.get("Hash")
+        size = int(upload_response.get("Size", len(final_content)))
 
-            # Parse response - format: {'data': {'Name': '...', 'Hash': '...', 'Size': '...'}}
-            if isinstance(upload_response, dict) and "data" in upload_response:
-                cid = upload_response["data"].get("Hash")
-                size = int(upload_response["data"].get("Size", len(final_content)))
-            else:
-                # Handle alternative response format
-                cid = getattr(upload_response, "Hash", None) or str(upload_response)
-                size = len(final_content)
+        logger.info(f"Uploaded to Lighthouse: {cid}")
 
-            logger.info(f"📤 Uploaded to Lighthouse: {cid}")
+        # Cache locally for fast retrieval
+        await self._cache_content(content_hash, final_content)
 
-            # Cache locally for fast retrieval
-            await self._cache_content(content_hash, final_content)
+        # Calculate cost
+        size_gb = Decimal(size) / Decimal(1024 * 1024 * 1024)
+        storage_cost = size_gb * LIGHTHOUSE_COST_PER_GB_MONTHLY
 
-            # Calculate cost
-            size_gb = Decimal(size) / Decimal(1024 * 1024 * 1024)
-            storage_cost = size_gb * LIGHTHOUSE_COST_PER_GB_MONTHLY
+        result = StorageResult(
+            content_hash=content_hash,
+            cid=cid,
+            tier=self._default_tier,
+            provider=self.provider_name,
+            encrypted=encrypt,
+            encryption_key_hash=encryption_key_hash,
+            size_bytes=size,
+            content_type=metadata.get("content_type"),
+            filename=filename,
+            storage_cost_usd=storage_cost,
+        )
 
-            result = StorageResult(
-                content_hash=content_hash,
-                cid=cid,
-                tier=self._default_tier,
-                provider=self.provider_name,
-                encrypted=encrypt,
-                encryption_key_hash=encryption_key_hash,
-                size_bytes=size,
-                content_type=metadata.get("content_type"),
-                filename=filename,
-                storage_cost_usd=storage_cost,
-            )
+        # Update local index
+        await self._update_index(result)
 
-            # Update local index
-            await self._update_index(result)
-
-            return result
-
-        finally:
-            # Clean up temp file
-            try:
-                os.unlink(tmp_path)
-            except Exception:
-                pass
+        return result
 
     async def retrieve(self, cid: str, encryption_key_hash: Optional[str] = None) -> bytes:
         """
@@ -270,16 +238,12 @@ class LighthouseProvider(StorageProvider, CryostasisCapable, MultiCurrencyPaymen
         # Try local cache first
         cached = await self._get_from_cache(cid)
         if cached:
-            logger.info(f"📂 Retrieved from cache: {cid[:16]}...")
+            logger.info(f"Retrieved from cache: {cid[:16]}...")
             content = cached
         else:
             # Download from Lighthouse IPFS gateway
-            logger.info(f"📡 Downloading from Lighthouse: {cid}")
-            import requests
-            gateway_url = f"{get_lighthouse_gateway_url()}/{cid}"
-            response = requests.get(gateway_url, timeout=HTTP_TIMEOUT_MEDIUM)
-            response.raise_for_status()
-            content = response.content
+            logger.info(f"Downloading from Lighthouse: {cid}")
+            content = await self._client.download(cid)
 
             # Cache for next time
             await self._cache_content(cid, content)
@@ -345,12 +309,11 @@ class LighthouseProvider(StorageProvider, CryostasisCapable, MultiCurrencyPaymen
             return False
 
         try:
-            # Check deal status
-            status = self._client.getDealStatus(cid)
-            logger.info(f"✅ Verified: {cid} - {status}")
+            status = await self._client.get_deal_status(cid)
+            logger.info(f"Verified: {cid} - {status}")
             return True
         except Exception as e:
-            logger.warning(f"⚠️ Verification failed for {cid}: {e}")
+            logger.warning(f"Verification failed for {cid}: {e}")
             return False
 
     async def get_stats(self) -> Dict[str, Any]:
@@ -499,11 +462,9 @@ class LighthouseProvider(StorageProvider, CryostasisCapable, MultiCurrencyPaymen
             raise ConnectionError("Lighthouse provider not available")
 
         try:
-            import requests
-            from kestrel_sovereign.kestrel_config.constants import HTTP_TIMEOUT_MEDIUM
+            import httpx
 
             # Convert USD to the specified currency
-            # Note: In production, use a price oracle. For now, use approximate rates.
             conversion_rates = {
                 "FIL": Decimal("5.50"),   # $5.50 per FIL (approximate)
                 "USDC": Decimal("1.00"),  # 1:1 with USD
@@ -512,33 +473,22 @@ class LighthouseProvider(StorageProvider, CryostasisCapable, MultiCurrencyPaymen
 
             amount_in_currency = amount_usd / conversion_rates[currency]
 
-            # Prepare payment request
-            # Lighthouse uses their REST API for payment operations
-            api_url = "https://api.lighthouse.storage/api/payment/deal"
-
-            headers = {
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json",
-            }
-
-            payload = {
-                "amount": str(amount_in_currency),
-                "currency": currency,
-                "wallet_address": wallet_address,
-                "duration_days": 365,  # Default 1 year storage
-            }
-
-            # Make payment request
-            response = requests.post(
-                api_url,
-                json=payload,
-                headers=headers,
-                timeout=HTTP_TIMEOUT_MEDIUM
+            # Lighthouse REST API for payment operations
+            client = await self._client._get_client()
+            response = await client.post(
+                "https://api.lighthouse.storage/api/payment/deal",
+                headers=self._client._auth_headers,
+                json={
+                    "amount": str(amount_in_currency),
+                    "currency": currency,
+                    "wallet_address": wallet_address,
+                    "duration_days": 365,
+                },
             )
 
             if response.status_code == 200:
                 result = response.json()
-                logger.info(f"💰 Payment successful: {amount_in_currency} {currency}")
+                logger.info(f"Payment successful: {amount_in_currency} {currency}")
 
                 return {
                     "status": "success",
@@ -552,9 +502,8 @@ class LighthouseProvider(StorageProvider, CryostasisCapable, MultiCurrencyPaymen
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                 }
             else:
-                # Handle payment failure
                 error_msg = response.json().get("error", "Unknown error")
-                logger.error(f"❌ Payment failed: {error_msg}")
+                logger.error(f"Payment failed: {error_msg}")
 
                 return {
                     "status": "failed",
@@ -566,11 +515,11 @@ class LighthouseProvider(StorageProvider, CryostasisCapable, MultiCurrencyPaymen
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                 }
 
-        except requests.RequestException as e:
-            logger.error(f"❌ Payment request failed: {e}")
+        except httpx.HTTPError as e:
+            logger.error(f"Payment request failed: {e}")
             raise ConnectionError(f"Failed to connect to Lighthouse payment API: {e}")
         except Exception as e:
-            logger.error(f"❌ Payment error: {e}")
+            logger.error(f"Payment error: {e}")
             raise
 
     async def get_balance(self, wallet_address: str, currency: str) -> Decimal:
@@ -599,8 +548,8 @@ class LighthouseProvider(StorageProvider, CryostasisCapable, MultiCurrencyPaymen
             raise ConnectionError("Lighthouse provider not available")
 
         try:
-            # Use SDK to get balance/quota information
-            balance_data = self._client.getBalance()
+            # Use REST API to get balance/quota information
+            balance_data = await self._client.get_balance()
 
             # Balance data format from SDK:
             # {

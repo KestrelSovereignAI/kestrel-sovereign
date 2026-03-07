@@ -89,8 +89,8 @@ dependencies = [
     # LLM provider SDKs (used at runtime via dynamic import)
     "anthropic>=0.75.0",
     "google-generativeai>=0.8.6",
-    # Decentralized storage
-    "lighthouseweb3>=0.1.6",
+    # CBOR encoding (for CAR files and IPLD)
+    "cbor2>=5.6.0",
     # Notifications (future use)
     "sendgrid>=6.12.5",
     "twilio>=9.9.1",
