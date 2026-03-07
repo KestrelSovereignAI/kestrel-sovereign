@@ -140,6 +140,27 @@ class StreamingMixin:
                     f"Available: {[p['name'] for p in self.providers]}"
                 )
             logger.info(f"Model override: {provider_name}/{model_name}")
+        elif not model_override:
+            # Check mandate preference (set by !model-set command or UI selection)
+            pref_model = self._mandate_preference.get("model")
+            pref_provider = self._mandate_preference.get("provider")
+            if pref_model:
+                if pref_provider:
+                    # Restrict to the mandated provider and override its model
+                    for p in self.providers:
+                        if p["name"] == pref_provider:
+                            override_provider = dict(p)
+                            override_provider["model"] = pref_model
+                            providers_to_use = [override_provider]
+                            logger.info(f"Model mandate set: using only {pref_provider} with {pref_model}")
+                            break
+                    else:
+                        logger.warning(f"Mandated provider '{pref_provider}' not found in available providers")
+                else:
+                    # Model set without provider — override model on all providers
+                    providers_to_use = [
+                        {**p, "model": pref_model} for p in self.providers
+                    ]
 
         if force_local_only:
             providers_to_use = [p for p in providers_to_use if p["name"] in ["ollama"]]
@@ -309,11 +330,27 @@ class StreamingMixin:
             ):
                 model_override = None
 
+        # Check mandate preference when no explicit override is given
+        target_model = model_override
+        if not target_model:
+            pref_model = self._mandate_preference.get("model")
+            pref_provider = self._mandate_preference.get("provider")
+            if pref_model:
+                target_model = pref_model
+                if pref_provider:
+                    for p in providers:
+                        if p["name"] == pref_provider:
+                            providers = [p]
+                            logger.info(f"Model mandate set: using only {pref_provider} with {pref_model}")
+                            break
+                    else:
+                        logger.warning(f"Mandated provider '{pref_provider}' not found in available providers")
+
         last_error = None
         for provider in providers:
             try:
                 adapter = provider["adapter"]
-                model = model_override or provider["model"]
+                model = target_model or provider["model"]
 
                 if hasattr(adapter, "get_streaming_response"):
                     async for chunk in adapter.get_streaming_response(

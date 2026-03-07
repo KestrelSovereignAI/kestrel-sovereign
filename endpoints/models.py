@@ -583,6 +583,49 @@ async def get_current_model(request: Request):
         raise HTTPException(status_code=500, detail="Error getting current model.")
 
 
+@router.post("/api/model/set")
+async def set_current_model(request: Request):
+    """Set the active model and provider for this session.
+
+    Accepts JSON body: {"model": "gpt-5-mini", "provider": "openai"}
+    The provider is optional. If omitted, auto-detection is used.
+    Also accepts combined format: {"model": "openai/gpt-5-mini"}.
+    """
+    if not hasattr(request.app.state, 'agent') or not request.app.state.agent:
+        raise HTTPException(status_code=503, detail="Agent not initialized.")
+
+    try:
+        data = await request.json()
+        model = data.get("model")
+        if not model:
+            raise HTTPException(status_code=400, detail="'model' field is required.")
+
+        agent = request.app.state.agent
+        if not hasattr(agent, 'llm_service') or not agent.llm_service:
+            raise HTTPException(status_code=503, detail="LLM service not available.")
+
+        provider = data.get("provider")
+        model_name = model
+
+        # Support combined "provider/model" format in the model field
+        if "/" in model and not provider:
+            provider, model_name = model.split("/", 1)
+
+        agent.llm_service.set_model_preference(model_name, provider)
+
+        return {
+            "success": True,
+            "model": model_name,
+            "provider": provider,
+            "full_model": f"{provider}/{model_name}" if provider else model_name,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error setting model: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Error setting model.")
+
+
 @router.get("/v1/models")
 def list_models_v1(request: Request):
     """Return a minimal models list for OpenAI-compatible clients."""
@@ -600,7 +643,12 @@ def list_models_v1(request: Request):
 
 @router.post("/v1/chat/completions")
 async def chat_completions(request: Request):
-    """Minimal Chat Completions-compatible endpoint."""
+    """Chat Completions-compatible endpoint.
+
+    Respects the 'model' field from the request body. When a model is provided
+    (e.g. "openai/gpt-5-mini"), it is passed as model_override to the agent AND
+    persisted via set_model_preference so subsequent requests use the same model.
+    """
     if not hasattr(request.app.state, 'agent') or not request.app.state.agent:
         raise HTTPException(status_code=503, detail="Agent not initialized.")
     try:
@@ -612,7 +660,23 @@ async def chat_completions(request: Request):
             user_input = "\n".join([m.get("content", "") for m in messages])
 
         agent = request.app.state.agent
-        assistant_text = await agent.process_input(user_input)
+
+        # Extract model from request and pass it through to the agent
+        model_from_request = data.get("model")
+        model_override = None
+        if model_from_request and model_from_request != "kestrel-local":
+            model_override = model_from_request
+            # Also persist as mandate preference so the selection sticks
+            if hasattr(agent, 'llm_service') and agent.llm_service:
+                provider = None
+                model_name = model_from_request
+                if "/" in model_from_request:
+                    provider, model_name = model_from_request.split("/", 1)
+                agent.llm_service.set_model_preference(model_name, provider)
+
+        assistant_text = await agent.process_input(
+            user_input, model_override=model_override
+        )
 
         resp = {
             "id": f"chatcmpl-{int(time.time()*1000)}",

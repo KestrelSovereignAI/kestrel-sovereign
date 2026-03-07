@@ -613,3 +613,114 @@ class TestEdgeCases:
         # Backend should be deactivated after failure
         status = llm_service.get_backend_status()
         assert not status["remote_active"]
+
+
+# =============================================================================
+# Priority 5 — Streaming Mandate Preference Tests
+# =============================================================================
+
+
+class TestStreamingMandatePreference:
+    """Tests that streaming methods respect mandate preference."""
+
+    @pytest.mark.asyncio
+    async def test_get_streaming_response_uses_mandate(self, llm_service, mock_adapter):
+        """Test that get_streaming_response respects mandate preference."""
+        # Set mandate to anthropic/claude-sonnet-4-5
+        llm_service.set_model_preference("claude-sonnet-4-5", provider="anthropic")
+
+        # Mock streaming response
+        async def mock_streaming(*args, **kwargs):
+            yield "Hello "
+            yield "world"
+        mock_adapter.get_streaming_response = Mock(return_value=mock_streaming())
+
+        chunks = []
+        async for chunk in llm_service.get_streaming_response(
+            system_prompt="Test",
+            user_prompt="Hello",
+        ):
+            chunks.append(chunk)
+
+        assert len(chunks) > 0
+        # Verify the adapter was called with the mandated model
+        call_args = mock_adapter.get_streaming_response.call_args
+        assert call_args is not None
+        assert call_args.kwargs.get("model") == "claude-sonnet-4-5" or \
+               (len(call_args.args) > 1 and call_args.args[1] == "claude-sonnet-4-5")
+
+    @pytest.mark.asyncio
+    async def test_stream_with_messages_uses_mandate(self, llm_service, mock_adapter):
+        """Test that stream_with_messages respects mandate preference."""
+        # Set mandate to anthropic/claude-sonnet-4-5
+        llm_service.set_model_preference("claude-sonnet-4-5", provider="anthropic")
+
+        # Mock streaming response
+        async def mock_streaming(*args, **kwargs):
+            yield "Streamed "
+            yield "response"
+        mock_adapter.get_streaming_response = Mock(return_value=mock_streaming())
+
+        messages = [{"role": "user", "content": "Test"}]
+        chunks = []
+        async for chunk in llm_service.stream_with_messages(
+            messages=messages,
+        ):
+            chunks.append(chunk)
+
+        assert len(chunks) > 0
+        # Verify the adapter was called with the mandated model
+        call_args = mock_adapter.get_streaming_response.call_args
+        assert call_args is not None
+        assert call_args.kwargs.get("model") == "claude-sonnet-4-5" or \
+               (len(call_args.args) > 1 and call_args.args[1] == "claude-sonnet-4-5")
+
+    @pytest.mark.asyncio
+    async def test_streaming_without_mandate_uses_default(self, llm_service, mock_adapter):
+        """Test that streaming without mandate uses provider default model."""
+        # Ensure no mandate is set
+        llm_service.clear_model_preference()
+
+        async def mock_streaming(*args, **kwargs):
+            yield "Default response"
+        mock_adapter.get_streaming_response = Mock(return_value=mock_streaming())
+
+        messages = [{"role": "user", "content": "Test"}]
+        chunks = []
+        async for chunk in llm_service.stream_with_messages(
+            messages=messages,
+        ):
+            chunks.append(chunk)
+
+        assert len(chunks) > 0
+        # Should use the provider's default model (gpt-5-mini for first provider)
+        call_args = mock_adapter.get_streaming_response.call_args
+        assert call_args is not None
+        model_used = call_args.kwargs.get("model") or (call_args.args[1] if len(call_args.args) > 1 else None)
+        assert model_used == "gpt-5-mini"
+
+    @pytest.mark.asyncio
+    async def test_streaming_override_takes_precedence_over_mandate(self, llm_service, mock_adapter):
+        """Test that explicit model_override takes precedence over mandate."""
+        # Set mandate to anthropic
+        llm_service.set_model_preference("claude-sonnet-4-5", provider="anthropic")
+
+        async def mock_streaming(*args, **kwargs):
+            yield "Override response"
+        mock_adapter.get_streaming_response = Mock(return_value=mock_streaming())
+
+        messages = [{"role": "user", "content": "Test"}]
+        chunks = []
+        async for chunk in llm_service.stream_with_messages(
+            messages=messages,
+            model_override="openai/gpt-5-mini",
+        ):
+            chunks.append(chunk)
+
+        assert len(chunks) > 0
+        # Should use the override model, not the mandate
+        # stream_with_messages resolves "openai/gpt-5-mini" → model "gpt-5-mini"
+        call_args = mock_adapter.get_streaming_response.call_args
+        assert call_args is not None
+        model_used = call_args.kwargs.get("model") or (call_args.args[1] if len(call_args.args) > 1 else None)
+        assert model_used in ("gpt-5-mini", "openai/gpt-5-mini")
