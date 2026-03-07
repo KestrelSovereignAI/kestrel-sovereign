@@ -598,27 +598,17 @@ class VertexAIAdapter(LLMAdapter):
         """
         Return fallback model list when API discovery fails.
 
-        Reads from the model catalog's featured list for vertex_ai.
-        Falls back to an empty list if catalog is unavailable.
+        Reads from the discovery cache for vertex_ai models.
+        Falls back to an empty list if no cache available.
         """
         try:
             from .model_catalog import get_catalog_service
             catalog = get_catalog_service()
-            featured = catalog.get_featured_models("vertex_ai")
-            if featured:
-                return [
-                    ModelInfo(
-                        id=model_id,
-                        provider="vertex_ai",
-                        display_name=model_id,
-                        supports_vision=True,
-                        supports_tools=True,
-                        supports_streaming=True,
-                    )
-                    for model_id in featured
-                ]
+            cached = catalog.load_cache()
+            if cached:
+                return [m for m in cached if m.provider == "vertex_ai"]
         except Exception as e:
-            logger.warning(f"Could not load vertex_ai fallback models from catalog: {e}")
+            logger.warning(f"Could not load vertex_ai fallback models from cache: {e}")
         return []
 
 
