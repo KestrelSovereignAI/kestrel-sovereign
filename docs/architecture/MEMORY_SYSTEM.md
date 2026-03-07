@@ -71,32 +71,32 @@ layer, not as a Feature plugin. It enriches every conversation message
 transparently and provides weighted retrieval to any component that
 needs context.
 
-```
-                    Incoming message
-                          |
-                          v
-                  +----------------+
-                  | EmotionalTagger|   Sentiment, importance, temporal tags
-                  +--------+-------+
-                           |
-              +------------+------------+
-              |                         |
-              v                         v
-    +------------------+     +-------------------+
-    | AssociativeLinker |     | conversation_history.metadata |
-    | (knowledge graph)|     | (JSON enrichment, no schema   |
-    +--------+---------+     |  changes required)             |
-             |               +-------------------+
-             v                        |
-    concept nodes &                   v
-    association edges       +-------------------+
-                            | MemoryRetriever   |   5-weight scoring
-                            +---------+---------+
-                                      |
-                                      v
-                            +-------------------+
-                            | MemoryConsolidator|   Episodes, patterns,
-                            +-------------------+   archival (background)
+```mermaid
+flowchart TD
+    MSG["Incoming Message"] --> ET["EmotionalTagger"]
+
+    ET -->|"sentiment, importance,<br/>temporal tags"| MD["conversation_history.metadata<br/>(JSON enrichment)"]
+    ET --> AL["AssociativeLinker"]
+
+    AL -->|"co-occurrence<br/>strengthening"| KG[("Concept Nodes &<br/>Association Edges")]
+
+    MD --> MR["MemoryRetriever"]
+    KG -->|"query expansion"| MR
+
+    MR -->|"5-weight scoring:<br/>semantic 0.30 · emotional 0.25<br/>importance 0.20 · recency 0.15<br/>access 0.10"| RESULTS["Ranked Memories"]
+
+    MD --> MC["MemoryConsolidator"]
+    MC -->|"background"| EP["Episodes, Patterns,<br/>Archival"]
+
+    style MSG fill:#4a9eff,color:#fff
+    style ET fill:#e07cc5,color:#fff
+    style AL fill:#c084fc,color:#fff
+    style KG fill:#c084fc,color:#fff
+    style MD fill:#64748b,color:#fff
+    style MR fill:#22c55e,color:#fff
+    style RESULTS fill:#22c55e,color:#fff
+    style MC fill:#f59e0b,color:#fff
+    style EP fill:#f59e0b,color:#fff
 ```
 
 The `MemorySystem` class in `storage/memory_system.py` acts as a facade,
