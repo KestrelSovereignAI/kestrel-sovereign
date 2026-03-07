@@ -9,6 +9,7 @@ from kestrel_sovereign.rate_limit import limiter
 
 from kestrel_sovereign.kestrel_config.constants import SESSION_GAP_MINUTES
 from kestrel_sovereign.storage.encryption import get_fernet, get_agent_fernet, decrypt_string
+from endpoints.agent_helpers import get_agent
 
 logger = logging.getLogger(__name__)
 
@@ -18,11 +19,8 @@ router = APIRouter(prefix="/api", tags=["conversations"])
 @router.get("/sessions")
 async def list_sessions(request: Request, limit: int = Query(50, ge=1, le=500)):
     """List conversation sessions with summary info."""
-    if not hasattr(request.app.state, 'agent') or not request.app.state.agent:
-        raise HTTPException(status_code=503, detail="Agent not initialized.")
-
     try:
-        agent = request.app.state.agent
+        agent = get_agent(request)
         storage = agent.storage
         history = await storage.get_conversation_history(limit)
         total_messages = len(history)
@@ -43,11 +41,8 @@ async def list_sessions(request: Request, limit: int = Query(50, ge=1, le=500)):
 @router.get("/conversations")
 async def list_conversations(request: Request, limit: int = Query(50, ge=1, le=500), decrypt: bool = True):
     """List conversation sessions grouped by date/time."""
-    if not hasattr(request.app.state, 'agent') or not request.app.state.agent:
-        raise HTTPException(status_code=503, detail="Agent not initialized.")
-
     try:
-        agent = request.app.state.agent
+        agent = get_agent(request)
         storage = agent.storage
 
         # Use privacy-aware agent_id accessor
@@ -173,11 +168,8 @@ async def list_conversations(request: Request, limit: int = Query(50, ge=1, le=5
 @router.get("/conversations/{session_id}")
 async def get_conversation(request: Request, session_id: str, limit: int = Query(100, ge=1, le=500), decrypt: bool = True):
     """Get messages for a specific conversation session."""
-    if not hasattr(request.app.state, 'agent') or not request.app.state.agent:
-        raise HTTPException(status_code=503, detail="Agent not initialized.")
-
     try:
-        agent = request.app.state.agent
+        agent = get_agent(request)
         storage = agent.storage
 
         # Use privacy-aware agent_id accessor
@@ -295,11 +287,8 @@ async def get_conversation(request: Request, session_id: str, limit: int = Query
 @limiter.limit("30/minute")
 async def start_new_conversation(request: Request):
     """Start a new conversation by adding a session marker."""
-    if not hasattr(request.app.state, 'agent') or not request.app.state.agent:
-        raise HTTPException(status_code=503, detail="Agent not initialized.")
-
     try:
-        agent = request.app.state.agent
+        agent = get_agent(request)
         storage = agent.storage
 
         await storage.add_conversation(
@@ -327,11 +316,8 @@ async def start_new_conversation(request: Request):
 @limiter.limit("30/minute")
 async def delete_message(request: Request, message_id: int):
     """Delete a single message by ID with agent_id isolation."""
-    if not hasattr(request.app.state, 'agent') or not request.app.state.agent:
-        raise HTTPException(status_code=503, detail="Agent not initialized.")
-
     try:
-        agent = request.app.state.agent
+        agent = get_agent(request)
         storage = agent.storage
         agent_id = getattr(storage, 'agent_id', '')
 
@@ -351,11 +337,8 @@ async def delete_message(request: Request, message_id: int):
 @router.get("/conversations/{session_id}/transcript")
 async def get_conversation_transcript(request: Request, session_id: str, decrypt: bool = True):
     """Get a human-readable markdown transcript for a conversation session."""
-    if not hasattr(request.app.state, 'agent') or not request.app.state.agent:
-        raise HTTPException(status_code=503, detail="Agent not initialized.")
-
     try:
-        agent = request.app.state.agent
+        agent = get_agent(request)
         storage = agent.storage
 
         # Use privacy-aware agent_id accessor

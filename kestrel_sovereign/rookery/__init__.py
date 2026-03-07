@@ -5,6 +5,7 @@ The rookery is the registry of agents managed by a single Kestrel Host.
 Each agent has its own directory, DID, database, and configuration.
 """
 
+from .agent_manager import AgentManager
 from .config import RookeryConfig, HostConfig, LocalAgentConfig, RemoteAgentConfig
 from .process_manager import ProcessManager, AgentProcess
 from .proxy import (
@@ -15,6 +16,7 @@ from .proxy import (
 )
 
 __all__ = [
+    "AgentManager",
     "RookeryConfig",
     "HostConfig",
     "LocalAgentConfig",

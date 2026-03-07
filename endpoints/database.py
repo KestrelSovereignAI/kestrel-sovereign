@@ -4,6 +4,7 @@ from pathlib import Path
 import logging
 
 from kestrel_sovereign.sql_utils import safe_table_name, safe_column_name
+from endpoints.agent_helpers import get_agent
 
 logger = logging.getLogger(__name__)
 
@@ -22,11 +23,8 @@ ALLOWED_TABLES = {
 @router.get("/tables")
 async def list_database_tables(request: Request):
     """List SQLite tables with row counts and schema info."""
-    if not hasattr(request.app.state, 'agent') or not request.app.state.agent:
-        raise HTTPException(status_code=503, detail="Agent not initialized.")
-
     try:
-        agent = request.app.state.agent
+        agent = get_agent(request)
         storage = agent.storage
 
         # Use async database query
@@ -100,9 +98,6 @@ async def query_database_table(
     search: str = None
 ):
     """Read-only query of a specific table with pagination."""
-    if not hasattr(request.app.state, 'agent') or not request.app.state.agent:
-        raise HTTPException(status_code=503, detail="Agent not initialized.")
-
     if table_name not in ALLOWED_TABLES:
         raise HTTPException(
             status_code=403,
@@ -110,7 +105,7 @@ async def query_database_table(
         )
 
     try:
-        agent = request.app.state.agent
+        agent = get_agent(request)
         storage = agent.storage
 
         # Validate table name for safe SQL interpolation (defense-in-depth;

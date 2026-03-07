@@ -4,6 +4,8 @@ from typing import Optional, Dict, Any, List
 from datetime import datetime
 import logging
 
+from endpoints.agent_helpers import get_agent
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["observability"])
@@ -33,8 +35,9 @@ async def get_observability_events(
     - `error`: Error events (e.g., tool_calling_ignored)
     - `metric`: Metrics (e.g., feature_tools_built count)
     """
-    agent = getattr(request.app.state, 'agent', None)
-    if not agent:
+    try:
+        agent = get_agent(request)
+    except Exception:
         return {"error": "No agent available", "events": []}
 
     obs_store = getattr(agent, 'observability_store', None)
@@ -90,8 +93,9 @@ async def get_observability_summary(
 
     Provides counts by event type and recent errors for quick health check.
     """
-    agent = getattr(request.app.state, 'agent', None)
-    if not agent:
+    try:
+        agent = get_agent(request)
+    except Exception:
         return {"error": "No agent available"}
 
     obs_store = getattr(agent, 'observability_store', None)

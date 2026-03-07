@@ -32,6 +32,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
 from kestrel_sovereign.rate_limit import limiter
+from endpoints.agent_helpers import get_agent
 
 from .protocol import (
     BridgeCapabilitiesResponse,
@@ -51,9 +52,7 @@ def _get_bridge_feature(request: Request):
 
     Raises HTTPException 503 if the agent or bridge feature is not available.
     """
-    agent = getattr(request.app.state, "agent", None)
-    if not agent:
-        raise HTTPException(status_code=503, detail="Agent not initialized.")
+    agent = get_agent(request)
 
     features = getattr(agent, "features", {})
     bridge = features.get("BridgeFeature")
@@ -278,8 +277,9 @@ def get_router() -> APIRouter:
         Returns bridge status information. This endpoint does NOT require
         auth (suitable for gateway health probes).
         """
-        agent = getattr(request.app.state, "agent", None)
-        if not agent:
+        try:
+            agent = get_agent(request)
+        except HTTPException:
             return {"status": "unavailable", "bridge": False, "agent": False}
 
         features = getattr(agent, "features", {})

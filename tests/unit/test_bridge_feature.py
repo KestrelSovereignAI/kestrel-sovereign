@@ -674,6 +674,8 @@ class TestRouterHelpers:
         from kestrel_sovereign.features.bridge.router import _get_bridge_feature
 
         request = MagicMock()
+        # get_agent() checks request.state.agent then request.app.state.agent
+        request.state = MagicMock(spec=[])  # no 'agent' attribute
         request.app.state = MagicMock(spec=[])  # no 'agent' attribute
 
         with pytest.raises(Exception) as exc_info:
@@ -687,6 +689,8 @@ class TestRouterHelpers:
         request = MagicMock()
         agent = MagicMock()
         agent.features = {}
+        # Set agent on request.state (multi-agent path) or app.state (single-agent)
+        request.state = MagicMock(spec=[])  # no agent on request.state
         request.app.state.agent = agent
 
         with pytest.raises(Exception) as exc_info:
@@ -704,6 +708,7 @@ class TestRouterHelpers:
         agent.features = {"BridgeFeature": bridge}
 
         request = MagicMock()
+        request.state = MagicMock(spec=[])  # no agent on request.state
         request.app.state.agent = agent
 
         resolved_agent, resolved_bridge = _get_bridge_feature(request)
