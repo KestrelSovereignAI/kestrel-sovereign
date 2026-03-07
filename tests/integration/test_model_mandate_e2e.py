@@ -281,3 +281,194 @@ class TestProtectedEndpointsRequireAuth:
 
         # Should be 401 without auth
         assert response.status_code == 401
+
+    def test_model_set_requires_auth(self, client):
+        """POST /api/model/set requires API key."""
+        response = client.post("/api/model/set", json={"model": "gpt-5"})
+
+        # Should be 401 without auth
+        assert response.status_code == 401
+
+
+class TestModelSetEndpoint:
+    """Tests for POST /api/model/set endpoint."""
+
+    @pytest.fixture
+    def client(self, monkeypatch):
+        """TestClient with mock agent for model set testing."""
+        from server import app
+        from unittest.mock import MagicMock
+        from kestrel_sovereign.llm.service import LLMService
+
+        test_api_key = "test-api-key-model-set"
+        monkeypatch.setenv("KESTREL_API_KEY", test_api_key)
+
+        mock_agent = MagicMock()
+        mock_agent.agent_id = "did:test:model_set"
+        mock_agent.llm_service = LLMService()
+        mock_agent.storage = None
+
+        app.state.agent = mock_agent
+
+        with TestClient(app) as client:
+            client.headers.update({"X-API-Key": test_api_key})
+            yield client
+
+    def test_set_model_with_provider(self, client):
+        """POST /api/model/set with explicit model and provider."""
+        response = client.post("/api/model/set", json={
+            "model": "gpt-5-mini",
+            "provider": "openai",
+        })
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["success"] is True
+        assert data["model"] == "gpt-5-mini"
+        assert data["provider"] == "openai"
+        assert data["full_model"] == "openai/gpt-5-mini"
+
+    def test_set_model_combined_format(self, client):
+        """POST /api/model/set with combined provider/model format."""
+        response = client.post("/api/model/set", json={
+            "model": "anthropic/claude-sonnet-4-5",
+        })
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["success"] is True
+        assert data["model"] == "claude-sonnet-4-5"
+        assert data["provider"] == "anthropic"
+
+    def test_set_model_without_provider(self, client):
+        """POST /api/model/set with model only (auto-detect)."""
+        response = client.post("/api/model/set", json={
+            "model": "gpt-5-mini",
+        })
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["success"] is True
+        assert data["model"] == "gpt-5-mini"
+        assert data["provider"] is None
+
+    def test_set_model_missing_field(self, client):
+        """POST /api/model/set without model field returns 400."""
+        response = client.post("/api/model/set", json={})
+
+        assert response.status_code == 400
+
+    def test_set_model_persists_to_current(self, client):
+        """POST /api/model/set should be reflected in GET /api/model/current."""
+        # Set the model
+        client.post("/api/model/set", json={
+            "model": "gpt-5-mini",
+            "provider": "openai",
+        })
+
+        # Verify it's reflected
+        response = client.get("/api/model/current")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["model_name"] == "gpt-5-mini"
+        assert data["provider"] == "openai"
+
+
+class TestChatCompletionsModelPassthrough:
+    """Tests that /v1/chat/completions respects the model field."""
+
+    @pytest.fixture
+    def client(self, monkeypatch):
+        """TestClient with mock agent for chat completions testing."""
+        from server import app
+        from unittest.mock import MagicMock, AsyncMock
+
+        test_api_key = "test-api-key-chat"
+        monkeypatch.setenv("KESTREL_API_KEY", test_api_key)
+
+        mock_agent = MagicMock()
+        mock_agent.agent_id = "did:test:chat_completions"
+        mock_agent.process_input = AsyncMock(return_value="Test response")
+        mock_agent.storage = None
+
+        # Create a mock llm_service with set_model_preference
+        mock_llm_service = MagicMock()
+        mock_llm_service.set_model_preference = MagicMock()
+        mock_agent.llm_service = mock_llm_service
+
+        app.state.agent = mock_agent
+
+        with TestClient(app) as client:
+            client.headers.update({"X-API-Key": test_api_key})
+            yield client, mock_agent
+
+    def test_model_passed_to_process_input(self, client):
+        """Model from request is passed as model_override to process_input."""
+        test_client, mock_agent = client
+
+        response = test_client.post("/v1/chat/completions", json={
+            "model": "openai/gpt-5-mini",
+            "messages": [{"role": "user", "content": "Hello"}],
+        })
+
+        assert response.status_code == 200
+        # Verify process_input was called with model_override
+        mock_agent.process_input.assert_called_once()
+        call_kwargs = mock_agent.process_input.call_args
+        assert call_kwargs.kwargs.get("model_override") == "openai/gpt-5-mini"
+
+    def test_model_persisted_via_set_preference(self, client):
+        """Model from request is also persisted via set_model_preference."""
+        test_client, mock_agent = client
+
+        test_client.post("/v1/chat/completions", json={
+            "model": "openai/gpt-5-mini",
+            "messages": [{"role": "user", "content": "Hello"}],
+        })
+
+        # Verify set_model_preference was called
+        mock_agent.llm_service.set_model_preference.assert_called_once_with(
+            "gpt-5-mini", "openai"
+        )
+
+    def test_kestrel_local_model_not_overridden(self, client):
+        """The default 'kestrel-local' model should not override."""
+        test_client, mock_agent = client
+
+        test_client.post("/v1/chat/completions", json={
+            "model": "kestrel-local",
+            "messages": [{"role": "user", "content": "Hello"}],
+        })
+
+        # Should NOT call set_model_preference for kestrel-local
+        mock_agent.llm_service.set_model_preference.assert_not_called()
+        # model_override should be None
+        call_kwargs = mock_agent.process_input.call_args
+        assert call_kwargs.kwargs.get("model_override") is None
+
+    def test_no_model_field_uses_default(self, client):
+        """When no model field is sent, don't override anything."""
+        test_client, mock_agent = client
+
+        test_client.post("/v1/chat/completions", json={
+            "messages": [{"role": "user", "content": "Hello"}],
+        })
+
+        # Should NOT call set_model_preference
+        mock_agent.llm_service.set_model_preference.assert_not_called()
+        # model_override should be None
+        call_kwargs = mock_agent.process_input.call_args
+        assert call_kwargs.kwargs.get("model_override") is None
+
+    def test_response_echoes_model(self, client):
+        """Response should echo the model from the request."""
+        test_client, mock_agent = client
+
+        response = test_client.post("/v1/chat/completions", json={
+            "model": "openai/gpt-5-mini",
+            "messages": [{"role": "user", "content": "Hello"}],
+        })
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["model"] == "openai/gpt-5-mini"
