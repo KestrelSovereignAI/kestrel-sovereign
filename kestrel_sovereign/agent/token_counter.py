@@ -106,12 +106,12 @@ class TokenCounter:
     falling back to character-based estimation.
     """
 
-    def __init__(self, model: str = "gpt-4"):
+    def __init__(self, model: str = "auto"):
         """
         Initialize token counter for a specific model.
 
         Args:
-            model: The model name (e.g., "gpt-4", "llama3.2:3b")
+            model: The model name for tiktoken encoding lookup
         """
         self.model = model
         self.encoder = None

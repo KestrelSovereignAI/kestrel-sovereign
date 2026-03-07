@@ -29,7 +29,7 @@ class ToolContextManager:
     def __init__(
         self,
         storage: "AsyncStorage",
-        model: str = "gpt-4",
+        model: str = "auto",
         agent_id: Optional[str] = None,
     ):
         """

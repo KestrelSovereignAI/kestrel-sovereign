@@ -84,6 +84,7 @@ class ModelDiscoveryMixin:
         # Add configured provider models (from llm_config.toml) that weren't discovered
         # This ensures models like xai/grok show up even without API discovery
         discovered_ids = set(m.id for m in all_models)
+        api_discovered_ids = set(discovered_ids)  # Snapshot before synthetic additions
         if hasattr(self, 'providers') and isinstance(self.providers, list):
             for provider in self.providers:
                 provider_name = provider.get('name')
@@ -125,12 +126,13 @@ class ModelDiscoveryMixin:
                     else:
                         logger.warning(f"No chat models discovered for {provider_name} — 'auto' unresolved")
 
-        # Freshness check: warn about configured models not found in discovery
-        discovered_ids = {m.id for m in all_models}
+        # Freshness check: warn about configured models not found via API discovery
+        # Uses api_discovered_ids (snapshot before synthetic additions) so the
+        # warning fires even when the model was synthetically added above
         if hasattr(self, 'providers') and isinstance(self.providers, list):
             for provider in self.providers:
                 model = provider.get("model")
-                if model and model != "auto" and model not in discovered_ids:
+                if model and model != "auto" and model not in api_discovered_ids:
                     logger.warning(
                         f"Configured model '{model}' for {provider.get('name')} "
                         f"not found in discovery — may be deprecated"

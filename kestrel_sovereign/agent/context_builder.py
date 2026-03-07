@@ -51,7 +51,7 @@ class ContextBuilder:
     def __init__(
         self,
         storage: "AsyncStorage",
-        model: str = "gpt-4",
+        model: str = "auto",
         consolidator: Optional["MemoryConsolidator"] = None,
         agent_data_path: Optional[str] = None
     ):
@@ -60,7 +60,7 @@ class ContextBuilder:
 
         Args:
             storage: The async storage instance for RAG and history retrieval
-            model: The model name for token counting (default: gpt-4)
+            model: The model name for token counting
             consolidator: Optional MemoryConsolidator for episode retrieval
             agent_data_path: Path to agent data directory (for SOUL.md, etc.)
         """
