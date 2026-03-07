@@ -59,7 +59,7 @@ docker run -d \
     -e RUNPOD_API_KEY="${RUNPOD_API_KEY:-}" \
     -e XAI_API_KEY="${XAI_API_KEY:-}" \
     -e OLLAMA_HOST="$OLLAMA_HOST" \
-    -e DEFAULT_LLM_MODEL="${DEFAULT_LLM_MODEL:-gpt-4o-mini}" \
+    -e DEFAULT_LLM_MODEL="${DEFAULT_LLM_MODEL:-gpt-5-mini}" \
     "$IMAGE_NAME"
 
 echo "Waiting for server to start..."

@@ -59,7 +59,7 @@ class ContextManager:
     5. Ensure privacy mode compliance
 
     Usage:
-        manager = ContextManager(storage, model="gpt-4")
+        manager = ContextManager(storage)
         result = await manager.build_context(
             query="Tell me about our conversation yesterday",
             agent_id="agent-123",
@@ -73,7 +73,7 @@ class ContextManager:
     def __init__(
         self,
         storage: "AsyncStorage",
-        model: str = "gpt-4",
+        model: str = "auto",
         agent_id: Optional[str] = None,
         consolidator: Optional["MemoryConsolidator"] = None,
         memory_retriever: Optional["MemoryRetriever"] = None,

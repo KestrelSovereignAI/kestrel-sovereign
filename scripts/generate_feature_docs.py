@@ -7,7 +7,7 @@ No annotations needed in the canonical file — audience profiles are system pro
 Usage:
     uv run python scripts/generate_feature_docs.py --audience investor
     uv run python scripts/generate_feature_docs.py --all
-    uv run python scripts/generate_feature_docs.py --audience user --model gpt-4o
+    uv run python scripts/generate_feature_docs.py --audience user --model gpt-5-mini
     uv run python scripts/generate_feature_docs.py --audience investor --dry-run
 """
 
@@ -127,7 +127,7 @@ def get_client_and_model(model_override: str | None) -> tuple:
         import openai
 
         client = openai.OpenAI()
-        model = model_override or "gpt-4o"
+        model = model_override or "gpt-5-mini"
         if model.startswith("openai/"):
             model = model.split("/", 1)[1]
 
@@ -230,7 +230,7 @@ def main():
     parser.add_argument(
         "--model",
         default=None,
-        help="LLM model override (e.g. gpt-4o, claude-sonnet-4-5-20250929, openai/gpt-4o)",
+        help="LLM model override (e.g. gpt-5-mini, claude-sonnet-4-5-20250929)",
     )
     parser.add_argument(
         "--dry-run",
