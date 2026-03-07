@@ -5,21 +5,14 @@ Abstractions for sync destinations. SQLite changes can be replicated
 to various targets including cloud storage and PostgreSQL.
 """
 
-import asyncio
 import json
 import logging
 import os
-import tempfile
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Dict, Any
-
-try:
-    import requests
-except ImportError:
-    requests = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
 
@@ -363,30 +356,23 @@ class LighthouseTarget(SyncTarget):
         timestamp = datetime.now(timezone.utc)
 
         try:
-            try:
-                from lighthouseweb3 import Lighthouse
-            except ImportError:
-                raise ImportError(
-                    "lighthouseweb3 is required. Install with: pip install lighthouseweb3"
-                )
+            from kestrel_sovereign.storage.providers.lighthouse_rest import LighthouseRestClient
 
-            lh = Lighthouse(token=self.api_key)
+            client = LighthouseRestClient(api_key=self.api_key)
 
-            # Upload the database snapshot
+            # Read and upload the database snapshot
+            with open(db_path, "rb") as f:
+                content = f.read()
+
             tag = f"{self.SNAPSHOT_TAG}-{self.agent_id}"
-            result = await asyncio.to_thread(
-                lh.upload,
-                source=str(db_path),
+            result = await client.upload(
+                content=content,
+                filename=db_path.name,
                 tag=tag,
             )
 
-            # Parse CID from response
-            if isinstance(result, dict) and "data" in result:
-                cid = result["data"].get("Hash") or result["data"].get("cid")
-                size = int(result["data"].get("Size", 0))
-            else:
-                cid = result.get("Hash") or result.get("cid")
-                size = int(result.get("Size", 0))
+            cid = result.get("Hash") or result.get("cid")
+            size = int(result.get("Size", len(content)))
 
             if not cid:
                 raise ValueError(f"No CID returned from Lighthouse upload: {result}")
@@ -402,7 +388,8 @@ class LighthouseTarget(SyncTarget):
                 "uploaded_at": timestamp.isoformat(),
                 "source_file": db_path.name,
             }
-            await self._upload_manifest(lh, manifest)
+            await self._upload_manifest(client, manifest)
+            await client.close()
 
             return SyncResult(
                 success=True,
@@ -424,28 +411,19 @@ class LighthouseTarget(SyncTarget):
                 error=str(e),
             )
 
-    async def _upload_manifest(self, lh: Any, manifest: Dict[str, Any]) -> None:
+    async def _upload_manifest(self, client: Any, manifest: Dict[str, Any]) -> None:
         """Upload manifest file to Lighthouse and save locally."""
         try:
-            with tempfile.NamedTemporaryFile(
-                mode="w", suffix=".json", delete=False, prefix="kestrel_manifest_"
-            ) as tmp:
-                json.dump(manifest, tmp, indent=2)
-                tmp_path = tmp.name
-
+            manifest_bytes = json.dumps(manifest, indent=2).encode("utf-8")
             tag = f"{self.MANIFEST_TAG}-{self.agent_id}"
-            result = await asyncio.to_thread(
-                lh.upload,
-                source=tmp_path,
+
+            result = await client.upload(
+                content=manifest_bytes,
+                filename=f"manifest_{self.agent_id}.json",
                 tag=tag,
             )
 
-            # Parse manifest CID
-            if isinstance(result, dict) and "data" in result:
-                manifest_cid = result["data"].get("Hash") or result["data"].get("cid")
-            else:
-                manifest_cid = result.get("Hash") or result.get("cid")
-
+            manifest_cid = result.get("Hash") or result.get("cid")
             manifest["manifest_cid"] = manifest_cid
             self._save_local_manifest(manifest)
             logger.debug(f"Uploaded manifest to Lighthouse: {manifest_cid}")
@@ -454,11 +432,6 @@ class LighthouseTarget(SyncTarget):
             # Manifest upload failure is non-fatal — snapshot is already safe
             logger.warning(f"Failed to upload manifest (snapshot is safe): {e}")
             self._save_local_manifest(manifest)
-        finally:
-            try:
-                Path(tmp_path).unlink(missing_ok=True)
-            except Exception:
-                pass
 
     async def restore_snapshot(self, dest_path: Path) -> Optional[SyncResult]:
         """
@@ -485,18 +458,11 @@ class LighthouseTarget(SyncTarget):
 
             logger.info(f"Restoring snapshot from Lighthouse: {snapshot_cid}")
 
-            # Download from IPFS gateway
-            from kestrel_sovereign.kestrel_config.defaults import get_lighthouse_gateway_url
-            from kestrel_sovereign.kestrel_config.constants import HTTP_TIMEOUT_MEDIUM
+            from kestrel_sovereign.storage.providers.lighthouse_rest import LighthouseRestClient
 
-            gateway_url = f"{get_lighthouse_gateway_url()}/{snapshot_cid}"
-            response = await asyncio.to_thread(
-                requests.get,
-                gateway_url,
-                timeout=HTTP_TIMEOUT_MEDIUM,
-            )
-            response.raise_for_status()
-            content = response.content
+            client = LighthouseRestClient(api_key=self.api_key)
+            content = await client.download(snapshot_cid)
+            await client.close()
 
             if not content:
                 logger.warning("Empty snapshot downloaded from Lighthouse")
@@ -560,25 +526,12 @@ class LighthouseTarget(SyncTarget):
     async def _query_uploads_api(self) -> Optional[str]:
         """Query Lighthouse uploads API to find the latest snapshot."""
         try:
-            from kestrel_sovereign.kestrel_config.constants import HTTP_TIMEOUT_MEDIUM
+            from kestrel_sovereign.storage.providers.lighthouse_rest import LighthouseRestClient
 
-            # Lighthouse REST API for listing uploads
-            api_url = "https://api.lighthouse.storage/api/user/uploads"
-            headers = {"Authorization": f"Bearer {self.api_key}"}
+            client = LighthouseRestClient(api_key=self.api_key)
+            uploads = await client.get_uploads()
+            await client.close()
 
-            response = await asyncio.to_thread(
-                requests.get,
-                api_url,
-                headers=headers,
-                timeout=HTTP_TIMEOUT_MEDIUM,
-            )
-
-            if response.status_code != 200:
-                logger.warning(f"Lighthouse uploads API returned {response.status_code}")
-                return None
-
-            data = response.json()
-            uploads = data.get("data", data) if isinstance(data, dict) else data
             if not isinstance(uploads, list):
                 return None
 
@@ -622,15 +575,12 @@ class LighthouseTarget(SyncTarget):
     async def _read_manifest_cid(self, manifest_cid: str) -> Optional[str]:
         """Download a manifest file and extract the snapshot CID."""
         try:
-            from kestrel_sovereign.kestrel_config.defaults import get_lighthouse_gateway_url
-            from kestrel_sovereign.kestrel_config.constants import HTTP_TIMEOUT_MEDIUM
+            from kestrel_sovereign.storage.providers.lighthouse_rest import LighthouseRestClient
 
-            gateway_url = f"{get_lighthouse_gateway_url()}/{manifest_cid}"
-            response = await asyncio.to_thread(
-                requests.get, gateway_url, timeout=HTTP_TIMEOUT_MEDIUM
-            )
-            response.raise_for_status()
-            manifest = response.json()
+            client = LighthouseRestClient(api_key=self.api_key)
+            content = await client.download(manifest_cid)
+            await client.close()
+            manifest = json.loads(content)
             return manifest.get("snapshot_cid")
         except Exception as e:
             logger.warning(f"Failed to read manifest {manifest_cid}: {e}")
@@ -654,9 +604,11 @@ class LighthouseTarget(SyncTarget):
     async def health_check(self) -> bool:
         """Check Lighthouse API connectivity."""
         try:
-            from lighthouseweb3 import Lighthouse
-            lh = Lighthouse(token=self.api_key)
-            await asyncio.to_thread(lh.getBalance)
+            from kestrel_sovereign.storage.providers.lighthouse_rest import LighthouseRestClient
+
+            client = LighthouseRestClient(api_key=self.api_key)
+            await client.get_balance()
+            await client.close()
             return True
         except Exception as e:
             logger.warning(f"Lighthouse health check failed: {e}")

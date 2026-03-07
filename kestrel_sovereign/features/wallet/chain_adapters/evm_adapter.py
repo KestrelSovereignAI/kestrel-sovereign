@@ -38,6 +38,7 @@ MAINNET_CHAIN_IDS = {
     42161,   # Arbitrum One
     10,      # Optimism Mainnet
     314,     # Filecoin Mainnet
+    8453,    # Base Mainnet
 }
 
 
