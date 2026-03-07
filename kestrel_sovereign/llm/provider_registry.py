@@ -131,7 +131,10 @@ class ProviderRegistry:
         if not api_key:
             raise ValueError("OpenAI API key not found.")
 
-        model = os.environ.get("OPENAI_MODEL", provider_config.get("model", "gpt-5-mini"))
+        model = os.environ.get("OPENAI_MODEL") or provider_config.get("model")
+        if not model:
+            logger.warning("No model configured for openai — set model= in llm_config.toml or OPENAI_MODEL env var")
+            model = "auto"
         provider_config["model"] = model
 
         client = openai.AsyncOpenAI(api_key=api_key)
@@ -152,7 +155,10 @@ class ProviderRegistry:
         # Use get_ollama_url() for canonical URL resolution
         # Support legacy OLLAMA_HOST env var for backwards compatibility
         host = os.environ.get("OLLAMA_HOST") or provider_config.get("host") or get_ollama_url()
-        model = os.environ.get("OLLAMA_MODEL", provider_config.get("model", "llama3.2"))
+        model = os.environ.get("OLLAMA_MODEL") or provider_config.get("model")
+        if not model:
+            logger.warning("No model configured for ollama — set model= in llm_config.toml or OLLAMA_MODEL env var")
+            model = "auto"
         provider_config["host"] = host
         provider_config["model"] = model
 
@@ -212,7 +218,10 @@ class ProviderRegistry:
                 "claude-agent-sdk not installed. Run: pip install claude-agent-sdk"
             )
 
-        model = provider_config.get("model", "claude-sonnet-4-20250514")
+        model = provider_config.get("model")
+        if not model:
+            logger.warning("No model configured for claude_max — set model= in llm_config.toml")
+            model = "auto"
         provider_config["model"] = model
 
         # ClaudeMaxAdapter handles its own client internally
@@ -290,7 +299,10 @@ class ProviderRegistry:
             raise ValueError("OpenRouter API key not found (set OPENROUTER_API_KEY).")
 
         base_url = provider_config.get("base_url") or get_openrouter_api_base()
-        model = os.environ.get("OPENROUTER_MODEL", provider_config.get("model", "anthropic/claude-3.5-sonnet"))
+        model = os.environ.get("OPENROUTER_MODEL") or provider_config.get("model")
+        if not model:
+            logger.warning("No model configured for openrouter — set model= in llm_config.toml or OPENROUTER_MODEL env var")
+            model = "auto"
         provider_config["model"] = model
 
         client = openai.AsyncOpenAI(api_key=api_key, base_url=base_url)

@@ -110,6 +110,32 @@ class ModelDiscoveryMixin:
         from kestrel_sovereign.agent.token_counter import register_discovered_limits
         register_discovered_limits(all_models)
 
+        # Auto-resolve providers with model="auto" to the first discovered chat model
+        if hasattr(self, 'providers') and isinstance(self.providers, list):
+            for provider in self.providers:
+                if provider.get("model") == "auto":
+                    provider_name = provider.get("name")
+                    provider_models = [
+                        m for m in all_models
+                        if m.provider == provider_name and m.category == ModelCategory.CHAT
+                    ]
+                    if provider_models:
+                        provider["model"] = provider_models[0].id
+                        logger.info(f"Auto-resolved model for {provider_name}: {provider['model']}")
+                    else:
+                        logger.warning(f"No chat models discovered for {provider_name} — 'auto' unresolved")
+
+        # Freshness check: warn about configured models not found in discovery
+        discovered_ids = {m.id for m in all_models}
+        if hasattr(self, 'providers') and isinstance(self.providers, list):
+            for provider in self.providers:
+                model = provider.get("model")
+                if model and model != "auto" and model not in discovered_ids:
+                    logger.warning(
+                        f"Configured model '{model}' for {provider.get('name')} "
+                        f"not found in discovery — may be deprecated"
+                    )
+
         # Cache results
         self._model_cache = all_models
         self._cache_timestamp = time.time()

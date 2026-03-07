@@ -598,37 +598,28 @@ class VertexAIAdapter(LLMAdapter):
         """
         Return fallback model list when API discovery fails.
 
-        Note: This is only used as a fallback - prefer API-based discovery.
+        Reads from the model catalog's featured list for vertex_ai.
+        Falls back to an empty list if catalog is unavailable.
         """
-        return [
-            ModelInfo(
-                id="gemini-2.0-flash-001",
-                provider="vertex_ai",
-                display_name="Gemini 2.0 Flash",
-                description="Fast and efficient Gemini model",
-                supports_vision=True,
-                supports_tools=True,
-                supports_streaming=True,
-            ),
-            ModelInfo(
-                id="gemini-1.5-pro",
-                provider="vertex_ai",
-                display_name="Gemini 1.5 Pro",
-                description="Advanced Gemini model with 1M token context",
-                supports_vision=True,
-                supports_tools=True,
-                supports_streaming=True,
-            ),
-            ModelInfo(
-                id="gemini-1.5-flash",
-                provider="vertex_ai",
-                display_name="Gemini 1.5 Flash",
-                description="Fast Gemini model with 1M token context",
-                supports_vision=True,
-                supports_tools=True,
-                supports_streaming=True,
-            ),
-        ]
+        try:
+            from .model_catalog import get_catalog_service
+            catalog = get_catalog_service()
+            featured = catalog.get_featured_models("vertex_ai")
+            if featured:
+                return [
+                    ModelInfo(
+                        id=model_id,
+                        provider="vertex_ai",
+                        display_name=model_id,
+                        supports_vision=True,
+                        supports_tools=True,
+                        supports_streaming=True,
+                    )
+                    for model_id in featured
+                ]
+        except Exception as e:
+            logger.warning(f"Could not load vertex_ai fallback models from catalog: {e}")
+        return []
 
 
 # Factory function for creating configured adapter

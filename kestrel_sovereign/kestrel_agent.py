@@ -420,7 +420,7 @@ class KestrelAgent(ConstitutionMixin, StreamingMixin, BackupMixin, SleepMixin):
             # Pass the memory retriever for semantic/emotional memory recall
             self.context_manager = ContextManager(
                 storage=self.storage,
-                model=self.llm_service.get_default_model() if hasattr(self.llm_service, 'get_default_model') else "gpt-4",
+                model=self.llm_service.get_default_model() if hasattr(self.llm_service, 'get_default_model') else (self.llm_service.providers[0]["model"] if self.llm_service.providers else "auto"),
                 agent_id=self.agent_id,
                 consolidator=self.memory_consolidator,
                 memory_retriever=self.memory_system.retriever,
@@ -436,6 +436,10 @@ class KestrelAgent(ConstitutionMixin, StreamingMixin, BackupMixin, SleepMixin):
                 agent_data_path=agent_data_dir,
             )
             logging.info("BootstrapService initialized")
+
+            # Load persisted model preference from database and register persistence callback
+            await self._load_model_preference()
+            self.llm_service.set_preference_persistence_callback(self._persist_model_preference)
 
             # Cache the features prompt (built once at session start)
             self._cached_features_prompt = self._build_features_prompt_section()
@@ -1845,6 +1849,51 @@ Expected Duration: {expected_duration}
             return f"{provider}/{model}" if provider else model
         return "unknown"
 
+    MODEL_PREFERENCE_KEY = "model_preference"
+
+    async def _load_model_preference(self) -> None:
+        """Load persisted model preference from agent_metadata table."""
+        try:
+            result = await self._raw_storage.db.fetchall(
+                "SELECT value FROM agent_metadata WHERE agent_id = ? AND key = ?",
+                (self.agent_id, self.MODEL_PREFERENCE_KEY),
+            )
+            if result:
+                import json
+                pref = json.loads(result[0][0])
+                model = pref.get("model")
+                provider = pref.get("provider")
+                if model:
+                    self.llm_service.set_model_preference(model, provider)
+                    logging.info(f"Loaded persisted model preference: {provider}/{model}" if provider else f"Loaded persisted model preference: {model}")
+        except Exception as e:
+            logging.warning(f"Failed to load model preference: {e}")
+
+    async def _persist_model_preference(self, model: str | None, provider: str | None) -> None:
+        """Persist model preference to agent_metadata table."""
+        try:
+            import json
+            from datetime import datetime, timezone
+            value = json.dumps({"model": model, "provider": provider})
+            await self._raw_storage.db.execute(
+                """INSERT OR REPLACE INTO agent_metadata (agent_id, key, value, updated_at)
+                   VALUES (?, ?, ?, ?)""",
+                (self.agent_id, self.MODEL_PREFERENCE_KEY, value, datetime.now(timezone.utc)),
+            )
+        except Exception as e:
+            logging.warning(f"Failed to persist model preference: {e}")
+
+    def _get_local_model_fallback(self) -> str:
+        """Get the configured local (ollama) model for economy/solvency fallback."""
+        # Check ollama provider in the providers list
+        for provider in self.llm_service.providers:
+            if provider.get("name") == "ollama":
+                return provider.get("model", "auto")
+        # Fall back to config
+        if hasattr(self.llm_service, 'config'):
+            return self.llm_service.config.get("ollama", {}).get("model", "auto")
+        return "auto"
+
     async def check_solvency(self) -> str:
         """
         Checks the agent's wallet balance and determines the economic operating mode.
@@ -1866,10 +1915,8 @@ Expected Duration: {expected_duration}
                     logging.warning(f"Solvency Check: Balance {balance} FIL. Switching to ECONOMY mode (Local Models).")
                     self._current_model_preference = "ECONOMY"
 
-                # Try to get the configured local model, default to 'llama3'
-                economy_model = "llama3"
-                if hasattr(self.llm_service, 'config'):
-                    economy_model = self.llm_service.config.get("ollama", {}).get("model", "llama3")
+                # Use configured local model from ollama provider
+                economy_model = self._get_local_model_fallback()
                 return economy_model
 
             # Red Zone: Critical (< 1 FIL)
@@ -1879,10 +1926,7 @@ Expected Duration: {expected_duration}
                     self._current_model_preference = "CRITICAL"
                 # In a full implementation, this would trigger hibernation
 
-                # Try to get the configured local model, default to 'llama3'
-                economy_model = "llama3"
-                if hasattr(self.llm_service, 'config'):
-                    economy_model = self.llm_service.config.get("ollama", {}).get("model", "llama3")
+                economy_model = self._get_local_model_fallback()
                 return economy_model
         except (ValueError, AttributeError, KeyError, TypeError) as e:
             logging.error(f"Solvency check failed: {e}")
