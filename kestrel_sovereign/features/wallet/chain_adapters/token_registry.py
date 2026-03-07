@@ -118,6 +118,33 @@ class TokenRegistry:
                 network=ChainNetwork.POLYGON_MAINNET,
             ),
         },
+        # Base Sepolia Testnet
+        ChainNetwork.BASE_SEPOLIA: {
+            "USDC": TokenInfo(
+                symbol="USDC",
+                name="USD Coin (Test)",
+                address="0x036CbD53842c5426634e7929541eC2318f3dCF7e",
+                decimals=6,
+                network=ChainNetwork.BASE_SEPOLIA,
+            ),
+        },
+        # Base Mainnet
+        ChainNetwork.BASE_MAINNET: {
+            "USDC": TokenInfo(
+                symbol="USDC",
+                name="USD Coin",
+                address="0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+                decimals=6,
+                network=ChainNetwork.BASE_MAINNET,
+            ),
+            "USDT": TokenInfo(
+                symbol="USDT",
+                name="Tether USD",
+                address="0xfde4C96c8593536E31F229EA8f37b2ADa2699bb2",
+                decimals=6,
+                network=ChainNetwork.BASE_MAINNET,
+            ),
+        },
         # Filecoin networks - no official stablecoins yet
         ChainNetwork.FILECOIN_CALIBRATION: {},
         ChainNetwork.FILECOIN_MAINNET: {},

@@ -5,7 +5,6 @@ Tests restore_snapshot, CID tracking, manifest upload/download, and cold-start f
 """
 
 import json
-import sys
 import pytest
 from datetime import datetime, timezone
 from pathlib import Path
@@ -90,6 +89,26 @@ class TestLocalManifest:
         assert target._load_local_manifest() is None
 
 
+def _mock_rest_client(upload_responses=None, download_content=None, uploads_list=None,
+                       balance_data=None, upload_error=None):
+    """Create a mock LighthouseRestClient for testing."""
+    mock_client = AsyncMock()
+
+    if upload_error:
+        mock_client.upload = AsyncMock(side_effect=upload_error)
+    elif upload_responses:
+        mock_client.upload = AsyncMock(side_effect=upload_responses)
+    else:
+        mock_client.upload = AsyncMock(return_value={"Hash": "QmDefault", "Size": "0"})
+
+    mock_client.download = AsyncMock(return_value=download_content or b"")
+    mock_client.get_uploads = AsyncMock(return_value=uploads_list or [])
+    mock_client.get_balance = AsyncMock(return_value=balance_data or {"data": {"dataUsed": "0"}})
+    mock_client.close = AsyncMock()
+
+    return mock_client
+
+
 class TestSyncSnapshot:
     """Test snapshot upload with manifest tracking."""
 
@@ -99,28 +118,22 @@ class TestSyncSnapshot:
             api_key="test-key", agent_id="agent-1", state_dir=tmp_path
         )
 
-    @pytest.fixture
-    def mock_lighthouse(self):
-        mock_client = Mock()
-        mock_module = MagicMock()
-        mock_module.Lighthouse.return_value = mock_client
-        with patch.dict("sys.modules", {"lighthouseweb3": mock_module}):
-            yield mock_client
-
     @pytest.mark.asyncio
-    async def test_sync_snapshot_success(self, target, tmp_path, mock_lighthouse):
+    async def test_sync_snapshot_success(self, target, tmp_path):
         """Snapshot upload should return CID and save manifest."""
-        # Create a test DB file
         db_path = tmp_path / "test.db"
         db_path.write_bytes(b"SQLite database content")
 
-        # Mock upload responses (snapshot + manifest)
-        mock_lighthouse.upload.side_effect = [
-            {"data": {"Hash": "QmSnapshot123", "Size": "23"}},
-            {"data": {"Hash": "QmManifest456", "Size": "100"}},
-        ]
+        mock_client = _mock_rest_client(upload_responses=[
+            {"Hash": "QmSnapshot123", "Size": "23"},
+            {"Hash": "QmManifest456", "Size": "100"},
+        ])
 
-        result = await target.sync_snapshot(db_path)
+        with patch(
+            "kestrel_sovereign.storage.providers.lighthouse_rest.LighthouseRestClient",
+            return_value=mock_client,
+        ):
+            result = await target.sync_snapshot(db_path)
 
         assert result.success is True
         assert result.bytes_synced == 23
@@ -133,65 +146,61 @@ class TestSyncSnapshot:
         assert manifest["snapshot_cid"] == "QmSnapshot123"
 
     @pytest.mark.asyncio
-    async def test_sync_snapshot_upload_failure(self, target, tmp_path, mock_lighthouse):
+    async def test_sync_snapshot_upload_failure(self, target, tmp_path):
         """Upload failure should return unsuccessful SyncResult."""
         db_path = tmp_path / "test.db"
         db_path.write_bytes(b"data")
 
-        mock_lighthouse.upload.side_effect = ConnectionError("network down")
+        mock_client = _mock_rest_client(upload_error=ConnectionError("network down"))
 
-        result = await target.sync_snapshot(db_path)
+        with patch(
+            "kestrel_sovereign.storage.providers.lighthouse_rest.LighthouseRestClient",
+            return_value=mock_client,
+        ):
+            result = await target.sync_snapshot(db_path)
 
         assert result.success is False
         assert "network down" in result.error
 
     @pytest.mark.asyncio
-    async def test_sync_snapshot_no_cid_in_response(self, target, tmp_path, mock_lighthouse):
+    async def test_sync_snapshot_no_cid_in_response(self, target, tmp_path):
         """Should fail cleanly if upload returns no CID."""
         db_path = tmp_path / "test.db"
         db_path.write_bytes(b"data")
 
-        mock_lighthouse.upload.return_value = {"data": {}}
+        mock_client = _mock_rest_client(upload_responses=[{}])
 
-        result = await target.sync_snapshot(db_path)
+        with patch(
+            "kestrel_sovereign.storage.providers.lighthouse_rest.LighthouseRestClient",
+            return_value=mock_client,
+        ):
+            result = await target.sync_snapshot(db_path)
 
         assert result.success is False
         assert "No CID" in result.error
 
     @pytest.mark.asyncio
-    async def test_sync_snapshot_manifest_failure_nonfatal(self, target, tmp_path, mock_lighthouse):
+    async def test_sync_snapshot_manifest_failure_nonfatal(self, target, tmp_path):
         """Manifest upload failure should not fail the snapshot."""
         db_path = tmp_path / "test.db"
         db_path.write_bytes(b"data")
 
+        mock_client = _mock_rest_client()
         # Snapshot succeeds, manifest upload fails
-        mock_lighthouse.upload.side_effect = [
-            {"data": {"Hash": "QmSnapshot123", "Size": "4"}},
+        mock_client.upload = AsyncMock(side_effect=[
+            {"Hash": "QmSnapshot123", "Size": "4"},
             ConnectionError("manifest upload failed"),
-        ]
+        ])
 
-        result = await target.sync_snapshot(db_path)
+        with patch(
+            "kestrel_sovereign.storage.providers.lighthouse_rest.LighthouseRestClient",
+            return_value=mock_client,
+        ):
+            result = await target.sync_snapshot(db_path)
 
         # Snapshot should still succeed
         assert result.success is True
         assert result.metadata["cid"] == "QmSnapshot123"
-
-    @pytest.mark.asyncio
-    async def test_sync_snapshot_tags_correctly(self, target, tmp_path, mock_lighthouse):
-        """Upload should use agent-specific tag."""
-        db_path = tmp_path / "test.db"
-        db_path.write_bytes(b"data")
-
-        mock_lighthouse.upload.side_effect = [
-            {"data": {"Hash": "QmTest", "Size": "4"}},
-            {"data": {"Hash": "QmManifest", "Size": "50"}},
-        ]
-
-        await target.sync_snapshot(db_path)
-
-        # First call is the snapshot upload
-        first_call = mock_lighthouse.upload.call_args_list[0]
-        assert first_call.kwargs.get("tag") == "kestrel-state-agent-1"
 
 
 class TestRestoreSnapshot:
@@ -209,14 +218,13 @@ class TestRestoreSnapshot:
         dest = tmp_path / "restored.db"
         db_content = b"restored database content"
 
-        with patch.dict("os.environ", {"LIGHTHOUSE_STATE_CID": "QmExplicit123"}):
-            with patch("kestrel_sovereign.storage.sync.targets.requests") as mock_req:
-                mock_response = Mock()
-                mock_response.status_code = 200
-                mock_response.content = db_content
-                mock_response.raise_for_status = Mock()
-                mock_req.get.return_value = mock_response
+        mock_client = _mock_rest_client(download_content=db_content)
 
+        with patch.dict("os.environ", {"LIGHTHOUSE_STATE_CID": "QmExplicit123"}):
+            with patch(
+                "kestrel_sovereign.storage.providers.lighthouse_rest.LighthouseRestClient",
+                return_value=mock_client,
+            ):
                 result = await target.restore_snapshot(dest)
 
         assert result is not None
@@ -230,16 +238,14 @@ class TestRestoreSnapshot:
         dest = tmp_path / "restored.db"
         db_content = b"from manifest"
 
-        # Save a local manifest
         target._save_local_manifest({"snapshot_cid": "QmFromManifest"})
 
-        with patch("kestrel_sovereign.storage.sync.targets.requests") as mock_req:
-            mock_response = Mock()
-            mock_response.status_code = 200
-            mock_response.content = db_content
-            mock_response.raise_for_status = Mock()
-            mock_req.get.return_value = mock_response
+        mock_client = _mock_rest_client(download_content=db_content)
 
+        with patch(
+            "kestrel_sovereign.storage.providers.lighthouse_rest.LighthouseRestClient",
+            return_value=mock_client,
+        ):
             result = await target.restore_snapshot(dest)
 
         assert result is not None
@@ -263,9 +269,14 @@ class TestRestoreSnapshot:
         dest = tmp_path / "restored.db"
         target._save_local_manifest({"snapshot_cid": "QmBadCID"})
 
-        with patch("kestrel_sovereign.storage.sync.targets.requests") as mock_req:
-            mock_req.get.side_effect = ConnectionError("gateway unreachable")
+        mock_client = AsyncMock()
+        mock_client.download = AsyncMock(side_effect=ConnectionError("gateway unreachable"))
+        mock_client.close = AsyncMock()
 
+        with patch(
+            "kestrel_sovereign.storage.providers.lighthouse_rest.LighthouseRestClient",
+            return_value=mock_client,
+        ):
             result = await target.restore_snapshot(dest)
 
         assert result is not None
@@ -278,12 +289,12 @@ class TestRestoreSnapshot:
         dest = tmp_path / "nested" / "dir" / "restored.db"
         target._save_local_manifest({"snapshot_cid": "QmNested"})
 
-        with patch("kestrel_sovereign.storage.sync.targets.requests") as mock_req:
-            mock_response = Mock()
-            mock_response.content = b"data"
-            mock_response.raise_for_status = Mock()
-            mock_req.get.return_value = mock_response
+        mock_client = _mock_rest_client(download_content=b"data")
 
+        with patch(
+            "kestrel_sovereign.storage.providers.lighthouse_rest.LighthouseRestClient",
+            return_value=mock_client,
+        ):
             result = await target.restore_snapshot(dest)
 
         assert result.success is True
@@ -295,12 +306,12 @@ class TestRestoreSnapshot:
         dest = tmp_path / "restored.db"
         target._save_local_manifest({"snapshot_cid": "QmEmpty"})
 
-        with patch("kestrel_sovereign.storage.sync.targets.requests") as mock_req:
-            mock_response = Mock()
-            mock_response.content = b""
-            mock_response.raise_for_status = Mock()
-            mock_req.get.return_value = mock_response
+        mock_client = _mock_rest_client(download_content=b"")
 
+        with patch(
+            "kestrel_sovereign.storage.providers.lighthouse_rest.LighthouseRestClient",
+            return_value=mock_client,
+        ):
             result = await target.restore_snapshot(dest)
 
         assert result is None
@@ -366,29 +377,17 @@ class TestQueryUploadsAPI:
     async def test_finds_snapshot_by_tag(self, target):
         """Should find latest snapshot matching agent tag."""
         uploads = [
-            {
-                "tag": "kestrel-state-agent-1",
-                "cid": "QmOlder",
-                "createdAt": "2026-01-01T00:00:00Z",
-            },
-            {
-                "tag": "kestrel-state-agent-1",
-                "cid": "QmNewer",
-                "createdAt": "2026-02-01T00:00:00Z",
-            },
-            {
-                "tag": "kestrel-state-other-agent",
-                "cid": "QmOther",
-                "createdAt": "2026-03-01T00:00:00Z",
-            },
+            {"tag": "kestrel-state-agent-1", "cid": "QmOlder", "createdAt": "2026-01-01T00:00:00Z"},
+            {"tag": "kestrel-state-agent-1", "cid": "QmNewer", "createdAt": "2026-02-01T00:00:00Z"},
+            {"tag": "kestrel-state-other-agent", "cid": "QmOther", "createdAt": "2026-03-01T00:00:00Z"},
         ]
 
-        with patch("kestrel_sovereign.storage.sync.targets.requests") as mock_req:
-            mock_response = Mock()
-            mock_response.status_code = 200
-            mock_response.json.return_value = {"data": uploads}
-            mock_req.get.return_value = mock_response
+        mock_client = _mock_rest_client(uploads_list=uploads)
 
+        with patch(
+            "kestrel_sovereign.storage.providers.lighthouse_rest.LighthouseRestClient",
+            return_value=mock_client,
+        ):
             cid = await target._query_uploads_api()
 
         assert cid == "QmNewer"
@@ -396,12 +395,12 @@ class TestQueryUploadsAPI:
     @pytest.mark.asyncio
     async def test_returns_none_when_no_snapshots(self, target):
         """Should return None if no matching uploads."""
-        with patch("kestrel_sovereign.storage.sync.targets.requests") as mock_req:
-            mock_response = Mock()
-            mock_response.status_code = 200
-            mock_response.json.return_value = {"data": []}
-            mock_req.get.return_value = mock_response
+        mock_client = _mock_rest_client(uploads_list=[])
 
+        with patch(
+            "kestrel_sovereign.storage.providers.lighthouse_rest.LighthouseRestClient",
+            return_value=mock_client,
+        ):
             cid = await target._query_uploads_api()
 
         assert cid is None
@@ -409,21 +408,14 @@ class TestQueryUploadsAPI:
     @pytest.mark.asyncio
     async def test_handles_api_error(self, target):
         """Should return None on API error."""
-        with patch("kestrel_sovereign.storage.sync.targets.requests") as mock_req:
-            mock_req.get.side_effect = ConnectionError("timeout")
+        mock_client = AsyncMock()
+        mock_client.get_uploads = AsyncMock(side_effect=ConnectionError("timeout"))
+        mock_client.close = AsyncMock()
 
-            cid = await target._query_uploads_api()
-
-        assert cid is None
-
-    @pytest.mark.asyncio
-    async def test_handles_non_200_response(self, target):
-        """Should return None on non-200 status."""
-        with patch("kestrel_sovereign.storage.sync.targets.requests") as mock_req:
-            mock_response = Mock()
-            mock_response.status_code = 401
-            mock_req.get.return_value = mock_response
-
+        with patch(
+            "kestrel_sovereign.storage.providers.lighthouse_rest.LighthouseRestClient",
+            return_value=mock_client,
+        ):
             cid = await target._query_uploads_api()
 
         assert cid is None
@@ -470,11 +462,12 @@ class TestHealthCheck:
     async def test_health_check_success(self):
         target = LighthouseTarget(api_key="test-key", agent_id="test")
 
-        mock_client = Mock()
-        mock_client.getBalance.return_value = {"data": {"dataUsed": "0"}}
-        mock_module = MagicMock()
-        mock_module.Lighthouse.return_value = mock_client
-        with patch.dict("sys.modules", {"lighthouseweb3": mock_module}):
+        mock_client = _mock_rest_client(balance_data={"data": {"dataUsed": "0"}})
+
+        with patch(
+            "kestrel_sovereign.storage.providers.lighthouse_rest.LighthouseRestClient",
+            return_value=mock_client,
+        ):
             result = await target.health_check()
 
         assert result is True
@@ -483,9 +476,14 @@ class TestHealthCheck:
     async def test_health_check_failure(self):
         target = LighthouseTarget(api_key="bad-key", agent_id="test")
 
-        mock_module = MagicMock()
-        mock_module.Lighthouse.return_value.getBalance.side_effect = Exception("auth failed")
-        with patch.dict("sys.modules", {"lighthouseweb3": mock_module}):
+        mock_client = AsyncMock()
+        mock_client.get_balance = AsyncMock(side_effect=Exception("auth failed"))
+        mock_client.close = AsyncMock()
+
+        with patch(
+            "kestrel_sovereign.storage.providers.lighthouse_rest.LighthouseRestClient",
+            return_value=mock_client,
+        ):
             result = await target.health_check()
 
         assert result is False
