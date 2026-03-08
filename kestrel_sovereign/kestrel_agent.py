@@ -660,8 +660,16 @@ Expected Duration: {expected_duration}
 
         if state == BootstrapState.PENDING:
             # First ever message - send wake-up greeting
+            # Generate message BEFORE setting state, so a failure doesn't
+            # leave us stuck in DISCOVERY with no greeting sent
+            try:
+                wake_up_msg = await self.bootstrap_service.generate_wake_up_message()
+            except Exception as e:
+                logging.error(f"[BOOTSTRAP] Failed to generate wake-up message: {e}")
+                # Fall through to normal processing rather than getting stuck
+                return None
+
             await self.bootstrap_service.set_bootstrap_state(BootstrapState.DISCOVERY)
-            wake_up_msg = await self.bootstrap_service.generate_wake_up_message()
 
             # Store the wake-up message in conversation history
             await self.privacy_agent.add_conversation("assistant", wake_up_msg, session_id=session_id)
