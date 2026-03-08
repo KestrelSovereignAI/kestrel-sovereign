@@ -60,6 +60,12 @@ USER_PROMPT_FILE = PROMPTS_DIR / "user_prompt.md"
 # Increased to 50 for long-running tasks like code analysis and multi-step operations
 MAX_TOOL_ITERATIONS = int(os.environ.get("KESTREL_MAX_TOOL_ITERATIONS", "50"))
 
+# Maximum chars for a single tool result before truncation
+MAX_TOOL_RESULT_CHARS = int(os.environ.get("KESTREL_MAX_TOOL_RESULT_CHARS", "8000"))
+
+# Reserve this fraction of context for the LLM response + next tool call
+CONTEXT_RESERVE_FRACTION = 0.2
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 
@@ -1427,7 +1433,14 @@ Expected Duration: {expected_duration}
                 # Add tool result to messages (serialize dataclasses, enums, etc.)
                 from kestrel_sovereign.features.base import _serialize_tool_result
                 result_json = json.dumps(_serialize_tool_result(result))
-                logging.info(f"[ORCHESTRATOR] Adding tool result to messages ({len(result_json)} chars): {result_json[:300]}...")
+
+                # Truncate oversized tool results to prevent context blowout
+                if len(result_json) > MAX_TOOL_RESULT_CHARS:
+                    truncated_len = len(result_json)
+                    result_json = result_json[:MAX_TOOL_RESULT_CHARS] + f'\n... [truncated {truncated_len - MAX_TOOL_RESULT_CHARS} chars]'
+                    logging.warning(f"[ORCHESTRATOR] Truncated tool result from {truncated_len} to {MAX_TOOL_RESULT_CHARS} chars")
+
+                logging.info(f"[ORCHESTRATOR] Adding tool result ({len(result_json)} chars): {result_json[:200]}...")
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tool_call.id,
@@ -1436,6 +1449,10 @@ Expected Duration: {expected_duration}
 
             # Continue conversation with tool results (include newly explored direct tools)
             all_tools = self._build_all_tools()
+
+            # Context windowing: prune old tool exchanges if approaching limit
+            messages = self._prune_orchestrator_messages(messages, all_tools)
+
             logging.info(f"[ORCHESTRATOR] Calling LLM with {len(messages)} messages, {len(all_tools)} tools")
             response = await self.llm_service.generate_with_messages(
                 messages=messages,
@@ -1473,6 +1490,75 @@ Expected Duration: {expected_duration}
 
         logging.warning("Max tool call iterations reached")
         return response.content or "Error: Maximum tool call iterations exceeded"
+
+    def _prune_orchestrator_messages(
+        self, messages: list, tools: list, context_limit: int = None
+    ) -> list:
+        """Prune orchestrator messages to stay within context limits.
+
+        Strategy: keep system + user messages (first 2), keep the most recent
+        assistant+tool exchange, and progressively drop older tool results
+        (replacing with summaries) until we fit.
+
+        Uses char-based estimation: ~4 chars per token.
+        """
+        if context_limit is None:
+            # Try to get from LLM service's provider info
+            context_limit = getattr(self.llm_service, '_context_limit', None) or 131072
+
+        # Estimate tokens from chars (conservative: 1 token ≈ 3.5 chars)
+        chars_per_token = 3.5
+        max_chars = int(context_limit * chars_per_token * (1 - CONTEXT_RESERVE_FRACTION))
+
+        # Also account for tool definitions (~500 chars each)
+        tool_chars = sum(len(json.dumps(t)) for t in tools) if tools else 0
+        max_message_chars = max_chars - tool_chars
+
+        def _total_chars(msgs):
+            total = 0
+            for m in msgs:
+                total += len(m.get("content", "") or "")
+                for tc in m.get("tool_calls", []):
+                    total += len(json.dumps(tc.get("function", {}).get("arguments", {})))
+            return total
+
+        current = _total_chars(messages)
+
+        if current <= max_message_chars:
+            return messages  # Fits fine
+
+        logging.warning(
+            f"[ORCHESTRATOR] Context pressure: ~{int(current / chars_per_token)}tok "
+            f"messages + ~{int(tool_chars / chars_per_token)}tok tools "
+            f"vs {context_limit}tok limit. Pruning old tool results."
+        )
+
+        # Keep system (idx 0) and user (idx 1) messages always.
+        # Prune from idx 2 forward, oldest tool results first.
+        # We need to keep assistant+tool pairs together for API validity.
+        protected = messages[:2]  # system + user
+        middle = messages[2:]
+
+        # Find tool messages (pruneable) — go from oldest to newest
+        for i, msg in enumerate(middle):
+            if _total_chars(protected + middle) <= max_message_chars:
+                break
+            if msg.get("role") == "tool" and len(msg.get("content", "")) > 200:
+                original_len = len(msg["content"])
+                # Replace with a compact summary
+                middle[i] = {
+                    "role": "tool",
+                    "tool_call_id": msg.get("tool_call_id", ""),
+                    "content": f"[Result truncated: was {original_len} chars. Tool completed successfully.]"
+                }
+
+        result = protected + middle
+        new_total = _total_chars(result)
+        logging.info(
+            f"[ORCHESTRATOR] After pruning: ~{int(new_total / chars_per_token)}tok "
+            f"(removed ~{int((current - new_total) / chars_per_token)}tok)"
+        )
+        return result
 
     async def _handle_orchestrator_response_streaming(
         self,
@@ -1689,7 +1775,14 @@ Expected Duration: {expected_duration}
 
                 from kestrel_sovereign.features.base import _serialize_tool_result
                 result_json = json.dumps(_serialize_tool_result(result))
-                logging.info(f"[ORCHESTRATOR-STREAM] Tool result ({len(result_json)} chars): {result_json[:300]}...")
+
+                # Truncate oversized tool results
+                if len(result_json) > MAX_TOOL_RESULT_CHARS:
+                    truncated_len = len(result_json)
+                    result_json = result_json[:MAX_TOOL_RESULT_CHARS] + f'\n... [truncated {truncated_len - MAX_TOOL_RESULT_CHARS} chars]'
+                    logging.warning(f"[ORCHESTRATOR-STREAM] Truncated tool result from {truncated_len} to {MAX_TOOL_RESULT_CHARS} chars")
+
+                logging.info(f"[ORCHESTRATOR-STREAM] Tool result ({len(result_json)} chars): {result_json[:200]}...")
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tool_call.id,
@@ -1698,6 +1791,10 @@ Expected Duration: {expected_duration}
 
             # Check if we need more tool calls with non-streaming first
             all_tools = self._build_all_tools()
+
+            # Context windowing: prune old tool exchanges if approaching limit
+            messages = self._prune_orchestrator_messages(messages, all_tools)
+
             logging.info(f"[ORCHESTRATOR-STREAM] Checking for more tool calls with {len(messages)} messages, {len(all_tools)} tools")
             response = await self.llm_service.generate_with_messages(
                 messages=messages,
