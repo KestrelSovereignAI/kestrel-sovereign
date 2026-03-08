@@ -92,23 +92,70 @@ class BootstrapService:
         """
         Check if bootstrap is needed for this agent.
 
-        Returns True only if:
-        - Bootstrap state is not COMPLETE
-        - AND no SOUL.md exists (if SOUL.md exists, agent is already configured)
+        An agent needs bootstrap only if:
+        1. No SOUL.md exists (primary check — SOUL.md is the artifact)
+        2. No conversation history exists (secondary — existing agents don't re-bootstrap)
+        3. Bootstrap state is not COMPLETE (tertiary — DB state)
+
+        If any evidence of an existing agent is found, auto-heal the DB state.
         """
-        # If SOUL.md exists, agent is already configured — skip bootstrap
+        # SOUL.md is the primary artifact — if it exists, agent is configured
         if self.agent_data_path:
             soul_path = Path(self.agent_data_path) / "SOUL.md"
             if soul_path.exists() and soul_path.stat().st_size > 0:
-                # Auto-heal: mark bootstrap complete if it wasn't
-                state = await self.get_bootstrap_state()
-                if state != BootstrapState.COMPLETE:
-                    logger.info("SOUL.md exists but bootstrap not marked complete — auto-completing")
-                    await self.set_bootstrap_state(BootstrapState.COMPLETE)
+                await self._ensure_complete("SOUL.md exists")
                 return False
 
+        # Existing conversation history means this is not a new agent
+        try:
+            history_count = await self.db.fetchall(
+                "SELECT COUNT(*) FROM conversations WHERE agent_id = ?",
+                (self.agent_id,),
+            )
+            if history_count and history_count[0][0] > 0:
+                await self._ensure_complete("conversation history exists")
+                return False
+        except Exception:
+            pass  # Table may not exist for truly new agents
+
         state = await self.get_bootstrap_state()
-        return state != BootstrapState.COMPLETE
+        if state == BootstrapState.COMPLETE:
+            return False
+
+        # State is DISCOVERY or AVATAR but stuck — check for timeout
+        if state in (BootstrapState.DISCOVERY, BootstrapState.AVATAR):
+            started = await self._get_started_time()
+            if started:
+                elapsed = (datetime.now(timezone.utc) - started).total_seconds()
+                if elapsed > 3600:  # Stuck for more than 1 hour
+                    logger.warning(
+                        f"Bootstrap stuck in {state.value} for {elapsed:.0f}s — "
+                        f"auto-completing with default SOUL.md"
+                    )
+                    await self.skip_discovery()
+                    return False
+
+        return True
+
+    async def _ensure_complete(self, reason: str) -> None:
+        """Mark bootstrap complete if it isn't already."""
+        state = await self.get_bootstrap_state()
+        if state != BootstrapState.COMPLETE:
+            logger.info(f"Auto-completing bootstrap: {reason}")
+            await self.set_bootstrap_state(BootstrapState.COMPLETE)
+
+    async def _get_started_time(self) -> Optional[datetime]:
+        """Get when bootstrap was started."""
+        try:
+            result = await self.db.fetchall(
+                "SELECT value FROM agent_metadata WHERE agent_id = ? AND key = ?",
+                (self.agent_id, self.BOOTSTRAP_STARTED_KEY),
+            )
+            if result:
+                return datetime.fromisoformat(result[0][0])
+        except Exception:
+            pass
+        return None
 
     async def get_bootstrap_state(self) -> BootstrapState:
         """Get the current bootstrap state from agent_metadata."""
@@ -123,11 +170,12 @@ class BootstrapService:
             if result:
                 state_str = result[0][0]
                 return BootstrapState(state_str)
-            # No state stored = PENDING (new agent)
+            # No state stored — could be new agent or missing row
             return BootstrapState.PENDING
         except Exception as e:
             logger.warning(f"Failed to get bootstrap state: {e}")
-            return BootstrapState.PENDING
+            # On DB error, assume complete to avoid hijacking existing agents
+            return BootstrapState.COMPLETE
 
     async def set_bootstrap_state(self, state: BootstrapState) -> None:
         """Update the bootstrap state in agent_metadata."""
