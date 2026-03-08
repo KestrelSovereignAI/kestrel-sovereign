@@ -42,11 +42,22 @@ class ModelAgent(Feature):
         """
         List all available models from all providers.
 
-        Returns:
-            List of ModelInfo objects describing available models.
+        Returns compact summaries to avoid context blowout (765+ models).
         """
         try:
-            return await self.llm_service.discover_all_models(use_cache=use_cache)
+            models = await self.llm_service.discover_all_models(use_cache=use_cache)
+            # Return compact list: only featured/non-hidden models with essential fields
+            compact = []
+            for m in models:
+                if m.is_hidden:
+                    continue
+                compact.append({
+                    "id": m.id,
+                    "provider": m.provider,
+                    "category": m.category.value if hasattr(m.category, 'value') else str(m.category),
+                    "featured": m.is_featured,
+                })
+            return compact
         except Exception as e:
             logger.error(f"Error listing models: {e}")
             raise
