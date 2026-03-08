@@ -92,10 +92,21 @@ class BootstrapService:
         """
         Check if bootstrap is needed for this agent.
 
-        Returns True if:
-        - Bootstrap state is PENDING or DISCOVERY or AVATAR (not COMPLETE)
-        - AND conversation history is empty or only has bootstrap messages
+        Returns True only if:
+        - Bootstrap state is not COMPLETE
+        - AND no SOUL.md exists (if SOUL.md exists, agent is already configured)
         """
+        # If SOUL.md exists, agent is already configured — skip bootstrap
+        if self.agent_data_path:
+            soul_path = Path(self.agent_data_path) / "SOUL.md"
+            if soul_path.exists() and soul_path.stat().st_size > 0:
+                # Auto-heal: mark bootstrap complete if it wasn't
+                state = await self.get_bootstrap_state()
+                if state != BootstrapState.COMPLETE:
+                    logger.info("SOUL.md exists but bootstrap not marked complete — auto-completing")
+                    await self.set_bootstrap_state(BootstrapState.COMPLETE)
+                return False
+
         state = await self.get_bootstrap_state()
         return state != BootstrapState.COMPLETE
 
