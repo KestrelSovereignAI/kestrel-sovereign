@@ -4,9 +4,7 @@
  */
 
 import API from './api.js';
-import { state, PRIVACY_MODES, Toast, loadCommands } from './ui.js';
-import { disconnectNotifications, connectNotifications, loadModels, updateContextStatus } from './chat.js';
-import { generateIdenticon } from './identicon.js';
+import { state, PRIVACY_MODES, Toast, formatBytes } from './ui.js';
 
 // ============================================================================
 // Agent Selection (Multi-Agent Support)
@@ -87,7 +85,7 @@ export async function loadIdentity() {
         // Build avatar URL - prefer serving from identity chain via avatar endpoint
         let avatarUrl = null;
         if (identity.avatar_hash || identity.avatar_url) {
-            // In multi-agent mode, serve from Kestrel identity chain via platform endpoint
+            // In multi-agent mode, serve from Kestrel identity chain via Frinz endpoint
             if (currentAgentId) {
                 avatarUrl = `/api/kestrel/companions/${encodeURIComponent(currentAgentId)}/avatar`;
             } else if (identity.avatar_url) {
@@ -100,23 +98,13 @@ export async function loadIdentity() {
         const navAvatar = document.getElementById('nav-agent-avatar');
         const navName = document.getElementById('nav-agent-name');
 
-        // Use DID + name as seed so agents sharing a DID still get unique icons
-        const identiconSeed = [identity.did, identity.name].filter(Boolean).join(':');
-        const identiconUrl = identiconSeed ? generateIdenticon(identiconSeed, 48) : null;
-
         if (navAvatar && navIcon) {
-            const navSrc = avatarUrl || identiconUrl;
-            if (navSrc) {
-                navAvatar.src = navSrc;
+            if (avatarUrl) {
+                navAvatar.src = avatarUrl;
                 navAvatar.style.display = 'block';
                 navAvatar.onerror = () => {
-                    // Custom avatar failed — fall back to identicon, then kestrel icon
-                    if (identiconUrl && navAvatar.src !== identiconUrl) {
-                        navAvatar.src = identiconUrl;
-                    } else {
-                        navAvatar.style.display = 'none';
-                        navIcon.style.display = 'inline';
-                    }
+                    navAvatar.style.display = 'none';
+                    navIcon.style.display = 'inline';
                 };
                 navIcon.style.display = 'none';
             } else {
@@ -124,26 +112,39 @@ export async function loadIdentity() {
                 navIcon.style.display = 'inline';
             }
         }
-        if (navName) {
-            navName.textContent = identity.name || 'Unnamed Agent';
+        if (navName && identity.name) {
+            navName.textContent = identity.name;
         }
 
-        // Avatar: custom image → identicon → kestrel logo
-        const fallbackSrc = identiconUrl || '/static/favicon.svg';
+        // Avatar: use stored image if available, fallback to emoji
         const avatarHtml = avatarUrl
-            ? `<img src="${avatarUrl}" alt="Avatar" class="identity-avatar-img" onerror="this.src='${fallbackSrc}';">`
-            : `<img src="${fallbackSrc}" alt="Identicon" class="identity-avatar-img">`;
+            ? `<img src="${avatarUrl}" alt="Avatar" class="identity-avatar-img" onerror="this.parentElement.innerHTML='\\u{1F985}'">`
+            : `<span class="identity-avatar-emoji">\u{1F985}</span>`;
 
         const card = document.getElementById('identity-card');
         card.innerHTML = `
             <div class="identity-header">
                 <div class="identity-avatar">${avatarHtml}</div>
                 <div class="identity-info">
-                    <h2>${identity.name || 'Unnamed Agent'}</h2>
+                    <h2>${identity.name || 'Kestrel Agent'}</h2>
                     <div class="identity-did" title="${identity.did}">
-                        <span class="identity-did-text">${identity.did || 'No DID assigned'}</span>
-                        <button onclick="copyToClipboard('${identity.did}')" style="background:none;border:none;cursor:pointer;flex-shrink:0;" title="Copy DID">\u{1F4CB}</button>
+                        ${identity.did || 'No DID assigned'}
+                        <button onclick="copyToClipboard('${identity.did}')" style="background:none;border:none;cursor:pointer;margin-left:0.5rem;" title="Copy DID">\u{1F4CB}</button>
                     </div>
+                </div>
+            </div>
+            <div class="identity-stats">
+                <div class="stat-item">
+                    <div class="value">${identity.constitution_hash ? '\u{2705}' : '\u{274C}'}</div>
+                    <div class="label">Constitution</div>
+                </div>
+                <div class="stat-item">
+                    <div class="value">${identity.avatar_hash ? '\u{1F5BC}' : '\u{2796}'}</div>
+                    <div class="label">Avatar</div>
+                </div>
+                <div class="stat-item">
+                    <div class="value" id="identity-fil-balance">${identity.initial_balance || '…'}</div>
+                    <div class="label">FIL Balance</div>
                 </div>
             </div>
         `;
@@ -161,6 +162,14 @@ export async function loadIdentity() {
                 </div>
             `;
         }
+
+        // Load live FIL balance from wallet endpoint into identity card stat
+        try {
+            const wallet = await API.getWallet();
+            const balEl = document.getElementById('identity-fil-balance');
+            if (balEl) balEl.textContent = wallet.total ?? 0;
+        } catch (_) { /* leave the '…' placeholder */ }
+
     } catch (e) {
         const card = document.getElementById('identity-card');
         if (card) card.innerHTML = `<div style="color: var(--error); padding: 1rem;">Failed to load identity: ${e.message}</div>`;
@@ -300,284 +309,45 @@ window.showPrivacySelector = function() {
 };
 
 // ============================================================================
-// Utilities
+// Sidebar
 // ============================================================================
 
-function escapeHtml(str) {
-    const div = document.createElement('div');
-    div.textContent = str;
-    return div.innerHTML;
-}
-
-// ============================================================================
-// Agents Pane (Rookery)
-// ============================================================================
-
-let selectedAgentName = null;
-
-export async function loadAgents() {
+export async function loadSidebar() {
     try {
-        const data = await API.getAgents();
-        const agents = data.agents || [];
-        const isStandalone = data.mode === 'standalone';
-
-        const container = document.getElementById('agents-list');
-        if (agents.length === 0) {
-            container.innerHTML = '<p style="color: var(--text-secondary); padding: 1rem; text-align: center;">No agents available</p>';
-            return;
-        }
-
-        container.innerHTML = '';
-        for (const agent of agents) {
-            const isOnline = agent.status !== 'offline';
-            const item = document.createElement('div');
-            item.className = `agent-item${selectedAgentName === agent.name ? ' selected' : ''}${!isOnline ? ' offline' : ''}`;
-            item.dataset.agentName = agent.name;
-
-            // Only enable rookery agent selection in non-standalone mode
-            if (isOnline && !isStandalone) {
-                item.addEventListener('click', () => window.selectAgent(agent.name));
-            }
-
-            item.innerHTML = `
-                <span class="agent-status-dot ${isOnline ? 'online' : 'offline'}"></span>
-                <div class="agent-info">
-                    <div class="agent-name">${escapeHtml(agent.name || 'Unnamed Agent')}</div>
-                    <div class="agent-description">${escapeHtml(agent.description || 'No description')}</div>
-                </div>
-            `;
-            container.appendChild(item);
-        }
-
-        // Auto-select first online agent only in rookery mode (not standalone)
-        if (!selectedAgentName && !isStandalone) {
-            const firstOnline = agents.find(a => a.status !== 'offline');
-            if (firstOnline) {
-                window.selectAgent(firstOnline.name);
-            }
-        }
+        const health = await API.health();
+        document.getElementById('agent-status').innerHTML = `
+            <div style="display: flex; align-items: center; gap: 0.5rem;">
+                <span style="width: 8px; height: 8px; border-radius: 50%; background: ${health.agent_initialized ? 'var(--success)' : 'var(--error)'};"></span>
+                <span>${health.agent_initialized ? 'Online' : 'Offline'}</span>
+            </div>
+        `;
     } catch (e) {
-        const container = document.getElementById('agents-list');
-        container.innerHTML = '<p style="color: var(--error); padding: 1rem;">Failed to load agents</p>';
-    }
-}
-
-window.selectAgent = async function(agentName) {
-    selectedAgentName = agentName;
-
-    // Set host agent routing in API layer
-    API.setHostAgent(agentName);
-
-    // Update selection UI
-    document.querySelectorAll('.agent-item').forEach(item => {
-        item.classList.toggle('selected', item.dataset.agentName === agentName);
-    });
-
-    // Update chat header with agent name
-    const navName = document.getElementById('nav-agent-name');
-    if (navName) navName.textContent = agentName;
-
-    // Show conversations pane
-    const conversationsPane = document.getElementById('conversations-pane');
-    conversationsPane.style.display = 'flex';
-
-    // Clear chat messages — previous agent's messages shouldn't persist
-    const chatContainer = document.getElementById('chat-container');
-    if (chatContainer) {
-        chatContainer.innerHTML = '';
+        document.getElementById('agent-status').innerHTML = '<span style="color: var(--error);">Error</span>';
     }
 
-    // Reset session and cached panel data so they reload from the new agent
-    state.currentSessionId = null;
-    state.identity = null;
-    state.constitution = null;
-    state.memories = null;
-    state.exports = null;
-    state.storage = null;
-    state.wallet = null;
-
-    // Reconnect SSE notifications to the new agent
-    disconnectNotifications();
-    connectNotifications();
-
-    // Reload all agent-specific data in parallel
-    await Promise.all([
-        loadIdentity(),
-        loadPrivacyMode(),
-        loadConversations(agentName),
-        loadModels(),
-        loadCommands(API),
-        updateContextStatus(),
-    ]);
-
-    // Reload the currently active panel (its cached state was cleared above)
-    const panel = state.currentPanel;
-    if (panel === 'constitution' && loadConstitution) loadConstitution();
-    if (panel === 'memories' && loadMemories) loadMemories();
-    if (panel === 'sovereignty' && loadExports) loadExports();
-    if (panel === 'tasks' && loadTasks) loadTasks();
-    if (panel === 'resources' && loadResources) loadResources();
-};
-
-// ============================================================================
-// Conversations Pane
-// ============================================================================
-
-let activeConversationId = null;
-
-export async function loadConversations(_agentName) {
-    // Agent routing is handled by API.setHostAgent() — all calls auto-prefix
     try {
-        const data = await API.getConversations();
-        const conversations = data.conversations || [];
-
-        const container = document.getElementById('conversations-list');
-        if (conversations.length === 0) {
-            container.innerHTML = '<p style="color: var(--text-secondary); padding: 1rem; text-align: center;">No conversations yet</p>';
-            return;
-        }
-
-        container.innerHTML = '';
-        for (const conv of conversations) {
-            const date = new Date(conv.started_at);
-            const timeStr = date.toLocaleString();
-
-            const item = document.createElement('div');
-            item.className = `conversation-item ${activeConversationId === conv.session_id ? 'active' : ''}`;
-            item.dataset.sessionId = conv.session_id;
-            item.addEventListener('click', () => window.loadConversation(conv.session_id));
-
-            const preview = document.createElement('div');
-            preview.className = 'conversation-preview';
-            preview.textContent = conv.preview || 'New conversation';
-
-            const time = document.createElement('div');
-            time.className = 'conversation-time';
-            time.textContent = timeStr;
-
-            item.appendChild(preview);
-            item.appendChild(time);
-            container.appendChild(item);
-        }
+        const stats = await API.getStorageStats();
+        state.storage = stats;
+        document.getElementById('storage-summary').innerHTML = `
+            <div style="font-size: 0.875rem;">
+                <div>${formatBytes(stats.database?.size_bytes || 0)}</div>
+                <div style="color: var(--text-secondary);">${stats.conversations?.count || 0} messages</div>
+            </div>
+        `;
     } catch (e) {
-        const container = document.getElementById('conversations-list');
-        container.innerHTML = '<p style="color: var(--error); padding: 1rem;">Failed to load conversations</p>';
+        document.getElementById('storage-summary').innerHTML = '<span style="color: var(--text-secondary);">Unavailable</span>';
     }
-}
 
-window.loadConversation = async function(sessionId) {
-    activeConversationId = sessionId;
-
-    // Update selection UI
-    document.querySelectorAll('.conversation-item').forEach(item => {
-        item.classList.toggle('active', item.dataset.sessionId === sessionId);
-    });
-
-    // Load conversation messages into chat panel
     try {
-        const data = await API.getConversation(sessionId);
-        const messages = data.messages || [];
-
-        const chatContainer = document.getElementById('chat-container');
-        chatContainer.innerHTML = '';
-
-        const renderMd = window.SharedMarkdown?.renderMarkdown;
-
-        for (const msg of messages) {
-            const messageDiv = document.createElement('div');
-            messageDiv.className = `message ${msg.role === 'user' ? 'user-message' : 'agent-message'}`;
-
-            const contentDiv = document.createElement('div');
-            contentDiv.className = 'message-content';
-
-            if (msg.role === 'assistant' && renderMd) {
-                contentDiv.innerHTML = renderMd(msg.content);
-            } else {
-                contentDiv.textContent = msg.content;
-            }
-
-            messageDiv.appendChild(contentDiv);
-            chatContainer.appendChild(messageDiv);
-        }
-
-        chatContainer.scrollTop = chatContainer.scrollHeight;
-
-        // Switch to chat panel
-        document.querySelector('[data-panel="chat"]')?.click();
+        const wallet = await API.getWallet();
+        state.wallet = wallet;
+        document.getElementById('wallet-summary').innerHTML = `
+            <div style="font-size: 0.875rem;">
+                <div>${wallet.total || 0} ${wallet.currency || 'FIL'}</div>
+                <div style="color: var(--text-secondary);">Balance</div>
+            </div>
+        `;
     } catch (e) {
-        console.error('Failed to load conversation:', e);
+        document.getElementById('wallet-summary').innerHTML = '<span style="color: var(--text-secondary);">Unavailable</span>';
     }
-};
-
-// ============================================================================
-// Pane Collapse/Expand + Resize
-// ============================================================================
-
-window.togglePane = function(paneId) {
-    const pane = document.getElementById(paneId);
-    if (pane) {
-        pane.classList.toggle('collapsed');
-    }
-};
-
-function initPaneResize(handleId, paneId) {
-    const handle = document.getElementById(handleId);
-    const pane = document.getElementById(paneId);
-    if (!handle || !pane) return;
-
-    let startX, startWidth;
-
-    handle.addEventListener('mousedown', (e) => {
-        startX = e.clientX;
-        startWidth = pane.offsetWidth;
-        document.body.style.cursor = 'col-resize';
-        document.body.style.userSelect = 'none';
-
-        function onMouseMove(e) {
-            const diff = e.clientX - startX;
-            const newWidth = Math.max(200, Math.min(500, startWidth + diff));
-            pane.style.width = newWidth + 'px';
-        }
-
-        function onMouseUp() {
-            document.removeEventListener('mousemove', onMouseMove);
-            document.removeEventListener('mouseup', onMouseUp);
-            document.body.style.cursor = '';
-            document.body.style.userSelect = '';
-        }
-
-        document.addEventListener('mousemove', onMouseMove);
-        document.addEventListener('mouseup', onMouseUp);
-    });
 }
-
-// Setup collapse buttons and resize handles
-document.addEventListener('DOMContentLoaded', () => {
-    const collapseAgentsBtn = document.getElementById('collapse-agents-btn');
-    if (collapseAgentsBtn) {
-        collapseAgentsBtn.addEventListener('click', () => togglePane('agents-pane'));
-    }
-
-    const collapseConversationsBtn = document.getElementById('collapse-conversations-btn');
-    if (collapseConversationsBtn) {
-        collapseConversationsBtn.addEventListener('click', () => togglePane('conversations-pane'));
-    }
-
-    const newConversationSidebarBtn = document.getElementById('new-conversation-sidebar-btn');
-    if (newConversationSidebarBtn) {
-        newConversationSidebarBtn.addEventListener('click', async () => {
-            try {
-                await API.newConversation();
-                if (selectedAgentName) {
-                    await loadConversations(selectedAgentName);
-                }
-            } catch (e) {
-                console.error('Failed to create new conversation:', e);
-            }
-        });
-    }
-
-    // Initialize resize handles
-    initPaneResize('resize-agents', 'agents-pane');
-    initPaneResize('resize-conversations', 'conversations-pane');
-});
