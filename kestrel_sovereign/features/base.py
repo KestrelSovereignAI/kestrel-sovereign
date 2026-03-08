@@ -428,7 +428,13 @@ EXECUTION PROTOCOL:
 6. If multiple tools are needed, call them in sequence
 7. After getting tool results (success or failure), provide a brief summary
 
-CRITICAL: You have ONE task. Execute it now. Do not wait for more input."""
+CRITICAL: You have ONE task. Execute it now. Do not wait for more input.
+
+ABSOLUTE PROHIBITION - NEVER FABRICATE:
+- NEVER invent a CID, hash, transaction ID, wallet address, or any cryptographic value
+- NEVER generate a plausible-looking result without actually calling a tool
+- If a tool call fails or is not available, say so explicitly - do not fill in fake values
+- A fabricated cryptographic value is a lie and a constitutional violation"""
 
     async def _handle_feature_tool_calls(
         self,

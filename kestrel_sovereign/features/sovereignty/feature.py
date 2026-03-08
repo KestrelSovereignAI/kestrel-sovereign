@@ -20,7 +20,10 @@ class SovereigntyFeature(Feature):
     def tool_description(self) -> str:
         return (
             "Manage data sovereignty - export agent state to IPFS/Filecoin for backup, "
-            "import and restore from backup CIDs, check sovereignty status and export history"
+            "import and restore from backup CIDs, check sovereignty status and export history. "
+            "CALL THIS TOOL when the user asks about: backing up, exporting their data, IPFS exports, "
+            "sovereignty status, previous backups, or any question about data portability. "
+            "Do NOT answer sovereignty questions from memory - always call this tool to get real data."
         )
 
     async def initialize(self):
