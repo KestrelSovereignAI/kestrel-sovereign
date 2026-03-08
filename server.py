@@ -310,11 +310,16 @@ async def auth_middleware(request: Request, call_next):
         if user_email:
             return await call_next(request)
 
-        # No valid auth — for the root page, redirect browsers to login
+        # No valid auth — for the root page in a browser:
         if request.url.path == "/" and SERVE_UI:
             accept = request.headers.get("accept", "")
             if "text/html" in accept:
-                return RedirectResponse(url="/auth/login", status_code=302)
+                if "google" in oauth._clients:
+                    # Cloud Run: redirect to Google OAuth login
+                    return RedirectResponse(url="/auth/login", status_code=302)
+                else:
+                    # Localhost: serve UI directly (it bootstraps its own API key)
+                    return await call_next(request)
 
         return JSONResponse(content={"detail": "Invalid or missing API Key"}, status_code=401)
 
