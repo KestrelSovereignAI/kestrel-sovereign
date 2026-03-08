@@ -133,11 +133,43 @@ class OpenAIAdapter(LLMAdapter):
                 output_tokens = getattr(response.usage, 'completion_tokens', None)
                 total_tokens = getattr(response.usage, 'total_tokens', None)
 
-            # Strip chain-of-thought reasoning tags (e.g., <think>...</think>)
-            # Models like Kimi K2.5, DeepSeek-R1 emit reasoning in these tags
+            # Strip chain-of-thought reasoning from response
             content = message.content
-            if content:
+
+            # 1. Use reasoning_content if server separated it (--reasoning-format deepseek)
+            reasoning_content = getattr(message, 'reasoning_content', None)
+            if reasoning_content and content:
+                # Server already stripped thinking — content is clean
+                pass
+            elif content:
+                # 2. Strip <think>...</think> tags (DeepSeek-R1 format)
                 content = re.sub(r'<think>.*?</think>\s*', '', content, flags=re.DOTALL)
+
+                # 3. Strip inline chain-of-thought from models that dump reasoning
+                #    as plain text (Kimi K2.5). Reasoning paragraphs start with
+                #    meta-cognitive phrases and don't contain markdown formatting.
+                paragraphs = content.split('\n\n')
+                if len(paragraphs) >= 2:
+                    reasoning_markers = [
+                        'The user', 'I should', 'I need to', 'Let me',
+                        'I\'ll ', 'I will ', 'This is a', 'Since ',
+                        'Looking at', 'Based on', 'I can see',
+                        'Overall,', 'Now I', 'I have',
+                    ]
+                    cleaned = []
+                    for p in paragraphs:
+                        stripped = p.strip()
+                        # Skip paragraphs that look like reasoning (start with
+                        # marker AND don't contain markdown formatting like
+                        # headers, tables, lists, or bold text)
+                        is_reasoning = (
+                            any(stripped.startswith(m) for m in reasoning_markers)
+                            and not any(c in stripped for c in ['#', '|', '- ', '* ', '**'])
+                        )
+                        if not is_reasoning:
+                            cleaned.append(p)
+                    if cleaned:
+                        content = '\n\n'.join(cleaned).strip()
 
             return LLMResponse(
                 content=content,
