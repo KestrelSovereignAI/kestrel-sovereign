@@ -9,6 +9,7 @@ Adapter for OpenAI's chat completion API with full support for:
 """
 import json
 import os
+import re
 import openai
 import logging
 from typing import Any, Dict, List, Optional, AsyncIterator, Type, Union
@@ -132,8 +133,14 @@ class OpenAIAdapter(LLMAdapter):
                 output_tokens = getattr(response.usage, 'completion_tokens', None)
                 total_tokens = getattr(response.usage, 'total_tokens', None)
 
+            # Strip chain-of-thought reasoning tags (e.g., <think>...</think>)
+            # Models like Kimi K2.5, DeepSeek-R1 emit reasoning in these tags
+            content = message.content
+            if content:
+                content = re.sub(r'<think>.*?</think>\s*', '', content, flags=re.DOTALL)
+
             return LLMResponse(
-                content=message.content,
+                content=content,
                 tool_calls=parsed_tool_calls,
                 raw=response,
                 input_tokens=input_tokens,
