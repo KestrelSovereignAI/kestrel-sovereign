@@ -89,7 +89,7 @@ class ModelDiscoveryMixin:
             for provider in self.providers:
                 provider_name = provider.get('name')
                 model_id = provider.get('model')
-                if model_id and model_id not in discovered_ids:
+                if model_id and model_id != "auto" and model_id not in discovered_ids:
                     # Cloud providers always support tools; only Ollama needs detection
                     is_cloud = provider_name not in ("ollama",)
                     all_models.append(ModelInfo(
@@ -192,10 +192,17 @@ class ModelDiscoveryMixin:
         Returns:
             List of ModelInfo objects from this adapter
         """
-        # Skip model discovery for OpenAI-compatible providers that reuse OpenAIAdapter
-        # These would incorrectly return OpenAI's models instead of their own
-        # They should implement their own list_models() or be configured in model_catalog.toml
+        # Skip adapter-based discovery for OpenAI-compatible providers that reuse
+        # OpenAIAdapter — they'd incorrectly return OpenAI's model list.
+        # Local providers (llama_cpp etc.) are discovered via direct /v1/models query below.
         SKIP_DISCOVERY = {'runpod', 'xai', 'groq', 'together', 'mistral', 'perplexity', 'fireworks', 'azure_openai'}
+
+        # Also skip local providers that reuse OpenAIAdapter — discover them directly
+        if hasattr(self, 'config') and isinstance(self.config, dict):
+            provider_config = self.config.get(adapter_name, {})
+            if isinstance(provider_config, dict) and provider_config.get("local"):
+                return await self._discover_local_openai_compatible(adapter_name, provider_config)
+
         if adapter_name in SKIP_DISCOVERY:
             logger.debug(f"{adapter_name}: skipping model discovery (OpenAI-compatible provider)")
             return []
@@ -213,6 +220,43 @@ class ModelDiscoveryMixin:
             return []
         except Exception as e:
             logger.warning(f"{adapter_name}: model discovery failed: {e}")
+            return []
+
+    async def _discover_local_openai_compatible(
+        self, provider_name: str, provider_config: dict
+    ) -> List[ModelInfo]:
+        """Discover models from a local OpenAI-compatible server (llama.cpp, etc.)."""
+        base_url = provider_config.get("base_url", "")
+        if not base_url:
+            return []
+
+        import httpx
+        models_url = f"{base_url.rstrip('/')}/models"
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.get(models_url)
+                resp.raise_for_status()
+                data = resp.json()
+
+            results = []
+            # Handle both OpenAI format {"data": [...]} and Ollama format {"models": [...]}
+            model_list = data.get("data") or data.get("models") or []
+            for m in model_list:
+                model_id = m.get("id") or m.get("model") or m.get("name", "")
+                if not model_id:
+                    continue
+                results.append(ModelInfo(
+                    id=model_id,
+                    provider=provider_name,
+                    display_name=model_id.split("/")[-1].replace(".gguf", ""),
+                    category=ModelCategory.CHAT,
+                    supports_tools=True,
+                    is_featured=True,
+                ))
+            logger.info(f"{provider_name}: discovered {len(results)} models from {models_url}")
+            return results
+        except Exception as e:
+            logger.warning(f"{provider_name}: local model discovery failed ({models_url}): {e}")
             return []
 
     def _get_adapters(self) -> Dict[str, Any]:

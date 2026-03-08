@@ -652,16 +652,31 @@ No other text or formatting.
         # Strip tools if the target model can't handle them
         tools = self._check_model_tool_support(available_providers, tools, model_override)
 
+        # Parse provider/model format (e.g., "openrouter/gpt-5.1")
         mandated_provider = None
-        if target_model:
+        if target_model and "/" in target_model:
+            provider_name, target_model = target_model.split("/", 1)
             for p in available_providers:
-                if target_model in p["model"] or p["name"] in target_model:
+                if p["name"] == provider_name:
                     mandated_provider = p
                     break
-
             if mandated_provider:
-                logger.info(f"Prioritizing mandated provider '{mandated_provider['name']}'")
-                available_providers = [mandated_provider] + [p for p in available_providers if p != mandated_provider]
+                logger.info(f"Using only provider '{provider_name}' with model '{target_model}'")
+                available_providers = [mandated_provider]
+        elif not target_model:
+            # Check mandate preference when no explicit override
+            pref_model = self._mandate_preference.get("model")
+            pref_provider = self._mandate_preference.get("provider")
+            if pref_model:
+                target_model = pref_model
+                if pref_provider:
+                    for p in available_providers:
+                        if p["name"] == pref_provider:
+                            mandated_provider = p
+                            break
+                    if mandated_provider:
+                        logger.info(f"Model mandate set: using only {pref_provider} with {pref_model}")
+                        available_providers = [mandated_provider]
 
         errors = {}
         for provider in available_providers:
@@ -1031,7 +1046,8 @@ No other text or formatting.
         # Fall back to standard providers
         providers = self.providers
         if force_local_only:
-            providers = [p for p in providers if p["name"] in ["ollama"]]
+            local_names = {p.name for p in self.provider_registry.get_local_providers()}
+            providers = [p for p in providers if p["name"] in local_names]
             # Clear any cloud model override — use the local provider's own model
             if model_override and providers and not any(
                 model_override == p["model"] for p in providers
@@ -1053,7 +1069,9 @@ No other text or formatting.
                         target_provider = p
                         break
                 if target_provider:
-                    providers = [target_provider] + [p for p in providers if p != target_provider]
+                    # Only use the specified provider — don't fall back to
+                    # others that won't have the same model
+                    providers = [target_provider]
                 else:
                     raise LLMServiceError(
                         f"Provider '{provider_name}' not available. "
@@ -1096,6 +1114,11 @@ No other text or formatting.
                 if isinstance(response, LLMResponse):
                     return response.content or ""
                 return response
+            except openai.BadRequestError as e:
+                # 400 = request problem (context too big, bad format, etc.)
+                # Don't fall back — the request itself is broken, not the provider.
+                logger.error(f"Provider {provider['name']} rejected request (400): {e}")
+                raise LLMServiceError(f"Request rejected by {provider['name']}: {e}") from e
             except (openai.APIError, openai.APIConnectionError, openai.RateLimitError, openai.AuthenticationError) as e:
                 logger.error(f"Provider {provider['name']} failed: {e}")
                 continue
