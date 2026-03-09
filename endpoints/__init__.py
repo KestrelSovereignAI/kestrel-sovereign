@@ -13,6 +13,7 @@ from .commands import router as commands_router
 from .files import router as files_router
 from .observability import router as observability_router
 from .saved_items import router as saved_items_router
+from .rasa_shim import router as rasa_shim_router
 
 __all__ = [
     "agent_router",
@@ -26,4 +27,5 @@ __all__ = [
     "files_router",
     "observability_router",
     "saved_items_router",
+    "rasa_shim_router",
 ]

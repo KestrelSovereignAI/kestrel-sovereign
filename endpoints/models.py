@@ -5,7 +5,7 @@ import aiohttp
 import time
 import logging
 
-from llm.model_metadata import ModelCategory
+from kestrel_sovereign.llm.model_metadata import ModelCategory
 
 logger = logging.getLogger(__name__)
 

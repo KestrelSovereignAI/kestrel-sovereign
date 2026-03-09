@@ -44,19 +44,41 @@ class WalletFeature(Feature):
         """Initialize the WalletAgent with the agent's database path."""
         logger.info("Initializing WalletFeature")
 
-        # Get database path from agent's storage
+        # Reuse wallet already created by KestrelAgent.initialize() — it reads
+        # the inception initialBalance from the agent graph node. Creating a new
+        # WalletAgent here would overwrite it with the default 100 FIL.
+        if hasattr(self.agent, 'wallet') and self.agent.wallet is not None:
+            self.wallet = self.agent.wallet
+            agent_id = getattr(self.agent, 'agent_id', 'default')
+            logger.info(
+                f"WalletFeature initialized for agent {agent_id}, "
+                f"total USD value: ${self.wallet.get_total_balance_usd()}"
+            )
+            return
+
+        # Fallback: agent didn't pre-initialize a wallet (e.g. lightweight test path).
+        # Read inception balance from agent node so we don't default to 100 FIL.
         db_path = None
         if hasattr(self.agent, 'storage') and hasattr(self.agent.storage, 'db_path'):
             db_path = self.agent.storage.db_path
         elif hasattr(self.agent, 'db_path'):
             db_path = self.agent.db_path
 
-        # Get agent ID
         agent_id = getattr(self.agent, 'agent_id', 'default')
 
-        # Initialize wallet
+        # Try to read inception initialBalance from the agent graph node
+        initial_balance = Decimal('100.0')
+        try:
+            if hasattr(self.agent, 'storage'):
+                agent_node = await self.agent.storage.get_node(agent_id)
+                if agent_node and 'initialBalance' in agent_node.properties:
+                    initial_balance = Decimal(agent_node.properties['initialBalance'])
+        except Exception as e:
+            logger.warning(f"Could not read initialBalance from agent node: {e}")
+
         self.wallet = WalletAgent(
             agent_id=agent_id,
+            initial_balance=initial_balance,
             db_path=db_path
         )
         await self.wallet.initialize()

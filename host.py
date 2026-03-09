@@ -66,12 +66,20 @@ PROJECT_DIR = Path(__file__).parent.resolve()
 
 
 def get_api_key() -> str:
-    """Get or generate the host API key."""
+    """Get or generate the host API key, persisting it to .env if newly generated."""
     api_key = os.environ.get("KESTREL_HOST_API_KEY") or os.environ.get("KESTREL_API_KEY")
     if not api_key:
         generated_key = secrets.token_urlsafe(32)
         os.environ["KESTREL_API_KEY"] = generated_key
-        logger.warning("No KESTREL_HOST_API_KEY or KESTREL_API_KEY set. Generated a temporary key.")
+        # Persist to .env so it survives restarts and won't cause browser 401s
+        env_path = PROJECT_DIR / ".env"
+        try:
+            with open(env_path, "a", encoding="utf-8") as f:
+                f.write(f"\nKESTREL_API_KEY={generated_key}\n")
+            logger.info(f"KESTREL_API_KEY generated and saved to .env")
+        except OSError as e:
+            logger.warning(f"Could not persist KESTREL_API_KEY to .env: {e}")
+            logger.warning(f"Add this to your .env manually: KESTREL_API_KEY={generated_key}")
         return generated_key
     # Strip surrounding quotes (Docker --env-file includes them literally)
     if len(api_key) >= 2 and api_key[0] == api_key[-1] and api_key[0] in ('"', "'"):

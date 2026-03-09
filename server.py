@@ -12,18 +12,18 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, JSONResponse
 from contextlib import asynccontextmanager
 import logging
-from main import get_agent_did_async
-from kestrel_agent import KestrelAgent
-from llm.service import LLMService
+from kestrel_sovereign.rookery.agent_manager import _get_agent_did
+from kestrel_sovereign.kestrel_agent import KestrelAgent
+from kestrel_sovereign.llm.service import LLMService
 from dotenv import load_dotenv
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 
-from kestrel_config.constants import SHUTDOWN_TIMEOUT
+from kestrel_sovereign.kestrel_config.constants import SHUTDOWN_TIMEOUT
 
 # Load environment variables from .env file
-load_dotenv(Path(__file__).parent / ".env", override=True)
+load_dotenv(Path(__file__).parent / ".env", override=False)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -32,6 +32,12 @@ logger = logging.getLogger(__name__)
 API_KEY_NAME = "X-API-Key"
 api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
 security = HTTPBearer(auto_error=False)
+
+# Paths where API key via query parameter (?api_key=...) is accepted.
+# EventSource/SSE connections cannot send custom headers, so these endpoints
+# need query param auth. Keeping this list explicit prevents the key from
+# leaking into logs on unrelated endpoints.
+SSE_PATHS: set[str] = {"/agent/notifications/sse", "/agent/stream"}
 
 
 def get_api_key():
@@ -75,9 +81,9 @@ async def verify_api_key(
     if token and token.credentials == expected_key:
         return True
 
-    # Support query parameter auth for SSE endpoints (EventSource can't send headers)
+    # Support query parameter auth for SSE endpoints only (EventSource can't send headers)
     api_key_query = request.query_params.get("api_key")
-    if api_key_query and api_key_query == expected_key:
+    if api_key_query and request.url.path in SSE_PATHS and api_key_query == expected_key:
         return True
 
     raise HTTPException(
@@ -102,7 +108,7 @@ async def lifespan(app: FastAPI):
             logger.info("Using PostgreSQL backend for Kestrel")
             storage_dir = os.environ.get("KESTREL_DB_PATH", os.getcwd())
             db_path = os.path.join(storage_dir, "kestrel_prime.db")  # For SQLite fallback stores
-            agent_did = await get_agent_did_async(storage_dir)
+            agent_did = await _get_agent_did(storage_dir)
             llm_service = LLMService()
             app.state.agent = KestrelAgent(
                 did=agent_did,
@@ -115,7 +121,7 @@ async def lifespan(app: FastAPI):
             # SQLite mode (default) - for local deployments
             storage_dir = os.environ.get("KESTREL_DB_PATH", os.getcwd())
             db_path = os.path.join(storage_dir, "kestrel_prime.db")
-            agent_did = await get_agent_did_async(storage_dir)
+            agent_did = await _get_agent_did(storage_dir)
             llm_service = LLMService()
             app.state.agent = KestrelAgent(
                 did=agent_did,
@@ -211,9 +217,10 @@ async def auth_middleware(request: Request, call_next):
                 response = await call_next(request)
                 return response
 
-        # Check query parameter (for SSE endpoints - EventSource can't send headers)
+        # Check query parameter (for SSE endpoints only - EventSource can't send headers)
+        # Restricted to SSE_PATHS to prevent key from appearing in logs on other endpoints.
         api_key_query = request.query_params.get("api_key")
-        if api_key_query and api_key_query == expected_key:
+        if api_key_query and request.url.path in SSE_PATHS and api_key_query == expected_key:
             response = await call_next(request)
             return response
 
