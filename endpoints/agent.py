@@ -4,7 +4,9 @@ from fastapi import APIRouter, HTTPException, Request, Query
 from fastapi.responses import StreamingResponse
 from typing import Optional
 import asyncio
+import json
 import logging
+import re
 
 from kestrel_sovereign.kestrel_config.constants import (
     MAX_SSE_CONNECTIONS_PER_CLIENT,
@@ -22,6 +24,24 @@ _sse_lock = asyncio.Lock()
 
 router = APIRouter(prefix="/agent", tags=["agent"])
 
+# Regex strips invalid JSON escape sequences (e.g. \! from zsh shells)
+_INVALID_JSON_ESCAPE = re.compile(rb'\\([^"\\/bfnrtu])')
+
+
+async def _parse_json_body(request: Request) -> dict:
+    """Parse JSON body, recovering from common shell-escaping issues."""
+    try:
+        return await request.json()
+    except (json.JSONDecodeError, ValueError) as orig_err:
+        raw = await request.body()
+        cleaned = _INVALID_JSON_ESCAPE.sub(lambda m: m.group(1), raw)
+        if cleaned != raw:
+            try:
+                return json.loads(cleaned)
+            except Exception:
+                pass
+        raise HTTPException(status_code=400, detail=f"Invalid JSON: {orig_err}")
+
 
 @router.post("/invoke")
 @limiter.limit("60/minute")
@@ -34,7 +54,7 @@ async def invoke_agent(request: Request):
       - 'session_id' to load context from a specific conversation session
     """
     try:
-        data = await request.json()
+        data = await _parse_json_body(request)
         user_input = data.get("input")
         model_override = data.get("model")
         provider_override = data.get("provider")
@@ -72,7 +92,7 @@ async def stream_agent_response(request: Request):
     import uuid
     
     try:
-        data = await request.json()
+        data = await _parse_json_body(request)
         user_input = data.get("input")
         model_override = data.get("model")
         provider_override = data.get("provider")
