@@ -271,13 +271,14 @@ export async function sendMessage() {
     state.isWaiting = true;
     showThinking(true);
 
-    // Don't pass model here - it's already set via !model-set command which stores
-    // the preference in llm_service._mandate_preference. Passing it again via
-    // model_override causes parsing issues with OpenRouter models like "google/gemma-2-27b-it"
-    // which get incorrectly split into provider="google" and model="gemma-2-27b-it".
-
     // Get current session ID for context-aware conversation
     const sessionId = state.currentSessionId || null;
+
+    // Send both provider and model so the backend can route to the correct provider.
+    // Without provider, the backend iterates ALL providers with just the model name,
+    // causing failures on providers that don't have that model.
+    const selectedModel = state.selectedModel || null;
+    const selectedProvider = state.selectedProvider || null;
 
     try {
         if (state.useStreaming) {
@@ -285,7 +286,7 @@ export async function sendMessage() {
             let fullContent = '';
 
             try {
-                for await (const chunk of API.streamInvoke(text, state.selectedModel, sessionId)) {
+                for await (const chunk of API.streamInvoke(text, selectedModel, sessionId, selectedProvider)) {
                     fullContent += chunk;
                     updateStreamingMessage(msgDiv, fullContent);
                 }
@@ -296,7 +297,7 @@ export async function sendMessage() {
                     console.log('Streaming not available, falling back to standard invoke');
                     state.useStreaming = false;
                     msgDiv.remove();
-                    const response = await API.invoke(text, state.selectedModel, sessionId);
+                    const response = await API.invoke(text, selectedModel, sessionId, selectedProvider);
                     await addMessage('agent', response.response);
                     await checkForModelChange(response.response);
                 } else {
@@ -304,7 +305,7 @@ export async function sendMessage() {
                 }
             }
         } else {
-            const response = await API.invoke(text, state.selectedModel, sessionId);
+            const response = await API.invoke(text, selectedModel, sessionId, selectedProvider);
             await addMessage('agent', response.response);
             await checkForModelChange(response.response);
         }
@@ -569,8 +570,9 @@ export async function loadModels() {
             return key ? { 'X-API-Key': key } : {};
         },
         onModelChange: async (provider, model) => {
-            // Update state
+            // Update state with both provider and model
             state.selectedModel = model;
+            state.selectedProvider = provider;
 
             // Send model-set command to agent with explicit provider
             // Format: !model-set <provider> <model>
@@ -584,9 +586,10 @@ export async function loadModels() {
     // Initialize - loads models, binds events, syncs with server
     await sharedModelSelector.init();
 
-    // Update state with initial selection
+    // Update state with initial selection (both provider and model)
     const selection = sharedModelSelector.getSelection();
     state.selectedModel = selection.model;
+    state.selectedProvider = selection.provider;
 }
 
 /**
@@ -597,9 +600,10 @@ function checkForModelChange(content) {
     if (sharedModelSelector) {
         const changed = sharedModelSelector.checkForModelChange(content);
         if (changed) {
-            // Update state
+            // Update state with both provider and model
             const selection = sharedModelSelector.getSelection();
             state.selectedModel = selection.model;
+            state.selectedProvider = selection.provider;
 
             // Visual feedback on model selector
             const modelSelect = document.getElementById('model-selector');

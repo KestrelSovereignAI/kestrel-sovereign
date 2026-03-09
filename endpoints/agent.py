@@ -37,10 +37,15 @@ async def invoke_agent(request: Request):
         data = await request.json()
         user_input = data.get("input")
         model_override = data.get("model")
+        provider_override = data.get("provider")
         session_id = data.get("session_id")
 
         if user_input is None:
             raise HTTPException(status_code=400, detail="Input not provided.")
+
+        # Combine provider and model for proper routing
+        if provider_override and model_override:
+            model_override = f"{provider_override}/{model_override}"
 
         agent = get_agent(request)
         response = await agent.process_input(
@@ -70,6 +75,7 @@ async def stream_agent_response(request: Request):
         data = await request.json()
         user_input = data.get("input")
         model_override = data.get("model")
+        provider_override = data.get("provider")
         session_id = data.get("session_id")
         audit_before_streaming = data.get("audit_before_streaming", False)
 
@@ -77,7 +83,13 @@ async def stream_agent_response(request: Request):
             raise HTTPException(status_code=400, detail="Input not provided.")
 
         agent = get_agent(request)
-        
+
+        # Combine provider and model into provider/model format for routing.
+        # The streaming path uses "/" in model_override to identify the provider
+        # and filter to only that provider (avoids trying all providers).
+        if provider_override and model_override:
+            model_override = f"{provider_override}/{model_override}"
+
         # Generate unique request ID for cancellation tracking
         request_id = str(uuid.uuid4())
         agent._current_request_id = request_id

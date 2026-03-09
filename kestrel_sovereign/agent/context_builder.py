@@ -53,20 +53,24 @@ class ContextBuilder:
         storage: "AsyncStorage",
         model: str = "auto",
         consolidator: Optional["MemoryConsolidator"] = None,
-        agent_data_path: Optional[str] = None
+        agent_data_path: Optional[str] = None,
+        llm_service=None,
     ):
         """
         Initialize the context builder.
 
         Args:
             storage: The async storage instance for RAG and history retrieval
-            model: The model name for token counting
+            model: Deprecated fallback model name (use llm_service instead)
             consolidator: Optional MemoryConsolidator for episode retrieval
             agent_data_path: Path to agent data directory (for SOUL.md, etc.)
+            llm_service: LLMService instance for resolved model identity
         """
         self.storage = storage
-        self.model = model
-        self.counter = get_token_counter(model)
+        self._llm_service = llm_service
+        self._model_fallback = model
+        self._counter = None
+        self._counter_model = None
         self.consolidator = consolidator
         self.agent_data_path = Path(agent_data_path) if agent_data_path else None
 
@@ -95,6 +99,33 @@ class ContextBuilder:
 
         # Load all bootstrap files (includes SOUL.md)
         self._bootstrap_loader.load()
+
+    @property
+    def model(self) -> str:
+        """Resolved model ID. Delegates to LLMService if available."""
+        if self._llm_service:
+            return self._llm_service.get_active_model_id()
+        return self._model_fallback
+
+    @model.setter
+    def model(self, value: str):
+        """Allow direct assignment for backward compatibility."""
+        self._model_fallback = value
+
+    @property
+    def counter(self) -> TokenCounter:
+        """TokenCounter keyed to current model, lazily cached."""
+        current_model = self.model
+        if self._counter is None or self._counter_model != current_model:
+            self._counter = get_token_counter(current_model)
+            self._counter_model = current_model
+        return self._counter
+
+    @counter.setter
+    def counter(self, value):
+        """Allow direct assignment for backward compatibility."""
+        self._counter = value
+        self._counter_model = None
 
     # ------------------------------------------------------------------
     # Bootstrap file access (delegated to BootstrapLoader)

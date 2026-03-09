@@ -1466,27 +1466,39 @@ class TestContextFeature:
 class TestLLMServiceCheapModel:
     """Tests for LLMService.get_cheap_model()."""
 
-    def test_get_cheap_model_returns_haiku(self):
-        """Test that get_cheap_model returns haiku for anthropic."""
+    def test_get_cheap_model_returns_none_when_no_cheap_provider(self):
+        """Test that get_cheap_model returns None when no cheap provider found."""
         from kestrel_sovereign.llm.service import LLMService
 
-        # Mock providers and provider_registry
         service = MagicMock(spec=LLMService)
         service.mandate_config = {"defaults": {}}
 
-        # Mock provider_registry
         mock_registry = MagicMock()
         mock_registry.get_providers_with_pattern.return_value = []
-        mock_anthropic_provider = MagicMock()
-        mock_anthropic_provider.model = "claude-3-opus"
-        mock_registry.get_provider_by_name.return_value = mock_anthropic_provider
         service.provider_registry = mock_registry
 
-        # Call the real method
         service.get_cheap_model = LLMService.get_cheap_model.__get__(service)
         result = service.get_cheap_model()
 
-        assert result == "claude-3-haiku-20240307"
+        assert result is None
+
+    def test_get_cheap_model_returns_matched_provider(self):
+        """Test that get_cheap_model returns first matched cheap provider."""
+        from kestrel_sovereign.llm.service import LLMService
+
+        service = MagicMock(spec=LLMService)
+        service.mandate_config = {"defaults": {}}
+
+        mock_registry = MagicMock()
+        mock_haiku = MagicMock()
+        mock_haiku.model = "claude-haiku-4-5"
+        mock_registry.get_providers_with_pattern.return_value = [mock_haiku]
+        service.provider_registry = mock_registry
+
+        service.get_cheap_model = LLMService.get_cheap_model.__get__(service)
+        result = service.get_cheap_model()
+
+        assert result == "claude-haiku-4-5"
 
     def test_get_cheap_model_from_config(self):
         """Test that get_cheap_model respects config."""
