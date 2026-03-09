@@ -408,6 +408,64 @@ async def get_context_status(
         raise HTTPException(status_code=500, detail="Error retrieving context status.")
 
 
+@router.get("/reflection/status")
+async def reflection_status(request: Request):
+    """Get reflection and self-improvement status.
+
+    Returns scheduled reflection tasks, recent execution history,
+    and health trend from training cycles.
+    """
+    agent = get_agent(request)
+
+    result = {
+        "reflection_hook_active": getattr(agent, "reflection_hook", None) is not None,
+        "scheduled_tasks": [],
+        "recent_executions": [],
+    }
+
+    # Get scheduled reflection tasks
+    scheduler = agent.features.get("SchedulerFeature") if hasattr(agent, "features") else None
+    if scheduler:
+        try:
+            tasks = await scheduler.schedule_list()
+            result["scheduled_tasks"] = [
+                t for t in tasks.get("tasks", [])
+                if t["task_name"] in ("reflect", "training_cycle")
+            ]
+        except Exception as e:
+            logger.warning(f"Failed to get scheduled tasks: {e}")
+
+    # Get recent reflection execution history from task_execution_log
+    db = None
+    if hasattr(agent, "_raw_storage") and hasattr(agent._raw_storage, "db"):
+        db = agent._raw_storage.db
+    if db:
+        try:
+            agent_id = getattr(agent, "agent_id", "") or getattr(agent, "did", "")
+            rows = await db.fetchall(
+                """
+                SELECT tel.task_id, st.task_name, tel.status, tel.duration_ms, tel.executed_at,
+                       SUBSTR(tel.result_text, 1, 500) as result_preview
+                FROM task_execution_log tel
+                JOIN scheduled_tasks st ON tel.task_id = st.id
+                WHERE tel.agent_id = ? AND st.task_name IN ('reflect', 'training_cycle')
+                ORDER BY tel.executed_at DESC LIMIT 10
+                """,
+                (agent_id,),
+            )
+            result["recent_executions"] = [
+                {
+                    "task_id": r[0], "task_name": r[1], "status": r[2],
+                    "duration_ms": r[3], "executed_at": r[4], "result_preview": r[5],
+                }
+                for r in rows
+            ]
+        except Exception as e:
+            logger.warning(f"Failed to get execution history: {e}")
+
+    return result
+
+
 @router.get("/tasks")
 async def list_tasks(
     request: Request,

@@ -145,9 +145,9 @@ def create_reflection_hook(agent) -> Optional[ReflectionSleepHook]:
     reflection_feature = None
 
     if hasattr(agent, 'get_feature'):
-        reflection_feature = agent.get_feature("reflection")
+        reflection_feature = agent.get_feature("reflection") or agent.get_feature("ReflectionFeature")
     elif hasattr(agent, 'features'):
-        reflection_feature = agent.features.get("reflection")
+        reflection_feature = agent.features.get("ReflectionFeature") or agent.features.get("reflection")
 
     if reflection_feature is None:
         logger.debug("Reflection feature not found, sleep hook not created")

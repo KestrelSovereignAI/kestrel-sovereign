@@ -330,6 +330,12 @@ class KestrelAgent(ConstitutionMixin, StreamingMixin, BackupMixin, SleepMixin):
             self.model_agent = self.features.get("ModelAgent")
             logging.info("Feature references set up")
 
+            # Wire reflection into sleep cycle (runs pre/post-consolidation analysis)
+            from kestrel_sovereign.features.reflection.hooks import create_reflection_hook
+            self.reflection_hook = create_reflection_hook(self)
+            if self.reflection_hook:
+                logging.info("Reflection hook enabled for sleep cycle")
+
             # Initialize state
             self.conversations = {}
             self.extension = None
@@ -358,6 +364,21 @@ class KestrelAgent(ConstitutionMixin, StreamingMixin, BackupMixin, SleepMixin):
                 )
                 await self.storage.add_node(agent_node)
                 logging.info("Agent node created")
+
+            # Load prompts from external files (fallback to embedded defaults)
+            self.prompt_template = _load_prompt_file(
+                SYSTEM_PROMPT_FILE,
+                fallback=self._get_default_system_prompt()
+            )
+            self.user_prompt_template = _load_prompt_file(
+                USER_PROMPT_FILE,
+                fallback=self._get_default_user_prompt()
+            )
+            # Extract just the template portion from user prompt file
+            if "```" in self.user_prompt_template:
+                match = re.search(r'```\s*(.*?)\s*```', self.user_prompt_template, re.DOTALL)
+                if match:
+                    self.user_prompt_template = match.group(1).strip()
 
             # Check if this is a test instance and load disclosure if so
             self._is_test_instance = agent_node.properties.get("is_test_instance", False)
@@ -465,6 +486,9 @@ class KestrelAgent(ConstitutionMixin, StreamingMixin, BackupMixin, SleepMixin):
             if self._heartbeat_config.enabled:
                 await self.heartbeat_runner.start()
 
+            # Auto-schedule reflection + training (idempotent — skips if already scheduled)
+            await self._setup_default_schedules()
+
     @property
     def privacy_mode(self) -> PrivacyMode:
         """Get current privacy mode."""
@@ -527,26 +551,41 @@ class KestrelAgent(ConstitutionMixin, StreamingMixin, BackupMixin, SleepMixin):
             if hasattr(feature, 'set_task_manager'):
                 feature.set_task_manager(self.task_manager)
 
-    # Solvency State
-        self._current_model_preference: Optional[str] = None
+    async def _setup_default_schedules(self):
+        """Register default scheduled tasks for self-improvement.
 
-        self.app_context: Optional[str] = None # For app-specific logic (e.g., 'elderly')
-        
-        # Load prompts from external files (fallback to embedded defaults)
-        self.prompt_template = _load_prompt_file(
-            SYSTEM_PROMPT_FILE,
-            fallback=self._get_default_system_prompt()
-        )
-        self.user_prompt_template = _load_prompt_file(
-            USER_PROMPT_FILE,
-            fallback=self._get_default_user_prompt()
-        )
-        # Extract just the template portion from user prompt file
-        if "```" in self.user_prompt_template:
-            # Extract template between code fences
-            match = re.search(r'```\s*(.*?)\s*```', self.user_prompt_template, re.DOTALL)
-            if match:
-                self.user_prompt_template = match.group(1).strip()
+        Idempotent — checks for existing tasks before adding.
+        Requires both SchedulerFeature and ReflectionFeature to be loaded.
+        """
+        scheduler = self.features.get("SchedulerFeature")
+        reflection = self.features.get("ReflectionFeature")
+        if not scheduler or not reflection:
+            return
+
+        # Check what's already scheduled
+        existing = await scheduler.schedule_list()
+        existing_names = {t["task_name"] for t in existing.get("tasks", [])}
+
+        defaults = [
+            ("reflect", "0 */4 * * *", '{"scope":"all","depth":"normal"}'),
+            ("training_cycle", "0 3 * * *", '{"iterations":3,"depth":"normal"}'),
+        ]
+
+        for task_name, cron, args in defaults:
+            if task_name in existing_names:
+                logging.debug(f"Schedule '{task_name}' already exists, skipping")
+                continue
+            result = await scheduler.schedule_add(
+                cron_expression=cron, task_name=task_name, args_json=args,
+            )
+            if result.get("success"):
+                logging.info(f"Scheduled '{task_name}' ({cron}), next: {result.get('next_run_at')}")
+            else:
+                logging.warning(f"Failed to schedule '{task_name}': {result.get('error')}")
+
+    # Solvency State
+    _current_model_preference: Optional[str] = None
+    app_context: Optional[str] = None  # For app-specific logic (e.g., 'elderly')
 
     def _get_default_system_prompt(self) -> str:
         """Fallback system prompt if file not found."""
