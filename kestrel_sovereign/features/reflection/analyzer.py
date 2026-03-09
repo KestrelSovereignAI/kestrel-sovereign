@@ -311,48 +311,87 @@ class InteractionAnalyzer:
         )
 
     def _parse_insights(self, response_text: str) -> List[Insight]:
-        """Parse LLM response into Insight objects."""
+        """Parse LLM response into Insight objects.
+
+        Handles common local-model quirks:
+        - Markdown code fences around JSON
+        - Thinking/reasoning text before/after JSON
+        - Multiple JSON objects in response
+        """
         import uuid
+        import re
+
+        text = response_text.strip()
+
+        # Strategy 1: Extract JSON from markdown code fence
+        fence_match = re.search(r'```(?:json)?\s*\n?(.*?)\n?```', text, re.DOTALL)
+        if fence_match:
+            text = fence_match.group(1).strip()
+
+        # Strategy 2: Find the first complete JSON object with { ... }
+        if not text.startswith("{"):
+            brace_start = text.find("{")
+            if brace_start >= 0:
+                text = text[brace_start:]
+
+        # Strategy 3: Trim trailing non-JSON content after the closing brace
+        if text.startswith("{"):
+            depth = 0
+            in_string = False
+            escape_next = False
+            end_pos = -1
+            for i, ch in enumerate(text):
+                if escape_next:
+                    escape_next = False
+                    continue
+                if ch == '\\' and in_string:
+                    escape_next = True
+                    continue
+                if ch == '"' and not escape_next:
+                    in_string = not in_string
+                    continue
+                if in_string:
+                    continue
+                if ch == '{':
+                    depth += 1
+                elif ch == '}':
+                    depth -= 1
+                    if depth == 0:
+                        end_pos = i + 1
+                        break
+            if end_pos > 0:
+                text = text[:end_pos]
 
         try:
-            # Try to extract JSON from response
-            # Handle case where LLM includes markdown code blocks
-            text = response_text.strip()
-            if text.startswith("```"):
-                # Remove markdown code blocks
-                lines = text.split("\n")
-                text = "\n".join(
-                    line for line in lines
-                    if not line.strip().startswith("```")
-                )
-
             data = json.loads(text)
-            insights_data = data.get("insights", [])
-
-            insights = []
-            for item in insights_data:
-                try:
-                    insight = Insight(
-                        id=str(uuid.uuid4()),
-                        type=InsightType(item.get("type", "pattern")),
-                        title=item.get("title", "Untitled Insight"),
-                        description=item.get("description", ""),
-                        evidence=item.get("evidence", []),
-                        confidence=float(item.get("confidence", 0.5)),
-                        actionable=bool(item.get("actionable", False)),
-                        suggested_action=item.get("suggested_action"),
-                    )
-                    insights.append(insight)
-                except Exception as e:
-                    logger.warning(f"Failed to parse insight: {e}")
-                    continue
-
-            return insights
-
         except json.JSONDecodeError as e:
             logger.error(f"Failed to parse JSON response: {e}")
-            logger.debug(f"Response text: {response_text[:500]}")
+            logger.debug(f"Response text (first 500 chars): {response_text[:500]}")
             return []
+
+        insights_data = data.get("insights", [])
+        if not insights_data:
+            logger.info(f"JSON parsed but no insights array (keys: {list(data.keys())})")
+
+        insights = []
+        for item in insights_data:
+            try:
+                insight = Insight(
+                    id=str(uuid.uuid4()),
+                    type=InsightType(item.get("type", "pattern")),
+                    title=item.get("title", "Untitled Insight"),
+                    description=item.get("description", ""),
+                    evidence=item.get("evidence", []),
+                    confidence=float(item.get("confidence", 0.5)),
+                    actionable=bool(item.get("actionable", False)),
+                    suggested_action=item.get("suggested_action"),
+                )
+                insights.append(insight)
+            except Exception as e:
+                logger.warning(f"Failed to parse insight: {e}")
+                continue
+
+        return insights
 
     async def analyze_error(
         self,
