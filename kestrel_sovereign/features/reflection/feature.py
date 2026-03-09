@@ -329,13 +329,56 @@ class ReflectionFeature(Feature):
             result.actions = self._prioritizer.prioritize(result.arms, result.memory, result.mind)
             result.completed_at = datetime.utcnow()
 
+            # Persist session and insights
+            await self._persist_reflection(result)
+
             return self._format_result(result)
 
         except Exception as e:
             logger.error(f"Reflection failed: {e}")
             result.error = str(e)
             result.completed_at = datetime.utcnow()
+            await self._persist_reflection(result)
             return self._format_result(result)
+
+    async def _persist_reflection(self, result: ReflectionResult) -> None:
+        """Store reflection session and insights to the database."""
+        if not self._db_helper:
+            return
+
+        try:
+            # Extract insights from Mind layer check details
+            insights = []
+            if result.mind:
+                for check in result.mind.checks:
+                    if check.details and "insights" in check.details:
+                        for item in check.details["insights"]:
+                            try:
+                                insights.append(Insight.from_dict(item))
+                            except Exception:
+                                continue
+
+            # Build and store session
+            from .models import ReflectionSession
+            session = ReflectionSession(
+                id=result.id,
+                trigger=result.trigger,
+                started_at=result.started_at,
+                completed_at=result.completed_at,
+                insights=insights,
+                error=result.error,
+            )
+            await self._db_helper.store_session(session)
+
+            # Store individual insights
+            for insight in insights:
+                await self._db_helper.store_insight(insight, session_id=result.id)
+
+            if insights:
+                logger.info(f"Persisted reflection session {result.id} with {len(insights)} insights")
+
+        except Exception as e:
+            logger.warning(f"Failed to persist reflection: {e}")
 
     def _format_result(self, result: ReflectionResult) -> Dict[str, Any]:
         """Format ReflectionResult for API response."""
