@@ -6,8 +6,9 @@ It replaces start_kestrel.sh / stop_kestrel.sh and subsumes main.py's
 interactive chat into `kestrel shell <name>`.
 
 Commands:
-    kestrel start                  # start host + all autostart agents
-    kestrel start <name>           # start just one agent
+    kestrel start                  # start all agents in-process (default)
+    kestrel start --subprocess     # start host + agents as separate processes
+    kestrel start <name>           # start just one agent (subprocess)
     kestrel stop                   # stop everything (agents first, then host)
     kestrel stop <name>            # stop just one agent
     kestrel status                 # table: host + all agents with ports, PIDs, status
@@ -117,8 +118,72 @@ def cmd_start(args) -> int:
             return 1
         return 0
 
+    if getattr(args, "subprocess", False):
+        return _start_subprocess_mode(project_dir, rookery, pm)
+    return _start_inprocess_mode(project_dir, rookery, pm)
+
+
+def _start_inprocess_mode(project_dir: Path, rookery, pm: ProcessManager) -> int:
+    """Start all agents in a single server process (default mode)."""
+    autostart = rookery.get_autostart_agents()
+    manual = {
+        name: cfg for name, cfg in rookery.get_local_agents().items()
+        if not cfg.autostart
+    }
+
+    print("\U0001F985 Kestrel Rookery starting (in-process)...")
+    print(f"   URL:      http://localhost:{rookery.host.port}")
+
+    if autostart or manual:
+        print("   Agents:")
+        for name, cfg in autostart.items():
+            resolved = (project_dir / cfg.data_dir).resolve()
+            print(f"     {name:12} {resolved}/       autostart")
+        for name, cfg in manual.items():
+            resolved = (project_dir / cfg.data_dir).resolve()
+            print(f"     {name:12} {resolved}/       manual")
+    print()
+
+    host_pid_file = _host_pid_file(project_dir)
+    existing_host = pm.read_pid(host_pid_file)
+    if existing_host and pm.is_process_running(existing_host):
+        print(f"   Server already running (PID: {existing_host})")
+        return 0
+
+    if existing_host:
+        pm.clear_pid(host_pid_file)
+
+    if pm.is_port_in_use(rookery.host.port):
+        print(f"   Port {rookery.host.port} already in use")
+        return 1
+
+    env = pm._load_env()
+    env["PORT"] = str(rookery.host.port)
+    env["KESTREL_MULTI_AGENT"] = "true"
+    env["KESTREL_SERVE_UI"] = "true"
+
+    log_file = _host_log_file(project_dir)
+    cmd = [sys.executable, "-m", "uvicorn", "server:app",
+           "--host", rookery.host.bind, "--port", str(rookery.host.port)]
+
+    print(f"   Starting server on :{rookery.host.port}...", end="", flush=True)
+    pm._spawn(cmd, env, log_file, host_pid_file)
+
+    if pm.wait_for_health(rookery.host.port, timeout=30):
+        print("          \u2705")
+    else:
+        print("          \u274c")
+        print(f"   Check log: {log_file}")
+        return 1
+
+    print(f"\n\U0001F985 Rookery ready: http://localhost:{rookery.host.port}")
+    return 0
+
+
+def _start_subprocess_mode(project_dir: Path, rookery, pm: ProcessManager) -> int:
+    """Start host + separate agent processes (legacy --subprocess mode)."""
     # Start the full rookery (host + autostart agents)
-    print("\U0001F985 Kestrel Rookery starting...")
+    print("\U0001F985 Kestrel Rookery starting (subprocess)...")
     print(f"   Host:     http://localhost:{rookery.host.port}")
 
     autostart = rookery.get_autostart_agents()
@@ -245,47 +310,93 @@ def cmd_status(args) -> int:
     project_dir = _get_project_dir()
     rookery = RookeryConfig.load(project_dir / ROOKERY_CONFIG_FILENAME)
 
-    # Header
-    print(f"  {'NAME':12} {'PORT':>6}   {'STATUS':10} {'PID':>7}   {'UPTIME':>8}")
-
-    # Host status
+    # Host/server status
     host_pid = ProcessManager.read_pid(_host_pid_file(project_dir))
     host_running = host_pid is not None and ProcessManager.is_process_running(host_pid)
-    host_status = "online" if host_running else "offline"
     host_pid_str = str(host_pid) if host_running else "-"
     host_uptime = _format_uptime(host_pid) if host_running else "-"
-    print(f"  {'host':12} {rookery.host.port:>6}   {host_status:10} {host_pid_str:>7}   {host_uptime:>8}")
 
-    # Agent status
-    for name, cfg in rookery.get_local_agents().items():
-        resolved_dir = (project_dir / cfg.data_dir).resolve()
-        pid = ProcessManager.read_pid(ProcessManager.agent_pid_file(resolved_dir))
-        running = pid is not None and ProcessManager.is_process_running(pid)
-        status_str = "online" if running else "offline"
-        pid_str = str(pid) if running else "-"
-        uptime = _format_uptime(pid) if running else "-"
-        print(f"  {name:12} {cfg.port:>6}   {status_str:10} {pid_str:>7}   {uptime:>8}")
+    # Detect mode: check if any agent has its own PID file (subprocess mode)
+    local_agents = rookery.get_local_agents()
+    any_agent_pid = any(
+        ProcessManager.read_pid(
+            ProcessManager.agent_pid_file((project_dir / cfg.data_dir).resolve())
+        ) is not None
+        for cfg in local_agents.values()
+    )
+
+    if any_agent_pid:
+        # Subprocess mode: show per-agent PID status
+        print(f"  {'NAME':12} {'PORT':>6}   {'STATUS':10} {'PID':>7}   {'UPTIME':>8}")
+        host_status = "online" if host_running else "offline"
+        print(f"  {'host':12} {rookery.host.port:>6}   {host_status:10} {host_pid_str:>7}   {host_uptime:>8}")
+
+        for name, cfg in local_agents.items():
+            resolved_dir = (project_dir / cfg.data_dir).resolve()
+            pid = ProcessManager.read_pid(ProcessManager.agent_pid_file(resolved_dir))
+            running = pid is not None and ProcessManager.is_process_running(pid)
+            status_str = "online" if running else "offline"
+            pid_str = str(pid) if running else "-"
+            uptime = _format_uptime(pid) if running else "-"
+            print(f"  {name:12} {cfg.port:>6}   {status_str:10} {pid_str:>7}   {uptime:>8}")
+    else:
+        # In-process mode: query server API for agent status
+        print(f"  {'NAME':12} {'STATUS':10} {'PID':>7}   {'UPTIME':>8}")
+        server_status = "online" if host_running else "offline"
+        print(f"  {'server':12} {server_status:10} {host_pid_str:>7}   {host_uptime:>8}")
+
+        if host_running:
+            agents = _query_agents_api(rookery.host.port)
+            if agents is not None:
+                for agent_info in agents:
+                    name = agent_info.get("name", "?")
+                    print(f"  {name:12} {'in-process':10} {host_pid_str:>7}   {host_uptime:>8}")
+            else:
+                # API unavailable, show config-based list
+                for name in local_agents:
+                    print(f"  {name:12} {'in-process':10} {host_pid_str:>7}   {host_uptime:>8}")
+        else:
+            for name in local_agents:
+                print(f"  {name:12} {'offline':10} {'-':>7}   {'-':>8}")
 
     return 0
+
+
+def _query_agents_api(port: int):
+    """Query the running server's /api/agents endpoint. Returns list or None."""
+    try:
+        import urllib.request
+        import json
+        url = f"http://localhost:{port}/api/agents"
+        req = urllib.request.Request(url, headers={"Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            data = json.loads(resp.read())
+            return data.get("agents", [])
+    except Exception:
+        return None
 
 
 def cmd_logs(args) -> int:
     """Tail agent or host logs."""
     project_dir = _get_project_dir()
 
-    if args.name == "host":
+    if args.name == "host" or args.name == "server":
         log_file = _host_log_file(project_dir)
     else:
         rookery = RookeryConfig.load(project_dir / ROOKERY_CONFIG_FILENAME)
         local_agents = rookery.get_local_agents()
         if args.name not in local_agents:
             print(f"Agent '{args.name}' not found in rookery config")
-            print("Use 'host' for host logs")
+            print("Use 'host' for host/server logs")
             return 1
 
         agent_cfg = local_agents[args.name]
         resolved_dir = (project_dir / agent_cfg.data_dir).resolve()
         log_file = ProcessManager.agent_log_file(resolved_dir)
+
+        # In-process mode: agent has no separate log, fall back to server log
+        if not log_file.exists():
+            log_file = _host_log_file(project_dir)
 
     if not log_file.exists():
         print(f"No log file found: {log_file}")
@@ -585,9 +696,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers = parser.add_subparsers(dest="command")
 
-    # kestrel start [name]
+    # kestrel start [name] [--subprocess]
     start_p = subparsers.add_parser("start", help="Start host and/or agents")
     start_p.add_argument("name", nargs="?", help="Agent name (omit for all)")
+    start_p.add_argument(
+        "--subprocess", action="store_true",
+        help="Run each agent as a separate process (legacy mode)",
+    )
 
     # kestrel stop [name]
     stop_p = subparsers.add_parser("stop", help="Stop host and/or agents")

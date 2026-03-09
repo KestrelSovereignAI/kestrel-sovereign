@@ -133,7 +133,9 @@ class StreamingMixin:
                 else:
                     other_providers.append(p)
             if override_provider:
-                providers_to_use = [override_provider] + other_providers
+                # Only use the specified provider — don't fall back to
+                # others that won't have the same model
+                providers_to_use = [override_provider]
             else:
                 raise RuntimeError(
                     f"Provider '{provider_name}' not available. "
@@ -330,9 +332,21 @@ class StreamingMixin:
             ):
                 model_override = None
 
-        # Check mandate preference when no explicit override is given
-        target_model = model_override
-        if not target_model:
+        # Parse provider/model format from model_override (e.g., "openrouter/gpt-5.1")
+        target_model = None
+        if model_override and "/" in model_override:
+            provider_name, target_model = model_override.split("/", 1)
+            for p in providers:
+                if p["name"] == provider_name:
+                    providers = [p]
+                    logger.info(f"Model override: using only {provider_name} with {target_model}")
+                    break
+            else:
+                logger.warning(f"Override provider '{provider_name}' not found in available providers")
+        elif model_override:
+            target_model = model_override
+        else:
+            # Check mandate preference when no explicit override is given
             pref_model = self._mandate_preference.get("model")
             pref_provider = self._mandate_preference.get("provider")
             if pref_model:
@@ -474,7 +488,9 @@ class StreamingMixin:
                         target_provider = p
                         break
                 if target_provider:
-                    providers = [target_provider] + [p for p in providers if p != target_provider]
+                    # Only use the specified provider — don't fall back to
+                    # others that won't have the same model
+                    providers = [target_provider]
             else:
                 target_model = model_override
         else:

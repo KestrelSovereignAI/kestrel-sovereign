@@ -84,31 +84,62 @@ class ContextManager:
 
         Args:
             storage: AsyncStorage instance for all storage operations
-            model: Model name for token counting/limits
+            model: Deprecated fallback model name (use llm_service instead)
             agent_id: Agent ID for scoped queries
             consolidator: MemoryConsolidator for episode access
             memory_retriever: MemoryRetriever for emotional memory access
-            llm_service: Optional LLM service for constitutional awareness
+            llm_service: LLMService for model identity and constitutional awareness
         """
         self.storage = storage
-        self.model = model
+        self._llm_service = llm_service
+        self._model_fallback = model
+        self._counter = None
+        self._counter_model = None
         self.agent_id = agent_id
         self.consolidator = consolidator
         self.memory_retriever = memory_retriever
+        # Keep public reference for constitutional awareness (used by build_context)
         self.llm_service = llm_service
 
-        # Initialize sub-components
-        self.counter = get_token_counter(model)
+        # Initialize sub-components — pass llm_service for lazy model resolution
         self.context_builder = ContextBuilder(
             storage=storage,
+            consolidator=consolidator,
+            llm_service=llm_service,
             model=model,
-            consolidator=consolidator
         )
 
         # Initialize specialized managers
         self.conversation_manager = ConversationManager(storage, agent_id)
         self.memory_manager = MemoryManager(storage, agent_id, consolidator, memory_retriever)
-        self.tool_context_manager = ToolContextManager(storage, model, agent_id)
+        self.tool_context_manager = ToolContextManager(storage, self.model, agent_id)
+
+    @property
+    def model(self) -> str:
+        """Resolved model ID. Delegates to LLMService if available."""
+        if self._llm_service:
+            return self._llm_service.get_active_model_id()
+        return self._model_fallback
+
+    @model.setter
+    def model(self, value: str):
+        """Allow direct assignment for backward compatibility."""
+        self._model_fallback = value
+
+    @property
+    def counter(self) -> TokenCounter:
+        """TokenCounter keyed to current model, lazily cached."""
+        current_model = self.model
+        if self._counter is None or self._counter_model != current_model:
+            self._counter = get_token_counter(current_model)
+            self._counter_model = current_model
+        return self._counter
+
+    @counter.setter
+    def counter(self, value):
+        """Allow direct assignment for backward compatibility."""
+        self._counter = value
+        self._counter_model = None
 
     async def build_context(
         self,

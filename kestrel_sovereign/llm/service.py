@@ -171,6 +171,10 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
             provider: Optional provider name (e.g., "openai", "anthropic").
                      If specified, only this provider will be used.
         """
+        # "auto" is not a real preference — it means "use default provider routing"
+        if model == "auto":
+            logger.debug("Ignoring model preference 'auto' — using default routing")
+            return
         self._mandate_preference = {"model": model, "provider": provider}
         if provider:
             logger.info(f"Model preference set to: {model} (provider: {provider})")
@@ -201,9 +205,32 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
             except RuntimeError:
                 pass
 
+    def get_active_model_id(self) -> str:
+        """Get the resolved model ID currently in use.
+
+        Single source of truth for model identity. Used by TokenCounter,
+        ContextBuilder, TokenBudget, etc.
+
+        Resolution order:
+        1. Mandate preference (user selected via UI or !model-set)
+        2. First provider's resolved model
+        3. "auto" as last resort
+
+        Returns:
+            Model ID string (e.g., "Kimi-K2.5-...", "gpt-5-mini")
+        """
+        pref = self._mandate_preference
+        if pref.get("model") and pref["model"] != "auto":
+            return pref["model"]
+        if self.providers:
+            model = self.providers[0].get("model", "auto")
+            if model != "auto":
+                return model
+        return "auto"
+
     def get_model_preference(self) -> Dict[str, Optional[str]]:
         """Get the current model preference.
-        
+
         Returns:
             Dict with 'model' and 'provider' keys, values may be None.
         """

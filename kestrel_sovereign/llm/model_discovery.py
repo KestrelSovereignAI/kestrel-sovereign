@@ -112,19 +112,7 @@ class ModelDiscoveryMixin:
         register_discovered_limits(all_models)
 
         # Auto-resolve providers with model="auto" to the first discovered chat model
-        if hasattr(self, 'providers') and isinstance(self.providers, list):
-            for provider in self.providers:
-                if provider.get("model") == "auto":
-                    provider_name = provider.get("name")
-                    provider_models = [
-                        m for m in all_models
-                        if m.provider == provider_name and m.category == ModelCategory.CHAT
-                    ]
-                    if provider_models:
-                        provider["model"] = provider_models[0].id
-                        logger.info(f"Auto-resolved model for {provider_name}: {provider['model']}")
-                    else:
-                        logger.warning(f"No chat models discovered for {provider_name} — 'auto' unresolved")
+        self._resolve_auto_providers(all_models)
 
         # Freshness check: warn about configured models not found via API discovery
         # Uses api_discovered_ids (snapshot before synthetic additions) so the
@@ -152,6 +140,27 @@ class ModelDiscoveryMixin:
             providers=providers
         )
 
+    def _resolve_auto_providers(self, models: list) -> None:
+        """Resolve providers with model='auto' to the first discovered chat model.
+
+        Called after both API discovery and cache loading so that
+        get_active_model_id() returns the real model ID immediately.
+        """
+        if not hasattr(self, 'providers') or not isinstance(self.providers, list):
+            return
+        for provider in self.providers:
+            if provider.get("model") == "auto":
+                provider_name = provider.get("name")
+                provider_models = [
+                    m for m in models
+                    if m.provider == provider_name and m.category == ModelCategory.CHAT
+                ]
+                if provider_models:
+                    provider["model"] = provider_models[0].id
+                    logger.info(f"Auto-resolved model for {provider_name}: {provider['model']}")
+                else:
+                    logger.warning(f"No chat models discovered for {provider_name} — 'auto' unresolved")
+
     def _load_from_disk_cache(self) -> bool:
         """Load models from disk cache if no in-memory cache exists.
 
@@ -174,6 +183,9 @@ class ModelDiscoveryMixin:
             # Register context limits from cache
             from kestrel_sovereign.agent.token_counter import register_discovered_limits
             register_discovered_limits(cached)
+
+            # Resolve "auto" providers from cached models
+            self._resolve_auto_providers(cached)
             return True
         return False
 
@@ -230,6 +242,9 @@ class ModelDiscoveryMixin:
         if not base_url:
             return []
 
+        # Config-level context_limit override (most reliable for local servers)
+        config_context_limit = provider_config.get("context_limit")
+
         import httpx
         models_url = f"{base_url.rstrip('/')}/models"
         try:
@@ -237,6 +252,13 @@ class ModelDiscoveryMixin:
                 resp = await client.get(models_url)
                 resp.raise_for_status()
                 data = resp.json()
+
+            # Detect context window from server props (llama.cpp exposes /props)
+            server_context_limit = config_context_limit
+            if not server_context_limit:
+                server_context_limit = await self._query_local_server_context(
+                    base_url, httpx
+                )
 
             results = []
             # Handle both OpenAI format {"data": [...]} and Ollama format {"models": [...]}
@@ -252,12 +274,53 @@ class ModelDiscoveryMixin:
                     category=ModelCategory.CHAT,
                     supports_tools=True,
                     is_featured=True,
+                    context_limit=server_context_limit,
                 ))
-            logger.info(f"{provider_name}: discovered {len(results)} models from {models_url}")
+            logger.info(
+                f"{provider_name}: discovered {len(results)} models from {models_url}"
+                + (f" (context: {server_context_limit})" if server_context_limit else "")
+            )
             return results
         except Exception as e:
             logger.warning(f"{provider_name}: local model discovery failed ({models_url}): {e}")
             return []
+
+    @staticmethod
+    async def _query_local_server_context(base_url: str, httpx_module) -> Optional[int]:
+        """Query a local server for its context window size.
+
+        Tries llama.cpp /props endpoint, then /slots, to detect n_ctx.
+        """
+        stripped = base_url.rstrip("/")
+        # Strip /v1 suffix if present — llama.cpp serves /props at root
+        if stripped.endswith("/v1"):
+            stripped = stripped[:-3]
+
+        for endpoint in ["/props", "/slots"]:
+            try:
+                async with httpx_module.AsyncClient(timeout=3.0) as client:
+                    resp = await client.get(f"{stripped}{endpoint}")
+                    if resp.status_code != 200:
+                        continue
+                    data = resp.json()
+                    # llama.cpp /props: n_ctx in default_generation_settings or top-level
+                    if isinstance(data, dict):
+                        ctx = (
+                            data.get("n_ctx")
+                            or data.get("default_generation_settings", {}).get("n_ctx")
+                        )
+                        if ctx:
+                            logger.info(f"Detected context window {ctx} from {endpoint}")
+                            return int(ctx)
+                    # /slots returns a list; each slot has n_ctx
+                    if isinstance(data, list) and data:
+                        ctx = data[0].get("n_ctx")
+                        if ctx:
+                            logger.info(f"Detected context window {ctx} from {endpoint}")
+                            return int(ctx)
+            except Exception:
+                continue
+        return None
 
     def _get_adapters(self) -> Dict[str, Any]:
         """

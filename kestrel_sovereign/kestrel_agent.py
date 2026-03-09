@@ -418,15 +418,15 @@ class KestrelAgent(ConstitutionMixin, StreamingMixin, BackupMixin, SleepMixin):
             agent_data_dir = str(Path(self.storage_path).parent) if self.storage_path else None
             self.context_builder = ContextBuilder(
                 self.storage,
+                llm_service=self.llm_service,
                 consolidator=self.memory_consolidator,
                 agent_data_path=agent_data_dir
             )
 
             # Initialize unified context manager (orchestrates all context sources)
-            # Pass the memory retriever for semantic/emotional memory recall
+            # Model identity derived lazily from llm_service.get_active_model_id()
             self.context_manager = ContextManager(
                 storage=self.storage,
-                model=self.llm_service.get_default_model() if hasattr(self.llm_service, 'get_default_model') else (self.llm_service.providers[0]["model"] if self.llm_service.providers else "auto"),
                 agent_id=self.agent_id,
                 consolidator=self.memory_consolidator,
                 memory_retriever=self.memory_system.retriever,
@@ -1000,13 +1000,10 @@ Expected Duration: {expected_duration}
             user_message=prompt  # Pass original user message for subagent context
         )
 
-        # Perform integrity audit on the response
-        audited_response = await self._perform_integrity_audit(response_text)
-
         # Store agent response (linked to session for resumed conversations)
-        await self.privacy_agent.add_conversation("assistant", audited_response, session_id=session_id)
+        await self.privacy_agent.add_conversation("assistant", response_text, session_id=session_id)
 
-        return audited_response
+        return response_text
 
     def _build_feature_tools(self) -> List[Dict[str, Any]]:
         """
@@ -1841,9 +1838,6 @@ Expected Duration: {expected_duration}
 
     # Streaming methods provided by StreamingMixin:
     # - process_input_streaming
-    # - _stream_with_pre_audit
-    # - _stream_with_post_audit
-    # - _perform_integrity_audit
 
     # Backup methods provided by BackupMixin:
     # - _command_backup
@@ -1934,25 +1928,25 @@ Expected Duration: {expected_duration}
         """
         Get the current LLM model being used by this agent.
 
-        Respects the mandate preference if set (via !model-set or UI selection).
+        Delegates to LLMService.get_active_model_id() as the single
+        source of truth, then formats with provider prefix.
 
         Returns:
             Current model ID (provider/model format)
         """
-        # First check if there's a mandate preference (set via !model-set or UI)
-        pref = self.llm_service.get_model_preference()
-        if pref.get("model"):
-            provider = pref.get("provider", "")
-            model = pref.get("model")
-            return f"{provider}/{model}" if provider else model
+        model_id = self.llm_service.get_active_model_id()
 
-        # Fall back to first provider's default
+        # Find the provider for this model
+        pref = self.llm_service.get_model_preference()
+        if pref.get("provider"):
+            return f"{pref['provider']}/{model_id}"
+
         if self.llm_service.providers:
-            first = self.llm_service.providers[0]
-            provider = first.get('name', '')
-            model = first.get('model', 'unknown')
-            return f"{provider}/{model}" if provider else model
-        return "unknown"
+            provider = self.llm_service.providers[0].get('name', '')
+            if provider:
+                return f"{provider}/{model_id}"
+
+        return model_id
 
     MODEL_PREFERENCE_KEY = "model_preference"
 
@@ -1968,7 +1962,7 @@ Expected Duration: {expected_duration}
                 pref = json.loads(result[0][0])
                 model = pref.get("model")
                 provider = pref.get("provider")
-                if model:
+                if model and model != "auto":
                     self.llm_service.set_model_preference(model, provider)
                     logging.info(f"Loaded persisted model preference: {provider}/{model}" if provider else f"Loaded persisted model preference: {model}")
         except Exception as e:

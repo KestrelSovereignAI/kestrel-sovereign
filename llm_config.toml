@@ -50,11 +50,12 @@ model = "meta-llama/Llama-3.1-8B-Instruct"
 api_key_env = "RUNPOD_API_KEY"
 
 # llama.cpp - Local server (start with ~/models/start-kimi.sh)
-# Model discovery via /v1/models endpoint
+# Model discovery via /v1/models endpoint; context_limit auto-detected from /props
 [llama_cpp]
 type = "openai_compatible"
 base_url = "http://localhost:8001/v1"
 local = true  # No API key required
+# context_limit = 131072  # Override if auto-detection fails
 
 # Ollama - Privacy mode and local/cloud GPU fallback
 # Host is configured via OLLAMA_HOST env var:

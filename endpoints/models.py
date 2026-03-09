@@ -727,7 +727,8 @@ async def chat_completions(request: Request):
         # Extract model from request and pass it through to the agent
         model_from_request = data.get("model")
         model_override = None
-        if model_from_request and model_from_request != "kestrel-local":
+        # Ignore sentinel values that aren't real model names
+        if model_from_request and model_from_request not in ("kestrel-local", "auto"):
             model_override = model_from_request
             # Also persist as mandate preference so the selection sticks
             if hasattr(agent, 'llm_service') and agent.llm_service:
