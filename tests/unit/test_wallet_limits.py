@@ -161,7 +161,7 @@ class TestMainnetBlocking:
     @pytest.mark.asyncio
     async def test_mainnet_chain_ids_are_blocked_by_default(self):
         """All mainnet chain IDs should be in the blocklist."""
-        expected_mainnets = {1, 56, 137, 42161, 10, 314}
+        expected_mainnets = {1, 56, 137, 42161, 10, 314, 8453}
         assert MAINNET_CHAIN_IDS == expected_mainnets
 
     @pytest.mark.asyncio

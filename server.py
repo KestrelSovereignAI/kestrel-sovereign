@@ -231,6 +231,16 @@ _AGENT_PATH_RE = re.compile(r"^/api/agents/([^/]+)/(.+)$")
 
 
 @app.middleware("http")
+async def static_cache_control(request: Request, call_next):
+    """Prevent browser caching of JS/CSS files during development."""
+    response = await call_next(request)
+    path = request.url.path
+    if path.endswith((".js", ".css")):
+        response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    return response
+
+
+@app.middleware("http")
 async def agent_routing_middleware(request: Request, call_next):
     """Route /api/agents/{name}/... requests to the correct in-process agent.
 
@@ -314,11 +324,13 @@ async def auth_middleware(request: Request, call_next):
         if request.url.path == "/" and SERVE_UI:
             accept = request.headers.get("accept", "")
             if "text/html" in accept:
-                if "google" in oauth._clients:
-                    # Cloud Run: redirect to Google OAuth login
+                # KESTREL_REQUIRE_OAUTH: explicitly opt in to OAuth login.
+                # Set this in Cloud Run deploy scripts to force Google
+                # sign-in for browser access. Without it, the UI is
+                # served directly using API key auth.
+                if os.environ.get("KESTREL_REQUIRE_OAUTH") and "google" in oauth._clients:
                     return RedirectResponse(url="/auth/login", status_code=302)
                 else:
-                    # Localhost: serve UI directly (it bootstraps its own API key)
                     return await call_next(request)
 
         return JSONResponse(content={"detail": "Invalid or missing API Key"}, status_code=401)

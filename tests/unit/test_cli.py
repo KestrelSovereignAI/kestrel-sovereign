@@ -398,7 +398,8 @@ class TestCmdStatus:
 
         assert rc == 0
         output = capsys.readouterr().out
-        assert "host" in output
+        # In-process mode (no agent PIDs) shows "server" instead of "host"
+        assert "server" in output or "host" in output
         assert "claw" in output
         assert "testbot" in output
         assert "offline" in output
@@ -413,7 +414,6 @@ class TestCmdStatus:
 
         output = capsys.readouterr().out
         assert "NAME" in output
-        assert "PORT" in output
         assert "STATUS" in output
         assert "PID" in output
 

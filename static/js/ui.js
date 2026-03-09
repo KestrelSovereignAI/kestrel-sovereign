@@ -89,6 +89,7 @@ export const state = {
     encryptedAtRest: false,
     useStreaming: true,
     selectedModel: null,
+    selectedProvider: null,
 };
 
 // ============================================================================

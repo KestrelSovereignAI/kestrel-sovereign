@@ -283,9 +283,9 @@ const API = {
     },
     getIpfsStatus: () => API.request('/api/ipfs/status'),
     getWallet: () => API.request('/api/wallet'),
-    invoke: (input, model = null, sessionId = null) => API.request('/agent/invoke', {
+    invoke: (input, model = null, sessionId = null, provider = null) => API.request('/agent/invoke', {
         method: 'POST',
-        body: JSON.stringify({ input, model, session_id: sessionId })
+        body: JSON.stringify({ input, model, session_id: sessionId, provider })
     }),
     
     /**
@@ -322,7 +322,7 @@ const API = {
         return this._streamAbortController;
     },
     
-    streamInvoke: async function*(input, model = null, sessionId = null) {
+    streamInvoke: async function*(input, model = null, sessionId = null, provider = null) {
         // Rewrite endpoint for multi-agent mode
         const url = rewriteEndpoint('/agent/stream');
 
@@ -343,7 +343,7 @@ const API = {
             const response = await fetch(url, {
                 method: 'POST',
                 headers,
-                body: JSON.stringify({ input, model, session_id: sessionId }),
+                body: JSON.stringify({ input, model, session_id: sessionId, provider }),
                 signal
             });
 
