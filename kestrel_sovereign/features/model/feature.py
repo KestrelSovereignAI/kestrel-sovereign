@@ -349,25 +349,44 @@ class ModelAgent(Feature):
 
     def set_model_preference(self, model_id: str) -> str:
         """
-        Set the preferred model for the agent (legacy method).
-        
-        NOTE: This is a legacy method. Prefer using llm_service.set_model_preference(model, provider)
-        directly for full control over provider routing.
+        Set the preferred model for the agent.
+
+        DEPRECATED: Use llm_service.set_model_preference(model, provider) directly.
+        This wrapper exists only for backward compatibility with callers that
+        pass a single "provider/model" string.
         """
+        import warnings
+        warnings.warn(
+            "ModelAgent.set_model_preference() is deprecated. "
+            "Use llm_service.set_model_preference(model, provider) directly.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         # Parse provider from model_id if present
         provider = None
         model = model_id
         if '/' in model_id:
             provider, model = model_id.split('/', 1)
-        
+
         self.llm_service.set_model_preference(model, provider)
         logger.info(f"Model preference set to: {model_id}")
         return f"Model preference set to {model_id}"
 
     def get_model_preference(self) -> Optional[str]:
         """
-        Get the current model preference (legacy method).
+        Get the current model preference.
+
+        DEPRECATED: Use llm_service.get_model_preference() directly.
+        This returns Optional[str] while the canonical method returns
+        Dict[str, Optional[str]] with 'model' and 'provider' keys.
         """
+        import warnings
+        warnings.warn(
+            "ModelAgent.get_model_preference() is deprecated. "
+            "Use llm_service.get_model_preference() directly.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         pref = self.llm_service.get_model_preference()
         if pref.get("model"):
             provider = pref.get("provider")

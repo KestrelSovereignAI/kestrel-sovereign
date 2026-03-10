@@ -209,7 +209,7 @@ from endpoints import (
     saved_items_router,
 )
 
-from endpoints.auth_oauth import router as auth_oauth_router, register_oauth
+from endpoints.auth_oauth import router as auth_oauth_router, register_oauth, oauth
 app.include_router(auth_oauth_router)
 register_oauth(app)
 
