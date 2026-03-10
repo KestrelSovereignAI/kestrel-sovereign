@@ -96,6 +96,7 @@ dependencies = [
     "twilio>=9.9.1",
     # GitHub Ticket Processor (pinned to specific commit for supply chain safety)
     "autoclaude @ git+https://github.com/UncleSaurus/autoclaude.git@c55f72d87744e12c42cf46c6236f71e26d2443e6",
+    "google-cloud-storage>=3.4.1",
 ]
 
 [project.optional-dependencies]
