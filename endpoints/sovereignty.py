@@ -114,7 +114,7 @@ async def list_sovereignty_exports(request: Request):
 
 @router.post("/sovereignty/export")
 async def trigger_sovereignty_export(request: Request):
-    """Trigger a sovereignty export via the agent's !export-sovereignty command."""
+    """Trigger a sovereignty export with the specified tier and encryption settings."""
     try:
         data = await request.json()
         tier = data.get("tier", "ipfs")
@@ -127,11 +127,11 @@ async def trigger_sovereignty_export(request: Request):
             )
 
         agent = get_agent(request)
-        cmd = f"!export-sovereignty --tier={tier}"
-        if not encrypt:
-            cmd += " --no-encrypt"
+        sovereignty = getattr(agent, 'features', {}).get("SovereigntyFeature")
+        if not sovereignty:
+            raise HTTPException(status_code=500, detail="Sovereignty feature not available.")
 
-        result = await agent.process_input(cmd)
+        result = await sovereignty.export_sovereignty(storage_tier=tier, encrypt=encrypt)
         return {"success": True, "message": result}
     except HTTPException:
         raise
