@@ -290,34 +290,56 @@ class KestrelAgent(ConstitutionMixin, StreamingMixin, BackupMixin, SleepMixin):
                 except Exception as e:
                     logging.warning(f"Failed to initialize LighthouseProvider: {e}", exc_info=True)
 
-            # Initialize Lighthouse sync for state persistence in ephemeral environments
-            # (e.g., Cloud Run scale-to-zero). Restores state on cold start, syncs on shutdown.
+            # Initialize sync service for state persistence in ephemeral environments
+            # (e.g., Cloud Run scale-to-zero). Supports multiple targets: GCS (primary), Lighthouse (legacy).
             self._sync_service = None
-            if (
-                os.environ.get("LIGHTHOUSE_API_KEY")
-                and self._db_backend.lower() != "postgres"
-            ):
+            if self._db_backend.lower() != "postgres":
                 try:
                     from kestrel_sovereign.storage.sync.service import SyncService
-                    from kestrel_sovereign.storage.sync.targets import LighthouseTarget
 
                     agent_id = self.did or self.agent_id or "default"
                     state_dir = Path(self.storage_path).parent if self.storage_path else None
-                    target = LighthouseTarget(
-                        api_key=os.environ["LIGHTHOUSE_API_KEY"],
-                        agent_id=agent_id,
-                        state_dir=state_dir,
-                    )
+                    targets_added = []
 
                     self._sync_service = SyncService(db_path=self.storage_path)
-                    self._sync_service.add_target(target)
-                    await self._sync_service.start()
-                    logging.info(f"Lighthouse sync service started for agent {agent_id}")
+
+                    # GCS target (primary backup)
+                    gcs_bucket = os.environ.get("GCS_BACKUP_BUCKET")
+                    if gcs_bucket:
+                        from kestrel_sovereign.storage.sync.targets import GCSTarget
+                        gcs_target = GCSTarget(
+                            bucket=gcs_bucket,
+                            agent_id=agent_id,
+                            state_dir=state_dir,
+                            project=os.environ.get("GCP_PROJECT"),
+                            credentials_path=os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"),
+                        )
+                        self._sync_service.add_target(gcs_target)
+                        targets_added.append(f"GCS({gcs_bucket})")
+
+                    # Lighthouse target (legacy/decentralized)
+                    if os.environ.get("LIGHTHOUSE_API_KEY"):
+                        from kestrel_sovereign.storage.sync.targets import LighthouseTarget
+                        lh_target = LighthouseTarget(
+                            api_key=os.environ["LIGHTHOUSE_API_KEY"],
+                            agent_id=agent_id,
+                            state_dir=state_dir,
+                        )
+                        self._sync_service.add_target(lh_target)
+                        targets_added.append("Lighthouse")
+
+                    if targets_added:
+                        await self._sync_service.start()
+                        logging.info(f"Sync service started for {agent_id}: {', '.join(targets_added)}")
+                    else:
+                        self._sync_service = None
+                        logging.debug("No sync targets configured (set GCS_BACKUP_BUCKET or LIGHTHOUSE_API_KEY)")
+
                 except (ImportError, AttributeError, TypeError, ConnectionError) as e:
-                    logging.warning(f"Failed to start Lighthouse sync: {e}")
+                    logging.warning(f"Failed to start sync service: {e}")
                     self._sync_service = None
                 except Exception as e:
-                    logging.warning(f"Failed to start Lighthouse sync: {e}", exc_info=True)
+                    logging.warning(f"Failed to start sync service: {e}", exc_info=True)
                     self._sync_service = None
 
             # Auto-discover and register features from features/ directory
