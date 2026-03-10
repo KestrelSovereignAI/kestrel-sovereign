@@ -187,8 +187,8 @@ class KeyResolutionService:
             try:
                 if await self._storage.has_key(provider_id=provider):
                     return True
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"Error checking key storage for {provider}: {e}")
 
         # Check environment
         key = await self.resolve_key(provider, require=False)

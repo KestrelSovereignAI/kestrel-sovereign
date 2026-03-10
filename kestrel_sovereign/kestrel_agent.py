@@ -538,8 +538,8 @@ class KestrelAgent(ConstitutionMixin, StreamingMixin, BackupMixin, SleepMixin):
                         "privacy_mode_change",
                         {"from": self._privacy_mode.value, "to": mode.value},
                     ))
-            except Exception:
-                pass  # Never block on consent failure
+            except Exception as e:
+                logging.debug(f"Consent request failed (non-blocking): {e}")
 
         self._privacy_mode = mode
         self.storage.set_privacy_mode(mode)

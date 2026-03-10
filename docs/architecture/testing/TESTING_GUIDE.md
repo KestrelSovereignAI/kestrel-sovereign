@@ -61,7 +61,7 @@ The project includes a comprehensive test runner with smart features:
 
 5. **E2E tests** (requires running server):
    ```bash
-   uv run python -m kestrel_sovereign.server &
+   uv run python server.py &
    cd tests/e2e && npx playwright test
    ```
 
@@ -151,7 +151,7 @@ npx playwright install
 
 ```bash
 # Start server first
-uv run python -m kestrel_sovereign.server &
+uv run python server.py &
 
 # Run tests
 npx playwright test
