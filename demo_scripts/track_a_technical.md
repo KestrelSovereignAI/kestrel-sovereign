@@ -45,8 +45,11 @@ try { $ol = Invoke-RestMethod http://localhost:11434/api/version -TimeoutSec 3; 
 
 ```powershell
 cd C:\Users\gabri\Kestrel
+$env:PYTHONIOENCODING = "utf-8"
 uv run kestrel start
 ```
+
+> **Windows note:** The `PYTHONIOENCODING` line is required — without it the startup banner emoji crashes the terminal on cp1252 systems.
 
 ### 3. Verify host and agent are healthy
 
@@ -456,12 +459,10 @@ $export.message
 ```
 ✅ Sovereignty Export Complete.
 CID: bcf3c68709a27ae072f63fc2946ec5224c0aad79329002d641870f7b9feef415
-Tier: ipfs
-Encrypted: True
+Tier: local_only
+Encrypted: False
 Size: 58271 bytes
 ```
-
-> **Note:** Tier shows `ipfs` regardless of the `"tier":"local"` parameter — known behavior. The export file is stored locally. `Encrypted: True` regardless of `"encrypt":false` request — also known behavior. Both will be addressed in a follow-up issue.
 
 ```powershell
 # Show the export receipt logged in the knowledge graph
