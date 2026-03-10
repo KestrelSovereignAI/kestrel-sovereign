@@ -422,37 +422,30 @@ class TestQueryUploadsAPI:
 
 
 class TestSyncWAL:
-    """Test WAL sync (delegates to sync_snapshot)."""
+    """Test WAL sync (no-op for Lighthouse)."""
 
     @pytest.mark.asyncio
-    async def test_sync_wal_delegates_to_snapshot(self, tmp_path):
+    async def test_sync_wal_is_noop(self, tmp_path):
         target = LighthouseTarget(
             api_key="k", agent_id="test", state_dir=tmp_path
         )
         wal_path = tmp_path / "test.db-wal"
         wal_path.write_bytes(b"wal data")
 
-        with patch.object(target, "sync_snapshot") as mock_sync:
-            mock_sync.return_value = SyncResult(
-                success=True,
-                target_name="test",
-                bytes_synced=8,
-                frames_synced=0,
-                timestamp=datetime.now(timezone.utc),
-            )
-            result = await target.sync_wal(wal_path, position=0)
+        result = await target.sync_wal(wal_path, position=0)
 
-        mock_sync.assert_called_once_with(wal_path)
         assert result.success is True
+        assert result.bytes_synced == 0
 
 
 class TestGetLatestPosition:
-    """Test WAL position tracking (not applicable for Lighthouse)."""
+    """Test WAL position tracking (returns max to prevent WAL sync)."""
 
     @pytest.mark.asyncio
-    async def test_returns_none(self):
+    async def test_returns_max_to_prevent_sync(self):
         target = LighthouseTarget(api_key="k", agent_id="test")
-        assert await target.get_latest_position() is None
+        pos = await target.get_latest_position()
+        assert pos == 2**63
 
 
 class TestHealthCheck:

@@ -5,9 +5,12 @@ Abstractions for sync destinations. SQLite changes can be replicated
 to various targets including cloud storage and PostgreSQL.
 """
 
+import hashlib
 import json
 import logging
 import os
+import sqlite3
+import tempfile
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -352,17 +355,34 @@ class LighthouseTarget(SyncTarget):
                 logger.warning(f"Failed to save local manifest: {e}")
 
     async def sync_snapshot(self, db_path: Path) -> SyncResult:
-        """Upload snapshot to Lighthouse and update manifest."""
+        """Upload snapshot to Lighthouse and update manifest.
+
+        Uses sqlite3.backup() for a consistent snapshot and skips upload
+        if the content hash matches the previous upload.
+        """
         timestamp = datetime.now(timezone.utc)
 
         try:
             from kestrel_sovereign.storage.providers.lighthouse_rest import LighthouseRestClient
 
-            client = LighthouseRestClient(api_key=self.api_key)
+            # Use sqlite3.backup() for consistent snapshot (safe with active WAL)
+            content = self._create_consistent_snapshot(db_path)
 
-            # Read and upload the database snapshot
-            with open(db_path, "rb") as f:
-                content = f.read()
+            # Skip upload if content unchanged
+            content_hash = hashlib.sha256(content).hexdigest()
+            manifest = self._load_local_manifest()
+            if manifest and manifest.get("content_hash") == content_hash:
+                logger.debug(f"Snapshot unchanged (hash={content_hash[:12]}), skipping upload")
+                return SyncResult(
+                    success=True,
+                    target_name=self.name,
+                    bytes_synced=0,
+                    frames_synced=0,
+                    timestamp=timestamp,
+                    metadata={"cid": manifest.get("snapshot_cid"), "skipped": True},
+                )
+
+            client = LighthouseRestClient(api_key=self.api_key)
 
             tag = f"{self.SNAPSHOT_TAG}-{self.agent_id}"
             result = await client.upload(
@@ -381,14 +401,15 @@ class LighthouseTarget(SyncTarget):
             self._latest_cid = cid
 
             # Upload manifest pointing to this snapshot
-            manifest = {
+            new_manifest = {
                 "agent_id": self.agent_id,
                 "snapshot_cid": cid,
                 "snapshot_size": size,
                 "uploaded_at": timestamp.isoformat(),
                 "source_file": db_path.name,
+                "content_hash": content_hash,
             }
-            await self._upload_manifest(client, manifest)
+            await self._upload_manifest(client, new_manifest)
             await client.close()
 
             return SyncResult(
@@ -410,6 +431,40 @@ class LighthouseTarget(SyncTarget):
                 timestamp=timestamp,
                 error=str(e),
             )
+
+    @staticmethod
+    def _create_consistent_snapshot(db_path: Path) -> bytes:
+        """Create a consistent snapshot using sqlite3.backup().
+
+        This is safe to call while the database is in use with an active WAL.
+        Falls back to raw file read if backup fails (e.g. not a SQLite DB).
+        Returns the snapshot as bytes.
+        """
+        tmp_path = None
+        try:
+            src = sqlite3.connect(str(db_path))
+            try:
+                with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
+                    tmp_path = tmp.name
+                dst = sqlite3.connect(tmp_path)
+                try:
+                    src.backup(dst)
+                finally:
+                    dst.close()
+                with open(tmp_path, "rb") as f:
+                    return f.read()
+            finally:
+                src.close()
+        except sqlite3.DatabaseError:
+            logger.debug(f"sqlite3.backup() failed for {db_path}, using raw read")
+            with open(db_path, "rb") as f:
+                return f.read()
+        finally:
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
 
     async def _upload_manifest(self, client: Any, manifest: Dict[str, Any]) -> None:
         """Upload manifest file to Lighthouse and save locally."""
@@ -588,19 +643,28 @@ class LighthouseTarget(SyncTarget):
             return None
 
     async def sync_wal(self, wal_path: Path, position: int) -> SyncResult:
-        """Upload WAL to Lighthouse (as full file for simplicity)."""
-        # For Lighthouse, we upload the entire WAL as a snapshot
-        # since IPFS content addressing means duplicates are deduplicated
-        return await self.sync_snapshot(wal_path)
+        """No-op for Lighthouse. WAL sync is not appropriate for content-addressed storage.
+
+        Lighthouse uses full consistent snapshots via sync_snapshot(). Uploading
+        the raw WAL file is wasteful (new CID on every write, not recoverable
+        without the matching DB, and burns storage quota for no benefit).
+        """
+        return SyncResult(
+            success=True,
+            target_name=self.name,
+            bytes_synced=0,
+            frames_synced=0,
+            timestamp=datetime.now(timezone.utc),
+        )
 
     async def get_latest_position(self) -> Optional[int]:
-        """
-        Get latest WAL position.
+        """Return max int to signal no WAL sync needed.
 
-        Lighthouse uses full snapshot sync rather than incremental WAL,
-        so position tracking is not applicable.
+        Returning None caused SyncService to always sync from position 0.
+        Returning a large value ensures the wal_position > last_pos check
+        in SyncService._sync_pending() is never true.
         """
-        return None
+        return 2**63
 
     async def health_check(self) -> bool:
         """Check Lighthouse API connectivity."""
