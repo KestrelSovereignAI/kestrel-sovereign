@@ -79,7 +79,7 @@ def load_config(file_name: str, section: Optional[str] = None) -> Dict[str, Any]
         example_path = Path(f"{file_name}.example")
         if example_path.exists():
             logger.info(f"'{file_name}' not found. Copying from '{example_path}'.")
-            config_path.write_text(example_path.read_text())
+            config_path.write_text(example_path.read_text(encoding='utf-8'), encoding='utf-8')
         else:
             logger.warning(f"'{file_name}' and '{example_path}' not found.")
             return {}
