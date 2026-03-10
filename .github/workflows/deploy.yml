@@ -99,7 +99,7 @@ jobs:
             KESTREL_ENV=development
             KESTREL_DB_BACKEND=sqlite
             KESTREL_DB_PATH=/app/agent_data
-            KESTREL_ALLOWED_EMAILS=jaslogic@gmail.com,noelschulz1981@gmail.com,gabriela.aquino@gmail.com
+            KESTREL_ALLOWED_EMAILS=${{ secrets.KESTREL_ALLOWED_EMAILS }}
 
       - name: Show dev URL
         run: |
@@ -151,7 +151,7 @@ jobs:
             KESTREL_ENV=production
             KESTREL_DB_BACKEND=sqlite
             KESTREL_DB_PATH=/app/agent_data
-            KESTREL_ALLOWED_EMAILS=jaslogic@gmail.com,noelschulz1981@gmail.com,gabriela.aquino@gmail.com
+            KESTREL_ALLOWED_EMAILS=${{ secrets.KESTREL_ALLOWED_EMAILS }}
 
       - name: Show prod URL
         run: |

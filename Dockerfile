@@ -19,7 +19,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Ollama
-RUN curl -fsSL https://ollama.ai/install.sh | sh
+RUN curl -fsSL https://ollama.com/install.sh | sh
 
 # Install uv
 RUN pip install uv

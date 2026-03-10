@@ -20,7 +20,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Install Ollama
 # NOTE: Pin to a specific version when available for production use
-RUN curl -fsSL https://ollama.ai/install.sh | sh
+RUN curl -fsSL https://ollama.com/install.sh | sh
 
 # Install uv
 RUN pip install uv
@@ -57,7 +57,7 @@ OLLAMA_PID=$!\n\
 sleep 5\n\
 \n\
 # Pull default model (can be overridden)\n\
-ollama pull llama2 || echo "Model pull failed, will use available models"\n\
+ollama pull llama3.2:3b || echo "Model pull failed, will use available models"\n\
 \n\
 # Start the Kestrel agent\n\
 /app/docker_entrypoint.sh\n\

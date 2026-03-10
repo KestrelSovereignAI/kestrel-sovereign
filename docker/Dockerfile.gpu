@@ -47,7 +47,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Install Ollama (GPU-enabled)
 # NOTE: Pin to a specific version when available for production use
-RUN apt-get update && apt-get install -y curl && curl -fsSL https://ollama.ai/install.sh | sh
+RUN apt-get update && apt-get install -y curl && curl -fsSL https://ollama.com/install.sh | sh
 
 # Install uv
 RUN /usr/local/bin/pip3 install uv
@@ -84,7 +84,7 @@ OLLAMA_PID=$!\n\
 sleep 10\n\
 \n\
 # Pull GPU-optimized model\n\
-ollama pull llama2:13b || ollama pull llama2 || echo "Model pull failed"\n\
+ollama pull llama3.2 || ollama pull llama3.2:3b || echo "Model pull failed"\n\
 \n\
 # Start the Kestrel agent\n\
 /app/docker_entrypoint.sh\n\
