@@ -201,8 +201,8 @@ class ReflectionFeature(Feature):
             except TicketConfigError as e:
                 logger.warning(f"ReflectionFeature: Ticket creator not available: {e}")
 
-        # Initialize self-model manager (optional - depends on Lighthouse config)
-        lighthouse_provider = self._get_lighthouse_provider()
+        # Initialize self-model manager (optional - requires a decentralized storage provider)
+        lighthouse_provider = self._get_decentralized_storage_provider()
         agent_did = self._get_agent_id()
         if lighthouse_provider and agent_did:
             try:
@@ -223,12 +223,35 @@ class ReflectionFeature(Feature):
             return self.agent.features.get(name)
         return None
 
-    def _get_lighthouse_provider(self):
-        """Get the lighthouse provider from the agent."""
-        if hasattr(self.agent, 'storage') and hasattr(self.agent.storage, 'lighthouse_provider'):
-            return self.agent.storage.lighthouse_provider
-        elif hasattr(self.agent, 'lighthouse_provider'):
-            return self.agent.lighthouse_provider
+    def _get_decentralized_storage_provider(self):
+        """
+        Return the best available decentralized storage provider.
+
+        Checks in priority order: Storacha → Lighthouse.
+        Falls back to the agent's storage attribute for forward compatibility.
+        """
+        # Storacha (preferred — UCAN/DID native)
+        storacha = (
+            getattr(self.agent, 'storacha_provider', None)
+            or (
+                hasattr(self.agent, 'storage')
+                and getattr(self.agent.storage, 'storacha_provider', None)
+            )
+        )
+        if storacha and storacha.is_available():
+            return storacha
+
+        # Lighthouse (fallback)
+        lighthouse = (
+            getattr(self.agent, 'lighthouse_provider', None)
+            or (
+                hasattr(self.agent, 'storage')
+                and getattr(self.agent.storage, 'lighthouse_provider', None)
+            )
+        )
+        if lighthouse and lighthouse.is_available():
+            return lighthouse
+
         return None
 
     def _get_agent_id(self) -> str:

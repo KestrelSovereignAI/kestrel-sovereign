@@ -17,8 +17,10 @@ router = APIRouter(prefix="/api", tags=["sovereignty"])
 
 STORAGE_CACHE_DIR = Path(__file__).parent.parent / "storage_cache"
 
-# Allowlist of valid storage tiers for sovereignty export
-ALLOWED_TIERS = {"local", "ipfs", "filecoin"}
+# Allowlist of valid storage tiers for sovereignty export.
+# Legacy names (ipfs, filecoin) map to CLOUD_HOT / CLOUD_COLD via SovereigntyFeature.
+# "storacha" and "cloud_hot" are the modern preferred values.
+ALLOWED_TIERS = {"local", "ipfs", "filecoin", "storacha", "cloud_hot", "cloud_cold"}
 
 # CID format: alphanumeric characters only (covers CIDv0 Qm... and CIDv1 bafy...)
 CID_PATTERN = re.compile(r'^[a-zA-Z0-9]+$')

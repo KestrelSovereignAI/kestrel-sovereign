@@ -290,6 +290,26 @@ class KestrelAgent(ConstitutionMixin, StreamingMixin, BackupMixin, SleepMixin):
                 except Exception as e:
                     logging.warning(f"Failed to initialize LighthouseProvider: {e}", exc_info=True)
 
+            # Initialize StorachaProvider for decentralized storage (IPFS/Filecoin via UCAN/DID)
+            self.storacha_provider = None
+            if os.environ.get("STORACHA_SPACE_DID") and os.environ.get("STORACHA_AGENT_KEY"):
+                try:
+                    from kestrel_sovereign.storage.providers.storacha_provider import StorachaProvider
+                    from kestrel_sovereign.storage.providers.base import StorageTier
+                    self.storacha_provider = StorachaProvider()
+                    if self.storacha_provider.is_available():
+                        logging.info(
+                            "StorachaProvider initialized — agent DID: %s",
+                            self.storacha_provider._ucan.agent_did[:40] if self.storacha_provider._ucan else "unknown",
+                        )
+                    else:
+                        self.storacha_provider = None
+                        logging.warning("StorachaProvider not available despite env vars being set")
+                except (ImportError, AttributeError, TypeError, ConnectionError) as e:
+                    logging.warning(f"Failed to initialize StorachaProvider: {e}")
+                except Exception as e:
+                    logging.warning(f"Failed to initialize StorachaProvider: {e}", exc_info=True)
+
             # Initialize sync service for state persistence in ephemeral environments
             # (e.g., Cloud Run scale-to-zero). Supports multiple targets: GCS (primary), Lighthouse (legacy).
             self._sync_service = None
@@ -317,6 +337,22 @@ class KestrelAgent(ConstitutionMixin, StreamingMixin, BackupMixin, SleepMixin):
                         self._sync_service.add_target(gcs_target)
                         targets_added.append(f"GCS({gcs_bucket})")
 
+                    # Storacha target (preferred decentralized — UCAN/DID auth)
+                    if os.environ.get("STORACHA_SPACE_DID") and os.environ.get("STORACHA_AGENT_KEY"):
+                        try:
+                            from kestrel_sovereign.storage.sync.targets import StorachaTarget
+                            storacha_target = StorachaTarget(
+                                space_did=os.environ["STORACHA_SPACE_DID"],
+                                agent_key=os.environ["STORACHA_AGENT_KEY"],
+                                proof=os.environ.get("STORACHA_PROOF", ""),
+                                agent_id=agent_id,
+                                state_dir=state_dir,
+                            )
+                            self._sync_service.add_target(storacha_target)
+                            targets_added.append("Storacha")
+                        except Exception as e:
+                            logging.warning(f"Failed to initialise StorachaTarget: {e}")
+
                     # Lighthouse target (legacy/decentralized)
                     if os.environ.get("LIGHTHOUSE_API_KEY"):
                         from kestrel_sovereign.storage.sync.targets import LighthouseTarget
@@ -333,7 +369,7 @@ class KestrelAgent(ConstitutionMixin, StreamingMixin, BackupMixin, SleepMixin):
                         logging.info(f"Sync service started for {agent_id}: {', '.join(targets_added)}")
                     else:
                         self._sync_service = None
-                        logging.debug("No sync targets configured (set GCS_BACKUP_BUCKET or LIGHTHOUSE_API_KEY)")
+                        logging.debug("No sync targets configured (set GCS_BACKUP_BUCKET, STORACHA_SPACE_DID, or LIGHTHOUSE_API_KEY)")
 
                 except (ImportError, AttributeError, TypeError, ConnectionError) as e:
                     logging.warning(f"Failed to start sync service: {e}")

@@ -48,6 +48,11 @@ def get_lighthouse_gateway_url() -> str:
     return os.getenv("LIGHTHOUSE_GATEWAY_URL", "https://gateway.lighthouse.storage/ipfs")
 
 
+def get_storacha_gateway_url() -> str:
+    """Get Storacha (web3.storage) IPFS gateway URL."""
+    return os.getenv("STORACHA_GATEWAY_URL", "https://w3s.link/ipfs")
+
+
 def get_xai_api_url() -> str:
     """Get xAI API base URL."""
     return os.getenv("XAI_API_URL", "https://api.x.ai/v1")

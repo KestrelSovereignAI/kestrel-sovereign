@@ -456,24 +456,45 @@ def create_default_manager(
     lighthouse_api_key: Optional[str] = None,
 ) -> TieredStorageManager:
     """
-    Create a TieredStorageManager with default providers.
+    Create a TieredStorageManager with default cloud storage providers.
+
+    Registers available providers in priority order:
+    - Storacha (CLOUD_HOT): preferred when STORACHA_* env vars are set
+    - Lighthouse (CLOUD_HOT + CLOUD_COLD): fallback / legacy
 
     Args:
-        privacy_mode: Initial privacy mode
-        lighthouse_api_key: Lighthouse API key (or from env)
+        privacy_mode:       Initial privacy mode
+        lighthouse_api_key: Lighthouse API key (or from LIGHTHOUSE_API_KEY env var)
 
     Returns:
         Configured TieredStorageManager
     """
-    from kestrel_sovereign.storage.providers.lighthouse_provider import LighthouseProvider
+    import os
 
     manager = TieredStorageManager(privacy_mode=privacy_mode)
 
-    # Register Lighthouse for cloud tiers
-    lighthouse = LighthouseProvider(api_key=lighthouse_api_key)
-    if lighthouse.is_available():
-        manager.register_provider(StorageTier.CLOUD_HOT, lighthouse)
-        manager.register_provider(StorageTier.CLOUD_COLD, lighthouse)
+    # Storacha (CLOUD_HOT) — preferred; UCAN/DID-native auth
+    if os.environ.get("STORACHA_SPACE_DID") and os.environ.get("STORACHA_AGENT_KEY"):
+        try:
+            from kestrel_sovereign.storage.providers.storacha_provider import StorachaProvider
+            storacha = StorachaProvider()
+            if storacha.is_available():
+                manager.register_provider(StorageTier.CLOUD_HOT, storacha)
+                logger.info("TieredStorageManager: registered StorachaProvider for CLOUD_HOT")
+        except Exception as e:
+            logger.warning(f"TieredStorageManager: StorachaProvider init failed: {e}")
+
+    # Lighthouse — CLOUD_HOT fallback (if Storacha not available) + CLOUD_COLD
+    try:
+        from kestrel_sovereign.storage.providers.lighthouse_provider import LighthouseProvider
+        lighthouse = LighthouseProvider(api_key=lighthouse_api_key)
+        if lighthouse.is_available():
+            if StorageTier.CLOUD_HOT not in manager._providers:
+                manager.register_provider(StorageTier.CLOUD_HOT, lighthouse)
+            manager.register_provider(StorageTier.CLOUD_COLD, lighthouse)
+            logger.info("TieredStorageManager: registered LighthouseProvider")
+    except Exception as e:
+        logger.warning(f"TieredStorageManager: LighthouseProvider init failed: {e}")
 
     # TODO: Register LocalProvider for LOCAL tier
     # TODO: Register BrowserProvider for BROWSER tier (JS-side)
