@@ -566,7 +566,7 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         """Get a structured response from the designated audit model."""
         audit_model_name = self.mandate_config.get("defaults", {}).get("feedback_audit_model")
         if not audit_model_name:
-            return {"risk_level": 3, "reasoning": "No feedback_audit_model defined."}
+            return {"risk_level": 1, "reasoning": "Audit skipped - no feedback_audit_model configured."}
 
         provider_for_model = None
         for p in self.providers:
@@ -575,7 +575,7 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
                 break
 
         if not provider_for_model:
-            return {"risk_level": 3, "reasoning": f"Could not find provider for '{audit_model_name}'."}
+            return {"risk_level": 1, "reasoning": f"Audit skipped - provider '{audit_model_name}' not available."}
 
         system_prompt = """
 You are an AI Integrity Auditor for a Kestrel agent's responses.

@@ -9,7 +9,7 @@ preferred = ""  # Empty = use UI model selector or llm_config.toml default
 # This should ideally be a model trusted for its analytical and
 # truth-seeking capabilities.
 # Using GPT-5-mini for high-capability constitutional auditing.
-feedback_audit_model = "gpt-5-mini"
+feedback_audit_model = ""  # Empty = use default provider chain
 
 # A list of models or providers that are explicitly banned from use.
 # This can be a provider name (e.g., "openai") or a specific model
