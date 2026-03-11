@@ -2058,39 +2058,45 @@ Expected Duration: {expected_duration}
         """
         Checks the agent's wallet balance and determines the economic operating mode.
         Returns the model preference based on solvency.
+
+        Uses total USD-equivalent value across all currencies so that agents holding
+        ETH, MATIC, or other non-FIL assets are correctly classified as solvent.
+        FIL balance is checked as a fallback for FIL-only wallets.
         """
         try:
-            balance = self.wallet.get_balance()
+            fil_balance = self.wallet.get_balance()
+            usd_balance = self.wallet.get_total_balance_usd()
 
-            # Green Zone: Rich (> 10 FIL)
-            if balance > Decimal("10.0"):
+            # Green Zone: > $5 USD equivalent (or > 10 FIL for FIL-only wallets)
+            if usd_balance > Decimal("5.0") or fil_balance > Decimal("10.0"):
                 if self._current_model_preference != "NORMAL":
-                    logging.info(f"Solvency Check: Balance {balance} FIL. Operating in NORMAL mode.")
+                    logging.info(
+                        f"Solvency Check: ${usd_balance:.2f} USD / {fil_balance} FIL. "
+                        f"Operating in NORMAL mode."
+                    )
                     self._current_model_preference = "NORMAL"
-                return None # No override, use default/mandated models
+                return None  # No override, use default/mandated models
 
-            # Yellow Zone: Economy (> 1 FIL)
-            elif balance > Decimal("1.0"):
+            # Yellow Zone: > $0.50 USD equivalent (or > 1 FIL)
+            elif usd_balance > Decimal("0.50") or fil_balance > Decimal("1.0"):
                 if self._current_model_preference != "ECONOMY":
-                    logging.warning(f"Solvency Check: Balance {balance} FIL. Switching to ECONOMY mode (Local Models).")
+                    logging.warning(
+                        f"Solvency Check: ${usd_balance:.2f} USD / {fil_balance} FIL. "
+                        f"Switching to ECONOMY mode (Local Models)."
+                    )
                     self._current_model_preference = "ECONOMY"
+                return self._get_local_model_fallback()
 
-                # Use configured local model from ollama provider
-                economy_model = self._get_local_model_fallback()
-                return economy_model
-
-            # Red Zone: Critical (< 1 FIL)
+            # Red Zone: Critical (< $0.50 USD and < 1 FIL)
             else:
                 if self._current_model_preference != "CRITICAL":
-                    logging.error(f"Solvency Check: Balance {balance} FIL. CRITICAL SOLVENCY. Forced to minimal model.")
+                    logging.error(
+                        f"Solvency Check: ${usd_balance:.2f} USD / {fil_balance} FIL. "
+                        f"CRITICAL SOLVENCY. Forced to minimal model."
+                    )
                     self._current_model_preference = "CRITICAL"
-                # In a full implementation, this would trigger hibernation
+                return self._get_local_model_fallback()
 
-                economy_model = self._get_local_model_fallback()
-                return economy_model
-        except (ValueError, AttributeError, KeyError, TypeError) as e:
-            logging.error(f"Solvency check failed: {e}")
-            return None
         except Exception as e:
             logging.error(f"Solvency check failed: {e}", exc_info=True)
             return None
