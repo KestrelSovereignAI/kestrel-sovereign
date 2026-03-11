@@ -1,0 +1,42 @@
+# Kubo IPFS node with GCS block backup
+#
+# Build:
+#   docker build -f docker/ipfs/Dockerfile.gcs -t kestrel-ipfs-gcs docker/ipfs/
+#
+# Run:
+#   docker run -d \
+#     -e GCS_BACKUP_BUCKET=kestrel-ipfs \
+#     -e GOOGLE_APPLICATION_CREDENTIALS=/credentials/sa.json \
+#     -v /path/to/sa.json:/credentials/sa.json:ro \
+#     -p 4001:4001 -p 5001:5001 -p 8080:8080 \
+#     kestrel-ipfs-gcs
+
+# Source images (platform auto-detected; use --platform flag for cross-arch)
+FROM gcr.io/google.com/cloudsdktool/google-cloud-cli:slim AS gcloud
+FROM ipfs/kubo:v0.34.0 AS kubo
+
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates tini python3 cron gosu && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY --from=kubo /usr/local/bin/ipfs /usr/local/bin/ipfs
+COPY --from=gcloud /usr/lib/google-cloud-sdk /usr/lib/google-cloud-sdk
+ENV PATH="/usr/lib/google-cloud-sdk/bin:${PATH}"
+
+COPY init.sh /container-init.d/001-kestrel-init.sh
+COPY gcs-backup.sh /usr/local/bin/gcs-backup.sh
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /container-init.d/001-kestrel-init.sh \
+             /usr/local/bin/gcs-backup.sh \
+             /usr/local/bin/entrypoint.sh
+
+RUN useradd -m -s /bin/bash ipfs
+RUN echo "0 */6 * * * /usr/local/bin/gcs-backup.sh >> /var/log/gcs-backup.log 2>&1" | crontab -
+
+ENV IPFS_PATH=/home/ipfs/.ipfs
+EXPOSE 4001 5001 8080
+
+ENTRYPOINT ["tini", "--", "/usr/local/bin/entrypoint.sh"]
+CMD ["daemon", "--migrate=true"]

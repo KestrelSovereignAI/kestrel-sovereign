@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from kestrel_sovereign.storage.providers.lighthouse_provider import LighthouseProvider
+    from kestrel_sovereign.storage.providers.base import StorageProvider
     from kestrel_sovereign.features.security.feature import SecurityFeature
     from .models import Insight, SelfModel
 
@@ -46,28 +46,32 @@ class SelfModelManager:
 
     def __init__(
         self,
-        storage_provider: "LighthouseProvider",
+        storage_provider: "StorageProvider",
         agent_did: str,
         db=None,
     ):
         """Initialize the self-model manager.
 
         Args:
-            storage_provider: Lighthouse provider for decentralized storage
+            storage_provider: Decentralized storage provider (Storacha or Lighthouse)
             agent_did: The agent's DID (decentralized identifier)
             db: Database connection for storing model pointers
 
         Raises:
-            ConfigurationError: If LIGHTHOUSE_API_KEY not set or provider unavailable
+            ConfigurationError: If no decentralized storage provider is available
         """
         # FAIL FAST - no fallbacks
-        if not os.environ.get("LIGHTHOUSE_API_KEY"):
+        _has_storacha = os.environ.get("STORACHA_SPACE_DID") and os.environ.get("STORACHA_AGENT_KEY")
+        _has_lighthouse = os.environ.get("LIGHTHOUSE_API_KEY")
+        if not _has_storacha and not _has_lighthouse:
             raise ConfigurationError(
-                "LIGHTHOUSE_API_KEY environment variable required for self-model storage"
+                "A decentralized storage provider is required for self-model storage. "
+                "Set STORACHA_SPACE_DID + STORACHA_AGENT_KEY (preferred) or LIGHTHOUSE_API_KEY."
             )
         if not storage_provider.is_available():
             raise ConfigurationError(
-                "Lighthouse provider not available - check API key configuration"
+                f"Storage provider '{storage_provider.provider_name}' is not available — "
+                "check your configuration."
             )
 
         self.storage = storage_provider

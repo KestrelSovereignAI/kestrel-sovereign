@@ -1,0 +1,40 @@
+# Kestrel IPFS Node (Kubo)
+#
+# Local development: standard Kubo with local datastore
+# Production (GCE/GKE): use Dockerfile.gcs for GCS-backed blocks
+#
+# Usage:
+#   docker compose -f docker/ipfs/docker-compose.yml up -d
+#
+# Ports:
+#   4001 - Swarm (libp2p, peer-to-peer)
+#   5001 - API (for adding/pinning content)
+#   8080 - Gateway (HTTP access to IPFS content)
+
+services:
+  ipfs:
+    image: ipfs/kubo:latest
+    platform: linux/arm64  # Apple Silicon; change to linux/amd64 for x86
+    container_name: kestrel-ipfs
+    restart: unless-stopped
+    ports:
+      - "4001:4001"      # Swarm
+      - "4001:4001/udp"  # Swarm UDP
+      - "5001:5001"      # API
+      - "8080:8080"      # Gateway
+    volumes:
+      - ipfs-data:/data/ipfs
+      - ./init.sh:/container-init.d/001-kestrel-init.sh
+    environment:
+      - IPFS_PROFILE=server
+      # Restrict API access to local + Docker network
+      - IPFS_LOGGING=error
+    healthcheck:
+      test: ["CMD", "ipfs", "id"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+volumes:
+  ipfs-data:
+    driver: local

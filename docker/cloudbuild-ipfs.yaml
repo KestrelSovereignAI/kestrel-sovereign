@@ -1,54 +1,36 @@
-# Cloud Build configuration for SimpleTuner with IPFS support
-# Builds and pushes to gcr.io/YOUR_PROJECT_ID/kestrel-lora with multiple tags
+# Cloud Build: Kestrel IPFS node (Kubo + GCS datastore plugin)
+#
+# Builds a custom Kubo image that stores IPFS blocks in Google Cloud Storage.
 #
 # Usage:
-#   cd ./
-#   gcloud builds submit --config=docker/cloudbuild-ipfs.yaml .
+#   gcloud builds submit --config=docker/cloudbuild-ipfs.yaml docker/ipfs/
 #
-# Tags:
-#   :ipfs-v1 - IPFS generation work (Lighthouse gateway default)
-#   :v2      - Training work (/workspace paths, no fallbacks)
-#   :latest  - Shared default
+# Or with substitutions:
+#   gcloud builds submit --config=docker/cloudbuild-ipfs.yaml \
+#     --substitutions=_TAG=v1 docker/ipfs/
+
+substitutions:
+  _TAG: latest
+  _IMAGE: kestrel-ipfs-gcs
 
 steps:
-  # Build the SimpleTuner image with all three tags
   - name: 'gcr.io/cloud-builders/docker'
     args:
       - 'build'
       - '-t'
-      - 'gcr.io/YOUR_PROJECT_ID/kestrel-lora:ipfs-v1'
+      - 'gcr.io/${PROJECT_ID}/${_IMAGE}:${_TAG}'
       - '-t'
-      - 'gcr.io/YOUR_PROJECT_ID/kestrel-lora:v2'
-      - '-t'
-      - 'gcr.io/YOUR_PROJECT_ID/kestrel-lora:latest'
+      - 'gcr.io/${PROJECT_ID}/${_IMAGE}:latest'
       - '-f'
-      - 'docker/Dockerfile.simpletuner'
+      - 'Dockerfile.gcs'
       - '.'
-    timeout: 3600s  # 1 hour for large image
-
-  # Push all tags
-  - name: 'gcr.io/cloud-builders/docker'
-    args:
-      - 'push'
-      - 'gcr.io/YOUR_PROJECT_ID/kestrel-lora:ipfs-v1'
-
-  - name: 'gcr.io/cloud-builders/docker'
-    args:
-      - 'push'
-      - 'gcr.io/YOUR_PROJECT_ID/kestrel-lora:v2'
-
-  - name: 'gcr.io/cloud-builders/docker'
-    args:
-      - 'push'
-      - 'gcr.io/YOUR_PROJECT_ID/kestrel-lora:latest'
+    timeout: 1800s
 
 images:
-  - 'gcr.io/YOUR_PROJECT_ID/kestrel-lora:ipfs-v1'
-  - 'gcr.io/YOUR_PROJECT_ID/kestrel-lora:v2'
-  - 'gcr.io/YOUR_PROJECT_ID/kestrel-lora:latest'
+  - 'gcr.io/${PROJECT_ID}/${_IMAGE}:${_TAG}'
+  - 'gcr.io/${PROJECT_ID}/${_IMAGE}:latest'
 
 options:
-  machineType: 'E2_HIGHCPU_32'  # Faster build
-  diskSizeGb: 200  # Large disk for CUDA image
+  diskSizeGb: 20
 
-timeout: 7200s  # 2 hour total timeout
+timeout: 1800s

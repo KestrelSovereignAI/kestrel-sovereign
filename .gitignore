@@ -1,3 +1,6 @@
+# IPFS node data
+.ipfs/
+
 # Environment and secrets
 .env
 .env.*
