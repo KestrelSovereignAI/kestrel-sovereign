@@ -34,8 +34,16 @@ from typing import Any, Dict, List, Optional, Tuple
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from kestrel_sovereign.storage.sync.service import SyncService, SyncState, SyncStats
-from kestrel_sovereign.storage.sync.wal_listener import WALListener, WALChange, WALFrame
 from kestrel_sovereign.storage.sync.targets import SyncTarget, SyncResult, S3Target, LighthouseTarget
+
+# WAL listener was removed in the sovereign-first persistence refactor.
+# These stubs allow tests that don't use WAL features to still run.
+try:
+    from kestrel_sovereign.storage.sync.wal_listener import WALListener, WALChange, WALFrame
+except ImportError:
+    WALListener = None
+    WALChange = None
+    WALFrame = None
 
 
 # =============================================================================

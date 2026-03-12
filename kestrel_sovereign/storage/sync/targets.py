@@ -1,8 +1,15 @@
 """
 Sync Targets
 
-Abstractions for sync destinations. SQLite changes can be replicated
-to various targets including cloud storage and PostgreSQL.
+Abstractions for sync destinations. Each target declares a TrustTier
+reflecting how much sovereignty the agent retains over its data:
+
+    SOVEREIGN   Infrastructure we own and operate (self-hosted IPFS)
+    FEDERATED   Agent-controlled auth, open protocol (Storacha/UCAN)
+    DELEGATED   Third-party service with API key (Lighthouse)
+    EXPEDIENT   Centralized cloud, fast but not sovereign (GCS, S3)
+
+Write to all configured targets. Restore from most trusted.
 """
 
 import hashlib
@@ -14,10 +21,22 @@ import tempfile
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
 from typing import Optional, Dict, Any
 
 logger = logging.getLogger(__name__)
+
+
+class TrustTier(Enum):
+    """Trust hierarchy for persistence targets.
+
+    Lower value = higher trust. Restore walks tiers in this order.
+    """
+    SOVEREIGN = 1   # Own infrastructure — self-hosted IPFS/Kubo
+    FEDERATED = 2   # Agent-controlled auth — Storacha/UCAN
+    DELEGATED = 3   # API-key gated — Lighthouse
+    EXPEDIENT = 4   # Centralized cloud — GCS, S3
 
 
 def _create_consistent_snapshot(db_path: Path) -> bytes:
@@ -73,6 +92,11 @@ class SyncTarget(ABC):
     def name(self) -> str:
         """Target name for logging and identification."""
         ...
+
+    @property
+    def trust_tier(self) -> TrustTier:
+        """Trust level of this target. Override in subclasses."""
+        return TrustTier.EXPEDIENT
 
     @abstractmethod
     async def sync_snapshot(self, db_path: Path) -> SyncResult:
@@ -155,6 +179,10 @@ class S3Target(SyncTarget):
     @property
     def name(self) -> str:
         return f"s3://{self.bucket}/{self.prefix}"
+
+    @property
+    def trust_tier(self) -> TrustTier:
+        return TrustTier.EXPEDIENT
 
     async def _get_client(self):
         """Get or create S3 client."""
@@ -346,6 +374,10 @@ class GCSTarget(SyncTarget):
     @property
     def name(self) -> str:
         return f"gs://{self.bucket_name}/{self.prefix}{self.agent_id}"
+
+    @property
+    def trust_tier(self) -> TrustTier:
+        return TrustTier.EXPEDIENT
 
     @property
     def _manifest_path(self) -> Optional[Path]:
@@ -571,6 +603,10 @@ class LighthouseTarget(SyncTarget):
     @property
     def name(self) -> str:
         return f"lighthouse://{self.agent_id}"
+
+    @property
+    def trust_tier(self) -> TrustTier:
+        return TrustTier.DELEGATED
 
     @property
     def _manifest_path(self) -> Optional[Path]:
@@ -955,6 +991,10 @@ class StorachaTarget(SyncTarget):
         return f"storacha://{self.agent_id}"
 
     @property
+    def trust_tier(self) -> TrustTier:
+        return TrustTier.FEDERATED
+
+    @property
     def _manifest_path(self) -> Optional[Path]:
         if self._state_dir:
             return self._state_dir / f".storacha_manifest_{self.agent_id}.json"
@@ -1177,4 +1217,211 @@ class StorachaTarget(SyncTarget):
             return True
         except Exception as e:
             logger.warning("Storacha health check failed: %s", e)
+            return False
+
+
+class SovereignIPFSTarget(SyncTarget):
+    """
+    Self-hosted IPFS (Kubo) sync target.
+
+    The sovereign default. Stores SQLite snapshots on infrastructure
+    we own and operate. Requires only a reachable Kubo API endpoint —
+    no third-party credentials.
+
+    Trust tier: SOVEREIGN (highest)
+    """
+
+    def __init__(
+        self,
+        api_url: str,
+        agent_id: str,
+        state_dir: Optional[Path] = None,
+    ):
+        self.api_url = api_url.rstrip("/")
+        self.agent_id = agent_id
+        self._state_dir = state_dir
+        self._client = None
+
+    @property
+    def name(self) -> str:
+        return f"ipfs://{self.agent_id}"
+
+    @property
+    def trust_tier(self) -> TrustTier:
+        return TrustTier.SOVEREIGN
+
+    @property
+    def _manifest_path(self) -> Optional[Path]:
+        if self._state_dir:
+            return self._state_dir / f".sovereign_ipfs_manifest_{self.agent_id}.json"
+        return None
+
+    def _load_local_manifest(self) -> Optional[Dict[str, Any]]:
+        path = self._manifest_path
+        if path and path.exists():
+            try:
+                with open(path, encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception as e:
+                logger.warning(f"Failed to load sovereign IPFS manifest: {e}")
+        return None
+
+    def _save_local_manifest(self, manifest: Dict[str, Any]) -> None:
+        path = self._manifest_path
+        if path:
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(manifest, f, indent=2)
+            except Exception as e:
+                logger.warning(f"Failed to save sovereign IPFS manifest: {e}")
+
+    async def _get_client(self):
+        """Get or create httpx async client."""
+        if self._client is None:
+            import httpx
+            self._client = httpx.AsyncClient(timeout=60.0)
+        return self._client
+
+    async def sync_snapshot(self, db_path: Path) -> SyncResult:
+        """Upload consistent snapshot via Kubo /api/v0/add?pin=true."""
+        timestamp = datetime.now(timezone.utc)
+
+        try:
+            content = _create_consistent_snapshot(db_path)
+            content_hash = hashlib.sha256(content).hexdigest()
+
+            # Content-hash dedup
+            manifest = self._load_local_manifest()
+            if manifest and manifest.get("content_hash") == content_hash:
+                logger.debug(f"Sovereign IPFS snapshot unchanged (hash={content_hash[:12]}), skipping")
+                return SyncResult(
+                    success=True,
+                    target_name=self.name,
+                    bytes_synced=0,
+                    frames_synced=0,
+                    timestamp=timestamp,
+                    metadata={"skipped": True, "cid": manifest.get("cid")},
+                )
+
+            client = await self._get_client()
+
+            # Kubo API: POST /api/v0/add?pin=true
+            filename = f"{self.agent_id}_{timestamp.strftime('%Y%m%d_%H%M%S')}.db"
+            response = await client.post(
+                f"{self.api_url}/api/v0/add",
+                params={"pin": "true", "quieter": "true"},
+                files={"file": (filename, content, "application/x-sqlite3")},
+            )
+            response.raise_for_status()
+            result_data = response.json()
+            cid = result_data["Hash"]
+
+            logger.info(
+                f"Uploaded snapshot to sovereign IPFS: {cid} ({len(content)} bytes)"
+            )
+
+            new_manifest = {
+                "agent_id": self.agent_id,
+                "cid": cid,
+                "content_hash": content_hash,
+                "size": len(content),
+                "uploaded_at": timestamp.isoformat(),
+            }
+            self._save_local_manifest(new_manifest)
+
+            return SyncResult(
+                success=True,
+                target_name=self.name,
+                bytes_synced=len(content),
+                frames_synced=0,
+                timestamp=timestamp,
+                metadata={"cid": cid},
+            )
+
+        except Exception as e:
+            logger.error(f"Failed to sync snapshot to sovereign IPFS: {e}")
+            return SyncResult(
+                success=False,
+                target_name=self.name,
+                bytes_synced=0,
+                frames_synced=0,
+                timestamp=timestamp,
+                error=str(e),
+            )
+
+    async def sync_wal(self, wal_path: Path, position: int) -> SyncResult:
+        """No-op. Sovereign IPFS uses full snapshots only."""
+        return SyncResult(
+            success=True,
+            target_name=self.name,
+            bytes_synced=0,
+            frames_synced=0,
+            timestamp=datetime.now(timezone.utc),
+        )
+
+    async def get_latest_position(self) -> Optional[int]:
+        """Signal that WAL sync is not needed."""
+        return 2**63
+
+    async def restore_snapshot(self, dest_path: Path) -> Optional[SyncResult]:
+        """Download latest snapshot from sovereign IPFS via /api/v0/cat."""
+        timestamp = datetime.now(timezone.utc)
+
+        # Resolve CID: env var → local manifest
+        cid = os.environ.get("SOVEREIGN_IPFS_CID")
+        if not cid:
+            manifest = self._load_local_manifest()
+            if manifest:
+                cid = manifest.get("cid")
+
+        if not cid:
+            logger.debug("No sovereign IPFS CID available for restore")
+            return None
+
+        try:
+            client = await self._get_client()
+            response = await client.post(
+                f"{self.api_url}/api/v0/cat",
+                params={"arg": cid},
+                timeout=120.0,
+            )
+            response.raise_for_status()
+            content = response.content
+
+            dest_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(dest_path, "wb") as f:
+                f.write(content)
+
+            logger.info(
+                f"Restored snapshot from sovereign IPFS: {cid} ({len(content)} bytes)"
+            )
+
+            return SyncResult(
+                success=True,
+                target_name=self.name,
+                bytes_synced=len(content),
+                frames_synced=0,
+                timestamp=timestamp,
+                metadata={"cid": cid},
+            )
+
+        except Exception as e:
+            logger.warning(f"Sovereign IPFS restore failed: {e}")
+            return None
+
+    async def health_check(self) -> bool:
+        """Check Kubo connectivity via /api/v0/id."""
+        try:
+            client = await self._get_client()
+            response = await client.post(
+                f"{self.api_url}/api/v0/id",
+                timeout=10.0,
+            )
+            response.raise_for_status()
+            peer_info = response.json()
+            logger.debug(f"Sovereign IPFS node: {peer_info.get('ID', 'unknown')}")
+            return True
+        except Exception as e:
+            logger.warning(f"Sovereign IPFS health check failed: {e}")
             return False
