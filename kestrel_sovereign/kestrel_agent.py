@@ -273,109 +273,86 @@ class KestrelAgent(ConstitutionMixin, StreamingMixin, BackupMixin, SleepMixin):
             # Expose observability store for orchestrator instrumentation
             self.observability_store = observability_store
 
-            # Initialize LighthouseProvider for decentralized storage (IPFS/Filecoin)
-            # This is used by features like ReflectionFeature for self-model storage
+            # Initialize storage providers for features (reflection self-model, etc.)
             self.lighthouse_provider = None
+            self.storacha_provider = None
+
+            if os.environ.get("STORACHA_SPACE_DID") and os.environ.get("STORACHA_AGENT_KEY"):
+                try:
+                    from kestrel_sovereign.storage.providers.storacha_provider import StorachaProvider
+                    self.storacha_provider = StorachaProvider()
+                    if not self.storacha_provider.is_available():
+                        self.storacha_provider = None
+                except Exception as e:
+                    logging.warning(f"StorachaProvider init failed: {e}")
+
             if os.environ.get("LIGHTHOUSE_API_KEY"):
                 try:
                     from kestrel_sovereign.storage.providers.lighthouse_provider import LighthouseProvider
                     self.lighthouse_provider = LighthouseProvider()
-                    if self.lighthouse_provider.is_available():
-                        logging.info("LighthouseProvider initialized for decentralized storage")
-                    else:
+                    if not self.lighthouse_provider.is_available():
                         self.lighthouse_provider = None
-                        logging.warning("LighthouseProvider not available despite API key")
-                except (ImportError, AttributeError, TypeError, ConnectionError) as e:
-                    logging.warning(f"Failed to initialize LighthouseProvider: {e}")
                 except Exception as e:
-                    logging.warning(f"Failed to initialize LighthouseProvider: {e}", exc_info=True)
+                    logging.warning(f"LighthouseProvider init failed: {e}")
 
-            # Initialize StorachaProvider for decentralized storage (IPFS/Filecoin via UCAN/DID)
-            self.storacha_provider = None
-            if os.environ.get("STORACHA_SPACE_DID") and os.environ.get("STORACHA_AGENT_KEY"):
-                try:
-                    from kestrel_sovereign.storage.providers.storacha_provider import StorachaProvider
-                    from kestrel_sovereign.storage.providers.base import StorageTier
-                    self.storacha_provider = StorachaProvider()
-                    if self.storacha_provider.is_available():
-                        logging.info(
-                            "StorachaProvider initialized — agent DID: %s",
-                            self.storacha_provider._ucan.agent_did[:40] if self.storacha_provider._ucan else "unknown",
-                        )
-                    else:
-                        self.storacha_provider = None
-                        logging.warning("StorachaProvider not available despite env vars being set")
-                except (ImportError, AttributeError, TypeError, ConnectionError) as e:
-                    logging.warning(f"Failed to initialize StorachaProvider: {e}")
-                except Exception as e:
-                    logging.warning(f"Failed to initialize StorachaProvider: {e}", exc_info=True)
-
-            # Initialize sync service for state persistence in ephemeral environments
-            # (e.g., Cloud Run scale-to-zero). Supports multiple targets: GCS (primary), Lighthouse (legacy).
+            # Sync service — event-driven snapshots to all configured targets.
+            # Targets are ordered by trust: Sovereign → Federated → Delegated → Expedient.
+            # Snapshots fire on shutdown, scheduled backup, or explicit !backup command.
             self._sync_service = None
             if self._db_backend.lower() != "postgres":
                 try:
                     from kestrel_sovereign.storage.sync.service import SyncService
+                    from kestrel_sovereign.storage.sync.targets import (
+                        SovereignIPFSTarget, StorachaTarget, LighthouseTarget, GCSTarget,
+                    )
 
                     agent_id = self.did or self.agent_id or "default"
                     state_dir = Path(self.storage_path).parent if self.storage_path else None
-                    targets_added = []
 
                     self._sync_service = SyncService(db_path=self.storage_path)
 
-                    # GCS target (primary backup)
-                    gcs_bucket = os.environ.get("GCS_BACKUP_BUCKET")
-                    if gcs_bucket:
-                        from kestrel_sovereign.storage.sync.targets import GCSTarget
-                        gcs_target = GCSTarget(
-                            bucket=gcs_bucket,
-                            agent_id=agent_id,
-                            state_dir=state_dir,
-                            project=os.environ.get("GCP_PROJECT"),
-                            credentials_path=os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"),
-                        )
-                        self._sync_service.add_target(gcs_target)
-                        targets_added.append(f"GCS({gcs_bucket})")
+                    # Sovereign: self-hosted IPFS (our infrastructure)
+                    sovereign_url = os.environ.get("SOVEREIGN_IPFS_URL")
+                    if sovereign_url:
+                        self._sync_service.add_target(SovereignIPFSTarget(
+                            api_url=sovereign_url, agent_id=agent_id, state_dir=state_dir,
+                        ))
 
-                    # Storacha target (preferred decentralized — UCAN/DID auth)
+                    # Federated: Storacha (UCAN/DID auth)
                     if os.environ.get("STORACHA_SPACE_DID") and os.environ.get("STORACHA_AGENT_KEY"):
                         try:
-                            from kestrel_sovereign.storage.sync.targets import StorachaTarget
-                            storacha_target = StorachaTarget(
+                            self._sync_service.add_target(StorachaTarget(
                                 space_did=os.environ["STORACHA_SPACE_DID"],
                                 agent_key=os.environ["STORACHA_AGENT_KEY"],
                                 proof=os.environ.get("STORACHA_PROOF", ""),
-                                agent_id=agent_id,
-                                state_dir=state_dir,
-                            )
-                            self._sync_service.add_target(storacha_target)
-                            targets_added.append("Storacha")
+                                agent_id=agent_id, state_dir=state_dir,
+                            ))
                         except Exception as e:
-                            logging.warning(f"Failed to initialise StorachaTarget: {e}")
+                            logging.warning(f"StorachaTarget init failed: {e}")
 
-                    # Lighthouse target (legacy/decentralized)
+                    # Delegated: Lighthouse (API key)
                     if os.environ.get("LIGHTHOUSE_API_KEY"):
-                        from kestrel_sovereign.storage.sync.targets import LighthouseTarget
-                        lh_target = LighthouseTarget(
+                        self._sync_service.add_target(LighthouseTarget(
                             api_key=os.environ["LIGHTHOUSE_API_KEY"],
-                            agent_id=agent_id,
-                            state_dir=state_dir,
-                        )
-                        self._sync_service.add_target(lh_target)
-                        targets_added.append("Lighthouse")
+                            agent_id=agent_id, state_dir=state_dir,
+                        ))
 
-                    if targets_added:
+                    # Expedient: GCS (fast cloud backup)
+                    gcs_bucket = os.environ.get("GCS_BACKUP_BUCKET")
+                    if gcs_bucket:
+                        self._sync_service.add_target(GCSTarget(
+                            bucket=gcs_bucket, agent_id=agent_id, state_dir=state_dir,
+                            project=os.environ.get("GCP_PROJECT"),
+                            credentials_path=os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"),
+                        ))
+
+                    if self._sync_service.targets:
                         await self._sync_service.start()
-                        logging.info(f"Sync service started for {agent_id}: {', '.join(targets_added)}")
                     else:
                         self._sync_service = None
-                        logging.debug("No sync targets configured (set GCS_BACKUP_BUCKET, STORACHA_SPACE_DID, or LIGHTHOUSE_API_KEY)")
 
-                except (ImportError, AttributeError, TypeError, ConnectionError) as e:
-                    logging.warning(f"Failed to start sync service: {e}")
-                    self._sync_service = None
                 except Exception as e:
-                    logging.warning(f"Failed to start sync service: {e}", exc_info=True)
+                    logging.warning(f"Sync service init failed: {e}", exc_info=True)
                     self._sync_service = None
 
             # Auto-discover and register features from features/ directory
@@ -627,6 +604,7 @@ class KestrelAgent(ConstitutionMixin, StreamingMixin, BackupMixin, SleepMixin):
         defaults = [
             ("reflect", "0 */4 * * *", '{"scope":"all","depth":"normal"}'),
             ("training_cycle", "0 3 * * *", '{"iterations":3,"depth":"normal"}'),
+            ("backup_snapshot", "0 */4 * * *", "{}"),
         ]
 
         for task_name, cron, args in defaults:
@@ -2343,18 +2321,18 @@ Expected Duration: {expected_duration}
             except Exception as e:
                 logging.warning(f"Error closing TaskManager: {e}", exc_info=True)
 
-        # Flush state to Lighthouse before closing storage
+        # Final snapshot to all sync targets before closing storage
         if getattr(self, '_sync_service', None) and self._sync_service.is_running:
             try:
                 await self._sync_service.force_snapshot()
                 await self._sync_service.stop()
-                logging.info("Lighthouse sync: final snapshot flushed")
+                logging.info("Sync service: final snapshot flushed")
             except asyncio.CancelledError:
-                logging.debug("Lighthouse sync flush cancelled")
+                logging.debug("Sync service flush cancelled")
             except (AttributeError, TypeError, ConnectionError) as e:
-                logging.warning(f"Error flushing Lighthouse sync: {e}")
+                logging.warning(f"Error flushing sync service: {e}")
             except Exception as e:
-                logging.warning(f"Error flushing Lighthouse sync: {e}", exc_info=True)
+                logging.warning(f"Error flushing sync service: {e}", exc_info=True)
 
         # Close storage
         if hasattr(self.storage, 'close'):

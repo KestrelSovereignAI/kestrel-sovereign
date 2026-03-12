@@ -112,6 +112,17 @@ class SchedulerFeature(Feature):
         Returns:
             JSON-encoded result string
         """
+        # Built-in tasks (not feature tools)
+        if task_name == "backup_snapshot":
+            sync = getattr(self.agent, "_sync_service", None)
+            if sync:
+                results = await sync.force_snapshot()
+                return json.dumps(
+                    {t: {"success": r.success, "bytes": r.bytes_synced} for t, r in results.items()},
+                    default=str,
+                )
+            return json.dumps({"error": "no sync service configured"})
+
         # Search all features for a matching tool
         features = getattr(self.agent, "features", {})
         for feature in features.values():

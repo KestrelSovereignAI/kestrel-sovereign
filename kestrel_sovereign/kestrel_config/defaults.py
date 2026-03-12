@@ -53,6 +53,11 @@ def get_storacha_gateway_url() -> str:
     return os.getenv("STORACHA_GATEWAY_URL", "https://w3s.link/ipfs")
 
 
+def get_sovereign_ipfs_url() -> str:
+    """Get sovereign (self-hosted) IPFS node API URL."""
+    return os.getenv("SOVEREIGN_IPFS_URL", "")
+
+
 def get_xai_api_url() -> str:
     """Get xAI API base URL."""
     return os.getenv("XAI_API_URL", "https://api.x.ai/v1")
