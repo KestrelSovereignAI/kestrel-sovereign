@@ -216,10 +216,23 @@ async def set_privacy_mode(request: Request):
         agent = get_agent(request)
         agent.set_privacy_mode(new_mode)
 
+        # If switching to a local-only mode, auto-switch model to a local provider
+        config = new_mode.to_config()
+        model_switched = None
+        if not config.allows_cloud_llm() and hasattr(agent, 'llm_service') and agent.llm_service:
+            llm = agent.llm_service
+            local_names = llm._get_local_provider_names()
+            local_provider = next((p for p in llm.providers if p["name"] in local_names), None)
+            if local_provider:
+                llm.set_model_preference(local_provider["model"], local_provider["name"])
+                model_switched = {"provider": local_provider["name"], "model": local_provider["model"]}
+
         return {
             "success": True,
             "mode": new_mode.value,
-            "message": f"Privacy mode set to {new_mode.value}"
+            "message": f"Privacy mode set to {new_mode.value}",
+            "allows_cloud_llm": config.allows_cloud_llm(),
+            "model_switched": model_switched,
         }
     except HTTPException:
         raise

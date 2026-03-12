@@ -276,11 +276,39 @@ window.showPrivacySelector = function() {
                 return;
             }
             try {
-                await API.setPrivacyMode(mode);
+                const result = await API.setPrivacyMode(mode);
                 state.privacyMode = mode;
                 updatePrivacyIndicator(mode);
                 dropdown.remove();
-                Toast.success(`Privacy mode set to ${PRIVACY_MODES[mode]?.label || mode}`);
+
+                // Auto-switch model selector when privacy mode requires local-only
+                if (result.model_switched && window._sharedModelSelector) {
+                    // Save current cloud selection before switching to local
+                    if (result.allows_cloud_llm === false) {
+                        const current = window._sharedModelSelector.getSelection();
+                        localStorage.setItem('kestrel_saved_cloud_provider', current.provider);
+                        localStorage.setItem('kestrel_saved_cloud_model', current.model);
+                    }
+                    window._sharedModelSelector.setSelection(
+                        result.model_switched.provider,
+                        result.model_switched.model
+                    );
+                    Toast.success(`Privacy: ${PRIVACY_MODES[mode]?.label || mode} — switched to ${result.model_switched.provider} (local only)`);
+                } else if (result.allows_cloud_llm !== false) {
+                    // Switching back to cloud-allowing mode — restore saved cloud selection
+                    const savedProvider = localStorage.getItem('kestrel_saved_cloud_provider');
+                    const savedModel = localStorage.getItem('kestrel_saved_cloud_model');
+                    if (savedProvider && savedModel && window._sharedModelSelector) {
+                        window._sharedModelSelector.setSelection(savedProvider, savedModel);
+                        Toast.success(`Privacy: ${PRIVACY_MODES[mode]?.label || mode} — restored ${savedProvider} model`);
+                        localStorage.removeItem('kestrel_saved_cloud_provider');
+                        localStorage.removeItem('kestrel_saved_cloud_model');
+                    } else {
+                        Toast.success(`Privacy mode set to ${PRIVACY_MODES[mode]?.label || mode}`);
+                    }
+                } else {
+                    Toast.success(`Privacy mode set to ${PRIVACY_MODES[mode]?.label || mode}`);
+                }
             } catch (e) {
                 Toast.error(`Failed to set privacy mode: ${e.message}`);
             }
