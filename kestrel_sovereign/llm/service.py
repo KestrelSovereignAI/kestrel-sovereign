@@ -660,8 +660,8 @@ No other text or formatting.
 
         available_providers = self.providers
         if force_local_only:
-            local_providers = ["ollama"]
-            available_providers = [p for p in self.providers if p["name"] in local_providers]
+            local_names = self._get_local_provider_names()
+            available_providers = [p for p in self.providers if p["name"] in local_names]
 
             if not available_providers:
                 raise RuntimeError("No local providers available.")
