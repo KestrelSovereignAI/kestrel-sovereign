@@ -118,6 +118,8 @@ const API = {
 
     // True when authenticated via OAuth session cookie (no explicit key needed)
     _oauthSession: false,
+    // True when server returned 404 for bootstrap (OAuth mode — bootstrap disabled)
+    _bootstrapDisabled: false,
 
     /**
      * Initialize authentication.
@@ -155,8 +157,12 @@ const API = {
                 sessionStorage.setItem('kestrel_api_key', this._apiKey);
                 console.log('API key retrieved and cached');
                 return;
-            } else if (resp.status === 403 || resp.status === 404) {
-                console.log('API key bootstrap unavailable — checking OAuth session');
+            } else if (resp.status === 404) {
+                // 404 = bootstrap explicitly disabled (server requires OAuth)
+                this._bootstrapDisabled = true;
+                console.log('API key bootstrap disabled — checking OAuth session');
+            } else if (resp.status === 403) {
+                console.log('API key bootstrap forbidden — checking OAuth session');
             } else {
                 console.error('Failed to get API key:', resp.status);
             }
@@ -177,10 +183,18 @@ const API = {
             // OAuth check failed — will redirect to login below
         }
 
-        // No auth available — redirect to OAuth login
+        // No auth available.
+        // If /api/auth/key returned 404 (not 401/403), bootstrap is disabled
+        // which means the server requires OAuth. Redirect to login.
+        // If bootstrap returned 401, it means we just couldn't auth — don't
+        // redirect, the server doesn't require OAuth.
         if (!this._apiKey && !this._jwtToken && !this._oauthSession) {
-            console.warn('No authentication available — redirecting to login');
-            window.location.href = '/auth/login';
+            if (this._bootstrapDisabled) {
+                console.warn('OAuth required — redirecting to login');
+                window.location.href = '/auth/login';
+            } else {
+                console.warn('No authentication available');
+            }
         }
     },
 

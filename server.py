@@ -49,11 +49,23 @@ def _set_startup_error(app: FastAPI, error: Optional[Exception]) -> None:
     app.state.startup_error = str(error) if error else None
 
 
-def _bootstrap_key_enabled() -> bool:
-    """Return whether localhost API-key bootstrap is explicitly enabled."""
-    return os.environ.get("KESTREL_ENABLE_API_KEY_BOOTSTRAP", "").lower() in {
+def _oauth_required() -> bool:
+    """Return whether OAuth is the required auth mode.
+
+    Set KESTREL_REQUIRE_OAUTH=true in Cloud Run deploy scripts to force
+    Google sign-in. When false (default, local dev), API key bootstrap
+    is available and the frontend won't redirect to OAuth.
+
+    This is the single source of truth for auth mode.
+    """
+    return os.environ.get("KESTREL_REQUIRE_OAUTH", "").lower() in {
         "1", "true", "yes", "on"
     }
+
+
+def _bootstrap_key_enabled() -> bool:
+    """Localhost API-key bootstrap is available when OAuth is not required."""
+    return not _oauth_required()
 
 
 def get_api_key():
@@ -342,11 +354,7 @@ async def auth_middleware(request: Request, call_next):
         if request.url.path == "/" and SERVE_UI:
             accept = request.headers.get("accept", "")
             if "text/html" in accept:
-                # KESTREL_REQUIRE_OAUTH: explicitly opt in to OAuth login.
-                # Set this in Cloud Run deploy scripts to force Google
-                # sign-in for browser access. Without it, the UI is
-                # served directly using API key auth.
-                if os.environ.get("KESTREL_REQUIRE_OAUTH") and "google" in oauth._clients:
+                if _oauth_required() and "google" in oauth._clients:
                     return RedirectResponse(url="/auth/login", status_code=302)
                 else:
                     return await call_next(request)
