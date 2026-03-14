@@ -4,7 +4,7 @@
  * Playwright-scripted demo showcasing 5 key features:
  *   Act 1: DID Identity Generation
  *   Act 2: Constitution Processing
- *   Act 3: Memory Persistence
+ *   Act 3: Memory Persistence (within-session conversation recall)
  *   Act 4: Privacy Mode Toggle
  *   Act 5: Sovereignty Export
  *
@@ -105,6 +105,43 @@ function authHeaders(apiKey) {
     return apiKey ? { 'X-API-Key': apiKey } : {};
 }
 
+/** Clear old conversation history so the demo starts with a clean context window.
+ *  We delete directly from SQLite because there is no bulk-clear API endpoint. */
+function clearConversationHistory() {
+    const { execSync } = require('child_process');
+    // Agent data lives under agent_data/<agent_name>/kestrel_prime.db.
+    // Walk all agent databases and clear conversation_history.
+    const agentDataDir = path.resolve(__dirname, '../../agent_data');
+    try {
+        const dbs = execSync(`find "${agentDataDir}" -name "kestrel_prime.db" -maxdepth 3 2>/dev/null`)
+            .toString().trim().split('\n').filter(Boolean);
+        for (const db of dbs) {
+            try {
+                execSync(`sqlite3 "${db}" "DELETE FROM conversation_history;"`);
+            } catch { /* table may not exist in some dbs */ }
+        }
+        narrator.narrate('Setup', `Cleared conversation history from ${dbs.length} agent database(s)`);
+    } catch (e) {
+        narrator.narrate('Setup', `Could not clear history: ${e.message}`);
+    }
+}
+
+/** Start a fresh session via the API. */
+async function startFreshSession(request) {
+    try {
+        const headers = apiKey ? { 'X-API-Key': apiKey } : {};
+        const resp = await request.post(`${BASE_URL}/api/conversations/new`, { headers });
+        if (resp.ok()) {
+            const data = await resp.json();
+            narrator.narrate('Setup', `Fresh session started: ${data.session_id || 'ok'}`);
+            return true;
+        }
+    } catch (e) {
+        narrator.narrate('Setup', `Could not start fresh session: ${e.message}`);
+    }
+    return false;
+}
+
 /** Send a chat message and wait for agent response. Returns last agent message locator or null. */
 async function demoSendMessage(page, message, timeout = 90000) {
     try {
@@ -151,6 +188,24 @@ async function navigateToPanel(page, panelName) {
         await page.waitForSelector(`#panel-${panelName}`, { state: 'visible', timeout: 5000 });
     } catch { /* panel may already be visible */ }
     await demoPause(page, 1000);
+}
+
+/** Remove context warnings and hide the noisy status bar for clean screenshots. */
+async function dismissContextWarning(page) {
+    await page.evaluate(() => {
+        document.querySelectorAll('.context-warning').forEach(el => el.remove());
+        // Hide the "N msgs · X% Compress" indicator — it's operational, not demo material
+        const status = document.getElementById('context-status');
+        if (status) status.style.display = 'none';
+    });
+}
+
+/** Scroll chat container to show the first user message at the top. */
+async function scrollChatToTop(page) {
+    await page.evaluate(() => {
+        const container = document.getElementById('chat-container');
+        if (container) container.scrollTop = 0;
+    });
 }
 
 /** Inject a highlight glow around an element for the recording. */
@@ -210,6 +265,10 @@ test.describe.serial('Kestrel Sovereign Technical Demo', () => {
 
         apiKey = await getApiKey(request);
         narrator.narrate('Setup', apiKey ? 'API key acquired' : 'No API key (public mode)');
+
+        // Clear old conversation history and start a fresh session
+        clearConversationHistory();
+        await startFreshSession(request);
     });
 
     // ========================================================================
@@ -270,6 +329,7 @@ test.describe.serial('Kestrel Sovereign Technical Demo', () => {
         // Navigate to chat
         narrator.narrate(section, 'Opening the Chat panel to interact with the agent...');
         await navigateToPanel(page, 'chat');
+        await dismissContextWarning(page);
 
         // Send a message that elicits constitutional awareness
         narrator.narrate(section,
@@ -285,6 +345,11 @@ test.describe.serial('Kestrel Sovereign Technical Demo', () => {
             narrator.narrate(section,
                 `Agent responded (${text.length} chars) — response governed by constitutional principles`);
         }
+
+        // Scroll to top so the user's question and beginning of response are visible
+        await dismissContextWarning(page);
+        await scrollChatToTop(page);
+        await demoPause(page, 500);
         await narrator.screenshot(page, 'chat-response');
 
         // Navigate to Constitution panel
@@ -317,8 +382,9 @@ test.describe.serial('Kestrel Sovereign Technical Demo', () => {
 
         // Navigate to chat
         await navigateToPanel(page, 'chat');
+        await dismissContextWarning(page);
 
-        // Send a memorable fact
+        // Beat 1: Send a memorable fact
         narrator.narrate(section,
             'Sending a unique fact for the agent to remember...',
             'We\'ll verify the agent stores and recalls this information');
@@ -331,17 +397,18 @@ test.describe.serial('Kestrel Sovereign Technical Demo', () => {
             const storeText = await stored.textContent().catch(() => '');
             narrator.narrate(section,
                 `Agent acknowledged — ${storeText.length} chars response`,
-                'The agent stores facts in its persistent knowledge graph');
+                'The fact is now stored in the agent\'s conversation memory');
         }
+        await dismissContextWarning(page);
         await narrator.screenshot(page, 'memory-stored');
 
-        // Ask for recall — proves the agent stored and can retrieve info
+        // Beat 2: Ask for recall within the same session — proves memory works
         narrator.narrate(section,
             'Now asking the agent to recall what we just told it...',
-            'The agent stores facts in its memory and can retrieve them');
+            'The agent retrieves facts from its conversation memory');
 
         const recalled = await demoSendMessage(page,
-            'Can you confirm what you remember about my favorite programming language and lucky number?');
+            'What is my favorite programming language and what is my lucky number?');
         await demoPause(page, 1500);
 
         if (recalled) {
@@ -350,19 +417,24 @@ test.describe.serial('Kestrel Sovereign Technical Demo', () => {
             const hasNumber = text.includes('7742');
             narrator.narrate(section,
                 `Agent recalled — Rust: ${hasRust}, 7742: ${hasNumber}`,
-                'The agent remembers! This data persists in the knowledge graph across sessions.');
+                hasRust && hasNumber
+                    ? 'Perfect recall. The conversation memory system works as expected.'
+                    : 'Partial recall — the memory system returned results but retrieval was incomplete.');
         }
+        await dismissContextWarning(page);
         await narrator.screenshot(page, 'memory-recalled');
 
-        // Show the memories panel — the knowledge graph
-        narrator.narrate(section, 'Opening the Memories panel — the knowledge graph stores structured data...');
+        // Beat 3: Show the memories panel — the knowledge graph (saved items, documents, etc.)
+        narrator.narrate(section,
+            'Opening the Memories panel — the knowledge graph stores structured data...',
+            'Saved items, documents, backups, and sovereignty receipts are persisted here');
         await navigateToPanel(page, 'memories');
         await demoPause(page, 2000);
 
         try {
             await page.waitForSelector('#panel-memories', { state: 'visible', timeout: 5000 });
             narrator.narrate(section,
-                'Knowledge graph visible — agent, documents, backups, and sovereignty receipts',
+                'Knowledge graph visible — agent identity, constitution, backups, and export receipts',
                 'Each node has a type badge and can be inspected or deleted by the owner');
         } catch {
             narrator.narrate(section, 'Memories panel displayed');
@@ -380,6 +452,7 @@ test.describe.serial('Kestrel Sovereign Technical Demo', () => {
         await demoPause(page, 1500);
 
         await navigateToPanel(page, 'chat');
+        await dismissContextWarning(page);
         await demoPause(page, 1000);
 
         // Show current privacy mode
@@ -429,23 +502,16 @@ test.describe.serial('Kestrel Sovereign Technical Demo', () => {
 
             narrator.narrate(section,
                 'EPHEMERAL mode active — nothing is stored',
-                'Notice the indicator changed — the agent now operates in zero-persistence mode. Only local LLMs allowed.');
+                'Notice the indicator changed and the LLM provider switched to local-only. No data leaves this device.');
             await narrator.screenshot(page, 'privacy-ephemeral');
         } catch (e) {
             narrator.narrate(section, `Ephemeral switch: ${e.message}`);
             await narrator.screenshot(page, 'privacy-ephemeral-fallback');
         }
 
-        // Send ephemeral message
-        narrator.narrate(section, 'Sending a message in EPHEMERAL mode — this will NOT be persisted...');
-        const ephResp = await demoSendMessage(page,
-            'This is an ephemeral message. It should not be stored anywhere.');
-        await demoPause(page, 1500);
-
-        if (ephResp) {
-            narrator.narrate(section, 'Agent responded in ephemeral mode — response exists only in memory');
-        }
-        await narrator.screenshot(page, 'ephemeral-chat');
+        // Don't try to send a message in ephemeral mode — local LLM may not
+        // be running, and an error on screen kills the demo.  The mode switch
+        // itself (indicator + provider change) is the story.
 
         // Restore to NORMAL
         narrator.narrate(section, 'Restoring NORMAL mode for full persistence...');
@@ -454,7 +520,19 @@ test.describe.serial('Kestrel Sovereign Technical Demo', () => {
             await page.waitForSelector('#privacy-dropdown', { state: 'visible', timeout: 5000 });
             await page.click('.privacy-option[data-mode="normal"]');
             await demoPause(page, 1500);
+
+            // Wait for toast to appear and dismiss it so the screenshot is clean
+            try {
+                await page.waitForSelector('.toast-item', { timeout: 3000 });
+                await demoPause(page, 2000);
+                // Dismiss any remaining toasts
+                await page.evaluate(() => {
+                    document.querySelectorAll('.toast-item').forEach(t => t.remove());
+                });
+            } catch { /* no toast, fine */ }
+
             narrator.narrate(section, 'NORMAL mode restored — full persistence re-enabled');
+            await dismissContextWarning(page);
             await narrator.screenshot(page, 'privacy-restored');
         } catch (e) {
             narrator.narrate(section, `Normal restore: ${e.message}`);
@@ -511,9 +589,18 @@ test.describe.serial('Kestrel Sovereign Technical Demo', () => {
                 await page.waitForSelector('#modal-overlay', { state: 'hidden', timeout: 30000 });
             } catch { /* modal may auto-close */ }
 
+            // Wait for the success toast (not just the "Starting..." one)
             try {
-                await page.waitForSelector('.toast-item', { timeout: 15000 });
-                const toastText = await page.locator('.toast-item').first().textContent();
+                await page.waitForFunction(() => {
+                    const toasts = document.querySelectorAll('.toast-item');
+                    for (const t of toasts) {
+                        if (t.textContent.includes('Complete') || t.textContent.includes('CID')) return true;
+                    }
+                    return false;
+                }, { timeout: 20000 });
+                await demoPause(page, 1000);
+
+                const toastText = await page.locator('.toast-item').last().textContent();
                 narrator.narrate(section,
                     `Export complete: ${toastText.trim()}`,
                     'The export contains the agent\'s DID, constitution, memory graph, and conversation history — everything needed to restore this agent anywhere.');
