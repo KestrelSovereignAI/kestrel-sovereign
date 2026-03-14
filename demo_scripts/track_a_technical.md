@@ -1,6 +1,8 @@
 # Track A — Technical Demo Script
 
-**Status:** Ready for rehearsal
+> **Note:** This content has been consolidated into [`docs/demos/DEMO_SCRIPT.md`](../docs/demos/DEMO_SCRIPT.md), which is now the single source of truth for the Track A demo. This file is kept for reference only.
+
+**Status:** Consolidated into DEMO_SCRIPT.md (March 14, 2026)
 **Owner:** Gabi
 **Demo Date:** March 15, 2026
 **Audience:** Enterprise technical (SHI VP Business Systems, Dell Enterprise AI)
