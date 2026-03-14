@@ -152,6 +152,7 @@ class KestrelAgent(ConstitutionMixin, StreamingMixin, BackupMixin, SleepMixin):
 
         # Cancellation tracking for stop button functionality
         self._current_request_id: Optional[str] = None
+        self._active_request_ids: set[str] = set()
         self._cancelled_requests: set = set()
 
         # Session state
@@ -2197,16 +2198,30 @@ Expected Duration: {expected_duration}
     # Request Cancellation (Stop Button Support)
     # =========================================================================
 
-    def cancel_current_request(self) -> bool:
+    def register_active_request(self, request_id: str) -> None:
+        """Track an active request for later cancellation and cleanup."""
+        if not hasattr(self, "_active_request_ids"):
+            self._active_request_ids = set()
+        self._active_request_ids.add(request_id)
+        # Preserve the legacy "current request" fallback for callers that
+        # do not yet pass an explicit request ID.
+        self._current_request_id = request_id
+
+    def cancel_current_request(self, request_id: Optional[str] = None) -> bool:
         """
         Cancel the current streaming request.
         
         Returns:
             True if a request was cancelled, False if no request was active.
         """
-        if self._current_request_id:
-            self._cancelled_requests.add(self._current_request_id)
-            logging.info(f"Cancelled request: {self._current_request_id}")
+        active_request_ids = getattr(self, "_active_request_ids", set())
+        target_request_id = request_id or self._current_request_id
+        if target_request_id and (
+            target_request_id in active_request_ids
+            or target_request_id == self._current_request_id
+        ):
+            self._cancelled_requests.add(target_request_id)
+            logging.info(f"Cancelled request: {target_request_id}")
             return True
         return False
 
@@ -2217,9 +2232,12 @@ Expected Duration: {expected_duration}
 
     def _cleanup_cancelled_request(self, request_id: str):
         """Remove a request from the cancelled set after it's been handled."""
+        active_request_ids = getattr(self, "_active_request_ids", None)
+        if active_request_ids is not None:
+            active_request_ids.discard(request_id)
         self._cancelled_requests.discard(request_id)
         if self._current_request_id == request_id:
-            self._current_request_id = None
+            self._current_request_id = next(iter(active_request_ids), None) if active_request_ids else None
 
     async def get_agent_card(self) -> "AgentCard":
         """
