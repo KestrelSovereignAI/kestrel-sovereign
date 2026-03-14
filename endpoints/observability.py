@@ -1,7 +1,7 @@
 """Observability endpoint - query A2A observability events for debugging."""
 from fastapi import APIRouter, Request, Query, HTTPException
 from typing import Optional, Dict, Any, List
-from datetime import datetime
+from datetime import datetime, timezone
 import logging
 
 from endpoints.agent_helpers import get_agent
@@ -105,7 +105,7 @@ async def get_observability_summary(
     try:
         from datetime import timedelta
         from kestrel_sovereign.kestrel_config.constants import DEFAULT_OBSERVABILITY_LIMIT
-        since = datetime.utcnow() - timedelta(minutes=minutes)
+        since = datetime.now(timezone.utc) - timedelta(minutes=minutes)
 
         # Query recent events
         events = await obs_store.query_events(
