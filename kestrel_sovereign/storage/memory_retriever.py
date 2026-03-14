@@ -97,12 +97,27 @@ class MemoryRetriever:
                 query, agent_id
             )
 
+        # Normalize query for dedup comparison
+        query_normalized = query.strip().lower()
+
         # Score each message
         scored: List[Tuple[Dict[str, Any], float]] = []
 
         for msg in history:
+            # Skip user messages — they're questions/requests, not knowledge.
+            # Only assistant and system messages contain useful recall content.
+            if msg.get("role") == "user":
+                continue
+
+            content = msg.get("content", "")
+
+            # Skip messages that are near-duplicates of the current query
+            # (prevents echoing back the user's own question from a prior turn)
+            if content.strip().lower() == query_normalized:
+                continue
+
             score = self._calculate_score(
-                content=msg.get("content", ""),
+                content=content,
                 query=query,
                 metadata=msg.get("metadata", {}),
                 emotional_context=emotional_context,

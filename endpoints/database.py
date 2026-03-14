@@ -20,6 +20,61 @@ ALLOWED_TABLES = {
 }
 
 
+async def _list_table_names(db):
+    """Return table names for the active backend."""
+    if db.backend_type == "postgres":
+        rows = await db.fetchall(
+            """SELECT table_name
+               FROM information_schema.tables
+               WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
+               ORDER BY table_name"""
+        )
+    else:
+        rows = await db.fetchall(
+            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+        )
+    return [row[0] for row in rows] if rows else []
+
+
+async def _get_table_columns(db, table_name: str):
+    """Return normalized column metadata for the active backend."""
+    safe_name = safe_table_name(table_name)
+    if db.backend_type == "postgres":
+        rows = await db.fetchall(
+            """
+            SELECT
+                c.column_name,
+                c.data_type,
+                c.is_nullable,
+                EXISTS (
+                    SELECT 1
+                    FROM information_schema.table_constraints tc
+                    JOIN information_schema.key_column_usage kcu
+                      ON tc.constraint_name = kcu.constraint_name
+                     AND tc.table_schema = kcu.table_schema
+                    WHERE tc.table_schema = c.table_schema
+                      AND tc.table_name = c.table_name
+                      AND tc.constraint_type = 'PRIMARY KEY'
+                      AND kcu.column_name = c.column_name
+                ) AS is_primary_key
+            FROM information_schema.columns c
+            WHERE c.table_schema = 'public' AND c.table_name = ?
+            ORDER BY c.ordinal_position
+            """,
+            (safe_name,),
+        )
+        return [
+            {"name": col[0], "type": col[1], "nullable": col[2] == "YES", "pk": bool(col[3])}
+            for col in (rows or [])
+        ]
+
+    rows = await db.fetchall(f"PRAGMA table_info({safe_name})")
+    return [
+        {"name": col[1], "type": col[2], "nullable": not col[3], "pk": bool(col[5])}
+        for col in (rows or [])
+    ]
+
+
 @router.get("/tables")
 async def list_database_tables(request: Request):
     """List SQLite tables with row counts and schema info."""
@@ -28,10 +83,7 @@ async def list_database_tables(request: Request):
         storage = agent.storage
 
         # Use async database query
-        table_rows = await storage.db.fetchall(
-            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
-        )
-        all_tables = [row[0] for row in table_rows] if table_rows else []
+        all_tables = await _list_table_names(storage.db)
 
         tables = []
         for table_name in all_tables:
@@ -50,11 +102,7 @@ async def list_database_tables(request: Request):
                 row_count = 0
 
             try:
-                col_rows = await storage.db.fetchall(f"PRAGMA table_info({safe_name})")
-                columns = [
-                    {"name": col[1], "type": col[2], "nullable": not col[3], "pk": bool(col[5])}
-                    for col in col_rows
-                ] if col_rows else []
+                columns = await _get_table_columns(storage.db, table_name)
             except Exception as e:
                 logger.warning(f"Failed to get columns for table {table_name}: {e}")
                 columns = []
@@ -112,9 +160,9 @@ async def query_database_table(
         # ALLOWED_TABLES check above is the primary gate)
         safe_name = safe_table_name(table_name)
 
-        # Get column info using async query
-        col_rows = await storage.db.fetchall(f"PRAGMA table_info({safe_name})")
-        columns = [col[1] for col in col_rows] if col_rows else []
+        # Get column info using backend-aware introspection
+        column_info = await _get_table_columns(storage.db, table_name)
+        columns = [col["name"] for col in column_info]
 
         if search and len(search) >= 2:
             search_conditions = []

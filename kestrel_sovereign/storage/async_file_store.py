@@ -136,6 +136,14 @@ class AsyncFileStore:
             return json.loads(row[0])
         return None
 
+    async def file_exists(self, content_hash: str) -> bool:
+        """Return whether a file row exists for the given content hash."""
+        row = await self.db.fetchone(
+            "SELECT 1 FROM files WHERE content_hash = ?",
+            (content_hash,)
+        )
+        return row is not None
+
     # =========================================================================
     # Avatar Storage Methods
     # =========================================================================

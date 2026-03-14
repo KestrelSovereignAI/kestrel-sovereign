@@ -1,5 +1,5 @@
 """Observability endpoint - query A2A observability events for debugging."""
-from fastapi import APIRouter, Request, Query
+from fastapi import APIRouter, Request, Query, HTTPException
 from typing import Optional, Dict, Any, List
 from datetime import datetime
 import logging
@@ -37,12 +37,12 @@ async def get_observability_events(
     """
     try:
         agent = get_agent(request)
-    except Exception:
-        return {"error": "No agent available", "events": []}
+    except HTTPException:
+        raise
 
     obs_store = getattr(agent, 'observability_store', None)
     if not obs_store:
-        return {"error": "No observability store available", "events": []}
+        raise HTTPException(status_code=503, detail="Observability store not available")
 
     try:
         events = await obs_store.query_events(
@@ -80,7 +80,7 @@ async def get_observability_events(
         }
     except Exception as e:
         logger.error(f"Error querying observability events: {e}", exc_info=True)
-        return {"error": "Failed to query observability events", "events": []}
+        raise HTTPException(status_code=500, detail="Failed to query observability events")
 
 
 @router.get("/api/observability/summary")
@@ -95,12 +95,12 @@ async def get_observability_summary(
     """
     try:
         agent = get_agent(request)
-    except Exception:
-        return {"error": "No agent available"}
+    except HTTPException:
+        raise
 
     obs_store = getattr(agent, 'observability_store', None)
     if not obs_store:
-        return {"error": "No observability store available"}
+        raise HTTPException(status_code=503, detail="Observability store not available")
 
     try:
         from datetime import timedelta
@@ -150,4 +150,4 @@ async def get_observability_summary(
         }
     except Exception as e:
         logger.error(f"Error getting observability summary: {e}", exc_info=True)
-        return {"error": "Failed to get observability summary"}
+        raise HTTPException(status_code=500, detail="Failed to get observability summary")

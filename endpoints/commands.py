@@ -65,7 +65,10 @@ async def get_commands(request: Request) -> Dict[str, Any]:
     try:
         agent = get_agent(request)
     except Exception:
-        return commands
+        return {
+            "commands": commands,
+            "count": len(commands),
+        }
     if hasattr(agent, 'features'):
         for feature_name, feature in agent.features.items():
             try:

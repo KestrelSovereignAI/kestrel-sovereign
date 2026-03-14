@@ -271,6 +271,37 @@ class TestMemoryRetriever:
         assert score_high_importance > score_low_importance
 
 
+    @pytest.mark.asyncio
+    async def test_retrieve_skips_user_messages(self):
+        """User messages should not be returned as memories (prevents echo)."""
+        store = AsyncMock()
+        store.get_conversation_history.return_value = [
+            {"role": "user", "content": "What is my favorite color?",
+             "metadata": {}, "created_at": "2025-01-15 10:00:00"},
+            {"role": "assistant", "content": "Your favorite color is blue.",
+             "metadata": {"importance": 0.8}, "created_at": "2025-01-15 10:00:01"},
+            {"role": "user", "content": "Remember my lucky number is 42",
+             "metadata": {}, "created_at": "2025-01-15 10:01:00"},
+            {"role": "assistant", "content": "I will remember your lucky number is 42.",
+             "metadata": {"importance": 0.7}, "created_at": "2025-01-15 10:01:01"},
+        ]
+
+        retriever = MemoryRetriever(store, None)
+        results = await retriever.retrieve(
+            query="favorite color",
+            agent_id="test-agent",
+            limit=10,
+            min_score=0.0
+        )
+
+        # Only assistant messages should be returned
+        for r in results:
+            assert r["role"] != "user", f"User message leaked into memories: {r['content']}"
+        # Should still find the assistant's answer
+        contents = [r["content"] for r in results]
+        assert any("blue" in c for c in contents)
+
+
 class TestDecayCalculation:
     """Tests for standalone decay calculation."""
 
