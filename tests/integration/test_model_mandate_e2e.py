@@ -223,12 +223,12 @@ class TestAuthKeyEndpoint:
         assert response.status_code == 403
         assert "localhost" in response.json()["detail"].lower()
 
-    def test_auth_key_disabled_by_default(self, monkeypatch):
-        """GET /api/auth/key is disabled unless explicitly enabled."""
+    def test_auth_key_disabled_when_oauth_required(self, monkeypatch):
+        """GET /api/auth/key returns 404 when OAuth mode disables bootstrap."""
         from server import app
         from unittest.mock import MagicMock
 
-        monkeypatch.delenv("KESTREL_ENABLE_API_KEY_BOOTSTRAP", raising=False)
+        monkeypatch.setenv("KESTREL_REQUIRE_OAUTH", "true")
 
         original_lifespan = app.router.lifespan_context
         app.router.lifespan_context = _noop_lifespan
@@ -238,10 +238,11 @@ class TestAuthKeyEndpoint:
             with TestClient(app) as client:
                 response = client.get("/api/auth/key")
         finally:
+            monkeypatch.delenv("KESTREL_REQUIRE_OAUTH", raising=False)
             app.router.lifespan_context = original_lifespan
             app.state.agent = None
 
-        assert response.status_code == 401
+        assert response.status_code == 404
 
 
 class TestProtectedEndpointsRequireAuth:
