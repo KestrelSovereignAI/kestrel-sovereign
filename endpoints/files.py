@@ -81,12 +81,14 @@ async def check_file(content_hash: str, request: Request):
 
         file_store = storage.files
 
-        # Just check metadata existence (faster than retrieving content)
-        metadata = await file_store.get_file_metadata(content_hash)
-        if not metadata:
+        # Check file existence first. Metadata is optional, so a file can exist
+        # even when no metadata row payload is present.
+        exists = await file_store.file_exists(content_hash)
+        if not exists:
             raise HTTPException(status_code=404, detail="File not found")
 
-        mime_type = metadata.get("mime_type", "application/octet-stream")
+        metadata = await file_store.get_file_metadata(content_hash)
+        mime_type = metadata.get("mime_type", "application/octet-stream") if metadata else "application/octet-stream"
 
         return Response(
             content=b"",

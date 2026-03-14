@@ -393,9 +393,17 @@ class SavedItemsStore:
             except json.JSONDecodeError:
                 raise ValueError("Structured item content must be valid JSON")
 
-        # Check for existing item with same content
+        # Check for an existing item representing the same logical record.
+        # Raw content alone is not enough, or cross-type saves collapse into
+        # one row and silently overwrite metadata.
         if deduplicate:
-            existing = await self.get_by_content_hash(content_hash)
+            existing = await self._find_duplicate(
+                content_hash=content_hash,
+                item_type=item_type,
+                schema_id=schema_id,
+                source_type=source_type,
+                source_ref=source_ref,
+            )
             if existing:
                 logger.info(f"Found existing item with same content: {existing.id}")
                 # Update the existing item
@@ -610,6 +618,37 @@ class SavedItemsStore:
             (content_hash, self.agent_id)
         )
         return SavedItem.from_row(row) if row else None
+
+    async def list_by_content_hash(self, content_hash: str) -> List[SavedItem]:
+        """List saved items with the same content hash for this agent."""
+        rows = await self.db.fetchall(
+            """SELECT id, agent_id, item_type, name, summary, content, content_hash,
+                      ipfs_cid, embedding, source_type, source_ref, schema_id,
+                      tags, metadata, created_at, updated_at
+               FROM saved_items WHERE content_hash = ? AND agent_id = ?""",
+            (content_hash, self.agent_id)
+        )
+        return [SavedItem.from_row(row) for row in (rows or [])]
+
+    async def _find_duplicate(
+        self,
+        content_hash: str,
+        item_type: str,
+        schema_id: Optional[str],
+        source_type: Optional[str],
+        source_ref: Optional[str],
+    ) -> Optional[SavedItem]:
+        """Find an existing row matching the same logical saved-item identity."""
+        matches = await self.list_by_content_hash(content_hash)
+        for item in matches:
+            if (
+                item.item_type == item_type
+                and item.schema_id == schema_id
+                and item.source_type == source_type
+                and item.source_ref == source_ref
+            ):
+                return item
+        return None
 
     async def list_items(
         self,

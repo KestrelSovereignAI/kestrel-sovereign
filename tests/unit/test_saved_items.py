@@ -67,8 +67,8 @@ class TestSavedItemsStore:
         assert item.tags == ["important", "architecture"]
 
     @pytest.mark.asyncio
-    async def test_deduplication(self, mock_db):
-        """Test that duplicate content updates existing item."""
+    async def test_deduplication_same_identity_updates_existing_item(self, mock_db):
+        """Test that duplicate content updates an item only for the same logical identity."""
         from kestrel_sovereign.storage.saved_items_store import SavedItemsStore, SavedItem
 
         store = SavedItemsStore(mock_db, agent_id="test-agent")
@@ -92,18 +92,58 @@ class TestSavedItemsStore:
             "2024-01-15T10:00:00",
             "2024-01-15T10:00:00"
         )
-        mock_db.fetchone.return_value = existing_row
+        mock_db.fetchall.return_value = [existing_row]
+        store.update_item = AsyncMock(return_value=SavedItem.from_row(existing_row))
 
         item = await store.save_item(
             item_type="structured",
             name="New Name",
             content="Same content",
+            source_type="manual",
             deduplicate=True,
             compute_embedding=False
         )
 
         # Should return updated existing item, not create new
         assert item.id == "existing-id"
+
+    @pytest.mark.asyncio
+    async def test_deduplication_does_not_merge_different_item_types(self, mock_db):
+        """Same content across item types should create distinct rows."""
+        from kestrel_sovereign.storage.saved_items_store import SavedItemsStore
+
+        store = SavedItemsStore(mock_db, agent_id="test-agent")
+        mock_db.fetchall.return_value = [
+            (
+                "existing-id",
+                "test-agent",
+                "stash",
+                "Existing Stash",
+                "Old summary",
+                "Same content",
+                "abc123hash",
+                None,
+                None,
+                "manual",
+                None,
+                None,
+                "[]",
+                "{}",
+                "2024-01-15T10:00:00",
+                "2024-01-15T10:00:00",
+            )
+        ]
+
+        item = await store.save_item(
+            item_type="structured",
+            name="Structured Copy",
+            content="Same content",
+            deduplicate=True,
+            compute_embedding=False,
+        )
+
+        assert item.id != "existing-id"
+        mock_db.execute.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_list_items(self, mock_db):
