@@ -340,8 +340,11 @@ class TestAutoClaudeE2E:
         if not issues:
             pytest.skip("No open issues in test repo")
 
-        context = client.build_issue_context(issues[0])
+        # build_issue_context expects a WorkItem, not a raw Issue
+        from autoclaude.platform import WorkItem
+        work_item = WorkItem(number=issues[0].number, title=issues[0].title, raw=issues[0])
+        context = client.build_issue_context(work_item)
 
-        assert context.number == issues[0].number
-        assert context.title == issues[0].title
+        assert context.number == work_item.number
+        assert context.title == work_item.title
         assert isinstance(context.comments, list)
