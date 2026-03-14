@@ -31,6 +31,7 @@ class ToolContextManager:
         storage: "AsyncStorage",
         model: str = "auto",
         agent_id: Optional[str] = None,
+        llm_service=None,
     ):
         """
         Initialize the tool context manager.
@@ -39,10 +40,23 @@ class ToolContextManager:
             storage: AsyncStorage instance for context operations
             model: Model name for token counting/limits
             agent_id: Agent ID for scoped queries
+            llm_service: Optional LLMService for live model resolution
         """
         self.storage = storage
-        self.model = model
+        self._model = model
         self.agent_id = agent_id
+        self._llm_service = llm_service
+
+    @property
+    def model(self) -> str:
+        """Resolve the current model dynamically when llm_service is available."""
+        if self._llm_service:
+            return self._llm_service.get_active_model_id()
+        return self._model
+
+    @model.setter
+    def model(self, value: str) -> None:
+        self._model = value
 
     async def get_status(self, counter) -> Dict[str, Any]:
         """

@@ -155,8 +155,8 @@ const API = {
                 sessionStorage.setItem('kestrel_api_key', this._apiKey);
                 console.log('API key retrieved and cached');
                 return;
-            } else if (resp.status === 403) {
-                console.log('API key endpoint not accessible — checking OAuth session');
+            } else if (resp.status === 403 || resp.status === 404) {
+                console.log('API key bootstrap unavailable — checking OAuth session');
             } else {
                 console.error('Failed to get API key:', resp.status);
             }
@@ -222,6 +222,8 @@ const API = {
                     sessionStorage.setItem('kestrel_api_key', this._apiKey);
                     console.log('API key refreshed - retrying request');
                     return this.request(endpoint, options, true);
+                } else if (keyResp.status === 403 || keyResp.status === 404) {
+                    console.warn('API key bootstrap unavailable during refresh');
                 }
             } catch (e) {
                 console.error('Failed to refresh API key:', e);
@@ -292,7 +294,10 @@ const API = {
      * Stop the current agent request/streaming.
      * @returns {Promise<Object>} Result with success and cancelled status
      */
-    stop: () => API.request('/agent/stop', { method: 'POST' }),
+    stop: (requestId = null) => API.request('/agent/stop', {
+        method: 'POST',
+        body: JSON.stringify(requestId ? { request_id: requestId } : {})
+    }),
     /**
      * Get available LLM models
      * @param {Object} options - Query options
@@ -313,6 +318,7 @@ const API = {
     
     // Current AbortController for cancellable streaming
     _streamAbortController: null,
+    _currentStreamRequestId: null,
     
     /**
      * Get the current AbortController for streaming.
@@ -320,6 +326,10 @@ const API = {
      */
     getStreamAbortController() {
         return this._streamAbortController;
+    },
+
+    getCurrentStreamRequestId() {
+        return this._currentStreamRequestId;
     },
     
     streamInvoke: async function*(input, model = null, sessionId = null, provider = null) {
@@ -356,6 +366,7 @@ const API = {
             }
 
             if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            API._currentStreamRequestId = response.headers.get('X-Request-ID');
             const reader = response.body.getReader();
             const decoder = new TextDecoder();
             
@@ -376,6 +387,7 @@ const API = {
             throw e;
         } finally {
             API._streamAbortController = null;
+            API._currentStreamRequestId = null;
         }
     },
 
