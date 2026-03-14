@@ -44,6 +44,18 @@ security = HTTPBearer(auto_error=False)
 SSE_PATHS = {"/agent/notifications/sse", "/agent/stream"}
 
 
+def _set_startup_error(app: FastAPI, error: Optional[Exception]) -> None:
+    """Persist startup failure state for diagnostics and health endpoints."""
+    app.state.startup_error = str(error) if error else None
+
+
+def _bootstrap_key_enabled() -> bool:
+    """Return whether localhost API-key bootstrap is explicitly enabled."""
+    return os.environ.get("KESTREL_ENABLE_API_KEY_BOOTSTRAP", "").lower() in {
+        "1", "true", "yes", "on"
+    }
+
+
 def get_api_key():
     """Get or generate the API key."""
     api_key = os.environ.get("KESTREL_API_KEY")
@@ -100,6 +112,7 @@ async def lifespan(app: FastAPI):
     """Manage the application's lifespan."""
     import asyncio
     logger.info("Server starting up...")
+    _set_startup_error(app, None)
 
     # Detect multi-agent mode
     multi_agent_env = os.environ.get("KESTREL_MULTI_AGENT", "").lower() in ("1", "true", "yes")
@@ -124,6 +137,7 @@ async def lifespan(app: FastAPI):
             logger.error(f"Error during multi-agent startup: {e}", exc_info=True)
             app.state.agent_manager = None
             app.state.agent = None
+            _set_startup_error(app, e)
     else:
         # --- Single-agent mode (original behavior) ---
         app.state.agent_manager = None
@@ -160,6 +174,8 @@ async def lifespan(app: FastAPI):
             logger.info(f"Kestrel Agent initialized and ready (backend: {db_backend})")
         except Exception as e:
             logger.error(f"Error during startup: {e}", exc_info=True)
+            app.state.agent = None
+            _set_startup_error(app, e)
 
     yield
 
@@ -284,7 +300,9 @@ async def auth_middleware(request: Request, call_next):
     1. API key (X-API-Key header, Bearer token, or query param) — for programmatic access
     2. OAuth session cookie — for browser access via Google sign-in
     """
-    public_paths = ["/health", "/health/detailed", "/api/auth/key", "/favicon.ico", "/webhooks/stripe/crypto"]
+    public_paths = ["/health", "/health/detailed", "/favicon.ico", "/webhooks/stripe/crypto"]
+    if _bootstrap_key_enabled():
+        public_paths.append("/api/auth/key")
     auth_paths = ["/auth/login", "/auth/callback", "/auth/logout"]
     static_prefixes = ["/static", "/js/", "/shared/", "/utils/"]
 
@@ -418,6 +436,9 @@ def _is_docker_network(host: str) -> bool:
 @limiter.limit("5/minute")
 async def get_bootstrap_key(request: Request):
     """Return API key for initial frontend setup (localhost only)."""
+    if not _bootstrap_key_enabled():
+        raise HTTPException(status_code=404, detail="API key bootstrap endpoint is disabled")
+
     client_host = request.client.host if request.client else None
     allowed_hosts = {"127.0.0.1", "localhost", "::1", "172.17.0.1"}
     is_docker_internal = client_host and _is_docker_network(client_host)
@@ -436,6 +457,7 @@ async def get_bootstrap_key(request: Request):
 @app.get("/health")
 def health_check(request: Request):
     """A simple health check endpoint."""
+    startup_error = getattr(request.app.state, "startup_error", None)
     agent = getattr(request.state, 'agent', None) or getattr(request.app.state, 'agent', None)
     if agent:
         return {"status": "ok", "agent_initialized": True}
@@ -443,7 +465,10 @@ def health_check(request: Request):
     manager = getattr(request.app.state, 'agent_manager', None)
     if manager and manager.list_agents():
         return {"status": "ok", "agent_initialized": True}
-    return {"status": "ok", "agent_initialized": False}
+    payload = {"status": "unhealthy" if startup_error else "degraded", "agent_initialized": False}
+    if startup_error:
+        payload["error"] = startup_error
+    return JSONResponse(status_code=503, content=payload)
 
 
 @app.get("/health/detailed")
@@ -458,9 +483,9 @@ async def health_detailed(request: Request):
         return {"status": "unhealthy", "error": "No agent available", "checks": []}
 
     # Find the HeartbeatFeature among the agent's features
-    features = getattr(agent, 'features', [])
+    features = getattr(agent, 'features', {})
     heartbeat_feature = None
-    for feat in features:
+    for feat in features.values() if isinstance(features, dict) else features:
         if feat.__class__.__name__ == "HeartbeatFeature":
             heartbeat_feature = feat
             break

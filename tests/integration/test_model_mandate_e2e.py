@@ -4,9 +4,15 @@ Integration tests for model mandate command and API.
 Tests the !model-mandate command and /api/models endpoint.
 Uses TestClient for API tests - no running server required.
 """
+from contextlib import asynccontextmanager
 import pytest
 from typing import Dict, Any
 from fastapi.testclient import TestClient
+
+
+@asynccontextmanager
+async def _noop_lifespan(_app):
+    yield
 
 
 class TestModelMandateMethods:
@@ -124,11 +130,16 @@ class TestModelDiscoveryAPI:
 
         mock_agent.llm_service.discover_all_models = mock_discover
 
+        original_lifespan = app.router.lifespan_context
+        app.router.lifespan_context = _noop_lifespan
         app.state.agent = mock_agent
-
-        with TestClient(app) as client:
-            client.headers.update({"X-API-Key": test_api_key})
-            yield client
+        try:
+            with TestClient(app) as client:
+                client.headers.update({"X-API-Key": test_api_key})
+                yield client
+        finally:
+            app.router.lifespan_context = original_lifespan
+            app.state.agent = None
 
     def test_api_models_returns_by_provider(self, client):
         """GET /api/models returns by_provider grouped format."""
@@ -181,15 +192,27 @@ class TestAuthKeyEndpoint:
         """TestClient with mock agent."""
         from server import app
         from unittest.mock import MagicMock
+        import os
 
+        original_bootstrap = os.environ.get("KESTREL_ENABLE_API_KEY_BOOTSTRAP")
+        os.environ["KESTREL_ENABLE_API_KEY_BOOTSTRAP"] = "true"
         mock_agent = MagicMock()
         mock_agent.agent_id = "did:test:auth_key"
         mock_agent.storage = None
 
+        original_lifespan = app.router.lifespan_context
+        app.router.lifespan_context = _noop_lifespan
         app.state.agent = mock_agent
-
-        with TestClient(app) as client:
-            yield client
+        try:
+            with TestClient(app) as client:
+                yield client
+        finally:
+            if original_bootstrap is None:
+                os.environ.pop("KESTREL_ENABLE_API_KEY_BOOTSTRAP", None)
+            else:
+                os.environ["KESTREL_ENABLE_API_KEY_BOOTSTRAP"] = original_bootstrap
+            app.router.lifespan_context = original_lifespan
+            app.state.agent = None
 
     def test_auth_key_rejects_non_localhost(self, client):
         """GET /api/auth/key rejects non-localhost requests (TestClient appears as 'testclient')."""
@@ -199,6 +222,26 @@ class TestAuthKeyEndpoint:
         # This is correct security behavior - auth key bootstrap only from localhost
         assert response.status_code == 403
         assert "localhost" in response.json()["detail"].lower()
+
+    def test_auth_key_disabled_by_default(self, monkeypatch):
+        """GET /api/auth/key is disabled unless explicitly enabled."""
+        from server import app
+        from unittest.mock import MagicMock
+
+        monkeypatch.delenv("KESTREL_ENABLE_API_KEY_BOOTSTRAP", raising=False)
+
+        original_lifespan = app.router.lifespan_context
+        app.router.lifespan_context = _noop_lifespan
+        app.state.agent = MagicMock()
+
+        try:
+            with TestClient(app) as client:
+                response = client.get("/api/auth/key")
+        finally:
+            app.router.lifespan_context = original_lifespan
+            app.state.agent = None
+
+        assert response.status_code == 401
 
 
 class TestProtectedEndpointsRequireAuth:
@@ -216,10 +259,15 @@ class TestProtectedEndpointsRequireAuth:
         mock_agent.storage.get_conversations = AsyncMock(return_value=[])
         mock_agent.storage.sovereign_adapter = None
 
+        original_lifespan = app.router.lifespan_context
+        app.router.lifespan_context = _noop_lifespan
         app.state.agent = mock_agent
-
-        with TestClient(app) as client:
-            yield client
+        try:
+            with TestClient(app) as client:
+                yield client
+        finally:
+            app.router.lifespan_context = original_lifespan
+            app.state.agent = None
 
     def test_memories_requires_auth(self, client):
         """GET /api/memories requires API key."""
@@ -308,11 +356,16 @@ class TestModelSetEndpoint:
         mock_agent.llm_service = LLMService()
         mock_agent.storage = None
 
+        original_lifespan = app.router.lifespan_context
+        app.router.lifespan_context = _noop_lifespan
         app.state.agent = mock_agent
-
-        with TestClient(app) as client:
-            client.headers.update({"X-API-Key": test_api_key})
-            yield client
+        try:
+            with TestClient(app) as client:
+                client.headers.update({"X-API-Key": test_api_key})
+                yield client
+        finally:
+            app.router.lifespan_context = original_lifespan
+            app.state.agent = None
 
     def test_set_model_with_provider(self, client):
         """POST /api/model/set with explicit model and provider."""
@@ -396,11 +449,16 @@ class TestChatCompletionsModelPassthrough:
         mock_llm_service.set_model_preference = MagicMock()
         mock_agent.llm_service = mock_llm_service
 
+        original_lifespan = app.router.lifespan_context
+        app.router.lifespan_context = _noop_lifespan
         app.state.agent = mock_agent
-
-        with TestClient(app) as client:
-            client.headers.update({"X-API-Key": test_api_key})
-            yield client, mock_agent
+        try:
+            with TestClient(app) as client:
+                client.headers.update({"X-API-Key": test_api_key})
+                yield client, mock_agent
+        finally:
+            app.router.lifespan_context = original_lifespan
+            app.state.agent = None
 
     def test_model_passed_to_process_input(self, client):
         """Model from request is passed as model_override to process_input."""
@@ -417,8 +475,8 @@ class TestChatCompletionsModelPassthrough:
         call_kwargs = mock_agent.process_input.call_args
         assert call_kwargs.kwargs.get("model_override") == "openai/gpt-5-mini"
 
-    def test_model_persisted_via_set_preference(self, client):
-        """Model from request is also persisted via set_model_preference."""
+    def test_model_is_not_persisted_via_set_preference(self, client):
+        """Model from request should stay request-scoped for OpenAI-compatible calls."""
         test_client, mock_agent = client
 
         test_client.post("/v1/chat/completions", json={
@@ -426,10 +484,7 @@ class TestChatCompletionsModelPassthrough:
             "messages": [{"role": "user", "content": "Hello"}],
         })
 
-        # Verify set_model_preference was called
-        mock_agent.llm_service.set_model_preference.assert_called_once_with(
-            "gpt-5-mini", "openai"
-        )
+        mock_agent.llm_service.set_model_preference.assert_not_called()
 
     def test_kestrel_local_model_not_overridden(self, client):
         """The default 'kestrel-local' model should not override."""
@@ -440,9 +495,7 @@ class TestChatCompletionsModelPassthrough:
             "messages": [{"role": "user", "content": "Hello"}],
         })
 
-        # Should NOT call set_model_preference for kestrel-local
         mock_agent.llm_service.set_model_preference.assert_not_called()
-        # model_override should be None
         call_kwargs = mock_agent.process_input.call_args
         assert call_kwargs.kwargs.get("model_override") is None
 
@@ -454,9 +507,7 @@ class TestChatCompletionsModelPassthrough:
             "messages": [{"role": "user", "content": "Hello"}],
         })
 
-        # Should NOT call set_model_preference
         mock_agent.llm_service.set_model_preference.assert_not_called()
-        # model_override should be None
         call_kwargs = mock_agent.process_input.call_args
         assert call_kwargs.kwargs.get("model_override") is None
 

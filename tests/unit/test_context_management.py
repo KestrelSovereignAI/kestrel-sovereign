@@ -332,6 +332,29 @@ class TestContextManagerIntegration:
         assert "model" in status
         assert "allocations" in status
 
+    @pytest.mark.asyncio
+    async def test_get_budget_status_uses_live_llm_service_model(self):
+        """Budget status should track llm_service model changes."""
+        from kestrel_sovereign.agent.context_manager import ContextManager
+
+        mock_storage = MagicMock()
+        mock_llm_service = MagicMock()
+        mock_llm_service.get_active_model_id.return_value = "gpt-4"
+
+        manager = ContextManager(
+            storage=mock_storage,
+            model="gpt-4",
+            agent_id="test-agent",
+            llm_service=mock_llm_service,
+        )
+
+        first = manager.get_budget_status(message_count=20)
+        mock_llm_service.get_active_model_id.return_value = "claude-3-5-sonnet"
+        second = manager.get_budget_status(message_count=20)
+
+        assert first["model"] == "gpt-4"
+        assert second["model"] == "claude-3-5-sonnet"
+
 
 class TestSessionCompression:
     """Tests for session compression feature."""

@@ -591,10 +591,10 @@ async def list_agent_models(
         # Get featured models
         featured = [m.to_dict() for m in models if m.is_featured]
 
-        # Get default model
+        # Get effective default model from the same routing source used at runtime.
         default_model = None
         if hasattr(agent, 'llm_service') and agent.llm_service:
-            default_model = agent.llm_service.default_model
+            default_model = agent.llm_service.get_active_model_id()
 
         return {
             "by_provider": by_provider,
@@ -711,8 +711,8 @@ async def chat_completions(request: Request):
     """Chat Completions-compatible endpoint.
 
     Respects the 'model' field from the request body. When a model is provided
-    (e.g. "openai/gpt-5-mini"), it is passed as model_override to the agent AND
-    persisted via set_model_preference so subsequent requests use the same model.
+    (e.g. "openai/gpt-5-mini"), it is passed as model_override to the agent for
+    this request only.
     """
     try:
         data = await request.json()
@@ -730,13 +730,6 @@ async def chat_completions(request: Request):
         # Ignore sentinel values that aren't real model names
         if model_from_request and model_from_request not in ("kestrel-local", "auto"):
             model_override = model_from_request
-            # Also persist as mandate preference so the selection sticks
-            if hasattr(agent, 'llm_service') and agent.llm_service:
-                provider = None
-                model_name = model_from_request
-                if "/" in model_from_request:
-                    provider, model_name = model_from_request.split("/", 1)
-                agent.llm_service.set_model_preference(model_name, provider)
 
         assistant_text = await agent.process_input(
             user_input, model_override=model_override

@@ -17,6 +17,7 @@ class TestAgentCancellation:
         # Create minimal mock
         agent = MagicMock(spec=KestrelAgent)
         agent._current_request_id = None
+        agent._active_request_ids = set()
         agent._cancelled_requests = set()
         
         # Bind actual methods
@@ -39,6 +40,16 @@ class TestAgentCancellation:
         
         assert result is True
         assert "test-request-123" in mock_agent._cancelled_requests
+
+    def test_cancel_specific_request_id(self, mock_agent):
+        """Explicit request IDs should be cancellable without changing current state first."""
+        mock_agent._active_request_ids = {"req-1", "req-2"}
+        mock_agent._current_request_id = "req-2"
+
+        result = mock_agent.cancel_current_request("req-1")
+
+        assert result is True
+        assert "req-1" in mock_agent._cancelled_requests
 
     def test_is_request_cancelled_returns_true_for_cancelled(self, mock_agent):
         """is_request_cancelled returns True for cancelled requests."""
@@ -131,3 +142,23 @@ class TestStopEndpoint:
         data = response.json()
         assert data["success"] is True
         assert data["cancelled"] is False
+
+    @pytest.mark.asyncio
+    async def test_stop_endpoint_passes_request_id(self):
+        """Stop endpoint forwards explicit request IDs for scoped cancellation."""
+        from fastapi.testclient import TestClient
+        from fastapi import FastAPI
+        from endpoints.agent import router
+
+        app = FastAPI()
+        app.include_router(router)
+
+        mock_agent = MagicMock()
+        mock_agent.cancel_current_request = MagicMock(return_value=True)
+        app.state.agent = mock_agent
+
+        client = TestClient(app)
+        response = client.post("/agent/stop", json={"request_id": "req-123"})
+
+        assert response.status_code == 200
+        mock_agent.cancel_current_request.assert_called_once_with(request_id="req-123")
