@@ -98,6 +98,21 @@ class StreamingMixin:
 
         return tools  # Model not in cache, pass tools through
 
+    def _get_local_provider_names(self) -> set:
+        """Get names of all local providers (ollama, llama_cpp, etc).
+
+        Uses provider_registry.get_local_providers() which checks for
+        providers marked with local=true in config, not just hardcoded names.
+        """
+        try:
+            if hasattr(self, 'provider_registry') and self.provider_registry:
+                local_providers = self.provider_registry.get_local_providers()
+                if local_providers:
+                    return {p.name for p in local_providers}
+        except (TypeError, AttributeError):
+            pass
+        return {"ollama"}  # Safe fallback if registry not available
+
     async def get_streaming_response(
         self,
         system_prompt: str,
@@ -165,7 +180,8 @@ class StreamingMixin:
                     ]
 
         if force_local_only:
-            providers_to_use = [p for p in providers_to_use if p["name"] in ["ollama"]]
+            local_names = self._get_local_provider_names()
+            providers_to_use = [p for p in providers_to_use if p["name"] in local_names]
             if not providers_to_use:
                 raise RuntimeError("No local providers available.")
 
@@ -325,7 +341,8 @@ class StreamingMixin:
         # Fall back to standard providers
         providers = self.providers
         if force_local_only:
-            providers = [p for p in providers if p["name"] in ["ollama"]]
+            local_names = self._get_local_provider_names()
+            providers = [p for p in providers if p["name"] in local_names]
             # Clear any cloud model override — use the local provider's own model
             if model_override and providers and not any(
                 model_override == p["model"] for p in providers
@@ -459,7 +476,8 @@ class StreamingMixin:
         # Determine providers to use
         providers = self.providers
         if force_local_only:
-            providers = [p for p in providers if p["name"] in ["ollama"]]
+            local_names = self._get_local_provider_names()
+            providers = [p for p in providers if p["name"] in local_names]
             if not providers:
                 raise LLMStreamingError("No local providers available")
             # Clear any cloud model override — use the local provider's own model

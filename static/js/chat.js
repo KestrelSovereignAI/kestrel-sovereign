@@ -247,7 +247,7 @@ async function stopRequest() {
     
     // Tell server to stop processing
     try {
-        const result = await API.stop();
+        const result = await API.stop(API.getCurrentStreamRequestId());
         console.log('Stop result:', result);
     } catch (e) {
         console.error('Error stopping request:', e);
@@ -585,6 +585,9 @@ export async function loadModels() {
 
     // Initialize - loads models, binds events, syncs with server
     await sharedModelSelector.init();
+
+    // Expose globally so other modules (identity.js) can auto-switch on privacy change
+    window._sharedModelSelector = sharedModelSelector;
 
     // Update state with initial selection (both provider and model)
     const selection = sharedModelSelector.getSelection();
