@@ -247,7 +247,7 @@ async function stopRequest() {
     
     // Tell server to stop processing
     try {
-        const result = await API.stop();
+        const result = await API.stop(API.getCurrentStreamRequestId());
         console.log('Stop result:', result);
     } catch (e) {
         console.error('Error stopping request:', e);

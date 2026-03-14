@@ -444,6 +444,7 @@ class TestCancellation:
             storage_path=str(tmp_path / "test.db")
         )
 
+        agent.register_active_request("request-123")
         agent._current_request_id = "request-123"
 
         result = agent.cancel_current_request()
@@ -472,6 +473,7 @@ class TestCancellation:
             storage_path=str(tmp_path / "test.db")
         )
 
+        agent.register_active_request("request-456")
         agent._current_request_id = "request-456"
         agent._cancelled_requests.add("request-456")
 
@@ -484,6 +486,7 @@ class TestCancellation:
             storage_path=str(tmp_path / "test.db")
         )
 
+        agent.register_active_request("request-456")
         agent._cancelled_requests.add("request-456")
 
         assert agent.is_request_cancelled("request-456") is True
@@ -496,9 +499,25 @@ class TestCancellation:
             storage_path=str(tmp_path / "test.db")
         )
 
+        agent.register_active_request("request-999")
         agent._current_request_id = "request-999"
 
         assert agent.is_request_cancelled() is False
+
+    def test_cancel_current_request_specific_id_returns_true(self, tmp_path):
+        """cancel_current_request(request_id) cancels the targeted active request."""
+        agent = KestrelAgent(
+            did="did:test:123",
+            storage_path=str(tmp_path / "test.db")
+        )
+
+        agent.register_active_request("request-1")
+        agent.register_active_request("request-2")
+
+        result = agent.cancel_current_request("request-1")
+
+        assert result is True
+        assert "request-1" in agent._cancelled_requests
 
 
 # =============================================================================

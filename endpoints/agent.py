@@ -43,6 +43,23 @@ async def _parse_json_body(request: Request) -> dict:
         raise HTTPException(status_code=400, detail=f"Invalid JSON: {orig_err}")
 
 
+async def _parse_optional_json_body(request: Request) -> dict:
+    """Parse JSON when present, returning an empty dict for an empty body."""
+    raw = await request.body()
+    if not raw.strip():
+        return {}
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as orig_err:
+        cleaned = _INVALID_JSON_ESCAPE.sub(lambda m: m.group(1), raw)
+        if cleaned != raw:
+            try:
+                return json.loads(cleaned)
+            except Exception:
+                pass
+        raise HTTPException(status_code=400, detail=f"Invalid JSON: {orig_err}")
+
+
 @router.post("/invoke")
 @limiter.limit("60/minute")
 async def invoke_agent(request: Request):
@@ -112,7 +129,10 @@ async def stream_agent_response(request: Request):
 
         # Generate unique request ID for cancellation tracking
         request_id = str(uuid.uuid4())
-        agent._current_request_id = request_id
+        if hasattr(agent, "register_active_request"):
+            agent.register_active_request(request_id)
+        else:
+            agent._current_request_id = request_id
 
         async def generate():
             try:
@@ -137,7 +157,11 @@ async def stream_agent_response(request: Request):
         return StreamingResponse(
             generate(),
             media_type="text/plain",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+                "X-Request-ID": request_id,
+            }
         )
     except Exception as e:
         logger.error(f"Error setting up stream: {e}", exc_info=True)
@@ -151,11 +175,14 @@ async def stop_agent_request(request: Request):
     Used by the stop button in the UI.
     """
     try:
+        data = await _parse_optional_json_body(request)
+        request_id = data.get("request_id") or request.query_params.get("request_id")
         agent = get_agent(request)
-        cancelled = agent.cancel_current_request()
+        cancelled = agent.cancel_current_request(request_id=request_id)
         return {
             "success": True,
             "cancelled": cancelled,
+            "request_id": request_id,
             "message": "Request cancelled" if cancelled else "No active request to cancel"
         }
     except Exception as e:

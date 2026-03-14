@@ -112,7 +112,12 @@ class ContextManager:
         # Initialize specialized managers
         self.conversation_manager = ConversationManager(storage, agent_id)
         self.memory_manager = MemoryManager(storage, agent_id, consolidator, memory_retriever)
-        self.tool_context_manager = ToolContextManager(storage, self.model, agent_id)
+        self.tool_context_manager = ToolContextManager(
+            storage=storage,
+            model=self.model,
+            agent_id=agent_id,
+            llm_service=llm_service,
+        )
 
     @property
     def model(self) -> str:
