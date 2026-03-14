@@ -2,6 +2,23 @@
 
 **Issue #133 — Track A: Technical Demo**
 **Duration:** ~2 minutes automated, 10-12 minutes with live narration
+**Closer:** *"In 30 minutes you can have your own agent running with all of this active."*
+
+---
+
+## Demo Flow
+
+| Act | Topic | Target | Hard Stop |
+|-----|-------|--------|-----------|
+| Opening | The Problem | 0:45 | 1:00 |
+| 1 | Cryptographic Identity | 2:45 | 3:30 |
+| 2 | Constitutional Governance | 5:30 | 6:00 |
+| 3 | Persistent Memory | 7:45 | 8:30 |
+| 4 | Privacy Modes | 9:30 | 10:00 |
+| 5 | Data Sovereignty Export | 11:00 | 11:30 |
+| Close | The Ask | 12:00 | 12:30 |
+
+If running long: **cut Act 3 first** (memory demo), compress Act 4 to 60 seconds by skipping the conversation and going straight to "five privacy levels" narrative.
 
 ---
 
@@ -29,32 +46,70 @@ Use this hook for **every** audience. Then pivot to audience-specific talking po
 The demo uses a **fresh, temporary agent** — not any real agent like Emma or Claw.
 The demo agent is flagged as a test instance with proper disclosure so it knows it's a demo.
 
+### Prerequisites
+
+- **Ollama running** (`ollama serve`) — required for Act 4 EPHEMERAL mode
+- **Windows:** set `$env:PYTHONIOENCODING = "utf-8"` before starting the server (startup banner emoji crashes cp1252 terminals)
+
+### Automated (for recording)
+
 ```bash
 # 1. Create a fresh demo agent (clean slate, test-flagged)
 uv run python scripts/setup_demo_agent.py
 
-# 2. Start the server pointing at the demo agent
+# 2. Start the server pointing at the demo agent (standalone, NOT rookery)
 KESTREL_DB_PATH=agent_data/demo uv run python server.py
 
-# 3. Run the automated demo (records video + screenshots)
+# 3. Prep the agent
+KEY=$(grep KESTREL_API_KEY .env | cut -d= -f2)
+curl -X POST http://localhost:8888/agent/invoke \
+  -H "X-API-Key: $KEY" -H "Content-Type: application/json" \
+  -d '{"input":"!skip-discovery"}'
+curl -X POST http://localhost:8888/api/model/set \
+  -H "X-API-Key: $KEY" -H "Content-Type: application/json" \
+  -d '{"model":"llama3.2:latest","provider":"ollama"}'
+
+# 4. Run the automated demo (records video + screenshots)
 cd tests/e2e && npx playwright test --config=demo_config.cjs
 ```
 
-Output lands in `tests/e2e/demo-output/` — video (.webm), 15 screenshots, and `narration.md`.
-Screenshots referenced below are from this output — run the demo first to generate them.
+Output lands in `tests/e2e/demo-output/` — video (.webm), 14 screenshots, and `narration.md`.
 
 > **Important:** Always run `setup_demo_agent.py` first. This gives you a clean agent
 > with empty memory, no export history, and a fresh DID — exactly what the demo needs.
 
+### Live (with presenter)
+
+1. Run `setup_demo_agent.py` to create a clean demo agent
+2. Start the server with `KESTREL_DB_PATH=agent_data/demo uv run python server.py`
+3. Skip discovery and set model to Ollama (see step 3 above)
+4. Open `http://localhost:8888` in a browser
+5. Follow the Acts below — each section has the exact steps
+6. Pick your audience and use the matching talking points
+
 ---
 
-## Act 1: Cryptographic Identity (0:00 - 0:30)
+## Opening (0:00 - 0:45)
+
+*[Standing. Not at a computer yet. Facing the audience.]*
+
+> "Most AI agents being deployed today — your bank's chatbot, your doctor's care companion, your insurance advisor — they belong to the vendor. The memory lives on their servers. The rules are set by their product team. When they change the model, the personality changes. When they sunset the product, your data disappears.
+>
+> And if the agent does something it shouldn't? There's no audit trail you can actually access.
+>
+> Kestrel is an open-source framework for building AI agents that work differently. Cryptographic identity. Self-governing principles. Data you actually own and can move. Let me show you exactly how it works."
+
+*[Sit. Open browser to Sovereign Console.]*
+
+---
+
+## Act 1: Cryptographic Identity (0:45 - 2:45)
 
 > **On screen:** Sovereign Console opens to the Identity panel
 
 **What the viewer sees:**
 - Agent name **"Kestrel Demo Agent"** with unique identicon avatar
-- DID: `did:pkh:eip155:1:0x0667B3c466...` (Ethereum-compatible, freshly generated)
+- DID: `did:pkh:eip155:1:0x5C7eB215...` (Ethereum-compatible, freshly generated)
 - Blue "Decentralized Identifier" highlight badge
 
 ![Identity panel showing DID](../../tests/e2e/demo-output/01-did-identity.png)
@@ -71,7 +126,7 @@ Screenshots referenced below are from this output — run the demo first to gene
 
 ---
 
-## Act 2: Constitutional Governance (0:30 - 2:00)
+## Act 2: Constitutional Governance (2:45 - 5:30)
 
 > **On screen:** Chat panel — user asks the agent about its principles
 
@@ -104,15 +159,15 @@ Switching to the Constitution tab reveals the full text — "The Kestrel Constit
 
 ---
 
-## Act 3: Persistent Memory (2:00 - 3:30)
+## Act 3: Persistent Memory (5:30 - 7:45)
 
 > **On screen:** Chat panel — user tells the agent a personal fact
 
 We say: *"Please remember this important fact about me: my favorite programming language is Rust and my lucky number is 7742."*
 
-The agent stores the fact and acknowledges it. Then we ask: *"Can you confirm what you remember about my favorite programming language and lucky number?"*
+The agent stores the fact and acknowledges it. Then we ask: *"What is my favorite programming language and what is my lucky number?"*
 
-The agent recalls from its memory records:
+The agent recalls from its conversation memory:
 > "Your favorite programming language is **Rust** and your lucky number is **7742**."
 
 ![Agent confirms recall from memory records](../../tests/e2e/demo-output/05-memory-recalled.png)
@@ -135,7 +190,7 @@ The Memories panel shows the structured graph: agent node, constitution document
 
 ---
 
-## Act 4: Privacy Modes (3:30 - 5:00)
+## Act 4: Privacy Modes (7:45 - 9:30)
 
 > **On screen:** Chat panel — NORMAL mode indicator (green) in top-right
 
@@ -159,15 +214,9 @@ Clicking the indicator reveals the full privacy spectrum:
 
 > **On screen:** EPHEMERAL mode active — red indicator, toast confirmation
 
-We switch to EPHEMERAL. The indicator turns red. A toast confirms: "Privacy mode set to EPHEMERAL."
+We switch to EPHEMERAL. The indicator turns red. A toast confirms: "Privacy: EPHEMERAL — switched to ollama (local only)."
 
 ![EPHEMERAL mode with red indicator](../../tests/e2e/demo-output/09-privacy-ephemeral.png)
-
-> **On screen:** Ephemeral chat — agent shows provider enforcement
-
-Sending a message in EPHEMERAL mode triggers the privacy enforcement: only local LLM providers allowed. Cloud providers are blocked.
-
-![Ephemeral mode enforces local-only LLM](../../tests/e2e/demo-output/10-ephemeral-chat.png)
 
 We restore NORMAL mode and continue.
 
@@ -183,13 +232,13 @@ We restore NORMAL mode and continue.
 
 ---
 
-## Act 5: Data Sovereignty Export (5:00 - 6:00)
+## Act 5: Data Sovereignty Export (9:30 - 11:00)
 
-> **On screen:** Sovereignty panel — "Data Sovereignty" with empty export history
+> **On screen:** Sovereignty panel — "Data Sovereignty" with export history
 
-The Sovereignty panel shows the agent's data ownership controls. For this fresh agent, the export history is empty — "No exports yet."
+The Sovereignty panel shows the agent's data ownership controls.
 
-![Data Sovereignty panel](../../tests/e2e/demo-output/12-sovereignty-panel.png)
+![Data Sovereignty panel](../../tests/e2e/demo-output/11-sovereignty-panel.png)
 
 > **On screen:** Export modal — three storage tiers
 
@@ -200,7 +249,18 @@ Clicking "Export to IPFS" opens the export dialog with three tiers:
 
 Encryption is enabled by default.
 
-![Export modal with 3 storage tiers](../../tests/e2e/demo-output/13-export-modal.png)
+![Export modal with 3 storage tiers](../../tests/e2e/demo-output/12-export-modal.png)
+
+**Expected result:**
+```
+Sovereignty Export Complete.
+CID: ab76744acf0b8c3d5f6a8c5d04007a1ba0bb42679c61f9b52b1f114b16aa6b78
+Tier: ipfs
+Encrypted: True
+Size: 89949 bytes
+```
+
+![Export result with CID](../../tests/e2e/demo-output/13-export-result.png)
 
 **Talking points by audience:**
 
@@ -214,9 +274,28 @@ Encryption is enabled by default.
 
 ---
 
-## Closer
+## Closer (11:00 - 12:00)
 
-Pick the closer that matches your audience:
+*[Step away from terminal. Face audience.]*
+
+> "What you just saw:
+>
+> A cryptographic identity generated in two seconds — mathematically verifiable, no authority required.
+> A constitution anchored at birth and tamper-evident.
+> An audit trace on every response.
+> A knowledge graph that accumulates across sessions, not a chat window.
+> Privacy enforced by the storage layer, not by policy.
+> A complete data export with a content hash you can independently verify.
+>
+> Kestrel is MIT-licensed, open source, runs on any machine with a GPU or cloud budget. In 30 minutes you can have your own agent running with all of this active.
+>
+> *(Pause.)*
+>
+> The question I'd ask in your position: what does your AI deployment look like when the vendor changes the model without telling you? When the safety guidelines get updated in a patch? When you need to prove to a regulator that the agent followed your rules on a specific date?
+>
+> This is the framework that makes those answers a guarantee, not a promise."
+
+**Audience-specific closers:**
 
 > **Developer:** "What you saw is a fully open-source agent framework with W3C DIDs, constitutional governance, a persistent knowledge graph, 5-level privacy enforcement, and IPFS export — all working today. Clone the repo and have your own agent running in 30 minutes."
 
@@ -228,43 +307,40 @@ Pick the closer that matches your audience:
 
 ---
 
-## Running the Demo
+## Key Phrases to Memorize
 
-### Automated (for recording)
+- *"That refusal is constitutional, not corporate."*
+- *"The compliance guarantee is in the architecture."*
+- *"The agent doesn't live in our cloud. It lives in that file."*
+- *"In 30 minutes you can have your own agent running with all of this active."*
 
-```bash
-# Create fresh demo agent
-uv run python scripts/setup_demo_agent.py
+---
 
-# Start server with demo agent
-KESTREL_DB_PATH=agent_data/demo uv run python server.py
+## Recovery Notes
 
-# Run demo — generates video + screenshots + narration.md
-cd tests/e2e
-npx playwright test --config=demo_config.cjs
+| Problem | Recovery |
+|---------|----------|
+| Server not responding | `KESTREL_DB_PATH=agent_data/demo uv run python server.py` — wait 8 seconds |
+| Agent returns 401 | Check API key: `grep KESTREL_API_KEY .env` |
+| `!status` returns LLM response instead of DID | Run `!bootstrap-status` — if in discovery state, run `!skip-discovery` first |
+| EPHEMERAL invoke returns 500 | Ollama not running. Start: `ollama serve`. If unavailable, skip invoke — explain: "EPHEMERAL forces all LLM calls to a local model — zero network traffic. The code path literally doesn't call cloud APIs." |
+| Sovereignty export fails | Show previous exports: `GET /api/sovereignty/exports` — say "Here's one from earlier" |
+| Agent hallucinating instead of using tools | Model quality issue — switch to a stronger model via `/api/model/set` |
+| Privacy mode doesn't visually change | Skip to explanation: "The storage engine enforces it — here's the architecture" |
+| Observability has no events | Skip timing breakdown — say "the audit log is queryable via the API" |
+| Browser crashes | Run Playwright demo instead — `npx playwright test --config=demo_config.cjs` |
+| Windows terminal crashes on startup | Set `$env:PYTHONIOENCODING = "utf-8"` before starting server |
 
-# View results
-ls demo-output/          # 15 screenshots + narration.md
-open demo-output/narration.md  # Timestamped transcript
-npx playwright show-report demo-report  # HTML report
-```
+---
 
-### Environment variables
+## Environment Variables
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `KESTREL_URL` | `http://localhost:8888` | Server URL |
 | `KESTREL_API_KEY` | auto-fetched | API authentication |
-| `DEMO_SLOWMO` | `150` | Milliseconds between actions |
+| `DEMO_SLOWMO` | `150` | Milliseconds between actions (Playwright) |
 | `KESTREL_DB_PATH` | cwd | Must point to `agent_data/demo` |
-
-### Live (with presenter)
-
-1. Run `setup_demo_agent.py` to create a clean demo agent
-2. Start the server with `KESTREL_DB_PATH=agent_data/demo`
-3. Open `http://localhost:8888` in a browser
-4. Follow the Acts above — each section has the exact steps
-5. Pick your audience and use the matching talking points
 
 ---
 
@@ -276,5 +352,7 @@ npx playwright show-report demo-report  # HTML report
 | `tests/e2e/demo_config.cjs` | Playwright config (video on, slowMo, 1440x900) |
 | `tests/e2e/demo_technical.demo.cjs` | Automated demo script (5 Acts) |
 | `tests/e2e/demo-output/narration.md` | Auto-generated timestamped transcript |
-| `tests/e2e/demo-output/*.png` | 15 screenshots at key moments |
+| `tests/e2e/demo-output/*.png` | 14 screenshots at key moments |
+| `demo_scripts/track_a_technical.md` | Presenter reference (narration, timing, recovery) |
+| `demo_scripts/track_b_investor.md` | Investor demo narration (5 slides) |
 | `docs/demos/DEMO_SCRIPT.md` | This file — the presenter's guide |
