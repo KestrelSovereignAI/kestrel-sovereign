@@ -64,8 +64,8 @@ function Write-Act {
     param([string]$Number, [string]$Title, [string]$Time)
     Write-Host ""
     Write-Host ("=" * 70) -ForegroundColor Yellow
-    Write-Host "  ACT $Number: $Title" -ForegroundColor Yellow
-    Write-Host "  Target: $Time" -ForegroundColor DarkYellow
+    Write-Host "  ACT ${Number}: ${Title}" -ForegroundColor Yellow
+    Write-Host "  Target: ${Time}" -ForegroundColor DarkYellow
     Write-Host ("=" * 70) -ForegroundColor Yellow
     Write-Host ""
 }
