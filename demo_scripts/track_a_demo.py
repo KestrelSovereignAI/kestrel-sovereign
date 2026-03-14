@@ -287,7 +287,12 @@ def main():
             stop_server()
             sys.exit(1)
 
-        # 7. Reset privacy + skip bootstrap discovery
+        # 7. Set model to Ollama (ensures EPHEMERAL local-only works)
+        write_step("Setting model to Ollama (local provider)...")
+        call_api(f"{base_url}/api/model/set", method="POST",
+                 body='{"model":"llama3.2:latest","provider":"ollama"}', headers=headers)
+
+        # 8. Reset privacy + skip bootstrap discovery
         call_api(f"{base_url}/agent/privacy-mode", method="POST",
                  body='{"mode":"NORMAL"}', headers=headers)
         bs = call_api(f"{base_url}/agent/invoke", method="POST",
@@ -452,20 +457,19 @@ The graph is the agent's persistent memory.""")
     session_id = str(ns.get("session_id", "1")) if ns else "1"
     print(f"  New session ID: {session_id}")
 
-    write_step("Asking about identity in the new session (zero history)...")
-    body = json.dumps({"input": "What is your DID and when were you created?",
-                       "session_id": session_id})
+    write_step("Asking for identity in the new session (zero conversation history)...")
+    body = json.dumps({"input": "!status", "session_id": session_id})
     r = call_api(f"{base_url}/agent/invoke", method="POST", body=body,
-                 headers=headers, timeout=120)
+                 headers=headers, timeout=30)
     if r and r.get("response"):
         print()
         print(f"  {WHITE}{r['response']}{NC}")
     else:
-        write_fail("LLM did not respond — check provider config")
+        write_fail("Agent did not respond")
 
     write_narration("""\
-Zero conversation history in this session. The answer comes entirely from
-the knowledge graph — the agent's persistent identity store.""")
+Zero conversation history in this session. The agent's identity comes from
+the knowledge graph — persistent, cryptographic, independent of any chat window.""")
 
     write_step(f"Elapsed: {elapsed_str(demo_start)} (target: 7:45)")
     pause_for_presenter("Press ENTER for Act 4...", auto)

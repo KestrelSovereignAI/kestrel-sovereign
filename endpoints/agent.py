@@ -249,7 +249,12 @@ async def set_privacy_mode(request: Request):
         if not config.allows_cloud_llm() and hasattr(agent, 'llm_service') and agent.llm_service:
             llm = agent.llm_service
             local_names = llm._get_local_provider_names()
-            local_provider = next((p for p in llm.providers if p["name"] in local_names), None)
+            local_providers = [p for p in llm.providers if p["name"] in local_names]
+            # Prefer ollama over llama_cpp — ollama is more universally available
+            local_provider = next(
+                (p for p in local_providers if p["name"] == "ollama"),
+                local_providers[0] if local_providers else None,
+            )
             if local_provider:
                 llm.set_model_preference(local_provider["model"], local_provider["name"])
                 model_switched = {"provider": local_provider["name"], "model": local_provider["model"]}
