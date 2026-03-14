@@ -889,19 +889,16 @@ Expected Duration: {expected_duration}
                 if response:
                     return response
 
-        # Store user input according to privacy mode
-        # Pass session_id to link this message to the resumed session
-        try:
-            await self.privacy_agent.add_conversation("user", user_input, session_id=session_id)
-        except DecryptionError:
-            # Log but continue - we can still process without storing
-            logging.warning("DecryptionError storing user input - continuing in degraded mode")
-
         # Prompt injection detection (log-only, does not block)
         check_prompt_injection(user_input)
 
         # Use unified ContextManager for token-aware context assembly
         # This handles: system prompt, episodes, memories, RAG, history
+        #
+        # IMPORTANT: We build context BEFORE storing the user message so that
+        # the memory retriever doesn't find the current message and present it
+        # as a pre-existing memory. The user message is stored after context
+        # assembly (below).
         constitution = await self._get_governing_constitution()
         try:
             logging.info(f"[SESSION-DEBUG] Fetching history with session_id={session_id}")
@@ -932,6 +929,13 @@ Expected Duration: {expected_duration}
             privacy_mode=self._privacy_mode.value,
             conversation_history=history,
         )
+
+        # NOW store user input — after context is built so memory retrieval
+        # doesn't find the current message as a "past memory"
+        try:
+            await self.privacy_agent.add_conversation("user", user_input, session_id=session_id)
+        except DecryptionError:
+            logging.warning("DecryptionError storing user input - continuing in degraded mode")
         self._session_briefed = True
 
         # Log budget usage for monitoring and store for API access
