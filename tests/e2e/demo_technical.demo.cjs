@@ -462,18 +462,18 @@ test.describe.serial('Kestrel Sovereign Technical Demo', () => {
         await dismissContextWarning(page);
         await narrator.screenshot(page, 'memory-recalled');
 
-        // Beat 3: Show the memories panel — the knowledge graph (saved items, documents, etc.)
+        // Beat 3: Show the memories panel — the provenance graph
         narrator.narrate(section,
-            'Opening the Memories panel — the knowledge graph stores structured data...',
-            'Saved items, documents, backups, and sovereignty receipts are persisted here');
+            'Opening the Knowledge Graph — the agent\'s verifiable identity record...',
+            'The graph stores system events: identity, constitution, exports. Conversation memory is a separate encrypted store searched by the agent\'s memory tools.');
         await navigateToPanel(page, 'memories');
         await demoPause(page, 2000);
 
         try {
             await page.waitForSelector('#panel-memories', { state: 'visible', timeout: 5000 });
             narrator.narrate(section,
-                'Knowledge graph visible — agent identity, constitution, backups, and export receipts',
-                'Each node has a type badge and can be inspected or deleted by the owner');
+                'Two foundational nodes: the agent identity and the constitution it was born with',
+                'These were written at inception — tamper-evident, cryptographically anchored. The conversation recall you just saw comes from the encrypted message store.');
         } catch {
             narrator.narrate(section, 'Memories panel displayed');
         }
