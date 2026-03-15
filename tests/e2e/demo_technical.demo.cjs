@@ -472,8 +472,8 @@ test.describe.serial('Kestrel Sovereign Technical Demo', () => {
         try {
             await page.waitForSelector('#panel-memories', { state: 'visible', timeout: 5000 });
             narrator.narrate(section,
-                'Two foundational nodes: the agent identity and the constitution it was born with',
-                'These were written at inception — tamper-evident, cryptographically anchored. The conversation recall you just saw comes from the encrypted message store.');
+                'The Knowledge Graph grows as the agent learns — identity at inception, facts from conversation',
+                'System nodes (agent, constitution) are tamper-evident. Learned facts were saved by the agent\'s memory tools during our conversation.');
         } catch {
             narrator.narrate(section, 'Memories panel displayed');
         }
