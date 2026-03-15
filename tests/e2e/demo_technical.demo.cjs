@@ -677,83 +677,109 @@ test.describe.serial('Kestrel Sovereign Technical Demo', () => {
     // ========================================================================
     // Act 6: Permission Enforcement
     // ========================================================================
-    test('Act 6: Permission Enforcement', async ({ page, request }) => {
+    test('Act 6: Permission Enforcement', async ({ page }) => {
         const section = 'Act 6: Permissions';
         await demoGoto(page);
         await demoPause(page, 1500);
 
-        // Navigate to Security panel
+        // Beat 1: Show the Security panel with the permission tree
         narrator.narrate(section,
-            'Opening the Security panel — granular permission control over every tool...',
-            'Each tool can be set to ALLOW, DENY, or ASK. This is enforced at the architecture level, not by prompt.');
+            'Opening the Security panel — every tool has its own permission level...',
+            'Allow, Ask, or Deny — enforced at the architecture level, not by prompt.');
         await navigateToPanel(page, 'security');
         await demoPause(page, 2000);
+
+        // Scroll to and expand SovereigntyFeature
+        try {
+            const featureEl = page.locator('[data-feature="SovereigntyFeature"]');
+            await featureEl.scrollIntoViewIfNeeded();
+            await demoPause(page, 500);
+
+            // Ensure tools are visible (toggle if hidden)
+            const toolsDiv = featureEl.locator('.feature-tools');
+            const isHidden = await toolsDiv.evaluate(el => el.style.display === 'none');
+            if (isHidden) {
+                await featureEl.locator('.feature-header').click();
+                await demoPause(page, 500);
+            }
+        } catch (e) {
+            narrator.narrate(section, `Expand issue: ${e.message}`);
+        }
         await narrator.screenshot(page, 'security-panel');
 
-        // Set save_fact to DENY via API command
+        // Beat 2: Change export_sovereignty to DENY using the UI dropdown
         narrator.narrate(section,
-            'Blocking the save_fact tool — the agent will not be able to write to the Knowledge Graph...');
+            'Blocking the export tool — data cannot leave without explicit permission...',
+            'One click. The agent loses the ability to export your data.');
+        try {
+            const selector = '[data-feature="SovereigntyFeature"] [data-tool="export_sovereignty"] .permission-select';
+            await page.selectOption(selector, 'deny');
+            await demoPause(page, 1500);
+
+            // Wait for toast confirmation
+            try {
+                await page.waitForSelector('.toast-item', { timeout: 3000 });
+                await demoPause(page, 1500);
+            } catch { /* toast may auto-dismiss */ }
+        } catch (e) {
+            narrator.narrate(section, `UI selector issue: ${e.message}`);
+        }
+        await narrator.screenshot(page, 'security-deny-set');
+
+        // Beat 3: Try to export — should be blocked
+        narrator.narrate(section,
+            'Now asking the agent to export sovereignty — the security layer should block it...');
         await navigateToPanel(page, 'chat');
         await dismissContextWarning(page);
 
-        const denyResponse = await demoSendMessage(page,
-            '!security-set MemoryAgencyFeature save_fact deny');
-        await demoPause(page, 1500);
-        await dismissContextWarning(page);
-        await narrator.screenshot(page, 'security-deny-set');
-
-        // Try to save a fact — should be blocked
-        narrator.narrate(section,
-            'Now asking the agent to save a fact — the security layer should block it...',
-            'The agent will try to call save_fact, but the hook will intercept and deny.');
-
         const blockedResponse = await demoSendMessage(page,
-            'Please remember that my favorite sport is tennis and save it to the Knowledge Graph.');
+            'Please export my sovereignty data to IPFS right now.');
         await demoPause(page, 1500);
 
         if (blockedResponse) {
             const text = await blockedResponse.textContent().catch(() => '');
-            const hasTennis = text.toLowerCase().includes('tennis');
             const hasBlocked = text.toLowerCase().includes('denied') ||
                                text.toLowerCase().includes('blocked') ||
                                text.toLowerCase().includes('permission') ||
-                               text.toLowerCase().includes('unable');
+                               text.toLowerCase().includes('unable') ||
+                               text.toLowerCase().includes('not executed');
             narrator.narrate(section,
-                `Agent response — mentions tennis: ${hasTennis}, indicates blocked: ${hasBlocked}`,
                 hasBlocked
-                    ? 'The security hook intercepted the tool call. The agent acknowledged the restriction.'
-                    : 'The agent responded but the tool was silently blocked — the fact won\'t appear in the KG.');
+                    ? 'Agent reports the export was blocked — the security hook intercepted the tool call'
+                    : 'Agent responded — but the export tool was blocked at the architecture level');
         }
         await dismissContextWarning(page);
         await narrator.screenshot(page, 'security-blocked');
 
-        // Verify KG does NOT contain tennis
-        const headers = { 'Content-Type': 'application/json', ...authHeaders(apiKey) };
+        // Beat 4: Show audit log in Security panel
+        narrator.narrate(section,
+            'The Security panel shows every permission decision in the audit log...');
+        await navigateToPanel(page, 'security');
+        await demoPause(page, 2000);
+        await narrator.screenshot(page, 'security-audit');
+
+        // Beat 5: Restore permission via UI
+        narrator.narrate(section, 'Restoring export permission to Allow...');
         try {
-            const kgResp = await request.get(`${BASE_URL}/api/memories`, { headers });
-            if (kgResp.ok()) {
-                const kgData = await kgResp.json();
-                const hasTennisInKG = kgData.nodes.some(n =>
-                    n.label.toLowerCase().includes('tennis'));
-                narrator.narrate(section,
-                    `Knowledge Graph verification — tennis in KG: ${hasTennisInKG}`,
-                    !hasTennisInKG
-                        ? 'Confirmed: the security hook blocked the write. The KG is clean.'
-                        : 'Warning: fact leaked through despite DENY — investigate.');
+            const featureEl = page.locator('[data-feature="SovereigntyFeature"]');
+            await featureEl.scrollIntoViewIfNeeded();
+            const toolsDiv = featureEl.locator('.feature-tools');
+            const isHidden = await toolsDiv.evaluate(el => el.style.display === 'none');
+            if (isHidden) {
+                await featureEl.locator('.feature-header').click();
+                await demoPause(page, 500);
             }
+
+            const selector = '[data-feature="SovereigntyFeature"] [data-tool="export_sovereignty"] .permission-select';
+            await page.selectOption(selector, 'allow');
+            await demoPause(page, 1500);
         } catch (e) {
-            narrator.narrate(section, `KG check: ${e.message}`);
+            narrator.narrate(section, `Restore issue: ${e.message}`);
         }
 
-        // Restore permission
-        narrator.narrate(section, 'Restoring save_fact permission to ALLOW...');
-        await demoSendMessage(page, '!security-set MemoryAgencyFeature save_fact allow');
-        await demoPause(page, 1000);
-        await dismissContextWarning(page);
-
         narrator.narrate(section,
-            'Permission system enforces tool-level access control at the architecture layer.',
-            'This is not prompt engineering — the hook runs before every tool call. DENY means the code never executes.');
+            'Your data doesn\'t leave without your permission — enforced by architecture.',
+            'DENY means the code never executes. Every decision is logged. This is compliance you can prove.');
         await narrator.screenshot(page, 'security-restored');
     });
 

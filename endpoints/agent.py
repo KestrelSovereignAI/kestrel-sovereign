@@ -163,6 +163,8 @@ async def stream_agent_response(request: Request):
                 "X-Request-ID": request_id,
             }
         )
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error setting up stream: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Error setting up stream.")
@@ -244,20 +246,34 @@ async def set_privacy_mode(request: Request):
         agent.set_privacy_mode(new_mode)
 
         # If switching to a local-only mode, auto-switch model to a local provider
+        # If switching back to cloud-allowed mode, restore the previous model
         config = new_mode.to_config()
         model_switched = None
-        if not config.allows_cloud_llm() and hasattr(agent, 'llm_service') and agent.llm_service:
+        if hasattr(agent, 'llm_service') and agent.llm_service:
             llm = agent.llm_service
-            local_names = llm._get_local_provider_names()
-            local_providers = [p for p in llm.providers if p["name"] in local_names]
-            # Prefer ollama over llama_cpp — ollama is more universally available
-            local_provider = next(
-                (p for p in local_providers if p["name"] == "ollama"),
-                local_providers[0] if local_providers else None,
-            )
-            if local_provider:
-                llm.set_model_preference(local_provider["model"], local_provider["name"])
-                model_switched = {"provider": local_provider["name"], "model": local_provider["model"]}
+            if not config.allows_cloud_llm():
+                # Save current preference before overriding to local
+                current_pref = llm.get_model_preference()
+                if current_pref and current_pref.get("provider") not in (llm._get_local_provider_names() or []):
+                    llm._pre_ephemeral_preference = current_pref
+
+                local_names = llm._get_local_provider_names()
+                local_providers = [p for p in llm.providers if p["name"] in local_names]
+                # Prefer ollama over llama_cpp — ollama is more universally available
+                local_provider = next(
+                    (p for p in local_providers if p["name"] == "ollama"),
+                    local_providers[0] if local_providers else None,
+                )
+                if local_provider:
+                    llm.set_model_preference(local_provider["model"], local_provider["name"])
+                    model_switched = {"provider": local_provider["name"], "model": local_provider["model"]}
+            elif config.allows_cloud_llm():
+                # Restore previous cloud preference if we saved one
+                saved = getattr(llm, '_pre_ephemeral_preference', None)
+                if saved:
+                    llm.set_model_preference(saved.get("model", ""), saved.get("provider", ""))
+                    model_switched = saved
+                    llm._pre_ephemeral_preference = None
 
         return {
             "success": True,

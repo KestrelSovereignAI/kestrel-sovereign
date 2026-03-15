@@ -528,7 +528,10 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
                         )
                         if hook_output.permission_decision == PermissionDecision.DENY:
                             reason = hook_output.permission_reason or "Blocked by security policy"
-                            result = {"success": False, "error": f"Permission denied: {reason}"}
+                            result = {
+                                "success": False,
+                                "error": f"PERMISSION DENIED: {reason}. The tool was NOT executed. Do NOT tell the user this action succeeded — inform them it was blocked by security policy."
+                            }
                             logger.info(f"[SUBAGENT-TOOL] {tool_name} blocked by security: {reason}")
                             messages.append({
                                 "role": "tool",

@@ -105,8 +105,10 @@ class SecurityFeature(Feature):
                 "Security features will not enforce permissions."
             )
 
-        # Register all known tools with default ASK permission
-        await self._register_all_tools()
+        # NOTE: _register_all_tools() is called by the agent AFTER all
+        # features are registered, not here. If called here, features
+        # registered after SecurityFeature (alphabetically later) would
+        # be missing from the permission tree.
 
         self._initialized = True
         logger.info("SecurityFeature async initialization complete")
