@@ -411,7 +411,7 @@ async def test_save_fact_creates_kg_node():
     assert fact_id in graph.nodes
     node = graph.nodes[fact_id]
     assert node.node_type == "learned_fact"
-    assert node.label == "user: 445"
+    assert node.label == "Favorite Number: 445"
     assert node.properties["subject"] == "user"
     assert node.properties["predicate"] == "favorite_number"
     assert node.properties["value"] == "445"
@@ -437,7 +437,7 @@ async def test_save_fact_upserts_same_subject_predicate():
 
     # Should still be one node (upserted)
     fact_id = "fact:test-agent:user:favorite_color"
-    assert graph.nodes[fact_id].label == "user: green"
+    assert graph.nodes[fact_id].label == "Favorite Color: green"
     assert graph.nodes[fact_id].properties["value"] == "green"
 
 

@@ -508,9 +508,35 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
                     except (json.JSONDecodeError, TypeError):
                         args = {}
 
-                # Find and execute the tool
+                # Find and execute the tool (with security hook enforcement)
                 tool = tools_by_name.get(tool_name)
                 if tool:
+                    # Check security hooks before executing
+                    hooks_manager = getattr(self.agent, 'hooks_manager', None)
+                    if hooks_manager:
+                        from kestrel_sovereign.hooks import HookInput, HookEvent
+                        from kestrel_sovereign.hooks.base import PermissionDecision
+                        hook_input = HookInput(
+                            session_id="subagent",
+                            hook_event_name=HookEvent.PRE_TOOL_USE.value,
+                            tool_name=tool_name,
+                            tool_input=args,
+                            feature_name=type(self).__name__,
+                        )
+                        hook_output = await hooks_manager.execute_hooks(
+                            HookEvent.PRE_TOOL_USE, hook_input
+                        )
+                        if hook_output.permission_decision == PermissionDecision.DENY:
+                            reason = hook_output.permission_reason or "Blocked by security policy"
+                            result = {"success": False, "error": f"Permission denied: {reason}"}
+                            logger.info(f"[SUBAGENT-TOOL] {tool_name} blocked by security: {reason}")
+                            messages.append({
+                                "role": "tool",
+                                "tool_call_id": tool_call.id,
+                                "content": json.dumps(result)
+                            })
+                            continue
+
                     try:
                         result = await tool.execute(**args)
                         result = _serialize_tool_result(result)
