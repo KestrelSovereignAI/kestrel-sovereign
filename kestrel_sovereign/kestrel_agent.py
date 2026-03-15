@@ -366,6 +366,12 @@ class KestrelAgent(ConstitutionMixin, StreamingMixin, BackupMixin, SleepMixin):
             self.model_agent = self.features.get("ModelAgent")
             logging.info("Feature references set up")
 
+            # Register all tools with SecurityFeature AFTER all features are loaded
+            security = self.features.get("SecurityFeature")
+            if security and hasattr(security, '_register_all_tools'):
+                await security._register_all_tools()
+                logging.info("Security permissions registered for all features")
+
             # Wire reflection into sleep cycle (runs pre/post-consolidation analysis)
             from kestrel_sovereign.features.reflection.hooks import create_reflection_hook
             self.reflection_hook = create_reflection_hook(self)
