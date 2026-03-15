@@ -92,7 +92,8 @@ class MemorySystem:
         )
         self.consolidator = MemoryConsolidator(
             self.storage.db,
-            self.agent_id
+            self.agent_id,
+            graph_store=self.storage.graph,
         )
 
         self._initialized = True
