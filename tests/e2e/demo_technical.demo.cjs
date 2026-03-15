@@ -675,6 +675,89 @@ test.describe.serial('Kestrel Sovereign Technical Demo', () => {
     });
 
     // ========================================================================
+    // Act 6: Permission Enforcement
+    // ========================================================================
+    test('Act 6: Permission Enforcement', async ({ page, request }) => {
+        const section = 'Act 6: Permissions';
+        await demoGoto(page);
+        await demoPause(page, 1500);
+
+        // Navigate to Security panel
+        narrator.narrate(section,
+            'Opening the Security panel — granular permission control over every tool...',
+            'Each tool can be set to ALLOW, DENY, or ASK. This is enforced at the architecture level, not by prompt.');
+        await navigateToPanel(page, 'security');
+        await demoPause(page, 2000);
+        await narrator.screenshot(page, 'security-panel');
+
+        // Set save_fact to DENY via API command
+        narrator.narrate(section,
+            'Blocking the save_fact tool — the agent will not be able to write to the Knowledge Graph...');
+        await navigateToPanel(page, 'chat');
+        await dismissContextWarning(page);
+
+        const denyResponse = await demoSendMessage(page,
+            '!security-set MemoryAgencyFeature save_fact deny');
+        await demoPause(page, 1500);
+        await dismissContextWarning(page);
+        await narrator.screenshot(page, 'security-deny-set');
+
+        // Try to save a fact — should be blocked
+        narrator.narrate(section,
+            'Now asking the agent to save a fact — the security layer should block it...',
+            'The agent will try to call save_fact, but the hook will intercept and deny.');
+
+        const blockedResponse = await demoSendMessage(page,
+            'Please remember that my favorite sport is tennis and save it to the Knowledge Graph.');
+        await demoPause(page, 1500);
+
+        if (blockedResponse) {
+            const text = await blockedResponse.textContent().catch(() => '');
+            const hasTennis = text.toLowerCase().includes('tennis');
+            const hasBlocked = text.toLowerCase().includes('denied') ||
+                               text.toLowerCase().includes('blocked') ||
+                               text.toLowerCase().includes('permission') ||
+                               text.toLowerCase().includes('unable');
+            narrator.narrate(section,
+                `Agent response — mentions tennis: ${hasTennis}, indicates blocked: ${hasBlocked}`,
+                hasBlocked
+                    ? 'The security hook intercepted the tool call. The agent acknowledged the restriction.'
+                    : 'The agent responded but the tool was silently blocked — the fact won\'t appear in the KG.');
+        }
+        await dismissContextWarning(page);
+        await narrator.screenshot(page, 'security-blocked');
+
+        // Verify KG does NOT contain tennis
+        const headers = { 'Content-Type': 'application/json', ...authHeaders(apiKey) };
+        try {
+            const kgResp = await request.get(`${BASE_URL}/api/memories`, { headers });
+            if (kgResp.ok()) {
+                const kgData = await kgResp.json();
+                const hasTennisInKG = kgData.nodes.some(n =>
+                    n.label.toLowerCase().includes('tennis'));
+                narrator.narrate(section,
+                    `Knowledge Graph verification — tennis in KG: ${hasTennisInKG}`,
+                    !hasTennisInKG
+                        ? 'Confirmed: the security hook blocked the write. The KG is clean.'
+                        : 'Warning: fact leaked through despite DENY — investigate.');
+            }
+        } catch (e) {
+            narrator.narrate(section, `KG check: ${e.message}`);
+        }
+
+        // Restore permission
+        narrator.narrate(section, 'Restoring save_fact permission to ALLOW...');
+        await demoSendMessage(page, '!security-set MemoryAgencyFeature save_fact allow');
+        await demoPause(page, 1000);
+        await dismissContextWarning(page);
+
+        narrator.narrate(section,
+            'Permission system enforces tool-level access control at the architecture layer.',
+            'This is not prompt engineering — the hook runs before every tool call. DENY means the code never executes.');
+        await narrator.screenshot(page, 'security-restored');
+    });
+
+    // ========================================================================
     // Write narration transcript
     // ========================================================================
     test.afterAll(async () => {
