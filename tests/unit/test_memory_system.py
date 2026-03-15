@@ -423,6 +423,111 @@ class TestMemoryEpisode:
         assert d["emotional_arc"] == "difficulty → resolution"
 
 
+class TestMemoryConsolidatorKG:
+    """Tests for MemoryConsolidator writing episodes to the Knowledge Graph."""
+
+    @pytest.mark.asyncio
+    async def test_save_episode_writes_kg_node(self):
+        """When graph_store is provided, _save_episode should create a KG node and edge."""
+        from kestrel_sovereign.storage.memory_consolidator import MemoryConsolidator
+
+        mock_db = AsyncMock()
+        mock_graph = AsyncMock()
+
+        consolidator = MemoryConsolidator(
+            db=mock_db,
+            agent_id="did:test:agent123",
+            graph_store=mock_graph,
+        )
+
+        episode = MemoryEpisode(
+            id="episode:did:test:agent123:2026-03-15:abc12345",
+            agent_id="did:test:agent123",
+            title="A joyful moment",
+            summary="A conversation with 5 messages. Emotional trajectory: generally positive.",
+            emotional_arc="generally positive",
+            key_message_ids=["1", "2", "3", "4", "5"],
+            timespan_start=datetime(2026, 3, 15, 10, 0, tzinfo=timezone.utc),
+            timespan_end=datetime(2026, 3, 15, 11, 0, tzinfo=timezone.utc),
+        )
+
+        await consolidator._save_episode(episode)
+
+        # Should have written to memory_episodes table
+        mock_db.execute.assert_called_once()
+
+        # Should have written a KG node
+        mock_graph.add_node.assert_called_once()
+        node = mock_graph.add_node.call_args[0][0]
+        assert node.node_id == episode.id
+        assert node.node_type == "episode"
+        assert node.label == "A joyful moment"
+        assert node.properties["source"] == "consolidator"
+        assert node.properties["message_count"] == 5
+        assert node.properties["emotional_arc"] == "generally positive"
+
+        # Should have created an edge from agent to episode
+        mock_graph.add_edge.assert_called_once_with(
+            "did:test:agent123", episode.id, "remembers"
+        )
+
+    @pytest.mark.asyncio
+    async def test_save_episode_without_graph_store(self):
+        """Without graph_store, _save_episode should still save to DB without error."""
+        from kestrel_sovereign.storage.memory_consolidator import MemoryConsolidator
+
+        mock_db = AsyncMock()
+
+        consolidator = MemoryConsolidator(
+            db=mock_db,
+            agent_id="did:test:agent123",
+        )
+
+        episode = MemoryEpisode(
+            id="episode:test:2026-03-15:xyz",
+            agent_id="did:test:agent123",
+            title="Test episode",
+            summary="Test summary",
+            emotional_arc="neutral",
+            key_message_ids=["1", "2", "3"],
+        )
+
+        await consolidator._save_episode(episode)
+
+        # Should have written to DB
+        mock_db.execute.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_save_episode_kg_failure_is_nonfatal(self):
+        """If KG write fails, the episode should still be saved to the DB."""
+        from kestrel_sovereign.storage.memory_consolidator import MemoryConsolidator
+
+        mock_db = AsyncMock()
+        mock_graph = AsyncMock()
+        mock_graph.add_node.side_effect = Exception("KG write failed")
+
+        consolidator = MemoryConsolidator(
+            db=mock_db,
+            agent_id="did:test:agent123",
+            graph_store=mock_graph,
+        )
+
+        episode = MemoryEpisode(
+            id="episode:test:2026-03-15:fail",
+            agent_id="did:test:agent123",
+            title="Should still save",
+            summary="Test",
+            emotional_arc="neutral",
+            key_message_ids=["1"],
+        )
+
+        # Should not raise
+        await consolidator._save_episode(episode)
+
+        # DB write should still have happened
+        mock_db.execute.assert_called_once()
+
+
 # Run tests
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

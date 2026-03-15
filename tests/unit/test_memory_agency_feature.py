@@ -160,13 +160,28 @@ class FakeDB:
         return 0
 
 
-def _make_feature(fake_db, agent_id="test-agent"):
+class FakeGraphStore:
+    """In-memory fake graph store for testing KG writes."""
+
+    def __init__(self):
+        self.nodes = {}   # node_id -> GraphNode
+        self.edges = []   # list of (source_id, target_id, label)
+
+    async def add_node(self, node):
+        self.nodes[node.node_id] = node
+
+    async def add_edge(self, source_id, target_id, label, properties=None):
+        self.edges.append((source_id, target_id, label))
+
+
+def _make_feature(fake_db, agent_id="test-agent", graph_store=None):
     """Create a MemoryAgencyFeature with a mocked agent and fake database."""
     from kestrel_sovereign.features.memory_agency.feature import MemoryAgencyFeature, PIN_QUOTA_DEFAULT
 
     storage = MagicMock()
     storage.db = fake_db
     storage.agent_id = agent_id
+    storage.graph = graph_store
 
     agent = MagicMock()
     agent.storage = storage
@@ -369,3 +384,88 @@ async def test_pin_preserves_existing_metadata():
     assert stored_meta["emotional_valence"] == 0.6
     assert stored_meta["emotional_categories"] == ["joy"]
     assert stored_meta["custom_field"] == "preserved"
+
+
+# --------------------------------------------------------------------------
+# save_fact tests
+# --------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_save_fact_creates_kg_node():
+    """save_fact should create a learned_fact node in the knowledge graph."""
+    db = FakeDB()
+    graph = FakeGraphStore()
+    feature = _make_feature(db, graph_store=graph)
+
+    result = await feature.save_fact(
+        subject="user", predicate="favorite_number", value="445"
+    )
+
+    assert result["saved"] is True
+    assert result["subject"] == "user"
+    assert result["predicate"] == "favorite_number"
+    assert result["value"] == "445"
+
+    # Verify KG node was created
+    fact_id = result["node_id"]
+    assert fact_id in graph.nodes
+    node = graph.nodes[fact_id]
+    assert node.node_type == "learned_fact"
+    assert node.label == "user: 445"
+    assert node.properties["subject"] == "user"
+    assert node.properties["predicate"] == "favorite_number"
+    assert node.properties["value"] == "445"
+    assert node.properties["confidence"] == 1.0
+    assert node.properties["source"] == "agent_tool"
+
+    # Verify edge was created
+    assert ("test-agent", fact_id, "knows") in graph.edges
+
+
+@pytest.mark.asyncio
+async def test_save_fact_upserts_same_subject_predicate():
+    """Saving the same subject+predicate should update the existing node."""
+    db = FakeDB()
+    graph = FakeGraphStore()
+    feature = _make_feature(db, graph_store=graph)
+
+    await feature.save_fact(subject="user", predicate="favorite_color", value="blue")
+    result = await feature.save_fact(subject="user", predicate="favorite_color", value="green")
+
+    assert result["saved"] is True
+    assert result["value"] == "green"
+
+    # Should still be one node (upserted)
+    fact_id = "fact:test-agent:user:favorite_color"
+    assert graph.nodes[fact_id].label == "user: green"
+    assert graph.nodes[fact_id].properties["value"] == "green"
+
+
+@pytest.mark.asyncio
+async def test_save_fact_clamps_confidence():
+    """Confidence should be clamped to [0.0, 1.0]."""
+    db = FakeDB()
+    graph = FakeGraphStore()
+    feature = _make_feature(db, graph_store=graph)
+
+    result = await feature.save_fact(
+        subject="user", predicate="test", value="x", confidence=2.5
+    )
+    assert result["confidence"] == 1.0
+
+    result = await feature.save_fact(
+        subject="user", predicate="test2", value="y", confidence=-0.5
+    )
+    assert result["confidence"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_save_fact_without_graph_returns_error():
+    """save_fact should return error if graph store is not available."""
+    db = FakeDB()
+    feature = _make_feature(db, graph_store=None)
+
+    result = await feature.save_fact(subject="user", predicate="name", value="Alice")
+
+    assert "error" in result
+    assert "not available" in result["error"]

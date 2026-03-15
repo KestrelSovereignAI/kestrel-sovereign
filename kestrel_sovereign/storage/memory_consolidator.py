@@ -49,16 +49,18 @@ class MemoryConsolidator:
     SESSION_EPISODE_THRESHOLD = 20 # Create episode after N messages in session
     SESSION_GAP_MINUTES = 30       # Minutes of inactivity = session end
 
-    def __init__(self, db: AsyncDatabase, agent_id: str):
+    def __init__(self, db: AsyncDatabase, agent_id: str, graph_store=None):
         """
         Initialize consolidator.
 
         Args:
             db: AsyncDatabase instance
             agent_id: Agent ID to consolidate memories for
+            graph_store: Optional AsyncGraphStore for writing episodes to the KG
         """
         self._db = db
         self.agent_id = agent_id
+        self._graph_store = graph_store
 
     async def run_consolidation(self) -> Dict[str, Any]:
         """
@@ -323,7 +325,7 @@ class MemoryConsolidator:
         )
 
     async def _save_episode(self, episode: MemoryEpisode) -> None:
-        """Save episode to database."""
+        """Save episode to database and optionally to the Knowledge Graph."""
         await self._db.execute(
             """INSERT INTO memory_episodes
                (id, agent_id, title, summary, timespan_start, timespan_end,
@@ -341,6 +343,38 @@ class MemoryConsolidator:
                 datetime.now(timezone.utc).isoformat(),
             )
         )
+
+        # Write episode as a KG node so it appears in the Memories panel
+        if self._graph_store:
+            try:
+                from .async_graph_store import GraphNode
+
+                episode_node = GraphNode(
+                    node_id=episode.id,
+                    node_type="episode",
+                    label=episode.title,
+                    properties={
+                        "source": "consolidator",
+                        "summary": episode.summary,
+                        "emotional_arc": episode.emotional_arc,
+                        "message_count": len(episode.key_message_ids),
+                        "timespan_start": (
+                            episode.timespan_start.isoformat()
+                            if episode.timespan_start else None
+                        ),
+                        "timespan_end": (
+                            episode.timespan_end.isoformat()
+                            if episode.timespan_end else None
+                        ),
+                    },
+                )
+                await self._graph_store.add_node(episode_node)
+                await self._graph_store.add_edge(
+                    self.agent_id, episode.id, "remembers"
+                )
+            except Exception as e:
+                # KG write is best-effort — don't fail episode creation
+                logger.warning("Failed to write episode to KG: %s", e)
 
     async def _detect_patterns(self) -> List[TemporalPattern]:
         """
