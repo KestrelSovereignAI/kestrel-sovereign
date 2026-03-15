@@ -1,11 +1,12 @@
 """
-Memory Agency -- agent-controlled memory pinning and release.
+Memory Agency -- agent-controlled memory pinning, release, and fact storage.
 
 Allows the agent to actively participate in its own memory by:
 - Pinning important memories (resist Ebbinghaus decay)
 - Releasing memories it wants to let go of
 - Listing currently pinned memories
 - Viewing pin statistics
+- Saving learned facts to the Knowledge Graph
 - Administrative bulk-unpin for sovereign/admin control
 
 Pinned memories get ``decay_protected = True`` in their metadata,
@@ -508,6 +509,83 @@ class MemoryAgencyFeature(Feature):
             )
 
         return result
+
+    # ------------------------------------------------------------------
+    # Knowledge Graph -- learned facts
+    # ------------------------------------------------------------------
+
+    @tool(
+        name="save_fact",
+        description=(
+            "Save a learned fact to the Knowledge Graph. Use this when the "
+            "user tells you something worth remembering permanently, like "
+            "preferences, personal details, or important information. "
+            "The fact appears immediately in the Knowledge Graph panel."
+        ),
+        category=ToolCategory.MEMORY,
+        command_prefix="!memory-save-fact",
+    )
+    async def save_fact(
+        self,
+        subject: str,
+        predicate: str,
+        value: str,
+        confidence: float = 1.0,
+    ) -> Dict[str, Any]:
+        """
+        Save a learned fact as a Knowledge Graph node.
+
+        Creates a ``learned_fact`` node linked to the agent via a
+        ``knows`` edge.  Facts are immediately visible in the KG panel.
+
+        Args:
+            subject: Who or what the fact is about (e.g. "user", "project")
+            predicate: The relationship or attribute (e.g. "favorite_color", "lives_in")
+            value: The fact value (e.g. "blue", "Portland")
+            confidence: Confidence level 0.0-1.0 (default 1.0)
+        """
+        from kestrel_sovereign.storage.async_graph_store import GraphNode
+
+        graph = getattr(self.storage, "graph", None)
+        if graph is None:
+            return {"error": "Knowledge graph not available"}
+
+        # Clamp confidence
+        confidence = max(0.0, min(1.0, confidence))
+
+        # Generate a deterministic-ish node ID for upsert on same subject+predicate
+        fact_id = f"fact:{self.agent_id}:{subject}:{predicate}"
+
+        node = GraphNode(
+            node_id=fact_id,
+            node_type="learned_fact",
+            label=f"{subject}: {value}",
+            properties={
+                "subject": subject,
+                "predicate": predicate,
+                "value": value,
+                "confidence": confidence,
+                "source": "agent_tool",
+                "saved_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+
+        await graph.add_node(node)
+        await graph.add_edge(self.agent_id, fact_id, "knows")
+
+        logger.info(
+            "Saved fact to KG: %s.%s = %s (confidence=%.2f)",
+            subject, predicate, value, confidence,
+        )
+
+        return {
+            "saved": True,
+            "node_id": fact_id,
+            "subject": subject,
+            "predicate": predicate,
+            "value": value,
+            "confidence": confidence,
+        }
 
     # ------------------------------------------------------------------
     # Admin / Sovereign tools
