@@ -418,10 +418,32 @@ test.describe.serial('Kestrel Sovereign Technical Demo', () => {
         await dismissContextWarning(page);
         await narrator.screenshot(page, 'memory-stored');
 
-        // Beat 2: Ask for recall within the same session — proves memory works
+        // Beat 2: Start a NEW session and ask for recall — proves cross-session persistence
         narrator.narrate(section,
-            'Now asking the agent to recall what we just told it...',
-            'The agent retrieves facts from its conversation memory');
+            'Starting a fresh session — zero conversation history...',
+            'This proves memory persists across sessions, not just within a tab');
+
+        // Start new session via API
+        const headers = { 'Content-Type': 'application/json', ...authHeaders(apiKey) };
+        try {
+            await page.evaluate(async (opts) => {
+                await fetch(`${opts.baseUrl}/api/conversations/new`, {
+                    method: 'POST',
+                    headers: opts.headers
+                });
+            }, { baseUrl: BASE_URL, headers });
+        } catch (e) {
+            narrator.narrate(section, `New session: ${e.message}`);
+        }
+
+        // Reload the page to simulate closing and reopening
+        await demoGoto(page);
+        await demoPause(page, 1500);
+        await navigateToPanel(page, 'chat');
+        await dismissContextWarning(page);
+
+        narrator.narrate(section,
+            'New session — asking for recall with zero conversation history...');
 
         const recalled = await demoSendMessage(page,
             'What is my favorite programming language and what is my lucky number?');
@@ -432,9 +454,9 @@ test.describe.serial('Kestrel Sovereign Technical Demo', () => {
             const hasRust = text.toLowerCase().includes('rust');
             const hasNumber = text.includes('7742');
             narrator.narrate(section,
-                `Agent recalled — Rust: ${hasRust}, 7742: ${hasNumber}`,
+                `Cross-session recall — Rust: ${hasRust}, 7742: ${hasNumber}`,
                 hasRust && hasNumber
-                    ? 'Perfect recall. The conversation memory system works as expected.'
+                    ? 'Perfect recall across sessions. The memory system persists beyond the conversation window.'
                     : 'Partial recall — the memory system returned results but retrieval was incomplete.');
         }
         await dismissContextWarning(page);

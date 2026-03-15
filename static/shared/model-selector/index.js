@@ -246,10 +246,13 @@ class ModelSelector {
             const data = await response.json();
             if (!data.model) return;
 
+            // Use bare model name (without provider/ prefix) for matching
+            const bareModel = data.model_name || data.model.split('/').pop();
+
             // Find which provider this model belongs to
             if (this.allModelsData?.by_provider) {
                 for (const [provider, models] of Object.entries(this.allModelsData.by_provider)) {
-                    if (models.some(m => m.id === data.model)) {
+                    if (models.some(m => m.id === bareModel)) {
                         // Update provider if different
                         if (this.providerSelect.value !== provider) {
                             this.providerSelect.value = provider;
@@ -257,8 +260,8 @@ class ModelSelector {
                             this._populateModels();
                         }
                         // Update model
-                        this.modelSelect.value = data.model;
-                        this.selectedModel = data.model;
+                        this.modelSelect.value = bareModel;
+                        this.selectedModel = bareModel;
                         this._saveState();
                         break;
                     }

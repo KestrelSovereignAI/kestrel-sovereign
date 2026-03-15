@@ -45,6 +45,22 @@ async def main():
         expected_duration="demo session",
     )
 
+    # Write demo-specific LLM config: Anthropic Opus first, Ollama for EPHEMERAL
+    llm_config_path = os.path.join(DEMO_DIR, "llm_config.toml")
+    with open(llm_config_path, "w") as f:
+        f.write("""# Demo agent LLM config — Opus 4.6 for quality, Ollama for EPHEMERAL
+provider_priority = ["anthropic", "ollama"]
+
+[anthropic]
+model = "claude-opus-4-6"
+api_key_env = "ANTHROPIC_API_KEY"
+
+[ollama]
+host = "http://localhost:11434"
+model = "llama3.2:latest"
+""")
+    print(f"  LLM config written: {llm_config_path}")
+
     print()
     print("=" * 60)
     print("  Demo Agent Created")
