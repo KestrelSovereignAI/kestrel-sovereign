@@ -216,11 +216,12 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # Mount static files (disabled when running behind Kestrel Host)
 SERVE_UI = os.environ.get("KESTREL_SERVE_UI", "true").lower() == "true"
+STATIC_DIR = Path(__file__).parent / "kestrel_sovereign" / "static"
 if SERVE_UI:
-    app.mount("/static", StaticFiles(directory="static"), name="static")
-    app.mount("/js", StaticFiles(directory="static/js"), name="js")
-    app.mount("/shared", StaticFiles(directory="static/shared"), name="shared")
-    app.mount("/utils", StaticFiles(directory="static/utils"), name="utils")
+    app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+    app.mount("/js", StaticFiles(directory=str(STATIC_DIR / "js")), name="js")
+    app.mount("/shared", StaticFiles(directory=str(STATIC_DIR / "shared")), name="shared")
+    app.mount("/utils", StaticFiles(directory=str(STATIC_DIR / "utils")), name="utils")
 
 # Include routers
 from endpoints import (
@@ -423,10 +424,10 @@ if SERVE_UI:
     async def read_root(request: Request):
         """Serve the main web UI."""
         try:
-            with open("static/index.html", encoding="utf-8") as f:
+            with open(STATIC_DIR / "index.html", encoding="utf-8") as f:
                 return HTMLResponse(content=f.read(), status_code=200)
         except FileNotFoundError:
-            logger.error("static/index.html not found.")
+            logger.error(f"{STATIC_DIR / 'index.html'} not found.")
             raise HTTPException(status_code=404, detail="Index file not found.")
 
 

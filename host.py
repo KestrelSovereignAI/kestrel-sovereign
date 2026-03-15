@@ -165,7 +165,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Kestrel Host", lifespan=lifespan)
 
 # Mount static files
-STATIC_DIR = Path(__file__).parent / "static"
+STATIC_DIR = Path(__file__).parent / "kestrel_sovereign" / "static"
 if STATIC_DIR.is_dir():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
     app.mount("/js", StaticFiles(directory=str(STATIC_DIR / "js")), name="js")
