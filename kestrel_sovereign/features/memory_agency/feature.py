@@ -520,7 +520,9 @@ class MemoryAgencyFeature(Feature):
             "Save a learned fact to the Knowledge Graph. Use this when the "
             "user tells you something worth remembering permanently, like "
             "preferences, personal details, or important information. "
-            "The fact appears immediately in the Knowledge Graph panel."
+            "The fact appears immediately in the Knowledge Graph panel. "
+            "Use 'user' as the subject for facts about the user. "
+            "Call once per distinct fact — do not save the same fact with different subject names."
         ),
         category=ToolCategory.MEMORY,
         command_prefix="!memory-save-fact",
@@ -559,7 +561,7 @@ class MemoryAgencyFeature(Feature):
         node = GraphNode(
             node_id=fact_id,
             node_type="learned_fact",
-            label=f"{subject}: {value}",
+            label=f"{predicate.replace('_', ' ').title()}: {value}",
             properties={
                 "subject": subject,
                 "predicate": predicate,

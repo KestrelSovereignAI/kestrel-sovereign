@@ -21,7 +21,7 @@ async def list_memories(request: Request, node_type: str = None, limit: int = Qu
             nodes = await storage.get_nodes_by_type(node_type)
         else:
             all_nodes = []
-            for ntype in ["agent", "document", "memory", "backup_artifact", "sovereignty_receipt"]:
+            for ntype in ["agent", "document", "memory", "backup_artifact", "sovereignty_receipt", "learned_fact", "episode"]:
                 type_nodes = await storage.get_nodes_by_type(ntype)
                 all_nodes.extend(type_nodes)
             nodes = all_nodes[:limit]
