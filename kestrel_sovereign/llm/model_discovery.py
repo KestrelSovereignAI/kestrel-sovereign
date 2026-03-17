@@ -8,6 +8,7 @@ Provides in-memory caching and disk-based cache for fast startup.
 import asyncio
 import logging
 import time
+from datetime import datetime
 from typing import List, Dict, Any, Optional, Set
 
 from .model_metadata import ModelInfo, ModelCategory
@@ -141,7 +142,7 @@ class ModelDiscoveryMixin:
         )
 
     def _resolve_auto_providers(self, models: list) -> None:
-        """Resolve providers with model='auto' to the first discovered chat model.
+        """Resolve providers with model='auto' using config hints and discovered models.
 
         Called after both API discovery and cache loading so that
         get_active_model_id() returns the real model ID immediately.
@@ -153,13 +154,80 @@ class ModelDiscoveryMixin:
                 provider_name = provider.get("name")
                 provider_models = [
                     m for m in models
-                    if m.provider == provider_name and m.category == ModelCategory.CHAT
+                    if m.provider == provider_name and m.category == ModelCategory.CHAT and not m.is_hidden
                 ]
-                if provider_models:
-                    provider["model"] = provider_models[0].id
+                selected_model = self._select_auto_model(provider_name, provider_models)
+                if selected_model:
+                    provider["model"] = selected_model.id
                     logger.info(f"Auto-resolved model for {provider_name}: {provider['model']}")
                 else:
                     logger.warning(f"No chat models discovered for {provider_name} — 'auto' unresolved")
+
+    def _select_auto_model(self, provider_name: str, provider_models: list[ModelInfo]) -> Optional[ModelInfo]:
+        """Select a concrete model for an auto-configured provider.
+
+        Selection order:
+        1. Config `selection_hints` pattern match
+        2. Featured models
+        3. Ranked discovered models
+        """
+        if not provider_models:
+            return None
+
+        provider_config = {}
+        if hasattr(self, "config") and isinstance(self.config, dict):
+            provider_config = self.config.get(provider_name, {}) or {}
+
+        selection_hints = provider_config.get("selection_hints", []) or []
+        for hint in selection_hints:
+            hint_lower = str(hint).lower()
+            matches = [
+                m for m in provider_models
+                if hint_lower in m.id.lower() or hint_lower in (m.display_name or "").lower()
+            ]
+            ranked_matches = self._rank_auto_candidates(matches)
+            if ranked_matches:
+                return ranked_matches[0]
+
+        featured = [m for m in provider_models if m.is_featured]
+        ranked_featured = self._rank_auto_candidates(featured)
+        if ranked_featured:
+            return ranked_featured[0]
+
+        ranked_all = self._rank_auto_candidates(provider_models)
+        return ranked_all[0] if ranked_all else None
+
+    def _rank_auto_candidates(self, models: list[ModelInfo]) -> list[ModelInfo]:
+        """Rank candidate models for auto-selection.
+
+        Prefers:
+        - tool-capable chat models
+        - non-preview / non-experimental IDs
+        - newer creation timestamps when available
+        - stable lexical order as final tie-break
+        """
+        def created_sort_key(model: ModelInfo) -> float:
+            created_at = model.created_at
+            if not created_at:
+                return 0.0
+            try:
+                return datetime.fromisoformat(created_at.replace("Z", "+00:00")).timestamp()
+            except Exception:
+                return 0.0
+
+        def sort_key(model: ModelInfo):
+            model_lower = model.id.lower()
+            display_lower = (model.display_name or "").lower()
+            is_preview = any(token in model_lower or token in display_lower for token in ("preview", "beta", "experimental", "exp"))
+            return (
+                0 if model.supports_tools else 1,
+                0 if not is_preview else 1,
+                -created_sort_key(model),
+                display_lower or model_lower,
+                model_lower,
+            )
+
+        return sorted(models, key=sort_key)
 
     def _load_from_disk_cache(self) -> bool:
         """Load models from disk cache if no in-memory cache exists.
