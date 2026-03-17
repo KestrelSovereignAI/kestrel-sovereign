@@ -438,7 +438,7 @@ consensus_rule = "unanimous"  # "unanimous", "supermajority", "majority", or "qu
 [[council.members]]
 name = "Claude"
 provider = "anthropic"
-model = "claude-opus-4-5-20251101"
+model = "auto"
 role = "constitutional_reviewer"
 
 # -----------------------------------------------------------------------------
@@ -448,7 +448,7 @@ role = "constitutional_reviewer"
 [[council.members]]
 name = "GPT"
 provider = "openai"
-model = "gpt-5.2"
+model = "auto"
 role = "security_analyst"
 
 # -----------------------------------------------------------------------------
@@ -459,7 +459,7 @@ role = "security_analyst"
 [[council.members]]
 name = "Gemini"
 provider = "vertex_ai"
-model = "gemini-3-pro-preview"
+model = "auto"
 role = "technical_reviewer"
 
 # =============================================================================
