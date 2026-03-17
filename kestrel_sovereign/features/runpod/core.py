@@ -287,11 +287,15 @@ class RunPodManagerCore:
         await asyncio.to_thread(self.provider.resume_pod, pod_id, gpu_count)
 
         started_at = datetime.now(timezone.utc)
+        if not profile.default_model:
+            raise RunPodManagerError(
+                f"Profile '{profile.id}' has no default_model configured; cannot resume pod"
+            )
         session = RunPodSession(
             pod_id=pod_id,
             profile=profile,
             task_profile=profile.task_type,
-            model_name=profile.default_model or "flux",
+            model_name=profile.default_model,
             pod_type=profile.pod_type,
             status=PodStatus.PROVISIONING,
             ttl_seconds=ttl_seconds,

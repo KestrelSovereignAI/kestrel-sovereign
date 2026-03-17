@@ -56,7 +56,7 @@ class RunPodOllamaMixin:
             # No stopped pod found, create new one
             result = await self.start_session(
                 task_profile="ollama",
-                model_name=profile.default_model or "qwen2.5:7b",
+                model_name=profile.default_model,
                 ttl_seconds=ttl_seconds,
                 metadata={
                     "name": "kestrel-ollama",
