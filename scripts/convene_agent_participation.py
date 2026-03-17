@@ -20,6 +20,7 @@ load_dotenv()
 
 from kestrel_sovereign.features.council.models import Evidence, CouncilConfig, CouncilMember, ConsensusRule
 from kestrel_sovereign.features.council.deliberation import convene_council
+from kestrel_sovereign.features.council.costing import print_token_usage_summary
 from kestrel_sovereign.features.council.storage import get_storage
 
 logging.basicConfig(
@@ -28,50 +29,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-MODEL_PRICING = {
-    ("anthropic", "claude-opus-4-5-20251101"): {"input": 15.00, "output": 75.00},
-    ("openai", "gpt-5.2"): {"input": 5.00, "output": 15.00},
-    ("vertex_ai", "gemini-3-pro-preview"): {"input": 1.25, "output": 5.00},
-    ("anthropic", "default"): {"input": 15.00, "output": 75.00},
-    ("openai", "default"): {"input": 5.00, "output": 15.00},
-    ("vertex_ai", "default"): {"input": 1.25, "output": 5.00},
-}
-
-
-def calculate_cost(provider, model, input_tokens, output_tokens):
-    key = (provider, model)
-    if key not in MODEL_PRICING:
-        key = (provider, "default")
-    if key not in MODEL_PRICING:
-        key = ("openai", "default")
-    prices = MODEL_PRICING[key]
-    return (input_tokens / 1_000_000) * prices["input"] + (output_tokens / 1_000_000) * prices["output"]
-
-
 def print_token_usage(session):
-    print()
-    print("=" * 70)
-    print("TOKEN USAGE & COST SUMMARY")
-    print("=" * 70)
-    print()
-
-    by_member = session.tokens_by_member()
-    total_cost = 0.0
-    print(f"{'Member':<12} {'Provider':<12} {'Input':>10} {'Output':>10} {'Est. Cost':>12}")
-    print("-" * 60)
-
-    for member_name, data in by_member.items():
-        provider = data.get("provider", "unknown")
-        model = data.get("model", "unknown")
-        cost = calculate_cost(provider, model, data["input"], data["output"])
-        total_cost += cost
-        print(f"{member_name:<12} {provider:<12} {data['input']:>10,} {data['output']:>10,} ${cost:>10.4f}")
-
-    totals = session.total_tokens()
-    print("-" * 60)
-    print(f"{'TOTAL':<12} {'':<12} {totals['input']:>10,} {totals['output']:>10,} ${total_cost:>10.4f}")
-    print()
-    return total_cost
+    return print_token_usage_summary(session)
 
 
 def load_council_config():

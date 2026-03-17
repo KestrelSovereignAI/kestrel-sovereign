@@ -23,6 +23,7 @@ load_dotenv()
 
 from kestrel_sovereign.features.council.models import Evidence, CouncilConfig, CouncilMember, ConsensusRule
 from kestrel_sovereign.features.council.deliberation import convene_council
+from kestrel_sovereign.features.council.costing import print_token_usage_summary
 from kestrel_sovereign.features.council.storage import get_storage
 
 logging.basicConfig(
@@ -31,77 +32,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Approximate pricing per 1M tokens (January 2026)
-MODEL_PRICING = {
-    ("anthropic", "claude-opus-4-5-20251101"): {"input": 15.00, "output": 75.00},
-    ("openai", "gpt-5.2"): {"input": 5.00, "output": 15.00},
-    ("vertex_ai", "gemini-3-pro-preview"): {"input": 1.25, "output": 5.00},
-    ("anthropic", "default"): {"input": 15.00, "output": 75.00},
-    ("openai", "default"): {"input": 5.00, "output": 15.00},
-    ("google", "default"): {"input": 1.25, "output": 5.00},
-    ("vertex_ai", "default"): {"input": 1.25, "output": 5.00},
-    ("ollama", "default"): {"input": 0.00, "output": 0.00},
-}
-
-
-def calculate_cost(provider: str, model: str, input_tokens: int, output_tokens: int) -> float:
-    """Calculate estimated cost for token usage."""
-    key = (provider, model)
-    if key not in MODEL_PRICING:
-        key = (provider, "default")
-    if key not in MODEL_PRICING:
-        key = ("openai", "default")
-
-    prices = MODEL_PRICING[key]
-    input_cost = (input_tokens / 1_000_000) * prices["input"]
-    output_cost = (output_tokens / 1_000_000) * prices["output"]
-    return input_cost + output_cost
-
-
 def print_token_usage(session) -> float:
-    """Print token usage summary and return total cost."""
-    print()
-    print("=" * 70)
-    print("TOKEN USAGE & COST SUMMARY")
-    print("=" * 70)
-    print()
-
-    by_member = session.tokens_by_member()
-    total_cost = 0.0
-
-    print(f"{'Member':<12} {'Provider':<12} {'Input':>10} {'Output':>10} {'Est. Cost':>12}")
-    print("-" * 60)
-
-    for member_name, data in by_member.items():
-        provider = data.get("provider", "unknown")
-        model = data.get("model", "unknown")
-        input_tokens = data["input"]
-        output_tokens = data["output"]
-        cost = calculate_cost(provider, model, input_tokens, output_tokens)
-        total_cost += cost
-
-        print(f"{member_name:<12} {provider:<12} {input_tokens:>10,} {output_tokens:>10,} ${cost:>10.4f}")
-
-    print("-" * 60)
-
-    totals = session.total_tokens()
-    print(f"{'TOTAL':<12} {'':<12} {totals['input']:>10,} {totals['output']:>10,} ${total_cost:>10.4f}")
-    print()
-
-    if session.token_usage:
-        print("Per-round breakdown:")
-        rounds_seen = set()
-        for usage in session.token_usage:
-            if usage.round_number not in rounds_seen:
-                rounds_seen.add(usage.round_number)
-                round_tokens = sum(
-                    u.total_tokens for u in session.token_usage
-                    if u.round_number == usage.round_number
-                )
-                print(f"  Round {usage.round_number}: {round_tokens:,} tokens")
-        print()
-
-    return total_cost
+    """Backward-compatible wrapper around shared council costing."""
+    return print_token_usage_summary(session)
 
 
 def load_council_config() -> CouncilConfig:
