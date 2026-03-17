@@ -202,13 +202,19 @@ class ProviderRegistry:
         else:
             client = anthropic.AsyncAnthropic(api_key=api_key)
         
+        model = os.environ.get("ANTHROPIC_MODEL") or provider_config.get("model")
+        if not model:
+            logger.warning("No model configured for anthropic — set model= in llm_config.toml or ANTHROPIC_MODEL env var")
+            model = "auto"
+        provider_config["model"] = model
+
         adapter = AnthropicAdapter()
 
         return ProviderInfo(
             name="anthropic",
             client=client,
             adapter=adapter,
-            model=provider_config["model"]
+            model=model
         )
 
     def _initialize_claude_max(self, provider_config: Dict[str, Any]) -> ProviderInfo:
@@ -246,15 +252,21 @@ class ProviderRegistry:
         if not api_key:
             raise ValueError("Google API key not found.")
 
+        model = os.environ.get("GOOGLE_MODEL") or provider_config.get("model")
+        if not model:
+            logger.warning("No model configured for google — set model= in llm_config.toml or GOOGLE_MODEL env var")
+            model = "auto"
+        provider_config["model"] = model
+
         genai.configure(api_key=api_key)
-        client = genai.GenerativeModel(provider_config["model"])
+        client = genai.GenerativeModel(model)
         adapter = GoogleAdapter()
 
         return ProviderInfo(
             name="google",
             client=client,
             adapter=adapter,
-            model=provider_config["model"]
+            model=model
         )
 
     def _initialize_vertex_ai(self, provider_config: Dict[str, Any]) -> ProviderInfo:
@@ -263,6 +275,12 @@ class ProviderRegistry:
             from google import genai
         except ImportError:
             raise ImportError("google-genai package not installed.")
+
+        model = os.environ.get("VERTEX_AI_MODEL") or provider_config.get("model")
+        if not model:
+            logger.warning("No model configured for vertex_ai — set model= in llm_config.toml or VERTEX_AI_MODEL env var")
+            model = "auto"
+        provider_config["model"] = model
 
         # Prefer API key (AI Studio) over service account (Vertex AI)
         api_key = os.environ.get("GOOGLE_API_KEY")
@@ -289,7 +307,7 @@ class ProviderRegistry:
             name="vertex_ai",
             client=client,
             adapter=adapter,
-            model=provider_config["model"]
+            model=model
         )
 
     def _initialize_openrouter(self, provider_config: Dict[str, Any]) -> ProviderInfo:
