@@ -1,78 +1,16 @@
-# Model Catalog - Featured models per provider
-# These appear in the default "featured" view
-# Update this file to change featured models without code changes
+# Model Catalog — Manual Overrides Only
+#
+# Everything else (model lists, display names, featured status) comes from
+# API discovery and is cached in model_discovery_cache.json.
+#
+# This file contains ONLY data that APIs don't provide reliably.
 
-[featured]
-openai = [
-    "gpt-5.1",
-    "gpt-5-mini",
-    "gpt-5-nano",
-]
+# Hidden models (truly broken/useless — won't show even in "Show More")
+# Keep this minimal — old models are still useful for some users
+[hidden]
+openai = ["babbage-002", "davinci-002"]
 
-anthropic = [
-    "claude-sonnet-4-5-20250929",
-    "claude-haiku-4-5-20251001",
-    "claude-opus-4-5-20251101",
-]
-
-ollama = [
-    "llama3.2",
-    "gpt-oss:20b",
-    "deepseek-r1:14b",
-    "qwen2.5:14b",
-    "phi4",
-]
-
-vertex_ai = [
-    "gemini-3-pro",
-    "gemini-2.5-flash",
-    "gemini-2.5-pro",
-]
-
-google = [
-    "gemini-3-pro",
-    "gemini-2.5-flash",
-]
-
-xai = [
-    "grok-4-1-fast-non-reasoning",
-]
-
-runpod = [
-    "meta-llama/Llama-3.1-8B-Instruct",
-]
-
-# OpenRouter featured models (from actual API discovery)
-openrouter = [
-    # Anthropic
-    "anthropic/claude-opus-4.5",
-    "anthropic/claude-sonnet-4.5",
-    "anthropic/claude-3.5-sonnet",
-    # OpenAI
-    "openai/gpt-5.2",
-    "openai/gpt-5.1",
-    "openai/gpt-4o",
-    "openai/o3-mini",
-    # Google
-    "google/gemini-3-pro-preview",
-    "google/gemini-2.5-pro",
-    "google/gemini-2.5-flash",
-    # DeepSeek
-    "deepseek/deepseek-r1",
-    "deepseek/deepseek-v3.2",
-    "deepseek/deepseek-chat-v3.1",
-    # Meta
-    "meta-llama/llama-3.1-405b-instruct",
-    "meta-llama/llama-3.1-70b-instruct",
-]
-
-# Display name overrides (optional, only when API doesn't provide good names)
-[display_names]
-"claude-sonnet-4-5-20250929" = "Claude Sonnet 4.5"
-"claude-haiku-4-5-20251001" = "Claude Haiku 4.5"
-"claude-opus-4-5-20251101" = "Claude Opus 4.5"
-
-# Model categories - since APIs don't consistently indicate chat vs embedding
+# Category overrides — APIs don't consistently indicate chat vs embedding
 # Models not listed here default to "chat"
 [categories.embedding]
 openai = ["text-embedding-3-small", "text-embedding-3-large", "text-embedding-ada-002"]
@@ -84,14 +22,16 @@ openai = ["dall-e-3", "dall-e-2"]
 [categories.audio]
 openai = ["whisper-1", "tts-1", "tts-1-hd"]
 
-# Hidden models (truly broken/useless - won't show even in "Show More")
-# Keep this minimal - old models are still useful for some users
-[hidden]
-openai = ["babbage-002", "davinci-002"]
-
-# Context window limits (tokens) - Used by token budget allocation
-# If not specified here, TokenCounter falls back to hardcoded defaults
-[context_limits]
+# Context limit overrides (tokens)
+# ONLY for providers whose APIs don't return context window sizes:
+#   - OpenAI: no context_length in /v1/models response
+#   - Anthropic: no context_length in API
+#   - Ollama: doesn't expose context in list, only in /api/show
+#
+# DO NOT add entries for providers that return this from their API:
+#   - OpenRouter: returns context_length per model
+#   - Google/Vertex AI: returns context window in API response
+[context_limits_override]
 # OpenAI models
 "gpt-4" = 8192
 "gpt-4-32k" = 32768
@@ -112,14 +52,10 @@ openai = ["babbage-002", "davinci-002"]
 "claude-3-haiku" = 200000
 "claude-3.5-sonnet" = 200000
 "claude-sonnet-4-5-20250929" = 200000
+"claude-sonnet-4-6" = 200000
 "claude-haiku-4-5-20251001" = 200000
 "claude-opus-4-5-20251101" = 1000000
-
-# Google/Vertex AI models
-"gemini-3-pro" = 2000000
-"gemini-2.5-flash" = 1000000
-"gemini-2.5-pro" = 1000000
-"gemini-2.0-flash-exp" = 1000000
+"claude-opus-4-6" = 200000
 
 # Ollama models (approximate)
 "llama3.2" = 128000
@@ -146,12 +82,8 @@ openai = ["babbage-002", "davinci-002"]
 # xAI models
 "grok-4-1-fast-non-reasoning" = 128000
 
-# OpenRouter: context limits come from API response (context_length field)
-
-# Tool calling support overrides
-# Ollama auto-detects via /api/show (template + parameter count >= 7B).
-# Cloud providers (OpenAI, Anthropic, Vertex) always support tools.
-# Use this section to override when auto-detection is wrong.
-[tool_support]
-# "deepseek-r1:14b" = false   # Reasoning model, can't do function calling
-# "phi4" = true                # Works despite being smaller
+# Display name overrides (optional — only when API/adapter gives a bad name)
+[display_name_overrides]
+"claude-sonnet-4-5-20250929" = "Claude Sonnet 4.5"
+"claude-haiku-4-5-20251001" = "Claude Haiku 4.5"
+"claude-opus-4-5-20251101" = "Claude Opus 4.5"
