@@ -1,6 +1,6 @@
 """Model mandate management for LLM Service."""
 import logging
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 
 from kestrel_sovereign.config import load_config
 
@@ -10,18 +10,92 @@ logger = logging.getLogger(__name__)
 class ModelMandateMixin:
     """Mixin class providing model mandate methods for LLMService."""
 
+    def _resolve_model_selector(
+        self,
+        selector: Optional[str],
+        providers: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Optional[str]]:
+        """Resolve a mandate selector to a provider/model pair.
+
+        Supported selectors:
+        - provider name: ``anthropic``
+        - provider/model: ``anthropic/claude-sonnet-4-6``
+        - exact model id: ``gpt-5-mini``
+        - alias: ``cheap``
+        """
+        providers = providers or self.providers
+
+        if not selector:
+            return {"selector": None, "provider": None, "model": None}
+
+        selector = selector.strip()
+        if not selector or selector == "auto":
+            return {"selector": None, "provider": None, "model": None}
+
+        if selector == "cheap" and hasattr(self, "get_cheap_model"):
+            cheap_model = self.get_cheap_model()
+            if not cheap_model or cheap_model == selector:
+                return {"selector": None, "provider": None, "model": None}
+            return self._resolve_model_selector(cheap_model, providers=providers)
+
+        if "/" in selector:
+            provider_name, model_name = selector.split("/", 1)
+            return {
+                "selector": selector,
+                "provider": provider_name,
+                "model": model_name,
+            }
+
+        for provider in providers:
+            if provider.get("name") == selector:
+                model_name = provider.get("model")
+                normalized = f"{selector}/{model_name}" if model_name else selector
+                return {
+                    "selector": normalized,
+                    "provider": selector,
+                    "model": model_name,
+                }
+
+        for provider in providers:
+            if provider.get("model") == selector:
+                provider_name = provider.get("name")
+                normalized = f"{provider_name}/{selector}" if provider_name else selector
+                return {
+                    "selector": normalized,
+                    "provider": provider_name,
+                    "model": selector,
+                }
+
+        return {"selector": selector, "provider": None, "model": selector}
+
+    def _get_default_mandate_selector(self) -> Optional[str]:
+        """Return the default configured selector, if any."""
+        return self.mandate_config.get("defaults", {}).get("preferred") or None
+
+    def _is_banned_selector(self, selector: Optional[str]) -> bool:
+        """Return True when selector resolves to a banned provider or model."""
+        banned = self.mandate_config.get("defaults", {}).get("banned", [])
+        if not selector:
+            return False
+
+        resolved = self._resolve_model_selector(selector)
+        candidates = {
+            selector,
+            resolved.get("selector"),
+            resolved.get("provider"),
+            resolved.get("model"),
+        }
+        return any(item and item in candidates for item in banned)
+
     def get_current_mandate(self) -> Dict[str, Any]:
         """Get the current model mandate configuration."""
         preference_model = self._mandate_preference.get("model")
         preference_provider = self._mandate_preference.get("provider")
 
         if preference_model is None:
-            preference_model = self.mandate_config.get("defaults", {}).get("preferred")
-            if preference_model:
-                for p in self.providers:
-                    if p.get("name") == preference_model or p.get("model") == preference_model:
-                        preference_provider = p.get("name")
-                        break
+            resolved_default = self._resolve_model_selector(self._get_default_mandate_selector())
+            preference_model = resolved_default.get("model")
+            preference_provider = resolved_default.get("provider")
 
         return {
             "preference": {

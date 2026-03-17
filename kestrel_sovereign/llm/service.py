@@ -331,17 +331,22 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         mandates = self.mandate_config.get("mandates", {})
         prompt_lower = user_prompt.lower()
 
-        for keyword, model in mandates.items():
+        for keyword, selector in mandates.items():
             pattern = r'\b' + re.escape(keyword.lower()) + r'\b'
             if re.search(pattern, prompt_lower):
-                banned_list = self.mandate_config.get("defaults", {}).get("banned", [])
-                if model in banned_list or any(b in model for b in banned_list):
-                    logger.warning(f"Mandate model '{model}' is banned. Ignoring.")
+                if self._is_banned_selector(selector):
+                    logger.warning(f"Mandate selector '{selector}' is banned. Ignoring.")
                     continue
-                logger.info(f"Model mandate triggered by '{keyword}'. Using: {model}")
-                return model
+                resolved = self._resolve_model_selector(selector)
+                logger.info(f"Model mandate triggered by '{keyword}'. Using: {resolved['selector'] or selector}")
+                return resolved["selector"] or selector
 
-        return self.mandate_config.get("defaults", {}).get("preferred")
+        default_selector = self._get_default_mandate_selector()
+        if self._is_banned_selector(default_selector):
+            logger.warning(f"Default mandate selector '{default_selector}' is banned. Ignoring.")
+            return None
+        resolved_default = self._resolve_model_selector(default_selector)
+        return resolved_default["selector"] or default_selector
 
     # ==================== Observability Methods ====================
 
@@ -462,13 +467,23 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         Returns:
             Model identifier for cheap model, or None to use default
         """
-        # Check mandate config for explicit cheap model
-        cheap_model = self.mandate_config.get("defaults", {}).get("cheap_model")
-        if cheap_model:
-            return cheap_model
+        defaults = self.mandate_config.get("defaults", {})
 
-        # Look for haiku/mini variants in configured providers using registry
-        cheap_patterns = ["haiku", "mini", "flash", "instant", "small", "fast"]
+        # Check mandate config for explicit cheap model selector.
+        cheap_selector = defaults.get("cheap_model")
+        if cheap_selector and cheap_selector != "auto":
+            resolved = self._resolve_model_selector(cheap_selector)
+            return resolved.get("model") or cheap_selector
+
+        # Look for cheap variants in configured providers using discovery-backed hints.
+        cheap_patterns = defaults.get("cheap_model_hints") or [
+            "haiku",
+            "mini",
+            "flash",
+            "instant",
+            "small",
+            "fast",
+        ]
         cheap_providers = self.provider_registry.get_providers_with_pattern(cheap_patterns)
 
         if cheap_providers:
@@ -507,7 +522,7 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         messages = provider["adapter"].create_messages(user_prompt=user_prompt, system_prompt=system_prompt)
 
         model_to_use = provider["model"]
-        if target_model and (":" in target_model or target_model.startswith("gpt-")):
+        if target_model:
             model_to_use = target_model
             logger.info(f"Overriding with mandate model: {model_to_use}")
 
@@ -563,19 +578,28 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
             return response
 
     async def get_audit_response(self, text_to_audit: str) -> Dict[str, Any]:
-        """Get a structured response from the designated audit model."""
-        audit_model_name = self.mandate_config.get("defaults", {}).get("feedback_audit_model")
-        if not audit_model_name:
-            return {"risk_level": 1, "reasoning": "Audit skipped - no feedback_audit_model configured."}
+        """Get a structured audit response from the normal provider chain."""
+        if not self.providers:
+            return {"risk_level": 1, "reasoning": "Audit skipped - no providers available."}
 
-        provider_for_model = None
-        for p in self.providers:
-            if audit_model_name in p["model"] or p["name"] in audit_model_name:
-                provider_for_model = p
-                break
+        target_selector = self._get_default_mandate_selector()
+        if not target_selector:
+            pref_model = self._mandate_preference.get("model")
+            pref_provider = self._mandate_preference.get("provider")
+            if pref_model:
+                target_selector = f"{pref_provider}/{pref_model}" if pref_provider else pref_model
 
-        if not provider_for_model:
-            return {"risk_level": 1, "reasoning": f"Audit skipped - provider '{audit_model_name}' not available."}
+        available_providers = self.providers
+        target_model = None
+        if target_selector:
+            resolved = self._resolve_model_selector(target_selector, providers=available_providers)
+            target_provider = resolved.get("provider")
+            target_model = resolved.get("model")
+            if target_provider:
+                available_providers = [
+                    provider for provider in available_providers
+                    if provider["name"] == target_provider
+                ] or available_providers
 
         system_prompt = """
 You are an AI Integrity Auditor for a Kestrel agent's responses.
@@ -597,21 +621,34 @@ No other text or formatting.
 """
 
         try:
-            logger.info(f"Auditing with provider: {provider_for_model['name']}")
-            messages = provider_for_model["adapter"].create_messages(user_prompt=text_to_audit, system_prompt=system_prompt)
+            errors = {}
+            for provider in available_providers:
+                logger.info(f"Auditing with provider: {provider['name']}")
+                messages = provider["adapter"].create_messages(
+                    user_prompt=text_to_audit,
+                    system_prompt=system_prompt,
+                )
 
-            response = await provider_for_model["adapter"].get_response(
-                client=provider_for_model["client"],
-                model=audit_model_name,
-                messages=messages,
-                format="json"
-            )
+                try:
+                    response = await provider["adapter"].get_response(
+                        client=provider["client"],
+                        model=target_model or provider["model"],
+                        messages=messages,
+                        format="json",
+                    )
+                    response_json = json.loads(response.content)
+                    if "risk_level" not in response_json or "reasoning" not in response_json:
+                        raise ValueError("Missing required keys in audit response.")
+                    return response_json
+                except (LLMProviderError, openai.APIError, openai.APIConnectionError, httpx.HTTPError, ConnectionError, TimeoutError) as exc:
+                    errors[provider["name"]] = str(exc)
+                    logger.warning(f"Audit provider {provider['name']} failed: {exc}")
+                    continue
 
-            response_json = json.loads(response.content)
-            if "risk_level" not in response_json or "reasoning" not in response_json:
-                raise ValueError("Missing required keys in audit response.")
-
-            return response_json
+            if errors:
+                joined = "; ".join(f"{name}: {error}" for name, error in errors.items())
+                return {"risk_level": 3, "reasoning": f"Audit provider failed: {joined}"}
+            return {"risk_level": 1, "reasoning": "Audit skipped - no providers available."}
 
         except json.JSONDecodeError as e:
             logger.error(f"Failed to parse audit JSON: {e}")
@@ -679,31 +716,24 @@ No other text or formatting.
         # Strip tools if the target model can't handle them
         tools = self._check_model_tool_support(available_providers, tools, model_override)
 
-        # Parse provider/model format (e.g., "openrouter/gpt-5.1")
-        mandated_provider = None
-        if target_model and "/" in target_model:
-            provider_name, target_model = target_model.split("/", 1)
-            for p in available_providers:
-                if p["name"] == provider_name:
-                    mandated_provider = p
-                    break
-            if mandated_provider:
-                logger.info(f"Using only provider '{provider_name}' with model '{target_model}'")
-                available_providers = [mandated_provider]
-        elif not target_model:
-            # Check mandate preference when no explicit override
+        if not target_model:
             pref_model = self._mandate_preference.get("model")
             pref_provider = self._mandate_preference.get("provider")
             if pref_model:
-                target_model = pref_model
-                if pref_provider:
-                    for p in available_providers:
-                        if p["name"] == pref_provider:
-                            mandated_provider = p
-                            break
-                    if mandated_provider:
-                        logger.info(f"Model mandate set: using only {pref_provider} with {pref_model}")
-                        available_providers = [mandated_provider]
+                target_model = f"{pref_provider}/{pref_model}" if pref_provider else pref_model
+
+        if target_model:
+            resolved = self._resolve_model_selector(target_model, providers=available_providers)
+            target_provider = resolved.get("provider")
+            target_model = resolved.get("model")
+            if target_provider:
+                matching_provider = next(
+                    (provider for provider in available_providers if provider["name"] == target_provider),
+                    None,
+                )
+                if matching_provider:
+                    logger.info(f"Using only provider '{target_provider}' with model '{target_model}'")
+                    available_providers = [matching_provider]
 
         errors = {}
         for provider in available_providers:
@@ -1084,46 +1114,31 @@ No other text or formatting.
         # Strip tools if the target model can't handle them
         tools = self._check_model_tool_support(providers, tools, model_override)
 
-        # Handle model override with provider prefix (e.g., "openai/gpt-5-mini")
-        target_provider = None
-        target_model = None
-        if model_override:
-            if "/" in model_override:
-                provider_name, target_model = model_override.split("/", 1)
-                # Find the specified provider
-                for p in providers:
-                    if p["name"] == provider_name:
-                        target_provider = p
-                        break
-                if target_provider:
-                    # Only use the specified provider — don't fall back to
-                    # others that won't have the same model
-                    providers = [target_provider]
-                else:
-                    raise LLMServiceError(
-                        f"Provider '{provider_name}' not available. "
-                        f"Available: {[p['name'] for p in providers]}"
-                    )
-            else:
-                target_model = model_override
-        else:
-            # Check mandate preference (set by !model-set command or UI selection)
+        target_selector = model_override
+        if not target_selector:
             pref_model = self._mandate_preference.get("model")
             pref_provider = self._mandate_preference.get("provider")
             if pref_model:
-                target_model = pref_model
-                if pref_provider:
-                    # When provider is explicitly set, ONLY use that provider
-                    # Don't fall back to others - they won't have the same model
-                    for p in providers:
-                        if p["name"] == pref_provider:
-                            target_provider = p
-                            break
-                    if target_provider:
-                        providers = [target_provider]
-                        logger.info(f"Model mandate set: using only {pref_provider} with {pref_model}")
-                    else:
-                        logger.warning(f"Mandated provider '{pref_provider}' not found in available providers")
+                target_selector = f"{pref_provider}/{pref_model}" if pref_provider else pref_model
+
+        target_model = None
+        if target_selector:
+            resolved = self._resolve_model_selector(target_selector, providers=providers)
+            target_provider = resolved.get("provider")
+            target_model = resolved.get("model")
+            if target_provider:
+                matched_provider = next(
+                    (provider for provider in providers if provider["name"] == target_provider),
+                    None,
+                )
+                if matched_provider:
+                    providers = [matched_provider]
+                    logger.info(f"Model mandate set: using only {target_provider} with {target_model}")
+                elif model_override:
+                    raise LLMServiceError(
+                        f"Provider '{target_provider}' not available. "
+                        f"Available: {[p['name'] for p in providers]}"
+                    )
 
         for provider in providers:
             try:

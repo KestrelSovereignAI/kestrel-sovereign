@@ -233,7 +233,7 @@ return audited_response
 - **Batch Auditing:** Group multiple responses for efficiency
 - **Caching:** Cache audit results for similar responses
 - **Dynamic Fees:** Adjust audit costs based on response complexity
-- **Parallel Processing:** Multiple audit models for high-volume scenarios
+- **Parallel Processing:** Multiple audit providers or routes for high-volume scenarios
 
 ---
 
@@ -305,14 +305,15 @@ return audited_response
 
 ### Model Configuration (`model_mandate.toml`)
 ```toml
-feedback_audit_model = "phi3"  # Local audit model
+cheap_model = "auto"
+cheap_model_hints = ["haiku", "mini", "flash", "instant", "small", "fast"]
 ```
 
 ### Environment Variables
 ```bash
 KESTREL_AUDIT_ENABLED=true      # Enable/disable auditing
 KESTREL_AUDIT_FEE=0.1          # FIL cost per audit
-KESTREL_AUDIT_MODEL=phi3       # Audit model selection
+KESTREL_AUDIT_ROUTE=default    # Audit uses the standard provider-routing path
 ```
 
 ### Monitoring & Alerts
@@ -338,14 +339,14 @@ Prevention: Monitor balance, implement auto-replenishment
 ```
 Solution: Fallback to simplified audit or skip
 Impact: Reduced ethical enforcement
-Prevention: Multiple audit models, health checks
+Prevention: Multiple audit routes, health checks
 ```
 
 **High False Positive Rate:**
 ```
 Solution: Adjust audit thresholds, retrain model
 Impact: User experience degradation
-Prevention: Continuous audit model improvement
+Prevention: Continuous audit prompt and route improvement
 ```
 
 ---
