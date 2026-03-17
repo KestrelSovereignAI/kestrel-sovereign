@@ -23,7 +23,7 @@ from .storage import CouncilStorage, get_storage
 logger = logging.getLogger(__name__)
 
 # Default config path (individual file for backward compat)
-CONFIG_PATH = Path(__file__).parent.parent.parent / "council_config.toml"
+CONFIG_PATH = Path("council_config.toml")
 
 # Unified config path (preferred)
 UNIFIED_CONFIG_PATH = Path("kestrel.toml")

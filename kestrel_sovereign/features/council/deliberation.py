@@ -24,6 +24,7 @@ from kestrel_sovereign.kestrel_config.defaults import (
     get_xai_api_url,
     get_groq_api_url,
 )
+from kestrel_sovereign.llm.model_selection import resolve_provider_default
 
 from .models import (
     CouncilMember,
@@ -206,12 +207,17 @@ async def _initialize_adapters(
 
     for member in members:
         try:
+            resolved_model = member.model
+            if resolved_model == "auto":
+                resolved_model = resolve_provider_default(member.provider)
             client, adapter = await _get_adapter_for_provider(
                 member.provider,
-                member.model
+                resolved_model
             )
-            adapters[member.name] = (client, adapter, member.model)
-            logger.info(f"Initialized adapter for {member.name} ({member.provider})")
+            adapters[member.name] = (client, adapter, resolved_model)
+            logger.info(
+                f"Initialized adapter for {member.name} ({member.provider}/{resolved_model})"
+            )
         except Exception as e:
             logger.error(f"Failed to initialize {member.name}: {e}")
             raise RuntimeError(
@@ -373,6 +379,7 @@ async def _run_deliberation_round(
 
     # Add messages to round and track token usage
     for member, result in zip(members, results):
+        _, _, resolved_model = adapters[member.name]
         if isinstance(result, Exception):
             logger.error(f"Member {member.name} failed: {result}")
             content = f"[Error: {str(result)}]"
@@ -384,7 +391,7 @@ async def _run_deliberation_round(
             session.add_token_usage(
                 member_name=member.name,
                 provider=member.provider,
-                model=member.model,
+                model=resolved_model,
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
                 round_number=round.round_number,
@@ -392,7 +399,7 @@ async def _run_deliberation_round(
 
         round.add_message(
             member_name=member.name,
-            model=member.model,
+            model=resolved_model,
             content=content
         )
 
@@ -509,6 +516,7 @@ Respond ONLY with a JSON verdict in this exact format:
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
     for member, result in zip(members, results):
+        _, _, resolved_model = adapters[member.name]
         if isinstance(result, Exception):
             content = f"[Error: {str(result)}]"
         else:
@@ -517,7 +525,7 @@ Respond ONLY with a JSON verdict in this exact format:
             session.add_token_usage(
                 member_name=member.name,
                 provider=member.provider,
-                model=member.model,
+                model=resolved_model,
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
                 round_number=round.round_number,
@@ -525,7 +533,7 @@ Respond ONLY with a JSON verdict in this exact format:
 
         round.add_message(
             member_name=member.name,
-            model=member.model,
+            model=resolved_model,
             content=content
         )
 

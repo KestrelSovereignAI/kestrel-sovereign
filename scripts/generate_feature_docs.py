@@ -7,7 +7,7 @@ No annotations needed in the canonical file — audience profiles are system pro
 Usage:
     uv run python scripts/generate_feature_docs.py --audience investor
     uv run python scripts/generate_feature_docs.py --all
-    uv run python scripts/generate_feature_docs.py --audience user --model gpt-5-mini
+    uv run python scripts/generate_feature_docs.py --audience user --model openai/gpt-5.1
     uv run python scripts/generate_feature_docs.py --audience investor --dry-run
 """
 
@@ -16,6 +16,8 @@ import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+
+from kestrel_sovereign.llm.model_selection import resolve_provider_default
 
 # ---------------------------------------------------------------------------
 # Audience profiles
@@ -95,6 +97,10 @@ AUDIENCES: dict[str, dict] = {
 # LLM client helpers
 # ---------------------------------------------------------------------------
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+SOURCE_FILE = PROJECT_ROOT / "KESTREL_FEATURES.md"
+OUTPUT_DIR = PROJECT_ROOT / "docs" / "generated"
+
 
 def get_client_and_model(model_override: str | None) -> tuple:
     """Auto-detect available LLM provider. Returns (call_fn, model_name, provider_name)."""
@@ -112,7 +118,7 @@ def get_client_and_model(model_override: str | None) -> tuple:
         import anthropic
 
         client = anthropic.Anthropic()
-        model = model_override or "claude-sonnet-4-5-20250929"
+        model = model_override or f"anthropic/{resolve_provider_default('anthropic')}"
         if model.startswith("anthropic/"):
             model = model.split("/", 1)[1]
 
@@ -131,7 +137,7 @@ def get_client_and_model(model_override: str | None) -> tuple:
         import openai
 
         client = openai.OpenAI()
-        model = model_override or "gpt-5-mini"
+        model = model_override or f"openai/{resolve_provider_default('openai')}"
         if model.startswith("openai/"):
             model = model.split("/", 1)[1]
 
@@ -151,15 +157,6 @@ def get_client_and_model(model_override: str | None) -> tuple:
     print("Error: No LLM API key found.")
     print("Set ANTHROPIC_API_KEY or OPENAI_API_KEY in your environment or .env file.")
     sys.exit(1)
-
-
-# ---------------------------------------------------------------------------
-# Core generation
-# ---------------------------------------------------------------------------
-
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-SOURCE_FILE = PROJECT_ROOT / "KESTREL_FEATURES.md"
-OUTPUT_DIR = PROJECT_ROOT / "docs" / "generated"
 
 
 def generate(audience: str, model_override: str | None = None, dry_run: bool = False) -> Path:
@@ -234,7 +231,7 @@ def main():
     parser.add_argument(
         "--model",
         default=None,
-        help="LLM model override (e.g. gpt-5-mini, claude-sonnet-4-5-20250929)",
+        help="LLM model override (e.g. openai/gpt-5.1, anthropic/claude-opus-4-5-20251101)",
     )
     parser.add_argument(
         "--dry-run",
