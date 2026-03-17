@@ -252,12 +252,24 @@ async def set_privacy_mode(request: Request):
         if hasattr(agent, 'llm_service') and agent.llm_service:
             llm = agent.llm_service
             if not config.allows_cloud_llm():
-                # Save current preference before overriding to local
-                current_pref = llm.get_model_preference()
-                if current_pref and current_pref.get("provider") not in (llm._get_local_provider_names() or []):
-                    llm._pre_ephemeral_preference = current_pref
-
                 local_names = llm._get_local_provider_names()
+                # Save the resolved active cloud route before overriding to local.
+                # A user may be running on the default provider/model without an
+                # explicit mandate preference, and that effective route still needs
+                # to be restored when leaving local-only privacy modes.
+                current_pref = llm.get_model_preference() or {}
+                current_provider = current_pref.get("provider")
+                current_model = current_pref.get("model")
+                if not current_model and getattr(llm, "providers", None):
+                    first_provider = llm.providers[0]
+                    current_provider = first_provider.get("name")
+                    current_model = first_provider.get("model")
+                if current_model and current_provider not in (local_names or []):
+                    llm._pre_ephemeral_preference = {
+                        "provider": current_provider,
+                        "model": current_model,
+                    }
+
                 local_providers = [p for p in llm.providers if p["name"] in local_names]
                 # Prefer ollama over llama_cpp — ollama is more universally available
                 local_provider = next(

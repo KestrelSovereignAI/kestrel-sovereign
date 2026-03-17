@@ -62,6 +62,20 @@ def test_commands_endpoint_merges_builtin_and_feature_commands():
         _restore_app(app, original)
 
 
+def test_commands_endpoint_builtin_inventory_matches_command_handler_specs():
+    from endpoints.commands import BUILTIN_COMMANDS
+    from kestrel_sovereign.command_handler import BUILTIN_COMMAND_SPECS
+
+    endpoint_cmds = {entry["cmd"] for entry in BUILTIN_COMMANDS}
+    handler_cmds = {entry["cmd"] for entry in BUILTIN_COMMAND_SPECS}
+
+    assert endpoint_cmds == handler_cmds
+    assert "!sleep" in endpoint_cmds
+    assert "!continue" in endpoint_cmds
+    assert "!reload-context" in endpoint_cmds
+    assert "!heartbeat" in endpoint_cmds
+
+
 def test_sessions_endpoint_returns_message_totals_from_history():
     history = [
         {"role": "user", "content": "hi"},
