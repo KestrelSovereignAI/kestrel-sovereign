@@ -2,13 +2,13 @@
 
 [defaults]
 # The default model provider to use if no specific mandate matches.
-# Options: "ollama", "openai", or a specific model name.
-preferred = "ollama"
+# Options: empty, a provider name, provider/model, or a specific model name.
+preferred = ""
 
-# The specific model to be used for auditing responses and code.
-# This should ideally be a model trusted for its analytical and
-# truth-seeking capabilities.
-feedback_audit_model = "grok"
+# Selector for lower-cost subqueries and compression work.
+# "auto" = pick from discovered providers using cheap_model_hints.
+cheap_model = "auto"
+cheap_model_hints = ["haiku", "mini", "flash", "instant", "small", "fast"]
 
 # A list of models or providers that are explicitly banned from use.
 # This can be a provider name (e.g., "openai") or a specific model
@@ -18,8 +18,9 @@ banned = []
 [mandates]
 # Define rules to route specific types of queries to specific models.
 # The key is a keyword or phrase that, if found in a user's prompt,
-# will trigger the mandate. The value is the model or provider to use.
-"truth" = "grok" # Hypothetical example from grok_says docs
-"summarize" = "phi3:latest"
-"code" = "codegemma:latest"
-"creative" = "llama3:latest" 
+# will trigger the mandate. The value may be a provider name,
+# provider/model pair, exact model id, or the alias "cheap".
+"truth" = "xai"
+"summarize" = "cheap"
+"code" = "ollama/codegemma:latest"
+"creative" = "anthropic"

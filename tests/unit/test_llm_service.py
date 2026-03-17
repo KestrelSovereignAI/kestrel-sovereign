@@ -53,14 +53,14 @@ def mock_mandate_config():
     """Mock model mandate configuration."""
     return {
         "defaults": {
-            "preferred": "gpt-5-mini",
-            "cheap_model": "claude-haiku-4-5",
-            "feedback_audit_model": "gpt-5-mini",
+            "preferred": "",
+            "cheap_model": "auto",
+            "cheap_model_hints": ["haiku", "mini", "flash"],
             "banned": ["gpt-3"],
         },
         "mandates": {
-            "vision": "gpt-5",
-            "code": "claude-sonnet-4-5",
+            "vision": "openai",
+            "code": "anthropic",
         },
     }
 
@@ -108,12 +108,18 @@ def mock_provider_registry(mock_openai_client, mock_adapter):
     provider_info_anthropic.adapter = mock_adapter
     provider_info_anthropic.model = "claude-sonnet-4-5"
 
+    provider_info_cheap = Mock()
+    provider_info_cheap.name = "anthropic"
+    provider_info_cheap.client = AsyncMock()
+    provider_info_cheap.adapter = mock_adapter
+    provider_info_cheap.model = "claude-haiku-4-5"
+
     registry.initialize_providers = Mock(return_value=[
         provider_info_openai,
         provider_info_anthropic,
     ])
     registry.get_provider_by_name = Mock(return_value=provider_info_anthropic)
-    registry.get_providers_with_pattern = Mock(return_value=[provider_info_anthropic])
+    registry.get_providers_with_pattern = Mock(return_value=[provider_info_cheap])
     registry.update_provider_client = Mock(return_value=True)
 
     return registry
@@ -195,7 +201,7 @@ class TestModelPreference:
 
     @pytest.mark.asyncio
     async def test_get_cheap_model_from_config(self, llm_service):
-        """Test get_cheap_model returns configured cheap model."""
+        """Test get_cheap_model resolves configured selector via discovery-backed hints."""
         cheap_model = llm_service.get_cheap_model()
         assert cheap_model == "claude-haiku-4-5"
 
@@ -353,7 +359,7 @@ class TestCoreGeneration:
 
     @pytest.mark.asyncio
     async def test_get_audit_response(self, llm_service, mock_adapter):
-        """Test get_audit_response returns structured audit result."""
+        """Test get_audit_response returns structured audit result without a dedicated audit model."""
         # Mock JSON response
         mock_adapter.get_response = AsyncMock(return_value=LLMResponse(
             content='{"risk_level": 1, "reasoning": "Normal response"}',

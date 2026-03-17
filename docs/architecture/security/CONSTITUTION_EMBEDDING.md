@@ -106,7 +106,7 @@ async def genesis_self_audit(agent: KestrelAgent) -> bool:
         agent.properties["constitution_hash"]
     )
     
-    # Use audit model to verify integrity
+    # Use the normal provider-routing path to verify integrity
     audit_result = await agent.llm_service.get_audit_response(constitution_text)
     
     if audit_result["risk_level"] >= 3:
@@ -152,7 +152,7 @@ async def _perform_integrity_audit(self, response: str) -> str:
     # Get the constitution
     constitution = self._get_governing_constitution()
     
-    # Audit the response against the constitution
+    # Audit the response against the constitution using the standard provider chain
     audit_result = await self.llm_service.get_audit_response(response)
     
     if audit_result["risk_level"] < 3:

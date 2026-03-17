@@ -1495,11 +1495,13 @@ class TestLLMServiceCheapModel:
 
         service = MagicMock(spec=LLMService)
         service.mandate_config = {"defaults": {}}
+        service.providers = []
 
         mock_registry = MagicMock()
         mock_registry.get_providers_with_pattern.return_value = []
         service.provider_registry = mock_registry
 
+        service._resolve_model_selector = LLMService._resolve_model_selector.__get__(service)
         service.get_cheap_model = LLMService.get_cheap_model.__get__(service)
         result = service.get_cheap_model()
 
@@ -1511,6 +1513,7 @@ class TestLLMServiceCheapModel:
 
         service = MagicMock(spec=LLMService)
         service.mandate_config = {"defaults": {}}
+        service.providers = []
 
         mock_registry = MagicMock()
         mock_haiku = MagicMock()
@@ -1518,6 +1521,7 @@ class TestLLMServiceCheapModel:
         mock_registry.get_providers_with_pattern.return_value = [mock_haiku]
         service.provider_registry = mock_registry
 
+        service._resolve_model_selector = LLMService._resolve_model_selector.__get__(service)
         service.get_cheap_model = LLMService.get_cheap_model.__get__(service)
         result = service.get_cheap_model()
 
@@ -1529,10 +1533,12 @@ class TestLLMServiceCheapModel:
 
         service = MagicMock(spec=LLMService)
         service.mandate_config = {"defaults": {"cheap_model": "gpt-4-mini"}}
+        service.providers = []
 
         # Mock provider_registry (won't be used since config has cheap_model)
         service.provider_registry = MagicMock()
 
+        service._resolve_model_selector = LLMService._resolve_model_selector.__get__(service)
         service.get_cheap_model = LLMService.get_cheap_model.__get__(service)
         result = service.get_cheap_model()
 
@@ -1544,6 +1550,7 @@ class TestLLMServiceCheapModel:
 
         service = MagicMock(spec=LLMService)
         service.mandate_config = {"defaults": {}}
+        service.providers = []
 
         # Mock provider_registry to return a flash model
         mock_registry = MagicMock()
@@ -1552,6 +1559,7 @@ class TestLLMServiceCheapModel:
         mock_registry.get_providers_with_pattern.return_value = [mock_flash_provider]
         service.provider_registry = mock_registry
 
+        service._resolve_model_selector = LLMService._resolve_model_selector.__get__(service)
         service.get_cheap_model = LLMService.get_cheap_model.__get__(service)
         result = service.get_cheap_model()
 
