@@ -1,233 +1,297 @@
 <!-- AUTO-GENERATED from KESTREL_FEATURES.md — do not edit manually -->
-<!-- Audience: user | Generated: 2026-03-16 | Model: anthropic/claude-sonnet-4-5-20250929 -->
+<!-- Audience: user | Generated: 2026-03-17 | Model: anthropic/claude-sonnet-4-5-20250929 -->
 <!-- Regenerate: uv run python scripts/generate_feature_docs.py --audience user -->
 
 # What Kestrel Can Do For You
 
-Kestrel is your personal AI agent with real sovereignty — you control your data, your privacy, and your agent's identity. Here's what makes Kestrel different and what you can do with it.
+Kestrel is your personal AI agent that you fully own and control. Unlike cloud-based AI assistants, Kestrel puts you in charge of your data, your privacy, and your agent's capabilities.
+
+## Your Agent, Your Rules
+
+### Complete Control Over Privacy
+
+You decide exactly how private your conversations should be. Kestrel gives you five clear privacy levels:
+
+| Privacy Mode | What It Means |
+|---|---|
+| **Ephemeral** | Nothing is saved — perfect for sensitive topics. Works only with AI models running on your own computer. |
+| **Isolated** | Temporary session storage that disappears when you're done. Still uses local AI models only. |
+| **Anonymous** | Conversations are stored with all personal information removed. Can use cloud AI services. |
+| **Normal** | Standard mode with full conversation history saved. Works with any AI service. |
+| **Public** | Everything saved and shareable — use this when you want to export or share your conversations. |
+
+You can switch privacy modes anytime, and Kestrel enforces your choice automatically.
+
+### Your Agent Has Its Own Identity
+
+When Kestrel starts up for the first time, it creates its own secure digital identity — think of it as your agent's fingerprint that proves it's genuine and hasn't been tampered with. This identity:
+
+- Stays with your agent permanently
+- Proves your agent's conversations and memories are authentic
+- Lets you verify nothing has been altered without your knowledge
+- Gives your agent a way to sign important decisions
+
+### Constitutional Governance
+
+Your agent follows a built-in constitution that defines its values and boundaries. The constitution ensures your agent:
+
+- Respects your autonomy and privacy
+- Asks permission before taking sensitive actions
+- Operates transparently so you always know what it's doing
+- Maintains continuity of its identity and memories over time
+
+You can read and modify this constitution — your agent genuinely works for you.
+
+## Works With Any AI Model
+
+Kestrel isn't locked to one company's AI. You can use:
+
+- **Cloud services** like ChatGPT (OpenAI), Claude (Anthropic), Gemini (Google)
+- **Local models** running on your own computer through Ollama
+- **Specialized providers** like OpenRouter for access to dozens of models
+- **Enterprise options** like Google Vertex AI
+
+Switch between models anytime. Kestrel handles the technical details so you just pick the AI that works best for your task and budget.
+
+## Memory That Actually Works
+
+### Conversation History
+
+Kestrel remembers your conversations and can find past discussions when you need them. You can:
+
+- Review full conversation transcripts
+- Search through your history
+- Delete specific messages or entire conversations
+- Export your data anytime
+
+### Smart Context Management
+
+Your agent automatically figures out what information to include when answering you. It balances:
+
+- Recent conversation context
+- Relevant past memories
+- Available information space in the AI model
+- Your current privacy settings
+
+You don't have to think about token limits or context windows — Kestrel handles it.
+
+### Long-Term Memory
+
+Beyond conversations, Kestrel can store and organize information you want to keep:
+
+- Save important items with tags and categories
+- Create structured records with custom schemas
+- Search and retrieve information later
+- Pin frequently accessed items for quick access
+
+## Built-In Capabilities
+
+### File Handling
+
+Upload and reference files in your conversations. Kestrel stores them securely and your agent can read and discuss their contents.
+
+### Web Search
+
+Your agent can search the internet to find current information, verify facts, or research topics you're discussing.
+
+### Task Management
+
+Create, track, and complete tasks. Your agent can help break down complex goals into manageable steps.
+
+### Scheduled Actions
+
+Set up recurring tasks or reminders. Your agent can perform actions on a schedule you define.
+
+### Code Editing
+
+If you're working with code, your agent can help edit files, suggest changes, and explain technical concepts.
+
+### GitHub Integration
+
+Connect to GitHub repositories for code review, issue tracking, or project management.
+
+## Security You Control
+
+### Permission System
+
+Kestrel asks before taking sensitive actions. You approve or deny requests, and your agent remembers your preferences. The security system:
+
+- Shows you exactly what your agent wants to do
+- Lets you approve, deny, or cancel requests
+- Keeps an audit log of all actions
+- Lets you reset permissions if needed
+
+### API Key Management
+
+Store API keys for external services securely. Kestrel encrypts them and tracks usage so you know exactly what's being spent.
+
+### Audit Trail
+
+Everything your agent does is logged. You can review the complete history of actions, decisions, and data access.
+
+## Data Sovereignty
+
+### Export Everything
+
+At any time, you can export:
+
+- All your conversations
+- Your agent's memories
+- Stored files and documents
+- Configuration and settings
+
+The exports are in standard formats you can read, backup, or import elsewhere.
+
+### Import and Migrate
+
+Moving from another system? Import your existing conversations and data. Kestrel preserves timestamps, context, and relationships.
+
+### Storage Transparency
+
+See exactly what's stored on disk:
+
+- Database statistics
+- File listings
+- Storage usage by category
+- Data retention policies
+
+### Retirement Option
+
+When you're done with Kestrel, you can formally retire your agent. This process:
+
+- Creates a final export of all data
+- Generates a signed record of the retirement
+- Optionally wipes all stored information
+- Gives you a complete archive to keep
+
+## Flexible Deployment
+
+### Run Anywhere
+
+Kestrel works on:
+
+- Your local computer (Mac, Linux, Windows)
+- A server you control
+- Cloud platforms (Google Cloud, RunPod, Vast.ai)
+
+You choose where your agent lives based on your privacy and performance needs.
+
+### Multiple Agents
+
+Create different agents for different purposes:
+
+- Personal agent with your private data
+- Work agent for professional tasks
+- Public agent for shareable demonstrations
+- Specialized agents for specific projects
+
+Each agent has its own identity, memory, and configuration.
+
+### Browser and API Access
+
+Use Kestrel through:
+
+- A web interface for everyday conversations
+- A REST API for programmatic access
+- Server-sent events (SSE) for real-time streaming
+- OpenAI-compatible endpoints for existing tools
+
+## Real-Time Features
+
+### Streaming Responses
+
+Watch your agent's responses appear word-by-word as it thinks. You can:
+
+- Stop generation at any time
+- See real-time progress
+- Get immediate feedback
+
+### Notifications
+
+Your agent can notify you about:
+
+- Completed tasks
+- Scheduled reminders
+- Important events
+- Permission requests
+
+Notifications work through the web interface or SSE streams.
+
+### Heartbeat Monitoring
+
+Check your agent's status anytime. See:
+
+- Whether it's running normally
+- Recent activity
+- Resource usage
+- Active tasks
+
+## Developer-Friendly
+
+### OpenAI-Compatible API
+
+If you have tools built for OpenAI's API, they'll work with Kestrel. The compatibility layer supports:
+
+- Chat completions
+- Model listings
+- Standard request formats
+
+Just point your tools at Kestrel's endpoint instead.
+
+### Webhooks
+
+Configure webhooks to notify external services when events happen in Kestrel. Perfect for integrating with other tools you use.
+
+### Extensible Architecture
+
+Kestrel is built with a feature system that lets developers add new capabilities. Current features include:
+
+**Core capabilities:** identity management, privacy controls, memory systems, task management, security permissions
+
+**External integrations:** web search, GitHub, various cloud compute providers
+
+**Advanced features:** reflection (self-assessment), state monitoring, training and learning, inter-agent communication
+
+**Developer tools:** code editing, deployment assistance, API bridges
+
+## Authentication Options
+
+### Local API Keys
+
+Generate API keys for programmatic access. Perfect when you're running Kestrel on your own machine.
+
+### OAuth for Multi-User
+
+When hosting Kestrel for a team or organization, enable OAuth authentication for secure multi-user access.
+
+### Flexible Access Control
+
+Different endpoints have different access requirements. Kestrel handles:
+
+- Public health checks
+- Protected agent interactions
+- Session-based browser access
+- API key authentication for scripts
+
+## Getting Started
+
+When you first start Kestrel:
+
+1. Your agent creates its unique identity
+2. The constitution is initialized
+3. Storage is set up for your data
+4. Default privacy mode is configured
+
+From there, you can:
+
+- Have your first conversation
+- Adjust privacy settings
+- Connect AI model providers
+- Upload files or configure integrations
+- Set up tasks or scheduled actions
+
+Everything is designed to work out of the box with sensible defaults, but every setting is yours to change.
 
 ---
 
-## Your Agent Has Its Own Identity
-
-**Secure, verifiable identity from day one**
-
-When your agent starts up, it creates its own cryptographic identity that nobody else can forge. This isn't just a username — it's a digital identity that proves your agent is truly yours.
-
-- **Constitutional foundation**: Your agent operates under a built-in constitution that defines its values and boundaries
-- **Permanent identity**: Your agent's identity stays consistent across sessions and can be verified by others
-- **Lifecycle management**: You can graduate your agent to full autonomy or retire it gracefully when you're done
-
----
-
-## Talk to Your Agent Your Way
-
-**Natural conversation with powerful control**
-
-Chat with your agent naturally, and it responds in context. Behind the scenes, you get fine-grained control over how those conversations work.
-
-- **Streaming responses**: Watch your agent think in real-time as it types
-- **Smart context**: Your agent remembers what matters and fits everything into the conversation smoothly
-- **Stop anytime**: Cancel a response mid-stream if it's going off track
-- **Reflection mode**: Your agent can pause and think about what it's learned
-- **Background tasks**: Set your agent loose on long-running work while you do something else
-- **Heartbeat monitoring**: Check in on your agent's health anytime
-
----
-
-## Works With Your Favorite AI Models
-
-**One agent, many AI providers**
-
-Kestrel isn't locked to one AI company. Switch between providers or use local models — your agent works the same way.
-
-**Supported providers:**
-- ChatGPT (OpenAI)
-- Claude (Anthropic)
-- Gemini (Google)
-- Vertex AI (Google Cloud)
-- Ollama (run models on your own machine)
-- OpenRouter (access to many models)
-
-**What this means for you:**
-- Pick the model that fits your task — creative writing, code, analysis, or chat
-- Switch providers without losing your conversation history
-- Run private models locally when you need total privacy
-- Automatic retry and fallback if a provider has issues
-
----
-
-## You Control Your Privacy
-
-**Five privacy levels — from totally ephemeral to fully public**
-
-Most AI tools give you "private" or "not private." Kestrel gives you a spectrum, so you can match privacy to the situation.
-
-| Privacy Level | What Gets Saved | Where AI Runs | Can You Share It? | Best For |
-|---------------|-----------------|---------------|-------------------|----------|
-| **Ephemeral** | Nothing | Your machine only | No | Ultra-sensitive topics |
-| **Isolated** | Temporary session only | Your machine only | No | Private work that needs short-term memory |
-| **Anonymous** | Saved with personal info removed | Cloud AI okay | No | General use with some privacy concerns |
-| **Normal** | Everything | Cloud AI okay | No | Daily conversations you want to keep |
-| **Public** | Everything | Cloud AI okay | Yes | Shared knowledge, public projects |
-
-**What privacy controls let you do:**
-- Have ephemeral conversations that vanish completely
-- Use cloud AI without sending personal information
-- Keep a permanent history of conversations you want to remember
-- Share specific conversations publicly while keeping others private
-- Change privacy level mid-conversation
-
----
-
-## Your Data Stays Yours
-
-**Full control over storage, export, and deletion**
-
-Kestrel stores your conversations and memories, but you're always in control.
-
-- **Persistent storage**: Your conversation history and agent memories are saved locally
-- **Export everything**: Download your full data package anytime — conversations, memories, identity
-- **Import to new instance**: Move your agent to a new machine and pick up where you left off
-- **Storage stats**: See exactly how much data you've accumulated
-- **File management**: Upload files, preview them, and delete what you don't need
-
----
-
-## Memory That Grows With You
-
-**Your agent remembers what matters**
-
-Kestrel doesn't just log conversations — it builds structured memories so your agent gets smarter over time.
-
-- **Automatic memory formation**: Important facts and context are saved as you chat
-- **Memory search**: Your agent can recall past conversations when relevant
-- **Identity chain**: See the history of your agent's identity and major events
-- **Memory agency**: Your agent can reflect on its own memories and surface insights
-
----
-
-## Built-In Security and Permissions
-
-**Safe automation with human oversight**
-
-Your agent can do a lot, but you stay in control of what it's allowed to touch.
-
-- **Permission system**: Features ask for permission before taking sensitive actions
-- **Pending requests**: Review and approve actions before they happen
-- **Audit log**: See everything your agent has done
-- **Session security**: Cancel all pending requests or reset your session
-- **Feature permissions**: Control which capabilities your agent can use
-
----
-
-## Organized Conversations
-
-**Never lose track of what you talked about**
-
-Kestrel organizes your conversations into sessions, so you can come back to any topic.
-
-- **Session management**: Create new conversations or continue old ones
-- **Full transcripts**: Export any conversation as a readable transcript
-- **Message history**: See every message, including tool use and thinking steps
-- **Search across sessions**: Find that conversation from last month
-- **Delete what you don't need**: Clean up old sessions anytime
-
----
-
-## Save and Organize Anything
-
-**Structured knowledge management**
-
-When your agent finds something worth keeping, it can save it with rich metadata.
-
-- **Flexible schemas**: Save bookmarks, research notes, code snippets, or anything else
-- **Tagging**: Organize saved items with tags
-- **Search**: Find items by content, tag, or schema
-- **Pin important items**: Keep critical information at the top
-- **Stats and summaries**: See what you've collected over time
-
----
-
-## Real-Time Notifications
-
-**Stay in the loop**
-
-Your agent can notify you when something important happens.
-
-- **Server-sent events**: Real-time updates delivered instantly
-- **Notification history**: Review past notifications
-- **Context updates**: Know when your agent's context window changes
-- **Task completion**: Get notified when background tasks finish
-
----
-
-## Extensible With Features
-
-**Capabilities that grow**
-
-Kestrel is built around a feature system that lets your agent gain new abilities.
-
-**Current feature areas include:**
-- **Identity and sovereignty**: Manage your agent's lifecycle and identity
-- **Memory and reflection**: How your agent learns and recalls
-- **Privacy and consent**: Control over data and permissions
-- **Compute and deployment**: Run workloads and manage infrastructure
-- **Integrations**: GitHub, web search, webhooks, and more
-- **Code editing**: Let your agent help with code
-- **Scheduling and tasks**: Background work and automation
-- **Wellness and state-of-mind**: Your agent can reflect on its own state
-
----
-
-## Developer-Friendly API
-
-**OpenAI-compatible endpoints and more**
-
-If you're building on top of Kestrel, you get a full REST API.
-
-- **OpenAI-compatible chat completions**: Drop-in replacement for OpenAI API
-- **Model listing**: See what models are available
-- **Agent control**: Start, stop, and configure your agent programmatically
-- **Data access**: Query conversations, memories, and files
-- **Observability**: Event streams and summaries for monitoring
-
----
-
-## Authentication That Fits Your Setup
-
-**Local or OAuth, your choice**
-
-Run Kestrel locally and skip authentication, or set up OAuth for multi-user deployments.
-
-- **Local mode**: API key generated on first run for single-user use
-- **OAuth mode**: Secure login for hosted deployments
-- **Session management**: Browser-based UI with persistent sessions
-- **API key or session**: Most endpoints work with either authentication method
-
----
-
-## Open and Auditable
-
-**No black boxes**
-
-Kestrel's architecture is transparent and testable.
-
-- **Constitutional governance**: Your agent's behavior is defined by a readable constitution
-- **Audit logs**: Every action is logged and reviewable
-- **Feature inventory**: You can see exactly what capabilities are loaded
-- **Test coverage**: Core contracts are verified with automated tests
-
----
-
-## What This All Means
-
-Kestrel gives you an AI agent that:
-- **Respects your privacy** with granular controls
-- **Works with your preferred AI models** — commercial or local
-- **Remembers what matters** and grows smarter over time
-- **Stays under your control** with permissions and audit logs
-- **Organizes your conversations and knowledge** so nothing gets lost
-- **Has its own verifiable identity** that you truly own
-
-Whether you're having a quick ephemeral chat, building a long-term research project, or automating complex workflows, Kestrel adapts to how you want to work — without compromising on sovereignty or control.
+**Your AI agent. Your data. Your control.**

@@ -72,7 +72,7 @@
 
 - Privacy modes and enforcement:
   - [`kestrel_sovereign/privacy.py`](kestrel_sovereign/privacy.py)
-  - [`kestrel_sovereign/privacy_agent.py`](kestrel_sovereign/privacy_agent.py)
+  - [`kestrel_sovereign/features/privacy/feature.py`](kestrel_sovereign/features/privacy/feature.py)
   - [`kestrel_sovereign/features/privacy/`](kestrel_sovereign/features/privacy)
 - Canonical privacy presets:
 
@@ -85,8 +85,8 @@
 | `public` | full | cloud | yes | Shareable and exportable |
 
 - Storage and persistence:
-  - [`kestrel_sovereign/storage.py`](kestrel_sovereign/storage.py)
-  - [`kestrel_sovereign/async_storage.py`](kestrel_sovereign/async_storage.py)
+  - [`kestrel_sovereign/storage/__init__.py`](kestrel_sovereign/storage/__init__.py)
+  - [`kestrel_sovereign/storage/async_storage.py`](kestrel_sovereign/storage/async_storage.py)
   - [`kestrel_sovereign/storage/`](kestrel_sovereign/storage)
 - Memory systems:
   - [`kestrel_sovereign/agent/memory_manager.py`](kestrel_sovereign/agent/memory_manager.py)
@@ -222,6 +222,7 @@ The currently exported `Feature` subclasses discovered from those modules includ
   - `GET /api/memories`
   - `GET /api/memories/{node_id}`
   - `GET /api/identity-chain`
+  - `DELETE /api/memories/{node_id}`
 - [`endpoints/sovereignty.py`](endpoints/sovereignty.py)
   - `GET /api/storage/stats`
   - `GET /api/sovereignty/exports`
