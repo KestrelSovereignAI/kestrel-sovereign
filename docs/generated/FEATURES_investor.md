@@ -2,11 +2,11 @@
 <!-- Audience: investor | Generated: 2026-03-17 | Model: anthropic/claude-sonnet-4-5-20250929 -->
 <!-- Regenerate: uv run python scripts/generate_feature_docs.py --audience investor -->
 
-# Kestrel Sovereign: Platform Overview for Investors
+# Kestrel Sovereign Platform Overview
 
 **Executive Summary**
 
-Kestrel Sovereign is an AI agent platform architected for data sovereignty, constitutional governance, and vendor independence. The system provides portable decentralized identity (DID), multi-provider LLM orchestration with no platform lock-in, and enterprise-grade privacy controls from inception. Its extensible feature architecture and comprehensive API surface position it as infrastructure for the next generation of autonomous AI applications where users—not platforms—own and control their AI agents.
+Kestrel Sovereign is an enterprise-grade AI platform built on three foundational differentiators: a constitutional governance framework with no industry equivalent, portable decentralized identity that prevents vendor lock-in, and privacy-by-design architecture that meets enterprise compliance requirements from day one. The platform provides vendor-independent access to multiple LLM providers while maintaining full data sovereignty and extensibility through a feature plugin system that supports domain-specific capabilities without core platform modifications.
 
 ---
 
@@ -14,374 +14,214 @@ Kestrel Sovereign is an AI agent platform architected for data sovereignty, cons
 
 ### Constitutional Governance Framework
 
-Kestrel implements a governance model with no current industry equivalent. Every agent operates under a formal constitution that defines permissible actions, ethical boundaries, and operational constraints. This constitutional layer:
+Kestrel's constitutional AI system represents a novel approach to AI governance with no direct industry equivalent. Rather than relying on post-hoc oversight or external review boards, the platform embeds constitutional principles directly into the agent runtime, ensuring that every agent action is evaluated against codified governance rules before execution.
 
-- Provides legally auditable decision-making frameworks
-- Enables transparent governance for regulated industries
-- Creates verifiable compliance trails for enterprise deployments
-- Establishes clear liability boundaries between platform, operator, and end-user
+The constitution defines three layers of constraint:
+- **Immutable principles** that cannot be overridden
+- **Governance policies** that shape agent behavior
+- **Operational boundaries** that define permitted actions
 
-The constitutional system is not advisory—it is enforceable at the runtime level, providing organizations with unprecedented control over AI agent behavior in production environments.
+This architecture provides auditable governance at the technical layer, making compliance verification a matter of log analysis rather than periodic review.
 
 ### Decentralized Identity and Portability
 
-Kestrel agents are born with cryptographically signed decentralized identifiers (DIDs). This architectural choice delivers:
+The platform's use of Decentralized Identifiers (DIDs) creates true data portability for AI agents. Each agent receives a cryptographically verifiable identity that persists across deployments, providers, and infrastructure changes.
 
-- **True data portability**: Users can export their entire agent state—conversation history, learned preferences, accumulated context—and migrate between hosting providers or self-hosted infrastructure without vendor permission
-- **Continuity verification**: Cryptographic signing ensures agent identity and history cannot be forged or tampered with
-- **Multi-tenant sovereignty**: Organizations can operate fleets of agents with verified identity chains, enabling audit and compliance requirements that current cloud AI services cannot satisfy
+**Competitive advantage**: Unlike platform-specific agent identities, DID-based agents can migrate between providers without losing continuity. An organization can move from one deployment environment to another—cloud to on-premise, or provider A to provider B—while maintaining cryptographic proof of agent history and continuity.
 
-The platform includes complete sovereignty lifecycle management: inception (agent birth with identity), graduation (full autonomy conferral), and retirement (verified data destruction).
+The identity system includes:
+- Cryptographic signing for all agent actions
+- Verifiable continuity chains that prove unbroken agent history
+- Lifecycle management from inception through retirement
+- Export and import capabilities that enable true data sovereignty
 
 ### Agent Runtime and Context Management
 
-The core orchestration engine manages:
+The core agent runtime provides sophisticated context assembly and token budget management, ensuring efficient use of LLM resources while maintaining conversation coherence across extended interactions.
 
-- **Intelligent context assembly**: Dynamically constructs prompt context from conversation history, retrieved memories, active tool state, and constitutional constraints while respecting token budget limits
-- **Streaming inference**: Real-time response generation with server-sent events for low-latency user experience
-- **Command routing**: Extensible handler system that dispatches user requests to appropriate feature modules
-- **Token budget optimization**: Automatic context pruning and prioritization to maximize response quality within model constraints
-
-This runtime architecture separates concerns between conversation management, context retrieval, tool invocation, and LLM inference—enabling independent scaling and optimization of each subsystem.
+Key architectural elements:
+- **Context builder** assembles relevant conversation history, memory fragments, and feature data within token constraints
+- **Streaming architecture** supports real-time interaction patterns required for production applications
+- **Command handler** routes user instructions to appropriate feature implementations
+- **Token budget system** prevents context overflow while maximizing available information
 
 ---
 
 ## AI Capabilities
 
-### Vendor-Independent Multi-LLM Platform
+### Multi-LLM Platform with Zero Lock-In
 
-Kestrel's unified LLM service layer eliminates platform lock-in through:
+Kestrel provides unified access to multiple LLM providers through a vendor-independent abstraction layer. Currently supported providers include OpenAI, Anthropic, Claude Max, Gemini, Vertex AI, Ollama, and OpenRouter, with a provider registry architecture that supports straightforward addition of new vendors.
 
-- **Provider abstraction**: Single API surface that routes to OpenAI, Anthropic, Claude Max, Google Gemini, Vertex AI, Ollama (local), OpenRouter, and mock providers for testing
-- **Automatic failover**: Provider outages trigger transparent failover to alternative models without service interruption
-- **Cost optimization**: Route requests to the most cost-effective provider that meets quality requirements
-- **Hybrid deployment**: Simultaneously use cloud LLMs for general tasks and local models for sensitive data processing
+**Strategic advantage**: Organizations avoid vendor lock-in at the infrastructure layer. If a preferred LLM provider changes pricing, terms of service, or availability, the platform can switch providers without application-layer changes. The same agent, with the same features and memory, can route to different underlying models based on cost optimization, latency requirements, or compliance constraints.
 
-The platform includes a model catalog with metadata (context windows, pricing, capability flags), usage tracking across providers, and intelligent retry logic with exponential backoff.
+The LLM service layer includes:
+- **Unified routing** that presents a consistent interface regardless of backend provider
+- **Model catalog** with metadata for cost, context windows, and capability profiles
+- **Automatic retry and fallback** for resilient production operations
+- **Usage tracking** for cost attribution and optimization analysis
 
-Organizations can add proprietary LLM providers by implementing a standard adapter interface—no core platform modifications required.
+### OpenAI-Compatible Endpoint
 
-### OpenAI-Compatible API Surface
+The platform exposes OpenAI-compatible `/v1/chat/completions` and `/v1/models` endpoints, enabling integration with existing tools and workflows built for the OpenAI API. This compatibility layer allows organizations to adopt Kestrel incrementally, replacing OpenAI infrastructure while maintaining existing client applications.
 
-For organizations with existing AI integrations, Kestrel exposes:
+### Feature Plugin Architecture
 
-- `GET /v1/models` — Model listing in OpenAI format
-- `POST /v1/chat/completions` — Drop-in replacement for OpenAI's chat API
+Kestrel's extensibility model uses a feature plugin system that supports domain-specific capabilities without modifying core platform code. The current platform includes 36 discoverable feature modules spanning:
 
-This compatibility layer allows gradual migration from OpenAI to Kestrel infrastructure while preserving existing application code, reducing adoption friction for enterprises.
+- **Infrastructure automation**: compute provisioning, deployment management, cloud platform integration
+- **Developer tools**: code editing, GitHub integration, web search
+- **Identity and security**: key management, wallet functionality, consent tracking
+- **Memory systems**: structured memory, memory agency, context management
+- **Operational capabilities**: scheduling, task management, delivery tracking, webhook integration
+- **Platform services**: sovereignty operations, audit anchoring, reflection and wellness monitoring
 
-### Extensible Feature Architecture
-
-Kestrel's feature system provides plugin-like extensibility:
-
-- 41 discoverable feature modules in the current platform release
-- 36 exported feature classes providing specialized capabilities
-- Standard lifecycle hooks (initialization, context injection, command handling, cleanup)
-- Isolated permission boundaries enforced by the security subsystem
-
-Current feature domains include:
-
-- **Memory systems**: Short-term conversation memory, long-term semantic memory, and memory agency (agents that curate and organize their own knowledge graphs)
-- **External integrations**: GitHub repository access, web search, webhook delivery
-- **Infrastructure control**: Cloud compute provisioning (GCP, RunPod, Vast.ai), model deployment, scheduler automation
-- **Collaboration**: Peer-to-peer agent communication, council decision-making (multi-agent consensus), bridge protocols for inter-agent messaging
-- **Identity and security**: Key management, wallet integration, visual identity generation, consent tracking
-
-This architecture allows organizations to build proprietary features—domain-specific knowledge retrieval, internal API integrations, custom compliance checks—without forking the core platform.
+**Extensibility advantage**: Organizations can develop proprietary features that leverage platform infrastructure—memory, privacy controls, constitutional oversight, identity—without forking or modifying the core codebase. Features remain isolated modules that can be enabled, disabled, or updated independently.
 
 ---
 
-## Data Sovereignty and Privacy
+## Data Sovereignty
 
-### Privacy-First Architecture
+### Privacy Architecture
 
-Kestrel implements privacy as a spectrum with five distinct operational modes:
+The platform implements privacy-by-design through a five-tier preset system that makes privacy controls explicit and enforceable:
 
-| Mode | Data Storage | LLM Location | Export | Use Case |
-|------|-------------|--------------|--------|----------|
-| **ephemeral** | None | Local only | No | Maximum privacy, no persistence |
-| **isolated** | Temporary | Local only | No | Session-based work, auto-purge |
-| **anonymous** | PII-scrubbed | Cloud allowed | No | Cloud inference with privacy guarantees |
-| **normal** | Full persistent | Cloud allowed | No | Standard production operation |
-| **public** | Full persistent | Cloud allowed | Yes | Shareable agents, open collaboration |
+| Preset | Storage | LLM Location | Shareable | Use Case |
+|--------|---------|--------------|-----------|----------|
+| `ephemeral` | none | local | no | Maximum privacy; nothing persisted |
+| `isolated` | temporary | local | no | Session-only storage with local inference |
+| `anonymous` | scrubbed | cloud | no | Cloud inference with PII removal |
+| `normal` | full | cloud | no | Standard persistent operation |
+| `public` | full | cloud | yes | Shareable and exportable contexts |
 
-Privacy mode enforcement is not configuration—it is architectural:
+Privacy mode selection determines:
+- Whether conversation data is stored and where
+- Whether cloud-based LLMs may process user data
+- Whether PII scrubbing is applied before storage
+- Whether data may be exported or shared
 
-- `ephemeral` mode disables all storage backends at runtime
-- `isolated` mode writes to temporary storage with automatic session cleanup
-- `anonymous` mode runs PII scrubbing before cloud LLM requests and storage writes
-- Privacy transitions require explicit user consent with audit logging
+**Compliance advantage**: Organizations gain explicit, auditable privacy controls that map directly to regulatory requirements. The `anonymous` preset, for instance, provides a technical implementation of data minimization principles required by GDPR, while `ephemeral` mode supports zero-persistence requirements for high-sensitivity contexts.
 
-This design provides **privacy controls from day one** rather than bolting compliance onto an existing cloud-first architecture.
+### Storage and Export Capabilities
 
-### Data Export and Portability
+The sovereignty layer provides complete data export and import capabilities, ensuring that organizations maintain operational control over AI-generated data and can migrate between deployments without data loss.
 
-The sovereignty API provides:
+Export capabilities include:
+- Full conversation transcripts with cryptographic signatures
+- Memory graphs with relationship preservation
+- Identity chains with continuity verification
+- Structured saved items with schema metadata
 
-- **Complete data export**: JSON packages containing conversation transcripts, memory graphs, identity chains, and file attachments
-- **Selective export**: Filter by date range, privacy level, or conversation topic
-- **Import verification**: Cryptographic validation of exported packages to detect tampering
-- **File management**: Direct access to stored files with content-addressed retrieval
-
-Organizations can implement retention policies, regulatory compliance workflows, and disaster recovery procedures using these primitives.
+Import operations validate cryptographic continuity, ensuring that imported data genuinely originated from the claimed agent identity.
 
 ---
 
-## Security and Access Control
+## Security and Privacy
 
-### Permission System
+### Permission System and Constitutional Oversight
 
-Kestrel implements fine-grained authorization:
+The security layer implements a permission tree that governs feature access and resource usage. When a feature requests elevated permissions—file system access, external API calls, compute provisioning—the request flows through constitutional evaluation before execution.
 
-- **Tree-structured permissions**: Features request specific capabilities (filesystem read, network egress, credential access) with hierarchical approval
-- **Pending authorization queue**: Non-interactive approval workflow for batch administrative review
-- **Session-scoped grants**: Permissions expire with user session, preventing privilege escalation from stale authorizations
-- **Audit trail**: Complete history of permission requests, approvals, denials, and revocations
+Security capabilities:
+- **Granular permissions** at the feature and operation level
+- **Approval workflows** for human-in-the-loop oversight when required
+- **Audit trail** of all permission grants and denials
+- **Session isolation** preventing permission leakage between conversations
+- **Constitutional evaluation** ensuring compliance with governance rules
 
-This system allows organizations to operate AI agents in production while maintaining security postures comparable to traditional application infrastructure.
+### Authentication and Authorization
 
-### Authentication Surface
+The platform supports multiple authentication patterns suited to different deployment scenarios:
 
-The platform supports multiple authentication modes:
+- **API key authentication** for programmatic access
+- **OAuth integration** for browser-based workflows
+- **Session management** for stateful interactions
+- **SSE-compatible auth** supporting server-sent events with query parameter tokens
 
-- **API key authentication**: Programmatic access for service-to-service integration
-- **OAuth 2.0 flow**: Browser-based user authentication with session management
-- **Localhost bootstrap**: Local-only API key generation for initial setup
-- **Hybrid authorization**: Routes accept API key or session tokens, enabling both interactive and automated use cases
-
-Critical routes enforce stricter requirements:
-
-- Server-sent event streams support `?api_key=` query parameter for browser EventSource compatibility
-- Browser conditional routes serve UI locally but redirect to OAuth when multi-tenant mode is active
-- Webhook endpoints validate cryptographic signatures (e.g., Stripe webhook verification)
+Route-level access control distinguishes between public endpoints, localhost-only bootstrap routes, and protected API surfaces requiring authentication.
 
 ---
 
 ## Deployment Flexibility
 
-### HTTP API Surface
+### Multi-Environment Support
 
-Kestrel exposes a comprehensive REST API organized into functional route families:
+Kestrel's architecture supports deployment across multiple environments without requiring application-layer changes:
 
-**Agent Interaction**
-- `/agent/invoke` — Synchronous agent invocation
-- `/agent/stream` — Streaming responses via SSE
-- `/agent/stop` — Interrupt long-running operations
-- `/agent/privacy-mode` — Read and modify privacy settings
-- `/agent/notifications` — Notification polling and SSE streams
-- `/agent/context-status` — Inspect active context budget and composition
-- `/agent/tasks` — Asynchronous task management
-- `/agent/heartbeat/*` — Agent lifecycle monitoring
+- **Local development** with Ollama or other local LLM providers
+- **Cloud deployments** using managed LLM services
+- **Hybrid architectures** with on-premise inference for sensitive data and cloud services for non-sensitive operations
+- **Air-gapped environments** using local-only privacy presets and on-premise LLM infrastructure
 
-**Data Management**
-- `/api/conversations/*` — Session and message CRUD
-- `/api/memories/*` — Memory graph access and management
-- `/api/saved-items/*` — Structured data persistence with schemas and tags
-- `/api/files/*` — Content-addressed file storage
+The privacy preset system makes environment-specific constraints explicit: an organization can enforce `isolated` or `ephemeral` modes for on-premise deployments while allowing `normal` mode in cloud environments.
 
-**Sovereignty Operations**
-- `/api/sovereignty/export` — Generate portable agent packages
-- `/api/sovereignty/import` — Restore from exported packages
-- `/api/sovereignty/files/*` — File catalog and preview
+### OAuth Integration
 
-**Administration**
-- `/api/models` — Model catalog and selection
-- `/api/agents` — Multi-agent management
-- `/api/keys` — LLM provider credential management
-- `/api/security/*` — Permission system controls
-- `/api/observability/*` — Event streams and operational summaries
-
-This API design prioritizes:
-- RESTful resource modeling for client library generation
-- SSE streams for real-time updates without WebSocket complexity
-- Content negotiation for both JSON and file downloads
-
-### Multi-Tenant and Single-User Modes
-
-Kestrel operates in two deployment configurations:
-
-**Single-User / Local Mode**
-- OAuth optional, API key bootstrap enabled
-- Filesystem storage backend
-- Local LLM inference via Ollama
-- Suitable for: Developer workstations, edge devices, air-gapped deployments
-
-**Multi-Tenant / Cloud Mode**
-- OAuth required for user sessions
-- Database-backed storage with tenant isolation
-- Cloud LLM routing with cost allocation
-- Suitable for: SaaS platforms, enterprise internal tools, managed hosting
-
-The same codebase supports both modes, allowing organizations to develop locally and deploy to cloud infrastructure without architectural changes.
+The platform includes OAuth support for enterprise identity providers, enabling integration with existing authentication infrastructure. The OAuth layer supports:
+- Standard authorization code flow
+- Session management with secure cookies
+- Token refresh for long-lived sessions
+- Logout with session cleanup
 
 ---
 
 ## Extensibility and Integration
 
-### Feature Plugin System
+### Feature Development Model
 
-Features are self-contained modules that register with the platform and receive:
+The feature plugin architecture enables organizations to build domain-specific capabilities that remain first-class platform citizens. Features gain access to:
+- **Memory systems** for persistent state
+- **Privacy controls** that automatically apply to feature-generated data
+- **Constitutional oversight** ensuring feature actions comply with governance rules
+- **Identity context** for feature operations attributed to the agent identity
+- **LLM access** through the unified multi-provider service
 
-- **Context injection**: Access to conversation history, memory systems, and user preferences
-- **Command routing**: Explicit invocation via `/command <feature_name> <args>`
-- **Lifecycle hooks**: Initialization, cleanup, periodic tasks
-- **Permission requests**: Declarative capability requirements enforced by security subsystem
+### HTTP API Surface
 
-Example feature categories:
+The platform exposes a comprehensive REST API covering:
 
-**Infrastructure Automation**
-- `gcp_compute`, `runpod`, `vastai` — Cloud resource provisioning
-- `deploy` — Application deployment workflows
-- `scheduler` — Cron-like task automation
+**Agent operations**: invoke, stream, stop, status queries, privacy mode management, notification delivery, context inspection, reflection status, task management, heartbeat monitoring
 
-**Knowledge Management**
-- `memory` — Core memory storage
-- `memory_agency` — Self-organizing knowledge graphs
-- `save` — Structured data persistence
-- `web_search` — Internet search integration
+**Conversation management**: session listing, conversation retrieval, transcript export, message deletion, new conversation creation
 
-**Collaboration**
-- `peers` — Inter-agent discovery and communication
-- `council` — Multi-agent voting and consensus
-- `bridge` — Cross-platform agent messaging
+**Memory access**: memory node retrieval, identity chain inspection, node deletion
 
-**Developer Experience**
-- `code_edit` — Codebase modification with diff generation
-- `github` — Repository access and pull request automation
-- `mcp` — Model Context Protocol integration
+**Sovereignty operations**: storage statistics, export generation, import processing, file management with preview support
 
-Organizations can package proprietary features as Python modules, register them with the feature loader, and distribute them to agents without modifying core platform code.
+**Model and provider management**: agent creation and deletion, identity inspection, constitution retrieval, wallet status, key management with usage tracking, model listing and selection, OpenAI-compatible endpoints
 
-### Model Context Protocol (MCP) Support
+**Security and permissions**: permission tree inspection, permission grants, approval workflows, audit trail access, request cancellation, session reset
 
-Kestrel implements the Model Context Protocol, enabling:
+**Observability**: event streaming, summary statistics
 
-- **Standardized tool interfaces**: Define tools once, use across multiple LLM providers
-- **Vendor-neutral tool calling**: Abstract provider-specific tool schemas (OpenAI functions, Anthropic tools, Gemini function calling)
-- **Tool catalog management**: Dynamic tool registration and discovery
+**Structured data**: saved item CRUD operations with schema support, tagging, search, and pinning capabilities
 
-This positions Kestrel as infrastructure for the emerging MCP ecosystem rather than a proprietary closed platform.
+### OpenAI API Compatibility
+
+The `/v1/chat/completions` and `/v1/models` endpoints provide OpenAI API compatibility, enabling drop-in replacement for existing tools and applications built against the OpenAI API surface.
 
 ---
 
-## Operational Maturity
+## Platform Maturity and Verification
 
-### Observability
+The platform includes comprehensive verification infrastructure to ensure canonical documentation remains synchronized with implemented capabilities:
 
-The platform provides:
+- **Feature discovery tests** validate that documented features match discoverable implementations
+- **Endpoint contract tests** verify HTTP route inventory against live router configuration
+- **Authentication decision table tests** ensure access control logic matches documented behavior
+- **Documentation canonicality tests** prevent drift between source-of-truth documents and generated artifacts
 
-- **Event stream API**: Real-time operational events (request start/end, errors, performance metrics)
-- **Summary statistics**: Aggregated views of system health
-- **Detailed health endpoints**: Component-level status checks
-- **Audit logging**: Immutable record of security-relevant events
-
-These primitives integrate with standard observability stacks (Prometheus, Grafana, DataDog) via the `/api/observability/*` endpoints.
-
-### Storage and Persistence
-
-Kestrel abstracts storage through a pluggable backend system:
-
-- **Async-first**: Non-blocking I/O for high-concurrency workloads
-- **Multi-backend**: Filesystem, SQLite, PostgreSQL, or custom implementations
-- **Content-addressed files**: Deduplication and integrity verification via cryptographic hashing
-- **Privacy-aware**: Storage operations respect active privacy mode constraints
-
-Organizations can implement custom storage backends (S3, Azure Blob, IPFS) by implementing the async storage interface.
-
-### Database Access
-
-Direct database introspection for administrative tooling:
-
-- `GET /api/db/tables` — Schema discovery
-- `GET /api/db/tables/{table_name}` — Table inspection and query
-
-This allows organizations to build custom dashboards, reporting tools, and data pipelines without relying on platform-provided UI components.
+This verification infrastructure provides confidence that platform capabilities match documented specifications, enabling reliable evaluation of the platform against organizational requirements.
 
 ---
 
-## Market Positioning
+## Competitive Positioning
 
-### Competitive Differentiation
+Kestrel Sovereign differentiates on four primary dimensions:
 
-**vs. OpenAI Assistants API**
-- Kestrel: Multi-provider LLM routing, no vendor lock-in
-- OpenAI: Single-provider dependency, proprietary infrastructure
+1. **Constitutional governance**: A technical implementation of AI governance that exceeds external review boards or policy-based approaches
+2. **Identity portability**: DID-based agents that prevent vendor lock-in at the identity layer
+3. **Privacy-by-design**: Explicit privacy controls that map directly to compliance requirements
+4. **Vendor independence**: Multi-LLM support that eliminates platform lock-in at the inference layer
 
-**vs. LangChain / LlamaIndex**
-- Kestrel: Integrated platform with identity, privacy, and security from day one
-- Competitors: Developer libraries requiring integration of separate identity, storage, and authorization systems
-
-**vs. Hugging Face Transformers**
-- Kestrel: Production-ready agent runtime with API surface
-- Hugging Face: Model inference library requiring custom orchestration
-
-**vs. Microsoft Semantic Kernel**
-- Kestrel: Constitutional governance and cryptographic identity
-- Semantic Kernel: Enterprise integration focus, weaker data sovereignty story
-
-### Strategic Advantages
-
-1. **Portable Identity**: Users can migrate agents between providers—DID architecture prevents platform lock-in at the identity layer, not just the API layer
-
-2. **Constitutional AI**: Only platform with enforceable governance frameworks—critical for regulated industries (healthcare, finance, legal) where AI decision-making requires audit trails and liability boundaries
-
-3. **Privacy Spectrum**: Five-mode privacy system provides GDPR/CCPA compliance pathways that cloud-first platforms cannot match without architectural rewrites
-
-4. **Vendor Independence**: Multi-LLM routing eliminates single-provider risk—organizations hedge against OpenAI/Anthropic pricing changes, outages, or policy shifts
-
-5. **Extensible Architecture**: Feature plugin system allows proprietary differentiation—organizations build competitive advantages on Kestrel infrastructure rather than being constrained by SaaS feature roadmaps
-
-### Total Addressable Market
-
-Kestrel targets three market segments:
-
-**Enterprise AI Infrastructure**
-- Organizations deploying AI agents in regulated industries
-- Required capabilities: Audit trails, data sovereignty, governance frameworks
-- Current gap: Cloud AI services lack compliance primitives
-
-**AI-Native SaaS Platforms**
-- Startups building agent-based applications
-- Required capabilities: Multi-tenancy, cost optimization, vendor independence
-- Current gap: Building agent infrastructure is undifferentiated heavy lifting
-
-**Edge and Specialized Deployments**
-- Defense, healthcare, financial institutions with air-gap requirements
-- Required capabilities: Local LLM inference, cryptographic identity, zero data exfiltration
-- Current gap: Cloud AI services architecturally incompatible with security requirements
-
----
-
-## Technical Validation
-
-### Test Coverage and Verification
-
-Kestrel maintains contract tests for critical subsystems:
-
-- **Authentication decision tables**: Verify that every route enforces correct authentication requirements
-- **Endpoint contract suite**: API response schemas match documented specifications
-- **Feature doc canonicality**: Generated documentation matches actual codebase capabilities
-- **Route discovery**: HTTP surface matches registered FastAPI routers
-
-This testing discipline ensures that platform capabilities are verifiable and that documentation drift is detectable via CI/CD pipelines.
-
-### Audit and Compliance Readiness
-
-The platform includes audit working papers and verification tooling that organizations can extend for compliance workflows:
-
-- Constitutional decision logging
-- Permission request/approval trails
-- Data export/import verification
-- Cryptographic identity chain validation
-
-These primitives position Kestrel as **audit-ready infrastructure** rather than a black-box AI service.
-
----
-
-## Conclusion
-
-Kestrel Sovereign represents a fundamental architectural shift in AI agent platforms: from cloud-centric services where providers own user data and identity, to infrastructure where users and organizations retain sovereignty over their AI agents.
-
-The platform's constitutional governance, portable DID-based identity, multi-provider LLM orchestration, and privacy-first architecture create defensible competitive advantages in markets where data sovereignty, regulatory compliance, and vendor independence are strategic requirements rather than nice-to-have features.
-
-For investors evaluating the AI infrastructure landscape, Kestrel's positioning is clear: it is not competing to be a better OpenAI wrapper—it is building the substrate for the next generation of autonomous AI applications where control, ownership, and portability are non-negotiable.
+The combination creates a platform suitable for organizations requiring enterprise-grade AI capabilities without accepting vendor lock-in, privacy compromises, or governance gaps inherent in single-vendor LLM platforms.

@@ -3,6 +3,8 @@
 from pathlib import Path
 import re
 
+from kestrel_sovereign.features import discover_feature_modules
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 FEATURES_ROOT = PROJECT_ROOT / "kestrel_sovereign" / "features"
@@ -10,16 +12,8 @@ ENDPOINTS_ROOT = PROJECT_ROOT / "endpoints"
 
 
 def _discover_feature_modules() -> list[str]:
-    modules = []
-    for item in sorted(FEATURES_ROOT.iterdir()):
-        if item.name.startswith(("_", ".")):
-            continue
-        if item.is_dir():
-            if (item / "feature.py").exists() or (item / "__init__.py").exists():
-                modules.append(item.name)
-        elif item.is_file() and item.suffix == ".py" and item.name != "base.py":
-            modules.append(item.stem)
-    return modules
+    return sorted(module_path.split(".")[-2] if module_path.endswith(".feature") else module_path.split(".")[-1]
+                  for module_path in discover_feature_modules())
 
 
 def _discover_exported_feature_classes() -> list[str]:

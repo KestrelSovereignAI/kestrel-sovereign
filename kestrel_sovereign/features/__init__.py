@@ -49,27 +49,39 @@ def discover_feature_modules() -> List[str]:
     Returns:
         List of module paths like ["features.sovereignty", "features.mcp"]
     """
-    modules = []
-    
+    candidate_modules = []
+
     # Scan for subdirectories with feature modules
     for item in FEATURES_DIR.iterdir():
         if item.name.startswith("_") or item.name.startswith("."):
             continue
-            
+
         if item.is_dir():
             # Check for __init__.py or feature.py
             init_file = item / "__init__.py"
             feature_file = item / "feature.py"
-            
+
             if feature_file.exists():
-                modules.append(f"kestrel_sovereign.features.{item.name}.feature")
+                candidate_modules.append(f"kestrel_sovereign.features.{item.name}.feature")
             elif init_file.exists():
-                modules.append(f"kestrel_sovereign.features.{item.name}")
+                candidate_modules.append(f"kestrel_sovereign.features.{item.name}")
         elif item.is_file() and item.suffix == ".py" and item.name != "base.py":
             # Single-file features like features/constitution.py
             module_name = item.stem
-            modules.append(f"kestrel_sovereign.features.{module_name}")
-    
+            candidate_modules.append(f"kestrel_sovereign.features.{module_name}")
+
+    # Only keep modules that actually expose a discoverable Feature subclass.
+    modules = []
+    for module_path in candidate_modules:
+        try:
+            module = importlib.import_module(module_path)
+        except ImportError as e:
+            logger.warning(f"Failed to import feature module {module_path}: {e}")
+            continue
+
+        if find_feature_class(module) is not None:
+            modules.append(module_path)
+
     return modules
 
 
