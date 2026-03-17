@@ -95,9 +95,9 @@
 
 ## Feature Module Inventory
 
-Feature discovery scans `kestrel_sovereign/features/` for single-file features, package `__init__.py`, and package `feature.py`. The current discovered module inventory is:
+Feature discovery scans `kestrel_sovereign/features/` for single-file features, package `__init__.py`, and package `feature.py`, then keeps only modules that actually export a discoverable `Feature` subclass. The current discovered module inventory is:
 
-- Current audited snapshot: `41` discoverable modules and `36` exported `Feature` subclasses.
+- Current audited snapshot: `36` discoverable modules and `36` exported `Feature` subclasses.
 
 - `audit_anchor`
 - `bootstrap`
@@ -116,14 +116,11 @@ Feature discovery scans `kestrel_sovereign/features/` for single-file features, 
 - `heartbeat`
 - `identity`
 - `keys`
-- `llm_keys`
 - `mcp`
 - `memory`
 - `memory_agency`
 - `model`
-- `ollama`
 - `peers`
-- `privacy`
 - `reflection`
 - `runpod`
 - `save`
@@ -132,9 +129,7 @@ Feature discovery scans `kestrel_sovereign/features/` for single-file features, 
 - `sovereignty`
 - `state_of_mind`
 - `tasks`
-- `training`
 - `vastai`
-- `vertex_ai`
 - `visual_identity`
 - `wallet`
 - `web_search`
@@ -331,6 +326,5 @@ The route surface is not just public versus protected. The current live classes 
 
 ## Known Boundaries
 
-- Some modules in `kestrel_sovereign/features/` are discovery-visible but do not currently export a `Feature` subclass.
-- Some route families are thin wrappers over lower-level services and still need stronger contract tests.
+- Some support packages live under `kestrel_sovereign/features/` but are not discoverable features because they do not export a `Feature` subclass.
 - Generated audience docs require an LLM provider key; dry-run validation should pass even when generation keys are absent.

@@ -21,14 +21,11 @@ Discovery rule: [`kestrel_sovereign/features/__init__.py`](../../kestrel_soverei
 - `heartbeat`
 - `identity`
 - `keys`
-- `llm_keys`
 - `mcp`
 - `memory`
 - `memory_agency`
 - `model`
-- `ollama`
 - `peers`
-- `privacy`
 - `reflection`
 - `runpod`
 - `save`
@@ -37,9 +34,7 @@ Discovery rule: [`kestrel_sovereign/features/__init__.py`](../../kestrel_soverei
 - `sovereignty`
 - `state_of_mind`
 - `tasks`
-- `training`
 - `vastai`
-- `vertex_ai`
 - `visual_identity`
 - `wallet`
 - `web_search`
@@ -48,4 +43,4 @@ Discovery rule: [`kestrel_sovereign/features/__init__.py`](../../kestrel_soverei
 
 ## Reconciliation note
 
-The old catalog described `28` feature plugins. The live discovery surface is materially larger and must be treated as the canonical inventory until code changes reduce or reclassify it.
+The old catalog described `28` feature plugins. The corrected discovery surface is `36` modules with `36` exported `Feature` subclasses; support packages that do not export a `Feature` subclass should not be counted as discoverable features.
