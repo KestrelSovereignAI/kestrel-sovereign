@@ -356,10 +356,10 @@ class CommandHandler:
         mode = self.agent.privacy_agent.privacy_mode
         mode_info = {
             PrivacyMode.EPHEMERAL: ("🔒", "EPHEMERAL: Nothing stored, local LLM only"),
-            PrivacyMode.ISOLATED: ("🔐", "ISOLATED: Temporary storage, deleted on session end"),
-            PrivacyMode.ANONYMOUS: ("🎭", "ANONYMOUS: Stored without PII, encrypted backups required"),
-            PrivacyMode.NORMAL: ("📝", "NORMAL: Standard persistence with all features"),
-            PrivacyMode.PUBLIC: ("🌐", "PUBLIC: Can be shared and exported"),
+            PrivacyMode.ISOLATED: ("🔐", "ISOLATED: Temporary session storage, local LLM only"),
+            PrivacyMode.ANONYMOUS: ("🎭", "ANONYMOUS: Stored with PII removed, cloud LLM allowed"),
+            PrivacyMode.NORMAL: ("📝", "NORMAL: Standard persistent storage"),
+            PrivacyMode.PUBLIC: ("🌐", "PUBLIC: Shareable and exportable"),
         }
         icon, description = mode_info.get(mode, ("", f"Current mode: {mode.value}"))
         return f"{icon} {description}"
