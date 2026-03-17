@@ -209,7 +209,7 @@ def build_progress_review_evidence() -> Evidence:
         architecture_docs=[
             "CLAUDE.md - Agent instructions",
             "council_config.toml - Council configuration",
-            "kestrel_sovereign/features/ - 28 feature modules",
+            "kestrel_sovereign/features/ - discovered feature module inventory (see KESTREL_FEATURES.md)",
         ],
         previous_decisions=[
             f"Previous council sessions: {state['previous_sessions']}",
