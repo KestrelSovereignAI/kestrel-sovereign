@@ -16,6 +16,43 @@ from kestrel_sovereign.privacy import PrivacyMode
 logger = logging.getLogger(__name__)
 
 
+BUILTIN_COMMAND_SPECS = [
+    # System
+    {"cmd": "!status", "handler": "_cmd_status", "description": "Show agent status", "category": "System"},
+    {"cmd": "!help", "handler": "_cmd_help", "description": "Show available commands", "category": "System"},
+    {"cmd": "!audit", "handler": "_cmd_audit", "description": "Toggle or check audit status", "args": "[on|off]", "category": "System"},
+    {"cmd": "!reload-context", "handler": "_cmd_reload_context", "description": "Hot-reload bootstrap files from disk", "category": "System"},
+    {"cmd": "!heartbeat", "handler": "_cmd_heartbeat", "description": "Trigger a manual heartbeat check", "category": "System"},
+
+    # Constitution
+    {"cmd": "!verify-constitution", "handler": "_cmd_verify_constitution", "description": "Verify constitution integrity", "category": "Constitution"},
+    {"cmd": "!safe-mode", "handler": "_cmd_safe_mode", "description": "Check or exit safe mode", "args": "[exit]", "category": "Constitution"},
+
+    # Privacy
+    {"cmd": "!privacy", "handler": "_cmd_privacy", "description": "Get or set privacy mode", "args": "[mode]", "category": "Privacy"},
+    {"cmd": "!set-privacy-mode", "handler": "_cmd_privacy", "description": "Set privacy mode", "args": "<mode>", "category": "Privacy"},
+    {"cmd": "!get-privacy-mode", "handler": "_cmd_get_privacy_mode", "description": "Get current privacy mode", "category": "Privacy"},
+    {"cmd": "!privacy-status", "handler": "_cmd_privacy_status", "description": "Detailed privacy status", "category": "Privacy"},
+    {"cmd": "!privacy-save", "handler": "_cmd_privacy_save", "description": "Save isolated session", "category": "Privacy"},
+    {"cmd": "!privacy-discard", "handler": "_cmd_privacy_discard", "description": "Discard isolated session", "category": "Privacy"},
+
+    # Backup and memory lifecycle
+    {"cmd": "!backup", "handler": "_cmd_backup", "description": "Create a backup", "args": "[--tier local|ipfs|filecoin]", "category": "Backup"},
+    {"cmd": "!promote-backup", "handler": "_cmd_promote_backup", "description": "Save isolated session and backup", "args": "[--tier ...]", "category": "Backup"},
+    {"cmd": "!sleep", "handler": "_cmd_sleep", "description": "Consolidate memories and export sovereignty snapshot", "args": "[--tier ...]", "category": "Memory"},
+    {"cmd": "!consolidate", "handler": "_cmd_consolidate", "description": "Consolidate memories only", "category": "Memory"},
+    {"cmd": "!compress", "handler": "_cmd_compress", "description": "Compress session context", "args": "[--keep N]", "category": "Memory"},
+
+    # Agent/runtime
+    {"cmd": "!create-agent", "handler": "_cmd_create_agent", "description": "Create trusted agent", "args": "<name>", "category": "Agent"},
+    {"cmd": "!anchor", "handler": "_cmd_anchor", "description": "Anchor memory state", "category": "Agent"},
+    {"cmd": "!set-app-context", "handler": "_cmd_set_app_context", "description": "Set app-specific context for the active session", "args": "<context>", "category": "Runtime"},
+    {"cmd": "!legacy-echo", "handler": "_cmd_legacy_echo", "description": "Echo through the legacy app-context path", "args": "<text>", "category": "Runtime"},
+    {"cmd": "!tasks", "handler": "_cmd_tasks", "description": "List background tasks", "args": "[all|completed|working|failed]", "category": "Tasks"},
+    {"cmd": "!continue", "handler": "_cmd_continue", "description": "Continue a stopped request", "category": "Runtime"},
+]
+
+
 class CommandCategory(Enum):
     """Categories of commands for organization and permissions."""
     SYSTEM = "system"           # Status, help, audit
@@ -81,58 +118,8 @@ class CommandHandler:
         Only commands that are NOT handled by features should be here.
         Feature-based commands are automatically discovered via A2A TaskManager.
         """
-        # System commands
-        self._command_handlers["!status"] = self._cmd_status
-        self._command_handlers["!help"] = self._cmd_help
-        self._command_handlers["!audit"] = self._cmd_audit
-        
-        # Constitution/integrity commands
-        self._command_handlers["!verify-constitution"] = self._cmd_verify_constitution
-        self._command_handlers["!safe-mode"] = self._cmd_safe_mode
-        # !constitution handled by ConstitutionFeature via tool registry
-        
-        # Privacy session management (not in PrivacyAgent feature)
-        self._command_handlers["!privacy"] = self._cmd_privacy
-        self._command_handlers["!set-privacy-mode"] = self._cmd_privacy
-        self._command_handlers["!get-privacy-mode"] = self._cmd_get_privacy_mode
-        self._command_handlers["!privacy-status"] = self._cmd_privacy_status
-        self._command_handlers["!privacy-save"] = self._cmd_privacy_save
-        self._command_handlers["!privacy-discard"] = self._cmd_privacy_discard
-        
-        # Backup commands (agent-level, not feature-level)
-        self._command_handlers["!backup"] = self._cmd_backup
-        self._command_handlers["!promote-backup"] = self._cmd_promote_backup
-
-        # Sleep/consolidation commands (agent-level)
-        self._command_handlers["!sleep"] = self._cmd_sleep
-        self._command_handlers["!consolidate"] = self._cmd_consolidate
-        self._command_handlers["!compress"] = self._cmd_compress
-        
-        # Sovereignty commands handled by SovereigntyFeature via tool registry
-        # !export-sovereignty, !import-sovereignty, !sovereignty-status, etc.
-        
-        # Agent creation (agent-level)
-        self._command_handlers["!create-agent"] = self._cmd_create_agent
-        self._command_handlers["!anchor"] = self._cmd_anchor
-
-        # Model commands (!model, !model-set, !model-list, !model-pull, !model-info)
-        # All handled by ModelAgent feature via tool registry
-
-        # App context
-        self._command_handlers["!set-app-context"] = self._cmd_set_app_context
-        self._command_handlers["!legacy-echo"] = self._cmd_legacy_echo
-
-        # Task management
-        self._command_handlers["!tasks"] = self._cmd_tasks
-        
-        # Continue from stopped request
-        self._command_handlers["!continue"] = self._cmd_continue
-
-        # Context reload
-        self._command_handlers["!reload-context"] = self._cmd_reload_context
-
-        # Heartbeat
-        self._command_handlers["!heartbeat"] = self._cmd_heartbeat
+        for spec in BUILTIN_COMMAND_SPECS:
+            self._command_handlers[spec["cmd"]] = getattr(self, spec["handler"])
     
     async def handle(self, user_input: str) -> Optional[str]:
         """
