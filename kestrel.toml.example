@@ -16,23 +16,27 @@ provider_priority = ["ollama", "openai"]
 [llm.ollama]
 # Local Ollama instance - install from https://ollama.ai
 host = "http://localhost:11434"
-model = "llama3.2:3b"  # Or phi3, llama3.1:8b, etc.
+model = "auto"
+selection_hints = ["llama3.2", "qwen", "gpt-oss"]
 
 [llm.openai]
 # Get your API key from https://platform.openai.com/api-keys
 # Set environment variable: export OPENAI_API_KEY="your-key-here"
 api_key = "sk-YOUR_API_KEY_HERE"
-model = "gpt-5"
+model = "auto"
+selection_hints = ["gpt-5", "mini"]
 
 # Optional: Anthropic Claude support
 #[llm.anthropic]
 #api_key = "sk-ant-YOUR_API_KEY_HERE"
-#model = "claude-3-5-sonnet-20241022"
+#model = "auto"
+#selection_hints = ["sonnet", "opus", "haiku"]
 
 # Optional: Additional Ollama models for specific tasks
 #[llm.ollama_large]
 #host = "http://localhost:11434"
-#model = "llama3.1:70b"  # For complex reasoning tasks
+#model = "auto"
+#selection_hints = ["llama3.1", "70b"]  # For complex reasoning tasks
 
 [llm.ensemble]
 # The number of agent instances to run in the ensemble.
@@ -41,77 +45,13 @@ model = "gpt-5"
 size = 1
 
 # =============================================================================
-# Model Catalog - Featured models per provider
+# Model Catalog - Manual Overrides Only
 # =============================================================================
-# These appear in the default "featured" view
-# Update this file to change featured models without code changes
+# Concrete discovered model lists live in model_discovery_cache.json.
+# This section is only for data that provider APIs do not return reliably.
 
-[llm.catalog.featured]
-openai = [
-    "gpt-5.1",
-    "gpt-5-mini",
-    "gpt-5-nano",
-]
-
-anthropic = [
-    "claude-sonnet-4-5-20250929",
-    "claude-haiku-4-5-20251001",
-    "claude-opus-4-5-20251101",
-]
-
-ollama = [
-    "llama3.2",
-    "gpt-oss:20b",
-    "deepseek-r1:14b",
-    "qwen2.5:14b",
-    "phi4",
-]
-
-vertex_ai = [
-    "gemini-3-pro",
-    "gemini-2.5-flash",
-    "gemini-2.5-pro",
-]
-
-google = [
-    "gemini-3-pro",
-    "gemini-2.5-flash",
-]
-
-xai = [
-    "grok-4-1-fast-non-reasoning",
-]
-
-runpod = [
-    "meta-llama/Llama-3.1-8B-Instruct",
-]
-
-# OpenRouter featured models (from actual API discovery)
-openrouter = [
-    # Anthropic
-    "anthropic/claude-opus-4.5",
-    "anthropic/claude-sonnet-4.5",
-    "anthropic/claude-3.5-sonnet",
-    # OpenAI
-    "openai/gpt-5.2",
-    "openai/gpt-5.1",
-    "openai/gpt-4o",
-    "openai/o3-mini",
-    # Google
-    "google/gemini-3-pro-preview",
-    "google/gemini-2.5-pro",
-    "google/gemini-2.5-flash",
-    # DeepSeek
-    "deepseek/deepseek-r1",
-    "deepseek/deepseek-v3.2",
-    "deepseek/deepseek-chat-v3.1",
-    # Meta
-    "meta-llama/llama-3.1-405b-instruct",
-    "meta-llama/llama-3.1-70b-instruct",
-]
-
-# Display name overrides (optional, only when API doesn't provide good names)
-[llm.catalog.display_names]
+# Display name overrides (optional — only when API/adapter gives a bad name)
+[llm.catalog.display_name_overrides]
 "claude-sonnet-4-5-20250929" = "Claude Sonnet 4.5"
 "claude-haiku-4-5-20251001" = "Claude Haiku 4.5"
 "claude-opus-4-5-20251101" = "Claude Opus 4.5"
@@ -133,9 +73,9 @@ openai = ["whisper-1", "tts-1", "tts-1-hd"]
 [llm.catalog.hidden]
 openai = ["babbage-002", "davinci-002"]
 
-# Context window limits (tokens) - Used by token budget allocation
-# If not specified here, TokenCounter falls back to hardcoded defaults
-[llm.catalog.context_limits]
+# Context limit overrides (tokens)
+# ONLY for providers whose APIs don't return context window sizes.
+[llm.catalog.context_limits_override]
 # OpenAI models
 "gpt-4" = 8192
 "gpt-4-32k" = 32768

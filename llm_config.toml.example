@@ -9,30 +9,36 @@ provider_priority = ["openai", "ollama"]
 
 # OpenAI (cloud) - Set OPENAI_API_KEY in .env
 [openai]
-model = "gpt-5-mini"
+model = "auto"
+selection_hints = ["gpt-5", "mini"]
 
 # Ollama - Local inference for privacy mode
 # Install from https://ollama.ai, then: ollama pull llama3.2
 [ollama]
 host = "http://localhost:11434"  # Overridden by OLLAMA_HOST env var
-model = "llama3.2:latest"
+model = "auto"
+selection_hints = ["llama3.2", "qwen", "gpt-oss"]
 
 # --- Optional providers (uncomment and add keys to .env) ---
 
 #[anthropic]
-#model = "claude-sonnet-4-5-20250514"
+#model = "auto"
+#selection_hints = ["sonnet", "opus", "haiku"]
 #api_key_env = "ANTHROPIC_API_KEY"
 
 #[openrouter]
 #type = "openai_compatible"
 #base_url = "https://openrouter.ai/api/v1"
-#model = "deepseek/deepseek-chat-v3.1"
+#model = "auto"
+#selection_hints = ["deepseek", "chat"]
 
 #[vertex_ai]
-#model = "gemini-3-pro-preview"
+#model = "auto"
+#selection_hints = ["gemini", "pro", "flash"]
 
 #[xai]
 #type = "openai_compatible"
 #base_url = "https://api.x.ai/v1"
-#model = "grok-4-1-fast-non-reasoning"
+#model = "auto"
+#selection_hints = ["grok", "fast"]
 #api_key_env = "XAI_API_KEY"

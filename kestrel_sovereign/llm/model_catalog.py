@@ -23,7 +23,7 @@ from .model_metadata import ModelInfo, ModelCategory
 logger = logging.getLogger(__name__)
 
 # Default paths
-DEFAULT_CATALOG_PATH = Path(__file__).parent.parent / "model_catalog.toml"
+DEFAULT_CATALOG_PATH = Path("model_catalog.toml")
 DEFAULT_CACHE_PATH = Path(__file__).parent.parent / "model_discovery_cache.json"
 
 
