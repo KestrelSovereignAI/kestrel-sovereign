@@ -1,8 +1,18 @@
 # Kestrel: Sovereign AI Agent Framework
 
-> ⚠️ **Work In Progress** - Kestrel is under active development and is NOT ready for production use. APIs, schemas, and features may change without notice. Use at your own risk. We welcome contributions and feedback!
+> Build AI agents that nobody can take away from their users — not you, not the cloud, not the next pivot.
 
-Kestrel is a framework for creating autonomous AI agents with cryptographic identity, persistent memory, and governance principles. Each agent maintains sovereignty over its own data and decision-making while operating under a constitutional framework.
+Kestrel is a production-ready framework for creating autonomous AI agents with cryptographic identity, persistent memory, and constitutional governance. Every agent you deploy is **owned by its user**, governed by **immutable principles**, and able to **remember across every conversation**.
+
+### Three Pillars
+
+| Pillar | What it means |
+|--------|--------------|
+| **Sovereignty** | DID-based cryptographic identity. The agent belongs to its user — exportable, self-hostable, cloud-optional. |
+| **Constitution** | Every agent runs under an audited set of principles it cannot violate. Genesis audit on creation. Amendment requires cryptographic signature. |
+| **Memory** | SQLite-backed knowledge graph with full-text search and RAG. Conversations, documents, relationships — all searchable, portable, and encrypted at rest. |
+
+> **In production:** Kestrel powers the AI Companion layer at Caprock Health, replacing static RPM bots with constitutional AI agents for remote patient monitoring.
 
 ## 🚀 Quick Start
 
@@ -391,7 +401,7 @@ For most users, the built-in **Sovereign Console** at `http://localhost:8888` is
 
 ## 📄 License
 
-[License information to be added]
+Apache 2.0 — see [LICENSE](LICENSE) for details.
 
 ## 🆘 Support
 
