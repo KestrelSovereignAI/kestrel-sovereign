@@ -23,7 +23,7 @@ Usage:
     lora_data = await manager.download_lora(session, job_id)
 
     # Ollama Cloud workflow
-    session = await manager.start_ollama_pod(["qwen2.5:7b"])
+    session = await manager.start_ollama_pod(["phi4"])
     base_url = await manager.get_ollama_base_url()
 
     # Or as a Kestrel feature
