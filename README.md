@@ -14,6 +14,8 @@ Kestrel is a production-ready framework for creating autonomous AI agents with c
 
 > **In production:** Kestrel powers the AI Companion layer at Caprock Health, replacing static RPM bots with constitutional AI agents for remote patient monitoring.
 
+For the maintained implementation surface, use [`KESTREL_FEATURES.md`](KESTREL_FEATURES.md) as the canonical inventory. Generated audience docs belong under `docs/generated/`, and historical catalogs belong under `docs/archive/`.
+
 ## 🚀 Quick Start
 
 ### Prerequisites

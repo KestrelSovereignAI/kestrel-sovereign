@@ -10,6 +10,10 @@
 
 ### Building / maintaining Kestrel (engineering)
 - Architecture (core, storage, security, tools): `architecture/README.md`
+- Canonical feature inventory: `../KESTREL_FEATURES.md`
+- Audit working papers: `audit/README.md`
+- Generated audience docs: `generated/README.md`
+- Historical feature catalogs: `archive/KESTREL_FEATURES_legacy.md`
 - Implementation plans: `plans/README.md`
 - Planning / roadmap notes: `planning/`
 - Development notes: `development/README.md`

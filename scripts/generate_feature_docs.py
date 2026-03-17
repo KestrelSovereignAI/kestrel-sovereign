@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Generate audience-specific feature docs from the canonical KESTREL_FEATURES.md.
 
-Reads the single source of truth and uses an LLM to transform it for different audiences.
+Reads the canonical source of truth and uses an LLM to transform it for different audiences.
 No annotations needed in the canonical file — audience profiles are system prompts here.
 
 Usage:
@@ -53,6 +53,7 @@ AUDIENCES: dict[str, dict] = {
             "  - 'secp256k1 keypairs' → 'your agent has its own secure identity'\n"
             "  - '5 privacy levels' → 'you control exactly how private your conversations are'\n"
             "  - 'multi-LLM' → 'works with ChatGPT, Claude, Gemini, and local models'\n"
+            "- If the source names privacy presets, keep those exact preset names and do not invent replacements\n"
             "- Keep the hierarchical structure but simplify headings\n"
             "- Use 'you/your' language — speak directly to the user\n"
             "- Include the privacy levels table but rewrite for non-technical readers\n"
@@ -76,8 +77,11 @@ AUDIENCES: dict[str, dict] = {
             "  - Privacy system → 'enterprise-grade privacy controls from day one'\n"
             "  - Feature plugin system → 'extensible platform architecture'\n"
             "- Add a brief executive summary at the top (3-4 sentences)\n"
-            "- Highlight quantitative metrics: 60+ API endpoints, 9+ LLM providers, "
-            "28 feature modules, 5 privacy levels, 9 Docker deployment targets\n"
+            "- Use quantitative metrics only when they are explicitly present in the "
+            "source document; do not invent or hardcode counts\n"
+            "- If you mention privacy presets, use the exact preset names from the source: "
+            "`ephemeral`, `isolated`, `anonymous`, `normal`, `public`\n"
+            "- If the source names route classes or HTTP methods, preserve those exactly rather than renaming them\n"
             "- Organize around: Platform Architecture, AI Capabilities, Data Sovereignty, "
             "Security & Privacy, Deployment Flexibility, Extensibility\n"
             "- Keep it to ~250-350 lines, professional tone\n"
