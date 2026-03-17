@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { createApiClient, rewriteEndpoint } from '../../static/js/api_client.mjs';
+import { createApiClient, rewriteEndpoint } from '../../kestrel_sovereign/static/js/api_client.mjs';
 
 function createStorage(initial = {}) {
     const store = new Map(Object.entries(initial));
