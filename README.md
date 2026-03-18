@@ -55,10 +55,10 @@ cp llm_config.toml.example llm_config.toml
 uv run kestrel health
 
 # 5. Create your agent
-uv run kestrel create --name MyAgent --output-dir ./agent_data/myagent
+uv run kestrel create MyAgent
 
 # 6. Start your agent
-uv run kestrel start ./agent_data/myagent
+uv run kestrel start MyAgent
 ```
 
 Your agent is now running at `http://localhost:8888`.
@@ -73,13 +73,13 @@ All commands work on Windows, macOS, and Linux. Pass the agent directory as an a
 
 ```bash
 uv run kestrel health                       # Check prerequisites
-uv run kestrel create --name MyAgent        # Create a new agent
-uv run kestrel start ./agent_data/myagent   # Start an agent
-uv run kestrel stop ./agent_data/myagent    # Stop an agent
+uv run kestrel create MyAgent               # Create a new agent
+uv run kestrel start MyAgent                # Start an agent
+uv run kestrel stop MyAgent                 # Stop an agent
 uv run kestrel status                       # Show all running agents
 uv run kestrel list                         # List available agents
-uv run kestrel chat ./agent_data/myagent    # CLI chat interface
-uv run kestrel config ./agent_data/myagent  # Show agent config
+uv run kestrel shell MyAgent                # CLI chat interface
+uv run kestrel config ./agent_data/MyAgent  # Show agent config
 ```
 
 ### Per-Agent Configuration
@@ -108,12 +108,12 @@ Each agent runs on its own port. Create configs for each:
 
 ```bash
 # Agent 1: Alpha on port 8888
-uv run kestrel create --name Alpha --output-dir ./agent_data/alpha --port 8888
-uv run kestrel start ./agent_data/alpha
+uv run kestrel create Alpha --port 8888
+uv run kestrel start Alpha
 
 # Agent 2: Helper on port 8889
-uv run kestrel create --name Helper --output-dir ./agent_data/helper --port 8889
-uv run kestrel start ./agent_data/helper
+uv run kestrel create Helper --port 8889
+uv run kestrel start Helper
 
 # Check status of all agents
 uv run kestrel status
