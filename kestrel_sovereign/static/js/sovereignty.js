@@ -60,7 +60,14 @@ function getTierColor(tier) {
 
 function renderExports(data) {
     const list = document.getElementById('export-list');
-    const allExports = [...(data.exports || []), ...(data.backups || [])];
+    const combined = [...(data.exports || []), ...(data.backups || [])];
+    const seen = new Set();
+    const allExports = combined.filter(e => {
+        const key = e.cid || e.node_id;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+    });
 
     if (allExports.length === 0) {
         list.innerHTML = '<p style="color: var(--text-secondary); text-align: center; padding: 2rem;">No exports yet. Click "Export to IPFS" to create your first backup.</p>';

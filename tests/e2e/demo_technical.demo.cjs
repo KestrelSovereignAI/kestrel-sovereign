@@ -756,6 +756,13 @@ test.describe.serial('Kestrel Sovereign Technical Demo', () => {
             'The Security panel shows every permission decision in the audit log...');
         await navigateToPanel(page, 'security');
         await demoPause(page, 2000);
+        // Scroll to the audit log section so it's visible in the screenshot
+        try {
+            await page.locator('#security-audit-log').scrollIntoViewIfNeeded();
+            await demoPause(page, 1000);
+        } catch {
+            // Audit log section may not exist yet — screenshot will show permissions tree
+        }
         await narrator.screenshot(page, 'security-audit');
 
         // Beat 5: Restore permission via UI

@@ -22,7 +22,7 @@ Unlike cloud-only AI services, Kestrel gives you complete control over your data
 
 - **Export everything**: Download all your conversations, memories, and files whenever you want
 - **Import freely**: Bring your data from one Kestrel to another
-- **Delete permanently**: When you delete something, it's actually gone
+- **Verifiable history**: Your memory logs are immutable — they can't be silently altered or erased, so you always have a trustworthy record
 - **See what's stored**: Browse exactly what data exists and where it lives
 
 ## Privacy That Actually Works
