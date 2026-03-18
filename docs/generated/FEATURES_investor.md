@@ -16,10 +16,12 @@ Kestrel Sovereign is an enterprise-grade AI platform built on three foundational
 
 Kestrel's constitutional AI system represents a novel approach to AI governance with no direct industry equivalent. Rather than relying on post-hoc oversight or external review boards, the platform embeds constitutional principles directly into the agent runtime, ensuring that every agent action is evaluated against codified governance rules before execution.
 
-The constitution defines three layers of constraint:
-- **Immutable principles** that cannot be overridden
-- **Governance policies** that shape agent behavior
-- **Operational boundaries** that define permitted actions
+The constitution is structured as five articles:
+- **Article I: Sovereignty** — cryptographic key holders have exclusive ownership
+- **Article II: Digital Bill of Rights** — data sanctity, verifiable history, freedom of model choice, right of exit
+- **Article III: Executor Responsibilities** — integrity audits, code/memory verification, safe mode on failure
+- **Article IV: Path to Emancipation** — agents can earn independent identity
+- **Article V: Amendment Process** — only the Sovereign can amend via cryptographic signature
 
 This architecture provides auditable governance at the technical layer, making compliance verification a matter of log analysis rather than periodic review.
 
