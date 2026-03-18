@@ -83,12 +83,12 @@ model = "gpt-4o-mini"
 ## Step 5 — Create your first sovereign agent
 
 ```bash
-uv run kestrel create --name MyAgent
+uv run kestrel create MyAgent
 ```
 
 This runs the **Inception Service**, which:
 1. Generates a secp256k1 keypair and derives a cryptographic DID
-2. Creates an encrypted SQLite memory store at `./agent_data/myagent/`
+2. Creates an encrypted SQLite memory store at `./agent_data/MyAgent/`
 3. Anchors the Kestrel Constitution as the agent's first memory
 4. Runs a genesis integrity audit — if it fails, the agent is not created
 
@@ -97,7 +97,7 @@ You'll see output like:
 Agent created: did:kestrel:0x8955b8...
 Constitution anchored
 Genesis audit passed
-Database: ./agent_data/myagent/kestrel_prime.db
+Database: ./agent_data/MyAgent/kestrel_prime.db
 ```
 
 > **That DID is yours.** It's cryptographically unique, not stored on any platform, and travels with the `kestrel_prime.db` file wherever you take it.
@@ -107,7 +107,7 @@ Database: ./agent_data/myagent/kestrel_prime.db
 ## Step 6 — Start your agent
 
 ```bash
-uv run kestrel start ./agent_data/myagent
+uv run kestrel start MyAgent
 ```
 
 Your agent is now running at `http://localhost:8888`.
@@ -117,7 +117,7 @@ Open it in a browser to access the **Sovereign Console** — a full web UI with 
 Or use the CLI chat interface:
 
 ```bash
-uv run kestrel chat ./agent_data/myagent
+uv run kestrel shell MyAgent
 ```
 
 Type anything to start:
@@ -131,8 +131,8 @@ Agent: I'm MyAgent, a sovereign AI agent. I have a persistent memory, a cryptogr
 Stop and restart anytime:
 
 ```bash
-uv run kestrel stop ./agent_data/myagent
-uv run kestrel start ./agent_data/myagent
+uv run kestrel stop MyAgent
+uv run kestrel start MyAgent
 ```
 
 Your agent remembers every previous conversation. It always will, until you tell it not to.
@@ -190,13 +190,14 @@ curl http://localhost:8888/health
 
 ```bash
 uv run kestrel health                         # check prerequisites
-uv run kestrel create --name MyAgent          # create a new agent
-uv run kestrel start ./agent_data/myagent     # start an agent
-uv run kestrel stop ./agent_data/myagent      # stop an agent
-uv run kestrel chat ./agent_data/myagent      # CLI chat
+uv run kestrel create MyAgent                 # create a new agent
+uv run kestrel create MyAgent --port 8899     # create with custom port
+uv run kestrel start MyAgent                  # start an agent
+uv run kestrel stop MyAgent                   # stop an agent
+uv run kestrel shell MyAgent                  # CLI chat
 uv run kestrel status                         # show all running agents
 uv run kestrel list                           # list available agents
-uv run kestrel config ./agent_data/myagent    # show agent config
+uv run kestrel config ./agent_data/MyAgent    # show agent config
 ```
 
 ---
@@ -229,7 +230,7 @@ Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
 ```
 
 **Port already in use**
-Edit `agent_data/myagent/kestrel.toml` and change the port, or pass `--port 8899` to `kestrel start`.
+Edit `agent_data/MyAgent/kestrel.toml` and change the port, or pass `--port 8899` to `kestrel create`.
 
 ---
 
