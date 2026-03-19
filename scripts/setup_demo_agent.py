@@ -28,6 +28,23 @@ from kestrel_sovereign.inception_service import create_kestrel_identity_async
 DEMO_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "agent_data", "demo")
 
 
+def build_demo_llm_config() -> str:
+    """Build a demo-friendly LLM config using policy-based defaults."""
+    return """# Demo agent LLM config — provider intent first, discovery/cache resolves concrete models
+provider_priority = ["anthropic", "ollama"]
+
+[anthropic]
+model = "auto"
+selection_hints = ["opus"]
+api_key_env = "ANTHROPIC_API_KEY"
+
+[ollama]
+host = "http://localhost:11434"
+model = "auto"
+selection_hints = ["llama3.2", "latest"]
+"""
+
+
 async def main():
     # Clean slate
     if os.path.exists(DEMO_DIR):
@@ -45,20 +62,10 @@ async def main():
         expected_duration="demo session",
     )
 
-    # Write demo-specific LLM config: Anthropic Opus first, Ollama for EPHEMERAL
+    # Write demo-specific LLM config with policy-based defaults
     llm_config_path = os.path.join(DEMO_DIR, "llm_config.toml")
     with open(llm_config_path, "w") as f:
-        f.write("""# Demo agent LLM config — Opus 4.6 for quality, Ollama for EPHEMERAL
-provider_priority = ["anthropic", "ollama"]
-
-[anthropic]
-model = "claude-opus-4-6"
-api_key_env = "ANTHROPIC_API_KEY"
-
-[ollama]
-host = "http://localhost:11434"
-model = "llama3.2:latest"
-""")
+        f.write(build_demo_llm_config())
     print(f"  LLM config written: {llm_config_path}")
 
     print()

@@ -300,7 +300,7 @@ class CouncilFeature(Feature):
                 "[[council.members]]\n"
                 "name = \"Claude\"\n"
                 "provider = \"anthropic\"\n"
-                "model = \"claude-opus-4-5-20251101\"\n"
+                "model = \"auto\"\n"
                 "role = \"constitutional_reviewer\"\n"
                 "```"
             )
