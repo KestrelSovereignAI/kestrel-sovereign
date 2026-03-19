@@ -23,6 +23,15 @@ from .models import RunPodManagerError
 logger = logging.getLogger(__name__)
 
 
+def _sanitize_env_vars(env_vars: Dict[str, Any]) -> Dict[str, str]:
+    """Drop unset environment values before sending pod env to RunPod."""
+    return {
+        key: str(value)
+        for key, value in env_vars.items()
+        if value is not None
+    }
+
+
 class GPUProvider(ABC):
     """Abstract provider that knows how to manage pods."""
 
@@ -60,7 +69,7 @@ class DirectRunPodProvider(GPUProvider):
             "cloud_type": metadata.get("cloud_type", self.cloud_type),
             "container_disk_in_gb": profile.container_disk_gb,
             "ports": ",".join(profile.ports),
-            "env": {**profile.env, **metadata.get("env_overrides", {})},
+            "env": _sanitize_env_vars({**profile.env, **metadata.get("env_overrides", {})}),
         }
 
         # Use network volume if specified (persistent storage, survives pod restart)
