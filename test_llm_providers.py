@@ -9,6 +9,7 @@ load_dotenv()
 
 
 async def test_providers():
+    from kestrel_sovereign.llm.model_selection import resolve_provider_default
     from kestrel_sovereign.llm.service import LLMService
 
     service = LLMService()
@@ -18,9 +19,9 @@ async def test_providers():
 
     # Test using model_override which matches against provider["model"] or provider["name"]
     providers_to_test = [
-        ("openai", "gpt-5.1"),
-        ("anthropic", "claude-opus-4-5-20251101"),
-        ("vertex_ai", "gemini-3-pro-preview"),  # Provider name matching
+        ("openai", resolve_provider_default("openai")),
+        ("anthropic", resolve_provider_default("anthropic")),
+        ("vertex_ai", resolve_provider_default("vertex_ai")),  # Provider name matching
     ]
 
     print("=" * 60)
