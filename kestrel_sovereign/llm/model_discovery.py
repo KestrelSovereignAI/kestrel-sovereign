@@ -7,12 +7,12 @@ Provides in-memory caching and disk-based cache for fast startup.
 """
 import asyncio
 import logging
-import time
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Set
 
 from .model_metadata import ModelInfo, ModelCategory
 from .model_catalog import get_catalog_service, ModelCatalogService
+from .model_cache import get_shared_model_cache
 
 logger = logging.getLogger(__name__)
 
@@ -24,11 +24,6 @@ class ModelDiscoveryMixin:
     Uses adapter.list_models() for each provider to get available models,
     then enriches them with catalog data (featured, hidden, display names).
     """
-
-    # Cache configuration
-    _cache_ttl: int = 300  # 5 minutes
-    _model_cache: Optional[List[ModelInfo]] = None
-    _cache_timestamp: Optional[float] = None
 
     async def discover_all_models(
         self,
@@ -49,13 +44,14 @@ class ModelDiscoveryMixin:
         Returns:
             List of ModelInfo objects, enriched with catalog data
         """
-        # Check cache
-        if use_cache and self._model_cache is not None and self._cache_timestamp is not None:
-            age = time.time() - self._cache_timestamp
-            if age < self._cache_ttl:
-                logger.debug(f"Using cached models (age: {age:.0f}s)")
+        # Check shared process-wide cache
+        shared_cache = get_shared_model_cache()
+        if use_cache:
+            cached = shared_cache.get()
+            if cached is not None:
+                logger.debug("Using shared model cache")
                 return self._filter_models(
-                    self._model_cache,
+                    cached,
                     featured_only=featured_only,
                     category=category,
                     providers=providers
@@ -127,9 +123,8 @@ class ModelDiscoveryMixin:
                         f"not found in discovery — may be deprecated"
                     )
 
-        # Cache results in memory and on disk
-        self._model_cache = all_models
-        self._cache_timestamp = time.time()
+        # Cache results in shared memory cache and on disk
+        shared_cache.set(all_models)
         catalog.write_cache(all_models)
 
         logger.info(f"Discovered {len(all_models)} models total")
@@ -230,22 +225,29 @@ class ModelDiscoveryMixin:
         return sorted(models, key=sort_key)
 
     def _load_from_disk_cache(self) -> bool:
-        """Load models from disk cache if no in-memory cache exists.
+        """Load models from disk cache into the shared process-wide cache.
 
-        Called on first access to provide immediate model availability
-        before API discovery completes.
+        Called during LLMService init to provide immediate model availability
+        before API discovery completes. Only the first LLMService instance
+        to call this actually reads from disk; subsequent instances find
+        the shared cache already populated.
 
         Returns:
             True if cache was loaded, False otherwise
         """
-        if self._model_cache is not None:
-            return False  # Already have in-memory data
+        shared_cache = get_shared_model_cache()
+        if shared_cache.has_data():
+            # Another LLMService instance already populated the shared cache.
+            # Still resolve auto providers for THIS instance's provider list.
+            cached = shared_cache.get_any()
+            if cached:
+                self._resolve_auto_providers(cached)
+            return False
 
         catalog = get_catalog_service()
         cached = catalog.load_cache()
         if cached:
-            self._model_cache = cached
-            self._cache_timestamp = 0.0  # Expired — will refresh on next discover_all_models()
+            shared_cache.set_stale(cached)
             logger.info(f"Pre-populated {len(cached)} models from disk cache")
 
             # Register context limits from cache
@@ -496,13 +498,13 @@ class ModelDiscoveryMixin:
         Group models by provider.
 
         Args:
-            models: Models to group (uses cache if None)
+            models: Models to group (uses shared cache if None)
 
         Returns:
             Dict mapping provider name to list of models
         """
         if models is None:
-            models = self._model_cache or []
+            models = get_shared_model_cache().get_any() or []
 
         result: Dict[str, List[ModelInfo]] = {}
         for model in models:
@@ -520,13 +522,13 @@ class ModelDiscoveryMixin:
         Get only featured models.
 
         Args:
-            models: Models to filter (uses cache if None)
+            models: Models to filter (uses shared cache if None)
 
         Returns:
             List of featured models
         """
         if models is None:
-            models = self._model_cache or []
+            models = get_shared_model_cache().get_any() or []
 
         return [m for m in models if m.is_featured and not m.is_hidden]
 
@@ -537,7 +539,6 @@ class ModelDiscoveryMixin:
             logger.info(f"Default model set to: {model_id}")
 
     def clear_model_cache(self):
-        """Clear the model cache to force rediscovery."""
-        self._model_cache = None
-        self._cache_timestamp = None
+        """Clear the shared model cache to force rediscovery."""
+        get_shared_model_cache().clear()
         logger.info("Model cache cleared")

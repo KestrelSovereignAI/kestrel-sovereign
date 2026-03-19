@@ -34,6 +34,15 @@ from .models import (
 logger = logging.getLogger(__name__)
 
 
+def _sanitize_env_vars(env_vars: Dict[str, Any]) -> Dict[str, str]:
+    """Drop unset environment values before building Vast.ai env strings."""
+    return {
+        key: str(value)
+        for key, value in env_vars.items()
+        if value is not None
+    }
+
+
 class VastAIManagerCore:
     """Core Vast.ai SDK operations and session management."""
 
@@ -219,7 +228,9 @@ class VastAIManagerCore:
                 logger.info(f"Selected offer {offer_id}: {offers[0].get('gpu_name', 'Unknown GPU')}")
 
             # Build environment variables as "-e KEY=VAL -e KEY2=VAL2" string
-            env_vars = {**profile.env, **metadata.get("env_overrides", {})}
+            env_vars = _sanitize_env_vars(
+                {**profile.env, **metadata.get("env_overrides", {})}
+            )
             env_string = None
             if env_vars:
                 # SDK expects env as string: "-e KEY=VAL -e KEY2=VAL2"
@@ -264,7 +275,7 @@ class VastAIManagerCore:
                 instance_id=instance_id,
                 profile=profile,
                 task_profile=task_profile,
-                model_name=chosen_model or "",
+                model_name=chosen_model,
                 status=InstanceStatus.CREATING,
                 ttl_seconds=ttl,
                 started_at=started_at,
