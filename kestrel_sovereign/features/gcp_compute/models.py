@@ -68,7 +68,7 @@ class GCPComputeSession:
     zone: str
     profile: GPUProfile
     task_profile: str
-    model_name: str
+    model_name: Optional[str]
     status: InstanceStatus
     ttl_seconds: int
     started_at: datetime

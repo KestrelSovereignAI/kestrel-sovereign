@@ -321,9 +321,11 @@ class ModelAgent(Feature):
             return False
 
         try:
-            # Primary check: look up in model discovery cache
-            if hasattr(self.llm_service, '_model_cache') and self.llm_service._model_cache:
-                for m in self.llm_service._model_cache:
+            # Primary check: look up in shared model discovery cache
+            from kestrel_sovereign.llm.model_cache import get_shared_model_cache
+            _cached_models = get_shared_model_cache().get_any()
+            if _cached_models:
+                for m in _cached_models:
                     if m.id == model_id and m.provider == "openrouter":
                         return True
 

@@ -105,10 +105,12 @@ class TestModelDiscovery:
     @pytest.mark.asyncio
     async def test_discover_all_models_with_cache(self, llm_service):
         """Test model discovery with caching"""
+        from kestrel_sovereign.llm.model_cache import get_shared_model_cache
+
         # First call - should fetch fresh
         models1 = await llm_service.discover_all_models(use_cache=True)
-        assert llm_service._model_cache is not None
-        assert llm_service._cache_timestamp is not None
+        shared_cache = get_shared_model_cache()
+        assert shared_cache.has_data()
 
         # Second call - should use cache
         models2 = await llm_service.discover_all_models(use_cache=True)

@@ -155,12 +155,15 @@ class RunPodFeature(Feature):
 
         ttl = self._coerce_optional_int(ttl_seconds)
         target_model = model_name or None
+        env_overrides = {
+            "KESTREL_PROFILE": profile_key,
+        }
+        if target_model:
+            env_overrides["TARGET_MODEL"] = target_model
+
         metadata = {
             "name": f"kestrel-{profile_key}-{datetime.now(timezone.utc).strftime('%H%M%S')}",
-            "env_overrides": {
-                "TARGET_MODEL": target_model,
-                "KESTREL_PROFILE": profile_key,
-            },
+            "env_overrides": env_overrides,
             "pod_type": pod_type or None,
         }
 

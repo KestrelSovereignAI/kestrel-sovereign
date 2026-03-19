@@ -12,6 +12,29 @@ incorrectly set provider="google" instead of provider="openrouter"
 import pytest
 from unittest.mock import MagicMock, AsyncMock
 from kestrel_sovereign.llm.model_metadata import ModelInfo
+from kestrel_sovereign.llm.model_cache import get_shared_model_cache
+
+# Standard test models used across fixtures
+_DEFAULT_TEST_MODELS = [
+    # OpenRouter models - note vendor/model format
+    ModelInfo(id="google/gemini-3-pro-preview", provider="openrouter", display_name="Gemini 3 Pro"),
+    ModelInfo(id="anthropic/claude-3.5-sonnet", provider="openrouter", display_name="Claude 3.5 Sonnet"),
+    ModelInfo(id="meta-llama/llama-3.1-70b-instruct", provider="openrouter", display_name="Llama 3.1 70B"),
+    ModelInfo(id="deepseek/deepseek-chat", provider="openrouter", display_name="DeepSeek Chat"),
+    # Direct provider models
+    ModelInfo(id="gpt-5", provider="openai", display_name="GPT-5"),
+    ModelInfo(id="claude-opus-4-5-20251101", provider="anthropic", display_name="Claude Opus 4.5"),
+    ModelInfo(id="llama3.2:3b", provider="ollama", display_name="Llama 3.2 3B"),
+]
+
+
+@pytest.fixture(autouse=True)
+def _populate_shared_cache():
+    """Populate shared model cache for tests, clean up after."""
+    cache = get_shared_model_cache()
+    cache.set(list(_DEFAULT_TEST_MODELS))
+    yield
+    cache.clear()
 
 
 class TestModelSetRouting:
@@ -21,17 +44,6 @@ class TestModelSetRouting:
     def mock_llm_service(self):
         """Create a mock LLMService with model cache."""
         service = MagicMock()
-        service._model_cache = [
-            # OpenRouter models - note vendor/model format
-            ModelInfo(id="google/gemini-3-pro-preview", provider="openrouter", display_name="Gemini 3 Pro"),
-            ModelInfo(id="anthropic/claude-3.5-sonnet", provider="openrouter", display_name="Claude 3.5 Sonnet"),
-            ModelInfo(id="meta-llama/llama-3.1-70b-instruct", provider="openrouter", display_name="Llama 3.1 70B"),
-            ModelInfo(id="deepseek/deepseek-chat", provider="openrouter", display_name="DeepSeek Chat"),
-            # Direct provider models
-            ModelInfo(id="gpt-5", provider="openai", display_name="GPT-5"),
-            ModelInfo(id="claude-opus-4-5-20251101", provider="anthropic", display_name="Claude Opus 4.5"),
-            ModelInfo(id="llama3.2:3b", provider="ollama", display_name="Llama 3.2 3B"),
-        ]
         service.set_model_preference = MagicMock()
         service.get_current_mandate = MagicMock(return_value={"preference": {}})
         service.providers = [{"name": "openai"}, {"name": "anthropic"}, {"name": "ollama"}, {"name": "openrouter"}]
@@ -121,10 +133,11 @@ class TestModelSetRouting:
     @pytest.mark.asyncio
     async def test_direct_anthropic_model_routes_to_anthropic(self, model_agent, mock_llm_service):
         """anthropic/claude-opus-4.5 should route to anthropic directly (not in OpenRouter cache)."""
-        # Clear cache to simulate model not discovered via OpenRouter
-        mock_llm_service._model_cache = [
+        # Override shared cache to simulate model not discovered via OpenRouter
+        cache = get_shared_model_cache()
+        cache.set([
             ModelInfo(id="claude-opus-4-5-20251101", provider="anthropic", display_name="Claude Opus 4.5"),
-        ]
+        ])
 
         result = await model_agent.set_model("anthropic/claude-opus-4-5-20251101")
 
@@ -170,12 +183,15 @@ class TestOpenRouterVendorDetection:
         """Create ModelAgent with mocked LLMService."""
         from kestrel_sovereign.features.model.feature import ModelAgent
 
-        agent = ModelAgent(agent=MagicMock())
-        agent.llm_service = MagicMock()
-        agent.llm_service._model_cache = [
+        # Populate shared cache with test data for this class
+        cache = get_shared_model_cache()
+        cache.set([
             ModelInfo(id="google/gemini-3-pro-preview", provider="openrouter", display_name="Gemini"),
             ModelInfo(id="gpt-5", provider="openai", display_name="GPT-5"),
-        ]
+        ])
+
+        agent = ModelAgent(agent=MagicMock())
+        agent.llm_service = MagicMock()
         return agent
 
     @pytest.mark.asyncio
@@ -193,7 +209,7 @@ class TestOpenRouterVendorDetection:
     @pytest.mark.asyncio
     async def test_detects_openrouter_only_vendor_without_cache(self, model_agent):
         """Known OpenRouter-only vendors should be detected even without cache."""
-        model_agent.llm_service._model_cache = []  # Empty cache
+        get_shared_model_cache().set([])  # Empty cache
 
         # These vendors only exist on OpenRouter
         assert await model_agent._is_openrouter_model("deepseek/deepseek-chat") is True
@@ -205,7 +221,7 @@ class TestOpenRouterVendorDetection:
     @pytest.mark.asyncio
     async def test_unknown_vendor_not_detected(self, model_agent):
         """Unknown vendor should NOT be detected as OpenRouter."""
-        model_agent.llm_service._model_cache = []  # Empty cache
+        get_shared_model_cache().set([])  # Empty cache
 
         # These could be direct provider models
         assert await model_agent._is_openrouter_model("openai/gpt-5") is False
@@ -223,7 +239,7 @@ class TestOpenRouterVendorDetection:
     @pytest.mark.asyncio
     async def test_handles_no_cache(self, model_agent):
         """Should handle missing cache gracefully."""
-        model_agent.llm_service._model_cache = None
+        get_shared_model_cache().clear()
 
         # Should fall back to vendor detection
         result = await model_agent._is_openrouter_model("deepseek/deepseek-chat")
@@ -245,11 +261,14 @@ class TestModelSetResponseFormat:
         mock_parent_agent = MagicMock()
         mock_parent_agent.storage = mock_storage
 
+        # Populate shared cache for this test class
+        cache = get_shared_model_cache()
+        cache.set([
+            ModelInfo(id="google/gemini-3-pro-preview", provider="openrouter", display_name="Gemini"),
+        ])
+
         agent = ModelAgent(agent=mock_parent_agent)
         agent.llm_service = MagicMock()
-        agent.llm_service._model_cache = [
-            ModelInfo(id="google/gemini-3-pro-preview", provider="openrouter", display_name="Gemini"),
-        ]
         agent.llm_service.set_model_preference = MagicMock()
         return agent
 
@@ -296,12 +315,15 @@ class TestExplicitProviderPassing:
         mock_parent_agent = MagicMock()
         mock_parent_agent.storage = mock_storage
 
-        agent = ModelAgent(agent=mock_parent_agent)
-        agent.llm_service = MagicMock()
-        agent.llm_service._model_cache = [
+        # Populate shared cache for this test class
+        cache = get_shared_model_cache()
+        cache.set([
             ModelInfo(id="google/gemini-3-pro-preview", provider="openrouter", display_name="Gemini"),
             ModelInfo(id="gpt-5", provider="openai", display_name="GPT-5"),
-        ]
+        ])
+
+        agent = ModelAgent(agent=mock_parent_agent)
+        agent.llm_service = MagicMock()
         agent.llm_service.set_model_preference = MagicMock()
         return agent
 

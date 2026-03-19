@@ -15,7 +15,7 @@ import time
 import asyncio
 from dataclasses import dataclass, field
 
-from kestrel_sovereign.kestrel_config.constants import LLM_CACHE_TTL_SECONDS, STORAGE_CACHE_TTL_SECONDS
+from kestrel_sovereign.kestrel_config.constants import STORAGE_CACHE_TTL_SECONDS
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import List, Dict, Any, Optional, Union, Type, TYPE_CHECKING
@@ -106,10 +106,8 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
             logger.error(f"Failed to initialize providers: {e}")
             self.providers = []
 
-        # Model discovery cache — pre-populate from disk if available
-        self._model_cache = None
-        self._cache_timestamp = None
-        self._cache_ttl = LLM_CACHE_TTL_SECONDS
+        # Model discovery uses process-wide SharedModelCache (see model_cache.py).
+        # Pre-populate from disk if this is the first LLMService instance.
         self._load_from_disk_cache()  # Immediate availability before API discovery
 
         # Storage info cache
