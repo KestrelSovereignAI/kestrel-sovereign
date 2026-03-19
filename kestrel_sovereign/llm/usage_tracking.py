@@ -230,7 +230,8 @@ class UsageTrackingMixin:
 
             logger.info(f"Successfully pulled model: {model_name}")
 
-            self._model_cache = None
+            from .model_cache import get_shared_model_cache
+            get_shared_model_cache().clear()
             self._storage_cache = None
 
             return True
@@ -340,7 +341,8 @@ class UsageTrackingMixin:
             except Exception as e:
                 logger.error(f"Failed to delete model {model_id}: {e}")
 
-        self._model_cache = None
+        from .model_cache import get_shared_model_cache
+        get_shared_model_cache().clear()
         self._storage_cache = None
 
         logger.info(f"Cleanup complete. Deleted {len(deleted_models)} models")

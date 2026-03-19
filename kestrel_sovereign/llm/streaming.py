@@ -82,7 +82,8 @@ class StreamingMixin:
             return tools  # Can't determine model, pass tools through
 
         # Check discovered model info (exact match only — no substring matching)
-        cache = getattr(self, "_model_cache", None)
+        from .model_cache import get_shared_model_cache
+        cache = get_shared_model_cache().get_any()
         if not cache:
             return tools  # No discovery data yet, pass tools through
 
