@@ -172,12 +172,15 @@ class VastAIFeature(Feature):
         ttl = self._coerce_optional_int(ttl_seconds)
         target_model = model_name or None
 
+        env_overrides = {
+            "KESTREL_PROFILE": profile_name,
+        }
+        if target_model:
+            env_overrides["TARGET_MODEL"] = target_model
+
         metadata = {
             "label": f"kestrel-{profile_name}-{datetime.now(timezone.utc).strftime('%H%M%S')}",
-            "env_overrides": {
-                "TARGET_MODEL": target_model,
-                "KESTREL_PROFILE": profile_name,
-            },
+            "env_overrides": env_overrides,
         }
 
         status = await self.manager.start_session(
