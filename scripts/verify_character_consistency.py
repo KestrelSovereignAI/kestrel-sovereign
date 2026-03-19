@@ -19,22 +19,32 @@ import os
 import sys
 from pathlib import Path
 
-# Check for Anthropic API key
-if not os.getenv("ANTHROPIC_API_KEY"):
-    print("Error: ANTHROPIC_API_KEY environment variable not set")
-    sys.exit(1)
-
-try:
-    import anthropic
-except ImportError:
-    print("Error: anthropic package not installed")
-    print("Run: uv add anthropic")
-    sys.exit(1)
-
+from kestrel_sovereign.llm.model_selection import resolve_provider_default
 
 # Directory with generated images
 TEST_OUTPUT_DIR = Path.home() / "models" / "local-training" / "consistency-test-output"
 MANIFEST_PATH = TEST_OUTPUT_DIR / "verification_manifest.json"
+
+
+def resolve_verification_model() -> str:
+    """Resolve the Anthropic model used for consistency verification."""
+    return os.getenv("CHARACTER_VERIFY_MODEL") or resolve_provider_default("anthropic")
+
+
+def get_anthropic_client():
+    """Construct the Anthropic client lazily so the script remains importable."""
+    if not os.getenv("ANTHROPIC_API_KEY"):
+        print("Error: ANTHROPIC_API_KEY environment variable not set")
+        sys.exit(1)
+
+    try:
+        import anthropic
+    except ImportError:
+        print("Error: anthropic package not installed")
+        print("Run: uv add anthropic")
+        sys.exit(1)
+
+    return anthropic.Anthropic()
 
 
 def load_image_as_base64(path: str) -> str:
@@ -65,7 +75,7 @@ def verify_character_consistency(manifest: dict) -> dict:
     - Confidence level
     - Detailed reasoning
     """
-    client = anthropic.Anthropic()
+    client = get_anthropic_client()
 
     # Build message with all images
     content = []
@@ -161,7 +171,7 @@ Format your response as JSON:
     # Call Claude
     print("Sending images to Claude for analysis...")
     response = client.messages.create(
-        model="claude-sonnet-4-6",
+        model=resolve_verification_model(),
         max_tokens=2000,
         messages=[{
             "role": "user",
