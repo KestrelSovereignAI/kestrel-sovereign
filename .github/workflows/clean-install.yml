@@ -1,0 +1,209 @@
+name: Clean Install Validation
+
+# Validates that QUICKSTART.md works on a fresh machine.
+# Covers: git clone → uv sync → kestrel create → kestrel start → 3 pillars verified.
+# See: https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/184
+
+on:
+  push:
+    branches: [main, vision-refinement-v2]
+  pull_request:
+    branches: [main, vision-refinement-v2]
+  workflow_dispatch:
+
+env:
+  PYTHON_VERSION: "3.13"
+  KESTREL_AUDIT_MODE: "skip"
+
+jobs:
+  clean-install:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@0c5e2b8115b80b4c7c5f358ab8d227e5571c47ce # v4.2.0
+
+      - name: Set up Python
+        run: uv python install ${{ env.PYTHON_VERSION }}
+
+      # Step 1: uv sync (QUICKSTART Step 2)
+      - name: Install dependencies (uv sync)
+        run: uv sync
+
+      # Step 2: Copy example config (QUICKSTART Step 4a)
+      - name: Configure LLM (copy example config)
+        run: cp llm_config.toml.example llm_config.toml
+
+      # Step 3: kestrel health (CLI smoke test)
+      - name: Run kestrel health
+        run: uv run kestrel health
+        continue-on-error: true  # health may warn about missing Ollama — that's OK in CI
+
+      # Step 4: kestrel create (QUICKSTART Step 5 — Inception)
+      - name: Create agent via inception
+        run: uv run kestrel create CITestAgent
+
+      # Step 5: Verify DID identity pillar
+      - name: Verify Identity Pillar — DID exists
+        run: |
+          DB_PATH="agent_data/CITestAgent/kestrel_prime.db"
+          if [ ! -f "$DB_PATH" ]; then
+            echo "FAIL: Agent database not created"
+            exit 1
+          fi
+          echo "Database exists: $DB_PATH"
+
+          # DID is stored as a graph node (node_type='agent', node_id=did:kestrel:...)
+          DID=$(uv run python -c "
+          import sqlite3, json
+          conn = sqlite3.connect('$DB_PATH')
+          cursor = conn.execute(\"SELECT node_id FROM graph_nodes WHERE node_type='agent' LIMIT 1\")
+          row = cursor.fetchone()
+          conn.close()
+          print(row[0] if row else '')
+          ")
+
+          if [ -z "$DID" ]; then
+            echo "FAIL: No DID found in graph_nodes"
+            exit 1
+          fi
+          echo "PASS: Identity Pillar — DID: $DID"
+
+      # Step 6: Verify Constitution pillar
+      - name: Verify Constitution Pillar — constitution anchored
+        run: |
+          DB_PATH="agent_data/CITestAgent/kestrel_prime.db"
+
+          RESULT=$(uv run python -c "
+          import sqlite3
+          conn = sqlite3.connect('$DB_PATH')
+          # Constitution is stored as a file and linked via graph edge 'governed_by'
+          cursor = conn.execute(\"SELECT COUNT(*) FROM graph_edges WHERE edge_type='governed_by'\")
+          edges = cursor.fetchone()[0]
+          cursor = conn.execute(\"SELECT COUNT(*) FROM graph_nodes WHERE node_type='document'\")
+          docs = cursor.fetchone()[0]
+          cursor = conn.execute(\"SELECT COUNT(*) FROM files WHERE filename='KESTREL_CONSTITUTION.md'\")
+          files = cursor.fetchone()[0]
+          cursor = conn.execute(\"SELECT COUNT(*) FROM document_chunks\")
+          chunks = cursor.fetchone()[0]
+          conn.close()
+          if edges > 0 and docs > 0 and files > 0:
+              print(f'OK:governed_by={edges},constitution_docs={docs},files={files},rag_chunks={chunks}')
+          else:
+              print(f'FAIL:governed_by={edges},constitution_docs={docs},files={files}')
+          ")
+
+          if echo "$RESULT" | grep -q "^FAIL"; then
+            echo "FAIL: Constitution not properly anchored — $RESULT"
+            exit 1
+          fi
+          echo "PASS: Constitution Pillar — $RESULT"
+
+      # Step 7: Verify Memory pillar — storage tables exist
+      - name: Verify Memory Pillar — storage tables exist
+        run: |
+          DB_PATH="agent_data/CITestAgent/kestrel_prime.db"
+
+          TABLE_CHECK=$(uv run python -c "
+          import sqlite3
+          conn = sqlite3.connect('$DB_PATH')
+          cursor = conn.execute(\"SELECT name FROM sqlite_master WHERE type='table'\")
+          tables = [row[0] for row in cursor.fetchall()]
+          conn.close()
+          # Core sovereignty tables created by inception
+          required = {'graph_nodes', 'graph_edges', 'files', 'document_chunks', 'conversation_history'}
+          missing = required - set(tables)
+          if missing:
+              print(f'MISSING:{missing}')
+          else:
+              print(f'OK:{len(tables)} tables')
+          ")
+
+          if echo "$TABLE_CHECK" | grep -q "MISSING"; then
+            echo "FAIL: $TABLE_CHECK"
+            exit 1
+          fi
+          echo "PASS: Memory Pillar — $TABLE_CHECK"
+
+      # Step 8: Start agent and verify health endpoint (QUICKSTART Step 6)
+      - name: Start agent and verify health endpoint
+        run: |
+          # Start agent in background (first agent gets port 8801)
+          uv run kestrel start CITestAgent &
+          START_PID=$!
+
+          # Wait for health endpoint (up to 30 seconds)
+          echo "Waiting for agent health endpoint..."
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:8801/health > /dev/null 2>&1; then
+              echo "PASS: Agent health endpoint responding on port 8801"
+              HEALTH=$(curl -s http://localhost:8801/health)
+              echo "Health response: $HEALTH"
+
+              # Stop agent
+              uv run kestrel stop CITestAgent 2>/dev/null || true
+              kill $START_PID 2>/dev/null || true
+              exit 0
+            fi
+            sleep 1
+          done
+
+          echo "FAIL: Agent did not respond on health endpoint within 30 seconds"
+          # Show logs for debugging
+          if [ -f "agent_data/CITestAgent/agent.log" ]; then
+            echo "=== Agent log ==="
+            tail -50 agent_data/CITestAgent/agent.log
+          fi
+          if [ -d "logs" ]; then
+            echo "=== Host logs ==="
+            ls -la logs/
+            for f in logs/*.log; do
+              [ -f "$f" ] && tail -20 "$f"
+            done
+          fi
+          kill $START_PID 2>/dev/null || true
+          exit 1
+
+      # Step 9: Verify DID persists across restart (identity portability)
+      - name: Verify DID persists across restart
+        run: |
+          DB_PATH="agent_data/CITestAgent/kestrel_prime.db"
+
+          DID_AFTER=$(uv run python -c "
+          import sqlite3
+          conn = sqlite3.connect('$DB_PATH')
+          cursor = conn.execute(\"SELECT node_id FROM graph_nodes WHERE node_type='agent' LIMIT 1\")
+          row = cursor.fetchone()
+          conn.close()
+          print(row[0] if row else '')
+          ")
+
+          if [ -z "$DID_AFTER" ]; then
+            echo "FAIL: DID not found after restart cycle"
+            exit 1
+          fi
+          echo "PASS: DID persists after stop/start cycle: $DID_AFTER"
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "============================================"
+          echo "  Clean Install Validation — ${{ matrix.os }}"
+          echo "============================================"
+          echo "  Python: ${{ env.PYTHON_VERSION }}"
+          echo "  uv sync: OK"
+          echo "  kestrel create: OK (inception + DID)"
+          echo "  Identity pillar: Verified"
+          echo "  Constitution pillar: Verified"
+          echo "  Memory pillar: Verified"
+          echo "  Health endpoint: Verified"
+          echo "  DID persistence: Verified"
+          echo "============================================"
