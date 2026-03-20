@@ -303,14 +303,14 @@ class CommandHandler:
     
     # === Constitution Commands ===
     
-    def _cmd_verify_constitution(self, user_input: str) -> str:
+    async def _cmd_verify_constitution(self, user_input: str) -> str:
         """Handle !verify-constitution command."""
-        is_valid, message = self.agent._verify_constitution_integrity()
+        is_valid, message = await self.agent._verify_constitution_integrity()
         self.agent._constitution_verified = is_valid
         if is_valid:
             return f"✅ {message}"
         else:
-            self.agent.enter_safe_mode(message)
+            await self.agent.enter_safe_mode(message)
             return f"🚨 {message}\n\nAgent has entered SAFE MODE. Contact administrator."
     
     def _cmd_safe_mode(self, user_input: str) -> str:
@@ -332,7 +332,7 @@ class CommandHandler:
         if len(parts) > 1:
             try:
                 mode = PrivacyMode(parts[1].lower())
-                return self.agent.privacy_agent.set_mode(mode)
+                return self.agent.set_privacy_mode(mode)
             except ValueError:
                 valid_modes = ", ".join([m.value for m in PrivacyMode])
                 return f"Invalid privacy mode. Valid modes are: {valid_modes}"
