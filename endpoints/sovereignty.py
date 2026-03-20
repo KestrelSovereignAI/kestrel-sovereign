@@ -1,4 +1,5 @@
 """Sovereignty export/import and file browser endpoints."""
+import asyncio
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import FileResponse
 from pathlib import Path
@@ -24,6 +25,60 @@ ALLOWED_TIERS = {"local", "ipfs", "filecoin", "storacha", "cloud_hot", "cloud_co
 
 # CID format: alphanumeric characters only (covers CIDv0 Qm... and CIDv1 bafy...)
 CID_PATTERN = re.compile(r'^[a-zA-Z0-9]+$')
+
+
+def _read_metadata_file(meta_path: Path):
+    with open(meta_path, 'r') as f:
+        content = f.read().strip()
+    if content.startswith('{'):
+        return json.loads(content)
+    return {"raw": content}
+
+
+def _list_storage_cache_files(cache_dir: Path):
+    files = []
+    total_size = 0
+
+    for filepath in cache_dir.iterdir():
+        if filepath.is_file():
+            stat = filepath.stat()
+            size = stat.st_size
+            total_size += size
+
+            ext = filepath.suffix.lower()
+            file_type = "cache" if ext == ".cache" else "meta" if ext == ".meta" else "other"
+
+            metadata = None
+            if file_type == "cache":
+                meta_path = filepath.with_suffix(".meta")
+                if meta_path.exists():
+                    try:
+                        metadata = _read_metadata_file(meta_path)
+                    except (json.JSONDecodeError, UnicodeDecodeError, IOError) as e:
+                        logger.warning(f"Could not read metadata file {meta_path}: {e}")
+                        metadata = {"error": "Could not read metadata"}
+
+            files.append({
+                "name": filepath.name,
+                "size": size,
+                "type": file_type,
+                "modified": stat.st_mtime,
+                "modified_iso": time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(stat.st_mtime)),
+                "hash": filepath.stem,
+                "has_meta": (file_type == "cache" and filepath.with_suffix(".meta").exists()),
+                "metadata": metadata,
+            })
+
+    files.sort(key=lambda x: x["modified"], reverse=True)
+    return files, total_size
+
+
+def _read_preview_bytes(real_path: Path, max_size: int):
+    stat = real_path.stat()
+    size = stat.st_size
+    with open(real_path, 'rb') as f:
+        content_bytes = f.read(max_size)
+    return size, content_bytes
 
 
 @router.get("/storage/stats")
@@ -175,45 +230,7 @@ async def list_sovereignty_files(request: Request):
         return {"files": [], "total_size": 0, "file_count": 0}
 
     try:
-        files = []
-        total_size = 0
-
-        for filepath in STORAGE_CACHE_DIR.iterdir():
-            if filepath.is_file():
-                stat = filepath.stat()
-                size = stat.st_size
-                total_size += size
-
-                ext = filepath.suffix.lower()
-                file_type = "cache" if ext == ".cache" else "meta" if ext == ".meta" else "other"
-
-                metadata = None
-                if file_type == "cache":
-                    meta_path = filepath.with_suffix(".meta")
-                    if meta_path.exists():
-                        try:
-                            with open(meta_path, 'r') as f:
-                                content = f.read().strip()
-                                if content.startswith('{'):
-                                    metadata = json.loads(content)
-                                else:
-                                    metadata = {"raw": content}
-                        except (json.JSONDecodeError, UnicodeDecodeError, IOError) as e:
-                            logger.warning(f"Could not read metadata file {meta_path}: {e}")
-                            metadata = {"error": "Could not read metadata"}
-
-                files.append({
-                    "name": filepath.name,
-                    "size": size,
-                    "type": file_type,
-                    "modified": stat.st_mtime,
-                    "modified_iso": time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(stat.st_mtime)),
-                    "hash": filepath.stem,
-                    "has_meta": (file_type == "cache" and filepath.with_suffix(".meta").exists()),
-                    "metadata": metadata,
-                })
-
-        files.sort(key=lambda x: x["modified"], reverse=True)
+        files, total_size = await asyncio.to_thread(_list_storage_cache_files, STORAGE_CACHE_DIR)
 
         return {
             "files": files,
@@ -281,12 +298,8 @@ async def preview_sovereignty_file(
         raise HTTPException(status_code=404, detail="File not found.")
 
     # Use the resolved real path for all subsequent operations
-    stat = real_path.stat()
-    size = stat.st_size
-
     try:
-        with open(real_path, 'rb') as f:
-            content_bytes = f.read(max_size)
+        size, content_bytes = await asyncio.to_thread(_read_preview_bytes, real_path, max_size)
 
         try:
             content = content_bytes.decode('utf-8')
