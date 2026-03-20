@@ -1,5 +1,6 @@
 """Focused contract tests for sovereignty endpoints."""
 
+import asyncio
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -164,6 +165,44 @@ def test_sovereignty_files_listing_and_preview_contract(tmp_path):
         assert preview_response.status_code == 200
         assert preview_response.json()["content"] == "hello world"
         assert invalid_response.status_code == 400
+    finally:
+        sovereignty_endpoints.STORAGE_CACHE_DIR = original_cache_dir
+        _restore_app(app, original)
+
+
+def test_sovereignty_file_browser_offloads_blocking_io(tmp_path):
+    from endpoints import sovereignty as sovereignty_endpoints
+
+    cache_dir = tmp_path / "storage_cache"
+    cache_dir.mkdir()
+    (cache_dir / "sample.cache").write_text("hello world")
+    (cache_dir / "sample.meta").write_text('{"source":"test"}')
+
+    agent = MagicMock(storage=MagicMock())
+    app, original = _prepare_app(agent)
+    original_cache_dir = sovereignty_endpoints.STORAGE_CACHE_DIR
+    sovereignty_endpoints.STORAGE_CACHE_DIR = cache_dir
+
+    real_to_thread = asyncio.to_thread
+    calls = []
+
+    async def tracking_to_thread(func, *args, **kwargs):
+        calls.append(func.__name__)
+        return await real_to_thread(func, *args, **kwargs)
+
+    try:
+        with patch.object(sovereignty_endpoints.asyncio, "to_thread", side_effect=tracking_to_thread):
+            with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+                with TestClient(app) as client:
+                    list_response = client.get("/api/sovereignty/files", headers={"X-API-Key": "test-key"})
+                    preview_response = client.get(
+                        "/api/sovereignty/files/sample.cache/preview",
+                        headers={"X-API-Key": "test-key"},
+                    )
+        assert list_response.status_code == 200
+        assert preview_response.status_code == 200
+        assert "_list_storage_cache_files" in calls
+        assert "_read_preview_bytes" in calls
     finally:
         sovereignty_endpoints.STORAGE_CACHE_DIR = original_cache_dir
         _restore_app(app, original)

@@ -26,7 +26,9 @@ First-pass control document for issue `#300`, focused on maintained runtime surf
 - `SecurityFeature.pending_approvals()` was mixing monotonic loop time with wall-clock request timestamps.
   - Fixed by computing approval age from UTC wall-clock time so pending request status is truthful.
 - SSE/MCP/VastAI runtime timers were still using `get_event_loop()` inside active async code.
-  - Fixed by normalizing those paths to `get_running_loop()` for running-loop timing semantics.
+  - Fixed by normalizing those paths to monotonic elapsed-time checks that work cleanly across sync/async boundaries.
+- Sovereignty file-browser endpoints were doing blocking filesystem work directly on async request paths.
+  - Fixed by offloading directory scans and preview reads via `asyncio.to_thread()`.
 - `CommandHandler.handle()` was checking `hasattr(result, '__await__')` instead of using `inspect.isawaitable()`.
   - Fixed to use the standard awaitability check.
 - `KestrelAgent.close()` exposed a misleading sync cleanup path over async storage shutdown.
