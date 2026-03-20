@@ -17,6 +17,7 @@ import logging
 import asyncio
 import aiohttp
 import docker
+import time
 from typing import Dict, Any, List, Optional
 from mcp.client.sse import sse_client
 from mcp.client.session import ClientSession
@@ -92,13 +93,13 @@ class MCPToolManager:
             TimeoutError: If container doesn't become ready within timeout
             RuntimeError: If container exits or fails
         """
-        start_time = asyncio.get_event_loop().time()
+        start_time = time.monotonic()
         delay = HEALTHCHECK_INITIAL_DELAY
         attempt = 0
         
         while True:
             attempt += 1
-            elapsed = asyncio.get_event_loop().time() - start_time
+            elapsed = time.monotonic() - start_time
             
             if elapsed >= timeout:
                 raise TimeoutError(
