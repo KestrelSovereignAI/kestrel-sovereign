@@ -536,7 +536,7 @@ class KestrelAgent(ConstitutionMixin, StreamingMixin, BackupMixin, SleepMixin):
         """Get current privacy mode."""
         return self._privacy_mode
     
-    def set_privacy_mode(self, mode: PrivacyMode) -> None:
+    def set_privacy_mode(self, mode: PrivacyMode) -> str:
         """
         Change the privacy mode.
 
@@ -563,8 +563,9 @@ class KestrelAgent(ConstitutionMixin, StreamingMixin, BackupMixin, SleepMixin):
 
         self._privacy_mode = mode
         self.storage.set_privacy_mode(mode)
-        self.privacy_agent.set_mode(mode)
+        status_message = self.privacy_agent.set_mode(mode)
         logging.info(f"Privacy mode changed to: {mode.value}")
+        return status_message
 
 
     async def _register_feature(self, feature: Feature):

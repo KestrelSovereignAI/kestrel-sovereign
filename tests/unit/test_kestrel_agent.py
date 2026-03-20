@@ -235,6 +235,28 @@ class TestPrivacyMode:
         mock_storage.set_privacy_mode.assert_called_once_with(PrivacyMode.ISOLATED)
         mock_privacy_agent.set_mode.assert_called_once_with(PrivacyMode.ISOLATED)
 
+    def test_set_privacy_mode_returns_privacy_agent_message(self, tmp_path):
+        """set_privacy_mode() returns the canonical privacy-agent status message."""
+        agent = KestrelAgent(
+            did="did:test:123",
+            storage_path=str(tmp_path / "test.db"),
+            privacy_mode=PrivacyMode.NORMAL,
+        )
+
+        mock_storage = MagicMock()
+        mock_storage.set_privacy_mode = MagicMock()
+        agent.storage = mock_storage
+
+        mock_privacy_agent = MagicMock()
+        mock_privacy_agent.set_mode = MagicMock(return_value="Privacy mode changed from normal to isolated.")
+        agent.privacy_agent = mock_privacy_agent
+
+        result = agent.set_privacy_mode(PrivacyMode.ISOLATED)
+
+        assert result == "Privacy mode changed from normal to isolated."
+        mock_storage.set_privacy_mode.assert_called_once_with(PrivacyMode.ISOLATED)
+        mock_privacy_agent.set_mode.assert_called_once_with(PrivacyMode.ISOLATED)
+
 
 # =============================================================================
 # Tests for Model Selection
