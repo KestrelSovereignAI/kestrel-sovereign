@@ -2127,13 +2127,6 @@ Expected Duration: {expected_duration}
             logging.error(f"Solvency check failed: {e}", exc_info=True)
             return None
 
-    def close(self):
-        """Synchronously close the agent. For async cleanup, use shutdown() instead."""
-        # Note: This is a best-effort sync close. For proper async cleanup, use shutdown().
-        if hasattr(self.storage, 'close'):
-            self.storage.close()
-        logging.info("Kestrel Agent shutdown complete.")
-    
     async def emit_event(self, event_type: str, data: Dict[str, Any]) -> None:
         """
         Emit an event to all registered listeners (for SSE notifications).

@@ -7,6 +7,7 @@ making the agent class cleaner and commands easier to test.
 
 import os
 import logging
+import inspect
 from typing import Optional, Dict, Any, Callable, Awaitable
 from dataclasses import dataclass
 from enum import Enum
@@ -142,7 +143,7 @@ class CommandHandler:
             handler = self._command_handlers[command]
             result = handler(user_input)
             # Handle both sync and async handlers
-            if hasattr(result, '__await__'):
+            if inspect.isawaitable(result):
                 return await result
             return result
 
@@ -378,9 +379,9 @@ Sharing:
 - Can share: {status['shareable']}
 """
     
-    def _cmd_privacy_save(self, user_input: str) -> str:
+    async def _cmd_privacy_save(self, user_input: str) -> str:
         """Handle !privacy-save command."""
-        return self.agent.privacy_agent.save_isolated_session()
+        return await self.agent.privacy_agent.save_isolated_session()
     
     def _cmd_privacy_discard(self, user_input: str) -> str:
         """Handle !privacy-discard command."""
