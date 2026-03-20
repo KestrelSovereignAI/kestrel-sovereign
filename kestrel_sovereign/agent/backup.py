@@ -70,7 +70,7 @@ class BackupMixin:
                 return save_msg
         return await self._command_backup(user_input.replace("!promote-backup", "!backup", 1))
 
-    def anchor_memory_state(self):
+    async def anchor_memory_state(self):
         """Creates a cryptographic anchor of current conversation history."""
         if self.privacy_agent.privacy_config.is_ephemeral():
             return "Error: Cannot anchor memory in ephemeral mode."
@@ -82,7 +82,7 @@ class BackupMixin:
             return f"Error: Insufficient funds. Need {cost} FIL."
 
         try:
-            self.wallet.transfer(cost, "Notary Service for memory anchor")
+            await self.wallet.transfer(cost, "Notary Service for memory anchor")
             tx_id = self.notary_service.publish_anchor(history_hash)
 
             self.storage.conversation.add_log_anchor(history_hash, tx_id)

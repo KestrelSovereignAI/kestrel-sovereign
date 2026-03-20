@@ -19,6 +19,10 @@ First-pass control document for issue `#300`, focused on maintained runtime surf
   - Fixed by making the handler explicitly async and awaiting the save.
 - `KestrelAgent.set_privacy_mode()` was a sync method branching on loop state to decide whether consent ran via `create_task()` or `run_until_complete()`.
   - Fixed by making the transition explicitly async and awaiting it from both command and API paths.
+- `KestrelAgent.create_trusted_agent()` was a sync method calling async graph storage without `await`.
+  - Fixed by making trusted-agent creation explicitly async and awaiting it from the command path.
+- `ContextBuilder.build_rag_context()` was a sync helper calling async `storage.search_chunks()`.
+  - Fixed by making the helper explicitly async and updating its tests to use the real storage contract.
 - `CommandHandler.handle()` was checking `hasattr(result, '__await__')` instead of using `inspect.isawaitable()`.
   - Fixed to use the standard awaitability check.
 - `KestrelAgent.close()` exposed a misleading sync cleanup path over async storage shutdown.
