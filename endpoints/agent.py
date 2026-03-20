@@ -243,7 +243,7 @@ async def set_privacy_mode(request: Request):
             )
 
         agent = get_agent(request)
-        agent.set_privacy_mode(new_mode)
+        await agent.set_privacy_mode(new_mode)
 
         # If switching to a local-only mode, auto-switch model to a local provider
         # If switching back to cloud-allowed mode, restore the previous model

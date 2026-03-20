@@ -194,7 +194,8 @@ class TestPrivacyMode:
 
         assert agent.privacy_mode == PrivacyMode.ANONYMOUS
 
-    def test_set_privacy_mode_changes_internal_state(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_set_privacy_mode_changes_internal_state(self, tmp_path):
         """set_privacy_mode() updates internal _privacy_mode."""
         agent = KestrelAgent(
             did="did:test:123",
@@ -208,12 +209,13 @@ class TestPrivacyMode:
         agent.privacy_agent = MagicMock()
         agent.privacy_agent.set_mode = MagicMock()
 
-        agent.set_privacy_mode(PrivacyMode.EPHEMERAL)
+        await agent.set_privacy_mode(PrivacyMode.EPHEMERAL)
 
         assert agent._privacy_mode == PrivacyMode.EPHEMERAL
         assert agent.privacy_mode == PrivacyMode.EPHEMERAL
 
-    def test_set_privacy_mode_updates_storage_wrapper(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_set_privacy_mode_updates_storage_wrapper(self, tmp_path):
         """set_privacy_mode() updates storage wrapper if initialized."""
         agent = KestrelAgent(
             did="did:test:123",
@@ -230,12 +232,13 @@ class TestPrivacyMode:
         mock_privacy_agent.set_mode = MagicMock()
         agent.privacy_agent = mock_privacy_agent
 
-        agent.set_privacy_mode(PrivacyMode.ISOLATED)
+        await agent.set_privacy_mode(PrivacyMode.ISOLATED)
 
         mock_storage.set_privacy_mode.assert_called_once_with(PrivacyMode.ISOLATED)
         mock_privacy_agent.set_mode.assert_called_once_with(PrivacyMode.ISOLATED)
 
-    def test_set_privacy_mode_returns_privacy_agent_message(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_set_privacy_mode_returns_privacy_agent_message(self, tmp_path):
         """set_privacy_mode() returns the canonical privacy-agent status message."""
         agent = KestrelAgent(
             did="did:test:123",
@@ -251,7 +254,7 @@ class TestPrivacyMode:
         mock_privacy_agent.set_mode = MagicMock(return_value="Privacy mode changed from normal to isolated.")
         agent.privacy_agent = mock_privacy_agent
 
-        result = agent.set_privacy_mode(PrivacyMode.ISOLATED)
+        result = await agent.set_privacy_mode(PrivacyMode.ISOLATED)
 
         assert result == "Privacy mode changed from normal to isolated."
         mock_storage.set_privacy_mode.assert_called_once_with(PrivacyMode.ISOLATED)
