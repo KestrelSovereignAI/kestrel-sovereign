@@ -198,7 +198,7 @@
         <canvas id="chartMilestones"></canvas>
       </div>
       <div class="chart-box">
-        <h3>Session Velocity Trend</h3>
+        <h3>Outcome Velocity Trend</h3>
         <canvas id="chartVelocity"></canvas>
       </div>
     </div>
@@ -297,22 +297,23 @@ const REPOS = [
 ];
 
 // Session data (sourced from SESSION_LOG.md)
+// Outcomes = issues closed + PRs merged + bugs fixed (tangible deliverables)
 const SESSION_DATA = [
-  { id: 1,  date: '2026-02-17', focus: 'Caprock integration + crash fixes', prs: 4, bugs: 3, loc: 576, aiHours: 4, bottleneck: null },
-  { id: 2,  date: '2026-02-18', focus: 'PR feedback, branch rules, backlog triage', prs: 1, bugs: 1, loc: 10, aiHours: 2.5, bottleneck: null },
-  { id: 3,  date: '2026-02-19', focus: 'Triage, OData, Redis, metrics pipeline', prs: 4, bugs: 5, loc: 730, aiHours: 5, bottleneck: null },
-  { id: 4,  date: '2026-02-20', focus: 'AppInsights sweep — all 8 exceptions', prs: 2, bugs: 6, loc: 45, aiHours: 3, bottleneck: null },
-  { id: 5,  date: '2026-02-22', focus: 'Windows install, 100% validation pass', prs: 0, bugs: 4, loc: 431, aiHours: 4, bottleneck: null },
-  { id: 6,  date: '2026-02-22', focus: 'RCS integration tests — 17/19 pass', prs: 0, bugs: 0, loc: 370, aiHours: 3.5, bottleneck: null },
-  { id: 7,  date: '2026-02-23', focus: 'Architecture pivot, open source strategy', prs: 0, bugs: 0, loc: 680, aiHours: 5, bottleneck: null },
-  { id: 8,  date: '2026-02-24', focus: 'Go/no-go, founding brief, baseline', prs: 0, bugs: 0, loc: 180, aiHours: 2, bottleneck: null },
-  { id: 11, date: '2026-03-06', focus: 'Post-vacation backlog review, OSS launch', prs: 0, bugs: 0, loc: 340, aiHours: 4, bottleneck: null },
-  { id: 12, date: '2026-03-08', focus: 'Demo prep: hallucination fix, inception', prs: 0, bugs: 1, loc: 35, aiHours: 2, bottleneck: null },
-  { id: 13, date: '2026-03-09', focus: 'Windows 11 validation, audit bug fix', prs: 0, bugs: 1, loc: 230, aiHours: 3, bottleneck: null },
-  { id: 16, date: '2026-03-13', focus: 'SMS confirmed, E2E demo all 5 acts', prs: 0, bugs: 4, loc: 35, aiHours: 3, bottleneck: 32 },
-  { id: 17, date: '2026-03-15', focus: 'Demo hardening for George, Act 6', prs: 5, bugs: 6, loc: 600, aiHours: 5, bottleneck: 25 },
-  { id: 18, date: '2026-03-17', focus: 'OSS sprint, Signal & Ship design', prs: 0, bugs: 0, loc: 1250, aiHours: 6, bottleneck: 17 },
-  { id: 19, date: '2026-03-18', focus: 'Backlog cleanup, CI, pricing model', prs: 2, bugs: 0, loc: 1010, aiHours: 5.5, bottleneck: 21 },
+  { id: 1,  date: '2026-02-17', focus: 'Caprock integration + crash fixes', prs: 4, bugs: 3, issues: 5, aiHours: 4, bottleneck: null },
+  { id: 2,  date: '2026-02-18', focus: 'PR feedback, branch rules, backlog triage', prs: 1, bugs: 1, issues: 3, aiHours: 2.5, bottleneck: null },
+  { id: 3,  date: '2026-02-19', focus: 'Triage, OData, Redis, metrics pipeline', prs: 4, bugs: 5, issues: 8, aiHours: 5, bottleneck: null },
+  { id: 4,  date: '2026-02-20', focus: 'AppInsights sweep — all 8 exceptions', prs: 2, bugs: 6, issues: 8, aiHours: 3, bottleneck: null },
+  { id: 5,  date: '2026-02-22', focus: 'Windows install, 100% validation pass', prs: 0, bugs: 4, issues: 4, aiHours: 4, bottleneck: null },
+  { id: 6,  date: '2026-02-22', focus: 'RCS integration tests — 17/19 pass', prs: 0, bugs: 0, issues: 2, aiHours: 3.5, bottleneck: null },
+  { id: 7,  date: '2026-02-23', focus: 'Architecture pivot, open source strategy', prs: 0, bugs: 0, issues: 3, aiHours: 5, bottleneck: null },
+  { id: 8,  date: '2026-02-24', focus: 'Go/no-go, founding brief, baseline', prs: 0, bugs: 0, issues: 2, aiHours: 2, bottleneck: null },
+  { id: 11, date: '2026-03-06', focus: 'Post-vacation backlog review, OSS launch', prs: 0, bugs: 0, issues: 5, aiHours: 4, bottleneck: null },
+  { id: 12, date: '2026-03-08', focus: 'Demo prep: hallucination fix, inception', prs: 0, bugs: 1, issues: 2, aiHours: 2, bottleneck: null },
+  { id: 13, date: '2026-03-09', focus: 'Windows 11 validation, audit bug fix', prs: 0, bugs: 1, issues: 3, aiHours: 3, bottleneck: null },
+  { id: 16, date: '2026-03-13', focus: 'SMS confirmed, E2E demo all 5 acts', prs: 0, bugs: 4, issues: 6, aiHours: 3, bottleneck: 32 },
+  { id: 17, date: '2026-03-15', focus: 'Demo hardening for George, Act 6', prs: 5, bugs: 6, issues: 12, aiHours: 5, bottleneck: 25 },
+  { id: 18, date: '2026-03-17', focus: 'OSS sprint, Signal & Ship design', prs: 0, bugs: 0, issues: 7, aiHours: 6, bottleneck: 17 },
+  { id: 19, date: '2026-03-18', focus: 'Backlog cleanup, CI, pricing model', prs: 2, bugs: 0, issues: 15, aiHours: 5.5, bottleneck: 21 },
 ];
 
 // Milestones (from STRATEGY.yaml)
@@ -570,7 +571,7 @@ function renderStrategic(data) {
 
   // KPIs
   const totalSessions = SESSION_DATA.length;
-  const totalLOC = SESSION_DATA.reduce((s, d) => s + d.loc, 0);
+  const totalOutcomes = SESSION_DATA.reduce((s, d) => s + d.issues + d.prs + d.bugs, 0);
   const totalPRs = SESSION_DATA.reduce((s, d) => s + d.prs, 0);
   const totalBugs = SESSION_DATA.reduce((s, d) => s + d.bugs, 0);
   const avgBottleneck = SESSION_DATA.filter(s => s.bottleneck != null);
@@ -578,8 +579,8 @@ function renderStrategic(data) {
 
   document.getElementById('stKpis').innerHTML = `
     <div class="kpi accent"><div class="label">Sessions</div><div class="value">${totalSessions}</div><div class="sub">since Feb 17</div></div>
-    <div class="kpi success"><div class="label">Total LOC</div><div class="value">${totalLOC.toLocaleString()}</div><div class="sub">code + docs</div></div>
-    <div class="kpi"><div class="label">PRs Opened</div><div class="value">${totalPRs}</div><div class="sub">across all repos</div></div>
+    <div class="kpi success"><div class="label">Outcomes Delivered</div><div class="value">${totalOutcomes}</div><div class="sub">issues + PRs + bugs</div></div>
+    <div class="kpi"><div class="label">PRs Merged</div><div class="value">${totalPRs}</div><div class="sub">across all repos</div></div>
     <div class="kpi"><div class="label">Bugs Fixed</div><div class="value">${totalBugs}</div><div class="sub">production issues</div></div>
     ${avgBN !== null ? `<div class="kpi ${avgBN <= 25 ? 'success' : 'warning'}"><div class="label">Avg Bottleneck</div><div class="value">${avgBN}%</div><div class="sub">human-blocked time</div></div>` : ''}
   `;
@@ -646,23 +647,23 @@ function renderStrategic(data) {
     options: { responsive: true, plugins: { legend: { position: 'right' } } },
   });
 
-  // Chart: Session velocity trend
+  // Chart: Session outcome velocity trend
   const sessionLabels = SESSION_DATA.map(s => 'S' + String(s.id).padStart(3, '0'));
-  const locData = SESSION_DATA.map(s => s.loc);
+  const outcomeData = SESSION_DATA.map(s => s.issues + s.prs + s.bugs);
   const bugData = SESSION_DATA.map(s => s.bugs);
   makeChart('chartVelocity', {
     type: 'line',
     data: {
       labels: sessionLabels,
       datasets: [
-        { label: 'LOC', data: locData, borderColor: '#4f46e5', backgroundColor: 'rgba(79,70,229,0.1)', fill: true, tension: 0.3 },
+        { label: 'Outcomes', data: outcomeData, borderColor: '#4f46e5', backgroundColor: 'rgba(79,70,229,0.1)', fill: true, tension: 0.3 },
         { label: 'Bugs Fixed', data: bugData, borderColor: '#ef4444', backgroundColor: 'rgba(239,68,68,0.1)', fill: true, tension: 0.3, yAxisID: 'y1' },
       ],
     },
     options: {
       responsive: true,
       scales: {
-        y: { beginAtZero: true, title: { display: true, text: 'LOC' } },
+        y: { beginAtZero: true, title: { display: true, text: 'Outcomes' } },
         y1: { beginAtZero: true, position: 'right', title: { display: true, text: 'Bugs' }, grid: { drawOnChartArea: false } },
       },
     },
