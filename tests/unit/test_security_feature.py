@@ -15,6 +15,7 @@ import tempfile
 import os
 from pathlib import Path
 from unittest.mock import MagicMock, AsyncMock
+from datetime import datetime, timedelta, timezone
 
 # Registry to track stores for cleanup
 _stores_to_close = []
@@ -64,6 +65,7 @@ from kestrel_sovereign.features.security.permissions import (
 )
 from kestrel_sovereign.features.security.approval_queue import ApprovalQueue, ApprovalRequest
 from kestrel_sovereign.features.security.hooks import SecurityHook
+from kestrel_sovereign.features.security.feature import SecurityFeature
 from kestrel_sovereign.hooks import HookInput, HookEvent, PermissionDecision
 
 
@@ -550,6 +552,51 @@ class TestSecurityIntegration:
         logs = await store.get_audit_log(limit=1)
         assert logs[0]["decision"] == "user_approved"
         assert logs[0]["user_choice"] == "session"
+
+
+class TestSecurityFeature:
+    """Tests for SecurityFeature command contracts."""
+
+    @pytest.mark.asyncio
+    async def test_pending_approvals_uses_wall_clock_age(self):
+        agent = MagicMock()
+        feature = SecurityFeature(agent)
+        feature.approval_queue = ApprovalQueue()
+
+        request = ApprovalRequest(
+            id="req-12345678",
+            feature_name="WalletAgent",
+            tool_name="send_tokens",
+            tool_args={"amount": 5},
+            created_at=datetime.now(timezone.utc) - timedelta(seconds=12),
+        )
+        feature.approval_queue._pending[request.id] = request
+
+        result = await feature.pending_approvals()
+
+        assert "Pending Approvals (1):" in result
+        assert "[req-1234] WalletAgent.send_tokens" in result
+        assert "(12s ago)" in result or "(11s ago)" in result or "(13s ago)" in result
+
+    @pytest.mark.asyncio
+    async def test_pending_approvals_handles_legacy_naive_timestamps(self):
+        agent = MagicMock()
+        feature = SecurityFeature(agent)
+        feature.approval_queue = ApprovalQueue()
+
+        request = ApprovalRequest(
+            id="req-legacy",
+            feature_name="WalletAgent",
+            tool_name="get_balance",
+            tool_args={},
+            created_at=(datetime.now(timezone.utc) - timedelta(seconds=5)).replace(tzinfo=None),
+        )
+        feature.approval_queue._pending[request.id] = request
+
+        result = await feature.pending_approvals()
+
+        assert "WalletAgent.get_balance" in result
+        assert "ago)" in result
 
 
 # === Run tests ===

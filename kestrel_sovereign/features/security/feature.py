@@ -7,6 +7,7 @@ providing CLI commands and API integration.
 
 import asyncio
 import logging
+from datetime import datetime, timezone
 from typing import Optional
 
 from kestrel_sovereign.features.base import Feature, tool
@@ -280,7 +281,10 @@ class SecurityFeature(Feature):
 
         lines = [f"Pending Approvals ({len(pending)}):"]
         for req in pending:
-            age = (asyncio.get_event_loop().time() - req.created_at.timestamp())
+            created_at = req.created_at
+            if created_at.tzinfo is None:
+                created_at = created_at.replace(tzinfo=timezone.utc)
+            age = (datetime.now(timezone.utc) - created_at).total_seconds()
             lines.append(
                 f"  [{req.id[:8]}] {req.feature_name}.{req.tool_name} "
                 f"({int(age)}s ago)"

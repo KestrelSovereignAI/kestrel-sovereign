@@ -8,7 +8,7 @@ the agent to stack requests while waiting for user decisions.
 import asyncio
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Awaitable, Callable, Dict, List, Optional
 from uuid import uuid4
@@ -141,7 +141,7 @@ class ApprovalQueue:
             feature_name=feature_name,
             tool_name=tool_name,
             tool_args=tool_args,
-            created_at=datetime.now(),
+            created_at=datetime.now(timezone.utc),
             timeout_seconds=timeout,
         )
 
