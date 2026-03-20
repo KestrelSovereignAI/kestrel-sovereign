@@ -1,7 +1,7 @@
 """Contracts for model preservation across privacy-mode transitions."""
 
 from contextlib import asynccontextmanager
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from fastapi.testclient import TestClient
 
@@ -61,7 +61,7 @@ def test_privacy_mode_restores_default_cloud_model_after_local_only_transition()
     privacy_agent = MagicMock()
     privacy_agent.privacy_config.allows_cloud_llm.return_value = True
     agent = MagicMock(llm_service=llm_service, privacy_agent=privacy_agent)
-    agent.set_privacy_mode = MagicMock()
+    agent.set_privacy_mode = AsyncMock()
 
     app, original = _prepare_app(agent)
     try:
@@ -101,7 +101,7 @@ def test_privacy_mode_restores_explicit_cloud_preference_after_local_only_transi
     privacy_agent = MagicMock()
     privacy_agent.privacy_config.allows_cloud_llm.return_value = True
     agent = MagicMock(llm_service=llm_service, privacy_agent=privacy_agent)
-    agent.set_privacy_mode = MagicMock()
+    agent.set_privacy_mode = AsyncMock()
 
     app, original = _prepare_app(agent)
     try:

@@ -536,7 +536,7 @@ class KestrelAgent(ConstitutionMixin, StreamingMixin, BackupMixin, SleepMixin):
         """Get current privacy mode."""
         return self._privacy_mode
     
-    def set_privacy_mode(self, mode: PrivacyMode) -> str:
+    async def set_privacy_mode(self, mode: PrivacyMode) -> str:
         """
         Change the privacy mode.
 
@@ -547,17 +547,10 @@ class KestrelAgent(ConstitutionMixin, StreamingMixin, BackupMixin, SleepMixin):
         consent = self.features.get("ConsentFeature") if hasattr(self, 'features') else None
         if consent:
             try:
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    loop.create_task(consent.request_consent(
-                        "privacy_mode_change",
-                        {"from": self._privacy_mode.value, "to": mode.value},
-                    ))
-                else:
-                    loop.run_until_complete(consent.request_consent(
-                        "privacy_mode_change",
-                        {"from": self._privacy_mode.value, "to": mode.value},
-                    ))
+                await consent.request_consent(
+                    "privacy_mode_change",
+                    {"from": self._privacy_mode.value, "to": mode.value},
+                )
             except Exception as e:
                 logging.debug(f"Consent request failed (non-blocking): {e}")
 

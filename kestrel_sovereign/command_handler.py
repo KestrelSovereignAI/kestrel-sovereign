@@ -327,13 +327,13 @@ class CommandHandler:
     
     # === Privacy Commands ===
     
-    def _cmd_privacy(self, user_input: str) -> str:
+    async def _cmd_privacy(self, user_input: str) -> str:
         """Handle !privacy and !set-privacy-mode commands."""
         parts = user_input.split()
         if len(parts) > 1:
             try:
                 mode = PrivacyMode(parts[1].lower())
-                return self.agent.set_privacy_mode(mode)
+                return await self.agent.set_privacy_mode(mode)
             except ValueError:
                 valid_modes = ", ".join([m.value for m in PrivacyMode])
                 return f"Invalid privacy mode. Valid modes are: {valid_modes}"
