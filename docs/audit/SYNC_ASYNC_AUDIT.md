@@ -17,6 +17,8 @@ First-pass control document for issue `#300`, focused on maintained runtime surf
   - Fixed by making the handler explicitly async and awaiting both calls.
 - `!privacy-save` was a sync handler returning a coroutine from `privacy_agent.save_isolated_session()`.
   - Fixed by making the handler explicitly async and awaiting the save.
+- `KestrelAgent.set_privacy_mode()` was a sync method branching on loop state to decide whether consent ran via `create_task()` or `run_until_complete()`.
+  - Fixed by making the transition explicitly async and awaiting it from both command and API paths.
 - `CommandHandler.handle()` was checking `hasattr(result, '__await__')` instead of using `inspect.isawaitable()`.
   - Fixed to use the standard awaitability check.
 - `KestrelAgent.close()` exposed a misleading sync cleanup path over async storage shutdown.
@@ -24,8 +26,6 @@ First-pass control document for issue `#300`, focused on maintained runtime surf
 
 ### Active patterns to audit further
 
-- Sync entrypoints that schedule async side effects via event-loop branching.
-  - Example: `KestrelAgent.set_privacy_mode()`
 - Conflicting close/shutdown contracts.
   - Audit remains relevant in other lifecycle surfaces, but the agent cleanup contract is now `await agent.shutdown()`.
 - Command/API parity for behaviors that cross runtime boundaries.

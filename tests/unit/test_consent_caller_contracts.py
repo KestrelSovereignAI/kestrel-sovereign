@@ -10,26 +10,6 @@ from kestrel_sovereign.kestrel_agent import KestrelAgent
 from kestrel_sovereign.privacy import PrivacyMode
 
 
-class _LoopStub:
-    def __init__(self, running: bool):
-        self._running = running
-        self.created = []
-        self.awaited = []
-
-    def is_running(self):
-        return self._running
-
-    def create_task(self, coro):
-        self.created.append(coro)
-        coro.close()
-        return MagicMock()
-
-    def run_until_complete(self, coro):
-        self.awaited.append(coro)
-        coro.close()
-        return None
-
-
 def _make_consent():
     consent = MagicMock()
     consent.request_consent = AsyncMock(return_value=None)
@@ -37,7 +17,8 @@ def _make_consent():
 
 
 class TestPrivacyConsentCaller:
-    def test_set_privacy_mode_requests_consent_with_sync_loop(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_set_privacy_mode_requests_consent_before_transition(self, tmp_path):
         agent = KestrelAgent(
             did="did:test:123",
             storage_path=str(tmp_path / "test.db"),
@@ -50,45 +31,14 @@ class TestPrivacyConsentCaller:
         consent = _make_consent()
         agent.features = {"ConsentFeature": consent}
 
-        loop = _LoopStub(running=False)
-        monkeypatch.setattr("kestrel_sovereign.kestrel_agent.asyncio.get_event_loop", lambda: loop)
+        await agent.set_privacy_mode(PrivacyMode.EPHEMERAL)
 
-        agent.set_privacy_mode(PrivacyMode.EPHEMERAL)
-
-        assert len(loop.awaited) == 1
-        consent.request_consent.assert_called_once_with(
+        consent.request_consent.assert_awaited_once_with(
             "privacy_mode_change",
             {"from": "normal", "to": "ephemeral"},
         )
         agent.storage.set_privacy_mode.assert_called_once_with(PrivacyMode.EPHEMERAL)
         agent.privacy_agent.set_mode.assert_called_once_with(PrivacyMode.EPHEMERAL)
-
-    def test_set_privacy_mode_requests_consent_with_running_loop(self, tmp_path, monkeypatch):
-        agent = KestrelAgent(
-            did="did:test:123",
-            storage_path=str(tmp_path / "test.db"),
-            privacy_mode=PrivacyMode.NORMAL,
-        )
-        agent.storage = MagicMock()
-        agent.storage.set_privacy_mode = MagicMock()
-        agent.privacy_agent = MagicMock()
-        agent.privacy_agent.set_mode = MagicMock()
-        consent = _make_consent()
-        agent.features = {"ConsentFeature": consent}
-
-        loop = _LoopStub(running=True)
-        monkeypatch.setattr("kestrel_sovereign.kestrel_agent.asyncio.get_event_loop", lambda: loop)
-
-        agent.set_privacy_mode(PrivacyMode.ISOLATED)
-
-        assert len(loop.created) == 1
-        assert len(loop.awaited) == 0
-        consent.request_consent.assert_called_once_with(
-            "privacy_mode_change",
-            {"from": "normal", "to": "isolated"},
-        )
-        agent.storage.set_privacy_mode.assert_called_once_with(PrivacyMode.ISOLATED)
-        agent.privacy_agent.set_mode.assert_called_once_with(PrivacyMode.ISOLATED)
 
 
 class TestModelConsentCaller:
