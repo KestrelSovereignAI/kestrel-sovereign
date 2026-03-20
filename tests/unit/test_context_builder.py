@@ -14,8 +14,7 @@ class TestContextBuilder:
     def mock_storage(self):
         """Create a mock storage instance."""
         storage = Mock()
-        # search_chunks is called both sync and async in different methods
-        storage.search_chunks = Mock(return_value=[])
+        storage.search_chunks = AsyncMock(return_value=[])
         return storage
 
     @pytest.fixture
@@ -214,48 +213,55 @@ class TestContextBuilder:
         assert "ADDITIONAL CONTEXT" in result
         assert "User prefers formal responses." in result
 
-    def test_build_rag_context_no_results(self, context_builder, mock_storage):
+    @pytest.mark.asyncio
+    async def test_build_rag_context_no_results(self, context_builder, mock_storage):
         """Test build_rag_context returns None when no results."""
         mock_storage.search_chunks.return_value = []
-        
-        result = context_builder.build_rag_context("test query")
-        
-        assert result is None
 
-    def test_build_rag_context_with_results(self, context_builder, mock_storage):
+        result = await context_builder.build_rag_context("test query")
+
+        assert result is None
+        mock_storage.search_chunks.assert_awaited_once_with("test query")
+
+    @pytest.mark.asyncio
+    async def test_build_rag_context_with_results(self, context_builder, mock_storage):
         """Test build_rag_context formats results correctly."""
         mock_storage.search_chunks.return_value = [
             {"document_name": "doc1.txt", "content": "Content 1"},
             {"document_name": "doc2.txt", "content": "Content 2"},
         ]
-        
-        result = context_builder.build_rag_context("test query")
-        
+
+        result = await context_builder.build_rag_context("test query")
+
         assert "[Document 1: doc1.txt]" in result
         assert "Content 1" in result
         assert "[Document 2: doc2.txt]" in result
         assert "Content 2" in result
+        mock_storage.search_chunks.assert_awaited_once_with("test query")
 
-    def test_build_rag_context_max_results(self, context_builder, mock_storage):
+    @pytest.mark.asyncio
+    async def test_build_rag_context_max_results(self, context_builder, mock_storage):
         """Test build_rag_context respects max_results."""
         mock_storage.search_chunks.return_value = [
             {"document_name": f"doc{i}.txt", "content": f"Content {i}"} 
             for i in range(10)
         ]
-        
-        result = context_builder.build_rag_context("test query", max_results=3)
-        
+
+        result = await context_builder.build_rag_context("test query", max_results=3)
+
         assert "[Document 1: doc0.txt]" in result
         assert "[Document 2: doc1.txt]" in result
         assert "[Document 3: doc2.txt]" in result
         assert "[Document 4:" not in result
+        mock_storage.search_chunks.assert_awaited_once_with("test query")
 
-    def test_build_rag_context_handles_error(self, context_builder, mock_storage):
+    @pytest.mark.asyncio
+    async def test_build_rag_context_handles_error(self, context_builder, mock_storage):
         """Test build_rag_context handles errors gracefully."""
         mock_storage.search_chunks.side_effect = Exception("Search failed")
-        
-        result = context_builder.build_rag_context("test query")
-        
+
+        result = await context_builder.build_rag_context("test query")
+
         assert result is None
 
 

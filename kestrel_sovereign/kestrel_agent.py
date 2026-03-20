@@ -1940,12 +1940,13 @@ Expected Duration: {expected_duration}
         # This function is now just a pass-through to the LLM service
         return await self.llm_service.get_audit_response(text_to_audit)
         
-    def create_trusted_agent(self, agent_name: str) -> str:
+    async def create_trusted_agent(self, agent_name: str) -> str:
         """
         Creates a new Kestrel agent identity and stores it in the trusted agents directory.
         This is a simplified, local version of the "Genesis Factory" concept.
         """
         from kestrel_sovereign.inception_service import generate_kestrel_identity, save_kestrel_identity
+        from kestrel_sovereign.storage import GraphNode
 
         # Generate a new identity
         try:
@@ -1968,7 +1969,7 @@ Expected Duration: {expected_duration}
                     "trust_level": "trusted"
                 }
             )
-            self.storage.graph_store.add_node(new_agent_node)
+            await self.storage.graph_store.add_node(new_agent_node)
 
             return f"Created trusted agent '{agent_name}' with DID: {new_agent_did_doc['id']}"
         except (OSError, ValueError, KeyError, TypeError) as e:

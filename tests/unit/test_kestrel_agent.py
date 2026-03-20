@@ -286,6 +286,71 @@ class TestModelSelection:
         # Verify result contains success message
         assert "Model set" in result
 
+
+class TestTrustedAgentCreation:
+    """Tests for trusted-agent creation boundaries."""
+
+    @pytest.mark.asyncio
+    async def test_create_trusted_agent_awaits_graph_store_write(self, tmp_path):
+        agent = KestrelAgent(
+            did="did:test:123",
+            storage_path=str(tmp_path / "test.db")
+        )
+
+        graph_store = MagicMock()
+        graph_store.add_node = AsyncMock()
+        agent.storage = MagicMock(graph_store=graph_store)
+
+        with patch(
+            "kestrel_sovereign.inception_service.generate_kestrel_identity",
+            return_value=({"id": "did:test:new"}, {"private_key": "secret"}),
+        ), patch(
+            "kestrel_sovereign.inception_service.save_kestrel_identity",
+        ):
+            result = await agent.create_trusted_agent("new-friend")
+
+        assert "Created trusted agent 'new-friend'" in result
+        graph_store.add_node.assert_awaited_once()
+        created_node = graph_store.add_node.await_args.args[0]
+        assert created_node.node_id == "did:test:new"
+        assert created_node.label == "new-friend"
+
+
+class TestMemoryAnchoring:
+    """Tests for async anchoring boundaries."""
+
+    @pytest.mark.asyncio
+    async def test_anchor_memory_state_awaits_wallet_transfer(self, tmp_path):
+        agent = KestrelAgent(
+            did="did:test:123",
+            storage_path=str(tmp_path / "test.db")
+        )
+
+        conversation = MagicMock()
+        conversation.get_conversation_history_hash.return_value = "hash-123"
+        conversation.add_log_anchor = MagicMock()
+        agent.storage = MagicMock(conversation=conversation)
+
+        wallet = MagicMock()
+        wallet.can_afford.return_value = True
+        wallet.transfer = AsyncMock()
+        agent.wallet = wallet
+
+        notary = MagicMock()
+        notary.estimate_cost.return_value = Decimal("0.5")
+        notary.publish_anchor.return_value = "tx-abc"
+        agent.notary_service = notary
+
+        privacy_config = MagicMock()
+        privacy_config.is_ephemeral.return_value = False
+        agent.privacy_agent = MagicMock(privacy_config=privacy_config)
+
+        result = await agent.anchor_memory_state()
+
+        assert "Successfully anchored memory state." in result
+        wallet.transfer.assert_awaited_once_with(Decimal("0.5"), "Notary Service for memory anchor")
+        conversation.add_log_anchor.assert_called_once_with("hash-123", "tx-abc")
+
     def test_get_current_model_with_preference_set(self, tmp_path):
         """get_current_model() returns provider/model when preference set."""
         mock_llm = MagicMock()
