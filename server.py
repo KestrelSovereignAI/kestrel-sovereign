@@ -255,6 +255,44 @@ app.include_router(observability_router)
 app.include_router(saved_items_router)
 
 
+# --- GitHub API Proxy (for Portfolio Dashboard) ---
+
+@app.get("/api/github/{path:path}")
+async def github_proxy(path: str, request: Request):
+    """Proxy GitHub API requests using server-side GITHUB_TOKEN."""
+    import httpx
+
+    token = os.environ.get("GITHUB_TOKEN", "")
+    if not token:
+        env_path = Path(__file__).parent / ".env"
+        if env_path.exists():
+            for line in env_path.read_text().splitlines():
+                if line.startswith("GITHUB_TOKEN="):
+                    token = line.split("=", 1)[1].strip().strip('"').strip("'")
+                    break
+    if not token:
+        return JSONResponse({"error": "No GITHUB_TOKEN configured"}, status_code=503)
+
+    gh_url = f"https://api.github.com/{path}"
+    if request.url.query:
+        gh_url += f"?{request.url.query}"
+
+    async with httpx.AsyncClient() as client:
+        try:
+            resp = await client.get(
+                gh_url,
+                headers={
+                    "Authorization": f"token {token}",
+                    "Accept": "application/vnd.github.v3+json",
+                    "User-Agent": "kestrel-host",
+                },
+                timeout=httpx.Timeout(connect=5.0, read=15.0, write=5.0, pool=5.0),
+            )
+            return JSONResponse(content=resp.json(), status_code=resp.status_code)
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=502)
+
+
 # Regex for multi-agent path routing: /api/agents/{name}/{remaining_path}
 _AGENT_PATH_RE = re.compile(r"^/api/agents/([^/]+)/(.+)$")
 
@@ -315,7 +353,7 @@ async def auth_middleware(request: Request, call_next):
     """
     public_paths = ["/health", "/health/detailed", "/favicon.ico", "/webhooks/stripe/crypto", "/api/auth/key"]
     auth_paths = ["/auth/login", "/auth/callback", "/auth/logout"]
-    static_prefixes = ["/static", "/js/", "/shared/", "/utils/"]
+    static_prefixes = ["/static", "/js/", "/shared/", "/utils/", "/api/github/"]
 
     if request.url.path in public_paths or request.url.path in auth_paths:
         return await call_next(request)

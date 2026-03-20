@@ -179,7 +179,7 @@ if STATIC_DIR.is_dir():
 async def auth_middleware(request: Request, call_next):
     """Global authentication middleware (same pattern as server.py)."""
     public_paths = {"/health", "/", "/favicon.ico", "/api/auth/key"}
-    static_prefixes = ("/static", "/js/", "/shared/", "/utils/")
+    static_prefixes = ("/static", "/js/", "/shared/", "/utils/", "/api/github/")
 
     if request.url.path in public_paths or any(
         request.url.path.startswith(p) for p in static_prefixes
@@ -251,6 +251,46 @@ async def get_bootstrap_key(request: Request):
         "header": API_KEY_NAME,
         "usage": "Include as 'X-API-Key' header or 'Authorization: Bearer <key>'",
     }
+
+
+# --- GitHub API Proxy (for dashboard) ---
+
+@app.get("/api/github/{path:path}")
+async def github_proxy(path: str, request: Request):
+    """Proxy GitHub API requests using server-side token."""
+    token = os.environ.get("GITHUB_TOKEN", "")
+    if not token:
+        # Try .env file
+        env_path = Path(__file__).parent / ".env"
+        if env_path.exists():
+            for line in env_path.read_text().splitlines():
+                if line.startswith("GITHUB_TOKEN="):
+                    token = line.split("=", 1)[1].strip().strip('"').strip("'")
+                    break
+    if not token:
+        return JSONResponse({"error": "No GITHUB_TOKEN configured on server"}, status_code=503)
+
+    gh_url = f"https://api.github.com/{path}"
+    if request.url.query:
+        gh_url += f"?{request.url.query}"
+
+    client: httpx.AsyncClient = request.app.state.http_client
+    try:
+        resp = await client.get(
+            gh_url,
+            headers={
+                "Authorization": f"token {token}",
+                "Accept": "application/vnd.github.v3+json",
+                "User-Agent": "kestrel-host",
+            },
+            timeout=httpx.Timeout(connect=5.0, read=15.0, write=5.0, pool=5.0),
+        )
+        return JSONResponse(
+            content=resp.json(),
+            status_code=resp.status_code,
+        )
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
 
 
 @app.get("/health")
