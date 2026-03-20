@@ -151,10 +151,17 @@ class GCPComputeFeature(Feature):
             # Register with LLM router if available
             if self.llm_service and result.get("inference_url"):
                 try:
-                    self.llm_service.set_remote_backend(
-                        url=result["inference_url"],
-                        backend_type=BackendType.REMOTE_OPENAI,
-                        metadata={"provider": "gcp", "instance": result.get("instance_name")},
+                    self.llm_service.switch_backend(
+                        BackendType.REMOTE_GPU,
+                        config={
+                            "base_url": result["inference_url"],
+                            "model": result.get("model_name"),
+                            "ttl_seconds": result.get("remaining_ttl_seconds"),
+                            "metadata": {
+                                "provider": "gcp",
+                                "instance": result.get("instance_name"),
+                            },
+                        },
                     )
                     result["llm_routing"] = "enabled"
                 except (KeyError, ValueError, TypeError) as e:
@@ -175,7 +182,7 @@ class GCPComputeFeature(Feature):
             # Unregister from LLM router
             if self.llm_service:
                 try:
-                    self.llm_service.clear_remote_backend()
+                    self.llm_service.switch_backend(BackendType.CLOUD)
                 except (KeyError, ValueError, TypeError) as e:
                     logger.warning(f"Invalid LLM routing state: {e}", exc_info=True)
                 except Exception as e:
