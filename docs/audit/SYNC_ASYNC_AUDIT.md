@@ -29,6 +29,8 @@ First-pass control document for issue `#300`, focused on maintained runtime surf
   - Fixed by normalizing those paths to monotonic elapsed-time checks that work cleanly across sync/async boundaries.
 - Sovereignty file-browser endpoints were doing blocking filesystem work directly on async request paths.
   - Fixed by offloading directory scans and preview reads via `asyncio.to_thread()`.
+- `StrategicMemory` GitHub helpers were using legacy loop executor plumbing for blocking network calls.
+  - Fixed by making the offload explicit with `asyncio.to_thread()` and direct contract tests.
 - `CommandHandler.handle()` was checking `hasattr(result, '__await__')` instead of using `inspect.isawaitable()`.
   - Fixed to use the standard awaitability check.
 - `KestrelAgent.close()` exposed a misleading sync cleanup path over async storage shutdown.

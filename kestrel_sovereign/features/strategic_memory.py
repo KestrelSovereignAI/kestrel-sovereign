@@ -299,10 +299,8 @@ class StrategicMemoryFeature(Feature):
             "User-Agent": "kestrel-agent",
         })
         try:
-            loop = asyncio.get_event_loop()
-            resp = await loop.run_in_executor(
-                None,
-                lambda: urllib.request.urlopen(req, timeout=10).read(),
+            resp = await asyncio.to_thread(
+                lambda: urllib.request.urlopen(req, timeout=10).read()
             )
             return json.loads(resp)
         except (urllib.error.URLError, urllib.error.HTTPError, Exception) as e:
@@ -827,10 +825,8 @@ class StrategicMemoryFeature(Feature):
             "User-Agent": "kestrel-agent",
         })
         try:
-            loop = asyncio.get_event_loop()
-            resp = await loop.run_in_executor(
-                None,
-                lambda: urllib.request.urlopen(req, timeout=10).read(),
+            resp = await asyncio.to_thread(
+                lambda: urllib.request.urlopen(req, timeout=10).read()
             )
             return json.loads(resp)
         except (urllib.error.URLError, urllib.error.HTTPError, Exception) as e:
