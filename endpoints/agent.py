@@ -7,6 +7,7 @@ import asyncio
 import json
 import logging
 import re
+import time
 
 from kestrel_sovereign.kestrel_config.constants import (
     MAX_SSE_CONNECTIONS_PER_CLIENT,
@@ -364,7 +365,7 @@ async def notifications_sse(request: Request):
 
             ping_interval = SSE_PING_INTERVAL_SECONDS
             poll_interval = 0.5  # Check for notifications every 500ms
-            last_ping = asyncio.get_event_loop().time()
+            last_ping = time.monotonic()
 
             while True:
                 # Check if client disconnected
@@ -392,7 +393,7 @@ async def notifications_sse(request: Request):
                     yield f"event: task_notification\ndata: {event_data}\n\n"
 
                 # Send keepalive ping
-                current_time = asyncio.get_event_loop().time()
+                current_time = time.monotonic()
                 if current_time - last_ping >= ping_interval:
                     yield f"event: ping\ndata: {json.dumps({'time': current_time})}\n\n"
                     last_ping = current_time
