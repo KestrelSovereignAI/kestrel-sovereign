@@ -412,7 +412,7 @@ Use `!constitution article <N>` for specific articles, or `!constitution search 
 
         return "\n\n".join(parts)
 
-    def build_rag_context(
+    async def build_rag_context(
         self,
         query: str,
         max_results: int = 5
@@ -428,7 +428,7 @@ Use `!constitution article <N>` for specific articles, or `!constitution search 
             Formatted RAG context or None if no results
         """
         try:
-            results = self.storage.search_chunks(query)[:max_results]
+            results = (await self.storage.search_chunks(query))[:max_results]
             if not results:
                 return None
 

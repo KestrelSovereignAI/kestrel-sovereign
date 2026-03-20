@@ -489,17 +489,17 @@ Sharing:
     
     # === Agent/Memory Commands ===
     
-    def _cmd_create_agent(self, user_input: str) -> str:
+    async def _cmd_create_agent(self, user_input: str) -> str:
         """Handle !create-agent command."""
         parts = user_input.split()
         if len(parts) > 1:
             agent_name = parts[1]
-            return self.agent.create_trusted_agent(agent_name)
+            return await self.agent.create_trusted_agent(agent_name)
         return "Usage: !create-agent <agent_name>"
     
-    def _cmd_anchor(self, user_input: str) -> str:
+    async def _cmd_anchor(self, user_input: str) -> str:
         """Handle !anchor command."""
-        return self.agent.anchor_memory_state()
+        return await self.agent.anchor_memory_state()
 
     # Model commands (!model, !model-set, !model-list, !model-pull, !model-info)
     # All handled by ModelAgent feature via tool registry
