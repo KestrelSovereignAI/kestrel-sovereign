@@ -25,6 +25,8 @@ First-pass control document for issue `#300`, focused on maintained runtime surf
   - Fixed by making the helper explicitly async and updating its tests to use the real storage contract.
 - `SecurityFeature.pending_approvals()` was mixing monotonic loop time with wall-clock request timestamps.
   - Fixed by computing approval age from UTC wall-clock time so pending request status is truthful.
+- SSE/MCP/VastAI runtime timers were still using `get_event_loop()` inside active async code.
+  - Fixed by normalizing those paths to `get_running_loop()` for running-loop timing semantics.
 - `CommandHandler.handle()` was checking `hasattr(result, '__await__')` instead of using `inspect.isawaitable()`.
   - Fixed to use the standard awaitability check.
 - `KestrelAgent.close()` exposed a misleading sync cleanup path over async storage shutdown.

@@ -20,6 +20,7 @@ import logging
 import re
 import shutil
 import subprocess
+import time
 from typing import List, Optional, Set
 
 from kestrel_sovereign.kestrel_config.constants import (
@@ -250,11 +251,11 @@ class DockerMCPGateway:
         )
 
         # Wait for gateway to be ready and capture auth token
-        start_time = asyncio.get_event_loop().time()
+        start_time = time.monotonic()
         self._output_lines = []
 
         while True:
-            elapsed = asyncio.get_event_loop().time() - start_time
+            elapsed = time.monotonic() - start_time
             if elapsed >= GATEWAY_STARTUP_TIMEOUT:
                 await self.stop()
                 raise DockerMCPGatewayError(
@@ -287,7 +288,7 @@ class DockerMCPGateway:
                     token = self._parse_auth_token(line)
                     if token:
                         self.auth_token = token
-                        self._start_time = asyncio.get_event_loop().time()
+                        self._start_time = time.monotonic()
                         logger.info(f"Gateway ready at http://localhost:{self.port}/sse")
 
                         # Start timeout task if configured
@@ -331,7 +332,7 @@ class DockerMCPGateway:
         """Reset the session timeout (call on activity to keep alive)."""
         if self.session_timeout and self.is_running:
             self._cancel_timeout_task()
-            self._start_time = asyncio.get_event_loop().time()  # Reset start time
+            self._start_time = time.monotonic()  # Reset start time
             self._start_timeout_task()
             logger.debug("Session timeout reset")
 
@@ -340,7 +341,7 @@ class DockerMCPGateway:
         """Get remaining time before session timeout (None if no timeout)."""
         if not self.session_timeout or not self._start_time:
             return None
-        elapsed = asyncio.get_event_loop().time() - self._start_time
+        elapsed = time.monotonic() - self._start_time
         remaining = self.session_timeout - elapsed
         return max(0, remaining)
 

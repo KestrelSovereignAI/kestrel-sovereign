@@ -7,6 +7,7 @@ the SimpleTuner container running on Vast.ai instances.
 
 import asyncio
 import logging
+import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -47,12 +48,12 @@ class VastAIHTTPAPIMixin:
             return False
 
         base_url = session.backend_base_url.rstrip("/")
-        deadline = asyncio.get_event_loop().time() + timeout
+        deadline = time.monotonic() + timeout
 
         logger.info(f"Waiting for SimpleTuner API at {base_url}/ready...")
 
         async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_DEFAULT) as client:
-            while asyncio.get_event_loop().time() < deadline:
+            while time.monotonic() < deadline:
                 try:
                     response = await client.get(f"{base_url}/ready")
                     if response.status_code == 200:
