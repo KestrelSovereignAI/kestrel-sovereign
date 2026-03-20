@@ -2,9 +2,9 @@
 
 | Domain | Canonical Source | Current Proof | Status |
 |---|---|---|---|
-| Foundation and constitution | `kestrel_sovereign/agent/constitution.py`, `kestrel_sovereign/data/KESTREL_CONSTITUTION.md` | existing unit coverage plus canonical inventory rewrite | Partial |
+| Foundation and constitution | `kestrel_sovereign/agent/constitution.py`, `kestrel_sovereign/data/KESTREL_CONSTITUTION.md` | existing unit coverage plus command-handler constitution contracts | Partial |
 | Identity and continuity | `kestrel_sovereign/inception_service.py`, `kestrel_sovereign/identity/` | existing unit coverage, no full catalog proof map yet | Partial |
-| Agent runtime and context | `kestrel_sovereign/kestrel_agent.py`, `kestrel_sovereign/agent/` | existing unit coverage, no full seam campaign yet | Partial |
+| Agent runtime and context | `kestrel_sovereign/kestrel_agent.py`, `kestrel_sovereign/agent/` | existing unit coverage plus direct runtime-route and consent-caller contracts, no full seam campaign yet | Partial |
 | LLM routing and mandate | `kestrel_sovereign/llm/` | existing unit coverage, mandate drift history noted | Partial |
 | Privacy, security, permissions | `kestrel_sovereign/privacy.py`, `endpoints/security.py`, `server.py` | auth decision-table proof added | Partial |
 | Storage and memory | `kestrel_sovereign/storage.py`, `kestrel_sovereign/storage/`, `endpoints/database.py` | weak endpoint contract suite added | Partial |
