@@ -226,9 +226,7 @@ async def test_kestrel_agent_activates_key_on_initialize():
 
             assert openrouter_provider is not None
 
-            close_result = agent.close()
-            if close_result is not None:
-                await close_result
+            await agent.shutdown()
 
         finally:
             # Always clean up the OpenRouter key

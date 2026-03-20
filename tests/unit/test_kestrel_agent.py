@@ -605,32 +605,22 @@ class TestNotifications:
 class TestLifecycle:
     """Tests for lifecycle methods."""
 
-    def test_close_calls_storage_close(self, tmp_path):
-        """close() calls storage.close() if storage initialized."""
+    @pytest.mark.asyncio
+    async def test_shutdown_does_not_crash_when_storage_none(self, tmp_path):
+        """shutdown() doesn't crash when storage is None."""
         agent = KestrelAgent(
             did="did:test:123",
             storage_path=str(tmp_path / "test.db")
         )
 
-        mock_storage = MagicMock()
-        mock_storage.close = MagicMock()
-        agent.storage = mock_storage
-
-        agent.close()
-
-        mock_storage.close.assert_called_once()
-
-    def test_close_does_not_crash_when_storage_none(self, tmp_path):
-        """close() doesn't crash when storage is None."""
-        agent = KestrelAgent(
-            did="did:test:123",
-            storage_path=str(tmp_path / "test.db")
-        )
-
+        agent.features = {}
+        agent.mcp_agent = None
+        agent.llm_service = None
+        agent.task_manager = None
         agent.storage = None
 
         # Should not raise exception
-        agent.close()
+        await agent.shutdown()
 
     @pytest.mark.asyncio
     async def test_shutdown_closes_all_components(self, tmp_path):
@@ -695,21 +685,6 @@ class TestLifecycle:
 
 class TestErrorHandling:
     """Tests for error handling in various scenarios."""
-
-    def test_close_propagates_storage_close_exception(self, tmp_path):
-        """close() propagates exception from storage.close()."""
-        agent = KestrelAgent(
-            did="did:test:123",
-            storage_path=str(tmp_path / "test.db")
-        )
-
-        mock_storage = MagicMock()
-        mock_storage.close.side_effect = RuntimeError("Close failed")
-        agent.storage = mock_storage
-
-        # Exception should propagate
-        with pytest.raises(RuntimeError, match="Close failed"):
-            agent.close()
 
     @pytest.mark.asyncio
     async def test_shutdown_handles_component_shutdown_exceptions(self, tmp_path):
