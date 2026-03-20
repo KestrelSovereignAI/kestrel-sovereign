@@ -23,6 +23,8 @@ First-pass control document for issue `#300`, focused on maintained runtime surf
   - Fixed by making trusted-agent creation explicitly async and awaiting it from the command path.
 - `ContextBuilder.build_rag_context()` was a sync helper calling async `storage.search_chunks()`.
   - Fixed by making the helper explicitly async and updating its tests to use the real storage contract.
+- `SecurityFeature.pending_approvals()` was mixing monotonic loop time with wall-clock request timestamps.
+  - Fixed by computing approval age from UTC wall-clock time so pending request status is truthful.
 - `CommandHandler.handle()` was checking `hasattr(result, '__await__')` instead of using `inspect.isawaitable()`.
   - Fixed to use the standard awaitability check.
 - `KestrelAgent.close()` exposed a misleading sync cleanup path over async storage shutdown.
