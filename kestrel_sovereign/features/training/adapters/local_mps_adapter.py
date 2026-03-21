@@ -521,8 +521,7 @@ class LocalMPSTrainingAdapter(TrainingProvider):
                     height=height,
                 ).images[0]
 
-            loop = asyncio.get_event_loop()
-            image = await loop.run_in_executor(None, generate)
+            image = await asyncio.to_thread(generate)
 
             # Convert to base64
             buffered = BytesIO()

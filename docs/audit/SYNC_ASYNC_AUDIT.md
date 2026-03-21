@@ -35,14 +35,18 @@ First-pass control document for issue `#300`, focused on maintained runtime surf
   - Fixed to use the standard awaitability check.
 - `KestrelAgent.close()` exposed a misleading sync cleanup path over async storage shutdown.
   - Fixed by removing `close()` and standardizing on `await agent.shutdown()` for maintained cleanup.
+- `CodeEditFeature` tool methods (`code_diff`, `code_commit`, `code_test`, `code_lint`, `code_rollback`) were calling `subprocess.run()` directly on the event loop.
+  - Fixed by introducing `_run_subprocess()` wrapper using `asyncio.to_thread()` and replacing all call sites.
+- `local_mps_adapter.py` `generate_image()` was using `get_event_loop().run_in_executor()`.
+  - Fixed by replacing with `asyncio.to_thread()`.
 
-### Active patterns to audit further
+### Resolved audit patterns
 
-- Conflicting close/shutdown contracts.
-  - Audit remains relevant in other lifecycle surfaces, but the agent cleanup contract is now `await agent.shutdown()`.
-- Command/API parity for behaviors that cross runtime boundaries.
-- Endpoint paths that mix blocking local file or subprocess work with async request handling.
-- Background-task and scheduler call paths that may assume a running event loop.
+- Conflicting close/shutdown contracts: resolved. Agent cleanup contract is `await agent.shutdown()`. MCPToolManager's sync `close()` is correctly called from async `shutdown()`.
+- Command/API parity: verified. `CommandHandler.handle()` properly dispatches both sync and async results.
+- Blocking subprocess/file work on async paths: resolved. All maintained tool paths now offload via `asyncio.to_thread()`.
+- Background-task and scheduler paths: verified. Scheduler and heartbeat use clean async task patterns with no event-loop assumptions.
+- `get_event_loop()` elimination: zero remaining calls in maintained source (`kestrel_sovereign/` and `endpoints/`).
 
 ## Initial high-risk surfaces
 
@@ -60,9 +64,23 @@ First-pass control document for issue `#300`, focused on maintained runtime surf
 - `tests/unit/test_command_handler_async_boundary_contracts.py`
 - `tests/unit/test_consent_caller_contracts.py`
 - `tests/unit/test_agent_runtime_endpoint_contracts.py`
+- `tests/unit/test_code_edit_feature.py` (subprocess offload contract)
+- `tests/unit/test_strategic_memory_async_contracts.py`
+- `tests/unit/test_sovereignty_endpoint_contracts.py`
+- `tests/unit/test_security_feature.py`
+- `tests/unit/test_context_builder.py`
+- `tests/unit/test_kestrel_agent.py`
 
-## Next audit targets
+## Audit status
 
-- inventory all sync methods that invoke async work indirectly
-- identify blocking I/O on active request paths
-- tighten event-loop ownership patterns in runtime and scheduler boundaries
+The sync/async boundary audit is materially complete for the maintained runtime surface:
+
+- All identified async-boundary violations have been fixed with root-cause changes.
+- All identified blocking I/O on async paths has been offloaded via `asyncio.to_thread()`.
+- All `get_event_loop()` usage has been eliminated from maintained source code.
+- No remaining sync methods are known to invoke async work without proper handling.
+- Direct contract tests cover each corrected seam.
+
+Remaining lower-priority items:
+- Some `datetime.utcnow()` deprecation warnings exist but are not async-boundary issues.
+- Future feature additions should follow the pattern: async tools offload blocking work via `asyncio.to_thread()`.
