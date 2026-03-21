@@ -33,6 +33,7 @@ Discovery rule: [`kestrel_sovereign/features/__init__.py`](../../kestrel_soverei
 - `security`
 - `sovereignty`
 - `state_of_mind`
+- `strategic_memory`
 - `tasks`
 - `vastai`
 - `visual_identity`
@@ -43,6 +44,6 @@ Discovery rule: [`kestrel_sovereign/features/__init__.py`](../../kestrel_soverei
 
 ## Reconciliation note
 
-The old catalog described `28` feature plugins. The corrected discovery surface is `36` modules with `36` exported `Feature` subclasses; support packages that do not export a `Feature` subclass should not be counted as discoverable features.
+The old catalog described `28` feature plugins. The corrected discovery surface is `37` modules with `37` exported `Feature` subclasses; support packages that do not export a `Feature` subclass should not be counted as discoverable features.
 
 Direct proof status for these modules now lives in [`FEATURE_PROOF_MATRIX.md`](./FEATURE_PROOF_MATRIX.md).

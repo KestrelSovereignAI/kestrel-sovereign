@@ -39,6 +39,7 @@ Status meanings:
 | `security` | `kestrel_sovereign/features/security.py` | `tests/unit/test_security_feature.py`, `tests/unit/test_security_endpoint_contracts.py`, `tests/integration/test_compute_security_integration.py` | Direct |
 | `sovereignty` | `kestrel_sovereign/features/sovereignty.py` | `tests/unit/test_sovereignty_endpoint_contracts.py`, `tests/unit/test_sovereignty_sanitization.py`, `tests/integration/test_sovereignty_e2e.py` | Direct |
 | `state_of_mind` | `kestrel_sovereign/features/state_of_mind.py` | `tests/unit/test_state_of_mind_feature.py` | Direct |
+| `strategic_memory` | `kestrel_sovereign/features/strategic_memory.py` | `tests/unit/test_strategic_memory_async_contracts.py` | Direct |
 | `tasks` | `kestrel_sovereign/features/tasks/` | `tests/unit/test_workflow_executor.py`, `tests/unit/test_a2a_task_manager.py`, `tests/integration/test_orchestration_e2e.py` | Direct |
 | `vastai` | `kestrel_sovereign/features/vastai/` | `tests/unit/test_vastai_feature.py`, `tests/unit/test_cloud_launcher_contracts.py`, `tests/integration/test_vastai_e2e.py` | Direct |
 | `visual_identity` | `kestrel_sovereign/features/visual_identity/` | `tests/unit/test_visual_identity_feature.py` | Direct |
