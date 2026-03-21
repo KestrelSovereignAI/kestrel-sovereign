@@ -68,11 +68,12 @@ def _make_agent(db=None, agent_id="test-heartbeat-agent"):
     agent.storage = storage
     agent._raw_storage = None
 
-    # LLM service
+    # LLM service — providers list matches real LLMService.providers structure
     llm_service = MagicMock()
-    llm_service.provider = "anthropic"
-    llm_service.adapter = None
-    llm_service.get_model_preference = MagicMock(return_value="claude-3-opus")
+    llm_service.providers = [{"name": "anthropic", "model": "claude-opus-4-6"}]
+    llm_service.get_model_preference = MagicMock(
+        return_value={"model": "claude-opus-4-6", "provider": "anthropic"}
+    )
     agent.llm_service = llm_service
 
     # No context manager by default
@@ -121,7 +122,7 @@ class TestCheckDatabase:
 
 class TestCheckLLMService:
     @pytest.mark.asyncio
-    async def test_pass_with_provider(self):
+    async def test_pass_with_providers(self):
         agent = _make_agent()
         result = await check_llm_service(agent)
         assert result["name"] == "llm_service"
@@ -136,10 +137,9 @@ class TestCheckLLMService:
         assert result["status"] == "fail"
 
     @pytest.mark.asyncio
-    async def test_warn_when_no_provider(self):
+    async def test_warn_when_no_providers(self):
         agent = _make_agent()
-        agent.llm_service.provider = None
-        agent.llm_service.adapter = None
+        agent.llm_service.providers = []
         result = await check_llm_service(agent)
         assert result["status"] == "warn"
 
@@ -147,7 +147,7 @@ class TestCheckLLMService:
     async def test_includes_model_preference(self):
         agent = _make_agent()
         result = await check_llm_service(agent)
-        assert "claude-3-opus" in result["message"]
+        assert "claude-opus-4-6" in result["message"]
 
 
 class TestCheckMemorySystem:

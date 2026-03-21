@@ -87,17 +87,18 @@ async def check_llm_service(agent) -> Dict[str, Any]:
 
     try:
         # Check that at least one provider is available
-        provider = getattr(llm_service, "provider", None)
-        adapter = getattr(llm_service, "adapter", None)
+        providers = getattr(llm_service, "providers", None) or []
         model_pref = None
         if hasattr(llm_service, "get_model_preference"):
             model_pref = llm_service.get_model_preference()
 
-        if provider or adapter:
-            provider_name = str(provider or adapter)
-            msg = f"LLM provider available: {provider_name}"
+        if providers:
+            names = [p.get("name", p.get("provider", "?")) for p in providers[:3]]
+            msg = f"LLM providers available: {', '.join(names)}"
+            if len(providers) > 3:
+                msg += f" (+{len(providers) - 3} more)"
             if model_pref:
-                msg += f" (model: {model_pref})"
+                msg += f" (preferred: {model_pref})"
             return {
                 "name": "llm_service",
                 "status": "pass",
@@ -108,7 +109,7 @@ async def check_llm_service(agent) -> Dict[str, Any]:
         return {
             "name": "llm_service",
             "status": "warn",
-            "message": "LLM service exists but no provider/adapter found",
+            "message": "LLM service exists but no providers initialized",
             "duration_ms": _elapsed(start),
         }
     except Exception as e:
