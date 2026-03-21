@@ -2,10 +2,11 @@
 
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from kestrel_sovereign.features.code_edit.feature import CodeEditFeature
+from kestrel_sovereign.features.code_edit.feature import CodeEditFeature, _run_subprocess
 
 
 @pytest.fixture
@@ -75,3 +76,20 @@ async def test_code_edit_applies_change_after_approval(feature):
     assert result["success"] is True
     assert target.read_text(encoding="utf-8") == "new\n"
     assert result["description"] == "replace text"
+
+
+@pytest.mark.asyncio
+async def test_subprocess_calls_are_offloaded_via_to_thread():
+    """Verify _run_subprocess uses asyncio.to_thread, not direct subprocess.run."""
+    import asyncio
+    import subprocess
+
+    with patch("asyncio.to_thread", new_callable=AsyncMock) as mock_thread:
+        mock_thread.return_value = subprocess.CompletedProcess(
+            args=["echo"], returncode=0, stdout="ok", stderr=""
+        )
+        result = await _run_subprocess(
+            ["echo", "test"], capture_output=True, text=True
+        )
+        mock_thread.assert_awaited_once()
+        assert result.returncode == 0

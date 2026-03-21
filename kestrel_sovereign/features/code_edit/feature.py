@@ -4,6 +4,8 @@ Code Edit Feature - Self-modification capabilities for Kestrel agents.
 This feature enables agents to modify their own source code with proper
 constitutional controls and approval workflows.
 """
+import asyncio
+import functools
 import logging
 import os
 import shutil
@@ -32,6 +34,11 @@ TEST_SUITE_TIMEOUT = 300   # 5 minutes for running test suite
 LINT_TIMEOUT = 60          # 1 minute for linting operations
 GIT_OPERATION_TIMEOUT = 30  # 30 seconds for git commands (diff, commit, rollback)
 GIT_QUICK_TIMEOUT = 10     # 10 seconds for quick git commands (rev-parse)
+
+
+async def _run_subprocess(*args, **kwargs) -> subprocess.CompletedProcess:
+    """Run subprocess.run off the event loop via asyncio.to_thread."""
+    return await asyncio.to_thread(functools.partial(subprocess.run, *args, **kwargs))
 
 
 class CodeEditFeature(Feature):
@@ -348,7 +355,7 @@ class CodeEditFeature(Feature):
         try:
             resolved = self._resolve_path(path)
             
-            result = subprocess.run(
+            result = await _run_subprocess(
                 [GIT_PATH, "diff", str(resolved)],
                 cwd=self.code_root,
                 capture_output=True,
@@ -411,7 +418,7 @@ class CodeEditFeature(Feature):
             resolved = self._resolve_path(files)
             
             # Stage files
-            subprocess.run(
+            await _run_subprocess(
                 [GIT_PATH, "add", str(resolved)],
                 cwd=self.code_root,
                 check=True,
@@ -419,7 +426,7 @@ class CodeEditFeature(Feature):
             )
             
             # Commit
-            result = subprocess.run(
+            result = await _run_subprocess(
                 [GIT_PATH, "commit", "-m", message],
                 cwd=self.code_root,
                 capture_output=True,
@@ -433,7 +440,7 @@ class CodeEditFeature(Feature):
                 return {"success": False, "error": result.stderr}
             
             # Get commit hash
-            hash_result = subprocess.run(
+            hash_result = await _run_subprocess(
                 [GIT_PATH, "rev-parse", "HEAD"],
                 cwd=self.code_root,
                 capture_output=True,
@@ -570,7 +577,7 @@ class CodeEditFeature(Feature):
             # Add timeout and capture
             cmd.extend(["--tb=short", "--no-header", "-q"])
             
-            result = subprocess.run(
+            result = await _run_subprocess(
                 cmd,
                 cwd=self.code_root,
                 capture_output=True,
@@ -615,7 +622,7 @@ class CodeEditFeature(Feature):
         try:
             resolved = self._resolve_path(path)
             
-            result = subprocess.run(
+            result = await _run_subprocess(
                 [PYTHON_PATH, "-m", "ruff", "check", str(resolved), "--output-format=text"],
                 cwd=self.code_root,
                 capture_output=True,
@@ -752,7 +759,7 @@ class CodeEditFeature(Feature):
                 cmd.append("--hard")
             cmd.append(commit)
             
-            result = subprocess.run(
+            result = await _run_subprocess(
                 cmd,
                 cwd=self.code_root,
                 capture_output=True,
