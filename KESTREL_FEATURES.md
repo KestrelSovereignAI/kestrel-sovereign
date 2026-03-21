@@ -97,7 +97,7 @@
 
 Feature discovery scans `kestrel_sovereign/features/` for single-file features, package `__init__.py`, and package `feature.py`, then keeps only modules that actually export a discoverable `Feature` subclass. The current discovered module inventory is:
 
-- Current audited snapshot: `36` discoverable modules and `36` exported `Feature` subclasses.
+- Current audited snapshot: `37` discoverable modules and `37` exported `Feature` subclasses.
 
 - `audit_anchor`
 - `bootstrap`
@@ -128,6 +128,7 @@ Feature discovery scans `kestrel_sovereign/features/` for single-file features, 
 - `security`
 - `sovereignty`
 - `state_of_mind`
+- `strategic_memory`
 - `tasks`
 - `vastai`
 - `visual_identity`
@@ -167,6 +168,7 @@ The currently exported `Feature` subclasses discovered from those modules includ
 - `SecurityFeature`
 - `SovereigntyFeature`
 - `StateOfMindFeature`
+- `StrategicMemoryFeature`
 - `TaskFeature`
 - `VastAIFeature`
 - `VisualIdentityFeature`
@@ -181,6 +183,7 @@ The currently exported `Feature` subclasses discovered from those modules includ
 
 - `GET /`
 - `GET /api/auth/key`
+- `GET /api/github/{path:path}`
 - `GET /health`
 - `GET /health/detailed`
 - `POST /webhooks/stripe/crypto`
