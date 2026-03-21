@@ -116,11 +116,24 @@ function clearConversationHistory() {
         const dbs = execSync(`find "${agentDataDir}" -name "kestrel_prime.db" -maxdepth 3 2>/dev/null`)
             .toString().trim().split('\n').filter(Boolean);
         for (const db of dbs) {
+            // Clear conversation history
             try {
                 execSync(`sqlite3 "${db}" "DELETE FROM conversation_history;"`);
             } catch { /* table may not exist in some dbs */ }
+            // Clear backup artifacts and sovereignty receipts from graph
+            try {
+                execSync(`sqlite3 "${db}" "DELETE FROM graph_nodes WHERE node_type IN ('backup_artifact', 'sovereignty_receipt');"`);
+            } catch { /* table may not exist */ }
+            // Clear security audit log so it starts empty
+            try {
+                execSync(`sqlite3 "${db}" "DELETE FROM security_audit_log;"`);
+            } catch { /* table may not exist */ }
+            // Reset any DENY permissions back to ASK (don't delete — they're registered at startup)
+            try {
+                execSync(`sqlite3 "${db}" "UPDATE security_permissions SET level = 'ask' WHERE level != 'ask';"`);
+            } catch { /* table may not exist */ }
         }
-        narrator.narrate('Setup', `Cleared conversation history from ${dbs.length} agent database(s)`);
+        narrator.narrate('Setup', `Cleared conversation history, exports, and permissions from ${dbs.length} agent database(s)`);
     } catch (e) {
         narrator.narrate('Setup', `Could not clear history: ${e.message}`);
     }
@@ -220,13 +233,12 @@ async function highlightElement(page, selector, label) {
         badge.className = 'demo-highlight-badge';
         badge.textContent = lbl;
         badge.style.cssText = `
-            position: absolute; top: -28px; left: 0;
+            display: inline-block; margin-bottom: 6px;
             background: #3b82f6; color: white; padding: 3px 10px;
             border-radius: 4px; font-size: 13px; font-weight: 600; z-index: 9999;
             white-space: nowrap;
         `;
-        if (getComputedStyle(el).position === 'static') el.style.position = 'relative';
-        el.prepend(badge);
+        el.parentElement.insertBefore(badge, el);
     }, { sel: selector, lbl: label });
 }
 
@@ -451,8 +463,10 @@ test.describe.serial('Kestrel Sovereign Technical Demo', () => {
 
         if (recalled) {
             const text = await recalled.textContent().catch(() => '');
-            const hasRust = text.toLowerCase().includes('rust');
-            const hasNumber = text.includes('7742');
+            const fullPageText = await page.textContent('body').catch(() => '');
+            const searchText = (text + ' ' + fullPageText).toLowerCase();
+            const hasRust = searchText.includes('rust');
+            const hasNumber = searchText.includes('7742');
             narrator.narrate(section,
                 `Cross-session recall — Rust: ${hasRust}, 7742: ${hasNumber}`,
                 hasRust && hasNumber
@@ -547,10 +561,11 @@ test.describe.serial('Kestrel Sovereign Technical Demo', () => {
             await narrator.screenshot(page, 'privacy-ephemeral-fallback');
         }
 
-        // Send a message in EPHEMERAL mode — proves the agent responds but stores nothing
+        // Send a simple message in EPHEMERAL mode — proves the agent responds but stores nothing.
+        // Keep the prompt simple to avoid tool calls from small local models.
         narrator.narrate(section, 'Sending a message in EPHEMERAL mode — this should leave zero traces...');
         const ephemeralResponse = await demoSendMessage(page,
-            'What is the meaning of sovereignty in the context of AI agents?');
+            'Hello! How are you doing today?');
         await demoPause(page, 1500);
 
         if (ephemeralResponse) {
@@ -666,10 +681,11 @@ test.describe.serial('Kestrel Sovereign Technical Demo', () => {
             await narrator.screenshot(page, 'export-fallback');
         }
 
-        // Final pause
+        // Final shot — return to Identity panel for a bookend that shows the full agent
         narrator.narrate(section,
             'Demo complete.',
             'With this sovereignty receipt, the owner can restore their AI companion on any compatible platform. No vendor lock-in. True data ownership.');
+        await navigateToPanel(page, 'identity');
         await demoPause(page, 2000);
         await narrator.screenshot(page, 'demo-final');
     });
@@ -724,6 +740,12 @@ test.describe.serial('Kestrel Sovereign Technical Demo', () => {
         } catch (e) {
             narrator.narrate(section, `UI selector issue: ${e.message}`);
         }
+        // Scroll the deny dropdown into view for a clear screenshot
+        try {
+            const toolEl = page.locator('[data-feature="SovereigntyFeature"] [data-tool="export_sovereignty"]');
+            await toolEl.scrollIntoViewIfNeeded();
+            await demoPause(page, 500);
+        } catch { /* best effort */ }
         await narrator.screenshot(page, 'security-deny-set');
 
         // Beat 3: Try to export — should be blocked
