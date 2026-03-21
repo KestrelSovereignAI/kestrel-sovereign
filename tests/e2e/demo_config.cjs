@@ -46,5 +46,5 @@ module.exports = defineConfig({
     },
   ],
 
-  outputDir: path.join(__dirname, 'demo-output'),
+  outputDir: path.join(__dirname, 'demo-output', 'playwright'),
 });
