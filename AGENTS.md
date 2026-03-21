@@ -48,24 +48,21 @@ cd tests/e2e && npx playwright test
 
 Run tests in order: Unit → Integration → E2E. Fix failures before moving up.
 
-## AutoClaude (GitHub Issue Processor)
+## Kestrel Talon (GitHub Issue Processor)
 
-Autonomous GitHub issue processing is handled by the standalone [`autoclaude`](https://github.com/UncleSaurus/autoclaude) package. Installed as a dependency.
+Autonomous GitHub issue processing is handled by the standalone [`kestrel-talon`](https://github.com/KestrelSovereignAI/kestrel-talon) package. Installed as a dependency.
 
 ### Quick Start
 
 ```bash
 # Process a specific issue
-autoclaude claim --repo owner/repo --issue 42
+kestrel-talon claim --repo owner/repo --issue 42
 
 # Multi-iteration for complex issues
-autoclaude claim --repo owner/repo --issue 42 --max-iterations 5
+kestrel-talon claim --repo owner/repo --issue 42 --max-iterations 5
 
 # PRD batch mode
-autoclaude batch --prd prd.json
-
-# Legacy alias still works
-uv run kestrel-github claim --repo owner/repo --issue 42
+kestrel-talon batch --prd prd.json
 ```
 
 ### Environment Variables
