@@ -55,6 +55,9 @@ class TestModelConsentCaller:
             return_value={"provider": "openai", "model": "gpt-5"}
         )
         model_agent.llm_service.set_model_preference = MagicMock()
+        # Bypass OpenRouter cache lookup — this test proves consent plumbing,
+        # not model catalog resolution.
+        model_agent._is_openrouter_model = AsyncMock(return_value=False)
 
         result = await model_agent.set_model("openai/gpt-5-mini")
 
@@ -80,6 +83,7 @@ class TestModelConsentCaller:
             return_value={"provider": "openai", "model": "gpt-5"}
         )
         model_agent.llm_service.set_model_preference = MagicMock()
+        model_agent._is_openrouter_model = AsyncMock(return_value=False)
 
         result = await model_agent.set_model("openai/gpt-5-mini")
 
