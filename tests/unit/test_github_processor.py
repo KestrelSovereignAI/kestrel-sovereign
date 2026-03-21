@@ -1,6 +1,4 @@
-"""Tests for AutoClaude (formerly kestrel_sovereign.github_processor).
-
-These test the autoclaude package which is now a standalone dependency.
+"""Tests for Kestrel Talon (GitHub/ADO issue processor).
 
 Run with: pytest tests/unit/test_github_processor.py -v
 """
@@ -11,8 +9,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from autoclaude.config import AutoClaudeConfig
-from autoclaude.models import (
+from kestreltalon.config import TalonConfig
+from kestreltalon.models import (
     CIStatus,
     IssueComment,
     IssueContext,
@@ -21,11 +19,11 @@ from autoclaude.models import (
 )
 
 
-class TestAutoClaudeConfig:
+class TestTalonConfig:
     """Tests for configuration."""
 
     def test_config_defaults(self):
-        config = AutoClaudeConfig()
+        config = TalonConfig()
 
         assert config.bot_assignee == "claude-bot"
         assert config.max_turns == 50
@@ -33,7 +31,7 @@ class TestAutoClaudeConfig:
 
     def test_config_validation_missing_token(self):
         with patch.dict(os.environ, {"GITHUB_TOKEN": "", "ANTHROPIC_API_KEY": "test"}):
-            config = AutoClaudeConfig(
+            config = TalonConfig(
                 github_token="",
                 anthropic_api_key="test",
                 repo="owner/repo",
@@ -43,7 +41,7 @@ class TestAutoClaudeConfig:
             assert "GITHUB_TOKEN" in str(errors)
 
     def test_config_validation_missing_repo(self):
-        config = AutoClaudeConfig(
+        config = TalonConfig(
             github_token="test",
             anthropic_api_key="test",
             repo="",
@@ -53,7 +51,7 @@ class TestAutoClaudeConfig:
         assert "repo" in str(errors).lower()
 
     def test_config_validation_invalid_repo_format(self):
-        config = AutoClaudeConfig(
+        config = TalonConfig(
             github_token="test",
             anthropic_api_key="test",
             repo="invalid-repo-format",
@@ -63,7 +61,7 @@ class TestAutoClaudeConfig:
         assert "owner/repo" in str(errors)
 
     def test_config_repo_parts(self):
-        config = AutoClaudeConfig(repo="myorg/myrepo")
+        config = TalonConfig(repo="myorg/myrepo")
 
         assert config.repo_owner == "myorg"
         assert config.repo_name == "myrepo"
@@ -234,9 +232,9 @@ class TestGitHubClientExtraction:
     """Tests for extraction methods in GitHubClient."""
 
     def test_extract_file_references(self):
-        from autoclaude.github_client import GitHubClient
+        from kestreltalon.github_client import GitHubClient
 
-        config = AutoClaudeConfig(
+        config = TalonConfig(
             github_token="test",
             anthropic_api_key="test",
             repo="owner/repo",
@@ -270,9 +268,9 @@ class TestGitHubClientExtraction:
         assert "tests/test_auth.py" in files
 
     def test_extract_error_messages(self):
-        from autoclaude.github_client import GitHubClient
+        from kestreltalon.github_client import GitHubClient
 
-        config = AutoClaudeConfig(
+        config = TalonConfig(
             github_token="test",
             anthropic_api_key="test",
             repo="owner/repo",
@@ -311,19 +309,19 @@ ValueError: Invalid token
     not os.environ.get("GITHUB_TOKEN") or not os.environ.get("ANTHROPIC_API_KEY"),
     reason="Requires GITHUB_TOKEN and ANTHROPIC_API_KEY",
 )
-class TestAutoClaudeE2E:
+class TestTalonE2E:
     """End-to-end tests requiring real credentials."""
 
     @pytest.fixture
     def config(self):
-        return AutoClaudeConfig(
+        return TalonConfig(
             repo=os.environ.get("TEST_GITHUB_REPO", "your-org/your-repo"),
             dry_run=True,
         )
 
     @pytest.mark.asyncio
     async def test_fetch_assigned_issues(self, config):
-        from autoclaude.github_client import GitHubClient
+        from kestreltalon.github_client import GitHubClient
 
         client = GitHubClient(config)
         issues = client.get_assigned_issues()
@@ -332,7 +330,7 @@ class TestAutoClaudeE2E:
 
     @pytest.mark.asyncio
     async def test_build_issue_context(self, config):
-        from autoclaude.github_client import GitHubClient
+        from kestreltalon.github_client import GitHubClient
 
         client = GitHubClient(config)
 
@@ -340,8 +338,7 @@ class TestAutoClaudeE2E:
         if not issues:
             pytest.skip("No open issues in test repo")
 
-        # build_issue_context expects a WorkItem, not a raw Issue
-        from autoclaude.platform import WorkItem
+        from kestreltalon.platform import WorkItem
         work_item = WorkItem(number=issues[0].number, title=issues[0].title, raw=issues[0])
         context = client.build_issue_context(work_item)
 
