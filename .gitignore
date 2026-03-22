@@ -135,8 +135,8 @@ docs/architecture/economics/work_sessions/
 .claude/settings.local.json
 *.code-workspace
 
-# AutoClaude progress tracking
-.autoclaude/
+# Kestrel Talon progress tracking
+.kestreltalon/
 
 # Config files with real infrastructure IDs (use .example versions)
 runpod_config.toml
