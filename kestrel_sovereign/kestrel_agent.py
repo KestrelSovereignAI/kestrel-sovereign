@@ -1498,6 +1498,20 @@ Expected Duration: {expected_duration}
                                 success=True,
                                 duration_ms=dispatch_duration,
                             )
+
+                            # Fire POST_SUBAGENT_CALL hook (non-blocking, parallel)
+                            post_hook_input = HookInput(
+                                session_id="orchestrator",
+                                hook_event_name=HookEvent.POST_SUBAGENT_CALL.value,
+                                tool_name=tool_name,
+                                tool_input=args,
+                                feature_name=hook_feature_name,
+                                tool_response=result if isinstance(result, dict) else {"result": str(result)},
+                                execution_time_ms=dispatch_duration,
+                            )
+                            await self.hooks_manager.execute_hooks_parallel(
+                                HookEvent.POST_SUBAGENT_CALL, post_hook_input
+                            )
                         except (ConnectionError, TimeoutError, ValueError, KeyError, TypeError, AttributeError) as e:
                             logging.error(f"Feature {tool_name} execution failed: {e}")
                             result = {"success": False, "error": str(e)}
@@ -1508,6 +1522,20 @@ Expected Duration: {expected_duration}
                                 success=False,
                                 duration_ms=dispatch_duration,
                                 error_message=str(e),
+                            )
+
+                            # Fire POST_SUBAGENT_CALL hook on failure
+                            post_hook_input = HookInput(
+                                session_id="orchestrator",
+                                hook_event_name=HookEvent.POST_SUBAGENT_CALL.value,
+                                tool_name=tool_name,
+                                tool_input=args,
+                                feature_name=hook_feature_name,
+                                tool_response={"success": False, "error": str(e)},
+                                execution_time_ms=dispatch_duration,
+                            )
+                            await self.hooks_manager.execute_hooks_parallel(
+                                HookEvent.POST_SUBAGENT_CALL, post_hook_input
                             )
                         except Exception as e:
                             logging.error(f"Feature {tool_name} execution failed: {e}", exc_info=True)
@@ -1520,6 +1548,20 @@ Expected Duration: {expected_duration}
                                 duration_ms=dispatch_duration,
                                 error_message=str(e),
                             )
+
+                            # Fire POST_SUBAGENT_CALL hook on failure
+                            post_hook_input = HookInput(
+                                session_id="orchestrator",
+                                hook_event_name=HookEvent.POST_SUBAGENT_CALL.value,
+                                tool_name=tool_name,
+                                tool_input=args,
+                                feature_name=hook_feature_name,
+                                tool_response={"success": False, "error": str(e)},
+                                execution_time_ms=dispatch_duration,
+                            )
+                            await self.hooks_manager.execute_hooks_parallel(
+                                HookEvent.POST_SUBAGENT_CALL, post_hook_input
+                            ) (Added `POST_SUBAGENT_CALL` hook firing in both non-streaming and streaming paths of `_handle_orchestrator_response()` and `_handle_orchestrator_response_streaming()` in `kestrel_agent.py`. The hook fires via `execute_hooks_parallel` (non-blocking) on both success and failure paths, including `tool_response` and `execution_time_ms` in the `HookInput`. Added 4 unit tests covering success, failure, parallel execution, and event isolation.\n\nTALON_COMPLETE')] (#319))
                 elif tool_name in self._direct_tools:
                     # Direct tool execution — no subagent LLM hop
                     tool = self._direct_tools[tool_name]
@@ -1824,6 +1866,7 @@ Expected Duration: {expected_duration}
                         logging.warning(f"[HOOKS] Subagent denied: {hook_feature_name}.{tool_name} - {reason}")
                         result = {"success": False, "error": f"Permission denied: {reason}"}
 
+
                         dispatch_duration = int((time.time() - dispatch_start) * 1000)
                         await self.observability_store.log_tool_response(
                             event_id=dispatch_event_id,
@@ -1831,6 +1874,7 @@ Expected Duration: {expected_duration}
                             duration_ms=dispatch_duration,
                             error_message=reason,
                         )
+
                         if tool_events is not None:
                             tool_events.append({'type': 'error', 'tool': tool_name, 'error': reason[:200]})
                         yield f"🚫 {tool_name} blocked by policy: {reason[:100]}\n"
@@ -1862,6 +1906,21 @@ Expected Duration: {expected_duration}
                                 success=True,
                                 duration_ms=dispatch_duration,
                             )
+
+                            # Fire POST_SUBAGENT_CALL hook (non-blocking, parallel)
+                            post_hook_input = HookInput(
+                                session_id="orchestrator",
+                                hook_event_name=HookEvent.POST_SUBAGENT_CALL.value,
+                                tool_name=tool_name,
+                                tool_input=args,
+                                feature_name=hook_feature_name,
+                                tool_response=result if isinstance(result, dict) else {"result": str(result)},
+                                execution_time_ms=dispatch_duration,
+                            )
+                            await self.hooks_manager.execute_hooks_parallel(
+                                HookEvent.POST_SUBAGENT_CALL, post_hook_input
+                            )
+
                             if tool_events is not None:
                                 tool_events.append({'type': 'complete', 'tool': tool_name, 'ms': dispatch_duration})
                             yield f"✓ {tool_name} complete ({dispatch_duration}ms)\n"
@@ -1875,6 +1934,21 @@ Expected Duration: {expected_duration}
                                 duration_ms=dispatch_duration,
                                 error_message=str(e),
                             )
+
+                            # Fire POST_SUBAGENT_CALL hook on failure
+                            post_hook_input = HookInput(
+                                session_id="orchestrator",
+                                hook_event_name=HookEvent.POST_SUBAGENT_CALL.value,
+                                tool_name=tool_name,
+                                tool_input=args,
+                                feature_name=hook_feature_name,
+                                tool_response={"success": False, "error": str(e)},
+                                execution_time_ms=dispatch_duration,
+                            )
+                            await self.hooks_manager.execute_hooks_parallel(
+                                HookEvent.POST_SUBAGENT_CALL, post_hook_input
+                            )
+
                             if tool_events is not None:
                                 tool_events.append({'type': 'error', 'tool': tool_name, 'error': str(e)[:200]})
                             yield f"❌ {tool_name} failed: {str(e)[:100]}\n"
@@ -1888,9 +1962,24 @@ Expected Duration: {expected_duration}
                                 duration_ms=dispatch_duration,
                                 error_message=str(e),
                             )
+
+                            # Fire POST_SUBAGENT_CALL hook on failure
+                            post_hook_input = HookInput(
+                                session_id="orchestrator",
+                                hook_event_name=HookEvent.POST_SUBAGENT_CALL.value,
+                                tool_name=tool_name,
+                                tool_input=args,
+                                feature_name=hook_feature_name,
+                                tool_response={"success": False, "error": str(e)},
+                                execution_time_ms=dispatch_duration,
+                            )
+                            await self.hooks_manager.execute_hooks_parallel(
+                                HookEvent.POST_SUBAGENT_CALL, post_hook_input
+                            )
+
                             if tool_events is not None:
                                 tool_events.append({'type': 'error', 'tool': tool_name, 'error': str(e)[:200]})
-                            yield f"❌ {tool_name} failed: {str(e)[:100]}\n"
+                            yield f"❌ {tool_name} failed: {str(e)[:100]}\n" (Added `POST_SUBAGENT_CALL` hook firing in both non-streaming and streaming paths of `_handle_orchestrator_response()` and `_handle_orchestrator_response_streaming()` in `kestrel_agent.py`. The hook fires via `execute_hooks_parallel` (non-blocking) on both success and failure paths, including `tool_response` and `execution_time_ms` in the `HookInput`. Added 4 unit tests covering success, failure, parallel execution, and event isolation.\n\nTALON_COMPLETE')] (#319))
 
                 elif tool_name in self._direct_tools:
                     # Direct tool execution — no subagent LLM hop
