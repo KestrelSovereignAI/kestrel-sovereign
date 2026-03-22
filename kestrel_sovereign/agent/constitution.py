@@ -100,7 +100,12 @@ class ConstitutionMixin:
                     return False, f"INTEGRITY FAILURE: Constitution at {path} has been modified."
                 else:
                     logging.info(f"Constitution integrity verified against {path}")
-                    return True, f"Constitution integrity verified. Hash: {stored_hash[:16]}..."
+                    base_msg = f"Constitution integrity verified. Hash: {stored_hash[:16]}..."
+                    # Also verify spawn mandate constraints if present
+                    spawn_valid, spawn_msg = await self._verify_spawn_mandate_constraints()
+                    if not spawn_valid:
+                        return False, spawn_msg
+                    return True, base_msg
             except FileNotFoundError:
                 continue
             except Exception as e:
@@ -108,7 +113,52 @@ class ConstitutionMixin:
                 continue
 
         logging.info("No filesystem constitution found, but anchored constitution is intact.")
+
+        # Also verify spawn mandate constraints if present
+        spawn_valid, spawn_msg = await self._verify_spawn_mandate_constraints()
+        if not spawn_valid:
+            return False, spawn_msg
+
         return True, f"Anchored constitution verified. Hash: {stored_hash[:16]}..."
+
+    async def _verify_spawn_mandate_constraints(self) -> Tuple[bool, str]:
+        """Verify spawn mandate constraints if this agent was spawned.
+
+        If the agent has a spawn_mandate property, validates that its
+        scoped constitution constraints are still valid restrictions
+        (not grants of new capabilities).
+
+        Returns:
+            Tuple of (is_valid, message). Returns (True, ...) if no
+            spawn mandate is present.
+        """
+        spawn_mandate = getattr(self, 'spawn_mandate', None)
+        if spawn_mandate is None:
+            return True, "No spawn mandate — base constitution only"
+
+        # Lazy import to avoid circular dependency
+        from kestrel_sovereign.spawn.scoped_constitution import ScopedConstitution
+
+        parent_features = {
+            name for name in getattr(self, 'features', {}).keys()
+        }
+
+        scoped = ScopedConstitution(
+            base_constitution="",  # Not needed for constraint validation
+            additional_constraints=getattr(spawn_mandate, 'additional_constraints', {}),
+            features_allowed=getattr(spawn_mandate, 'features_allowed', []),
+            parent_features=parent_features,
+        )
+
+        is_valid, message = scoped.validate_constraints()
+        if not is_valid:
+            logging.critical(
+                f"SPAWN MANDATE CONSTRAINT VIOLATION: {message}"
+            )
+            return False, f"SPAWN MANDATE VIOLATION: {message}"
+
+        logging.info("Spawn mandate constraints verified successfully")
+        return True, "Spawn mandate constraints verified"
 
     async def enter_safe_mode(self, reason: str):
         """Enter safe mode when integrity checks fail."""
