@@ -1571,7 +1571,7 @@ Expected Duration: {expected_duration}
                             )
                             await self.hooks_manager.execute_hooks_parallel(
                                 HookEvent.POST_SUBAGENT_CALL, post_hook_input
-                            ) (Added `POST_SUBAGENT_CALL` hook firing in both non-streaming and streaming paths of `_handle_orchestrator_response()` and `_handle_orchestrator_response_streaming()` in `kestrel_agent.py`. The hook fires via `execute_hooks_parallel` (non-blocking) on both success and failure paths, including `tool_response` and `execution_time_ms` in the `HookInput`. Added 4 unit tests covering success, failure, parallel execution, and event isolation.\n\nTALON_COMPLETE')] (#319))
+                            )
                 elif tool_name in self._direct_tools:
                     # Direct tool execution — no subagent LLM hop
                     tool = self._direct_tools[tool_name]
@@ -1989,7 +1989,7 @@ Expected Duration: {expected_duration}
 
                             if tool_events is not None:
                                 tool_events.append({'type': 'error', 'tool': tool_name, 'error': str(e)[:200]})
-                            yield f"❌ {tool_name} failed: {str(e)[:100]}\n" (Added `POST_SUBAGENT_CALL` hook firing in both non-streaming and streaming paths of `_handle_orchestrator_response()` and `_handle_orchestrator_response_streaming()` in `kestrel_agent.py`. The hook fires via `execute_hooks_parallel` (non-blocking) on both success and failure paths, including `tool_response` and `execution_time_ms` in the `HookInput`. Added 4 unit tests covering success, failure, parallel execution, and event isolation.\n\nTALON_COMPLETE')] (#319))
+                            yield f"❌ {tool_name} failed: {str(e)[:100]}\n"
 
                 elif tool_name in self._direct_tools:
                     # Direct tool execution — no subagent LLM hop
