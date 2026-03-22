@@ -249,6 +249,7 @@ from endpoints import (
     observability_router,
     saved_items_router,
     metrics_router,
+    spawn_router,
 )
 
 from endpoints.auth_oauth import router as auth_oauth_router, register_oauth, oauth
@@ -267,6 +268,7 @@ app.include_router(security_router)
 app.include_router(observability_router)
 app.include_router(saved_items_router)
 app.include_router(metrics_router)
+app.include_router(spawn_router)
 
 
 # --- GitHub API Proxy (for Portfolio Dashboard) ---

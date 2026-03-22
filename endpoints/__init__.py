@@ -14,6 +14,7 @@ from .files import router as files_router
 from .observability import router as observability_router
 from .saved_items import router as saved_items_router
 from .metrics import router as metrics_router
+from .spawn import router as spawn_router
 
 __all__ = [
     "agent_router",
@@ -28,4 +29,5 @@ __all__ = [
     "observability_router",
     "saved_items_router",
     "metrics_router",
+    "spawn_router",
 ]
