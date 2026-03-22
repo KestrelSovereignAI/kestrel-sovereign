@@ -396,6 +396,131 @@ class TestHooksManager:
         assert hook3.call_count == 1
 
 
+# === USER_PROMPT_SUBMIT Hook Tests ===
+
+
+class UserPromptSubmitAllowHook(Hook):
+    """Test hook for USER_PROMPT_SUBMIT that allows."""
+
+    def __init__(self, name: str = "prompt_allow", priority: int = 100):
+        super().__init__(name=name, events=[HookEvent.USER_PROMPT_SUBMIT], priority=priority)
+        self.call_count = 0
+        self.received_message = None
+
+    async def execute(self, input: HookInput) -> HookOutput:
+        self.call_count += 1
+        self.received_message = input.user_message
+        return HookOutput.allow("Prompt allowed")
+
+
+class UserPromptSubmitDenyHook(Hook):
+    """Test hook for USER_PROMPT_SUBMIT that denies."""
+
+    def __init__(self, name: str = "prompt_deny", priority: int = 100):
+        super().__init__(name=name, events=[HookEvent.USER_PROMPT_SUBMIT], priority=priority)
+        self.call_count = 0
+
+    async def execute(self, input: HookInput) -> HookOutput:
+        self.call_count += 1
+        return HookOutput.deny("Content policy violation")
+
+
+class UserPromptSubmitModifyHook(Hook):
+    """Test hook for USER_PROMPT_SUBMIT that modifies user_message."""
+
+    def __init__(self, replacement: str, name: str = "prompt_modify", priority: int = 100):
+        super().__init__(name=name, events=[HookEvent.USER_PROMPT_SUBMIT], priority=priority)
+        self.replacement = replacement
+        self.call_count = 0
+
+    async def execute(self, input: HookInput) -> HookOutput:
+        self.call_count += 1
+        return HookOutput.modify({"user_message": self.replacement}, "Input sanitized")
+
+
+class TestUserPromptSubmitHooks:
+    """Tests for USER_PROMPT_SUBMIT hook event."""
+
+    @pytest.mark.asyncio
+    async def test_fires_with_correct_user_message(self):
+        """Verify USER_PROMPT_SUBMIT fires with correct user_message in HookInput."""
+        manager = HooksManager()
+        hook = UserPromptSubmitAllowHook()
+        manager.register(hook)
+
+        hook_input = HookInput(
+            session_id="test-session",
+            hook_event_name=HookEvent.USER_PROMPT_SUBMIT.value,
+            user_message="Hello, agent!",
+        )
+
+        output = await manager.execute_hooks(HookEvent.USER_PROMPT_SUBMIT, hook_input)
+        assert output.continue_execution is True
+        assert hook.call_count == 1
+        assert hook.received_message == "Hello, agent!"
+
+    @pytest.mark.asyncio
+    async def test_deny_blocks_processing(self):
+        """Test DENY blocks processing and returns rejection."""
+        manager = HooksManager()
+        deny_hook = UserPromptSubmitDenyHook(priority=50)
+        allow_hook = UserPromptSubmitAllowHook(priority=100)
+
+        manager.register(deny_hook)
+        manager.register(allow_hook)
+
+        hook_input = HookInput(
+            session_id="test-session",
+            hook_event_name=HookEvent.USER_PROMPT_SUBMIT.value,
+            user_message="bad input",
+        )
+
+        output = await manager.execute_hooks(HookEvent.USER_PROMPT_SUBMIT, hook_input)
+        assert output.continue_execution is False
+        assert output.permission_decision == PermissionDecision.DENY
+        assert output.permission_reason == "Content policy violation"
+        assert deny_hook.call_count == 1
+        assert allow_hook.call_count == 0  # Chain stopped before allow hook
+
+    @pytest.mark.asyncio
+    async def test_modify_updates_user_input(self):
+        """Test MODIFY updates user_input before context building.
+
+        The HooksManager applies updated_input to hook_input.tool_input,
+        so callers check hook_input.tool_input["user_message"] after execution.
+        """
+        manager = HooksManager()
+        hook = UserPromptSubmitModifyHook(replacement="sanitized input")
+        manager.register(hook)
+
+        hook_input = HookInput(
+            session_id="test-session",
+            hook_event_name=HookEvent.USER_PROMPT_SUBMIT.value,
+            user_message="original input",
+        )
+
+        output = await manager.execute_hooks(HookEvent.USER_PROMPT_SUBMIT, hook_input)
+        assert output.continue_execution is True
+        assert hook.call_count == 1
+        # Manager applies updated_input to hook_input.tool_input
+        assert hook_input.tool_input == {"user_message": "sanitized input"}
+
+    @pytest.mark.asyncio
+    async def test_no_hooks_allows(self):
+        """No registered hooks should allow processing to continue."""
+        manager = HooksManager()
+
+        hook_input = HookInput(
+            session_id="test-session",
+            hook_event_name=HookEvent.USER_PROMPT_SUBMIT.value,
+            user_message="any input",
+        )
+
+        output = await manager.execute_hooks(HookEvent.USER_PROMPT_SUBMIT, hook_input)
+        assert output.continue_execution is True
+        assert output.permission_decision == PermissionDecision.ALLOW
+
+
 # === Run tests ===
 
 if __name__ == "__main__":

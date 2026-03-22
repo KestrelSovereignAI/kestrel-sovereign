@@ -3,6 +3,7 @@ import logging
 import time
 from typing import Dict, Any
 
+from kestrel_sovereign.hooks import HookEvent, HookInput, PermissionDecision
 from kestrel_sovereign.llm.adapter import LLMResponse
 from kestrel_sovereign.security.input_guardrails import (
     wrap_user_input,
@@ -50,6 +51,24 @@ class StreamingMixin:
 
         # Prompt injection detection (log-only, does not block)
         check_prompt_injection(user_input)
+
+        # Fire USER_PROMPT_SUBMIT hook
+        if self.hooks_manager:
+            hook_input = HookInput(
+                session_id=session_id or "",
+                hook_event_name=HookEvent.USER_PROMPT_SUBMIT.value,
+                user_message=user_input,
+            )
+            hook_output = await self.hooks_manager.execute_hooks(
+                HookEvent.USER_PROMPT_SUBMIT, hook_input
+            )
+            if hook_output.permission_decision == PermissionDecision.DENY:
+                yield f"[Input rejected: {hook_output.permission_reason}]"
+                return
+            # The manager applies updated_input to hook_input.tool_input;
+            # check if hooks modified the user_message via that path.
+            if hook_input.tool_input and "user_message" in hook_input.tool_input:
+                user_input = hook_input.tool_input["user_message"]
 
         # Build full context using context_manager (same as process_input)
         force_local_only = not self.privacy_agent.privacy_config.allows_cloud_llm()
