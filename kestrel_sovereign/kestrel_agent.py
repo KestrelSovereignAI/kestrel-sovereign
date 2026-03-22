@@ -1405,54 +1405,80 @@ Expected Duration: {expected_duration}
                     # Determine feature_name for hooks (class name)
                     hook_feature_name = type(feature).__name__
 
-                    async def _exec_feature(f=feature, a=args):
-                        task = a.get("task", "")
-                        context = a.get("context")
-                        if not context and user_message:
-                            context = f"User's original request: {user_message}"
-                        logging.info(f"Dispatching to feature subagent: {f.tool_name}")
-                        r = await f.execute_as_subagent(task=task, context=context)
-                        self._register_explored_feature_tools(f)
-                        return r
-
-                    try:
-                        result = await self._execute_tool_with_hooks(
-                            tool_name=tool_name,
-                            feature_name=hook_feature_name,
-                            args=args,
-                            session_id="orchestrator",
-                            execute_fn=_exec_feature,
-                        )
-
-                        # Log success
-                        dispatch_duration = int((time.time() - dispatch_start) * 1000)
-                        await self.observability_store.log_tool_response(
-                            event_id=dispatch_event_id,
-                            success=True,
-                            duration_ms=dispatch_duration,
-                        )
-                    except (ConnectionError, TimeoutError, ValueError, KeyError, TypeError, AttributeError) as e:
-                        logging.error(f"Feature {tool_name} execution failed: {e}")
-                        result = {"success": False, "error": str(e)}
+                    # --- PRE_SUBAGENT_CALL hooks (feature-level security) ---
+                    subagent_hook_input = HookInput(
+                        session_id="orchestrator",
+                        hook_event_name=HookEvent.PRE_SUBAGENT_CALL.value,
+                        tool_name=tool_name,
+                        tool_input=args,
+                        feature_name=hook_feature_name,
+                    )
+                    subagent_hook_output = await self.hooks_manager.execute_hooks(
+                        HookEvent.PRE_SUBAGENT_CALL, subagent_hook_input
+                    )
+                    if subagent_hook_output.permission_decision == PermissionDecision.DENY:
+                        reason = subagent_hook_output.permission_reason or "Subagent call blocked by policy"
+                        logging.warning(f"[HOOKS] Subagent denied: {hook_feature_name}.{tool_name} - {reason}")
+                        result = {"success": False, "error": f"Permission denied: {reason}"}
 
                         dispatch_duration = int((time.time() - dispatch_start) * 1000)
                         await self.observability_store.log_tool_response(
                             event_id=dispatch_event_id,
                             success=False,
                             duration_ms=dispatch_duration,
-                            error_message=str(e),
+                            error_message=reason,
                         )
-                    except Exception as e:
-                        logging.error(f"Feature {tool_name} execution failed: {e}", exc_info=True)
-                        result = {"success": False, "error": str(e)}
+                    else:
+                        # Subagent hook allowed — proceed with tool execution
 
-                        dispatch_duration = int((time.time() - dispatch_start) * 1000)
-                        await self.observability_store.log_tool_response(
-                            event_id=dispatch_event_id,
-                            success=False,
-                            duration_ms=dispatch_duration,
-                            error_message=str(e),
-                        )
+                        async def _exec_feature(f=feature, a=args):
+                            task = a.get("task", "")
+                            context = a.get("context")
+                            if not context and user_message:
+                                context = f"User's original request: {user_message}"
+                            logging.info(f"Dispatching to feature subagent: {f.tool_name}")
+                            r = await f.execute_as_subagent(task=task, context=context)
+                            self._register_explored_feature_tools(f)
+                            return r
+
+                        try:
+                            result = await self._execute_tool_with_hooks(
+                                tool_name=tool_name,
+                                feature_name=hook_feature_name,
+                                args=args,
+                                session_id="orchestrator",
+                                execute_fn=_exec_feature,
+                            )
+
+                            # Log success
+                            dispatch_duration = int((time.time() - dispatch_start) * 1000)
+                            await self.observability_store.log_tool_response(
+                                event_id=dispatch_event_id,
+                                success=True,
+                                duration_ms=dispatch_duration,
+                            )
+                        except (ConnectionError, TimeoutError, ValueError, KeyError, TypeError, AttributeError) as e:
+                            logging.error(f"Feature {tool_name} execution failed: {e}")
+                            result = {"success": False, "error": str(e)}
+
+                            dispatch_duration = int((time.time() - dispatch_start) * 1000)
+                            await self.observability_store.log_tool_response(
+                                event_id=dispatch_event_id,
+                                success=False,
+                                duration_ms=dispatch_duration,
+                                error_message=str(e),
+                            )
+                        except Exception as e:
+                            logging.error(f"Feature {tool_name} execution failed: {e}", exc_info=True)
+                            result = {"success": False, "error": str(e)}
+
+                            dispatch_duration = int((time.time() - dispatch_start) * 1000)
+                            await self.observability_store.log_tool_response(
+                                event_id=dispatch_event_id,
+                                success=False,
+                                duration_ms=dispatch_duration,
+                                error_message=str(e),
+                            )
                 elif tool_name in self._direct_tools:
                     # Direct tool execution — no subagent LLM hop
                     tool = self._direct_tools[tool_name]
@@ -1741,60 +1767,89 @@ Expected Duration: {expected_duration}
                 if feature:
                     hook_feature_name = type(feature).__name__
 
-                    async def _exec_feature_stream(f=feature, a=args):
-                        task = a.get("task", "")
-                        context = a.get("context")
-                        if not context and user_message:
-                            context = f"User's original request: {user_message}"
-                        logging.info(f"[STREAM] Dispatching to feature subagent: {f.tool_name}")
-                        r = await f.execute_as_subagent(task=task, context=context)
-                        self._register_explored_feature_tools(f)
-                        return r
+                    # --- PRE_SUBAGENT_CALL hooks (feature-level security) ---
+                    subagent_hook_input = HookInput(
+                        session_id="orchestrator",
+                        hook_event_name=HookEvent.PRE_SUBAGENT_CALL.value,
+                        tool_name=tool_name,
+                        tool_input=args,
+                        feature_name=hook_feature_name,
+                    )
+                    subagent_hook_output = await self.hooks_manager.execute_hooks(
+                        HookEvent.PRE_SUBAGENT_CALL, subagent_hook_input
+                    )
+                    if subagent_hook_output.permission_decision == PermissionDecision.DENY:
+                        reason = subagent_hook_output.permission_reason or "Subagent call blocked by policy"
+                        logging.warning(f"[HOOKS] Subagent denied: {hook_feature_name}.{tool_name} - {reason}")
+                        result = {"success": False, "error": f"Permission denied: {reason}"}
 
-                    try:
-                        result = await self._execute_tool_with_hooks(
-                            tool_name=tool_name,
-                            feature_name=hook_feature_name,
-                            args=args,
-                            session_id="orchestrator",
-                            execute_fn=_exec_feature_stream,
-                        )
-
-                        dispatch_duration = int((time.time() - dispatch_start) * 1000)
-                        await self.observability_store.log_tool_response(
-                            event_id=dispatch_event_id,
-                            success=True,
-                            duration_ms=dispatch_duration,
-                        )
-                        if tool_events is not None:
-                            tool_events.append({'type': 'complete', 'tool': tool_name, 'ms': dispatch_duration})
-                        yield f"✓ {tool_name} complete ({dispatch_duration}ms)\n"
-                    except (ConnectionError, TimeoutError, ValueError, KeyError, TypeError, AttributeError) as e:
-                        logging.error(f"Feature {tool_name} execution failed: {e}")
-                        result = {"success": False, "error": str(e)}
                         dispatch_duration = int((time.time() - dispatch_start) * 1000)
                         await self.observability_store.log_tool_response(
                             event_id=dispatch_event_id,
                             success=False,
                             duration_ms=dispatch_duration,
-                            error_message=str(e),
+                            error_message=reason,
                         )
                         if tool_events is not None:
-                            tool_events.append({'type': 'error', 'tool': tool_name, 'error': str(e)[:200]})
-                        yield f"❌ {tool_name} failed: {str(e)[:100]}\n"
-                    except Exception as e:
-                        logging.error(f"Feature {tool_name} execution failed: {e}", exc_info=True)
-                        result = {"success": False, "error": str(e)}
-                        dispatch_duration = int((time.time() - dispatch_start) * 1000)
-                        await self.observability_store.log_tool_response(
-                            event_id=dispatch_event_id,
-                            success=False,
-                            duration_ms=dispatch_duration,
-                            error_message=str(e),
-                        )
-                        if tool_events is not None:
-                            tool_events.append({'type': 'error', 'tool': tool_name, 'error': str(e)[:200]})
-                        yield f"❌ {tool_name} failed: {str(e)[:100]}\n"
+                            tool_events.append({'type': 'error', 'tool': tool_name, 'error': reason[:200]})
+                        yield f"🚫 {tool_name} blocked by policy: {reason[:100]}\n"
+                    else:
+                        # Subagent hook allowed — proceed with tool execution
+
+                        async def _exec_feature_stream(f=feature, a=args):
+                            task = a.get("task", "")
+                            context = a.get("context")
+                            if not context and user_message:
+                                context = f"User's original request: {user_message}"
+                            logging.info(f"[STREAM] Dispatching to feature subagent: {f.tool_name}")
+                            r = await f.execute_as_subagent(task=task, context=context)
+                            self._register_explored_feature_tools(f)
+                            return r
+
+                        try:
+                            result = await self._execute_tool_with_hooks(
+                                tool_name=tool_name,
+                                feature_name=hook_feature_name,
+                                args=args,
+                                session_id="orchestrator",
+                                execute_fn=_exec_feature_stream,
+                            )
+
+                            dispatch_duration = int((time.time() - dispatch_start) * 1000)
+                            await self.observability_store.log_tool_response(
+                                event_id=dispatch_event_id,
+                                success=True,
+                                duration_ms=dispatch_duration,
+                            )
+                            if tool_events is not None:
+                                tool_events.append({'type': 'complete', 'tool': tool_name, 'ms': dispatch_duration})
+                            yield f"✓ {tool_name} complete ({dispatch_duration}ms)\n"
+                        except (ConnectionError, TimeoutError, ValueError, KeyError, TypeError, AttributeError) as e:
+                            logging.error(f"Feature {tool_name} execution failed: {e}")
+                            result = {"success": False, "error": str(e)}
+                            dispatch_duration = int((time.time() - dispatch_start) * 1000)
+                            await self.observability_store.log_tool_response(
+                                event_id=dispatch_event_id,
+                                success=False,
+                                duration_ms=dispatch_duration,
+                                error_message=str(e),
+                            )
+                            if tool_events is not None:
+                                tool_events.append({'type': 'error', 'tool': tool_name, 'error': str(e)[:200]})
+                            yield f"❌ {tool_name} failed: {str(e)[:100]}\n"
+                        except Exception as e:
+                            logging.error(f"Feature {tool_name} execution failed: {e}", exc_info=True)
+                            result = {"success": False, "error": str(e)}
+                            dispatch_duration = int((time.time() - dispatch_start) * 1000)
+                            await self.observability_store.log_tool_response(
+                                event_id=dispatch_event_id,
+                                success=False,
+                                duration_ms=dispatch_duration,
+                                error_message=str(e),
+                            )
+                            if tool_events is not None:
+                                tool_events.append({'type': 'error', 'tool': tool_name, 'error': str(e)[:200]})
+                            yield f"❌ {tool_name} failed: {str(e)[:100]}\n"
 
                 elif tool_name in self._direct_tools:
                     # Direct tool execution — no subagent LLM hop

@@ -396,6 +396,208 @@ class TestHooksManager:
         assert hook3.call_count == 1
 
 
+# === PRE_SUBAGENT_CALL Tests ===
+
+
+class SubagentAllowHook(Hook):
+    """Test hook for PRE_SUBAGENT_CALL that always allows."""
+
+    def __init__(self, name: str = "subagent_allow", priority: int = 100):
+        super().__init__(name=name, events=[HookEvent.PRE_SUBAGENT_CALL], priority=priority)
+        self.call_count = 0
+        self.last_input = None
+
+    async def execute(self, input: HookInput) -> HookOutput:
+        self.call_count += 1
+        self.last_input = input
+        return HookOutput.allow("Subagent allowed")
+
+
+class SubagentDenyHook(Hook):
+    """Test hook for PRE_SUBAGENT_CALL that always denies."""
+
+    def __init__(self, name: str = "subagent_deny", priority: int = 100):
+        super().__init__(name=name, events=[HookEvent.PRE_SUBAGENT_CALL], priority=priority)
+        self.call_count = 0
+        self.last_input = None
+
+    async def execute(self, input: HookInput) -> HookOutput:
+        self.call_count += 1
+        self.last_input = input
+        return HookOutput.deny("Subagent blocked by test policy")
+
+
+class DualEventHook(Hook):
+    """Test hook registered for both PRE_TOOL_USE and PRE_SUBAGENT_CALL (like SecurityHook)."""
+
+    def __init__(self, name: str = "dual_event", priority: int = 10):
+        super().__init__(
+            name=name,
+            events=[HookEvent.PRE_TOOL_USE, HookEvent.PRE_SUBAGENT_CALL],
+            priority=priority,
+        )
+        self.calls = []  # List of (event_name, tool_name) tuples
+
+    async def execute(self, input: HookInput) -> HookOutput:
+        self.calls.append((input.hook_event_name, input.tool_name))
+        return HookOutput.allow("Allowed by dual hook")
+
+
+class TestPreSubagentCall:
+    """Tests for PRE_SUBAGENT_CALL hook event."""
+
+    @pytest.mark.asyncio
+    async def test_subagent_hook_receives_correct_input(self):
+        """Verify PRE_SUBAGENT_CALL hook receives tool_name, tool_input, feature_name."""
+        manager = HooksManager()
+        hook = SubagentAllowHook()
+        manager.register(hook)
+
+        hook_input = HookInput(
+            session_id="orchestrator",
+            hook_event_name=HookEvent.PRE_SUBAGENT_CALL.value,
+            tool_name="mcp_search",
+            tool_input={"task": "search for files", "context": "user request"},
+            feature_name="MCPFeature",
+        )
+
+        output = await manager.execute_hooks(HookEvent.PRE_SUBAGENT_CALL, hook_input)
+
+        assert output.continue_execution is True
+        assert hook.call_count == 1
+        assert hook.last_input.tool_name == "mcp_search"
+        assert hook.last_input.tool_input == {"task": "search for files", "context": "user request"}
+        assert hook.last_input.feature_name == "MCPFeature"
+        assert hook.last_input.hook_event_name == "PreSubagentCall"
+
+    @pytest.mark.asyncio
+    async def test_subagent_deny_blocks_execution(self):
+        """Verify DENY on PRE_SUBAGENT_CALL blocks and returns correct output."""
+        manager = HooksManager()
+        hook = SubagentDenyHook()
+        manager.register(hook)
+
+        hook_input = HookInput(
+            session_id="orchestrator",
+            hook_event_name=HookEvent.PRE_SUBAGENT_CALL.value,
+            tool_name="wallet_transfer",
+            tool_input={"task": "send 100 USDC"},
+            feature_name="WalletFeature",
+        )
+
+        output = await manager.execute_hooks(HookEvent.PRE_SUBAGENT_CALL, hook_input)
+
+        assert output.continue_execution is False
+        assert output.permission_decision == PermissionDecision.DENY
+        assert "blocked by test policy" in output.permission_reason
+        assert hook.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_dual_event_hook_receives_both_events(self):
+        """Verify a hook registered for both events receives both independently."""
+        manager = HooksManager()
+        hook = DualEventHook()
+        manager.register(hook)
+
+        # Fire PRE_SUBAGENT_CALL
+        subagent_input = HookInput(
+            session_id="orchestrator",
+            hook_event_name=HookEvent.PRE_SUBAGENT_CALL.value,
+            tool_name="compute_provision",
+            tool_input={"task": "provision GPU"},
+            feature_name="ComputeFeature",
+        )
+        await manager.execute_hooks(HookEvent.PRE_SUBAGENT_CALL, subagent_input)
+
+        # Fire PRE_TOOL_USE
+        tool_input = HookInput(
+            session_id="orchestrator",
+            hook_event_name=HookEvent.PRE_TOOL_USE.value,
+            tool_name="compute_provision",
+            tool_input={"task": "provision GPU"},
+            feature_name="ComputeFeature",
+        )
+        await manager.execute_hooks(HookEvent.PRE_TOOL_USE, tool_input)
+
+        assert len(hook.calls) == 2
+        assert hook.calls[0] == ("PreSubagentCall", "compute_provision")
+        assert hook.calls[1] == ("PreToolUse", "compute_provision")
+
+    @pytest.mark.asyncio
+    async def test_subagent_deny_stops_chain(self):
+        """Verify DENY on PRE_SUBAGENT_CALL stops the hook chain."""
+        manager = HooksManager()
+        deny_hook = SubagentDenyHook(name="deny_first", priority=10)
+        allow_hook = SubagentAllowHook(name="allow_second", priority=100)
+
+        manager.register(deny_hook)
+        manager.register(allow_hook)
+
+        hook_input = HookInput(
+            session_id="orchestrator",
+            hook_event_name=HookEvent.PRE_SUBAGENT_CALL.value,
+            tool_name="dangerous_tool",
+            tool_input={"task": "do something risky"},
+            feature_name="RiskyFeature",
+        )
+
+        output = await manager.execute_hooks(HookEvent.PRE_SUBAGENT_CALL, hook_input)
+
+        assert output.permission_decision == PermissionDecision.DENY
+        assert deny_hook.call_count == 1
+        assert allow_hook.call_count == 0  # Chain was stopped
+
+    @pytest.mark.asyncio
+    async def test_no_subagent_hooks_allows(self):
+        """Verify no registered PRE_SUBAGENT_CALL hooks results in ALLOW."""
+        manager = HooksManager()
+
+        hook_input = HookInput(
+            session_id="orchestrator",
+            hook_event_name=HookEvent.PRE_SUBAGENT_CALL.value,
+            tool_name="any_tool",
+            tool_input={"task": "anything"},
+            feature_name="AnyFeature",
+        )
+
+        output = await manager.execute_hooks(HookEvent.PRE_SUBAGENT_CALL, hook_input)
+
+        assert output.continue_execution is True
+        assert output.permission_decision == PermissionDecision.ALLOW
+
+    @pytest.mark.asyncio
+    async def test_subagent_hook_independent_of_tool_hooks(self):
+        """Verify PRE_SUBAGENT_CALL hooks don't fire for PRE_TOOL_USE events and vice versa."""
+        manager = HooksManager()
+        subagent_hook = SubagentAllowHook(name="subagent_only")
+        tool_hook = AllowAllHook(name="tool_only")
+
+        manager.register(subagent_hook)
+        manager.register(tool_hook)
+
+        # Fire PRE_TOOL_USE — only tool_hook should fire
+        tool_input = HookInput(
+            session_id="test",
+            hook_event_name=HookEvent.PRE_TOOL_USE.value,
+            tool_name="some_tool",
+        )
+        await manager.execute_hooks(HookEvent.PRE_TOOL_USE, tool_input)
+
+        assert tool_hook.call_count == 1
+        assert subagent_hook.call_count == 0
+
+        # Fire PRE_SUBAGENT_CALL — only subagent_hook should fire
+        subagent_input = HookInput(
+            session_id="test",
+            hook_event_name=HookEvent.PRE_SUBAGENT_CALL.value,
+            tool_name="some_feature",
+        )
+        await manager.execute_hooks(HookEvent.PRE_SUBAGENT_CALL, subagent_input)
+
+        assert tool_hook.call_count == 1  # Unchanged
+        assert subagent_hook.call_count == 1
+
+
 # === Run tests ===
 
 if __name__ == "__main__":
