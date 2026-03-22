@@ -903,6 +903,23 @@ Expected Duration: {expected_duration}
         # Prompt injection detection (log-only, does not block)
         check_prompt_injection(user_input)
 
+        # Fire USER_PROMPT_SUBMIT hook
+        if self.hooks_manager:
+            hook_input = HookInput(
+                session_id=session_id or "",
+                hook_event_name=HookEvent.USER_PROMPT_SUBMIT.value,
+                user_message=user_input,
+            )
+            hook_output = await self.hooks_manager.execute_hooks(
+                HookEvent.USER_PROMPT_SUBMIT, hook_input
+            )
+            if hook_output.permission_decision == PermissionDecision.DENY:
+                return f"[Input rejected: {hook_output.permission_reason}]"
+            # The manager applies updated_input to hook_input.tool_input;
+            # check if hooks modified the user_message via that path.
+            if hook_input.tool_input and "user_message" in hook_input.tool_input:
+                user_input = hook_input.tool_input["user_message"]
+
         # Use unified ContextManager for token-aware context assembly
         # This handles: system prompt, episodes, memories, RAG, history
         #
