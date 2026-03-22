@@ -22,6 +22,7 @@ class ToolCategory(Enum):
     DATA_ACCESS = "data_access"
     COMPUTE = "compute"
     UTILITY = "utility"  # Task monitoring, status checks, background operations
+    AGENT_MANAGEMENT = "agent_management"  # Spawning, delegating, terminating child agents
 
 
 @dataclass
