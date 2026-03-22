@@ -1080,6 +1080,19 @@ Expected Duration: {expected_duration}
             user_message=prompt  # Pass original user message for subagent context
         )
 
+        # Fire POST_RESPONSE hooks (e.g., response audit)
+        if self.hooks_manager and self.hooks_manager.get_enabled_hooks(HookEvent.POST_RESPONSE):
+            hook_input = HookInput(
+                session_id=session_id or "",
+                hook_event_name=HookEvent.POST_RESPONSE.value,
+                response_text=response_text,
+            )
+            hook_output = await self.hooks_manager.execute_hooks(HookEvent.POST_RESPONSE, hook_input)
+            if hook_output.permission_decision == PermissionDecision.DENY:
+                response_text = f"[Response blocked by audit: {hook_output.permission_reason}]"
+            elif hook_output.updated_input and "response_text" in hook_output.updated_input:
+                response_text = hook_output.updated_input["response_text"]
+
         # Store agent response (linked to session for resumed conversations)
         await self.privacy_agent.add_conversation("assistant", response_text, session_id=session_id)
 

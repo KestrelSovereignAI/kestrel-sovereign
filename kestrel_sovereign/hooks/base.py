@@ -33,6 +33,7 @@ class HookEvent(Enum):
     POST_SUBAGENT_CALL = "PostSubagentCall"
     USER_PROMPT_SUBMIT = "UserPromptSubmit"
     STOP = "Stop"
+    POST_RESPONSE = "PostResponse"
 
 
 class PermissionDecision(Enum):
@@ -73,6 +74,9 @@ class HookInput:
     # For UserPromptSubmit
     user_message: Optional[str] = None
 
+    # For PostResponse
+    response_text: Optional[str] = None
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
         return {
@@ -86,6 +90,7 @@ class HookInput:
             "tool_response": self.tool_response,
             "execution_time_ms": self.execution_time_ms,
             "user_message": self.user_message,
+            "response_text": self.response_text,
         }
 
 
