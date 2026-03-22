@@ -248,6 +248,7 @@ from endpoints import (
     security_router,
     observability_router,
     saved_items_router,
+    metrics_router,
 )
 
 from endpoints.auth_oauth import router as auth_oauth_router, register_oauth, oauth
@@ -265,6 +266,7 @@ app.include_router(files_router)
 app.include_router(security_router)
 app.include_router(observability_router)
 app.include_router(saved_items_router)
+app.include_router(metrics_router)
 
 
 # --- GitHub API Proxy (for Portfolio Dashboard) ---
@@ -342,6 +344,28 @@ async def logging_context_middleware(request: Request, call_next):
 
 
 @app.middleware("http")
+async def request_metrics_middleware(request: Request, call_next):
+    """Record Prometheus request count and latency metrics."""
+    from kestrel_sovereign.metrics import PROMETHEUS_AVAILABLE, REQUEST_COUNT, REQUEST_DURATION
+    if not PROMETHEUS_AVAILABLE:
+        return await call_next(request)
+
+    import time as _time
+    start = _time.monotonic()
+    response = await call_next(request)
+    duration = _time.monotonic() - start
+
+    # Normalize path to avoid unbounded cardinality from path params
+    path = request.url.path
+    method = request.method
+    status = str(response.status_code)
+
+    REQUEST_COUNT.labels(method=method, path=path, status=status).inc()
+    REQUEST_DURATION.labels(method=method, path=path).observe(duration)
+    return response (Added Prometheus-compatible `/metrics` endpoint with `prometheus-client` as optional `[observability]` dependency. Created `kestrel_sovereign/metrics.py` with 12 metric definitions (counters, histograms, gauges), `endpoints/metrics.py` for the endpoint, instrumented `ObservabilityHook` for hook/tool metrics, `LLMService._log_llm_call()` for LLM metrics, and added request middleware in `server.py`. All 23 new tests and 89 total related tests pass. Gracefully degrades to 404 when prometheus-client is not installed.\n\nTALON_COMPLETE')] (#324))
+
+
+@app.middleware("http")
 async def static_cache_control(request: Request, call_next):
     """Prevent browser caching of JS/CSS files during development."""
     response = await call_next(request)
@@ -395,7 +419,7 @@ async def auth_middleware(request: Request, call_next):
     1. API key (X-API-Key header, Bearer token, or query param) — for programmatic access
     2. OAuth session cookie — for browser access via Google sign-in
     """
-    public_paths = ["/health", "/health/detailed", "/favicon.ico", "/webhooks/stripe/crypto", "/api/auth/key"]
+    public_paths = ["/health", "/health/detailed", "/favicon.ico", "/webhooks/stripe/crypto", "/api/auth/key", "/metrics"]
     auth_paths = ["/auth/login", "/auth/callback", "/auth/logout"]
     static_prefixes = ["/static", "/js/", "/shared/", "/utils/", "/api/github/"]
 
