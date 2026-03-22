@@ -97,7 +97,7 @@
 
 Feature discovery scans `kestrel_sovereign/features/` for single-file features, package `__init__.py`, and package `feature.py`, then keeps only modules that actually export a discoverable `Feature` subclass. The current discovered module inventory is:
 
-- Current audited snapshot: `39` discoverable modules and `38` exported `Feature` subclasses.
+- Current audited snapshot: `40` discoverable modules and `39` exported `Feature` subclasses.
 
 - `audit_anchor`
 - `bootstrap`
@@ -129,6 +129,7 @@ Feature discovery scans `kestrel_sovereign/features/` for single-file features, 
 - `scheduler`
 - `security`
 - `sovereignty`
+- `spawn`
 - `state_of_mind`
 - `strategic_memory`
 - `tasks`
@@ -171,6 +172,7 @@ The currently exported `Feature` subclasses discovered from those modules includ
 - `SchedulerFeature`
 - `SecurityFeature`
 - `SovereigntyFeature`
+- `SpawnFeature`
 - `StateOfMindFeature`
 - `StrategicMemoryFeature`
 - `TaskFeature`
