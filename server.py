@@ -25,6 +25,7 @@ from kestrel_sovereign.rate_limit import limiter
 import re
 
 from kestrel_sovereign.kestrel_config.constants import SHUTDOWN_TIMEOUT
+from kestrel_sovereign.telemetry import setup_tracing
 
 # Load environment variables from .env file
 # override=False: Don't clobber env vars already set by ProcessManager
@@ -196,6 +197,9 @@ async def lifespan(app: FastAPI):
             logger.error(f"Error during startup: {e}", exc_info=True)
             app.state.agent = None
             _set_startup_error(app, e)
+
+    # Initialize OpenTelemetry tracing (no-op if packages not installed)
+    setup_tracing(app)
 
     yield
 

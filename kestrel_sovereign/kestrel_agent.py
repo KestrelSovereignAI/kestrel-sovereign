@@ -41,6 +41,7 @@ from kestrel_sovereign.security.input_guardrails import (
     validate_tool_arguments,
     ANTI_INJECTION_SYSTEM_PROMPT,
 )
+from kestrel_sovereign.telemetry import optional_span
 
 # Optional ollama import (not available in remote-only containers)
 try:
@@ -900,6 +901,18 @@ Expected Duration: {expected_duration}
                 if response:
                     return response
 
+        # --- OpenTelemetry span for the full request lifecycle ---
+        with optional_span("agent.process_input", {
+            "agent.did": self.did,
+            "agent.session_id": session_id or "",
+            "agent.input_length": len(user_input),
+        }) as _otel_span:
+            return await self._process_input_traced(
+                user_input, model_override, session_id, _otel_span
+            )
+
+    async def _process_input_traced(self, user_input: str, model_override: str, session_id: str, _otel_span) -> str:
+        """Inner process_input logic wrapped in an OTEL span."""
         # Prompt injection detection (log-only, does not block)
         check_prompt_injection(user_input)
 
@@ -1134,6 +1147,10 @@ Expected Duration: {expected_duration}
                 HookEvent.STOP, hook_input
             )
 
+        # Record response length on OTEL span (privacy: no content)
+        if _otel_span:
+            _otel_span.set_attribute("agent.response_length", len(response_text))
+
         return response_text
 
     def _build_feature_tools(self) -> List[Dict[str, Any]]:
@@ -1321,8 +1338,14 @@ Expected Duration: {expected_duration}
 
         # --- Execute the tool ---
         exec_start = time.time()
-        result = await execute_fn()
-        exec_duration_ms = int((time.time() - exec_start) * 1000)
+        with optional_span("agent.tool_execution", {
+            "tool.name": tool_name,
+            "tool.feature": feature_name,
+        }) as tool_span:
+            result = await execute_fn()
+            exec_duration_ms = int((time.time() - exec_start) * 1000)
+            if tool_span:
+                tool_span.set_attribute("tool.duration_ms", exec_duration_ms)
 
         # --- POST_TOOL_USE hooks (parallel, non-blocking) ---
         post_hook_input = HookInput(
@@ -1488,7 +1511,10 @@ Expected Duration: {expected_duration}
                             if not context and user_message:
                                 context = f"User's original request: {user_message}"
                             logging.info(f"Dispatching to feature subagent: {f.tool_name}")
-                            r = await f.execute_as_subagent(task=task, context=context)
+                            with optional_span("agent.feature_dispatch", {
+                                "feature.name": f.tool_name,
+                            }):
+                                r = await f.execute_as_subagent(task=task, context=context)
                             self._register_explored_feature_tools(f)
                             return r
 
