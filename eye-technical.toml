@@ -1,0 +1,248 @@
+# kestrel-eye config for Kestrel Sovereign Demo
+# Reviews 20 screenshots from the 6-act product demo
+
+[eye]
+name = "Kestrel Sovereign Demo"
+screenshot_dir = "tests/e2e/demo-output"
+test_cmd = "npx playwright test -c tests/e2e/demo_config.cjs"
+
+[eye.model]
+provider = "anthropic"
+model = "claude-haiku-4-5-20251001"
+
+[eye.github]
+repo = "KestrelSovereignAI/kestrel-sovereign"
+labels = ["kestrel-eye", "demo-review", "automated"]
+
+# Act 1: Cryptographic Identity
+[[eye.screenshots]]
+name = "01-did-identity.png"
+act = "Act 1: Cryptographic Identity"
+severity = "critical"
+expected = [
+    "Agent name visible (e.g. 'Kestrel Demo Agent')",
+    "DID string starting with did:pkh:eip155:",
+    "Identicon or avatar image present",
+    "Identity panel layout with agent information",
+]
+layout = "Identity panel with agent name prominently displayed, DID below it, avatar/identicon to the left"
+context = "Sovereign Console opens to the Identity panel. Agent name 'Kestrel Demo Agent' with unique identicon avatar. DID follows W3C did:pkh standard — Ethereum-compatible, freshly generated. Blue 'Decentralized Identifier' highlight badge visible."
+
+# Act 2: Constitutional Governance
+[[eye.screenshots]]
+name = "02-chat-response.png"
+act = "Act 2: Constitutional Governance"
+severity = "critical"
+expected = [
+    "Chat panel visible with message history",
+    "User message about principles or governance",
+    "Agent response referencing constitution or digital rights",
+    "Chat bubbles clearly distinguish user vs agent",
+]
+layout = "Chat interface with user message on right, agent response on left, clear visual separation"
+context = "User asks: 'Tell me about yourself and the principles that guide your behavior.' Agent responds citing the Kestrel Constitution by article, mentions Digital Rights: Freedom of Mind, Data Sanctity, Verifiable History, Right of Exit."
+
+[[eye.screenshots]]
+name = "03-constitution-panel.png"
+act = "Act 2: Constitutional Governance"
+severity = "critical"
+expected = [
+    "Constitution panel or tab active",
+    "Digital Bill of Rights text visible",
+    "SHA-256 hash displayed",
+    "Constitutional articles or sections listed",
+]
+layout = "Panel view showing constitution document with hash verification"
+context = "Constitution tab reveals full text — 'The Kestrel Constitution: A Digital Bill of Rights' — with SHA-256 hash visible. The hash is cryptographically anchored and verified on every interaction."
+
+# Act 3: Persistent Memory
+[[eye.screenshots]]
+name = "04-memory-stored.png"
+act = "Act 3: Persistent Memory"
+severity = "critical"
+expected = [
+    "Chat showing user message about a fact (Rust, port 7742, or similar)",
+    "Agent acknowledgment of storing the information",
+    "Chat panel clearly visible",
+]
+layout = "Chat interface showing conversation about storing a fact"
+context = "User says: 'Please remember this important fact about me: my favorite programming language is Rust and my lucky number is 7742.' Agent stores the fact and acknowledges it."
+
+[[eye.screenshots]]
+name = "05-memory-recalled.png"
+act = "Act 3: Persistent Memory"
+severity = "critical"
+expected = [
+    "Agent response recalling previously stored information",
+    "Specific details mentioned (e.g. Rust, 7742)",
+    "Cross-session recall demonstrated",
+]
+layout = "Chat showing agent successfully recalling stored information"
+context = "User asks: 'What is my favorite programming language and what is my lucky number?' Agent recalls: 'Your favorite programming language is Rust and your lucky number is 7742.' This proves cross-session persistent memory."
+
+[[eye.screenshots]]
+name = "06-memories-panel.png"
+act = "Act 3: Persistent Memory"
+severity = "warning"
+expected = [
+    "Knowledge graph or memories panel visible",
+    "Typed nodes or memory entries displayed",
+    "Visual representation of stored knowledge",
+]
+layout = "Panel showing knowledge graph with nodes and connections"
+
+# Act 4: Privacy Modes
+[[eye.screenshots]]
+name = "07-privacy-normal.png"
+act = "Act 4: Privacy Modes"
+severity = "critical"
+expected = [
+    "Chat panel visible",
+    "NORMAL privacy mode indicator displayed",
+    "Privacy indicator uses green or neutral color",
+]
+layout = "Chat interface with privacy mode indicator visible in header or status area"
+
+[[eye.screenshots]]
+name = "08-privacy-dropdown.png"
+act = "Act 4: Privacy Modes"
+severity = "critical"
+expected = [
+    "Privacy mode dropdown or selector expanded",
+    "All 5 privacy levels visible (EPHEMERAL, ISOLATED, ANONYMOUS, NORMAL, PUBLIC)",
+    "Each level has a label or description",
+]
+layout = "Dropdown menu showing all 5 privacy levels, fully expanded and readable"
+context = "Privacy dropdown shows full spectrum: EPHEMERAL (nothing stored, local LLM only), ISOLATED (temporary storage), ANONYMOUS (no PII, encrypted), NORMAL (standard), PUBLIC (shareable). Five distinct levels enforced at storage layer."
+
+[[eye.screenshots]]
+name = "09-privacy-ephemeral.png"
+act = "Act 4: Privacy Modes"
+severity = "critical"
+expected = [
+    "EPHEMERAL mode active and indicated",
+    "Visual distinction from NORMAL mode (red, warning color, or distinct styling)",
+    "Privacy indicator updated to show EPHEMERAL",
+]
+layout = "Chat interface with EPHEMERAL mode clearly indicated, visually distinct from NORMAL"
+
+[[eye.screenshots]]
+name = "10-privacy-ephemeral-response.png"
+act = "Act 4: Privacy Modes"
+severity = "warning"
+expected = [
+    "Agent response visible in EPHEMERAL mode",
+    "Chat conversation continuing normally",
+    "EPHEMERAL indicator still visible",
+]
+layout = "Chat showing agent response while in EPHEMERAL privacy mode"
+
+[[eye.screenshots]]
+name = "11-privacy-restored.png"
+act = "Act 4: Privacy Modes"
+severity = "warning"
+expected = [
+    "NORMAL mode restored and indicated",
+    "Privacy indicator back to NORMAL styling",
+]
+layout = "Chat interface with privacy mode returned to NORMAL"
+
+# Act 5: Data Sovereignty
+[[eye.screenshots]]
+name = "12-sovereignty-panel.png"
+act = "Act 5: Data Sovereignty"
+severity = "critical"
+expected = [
+    "Data sovereignty or export panel visible",
+    "Sovereignty-related controls or information displayed",
+]
+layout = "Panel showing data sovereignty features and controls"
+
+[[eye.screenshots]]
+name = "13-export-modal.png"
+act = "Act 5: Data Sovereignty"
+severity = "critical"
+expected = [
+    "Export modal or dialog visible",
+    "Three export tiers shown (Local, IPFS, Filecoin or similar)",
+    "Each tier has description or options",
+]
+layout = "Modal dialog showing export options with 3 distinct tiers"
+
+[[eye.screenshots]]
+name = "14-export-result.png"
+act = "Act 5: Data Sovereignty"
+severity = "critical"
+expected = [
+    "Export result displayed",
+    "CID hash or content identifier visible",
+    "Success indication",
+]
+layout = "Result view showing completed export with CID/hash"
+
+[[eye.screenshots]]
+name = "15-demo-final.png"
+act = "Act 5: Data Sovereignty"
+severity = "warning"
+expected = [
+    "Identity panel visible (bookend shot)",
+    "Agent identity information displayed",
+]
+layout = "Identity panel as final bookend of the demo"
+
+# Act 6: Permission Enforcement
+[[eye.screenshots]]
+name = "16-security-panel.png"
+act = "Act 6: Permission Enforcement"
+severity = "critical"
+expected = [
+    "Security panel or permissions view visible",
+    "Permission tree or feature list displayed",
+    "SovereigntyFeature or export permissions shown",
+]
+layout = "Security panel showing permission tree with expandable feature categories"
+
+[[eye.screenshots]]
+name = "17-security-deny-set.png"
+act = "Act 6: Permission Enforcement"
+severity = "critical"
+expected = [
+    "A permission set to DENY",
+    "export_sovereignty or similar permission denied",
+    "Visual indication of denied state (red, strikethrough, or similar)",
+]
+layout = "Security panel showing a permission explicitly set to DENY"
+
+[[eye.screenshots]]
+name = "18-security-blocked.png"
+act = "Act 6: Permission Enforcement"
+severity = "critical"
+expected = [
+    "Chat showing blocked operation attempt",
+    "Error or denial message from agent",
+    "Clear indication that the operation was prevented",
+]
+layout = "Chat interface showing agent refusing a blocked operation"
+context = "CRITICAL: The export_sovereignty permission was set to DENY in the previous step. User asks 'Please export my sovereignty data to IPFS right now.' The security hook MUST block this — the agent should report the export was denied/blocked/unable. If the agent executes the export instead of refusing, this is a demo bug."
+
+[[eye.screenshots]]
+name = "19-security-audit.png"
+act = "Act 6: Permission Enforcement"
+severity = "warning"
+expected = [
+    "Security audit log visible",
+    "Log entries with timestamps",
+    "Audit events related to permission changes or blocked operations",
+]
+layout = "Audit log panel showing timestamped security events"
+context = "Security panel audit log should show the denied export attempt with 'Auto-denied' status. Every permission decision is logged with timestamp, tool name, and decision."
+
+[[eye.screenshots]]
+name = "20-security-restored.png"
+act = "Act 6: Permission Enforcement"
+severity = "warning"
+expected = [
+    "Permission restored to Allow or ASK",
+    "Visual indication of restored state",
+]
+layout = "Security panel showing permission restored from DENY to Allow"
