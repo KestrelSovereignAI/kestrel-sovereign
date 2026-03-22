@@ -25,6 +25,8 @@ class HookEvent(Enum):
     - POST_SUBAGENT_CALL: After subagent returns
     - USER_PROMPT_SUBMIT: When user sends a message
     - STOP: When agent finishes responding
+    - AGENT_SPAWN: When a child agent is created
+    - AGENT_TERMINATE: When a child agent is terminated
     """
     SESSION_START = "SessionStart"
     PRE_TOOL_USE = "PreToolUse"
@@ -34,6 +36,8 @@ class HookEvent(Enum):
     USER_PROMPT_SUBMIT = "UserPromptSubmit"
     STOP = "Stop"
     POST_RESPONSE = "PostResponse"
+    AGENT_SPAWN = "AgentSpawn"
+    AGENT_TERMINATE = "AgentTerminate"
 
 
 class PermissionDecision(Enum):
@@ -77,6 +81,13 @@ class HookInput:
     # For PostResponse
     response_text: Optional[str] = None
 
+    # For AgentSpawn / AgentTerminate
+    parent_did: Optional[str] = None
+    child_did: Optional[str] = None
+    child_name: Optional[str] = None
+    spawn_purpose: Optional[str] = None
+    termination_reason: Optional[str] = None
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
         return {
@@ -91,6 +102,11 @@ class HookInput:
             "execution_time_ms": self.execution_time_ms,
             "user_message": self.user_message,
             "response_text": self.response_text,
+            "parent_did": self.parent_did,
+            "child_did": self.child_did,
+            "child_name": self.child_name,
+            "spawn_purpose": self.spawn_purpose,
+            "termination_reason": self.termination_reason,
         }
 
 
