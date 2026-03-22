@@ -260,4 +260,4 @@ class StreamingMixin:
             return f"[Response blocked by audit: {hook_output.permission_reason}]"
         elif hook_output.updated_input and "response_text" in hook_output.updated_input:
             return hook_output.updated_input["response_text"]
-        return response_text (Added `HookEvent.STOP` firing in both non-streaming (`kestrel_agent.py:process_input()`) and streaming (`agent/streaming.py:process_input_streaming()`) paths, after the response is stored to conversation history, using `execute_hooks_parallel` for non-blocking execution.\n\nTALON_COMPLETE')] (#320))
+        return response_text
