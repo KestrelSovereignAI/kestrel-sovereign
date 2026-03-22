@@ -1124,6 +1124,16 @@ Expected Duration: {expected_duration}
         # Store agent response (linked to session for resumed conversations)
         await self.privacy_agent.add_conversation("assistant", response_text, session_id=session_id)
 
+        # Fire STOP hook (response cycle complete)
+        if self.hooks_manager:
+            hook_input = HookInput(
+                session_id=session_id or "",
+                hook_event_name=HookEvent.STOP.value,
+            )
+            await self.hooks_manager.execute_hooks_parallel(
+                HookEvent.STOP, hook_input
+            )
+
         return response_text
 
     def _build_feature_tools(self) -> List[Dict[str, Any]]:
