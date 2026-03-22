@@ -10,6 +10,12 @@ import logging
 from typing import Any, Dict
 
 from kestrel_sovereign.hooks.base import Hook, HookEvent, HookInput, HookOutput
+from kestrel_sovereign.metrics import (
+    PROMETHEUS_AVAILABLE,
+    HOOK_EVENTS,
+    TOOL_CALLS,
+    TOOL_DURATION,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +86,21 @@ class ObservabilityHook(Hook):
                 metric_value=1,
                 metadata=metadata,
             )
+
+            # --- Prometheus counters (fire-and-forget, same try/except) ---
+            if PROMETHEUS_AVAILABLE:
+                HOOK_EVENTS.labels(event_type=event_type).inc()
+
+                # Tool metrics from PostToolUse events
+                if event_type == "PostToolUse" and input.tool_name:
+                    success = metadata.get("success", True)
+                    TOOL_CALLS.labels(
+                        tool_name=input.tool_name, success=str(success)
+                    ).inc()
+                    if input.execution_time_ms is not None:
+                        TOOL_DURATION.labels(
+                            tool_name=input.tool_name
+                        ).observe(input.execution_time_ms / 1000)
 
         except Exception as e:
             # Never let observability failures affect agent operation

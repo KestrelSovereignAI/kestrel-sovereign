@@ -269,6 +269,8 @@ The currently exported `Feature` subclasses discovered from those modules includ
   - `POST /api/security/cancel/{request_id}`
   - `POST /api/security/cancel-all`
   - `POST /api/security/reset-session`
+- [`endpoints/metrics.py`](endpoints/metrics.py)
+  - `GET /metrics`
 - [`endpoints/observability.py`](endpoints/observability.py)
   - `GET /api/observability/events`
   - `GET /api/observability/summary`
