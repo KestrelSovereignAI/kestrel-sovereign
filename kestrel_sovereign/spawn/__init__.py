@@ -3,7 +3,8 @@ Spawn subsystem for Kestrel agent delegation.
 
 Provides SpawnMandate for parent-child DID delegation chains,
 DelegatedWallet for budget ceiling enforcement,
-and ScopedConstitution for constitutional narrowing.
+ScopedConstitution for constitutional narrowing,
+and SpawnedAgentLifecycle for TTL monitoring and auto-cleanup.
 """
 
 from .mandate import (
@@ -20,6 +21,12 @@ from .delegated_wallet import (
     release_delegated_wallet,
 )
 from .scoped_constitution import ScopedConstitution
+from .lifecycle import (
+    SpawnedAgentLifecycle,
+    SpawnResult,
+    SpawnStatus,
+    SpawnMode,
+)
 
 __all__ = [
     "SpawnMandate",
@@ -32,4 +39,8 @@ __all__ = [
     "create_delegated_wallet",
     "release_delegated_wallet",
     "ScopedConstitution",
+    "SpawnedAgentLifecycle",
+    "SpawnResult",
+    "SpawnStatus",
+    "SpawnMode",
 ]
