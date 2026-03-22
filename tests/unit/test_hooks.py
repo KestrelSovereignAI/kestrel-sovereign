@@ -81,6 +81,20 @@ class TimeoutHook(Hook):
         return HookOutput.allow()
 
 
+class SessionStartHook(Hook):
+    """Test hook that listens on SESSION_START."""
+
+    def __init__(self, name: str = "session_start_hook", priority: int = 100):
+        super().__init__(name=name, events=[HookEvent.SESSION_START], priority=priority)
+        self.call_count = 0
+        self.received_input: "HookInput | None" = None
+
+    async def execute(self, input: HookInput) -> HookOutput:
+        self.call_count += 1
+        self.received_input = input
+        return HookOutput.allow("Session started")
+
+
 class FailingHook(Hook):
     """Test hook that raises an exception."""
 
@@ -394,6 +408,51 @@ class TestHooksManager:
         assert hook1.call_count == 1
         assert hook2.call_count == 1
         assert hook3.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_session_start_fires_with_correct_input(self):
+        """Test that SESSION_START hook fires via execute_hooks_parallel with correct HookInput."""
+        manager = HooksManager()
+        hook = SessionStartHook()
+        manager.register(hook)
+
+        hook_input = HookInput(
+            session_id="agent_init",
+            hook_event_name=HookEvent.SESSION_START.value,
+        )
+
+        outputs = await manager.execute_hooks_parallel(
+            HookEvent.SESSION_START, hook_input
+        )
+
+        assert len(outputs) == 1
+        assert hook.call_count == 1
+        assert hook.received_input.session_id == "agent_init"
+        assert hook.received_input.hook_event_name == "SessionStart"
+        assert hook.received_input.tool_name is None
+        assert hook.received_input.user_message is None
+
+    @pytest.mark.asyncio
+    async def test_session_start_multiple_hooks_parallel(self):
+        """Test that multiple SESSION_START hooks execute in parallel."""
+        manager = HooksManager()
+        hook1 = SessionStartHook(name="hook1")
+        hook2 = SessionStartHook(name="hook2")
+        manager.register(hook1)
+        manager.register(hook2)
+
+        hook_input = HookInput(
+            session_id="agent_init",
+            hook_event_name=HookEvent.SESSION_START.value,
+        )
+
+        outputs = await manager.execute_hooks_parallel(
+            HookEvent.SESSION_START, hook_input
+        )
+
+        assert len(outputs) == 2
+        assert hook1.call_count == 1
+        assert hook2.call_count == 1
 
 
 # === Run tests ===
