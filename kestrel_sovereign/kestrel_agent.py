@@ -387,6 +387,17 @@ class KestrelAgent(ConstitutionMixin, StreamingMixin, BackupMixin, SleepMixin):
             self._constitution_verified = False
             logging.info("State initialized")
 
+            # Fire SESSION_START hook
+            if self.hooks_manager:
+                from kestrel_sovereign.hooks.base import HookInput, HookEvent
+                hook_input = HookInput(
+                    session_id="agent_init",
+                    hook_event_name=HookEvent.SESSION_START.value,
+                )
+                await self.hooks_manager.execute_hooks_parallel(
+                    HookEvent.SESSION_START, hook_input
+                )
+
             # Disable audit if only mock providers are available (demo mode)
             if self.llm_service.providers and all(p["name"] == "mock" for p in self.llm_service.providers):
                 self.audit_enabled = False
