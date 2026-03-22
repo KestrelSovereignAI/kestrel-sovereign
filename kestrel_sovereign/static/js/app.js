@@ -24,6 +24,7 @@ import { Security } from './security.js';
 import { initTasks, loadTasks } from './tasks.js';
 import { loadResources } from './resources.js';
 import { initMetrics, loadMetrics } from './metrics.js';
+import { initSpawn, loadSpawn } from './spawn.js';
 // Import modules with side effects that define window.* functions
 import './database.js';  // Defines window.toggleDbExplorer
 import './ipfs.js';      // Defines window.toggleIpfsStatus
@@ -49,6 +50,7 @@ async function init() {
         loadTasks,
         loadResources,
         loadMetrics,
+        loadSpawn,
     });
 
     // Initialize navigation
@@ -62,6 +64,9 @@ async function init() {
 
     // Initialize metrics component
     initMetrics();
+
+    // Initialize spawn component
+    initSpawn();
 
     // Initialize security module
     Security.init();
