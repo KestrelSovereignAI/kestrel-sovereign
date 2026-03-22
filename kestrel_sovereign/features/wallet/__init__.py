@@ -11,6 +11,9 @@ but the core wallet functionality will still work.
 
 from .feature import WalletAgent, Currency
 from .wallet_feature import WalletFeature
+from .economic_gates import EconomicGateMixin
+from .filecoin_tools import FilecoinToolsMixin
+from .multichain_tools import MultichainToolsMixin
 from .filecoin_testnet import FilecoinTestnetAdapter, FilecoinNetwork
 from .filecoin_keys import FilecoinKeyManager
 from .transaction_manager import TransactionManager, TransactionAudit
@@ -52,6 +55,10 @@ __all__ = [
     "WalletAgent",
     "WalletFeature",
     "Currency",
+    # Mixins
+    "EconomicGateMixin",
+    "FilecoinToolsMixin",
+    "MultichainToolsMixin",
     # Filecoin
     "FilecoinTestnetAdapter",
     "FilecoinNetwork",

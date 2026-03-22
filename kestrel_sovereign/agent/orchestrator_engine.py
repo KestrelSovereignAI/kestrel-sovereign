@@ -1,0 +1,680 @@
+"""
+Orchestrator engine mixin for tool execution and response handling.
+
+Extracted from kestrel_agent.py — handles the core orchestrator loop:
+- Tool execution with hook enforcement (PRE/POST_TOOL_USE)
+- Non-streaming orchestrator response handling
+- Streaming orchestrator response handling
+- Message pruning for context pressure management
+"""
+
+import json
+import logging
+import time
+from typing import Any, Dict, List, Optional, Union
+
+from kestrel_sovereign.hooks import HookEvent, HookInput, PermissionDecision
+from kestrel_sovereign.llm.adapter import LLMResponse
+from kestrel_sovereign.security.input_guardrails import validate_tool_arguments
+from kestrel_sovereign.telemetry import optional_span
+
+# These constants are also defined in kestrel_agent.py — import from there at
+# runtime so that env-var overrides are respected.  The mixin accesses them via
+# module-level names; kestrel_agent.py re-exports them.
+MAX_TOOL_ITERATIONS = None  # set by _init_constants()
+MAX_TOOL_RESULT_CHARS = None
+CONTEXT_RESERVE_FRACTION = None
+
+
+def _init_constants():
+    """Lazily import constants from kestrel_agent to avoid circular imports."""
+    global MAX_TOOL_ITERATIONS, MAX_TOOL_RESULT_CHARS, CONTEXT_RESERVE_FRACTION
+    if MAX_TOOL_ITERATIONS is None:
+        from kestrel_sovereign import kestrel_agent as _ka
+        MAX_TOOL_ITERATIONS = _ka.MAX_TOOL_ITERATIONS
+        MAX_TOOL_RESULT_CHARS = _ka.MAX_TOOL_RESULT_CHARS
+        CONTEXT_RESERVE_FRACTION = _ka.CONTEXT_RESERVE_FRACTION
+
+
+class OrchestratorEngineMixin:
+    """Mixin providing orchestrator loop methods for KestrelAgent."""
+
+    async def _execute_tool_with_hooks(
+        self,
+        tool_name: str,
+        feature_name: str,
+        args: dict,
+        session_id: str,
+        execute_fn,
+    ) -> dict:
+        """
+        Execute a tool with PRE_TOOL_USE and POST_TOOL_USE hook enforcement.
+
+        This is the single entry point for all tool execution in the orchestrator
+        loop, ensuring security hooks (permissions, audit logging) are always
+        invoked regardless of whether the tool is a feature subagent dispatch
+        or a direct tool call.
+
+        Args:
+            tool_name: Name of the tool being called
+            feature_name: Name of the owning feature (for permission lookup)
+            args: Arguments to pass to the tool
+            session_id: Session ID for hook context
+            execute_fn: Async callable that performs the actual tool execution.
+                        Called with no arguments; should return the tool result.
+
+        Returns:
+            Tool result dict, or an error dict if permission was denied.
+        """
+        # --- PRE_TOOL_USE hooks ---
+        hook_input = HookInput(
+            session_id=session_id,
+            hook_event_name=HookEvent.PRE_TOOL_USE.value,
+            tool_name=tool_name,
+            tool_input=args,
+            feature_name=feature_name,
+        )
+
+        hook_output = await self.hooks_manager.execute_hooks(
+            HookEvent.PRE_TOOL_USE,
+            hook_input,
+        )
+
+        if hook_output.permission_decision == PermissionDecision.DENY:
+            reason = hook_output.permission_reason or "Blocked by security policy"
+            logging.info(f"[HOOKS] Tool denied: {feature_name}.{tool_name} - {reason}")
+            return {"success": False, "error": f"Permission denied: {reason}"}
+
+        # If hooks modified the input, update args (callers that need it can
+        # inspect the returned result; the execute_fn closure already captured
+        # the original args, so we pass updated_input through the result).
+        if hook_output.updated_input:
+            args = hook_output.updated_input
+
+        # --- Execute the tool ---
+        exec_start = time.time()
+        with optional_span("agent.tool_execution", {
+            "tool.name": tool_name,
+            "tool.feature": feature_name,
+        }) as tool_span:
+            result = await execute_fn()
+            exec_duration_ms = int((time.time() - exec_start) * 1000)
+            if tool_span:
+                tool_span.set_attribute("tool.duration_ms", exec_duration_ms)
+
+        # --- POST_TOOL_USE hooks (parallel, non-blocking) ---
+        post_hook_input = HookInput(
+            session_id=session_id,
+            hook_event_name=HookEvent.POST_TOOL_USE.value,
+            tool_name=tool_name,
+            tool_input=args,
+            feature_name=feature_name,
+            tool_response=result if isinstance(result, dict) else {"result": str(result)},
+            execution_time_ms=exec_duration_ms,
+        )
+        await self.hooks_manager.execute_hooks_parallel(
+            HookEvent.POST_TOOL_USE,
+            post_hook_input,
+        )
+
+        return result
+
+    # ------------------------------------------------------------------
+    # Shared helpers used by both streaming and non-streaming loops
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _build_tool_calls_msg(tool_calls) -> list:
+        """Convert LLMResponse tool_calls to OpenAI-format dicts."""
+        return [
+            {
+                "id": tc.id,
+                "type": "function",
+                "function": {
+                    "name": tc.name,
+                    # ollama library expects arguments as dict, not string
+                    "arguments": tc.arguments if isinstance(tc.arguments, dict)
+                    else json.loads(tc.arguments) if tc.arguments else {}
+                }
+            }
+            for tc in tool_calls
+        ]
+
+    async def _dispatch_tool_call(
+        self,
+        tool_call,
+        features_by_tool_name: dict,
+        known_tools: set,
+        messages: list,
+        iteration: int,
+        user_message: Optional[str],
+        *,
+        tool_events: Optional[list] = None,
+        streaming: bool = False,
+    ):
+        """
+        Dispatch a single tool call — used by both streaming and non-streaming loops.
+
+        Yields status strings when streaming=True.
+        Returns the tool result dict.
+        """
+        _init_constants()
+        tool_name = tool_call.name
+        args = tool_call.arguments if isinstance(tool_call.arguments, dict) else {}
+        log_prefix = "[ORCHESTRATOR-STREAM]" if streaming else "[ORCHESTRATOR]"
+
+        # Validate tool arguments before execution
+        is_valid, validation_error = validate_tool_arguments(
+            tool_name, args, known_tools=known_tools
+        )
+        if not is_valid:
+            logging.warning(f"{log_prefix} Tool validation failed: {validation_error}")
+            result = {"success": False, "error": f"Tool validation failed: {validation_error}"}
+            from kestrel_sovereign.features.base import _serialize_tool_result
+            result_json = json.dumps(_serialize_tool_result(result))
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tool_call.id,
+                "content": result_json
+            })
+            return
+
+        # Stream tool start indicator
+        if streaming and tool_events is not None:
+            tool_events.append({'type': 'start', 'tool': tool_name})
+
+        dispatch_start = time.time()
+        dispatch_event_id = await self.observability_store.log_tool_call(
+            agent_name=self.did,
+            tool_name=f"feature_dispatch:{tool_name}",
+            metadata={"arguments": args, "iteration": iteration}
+        )
+
+        feature = features_by_tool_name.get(tool_name)
+        result = None
+
+        if feature:
+            result = await self._dispatch_feature_tool(
+                tool_call, feature, args, dispatch_start, dispatch_event_id,
+                user_message, tool_events=tool_events, streaming=streaming,
+            )
+        elif tool_name in self._direct_tools:
+            result = await self._dispatch_direct_tool(
+                tool_call, tool_name, args, dispatch_start, dispatch_event_id,
+                tool_events=tool_events, streaming=streaming,
+            )
+        else:
+            result = {"success": False, "error": f"Unknown feature tool: {tool_name}"}
+            dispatch_duration = int((time.time() - dispatch_start) * 1000)
+            await self.observability_store.log_tool_response(
+                event_id=dispatch_event_id,
+                success=False,
+                duration_ms=dispatch_duration,
+                error_message=f"Unknown feature tool: {tool_name}",
+            )
+            if not streaming:
+                await self.observability_store.log_error(
+                    agent_name=self.did,
+                    error_type="unknown_feature_tool",
+                    error_message=f"Unknown feature tool: {tool_name}",
+                    metadata={"tool_name": tool_name, "available": list(features_by_tool_name.keys())}
+                )
+            if streaming and tool_events is not None:
+                tool_events.append({'type': 'error', 'tool': tool_name, 'error': f'Unknown feature tool: {tool_name}'})
+
+        # Add tool result to messages
+        from kestrel_sovereign.features.base import _serialize_tool_result
+        result_json = json.dumps(_serialize_tool_result(result))
+
+        if len(result_json) > MAX_TOOL_RESULT_CHARS:
+            truncated_len = len(result_json)
+            result_json = result_json[:MAX_TOOL_RESULT_CHARS] + f'\n... [truncated {truncated_len - MAX_TOOL_RESULT_CHARS} chars]'
+            logging.warning(f"{log_prefix} Truncated tool result from {truncated_len} to {MAX_TOOL_RESULT_CHARS} chars")
+
+        logging.info(f"{log_prefix} Tool result ({len(result_json)} chars): {result_json[:200]}...")
+        messages.append({
+            "role": "tool",
+            "tool_call_id": tool_call.id,
+            "content": result_json
+        })
+
+        return result
+
+    async def _dispatch_feature_tool(
+        self, tool_call, feature, args, dispatch_start, dispatch_event_id,
+        user_message, *, tool_events=None, streaming=False,
+    ):
+        """Dispatch to a feature subagent with hook enforcement."""
+        tool_name = tool_call.name
+        hook_feature_name = type(feature).__name__
+
+        # --- PRE_SUBAGENT_CALL hooks ---
+        subagent_hook_input = HookInput(
+            session_id="orchestrator",
+            hook_event_name=HookEvent.PRE_SUBAGENT_CALL.value,
+            tool_name=tool_name,
+            tool_input=args,
+            feature_name=hook_feature_name,
+        )
+        subagent_hook_output = await self.hooks_manager.execute_hooks(
+            HookEvent.PRE_SUBAGENT_CALL, subagent_hook_input
+        )
+        if subagent_hook_output.permission_decision == PermissionDecision.DENY:
+            reason = subagent_hook_output.permission_reason or "Subagent call blocked by policy"
+            logging.warning(f"[HOOKS] Subagent denied: {hook_feature_name}.{tool_name} - {reason}")
+            result = {"success": False, "error": f"Permission denied: {reason}"}
+
+            dispatch_duration = int((time.time() - dispatch_start) * 1000)
+            await self.observability_store.log_tool_response(
+                event_id=dispatch_event_id,
+                success=False,
+                duration_ms=dispatch_duration,
+                error_message=reason,
+            )
+            if streaming and tool_events is not None:
+                tool_events.append({'type': 'error', 'tool': tool_name, 'error': reason[:200]})
+            return result
+
+        # Subagent hook allowed — execute
+        async def _exec_feature(f=feature, a=args):
+            task = a.get("task", "")
+            context = a.get("context")
+            if not context and user_message:
+                context = f"User's original request: {user_message}"
+            log_tag = "[STREAM] " if streaming else ""
+            logging.info(f"{log_tag}Dispatching to feature subagent: {f.tool_name}")
+            with optional_span("agent.feature_dispatch", {"feature.name": f.tool_name}):
+                r = await f.execute_as_subagent(task=task, context=context)
+            self._register_explored_feature_tools(f)
+            return r
+
+        try:
+            result = await self._execute_tool_with_hooks(
+                tool_name=tool_name,
+                feature_name=hook_feature_name,
+                args=args,
+                session_id="orchestrator",
+                execute_fn=_exec_feature,
+            )
+
+            dispatch_duration = int((time.time() - dispatch_start) * 1000)
+            await self.observability_store.log_tool_response(
+                event_id=dispatch_event_id,
+                success=True,
+                duration_ms=dispatch_duration,
+            )
+
+            # Fire POST_SUBAGENT_CALL hook (non-blocking, parallel)
+            post_hook_input = HookInput(
+                session_id="orchestrator",
+                hook_event_name=HookEvent.POST_SUBAGENT_CALL.value,
+                tool_name=tool_name,
+                tool_input=args,
+                feature_name=hook_feature_name,
+                tool_response=result if isinstance(result, dict) else {"result": str(result)},
+                execution_time_ms=dispatch_duration,
+            )
+            await self.hooks_manager.execute_hooks_parallel(
+                HookEvent.POST_SUBAGENT_CALL, post_hook_input
+            )
+
+            if streaming and tool_events is not None:
+                tool_events.append({'type': 'complete', 'tool': tool_name, 'ms': dispatch_duration})
+            return result
+
+        except (ConnectionError, TimeoutError, ValueError, KeyError, TypeError, AttributeError) as e:
+            return await self._handle_feature_error(
+                e, tool_name, hook_feature_name, args, dispatch_start,
+                dispatch_event_id, tool_events=tool_events, streaming=streaming,
+            )
+        except Exception as e:
+            return await self._handle_feature_error(
+                e, tool_name, hook_feature_name, args, dispatch_start,
+                dispatch_event_id, tool_events=tool_events, streaming=streaming,
+                log_traceback=True,
+            )
+
+    async def _handle_feature_error(
+        self, error, tool_name, hook_feature_name, args, dispatch_start,
+        dispatch_event_id, *, tool_events=None, streaming=False, log_traceback=False,
+    ):
+        """Handle feature execution error with logging and hooks."""
+        if log_traceback:
+            logging.error(f"Feature {tool_name} execution failed: {error}", exc_info=True)
+        else:
+            logging.error(f"Feature {tool_name} execution failed: {error}")
+        result = {"success": False, "error": str(error)}
+
+        dispatch_duration = int((time.time() - dispatch_start) * 1000)
+        await self.observability_store.log_tool_response(
+            event_id=dispatch_event_id,
+            success=False,
+            duration_ms=dispatch_duration,
+            error_message=str(error),
+        )
+
+        # Fire POST_SUBAGENT_CALL hook on failure
+        post_hook_input = HookInput(
+            session_id="orchestrator",
+            hook_event_name=HookEvent.POST_SUBAGENT_CALL.value,
+            tool_name=tool_name,
+            tool_input=args,
+            feature_name=hook_feature_name,
+            tool_response={"success": False, "error": str(error)},
+            execution_time_ms=dispatch_duration,
+        )
+        await self.hooks_manager.execute_hooks_parallel(
+            HookEvent.POST_SUBAGENT_CALL, post_hook_input
+        )
+
+        if streaming and tool_events is not None:
+            tool_events.append({'type': 'error', 'tool': tool_name, 'error': str(error)[:200]})
+        return result
+
+    async def _dispatch_direct_tool(
+        self, tool_call, tool_name, args, dispatch_start, dispatch_event_id,
+        *, tool_events=None, streaming=False,
+    ):
+        """Dispatch a direct tool call (no subagent LLM hop)."""
+        tool = self._direct_tools[tool_name]
+        hook_feature_name = self._tool_to_feature.get(tool_name, tool_name)
+
+        async def _exec_direct(t=tool, a=args):
+            return await t.execute(**a)
+
+        try:
+            result = await self._execute_tool_with_hooks(
+                tool_name=tool_name,
+                feature_name=hook_feature_name,
+                args=args,
+                session_id="orchestrator",
+                execute_fn=_exec_direct,
+            )
+
+            dispatch_duration = int((time.time() - dispatch_start) * 1000)
+            await self.observability_store.log_tool_response(
+                event_id=dispatch_event_id,
+                success=True,
+                duration_ms=dispatch_duration,
+            )
+            if not streaming:
+                logging.info(f"[DIRECT-TOOL] {tool_name} ({dispatch_duration}ms)")
+            if streaming and tool_events is not None:
+                tool_events.append({'type': 'complete', 'tool': tool_name, 'ms': dispatch_duration})
+            return result
+        except Exception as e:
+            logging.error(f"[DIRECT-TOOL] {tool_name} failed: {e}")
+            result = {"success": False, "error": str(e)}
+
+            dispatch_duration = int((time.time() - dispatch_start) * 1000)
+            await self.observability_store.log_tool_response(
+                event_id=dispatch_event_id,
+                success=False,
+                duration_ms=dispatch_duration,
+                error_message=str(e),
+            )
+            if streaming and tool_events is not None:
+                tool_events.append({'type': 'error', 'tool': tool_name, 'error': str(e)[:200]})
+            return result
+
+    # ------------------------------------------------------------------
+    # Non-streaming orchestrator response handler
+    # ------------------------------------------------------------------
+
+    async def _handle_orchestrator_response(
+        self,
+        response: Union[str, LLMResponse],
+        feature_tools: List[Dict[str, Any]],
+        system_prompt: str,
+        force_local_only: bool,
+        effective_model: str,
+        max_iterations: int = None,
+        user_message: str = None
+    ) -> str:
+        """
+        Handle the orchestrator's response, executing any tool calls.
+
+        If the LLM returns tool_calls, we dispatch them to the appropriate
+        features (as subagents), then continue the conversation with results.
+        """
+        _init_constants()
+        if max_iterations is None:
+            max_iterations = MAX_TOOL_ITERATIONS
+
+        if isinstance(response, str):
+            return response
+
+        if not response.has_tool_calls:
+            return response.content or ""
+
+        # Build message history for multi-turn tool calling
+        messages = [
+            {"role": "system", "content": system_prompt},
+        ]
+
+        if user_message:
+            messages.append({"role": "user", "content": user_message})
+            logging.debug(f"[ORCHESTRATOR] Added user message to context: {user_message[:100]}...")
+        else:
+            logging.warning("[ORCHESTRATOR] No user_message provided - LLM won't have context for tool results!")
+
+        # Add initial assistant response with tool calls
+        assistant_msg = {"role": "assistant", "content": response.content or ""}
+        if response.tool_calls:
+            assistant_msg["tool_calls"] = self._build_tool_calls_msg(response.tool_calls)
+        messages.append(assistant_msg)
+
+        features_by_tool_name = {f.tool_name: f for f in self.features.values()}
+        known_tools = set(features_by_tool_name.keys()) | set(self._direct_tools.keys())
+
+        for iteration in range(max_iterations):
+            if iteration >= max_iterations * 0.8:
+                logging.warning(f"[ORCHESTRATOR] Approaching max iterations: {iteration + 1}/{max_iterations}")
+
+            for tool_call in response.tool_calls:
+                await self._dispatch_tool_call(
+                    tool_call, features_by_tool_name, known_tools, messages,
+                    iteration, user_message,
+                )
+
+            # Continue conversation with tool results
+            all_tools = self._build_all_tools()
+            messages = self._prune_orchestrator_messages(messages, all_tools)
+
+            logging.info(f"[ORCHESTRATOR] Calling LLM with {len(messages)} messages, {len(all_tools)} tools")
+            response = await self.llm_service.generate_with_messages(
+                messages=messages,
+                tools=all_tools or None,
+                force_local_only=force_local_only,
+                model_override=effective_model
+            )
+
+            if isinstance(response, str):
+                logging.info(f"[ORCHESTRATOR] Final response (string): {response[:300]}...")
+                return response
+
+            if not response.has_tool_calls:
+                final_content = response.content or ""
+                logging.info(f"[ORCHESTRATOR] Final response (no more tool calls): {final_content[:300]}...")
+                return final_content
+
+            assistant_msg = {"role": "assistant", "content": response.content or ""}
+            if response.tool_calls:
+                assistant_msg["tool_calls"] = self._build_tool_calls_msg(response.tool_calls)
+            messages.append(assistant_msg)
+
+        logging.warning("Max tool call iterations reached")
+        return response.content or "Error: Maximum tool call iterations exceeded"
+
+    # ------------------------------------------------------------------
+    # Message pruning
+    # ------------------------------------------------------------------
+
+    def _prune_orchestrator_messages(
+        self, messages: list, tools: list, context_limit: int = None
+    ) -> list:
+        """Prune orchestrator messages to stay within context limits.
+
+        Strategy: keep system + user messages (first 2), keep the most recent
+        assistant+tool exchange, and progressively drop older tool results
+        (replacing with summaries) until we fit.
+
+        Uses char-based estimation: ~4 chars per token.
+        """
+        _init_constants()
+        if context_limit is None:
+            context_limit = getattr(self.llm_service, '_context_limit', None) or 131072
+
+        chars_per_token = 3.5
+        max_chars = int(context_limit * chars_per_token * (1 - CONTEXT_RESERVE_FRACTION))
+
+        tool_chars = sum(len(json.dumps(t)) for t in tools) if tools else 0
+        max_message_chars = max_chars - tool_chars
+
+        def _total_chars(msgs):
+            total = 0
+            for m in msgs:
+                total += len(m.get("content", "") or "")
+                for tc in m.get("tool_calls", []):
+                    total += len(json.dumps(tc.get("function", {}).get("arguments", {})))
+            return total
+
+        current = _total_chars(messages)
+
+        if current <= max_message_chars:
+            return messages
+
+        logging.warning(
+            f"[ORCHESTRATOR] Context pressure: ~{int(current / chars_per_token)}tok "
+            f"messages + ~{int(tool_chars / chars_per_token)}tok tools "
+            f"vs {context_limit}tok limit. Pruning old tool results."
+        )
+
+        protected = messages[:2]  # system + user
+        middle = messages[2:]
+
+        for i, msg in enumerate(middle):
+            if _total_chars(protected + middle) <= max_message_chars:
+                break
+            if msg.get("role") == "tool" and len(msg.get("content", "")) > 200:
+                original_len = len(msg["content"])
+                middle[i] = {
+                    "role": "tool",
+                    "tool_call_id": msg.get("tool_call_id", ""),
+                    "content": f"[Result truncated: was {original_len} chars. Tool completed successfully.]"
+                }
+
+        result = protected + middle
+        new_total = _total_chars(result)
+        logging.info(
+            f"[ORCHESTRATOR] After pruning: ~{int(new_total / chars_per_token)}tok "
+            f"(removed ~{int((current - new_total) / chars_per_token)}tok)"
+        )
+        return result
+
+    # ------------------------------------------------------------------
+    # Streaming orchestrator response handler
+    # ------------------------------------------------------------------
+
+    async def _handle_orchestrator_response_streaming(
+        self,
+        response,
+        feature_tools: list,
+        system_prompt: str,
+        force_local_only: bool,
+        effective_model: str,
+        max_iterations: int = None,
+        user_message: str = None,
+        tool_events: list = None,
+    ):
+        """
+        Streaming version of _handle_orchestrator_response.
+
+        Executes tool calls synchronously, then streams the final LLM response.
+        Tool execution cannot be streamed (we need complete results), but the
+        final text response streams token-by-token.
+
+        Yields:
+            Text chunks as they arrive from the LLM
+        """
+        _init_constants()
+        if max_iterations is None:
+            max_iterations = MAX_TOOL_ITERATIONS
+
+        if isinstance(response, str):
+            yield response
+            return
+
+        if not response.has_tool_calls:
+            yield response.content or ""
+            return
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+        ]
+
+        if user_message:
+            messages.append({"role": "user", "content": user_message})
+            logging.debug(f"[ORCHESTRATOR-STREAM] Added user message to context: {user_message[:100]}...")
+        else:
+            logging.warning("[ORCHESTRATOR-STREAM] No user_message provided!")
+
+        assistant_msg = {"role": "assistant", "content": response.content or ""}
+        if response.tool_calls:
+            assistant_msg["tool_calls"] = self._build_tool_calls_msg(response.tool_calls)
+        messages.append(assistant_msg)
+
+        features_by_tool_name = {f.tool_name: f for f in self.features.values()}
+        known_tools = set(features_by_tool_name.keys()) | set(self._direct_tools.keys())
+
+        for iteration in range(max_iterations):
+            for tool_call in response.tool_calls:
+                tool_name = tool_call.name
+
+                # Stream tool start indicator
+                if tool_events is not None:
+                    pass  # handled in _dispatch_tool_call
+                yield f"\U0001f527 Calling {tool_name}...\n"
+
+                await self._dispatch_tool_call(
+                    tool_call, features_by_tool_name, known_tools, messages,
+                    iteration, user_message,
+                    tool_events=tool_events, streaming=True,
+                )
+
+                # Stream completion indicator
+                # (tool_events already updated by _dispatch_tool_call)
+
+            all_tools = self._build_all_tools()
+            messages = self._prune_orchestrator_messages(messages, all_tools)
+
+            logging.info(f"[ORCHESTRATOR-STREAM] Checking for more tool calls with {len(messages)} messages, {len(all_tools)} tools")
+            response = await self.llm_service.generate_with_messages(
+                messages=messages,
+                tools=all_tools or None,
+                force_local_only=force_local_only,
+                model_override=effective_model
+            )
+
+            if isinstance(response, str):
+                yield response
+                return
+
+            if not response.has_tool_calls:
+                logging.info("[ORCHESTRATOR-STREAM] Streaming final response")
+                yield "\n---\n"
+                async for chunk in self.llm_service.stream_with_messages(
+                    messages=messages,
+                    force_local_only=force_local_only,
+                    model_override=effective_model
+                ):
+                    yield chunk
+                return
+
+            assistant_msg = {"role": "assistant", "content": response.content or ""}
+            if response.tool_calls:
+                assistant_msg["tool_calls"] = self._build_tool_calls_msg(response.tool_calls)
+            messages.append(assistant_msg)
+
+        logging.warning("Max tool call iterations reached")
+        yield "Error: Maximum tool call iterations exceeded"

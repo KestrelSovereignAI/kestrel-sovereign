@@ -362,7 +362,7 @@ async def request_metrics_middleware(request: Request, call_next):
 
     REQUEST_COUNT.labels(method=method, path=path, status=status).inc()
     REQUEST_DURATION.labels(method=method, path=path).observe(duration)
-    return response (Added Prometheus-compatible `/metrics` endpoint with `prometheus-client` as optional `[observability]` dependency. Created `kestrel_sovereign/metrics.py` with 12 metric definitions (counters, histograms, gauges), `endpoints/metrics.py` for the endpoint, instrumented `ObservabilityHook` for hook/tool metrics, `LLMService._log_llm_call()` for LLM metrics, and added request middleware in `server.py`. All 23 new tests and 89 total related tests pass. Gracefully degrades to 404 when prometheus-client is not installed.\n\nTALON_COMPLETE')] (#324))
+    return response
 
 
 @app.middleware("http")
