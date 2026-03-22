@@ -31,7 +31,15 @@ from kestrel_sovereign.kestrel_config.constants import SHUTDOWN_TIMEOUT
 # (e.g., KESTREL_DB_PATH is set per-agent in rookery mode)
 load_dotenv(Path(__file__).parent / ".env", override=False)
 
-logging.basicConfig(level=logging.INFO)
+from kestrel_sovereign.logging_config import (
+    setup_logging,
+    correlation_id_var,
+    session_id_var,
+    agent_name_var,
+    get_correlation_id,
+)
+
+setup_logging()
 logger = logging.getLogger(__name__)
 
 # Security Configuration
@@ -295,6 +303,38 @@ async def github_proxy(path: str, request: Request):
 
 # Regex for multi-agent path routing: /api/agents/{name}/{remaining_path}
 _AGENT_PATH_RE = re.compile(r"^/api/agents/([^/]+)/(.+)$")
+
+
+@app.middleware("http")
+async def logging_context_middleware(request: Request, call_next):
+    """Set request-scoped logging context (correlation ID, session ID, agent name).
+
+    Starlette processes middleware in reverse order of addition, so this
+    runs early (before auth/routing) and cleans up after the response.
+    """
+    # Correlation ID: prefer incoming header, else generate
+    cid = request.headers.get("X-Correlation-ID") or get_correlation_id()
+    token_cid = correlation_id_var.set(cid)
+
+    # Session ID from query params or headers (if available)
+    sid = request.query_params.get("session_id") or request.headers.get("X-Session-ID")
+    token_sid = session_id_var.set(sid) if sid else None
+
+    # Agent name from app state (if initialized)
+    agent = getattr(request.app.state, "agent", None)
+    aname = getattr(agent, "name", None) if agent else None
+    token_aname = agent_name_var.set(aname) if aname else None
+
+    try:
+        response = await call_next(request)
+        response.headers["X-Correlation-ID"] = cid
+        return response
+    finally:
+        correlation_id_var.reset(token_cid)
+        if token_sid is not None:
+            session_id_var.reset(token_sid)
+        if token_aname is not None:
+            agent_name_var.reset(token_aname)
 
 
 @app.middleware("http")
