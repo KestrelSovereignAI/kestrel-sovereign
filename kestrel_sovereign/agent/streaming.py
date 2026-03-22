@@ -221,6 +221,18 @@ class StreamingMixin:
             final_text = await self._fire_post_response_hook(final_text, session_id)
             await self.privacy_agent.add_conversation("assistant", final_text, session_id=session_id)
 
+        # Fire STOP hook (streaming response cycle complete)
+        hooks_manager = getattr(self, "hooks_manager", None)
+        if hooks_manager:
+            from kestrel_sovereign.hooks.base import HookInput, HookEvent
+            hook_input = HookInput(
+                session_id=session_id or "",
+                hook_event_name=HookEvent.STOP.value,
+            )
+            await hooks_manager.execute_hooks_parallel(
+                HookEvent.STOP, hook_input
+            )
+
     async def _fire_post_response_hook(self, response_text: str, session_id: str = None) -> str:
         """Fire POST_RESPONSE hooks on completed response text.
 
@@ -248,4 +260,4 @@ class StreamingMixin:
             return f"[Response blocked by audit: {hook_output.permission_reason}]"
         elif hook_output.updated_input and "response_text" in hook_output.updated_input:
             return hook_output.updated_input["response_text"]
-        return response_text
+        return response_text (Added `HookEvent.STOP` firing in both non-streaming (`kestrel_agent.py:process_input()`) and streaming (`agent/streaming.py:process_input_streaming()`) paths, after the response is stored to conversation history, using `execute_hooks_parallel` for non-blocking execution.\n\nTALON_COMPLETE')] (#320))
