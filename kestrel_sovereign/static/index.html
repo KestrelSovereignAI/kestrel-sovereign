@@ -826,6 +826,7 @@
             </button>
             <button class="nav-tab" data-panel="sovereignty">Sovereignty</button>
             <button class="nav-tab" data-panel="resources">Resources</button>
+            <button class="nav-tab" data-panel="metrics">Metrics</button>
             <button class="nav-tab" data-panel="security">
                 🔒 Security
                 <span id="security-pending-badge" style="
@@ -1255,6 +1256,121 @@
             </div>
         </div>
 
+        <!-- Metrics Panel -->
+        <div class="panel" id="panel-metrics">
+            <div class="panel-content">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.5rem;">
+                    <h2 style="margin: 0;">Metrics Dashboard</h2>
+                    <div style="display: flex; align-items: center; gap: 0.75rem;">
+                        <label style="font-size: 0.8rem; color: var(--text-secondary);">
+                            Auto-refresh
+                            <select id="metrics-refresh-interval" style="
+                                margin-left: 0.25rem;
+                                padding: 0.2rem 0.4rem;
+                                background: var(--bg-tertiary);
+                                color: var(--text-primary);
+                                border: 1px solid var(--border-color);
+                                border-radius: 4px;
+                                font-size: 0.8rem;
+                            ">
+                                <option value="0">Off</option>
+                                <option value="10">10s</option>
+                                <option value="30" selected>30s</option>
+                                <option value="60">60s</option>
+                            </select>
+                        </label>
+                        <button id="btn-refresh-metrics" style="
+                            padding: 0.375rem 0.75rem;
+                            background: var(--bg-tertiary);
+                            border: 1px solid var(--border-color);
+                            border-radius: 4px;
+                            color: var(--text-primary);
+                            cursor: pointer;
+                            font-size: 0.85rem;
+                        ">↻ Refresh</button>
+                    </div>
+                </div>
+
+                <!-- KPI Cards -->
+                <div id="metrics-kpi-cards" style="
+                    display: grid;
+                    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+                    gap: 1rem;
+                    margin-bottom: 1.5rem;
+                ">
+                    <div class="loading">Loading metrics...</div>
+                </div>
+
+                <!-- Charts Row -->
+                <div style="
+                    display: grid;
+                    grid-template-columns: 1fr 1fr;
+                    gap: 1.5rem;
+                    margin-bottom: 1.5rem;
+                ">
+                    <!-- Event Timeline -->
+                    <div style="
+                        background: var(--bg-secondary);
+                        border: 1px solid var(--border-color);
+                        border-radius: 8px;
+                        padding: 1rem;
+                    ">
+                        <h3 style="margin: 0 0 0.75rem 0; font-size: 0.95rem;">Event Timeline</h3>
+                        <div style="position: relative; height: 250px;">
+                            <canvas id="metrics-timeline-chart"></canvas>
+                        </div>
+                    </div>
+
+                    <!-- Tool Duration -->
+                    <div style="
+                        background: var(--bg-secondary);
+                        border: 1px solid var(--border-color);
+                        border-radius: 8px;
+                        padding: 1rem;
+                    ">
+                        <h3 style="margin: 0 0 0.75rem 0; font-size: 0.95rem;">Tool Duration (avg ms)</h3>
+                        <div style="position: relative; height: 250px;">
+                            <canvas id="metrics-duration-chart"></canvas>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Second Charts Row -->
+                <div style="
+                    display: grid;
+                    grid-template-columns: 1fr 2fr;
+                    gap: 1.5rem;
+                    margin-bottom: 1.5rem;
+                ">
+                    <!-- Event Distribution -->
+                    <div style="
+                        background: var(--bg-secondary);
+                        border: 1px solid var(--border-color);
+                        border-radius: 8px;
+                        padding: 1rem;
+                    ">
+                        <h3 style="margin: 0 0 0.75rem 0; font-size: 0.95rem;">Event Distribution</h3>
+                        <div style="position: relative; height: 250px;">
+                            <canvas id="metrics-distribution-chart"></canvas>
+                        </div>
+                    </div>
+
+                    <!-- Recent Errors -->
+                    <div style="
+                        background: var(--bg-secondary);
+                        border: 1px solid var(--border-color);
+                        border-radius: 8px;
+                        padding: 1rem;
+                    ">
+                        <h3 style="margin: 0 0 0.75rem 0; font-size: 0.95rem;">Recent Errors</h3>
+                        <div id="metrics-errors-list" style="max-height: 250px; overflow-y: auto;">
+                            <p style="color: var(--text-secondary); font-size: 0.85rem;">No errors recorded</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
         <!-- Security Panel -->
         <div class="panel" id="panel-security">
             <div class="panel-content">
@@ -1337,6 +1453,7 @@
     </div>
 
     <!-- Scripts -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/marked@11.1.1/marked.min.js"></script>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
     <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
