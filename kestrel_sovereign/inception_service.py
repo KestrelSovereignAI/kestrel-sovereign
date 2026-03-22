@@ -290,6 +290,8 @@ async def create_kestrel_identity_async(
     agent_name: Optional[str] = None,
     expected_duration: Optional[str] = None,
     database: Optional["AsyncDatabase"] = None,
+    parent_did: Optional[str] = None,
+    spawn_mandate: Optional["SpawnMandate"] = None,
 ) -> AgentCredentials:
     """
     Generates a new Kestrel identity, including cryptographic keys, a W3C DID,
@@ -306,6 +308,10 @@ async def create_kestrel_identity_async(
         database: Optional existing AsyncDatabase (e.g., PostgreSQL). If provided,
                   uses this instead of creating a new SQLite database. Useful for
                   multi-tenant deployments like multi-tenant platforms.
+        parent_did: Optional DID of the parent agent that is spawning this child.
+                    When provided, the child's DID document gets a "controller" field.
+        spawn_mandate: Optional SpawnMandate authorizing this child agent's creation.
+                       Used together with parent_did for delegation chains.
     """
     # Generate test cycle ID if needed
     if is_test_instance and not test_cycle_id:
@@ -351,7 +357,13 @@ async def create_kestrel_identity_async(
     # 1. Generate cryptographic keys
     did_document, keys = generate_kestrel_identity()
     agent_did = did_document["id"]
-    logging.info(f"Generated DID: {agent_did}")
+
+    # If spawned by a parent, add controller field to DID document
+    if parent_did:
+        did_document["controller"] = parent_did
+        logging.info(f"Generated child DID: {agent_did} (controller: {parent_did})")
+    else:
+        logging.info(f"Generated DID: {agent_did}")
 
     # 2. Save keys (encrypted if KESTREL_DATA_KEY is set)
     key_id = f"kestrel_{keys['address']}"
@@ -429,6 +441,17 @@ async def create_kestrel_identity_async(
 
     # 6. Link the agent to its constitution
     await graph.add_edge(agent_node.node_id, constitution_node.node_id, "governed_by")
+
+    # 6b. If spawned by a parent, record the delegation relationship
+    if parent_did:
+        edge_properties = {}
+        if spawn_mandate:
+            edge_properties["purpose"] = spawn_mandate.purpose
+            edge_properties["ttl_seconds"] = spawn_mandate.ttl_seconds
+            edge_properties["max_child_depth"] = spawn_mandate.max_child_depth
+            edge_properties["created_at"] = spawn_mandate.created_at
+        await graph.add_edge(agent_did, parent_did, "spawned_by", properties=edge_properties)
+        logging.info(f"Recorded spawned_by edge from {agent_did} to {parent_did}")
 
     # 7. OpenRouter key provisioning is opt-in (not automatic at inception).
     # Agents use the shared OPENROUTER_API_KEY by default.
