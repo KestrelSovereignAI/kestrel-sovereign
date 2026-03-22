@@ -103,7 +103,12 @@ class TestRealStreaming:
 
         mock_feature = MagicMock()
         mock_feature.tool_name = "test_tool"
+        mock_feature.name = "test_feature"
         mock_feature.execute_as_subagent = AsyncMock(return_value={"success": True, "data": "result"})
+        mock_feature.to_orchestrator_tool.return_value = {
+            "type": "function",
+            "function": {"name": "test_tool", "description": "test", "parameters": {}}
+        }
         mock_agent.features = {"test_feature": mock_feature}
 
         mock_agent.hooks_manager = HooksManager()
@@ -131,12 +136,23 @@ class TestRealStreaming:
 
         mock_agent.llm_service.stream_with_messages = mock_stream
 
-        mock_agent._handle_orchestrator_response_streaming = (
-            KestrelAgent._handle_orchestrator_response_streaming.__get__(mock_agent)
-        )
-        mock_agent._execute_tool_with_hooks = (
-            KestrelAgent._execute_tool_with_hooks.__get__(mock_agent)
-        )
+        # Bind all orchestrator engine and tool registry mixin methods
+        for method_name in (
+            '_handle_orchestrator_response_streaming',
+            '_execute_tool_with_hooks',
+            '_dispatch_tool_call',
+            '_dispatch_feature_tool',
+            '_dispatch_direct_tool',
+            '_handle_feature_error',
+            '_prune_orchestrator_messages',
+            '_build_all_tools',
+            '_build_feature_tools',
+        ):
+            setattr(mock_agent, method_name,
+                    getattr(KestrelAgent, method_name).__get__(mock_agent))
+        mock_agent._build_tool_calls_msg = KestrelAgent._build_tool_calls_msg
+        mock_agent._explored_features = {}
+        mock_agent._direct_tool_defs = []
         mock_agent._register_explored_feature_tools = MagicMock()
 
         chunks = []

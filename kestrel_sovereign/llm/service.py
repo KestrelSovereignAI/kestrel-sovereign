@@ -13,11 +13,8 @@ import json
 import os
 import time
 import asyncio
-from dataclasses import dataclass, field
-
 from kestrel_sovereign.kestrel_config.constants import STORAGE_CACHE_TTL_SECONDS
 from datetime import datetime, timedelta, timezone
-from enum import Enum
 from typing import List, Dict, Any, Optional, Union, Type, TYPE_CHECKING
 
 import openai
@@ -44,6 +41,7 @@ from .mandate import ModelMandateMixin
 from .usage_tracking import UsageTrackingMixin
 from .streaming import StreamingMixin
 from .constitutional_awareness import ConstitutionalAwarenessMixin
+from .remote_backend import RemoteBackendMixin, BackendType, RemoteGPUConfig
 from kestrel_sovereign.kestrel_config.constants import (
     HTTP_TIMEOUT_MEDIUM,
     CLIENT_CLOSE_TIMEOUT,
@@ -54,32 +52,11 @@ from kestrel_sovereign.telemetry import optional_span
 logger = logging.getLogger(__name__)
 
 
-class BackendType(str, Enum):
-    """LLM backend types."""
-    CLOUD = "cloud"
-    LOCAL = "local"
-    REMOTE_GPU = "remote_gpu"
-
-
-@dataclass
-class RemoteGPUConfig:
-    """Configuration for remote GPU backend (RunPod, etc.)."""
-    base_url: str
-    model: str
-    api_key: Optional[str] = None
-    headers: Dict[str, str] = field(default_factory=dict)
-    context_window: Optional[int] = None
-    ttl_seconds: Optional[int] = None
-    expires_at: Optional[datetime] = None
-    metadata: Dict[str, Any] = field(default_factory=dict)
-    timeout_seconds: int = HTTP_TIMEOUT_MEDIUM
-
-
 class LLMServiceError(LLMError):
     """Raised when LLM service cannot fulfill a request."""
 
 
-class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, StreamingMixin, ConstitutionalAwarenessMixin):
+class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, StreamingMixin, ConstitutionalAwarenessMixin, RemoteBackendMixin):
     """Unified LLM service with provider fallback and remote GPU support."""
 
     def __init__(self, config_path: str = "llm_config.toml", database_url: Optional[str] = None):
@@ -929,77 +906,7 @@ No other text or formatting.
         except asyncio.CancelledError:
             logger.debug("Cancelled while closing usage DB")
 
-    # ==================== Remote GPU Backend Methods ====================
-    # Merged from BrainRouter for unified LLM management
-
-    def switch_backend(self, backend: BackendType, config: Optional[Dict[str, Any]] = None) -> None:
-        """Switch the active backend (cloud/local/remote_gpu)."""
-        if backend == BackendType.REMOTE_GPU:
-            if not config:
-                raise LLMServiceError("Remote GPU backend requires configuration")
-            self._activate_remote_backend(config)
-            return
-
-        # Switching to cloud/local clears any remote session
-        self._deactivate_remote_backend()
-        logger.info(f"LLMService switched to {backend.value} backend")
-        self._backend = backend
-
-    def _activate_remote_backend(self, config: Dict[str, Any]) -> None:
-        """Activate a remote GPU backend."""
-        base_url = config.get("base_url") or config.get("inference_url")
-        if not base_url:
-            raise LLMServiceError("Remote backend requires base_url")
-        model = config.get("model") or config.get("model_name")
-        if not model:
-            raise LLMServiceError("Remote backend requires a model name")
-
-        expires_at = config.get("expires_at")
-        if isinstance(expires_at, str):
-            expires_at = datetime.fromisoformat(expires_at)
-        ttl_seconds = config.get("ttl_seconds")
-        if expires_at is None and ttl_seconds:
-            expires_at = datetime.now(timezone.utc) + timedelta(seconds=int(ttl_seconds))
-
-        self._remote_config = RemoteGPUConfig(
-            base_url=base_url.rstrip("/"),
-            model=model,
-            api_key=config.get("api_key"),
-            headers=config.get("headers") or {},
-            context_window=config.get("context_window"),
-            ttl_seconds=ttl_seconds,
-            expires_at=expires_at,
-            metadata=config,
-            timeout_seconds=int(config.get("timeout_seconds", HTTP_TIMEOUT_MEDIUM)),
-        )
-        self._remote_client = openai.AsyncOpenAI(
-            base_url=self._remote_config.base_url,
-            api_key=self._remote_config.api_key or os.environ.get("RUNPOD_API_KEY", "sk-kestrel-gpu"),
-            default_headers=self._remote_config.headers or None,
-            timeout=self._remote_config.timeout_seconds,
-        )
-        self._backend = BackendType.REMOTE_GPU
-        logger.info(f"Remote GPU backend activated at {base_url}")
-
-    def _deactivate_remote_backend(self, reason: Optional[str] = None) -> None:
-        """Deactivate remote GPU backend."""
-        if self._remote_client is None and self._backend != BackendType.REMOTE_GPU:
-            return
-        if reason:
-            logger.info(f"Deactivating remote backend: {reason}")
-        self._remote_client = None
-        self._remote_config = None
-        self._backend = self._default_backend
-
-    def get_backend_status(self) -> Dict[str, Any]:
-        """Return current backend status for telemetry/UIs."""
-        return {
-            "current_backend": self._backend.value,
-            "default_backend": self._default_backend.value,
-            "remote_active": self._remote_config is not None,
-            "remote_metadata": self._remote_config.metadata if self._remote_config else None,
-            "last_remote_error": self._last_remote_error,
-        }
+    # Remote GPU Backend Methods are provided by RemoteBackendMixin
 
     async def generate(
         self,
@@ -1218,9 +1125,4 @@ No other text or formatting.
     # generate_stream, stream_with_messages, and stream_with_tool_detection
     # are provided by StreamingMixin
 
-    def _ensure_remote_active(self) -> None:
-        """Verify remote GPU backend is active and not expired."""
-        if not self._remote_config or not self._remote_client:
-            raise LLMServiceError("Remote backend is not active")
-        if self._remote_config.expires_at and datetime.now(timezone.utc) >= self._remote_config.expires_at:
-            raise LLMServiceError("Remote backend session expired")
+    # _ensure_remote_active is provided by RemoteBackendMixin
