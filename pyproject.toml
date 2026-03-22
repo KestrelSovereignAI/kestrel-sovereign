@@ -129,6 +129,13 @@ local = [
     "langchain-community>=0.3.31",
     "numpy==2.3.1",
 ]
+# OpenTelemetry observability (opt-in tracing)
+observability = [
+    "opentelemetry-api>=1.20.0",
+    "opentelemetry-sdk>=1.20.0",
+    "opentelemetry-instrumentation-fastapi>=0.41b0",
+    "opentelemetry-exporter-otlp-proto-grpc>=1.20.0",
+]
 # Cloud storage (GCS bucket access)
 cloud-storage = [
     "google-cloud-storage>=3.4.1",
@@ -139,6 +146,7 @@ full = [
     "kestrel_sovereign[ml]",
     "kestrel_sovereign[test]",
     "kestrel_sovereign[cloud-storage]",
+    "kestrel_sovereign[observability]",
 ]
 
 [project.scripts]

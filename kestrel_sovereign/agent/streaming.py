@@ -10,6 +10,7 @@ from kestrel_sovereign.security.input_guardrails import (
     check_prompt_injection,
     ANTI_INJECTION_SYSTEM_PROMPT,
 )
+from kestrel_sovereign.telemetry import start_span, end_span
 
 
 class StreamingMixin:
@@ -46,6 +47,30 @@ class StreamingMixin:
             yield result
             return
 
+        # Start OTEL span for streaming request lifecycle
+        _otel_span = start_span("agent.process_input_streaming", {
+            "agent.did": self.did,
+            "agent.session_id": session_id or "",
+            "agent.input_length": len(user_input),
+            "agent.streaming": True,
+        })
+
+        try:
+            async for chunk in self._process_input_streaming_traced(
+                user_input, model_override, session_id, _otel_span
+            ):
+                yield chunk
+        except Exception as exc:
+            end_span(_otel_span, error=exc)
+            raise
+        else:
+            end_span(_otel_span)
+            return
+
+    async def _process_input_streaming_traced(
+        self, user_input, model_override, session_id, _otel_span
+    ):
+        """Inner streaming logic wrapped in an OTEL span."""
         # Store user message (linked to session for resumed conversations)
         await self.privacy_agent.add_conversation("user", user_input, session_id=session_id)
 
@@ -260,4 +285,4 @@ class StreamingMixin:
             return f"[Response blocked by audit: {hook_output.permission_reason}]"
         elif hook_output.updated_input and "response_text" in hook_output.updated_input:
             return hook_output.updated_input["response_text"]
-        return response_text (Added `HookEvent.STOP` firing in both non-streaming (`kestrel_agent.py:process_input()`) and streaming (`agent/streaming.py:process_input_streaming()`) paths, after the response is stored to conversation history, using `execute_hooks_parallel` for non-blocking execution.\n\nTALON_COMPLETE')] (#320))
+        return response_text
