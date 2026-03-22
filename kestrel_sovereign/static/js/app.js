@@ -23,6 +23,7 @@ import { initChat, loadModels, connectNotifications, updateContextStatus } from 
 import { Security } from './security.js';
 import { initTasks, loadTasks } from './tasks.js';
 import { loadResources } from './resources.js';
+import { initMetrics, loadMetrics } from './metrics.js';
 // Import modules with side effects that define window.* functions
 import './database.js';  // Defines window.toggleDbExplorer
 import './ipfs.js';      // Defines window.toggleIpfsStatus
@@ -47,6 +48,7 @@ async function init() {
         loadExports,
         loadTasks,
         loadResources,
+        loadMetrics,
     });
 
     // Initialize navigation
@@ -57,6 +59,9 @@ async function init() {
 
     // Initialize tasks component
     initTasks();
+
+    // Initialize metrics component
+    initMetrics();
 
     // Initialize security module
     Security.init();
