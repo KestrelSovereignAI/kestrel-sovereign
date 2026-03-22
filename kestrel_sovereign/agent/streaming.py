@@ -192,9 +192,41 @@ class StreamingMixin:
                 tool_response_chunks.append(chunk)
                 yield chunk
             # Store the full response after streaming completes, with tool events in metadata
+            tool_final_text = "".join(tool_response_chunks)
+            tool_final_text = await self._fire_post_response_hook(tool_final_text, session_id)
             meta = {'tool_events': tool_events} if tool_events else None
-            await self.privacy_agent.add_conversation("assistant", "".join(tool_response_chunks), metadata=meta, session_id=session_id)
+            await self.privacy_agent.add_conversation("assistant", tool_final_text, metadata=meta, session_id=session_id)
         else:
             # No tool calls - text was already streamed above
             final_text = "".join(full_response)
+            final_text = await self._fire_post_response_hook(final_text, session_id)
             await self.privacy_agent.add_conversation("assistant", final_text, session_id=session_id)
+
+    async def _fire_post_response_hook(self, response_text: str, session_id: str = None) -> str:
+        """Fire POST_RESPONSE hooks on completed response text.
+
+        In streaming mode the text has already been sent to the client, so
+        DENY prevents storage (and logs the issue) while MODIFY can annotate
+        what gets stored.
+
+        Returns:
+            Possibly modified response_text.
+        """
+        from kestrel_sovereign.hooks.base import HookEvent, HookInput, PermissionDecision
+
+        hooks_manager = getattr(self, "hooks_manager", None)
+        if not hooks_manager or not hooks_manager.get_enabled_hooks(HookEvent.POST_RESPONSE):
+            return response_text
+
+        hook_input = HookInput(
+            session_id=session_id or "",
+            hook_event_name=HookEvent.POST_RESPONSE.value,
+            response_text=response_text,
+        )
+        hook_output = await hooks_manager.execute_hooks(HookEvent.POST_RESPONSE, hook_input)
+        if hook_output.permission_decision == PermissionDecision.DENY:
+            logger.warning(f"POST_RESPONSE hook denied (streaming): {hook_output.permission_reason}")
+            return f"[Response blocked by audit: {hook_output.permission_reason}]"
+        elif hook_output.updated_input and "response_text" in hook_output.updated_input:
+            return hook_output.updated_input["response_text"]
+        return response_text
