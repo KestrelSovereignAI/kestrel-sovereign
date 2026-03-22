@@ -782,6 +782,139 @@ class TestPreSubagentCall:
         assert subagent_hook.call_count == 1
 
 
+# === POST_SUBAGENT_CALL Tests ===
+
+class PostSubagentHook(Hook):
+    """Test hook that captures POST_SUBAGENT_CALL inputs."""
+
+    def __init__(self, name: str = "post_subagent_hook"):
+        super().__init__(
+            name=name,
+            events=[HookEvent.POST_SUBAGENT_CALL],
+            priority=100,
+        )
+        self.received_inputs = []
+
+    async def execute(self, input: HookInput) -> HookOutput:
+        self.received_inputs.append(input)
+        return HookOutput.allow()
+
+
+class TestPostSubagentCall:
+    """Tests for POST_SUBAGENT_CALL hook event."""
+
+    @pytest.mark.asyncio
+    async def test_post_subagent_call_fires_on_success(self):
+        """POST_SUBAGENT_CALL hook receives correct input on success."""
+        manager = HooksManager()
+        hook = PostSubagentHook()
+        manager.register(hook)
+
+        hook_input = HookInput(
+            session_id="orchestrator",
+            hook_event_name=HookEvent.POST_SUBAGENT_CALL.value,
+            tool_name="memory_search",
+            tool_input={"task": "find old conversations"},
+            feature_name="MemoryFeature",
+            tool_response={"success": True, "results": ["item1"]},
+            execution_time_ms=150,
+        )
+
+        outputs = await manager.execute_hooks_parallel(
+            HookEvent.POST_SUBAGENT_CALL, hook_input
+        )
+
+        assert len(outputs) == 1
+        assert len(hook.received_inputs) == 1
+        received = hook.received_inputs[0]
+        assert received.hook_event_name == "PostSubagentCall"
+        assert received.tool_name == "memory_search"
+        assert received.feature_name == "MemoryFeature"
+        assert received.tool_response == {"success": True, "results": ["item1"]}
+        assert received.execution_time_ms == 150
+
+    @pytest.mark.asyncio
+    async def test_post_subagent_call_fires_on_failure(self):
+        """POST_SUBAGENT_CALL hook receives error info on failure."""
+        manager = HooksManager()
+        hook = PostSubagentHook()
+        manager.register(hook)
+
+        hook_input = HookInput(
+            session_id="orchestrator",
+            hook_event_name=HookEvent.POST_SUBAGENT_CALL.value,
+            tool_name="memory_search",
+            tool_input={"task": "find old conversations"},
+            feature_name="MemoryFeature",
+            tool_response={"success": False, "error": "Connection refused"},
+            execution_time_ms=50,
+        )
+
+        outputs = await manager.execute_hooks_parallel(
+            HookEvent.POST_SUBAGENT_CALL, hook_input
+        )
+
+        assert len(outputs) == 1
+        received = hook.received_inputs[0]
+        assert received.tool_response["success"] is False
+        assert "Connection refused" in received.tool_response["error"]
+
+    @pytest.mark.asyncio
+    async def test_post_subagent_call_parallel_execution(self):
+        """Multiple POST_SUBAGENT_CALL hooks execute in parallel."""
+        manager = HooksManager()
+        hook1 = PostSubagentHook(name="observer_1")
+        hook2 = PostSubagentHook(name="observer_2")
+        hook3 = PostSubagentHook(name="observer_3")
+
+        manager.register(hook1)
+        manager.register(hook2)
+        manager.register(hook3)
+
+        hook_input = HookInput(
+            session_id="orchestrator",
+            hook_event_name=HookEvent.POST_SUBAGENT_CALL.value,
+            tool_name="web_search",
+            feature_name="SearchFeature",
+            tool_response={"success": True},
+            execution_time_ms=200,
+        )
+
+        outputs = await manager.execute_hooks_parallel(
+            HookEvent.POST_SUBAGENT_CALL, hook_input
+        )
+
+        assert len(outputs) == 3
+        assert len(hook1.received_inputs) == 1
+        assert len(hook2.received_inputs) == 1
+        assert len(hook3.received_inputs) == 1
+
+    @pytest.mark.asyncio
+    async def test_post_subagent_call_does_not_trigger_pre_hooks(self):
+        """POST_SUBAGENT_CALL does not trigger PRE_TOOL_USE hooks."""
+        manager = HooksManager()
+        pre_hook = AllowAllHook(name="pre_only")
+        post_hook = PostSubagentHook(name="post_only")
+
+        manager.register(pre_hook)
+        manager.register(post_hook)
+
+        hook_input = HookInput(
+            session_id="orchestrator",
+            hook_event_name=HookEvent.POST_SUBAGENT_CALL.value,
+            tool_name="test_tool",
+            tool_response={"success": True},
+        )
+
+        outputs = await manager.execute_hooks_parallel(
+            HookEvent.POST_SUBAGENT_CALL, hook_input
+        )
+
+        assert len(outputs) == 1
+        assert pre_hook.call_count == 0
+        assert len(post_hook.received_inputs) == 1
+
+
 # === Run tests ===
 
 if __name__ == "__main__":
