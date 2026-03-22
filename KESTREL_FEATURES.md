@@ -273,6 +273,8 @@ The currently exported `Feature` subclasses discovered from those modules includ
   - `POST /api/security/reset-session`
 - [`endpoints/metrics.py`](endpoints/metrics.py)
   - `GET /metrics`
+- [`endpoints/spawn.py`](endpoints/spawn.py)
+  - `GET /api/spawn/children`
 - [`endpoints/observability.py`](endpoints/observability.py)
   - `GET /api/observability/events`
   - `GET /api/observability/summary`

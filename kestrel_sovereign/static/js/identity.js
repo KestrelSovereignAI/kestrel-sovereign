@@ -40,6 +40,7 @@ let loadExports = null;
 let loadTasks = null;
 let loadResources = null;
 let loadMetrics = null;
+let loadSpawn = null;
 
 export function setLazyLoaders(loaders) {
     loadConstitution = loaders.loadConstitution;
@@ -48,6 +49,7 @@ export function setLazyLoaders(loaders) {
     loadTasks = loaders.loadTasks;
     loadResources = loaders.loadResources;
     loadMetrics = loaders.loadMetrics;
+    loadSpawn = loaders.loadSpawn;
 }
 
 export function initNavigation() {
@@ -69,6 +71,7 @@ export function initNavigation() {
             if (panelId === 'tasks' && loadTasks) loadTasks();
             if (panelId === 'resources' && loadResources) loadResources();
             if (panelId === 'metrics' && loadMetrics) loadMetrics();
+            if (panelId === 'spawn' && loadSpawn) loadSpawn();
         });
     });
 }
@@ -448,6 +451,7 @@ window.selectAgent = async function(agentName) {
     if (panel === 'sovereignty' && loadExports) loadExports();
     if (panel === 'tasks' && loadTasks) loadTasks();
     if (panel === 'resources' && loadResources) loadResources();
+    if (panel === 'spawn' && loadSpawn) loadSpawn();
 };
 
 // ============================================================================
