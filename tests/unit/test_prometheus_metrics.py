@@ -17,15 +17,26 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+try:
+    import prometheus_client  # noqa: F401
+    _HAS_PROMETHEUS = True
+except ImportError:
+    _HAS_PROMETHEUS = False
+
+requires_prometheus = pytest.mark.skipif(
+    not _HAS_PROMETHEUS,
+    reason="prometheus-client not installed (optional dependency)",
+)
+
 
 # ---------------------------------------------------------------------------
 # 1. Metric definitions
 # ---------------------------------------------------------------------------
 
+@requires_prometheus
 class TestMetricDefinitions:
     def test_prometheus_available_flag(self):
         from kestrel_sovereign.metrics import PROMETHEUS_AVAILABLE
-        # Should be True since prometheus-client is installed in test env
         assert PROMETHEUS_AVAILABLE is True
 
     def test_registry_exists(self):
@@ -63,6 +74,7 @@ class TestMetricDefinitions:
 # 2. generate_metrics helper
 # ---------------------------------------------------------------------------
 
+@requires_prometheus
 class TestGenerateMetrics:
     def test_generates_bytes(self):
         from kestrel_sovereign.metrics import generate_metrics
@@ -86,6 +98,7 @@ class TestGenerateMetrics:
 # 3. /metrics endpoint
 # ---------------------------------------------------------------------------
 
+@requires_prometheus
 class TestMetricsEndpoint:
     @pytest.fixture
     def endpoint_module(self):
@@ -115,6 +128,7 @@ class TestMetricsEndpoint:
 # 4. ObservabilityHook increments Prometheus counters
 # ---------------------------------------------------------------------------
 
+@requires_prometheus
 class TestObservabilityHookPrometheus:
     def _make_agent(self):
         agent = MagicMock()
@@ -233,6 +247,7 @@ class TestObservabilityHookPrometheus:
 # 5. LLM service Prometheus instrumentation
 # ---------------------------------------------------------------------------
 
+@requires_prometheus
 class TestLLMServicePrometheus:
     @pytest.mark.asyncio
     async def test_llm_call_increments_counters(self):
@@ -333,13 +348,14 @@ class TestLLMServicePrometheus:
 
 class TestGracefulDegradation:
     def test_metrics_module_loads_without_prometheus(self):
-        """When PROMETHEUS_AVAILABLE is False, all metric objects are None."""
-        # We can't actually uninstall prometheus-client mid-test, but we
-        # verify that the code path works by checking the structure.
+        """Metrics module loads regardless of prometheus-client availability."""
         import kestrel_sovereign.metrics as m
-        # When available, all metrics should be non-None
-        assert m.PROMETHEUS_AVAILABLE is True
-        assert m.REQUEST_COUNT is not None
+        # PROMETHEUS_AVAILABLE reflects whether the package is installed
+        assert m.PROMETHEUS_AVAILABLE is _HAS_PROMETHEUS
+        if _HAS_PROMETHEUS:
+            assert m.REQUEST_COUNT is not None
+        else:
+            assert m.REQUEST_COUNT is None
 
     @pytest.mark.asyncio
     async def test_hook_works_without_prometheus(self):
@@ -365,6 +381,7 @@ class TestGracefulDegradation:
 # 7. Label cardinality
 # ---------------------------------------------------------------------------
 
+@requires_prometheus
 class TestLabelCardinality:
     def test_no_user_data_in_labels(self):
         """Verify metric label names don't include user/session identifiers."""

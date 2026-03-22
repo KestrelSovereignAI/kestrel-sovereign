@@ -39,6 +39,7 @@ let loadMemories = null;
 let loadExports = null;
 let loadTasks = null;
 let loadResources = null;
+let loadMetrics = null;
 
 export function setLazyLoaders(loaders) {
     loadConstitution = loaders.loadConstitution;
@@ -46,6 +47,7 @@ export function setLazyLoaders(loaders) {
     loadExports = loaders.loadExports;
     loadTasks = loaders.loadTasks;
     loadResources = loaders.loadResources;
+    loadMetrics = loaders.loadMetrics;
 }
 
 export function initNavigation() {
@@ -66,6 +68,7 @@ export function initNavigation() {
             if (panelId === 'sovereignty' && !state.exports && loadExports) loadExports();
             if (panelId === 'tasks' && loadTasks) loadTasks();
             if (panelId === 'resources' && loadResources) loadResources();
+            if (panelId === 'metrics' && loadMetrics) loadMetrics();
         });
     });
 }
