@@ -437,6 +437,25 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
                 output_tokens=output_tokens,
             )
 
+        # Prometheus metrics (no-op when prometheus-client not installed)
+        from kestrel_sovereign.metrics import (
+            PROMETHEUS_AVAILABLE as _prom,
+            LLM_CALLS,
+            LLM_DURATION,
+            LLM_TOKENS,
+        )
+        if _prom:
+            LLM_CALLS.labels(
+                provider=provider, model=model, success=str(success)
+            ).inc()
+            LLM_DURATION.labels(provider=provider, model=model).observe(
+                duration_ms / 1000
+            )
+            if input_tokens is not None:
+                LLM_TOKENS.labels(model=model, direction="input").inc(input_tokens)
+            if output_tokens is not None:
+                LLM_TOKENS.labels(model=model, direction="output").inc(output_tokens)
+
         # Trigger metering callback for billing (Phase 1: tracking only)
         if self._metering_callback and success:
             companion_id = self._observability_context.get("companion_id")
