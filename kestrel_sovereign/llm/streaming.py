@@ -267,7 +267,7 @@ class StreamingMixin:
         Yields:
             Text chunks as they arrive (JSON chunks if response_format provided)
         """
-        from .service import BackendType
+        from .remote_backend import BackendType
 
         # Try remote GPU first if active
         if self._backend == BackendType.REMOTE_GPU and self._remote_client and not force_local_only:
@@ -319,7 +319,7 @@ class StreamingMixin:
         Yields:
             Text chunks as they arrive from the LLM
         """
-        from .service import BackendType
+        from .remote_backend import BackendType
 
         # Try remote GPU first if active
         if self._backend == BackendType.REMOTE_GPU and self._remote_client and not force_local_only:
@@ -453,7 +453,7 @@ class StreamingMixin:
                 for tc in tool_response.tool_calls:
                     result = await execute_tool(tc)
         """
-        from .service import BackendType
+        from .remote_backend import BackendType
 
         # Try remote GPU first if active
         if self._backend == BackendType.REMOTE_GPU and self._remote_client and not force_local_only:
