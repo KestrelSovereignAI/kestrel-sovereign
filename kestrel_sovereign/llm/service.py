@@ -49,6 +49,7 @@ from kestrel_sovereign.kestrel_config.constants import (
     CLIENT_CLOSE_TIMEOUT,
 )
 from kestrel_sovereign.config import load_config
+from kestrel_sovereign.telemetry import optional_span
 
 logger = logging.getLogger(__name__)
 
@@ -739,16 +740,28 @@ No other text or formatting.
                 provider_name = provider['name']
                 logger.info(f"Attempting provider: {provider_name}")
 
-                result = await self._try_single_provider(
-                    provider=provider,
-                    target_model=target_model,
-                    system_prompt=system_prompt,
-                    user_prompt=user_prompt,
-                    tools=tools,
-                    response_format=response_format,
-                    force_local_only=force_local_only,
-                    start_time=start_time
-                )
+                with optional_span("agent.llm_call", {
+                    "llm.method": "get_response",
+                    "llm.provider": provider_name,
+                    "llm.model": target_model or provider.get("model", ""),
+                }) as llm_span:
+                    result = await self._try_single_provider(
+                        provider=provider,
+                        target_model=target_model,
+                        system_prompt=system_prompt,
+                        user_prompt=user_prompt,
+                        tools=tools,
+                        response_format=response_format,
+                        force_local_only=force_local_only,
+                        start_time=start_time
+                    )
+                    if llm_span and isinstance(result, LLMResponse):
+                        if result.input_tokens is not None:
+                            llm_span.set_attribute("llm.usage.prompt_tokens", result.input_tokens)
+                        if result.output_tokens is not None:
+                            llm_span.set_attribute("llm.usage.completion_tokens", result.output_tokens)
+                        if result.total_tokens is not None:
+                            llm_span.set_attribute("llm.usage.total_tokens", result.total_tokens)
 
                 logger.info(f"Success from {provider_name}")
                 return result
@@ -998,50 +1011,59 @@ No other text or formatting.
         Returns:
             String content or LLMResponse (if tools/structured output)
         """
-        # Try remote GPU first if active
-        if self._backend == BackendType.REMOTE_GPU and self._remote_client and not force_local_only:
-            try:
-                self._ensure_remote_active()
-                messages = self._remote_adapter.create_messages(user_prompt=user_prompt, system_prompt=system_prompt)
-                model = model_override or self._remote_config.model
-                response = await self._remote_adapter.get_response(
-                    client=self._remote_client,
-                    model=model,
-                    messages=messages,
-                    tools=tools,
-                    response_format=response_format,
-                )
-                if tools is not None or response_format is not None:
+        with optional_span("agent.llm_call", {
+            "llm.method": "generate",
+            "llm.model": model_override or "",
+            "llm.force_local_only": force_local_only,
+            "llm.has_tools": tools is not None,
+        }) as llm_span:
+            # Try remote GPU first if active
+            if self._backend == BackendType.REMOTE_GPU and self._remote_client and not force_local_only:
+                try:
+                    self._ensure_remote_active()
+                    messages = self._remote_adapter.create_messages(user_prompt=user_prompt, system_prompt=system_prompt)
+                    model = model_override or self._remote_config.model
+                    response = await self._remote_adapter.get_response(
+                        client=self._remote_client,
+                        model=model,
+                        messages=messages,
+                        tools=tools,
+                        response_format=response_format,
+                    )
+                    if llm_span:
+                        llm_span.set_attribute("llm.provider", "remote_gpu")
+                        llm_span.set_attribute("llm.model_used", model)
+                    if tools is not None or response_format is not None:
+                        return response
+                    if isinstance(response, LLMResponse):
+                        return response.content or ""
                     return response
-                if isinstance(response, LLMResponse):
-                    return response.content or ""
-                return response
-            except (openai.APIError, openai.APIConnectionError, openai.RateLimitError, openai.AuthenticationError) as exc:
-                self._last_remote_error = str(exc)
-                logger.warning(f"Remote GPU API error: {exc}, falling back to providers", exc_info=True)
-                self._deactivate_remote_backend(reason=str(exc))
-            except (httpx.HTTPError, ConnectionError, TimeoutError, asyncio.TimeoutError) as exc:
-                self._last_remote_error = str(exc)
-                logger.warning(f"Remote GPU network error: {exc}, falling back to providers", exc_info=True)
-                self._deactivate_remote_backend(reason=str(exc))
-            except LLMServiceError as exc:
-                self._last_remote_error = str(exc)
-                logger.warning(f"Remote GPU service error: {exc}, falling back to providers", exc_info=True)
-                self._deactivate_remote_backend(reason=str(exc))
-            except Exception as exc:
-                self._last_remote_error = str(exc)
-                logger.warning(f"Remote GPU failed: {exc}, falling back to providers", exc_info=True)
-                self._deactivate_remote_backend(reason=str(exc))
+                except (openai.APIError, openai.APIConnectionError, openai.RateLimitError, openai.AuthenticationError) as exc:
+                    self._last_remote_error = str(exc)
+                    logger.warning(f"Remote GPU API error: {exc}, falling back to providers", exc_info=True)
+                    self._deactivate_remote_backend(reason=str(exc))
+                except (httpx.HTTPError, ConnectionError, TimeoutError, asyncio.TimeoutError) as exc:
+                    self._last_remote_error = str(exc)
+                    logger.warning(f"Remote GPU network error: {exc}, falling back to providers", exc_info=True)
+                    self._deactivate_remote_backend(reason=str(exc))
+                except LLMServiceError as exc:
+                    self._last_remote_error = str(exc)
+                    logger.warning(f"Remote GPU service error: {exc}, falling back to providers", exc_info=True)
+                    self._deactivate_remote_backend(reason=str(exc))
+                except Exception as exc:
+                    self._last_remote_error = str(exc)
+                    logger.warning(f"Remote GPU failed: {exc}, falling back to providers", exc_info=True)
+                    self._deactivate_remote_backend(reason=str(exc))
 
-        # Fall back to standard provider chain
-        return await self.get_response(
-            system_prompt=system_prompt,
-            user_prompt=user_prompt,
-            force_local_only=force_local_only,
-            model_override=model_override,
-            tools=tools,
-            response_format=response_format,
-        )
+            # Fall back to standard provider chain
+            return await self.get_response(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                force_local_only=force_local_only,
+                model_override=model_override,
+                tools=tools,
+                response_format=response_format,
+            )
 
     async def generate_with_messages(
         self,

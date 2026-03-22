@@ -165,6 +165,7 @@ The currently exported `Feature` subclasses discovered from those modules includ
 - `ObservabilityFeature`
 - `PeersFeature`
 - `ReflectionFeature`
+- `ResponseAuditFeature`
 - `RunPodFeature`
 - `SaveFeature`
 - `SchedulerFeature`
