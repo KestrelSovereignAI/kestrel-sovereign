@@ -1,0 +1,156 @@
+# kestrel-eye config for Kestrel Spawn Agent Demo
+# Reviews 10 screenshots from the narrated spawn lifecycle demo (Issue #354)
+
+[eye]
+name = "Kestrel Spawn Agent Demo"
+screenshot_dir = "demos/spawn/demo-output"
+test_cmd = "cd demos/spawn && npx playwright test --config=demo_config.cjs"
+
+[eye.model]
+provider = "anthropic"
+model = "claude-haiku-4-5-20251001"
+
+[eye.github]
+repo = "KestrelSovereignAI/kestrel-sovereign"
+labels = ["kestrel-eye", "spawn-review", "automated"]
+
+# Beat 1: "Claw receives a complex research request"
+[[eye.screenshots]]
+name = "01-research-request.png"
+act = "Beat 1: Research Request"
+severity = "critical"
+expected = [
+    "Chat panel visible with message input area",
+    "User's complex research request text visible in input or as sent message",
+    "Request mentions parallel research, DIDs, constitutional governance",
+    "Sovereign Console UI frame visible (nav tabs, header)",
+]
+layout = "Chat panel with a multi-sentence research request visible in the message input or chat history"
+context = "User sends a complex, multi-faceted research request about sovereign AI architecture. The request explicitly asks the agent to spawn specialist agents for parallel investigation of (1) decentralized identity and (2) constitutional governance."
+
+# Beat 2: "Claw decides to parallelize"
+[[eye.screenshots]]
+name = "02-agent-decides-to-spawn.png"
+act = "Beat 2: Decision to Spawn"
+severity = "critical"
+expected = [
+    "Chat panel with agent response visible",
+    "Agent response mentions spawning, delegation, specialists, or parallel work",
+    "Clear distinction between user message and agent response",
+    "Response indicates the agent is breaking the task into sub-tasks",
+]
+layout = "Chat interface showing the agent's response explaining its decision to delegate work to specialist child agents"
+context = "The agent analyzes the multi-faceted request and decides to spawn specialist workers rather than tackle everything sequentially. The response should reference spawning child agents, delegation, or parallel research."
+
+# Beat 3: "Two workers appear in the Console" (spawn-panel with children)
+[[eye.screenshots]]
+name = "03-spawn-panel-children.png"
+act = "Beat 3: Workers Appear"
+severity = "critical"
+expected = [
+    "Spawn panel visible and active",
+    "Active children table with at least one row",
+    "Child agent names and purposes visible in the table",
+    "Status column showing RUNNING or similar active state",
+    "No 'No active children' empty-state message",
+]
+layout = "Spawn panel with an active children table showing rows for spawned worker agents, each with name, purpose, status, and budget columns"
+context = "Navigating to the Spawn panel reveals newly created child agents. Each child has a name, purpose description, status (RUNNING), its own DID, TTL countdown, and budget allocation. This proves the spawn system is working."
+
+# Beat 4: "Workers begin independent research" (delegation chain)
+[[eye.screenshots]]
+name = "04-delegation-chain.png"
+act = "Beat 4: Delegation Chain"
+severity = "critical"
+expected = [
+    "Spawn panel visible",
+    "Delegation chain tree visualization present",
+    "Parent agent (Claw or root) at the top of the tree",
+    "Child workers shown as branches below the parent",
+    "Tree structure showing parent-child relationships",
+]
+layout = "Spawn panel with a tree visualization showing the parent agent at the root with child worker agents as branches beneath it"
+context = "The delegation chain tree shows the parent-child relationship: Claw (parent) delegates to Worker1 and Worker2. Each worker operates independently with scoped constitutional authority inherited from the parent."
+
+# Beat 5: "Budget meters tick"
+[[eye.screenshots]]
+name = "05-budget-meters.png"
+act = "Beat 5: Budget Meters"
+severity = "critical"
+expected = [
+    "Budget progress bars visible for child agents",
+    "Non-zero spend shown in at least one budget bar",
+    "Chart.js stacked bar chart or budget visualization present",
+    "Spent vs remaining budget clearly distinguished by color",
+]
+layout = "Spawn panel showing budget progress bars per child agent and a stacked bar chart visualizing budget allocation and consumption"
+context = "Budget meters show real-time spending per child agent. As workers make LLM calls, the 'Spent' portion grows while 'Remaining' shrinks. Each worker has a capped budget — overspend is blocked, unspent is returned to the parent."
+
+# Beat 6: "First worker reports back"
+[[eye.screenshots]]
+name = "06-first-worker-done.png"
+act = "Beat 6: First Worker Complete"
+severity = "critical"
+expected = [
+    "Spawn panel with children table visible",
+    "At least one child with status COMPLETED or TERMINATED",
+    "Status change visually distinct from RUNNING state",
+    "Budget accounting shows final consumption for completed worker",
+]
+layout = "Spawn panel showing at least one child agent with a completed/terminated status, distinct from any still-running workers"
+context = "One worker completes its research and reports results back to the parent. Its status changes to COMPLETED in the children table. Budget accounting shows final consumption for the finished worker."
+
+# Beat 7: "All workers report back"
+[[eye.screenshots]]
+name = "07-all-workers-done.png"
+act = "Beat 7: All Workers Complete"
+severity = "warning"
+expected = [
+    "All children in terminal state (COMPLETED/TERMINATED)",
+    "No workers showing RUNNING status",
+    "Budget chart reflects total consumption across all workers",
+]
+layout = "Spawn panel with all child agents in terminal state and final budget accounting visible"
+context = "All workers have completed their research. The budget chart reflects total consumption across all workers. Results are ready for the parent agent to synthesize."
+
+# Beat 8: "Workers auto-terminate" (cleanup)
+[[eye.screenshots]]
+name = "08-workers-terminated.png"
+act = "Beat 8: Cleanup"
+severity = "warning"
+expected = [
+    "Workers terminated or removed from active list",
+    "Budget returned indicator or zero remaining budget shown",
+    "Spawn panel showing post-cleanup state",
+    "History section may show termination entries",
+]
+layout = "Spawn panel after auto-termination — active children list empty or showing terminated status, unspent budget returned to parent"
+context = "TTL/completion cleanup occurs. Unspent budget is returned to the parent. The active children count drops as ephemeral workers are cleaned up. This demonstrates the full lifecycle from spawn to termination."
+
+# Beat 9: "Claw synthesizes results"
+[[eye.screenshots]]
+name = "09-synthesized-response.png"
+act = "Beat 9: Synthesis"
+severity = "critical"
+expected = [
+    "Chat panel visible with agent's synthesized response",
+    "Response incorporates findings from multiple research areas",
+    "Response references both DID/sovereignty and constitutional governance topics",
+    "Comprehensive, multi-paragraph analysis visible",
+]
+layout = "Chat panel showing the parent agent's synthesized response that combines findings from all specialist workers into a unified analysis"
+context = "Back in the Chat panel, the parent agent combines findings from all workers into a unified, comprehensive response. The synthesis should cover both research axes: decentralized identity and constitutional governance."
+
+# Beat 10: "Spawn history shows the full story"
+[[eye.screenshots]]
+name = "10-spawn-history.png"
+act = "Beat 10: Spawn History"
+severity = "warning"
+expected = [
+    "Spawn history timeline or event list visible",
+    "Spawn and termination events with timestamps",
+    "Child agent names referenced in history entries",
+    "Budget consumption recorded per worker in history",
+]
+layout = "Spawn panel history section showing a timeline of spawn events, completions, and terminations with timestamps and budget data"
+context = "The spawn history timeline shows the complete lifecycle: spawn events, completion events, timestamps, and budget consumed per worker. This is the audit trail of the entire delegation process."
