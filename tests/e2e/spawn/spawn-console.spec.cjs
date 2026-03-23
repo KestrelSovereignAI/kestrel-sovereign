@@ -21,15 +21,21 @@ const BASE_URL = process.env.KESTREL_URL || 'http://localhost:8888';
 // Helpers
 // ============================================================================
 
+// Module-level API key cache to avoid rate-limit on /api/auth/key (5/min)
+let _cachedApiKey = null;
+
 async function getApiKey(request) {
+    if (_cachedApiKey) return _cachedApiKey;
     if (process.env.KESTREL_API_KEY) {
-        return process.env.KESTREL_API_KEY;
+        _cachedApiKey = process.env.KESTREL_API_KEY;
+        return _cachedApiKey;
     }
     try {
         const response = await request.get(`${BASE_URL}/api/auth/key`);
         if (response.ok()) {
             const data = await response.json();
-            return data.key;
+            _cachedApiKey = data.key;
+            return _cachedApiKey;
         }
     } catch (e) {
         console.warn('Could not fetch API key:', e.message);
@@ -40,6 +46,40 @@ async function getApiKey(request) {
 function authHeaders(apiKey) {
     if (!apiKey) return {};
     return { 'X-API-Key': apiKey };
+}
+
+/**
+ * Intercept /api/auth/key requests in the browser so the frontend
+ * never hits the rate-limited endpoint. Instead, return the cached key.
+ */
+async function setupApiKeyIntercept(page, apiKey) {
+    if (!apiKey) return;
+    await page.route('**/api/auth/key', async (route) => {
+        await route.fulfill({
+            status: 200,
+            contentType: 'application/json',
+            body: JSON.stringify({
+                key: apiKey,
+                header: 'X-API-Key',
+                usage: 'Include as X-API-Key header'
+            }),
+        });
+    });
+}
+
+async function waitForPageReady(page, apiKey) {
+    await setupApiKeyIntercept(page, apiKey);
+    await page.goto(BASE_URL);
+    await page.waitForLoadState('domcontentloaded');
+    await page.waitForSelector('.identity-header', { timeout: 30000 });
+}
+
+async function navigateToSpawnPanel(page, apiKey) {
+    await waitForPageReady(page, apiKey);
+    await page.locator('.nav-tab[data-panel="spawn"]').click();
+    await page.waitForSelector('#panel-spawn.active', { timeout: 5000 });
+    // Wait for the panel data to load via auto-refresh or initial load
+    await page.waitForTimeout(2000);
 }
 
 // ============================================================================
@@ -54,8 +94,7 @@ test.describe('Spawn Console Panel', () => {
     });
 
     test('spawn tab exists in navigation', async ({ page }) => {
-        await page.goto(BASE_URL);
-        await page.waitForLoadState('domcontentloaded');
+        await waitForPageReady(page, apiKey);
 
         const spawnTab = page.locator('.nav-tab[data-panel="spawn"]');
         await expect(spawnTab).toBeVisible();
@@ -65,30 +104,23 @@ test.describe('Spawn Console Panel', () => {
     });
 
     test('spawn panel renders all sections on tab click', async ({ page }) => {
-        await page.goto(BASE_URL);
-        await page.waitForLoadState('domcontentloaded');
+        await navigateToSpawnPanel(page, apiKey);
 
-        // Click the Spawn tab
-        await page.locator('.nav-tab[data-panel="spawn"]').click();
-
-        // Panel should become active
         const panel = page.locator('#panel-spawn');
         await expect(panel).toBeVisible();
 
         await page.screenshot({ path: 'test-results/spawn-console-panel-initial.png' });
 
-        // Verify all sub-sections exist
-        await expect(panel.locator('text=Spawn Manager')).toBeVisible();
-        await expect(panel.locator('text=Active Children')).toBeVisible();
-        await expect(panel.locator('text=Delegation Chain')).toBeVisible();
-        await expect(panel.locator('text=Budget Allocation')).toBeVisible();
-        await expect(panel.locator('text=Spawn History')).toBeVisible();
+        // Verify all sub-sections exist using heading selectors to avoid ambiguous matches
+        await expect(panel.locator('h2:has-text("Spawn Manager")')).toBeVisible();
+        await expect(panel.locator('h3:has-text("Active Children")')).toBeVisible();
+        await expect(panel.locator('h3:has-text("Delegation Chain")')).toBeVisible();
+        await expect(panel.locator('h3:has-text("Budget Allocation")')).toBeVisible();
+        await expect(panel.locator('h3:has-text("Spawn History")')).toBeVisible();
     });
 
     test('active children section renders', async ({ page }) => {
-        await page.goto(BASE_URL);
-        await page.waitForLoadState('domcontentloaded');
-        await page.locator('.nav-tab[data-panel="spawn"]').click();
+        await navigateToSpawnPanel(page, apiKey);
 
         const childrenList = page.locator('#spawn-children-list');
         await expect(childrenList).toBeVisible();
@@ -101,9 +133,7 @@ test.describe('Spawn Console Panel', () => {
     });
 
     test('delegation chain section renders', async ({ page }) => {
-        await page.goto(BASE_URL);
-        await page.waitForLoadState('domcontentloaded');
-        await page.locator('.nav-tab[data-panel="spawn"]').click();
+        await navigateToSpawnPanel(page, apiKey);
 
         const chainSection = page.locator('#spawn-delegation-chain');
         await expect(chainSection).toBeVisible();
@@ -115,9 +145,7 @@ test.describe('Spawn Console Panel', () => {
     });
 
     test('budget chart canvas exists', async ({ page }) => {
-        await page.goto(BASE_URL);
-        await page.waitForLoadState('domcontentloaded');
-        await page.locator('.nav-tab[data-panel="spawn"]').click();
+        await navigateToSpawnPanel(page, apiKey);
 
         const canvas = page.locator('#spawn-budget-chart');
         await expect(canvas).toBeAttached();
@@ -126,9 +154,7 @@ test.describe('Spawn Console Panel', () => {
     });
 
     test('spawn history section renders', async ({ page }) => {
-        await page.goto(BASE_URL);
-        await page.waitForLoadState('domcontentloaded');
-        await page.locator('.nav-tab[data-panel="spawn"]').click();
+        await navigateToSpawnPanel(page, apiKey);
 
         const historyList = page.locator('#spawn-history-list');
         await expect(historyList).toBeVisible();
@@ -152,9 +178,7 @@ test.describe('Spawn Auto-Refresh Controls', () => {
     });
 
     test('refresh button exists and is clickable', async ({ page }) => {
-        await page.goto(BASE_URL);
-        await page.waitForLoadState('domcontentloaded');
-        await page.locator('.nav-tab[data-panel="spawn"]').click();
+        await navigateToSpawnPanel(page, apiKey);
 
         const refreshBtn = page.locator('#btn-refresh-spawn');
         await expect(refreshBtn).toBeVisible();
@@ -169,9 +193,7 @@ test.describe('Spawn Auto-Refresh Controls', () => {
     });
 
     test('auto-refresh interval selector works', async ({ page }) => {
-        await page.goto(BASE_URL);
-        await page.waitForLoadState('domcontentloaded');
-        await page.locator('.nav-tab[data-panel="spawn"]').click();
+        await navigateToSpawnPanel(page, apiKey);
 
         const select = page.locator('#spawn-refresh-interval');
         await expect(select).toBeVisible();
@@ -219,9 +241,7 @@ test.describe('Spawn Panel Data Display', () => {
         const apiData = await response.json();
 
         // Navigate to the spawn panel
-        await page.goto(BASE_URL);
-        await page.waitForLoadState('domcontentloaded');
-        await page.locator('.nav-tab[data-panel="spawn"]').click();
+        await navigateToSpawnPanel(page, apiKey);
 
         // Click refresh to ensure data is loaded
         await page.locator('#btn-refresh-spawn').click();
@@ -233,7 +253,6 @@ test.describe('Spawn Panel Data Display', () => {
             const listContent = await childrenList.textContent();
 
             for (const child of apiData.children) {
-                // Child name should appear somewhere in the panel
                 const nameVisible = listContent.includes(child.name);
                 if (nameVisible) {
                     expect(nameVisible).toBe(true);
@@ -243,41 +262,44 @@ test.describe('Spawn Panel Data Display', () => {
             // Delegation chain should show parent
             const chainContent = await page.locator('#spawn-delegation-chain').textContent();
             expect(chainContent.length).toBeGreaterThan(0);
+        } else {
+            // Empty state: verify the empty-state message is shown
+            const childrenList = page.locator('#spawn-children-list');
+            const content = await childrenList.textContent();
+            expect(content).toContain('No active child agents');
         }
 
         await page.screenshot({ path: 'test-results/spawn-console-data-display.png' });
     });
 
     test('child cards show status, purpose, and budget info', async ({ page, request }) => {
-        const apiData = await request.get(`${BASE_URL}/api/spawn/children`, {
+        const response = await request.get(`${BASE_URL}/api/spawn/children`, {
             headers: authHeaders(apiKey)
-        }).then(r => r.json());
+        });
+        expect(response.ok()).toBeTruthy();
+        const apiData = await response.json();
 
-        await page.goto(BASE_URL);
-        await page.waitForLoadState('domcontentloaded');
-        await page.locator('.nav-tab[data-panel="spawn"]').click();
+        await navigateToSpawnPanel(page, apiKey);
         await page.locator('#btn-refresh-spawn').click();
         await page.waitForTimeout(2000);
 
         if (apiData.count > 0) {
             const childrenList = page.locator('#spawn-children-list');
-
-            // Check for status indicators (badges)
-            // The UI uses status classes/badges for running/stopped
             const content = await childrenList.innerHTML();
-
-            // Should contain status text
             const hasStatusIndicator = /running|stopped|completed|terminated/i.test(content);
             expect(hasStatusIndicator).toBe(true);
+        } else {
+            // No children: verify empty state message
+            const childrenList = page.locator('#spawn-children-list');
+            const content = await childrenList.textContent();
+            expect(content).toContain('No active child agents');
         }
 
         await page.screenshot({ path: 'test-results/spawn-console-child-cards.png' });
     });
 
     test('full panel screenshot for kestrel-eye verification', async ({ page }) => {
-        await page.goto(BASE_URL);
-        await page.waitForLoadState('domcontentloaded');
-        await page.locator('.nav-tab[data-panel="spawn"]').click();
+        await navigateToSpawnPanel(page, apiKey);
 
         // Click refresh to load all data
         await page.locator('#btn-refresh-spawn').click();
@@ -333,17 +355,21 @@ test.describe('Spawn API Contract', () => {
         // Count matches array length
         expect(data.count).toBe(data.children.length);
 
-        // Delegation chain structure
-        expect(data.delegation_chain).toHaveProperty('name');
-        expect(data.delegation_chain).toHaveProperty('did');
-        expect(data.delegation_chain).toHaveProperty('status');
-        expect(data.delegation_chain).toHaveProperty('children');
+        // Delegation chain structure: only validate properties when non-empty.
+        // When no agent manager exists, delegation_chain is {}.
+        if (Object.keys(data.delegation_chain).length > 0) {
+            expect(data.delegation_chain).toHaveProperty('name');
+            expect(data.delegation_chain).toHaveProperty('did');
+            expect(data.delegation_chain).toHaveProperty('status');
+            expect(data.delegation_chain).toHaveProperty('children');
+        }
     });
 
     test('each child has required fields', async ({ request }) => {
         const response = await request.get(`${BASE_URL}/api/spawn/children`, {
             headers: authHeaders(apiKey)
         });
+        expect(response.ok()).toBeTruthy();
         const data = await response.json();
 
         const requiredFields = [
@@ -369,6 +395,7 @@ test.describe('Spawn API Contract', () => {
         const response = await request.get(`${BASE_URL}/api/spawn/children`, {
             headers: authHeaders(apiKey)
         });
+        expect(response.ok()).toBeTruthy();
         const data = await response.json();
 
         for (const event of data.history) {
