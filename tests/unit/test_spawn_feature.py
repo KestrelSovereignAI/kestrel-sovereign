@@ -17,7 +17,7 @@ def _make_mock_agent(agent_id: str = "did:pkh:eip155:1:0xPARENT"):
     agent.agent_id = agent_id
     agent.initialize = AsyncMock()
     agent.shutdown = AsyncMock()
-    agent.chat = AsyncMock(return_value="task completed")
+    agent.process_input = AsyncMock(return_value="task completed")
     agent._private_key = None  # No signing in unit tests
     return agent
 
@@ -64,26 +64,42 @@ class TestSpawnFeatureTools:
         assert feature.tool_name == "spawn_feature"
 
 
-class TestSpawnFeatureNoManager:
-    """Tools return errors gracefully when no AgentManager is present."""
+class TestSpawnFeatureAutoManager:
+    """In single-agent mode, SpawnFeature auto-creates an AgentManager."""
 
     @pytest.mark.asyncio
-    async def test_spawn_without_manager(self):
-        feature = _make_spawn_feature(manager=None)
-        result = await feature.spawn_agent(name="child1", purpose="test")
-        assert result["spawned"] is False
-        assert "AgentManager" in result["error"]
+    async def test_auto_creates_manager(self):
+        parent = _make_mock_agent()
+        parent._agent_manager = None
+        parent.agent_manager = None
+        parent.storage_path = "/tmp/test/kestrel_prime.db"
+        feature = SpawnFeature(parent)
+        feature._agent_manager = None
+        feature._child_results = {}
+        feature._child_tasks = {}
+        feature._lifecycle = None
+        manager = feature._get_agent_manager()
+        assert manager is not None
+        assert parent._agent_manager is manager  # attached back
 
     @pytest.mark.asyncio
-    async def test_list_children_without_manager(self):
-        feature = _make_spawn_feature(manager=None)
+    async def test_list_children_auto_manager(self):
+        parent = _make_mock_agent()
+        parent._agent_manager = None
+        parent.agent_manager = None
+        parent.storage_path = "/tmp/test/kestrel_prime.db"
+        feature = SpawnFeature(parent)
+        feature._agent_manager = None
+        feature._child_results = {}
+        feature._child_tasks = {}
+        feature._lifecycle = None
         result = await feature.list_children()
         assert result["children"] == []
-        assert "AgentManager" in result["error"]
+        assert result["count"] == 0
 
     @pytest.mark.asyncio
-    async def test_delegate_without_manager(self):
-        feature = _make_spawn_feature(manager=None)
+    async def test_delegate_without_children(self):
+        feature = _make_spawn_feature(manager=MagicMock())
         result = await feature.delegate_task(child_name="child1", task="do stuff")
         assert result["delegated"] is False
 
@@ -195,7 +211,7 @@ class TestSpawnFeatureWithManager:
     async def test_get_child_result_after_delegation(self):
         parent = _make_mock_agent("did:parent")
         child = _make_mock_agent("did:child")
-        child.chat = AsyncMock(return_value="analysis complete: 42")
+        child.process_input = AsyncMock(return_value="analysis complete: 42")
 
         manager = MagicMock()
         manager.get_agent = MagicMock(return_value=child)
@@ -221,7 +237,7 @@ class TestSpawnFeatureWithManager:
             await asyncio.sleep(10)
             return "done"
 
-        child.chat = slow_chat
+        child.process_input = slow_chat
 
         manager = MagicMock()
         manager.get_agent = MagicMock(return_value=child)
@@ -433,7 +449,7 @@ class TestSpawnLifecycle:
     async def test_full_lifecycle(self):
         parent = _make_mock_agent("did:parent")
         child = _make_mock_agent("did:child")
-        child.chat = AsyncMock(return_value="result: 42")
+        child.process_input = AsyncMock(return_value="result: 42")
 
         manager = MagicMock()
         manager.spawn_agent = AsyncMock(return_value=child)

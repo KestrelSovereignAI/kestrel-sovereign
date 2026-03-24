@@ -19,6 +19,7 @@ Architecture:
 import asyncio
 import logging
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from kestrel_sovereign.features.base import Feature, tool
@@ -39,11 +40,17 @@ class SpawnFeature(Feature):
 
     async def initialize(self):
         self._agent_manager = None
+        self._lifecycle = None
         self._child_results: dict[str, Any] = {}  # child_name -> latest result
         self._child_tasks: dict[str, asyncio.Task] = {}  # child_name -> running task
 
     def _get_agent_manager(self):
-        """Lazily resolve the AgentManager from the agent's rookery context."""
+        """Lazily resolve or create an AgentManager.
+
+        In rookery mode the manager already exists on the agent.  In
+        single-agent mode we create a lightweight one on-the-fly so
+        spawn_agent works regardless of deployment mode.
+        """
         if self._agent_manager is not None:
             return self._agent_manager
 
@@ -51,6 +58,31 @@ class SpawnFeature(Feature):
         manager = getattr(self.agent, '_agent_manager', None)
         if manager is None:
             manager = getattr(self.agent, 'agent_manager', None)
+
+        # Single-agent mode: create a lightweight AgentManager
+        if manager is None:
+            from kestrel_sovereign.rookery.agent_manager import AgentManager
+            storage_dir = getattr(self.agent, 'storage_path', None)
+            base_dir = Path(storage_dir).parent.parent if storage_dir else None
+            manager = AgentManager(base_data_dir=base_dir)
+            # Register the current agent so it appears as the parent
+            agent_name = getattr(self.agent, 'agent_name', None) or 'default'
+            manager._agents[agent_name] = self.agent
+            agent_did = getattr(self.agent, 'did', None) or ''
+            if agent_did:
+                manager._agent_names[agent_did] = agent_name
+            # Attach back to agent so endpoints and other code can find it
+            self.agent._agent_manager = manager
+            logger.info("Created lightweight AgentManager for single-agent spawn")
+
+        # Ensure lifecycle is wired up
+        if not getattr(manager, '_lifecycle', None):
+            from kestrel_sovereign.spawn.lifecycle import SpawnedAgentLifecycle
+            lifecycle = SpawnedAgentLifecycle(manager)
+            manager._lifecycle = lifecycle
+            self._lifecycle = lifecycle
+            logger.info("SpawnedAgentLifecycle attached to AgentManager")
+
         self._agent_manager = manager
         return manager
 
@@ -125,6 +157,19 @@ class SpawnFeature(Feature):
                 parent_agent=self.agent,
                 mandate=mandate,
             )
+            # Register with lifecycle for TTL tracking and history
+            from kestrel_sovereign.spawn.lifecycle import SpawnedAgentLifecycle
+            lifecycle = getattr(manager, '_lifecycle', None)
+            if isinstance(lifecycle, SpawnedAgentLifecycle):
+                from kestrel_sovereign.spawn.lifecycle import SpawnMode
+                await lifecycle.register(
+                    child_name=name,
+                    child_did=child.agent_id,
+                    parent_did=self.agent.agent_id,
+                    ttl_seconds=ttl,
+                    purpose=purpose,
+                    mode=SpawnMode.EPHEMERAL if ttl > 0 else SpawnMode.PERSISTENT,
+                )
             return {
                 "spawned": True,
                 "child_name": name,
@@ -211,7 +256,7 @@ class SpawnFeature(Feature):
         # Run the task asynchronously via the child agent's chat method
         async def _run_child_task():
             try:
-                result = await child_agent.chat(task)
+                result = await child_agent.process_input(task)
                 self._child_results[child_name] = {
                     "success": True,
                     "result": result,
