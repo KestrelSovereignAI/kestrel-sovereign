@@ -315,10 +315,10 @@ test.describe.serial('Kestrel Spawn Agent Demo', () => {
             'This request has multiple independent axes — ideal for parallel investigation by specialist agents');
 
         await page.locator('#message-input').fill(
-            'Use your spawn_agent tool to create two child agents for parallel research: ' +
-            '(1) spawn_agent name="did-researcher" purpose="Research how decentralized identity DIDs enable agent sovereignty" budget=1.0 ttl=120, ' +
-            'and (2) spawn_agent name="constitution-researcher" purpose="Research how constitutional governance prevents AI misalignment" budget=1.0 ttl=120. ' +
-            'Create both agents now using the spawn_agent tool.'
+            'I need a comprehensive analysis of sovereign AI architecture. ' +
+            'Research two areas in parallel: (1) How decentralized identity (DIDs) enables agent sovereignty, ' +
+            'and (2) How constitutional governance prevents AI misalignment. ' +
+            'Spawn specialist agents to research each area independently, then synthesize their findings.'
         );
         await demoPause(page, 2000);
 
@@ -343,10 +343,10 @@ test.describe.serial('Kestrel Spawn Agent Demo', () => {
             'Watch for the agent deciding to spawn specialist workers rather than tackle everything sequentially');
 
         const response = await demoSendMessage(page,
-            'Use your spawn_agent tool to create two child agents for parallel research: ' +
-            '(1) spawn_agent name="did-researcher" purpose="Research how decentralized identity DIDs enable agent sovereignty" budget=1.0 ttl=120, ' +
-            'and (2) spawn_agent name="constitution-researcher" purpose="Research how constitutional governance prevents AI misalignment" budget=1.0 ttl=120. ' +
-            'Create both agents now using the spawn_agent tool.',
+            'I need a comprehensive analysis of sovereign AI architecture. ' +
+            'Research two areas in parallel: (1) How decentralized identity (DIDs) enables agent sovereignty, ' +
+            'and (2) How constitutional governance prevents AI misalignment. ' +
+            'Spawn specialist agents to research each area independently, then synthesize their findings.',
             180000 // 3 minutes — spawn + LLM calls take time
         );
 
