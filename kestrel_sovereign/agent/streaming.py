@@ -249,7 +249,6 @@ class StreamingMixin:
         # Fire STOP hook (streaming response cycle complete)
         hooks_manager = getattr(self, "hooks_manager", None)
         if hooks_manager:
-            from kestrel_sovereign.hooks.base import HookInput, HookEvent
             hook_input = HookInput(
                 session_id=session_id or "",
                 hook_event_name=HookEvent.STOP.value,
@@ -268,8 +267,6 @@ class StreamingMixin:
         Returns:
             Possibly modified response_text.
         """
-        from kestrel_sovereign.hooks.base import HookEvent, HookInput, PermissionDecision
-
         hooks_manager = getattr(self, "hooks_manager", None)
         if not hooks_manager or not hooks_manager.get_enabled_hooks(HookEvent.POST_RESPONSE):
             return response_text
