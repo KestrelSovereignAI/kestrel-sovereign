@@ -381,6 +381,13 @@ class KestrelAgent(
             self.model_agent = self.features.get("ModelAgent")
             logging.info("Feature references set up")
 
+            # Pre-explore SpawnFeature so spawn tools are immediately
+            # available to the orchestrator (not behind a subagent hop)
+            spawn_feature = self.features.get("SpawnFeature")
+            if spawn_feature:
+                self._register_explored_feature_tools(spawn_feature)
+                logging.info("SpawnFeature tools pre-explored for direct calling")
+
             # Register all tools with SecurityFeature AFTER all features are loaded
             security = self.features.get("SecurityFeature")
             if security and hasattr(security, '_register_all_tools'):
