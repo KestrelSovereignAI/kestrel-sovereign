@@ -329,6 +329,7 @@ test.describe.serial('Kestrel Spawn Agent Demo', () => {
 
     // ========================================================================
     // Beat 2: "Claw decides to parallelize"
+    // Send message and poll spawn API in parallel — catch children alive
     // ========================================================================
     test('Beat 2: Claw decides to parallelize', async ({ page, request }) => {
         const section = 'Beat 2: Decision to Spawn';
@@ -342,34 +343,61 @@ test.describe.serial('Kestrel Spawn Agent Demo', () => {
             'Sending the research request — the agent will reason about how to approach it',
             'Watch for the agent deciding to spawn specialist workers rather than tackle everything sequentially');
 
-        const response = await demoSendMessage(page,
+        // Send message WITHOUT waiting — we need to poll spawn API while streaming
+        await page.locator('#message-input').fill(
             'I need a comprehensive analysis of sovereign AI architecture. ' +
             'Research two areas in parallel: (1) How decentralized identity (DIDs) enables agent sovereignty, ' +
             'and (2) How constitutional governance prevents AI misalignment. ' +
-            'Spawn specialist agents to research each area independently, then synthesize their findings.',
-            180000 // 3 minutes — spawn + LLM calls take time
+            'Spawn specialist agents to research each area independently, then synthesize their findings.'
         );
+        await page.locator('#send-button').click();
 
-        await demoPause(page, 2000);
+        // Poll spawn API while agent is streaming — catch children alive
+        narrator.narrate(section,
+            'Message sent — polling spawn API to catch children as they appear...',
+            'The agent will call spawn_agent during its response cycle');
 
-        if (response) {
-            const text = await response.textContent().catch(() => '');
-            const mentionsSpawn = text.toLowerCase().includes('spawn') ||
-                                  text.toLowerCase().includes('specialist') ||
-                                  text.toLowerCase().includes('delegat') ||
-                                  text.toLowerCase().includes('parallel');
+        const spawnData = await waitForSpawnChildren(request, 1, 120000);
+
+        if (spawnData.children.length > 0) {
             narrator.narrate(section,
-                mentionsSpawn
-                    ? `Agent decided to parallelize — response mentions spawning/delegation (${text.length} chars)`
-                    : `Agent responded (${text.length} chars) — checking if spawn occurred via API`,
-                'The agent analyzes the task complexity and decides whether to spawn child agents');
+                `${spawnData.children.length} child agent(s) detected while agent is still processing!`,
+                'Children are alive — switching to Spawn panel to screenshot them');
+
+            // Switch to spawn panel to screenshot live children
+            await navigateToPanel(page, 'spawn');
+            await demoPause(page, 2000);
+            await clearHighlights(page);
+            await highlightElement(page, '#spawn-children-list', 'Active Child Agents');
+            await narrator.screenshot(page, 'agent-decides-to-spawn');
+
+            // Switch back to chat and wait for response to complete
+            await navigateToPanel(page, 'chat');
         } else {
-            narrator.narrate(section, 'Waiting for agent response (spawn decisions may take longer)...');
+            narrator.narrate(section,
+                'Children spawned and completed before we could catch them — checking history');
+            await narrator.screenshot(page, 'agent-decides-to-spawn');
         }
 
+        // Now wait for the agent response to finish
+        try {
+            await page.waitForFunction(
+                () => {
+                    const msgs = document.querySelectorAll('.agent-message');
+                    if (msgs.length === 0) return false;
+                    const last = msgs[msgs.length - 1];
+                    return (last.textContent || '').trim().length > 5 &&
+                           !last.querySelector('.streaming');
+                },
+                { timeout: 180000 }
+            );
+        } catch (e) {
+            // Response may have already completed while we were on spawn panel
+        }
+
+        await demoPause(page, 1000);
         await dismissContextWarning(page);
         await scrollChatToBottom(page);
-        await narrator.screenshot(page, 'agent-decides-to-spawn');
     });
 
     // ========================================================================
@@ -384,8 +412,8 @@ test.describe.serial('Kestrel Spawn Agent Demo', () => {
         await navigateToPanel(page, 'spawn');
         await demoPause(page, 2000);
 
-        // Check spawn API for children
-        const spawnData = await waitForSpawnChildren(request, 1, 30000);
+        // Check spawn API — children may be alive or in history by now
+        const spawnData = await getSpawnChildren(request);
 
         if (spawnData.children.length > 0) {
             narrator.narrate(section,
@@ -395,6 +423,14 @@ test.describe.serial('Kestrel Spawn Agent Demo', () => {
             for (const child of spawnData.children) {
                 narrator.narrate(section,
                     `  Child: "${child.name}" — ${child.purpose || 'working'} (status: ${child.status}, budget: ${child.budget_allocated})`);
+            }
+        } else if (spawnData.history.length > 0) {
+            narrator.narrate(section,
+                `Children already completed — ${spawnData.history.length} event(s) in spawn history`,
+                'Children lived and died during the agent response cycle');
+            for (const event of spawnData.history) {
+                narrator.narrate(section,
+                    `  ${event.event}: "${event.child_name}" — ${event.status || 'done'}`);
             }
         } else {
             narrator.narrate(section,
