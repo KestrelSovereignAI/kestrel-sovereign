@@ -3,6 +3,6 @@
     "test:js": "node --test tests/frontend/*.test.mjs"
   },
   "devDependencies": {
-    "@playwright/test": "^1.56.1"
+    "@playwright/test": "^1.58.2"
   }
 }
