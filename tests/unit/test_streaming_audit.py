@@ -143,6 +143,7 @@ class TestRealStreaming:
             '_dispatch_tool_call',
             '_dispatch_feature_tool',
             '_dispatch_direct_tool',
+            '_get_denied_tools',
             '_handle_feature_error',
             '_prune_orchestrator_messages',
             '_build_all_tools',
