@@ -268,6 +268,8 @@ The currently exported `Feature` subclasses discovered from those modules includ
 - [`endpoints/observability.py`](endpoints/observability.py)
   - `GET /api/observability/events`
   - `GET /api/observability/summary`
+- [`endpoints/rasa_shim.py`](endpoints/rasa_shim.py)
+  - `POST /webhooks/rest/webhook`
 - [`endpoints/saved_items.py`](endpoints/saved_items.py)
   - `GET /api/saved-items`
   - `POST /api/saved-items`

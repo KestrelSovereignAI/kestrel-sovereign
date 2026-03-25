@@ -45,7 +45,15 @@ def db_path():
     fd, path = tempfile.mkstemp(suffix=".db")
     os.close(fd)
     yield path
-    os.unlink(path)
+    try:
+        os.unlink(path)
+    except PermissionError:
+        import time
+        time.sleep(0.1)
+        try:
+            os.unlink(path)
+        except PermissionError:
+            pass  # Windows file locking; temp dir cleanup handles it
 
 
 # Registry to track task managers for cleanup
