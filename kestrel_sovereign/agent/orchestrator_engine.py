@@ -275,8 +275,12 @@ class OrchestratorEngineMixin:
                 tool_events.append({'type': 'error', 'tool': tool_name, 'error': reason[:200]})
             return result
 
-        # Subagent hook allowed — execute
-        async def _exec_feature(f=feature, a=args):
+        # Subagent hook allowed — collect denied tools before dispatch
+        denied_tools = await self._get_denied_tools(hook_feature_name)
+        if denied_tools:
+            logging.info(f"[SECURITY] Stripping denied tools from {hook_feature_name}: {denied_tools}")
+
+        async def _exec_feature(f=feature, a=args, dt=denied_tools):
             task = a.get("task", "")
             context = a.get("context")
             if not context and user_message:
@@ -284,7 +288,7 @@ class OrchestratorEngineMixin:
             log_tag = "[STREAM] " if streaming else ""
             logging.info(f"{log_tag}Dispatching to feature subagent: {f.tool_name}")
             with optional_span("agent.feature_dispatch", {"feature.name": f.tool_name}):
-                r = await f.execute_as_subagent(task=task, context=context)
+                r = await f.execute_as_subagent(task=task, context=context, denied_tools=dt)
             self._register_explored_feature_tools(f)
             return r
 
@@ -333,6 +337,47 @@ class OrchestratorEngineMixin:
                 dispatch_event_id, tool_events=tool_events, streaming=streaming,
                 log_traceback=True,
             )
+
+    async def _get_denied_tools(self, feature_name: str) -> set:
+        """Get tools denied by security policy for a feature.
+
+        Queries the permission store to find which of this feature's tools
+        are set to DENY. These tools should be stripped from the subagent's
+        tool palette before dispatch — the LLM cannot call what it cannot see.
+        """
+        try:
+            security_feature = self.features.get("SecurityFeature")
+            if not security_feature:
+                return set()
+
+            store = getattr(security_feature, "permission_store", None)
+            if not store or not callable(getattr(store, "get_permission", None)):
+                return set()
+
+            from kestrel_sovereign.features.security.permissions import PermissionLevel, PermissionStore
+            if not isinstance(store, PermissionStore):
+                return set()
+
+            # Get the actual feature instance to enumerate its tools
+            feature = None
+            for f in self.features.values():
+                if type(f).__name__ == feature_name:
+                    feature = f
+                    break
+
+            if not feature or not callable(getattr(feature, "get_tools", None)):
+                return set()
+
+            denied = set()
+            for tool_obj in feature.get_tools():
+                level = await store.get_permission(feature_name, tool_obj.name)
+                if level == PermissionLevel.DENY:
+                    denied.add(tool_obj.name)
+
+            return denied
+        except Exception as e:
+            logging.debug(f"[SECURITY] Could not check denied tools: {e}")
+            return set()
 
     async def _handle_feature_error(
         self, error, tool_name, hook_feature_name, args, dispatch_start,

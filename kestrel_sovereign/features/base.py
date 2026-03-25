@@ -329,7 +329,8 @@ class Feature(ABC):
         self,
         task: str,
         context: Optional[str] = None,
-        max_iterations: Optional[int] = None
+        max_iterations: Optional[int] = None,
+        denied_tools: Optional[set] = None,
     ) -> Dict[str, Any]:
         """
         Execute this feature as a subagent with its own LLM context.
@@ -338,22 +339,37 @@ class Feature(ABC):
         a feature as a tool, the feature:
         1. Gets its own system prompt (feature-specific)
         2. Receives the task from the orchestrator
-        3. Has access to ITS OWN tools only
+        3. Has access to ITS OWN tools only (minus any denied by security)
         4. Makes its own LLM call(s) to decide what to do
         5. Returns results to the orchestrator
 
         Args:
             task: What the orchestrator wants this feature to do
             context: Optional conversation context from the orchestrator
+            denied_tools: Tool names denied by security policy (stripped from palette)
 
         Returns:
             Dict with success status and result
         """
         try:
-            # Get feature's own tools in OpenAI format
+            # Get feature's own tools, excluding any denied by security policy
+            available_tools = self.get_tools()
+            if denied_tools:
+                available_tools = [t for t in available_tools if t.name not in denied_tools]
+                logger.info(f"Feature {self.name}: stripped {len(denied_tools)} denied tools, {len(available_tools)} remaining")
+
+            # If ALL tools are denied, return immediately with denial
+            if not available_tools and denied_tools:
+                denied_list = ", ".join(sorted(denied_tools))
+                return {
+                    "success": False,
+                    "error": f"All tools in {self.name} are blocked by security policy (denied: {denied_list}). "
+                             f"The requested operation cannot be performed.",
+                }
+
             feature_tools = [
                 tool.schema.to_openai_format()
-                for tool in self.get_tools()
+                for tool in available_tools
             ]
             logger.debug(f"Feature {self.name} has {len(feature_tools)} tools available")
 
