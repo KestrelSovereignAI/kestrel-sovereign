@@ -43,7 +43,7 @@ logger = logging.getLogger(__name__)
 # RealVisXL V5.0 in diffusers format - photorealistic, top-rated SDXL model
 # Used for both training (with text encoder) and inference
 DEFAULT_MODEL_PATH = os.environ.get("LOCAL_MPS_MODEL_PATH", "")
-DEFAULT_WORKING_DIR = os.path.expanduser("~/models/local-training")
+DEFAULT_WORKING_DIR = os.environ.get("LOCAL_MPS_WORKING_DIR", "/Volumes/data2/models/local-training")
 DEFAULT_DIFFUSERS_PATH = os.environ.get("DIFFUSERS_PATH", "")
 
 
@@ -206,8 +206,11 @@ class LocalMPSTrainingAdapter(TrainingProvider):
             # Training parameters
             steps = config.steps or 500
             learning_rate = config.learning_rate or 1e-4
-            resolution = config.resolution or 512  # 512 for memory efficiency on MPS
             lora_rank = config.lora_rank or 128  # High rank for strong identity encoding
+
+            # Diffusers script needs a single int resolution, not multi-res string
+            raw_resolution = config.resolution or "512"
+            resolution = int(str(raw_resolution).split(",")[0].strip())
 
             # Build training command using diffusers script
             training_script = self.diffusers_path / "examples/text_to_image/train_text_to_image_lora_sdxl.py"
@@ -449,35 +452,66 @@ class LocalMPSTrainingAdapter(TrainingProvider):
 
     async def generate_image(
         self,
-        lora_bytes: bytes,
-        prompt: str,
-        config: GenerationConfig | None = None,
+        config: GenerationConfig,
+        session=None,
+        lora_ipfs_cid: str | None = None,
+        ipfs_gateway: str | None = None,
+        flux_version: str | None = None,
+        lora_bytes: bytes | None = None,
     ) -> GenerationResult:
         """
         Generate image with trained LoRA using SDXL on MPS.
 
+        Unified interface matching RunPod/VertexAI adapters.
+        Loads LoRA from config.lora_path (local file) or lora_bytes.
+
         Args:
-            lora_bytes: Trained LoRA weights (.safetensors)
-            prompt: Generation prompt (include trigger word)
-            config: Generation configuration
+            config: Generation configuration (prompt, lora_path, dimensions, etc.)
+            session: Ignored (RunPod compatibility)
+            lora_ipfs_cid: Ignored (no IPFS fetch on local)
+            ipfs_gateway: Ignored
+            flux_version: Ignored (always SDXL on MPS)
+            lora_bytes: Direct LoRA bytes (optional, overrides config.lora_path)
 
         Returns:
             GenerationResult with base64 images
         """
-        # Generation settings - use config if provided, otherwise sensible defaults
+        prompt = config.prompt if config else ""
         num_inference_steps = config.num_inference_steps if config else 30
         guidance_scale = config.guidance_scale if config else 7.5
         width = config.width if config else 1024
         height = config.height if config else 1024
+
+        # Load LoRA bytes from file path if not provided directly
+        if not lora_bytes and config and config.lora_path:
+            lora_file = config.lora_path
+            # Strip file:// prefix if present
+            if lora_file.startswith("file://"):
+                lora_file = lora_file[7:]
+            if Path(lora_file).exists():
+                lora_bytes = Path(lora_file).read_bytes()
+                logger.info(f"Loaded LoRA from {lora_file} ({len(lora_bytes)} bytes)")
+            else:
+                return GenerationResult(
+                    job_id="local-mps", images=[], state=GenerationState.FAILED,
+                    error=f"LoRA file not found: {lora_file}",
+                )
+
+        if not lora_bytes:
+            return GenerationResult(
+                job_id="local-mps", images=[], state=GenerationState.FAILED,
+                error="No LoRA weights provided (no lora_path or lora_bytes)",
+            )
 
         try:
             import torch
             from diffusers import StableDiffusionXLPipeline
         except ImportError as e:
             return GenerationResult(
+                job_id="local-mps",
                 images=[],
                 state=GenerationState.FAILED,
-                error=f"Missing dependencies: {e}",
+                error=f"Missing dependencies: {e}. Install torch and diffusers in the server venv.",
             )
 
         # Load pipeline lazily
@@ -492,12 +526,21 @@ class LocalMPSTrainingAdapter(TrainingProvider):
                     torch_dtype=torch.float16,
                 )
             else:
-                self._pipeline = StableDiffusionXLPipeline.from_pretrained(
-                    model_path_str,
-                    torch_dtype=torch.float16,
-                    variant="fp16",
-                    use_safetensors=True,
-                )
+                try:
+                    self._pipeline = StableDiffusionXLPipeline.from_pretrained(
+                        model_path_str,
+                        torch_dtype=torch.float16,
+                        variant="fp16",
+                        use_safetensors=True,
+                    )
+                except OSError:
+                    # fp16 variant not available, load without variant
+                    logger.info("fp16 variant not available, loading full precision")
+                    self._pipeline = StableDiffusionXLPipeline.from_pretrained(
+                        model_path_str,
+                        torch_dtype=torch.float16,
+                        use_safetensors=True,
+                    )
             self._pipeline.to("mps")
             self._pipeline_loaded = True
 

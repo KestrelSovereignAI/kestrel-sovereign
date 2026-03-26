@@ -92,16 +92,24 @@ class VisualIdentityFeature(Feature):
             self.service = ImageGenerationService()
             self.enabled = self.service.enabled
             if not self.enabled:
-                logger.warning("VisualIdentityFeature disabled (missing REPLICATE_API_TOKEN)")
+                logger.warning("VisualIdentityFeature: Replicate not available")
         else:
             self.service = None
             self.enabled = False
-            logger.warning("VisualIdentityFeature disabled (ImageGenerationService unavailable)")
+            logger.info("VisualIdentityFeature: ImageGenerationService unavailable, checking training providers")
 
         # LoRA training via unified TrainingProviderFactory
         self._training_provider = None  # Lazy-loaded via TrainingProviderFactory
         self._lora_initialized = False
         self.db_pool = None  # Direct db_pool reference for companion lookups
+
+        # Enable feature if a training provider with generation capability exists
+        # (e.g., local_mps can generate selfies without Replicate)
+        if not self.enabled and TRAINING_FACTORY_AVAILABLE:
+            gen_provider = TrainingProviderFactory.get_generation_provider()
+            if gen_provider:
+                self.enabled = True
+                logger.info(f"VisualIdentityFeature enabled via generation provider: {gen_provider.provider_name}")
 
     def _ensure_lora_services(self) -> bool:
         """
@@ -352,10 +360,10 @@ Looking good! Want another one in a different style?"
         Returns:
             {"success": bool, "image_url": str, "scene": str, "used_lora": bool, "trained_this_request": bool, "error": str}
         """
-        if not self.enabled or not self.service:
+        if not self.enabled:
             return {
                 "success": False,
-                "error": "Image generation not available (missing REPLICATE_API_TOKEN)"
+                "error": "Image generation not available (no providers configured)"
             }
 
         # AUTO-FILL companion_id from agent's companion_context if not provided
