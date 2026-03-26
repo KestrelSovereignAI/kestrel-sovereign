@@ -462,8 +462,9 @@ class LocalMPSTrainingAdapter(TrainingProvider):
         """
         Generate image with trained LoRA using SDXL on MPS.
 
-        Unified interface matching RunPod/VertexAI adapters.
-        Loads LoRA from config.lora_path (local file) or lora_bytes.
+        Runs generation as a subprocess using the diffusers venv's Python,
+        same pattern as training. This avoids version conflicts between the
+        server's diffusers and the training/inference diffusers.
 
         Args:
             config: Generation configuration (prompt, lora_path, dimensions, etc.)
@@ -482,120 +483,120 @@ class LocalMPSTrainingAdapter(TrainingProvider):
         width = config.width if config else 1024
         height = config.height if config else 1024
 
-        # Load LoRA bytes from file path if not provided directly
-        if not lora_bytes and config and config.lora_path:
-            lora_file = config.lora_path
-            # Strip file:// prefix if present
-            if lora_file.startswith("file://"):
-                lora_file = lora_file[7:]
-            if Path(lora_file).exists():
-                lora_bytes = Path(lora_file).read_bytes()
-                logger.info(f"Loaded LoRA from {lora_file} ({len(lora_bytes)} bytes)")
-            else:
-                return GenerationResult(
-                    job_id="local-mps", images=[], state=GenerationState.FAILED,
-                    error=f"LoRA file not found: {lora_file}",
-                )
+        # Resolve LoRA path
+        lora_path = None
+        if config and config.lora_path:
+            lora_path = config.lora_path
+            if lora_path.startswith("file://"):
+                lora_path = lora_path[7:]
+        elif lora_bytes:
+            # Save bytes to temp file
+            temp_lora = self.working_dir / "temp_lora.safetensors"
+            temp_lora.write_bytes(lora_bytes)
+            lora_path = str(temp_lora)
 
-        if not lora_bytes:
+        if not lora_path or not Path(lora_path).exists():
             return GenerationResult(
                 job_id="local-mps", images=[], state=GenerationState.FAILED,
-                error="No LoRA weights provided (no lora_path or lora_bytes)",
+                error=f"LoRA file not found: {lora_path}",
             )
 
-        try:
-            import torch
-            from diffusers import StableDiffusionXLPipeline
-        except ImportError as e:
+        # Use diffusers venv Python for generation (avoids version conflicts)
+        diffusers_python = str(self.diffusers_path / ".venv/bin/python3")
+        if not Path(diffusers_python).exists():
             return GenerationResult(
-                job_id="local-mps",
-                images=[],
-                state=GenerationState.FAILED,
-                error=f"Missing dependencies: {e}. Install torch and diffusers in the server venv.",
+                job_id="local-mps", images=[], state=GenerationState.FAILED,
+                error=f"Diffusers Python not found: {diffusers_python}",
             )
 
-        # Load pipeline lazily
-        if not self._pipeline_loaded:
-            logger.info(f"Loading SDXL pipeline from {self.model_path}")
-            model_path_str = str(self.model_path)
+        output_path = self.working_dir / "generated_selfie.png"
 
-            # Handle single safetensors file (like Illustrious XL) vs diffusers directory
-            if model_path_str.endswith(".safetensors"):
-                self._pipeline = StableDiffusionXLPipeline.from_single_file(
-                    model_path_str,
-                    torch_dtype=torch.float16,
-                )
-            else:
-                try:
-                    self._pipeline = StableDiffusionXLPipeline.from_pretrained(
-                        model_path_str,
-                        torch_dtype=torch.float16,
-                        variant="fp16",
-                        use_safetensors=True,
-                    )
-                except (OSError, ValueError):
-                    # fp16 variant not available, load without variant
-                    logger.info("fp16 variant not available, loading full precision")
-                    self._pipeline = StableDiffusionXLPipeline.from_pretrained(
-                        model_path_str,
-                        torch_dtype=torch.float16,
-                        use_safetensors=True,
-                    )
-            self._pipeline.to("mps")
-            self._pipeline_loaded = True
+        # Inline generation script — runs in the diffusers venv
+        script = f"""
+import torch, base64, sys
+from diffusers import StableDiffusionXLPipeline
 
-        # Save LoRA temporarily
-        temp_lora = self.working_dir / "temp_lora.safetensors"
-        temp_lora.write_bytes(lora_bytes)
+pipe = StableDiffusionXLPipeline.from_pretrained(
+    "{self.model_path}",
+    torch_dtype=torch.float16,
+    use_safetensors=True,
+)
+pipe.load_lora_weights("{lora_path}")
+pipe.to("mps")
+
+image = pipe(
+    prompt="{prompt.replace('"', '\\"')}",
+    negative_prompt="",
+    num_inference_steps={num_inference_steps},
+    guidance_scale={guidance_scale},
+    width={width},
+    height={height},
+    generator=torch.Generator(device="mps").manual_seed(42),
+).images[0]
+
+image.save("{output_path}")
+print("OK")
+"""
+        logger.info(f"Generating selfie via subprocess: {prompt[:60]}...")
+        start_time = asyncio.get_event_loop().time()
 
         try:
-            self._pipeline.load_lora_weights(str(temp_lora))
+            process = await asyncio.create_subprocess_exec(
+                diffusers_python, "-c", script,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env={**os.environ, "TOKENIZERS_PARALLELISM": "false"},
+            )
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(), timeout=300,
+            )
 
-            generator = torch.Generator(device="mps").manual_seed(42)
+            elapsed = asyncio.get_event_loop().time() - start_time
 
-            def generate():
-                return self._pipeline(
-                    prompt=prompt,
-                    negative_prompt="",
-                    num_inference_steps=num_inference_steps,
-                    guidance_scale=guidance_scale,
-                    generator=generator,
-                    width=width,
-                    height=height,
-                ).images[0]
+            if process.returncode != 0:
+                error_msg = stderr.decode()[-500:] if stderr else "Unknown error"
+                logger.error(f"Generation subprocess failed: {error_msg}")
+                return GenerationResult(
+                    job_id="local-mps", images=[], state=GenerationState.FAILED,
+                    error=f"Generation failed: {error_msg}",
+                    elapsed_seconds=elapsed,
+                )
 
-            image = await asyncio.to_thread(generate)
+            # Read output image and convert to base64
+            if not output_path.exists():
+                return GenerationResult(
+                    job_id="local-mps", images=[], state=GenerationState.FAILED,
+                    error="Generation produced no output file",
+                    elapsed_seconds=elapsed,
+                )
 
-            # Convert to base64
-            buffered = BytesIO()
-            image.save(buffered, format="PNG")
-            img_base64 = base64.b64encode(buffered.getvalue()).decode()
+            img_bytes = output_path.read_bytes()
+            img_base64 = base64.b64encode(img_bytes).decode()
             data_url = f"data:image/png;base64,{img_base64}"
 
-            self._pipeline.unload_lora_weights()
+            logger.info(f"Selfie generated in {elapsed:.1f}s ({len(img_bytes)} bytes)")
 
             return GenerationResult(
-                job_id="inline-generation",
+                job_id="local-mps",
                 state=GenerationState.COMPLETED,
                 images=[data_url],
+                elapsed_seconds=elapsed,
             )
 
+        except asyncio.TimeoutError:
+            return GenerationResult(
+                job_id="local-mps", images=[], state=GenerationState.FAILED,
+                error="Generation timed out (300s)",
+            )
         except Exception as e:
             logger.error(f"Generation failed: {e}")
-            try:
-                self._pipeline.unload_lora_weights()
-            except Exception:
-                pass
             return GenerationResult(
-                job_id="inline-generation",
-                state=GenerationState.FAILED,
-                images=[],
+                job_id="local-mps", images=[], state=GenerationState.FAILED,
                 error=str(e),
             )
-
         finally:
-            if temp_lora.exists():
-                temp_lora.unlink()
+            if output_path.exists():
+                output_path.unlink()
 
     async def close(self) -> None:
         """Close resources."""
