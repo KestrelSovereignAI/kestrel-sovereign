@@ -533,7 +533,7 @@ class LocalMPSTrainingAdapter(TrainingProvider):
                         variant="fp16",
                         use_safetensors=True,
                     )
-                except OSError:
+                except (OSError, ValueError):
                     # fp16 variant not available, load without variant
                     logger.info("fp16 variant not available, loading full precision")
                     self._pipeline = StableDiffusionXLPipeline.from_pretrained(
