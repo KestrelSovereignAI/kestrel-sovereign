@@ -93,7 +93,7 @@ jobs:
           edges = cursor.fetchone()[0]
           cursor = conn.execute(\"SELECT COUNT(*) FROM graph_nodes WHERE node_type='document'\")
           docs = cursor.fetchone()[0]
-          cursor = conn.execute(\"SELECT COUNT(*) FROM files WHERE filename='KESTREL_CONSTITUTION.md'\")
+          cursor = conn.execute(\"SELECT COUNT(*) FROM files WHERE original_name='KESTREL_CONSTITUTION.md'\")
           files = cursor.fetchone()[0]
           cursor = conn.execute(\"SELECT COUNT(*) FROM document_chunks\")
           chunks = cursor.fetchone()[0]
