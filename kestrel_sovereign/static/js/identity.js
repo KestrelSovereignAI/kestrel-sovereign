@@ -136,23 +136,45 @@ export async function loadIdentity() {
 
         // Avatar: custom image → identicon → kestrel logo
         const fallbackSrc = identiconUrl || '/static/favicon.svg';
-        const avatarHtml = avatarUrl
-            ? `<img src="${avatarUrl}" alt="Avatar" class="identity-avatar-img" onerror="this.src='${fallbackSrc}';">`
-            : `<img src="${fallbackSrc}" alt="Identicon" class="identity-avatar-img">`;
+        const avatarSrc = avatarUrl || fallbackSrc;
 
         const card = document.getElementById('identity-card');
         card.innerHTML = `
             <div class="identity-header">
-                <div class="identity-avatar">${avatarHtml}</div>
+                <div class="identity-avatar-wrapper">
+                    <div class="identity-avatar">
+                        <img src="${avatarSrc}" alt="Avatar" class="identity-avatar-img"
+                             id="identity-avatar-img"
+                             onerror="this.src='${fallbackSrc}';">
+                    </div>
+                    <div class="avatar-actions">
+                        <button id="avatar-upload-btn" title="Upload image">Upload</button>
+                        <button id="avatar-generate-btn" title="Generate with AI">Generate</button>
+                        <input type="file" id="avatar-file-input" accept="image/*" style="display:none;">
+                    </div>
+                </div>
                 <div class="identity-info">
-                    <h2>${identity.name || 'Unnamed Agent'}</h2>
+                    <input type="text" class="profile-editor-name" id="profile-name"
+                           value="${(identity.name || '').replace(/"/g, '&quot;')}"
+                           placeholder="Agent name" maxlength="64">
+                    <textarea class="profile-editor-desc" id="profile-desc"
+                              placeholder="Add a description..." maxlength="500"
+                              rows="1">${identity.description || ''}</textarea>
                     <div class="identity-did" title="${identity.did}">
                         <span class="identity-did-text">${identity.did || 'No DID assigned'}</span>
                         <button onclick="copyToClipboard('${identity.did}')" style="background:none;border:none;cursor:pointer;flex-shrink:0;" title="Copy DID">\u{1F4CB}</button>
                     </div>
                 </div>
             </div>
+            <div class="avatar-generate-panel" id="avatar-generate-panel" style="display:none;">
+                <input type="text" id="avatar-gen-prompt" placeholder="Describe the avatar you want...">
+                <button id="avatar-gen-submit">Generate</button>
+                <div class="avatar-options" id="avatar-options"></div>
+            </div>
         `;
+
+        // Wire up profile editor events
+        _wireProfileEditor(identity);
 
         if (identity.genesis_audit) {
             const auditEl = document.getElementById('genesis-audit');
@@ -171,6 +193,163 @@ export async function loadIdentity() {
         const card = document.getElementById('identity-card');
         if (card) card.innerHTML = `<div style="color: var(--error); padding: 1rem;">Failed to load identity: ${e.message}</div>`;
     }
+}
+
+// ============================================================================
+// Profile Editor Wiring
+// ============================================================================
+
+function _wireProfileEditor(identity) {
+    const nameInput = document.getElementById('profile-name');
+    const descInput = document.getElementById('profile-desc');
+    const uploadBtn = document.getElementById('avatar-upload-btn');
+    const generateBtn = document.getElementById('avatar-generate-btn');
+    const fileInput = document.getElementById('avatar-file-input');
+    const genPanel = document.getElementById('avatar-generate-panel');
+    const genPrompt = document.getElementById('avatar-gen-prompt');
+    const genSubmit = document.getElementById('avatar-gen-submit');
+
+    // --- Name save on blur/Enter ---
+    let savedName = identity.name || '';
+    const saveName = async () => {
+        const newName = nameInput.value.trim();
+        if (!newName || newName === savedName) return;
+        try {
+            await API.updateIdentity({ name: newName });
+            savedName = newName;
+            // Update nav header
+            const navName = document.getElementById('nav-agent-name');
+            if (navName) navName.textContent = newName;
+            Toast.success('Name updated');
+        } catch (e) {
+            Toast.error(`Failed to update name: ${e.message}`);
+            nameInput.value = savedName;
+        }
+    };
+    nameInput.addEventListener('blur', saveName);
+    nameInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') { e.preventDefault(); nameInput.blur(); }
+    });
+
+    // --- Description save on blur ---
+    let savedDesc = identity.description || '';
+    const saveDesc = async () => {
+        const newDesc = descInput.value.trim();
+        if (newDesc === savedDesc) return;
+        try {
+            await API.updateIdentity({ description: newDesc });
+            savedDesc = newDesc;
+            Toast.success('Description updated');
+        } catch (e) {
+            Toast.error(`Failed to update description: ${e.message}`);
+            descInput.value = savedDesc;
+        }
+    };
+    descInput.addEventListener('blur', saveDesc);
+
+    // --- Avatar upload ---
+    uploadBtn.addEventListener('click', () => fileInput.click());
+    fileInput.addEventListener('change', async () => {
+        const file = fileInput.files[0];
+        if (!file) return;
+        try {
+            uploadBtn.textContent = 'Uploading...';
+            uploadBtn.disabled = true;
+            const result = await API.uploadAvatar(file);
+            if (result.avatar_url) {
+                document.getElementById('identity-avatar-img').src = result.avatar_url;
+                // Update nav avatar
+                const navAvatar = document.getElementById('nav-agent-avatar');
+                const navIcon = document.getElementById('nav-agent-icon');
+                if (navAvatar) {
+                    navAvatar.src = result.avatar_url;
+                    navAvatar.style.display = 'block';
+                    if (navIcon) navIcon.style.display = 'none';
+                }
+            }
+            Toast.success('Avatar updated');
+        } catch (e) {
+            Toast.error(`Failed to upload avatar: ${e.message}`);
+        } finally {
+            uploadBtn.textContent = 'Upload';
+            uploadBtn.disabled = false;
+            fileInput.value = '';
+        }
+    });
+
+    // --- Avatar generate toggle ---
+    generateBtn.addEventListener('click', () => {
+        const visible = genPanel.style.display !== 'none';
+        genPanel.style.display = visible ? 'none' : 'block';
+        if (!visible) genPrompt.focus();
+    });
+
+    // --- Avatar generate submit ---
+    const doGenerate = async () => {
+        const desc = genPrompt.value.trim();
+        if (!desc) return;
+        const optionsEl = document.getElementById('avatar-options');
+        try {
+            genSubmit.disabled = true;
+            genSubmit.textContent = 'Generating...';
+            optionsEl.innerHTML = '<span style="font-size:0.75rem;color:var(--text-tertiary);">This may take a moment...</span>';
+
+            const result = await API.generateAvatar(desc);
+
+            if (!result.success) {
+                Toast.error(result.error || 'Generation failed');
+                optionsEl.innerHTML = '';
+                return;
+            }
+
+            // Show generated options as clickable thumbnails
+            optionsEl.innerHTML = '';
+            const urls = result.image_urls || [];
+            for (const url of urls) {
+                const img = document.createElement('img');
+                img.src = url;
+                img.alt = 'Generated avatar option';
+                img.addEventListener('click', async () => {
+                    try {
+                        Toast.info('Setting avatar...');
+                        const setResult = await API.setAvatarFromUrl(url);
+                        if (setResult.avatar_url) {
+                            document.getElementById('identity-avatar-img').src = setResult.avatar_url;
+                            const navAvatar = document.getElementById('nav-agent-avatar');
+                            const navIcon = document.getElementById('nav-agent-icon');
+                            if (navAvatar) {
+                                navAvatar.src = setResult.avatar_url;
+                                navAvatar.style.display = 'block';
+                                if (navIcon) navIcon.style.display = 'none';
+                            }
+                        }
+                        Toast.success('Avatar set!');
+                        genPanel.style.display = 'none';
+                    } catch (e) {
+                        Toast.error(`Failed to set avatar: ${e.message}`);
+                    }
+                });
+                optionsEl.appendChild(img);
+            }
+
+            // If stored_url is available, the first one is already set as primary
+            if (result.stored_url) {
+                document.getElementById('identity-avatar-img').src = result.stored_url;
+                Toast.info('First option auto-saved. Click another to switch.');
+            }
+        } catch (e) {
+            Toast.error(`Generation failed: ${e.message}`);
+            optionsEl.innerHTML = '';
+        } finally {
+            genSubmit.disabled = false;
+            genSubmit.textContent = 'Generate';
+        }
+    };
+
+    genSubmit.addEventListener('click', doGenerate);
+    genPrompt.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') { e.preventDefault(); doGenerate(); }
+    });
 }
 
 // ============================================================================

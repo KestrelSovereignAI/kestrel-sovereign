@@ -24,6 +24,113 @@ from kestrel_sovereign.bootstrap import BootstrapState
 logger = logging.getLogger(__name__)
 
 
+# ------------------------------------------------------------------
+# Shared rename helpers (used by both !rename tool and HTTP endpoint)
+# ------------------------------------------------------------------
+
+async def rename_agent_core(agent, new_name: str) -> tuple[str, bool]:
+    """
+    Rename an agent, updating all stores + SOUL.md.
+
+    Args:
+        agent: KestrelAgent instance
+        new_name: New name (1-64 characters, pre-stripped)
+
+    Returns:
+        (result_message, soul_updated) tuple
+
+    Raises:
+        ValueError: If name is invalid
+        RuntimeError: If rename fails
+    """
+    if not new_name or not new_name.strip():
+        raise ValueError("Name cannot be empty.")
+    new_name = new_name.strip()
+    if len(new_name) > 64:
+        raise ValueError("Name too long. Maximum 64 characters.")
+    if len(new_name) < 1:
+        raise ValueError("Name too short. Minimum 1 character.")
+
+    old_name = getattr(agent, '_agent_name', 'Unknown')
+
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+
+    await agent._raw_storage.db.execute(
+        """
+        INSERT OR REPLACE INTO agent_metadata (agent_id, key, value, updated_at)
+        VALUES (?, ?, ?, ?)
+        """,
+        (agent.agent_id, "name", new_name, now),
+    )
+
+    # Update agent node properties
+    agent_node = await agent.storage.get_node(agent.agent_id)
+    if agent_node:
+        agent_node.properties["name"] = new_name
+        agent_node.label = new_name
+        await agent.storage.add_node(agent_node)
+
+    # Update in-memory reference
+    agent._agent_name = new_name
+
+    # Update bootstrap service name
+    if hasattr(agent, 'bootstrap_service') and agent.bootstrap_service:
+        agent.bootstrap_service.agent_name = new_name
+
+    # Update SOUL.md if it exists
+    soul_updated = await _update_soul_name(agent, old_name, new_name)
+
+    logger.info(f"Agent renamed: {old_name} -> {new_name}")
+    result = f"Renamed from '{old_name}' to '{new_name}'."
+    if soul_updated:
+        result += " SOUL.md updated."
+    return result, soul_updated
+
+
+async def _update_soul_name(agent, old_name: str, new_name: str) -> bool:
+    """Update the agent name in SOUL.md if it exists."""
+    if not hasattr(agent, 'bootstrap_service') or not agent.bootstrap_service:
+        return False
+
+    agent_data_path = agent.bootstrap_service.agent_data_path
+    if not agent_data_path:
+        return False
+
+    soul_path = Path(agent_data_path) / "SOUL.md"
+    if not soul_path.exists():
+        return False
+
+    try:
+        content = soul_path.read_text(encoding="utf-8")
+
+        patterns = [
+            (rf"# SOUL\.md\s*[-\u2014]\s*You Are {re.escape(old_name)}", f"# SOUL.md - You Are {new_name}"),
+            (rf"# SOUL\.md\s*[-\u2014]\s*{re.escape(old_name)}", f"# SOUL.md - {new_name}"),
+            (rf"You're {re.escape(old_name)}", f"You're {new_name}"),
+            (rf"I'm {re.escape(old_name)}", f"I'm {new_name}"),
+        ]
+
+        updated = False
+        for pattern, replacement in patterns:
+            new_content, count = re.subn(pattern, replacement, content, flags=re.IGNORECASE)
+            if count > 0:
+                content = new_content
+                updated = True
+
+        if updated:
+            soul_path.write_text(content, encoding="utf-8")
+            if hasattr(agent, 'context_builder'):
+                agent.context_builder._load_soul_md()
+            return True
+
+        return False
+
+    except Exception as e:
+        logger.warning(f"Failed to update SOUL.md name: {e}")
+        return False
+
+
 class BootstrapFeature(Feature):
     """
     Feature for managing agent bootstrap, discovery, and identity.
@@ -377,55 +484,11 @@ class BootstrapFeature(Feature):
         if not new_name or not new_name.strip():
             return "Please provide a new name. Usage: !rename <new_name>"
 
-        new_name = new_name.strip()
-
-        # Validate name
-        if len(new_name) > 64:
-            return "Name too long. Maximum 64 characters."
-
-        if len(new_name) < 1:
-            return "Name too short. Minimum 1 character."
-
-        # Get current name
-        old_name = getattr(self.agent, '_agent_name', 'Unknown')
-
         try:
-            # Update in agent metadata table
-            from datetime import datetime, timezone
-            now = datetime.now(timezone.utc)
-
-            await self.agent._raw_storage.db.execute(
-                """
-                INSERT OR REPLACE INTO agent_metadata (agent_id, key, value, updated_at)
-                VALUES (?, ?, ?, ?)
-                """,
-                (self.agent.agent_id, "name", new_name, now),
-            )
-
-            # Update agent node properties
-            agent_node = await self.agent.storage.get_node(self.agent.agent_id)
-            if agent_node:
-                agent_node.properties["name"] = new_name
-                agent_node.label = new_name
-                await self.agent.storage.add_node(agent_node)
-
-            # Update in-memory reference
-            self.agent._agent_name = new_name
-
-            # Update bootstrap service name
-            if hasattr(self.agent, 'bootstrap_service') and self.agent.bootstrap_service:
-                self.agent.bootstrap_service.agent_name = new_name
-
-            # Update SOUL.md if it exists
-            soul_updated = await self._update_soul_name(old_name, new_name)
-
-            result = f"Renamed from '{old_name}' to '{new_name}'."
-            if soul_updated:
-                result += " SOUL.md updated."
-
-            logger.info(f"Agent renamed: {old_name} -> {new_name}")
+            result, _ = await rename_agent_core(self.agent, new_name)
             return result
-
+        except ValueError as e:
+            return str(e)
         except Exception as e:
             logger.error(f"Failed to rename agent: {e}")
             return f"Failed to rename: {str(e)}"
@@ -459,53 +522,5 @@ class BootstrapFeature(Feature):
         return None
 
     async def _update_soul_name(self, old_name: str, new_name: str) -> bool:
-        """
-        Update the agent name in SOUL.md if it exists.
-
-        Returns:
-            True if SOUL.md was updated
-        """
-        if not hasattr(self.agent, 'bootstrap_service') or not self.agent.bootstrap_service:
-            return False
-
-        agent_data_path = self.agent.bootstrap_service.agent_data_path
-        if not agent_data_path:
-            return False
-
-        soul_path = Path(agent_data_path) / "SOUL.md"
-        if not soul_path.exists():
-            return False
-
-        try:
-            content = soul_path.read_text(encoding="utf-8")
-
-            # Update the header: "# SOUL.md - You Are OldName" -> "# SOUL.md - You Are NewName"
-            # Also handle variations like "# SOUL.md - OldName" or "# SOUL.md -- You Are OldName"
-            patterns = [
-                (rf"# SOUL\.md\s*[-\u2014]\s*You Are {re.escape(old_name)}", f"# SOUL.md - You Are {new_name}"),
-                (rf"# SOUL\.md\s*[-\u2014]\s*{re.escape(old_name)}", f"# SOUL.md - {new_name}"),
-                (rf"You're {re.escape(old_name)}", f"You're {new_name}"),
-                (rf"I'm {re.escape(old_name)}", f"I'm {new_name}"),
-            ]
-
-            updated = False
-            for pattern, replacement in patterns:
-                new_content, count = re.subn(pattern, replacement, content, flags=re.IGNORECASE)
-                if count > 0:
-                    content = new_content
-                    updated = True
-
-            if updated:
-                soul_path.write_text(content, encoding="utf-8")
-
-                # Reload SOUL.md into context builder
-                if hasattr(self.agent, 'context_builder'):
-                    self.agent.context_builder._load_soul_md()
-
-                return True
-
-            return False
-
-        except Exception as e:
-            logger.warning(f"Failed to update SOUL.md name: {e}")
-            return False
+        """Update the agent name in SOUL.md. Delegates to module-level helper."""
+        return await _update_soul_name(self.agent, old_name, new_name)
