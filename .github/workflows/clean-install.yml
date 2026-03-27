@@ -89,7 +89,7 @@ jobs:
           import sqlite3
           conn = sqlite3.connect('$DB_PATH')
           # Constitution is stored as a file and linked via graph edge 'governed_by'
-          cursor = conn.execute(\"SELECT COUNT(*) FROM graph_edges WHERE edge_type='governed_by'\")
+          cursor = conn.execute(\"SELECT COUNT(*) FROM graph_edges WHERE label='governed_by'\")
           edges = cursor.fetchone()[0]
           cursor = conn.execute(\"SELECT COUNT(*) FROM graph_nodes WHERE node_type='document'\")
           docs = cursor.fetchone()[0]
