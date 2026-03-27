@@ -139,16 +139,16 @@ jobs:
       # Step 8: Start agent and verify health endpoint (QUICKSTART Step 6)
       - name: Start agent and verify health endpoint
         run: |
-          # Start agent in background (first agent gets port 8801)
+          # Start agent in background (rookery assigns port 8802 to first agent)
           uv run kestrel start CITestAgent &
           START_PID=$!
 
           # Wait for health endpoint (up to 30 seconds)
           echo "Waiting for agent health endpoint..."
           for i in $(seq 1 30); do
-            if curl -sf http://localhost:8801/health > /dev/null 2>&1; then
-              echo "PASS: Agent health endpoint responding on port 8801"
-              HEALTH=$(curl -s http://localhost:8801/health)
+            if curl -sf http://localhost:8802/health > /dev/null 2>&1; then
+              echo "PASS: Agent health endpoint responding on port 8802"
+              HEALTH=$(curl -s http://localhost:8802/health)
               echo "Health response: $HEALTH"
 
               # Stop agent
