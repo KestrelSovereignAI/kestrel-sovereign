@@ -243,6 +243,9 @@ The currently exported `Feature` subclasses discovered from those modules includ
   - `POST /api/agents`
   - `DELETE /api/agents/{agent_name}`
   - `GET /api/identity`
+  - `PATCH /api/identity`
+  - `POST /api/identity/avatar`
+  - `POST /api/identity/avatar/generate`
   - `GET /api/constitution`
   - `GET /api/ipfs/status`
   - `GET /api/wallet`
