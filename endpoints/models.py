@@ -1,8 +1,10 @@
 """Model, wallet, and IPFS status endpoints."""
-from fastapi import APIRouter, HTTPException, Request, Query
+from fastapi import APIRouter, HTTPException, Request, Query, UploadFile, File
+from fastapi.responses import Response
 from pydantic import BaseModel, Field
 from typing import Optional, List
 import aiohttp
+import httpx
 import re
 import time
 import logging
@@ -11,6 +13,7 @@ from kestrel_sovereign.kestrel_config.defaults import get_ipfs_api_url
 from kestrel_sovereign.llm.model_metadata import ModelCategory
 from kestrel_sovereign.sql_utils import safe_column_name
 from kestrel_sovereign.rate_limit import limiter
+from kestrel_sovereign.features.bootstrap.feature import rename_agent_core
 from endpoints.agent_helpers import get_agent
 
 logger = logging.getLogger(__name__)
@@ -149,12 +152,26 @@ async def get_identity(request: Request):
         avatar_hash = agent_node.properties.get("avatar_hash") if agent_node else None
         avatar_url = f"/api/files/{avatar_hash}" if avatar_hash else None
 
-        # Get agent name from node properties
+        # Get agent name and description from node properties
         agent_name = agent_node.properties.get("name") if agent_node else None
+        description = agent_node.properties.get("description") if agent_node else None
+
+        # Fall back to agent_metadata table for description
+        if description is None:
+            try:
+                row = await agent._raw_storage.db.fetchone(
+                    "SELECT value FROM agent_metadata WHERE agent_id = ? AND key = ?",
+                    (agent.agent_id, "description"),
+                )
+                if row:
+                    description = row[0]
+            except Exception:
+                pass
 
         return {
             "did": agent.agent_id,
             "name": agent_name,
+            "description": description,
             "node_type": agent_node.node_type if agent_node else "agent",
             "created_at": agent_node.properties.get("created_at") if agent_node else None,
             "constitution_hash": agent_node.properties.get("constitution_hash") if agent_node else None,
@@ -164,6 +181,190 @@ async def get_identity(request: Request):
     except Exception as e:
         logger.error(f"Error getting identity: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Error retrieving identity.")
+
+
+# ------------------------------------------------------------------
+# Identity update endpoints
+# ------------------------------------------------------------------
+
+class UpdateIdentityRequest(BaseModel):
+    """Request body for updating agent identity."""
+    name: Optional[str] = Field(None, min_length=1, max_length=64)
+    description: Optional[str] = Field(None, max_length=500)
+
+
+class SetAvatarUrlRequest(BaseModel):
+    """Request body for setting avatar from URL."""
+    url: str = Field(..., min_length=1)
+
+
+class GenerateAvatarRequest(BaseModel):
+    """Request body for AI avatar generation."""
+    description: str = Field(..., min_length=1, max_length=1000)
+    num_outputs: int = Field(2, ge=1, le=4)
+
+
+_AVATAR_MIME_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
+_AVATAR_MAX_SIZE = 10 * 1024 * 1024  # 10 MB
+
+
+@router.patch("/api/identity")
+@limiter.limit("10/minute")
+async def update_identity(request: Request, body: UpdateIdentityRequest):
+    """Update agent name and/or description."""
+    try:
+        agent = get_agent(request)
+
+        if body.name is None and body.description is None:
+            raise HTTPException(status_code=422, detail="At least one of 'name' or 'description' required.")
+
+        updated_fields = []
+
+        if body.name is not None:
+            try:
+                await rename_agent_core(agent, body.name)
+                updated_fields.append("name")
+            except ValueError as e:
+                raise HTTPException(status_code=422, detail=str(e))
+
+        if body.description is not None:
+            from datetime import datetime, timezone
+            now = datetime.now(timezone.utc)
+            await agent._raw_storage.db.execute(
+                """
+                INSERT OR REPLACE INTO agent_metadata (agent_id, key, value, updated_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (agent.agent_id, "description", body.description, now),
+            )
+            # Also update node properties
+            agent_node = await agent.storage.get_node(agent.agent_id)
+            if agent_node:
+                agent_node.properties["description"] = body.description
+                await agent.storage.add_node(agent_node)
+            updated_fields.append("description")
+
+        # Return updated identity
+        agent_node = await agent.storage.get_node(agent.agent_id)
+        avatar_hash = agent_node.properties.get("avatar_hash") if agent_node else None
+
+        return {
+            "success": True,
+            "updated_fields": updated_fields,
+            "did": agent.agent_id,
+            "name": agent_node.properties.get("name") if agent_node else None,
+            "description": agent_node.properties.get("description") if agent_node else None,
+            "avatar_hash": avatar_hash,
+            "avatar_url": f"/api/files/{avatar_hash}" if avatar_hash else None,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error updating identity: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Error updating identity.")
+
+
+@router.post("/api/identity/avatar")
+@limiter.limit("10/minute")
+async def set_avatar(request: Request, file: Optional[UploadFile] = File(None)):
+    """Set agent avatar from file upload or URL.
+
+    Accepts either:
+    - multipart/form-data with a 'file' field (image upload)
+    - application/json with {"url": "https://..."} (set from URL)
+    """
+    try:
+        agent = get_agent(request)
+        storage = agent.storage
+        if not storage or not hasattr(storage, 'files'):
+            raise HTTPException(status_code=503, detail="File storage not available.")
+
+        image_data: bytes
+        source_url: Optional[str] = None
+
+        content_type = request.headers.get("content-type", "")
+
+        if "multipart/form-data" in content_type and file:
+            # File upload
+            if file.content_type and file.content_type not in _AVATAR_MIME_TYPES:
+                raise HTTPException(status_code=400, detail=f"Invalid image type '{file.content_type}'. Allowed: {', '.join(_AVATAR_MIME_TYPES)}")
+            image_data = await file.read()
+            if len(image_data) > _AVATAR_MAX_SIZE:
+                raise HTTPException(status_code=400, detail=f"File too large. Maximum {_AVATAR_MAX_SIZE // (1024*1024)} MB.")
+            if len(image_data) == 0:
+                raise HTTPException(status_code=400, detail="Empty file.")
+        elif "application/json" in content_type:
+            # URL-based
+            body = await request.json()
+            url = body.get("url")
+            if not url:
+                raise HTTPException(status_code=422, detail="Missing 'url' field.")
+            source_url = url
+            try:
+                async with httpx.AsyncClient(timeout=30.0) as client:
+                    resp = await client.get(url)
+                    resp.raise_for_status()
+                    image_data = resp.content
+            except httpx.HTTPError as e:
+                raise HTTPException(status_code=400, detail=f"Failed to download image: {e}")
+            if len(image_data) > _AVATAR_MAX_SIZE:
+                raise HTTPException(status_code=400, detail="Downloaded image too large.")
+            if len(image_data) == 0:
+                raise HTTPException(status_code=400, detail="Downloaded image is empty.")
+        else:
+            raise HTTPException(status_code=400, detail="Send multipart/form-data with file or application/json with url.")
+
+        avatar_hash = await storage.files.store_avatar(
+            image_data=image_data,
+            agent_id=agent.agent_id,
+            avatar_type="primary",
+            source_url=source_url,
+        )
+
+        return {
+            "success": True,
+            "avatar_hash": avatar_hash,
+            "avatar_url": f"/api/files/{avatar_hash}",
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error setting avatar: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Error setting avatar.")
+
+
+@router.post("/api/identity/avatar/generate")
+@limiter.limit("3/minute")
+async def generate_avatar(request: Request, body: GenerateAvatarRequest):
+    """Generate avatar options using AI image generation.
+
+    Requires VisualIdentityFeature to be enabled (REPLICATE_API_TOKEN set).
+    """
+    try:
+        agent = get_agent(request)
+
+        if not hasattr(agent, 'features'):
+            raise HTTPException(status_code=503, detail="Agent features not available.")
+
+        visual_identity = agent.features.get("VisualIdentityFeature")
+        if not visual_identity:
+            raise HTTPException(status_code=503, detail="Image generation not available. VisualIdentityFeature not loaded.")
+
+        result = await visual_identity.generate_avatar(body.description, body.num_outputs)
+
+        if not result.get("success"):
+            error_msg = result.get("error", "Unknown error")
+            raise HTTPException(status_code=503, detail=f"Avatar generation failed: {error_msg}")
+
+        return result
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error generating avatar: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Error generating avatar.")
 
 
 @router.get("/api/constitution")
