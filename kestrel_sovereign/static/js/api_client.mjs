@@ -157,9 +157,14 @@ export function createApiClient({
         },
 
         async request(endpoint, options = {}, retried = false) {
+            const headers = buildHeaders(options.headers);
+            // Let the browser set Content-Type for FormData (multipart boundary)
+            if (options.body instanceof FormData) {
+                delete headers['Content-Type'];
+            }
             const response = await fetchImpl(rewrite(endpoint), {
-                headers: buildHeaders(options.headers),
                 ...options,
+                headers,
             });
 
             if (response.status === 401 && !retried) {
@@ -214,6 +219,26 @@ export function createApiClient({
         getAgentInfo: () => client.request('/agent/info'),
         getAgents: () => client.request('/api/agents'),
         getIdentity: () => client.request('/api/identity'),
+        updateIdentity: (data) => client.request('/api/identity', {
+            method: 'PATCH',
+            body: JSON.stringify(data),
+        }),
+        uploadAvatar: (file) => {
+            const formData = new FormData();
+            formData.append('file', file);
+            return client.request('/api/identity/avatar', {
+                method: 'POST',
+                body: formData,
+            });
+        },
+        setAvatarFromUrl: (url) => client.request('/api/identity/avatar', {
+            method: 'POST',
+            body: JSON.stringify({ url }),
+        }),
+        generateAvatar: (description, numOutputs = 2) => client.request('/api/identity/avatar/generate', {
+            method: 'POST',
+            body: JSON.stringify({ description, num_outputs: numOutputs }),
+        }),
         getConstitution: () => client.request('/api/constitution'),
         getPrivacyMode: () => client.request('/agent/privacy-mode'),
         setPrivacyMode: (mode) => client.request('/agent/privacy-mode', { method: 'POST', body: JSON.stringify({ mode }) }),
