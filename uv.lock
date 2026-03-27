@@ -2737,9 +2737,10 @@ test = [
 [[package]]
 name = "kestrel-talon"
 version = "0.1.0"
-source = { git = "https://github.com/KestrelSovereignAI/kestrel-talon.git#a72a7e61003bf4e3b45abc7b3eae8b53d96d0bc9" }
+source = { git = "https://github.com/KestrelSovereignAI/kestrel-talon.git#4966d8e35eee6dd296dc9769b4f8eada1aa0bb6a" }
 dependencies = [
     { name = "claude-agent-sdk" },
+    { name = "cryptography" },
     { name = "pygithub" },
     { name = "python-dotenv" },
     { name = "pyyaml" },
