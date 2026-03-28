@@ -1,0 +1,34 @@
+# Talon Daemon Configuration
+# Continuous GitHub issue processing for Mac Studio M3 Ultra
+
+[daemon]
+poll_interval = 300          # 5 minutes between polls
+cooldown = 60                # 1 minute between issues (KV cache turnover)
+backend = "claude"           # "claude" (Max OAuth) or "opencode" (local Kimi)
+model = "opus"               # Claude model when backend=claude
+opencode_model = "kimi-local/kimi-k2.5"  # Model when backend=opencode
+gh_user = "UncleSaurus"
+max_daily_issues = 50
+worktree = true              # Process in isolated worktrees
+skip_clarification = true    # Skip analysis phase, go straight to implementation
+self_review = true           # Review diff for wiring bugs before commit
+verbose = false              # Set true to stream agent output to stderr
+
+# Pause processing: touch /tmp/talon-daemon-pause
+# Resume: rm /tmp/talon-daemon-pause
+
+[[repos]]
+repo = "KestrelSovereignAI/kestrel-sovereign"
+repo_dir = "/Volumes/data2/projects/kestrel-sovereign"
+label = "enhancement"
+quality_checks = ["./run_tests.py --unit --skip-check"]
+max_iterations = 1
+max_turns = 50
+
+[[repos]]
+repo = "KestrelSovereignAI/frinz"
+repo_dir = "/Volumes/data2/projects/frinz"
+label = "enhancement"
+quality_checks = ["uv run pytest tests/ -x --timeout=60"]
+max_iterations = 1
+max_turns = 50
