@@ -478,7 +478,7 @@ class LocalMPSTrainingAdapter(TrainingProvider):
             GenerationResult with base64 images
         """
         prompt = config.prompt if config else ""
-        num_inference_steps = config.num_inference_steps if config else 30
+        num_inference_steps = config.num_inference_steps if config else 40
         guidance_scale = config.guidance_scale if config else 7.5
         width = config.width if config else 1024
         height = config.height if config else 1024
@@ -526,7 +526,7 @@ pipe.to("mps")
 
 image = pipe(
     prompt="{prompt.replace('"', '\\"')}",
-    negative_prompt="",
+    negative_prompt="deformed, bad anatomy, missing limbs, extra limbs, missing arms, extra arms, missing fingers, extra fingers, mutated hands, blurry, low quality",
     num_inference_steps={num_inference_steps},
     guidance_scale={guidance_scale},
     width={width},
