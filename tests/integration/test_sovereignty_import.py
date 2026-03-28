@@ -85,6 +85,8 @@ async def test_export_import_roundtrip(temp_db):
         assert stats['messages_restored'] == 4
         assert stats['shards_restored'] > 0
         assert stats['agent_did'] == agent_did
+        assert stats['manifest_version'] == "3.0"
+        assert 'assets_restored' in stats
         print(f"✅ Imported {stats['messages_restored']} messages")
 
         # 5. Verify restored data matches original

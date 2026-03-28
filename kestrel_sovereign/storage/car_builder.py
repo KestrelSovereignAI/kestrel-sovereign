@@ -292,6 +292,28 @@ class CARBuilder:
             self._blocks.append((cid_bytes, cbor_data))
         return cid_str
 
+    def add_external_ref(self, external_cid: str, ref_type: str = "external_ref") -> str:
+        """
+        Add a dag-cbor link node that references an existing IPFS CID.
+
+        This avoids re-downloading large assets (e.g. 170MB LoRA weights)
+        just to re-upload them.  The CAR archive stores a small link node
+        instead of the full blob.
+
+        Args:
+            external_cid: The existing IPFS CID to reference
+            ref_type: Label for the reference type (default ``"external_ref"``)
+
+        Returns:
+            CID string of the link node (for inclusion in the manifest)
+        """
+        link_cid_bytes = cid_string_to_bytes(external_cid)
+        link_obj = {
+            "link": make_cid_link(link_cid_bytes),
+            "type": ref_type,
+        }
+        return self.add_dag_cbor_block(link_obj)
+
     def set_root(self, cid_str: str) -> None:
         """
         Set the root CID of the CAR archive.
