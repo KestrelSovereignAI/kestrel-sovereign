@@ -42,6 +42,19 @@ from .privacy_wrapper import (
     wrap_storage_with_privacy,
 )
 
+# Import sovereignty types
+from .sovereign_adapter import (
+    SovereignStorageAdapter,
+    RootManifest,
+    ShardMetadata,
+    AssetDescriptor,
+    AssetMetadata,
+    AssetCollector,
+)
+
+# Import CAR builder/reader
+from .car_builder import CARBuilder, CARReader
+
 # Import memory system components
 from .memory_models import (
     MemoryMetadata,
@@ -107,6 +120,15 @@ __all__ = [
     "DecryptionError",
     # Utilities
     "get_default_agent_data_dir",
+    # Sovereignty
+    "SovereignStorageAdapter",
+    "RootManifest",
+    "ShardMetadata",
+    "AssetDescriptor",
+    "AssetMetadata",
+    "AssetCollector",
+    "CARBuilder",
+    "CARReader",
     # Backward compatibility
     "Storage",
 ]
