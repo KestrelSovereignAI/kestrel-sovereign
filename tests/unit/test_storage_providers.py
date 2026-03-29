@@ -972,3 +972,265 @@ class TestSyncManifest:
         assert len(manifest.items) == 2
         assert manifest.total_bytes == 3072
         assert manifest.estimated_cost_usd == Decimal("0.001")
+
+
+# =============================================================================
+# FilebaseProvider Tests
+# =============================================================================
+
+class TestFilebaseProvider:
+    """Tests for FilebaseProvider (S3-compatible IPFS storage)."""
+
+    @pytest.mark.asyncio
+    async def test_filebase_provider_creation_without_credentials(self):
+        """Test FilebaseProvider creation without credentials."""
+        # Import here to avoid import errors if boto3 not installed
+        try:
+            from kestrel_sovereign.storage.providers.filebase_provider import FilebaseProvider
+        except ImportError:
+            pytest.skip("boto3 not installed")
+
+        provider = FilebaseProvider(
+            api_key="",
+            api_key_secret="",
+        )
+
+        assert provider.provider_name == "filebase"
+        assert provider.tier == StorageTier.CLOUD_HOT
+        assert provider.is_available() is False
+
+    @pytest.mark.asyncio
+    async def test_filebase_provider_with_mocked_s3(self):
+        """Test FilebaseProvider with mocked boto3 S3 client."""
+        try:
+            from kestrel_sovereign.storage.providers.filebase_provider import FilebaseProvider
+        except ImportError:
+            pytest.skip("boto3 not installed")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Create provider with mock credentials
+            provider = FilebaseProvider(
+                api_key="test_key",
+                api_key_secret="test_secret",
+                bucket_name="test-bucket",
+                cache_dir=tmpdir,
+            )
+
+            # Mock the S3 client
+            mock_s3_client = MagicMock()
+            mock_s3_client.head_bucket = MagicMock()
+            mock_s3_client.put_object = MagicMock()
+            mock_s3_client.head_object = MagicMock(return_value={
+                "Metadata": {"cid": "QmTestCID123"},
+                "ResponseMetadata": {"HTTPHeaders": {}},
+            })
+            mock_s3_client.get_object = MagicMock(return_value={
+                "Body": MagicMock(read=lambda: b"test content"),
+            })
+
+            provider._s3_client = mock_s3_client
+            provider._available = True
+
+            # Test store
+            content = b"Hello, Filebase!"
+            result = await provider.store(content, encrypt=False)
+
+            assert result.provider == "filebase"
+            assert result.tier == StorageTier.CLOUD_HOT
+            assert result.content_hash == hashlib.sha256(content).hexdigest()
+            assert result.cid == "QmTestCID123"
+            assert result.size_bytes == len(content)
+
+            # Verify S3 put_object was called
+            mock_s3_client.put_object.assert_called_once()
+            call_args = mock_s3_client.put_object.call_args
+            assert call_args[1]["Bucket"] == "test-bucket"
+            assert call_args[1]["Body"] == content
+
+    @pytest.mark.asyncio
+    async def test_filebase_provider_retrieve_with_mock(self):
+        """Test retrieving content from Filebase with mock."""
+        try:
+            from kestrel_sovereign.storage.providers.filebase_provider import FilebaseProvider
+        except ImportError:
+            pytest.skip("boto3 not installed")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            provider = FilebaseProvider(
+                api_key="test_key",
+                api_key_secret="test_secret",
+                bucket_name="test-bucket",
+                cache_dir=tmpdir,
+            )
+
+            # Mock S3 client
+            content = b"test retrieve content"
+            mock_s3_client = MagicMock()
+            mock_s3_client.head_bucket = MagicMock()
+            mock_s3_client.get_object = MagicMock(return_value={
+                "Body": MagicMock(read=lambda: content),
+            })
+
+            provider._s3_client = mock_s3_client
+            provider._available = True
+
+            # Store in index for retrieval
+            content_hash = hashlib.sha256(content).hexdigest()
+            await provider._update_index(StorageResult(
+                content_hash=content_hash,
+                cid="QmTestCID",
+                tier=StorageTier.CLOUD_HOT,
+                provider="filebase",
+                size_bytes=len(content),
+                filename="test.bin",
+            ))
+
+            # Test retrieve
+            retrieved = await provider.retrieve("QmTestCID")
+            assert retrieved == content
+
+    @pytest.mark.asyncio
+    async def test_filebase_provider_list_content(self):
+        """Test listing content from Filebase provider."""
+        try:
+            from kestrel_sovereign.storage.providers.filebase_provider import FilebaseProvider
+        except ImportError:
+            pytest.skip("boto3 not installed")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            provider = FilebaseProvider(
+                api_key="test_key",
+                api_key_secret="test_secret",
+                cache_dir=tmpdir,
+            )
+
+            # Add some items to index
+            for i in range(3):
+                content_hash = f"hash{i}"
+                await provider._update_index(StorageResult(
+                    content_hash=content_hash,
+                    cid=f"QmCID{i}",
+                    tier=StorageTier.CLOUD_HOT,
+                    provider="filebase",
+                    size_bytes=1024 * i,
+                ))
+
+            # List content
+            items = await provider.list_content()
+            assert len(items) == 3
+            assert all(item.provider == "filebase" for item in items)
+
+    @pytest.mark.asyncio
+    async def test_filebase_provider_stats(self):
+        """Test getting provider stats."""
+        try:
+            from kestrel_sovereign.storage.providers.filebase_provider import FilebaseProvider
+        except ImportError:
+            pytest.skip("boto3 not installed")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            provider = FilebaseProvider(
+                api_key="test_key",
+                api_key_secret="test_secret",
+                bucket_name="test-bucket",
+                endpoint_url="https://s3.filebase.com",
+                cache_dir=tmpdir,
+            )
+
+            stats = await provider.get_stats()
+
+            assert stats["provider"] == "filebase"
+            assert stats["tier"] == "cloud_hot"
+            assert stats["bucket"] == "test-bucket"
+            assert stats["endpoint"] == "https://s3.filebase.com"
+            assert "free_tier_bytes" in stats
+
+    @pytest.mark.asyncio
+    async def test_filebase_provider_estimate_cost(self):
+        """Test cost estimation."""
+        try:
+            from kestrel_sovereign.storage.providers.filebase_provider import FilebaseProvider
+        except ImportError:
+            pytest.skip("boto3 not installed")
+
+        provider = FilebaseProvider(
+            api_key="test_key",
+            api_key_secret="test_secret",
+        )
+
+        # Within free tier
+        cost = await provider.estimate_cost(1024 * 1024)  # 1 MB
+        assert cost == Decimal("0")
+
+        # Above free tier (5 GB)
+        cost = await provider.estimate_cost(6 * 1024 * 1024 * 1024)  # 6 GB
+        assert cost > Decimal("0")
+
+    @pytest.mark.asyncio
+    async def test_filebase_provider_cid_extraction(self):
+        """Test CID extraction from Filebase response."""
+        try:
+            from kestrel_sovereign.storage.providers.filebase_provider import FilebaseProvider
+        except ImportError:
+            pytest.skip("boto3 not installed")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            provider = FilebaseProvider(
+                api_key="test_key",
+                api_key_secret="test_secret",
+                bucket_name="test-bucket",
+                cache_dir=tmpdir,
+            )
+
+            # Mock S3 client with CID in metadata
+            mock_s3_client = MagicMock()
+            mock_s3_client.head_bucket = MagicMock()
+            mock_s3_client.put_object = MagicMock()
+
+            # Test CID in Metadata field
+            mock_s3_client.head_object = MagicMock(return_value={
+                "Metadata": {"cid": "QmTestCIDFromMetadata"},
+                "ResponseMetadata": {"HTTPHeaders": {}},
+            })
+
+            provider._s3_client = mock_s3_client
+            provider._available = True
+
+            content = b"test cid extraction"
+            result = await provider.store(content, encrypt=False)
+
+            assert result.cid == "QmTestCIDFromMetadata"
+
+    @pytest.mark.asyncio
+    async def test_filebase_provider_fallback_to_content_hash_if_no_cid(self):
+        """Test fallback to content_hash if CID not in response."""
+        try:
+            from kestrel_sovereign.storage.providers.filebase_provider import FilebaseProvider
+        except ImportError:
+            pytest.skip("boto3 not installed")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            provider = FilebaseProvider(
+                api_key="test_key",
+                api_key_secret="test_secret",
+                bucket_name="test-bucket",
+                cache_dir=tmpdir,
+            )
+
+            # Mock S3 client without CID in response
+            mock_s3_client = MagicMock()
+            mock_s3_client.head_bucket = MagicMock()
+            mock_s3_client.put_object = MagicMock()
+            mock_s3_client.head_object = MagicMock(return_value={
+                "Metadata": {},
+                "ResponseMetadata": {"HTTPHeaders": {}},
+            })
+
+            provider._s3_client = mock_s3_client
+            provider._available = True
+
+            content = b"test fallback"
+            result = await provider.store(content, encrypt=False)
+
+            # Should fallback to content_hash
+            assert result.cid == hashlib.sha256(content).hexdigest()
