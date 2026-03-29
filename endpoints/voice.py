@@ -6,6 +6,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from endpoints.agent_helpers import get_agent
+from kestrel_sovereign.features.voice.feature import VoicePrivacyError
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +63,16 @@ async def list_voices(request: Request, provider: str = "") -> dict:
     """List available TTS voices, filtered by current privacy mode."""
     agent = get_agent(request)
     vf = _get_voice_feature(agent)
+
+    # If a specific cloud provider is requested and privacy blocks it, return 403
+    if provider and not vf.is_provider_allowed(provider, "tts"):
+        mode_name = vf._get_privacy_mode_name()
+        raise HTTPException(
+            status_code=403,
+            detail=f"Cannot list voices from '{provider}' in {mode_name} privacy mode. "
+                   f"Only local providers are allowed.",
+        )
+
     try:
         return await vf.list_voices(provider=provider)
     except Exception as e:
@@ -74,7 +85,9 @@ async def get_voice_config(request: Request) -> dict:
     """Get the agent's current voice configuration."""
     agent = get_agent(request)
     vf = _get_voice_feature(agent)
-    return vf._voice_config.to_dict()
+    config = vf._voice_config.to_dict()
+    config["audio_storage_policy"] = vf._get_audio_storage_policy()
+    return config
 
 
 @router.post("/config")
@@ -82,6 +95,22 @@ async def set_voice_config(request: Request, body: VoiceConfigRequest) -> dict:
     """Set the agent's voice configuration."""
     agent = get_agent(request)
     vf = _get_voice_feature(agent)
+
+    # Validate requested providers against privacy mode before applying
+    if body.tts_provider and not vf.is_provider_allowed(body.tts_provider, "tts"):
+        mode_name = vf._get_privacy_mode_name()
+        raise HTTPException(
+            status_code=403,
+            detail=f"Cannot use '{body.tts_provider}' TTS provider in {mode_name} privacy mode. "
+                   f"Install piper-tts for local TTS, or switch to 'anonymous' or higher privacy mode.",
+        )
+    if body.stt_provider and not vf.is_provider_allowed(body.stt_provider, "stt"):
+        mode_name = vf._get_privacy_mode_name()
+        raise HTTPException(
+            status_code=403,
+            detail=f"Cannot use '{body.stt_provider}' STT provider in {mode_name} privacy mode. "
+                   f"Install faster-whisper for local STT, or switch to 'anonymous' or higher privacy mode.",
+        )
 
     from kestrel_sovereign.voice.base import VoiceConfig
 
@@ -116,6 +145,8 @@ async def synthesize_speech(request: Request, body: TTSRequest) -> Response:
 
     try:
         tts = await vf._get_tts_provider()
+    except VoicePrivacyError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=503, detail=str(e))
 
@@ -151,6 +182,8 @@ async def synthesize_speech_stream(request: Request, body: TTSRequest) -> Stream
 
     try:
         tts = await vf._get_tts_provider()
+    except VoicePrivacyError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=503, detail=str(e))
 
@@ -198,6 +231,8 @@ async def transcribe_audio(
 
     try:
         stt = await vf._get_stt_provider()
+    except VoicePrivacyError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=503, detail=str(e))
 
