@@ -129,9 +129,13 @@ local = [
     "langchain-community>=0.3.31",
     "numpy==2.3.1",
 ]
-# Voice providers (TTS/STT cloud services)
+# Voice (TTS/STT) — local + cloud providers
 voice = [
     "elevenlabs>=1.0.0",
+    "piper-tts>=1.2.0",
+    "soundfile>=0.13.0",
+    "faster-whisper>=1.1.0",
+    "deepgram-sdk>=4.0.0",
 ]
 # Observability (OpenTelemetry tracing + Prometheus metrics)
 observability = [
@@ -144,13 +148,6 @@ observability = [
 # Cloud storage (GCS bucket access)
 cloud-storage = [
     "google-cloud-storage>=3.4.1",
-]
-# Voice (TTS/STT) — local + cloud providers
-voice = [
-    "piper-tts>=1.2.0",
-    "soundfile>=0.13.0",
-    "faster-whisper>=1.1.0",
-    "deepgram-sdk>=4.0.0",
 ]
 # Full installation (everything)
 full = [
