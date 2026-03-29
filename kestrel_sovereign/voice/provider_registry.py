@@ -4,6 +4,7 @@ Voice Provider Registry.
 Manages TTS and STT provider registration, discovery, and routing.
 Mirrors the pattern in kestrel_sovereign/llm/provider_registry.py.
 """
+import importlib.util
 import logging
 from typing import Optional
 
@@ -80,6 +81,15 @@ class VoiceProviderRegistry:
         if name == "openai":
             from .openai_tts import OpenAITTSProvider
             return OpenAITTSProvider(config=provider_config)
+
+        if name == "elevenlabs":
+            if importlib.util.find_spec("elevenlabs") is not None:
+                from .elevenlabs_tts import ElevenLabsTTSProvider
+                provider_config = self._config.get("elevenlabs", {})
+                return ElevenLabsTTSProvider(config=provider_config)
+            else:
+                logger.warning("ElevenLabs TTS requested but 'elevenlabs' package not installed.")
+                return None
 
         logger.warning(f"No TTS provider implementation for '{name}' yet.")
         return None
