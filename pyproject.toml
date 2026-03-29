@@ -150,6 +150,7 @@ voice = [
     "piper-tts>=1.2.0",
     "soundfile>=0.13.0",
     "faster-whisper>=1.1.0",
+    "deepgram-sdk>=4.0.0",
 ]
 # Full installation (everything)
 full = [

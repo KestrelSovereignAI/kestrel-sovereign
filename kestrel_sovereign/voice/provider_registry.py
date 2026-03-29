@@ -103,7 +103,7 @@ class VoiceProviderRegistry:
         """Create an STT provider by name using importlib for optional deps.
 
         Args:
-            name: Provider name (e.g., "faster_whisper", "openai").
+            name: Provider name (e.g., "faster_whisper", "openai", "deepgram").
 
         Returns:
             STTProvider instance or None if unknown.
@@ -121,6 +121,15 @@ class VoiceProviderRegistry:
                 return FasterWhisperSTTProvider(config=provider_config)
             except ImportError:
                 logger.warning("faster-whisper package not installed. Skipping faster_whisper STT.")
+                return None
+
+        if name == "deepgram":
+            try:
+                from .deepgram_stt import DeepgramSTTProvider
+                provider_config = self._config.get("deepgram", {})
+                return DeepgramSTTProvider(config=provider_config)
+            except ImportError:
+                logger.warning("deepgram-sdk not installed, skipping Deepgram STT provider.")
                 return None
 
         logger.warning(f"No STT provider implementation for '{name}' yet.")
