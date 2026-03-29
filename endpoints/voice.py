@@ -32,6 +32,13 @@ class TTSRequest(BaseModel):
     format: str = "opus"  # opus, mp3, wav, pcm
 
 
+class TTSStreamRequest(BaseModel):
+    text: str = ""  # Mode 1: full text to synthesize incrementally
+    request_id: str = ""  # Mode 2: piggyback on active agent stream
+    voice_id: str = ""
+    format: str = "opus"
+
+
 # ------------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------------
@@ -175,8 +182,19 @@ async def synthesize_speech(request: Request, body: TTSRequest) -> Response:
 
 
 @router.post("/tts/stream")
-async def synthesize_speech_stream(request: Request, body: TTSRequest) -> StreamingResponse:
-    """Streaming TTS. Returns chunked audio."""
+async def synthesize_speech_stream(request: Request, body: TTSStreamRequest) -> StreamingResponse:
+    """Streaming TTS with chunked audio output.
+
+    Two modes:
+    1. Full text mode: ``body.text`` provided — split into sentences,
+       synthesize each incrementally and stream audio chunks.
+    2. Agent response mode: ``body.request_id`` provided — tap into an
+       active agent streaming response and synthesize sentences as they
+       complete.
+    """
+    if not body.text and not body.request_id:
+        raise HTTPException(status_code=400, detail="Provide either 'text' or 'request_id'.")
+
     agent = get_agent(request)
     vf = _get_voice_feature(agent)
 
@@ -198,13 +216,30 @@ async def synthesize_speech_stream(request: Request, body: TTSRequest) -> Stream
 
     async def audio_generator():
         try:
-            async for chunk in tts.synthesize_stream(
-                text=body.text,
-                voice_id=voice_id,
-                model=vf._voice_config.tts_model,
-                output_format=output_format,
-            ):
-                yield chunk
+            if body.request_id:
+                # Mode 2: tap into active agent stream
+                async for chunk in vf.stream_speak(
+                    request_id=body.request_id,
+                    voice_id=voice_id,
+                    output_format=output_format,
+                ):
+                    yield chunk
+            else:
+                # Mode 1: split text into sentences, synthesize each
+                from kestrel_sovereign.voice.base import split_sentences
+
+                sentences = split_sentences(body.text)
+                if not sentences:
+                    sentences = [body.text]
+
+                for sentence in sentences:
+                    async for chunk in tts.synthesize_stream(
+                        text=sentence,
+                        voice_id=voice_id,
+                        model=vf._voice_config.tts_model,
+                        output_format=output_format,
+                    ):
+                        yield chunk
         except Exception as e:
             logger.error("TTS streaming error: %s", e, exc_info=True)
 
