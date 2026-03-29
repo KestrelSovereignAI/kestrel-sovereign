@@ -165,8 +165,12 @@ banned = []
 # Priority order for voice providers. Local providers (piper, faster_whisper)
 # are tried first for privacy; cloud providers (openai) as fallback.
 [voice]
-tts_provider_priority = ["piper", "openai"]
+tts_provider_priority = ["piper", "elevenlabs", "openai"]
 stt_provider_priority = ["faster_whisper", "openai"]
+
+[voice.elevenlabs]
+# model = "eleven_multilingual_v2"
+# default_voice_id = ""  # Set to a specific voice ID
 
 # =============================================================================
 # Constitutional Profiles

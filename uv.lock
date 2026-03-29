@@ -1310,6 +1310,23 @@ wheels = [
 ]
 
 [[package]]
+name = "elevenlabs"
+version = "2.40.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "httpx" },
+    { name = "pydantic" },
+    { name = "pydantic-core" },
+    { name = "requests" },
+    { name = "typing-extensions" },
+    { name = "websockets" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/0a/5c/d1445f6f7958cf12cba297a44879e6054b7423cd0b2f437ac36bf0493c87/elevenlabs-2.40.0.tar.gz", hash = "sha256:84eaf10819950cbacc643b5ecf80400e5b67bb3af79394be9ee70e8d361d4b27", size = 554860, upload-time = "2026-03-23T11:30:41.742Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/15/62/f08985526677486460a86428a933cfe7a2f0b3659698b2bb333d587d96a4/elevenlabs-2.40.0-py3-none-any.whl", hash = "sha256:56e7939da45eff180e9deeeb84ff25dd616a47d55f179f102d964fc8207146f5", size = 1495785, upload-time = "2026-03-23T11:30:39.888Z" },
+]
+
+[[package]]
 name = "email-validator"
 version = "2.3.0"
 source = { registry = "https://pypi.org/simple" }
@@ -2605,6 +2622,9 @@ test = [
     { name = "pytest-timeout" },
     { name = "pytest-xdist" },
 ]
+voice = [
+    { name = "elevenlabs" },
+]
 
 [package.dev-dependencies]
 dev = [
@@ -2641,6 +2661,7 @@ requires-dist = [
     { name = "cryptography", specifier = ">=45.0.5,<46.0.0" },
     { name = "diffusers", marker = "extra == 'ml'", specifier = ">=0.36.0" },
     { name = "docker", specifier = ">=7.1.0" },
+    { name = "elevenlabs", marker = "extra == 'voice'", specifier = ">=1.0.0" },
     { name = "email-validator", specifier = ">=2.3.0" },
     { name = "fastapi", specifier = "==0.128.1" },
     { name = "google-auth", specifier = ">=2.40.3" },
@@ -2716,7 +2737,7 @@ requires-dist = [
     { name = "vastai-sdk", specifier = ">=0.1.0" },
     { name = "web3", specifier = ">=7.0.0" },
 ]
-provides-extras = ["test", "ml", "local", "observability", "cloud-storage", "full"]
+provides-extras = ["test", "ml", "local", "voice", "observability", "cloud-storage", "full"]
 
 [package.metadata.requires-dev]
 dev = [
