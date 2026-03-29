@@ -67,6 +67,12 @@ class PersonalityFingerprint:
     preferred_greeting: Optional[str] = None
     preferred_signoff: Optional[str] = None
 
+    # Voice personality (abstract preferences, separate from concrete voice_config)
+    voice_gender_preference: Optional[str] = None   # "feminine", "masculine", "neutral"
+    voice_age_preference: Optional[str] = None       # "young", "middle", "mature"
+    voice_energy: Optional[str] = None               # "calm", "warm", "energetic", "authoritative"
+    voice_accent_preference: Optional[str] = None    # "american", "british", "neutral", etc.
+
     # Few-shot examples for calibration (input -> output pairs)
     calibration_examples: List[Dict[str, str]] = field(default_factory=list)
 

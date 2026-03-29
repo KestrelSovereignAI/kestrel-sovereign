@@ -6,7 +6,10 @@ Defines the abstract contracts that all voice providers must implement.
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, asdict
-from typing import AsyncIterator
+from typing import AsyncIterator, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from kestrel_sovereign.identity.identity_package import PersonalityFingerprint
 
 logger = logging.getLogger(__name__)
 
@@ -20,6 +23,9 @@ class VoiceInfo:
     language: str = "en"    # ISO 639-1 language code
     gender: str = "neutral" # "masculine", "feminine", "neutral"
     preview_url: str = ""   # URL to sample audio (optional)
+    age: str = "middle"     # "young", "middle", "mature"
+    energy: str = "neutral" # "calm", "warm", "energetic", "authoritative"
+    accent: str = "neutral" # "american", "british", etc.
 
 
 @dataclass
@@ -43,6 +49,51 @@ class VoiceConfig:
         known_fields = {f.name for f in cls.__dataclass_fields__.values()}
         filtered = {k: v for k, v in data.items() if k in known_fields}
         return cls(**filtered)
+
+
+def match_voice(personality: "PersonalityFingerprint", available_voices: list[VoiceInfo]) -> VoiceInfo | None:
+    """Find the best matching voice for a personality across available providers.
+
+    Scoring:
+    - Gender match: +3 points
+    - Age match: +2 points
+    - Energy match: +2 points
+    - Accent match: +1 point
+
+    Dimensions where the personality preference is None are skipped.
+
+    Returns the highest-scoring voice, or None if no voices available.
+    """
+    if not available_voices:
+        return None
+
+    best_voice = None
+    best_score = -1
+
+    for voice in available_voices:
+        score = 0
+
+        if personality.voice_gender_preference is not None:
+            if voice.gender == personality.voice_gender_preference:
+                score += 3
+
+        if personality.voice_age_preference is not None:
+            if voice.age == personality.voice_age_preference:
+                score += 2
+
+        if personality.voice_energy is not None:
+            if voice.energy == personality.voice_energy:
+                score += 2
+
+        if personality.voice_accent_preference is not None:
+            if voice.accent == personality.voice_accent_preference:
+                score += 1
+
+        if score > best_score:
+            best_score = score
+            best_voice = voice
+
+    return best_voice
 
 
 class TTSProvider(ABC):

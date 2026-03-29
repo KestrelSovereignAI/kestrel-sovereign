@@ -25,18 +25,22 @@ DEFAULT_VOICES = {
     "en_US-lessac-medium": VoiceInfo(
         voice_id="en_US-lessac-medium", name="Lessac",
         provider="piper", gender="masculine",
+        age="middle", energy="calm", accent="american",
     ),
     "en_US-amy-medium": VoiceInfo(
         voice_id="en_US-amy-medium", name="Amy",
         provider="piper", gender="feminine",
+        age="middle", energy="warm", accent="american",
     ),
     "en_US-ryan-medium": VoiceInfo(
         voice_id="en_US-ryan-medium", name="Ryan",
         provider="piper", gender="masculine",
+        age="young", energy="energetic", accent="american",
     ),
     "en_GB-alba-medium": VoiceInfo(
         voice_id="en_GB-alba-medium", name="Alba",
         provider="piper", gender="feminine",
+        age="young", energy="warm", accent="british",
     ),
 }
 
