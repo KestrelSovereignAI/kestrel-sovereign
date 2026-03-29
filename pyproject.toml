@@ -145,10 +145,11 @@ observability = [
 cloud-storage = [
     "google-cloud-storage>=3.4.1",
 ]
-# Voice (TTS/STT) — local Piper TTS + audio format conversion
+# Voice (TTS/STT) — local + cloud providers
 voice = [
     "piper-tts>=1.2.0",
     "soundfile>=0.13.0",
+    "faster-whisper>=1.1.0",
 ]
 # Full installation (everything)
 full = [

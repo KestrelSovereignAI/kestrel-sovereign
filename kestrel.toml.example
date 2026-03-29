@@ -172,6 +172,12 @@ stt_provider_priority = ["faster_whisper", "openai"]
 model = "en_US-lessac-medium"
 data_dir = "/data/models/piper"
 
+[voice.faster_whisper]
+model = "large-v3"
+device = "auto"
+data_dir = "/data/models/whisper"
+compute_type = "auto"
+
 [voice.elevenlabs]
 # model = "eleven_multilingual_v2"
 # default_voice_id = ""  # Set to a specific voice ID
