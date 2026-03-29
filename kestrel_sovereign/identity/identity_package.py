@@ -218,6 +218,9 @@ class AgentIdentityPackage:
     source_substrate: str = SubstrateType.UNKNOWN.value
     migration_history: List[MigrationRecord] = field(default_factory=list)
 
+    # === VOICE IDENTITY ===
+    voice_config: Optional[Dict[str, Any]] = None  # VoiceConfig.to_dict()
+
     # === VERIFICATION ===
     content_hash: str = ""  # SHA256 of package contents (before signature)
     signature: str = ""  # DID-signed hash for authenticity
@@ -263,6 +266,9 @@ class AgentIdentityPackage:
             # Wallet
             "wallet_balance": self.wallet_balance,
             "wallet_transaction_history": self.wallet_transaction_history,
+
+            # Voice identity
+            "voice_config": self.voice_config,
 
             # Migration metadata
             "package_version": self.package_version,
@@ -313,6 +319,7 @@ class AgentIdentityPackage:
             tool_preferences=data.get("tool_preferences", {}),
             wallet_balance=data.get("wallet_balance", "0.0"),
             wallet_transaction_history=data.get("wallet_transaction_history", []),
+            voice_config=data.get("voice_config"),
             package_version=data.get("package_version", IDENTITY_PACKAGE_VERSION),
             export_timestamp=data.get("export_timestamp", ""),
             source_substrate=data.get("source_substrate", SubstrateType.UNKNOWN.value),

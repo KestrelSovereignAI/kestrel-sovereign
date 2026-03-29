@@ -297,6 +297,13 @@ The currently exported `Feature` subclasses discovered from those modules includ
   - `POST /api/saved-items/structured`
   - `POST /api/saved-items/search`
   - `POST /api/saved-items/{item_id}/pin`
+- [`endpoints/voice.py`](endpoints/voice.py)
+  - `GET /voice/voices`
+  - `GET /voice/config`
+  - `POST /voice/config`
+  - `POST /voice/tts`
+  - `POST /voice/tts/stream`
+  - `POST /voice/stt`
 
 ## Authentication Surface
 
