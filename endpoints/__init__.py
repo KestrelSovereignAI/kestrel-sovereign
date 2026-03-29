@@ -15,6 +15,7 @@ from .observability import router as observability_router
 from .saved_items import router as saved_items_router
 from .metrics import router as metrics_router
 from .spawn import router as spawn_router
+from .voice import router as voice_router
 
 __all__ = [
     "agent_router",
@@ -30,4 +31,5 @@ __all__ = [
     "saved_items_router",
     "metrics_router",
     "spawn_router",
+    "voice_router",
 ]
