@@ -288,12 +288,32 @@ async def set_privacy_mode(request: Request):
                     model_switched = saved
                     llm._pre_ephemeral_preference = None
 
+        # Auto-switch voice providers if VoiceFeature is active
+        voice_switched = None
+        biometric_warning = None
+        features = getattr(agent, "features", {})
+        vf = features.get("VoiceFeature") if features else None
+        if vf and hasattr(vf, "on_privacy_mode_changed"):
+            try:
+                voice_switched = await vf.on_privacy_mode_changed()
+            except Exception as ve:
+                logger.warning("Voice auto-switch failed: %s", ve)
+
+            # Biometric warning when switching TO a mode that allows cloud voice
+            if config.allows_cloud_llm() and hasattr(vf, "biometric_warning"):
+                # Only warn if there are cloud voice providers configured
+                vc = getattr(vf, "_voice_config", None)
+                if vc and (vc.tts_provider or vc.stt_provider):
+                    biometric_warning = vf.biometric_warning()
+
         return {
             "success": True,
             "mode": new_mode.value,
             "message": f"Privacy mode set to {new_mode.value}",
             "allows_cloud_llm": config.allows_cloud_llm(),
             "model_switched": model_switched,
+            "voice_switched": voice_switched,
+            "biometric_warning": biometric_warning,
         }
     except HTTPException:
         raise
