@@ -75,8 +75,12 @@ class VoiceProviderRegistry:
         Returns:
             TTSProvider instance or None if unknown.
         """
-        # Provider implementations will be added in future issues.
-        # Each provider module will be imported lazily via importlib.
+        provider_config = self._config.get(name, {})
+
+        if name == "openai":
+            from .openai_tts import OpenAITTSProvider
+            return OpenAITTSProvider(config=provider_config)
+
         logger.warning(f"No TTS provider implementation for '{name}' yet.")
         return None
 
