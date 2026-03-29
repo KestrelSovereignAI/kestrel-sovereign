@@ -91,6 +91,11 @@ class VoiceProviderRegistry:
                 logger.warning("ElevenLabs TTS requested but 'elevenlabs' package not installed.")
                 return None
 
+        if name == "piper":
+            from .piper_tts import PiperTTSProvider
+            piper_config = self._config.get("piper", {})
+            return PiperTTSProvider(piper_config)
+
         logger.warning(f"No TTS provider implementation for '{name}' yet.")
         return None
 
