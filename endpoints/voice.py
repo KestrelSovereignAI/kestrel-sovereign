@@ -1,7 +1,10 @@
-"""Voice HTTP endpoints — TTS synthesis, STT transcription, voice config."""
+"""Voice HTTP endpoints and WebSocket real-time voice chat."""
+import asyncio
+import json
 import logging
+import secrets
 
-from fastapi import APIRouter, HTTPException, Request, UploadFile, File, Response
+from fastapi import APIRouter, HTTPException, Request, UploadFile, File, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
@@ -297,3 +300,287 @@ async def transcribe_audio(
         "language": language or "auto",
         "duration_seconds": None,  # Provider-dependent; not all return this
     }
+
+
+# ------------------------------------------------------------------
+# WebSocket binary framing helpers
+# ------------------------------------------------------------------
+
+# 1-byte header distinguishes JSON control messages from audio data.
+FRAME_JSON: int = 0x00
+FRAME_AUDIO: int = 0x01
+
+
+def encode_control(payload: dict) -> bytes:
+    """Encode a JSON control message with the 0x00 header byte."""
+    return bytes([FRAME_JSON]) + json.dumps(payload).encode("utf-8")
+
+
+def encode_audio(chunk: bytes) -> bytes:
+    """Encode an audio chunk with the 0x01 header byte."""
+    return bytes([FRAME_AUDIO]) + chunk
+
+
+# ------------------------------------------------------------------
+# WebSocket voice chat
+# ------------------------------------------------------------------
+
+# Voice chat states
+_STATE_LISTENING = "listening"
+_STATE_THINKING = "thinking"
+_STATE_SPEAKING = "speaking"
+
+
+def _ws_get_agent(websocket: WebSocket):
+    """Get agent from WebSocket app state (mirrors get_agent for HTTP)."""
+    agent = getattr(websocket.state, "agent", None) if hasattr(websocket, "state") else None
+    if agent is not None:
+        return agent
+    agent = getattr(websocket.app.state, "agent", None)
+    if agent is not None:
+        return agent
+    return None
+
+
+def _ws_authenticate(websocket: WebSocket) -> bool:
+    """Authenticate WebSocket via query parameter api_key or cookie session."""
+    import os
+    expected_key = os.environ.get("KESTREL_API_KEY", "")
+    if not expected_key:
+        return True  # No key configured — open access
+
+    # Check query parameter
+    api_key = websocket.query_params.get("api_key", "")
+    if api_key and secrets.compare_digest(api_key, expected_key):
+        return True
+
+    # Check cookie-based session (OAuth flow)
+    if hasattr(websocket, "session"):
+        user_email = websocket.session.get("user_email")
+        if user_email:
+            return True
+
+    return False
+
+
+@router.websocket("/chat")
+async def voice_chat(websocket: WebSocket):
+    """Real-time bidirectional voice chat over WebSocket.
+
+    Protocol:
+    - Client → Server: raw audio bytes (opus frames)
+    - Server → Client: mixed binary/JSON messages distinguished by 1-byte header:
+      - 0x00 + JSON bytes = control message (transcript, status, error)
+      - 0x01 + audio bytes = TTS audio chunk
+
+    Control messages:
+    - {"type": "transcript", "text": "what the user said", "final": true}
+    - {"type": "response", "text": "agent's text response"}
+    - {"type": "status", "state": "listening|thinking|speaking"}
+    - {"type": "error", "message": "..."}
+
+    Auth: query parameter ?api_key=... or session cookie.
+    """
+    # --- Auth check before accept ---
+    if not _ws_authenticate(websocket):
+        await websocket.close(code=4401, reason="Authentication required")
+        return
+
+    # --- Resolve agent ---
+    agent = _ws_get_agent(websocket)
+    if agent is None:
+        await websocket.close(code=4503, reason="Agent not initialized")
+        return
+
+    # --- Resolve VoiceFeature ---
+    features = getattr(agent, "features", {})
+    vf = features.get("VoiceFeature")
+    if vf is None:
+        await websocket.close(code=4503, reason="VoiceFeature not available")
+        return
+
+    # --- Privacy gate: check at connection time ---
+    try:
+        stt = await vf._get_stt_provider()
+    except VoicePrivacyError as e:
+        await websocket.close(code=4403, reason=str(e))
+        return
+    except Exception as e:
+        await websocket.close(code=4503, reason=f"STT provider unavailable: {e}")
+        return
+
+    try:
+        tts = await vf._get_tts_provider()
+    except VoicePrivacyError as e:
+        await websocket.close(code=4403, reason=str(e))
+        return
+    except Exception as e:
+        await websocket.close(code=4503, reason=f"TTS provider unavailable: {e}")
+        return
+
+    # Resolve voice_id for TTS
+    voice_id = vf._voice_config.tts_voice_id
+    if not voice_id:
+        try:
+            voices = await tts.list_voices()
+            if voices:
+                voice_id = voices[0].voice_id
+        except Exception:
+            pass
+    output_format = vf._voice_config.output_format or "opus"
+
+    # --- Accept the connection ---
+    await websocket.accept()
+
+    async def send_control(payload: dict):
+        """Send a framed JSON control message."""
+        await websocket.send_bytes(encode_control(payload))
+
+    async def send_status(state: str):
+        """Send a status transition control message."""
+        await send_control({"type": "status", "state": state})
+
+    # Notify client we are ready
+    await send_status(_STATE_LISTENING)
+
+    # --- Audio buffer for STT ---
+    # Accumulates client audio frames and feeds them to the STT provider.
+    audio_queue: asyncio.Queue[bytes | None] = asyncio.Queue()
+
+    async def audio_stream_from_queue():
+        """Yield audio chunks from the queue until sentinel (None)."""
+        while True:
+            chunk = await audio_queue.get()
+            if chunk is None:
+                break
+            yield chunk
+
+    async def _process_utterance(transcript_text: str):
+        """Run agent processing and TTS for a final transcript."""
+        # --- Thinking ---
+        await send_status(_STATE_THINKING)
+        await send_control({"type": "transcript", "text": transcript_text, "final": True})
+
+        # Collect the full agent response via streaming
+        full_response = []
+        try:
+            if hasattr(agent, "process_input_streaming"):
+                async for chunk in agent.process_input_streaming(transcript_text):
+                    full_response.append(chunk)
+                    # Send incremental text to client
+                    await send_control({"type": "response", "text": chunk})
+            else:
+                result = await agent.process_input(transcript_text)
+                full_response.append(result)
+                await send_control({"type": "response", "text": result})
+        except Exception as e:
+            logger.error("Agent processing error in voice chat: %s", e, exc_info=True)
+            await send_control({"type": "error", "message": "Agent processing failed."})
+            await send_status(_STATE_LISTENING)
+            return
+
+        response_text = "".join(full_response)
+        if not response_text.strip():
+            await send_status(_STATE_LISTENING)
+            return
+
+        # --- Speaking ---
+        await send_status(_STATE_SPEAKING)
+
+        try:
+            if voice_id:
+                async for audio_chunk in tts.synthesize_stream(
+                    text=response_text,
+                    voice_id=voice_id,
+                    model=vf._voice_config.tts_model,
+                    output_format=output_format,
+                ):
+                    await websocket.send_bytes(encode_audio(audio_chunk))
+            else:
+                logger.warning("No TTS voice_id configured; skipping speech synthesis.")
+        except Exception as e:
+            logger.error("TTS streaming error in voice chat: %s", e, exc_info=True)
+            await send_control({"type": "error", "message": "TTS synthesis failed."})
+
+        # Back to listening
+        await send_status(_STATE_LISTENING)
+
+    # --- Main receive loop ---
+    try:
+        while True:
+            message = await websocket.receive()
+
+            if message.get("type") == "websocket.disconnect":
+                break
+
+            # Binary data = audio frames from client
+            if "bytes" in message and message["bytes"]:
+                audio_data = message["bytes"]
+
+                # Feed audio to STT provider for transcription
+                try:
+                    # Use streaming STT if available: feed chunks through the queue
+                    # For simpler providers without true streaming, batch-transcribe
+                    # the audio chunk directly.
+                    if hasattr(stt, "transcribe_stream"):
+                        # Create a one-shot stream from this audio frame
+                        async def _single_chunk_stream(data=audio_data):
+                            yield data
+
+                        async for text_segment in stt.transcribe_stream(
+                            _single_chunk_stream(), language=""
+                        ):
+                            if not text_segment.strip():
+                                continue
+                            # Treat each yielded segment as a final transcript
+                            # (provider handles partial vs final internally)
+                            is_final = True
+                            await send_control({
+                                "type": "transcript",
+                                "text": text_segment,
+                                "final": is_final,
+                            })
+                            if is_final:
+                                await _process_utterance(text_segment)
+                    else:
+                        # Batch fallback: transcribe the received audio chunk
+                        transcript = await stt.transcribe(
+                            audio=audio_data, language="", audio_format="opus"
+                        )
+                        if transcript and transcript.strip():
+                            await send_control({
+                                "type": "transcript",
+                                "text": transcript,
+                                "final": True,
+                            })
+                            await _process_utterance(transcript)
+
+                except Exception as e:
+                    logger.error("STT error in voice chat: %s", e, exc_info=True)
+                    await send_control({"type": "error", "message": "Transcription failed."})
+
+            # Text data = JSON control messages from client (e.g., config updates)
+            elif "text" in message and message["text"]:
+                try:
+                    client_msg = json.loads(message["text"])
+                    msg_type = client_msg.get("type", "")
+
+                    if msg_type == "config":
+                        # Allow runtime config updates (e.g., language hint)
+                        logger.debug("Voice chat config update: %s", client_msg)
+                    elif msg_type == "end":
+                        # Client signals end of conversation
+                        break
+                    else:
+                        logger.debug("Unknown client message type: %s", msg_type)
+                except json.JSONDecodeError:
+                    await send_control({"type": "error", "message": "Invalid JSON."})
+
+    except WebSocketDisconnect:
+        logger.debug("Voice chat WebSocket disconnected")
+    except Exception as e:
+        logger.error("Unexpected error in voice chat: %s", e, exc_info=True)
+        try:
+            await send_control({"type": "error", "message": "Internal server error."})
+        except Exception:
+            pass
