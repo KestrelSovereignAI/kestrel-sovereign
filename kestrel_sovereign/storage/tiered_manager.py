@@ -460,6 +460,7 @@ def create_default_manager(
 
     Registers available providers in priority order:
     - Storacha (CLOUD_HOT): preferred when STORACHA_* env vars are set
+    - Filebase (CLOUD_HOT): S3-compatible IPFS storage when FILEBASE_* env vars are set
     - Lighthouse (CLOUD_HOT + CLOUD_COLD): fallback / legacy
 
     Args:
@@ -484,7 +485,19 @@ def create_default_manager(
         except Exception as e:
             logger.warning(f"TieredStorageManager: StorachaProvider init failed: {e}")
 
-    # Lighthouse — CLOUD_HOT fallback (if Storacha not available) + CLOUD_COLD
+    # Filebase (CLOUD_HOT) — S3-compatible IPFS storage
+    if StorageTier.CLOUD_HOT not in manager._providers:
+        if os.environ.get("FILEBASE_API_KEY") and os.environ.get("FILEBASE_API_KEY_SECRET"):
+            try:
+                from kestrel_sovereign.storage.providers.filebase_provider import FilebaseProvider
+                filebase = FilebaseProvider()
+                if filebase.is_available():
+                    manager.register_provider(StorageTier.CLOUD_HOT, filebase)
+                    logger.info("TieredStorageManager: registered FilebaseProvider for CLOUD_HOT")
+            except Exception as e:
+                logger.warning(f"TieredStorageManager: FilebaseProvider init failed: {e}")
+
+    # Lighthouse — CLOUD_HOT fallback (if Storacha/Filebase not available) + CLOUD_COLD
     try:
         from kestrel_sovereign.storage.providers.lighthouse_provider import LighthouseProvider
         lighthouse = LighthouseProvider(api_key=lighthouse_api_key)
