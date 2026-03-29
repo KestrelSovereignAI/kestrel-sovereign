@@ -12,6 +12,13 @@ from .provider_registry import VoiceProviderRegistry
 from .elevenlabs_tts import ElevenLabsTTSProvider
 from .faster_whisper_stt import FasterWhisperSTTProvider
 
+# Optional providers — import errors are swallowed so the package works
+# without optional dependencies installed.
+try:
+    from .deepgram_stt import DeepgramSTTProvider
+except ImportError:
+    DeepgramSTTProvider = None  # type: ignore[assignment,misc]
+
 __all__ = [
     "TTSProvider",
     "STTProvider",
@@ -23,4 +30,5 @@ __all__ = [
     "PiperTTSProvider",
     "ElevenLabsTTSProvider",
     "FasterWhisperSTTProvider",
+    "DeepgramSTTProvider",
 ]
