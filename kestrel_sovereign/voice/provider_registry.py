@@ -87,17 +87,18 @@ class VoiceProviderRegistry:
     def _create_stt_provider(self, name: str) -> Optional[STTProvider]:
         """Create an STT provider by name using importlib for optional deps.
 
-        Concrete provider implementations will be added as they are developed
-        (e.g., FasterWhisperSTTProvider, OpenAISTTProvider).
-
         Args:
             name: Provider name (e.g., "faster_whisper", "openai").
 
         Returns:
             STTProvider instance or None if unknown.
         """
-        # Provider implementations will be added in future issues.
-        # Each provider module will be imported lazily via importlib.
+        provider_config = self._config.get(name, {})
+
+        if name == "openai":
+            from .openai_stt import OpenAISTTProvider
+            return OpenAISTTProvider(config=provider_config)
+
         logger.warning(f"No STT provider implementation for '{name}' yet.")
         return None
 
