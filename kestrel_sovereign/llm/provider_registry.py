@@ -24,7 +24,7 @@ from .anthropic_adapter import AnthropicAdapter
 from .google_adapter import GoogleAdapter
 from .vertex_adapter import VertexAIAdapter
 from .openrouter_adapter import OpenRouterAdapter
-from .claude_max_adapter import ClaudeMaxAdapter, CLAUDE_SDK_AVAILABLE
+from .claude_max_adapter import ClaudeMaxAdapter
 
 logger = logging.getLogger(__name__)
 
@@ -218,11 +218,22 @@ class ProviderRegistry:
         )
 
     def _initialize_claude_max(self, provider_config: Dict[str, Any]) -> ProviderInfo:
-        """Initialize Claude Max provider."""
-        if not CLAUDE_SDK_AVAILABLE:
-            raise ImportError(
-                "claude-agent-sdk not installed. Run: pip install claude-agent-sdk"
+        """Initialize Claude Max provider using OAuth token auth.
+
+        Uses the standard Anthropic SDK with auth_token instead of api_key.
+        The token comes from ANTHROPIC_AUTH_TOKEN env var (via `claude login`).
+        """
+        auth_token = os.environ.get("ANTHROPIC_AUTH_TOKEN") or provider_config.get("auth_token")
+        if not auth_token:
+            raise ValueError(
+                "ANTHROPIC_AUTH_TOKEN not set. "
+                "Run `claude login` and export the token, or set auth_token in llm_config.toml."
             )
+
+        try:
+            import anthropic
+        except ImportError:
+            raise ImportError("anthropic package not installed. Run: pip install anthropic")
 
         model = provider_config.get("model")
         if not model:
@@ -230,9 +241,8 @@ class ProviderRegistry:
             model = "auto"
         provider_config["model"] = model
 
-        # ClaudeMaxAdapter handles its own client internally
-        adapter = ClaudeMaxAdapter(model=model)
-        client = adapter  # Adapter is self-contained
+        client = anthropic.AsyncAnthropic(auth_token=auth_token)
+        adapter = ClaudeMaxAdapter()
 
         return ProviderInfo(
             name="claude_max",
