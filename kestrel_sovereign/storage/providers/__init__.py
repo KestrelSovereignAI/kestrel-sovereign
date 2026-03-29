@@ -8,13 +8,15 @@ Provides a unified interface for multi-tier sovereign storage:
 - Tier 4 (Cloud Cold): Lighthouse Filecoin perpetual storage
 
 Provider selection order (CLOUD_HOT):
-  1. Storacha  — when STORACHA_SPACE_DID + STORACHA_AGENT_KEY + STORACHA_PROOF are set
-  2. Lighthouse — when LIGHTHOUSE_API_KEY is set
+  1. Storacha   — when STORACHA_SPACE_DID + STORACHA_AGENT_KEY + STORACHA_PROOF are set
+  2. Filebase   — when FILEBASE_API_KEY + FILEBASE_API_KEY_SECRET are set
+  3. Lighthouse — when LIGHTHOUSE_API_KEY is set
 
 Provider implementations are NOT re-exported here to avoid importing optional
 dependencies at package import time.  Import directly when needed:
 
     from kestrel_sovereign.storage.providers.storacha_provider import StorachaProvider
+    from kestrel_sovereign.storage.providers.filebase_provider import FilebaseProvider
     from kestrel_sovereign.storage.providers.lighthouse_provider import LighthouseProvider
 """
 
