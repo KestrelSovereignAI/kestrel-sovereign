@@ -8,6 +8,7 @@ from .base import TTSProvider, STTProvider, VoiceConfig, VoiceInfo
 from .openai_tts import OpenAITTSProvider
 from .openai_stt import OpenAISTTProvider
 from .provider_registry import VoiceProviderRegistry
+from .elevenlabs_tts import ElevenLabsTTSProvider
 
 __all__ = [
     "TTSProvider",
@@ -17,4 +18,5 @@ __all__ = [
     "VoiceProviderRegistry",
     "OpenAITTSProvider",
     "OpenAISTTProvider",
+    "ElevenLabsTTSProvider",
 ]
