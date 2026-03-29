@@ -114,6 +114,15 @@ class VoiceProviderRegistry:
             from .openai_stt import OpenAISTTProvider
             return OpenAISTTProvider(config=provider_config)
 
+        if name == "faster_whisper":
+            try:
+                from .faster_whisper_stt import FasterWhisperSTTProvider
+                provider_config = self._config.get("faster_whisper", {})
+                return FasterWhisperSTTProvider(config=provider_config)
+            except ImportError:
+                logger.warning("faster-whisper package not installed. Skipping faster_whisper STT.")
+                return None
+
         logger.warning(f"No STT provider implementation for '{name}' yet.")
         return None
 

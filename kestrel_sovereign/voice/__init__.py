@@ -10,6 +10,7 @@ from .openai_stt import OpenAISTTProvider
 from .piper_tts import PiperTTSProvider
 from .provider_registry import VoiceProviderRegistry
 from .elevenlabs_tts import ElevenLabsTTSProvider
+from .faster_whisper_stt import FasterWhisperSTTProvider
 
 __all__ = [
     "TTSProvider",
@@ -21,4 +22,5 @@ __all__ = [
     "OpenAISTTProvider",
     "PiperTTSProvider",
     "ElevenLabsTTSProvider",
+    "FasterWhisperSTTProvider",
 ]
