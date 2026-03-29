@@ -168,6 +168,10 @@ banned = []
 tts_provider_priority = ["piper", "elevenlabs", "openai"]
 stt_provider_priority = ["faster_whisper", "openai"]
 
+[voice.piper]
+model = "en_US-lessac-medium"
+data_dir = "/data/models/piper"
+
 [voice.elevenlabs]
 # model = "eleven_multilingual_v2"
 # default_voice_id = ""  # Set to a specific voice ID

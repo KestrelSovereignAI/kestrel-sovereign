@@ -145,6 +145,11 @@ observability = [
 cloud-storage = [
     "google-cloud-storage>=3.4.1",
 ]
+# Voice (TTS/STT) — local Piper TTS + audio format conversion
+voice = [
+    "piper-tts>=1.2.0",
+    "soundfile>=0.13.0",
+]
 # Full installation (everything)
 full = [
     "kestrel_sovereign[local]",
@@ -152,6 +157,7 @@ full = [
     "kestrel_sovereign[test]",
     "kestrel_sovereign[cloud-storage]",
     "kestrel_sovereign[observability]",
+    "kestrel_sovereign[voice]",
 ]
 
 [project.scripts]
