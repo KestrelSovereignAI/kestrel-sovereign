@@ -9,6 +9,8 @@ import logging
 import re
 import time
 
+from kestrel_sovereign.voice.stream_tap import AgentStreamTap
+
 from kestrel_sovereign.kestrel_config.constants import (
     MAX_SSE_CONNECTIONS_PER_CLIENT,
     SSE_PING_INTERVAL_SECONDS,
@@ -135,6 +137,10 @@ async def stream_agent_response(request: Request):
         else:
             agent._current_request_id = request_id
 
+        # Register the stream tap so TTS consumers can subscribe
+        stream_tap = AgentStreamTap.get_instance()
+        stream_tap.register(request_id)
+
         async def generate():
             try:
                 async for chunk in agent.process_input_streaming(
@@ -147,11 +153,15 @@ async def stream_agent_response(request: Request):
                     if agent.is_request_cancelled(request_id):
                         yield "\n\n---\n⏹️ **Request stopped**\n\nType `!continue` to resume from where I left off, or start a new message."
                         break
+                    # Publish text chunk for TTS stream consumers
+                    await stream_tap.publish(request_id, chunk)
                     yield chunk
             except Exception as e:
                 logger.error(f"Streaming error: {e}", exc_info=True)
                 yield "\n\nAn error occurred while generating the response."
             finally:
+                # Signal stream completion for TTS consumers
+                await stream_tap.finish(request_id)
                 # Cleanup request tracking
                 agent._cleanup_cancelled_request(request_id)
 
