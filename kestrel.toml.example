@@ -183,6 +183,11 @@ device = "auto"
 data_dir = "/data/models/whisper"
 compute_type = "auto"
 
+[voice.vad]
+aggressiveness = 2         # 0-3, higher = more aggressive non-speech filtering
+silence_threshold_ms = 800 # How long silence before "speech_end" fires
+pre_speech_padding_ms = 300 # How much audio to keep before speech start
+
 [voice.elevenlabs]
 # model = "eleven_multilingual_v2"
 # default_voice_id = ""  # Set to a specific voice ID
