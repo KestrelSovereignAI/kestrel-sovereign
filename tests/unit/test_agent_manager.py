@@ -7,6 +7,7 @@ from pathlib import Path
 
 from kestrel_sovereign.rookery.agent_manager import AgentManager
 from kestrel_sovereign.rookery.config import LocalAgentConfig, RookeryConfig
+from kestrel_sovereign.spawn.mandate import SpawnMandate
 
 
 def _make_mock_agent(agent_id: str = "did:pkh:eip155:1:0xABC"):
@@ -211,3 +212,86 @@ class TestCreateAgent:
         mock_inception.assert_awaited_once()
         assert agent is mock_agent
         assert manager.get_agent("NewBot") is mock_agent
+
+    @pytest.mark.asyncio
+    @patch("kestrel_sovereign.inception_service.create_kestrel_identity_async", new_callable=AsyncMock)
+    @patch("kestrel_sovereign.rookery.agent_manager._get_agent_did", new_callable=AsyncMock)
+    @patch("kestrel_sovereign.rookery.agent_manager.KestrelAgent")
+    @patch("kestrel_sovereign.rookery.agent_manager.LLMService")
+    async def test_create_agent_passes_parent_did(
+        self, mock_llm_cls, mock_agent_cls, mock_get_did, mock_inception, tmp_path
+    ):
+        """create_agent should forward parent_did to inception service."""
+        mock_get_did.return_value = "did:child"
+        mock_agent = _make_mock_agent("did:child")
+        mock_agent_cls.return_value = mock_agent
+
+        manager = AgentManager(base_data_dir=tmp_path)
+
+        with patch.object(LocalAgentConfig, "validate_runtime", return_value=[]):
+            await manager.create_agent("ChildBot", parent_did="did:parent-abc")
+
+        # Verify inception was called WITH parent_did
+        mock_inception.assert_awaited_once()
+        call_kwargs = mock_inception.call_args[1]
+        assert call_kwargs["parent_did"] == "did:parent-abc"
+        assert call_kwargs["agent_name"] == "ChildBot"
+
+
+class TestSpawnAgent:
+    """Test spawn_agent (delegation chain)."""
+
+    @pytest.mark.asyncio
+    @patch("kestrel_sovereign.inception_service.create_kestrel_identity_async", new_callable=AsyncMock)
+    @patch("kestrel_sovereign.rookery.agent_manager._get_agent_did", new_callable=AsyncMock)
+    @patch("kestrel_sovereign.rookery.agent_manager.KestrelAgent")
+    @patch("kestrel_sovereign.rookery.agent_manager.LLMService")
+    async def test_spawn_passes_parent_did_to_create(
+        self, mock_llm_cls, mock_agent_cls, mock_get_did, mock_inception, tmp_path
+    ):
+        """spawn_agent should pass parent's DID to create_agent for delegation."""
+        mock_get_did.return_value = "did:spawned-child"
+        mock_child = _make_mock_agent("did:spawned-child")
+        mock_agent_cls.return_value = mock_child
+
+        manager = AgentManager(base_data_dir=tmp_path)
+
+        parent = _make_mock_agent("did:parent-xyz")
+        parent._private_key = None  # No key — skip signing
+
+        mandate = SpawnMandate(
+            parent_did="did:parent-xyz",
+            purpose="test spawn",
+        )
+
+        with patch.object(LocalAgentConfig, "validate_runtime", return_value=[]):
+            child = await manager.spawn_agent("SpawnedBot", parent, mandate)
+
+        # Verify inception received parent_did
+        call_kwargs = mock_inception.call_args[1]
+        assert call_kwargs["parent_did"] == "did:parent-xyz"
+
+        # Verify parent-child tracking
+        assert "SpawnedBot" in manager.get_children("did:parent-xyz")
+        assert manager.get_mandate("SpawnedBot") is mandate
+        assert mandate.child_did == "did:spawned-child"
+
+    @pytest.mark.asyncio
+    @patch("kestrel_sovereign.inception_service.create_kestrel_identity_async", new_callable=AsyncMock)
+    @patch("kestrel_sovereign.rookery.agent_manager._get_agent_did", new_callable=AsyncMock)
+    @patch("kestrel_sovereign.rookery.agent_manager.KestrelAgent")
+    @patch("kestrel_sovereign.rookery.agent_manager.LLMService")
+    async def test_spawn_duplicate_name_raises(
+        self, mock_llm_cls, mock_agent_cls, mock_get_did, mock_inception, tmp_path
+    ):
+        """spawn_agent should fail if child name already exists."""
+        manager = AgentManager(base_data_dir=tmp_path)
+        manager._agents["Existing"] = _make_mock_agent("did:existing")
+
+        parent = _make_mock_agent("did:parent")
+        parent._private_key = None
+
+        mandate = SpawnMandate(parent_did="did:parent", purpose="dupe test")
+
+        with pytest.raises(ValueError, match="already exists"):
+            await manager.spawn_agent("Existing", parent, mandate)
