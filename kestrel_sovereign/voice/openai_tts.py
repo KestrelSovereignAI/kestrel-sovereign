@@ -23,12 +23,18 @@ class OpenAITTSProvider(TTSProvider):
     is_local = False
 
     VOICES = {
-        "alloy": VoiceInfo(voice_id="alloy", name="Alloy", provider="openai", gender="neutral"),
-        "echo": VoiceInfo(voice_id="echo", name="Echo", provider="openai", gender="masculine"),
-        "fable": VoiceInfo(voice_id="fable", name="Fable", provider="openai", gender="neutral"),
-        "nova": VoiceInfo(voice_id="nova", name="Nova", provider="openai", gender="feminine"),
-        "onyx": VoiceInfo(voice_id="onyx", name="Onyx", provider="openai", gender="masculine"),
-        "shimmer": VoiceInfo(voice_id="shimmer", name="Shimmer", provider="openai", gender="feminine"),
+        "alloy": VoiceInfo(voice_id="alloy", name="Alloy", provider="openai", gender="neutral",
+                           age="young", energy="warm", accent="american"),
+        "echo": VoiceInfo(voice_id="echo", name="Echo", provider="openai", gender="masculine",
+                          age="middle", energy="calm", accent="american"),
+        "fable": VoiceInfo(voice_id="fable", name="Fable", provider="openai", gender="neutral",
+                           age="middle", energy="warm", accent="british"),
+        "nova": VoiceInfo(voice_id="nova", name="Nova", provider="openai", gender="feminine",
+                          age="young", energy="warm", accent="american"),
+        "onyx": VoiceInfo(voice_id="onyx", name="Onyx", provider="openai", gender="masculine",
+                          age="mature", energy="authoritative", accent="american"),
+        "shimmer": VoiceInfo(voice_id="shimmer", name="Shimmer", provider="openai", gender="feminine",
+                             age="middle", energy="energetic", accent="american"),
     }
 
     MODELS = ["tts-1", "tts-1-hd"]
