@@ -3,7 +3,11 @@ name: Kestrel CI
 on:
   push:
     tags:
-      - 'v[0-9]+.[0-9]+.[0-9]+'  # Only run on version tags like v1.0.0, v2.3.4
+      - 'v[0-9]+.[0-9]+.[0-9]+'  # Run on version tags like v1.0.0, v2.3.4
+    branches:
+      - 'issue-*'  # Run on kestrel-talon feature branches
+  pull_request:
+    branches: [main]  # Run on PRs targeting main
   workflow_dispatch:  # Manual trigger
 
 env:
