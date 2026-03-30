@@ -173,7 +173,7 @@ class AgentManager:
                 logger.warning(f"Agent '{name}' shutdown issue: {e}")
             return True
 
-    async def create_agent(self, name: str) -> KestrelAgent:
+    async def create_agent(self, name: str, parent_did: str = None) -> KestrelAgent:
         """Create a new agent via inception and load it.
 
         Runs the inception service to generate a new DID and database,
@@ -181,6 +181,7 @@ class AgentManager:
 
         Args:
             name: Name for the new agent (used as directory name and routing key).
+            parent_did: Optional DID of parent agent for delegation chain.
 
         Returns:
             The newly created and initialized KestrelAgent.
@@ -200,6 +201,7 @@ class AgentManager:
             await create_kestrel_identity_async(
                 output_dir=str(agent_dir),
                 agent_name=name,
+                parent_did=parent_did,
             )
         except Exception as e:
             raise ValueError(f"Inception failed for '{name}': {e}")
@@ -239,7 +241,7 @@ class AgentManager:
             sign_mandate(mandate, parent_private_key)
 
         # Create the child via the existing create_agent flow
-        child = await self.create_agent(name)
+        child = await self.create_agent(name, parent_did=parent_agent.agent_id)
 
         # Fill in child DID on the mandate
         mandate.child_did = child.agent_id

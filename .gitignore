@@ -173,3 +173,12 @@ scripts/verify_trigger_word.py
 # E2E tests with local paths
 tests/e2e/simpletuner/local-lora-training.spec.js
 tests/e2e/simpletuner/playwright.config.cjs
+
+# Temp automation scripts
+_*.py
+_*.txt
+_*.md
+_*.json
+_*.js
+!_test_*
+

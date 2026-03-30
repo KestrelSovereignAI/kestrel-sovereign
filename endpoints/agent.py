@@ -691,3 +691,57 @@ async def heartbeat_trigger(request: Request):
     except Exception as e:
         logger.error(f"Heartbeat trigger error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Error triggering heartbeat.")
+
+
+# =========================================================================
+# Agent Mesh Protocol
+# =========================================================================
+
+
+@router.post("/mesh")
+@limiter.limit("120/minute")
+async def receive_mesh_message(request: Request):
+    """
+    Receive a structured mesh message from a peer agent.
+
+    This endpoint accepts MeshMessage payloads (assign, review_needed,
+    complete, reject, status_update) and stores them in the agent's
+    mesh inbox via PeersFeature.
+
+    Used by the Falconer agent mesh for Claws → Talon → Eye communication.
+    """
+    agent = get_agent(request)
+    body = await _parse_json_body(request)
+
+    peers = agent.features.get("PeersFeature")
+    if not peers:
+        raise HTTPException(
+            status_code=503,
+            detail="PeersFeature not loaded — agent cannot receive mesh messages",
+        )
+
+    result = peers.receive_mesh_message(body)
+
+    if not result.get("accepted"):
+        raise HTTPException(status_code=400, detail=result.get("error", "Invalid mesh message"))
+
+    return result
+
+
+@router.get("/mesh/inbox")
+async def get_mesh_inbox(request: Request, limit: int = Query(default=20, ge=1, le=100)):
+    """
+    Retrieve recent mesh messages from this agent's inbox.
+
+    Useful for dashboards and debugging the mesh protocol.
+    """
+    agent = get_agent(request)
+
+    peers = agent.features.get("PeersFeature")
+    if not peers:
+        raise HTTPException(
+            status_code=503,
+            detail="PeersFeature not loaded",
+        )
+
+    return await peers.mesh_inbox(limit=limit)
