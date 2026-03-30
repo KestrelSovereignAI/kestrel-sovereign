@@ -2668,6 +2668,7 @@ full = [
     { name = "torchaudio" },
     { name = "torchvision" },
     { name = "transformers" },
+    { name = "webrtcvad" },
 ]
 local = [
     { name = "chromadb" },
@@ -2708,6 +2709,7 @@ voice = [
     { name = "faster-whisper" },
     { name = "piper-tts" },
     { name = "soundfile" },
+    { name = "webrtcvad" },
 ]
 
 [package.dev-dependencies]
@@ -2825,6 +2827,7 @@ requires-dist = [
     { name = "uvicorn", specifier = "==0.35.0" },
     { name = "vastai-sdk", specifier = ">=0.1.0" },
     { name = "web3", specifier = ">=7.0.0" },
+    { name = "webrtcvad", marker = "extra == 'voice'", specifier = ">=2.0.10" },
 ]
 provides-extras = ["test", "ml", "local", "voice", "observability", "cloud-storage", "full"]
 
@@ -6636,6 +6639,12 @@ sdist = { url = "https://files.pythonhosted.org/packages/4c/85/1515644dc1b0170e4
 wheels = [
     { url = "https://files.pythonhosted.org/packages/66/94/68ce430b5e19803d2b34736dd653e8627bde68d93cd8b0bec44384487a59/web3-7.14.0-py3-none-any.whl", hash = "sha256:a78c0a979bf11c47795f564512131c01b7598a276976f7031c55140f733e210a", size = 1370801, upload-time = "2025-10-16T19:25:04.052Z" },
 ]
+
+[[package]]
+name = "webrtcvad"
+version = "2.0.10"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/89/34/e2de2d97f3288512b9ea56f92e7452f8207eb5a0096500badf9dfd48f5e6/webrtcvad-2.0.10.tar.gz", hash = "sha256:f1bed2fb25b63fb7b1a55d64090c993c9c9167b28485ae0bcdd81cf6ede96aea", size = 66156, upload-time = "2017-01-07T23:05:18.732Z" }
 
 [[package]]
 name = "websocket-client"
