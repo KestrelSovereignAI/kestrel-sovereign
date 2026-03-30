@@ -13,9 +13,10 @@ from dataclasses import asdict
 from typing import Any, Dict, Optional
 
 from kestrel_sovereign.features.base import Feature, tool
+from kestrel_sovereign.identity.identity_package import PersonalityFingerprint
 from kestrel_sovereign.privacy import PrivacyConfig, PRIVACY_PRESETS
 from kestrel_sovereign.tools.base import ToolCategory
-from kestrel_sovereign.voice.base import VoiceConfig, VoiceInfo, TTSProvider, STTProvider
+from kestrel_sovereign.voice.base import VoiceConfig, VoiceInfo, TTSProvider, STTProvider, match_voice
 from kestrel_sovereign.voice.provider_registry import VoiceProviderRegistry
 
 logger = logging.getLogger(__name__)
@@ -179,6 +180,107 @@ class VoiceFeature(Feature):
             if provider:
                 return provider
         raise VoicePrivacyError("No STT provider available. Configure a voice provider.")
+
+    def _get_personality(self) -> PersonalityFingerprint | None:
+        """Get the agent's personality fingerprint if available."""
+        identity = getattr(self.agent, "identity", None)
+        if identity is None:
+            return None
+        personality = getattr(identity, "personality", None)
+        if isinstance(personality, PersonalityFingerprint):
+            return personality
+        if isinstance(personality, dict):
+            return PersonalityFingerprint.from_dict(personality)
+        return None
+
+    def _sync_personality_from_voice(self, voice: VoiceInfo) -> None:
+        """Update personality voice hints to match the selected voice metadata."""
+        identity = getattr(self.agent, "identity", None)
+        if identity is None:
+            return
+        personality = getattr(identity, "personality", None)
+        if personality is None:
+            return
+        if isinstance(personality, dict):
+            personality = PersonalityFingerprint.from_dict(personality)
+            identity.personality = personality
+        personality.voice_gender_preference = voice.gender
+        personality.voice_age_preference = voice.age
+        personality.voice_energy = voice.energy
+        personality.voice_accent_preference = voice.accent
+
+    async def _resolve_voice(self) -> tuple[TTSProvider, str]:
+        """Resolve the effective TTS provider and voice_id.
+
+        Priority:
+        1. Explicit voice_config (provider + voice_id)
+        2. Personality-based matching across available providers
+        3. First available provider's default voice
+        """
+        # Priority 1: Explicit voice_config
+        if self._voice_config.tts_provider and self._voice_config.tts_voice_id:
+            registry = await self._ensure_registry()
+            provider = registry.get_tts(self._voice_config.tts_provider)
+            if provider:
+                # Check availability
+                try:
+                    available = await provider.is_available()
+                except Exception:
+                    available = False
+                if available:
+                    return provider, self._voice_config.tts_voice_id
+
+            # Configured provider unavailable — fall through to personality matching
+            logger.info(
+                "Configured voice provider '%s' unavailable, attempting personality-based matching",
+                self._voice_config.tts_provider,
+            )
+
+        # Priority 2: Personality-based matching
+        personality = self._get_personality()
+        if personality and any([
+            personality.voice_gender_preference,
+            personality.voice_age_preference,
+            personality.voice_energy,
+            personality.voice_accent_preference,
+        ]):
+            registry = await self._ensure_registry()
+            all_voices: list[VoiceInfo] = []
+            cloud_ok = self._cloud_allowed()
+
+            for name in registry.list_tts_providers():
+                tts = registry.get_tts(name)
+                if tts is None:
+                    continue
+                if not cloud_ok and not tts.is_local:
+                    continue
+                try:
+                    if not await tts.is_available():
+                        continue
+                    voices = await tts.list_voices()
+                    all_voices.extend(voices)
+                except Exception:
+                    continue
+
+            matched = match_voice(personality, all_voices)
+            if matched:
+                tts = registry.get_tts(matched.provider)
+                if tts:
+                    logger.info(
+                        "Personality-matched voice: %s/%s (score based on gender=%s, age=%s, energy=%s, accent=%s)",
+                        matched.provider, matched.voice_id,
+                        personality.voice_gender_preference,
+                        personality.voice_age_preference,
+                        personality.voice_energy,
+                        personality.voice_accent_preference,
+                    )
+                    return tts, matched.voice_id
+
+        # Priority 3: First available provider's default voice
+        tts = await self._get_tts_provider()
+        voices = await tts.list_voices()
+        voice_id = voices[0].voice_id if voices else ""
+        return tts, voice_id
 
     def is_provider_allowed(self, provider_name: str, provider_type: str = "tts") -> bool:
         """Check if a specific provider is allowed under current privacy mode.
@@ -355,6 +457,17 @@ class VoiceFeature(Feature):
         if identity and hasattr(identity, "voice_config"):
             identity.voice_config = self._voice_config.to_dict()
 
+        # Sync personality hints with selected voice metadata
+        if tts:
+            try:
+                provider_voices = await tts.list_voices()
+                for v in provider_voices:
+                    if v.voice_id == voice_id:
+                        self._sync_personality_from_voice(v)
+                        break
+            except Exception:
+                pass
+
         return {
             "success": True,
             "voice_id": voice_id,
@@ -368,14 +481,9 @@ class VoiceFeature(Feature):
         Args:
             text: The text to speak aloud
         """
-        tts = await self._get_tts_provider()
-        voice_id = self._voice_config.tts_voice_id
+        tts, voice_id = await self._resolve_voice()
         if not voice_id:
-            # Use first available voice
-            voices = await tts.list_voices()
-            if not voices:
-                return {"success": False, "error": "No voices available on the current TTS provider."}
-            voice_id = voices[0].voice_id
+            return {"success": False, "error": "No voices available on any TTS provider."}
 
         audio_bytes = await tts.synthesize(
             text=text,

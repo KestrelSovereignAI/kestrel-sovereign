@@ -156,8 +156,23 @@ class ElevenLabsTTSProvider(TTSProvider):
         voices = []
         for voice in response.voices:
             labels = getattr(voice, "labels", {}) or {}
-            gender = labels.get("gender", "neutral") if isinstance(labels, dict) else "neutral"
-            language = labels.get("language", "en") if isinstance(labels, dict) else "en"
+            if not isinstance(labels, dict):
+                labels = {}
+            gender = labels.get("gender", "neutral")
+            language = labels.get("language", "en")
+            age = labels.get("age", "middle")
+            accent = labels.get("accent", "neutral")
+            use_case = labels.get("use_case", "")
+            # Infer energy from use_case or descriptive labels
+            energy = "neutral"
+            if "narration" in use_case or "meditation" in use_case:
+                energy = "calm"
+            elif "news" in use_case or "conversation" in use_case:
+                energy = "warm"
+            elif "animation" in use_case or "gaming" in use_case:
+                energy = "energetic"
+            elif "authoritative" in labels.get("description", "").lower():
+                energy = "authoritative"
             preview = getattr(voice, "preview_url", "") or ""
 
             voices.append(
@@ -168,6 +183,9 @@ class ElevenLabsTTSProvider(TTSProvider):
                     language=language,
                     gender=gender,
                     preview_url=preview,
+                    age=age,
+                    energy=energy,
+                    accent=accent,
                 )
             )
 
