@@ -21,6 +21,7 @@ from kestrel_sovereign.tools.base import ToolCategory
 from .backlog_hygiene import run_backlog_hygiene
 from .morning_signal import generate_morning_signal, generate_portfolio_dashboard
 from .session_log import collect_session_log
+from .talon_handoff import dispatch_to_talon
 
 logger = logging.getLogger(__name__)
 
@@ -284,6 +285,17 @@ class StrategicMemoryFeature(Feature):
     async def morning_signal(self) -> str:
         """Generate the Morning Signal briefing from strategic memory + live GitHub data."""
         return await generate_morning_signal(self._data)
+
+    @tool(
+        name="signal_dispatch",
+        description="Pick the highest-priority issue from strategic memory and dispatch it to Talon via the Agent Mesh Protocol. Works with any signal source (morning, hygiene, event-driven, on-demand).",
+        category=ToolCategory.SYSTEM,
+        command_prefix="!dispatch",
+    )
+    async def signal_dispatch(self) -> str:
+        """Pick top issue from strategic memory and dispatch to Talon."""
+        dispatch_result = await dispatch_to_talon(self._data)
+        return f"## Signal Dispatch\n{dispatch_result}"
 
     @tool(
         name="portfolio_dashboard",

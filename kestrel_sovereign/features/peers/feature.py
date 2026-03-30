@@ -4,6 +4,9 @@ Peers Feature — Inter-agent communication for rookery environments.
 Allows agents to discover sibling agents and send messages to them
 through the rookery host proxy. Works in both local and cloud deployments.
 
+Includes the Agent Mesh Protocol for structured message exchange between
+Falconer agents (Claws, Talon, Eye, Flight).
+
 Architecture:
     Agent A → PeersFeature.ask_agent("emma", "What do you think?")
         → POST http://{host}/api/agents/emma/agent/invoke
@@ -11,12 +14,18 @@ Architecture:
                 → Emma processes, returns response
             ← Response flows back through proxy
         ← Agent A receives Emma's answer
+
+    Mesh Protocol:
+        Claws → send_mesh_message(talon, assign, {issue: 42})
+            → POST http://{host}/api/agents/talon/agent/mesh
+            ← Talon acknowledges receipt
 """
 
+import json
 import logging
 import os
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Any, Dict, List, Optional
 
 import httpx
 
@@ -74,6 +83,8 @@ class PeersFeature(Feature):
         self._host_url = _discover_host_url()
         self._api_key = os.environ.get("KESTREL_API_KEY", "")
         self._own_name = self._get_own_name()
+        self._mesh_inbox: List[Dict[str, Any]] = []
+        self._mesh_log: List[Dict[str, Any]] = []
 
         if self._host_url:
             logger.info(f"PeersFeature initialized: host={self._host_url}, self={self._own_name}")
@@ -223,3 +234,154 @@ class PeersFeature(Feature):
                 "response": None,
                 "error": str(e),
             }
+
+    # ------------------------------------------------------------------
+    # Agent Mesh Protocol
+    # ------------------------------------------------------------------
+
+    @tool(
+        name="send_mesh_message",
+        description="Send a structured mesh message to a peer agent. Use for task assignments, review requests, completions, and rejections between Falconer agents.",
+        category=ToolCategory.COMMUNICATION,
+        command_prefix="!mesh send",
+    )
+    async def send_mesh_message(
+        self,
+        recipient: str,
+        message_type: str,
+        payload_json: str,
+        priority: str = "normal",
+        repo: str = "",
+        correlation_id: str = "",
+    ) -> Dict[str, Any]:
+        """
+        Send a structured mesh message to a peer agent.
+
+        The message is delivered to the recipient's /agent/mesh endpoint
+        via the rookery host proxy. The recipient stores it in their
+        mesh inbox for processing.
+
+        Args:
+            recipient: Name of the target agent (e.g. "talon", "eye")
+            message_type: One of: assign, review_needed, complete, reject, status_update
+            payload_json: JSON string with type-specific data
+            priority: Priority level: critical, high, normal, low
+            repo: GitHub repo in "owner/name" format (optional)
+            correlation_id: Links to a previous message (for replies)
+        """
+        from .mesh import MeshMessage, MeshMessageType, MeshPriority
+
+        if not self._host_url:
+            return {"sent": False, "error": "Not running in a rookery environment"}
+
+        try:
+            msg_type = MeshMessageType(message_type)
+        except ValueError:
+            valid = [t.value for t in MeshMessageType]
+            return {"sent": False, "error": f"Invalid message_type. Must be one of: {valid}"}
+
+        try:
+            msg_priority = MeshPriority(priority)
+        except ValueError:
+            valid = [p.value for p in MeshPriority]
+            return {"sent": False, "error": f"Invalid priority. Must be one of: {valid}"}
+
+        try:
+            payload = json.loads(payload_json) if isinstance(payload_json, str) else payload_json
+        except json.JSONDecodeError as e:
+            return {"sent": False, "error": f"Invalid payload_json: {e}"}
+
+        msg = MeshMessage(
+            type=msg_type,
+            sender=self._own_name,
+            recipient=recipient,
+            priority=msg_priority,
+            payload=payload,
+            repo=repo or None,
+            correlation_id=correlation_id or None,
+        )
+
+        # Deliver via rookery host → recipient's /agent/mesh endpoint
+        url = f"{self._host_url}/api/agents/{recipient}/agent/mesh"
+
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.post(
+                    url,
+                    json=msg.to_dict(),
+                    headers=self._build_headers(),
+                    timeout=httpx.Timeout(
+                        connect=PEER_CONNECT_TIMEOUT,
+                        read=PEER_READ_TIMEOUT,
+                        write=PEER_READ_TIMEOUT,
+                        pool=PEER_CONNECT_TIMEOUT,
+                    ),
+                )
+
+            if resp.status_code == 404:
+                return {"sent": False, "error": f"Agent '{recipient}' not found or mesh endpoint not available"}
+            if resp.status_code == 503:
+                return {"sent": False, "error": f"Agent '{recipient}' is offline"}
+
+            resp.raise_for_status()
+
+            # Log the outbound message
+            self._mesh_log.append(msg.to_dict())
+            logger.info(f"Mesh message sent: {msg.type.value} → {recipient} (id={msg.id})")
+
+            return {
+                "sent": True,
+                "message_id": msg.id,
+                "type": msg.type.value,
+                "recipient": recipient,
+            }
+
+        except httpx.ConnectError:
+            return {"sent": False, "error": f"Could not reach agent '{recipient}'"}
+        except httpx.TimeoutException:
+            return {"sent": False, "error": f"Agent '{recipient}' timed out"}
+        except Exception as e:
+            logger.error(f"Mesh send to '{recipient}' failed: {e}")
+            return {"sent": False, "error": str(e)}
+
+    @tool(
+        name="mesh_inbox",
+        description="View incoming mesh messages from peer agents. Shows assignments, review requests, and status updates.",
+        category=ToolCategory.COMMUNICATION,
+        command_prefix="!mesh inbox",
+    )
+    async def mesh_inbox(self, limit: int = 20) -> Dict[str, Any]:
+        """
+        View recent incoming mesh messages.
+
+        Args:
+            limit: Maximum number of messages to return (default 20).
+        """
+        messages = self._mesh_inbox[-limit:] if limit > 0 else self._mesh_inbox
+        return {
+            "messages": messages,
+            "count": len(messages),
+            "total": len(self._mesh_inbox),
+        }
+
+    def receive_mesh_message(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Receive and store an incoming mesh message (called by the /agent/mesh endpoint).
+
+        Returns acknowledgement dict.
+        """
+        from .mesh import MeshMessage
+
+        try:
+            msg = MeshMessage.from_dict(data)
+        except (KeyError, ValueError) as e:
+            return {"accepted": False, "error": f"Invalid mesh message: {e}"}
+
+        self._mesh_inbox.append(msg.to_dict())
+        logger.info(f"Mesh message received: {msg.type.value} from {msg.sender} (id={msg.id})")
+
+        return {
+            "accepted": True,
+            "message_id": msg.id,
+            "type": msg.type.value,
+        }
