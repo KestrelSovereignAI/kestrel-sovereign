@@ -639,6 +639,8 @@ class KestrelAgent(
             ("reflect", "0 */4 * * *", '{"scope":"all","depth":"normal"}'),
             ("training_cycle", "0 3 * * *", '{"iterations":3,"depth":"normal"}'),
             ("backup_snapshot", "0 */4 * * *", "{}"),
+            ("morning_signal", "0 8 * * *", "{}"),
+            ("signal_dispatch", "5 8 * * *", "{}"),
         ]
 
         for task_name, cron, args in defaults:
