@@ -429,6 +429,36 @@ async def voice_chat(websocket: WebSocket):
             pass
     output_format = vf._voice_config.output_format or "opus"
 
+    # --- Initialize VAD (optional — degrades gracefully if webrtcvad missing) ---
+    vad = None
+    try:
+        from kestrel_sovereign.voice.vad import VoiceActivityDetector, load_vad_config
+
+        # Load VAD config from agent's kestrel.toml if available
+        vad_config_dict = {}
+        agent_config = getattr(agent, "config", None)
+        if agent_config and hasattr(agent_config, "config_file"):
+            import toml as _toml
+            try:
+                cfg_path = getattr(agent_config, "config_file", None)
+                if cfg_path and hasattr(cfg_path, "exists") and cfg_path.exists():
+                    vad_config_dict = _toml.load(str(cfg_path))
+            except Exception:
+                pass
+        vad_cfg = load_vad_config(vad_config_dict or None)
+        vad = VoiceActivityDetector(
+            aggressiveness=vad_cfg["aggressiveness"],
+            silence_threshold_ms=vad_cfg["silence_threshold_ms"],
+            pre_speech_padding_ms=vad_cfg["pre_speech_padding_ms"],
+        )
+        logger.info("VAD enabled (aggressiveness=%d, silence=%dms, padding=%dms)",
+                     vad_cfg["aggressiveness"], vad_cfg["silence_threshold_ms"],
+                     vad_cfg["pre_speech_padding_ms"])
+    except ImportError:
+        logger.info("webrtcvad not installed — VAD disabled, using direct STT passthrough")
+    except Exception as e:
+        logger.warning("VAD initialization failed — falling back to direct STT: %s", e)
+
     # --- Accept the connection ---
     await websocket.accept()
 
@@ -442,18 +472,6 @@ async def voice_chat(websocket: WebSocket):
 
     # Notify client we are ready
     await send_status(_STATE_LISTENING)
-
-    # --- Audio buffer for STT ---
-    # Accumulates client audio frames and feeds them to the STT provider.
-    audio_queue: asyncio.Queue[bytes | None] = asyncio.Queue()
-
-    async def audio_stream_from_queue():
-        """Yield audio chunks from the queue until sentinel (None)."""
-        while True:
-            chunk = await audio_queue.get()
-            if chunk is None:
-                break
-            yield chunk
 
     async def _process_utterance(transcript_text: str):
         """Run agent processing and TTS for a final transcript."""
@@ -505,82 +523,141 @@ async def voice_chat(websocket: WebSocket):
         # Back to listening
         await send_status(_STATE_LISTENING)
 
-    # --- Main receive loop ---
-    try:
-        while True:
-            message = await websocket.receive()
-
-            if message.get("type") == "websocket.disconnect":
-                break
-
-            # Binary data = audio frames from client
-            if "bytes" in message and message["bytes"]:
-                audio_data = message["bytes"]
-
-                # Feed audio to STT provider for transcription
-                try:
-                    # Use streaming STT if available: feed chunks through the queue
-                    # For simpler providers without true streaming, batch-transcribe
-                    # the audio chunk directly.
-                    if hasattr(stt, "transcribe_stream"):
-                        # Create a one-shot stream from this audio frame
-                        async def _single_chunk_stream(data=audio_data):
-                            yield data
-
-                        async for text_segment in stt.transcribe_stream(
-                            _single_chunk_stream(), language=""
-                        ):
-                            if not text_segment.strip():
-                                continue
-                            # Treat each yielded segment as a final transcript
-                            # (provider handles partial vs final internally)
-                            is_final = True
-                            await send_control({
-                                "type": "transcript",
-                                "text": text_segment,
-                                "final": is_final,
-                            })
-                            if is_final:
-                                await _process_utterance(text_segment)
-                    else:
-                        # Batch fallback: transcribe the received audio chunk
-                        transcript = await stt.transcribe(
-                            audio=audio_data, language="", audio_format="opus"
-                        )
-                        if transcript and transcript.strip():
-                            await send_control({
-                                "type": "transcript",
-                                "text": transcript,
-                                "final": True,
-                            })
-                            await _process_utterance(transcript)
-
-                except Exception as e:
-                    logger.error("STT error in voice chat: %s", e, exc_info=True)
-                    await send_control({"type": "error", "message": "Transcription failed."})
-
-            # Text data = JSON control messages from client (e.g., config updates)
-            elif "text" in message and message["text"]:
-                try:
-                    client_msg = json.loads(message["text"])
-                    msg_type = client_msg.get("type", "")
-
-                    if msg_type == "config":
-                        # Allow runtime config updates (e.g., language hint)
-                        logger.debug("Voice chat config update: %s", client_msg)
-                    elif msg_type == "end":
-                        # Client signals end of conversation
-                        break
-                    else:
-                        logger.debug("Unknown client message type: %s", msg_type)
-                except json.JSONDecodeError:
-                    await send_control({"type": "error", "message": "Invalid JSON."})
-
-    except WebSocketDisconnect:
-        logger.debug("Voice chat WebSocket disconnected")
-    except Exception as e:
-        logger.error("Unexpected error in voice chat: %s", e, exc_info=True)
+    async def _transcribe_and_process(audio_data: bytes):
+        """Transcribe audio data via STT and process the result."""
         try:
-            await send_control({"type": "error", "message": "Internal server error."})
-        except Exception:
-            pass
+            if hasattr(stt, "transcribe_stream"):
+                async def _single_chunk_stream(data=audio_data):
+                    yield data
+
+                async for text_segment in stt.transcribe_stream(
+                    _single_chunk_stream(), language=""
+                ):
+                    if not text_segment.strip():
+                        continue
+                    is_final = True
+                    await send_control({
+                        "type": "transcript",
+                        "text": text_segment,
+                        "final": is_final,
+                    })
+                    if is_final:
+                        await _process_utterance(text_segment)
+            else:
+                transcript = await stt.transcribe(
+                    audio=audio_data, language="", audio_format="opus"
+                )
+                if transcript and transcript.strip():
+                    await send_control({
+                        "type": "transcript",
+                        "text": transcript,
+                        "final": True,
+                    })
+                    await _process_utterance(transcript)
+        except Exception as e:
+            logger.error("STT error in voice chat: %s", e, exc_info=True)
+            await send_control({"type": "error", "message": "Transcription failed."})
+
+    # --- VAD-based receive loop ---
+    if vad is not None:
+        # VAD mode: feed audio through VAD, accumulate utterances,
+        # then send complete utterances to STT.
+        audio_queue: asyncio.Queue[bytes | None] = asyncio.Queue()
+
+        async def _vad_audio_stream():
+            """Yield audio frames from the queue for VAD processing."""
+            while True:
+                frame = await audio_queue.get()
+                if frame is None:
+                    break
+                yield frame
+
+        async def _vad_processor():
+            """Run VAD on queued audio and process detected utterances."""
+            try:
+                async for event_type, audio_data in vad.detect_utterances(_vad_audio_stream()):
+                    if event_type == "speech_start":
+                        await send_status(_STATE_LISTENING)
+                    elif event_type == "speech_end":
+                        await _transcribe_and_process(audio_data)
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.error("VAD processor error: %s", e, exc_info=True)
+
+        vad_task = asyncio.create_task(_vad_processor())
+
+        try:
+            while True:
+                message = await websocket.receive()
+
+                if message.get("type") == "websocket.disconnect":
+                    break
+
+                if "bytes" in message and message["bytes"]:
+                    await audio_queue.put(message["bytes"])
+
+                elif "text" in message and message["text"]:
+                    try:
+                        client_msg = json.loads(message["text"])
+                        msg_type = client_msg.get("type", "")
+
+                        if msg_type == "config":
+                            logger.debug("Voice chat config update: %s", client_msg)
+                        elif msg_type == "end":
+                            break
+                        else:
+                            logger.debug("Unknown client message type: %s", msg_type)
+                    except json.JSONDecodeError:
+                        await send_control({"type": "error", "message": "Invalid JSON."})
+
+        except WebSocketDisconnect:
+            logger.debug("Voice chat WebSocket disconnected")
+        except Exception as e:
+            logger.error("Unexpected error in voice chat: %s", e, exc_info=True)
+            try:
+                await send_control({"type": "error", "message": "Internal server error."})
+            except Exception:
+                pass
+        finally:
+            await audio_queue.put(None)  # Signal VAD stream end
+            vad_task.cancel()
+            try:
+                await vad_task
+            except asyncio.CancelledError:
+                pass
+
+    else:
+        # --- Fallback: direct STT passthrough (no VAD) ---
+        try:
+            while True:
+                message = await websocket.receive()
+
+                if message.get("type") == "websocket.disconnect":
+                    break
+
+                if "bytes" in message and message["bytes"]:
+                    await _transcribe_and_process(message["bytes"])
+
+                elif "text" in message and message["text"]:
+                    try:
+                        client_msg = json.loads(message["text"])
+                        msg_type = client_msg.get("type", "")
+
+                        if msg_type == "config":
+                            logger.debug("Voice chat config update: %s", client_msg)
+                        elif msg_type == "end":
+                            break
+                        else:
+                            logger.debug("Unknown client message type: %s", msg_type)
+                    except json.JSONDecodeError:
+                        await send_control({"type": "error", "message": "Invalid JSON."})
+
+        except WebSocketDisconnect:
+            logger.debug("Voice chat WebSocket disconnected")
+        except Exception as e:
+            logger.error("Unexpected error in voice chat: %s", e, exc_info=True)
+            try:
+                await send_control({"type": "error", "message": "Internal server error."})
+            except Exception:
+                pass
