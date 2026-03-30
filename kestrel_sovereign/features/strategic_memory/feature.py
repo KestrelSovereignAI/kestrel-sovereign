@@ -21,7 +21,7 @@ from kestrel_sovereign.tools.base import ToolCategory
 from .backlog_hygiene import run_backlog_hygiene
 from .morning_signal import generate_morning_signal, generate_portfolio_dashboard
 from .session_log import collect_session_log
-from .talon_handoff import dispatch_to_talon
+from .talon_handoff import dispatch_to_talon, pick_top_issue
 
 logger = logging.getLogger(__name__)
 
@@ -292,10 +292,51 @@ class StrategicMemoryFeature(Feature):
         category=ToolCategory.SYSTEM,
         command_prefix="!dispatch",
     )
-    async def signal_dispatch(self) -> str:
-        """Pick top issue from strategic memory and dispatch to Talon."""
+    async def signal_dispatch(self, mode: str = "execute") -> str:
+        """Pick top issue from strategic memory and dispatch to Talon.
+
+        Args:
+            mode: 'execute' to dispatch immediately, 'suggest' to show suggestion only.
+        """
+        if mode == "suggest":
+            issue = await pick_top_issue(self._data)
+            if not issue:
+                return "## Signal Dispatch (suggest)\nNo actionable issue found."
+            return (
+                f"## Signal Dispatch (suggest)\n"
+                f"**Top issue:** {issue['repo']}#{issue['issue_number']}: {issue['issue_title']}\n"
+                f"**Priority:** {issue['priority']}\n"
+                f"**Context:** {issue.get('context', 'N/A')}\n\n"
+                f"Use `!dispatch` or `!talon claim {issue['repo']} {issue['issue_number']}` to execute."
+            )
+
+        # Try TalonCoordinatorFeature first (preferred path)
+        coordinator = self._get_talon_coordinator()
+        if coordinator:
+            issue = await pick_top_issue(self._data)
+            if not issue:
+                return "## Signal Dispatch\nNo actionable issue found."
+            result = await coordinator.talon_claim(
+                repo=issue["repo"], issue=issue["issue_number"],
+            )
+            status = "dispatched" if result.get("dispatched") else f"failed: {result.get('error', 'unknown')}"
+            return (
+                f"## Signal Dispatch\n"
+                f"{issue['repo']}#{issue['issue_number']}: {issue['issue_title']} -- {status}\n"
+                f"Method: {result.get('method', 'N/A')}"
+            )
+
+        # Fallback: direct mesh dispatch via talon_handoff
         dispatch_result = await dispatch_to_talon(self._data)
         return f"## Signal Dispatch\n{dispatch_result}"
+
+    def _get_talon_coordinator(self):
+        """Get TalonCoordinatorFeature if loaded."""
+        if hasattr(self.agent, '_features'):
+            for f in self.agent._features:
+                if type(f).__name__ == "TalonCoordinatorFeature":
+                    return f
+        return None
 
     @tool(
         name="portfolio_dashboard",
