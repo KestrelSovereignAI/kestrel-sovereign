@@ -182,7 +182,7 @@ class PrivacyEnforcingStorage:
     
     # === Conversation Storage (Privacy-Sensitive) ===
     
-    async def add_conversation(self, role: str, content: str, metadata: Optional[Dict] = None) -> None:
+    async def add_conversation(self, role: str, content: str, metadata: Optional[Dict] = None, session_id: Optional[str] = None) -> None:
         """
         Add a conversation entry, respecting privacy mode.
         
@@ -208,12 +208,13 @@ class PrivacyEnforcingStorage:
             self._session_conversations.append({
                 "role": role,
                 "content": processed_content,
-                "metadata": metadata
+                "metadata": metadata,
+                "session_id": session_id
             })
             logger.debug(f"Conversation stored in session ({len(self._session_conversations)} total)")
         else:
             # Store in persistent storage
-            await self._storage.add_conversation(role, processed_content, metadata)
+            await self._storage.add_conversation(role, processed_content, metadata, session_id)
     
     async def get_conversation_history(
         self, limit: int = 100, session_id: str = None
@@ -257,7 +258,8 @@ class PrivacyEnforcingStorage:
             await self._storage.add_conversation(
                 conv["role"],
                 conv["content"],
-                conv.get("metadata")
+                conv.get("metadata"),
+                conv.get("session_id")
             )
             count += 1
         self._session_conversations.clear()

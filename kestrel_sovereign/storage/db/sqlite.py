@@ -64,10 +64,13 @@ class SQLiteBackend(DatabaseBackend):
                 db_dir = Path(self.db_path).parent
                 db_dir.mkdir(parents=True, exist_ok=True)
             
-            self._connection = await aiosqlite.connect(self.db_path)
+            self._connection = await aiosqlite.connect(self.db_path, timeout=30)
             
             # Enable WAL mode for better concurrency
             await self._connection.execute("PRAGMA journal_mode=WAL")
+            
+            # Allow concurrent writers to wait up to 30s for the lock
+            await self._connection.execute("PRAGMA busy_timeout=30000")
             
             # Enable foreign keys
             await self._connection.execute("PRAGMA foreign_keys=ON")
