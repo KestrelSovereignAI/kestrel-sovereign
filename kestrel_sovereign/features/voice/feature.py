@@ -10,14 +10,15 @@ content_hash — raw bytes are never returned in tool results.
 
 import logging
 from dataclasses import asdict
-from typing import Any, Dict, Optional
+from typing import Any, AsyncIterator, Dict, Optional
 
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.identity.identity_package import PersonalityFingerprint
 from kestrel_sovereign.privacy import PrivacyConfig, PRIVACY_PRESETS
 from kestrel_sovereign.tools.base import ToolCategory
-from kestrel_sovereign.voice.base import VoiceConfig, VoiceInfo, TTSProvider, STTProvider, match_voice
+from kestrel_sovereign.voice.base import VoiceConfig, VoiceInfo, TTSProvider, STTProvider, match_voice, split_sentences
 from kestrel_sovereign.voice.provider_registry import VoiceProviderRegistry
+from kestrel_sovereign.voice.stream_tap import AgentStreamTap
 
 logger = logging.getLogger(__name__)
 
@@ -181,6 +182,7 @@ class VoiceFeature(Feature):
                 return provider
         raise VoicePrivacyError("No STT provider available. Configure a voice provider.")
 
+<<<<<<< HEAD
     def _get_personality(self) -> PersonalityFingerprint | None:
         """Get the agent's personality fingerprint if available."""
         identity = getattr(self.agent, "identity", None)
@@ -281,6 +283,70 @@ class VoiceFeature(Feature):
         voices = await tts.list_voices()
         voice_id = voices[0].voice_id if voices else ""
         return tts, voice_id
+
+    async def stream_speak(
+        self,
+        request_id: str,
+        voice_id: str = "",
+        output_format: str = "",
+    ) -> AsyncIterator[bytes]:
+        """Synthesize speech incrementally from an active agent stream.
+
+        Hooks into the agent's streaming response (identified by *request_id*),
+        buffers text until sentence boundaries, and yields audio chunks as each
+        sentence is synthesized.
+
+        Args:
+            request_id: The agent request whose text stream to follow.
+            voice_id: Override voice. Falls back to agent config then first available.
+            output_format: Audio format (opus, mp3, wav, pcm). Falls back to config.
+
+        Yields:
+            Audio data chunks (bytes).
+        """
+        tts = await self._get_tts_provider()
+
+        voice_id = voice_id or self._voice_config.tts_voice_id
+        if not voice_id:
+            voices = await tts.list_voices()
+            if voices:
+                voice_id = voices[0].voice_id
+
+        output_format = output_format or self._voice_config.output_format or "opus"
+
+        tap = AgentStreamTap.get_instance()
+        buffer = ""
+
+        async for text_chunk in tap.subscribe(request_id):
+            buffer += text_chunk
+            sentences = split_sentences(buffer)
+
+            if len(sentences) <= 1:
+                # Not enough for a sentence boundary yet — keep buffering
+                continue
+
+            # Synthesize all complete sentences (keep the last fragment as buffer)
+            to_speak = " ".join(sentences[:-1])
+            buffer = sentences[-1]
+
+            async for audio_chunk in tts.synthesize_stream(
+                text=to_speak,
+                voice_id=voice_id,
+                model=self._voice_config.tts_model,
+                output_format=output_format,
+            ):
+                yield audio_chunk
+
+        # Flush any remaining buffered text
+        remaining = buffer.strip()
+        if remaining:
+            async for audio_chunk in tts.synthesize_stream(
+                text=remaining,
+                voice_id=voice_id,
+                model=self._voice_config.tts_model,
+                output_format=output_format,
+            ):
+                yield audio_chunk
 
     def is_provider_allowed(self, provider_name: str, provider_type: str = "tts") -> bool:
         """Check if a specific provider is allowed under current privacy mode.

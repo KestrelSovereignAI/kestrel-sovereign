@@ -4,6 +4,7 @@ Base classes for voice providers (TTS and STT).
 Defines the abstract contracts that all voice providers must implement.
 """
 import logging
+import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, asdict
 from typing import AsyncIterator, TYPE_CHECKING
@@ -94,6 +95,23 @@ def match_voice(personality: "PersonalityFingerprint", available_voices: list[Vo
             best_voice = voice
 
     return best_voice
+
+
+# Sentence boundary: period, exclamation, or question mark followed by
+# whitespace or end-of-string.  Keeps the punctuation with the sentence.
+_SENTENCE_BOUNDARY_RE = re.compile(r"(?<=[.!?])\s+")
+
+
+def split_sentences(text: str) -> list[str]:
+    """Split text into sentences for incremental TTS.
+
+    Uses simple regex for sentence boundaries (. ! ? followed by space/end).
+    Returns non-empty sentences with whitespace stripped.
+    """
+    if not text or not text.strip():
+        return []
+    parts = _SENTENCE_BOUNDARY_RE.split(text.strip())
+    return [s.strip() for s in parts if s.strip()]
 
 
 class TTSProvider(ABC):
