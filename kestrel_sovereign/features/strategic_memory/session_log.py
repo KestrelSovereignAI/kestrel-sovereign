@@ -13,6 +13,30 @@ from .github_integration import get_github_token, github_api_get, short_repo
 
 logger = logging.getLogger(__name__)
 
+# Branch prefixes and labels that identify Talon-created PRs
+TALON_BRANCH_PREFIXES = ("talon/", "talon-")
+TALON_LABELS = {"talon-pr", "talon"}
+
+
+def _is_talon_pr(pr: Dict[str, Any]) -> bool:
+    """Check if a PR was created by Talon (branch naming or label)."""
+    head_ref = (pr.get("head") or {}).get("ref", "")
+    if any(head_ref.startswith(prefix) for prefix in TALON_BRANCH_PREFIXES):
+        return True
+    labels = {l["name"].lower() for l in pr.get("labels", [])}
+    return bool(labels & TALON_LABELS)
+
+
+def _review_latency(created_at: str, merged_at: str) -> float:
+    """Calculate hours between PR creation and merge."""
+    try:
+        fmt = "%Y-%m-%dT%H:%M:%SZ"
+        created = datetime.strptime(created_at, fmt).replace(tzinfo=timezone.utc)
+        merged = datetime.strptime(merged_at, fmt).replace(tzinfo=timezone.utc)
+        return max(0.0, (merged - created).total_seconds() / 3600)
+    except (ValueError, TypeError):
+        return 0.0
+
 
 async def collect_session_log(
     data: Dict[str, Any],
@@ -49,6 +73,7 @@ async def collect_session_log(
     prs_merged: List[Dict] = []
     prs_opened: List[Dict] = []
     comments_posted: List[Dict] = []
+    talon_prs: List[Dict] = []  # PRs opened/merged by Talon agent
     all_repos = repos[:]
     contributors: Dict[str, Dict] = {}
 
@@ -78,12 +103,21 @@ async def collect_session_log(
             for p in merged:
                 if p.get("merged_at") and p["merged_at"][:10] == today_str:
                     author = (p.get("user") or {}).get("login", "unknown")
-                    prs_merged.append({
+                    is_talon = _is_talon_pr(p)
+                    pr_entry = {
                         "repo": short, "number": p["number"],
                         "title": p["title"], "author": author,
-                    })
+                        "is_talon": is_talon,
+                    }
+                    prs_merged.append(pr_entry)
                     contributors.setdefault(author, {"closed": 0, "prs": 0, "comments": 0})
                     contributors[author]["prs"] += 1
+                    if is_talon:
+                        latency = _review_latency(p.get("created_at"), p["merged_at"])
+                        talon_prs.append({
+                            **pr_entry, "status": "merged",
+                            "review_latency_hours": latency,
+                        })
 
         # PRs opened today
         opened = await github_api_get(
@@ -93,10 +127,15 @@ async def collect_session_log(
             for p in opened:
                 if p.get("created_at", "")[:10] == today_str:
                     author = (p.get("user") or {}).get("login", "unknown")
-                    prs_opened.append({
+                    is_talon = _is_talon_pr(p)
+                    pr_entry = {
                         "repo": short, "number": p["number"],
                         "title": p["title"], "author": author,
-                    })
+                        "is_talon": is_talon,
+                    }
+                    prs_opened.append(pr_entry)
+                    if is_talon:
+                        talon_prs.append({**pr_entry, "status": "open"})
 
         # Comments today
         comments = await github_api_get(
@@ -125,11 +164,15 @@ async def collect_session_log(
         lines.append("")
 
     # Outcomes summary
+    talon_merged = [t for t in talon_prs if t.get("status") == "merged"]
+    talon_open = [t for t in talon_prs if t.get("status") == "open"]
     lines.append("## Outcomes")
     lines.append(f"- **{len(issues_closed)}** issues closed")
     lines.append(f"- **{len(prs_merged)}** PRs merged")
     lines.append(f"- **{len(prs_opened)}** PRs opened")
     lines.append(f"- **{len(comments_posted)}** comments posted")
+    if talon_prs:
+        lines.append(f"- **{len(talon_prs)}** Talon PRs ({len(talon_merged)} merged, {len(talon_open)} pending review)")
     lines.append("")
 
     # Issues closed
@@ -168,6 +211,22 @@ async def collect_session_log(
             lines.append(
                 f"| @{name} | {counts['closed']} | {counts['prs']} | {counts['comments']} | {score} |"
             )
+        lines.append("")
+
+    # Talon Outcomes
+    if talon_prs:
+        lines.append("## Talon Outcomes")
+        for t in talon_prs:
+            status_str = t["status"]
+            latency = t.get("review_latency_hours")
+            if latency is not None:
+                status_str += f" (review: {latency:.1f}h)"
+            lines.append(f"- {t['repo']}#{t['number']}: {t['title']} [{status_str}]")
+        if talon_merged:
+            latencies = [t["review_latency_hours"] for t in talon_merged if t.get("review_latency_hours") is not None]
+            if latencies:
+                avg_latency = sum(latencies) / len(latencies)
+                lines.append(f"- **Avg review latency:** {avg_latency:.1f}h")
         lines.append("")
 
     # Activity feed (last 5 comments)
