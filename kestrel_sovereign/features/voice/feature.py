@@ -182,7 +182,6 @@ class VoiceFeature(Feature):
                 return provider
         raise VoicePrivacyError("No STT provider available. Configure a voice provider.")
 
-<<<<<<< HEAD
     def _get_personality(self) -> PersonalityFingerprint | None:
         """Get the agent's personality fingerprint if available."""
         identity = getattr(self.agent, "identity", None)
