@@ -286,7 +286,9 @@ class ModelDiscoveryMixin:
                 return await self._discover_local_openai_compatible(adapter_name, provider_config)
 
         if adapter_name in SKIP_DISCOVERY:
-            logger.debug(f"{adapter_name}: skipping model discovery (OpenAI-compatible provider)")
+            provider_config = self.config.get(adapter_name, {}) if hasattr(self, 'config') and isinstance(self.config, dict) else {}
+            if isinstance(provider_config, dict):
+                return await self._discover_openai_compatible_remote(adapter_name, provider_config)
             return []
 
         try:
@@ -353,6 +355,60 @@ class ModelDiscoveryMixin:
             return results
         except Exception as e:
             logger.warning(f"{provider_name}: local model discovery failed ({models_url}): {e}")
+            return []
+
+    async def _discover_openai_compatible_remote(
+        self, provider_name: str, provider_config: dict
+    ) -> List[ModelInfo]:
+        """Discover models from a remote OpenAI-compatible provider (xai, groq, etc.).
+
+        Queries the provider's own /models endpoint using their API key,
+        rather than reusing the OpenAI adapter (which would return OpenAI's models).
+        """
+        import os
+        base_url = provider_config.get("base_url", "")
+        if not base_url:
+            logger.debug(f"{provider_name}: no base_url configured, skipping discovery")
+            return []
+
+        # Resolve API key from config or convention
+        api_key_env = provider_config.get("api_key_env", f"{provider_name.upper()}_API_KEY")
+        api_key = os.environ.get(api_key_env, "")
+        if not api_key:
+            logger.debug(f"{provider_name}: {api_key_env} not set, skipping discovery")
+            return []
+
+        import httpx
+        models_url = f"{base_url.rstrip('/')}/models"
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(
+                    models_url,
+                    headers={"Authorization": f"Bearer {api_key}"},
+                )
+                resp.raise_for_status()
+                data = resp.json()
+
+            results = []
+            model_list = data.get("data") or data.get("models") or []
+            for m in model_list:
+                model_id = m.get("id") or m.get("model") or m.get("name", "")
+                if not model_id:
+                    continue
+                results.append(ModelInfo(
+                    id=model_id,
+                    provider=provider_name,
+                    display_name=m.get("name") or model_id,
+                    category=ModelCategory.CHAT,
+                    supports_tools=True,
+                    is_featured=False,
+                    context_limit=m.get("context_length") or m.get("context_window"),
+                    created_at=str(m.get("created")) if m.get("created") else None,
+                ))
+            logger.info(f"{provider_name}: discovered {len(results)} models from {models_url}")
+            return results
+        except Exception as e:
+            logger.warning(f"{provider_name}: remote model discovery failed ({models_url}): {e}")
             return []
 
     @staticmethod
