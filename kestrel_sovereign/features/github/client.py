@@ -41,7 +41,7 @@ class GitHubClient:
             key_resolver: Optional KeyResolutionService for dynamic key resolution
         """
         self._key_resolver = key_resolver
-        self.token = token or os.getenv("GITHUB_PAT") or os.getenv("GITHUB_TOKEN")
+        self.token = token or os.getenv("GITHUB_PAT") or os.getenv("GITHUB_TOKEN") or os.getenv("GH_TOKEN")
         self._configured = bool(self.token)
 
         if self._configured:
@@ -86,7 +86,7 @@ class GitHubClient:
         """Check if client is properly configured with a token."""
         if not self._configured:
             raise GitHubClientError(
-                "GitHub feature not available: No GITHUB_PAT or GITHUB_TOKEN environment variable set. "
+                "GitHub feature not available: No GITHUB_PAT, GITHUB_TOKEN, or GH_TOKEN environment variable set. "
                 "Contact your administrator to enable GitHub integration.",
                 status_code=503
             )
@@ -421,3 +421,119 @@ class GitHubClient:
             raise GitHubClientError(f"Validation failed: {response.text}", 422)
         else:
             raise GitHubClientError(f"Issue creation failed: {response.text}", response.status_code)
+
+    async def list_issues(
+        self,
+        repo: str,
+        state: str = "open",
+        labels: Optional[list[str]] = None,
+        per_page: int = 30,
+    ) -> list[dict]:
+        """List issues in a repository.
+
+        Args:
+            repo: Repository in 'owner/repo' format
+            state: Issue state filter ('open', 'closed', 'all')
+            labels: Optional list of label names to filter by
+            per_page: Number of results per page (max 100)
+
+        Returns:
+            List of issue dicts (excludes pull requests)
+
+        Raises:
+            GitHubClientError: If request fails
+        """
+        owner, repo_name = self._parse_repo(repo)
+        client = await self._get_client()
+
+        params = {
+            "state": state,
+            "per_page": min(per_page, 100),
+        }
+        if labels:
+            params["labels"] = ",".join(labels)
+
+        response = await client.get(
+            f"/repos/{owner}/{repo_name}/issues",
+            params=params,
+        )
+
+        if response.status_code == 404:
+            raise GitHubClientError(f"Repository not found: {repo}", 404)
+        elif response.status_code == 403:
+            raise GitHubClientError("Rate limited or access denied", 403)
+        elif response.status_code != 200:
+            raise GitHubClientError(f"GitHub API error: {response.text}", response.status_code)
+
+        # GitHub's issues endpoint also returns PRs; filter them out
+        items = response.json()
+        return [i for i in items if "pull_request" not in i]
+
+    async def get_issue(
+        self,
+        repo: str,
+        issue_number: int,
+    ) -> dict:
+        """Get a specific issue by number.
+
+        Args:
+            repo: Repository in 'owner/repo' format
+            issue_number: Issue number
+
+        Returns:
+            Issue data dict
+
+        Raises:
+            GitHubClientError: If request fails
+        """
+        owner, repo_name = self._parse_repo(repo)
+        client = await self._get_client()
+
+        response = await client.get(
+            f"/repos/{owner}/{repo_name}/issues/{issue_number}",
+        )
+
+        if response.status_code == 404:
+            raise GitHubClientError(f"Issue #{issue_number} not found in {repo}", 404)
+        elif response.status_code == 403:
+            raise GitHubClientError("Rate limited or access denied", 403)
+        elif response.status_code != 200:
+            raise GitHubClientError(f"GitHub API error: {response.text}", response.status_code)
+
+        return response.json()
+
+    async def get_issue_comments(
+        self,
+        repo: str,
+        issue_number: int,
+        per_page: int = 30,
+    ) -> list[dict]:
+        """Get comments on an issue.
+
+        Args:
+            repo: Repository in 'owner/repo' format
+            issue_number: Issue number
+            per_page: Number of results per page (max 100)
+
+        Returns:
+            List of comment dicts
+
+        Raises:
+            GitHubClientError: If request fails
+        """
+        owner, repo_name = self._parse_repo(repo)
+        client = await self._get_client()
+
+        response = await client.get(
+            f"/repos/{owner}/{repo_name}/issues/{issue_number}/comments",
+            params={"per_page": min(per_page, 100)},
+        )
+
+        if response.status_code == 404:
+            raise GitHubClientError(f"Issue #{issue_number} not found in {repo}", 404)
+        elif response.status_code == 403:
+            raise GitHubClientError("Rate limited or access denied", 403)
+        elif response.status_code != 200:
+            raise GitHubClientError(f"GitHub API error: {response.text}", response.status_code)
+
+        return response.json()

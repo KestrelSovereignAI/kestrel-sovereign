@@ -213,6 +213,7 @@ class ProcessManager:
         config: LocalAgentConfig,
         host_bind: str = "0.0.0.0",
         host_port: int = 8888,
+        standalone: bool = False,
     ) -> AgentProcess:
         """Start a single agent process.
 
@@ -221,6 +222,7 @@ class ProcessManager:
             config: The agent's LocalAgentConfig.
             host_bind: Interface to bind to.
             host_port: Host port (for inter-agent communication).
+            standalone: If True, agent serves its own UI (solo mode).
 
         Returns:
             AgentProcess with pid set on success.
@@ -267,7 +269,7 @@ class ProcessManager:
         env = self._load_env()
         env["KESTREL_DB_PATH"] = str(resolved_dir)
         env["PORT"] = str(config.port)
-        env["KESTREL_SERVE_UI"] = "false"
+        env["KESTREL_SERVE_UI"] = "true" if standalone else "false"
         env["KESTREL_HOST_URL"] = f"http://localhost:{host_port}"
 
         # Per-agent data key: KESTREL_DATA_KEY_CLAW overrides KESTREL_DATA_KEY
