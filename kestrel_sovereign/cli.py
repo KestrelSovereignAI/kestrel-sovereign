@@ -105,7 +105,7 @@ def cmd_start(args) -> int:
         agent_cfg = local_agents[args.name]
         print(f"   Starting {args.name} on :{agent_cfg.port}...", end="", flush=True)
         try:
-            pm.start_agent(args.name, agent_cfg, rookery.host.bind)
+            pm.start_agent(args.name, agent_cfg, rookery.host.bind, standalone=True)
         except RuntimeError as e:
             print(f"          \u274c")
             print(f"   {e}")

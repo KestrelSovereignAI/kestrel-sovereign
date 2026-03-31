@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 # Configuration
 GITHUB_SELF_REPO = os.getenv("GITHUB_SELF_REPO", "KestrelSovereignAI/kestrel-sovereign")
 GITHUB_DEFAULT_BRANCH = os.getenv("GITHUB_DEFAULT_BRANCH", "main")
+GITHUB_SELF_FEATURES_ROOT = os.getenv("GITHUB_SELF_FEATURES_ROOT", "kestrel_sovereign/features")
 
 
 class GitHubFeature(Feature):
@@ -414,7 +415,7 @@ Use `list_source_components` to see the feature components that make up this age
         
         # Get features directory listing
         try:
-            files = await self.client.list_directory(repo, "features", ref)
+            files = await self.client.list_directory(repo, GITHUB_SELF_FEATURES_ROOT, ref)
         except GitHubClientError as e:
             return f"Could not access features directory: {e}"
         
@@ -426,7 +427,7 @@ Use `list_source_components` to see the feature components that make up this age
                 manifest = None
                 try:
                     manifest_content = await self.client.get_file_content(
-                        repo, f"features/{f.name}/component.yaml", ref
+                        repo, f"{GITHUB_SELF_FEATURES_ROOT}/{f.name}/component.yaml", ref
                     )
                     manifest_data = yaml.safe_load(manifest_content.content)
                     manifest = ComponentManifest.from_dict(manifest_data, f.name)
@@ -448,7 +449,7 @@ Use `list_source_components` to see the feature components that make up this age
                         comp_files = await self.client.get_tree(repo, ref)
                         comp_files = [
                             cf for cf in comp_files 
-                            if cf.path.startswith(f"features/{f.name}/") and cf.is_file()
+                            if cf.path.startswith(f"{GITHUB_SELF_FEATURES_ROOT}/{f.name}/") and cf.is_file()
                         ]
                         component_info["files"] = [cf.path for cf in comp_files]
                     except GitHubClientError:
@@ -464,7 +465,7 @@ Use `list_source_components` to see the feature components that make up this age
             lines.append(f"\n## {m.feature_name}")
             lines.append(f"**Description:** {m.description}")
             lines.append(f"**Version:** {m.version}")
-            lines.append(f"**Entry Point:** features/{m.feature_name}/{m.entry_point}")
+            lines.append(f"**Entry Point:** {GITHUB_SELF_FEATURES_ROOT}/{m.feature_name}/{m.entry_point}")
             
             if m.tools:
                 lines.append(f"**Tools:** {', '.join(m.tools)}")
@@ -500,7 +501,7 @@ Use `list_source_components` to see the feature components that make up this age
         repo = GITHUB_SELF_REPO
         ref = GITHUB_DEFAULT_BRANCH
         
-        component_path = f"features/{component}"
+        component_path = f"{GITHUB_SELF_FEATURES_ROOT}/{component}"
         
         # Get all files in component
         try:
@@ -573,3 +574,161 @@ Use `list_source_components` to see the feature components that make up this age
         if path:
             return f"Invalidated cache for {repo}:{path}"
         return f"Invalidated all cache for {repo}"
+
+    # --- Issue tools ---
+
+    @tool(
+        name="list_github_issues",
+        description="List issues in a GitHub repository. Filters out pull requests.",
+        category=ToolCategory.DATA_ACCESS,
+    )
+    async def list_github_issues(
+        self,
+        repo: str = "self",
+        state: str = "open",
+        labels: Optional[str] = None,
+        max_results: int = 30,
+    ) -> str:
+        """List issues in a repository.
+
+        Args:
+            repo: Repository in 'owner/repo' format, or 'self' for agent's own repo
+            state: Issue state filter ('open', 'closed', 'all')
+            labels: Comma-separated label names to filter by
+            max_results: Maximum number of issues to return (max 100)
+
+        Returns:
+            Formatted issue list
+        """
+        repo = self._resolve_repo(repo)
+
+        try:
+            label_list = [l.strip() for l in labels.split(",")] if labels else None
+            issues = await self.client.list_issues(
+                repo, state=state, labels=label_list, per_page=max_results,
+            )
+        except GitHubClientError as e:
+            return f"Could not list issues: {e}"
+
+        if not issues:
+            return f"No {state} issues found in {repo}"
+
+        lines = [f"# Issues in {repo} ({state})\n"]
+        for issue in issues:
+            number = issue.get("number")
+            title = issue.get("title", "")
+            issue_labels = [l["name"] for l in issue.get("labels", [])]
+            assignees = [a["login"] for a in issue.get("assignees", [])]
+            updated = issue.get("updated_at", "")[:10]
+
+            line = f"- **#{number}** {title}"
+            if issue_labels:
+                line += f"  [{', '.join(issue_labels)}]"
+            if assignees:
+                line += f"  @{', @'.join(assignees)}"
+            line += f"  (updated {updated})"
+            lines.append(line)
+
+        lines.append(f"\n*{len(issues)} issue(s) shown*")
+        return "\n".join(lines)
+
+    @tool(
+        name="get_github_issue",
+        description="Get details of a specific GitHub issue by number.",
+        category=ToolCategory.DATA_ACCESS,
+    )
+    async def get_github_issue(
+        self,
+        issue_number: int,
+        repo: str = "self",
+    ) -> str:
+        """Get a specific issue.
+
+        Args:
+            issue_number: Issue number
+            repo: Repository in 'owner/repo' format, or 'self' for agent's own repo
+
+        Returns:
+            Formatted issue details
+        """
+        repo = self._resolve_repo(repo)
+
+        try:
+            issue = await self.client.get_issue(repo, issue_number)
+        except GitHubClientError as e:
+            return f"Could not get issue #{issue_number}: {e}"
+
+        title = issue.get("title", "")
+        state = issue.get("state", "")
+        body = issue.get("body", "") or "(no description)"
+        author = issue.get("user", {}).get("login", "unknown")
+        created = issue.get("created_at", "")[:10]
+        updated = issue.get("updated_at", "")[:10]
+        issue_labels = [l["name"] for l in issue.get("labels", [])]
+        assignees = [a["login"] for a in issue.get("assignees", [])]
+        milestone = issue.get("milestone", {})
+        milestone_name = milestone.get("title") if milestone else None
+        comments_count = issue.get("comments", 0)
+
+        lines = [
+            f"# #{issue_number}: {title}\n",
+            f"**State:** {state}",
+            f"**Author:** @{author}",
+            f"**Created:** {created} | **Updated:** {updated}",
+        ]
+        if issue_labels:
+            lines.append(f"**Labels:** {', '.join(issue_labels)}")
+        if assignees:
+            lines.append(f"**Assignees:** {', '.join('@' + a for a in assignees)}")
+        if milestone_name:
+            lines.append(f"**Milestone:** {milestone_name}")
+        lines.append(f"**Comments:** {comments_count}")
+        lines.append(f"\n---\n\n{body}")
+
+        return "\n".join(lines)
+
+    @tool(
+        name="get_github_issue_comments",
+        description="Get comments on a specific GitHub issue.",
+        category=ToolCategory.DATA_ACCESS,
+    )
+    async def get_github_issue_comments(
+        self,
+        issue_number: int,
+        repo: str = "self",
+        max_results: int = 30,
+    ) -> str:
+        """Get comments on an issue.
+
+        Args:
+            issue_number: Issue number
+            repo: Repository in 'owner/repo' format, or 'self' for agent's own repo
+            max_results: Maximum number of comments to return
+
+        Returns:
+            Formatted comment list
+        """
+        repo = self._resolve_repo(repo)
+
+        try:
+            comments = await self.client.get_issue_comments(
+                repo, issue_number, per_page=max_results,
+            )
+        except GitHubClientError as e:
+            return f"Could not get comments for issue #{issue_number}: {e}"
+
+        if not comments:
+            return f"No comments on issue #{issue_number} in {repo}"
+
+        lines = [f"# Comments on #{issue_number} in {repo}\n"]
+        for comment in comments:
+            author = comment.get("user", {}).get("login", "unknown")
+            created = comment.get("created_at", "")[:10]
+            body = comment.get("body", "")
+
+            lines.append(f"## @{author} ({created})\n")
+            lines.append(body)
+            lines.append("")
+
+        lines.append(f"\n*{len(comments)} comment(s)*")
+        return "\n".join(lines)
