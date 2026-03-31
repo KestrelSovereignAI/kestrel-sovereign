@@ -325,6 +325,39 @@ class ModelSelector {
     }
 
     /**
+     * Update the current-model endpoint dynamically (e.g., when companion changes)
+     * @param {string|null} url - New endpoint URL, or null to disable sync
+     */
+    setCurrentModelEndpoint(url) {
+        this.currentModelEndpoint = url;
+    }
+
+    /**
+     * Set the active model on the server via POST
+     * @param {string} endpoint - POST endpoint URL
+     * @param {string} provider - Provider name
+     * @param {string} model - Model ID
+     * @returns {Promise<boolean>} - Whether the request succeeded
+     */
+    async setModelOnServer(endpoint, provider, model) {
+        try {
+            const headers = {
+                'Content-Type': 'application/json',
+                ...this.getAuthHeader()
+            };
+            const response = await fetch(endpoint, {
+                method: 'POST',
+                headers,
+                body: JSON.stringify({ provider, model })
+            });
+            return response.ok;
+        } catch (e) {
+            console.warn('ModelSelector: Failed to set model on server:', e);
+            return false;
+        }
+    }
+
+    /**
      * Set selection programmatically
      * @param {string} provider - Provider name
      * @param {string} model - Model ID
