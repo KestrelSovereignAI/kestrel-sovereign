@@ -916,16 +916,8 @@ class TaskManager:
 
         Returns:
             Number of tasks deleted
-
-        Note: Task cleanup requires timestamp-based deletion in task_store.
-        Currently returns 0 as the underlying store does not support cleanup.
         """
-        logger.warning(
-            f"cleanup_old_tasks called for tasks older than {older_than_days} days, "
-            "but cleanup is not yet implemented in task_store"
-        )
-        # Return 0 - no tasks deleted until cleanup is implemented
-        return 0
+        return await self.task_store.cleanup_old(older_than_days=older_than_days)
 
 
 # Factory function for easy creation
