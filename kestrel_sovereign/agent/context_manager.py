@@ -156,6 +156,7 @@ class ContextManager:
         privacy_mode: str = "NORMAL",
         emotional_context: Optional[Dict[str, Any]] = None,
         conversation_history: Optional[List[Dict]] = None,
+        reflection_guidance: Optional[List[str]] = None,
     ) -> ContextResult:
         """
         Build complete context for an LLM request.
@@ -228,6 +229,18 @@ class ContextManager:
         memory_count = 0
         rag_chunks = 0
 
+        # 1b. Inject reflection guidance into system prompt
+        if reflection_guidance:
+            guidance_text = "\n--- ACTIVE REFLECTION GUIDANCE ---\n"
+            guidance_text += "Based on self-reflection, keep these insights in mind:\n"
+            for item in reflection_guidance:
+                guidance_text += f"- {item}\n"
+            guidance_text += "--- END GUIDANCE ---"
+            guidance_tokens = self.counter.count(guidance_text)
+            budget.use("system", guidance_tokens)
+            system_prompt = f"{system_prompt}\n\n{guidance_text}"
+            logger.info(f"Injected {len(reflection_guidance)} reflection guidance items into prompt")
+
         # 2. Add episodes for long conversations
         if message_count >= self.EPISODE_THRESHOLD_MESSAGES and self.consolidator:
             episode_context = await self.context_builder.get_episode_context(
@@ -294,6 +307,26 @@ class ContextManager:
         if len(formatted_history) < len(history) * 0.5:
             warnings.append(
                 f"History truncated: {len(formatted_history)}/{len(history)} messages"
+            )
+
+        # Pre-send budget enforcement: if total exceeds budget, drop oldest history
+        if budget.total_used > budget.total_budget and len(formatted_history) > 1:
+            overage = budget.total_used - budget.total_budget
+            logger.warning(
+                f"Context budget exceeded by {overage} tokens — auto-pruning oldest history"
+            )
+            pruned_tokens = 0
+            while formatted_history and pruned_tokens < overage:
+                dropped = formatted_history.pop(0)  # Drop oldest
+                dropped_tokens = self.counter.count(dropped.get("content", "")) + 4
+                pruned_tokens += dropped_tokens
+            # Update budget tracking
+            new_history_tokens = self.counter.count_messages(formatted_history)
+            alloc = budget.allocations["history"]
+            alloc.used = new_history_tokens
+            alloc.items = len(formatted_history)
+            warnings.append(
+                f"Auto-pruned {pruned_tokens} tokens from history to fit budget"
             )
 
         logger.info(
@@ -440,9 +473,9 @@ class ContextManager:
         )
 
     # Delegate to ToolContextManager
-    async def get_status(self) -> Dict[str, Any]:
-        """Delegate to ToolContextManager."""
-        return await self.tool_context_manager.get_status(self.counter)
+    async def get_status(self, history: Optional[list] = None) -> Dict[str, Any]:
+        """Delegate to ToolContextManager. Pass session-filtered history for accurate reporting."""
+        return await self.tool_context_manager.get_status(self.counter, history=history)
 
     def get_budget_status(self, message_count: int = 0) -> Dict[str, Any]:
         """Delegate to ToolContextManager."""

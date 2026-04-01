@@ -344,9 +344,23 @@ class TaskManager:
         await self.task_store.save(task)
 
         if sync:
-            # Execute synchronously
+            # Execute synchronously with transaction safety
             task = await handler.handle_task(task)
-            await self.task_store.save(task)
+            try:
+                async with self.task_store._backend.transaction():
+                    await self.task_store.save(task)
+            except Exception as save_err:
+                logger.error(
+                    f"Failed to save completed task {task.id}: {save_err}. "
+                    "Retrying outside transaction..."
+                )
+                try:
+                    await self.task_store.save(task)
+                except Exception as retry_err:
+                    logger.critical(
+                        f"Task {task.id} completed but save failed permanently: {retry_err}. "
+                        f"Result lost for skill={skill_id}, agent={agent_id}"
+                    )
 
             # Execute POST_TOOL_USE hooks
             if self.hooks_manager:

@@ -351,6 +351,10 @@ class BootstrapLoader:
         for filename in self._file_order:
             filepath = self._find_file(filename)
             if filepath is None:
+                logger.warning(
+                    f"Bootstrap file '{filename}' not found in any search path — "
+                    "agent will start without this context"
+                )
                 continue
 
             try:

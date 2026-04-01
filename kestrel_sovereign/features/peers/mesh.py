@@ -8,11 +8,12 @@ ask_agent() transport but carry structured payloads.
 Message types:
     assign          — Claws assigns an issue to Talon for implementation
     review_needed   — Talon requests Eye review of a PR/screenshot
+    red_action      — Claws dispatches adversarial code review before merge
     complete        — Agent reports a task finished
     reject          — Agent declines assignment (capacity, scope, blocked)
     status_update   — Progress update on an in-flight task
 
-Reference: signal-and-ship #3 (Agent Mesh Protocol)
+Reference: signal-and-ship #3 (Agent Mesh Protocol), #447 (Red-Action)
 """
 
 from __future__ import annotations
@@ -22,13 +23,14 @@ import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 
 class MeshMessageType(str, Enum):
     """Types of inter-agent mesh messages."""
     ASSIGN = "assign"
     REVIEW_NEEDED = "review_needed"
+    RED_ACTION = "red_action"
     COMPLETE = "complete"
     REJECT = "reject"
     STATUS_UPDATE = "status_update"
@@ -40,6 +42,38 @@ class MeshPriority(str, Enum):
     HIGH = "high"
     NORMAL = "normal"
     LOW = "low"
+
+
+class RedActionRisk(str, Enum):
+    """Risk level for red-action review dispatch."""
+    AUTO = "auto"      # Claws decides based on critical path tags
+    MANUAL = "manual"  # Falconer explicitly requests red-action
+    SKIP = "skip"      # Low-risk, no red-action needed
+
+
+# Critical paths that auto-trigger red-action review.
+# PRs touching files in these directories always get red-action.
+CRITICAL_PATH_PATTERNS: List[str] = [
+    "kestrel_sovereign/agent/context",       # Context assembly — core pipeline
+    "kestrel_sovereign/hooks/",              # Hook system — security enforcement
+    "kestrel_sovereign/agent/constitution",  # Constitutional governance
+    "kestrel_sovereign/llm/",               # LLM routing — model selection
+    "kestrel_sovereign/features/privacy",    # Privacy modes
+    "kestrel_sovereign/storage/encryption",  # Key management / encryption
+    "kestrel_sovereign/auth",               # Authentication
+    "endpoints/auth",                       # Auth endpoints
+    "kestrel_sovereign/features/wallet",     # Wallet / sovereignty
+]
+
+
+def is_critical_path(changed_files: List[str]) -> bool:
+    """Check if any changed files touch a critical path that requires red-action."""
+    for filepath in changed_files:
+        normalised = filepath.replace("\\", "/")
+        for pattern in CRITICAL_PATH_PATTERNS:
+            if pattern in normalised:
+                return True
+    return False
 
 
 @dataclass
@@ -178,4 +212,56 @@ def make_reject_message(
         recipient=recipient,
         correlation_id=correlation_id,
         payload={"reason": reason},
+    )
+
+
+def make_red_action_message(
+    sender: str,
+    recipient: str,
+    repo: str,
+    pr_number: int,
+    pr_title: str,
+    changed_files: List[str],
+    risk: RedActionRisk = RedActionRisk.AUTO,
+    issue_number: Optional[int] = None,
+    correlation_id: Optional[str] = None,
+    context: str = "",
+) -> MeshMessage:
+    """
+    Create a red-action review request (Claws → Red-Action reviewer).
+
+    Dispatched after Eye (visual QA) but before merge. The reviewer
+    performs adversarial code review on the actual code paths.
+
+    Args:
+        sender: Requesting agent (usually "claws").
+        recipient: Agent performing review (could be self or dedicated reviewer).
+        repo: GitHub repo in "owner/name" format.
+        pr_number: Pull request number to review.
+        pr_title: PR title for context.
+        changed_files: List of files changed in the PR.
+        risk: How the review was triggered (auto, manual, skip).
+        issue_number: Related issue number (if any).
+        correlation_id: Links to the original assign message chain.
+        context: Additional context for the reviewer.
+    """
+    critical = is_critical_path(changed_files)
+    priority = MeshPriority.HIGH if critical else MeshPriority.NORMAL
+
+    return MeshMessage(
+        type=MeshMessageType.RED_ACTION,
+        sender=sender,
+        recipient=recipient,
+        repo=repo,
+        priority=priority,
+        correlation_id=correlation_id,
+        payload={
+            "pr_number": pr_number,
+            "pr_title": pr_title,
+            "issue_number": issue_number,
+            "changed_files": changed_files,
+            "critical_path": critical,
+            "risk_level": risk.value,
+            "context": context,
+        },
     )

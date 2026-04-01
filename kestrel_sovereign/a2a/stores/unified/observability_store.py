@@ -342,9 +342,13 @@ class ObservabilityStore(UnifiedStoreBase):
 
     async def prune_old_events(self, older_than_days: int = 30) -> int:
         """Delete old events. Returns count deleted."""
-        interval = self.interval_days(older_than_days)
+        from datetime import datetime, timedelta, timezone
+
+        cutoff = datetime.now(timezone.utc) - timedelta(days=int(older_than_days))
+        cutoff_str = cutoff.strftime("%Y-%m-%dT%H:%M:%S")
         rows_affected = await self._backend.execute(
-            f"DELETE FROM a2a_observability WHERE timestamp < {interval}"
+            "DELETE FROM a2a_observability WHERE timestamp < ?",
+            (cutoff_str,),
         )
         return rows_affected
 

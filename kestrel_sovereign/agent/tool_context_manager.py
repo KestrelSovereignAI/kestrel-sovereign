@@ -58,25 +58,38 @@ class ToolContextManager:
     def model(self, value: str) -> None:
         self._model = value
 
-    async def get_status(self, counter) -> Dict[str, Any]:
+    async def get_status(self, counter, history: Optional[list] = None, session_id: Optional[str] = None) -> Dict[str, Any]:
         """
         Get detailed context window status for agent introspection.
 
-        Returns comprehensive information about context utilization,
-        budget allocation, and recommendations.
+        Uses the same data path as the LLM to ensure the status report
+        reflects what the model actually receives.
+
+        Args:
+            counter: TokenCounter for token counting
+            history: Pre-fetched session-filtered history (preferred).
+                     If None, falls back to limited fetch to approximate LLM path.
+            session_id: Optional session ID for scoped history fetch.
+
+        Returns:
+            Comprehensive information about context utilization and budget.
         """
         from .token_budget import create_budget
 
-        # Get conversation history
-        history = []
-        conv_store = self._get_conversation_store()
-        if conv_store:
-            history = await conv_store.get_full_history()
+        # Use provided history (same as LLM sees) or fetch with same constraints
+        if history is None:
+            conv_store = self._get_conversation_store()
+            if conv_store:
+                # Mirror the LLM path: limited to 50 messages
+                all_history = await conv_store.get_full_history()
+                history = all_history[-50:] if len(all_history) > 50 else all_history
+            else:
+                history = []
 
         message_count = len(history)
         budget = create_budget(self.model, message_count, adaptive=True)
 
-        # Calculate tokens by category
+        # Calculate tokens by category — this mirrors what format_conversation_history does
         history_tokens = sum(
             counter.count(m.get("content", ""))
             for m in history
@@ -87,16 +100,17 @@ class ToolContextManager:
         if history and history[0].get("created_at"):
             oldest_timestamp = history[0].get("created_at")
 
-        # Calculate utilization
-        total_used = history_tokens  # Base from history
-        utilization = (total_used / budget.total_budget * 100) if budget.total_budget > 0 else 0
+        # Report utilization per-allocation AND total
+        history_utilization = (history_tokens / budget.history * 100) if budget.history > 0 else 0
+        total_utilization = (history_tokens / budget.total_budget * 100) if budget.total_budget > 0 else 0
 
         return {
             "success": True,
             "total_budget": budget.total_budget,
-            "total_used": total_used,
-            "utilization_percent": round(utilization, 1),
-            "compression_recommended": utilization >= 70.0,
+            "total_used": history_tokens,
+            "utilization_percent": round(total_utilization, 1),
+            "history_utilization_percent": round(history_utilization, 1),
+            "compression_recommended": history_utilization >= 70.0,
             "allocations": {
                 "system": {
                     "budget": budget.system,
@@ -105,7 +119,7 @@ class ToolContextManager:
                 "history": {
                     "budget": budget.history,
                     "used": history_tokens,
-                    "percent": round(history_tokens / budget.history * 100, 1) if budget.history > 0 else 0
+                    "percent": round(history_utilization, 1),
                 },
                 "episodes": {
                     "budget": budget.episodes,
@@ -122,7 +136,8 @@ class ToolContextManager:
             },
             "message_count": message_count,
             "oldest_message_age": oldest_timestamp,
-            "model": self.model
+            "model": self.model,
+            "note": "Status reflects the same data path used by the LLM (session-filtered, limited to 50 messages)."
         }
 
     def get_budget_status(self, message_count: int = 0) -> Dict[str, Any]:

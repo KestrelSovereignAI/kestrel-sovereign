@@ -48,13 +48,22 @@ class ObservabilityHook(Hook):
         try:
             store = getattr(self.agent, "observability_store", None)
             if not store:
+                logger.warning(
+                    "ObservabilityHook: observability_store not initialized — "
+                    "event '%s' dropped. This usually means the hook fired "
+                    "before store setup completed.",
+                    input.hook_event_name,
+                )
                 return HookOutput.allow()
 
             agent_name = getattr(self.agent, "agent_name", "unknown")
             event_type = input.hook_event_name
+            # Classify the hook event into a broader category for querying
+            event_category = EVENT_TYPE_MAP.get(event_type, "lifecycle")
 
             metadata: Dict[str, Any] = {
                 "hook_event": event_type,
+                "event_category": event_category,
                 "session_id": input.session_id,
             }
 
