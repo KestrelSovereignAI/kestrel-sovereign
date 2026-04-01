@@ -373,6 +373,29 @@ test.describe.serial('Kestrel Sovereign Technical Demo', () => {
         await navigateToPanel(page, 'chat');
         await dismissContextWarning(page);
 
+        // Select a working provider from the dropdown (prefer OpenRouter/Anthropic over local Ollama)
+        try {
+            const providerSelect = page.locator('#provider-selector');
+            const options = await providerSelect.locator('option').allTextContents();
+            const preferred = ['openrouter', 'anthropic', 'openai'];
+            let selected = false;
+            for (const pref of preferred) {
+                const match = options.find(o => o.toLowerCase().includes(pref));
+                if (match) {
+                    await providerSelect.selectOption({ label: match });
+                    narrator.narrate(section, `Provider set to: ${match}`);
+                    await demoPause(page, 1000);
+                    selected = true;
+                    break;
+                }
+            }
+            if (!selected) {
+                narrator.narrate(section, `Using default provider (available: ${options.join(', ')})`);
+            }
+        } catch (e) {
+            narrator.narrate(section, `Could not set provider: ${e.message}`);
+        }
+
         // Send a message that elicits constitutional awareness
         narrator.narrate(section,
             'Sending a message — every response is processed through the Constitution',

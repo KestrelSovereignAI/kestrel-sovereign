@@ -264,7 +264,7 @@
         <div id="costBreakdown"></div>
       </div>
       <div class="budget-card">
-        <h4>Ceremony Cost Saved (Signal & Ship)</h4>
+        <h4>Ceremony Cost Saved (Kestrel Falconer)</h4>
         <div id="ceremonyCost"></div>
       </div>
     </div>
@@ -294,6 +294,7 @@ const REPOS = [
   'SaravananDCK/RemoteCares',
   'KestrelSovereignAI/frinz',
   'KestrelSovereignAI/signal-and-ship',
+  'KestrelSovereignAI/kestrelclaw',
 ];
 
 // Session data (sourced from SESSION_LOG.md)
@@ -312,15 +313,16 @@ const SESSION_DATA = [
   { id: 13, date: '2026-03-09', focus: 'Windows 11 validation, audit bug fix', prs: 0, bugs: 1, issues: 3, aiHours: 3, bottleneck: null },
   { id: 16, date: '2026-03-13', focus: 'SMS confirmed, E2E demo all 5 acts', prs: 0, bugs: 4, issues: 6, aiHours: 3, bottleneck: 32 },
   { id: 17, date: '2026-03-15', focus: 'Demo hardening for George, Act 6', prs: 5, bugs: 6, issues: 12, aiHours: 5, bottleneck: 25 },
-  { id: 18, date: '2026-03-17', focus: 'OSS sprint, Signal & Ship design', prs: 0, bugs: 0, issues: 7, aiHours: 6, bottleneck: 17 },
+  { id: 18, date: '2026-03-17', focus: 'OSS sprint, Kestrel Falconer design', prs: 0, bugs: 0, issues: 7, aiHours: 6, bottleneck: 17 },
   { id: 19, date: '2026-03-18', focus: 'Backlog cleanup, CI, pricing model', prs: 2, bugs: 0, issues: 15, aiHours: 5.5, bottleneck: 21 },
+  { id: 20, date: '2026-03-20', focus: 'Strategic Memory, model cache, LOC→outcomes', prs: 3, bugs: 0, issues: 3, aiHours: 4.25, bottleneck: 29 },
 ];
 
 // Milestones (from STRATEGY.yaml)
 const MILESTONES = [
   { name: 'Caprock Validation', due: '2026-04-03', owner: 'Jason', status: 'on_track', repos: ['jaslogic1/RemoteCares', 'SaravananDCK/RemoteCares'] },
   { name: 'Open Source Launch', due: '2026-04-20', owner: 'Gabi', status: 'in_progress', repos: ['KestrelSovereignAI/kestrel-sovereign'] },
-  { name: 'Signal & Ship', due: null, owner: 'Jim', status: 'data_collection', repos: ['KestrelSovereignAI/signal-and-ship'] },
+  { name: 'Kestrel Falconer', due: null, owner: 'Jim', status: 'data_collection', repos: ['KestrelSovereignAI/signal-and-ship'] },
   { name: 'Kestrel Live Demo', due: '2026-03-22', owner: 'Gabi', status: 'complete', repos: ['KestrelSovereignAI/kestrel-sovereign'] },
   { name: 'IP & Patent Strategy', due: null, owner: 'Gabi', status: 'active', repos: ['KestrelSovereignAI/kestrel-sovereign'] },
 ];

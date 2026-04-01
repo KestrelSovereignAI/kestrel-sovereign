@@ -429,6 +429,8 @@ async def auth_middleware(request: Request, call_next):
 
     if request.url.path in public_paths or request.url.path in auth_paths:
         return await call_next(request)
+    if request.method == "OPTIONS":
+        return await call_next(request)
     if SERVE_UI and any(request.url.path.startswith(p) for p in static_prefixes):
         return await call_next(request)
 
@@ -517,6 +519,8 @@ _DEFAULT_CORS_ORIGINS = [
     "http://127.0.0.1:8080",
     "http://localhost:3000",
     "http://127.0.0.1:3000",
+    "http://localhost:8888",
+    "http://127.0.0.1:8888",
 ]
 _cors_env = os.environ.get("KESTREL_CORS_ORIGINS", "")
 CORS_ORIGINS = [o.strip() for o in _cors_env.split(",") if o.strip()] if _cors_env else _DEFAULT_CORS_ORIGINS

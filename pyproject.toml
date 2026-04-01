@@ -33,6 +33,7 @@ dependencies = [
     # Config and utilities
     "python-dotenv==1.1.1",
     "toml==0.10.2",
+    "PyYAML>=6.0",
     # Email
     "resend>=2.19.0",
     "email-validator>=2.3.0",
