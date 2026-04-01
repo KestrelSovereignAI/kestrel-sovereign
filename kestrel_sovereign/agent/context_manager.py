@@ -156,6 +156,7 @@ class ContextManager:
         privacy_mode: str = "NORMAL",
         emotional_context: Optional[Dict[str, Any]] = None,
         conversation_history: Optional[List[Dict]] = None,
+        reflection_guidance: Optional[List[str]] = None,
     ) -> ContextResult:
         """
         Build complete context for an LLM request.
@@ -282,7 +283,19 @@ class ContextManager:
                 logger.warning(f"RAG retrieval failed: {e}")
                 warnings.append(f"Document search unavailable: {e}")
 
-        # 5. Format conversation history with remaining budget
+        # 5. Inject active reflection guidance (learned behavioral rules)
+        if reflection_guidance:
+            guidance_text = "--- REFLECTION GUIDANCE (learned from past interactions) ---\n"
+            for rule in reflection_guidance:
+                guidance_text += f"- {rule}\n"
+            guidance_text += "--- END REFLECTION GUIDANCE ---"
+            guidance_tokens = self.counter.count(guidance_text)
+            if budget.can_fit("reflection", guidance_tokens):
+                budget.use("reflection", guidance_tokens)
+                system_prompt = f"{system_prompt}\n\n{guidance_text}"
+                logger.debug(f"Added {len(reflection_guidance)} reflection guidance rules")
+
+        # 6. Format conversation history with remaining budget
         formatted_history = self.context_builder.format_conversation_history(
             history=history,
             max_tokens=budget.history

@@ -992,6 +992,15 @@ Expected Duration: {expected_duration}
 
         # Build full context with token budget management
         # Pass the session-filtered history so context_manager uses it
+        # Fetch active reflection guidance (learned behavioral rules)
+        reflection_guidance = None
+        reflection_feature = self.features.get("ReflectionFeature")
+        if reflection_feature and hasattr(reflection_feature, "get_active_guidance"):
+            try:
+                reflection_guidance = await reflection_feature.get_active_guidance()
+            except Exception as e:
+                logging.warning(f"Failed to fetch reflection guidance: {e}")
+
         context_result = await self.context_manager.build_context(
             query=user_input,
             constitution=constitution,
@@ -1000,6 +1009,7 @@ Expected Duration: {expected_duration}
             include_rag=True,
             privacy_mode=self._privacy_mode.value,
             conversation_history=history,
+            reflection_guidance=reflection_guidance or None,
         )
 
         # NOW store user input — after context is built so memory retrieval

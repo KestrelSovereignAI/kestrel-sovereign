@@ -19,17 +19,6 @@ from kestrel_sovereign.metrics import (
 
 logger = logging.getLogger(__name__)
 
-# Maps hook event names to ObservabilityStore event types
-EVENT_TYPE_MAP = {
-    "SessionStart": "lifecycle",
-    "UserPromptSubmit": "lifecycle",
-    "PreToolUse": "tool_call",
-    "PostToolUse": "tool_response",
-    "PreSubagentCall": "subagent_call",
-    "PostSubagentCall": "subagent_response",
-    "Stop": "lifecycle",
-}
-
 
 class ObservabilityHook(Hook):
     """Default observer for all lifecycle events. Writes to ObservabilityStore."""
