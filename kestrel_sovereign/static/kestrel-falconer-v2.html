@@ -98,6 +98,7 @@
   .bird-card h4 { font-size: 20px; font-weight: 700; margin-bottom: 4px; }
   .bird-role-tag { font-size: 10px; font-weight: 700; letter-spacing: 1.5px; text-transform: uppercase; margin-bottom: 14px; }
   .bird-card .bird-headline { font-size: 13px; font-style: italic; color: #6b7b8d; margin-bottom: 16px; min-height: 36px; line-height: 1.4; }
+  .tag-done { background: rgba(102,187,106,0.15); color: #66bb6a; }
   .bird-capability {
     background: rgba(255,255,255,0.04); border-radius: 6px;
     padding: 8px 12px; margin-bottom: 6px;
@@ -396,7 +397,7 @@
         <rect x="50" y="180" width="230" height="3" rx="1.5" fill="#8e24aa"/>
         <text x="165" y="210" text-anchor="middle" fill="#ce93d8" font-size="28">&#x1F9BE;</text>
         <text x="165" y="235" text-anchor="middle" fill="#ce93d8" font-size="17" font-weight="700">Kestrel-Claws</text>
-        <text x="165" y="252" text-anchor="middle" fill="#8e24aa" font-size="9" font-weight="700" letter-spacing="1.5">PdM / PM / SCRUM MASTER</text>
+        <text x="165" y="252" text-anchor="middle" fill="#8e24aa" font-size="9" font-weight="700" letter-spacing="1.5">PdM / PM / TPM</text>
         <text x="165" y="275" text-anchor="middle" fill="#6b4b7d" font-size="11" font-style="italic">"The grip that holds it together"</text>
         <text x="75" y="298" fill="#9a7b9e" font-size="10">&#8226; Vision &amp; strategy tracking</text>
         <text x="75" y="314" fill="#9a7b9e" font-size="10">&#8226; Milestone &amp; deadline management</text>
@@ -560,7 +561,7 @@
       <tbody>
         <tr>
           <td class="role-product role-claws">&#x1F9BE; Kestrel-Claws</td>
-          <td class="role-replaces">Product Manager, Program Manager, Scrum Master</td>
+          <td class="role-replaces">Product Manager, Program Manager, Technical Program Manager</td>
           <td class="role-delivers">Vision tracking, milestone management, backlog prioritization, morning briefings, dependency tracking, plan adjustments, learning loop</td>
           <td>Approves priorities, resolves blockers, makes strategic calls</td>
         </tr>
@@ -691,16 +692,16 @@
           <div class="proof-stat-label">Falconers</div>
         </div>
         <div class="proof-stat">
-          <div class="proof-stat-value">7</div>
+          <div class="proof-stat-value">6</div>
           <div class="proof-stat-label">Repos managed</div>
         </div>
         <div class="proof-stat">
-          <div class="proof-stat-value">16</div>
+          <div class="proof-stat-value">11</div>
           <div class="proof-stat-label">Active milestones</div>
         </div>
         <div class="proof-stat">
-          <div class="proof-stat-value">20+</div>
-          <div class="proof-stat-label">Sessions logged</div>
+          <div class="proof-stat-value">41</div>
+          <div class="proof-stat-label">Working sessions</div>
         </div>
       </div>
     </div>
@@ -784,13 +785,18 @@
   <div class="metrics">
     <div class="section-header">
       <h2>Measured Results</h2>
-      <p>Real data from a 3-person team running Falconer to build Kestrel itself.</p>
+      <p>Real data from a 3-person team running Falconer across 6 repos. All numbers pulled live from GitHub.</p>
     </div>
     <div class="metrics-grid">
       <div class="metric">
-        <div class="metric-value">73% &rarr; 20%</div>
-        <div class="metric-label">Human Bottleneck Reduction</div>
-        <div class="metric-detail">Process was the bottleneck, not AI</div>
+        <div class="metric-value">310</div>
+        <div class="metric-label">Issues Closed</div>
+        <div class="metric-detail">450 total tickets, 69% completion rate</div>
+      </div>
+      <div class="metric">
+        <div class="metric-value">96</div>
+        <div class="metric-label">Closed in Last 30 Days</div>
+        <div class="metric-detail">36 PRs merged across 6 repos</div>
       </div>
       <div class="metric">
         <div class="metric-value">0 hrs</div>
@@ -798,14 +804,9 @@
         <div class="metric-detail">No standups, planning poker, or retros</div>
       </div>
       <div class="metric">
-        <div class="metric-value">100%</div>
-        <div class="metric-label">Backlog Health</div>
-        <div class="metric-detail">Every ticket: assignee, milestone, criteria</div>
-      </div>
-      <div class="metric">
         <div class="metric-value">0</div>
         <div class="metric-label">Safety Incidents</div>
-        <div class="metric-detail">Caprock clinical validation: zero failures</div>
+        <div class="metric-detail">Caprock clinical validation: 0 open bugs</div>
       </div>
     </div>
   </div>
@@ -849,7 +850,7 @@
       <a href="https://github.com/KestrelSovereignAI">github.com/KestrelSovereignAI</a>
     </p>
     <p style="margin-top: 10px; color: #2a3a4a; font-size: 11px;">
-      Confidential &mdash; March 2026
+      Confidential &mdash; March 31, 2026
     </p>
   </div>
 
