@@ -22,9 +22,19 @@ COPY . .
 RUN chmod +x /app/docker/cloudrun_entrypoint.sh
 
 # Create the virtual environment and install
-RUN uv venv /app/.venv && \
+# Uses Docker secret for GitHub token to access private repos (kestrel-talon)
+RUN --mount=type=secret,id=github_token \
+    uv venv /app/.venv && \
+    GIT_AUTH="$(cat /run/secrets/github_token 2>/dev/null || true)" && \
+    if [ -n "$GIT_AUTH" ]; then \
+        git config --global url."https://${GIT_AUTH}@github.com/".insteadOf "https://github.com/"; \
+    fi && \
     uv pip install --python /app/.venv/bin/python . && \
-    (uv pip uninstall --python /app/.venv/bin/python ollama || true)
+    (uv pip uninstall --python /app/.venv/bin/python ollama || true) && \
+    git config --global --unset-all url."https://${GIT_AUTH}@github.com/".insteadOf 2>/dev/null || true
+
+# Cloud LLM config (local llm_config.toml is excluded via .dockerignore)
+COPY docker/llm_config.cloudrun.toml /app/llm_config.toml
 
 # Create directories for agent data
 RUN mkdir -p /app/agent_data
