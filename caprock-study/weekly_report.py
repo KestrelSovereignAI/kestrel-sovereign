@@ -59,9 +59,8 @@ def build_weekly_markdown(cumulative: dict, week_end: date) -> str:
     patient_rows = []
     for name, stats in sorted(adherence.items()):
         pct = stats["adherence_pct"]
-        trend_icon = "📈" if cumulative.get("study_trend") == "improving" else \
-                     "📉" if cumulative.get("study_trend") == "declining" else "➡️"
-        status = "🟢" if pct >= 70 else "🟡" if pct >= 40 else "🔴"
+        trend_icon = ""
+        status = "[OK]" if pct >= 70 else "[WARN]" if pct >= 40 else "[LOW]"
         patient_rows.append(
             f"| {name} | {stats['days_replied']}/{stats['days_active']} days | {pct}% | {status} |"
         )
@@ -71,11 +70,18 @@ def build_weekly_markdown(cumulative: dict, week_end: date) -> str:
     for s in series:
         at_risk_this_week.update(s.get("at_risk", []))
 
+    # Vitals compliance (primary outcome)
+    vitals_rates = [s.get("vitals_compliance_pct", 0) for s in series if s.get("vitals_compliance_pct") is not None]
+    avg_vitals_compliance = round(sum(vitals_rates) / len(vitals_rates), 1) if vitals_rates else 0
+    total_vitals_readings = sum(s.get("total_readings", 0) for s in series)
+    abnormal_readings = sum(s.get("abnormal_readings", 0) for s in series)
+    critical_readings = sum(s.get("critical_readings", 0) for s in series)
+
     risk_section = ""
     if at_risk_this_week:
-        risk_section = "\n### ⚠️ At-Risk Patients (3+ days without reply)\n"
+        risk_section = "\n### At-Risk Patients (3+ days without reply)\n"
         for name in sorted(at_risk_this_week):
-            risk_section += f"- {name} — please follow up\n"
+            risk_section += f"- {name} -- please follow up\n"
 
     study_days_total = cumulative.get("total_days_collected", 0)
     cohort = cumulative.get("cohort_size", 10)
@@ -87,7 +93,7 @@ def build_weekly_markdown(cumulative: dict, week_end: date) -> str:
 
 ---
 
-### 📊 This Week Summary
+### Summary
 
 | Metric | Value |
 |--------|-------|
@@ -97,15 +103,25 @@ def build_weekly_markdown(cumulative: dict, week_end: date) -> str:
 | 7-day trend | {cumulative.get('study_trend', 'n/a')} |
 | Total escalations to date | {cumulative.get('total_escalations', 0)} |
 
+### Vitals Compliance (Primary Outcome)
+
+| Metric | Value |
+|--------|-------|
+| Avg daily compliance (readings submitted) | **{avg_vitals_compliance}%** |
+| Target | 20% improvement over baseline |
+| Total readings this week | {total_vitals_readings} |
+| Abnormal readings | {abnormal_readings} |
+| Critical readings | {critical_readings} |
+
 ---
 
-### 👤 Per-Patient Adherence (study-to-date)
+### Per-Patient Adherence (study-to-date)
 
 | Patient | Reply Days | Adherence | Status |
 |---------|-----------|-----------|--------|
 {chr(10).join(patient_rows) if patient_rows else "| No data yet | — | — | — |"}
 
-🟢 ≥70% · 🟡 40–69% · 🔴 <40%
+Green = 70%+ · Yellow = 40-69% · Red = below 40%
 {risk_section}
 ---
 

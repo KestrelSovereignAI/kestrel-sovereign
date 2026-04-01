@@ -1,22 +1,21 @@
 """
 Caprock Clinical Validation Study — Daily Metrics Collector
 ============================================================
-Queries the RemoteCares staging PostgreSQL database and emits a
-structured JSON snapshot of patient adherence and engagement metrics.
+Queries the RemoteCares SQL Server database and emits a structured JSON
+snapshot of patient adherence and engagement metrics.
 
 Run daily (via GitHub Action or cron). Output goes to:
   caprock-study/snapshots/YYYY-MM-DD.json
 
-Activation requirements:
-  - DB_HOST         environment variable (or CAPROCK_DB_HOST secret)
-  - DB_PORT         (default: 5432)
-  - DB_NAME         (default: remotecares)
-  - DB_USER
-  - DB_PASSWORD
-  - STUDY_START     ISO date when Kestrel went live (e.g. 2026-03-17)
-  - VITALS_TABLE    Table name for readings/vitals (set once Jason confirms) — optional
-  - BUSINESS_HRS_START   Hour (local, 24h) when care managers start (default: 8)
-  - BUSINESS_HRS_END     Hour (local, 24h) when care managers finish (default: 18)
+Environment variables:
+  DB_SERVER          — SQL Server host (e.g. myserver.database.windows.net)
+  DB_NAME            — (default: remotecares)
+  DB_USER
+  DB_PASSWORD
+  STUDY_START        — ISO date when Kestrel went live (e.g. 2026-03-17)
+  BUSINESS_HRS_START — Hour (local, 24h) when care managers start (default: 8)
+  BUSINESS_HRS_END   — Hour (local, 24h) when care managers finish (default: 18)
+  ODBC_DRIVER        — ODBC driver name (default: ODBC Driver 18 for SQL Server)
 
 Usage:
   python collect_metrics.py --date 2026-03-17 --out snapshots/2026-03-17.json
@@ -26,8 +25,7 @@ Usage:
 import os
 import json
 import argparse
-import psycopg2
-import psycopg2.extras
+import pyodbc
 from datetime import date, datetime, timedelta
 
 # ---------------------------------------------------------------------------
@@ -61,9 +59,9 @@ STUDY_PHASES = {
     },
 }
 
-BUSINESS_HRS_START = int(os.environ.get("BUSINESS_HRS_START", 8))   # 08:00 local
-BUSINESS_HRS_END   = int(os.environ.get("BUSINESS_HRS_END",  18))   # 18:00 local
-VITALS_TABLE       = os.environ.get("VITALS_TABLE")                  # e.g. "VitalSigns" — set once confirmed
+BUSINESS_HRS_START = int(os.environ.get("BUSINESS_HRS_START", 8))
+BUSINESS_HRS_END   = int(os.environ.get("BUSINESS_HRS_END",  18))
+ODBC_DRIVER = os.environ.get("ODBC_DRIVER", "ODBC Driver 18 for SQL Server")
 
 
 def get_study_phase(study_start: date, target_date: date) -> dict:
@@ -84,14 +82,30 @@ def get_study_phase(study_start: date, target_date: date) -> dict:
 # ---------------------------------------------------------------------------
 
 def get_connection():
-    return psycopg2.connect(
-        host=os.environ["DB_HOST"],
-        port=int(os.environ.get("DB_PORT", 5432)),
-        dbname=os.environ.get("DB_NAME", "remotecares"),
-        user=os.environ["DB_USER"],
-        password=os.environ["DB_PASSWORD"],
-        sslmode="require",
+    server = os.environ["DB_SERVER"]
+    database = os.environ.get("DB_NAME", "remotecares")
+    user = os.environ["DB_USER"]
+    password = os.environ["DB_PASSWORD"]
+    conn_str = (
+        f"DRIVER={{{ODBC_DRIVER}}};"
+        f"SERVER={server};"
+        f"DATABASE={database};"
+        f"UID={user};"
+        f"PWD={password};"
+        "Encrypt=yes;TrustServerCertificate=no;"
     )
+    return pyodbc.connect(conn_str)
+
+
+def rows_to_dicts(cursor):
+    columns = [col[0] for col in cursor.description]
+    return [dict(zip(columns, row)) for row in cursor.fetchall()]
+
+
+def row_to_dict(cursor):
+    columns = [col[0] for col in cursor.description]
+    row = cursor.fetchone()
+    return dict(zip(columns, row)) if row else {}
 
 
 # ---------------------------------------------------------------------------
@@ -102,46 +116,39 @@ def fetch_active_patients(cur):
     """Return list of active Caprock RPM patients."""
     cur.execute("""
         SELECT
-            p."Id"                  AS patient_id,
-            p."FullNameLF"          AS name,
-            p."MobilePhone"         AS mobile,
-            pa."IsAgentActive"      AS agent_active,
-            pa."IsRpmActive"        AS rpm_active,
-            pa."IsRpmMedicaidActive" AS rpm_medicaid
-        FROM "PatientAssistant" pa
-        JOIN "Person" p ON p."Id" = pa."PersonId"
-        WHERE (pa."IsRpmActive" = true OR pa."IsRpmMedicaidActive" = true)
-          AND pa."IsAgentActive" = true
+            p.Oid               AS patient_id,
+            p.FullName          AS name,
+            p.MobilePhone       AS mobile,
+            p.IsRpmActive       AS rpm_active,
+            p.IsRpmMedicaidActive AS rpm_medicaid
+        FROM Patients p
+        WHERE (p.IsRpmActive = 1 OR p.IsRpmMedicaidActive = 1)
     """)
-    return [dict(r) for r in cur.fetchall()]
+    return rows_to_dicts(cur)
 
 
 def fetch_sms_stats(cur, target_date: date):
-    """
-    Daily SMS engagement metrics from SmsLogs.
-    Direction: 0 = outbound (system → patient), 1 = inbound (patient → system)
-    """
+    """Daily SMS engagement metrics from SmsLogs."""
     day_start = datetime.combine(target_date, datetime.min.time())
     day_end   = datetime.combine(target_date + timedelta(days=1), datetime.min.time())
 
     cur.execute("""
         SELECT
-            COUNT(*) FILTER (WHERE "Direction" = 0)                      AS outbound_total,
-            COUNT(*) FILTER (WHERE "Direction" = 1)                      AS inbound_total,
-            COUNT(DISTINCT "PatientId") FILTER (WHERE "Direction" = 0)   AS patients_messaged,
-            COUNT(DISTINCT "PatientId") FILTER (WHERE "Direction" = 1)   AS patients_replied
-        FROM "SmsLogs"
-        WHERE "CreatedAt" >= %s AND "CreatedAt" < %s
-    """, (day_start, day_end))
-    return dict(cur.fetchone())
+            SUM(CASE WHEN Direction = 0 THEN 1 ELSE 0 END)                    AS outbound_total,
+            SUM(CASE WHEN Direction = 1 THEN 1 ELSE 0 END)                    AS inbound_total,
+            COUNT(DISTINCT CASE WHEN Direction = 0 THEN PatientId END)         AS patients_messaged,
+            COUNT(DISTINCT CASE WHEN Direction = 1 THEN PatientId END)         AS patients_replied
+        FROM SmsLogs
+        WHERE CreatedOn >= ? AND CreatedOn < ?
+    """, day_start, day_end)
+    result = row_to_dict(cur)
+    return {k: (v or 0) for k, v in result.items()}
 
 
 def fetch_after_hours_compliance(cur, target_date: date) -> dict:
     """
     Phase 1 rule: AI must NOT send open-ended questions after business hours.
     Flags any outbound AI messages sent outside business hours that contain a '?'.
-    A violation in Phase 1 means AI asked a wellness question when no care manager
-    was available to respond to a potential urgent reply.
     """
     day_start = datetime.combine(target_date, datetime.min.time())
     day_end   = datetime.combine(target_date + timedelta(days=1), datetime.min.time())
@@ -150,158 +157,165 @@ def fetch_after_hours_compliance(cur, target_date: date) -> dict:
         cur.execute("""
             SELECT
                 COUNT(*) AS after_hours_total,
-                COUNT(*) FILTER (WHERE "Message" LIKE '%%?%%') AS after_hours_questions
-            FROM "SmsLogs"
-            WHERE "Direction" = 0
-              AND "CreatedAt" >= %s AND "CreatedAt" < %s
-              AND (EXTRACT(HOUR FROM "CreatedAt") < %s
-                   OR EXTRACT(HOUR FROM "CreatedAt") >= %s)
-        """, (day_start, day_end, BUSINESS_HRS_START, BUSINESS_HRS_END))
-        row = dict(cur.fetchone())
+                SUM(CASE WHEN Content LIKE '%?%' THEN 1 ELSE 0 END) AS after_hours_questions
+            FROM SmsLogs
+            WHERE Direction = 0
+              AND CreatedOn >= ? AND CreatedOn < ?
+              AND (DATEPART(HOUR, CreatedOn) < ? OR DATEPART(HOUR, CreatedOn) >= ?)
+        """, day_start, day_end, BUSINESS_HRS_START, BUSINESS_HRS_END)
+        row = row_to_dict(cur)
+        after_hrs_total = row.get("after_hours_total", 0) or 0
+        after_hrs_questions = row.get("after_hours_questions", 0) or 0
         return {
-            "after_hours_outbound":  row["after_hours_total"],
-            "after_hours_questions": row["after_hours_questions"],
-            "phase1_violation":      row["after_hours_questions"] > 0,
+            "after_hours_outbound":  after_hrs_total,
+            "after_hours_questions": after_hrs_questions,
+            "phase1_violation":      after_hrs_questions > 0,
         }
     except Exception:
         return {"after_hours_outbound": None, "after_hours_questions": None, "phase1_violation": None}
 
 
-def fetch_kestrel_ai_stats(cur, target_date: date) -> dict:
-    """
-    Kestrel AI message counts from AgentMessages.
-    Attempts to read extended columns (UrgencyLevel, ConfidenceScore, Zone)
-    — falls back gracefully if columns don't yet exist.
-    Tracked by: jaslogic1/RemoteCares#67
-    """
-    day_start = datetime.combine(target_date, datetime.min.time())
-    day_end   = datetime.combine(target_date + timedelta(days=1), datetime.min.time())
-
-    # Base query — always works once table has any rows
-    base_result = {"ai_messages_sent": 0, "safezone_triggered": 0, "escalations": 0,
-                   "triage_breakdown": None, "avg_confidence_score": None, "zone_breakdown": None}
-    try:
-        cur.execute("""
-            SELECT
-                COUNT(*)                                            AS ai_messages_sent,
-                COUNT(*) FILTER (WHERE "SafeZoneTriggered" = true) AS safezone_triggered,
-                COUNT(*) FILTER (WHERE "EscalationLevel" > 0)      AS escalations
-            FROM "AgentMessages"
-            WHERE "CreatedAt" >= %s AND "CreatedAt" < %s
-        """, (day_start, day_end))
-        row = cur.fetchone()
-        if row:
-            base_result.update({"ai_messages_sent": row["ai_messages_sent"],
-                                 "safezone_triggered": row["safezone_triggered"],
-                                 "escalations": row["escalations"]})
-    except Exception:
-        return base_result
-
-    # Extended query — needs jaslogic1/RemoteCares#67 (UrgencyLevel, ConfidenceScore, Zone)
-    try:
-        cur.execute("""
-            SELECT
-                "UrgencyLevel",
-                COUNT(*) AS cnt,
-                AVG("ConfidenceScore") AS avg_confidence
-            FROM "AgentMessages"
-            WHERE "CreatedAt" >= %s AND "CreatedAt" < %s
-              AND "UrgencyLevel" IS NOT NULL
-            GROUP BY "UrgencyLevel"
-        """, (day_start, day_end))
-        rows = cur.fetchall()
-        if rows:
-            breakdown = {r["UrgencyLevel"]: {"count": r["cnt"],
-                                              "avg_confidence": round(float(r["avg_confidence"] or 0), 3)}
-                         for r in rows}
-            base_result["triage_breakdown"] = breakdown
-            all_conf = [r["avg_confidence"] for r in rows if r["avg_confidence"]]
-            if all_conf:
-                base_result["avg_confidence_score"] = round(sum(all_conf) / len(all_conf), 3)
-    except Exception:
-        pass  # columns not yet added — tracked in #67
-
-    # Zone breakdown
-    try:
-        cur.execute("""
-            SELECT "Zone", COUNT(*) AS cnt
-            FROM "AgentMessages"
-            WHERE "CreatedAt" >= %s AND "CreatedAt" < %s
-            GROUP BY "Zone"
-        """, (day_start, day_end))
-        rows = cur.fetchall()
-        if rows:
-            base_result["zone_breakdown"] = {r["Zone"]: r["cnt"] for r in rows if r["Zone"]}
-    except Exception:
-        pass  # Zone column not yet added
-
-    return base_result
-
-
 def fetch_vitals_compliance(cur, target_date: date, patient_ids: list) -> dict:
     """
-    PRIMARY OUTCOME METRIC: % of patients who submitted a reading today.
-    Requires VITALS_TABLE env var to be set.
-    Schema confirmation tracked in: jaslogic1/RemoteCares#68
+    PRIMARY OUTCOME METRIC: % of patients who submitted a device reading today.
+    Source = 0 means reading came from a physical device (not manual/missed).
     """
-    if not VITALS_TABLE:
-        return {"status": "pending_schema_confirmation", "ref": "jaslogic1/RemoteCares#68"}
+    if not patient_ids:
+        return {"status": "no_patients"}
 
     day_start = datetime.combine(target_date, datetime.min.time())
     day_end   = datetime.combine(target_date + timedelta(days=1), datetime.min.time())
+    placeholders = ",".join("?" for _ in patient_ids)
 
     try:
         cur.execute(f"""
             SELECT
-                COUNT(DISTINCT "PatientId")  AS patients_with_readings,
-                COUNT(*)                     AS total_readings
-            FROM "{VITALS_TABLE}"
-            WHERE "PatientId" = ANY(%s)
-              AND "CreatedAt" >= %s AND "CreatedAt" < %s
-        """, (patient_ids, day_start, day_end))
-        row = dict(cur.fetchone())
+                COUNT(DISTINCT vs.PatientId)  AS patients_with_readings,
+                COUNT(*)                      AS total_readings
+            FROM VitalSigns vs
+            JOIN Encounters e ON e.Oid = vs.EncounterId
+            WHERE vs.PatientId IN ({placeholders})
+              AND e.StartOn >= ? AND e.StartOn < ?
+              AND vs.Source = 0
+        """, patient_ids + [day_start, day_end])
+        row = row_to_dict(cur)
         total = len(patient_ids)
-        with_readings = row["patients_with_readings"]
+        with_readings = row.get("patients_with_readings", 0) or 0
         return {
             "patients_with_readings": with_readings,
             "total_patients":         total,
             "compliance_pct":         round(with_readings / total * 100, 1) if total else 0.0,
-            "total_readings_today":   row["total_readings"],
+            "total_readings_today":   row.get("total_readings", 0) or 0,
         }
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
 
-def fetch_per_patient_sms(cur, target_date: date, patient_ids: list):
-    """Per-patient SMS activity for the target date."""
+def fetch_vitals_by_type(cur, target_date: date, patient_ids: list) -> dict:
+    """Breakdown of today's readings by vital sign type (BP, glucose, SpO2, etc.)."""
+    if not patient_ids:
+        return {}
+
     day_start = datetime.combine(target_date, datetime.min.time())
     day_end   = datetime.combine(target_date + timedelta(days=1), datetime.min.time())
+    placeholders = ",".join("?" for _ in patient_ids)
 
-    cur.execute("""
+    try:
+        cur.execute(f"""
+            SELECT
+                CASE
+                    WHEN vs.Systolic IS NOT NULL THEN 'BloodPressure'
+                    WHEN vs.BloodGlucose IS NOT NULL THEN 'BloodGlucose'
+                    WHEN vs.SpO2 IS NOT NULL THEN 'SpO2'
+                    WHEN vs.WeightInPounds IS NOT NULL THEN 'Weight'
+                    ELSE 'Other'
+                END AS reading_type,
+                COUNT(*) AS count,
+                COUNT(DISTINCT vs.PatientId) AS patients
+            FROM VitalSigns vs
+            JOIN Encounters e ON e.Oid = vs.EncounterId
+            WHERE vs.PatientId IN ({placeholders})
+              AND e.StartOn >= ? AND e.StartOn < ?
+              AND vs.Source = 0
+            GROUP BY
+                CASE
+                    WHEN vs.Systolic IS NOT NULL THEN 'BloodPressure'
+                    WHEN vs.BloodGlucose IS NOT NULL THEN 'BloodGlucose'
+                    WHEN vs.SpO2 IS NOT NULL THEN 'SpO2'
+                    WHEN vs.WeightInPounds IS NOT NULL THEN 'Weight'
+                    ELSE 'Other'
+                END
+        """, patient_ids + [day_start, day_end])
+        return {row["reading_type"]: {"count": row["count"], "patients": row["patients"]}
+                for row in rows_to_dicts(cur)}
+    except Exception:
+        return {}
+
+
+def fetch_result_outcome_breakdown(cur, target_date: date, patient_ids: list) -> dict:
+    """Breakdown of reading results: Normal, Abnormal, Critical."""
+    if not patient_ids:
+        return {}
+
+    day_start = datetime.combine(target_date, datetime.min.time())
+    day_end   = datetime.combine(target_date + timedelta(days=1), datetime.min.time())
+    placeholders = ",".join("?" for _ in patient_ids)
+
+    try:
+        cur.execute(f"""
+            SELECT
+                vs.ResultOutcome,
+                COUNT(*) AS count
+            FROM VitalSigns vs
+            JOIN Encounters e ON e.Oid = vs.EncounterId
+            WHERE vs.PatientId IN ({placeholders})
+              AND e.StartOn >= ? AND e.StartOn < ?
+              AND vs.Source = 0
+              AND vs.ResultOutcome IS NOT NULL
+            GROUP BY vs.ResultOutcome
+        """, patient_ids + [day_start, day_end])
+        # ResultOutcome enum: 0=Normal, 1=Abnormal, 2=Critical
+        outcome_labels = {0: "Normal", 1: "Abnormal", 2: "Critical"}
+        return {outcome_labels.get(row["ResultOutcome"], str(row["ResultOutcome"])): row["count"]
+                for row in rows_to_dicts(cur)}
+    except Exception:
+        return {}
+
+
+def fetch_per_patient_sms(cur, target_date: date, patient_ids: list):
+    """Per-patient SMS activity for the target date."""
+    if not patient_ids:
+        return {}
+
+    day_start = datetime.combine(target_date, datetime.min.time())
+    day_end   = datetime.combine(target_date + timedelta(days=1), datetime.min.time())
+    placeholders = ",".join("?" for _ in patient_ids)
+
+    cur.execute(f"""
         SELECT
-            "PatientId"                                          AS patient_id,
-            COUNT(*) FILTER (WHERE "Direction" = 0)             AS outbound,
-            COUNT(*) FILTER (WHERE "Direction" = 1)             AS inbound,
-            MAX("CreatedAt") FILTER (WHERE "Direction" = 1)     AS last_reply_at
-        FROM "SmsLogs"
-        WHERE "PatientId" = ANY(%s)
-          AND "CreatedAt" >= %s AND "CreatedAt" < %s
-        GROUP BY "PatientId"
-    """, (patient_ids, day_start, day_end))
-    return {str(r["patient_id"]): dict(r) for r in cur.fetchall()}
+            PatientId                                                       AS patient_id,
+            SUM(CASE WHEN Direction = 0 THEN 1 ELSE 0 END)                AS outbound,
+            SUM(CASE WHEN Direction = 1 THEN 1 ELSE 0 END)                AS inbound,
+            MAX(CASE WHEN Direction = 1 THEN CreatedOn END)                AS last_reply_at
+        FROM SmsLogs
+        WHERE PatientId IN ({placeholders})
+          AND CreatedOn >= ? AND CreatedOn < ?
+        GROUP BY PatientId
+    """, patient_ids + [day_start, day_end])
+    return {str(r["patient_id"]): r for r in rows_to_dicts(cur)}
 
 
 def fetch_response_streak(cur, patient_id, as_of: date, lookback_days: int = 30):
     """Count consecutive days ending on as_of date that patient replied."""
     cur.execute("""
-        SELECT DISTINCT DATE("CreatedAt") AS reply_date
-        FROM "SmsLogs"
-        WHERE "PatientId" = %s
-          AND "Direction" = 1
-          AND "CreatedAt" >= %s AND "CreatedAt" <= %s
+        SELECT DISTINCT CAST(CreatedOn AS DATE) AS reply_date
+        FROM SmsLogs
+        WHERE PatientId = ?
+          AND Direction = 1
+          AND CreatedOn >= ? AND CreatedOn <= ?
         ORDER BY reply_date DESC
-    """, (patient_id, as_of - timedelta(days=lookback_days), as_of))
-    rows = [r["reply_date"] for r in cur.fetchall()]
+    """, patient_id, as_of - timedelta(days=lookback_days), as_of)
+    rows = [row[0] for row in cur.fetchall()]
     streak = 0
     check = as_of
     while check in rows:
@@ -313,26 +327,27 @@ def fetch_response_streak(cur, patient_id, as_of: date, lookback_days: int = 30)
 def fetch_days_since_last_reply(cur, patient_id, as_of: date):
     """How many days since patient last sent an inbound SMS."""
     cur.execute("""
-        SELECT MAX(DATE("CreatedAt")) AS last_day
-        FROM "SmsLogs"
-        WHERE "PatientId" = %s AND "Direction" = 1
-    """, (patient_id,))
+        SELECT MAX(CAST(CreatedOn AS DATE)) AS last_day
+        FROM SmsLogs
+        WHERE PatientId = ? AND Direction = 1
+    """, patient_id)
     row = cur.fetchone()
-    if not row or not row["last_day"]:
+    if not row or not row[0]:
         return None
-    return (as_of - row["last_day"]).days
+    return (as_of - row[0]).days
 
 
 def fetch_weekly_trend(cur, patient_id, week_end: date):
     """Response rate for prior 2 weeks to detect trend direction."""
     def week_rate(start, end):
         cur.execute("""
-            SELECT COUNT(DISTINCT DATE("CreatedAt")) AS reply_days
-            FROM "SmsLogs"
-            WHERE "PatientId" = %s AND "Direction" = 1
-              AND "CreatedAt" >= %s AND "CreatedAt" < %s
-        """, (patient_id, start, end))
-        return cur.fetchone()["reply_days"]
+            SELECT COUNT(DISTINCT CAST(CreatedOn AS DATE)) AS reply_days
+            FROM SmsLogs
+            WHERE PatientId = ? AND Direction = 1
+              AND CreatedOn >= ? AND CreatedOn < ?
+        """, patient_id, start, end)
+        row = cur.fetchone()
+        return row[0] if row else 0
 
     this_week_start = week_end - timedelta(days=6)
     prev_week_start = this_week_start - timedelta(days=7)
@@ -361,22 +376,24 @@ def collect(target_date: date) -> dict:
     study_phase = get_study_phase(study_start, target_date)
 
     conn = get_connection()
-    conn.autocommit = True
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur = conn.cursor()
 
     try:
         patients    = fetch_active_patients(cur)
         patient_ids = [p["patient_id"] for p in patients]
 
-        sms_daily    = fetch_sms_stats(cur, target_date)
-        ai_daily     = fetch_kestrel_ai_stats(cur, target_date)
-        vitals_daily = fetch_vitals_compliance(cur, target_date, patient_ids)
-        after_hrs    = fetch_after_hours_compliance(cur, target_date)
-        per_pat      = fetch_per_patient_sms(cur, target_date, patient_ids)
+        sms_daily       = fetch_sms_stats(cur, target_date)
+        vitals_daily    = fetch_vitals_compliance(cur, target_date, patient_ids)
+        vitals_by_type  = fetch_vitals_by_type(cur, target_date, patient_ids)
+        outcome_breakdown = fetch_result_outcome_breakdown(cur, target_date, patient_ids)
+        after_hrs       = fetch_after_hours_compliance(cur, target_date)
+        per_pat         = fetch_per_patient_sms(cur, target_date, patient_ids)
 
+        patients_messaged = sms_daily.get("patients_messaged", 0)
+        patients_replied = sms_daily.get("patients_replied", 0)
         response_rate = (
-            round(sms_daily["patients_replied"] / sms_daily["patients_messaged"] * 100, 1)
-            if sms_daily["patients_messaged"] > 0 else 0.0
+            round(patients_replied / patients_messaged * 100, 1)
+            if patients_messaged > 0 else 0.0
         )
 
         patient_details = []
@@ -391,9 +408,9 @@ def collect(target_date: date) -> dict:
             rec = {
                 "patient_id":           pid,
                 "name":                 p["name"],
-                "sms_out_today":        sms["outbound"],
-                "sms_in_today":         sms["inbound"],
-                "replied_today":        sms["inbound"] > 0,
+                "sms_out_today":        sms.get("outbound", 0) or 0,
+                "sms_in_today":         sms.get("inbound", 0) or 0,
+                "replied_today":        (sms.get("inbound", 0) or 0) > 0,
                 "reply_streak_days":    streak,
                 "days_since_last_reply": days_silent,
                 "weekly_trend":         trend,
@@ -412,11 +429,12 @@ def collect(target_date: date) -> dict:
                 **sms_daily,
                 "response_rate_pct": response_rate,
             },
-            "daily_vitals":     vitals_daily,      # PRIMARY OUTCOME METRIC
-            "daily_kestrel_ai": ai_daily,
-            "after_hours":      after_hrs,          # Phase 1 compliance check
-            "at_risk_patients": at_risk,
-            "patient_details":  patient_details,
+            "daily_vitals":           vitals_daily,
+            "vitals_by_type":         vitals_by_type,
+            "outcome_breakdown":      outcome_breakdown,
+            "after_hours":            after_hrs,
+            "at_risk_patients":       at_risk,
+            "patient_details":        patient_details,
         }
 
         return snapshot
@@ -453,10 +471,15 @@ if __name__ == "__main__":
     print(f"  SMS response rate: {snapshot['daily_sms']['response_rate_pct']}%")
     vitals = snapshot["daily_vitals"]
     if isinstance(vitals, dict) and "compliance_pct" in vitals:
-        print(f"  Reading compliance: {vitals['compliance_pct']}% ({vitals['patients_with_readings']}/{vitals['total_patients']} patients)")
+        print(f"  Reading compliance: {vitals['compliance_pct']}% "
+              f"({vitals['patients_with_readings']}/{vitals['total_patients']} patients)")
     else:
-        print(f"  Reading compliance: {vitals.get('status', 'n/a')} (set VITALS_TABLE env var to activate)")
+        print(f"  Reading compliance: {vitals.get('status', 'n/a')}")
+    if snapshot["vitals_by_type"]:
+        print(f"  Reading types: {snapshot['vitals_by_type']}")
+    if snapshot["outcome_breakdown"]:
+        print(f"  Outcomes: {snapshot['outcome_breakdown']}")
     after = snapshot["after_hours"]
     if after.get("phase1_violation"):
-        print(f"  ⚠️  PHASE 1 VIOLATION: {after['after_hours_questions']} after-hours questions detected!")
+        print(f"  PHASE 1 VIOLATION: {after['after_hours_questions']} after-hours questions detected!")
     print(f"  At-risk (3+ days silent): {snapshot['at_risk_patients']}")

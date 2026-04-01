@@ -34,6 +34,7 @@ DEFAULT_BOOTSTRAP_FILES = [
     "MEMORY.md",
     "CAPABILITIES.md",
     "GOALS.md",
+    "STRATEGY.yaml",
 ]
 
 DEFAULT_MAX_BYTES_PER_FILE = 10_240      # 10 KB

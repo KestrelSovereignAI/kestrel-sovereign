@@ -1,0 +1,677 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Kestrel Falconer — Operational Dashboard</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f172a; color: #e2e8f0; min-height: 100vh; }
+
+  /* Header */
+  .header { background: #1e293b; border-bottom: 1px solid #334155; padding: 16px 32px; display: flex; align-items: center; justify-content: space-between; }
+  .header-left { display: flex; align-items: center; gap: 14px; }
+  .header-left h1 { font-size: 20px; font-weight: 700; color: #f8fafc; letter-spacing: -0.02em; }
+  .header-left h1 span { color: #818cf8; }
+  .header-left .subtitle { font-size: 12px; color: #64748b; margin-top: 2px; }
+  .header-right { display: flex; align-items: center; gap: 14px; }
+  .status-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+  .status-dot.online { background: #22c55e; box-shadow: 0 0 6px #22c55e; }
+  .status-dot.offline { background: #ef4444; box-shadow: 0 0 6px #ef4444; }
+  .status-dot.unknown { background: #f59e0b; }
+  .live-badge { display: flex; align-items: center; gap: 6px; font-size: 12px; color: #94a3b8; }
+  .refresh-time { font-size: 11px; color: #475569; }
+
+  /* Token bar */
+  .token-bar { background: #1a1a2e; border-bottom: 1px solid #334155; padding: 10px 32px; display: flex; align-items: center; gap: 12px; font-size: 13px; color: #94a3b8; }
+  .token-bar input { flex: 1; max-width: 400px; padding: 6px 10px; border: 1px solid #334155; border-radius: 4px; font-size: 12px; font-family: monospace; background: #0f172a; color: #e2e8f0; }
+  .token-bar.hidden { display: none; }
+  .btn { padding: 6px 14px; border-radius: 6px; border: 1px solid #334155; background: #1e293b; color: #94a3b8; font-size: 12px; cursor: pointer; font-weight: 500; transition: all 0.2s; }
+  .btn:hover { background: #334155; color: #f8fafc; }
+  .btn-primary { background: #4f46e5; color: #fff; border-color: #4f46e5; }
+  .btn-primary:hover { background: #4338ca; }
+
+  /* Tabs */
+  .tabs { background: #1e293b; border-bottom: 1px solid #334155; padding: 0 32px; display: flex; gap: 0; }
+  .tab { padding: 12px 20px; font-size: 13px; font-weight: 500; color: #64748b; cursor: pointer; border-bottom: 2px solid transparent; transition: all 0.2s; }
+  .tab:hover { color: #cbd5e1; }
+  .tab.active { color: #818cf8; border-bottom-color: #818cf8; }
+
+  /* Content */
+  .content { padding: 24px 32px; max-width: 1440px; margin: 0 auto; }
+  .content.hidden { display: none; }
+
+  /* KPI Cards */
+  .kpi-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 14px; margin-bottom: 24px; }
+  .kpi { background: #1e293b; border: 1px solid #334155; border-radius: 10px; padding: 18px; transition: border-color 0.3s; }
+  .kpi:hover { border-color: #475569; }
+  .kpi .label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; color: #64748b; margin-bottom: 4px; }
+  .kpi .value { font-size: 28px; font-weight: 700; color: #f8fafc; }
+  .kpi .sub { font-size: 12px; color: #64748b; margin-top: 4px; }
+  .kpi.accent { border-left: 3px solid #818cf8; }
+  .kpi.success { border-left: 3px solid #22c55e; }
+  .kpi.warning { border-left: 3px solid #f59e0b; }
+  .kpi.danger { border-left: 3px solid #ef4444; }
+
+  /* Agent Cards (Flock) */
+  .flock-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px; margin-bottom: 24px; }
+  .agent-card { background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 20px; position: relative; overflow: hidden; }
+  .agent-card::before { content: ''; position: absolute; top: 0; left: 0; right: 0; height: 3px; }
+  .agent-card.online::before { background: linear-gradient(90deg, #22c55e, #4ade80); }
+  .agent-card.offline::before { background: linear-gradient(90deg, #ef4444, #f87171); }
+  .agent-card.unknown::before { background: linear-gradient(90deg, #f59e0b, #fbbf24); }
+  .agent-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; }
+  .agent-name { display: flex; align-items: center; gap: 10px; }
+  .agent-name .icon { font-size: 24px; }
+  .agent-name h3 { font-size: 16px; font-weight: 600; color: #f8fafc; }
+  .agent-name .role { font-size: 11px; color: #818cf8; text-transform: uppercase; letter-spacing: 0.05em; }
+  .agent-badge { padding: 3px 10px; border-radius: 12px; font-size: 11px; font-weight: 600; }
+  .agent-badge.online { background: rgba(34,197,94,0.15); color: #4ade80; }
+  .agent-badge.offline { background: rgba(239,68,68,0.15); color: #f87171; }
+  .agent-badge.unknown { background: rgba(245,158,11,0.15); color: #fbbf24; }
+  .agent-stats { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .agent-stat { background: #0f172a; border-radius: 8px; padding: 10px 12px; }
+  .agent-stat .stat-label { font-size: 10px; color: #64748b; text-transform: uppercase; letter-spacing: 0.05em; }
+  .agent-stat .stat-value { font-size: 16px; font-weight: 600; color: #f8fafc; margin-top: 2px; }
+  .agent-stat .stat-sub { font-size: 10px; color: #475569; }
+
+  /* Context bar */
+  .context-bar { margin-top: 12px; }
+  .context-bar .bar-label { display: flex; justify-content: space-between; font-size: 11px; color: #64748b; margin-bottom: 4px; }
+  .bar-track { height: 6px; background: #0f172a; border-radius: 3px; overflow: hidden; }
+  .bar-fill { height: 100%; border-radius: 3px; transition: width 0.5s; }
+  .bar-fill.green { background: #22c55e; }
+  .bar-fill.yellow { background: #f59e0b; }
+  .bar-fill.red { background: #ef4444; }
+  .bar-fill.blue { background: #818cf8; }
+
+  /* Section titles */
+  .section-title { font-size: 15px; font-weight: 600; color: #f8fafc; margin-bottom: 14px; display: flex; align-items: center; gap: 8px; }
+  .section-title .count { font-size: 12px; color: #64748b; font-weight: 400; }
+
+  /* Task / Message feed */
+  .feed { background: #1e293b; border: 1px solid #334155; border-radius: 10px; overflow: hidden; margin-bottom: 24px; }
+  .feed-item { padding: 12px 18px; border-bottom: 1px solid #1a1a2e; display: flex; align-items: flex-start; gap: 12px; transition: background 0.2s; }
+  .feed-item:last-child { border-bottom: none; }
+  .feed-item:hover { background: #263044; }
+  .feed-icon { width: 32px; height: 32px; border-radius: 8px; display: flex; align-items: center; justify-content: center; font-size: 14px; flex-shrink: 0; }
+  .feed-icon.task { background: rgba(129,140,248,0.15); }
+  .feed-icon.mesh { background: rgba(34,197,94,0.15); }
+  .feed-icon.alert { background: rgba(239,68,68,0.15); }
+  .feed-icon.info { background: rgba(56,189,248,0.15); }
+  .feed-body { flex: 1; min-width: 0; }
+  .feed-body .title { font-size: 13px; font-weight: 500; color: #e2e8f0; }
+  .feed-body .meta { font-size: 11px; color: #64748b; margin-top: 2px; }
+  .feed-body .detail { font-size: 12px; color: #94a3b8; margin-top: 4px; word-break: break-word; }
+  .feed-status { font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 4px; white-space: nowrap; }
+  .feed-status.completed { background: rgba(34,197,94,0.15); color: #4ade80; }
+  .feed-status.running { background: rgba(129,140,248,0.15); color: #a5b4fc; }
+  .feed-status.failed { background: rgba(239,68,68,0.15); color: #f87171; }
+  .feed-status.pending { background: rgba(245,158,11,0.15); color: #fbbf24; }
+
+  /* Empty state */
+  .empty-state { padding: 40px; text-align: center; color: #475569; font-size: 13px; }
+  .empty-state .icon { font-size: 32px; margin-bottom: 8px; }
+
+  /* Scheduled tasks table */
+  table { width: 100%; border-collapse: collapse; background: #1e293b; border: 1px solid #334155; border-radius: 10px; overflow: hidden; margin-bottom: 24px; }
+  th { text-align: left; padding: 10px 14px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; color: #64748b; border-bottom: 1px solid #334155; background: #162032; }
+  td { padding: 9px 14px; font-size: 13px; border-bottom: 1px solid #1a1a2e; color: #cbd5e1; }
+  tr:last-child td { border-bottom: none; }
+  tr:hover td { background: #263044; }
+
+  /* Constitution panel */
+  .constitution-panel { background: #1e293b; border: 1px solid #334155; border-radius: 10px; padding: 20px; margin-bottom: 24px; }
+  .constitution-panel .hash { font-family: monospace; font-size: 13px; color: #818cf8; word-break: break-all; margin-top: 8px; padding: 10px; background: #0f172a; border-radius: 6px; }
+  .did-display { font-family: monospace; font-size: 12px; color: #94a3b8; margin-top: 4px; }
+
+  /* Two-column layout */
+  .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 24px; }
+  @media (max-width: 900px) { .two-col { grid-template-columns: 1fr; } }
+
+  /* Skills grid */
+  .skills-grid { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+  .skill-tag { padding: 3px 8px; border-radius: 4px; font-size: 11px; background: rgba(129,140,248,0.1); color: #a5b4fc; border: 1px solid rgba(129,140,248,0.2); }
+
+  /* Loading spinner */
+  .loading { text-align: center; padding: 60px; }
+  .spinner { width: 32px; height: 32px; border: 3px solid #334155; border-top-color: #818cf8; border-radius: 50%; animation: spin 0.8s linear infinite; margin: 0 auto 12px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* Toast notification */
+  .toast { position: fixed; bottom: 20px; right: 20px; background: #1e293b; border: 1px solid #334155; border-radius: 8px; padding: 12px 18px; font-size: 13px; color: #e2e8f0; box-shadow: 0 8px 30px rgba(0,0,0,0.4); transform: translateY(100px); opacity: 0; transition: all 0.3s; z-index: 100; }
+  .toast.show { transform: translateY(0); opacity: 1; }
+
+  /* Pulse animation for live dot */
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+  .pulse { animation: pulse 2s infinite; }
+</style>
+</head>
+<body>
+
+<!-- Header -->
+<div class="header">
+  <div class="header-left">
+    <div>
+      <h1>🦅 Kestrel <span>Falconer</span></h1>
+      <div class="subtitle">Operational Dashboard — The Sovereign Flock</div>
+    </div>
+  </div>
+  <div class="header-right">
+    <div class="live-badge">
+      <span class="status-dot online pulse" id="liveDot"></span>
+      <span id="liveText">Connecting...</span>
+    </div>
+    <span class="refresh-time" id="lastRefresh"></span>
+    <button class="btn" onclick="refreshAll()">↻ Refresh</button>
+    <button class="btn" onclick="disconnect()" title="Clear API key">🔓</button>
+  </div>
+</div>
+
+<!-- Token bar (shown if no token in localStorage) -->
+<div class="token-bar" id="tokenBar">
+  <span>🔑 API Key:</span>
+  <input type="password" id="apiKeyInput" placeholder="Enter your KESTREL_API_KEY..." />
+  <button class="btn btn-primary" onclick="saveToken()">Connect</button>
+</div>
+
+<!-- Tabs -->
+<div class="tabs">
+  <div class="tab active" onclick="switchTab('flock')">🦅 Flock Status</div>
+  <div class="tab" onclick="switchTab('tasks')">📋 Tasks & Jobs</div>
+  <div class="tab" onclick="switchTab('mesh')">🔗 Mesh Messages</div>
+  <div class="tab" onclick="switchTab('governance')">🛡️ Governance</div>
+</div>
+
+<!-- Tab: Flock Status -->
+<div class="content" id="tab-flock">
+  <div class="kpi-grid" id="kpiGrid">
+    <div class="kpi accent"><div class="label">Agents Online</div><div class="value" id="kpiOnline">—</div><div class="sub" id="kpiOnlineSub">loading...</div></div>
+    <div class="kpi success"><div class="label">Total Skills</div><div class="value" id="kpiSkills">—</div><div class="sub">across all agents</div></div>
+    <div class="kpi warning"><div class="label">Active Tasks</div><div class="value" id="kpiTasks">—</div><div class="sub" id="kpiTasksSub">loading...</div></div>
+    <div class="kpi accent"><div class="label">Mesh Messages</div><div class="value" id="kpiMesh">—</div><div class="sub">in inbox</div></div>
+    <div class="kpi success"><div class="label">Context Health</div><div class="value" id="kpiContext">—</div><div class="sub" id="kpiContextSub">loading...</div></div>
+  </div>
+
+  <div class="section-title">🦅 The Flock <span class="count" id="flockCount"></span></div>
+  <div class="flock-grid" id="flockGrid">
+    <div class="loading"><div class="spinner"></div>Loading flock status...</div>
+  </div>
+</div>
+
+<!-- Tab: Tasks & Jobs -->
+<div class="content hidden" id="tab-tasks">
+  <div class="section-title">📋 Recent Tasks <span class="count" id="taskCount"></span></div>
+  <div class="feed" id="taskFeed">
+    <div class="loading"><div class="spinner"></div>Loading tasks...</div>
+  </div>
+
+  <div class="section-title">⏰ Scheduled Tasks</div>
+  <table id="scheduleTable">
+    <thead><tr><th>Task</th><th>Schedule</th><th>Last Run</th><th>Next Run</th><th>Status</th></tr></thead>
+    <tbody id="scheduleBody"><tr><td colspan="5" style="text-align:center;color:#475569;">Loading...</td></tr></tbody>
+  </table>
+</div>
+
+<!-- Tab: Mesh Messages -->
+<div class="content hidden" id="tab-mesh">
+  <div class="section-title">🔗 Mesh Inbox <span class="count" id="meshCount"></span></div>
+  <div class="feed" id="meshFeed">
+    <div class="loading"><div class="spinner"></div>Loading mesh messages...</div>
+  </div>
+</div>
+
+<!-- Tab: Governance -->
+<div class="content hidden" id="tab-governance">
+  <div class="two-col">
+    <div>
+      <div class="section-title">🛡️ Constitutional Identity</div>
+      <div class="constitution-panel" id="constitutionPanel">
+        <div class="loading"><div class="spinner"></div>Loading identity...</div>
+      </div>
+    </div>
+    <div>
+      <div class="section-title">🔒 Privacy & Model</div>
+      <div class="constitution-panel" id="modelPanel">
+        <div class="loading"><div class="spinner"></div>Loading model info...</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="section-title">🧩 Agent Features</div>
+  <div class="constitution-panel" id="featuresPanel">
+    <div class="loading"><div class="spinner"></div>Loading features...</div>
+  </div>
+</div>
+
+<!-- Toast -->
+<div class="toast" id="toast"></div>
+
+<script>
+// ===== STATE =====
+const BASE = window.location.protocol === 'file:' ? 'http://localhost:8888' : window.location.origin;
+let API_KEY = localStorage.getItem('kestrel_api_key') || '';
+let agentsData = [];
+let refreshTimer = null;
+
+// ===== INIT =====
+document.addEventListener('DOMContentLoaded', () => {
+  if (window.location.protocol === 'file:') {
+    document.getElementById('flockGrid').innerHTML =
+      '<div class="empty-state"><div class="icon">⚠️</div>Open this dashboard via the server, not from disk:<br><br>' +
+      '<a href="http://localhost:8888/static/falconer-dashboard.html" style="color:#818cf8;">http://localhost:8888/static/falconer-dashboard.html</a></div>';
+    return;
+  }
+  // Allow ?key= query param for convenience
+  const params = new URLSearchParams(window.location.search);
+  if (params.get('key')) {
+    API_KEY = params.get('key');
+    localStorage.setItem('kestrel_api_key', API_KEY);
+  }
+
+  if (API_KEY) {
+    document.getElementById('tokenBar').classList.add('hidden');
+    refreshAll();
+    startAutoRefresh();
+  } else {
+    // Show clear prompt instead of infinite loading spinners
+    document.getElementById('flockGrid').innerHTML =
+      '<div class="empty-state"><div class="icon">🔑</div>Enter your KESTREL_API_KEY above to connect</div>';
+    document.getElementById('tokenBar').style.background = '#1e293b';
+    document.getElementById('tokenBar').style.borderColor = '#818cf8';
+    document.getElementById('apiKeyInput').focus();
+  }
+});
+
+async function saveToken() {
+  const input = document.getElementById('apiKeyInput');
+  const key = input.value.trim();
+  if (!key) return;
+
+  // Test the key before saving
+  try {
+    const resp = await fetch(BASE + '/api/agents', { headers: { 'X-API-Key': key } });
+    if (!resp.ok) {
+      showToast('Invalid API key — got ' + resp.status + '. Check your KESTREL_API_KEY in .env');
+      input.style.borderColor = '#ef4444';
+      return;
+    }
+  } catch (err) {
+    showToast('Cannot reach server: ' + err.message);
+    return;
+  }
+
+  API_KEY = key;
+  localStorage.setItem('kestrel_api_key', API_KEY);
+  document.getElementById('tokenBar').classList.add('hidden');
+  refreshAll();
+  startAutoRefresh();
+  showToast('Connected to Kestrel Falconer');
+}
+
+function disconnect() {
+  API_KEY = '';
+  localStorage.removeItem('kestrel_api_key');
+  if (refreshTimer) clearInterval(refreshTimer);
+  document.getElementById('tokenBar').classList.remove('hidden');
+  document.getElementById('tokenBar').style.background = '#1e293b';
+  document.getElementById('tokenBar').style.borderColor = '#818cf8';
+  document.getElementById('apiKeyInput').value = '';
+  document.getElementById('apiKeyInput').focus();
+  document.getElementById('flockGrid').innerHTML =
+    '<div class="empty-state"><div class="icon">🔑</div>Enter your KESTREL_API_KEY above to connect</div>';
+  showToast('Disconnected');
+}
+
+// ===== API HELPERS =====
+async function api(path) {
+  const resp = await fetch(BASE + path, {
+    headers: { 'X-API-Key': API_KEY },
+  });
+  if (!resp.ok) throw new Error(`${resp.status} ${resp.statusText}`);
+  return resp.json();
+}
+
+async function agentApi(agentName, path) {
+  return api(`/api/agents/${encodeURIComponent(agentName)}${path}`);
+}
+
+// ===== REFRESH ALL =====
+async function refreshAll() {
+  try {
+    document.getElementById('liveDot').className = 'status-dot online pulse';
+    document.getElementById('liveText').textContent = 'Refreshing...';
+
+    // Fetch agents list
+    const agentsResp = await api('/api/agents');
+    agentsData = agentsResp.agents || [];
+
+    // Fetch per-agent details in parallel
+    const details = await Promise.allSettled(
+      agentsData.map(async (agent) => {
+        const [info, context, tasks, mesh, heartbeat] = await Promise.allSettled([
+          agentApi(agent.name, '/agent/info'),
+          agentApi(agent.name, '/agent/context-status'),
+          agentApi(agent.name, '/agent/tasks'),
+          agentApi(agent.name, '/agent/mesh/inbox?limit=20'),
+          agentApi(agent.name, '/agent/heartbeat/status'),
+        ]);
+        return {
+          ...agent,
+          info: info.status === 'fulfilled' ? info.value : null,
+          context: context.status === 'fulfilled' ? context.value : null,
+          tasks: tasks.status === 'fulfilled' ? tasks.value : null,
+          mesh: mesh.status === 'fulfilled' ? mesh.value : null,
+          heartbeat: heartbeat.status === 'fulfilled' ? heartbeat.value : null,
+          online: info.status === 'fulfilled' && !info.value?.detail,
+        };
+      })
+    );
+
+    const enriched = details
+      .filter(d => d.status === 'fulfilled')
+      .map(d => d.value);
+
+    renderKPI(enriched);
+    renderFlock(enriched);
+    renderTasks(enriched);
+    renderMesh(enriched);
+    renderGovernance(enriched);
+
+    document.getElementById('liveDot').className = 'status-dot online pulse';
+    document.getElementById('liveText').textContent = 'Live';
+    document.getElementById('lastRefresh').textContent = 'Updated ' + new Date().toLocaleTimeString();
+  } catch (err) {
+    console.error('Refresh failed:', err);
+    document.getElementById('liveDot').className = 'status-dot offline';
+    document.getElementById('liveText').textContent = 'Disconnected';
+    showToast('Connection error: ' + err.message);
+  }
+}
+
+function startAutoRefresh() {
+  if (refreshTimer) clearInterval(refreshTimer);
+  refreshTimer = setInterval(refreshAll, 30000); // every 30s
+}
+
+// ===== RENDER: KPI =====
+function renderKPI(agents) {
+  const online = agents.filter(a => a.online).length;
+  const total = agents.length;
+  document.getElementById('kpiOnline').textContent = `${online}/${total}`;
+  document.getElementById('kpiOnlineSub').textContent = online === total ? 'all agents operational' : `${total - online} agent(s) offline`;
+
+  const totalSkills = agents.reduce((s, a) => s + (a.skills?.length || 0), 0);
+  document.getElementById('kpiSkills').textContent = totalSkills;
+
+  let totalTasks = 0;
+  let activeTasks = 0;
+  agents.forEach(a => {
+    const tasks = a.tasks?.tasks || [];
+    totalTasks += tasks.length;
+    activeTasks += tasks.filter(t => t.status === 'running' || t.status === 'pending').length;
+  });
+  document.getElementById('kpiTasks').textContent = activeTasks;
+  document.getElementById('kpiTasksSub').textContent = `${totalTasks} total across flock`;
+
+  let totalMesh = 0;
+  agents.forEach(a => { totalMesh += a.mesh?.total || 0; });
+  document.getElementById('kpiMesh').textContent = totalMesh;
+
+  // Context from first online agent
+  const primary = agents.find(a => a.context);
+  if (primary?.context) {
+    const pct = Math.round(primary.context.utilization_percent || 0);
+    document.getElementById('kpiContext').textContent = primary.context.status || 'healthy';
+    document.getElementById('kpiContextSub').textContent = `${pct}% utilized — ${primary.context.model}`;
+  }
+}
+
+// ===== RENDER: FLOCK CARDS =====
+const BIRD_MAP = {
+  'Kestrel':       { icon: '🦅', role: 'Sovereign Agent', bird: 'Kestrel' },
+  'kestrel-demo':  { icon: '🪶', role: 'Demo Agent', bird: 'Fledgling' },
+  'gabi':          { icon: '🦉', role: 'CEO / Falconer', bird: 'Great Horned Owl' },
+  'jason':         { icon: '🦊', role: 'Product Strategy', bird: 'Merlin' },
+  'noel':          { icon: '🐦', role: 'CMO', bird: 'Swift' },
+};
+
+function renderFlock(agents) {
+  const grid = document.getElementById('flockGrid');
+  document.getElementById('flockCount').textContent = `(${agents.length} agents)`;
+
+  if (agents.length === 0) {
+    grid.innerHTML = '<div class="empty-state"><div class="icon">🦅</div>No agents discovered</div>';
+    return;
+  }
+
+  grid.innerHTML = agents.map(agent => {
+    const bird = BIRD_MAP[agent.name] || { icon: '🐦', role: 'Agent', bird: 'Unknown' };
+    const status = agent.online ? 'online' : 'offline';
+    const ctx = agent.context || {};
+    const utilPct = Math.round(ctx.utilization_percent || 0);
+    const barColor = utilPct > 80 ? 'red' : utilPct > 50 ? 'yellow' : 'green';
+    const taskCount = agent.tasks?.tasks?.length || 0;
+    const completedTasks = (agent.tasks?.tasks || []).filter(t => t.status === 'completed').length;
+    const skillCount = agent.skills?.length || 0;
+    const featureCount = agent.info?.features?.length || 0;
+    const hb = agent.heartbeat || {};
+
+    return `
+      <div class="agent-card ${status}">
+        <div class="agent-header">
+          <div class="agent-name">
+            <span class="icon">${bird.icon}</span>
+            <div>
+              <h3>${agent.name}</h3>
+              <div class="role">${bird.role}</div>
+            </div>
+          </div>
+          <span class="agent-badge ${status}">${status}</span>
+        </div>
+        <div class="agent-stats">
+          <div class="agent-stat">
+            <div class="stat-label">Skills</div>
+            <div class="stat-value">${skillCount}</div>
+          </div>
+          <div class="agent-stat">
+            <div class="stat-label">Features</div>
+            <div class="stat-value">${featureCount}</div>
+          </div>
+          <div class="agent-stat">
+            <div class="stat-label">Tasks</div>
+            <div class="stat-value">${completedTasks}/${taskCount}</div>
+            <div class="stat-sub">completed</div>
+          </div>
+          <div class="agent-stat">
+            <div class="stat-label">Model</div>
+            <div class="stat-value" style="font-size:11px;">${ctx.model ? ctx.model.split('/').pop() : '—'}</div>
+          </div>
+        </div>
+        <div class="context-bar">
+          <div class="bar-label">
+            <span>Context Window</span>
+            <span>${utilPct}% of ${ctx.context_limit ? Math.round(ctx.context_limit/1024) + 'K' : '—'}</span>
+          </div>
+          <div class="bar-track"><div class="bar-fill ${barColor}" style="width:${utilPct}%"></div></div>
+        </div>
+      </div>
+    `;
+  }).join('');
+}
+
+// ===== RENDER: TASKS =====
+function renderTasks(agents) {
+  const allTasks = [];
+  agents.forEach(a => {
+    (a.tasks?.tasks || []).forEach(t => {
+      allTasks.push({ ...t, agentName: a.name });
+    });
+  });
+
+  document.getElementById('taskCount').textContent = `(${allTasks.length})`;
+
+  const feed = document.getElementById('taskFeed');
+  if (allTasks.length === 0) {
+    feed.innerHTML = '<div class="empty-state"><div class="icon">📋</div>No tasks recorded yet</div>';
+  } else {
+    feed.innerHTML = allTasks.slice(0, 30).map(t => {
+      const statusClass = t.status === 'completed' ? 'completed' : t.status === 'failed' ? 'failed' : t.status === 'running' ? 'running' : 'pending';
+      return `
+        <div class="feed-item">
+          <div class="feed-icon task">📋</div>
+          <div class="feed-body">
+            <div class="title">${escapeHtml(t.skill || t.message || 'Task')}</div>
+            <div class="meta">${escapeHtml(t.agentName)} → ${escapeHtml(t.agent_id || '')}</div>
+            <div class="detail">${escapeHtml(t.message || '')}</div>
+          </div>
+          <span class="feed-status ${statusClass}">${t.status}</span>
+        </div>
+      `;
+    }).join('');
+  }
+
+  // Scheduled tasks (from reflection status)
+  renderScheduledTasks(agents);
+}
+
+function renderScheduledTasks(agents) {
+  // Find first agent that has reflection data
+  let scheduled = [];
+  for (const a of agents) {
+    try {
+      // Try to fetch reflection from proxy — we already have it if loaded
+      // For now, we'll call at render time
+      agentApi(a.name, '/agent/reflection/status').then(data => {
+        if (data.scheduled_tasks?.length) {
+          const body = document.getElementById('scheduleBody');
+          body.innerHTML = data.scheduled_tasks.map(t => `
+            <tr>
+              <td>${escapeHtml(t.task_name)}</td>
+              <td><code style="color:#818cf8;">${escapeHtml(t.cron_expression)}</code></td>
+              <td>${t.last_run_at ? formatTime(t.last_run_at) : '—'}</td>
+              <td>${t.next_run_at ? formatTime(t.next_run_at) : '—'}</td>
+              <td><span class="feed-status ${t.enabled ? 'completed' : 'pending'}">${t.enabled ? 'enabled' : 'disabled'}</span></td>
+            </tr>
+          `).join('');
+        }
+      }).catch(() => {});
+    } catch { break; }
+  }
+}
+
+// ===== RENDER: MESH =====
+function renderMesh(agents) {
+  const allMessages = [];
+  agents.forEach(a => {
+    (a.mesh?.messages || []).forEach(m => {
+      allMessages.push({ ...m, agentName: a.name });
+    });
+  });
+
+  document.getElementById('meshCount').textContent = `(${allMessages.length} messages)`;
+
+  const feed = document.getElementById('meshFeed');
+  if (allMessages.length === 0) {
+    feed.innerHTML = '<div class="empty-state"><div class="icon">🔗</div>No mesh messages in inbox<div style="margin-top:8px;font-size:12px;">Messages appear when agents communicate via the mesh protocol</div></div>';
+  } else {
+    feed.innerHTML = allMessages.slice(0, 50).map(m => `
+      <div class="feed-item">
+        <div class="feed-icon mesh">🔗</div>
+        <div class="feed-body">
+          <div class="title">${escapeHtml(m.type || m.intent || 'Message')}</div>
+          <div class="meta">From: ${escapeHtml(m.sender || m.from || '?')} → To: ${escapeHtml(m.agentName)}</div>
+          <div class="detail">${escapeHtml(JSON.stringify(m.payload || m.content || m, null, 0).slice(0, 200))}</div>
+        </div>
+      </div>
+    `).join('');
+  }
+}
+
+// ===== RENDER: GOVERNANCE =====
+function renderGovernance(agents) {
+  const primary = agents.find(a => a.online);
+  if (!primary) return;
+
+  // Fetch identity and model
+  agentApi(primary.name, '/api/identity').then(id => {
+    document.getElementById('constitutionPanel').innerHTML = `
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px;">
+        <span style="font-size:24px;">🛡️</span>
+        <div>
+          <div style="font-size:15px;font-weight:600;color:#f8fafc;">${escapeHtml(id.name || primary.name)}</div>
+          <div class="did-display">${escapeHtml(id.did || '—')}</div>
+        </div>
+      </div>
+      <div style="font-size:12px;color:#64748b;margin-bottom:4px;">Node Type: <span style="color:#818cf8;">${escapeHtml(id.node_type || '—')}</span></div>
+      <div style="font-size:12px;color:#64748b;margin-bottom:4px;">Created: <span style="color:#94a3b8;">${id.created_at ? formatTime(id.created_at) : '—'}</span></div>
+      <div style="font-size:12px;color:#64748b;margin-bottom:8px;">Constitution Hash:</div>
+      <div class="hash">${escapeHtml(id.constitution_hash || 'none')}</div>
+    `;
+  }).catch(err => {
+    document.getElementById('constitutionPanel').innerHTML = `<div style="color:#f87171;">Error loading identity: ${escapeHtml(err.message)}</div>`;
+  });
+
+  agentApi(primary.name, '/api/model/current').then(model => {
+    const ctx = primary.context || {};
+    document.getElementById('modelPanel').innerHTML = `
+      <div style="font-size:14px;font-weight:600;color:#f8fafc;margin-bottom:12px;">Current LLM</div>
+      <div style="font-size:24px;font-weight:700;color:#818cf8;margin-bottom:8px;">${escapeHtml(model.model_name || model.model || '—')}</div>
+      <div style="font-size:12px;color:#64748b;margin-bottom:4px;">Provider: <span style="color:#94a3b8;">${escapeHtml(model.provider || '—')}</span></div>
+      <div style="font-size:12px;color:#64748b;margin-bottom:4px;">Privacy Mode: <span style="color:#22c55e;">${escapeHtml(primary.info?.privacy_mode || '—')}</span></div>
+      <div style="font-size:12px;color:#64748b;margin-bottom:4px;">Context: <span style="color:#94a3b8;">${ctx.message_count || 0} messages / ${ctx.total_tokens || 0} tokens</span></div>
+      <div style="font-size:12px;color:#64748b;">Audit Enabled: <span style="color:${primary.info?.audit_enabled ? '#22c55e' : '#f87171'};">${primary.info?.audit_enabled ? 'Yes' : 'No'}</span></div>
+    `;
+  }).catch(err => {
+    document.getElementById('modelPanel').innerHTML = `<div style="color:#f87171;">Error loading model: ${escapeHtml(err.message)}</div>`;
+  });
+
+  // Features panel
+  if (primary.info?.features) {
+    const feats = primary.info.features;
+    document.getElementById('featuresPanel').innerHTML = `
+      <div style="font-size:13px;color:#64748b;margin-bottom:8px;">${feats.length} features loaded on ${escapeHtml(primary.name)}</div>
+      <div class="skills-grid">
+        ${feats.map(f => `<span class="skill-tag">${escapeHtml(f)}</span>`).join('')}
+      </div>
+    `;
+  }
+}
+
+// ===== TAB SWITCHING =====
+function switchTab(name) {
+  document.querySelectorAll('.content').forEach(el => el.classList.add('hidden'));
+  document.querySelectorAll('.tab').forEach(el => el.classList.remove('active'));
+  document.getElementById('tab-' + name).classList.remove('hidden');
+  // Find and activate the clicked tab
+  const tabs = document.querySelectorAll('.tab');
+  const tabMap = { flock: 0, tasks: 1, mesh: 2, governance: 3 };
+  if (tabMap[name] !== undefined) tabs[tabMap[name]].classList.add('active');
+}
+
+// ===== UTILS =====
+function escapeHtml(text) {
+  if (typeof text !== 'string') return String(text || '');
+  const div = document.createElement('div');
+  div.textContent = text;
+  return div.innerHTML;
+}
+
+function formatTime(iso) {
+  if (!iso) return '—';
+  try {
+    const d = new Date(iso);
+    return d.toLocaleDateString() + ' ' + d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  } catch { return iso; }
+}
+
+function showToast(msg) {
+  const toast = document.getElementById('toast');
+  toast.textContent = msg;
+  toast.classList.add('show');
+  setTimeout(() => toast.classList.remove('show'), 3000);
+}
+</script>
+
+</body>
+</html>
