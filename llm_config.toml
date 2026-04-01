@@ -4,7 +4,7 @@
 # 2. The 'provider_priority' list determines the fallback order.
 # 3. For OpenAI, set the OPENAI_API_KEY environment variable.
 
-provider_priority = ["llama_cpp", "ollama", "claude_max", "openrouter", "openai", "openai_mini", "anthropic", "vertex_ai", "runpod", "xai"]
+provider_priority = ["openrouter", "llama_cpp", "ollama", "claude_max", "openai", "openai_mini", "anthropic", "vertex_ai", "runpod", "xai"]
 
 # Claude Max - Use your Claude Max subscription ($100/$200/month) for API access
 # Requires: pip install claude-agent-sdk && claude login
