@@ -26,6 +26,17 @@
   .token-bar { background: #1a1a2e; border-bottom: 1px solid #334155; padding: 10px 32px; display: flex; align-items: center; gap: 12px; font-size: 13px; color: #94a3b8; }
   .token-bar input { flex: 1; max-width: 400px; padding: 6px 10px; border: 1px solid #334155; border-radius: 4px; font-size: 12px; font-family: monospace; background: #0f172a; color: #e2e8f0; }
   .token-bar.hidden { display: none; }
+  .auth-tabs { display: flex; gap: 0; margin-right: 12px; }
+  .auth-tab { padding: 5px 12px; font-size: 11px; font-weight: 600; color: #64748b; cursor: pointer; border: 1px solid #334155; background: #0f172a; transition: all 0.2s; }
+  .auth-tab:first-child { border-radius: 4px 0 0 4px; }
+  .auth-tab:last-child { border-radius: 0 4px 4px 0; }
+  .auth-tab.active { background: #4f46e5; color: #fff; border-color: #4f46e5; }
+  .auth-form { display: flex; align-items: center; gap: 8px; flex: 1; }
+  .auth-form.hidden { display: none; }
+  .auth-badge { display: inline-flex; align-items: center; gap: 5px; padding: 3px 10px; border-radius: 12px; font-size: 11px; font-weight: 600; }
+  .auth-badge.oauth { background: rgba(34,197,94,0.15); color: #4ade80; }
+  .auth-badge.jwt { background: rgba(129,140,248,0.15); color: #a5b4fc; }
+  .auth-badge.apikey { background: rgba(245,158,11,0.15); color: #fbbf24; }
   .btn { padding: 6px 14px; border-radius: 6px; border: 1px solid #334155; background: #1e293b; color: #94a3b8; font-size: 12px; cursor: pointer; font-weight: 500; transition: all 0.2s; }
   .btn:hover { background: #334155; color: #f8fafc; }
   .btn-primary { background: #4f46e5; color: #fff; border-color: #4f46e5; }
@@ -163,16 +174,36 @@
       <span id="liveText">Connecting...</span>
     </div>
     <span class="refresh-time" id="lastRefresh"></span>
+    <span id="authBadge"></span>
     <button class="btn" onclick="refreshAll()">↻ Refresh</button>
-    <button class="btn" onclick="disconnect()" title="Clear API key">🔓</button>
+    <button class="btn" onclick="disconnect()" title="Sign out / disconnect">🔓</button>
   </div>
 </div>
 
-<!-- Token bar (shown if no token in localStorage) -->
+<!-- Auth bar (shown when not authenticated) -->
 <div class="token-bar" id="tokenBar">
-  <span>🔑 API Key:</span>
-  <input type="password" id="apiKeyInput" placeholder="Enter your KESTREL_API_KEY..." />
-  <button class="btn btn-primary" onclick="saveToken()">Connect</button>
+  <div class="auth-tabs">
+    <div class="auth-tab active" onclick="switchAuthTab('oauth')">🔐 OAuth</div>
+    <div class="auth-tab" onclick="switchAuthTab('jwt')">📧 Email Login</div>
+    <div class="auth-tab" onclick="switchAuthTab('apikey')">🔑 API Key</div>
+  </div>
+  <!-- OAuth form -->
+  <div class="auth-form" id="authForm-oauth">
+    <span>Sign in with your Google account:</span>
+    <button class="btn btn-primary" onclick="window.location.href=BASE+'/auth/login'">Sign in with Google</button>
+  </div>
+  <!-- JWT email/password form -->
+  <div class="auth-form hidden" id="authForm-jwt">
+    <input type="email" id="jwtEmailInput" placeholder="Email address" style="max-width:220px;padding:6px 10px;border:1px solid #334155;border-radius:4px;font-size:12px;background:#0f172a;color:#e2e8f0;" />
+    <input type="password" id="jwtPasswordInput" placeholder="Password" style="max-width:200px;padding:6px 10px;border:1px solid #334155;border-radius:4px;font-size:12px;background:#0f172a;color:#e2e8f0;" />
+    <button class="btn btn-primary" onclick="loginJwt()">Login</button>
+  </div>
+  <!-- API key form -->
+  <div class="auth-form hidden" id="authForm-apikey">
+    <span>🔑</span>
+    <input type="password" id="apiKeyInput" placeholder="Enter your KESTREL_API_KEY..." style="flex:1;max-width:400px;padding:6px 10px;border:1px solid #334155;border-radius:4px;font-size:12px;font-family:monospace;background:#0f172a;color:#e2e8f0;" />
+    <button class="btn btn-primary" onclick="saveApiKey()">Connect</button>
+  </div>
 </div>
 
 <!-- Tabs -->
@@ -250,18 +281,48 @@
 <script>
 // ===== STATE =====
 const BASE = window.location.protocol === 'file:' ? 'http://localhost:8888' : window.location.origin;
+let authMethod = null;   // 'oauth' | 'jwt' | 'apikey' | null
+let jwtToken = localStorage.getItem('kestrel_jwt') || '';
 let API_KEY = localStorage.getItem('kestrel_api_key') || '';
+let userInfo = null;
 let agentsData = [];
 let refreshTimer = null;
 
+// ===== AUTH BADGE =====
+function updateAuthBadge() {
+  const badge = document.getElementById('authBadge');
+  if (authMethod === 'oauth') {
+    badge.innerHTML = `<span class="auth-badge oauth">🔐 OAuth${userInfo?.email ? ' — ' + escapeHtml(userInfo.email) : ''}</span>`;
+  } else if (authMethod === 'jwt') {
+    badge.innerHTML = `<span class="auth-badge jwt">📧 JWT${userInfo?.email ? ' — ' + escapeHtml(userInfo.email) : ''}</span>`;
+  } else if (authMethod === 'apikey') {
+    badge.innerHTML = `<span class="auth-badge apikey">🔑 API Key</span>`;
+  } else {
+    badge.innerHTML = '';
+  }
+}
+
+// ===== AUTH TAB SWITCHING =====
+function switchAuthTab(name) {
+  document.querySelectorAll('.auth-tab').forEach(el => el.classList.remove('active'));
+  document.querySelectorAll('.auth-form').forEach(el => el.classList.add('hidden'));
+  // Find the clicked tab
+  const tabs = document.querySelectorAll('.auth-tab');
+  const tabMap = { oauth: 0, jwt: 1, apikey: 2 };
+  if (tabMap[name] !== undefined) tabs[tabMap[name]].classList.add('active');
+  const form = document.getElementById('authForm-' + name);
+  if (form) form.classList.remove('hidden');
+}
+
 // ===== INIT =====
-document.addEventListener('DOMContentLoaded', () => {
+document.addEventListener('DOMContentLoaded', async () => {
   if (window.location.protocol === 'file:') {
     document.getElementById('flockGrid').innerHTML =
       '<div class="empty-state"><div class="icon">⚠️</div>Open this dashboard via the server, not from disk:<br><br>' +
       '<a href="http://localhost:8888/static/falconer-dashboard.html" style="color:#818cf8;">http://localhost:8888/static/falconer-dashboard.html</a></div>';
     return;
   }
+
   // Allow ?key= query param for convenience
   const params = new URLSearchParams(window.location.search);
   if (params.get('key')) {
@@ -269,30 +330,116 @@ document.addEventListener('DOMContentLoaded', () => {
     localStorage.setItem('kestrel_api_key', API_KEY);
   }
 
-  if (API_KEY) {
+  // Try auth methods in priority order: OAuth session → JWT → API key
+  let authenticated = false;
+
+  // 1. Check OAuth session
+  try {
+    const resp = await fetch(BASE + '/auth/me', { credentials: 'include' });
+    if (resp.ok) {
+      const data = await resp.json();
+      if (data.email && data.auth_method === 'oauth') {
+        authMethod = 'oauth';
+        userInfo = data;
+        authenticated = true;
+      }
+    }
+  } catch (e) { /* no session */ }
+
+  // 2. Check stored JWT
+  if (!authenticated && jwtToken) {
+    try {
+      const resp = await fetch(BASE + '/auth/verify', {
+        headers: { 'Authorization': 'Bearer ' + jwtToken },
+      });
+      if (resp.ok) {
+        const data = await resp.json();
+        authMethod = 'jwt';
+        userInfo = { email: data.email, name: data.name };
+        authenticated = true;
+      } else {
+        // JWT expired or invalid — clear it
+        jwtToken = '';
+        localStorage.removeItem('kestrel_jwt');
+      }
+    } catch (e) { /* JWT check failed */ }
+  }
+
+  // 3. Check stored API key
+  if (!authenticated && API_KEY) {
+    try {
+      const resp = await fetch(BASE + '/api/agents', {
+        headers: { 'X-API-Key': API_KEY },
+      });
+      if (resp.ok) {
+        authMethod = 'apikey';
+        authenticated = true;
+      } else {
+        API_KEY = '';
+        localStorage.removeItem('kestrel_api_key');
+      }
+    } catch (e) { /* API key check failed */ }
+  }
+
+  if (authenticated) {
     document.getElementById('tokenBar').classList.add('hidden');
+    updateAuthBadge();
     refreshAll();
     startAutoRefresh();
   } else {
-    // Show clear prompt instead of infinite loading spinners
+    // Show auth bar
     document.getElementById('flockGrid').innerHTML =
-      '<div class="empty-state"><div class="icon">🔑</div>Enter your KESTREL_API_KEY above to connect</div>';
+      '<div class="empty-state"><div class="icon">🔐</div>Sign in above to connect to the Sovereign Flock</div>';
     document.getElementById('tokenBar').style.background = '#1e293b';
     document.getElementById('tokenBar').style.borderColor = '#818cf8';
-    document.getElementById('apiKeyInput').focus();
   }
 });
 
-async function saveToken() {
+// ===== JWT LOGIN =====
+async function loginJwt() {
+  const email = document.getElementById('jwtEmailInput').value.trim();
+  const password = document.getElementById('jwtPasswordInput').value;
+  if (!email || !password) {
+    showToast('Enter email and password');
+    return;
+  }
+
+  try {
+    const resp = await fetch(BASE + '/auth/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, password }),
+    });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      showToast(err.detail || 'Login failed — ' + resp.status);
+      return;
+    }
+    const data = await resp.json();
+    jwtToken = data.access_token;
+    localStorage.setItem('kestrel_jwt', jwtToken);
+    authMethod = 'jwt';
+    userInfo = { email: data.email };
+    document.getElementById('tokenBar').classList.add('hidden');
+    updateAuthBadge();
+    refreshAll();
+    startAutoRefresh();
+    showToast('Signed in as ' + data.email);
+  } catch (err) {
+    showToast('Cannot reach server: ' + err.message);
+  }
+}
+
+// ===== API KEY SAVE =====
+async function saveApiKey() {
   const input = document.getElementById('apiKeyInput');
   const key = input.value.trim();
   if (!key) return;
 
-  // Test the key before saving
   try {
     const resp = await fetch(BASE + '/api/agents', { headers: { 'X-API-Key': key } });
     if (!resp.ok) {
-      showToast('Invalid API key — got ' + resp.status + '. Check your KESTREL_API_KEY in .env');
+      showToast('Invalid API key — got ' + resp.status);
       input.style.borderColor = '#ef4444';
       return;
     }
@@ -303,31 +450,54 @@ async function saveToken() {
 
   API_KEY = key;
   localStorage.setItem('kestrel_api_key', API_KEY);
+  authMethod = 'apikey';
   document.getElementById('tokenBar').classList.add('hidden');
+  updateAuthBadge();
   refreshAll();
   startAutoRefresh();
-  showToast('Connected to Kestrel Falconer');
+  showToast('Connected via API key');
 }
 
+// ===== DISCONNECT =====
 function disconnect() {
-  API_KEY = '';
-  localStorage.removeItem('kestrel_api_key');
+  if (authMethod === 'oauth') {
+    // Redirect to OAuth logout
+    window.location.href = BASE + '/auth/logout';
+    return;
+  }
+  if (authMethod === 'jwt') {
+    jwtToken = '';
+    localStorage.removeItem('kestrel_jwt');
+  }
+  if (authMethod === 'apikey') {
+    API_KEY = '';
+    localStorage.removeItem('kestrel_api_key');
+  }
+  authMethod = null;
+  userInfo = null;
   if (refreshTimer) clearInterval(refreshTimer);
   document.getElementById('tokenBar').classList.remove('hidden');
   document.getElementById('tokenBar').style.background = '#1e293b';
   document.getElementById('tokenBar').style.borderColor = '#818cf8';
-  document.getElementById('apiKeyInput').value = '';
-  document.getElementById('apiKeyInput').focus();
+  updateAuthBadge();
   document.getElementById('flockGrid').innerHTML =
-    '<div class="empty-state"><div class="icon">🔑</div>Enter your KESTREL_API_KEY above to connect</div>';
+    '<div class="empty-state"><div class="icon">🔐</div>Sign in above to connect to the Sovereign Flock</div>';
   showToast('Disconnected');
 }
 
 // ===== API HELPERS =====
 async function api(path) {
-  const resp = await fetch(BASE + path, {
-    headers: { 'X-API-Key': API_KEY },
-  });
+  const headers = {};
+  if (authMethod === 'jwt' && jwtToken) {
+    headers['Authorization'] = 'Bearer ' + jwtToken;
+  } else if (authMethod === 'apikey' && API_KEY) {
+    headers['X-API-Key'] = API_KEY;
+  }
+  const opts = { headers };
+  if (authMethod === 'oauth') {
+    opts.credentials = 'include';
+  }
+  const resp = await fetch(BASE + path, opts);
   if (!resp.ok) throw new Error(`${resp.status} ${resp.statusText}`);
   return resp.json();
 }

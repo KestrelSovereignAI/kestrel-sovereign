@@ -424,7 +424,7 @@ async def auth_middleware(request: Request, call_next):
     2. OAuth session cookie — for browser access via Google sign-in
     """
     public_paths = ["/health", "/health/detailed", "/favicon.ico", "/webhooks/stripe/crypto", "/api/auth/key", "/metrics"]
-    auth_paths = ["/auth/login", "/auth/callback", "/auth/logout"]
+    auth_paths = ["/auth/login", "/auth/callback", "/auth/logout", "/auth/token"]
     static_prefixes = ["/static", "/js/", "/shared/", "/utils/", "/api/github/"]
 
     if request.url.path in public_paths or request.url.path in auth_paths:
@@ -442,12 +442,21 @@ async def auth_middleware(request: Request, call_next):
         if api_key_header and secrets.compare_digest(api_key_header, expected_key):
             return await call_next(request)
 
-        # Check Bearer token
+        # Check Bearer token (API key OR JWT)
         auth_header = request.headers.get("Authorization")
         if auth_header and auth_header.startswith("Bearer "):
             token = auth_header[7:]
+            # First try: API key match
             if secrets.compare_digest(token, expected_key):
                 return await call_next(request)
+            # Second try: JWT token
+            try:
+                from endpoints.auth_oauth import _verify_jwt
+                jwt_payload = _verify_jwt(token)
+                if jwt_payload:
+                    return await call_next(request)
+            except Exception:
+                pass
 
         # Check query parameter for SSE endpoints only (EventSource can't send headers)
         # Restricted to SSE_PATHS to avoid leaking keys in URL logs on other endpoints
