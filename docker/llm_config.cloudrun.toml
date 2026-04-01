@@ -1,0 +1,20 @@
+# LLM provider configuration for Cloud Run deployment.
+# Cloud-only providers — no local llama_cpp or ollama.
+
+provider_priority = ["anthropic", "openai", "vertex_ai"]
+
+# Anthropic (Claude) — Primary provider for Meridian and all cloud agents
+[anthropic]
+model = "auto"
+selection_hints = ["sonnet", "opus"]
+api_key_env = "ANTHROPIC_API_KEY"
+
+# OpenAI — Fallback
+[openai]
+model = "auto"
+selection_hints = ["gpt-4", "gpt-5"]
+
+# Vertex AI / Google AI Studio (Gemini)
+[vertex_ai]
+model = "auto"
+selection_hints = ["gemini", "pro", "flash"]
