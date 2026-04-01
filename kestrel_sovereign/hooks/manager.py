@@ -7,6 +7,7 @@ hooks are called in priority order with proper timeout handling.
 
 import asyncio
 import logging
+import threading
 from typing import Dict, List, Optional
 
 from kestrel_sovereign.hooks.base import (
@@ -54,6 +55,7 @@ class HooksManager:
     def __init__(self):
         """Initialize the hooks manager with empty hook registry."""
         self._hooks: Dict[HookEvent, List[Hook]] = {e: [] for e in HookEvent}
+        self._registry_lock = threading.Lock()
 
     def register(self, hook: Hook) -> None:
         """
@@ -64,16 +66,18 @@ class HooksManager:
 
         Note:
             Hooks are automatically sorted by priority after registration.
+            Thread-safe: mutations are protected by _registry_lock.
         """
-        for event in hook.events:
-            if hook not in self._hooks[event]:
-                self._hooks[event].append(hook)
-                # Sort by priority (lower = earlier)
-                self._hooks[event].sort(key=lambda h: h.priority)
-                logger.info(
-                    f"Registered hook '{hook.name}' for event {event.value} "
-                    f"(priority {hook.priority})"
-                )
+        with self._registry_lock:
+            for event in hook.events:
+                if hook not in self._hooks[event]:
+                    self._hooks[event].append(hook)
+                    # Sort by priority (lower = earlier)
+                    self._hooks[event].sort(key=lambda h: h.priority)
+                    logger.info(
+                        f"Registered hook '{hook.name}' for event {event.value} "
+                        f"(priority {hook.priority})"
+                    )
 
     def unregister(self, hook: Hook) -> None:
         """
@@ -82,10 +86,11 @@ class HooksManager:
         Args:
             hook: The Hook instance to unregister
         """
-        for event in hook.events:
-            if hook in self._hooks[event]:
-                self._hooks[event].remove(hook)
-                logger.info(f"Unregistered hook '{hook.name}' from event {event.value}")
+        with self._registry_lock:
+            for event in hook.events:
+                if hook in self._hooks[event]:
+                    self._hooks[event].remove(hook)
+                    logger.info(f"Unregistered hook '{hook.name}' from event {event.value}")
 
     def unregister_by_name(self, name: str) -> bool:
         """
@@ -98,12 +103,13 @@ class HooksManager:
             True if a hook was found and removed, False otherwise
         """
         found = False
-        for event in HookEvent:
-            hooks_to_remove = [h for h in self._hooks[event] if h.name == name]
-            for hook in hooks_to_remove:
-                self._hooks[event].remove(hook)
-                found = True
-                logger.info(f"Unregistered hook '{name}' from event {event.value}")
+        with self._registry_lock:
+            for event in HookEvent:
+                hooks_to_remove = [h for h in self._hooks[event] if h.name == name]
+                for hook in hooks_to_remove:
+                    self._hooks[event].remove(hook)
+                    found = True
+                    logger.info(f"Unregistered hook '{name}' from event {event.value}")
         return found
 
     def get_hooks(self, event: HookEvent) -> List[Hook]:
@@ -142,12 +148,13 @@ class HooksManager:
             True if a hook was found, False otherwise
         """
         found = False
-        for event in HookEvent:
-            for hook in self._hooks[event]:
-                if hook.name == name:
-                    hook.enabled = enabled
-                    found = True
-                    logger.info(f"Hook '{name}' {'enabled' if enabled else 'disabled'}")
+        with self._registry_lock:
+            for event in HookEvent:
+                for hook in self._hooks[event]:
+                    if hook.name == name:
+                        hook.enabled = enabled
+                        found = True
+                        logger.info(f"Hook '{name}' {'enabled' if enabled else 'disabled'}")
         return found
 
     async def execute_hooks(

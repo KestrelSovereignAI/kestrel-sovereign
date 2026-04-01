@@ -928,8 +928,30 @@ Expected Duration: {expected_duration}
             if user_input.strip().lower() == "!continue":
                 user_input = "Please continue from where you left off."
             else:
+                # Fire USER_PROMPT_SUBMIT hook so commands are auditable
+                if self.hooks_manager:
+                    hook_input = HookInput(
+                        session_id=session_id or "",
+                        hook_event_name=HookEvent.USER_PROMPT_SUBMIT.value,
+                        user_message=user_input,
+                    )
+                    hook_output = await self.hooks_manager.execute_hooks(
+                        HookEvent.USER_PROMPT_SUBMIT, hook_input
+                    )
+                    if hook_output.permission_decision == PermissionDecision.DENY:
+                        return f"[Input rejected: {hook_output.permission_reason}]"
+
                 response = await self.command_handler.handle(user_input)
                 if response:
+                    # Fire STOP hook for lifecycle completeness
+                    if self.hooks_manager:
+                        stop_input = HookInput(
+                            session_id=session_id or "",
+                            hook_event_name=HookEvent.STOP.value,
+                        )
+                        await self.hooks_manager.execute_hooks_parallel(
+                            HookEvent.STOP, stop_input
+                        )
                     return response
 
         # --- OpenTelemetry span for the full request lifecycle ---

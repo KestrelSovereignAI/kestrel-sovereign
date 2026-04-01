@@ -48,6 +48,11 @@ class ObservabilityHook(Hook):
         try:
             store = getattr(self.agent, "observability_store", None)
             if not store:
+                logger.warning(
+                    "ObservabilityHook: observability_store not initialized — "
+                    "event '%s' dropped. This may indicate an initialization race.",
+                    input.hook_event_name,
+                )
                 return HookOutput.allow()
 
             agent_name = getattr(self.agent, "agent_name", "unknown")
