@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 
 # Timeout for inter-agent calls (seconds)
 PEER_CONNECT_TIMEOUT = 5.0
-PEER_READ_TIMEOUT = 120.0  # LLM responses can be slow
+PEER_READ_TIMEOUT = 300.0  # Local LLM responses (e.g. Kimi K2.5) can be very slow
 
 
 def _discover_host_url() -> Optional[str]:
