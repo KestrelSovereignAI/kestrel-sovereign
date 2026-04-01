@@ -371,6 +371,14 @@ class KestrelAgent(
                     logging.warning(f"Sync service init failed: {e}", exc_info=True)
                     self._sync_service = None
 
+            # Resolve agent name BEFORE features so features can use it
+            # (e.g. PeersFeature._get_own_name() reads self._agent_name)
+            _agent_node = await self.storage.get_node(self.agent_id)
+            if _agent_node:
+                self._agent_name = _agent_node.properties.get("name", "Unnamed Agent")
+            else:
+                self._agent_name = "Unnamed Agent"
+
             # Auto-discover and register features from features/ directory
             # Features can be disabled via KESTREL_DISABLED_FEATURES env var
             for feature in discover_features(self):
