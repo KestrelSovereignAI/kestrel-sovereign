@@ -190,8 +190,10 @@ class DeepgramSTTProvider(STTProvider):
             send_task.cancel()
             try:
                 await send_task
-            except asyncio.CancelledError:
+            except (asyncio.CancelledError, asyncio.InvalidStateError):
                 pass
+            except Exception as e:
+                logger.error("Unexpected error in Deepgram send_task cleanup: %s", e)
             try:
                 await connection.finish()
             except Exception:

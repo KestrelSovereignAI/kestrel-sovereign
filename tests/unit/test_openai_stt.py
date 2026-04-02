@@ -88,15 +88,19 @@ def _make_mock_client(transcription_result="Hello world"):
     return mock_client
 
 
+def _make_provider_with_mock(transcription_result="Hello world"):
+    """Create an OpenAISTTProvider with a mocked client injected."""
+    provider = OpenAISTTProvider()
+    mock_client = _make_mock_client(transcription_result)
+    provider._client = mock_client
+    return provider, mock_client
+
+
 class TestTranscribe:
     @pytest.mark.asyncio
     async def test_basic_transcription(self):
-        provider = OpenAISTTProvider()
-        mock_client = _make_mock_client("Hello world")
-
-        with patch("kestrel_sovereign.voice.openai_stt.openai") as mock_openai:
-            mock_openai.AsyncOpenAI.return_value = mock_client
-            result = await provider.transcribe(b"fake-audio-data", audio_format="wav")
+        provider, mock_client = _make_provider_with_mock("Hello world")
+        result = await provider.transcribe(b"fake-audio-data", audio_format="wav")
 
         assert result == "Hello world"
         mock_client.audio.transcriptions.create.assert_called_once()
@@ -106,14 +110,10 @@ class TestTranscribe:
 
     @pytest.mark.asyncio
     async def test_transcription_with_language_hint(self):
-        provider = OpenAISTTProvider()
-        mock_client = _make_mock_client("Bonjour")
-
-        with patch("kestrel_sovereign.voice.openai_stt.openai") as mock_openai:
-            mock_openai.AsyncOpenAI.return_value = mock_client
-            result = await provider.transcribe(
-                b"french-audio", language="fr", audio_format="mp3",
-            )
+        provider, mock_client = _make_provider_with_mock("Bonjour")
+        result = await provider.transcribe(
+            b"french-audio", language="fr", audio_format="mp3",
+        )
 
         assert result == "Bonjour"
         call_kwargs = mock_client.audio.transcriptions.create.call_args.kwargs
@@ -121,24 +121,16 @@ class TestTranscribe:
 
     @pytest.mark.asyncio
     async def test_transcription_no_language_omits_param(self):
-        provider = OpenAISTTProvider()
-        mock_client = _make_mock_client("Hello")
-
-        with patch("kestrel_sovereign.voice.openai_stt.openai") as mock_openai:
-            mock_openai.AsyncOpenAI.return_value = mock_client
-            await provider.transcribe(b"audio", audio_format="wav")
+        provider, mock_client = _make_provider_with_mock("Hello")
+        await provider.transcribe(b"audio", audio_format="wav")
 
         call_kwargs = mock_client.audio.transcriptions.create.call_args.kwargs
         assert "language" not in call_kwargs
 
     @pytest.mark.asyncio
     async def test_file_tuple_has_correct_extension(self):
-        provider = OpenAISTTProvider()
-        mock_client = _make_mock_client("text")
-
-        with patch("kestrel_sovereign.voice.openai_stt.openai") as mock_openai:
-            mock_openai.AsyncOpenAI.return_value = mock_client
-            await provider.transcribe(b"audio", audio_format="flac")
+        provider, mock_client = _make_provider_with_mock("text")
+        await provider.transcribe(b"audio", audio_format="flac")
 
         call_kwargs = mock_client.audio.transcriptions.create.call_args.kwargs
         filename, _ = call_kwargs["file"]
@@ -146,16 +138,19 @@ class TestTranscribe:
 
     @pytest.mark.asyncio
     async def test_opus_uses_ogg_extension(self):
-        provider = OpenAISTTProvider()
-        mock_client = _make_mock_client("text")
-
-        with patch("kestrel_sovereign.voice.openai_stt.openai") as mock_openai:
-            mock_openai.AsyncOpenAI.return_value = mock_client
-            await provider.transcribe(b"audio", audio_format="opus")
+        provider, mock_client = _make_provider_with_mock("text")
+        await provider.transcribe(b"audio", audio_format="opus")
 
         call_kwargs = mock_client.audio.transcriptions.create.call_args.kwargs
         filename, _ = call_kwargs["file"]
         assert filename == "audio.ogg"
+
+    @pytest.mark.asyncio
+    async def test_no_client_raises_runtime_error(self):
+        provider = OpenAISTTProvider()
+        provider._client = None
+        with pytest.raises(RuntimeError, match="OpenAI API key not configured"):
+            await provider.transcribe(b"audio", audio_format="wav")
 
 
 # ---------------------------------------------------------------------------
@@ -165,40 +160,28 @@ class TestTranscribe:
 class TestFileSizeLimit:
     @pytest.mark.asyncio
     async def test_small_file_single_call(self):
-        provider = OpenAISTTProvider()
-        mock_client = _make_mock_client("single chunk")
-
-        with patch("kestrel_sovereign.voice.openai_stt.openai") as mock_openai:
-            mock_openai.AsyncOpenAI.return_value = mock_client
-            audio = b"x" * (MAX_FILE_SIZE - 1)
-            result = await provider.transcribe(audio, audio_format="wav")
+        provider, mock_client = _make_provider_with_mock("single chunk")
+        audio = b"x" * (MAX_FILE_SIZE - 1)
+        result = await provider.transcribe(audio, audio_format="wav")
 
         assert result == "single chunk"
         assert mock_client.audio.transcriptions.create.call_count == 1
 
     @pytest.mark.asyncio
     async def test_large_file_split_into_chunks(self):
-        provider = OpenAISTTProvider()
-        mock_client = _make_mock_client("part")
-
-        with patch("kestrel_sovereign.voice.openai_stt.openai") as mock_openai:
-            mock_openai.AsyncOpenAI.return_value = mock_client
-            # Just over 2 chunks worth
-            audio = b"x" * (MAX_FILE_SIZE * 2 + 100)
-            result = await provider.transcribe(audio, audio_format="wav")
+        provider, mock_client = _make_provider_with_mock("part")
+        # Just over 2 chunks worth
+        audio = b"x" * (MAX_FILE_SIZE * 2 + 100)
+        result = await provider.transcribe(audio, audio_format="wav")
 
         assert mock_client.audio.transcriptions.create.call_count == 3
         assert result == "part part part"
 
     @pytest.mark.asyncio
     async def test_exact_limit_single_call(self):
-        provider = OpenAISTTProvider()
-        mock_client = _make_mock_client("ok")
-
-        with patch("kestrel_sovereign.voice.openai_stt.openai") as mock_openai:
-            mock_openai.AsyncOpenAI.return_value = mock_client
-            audio = b"x" * MAX_FILE_SIZE
-            await provider.transcribe(audio, audio_format="wav")
+        provider, mock_client = _make_provider_with_mock("ok")
+        audio = b"x" * MAX_FILE_SIZE
+        await provider.transcribe(audio, audio_format="wav")
 
         assert mock_client.audio.transcriptions.create.call_count == 1
 
@@ -220,6 +203,7 @@ class TestTranscribeStream:
 
         mock_client = AsyncMock()
         mock_client.audio.transcriptions.create = mock_create
+        provider._client = mock_client
 
         async def audio_gen():
             # Yield enough data to trigger at least one flush (>1 MB)
@@ -227,11 +211,9 @@ class TestTranscribeStream:
             for _ in range(4):
                 yield b"x" * chunk_size
 
-        with patch("kestrel_sovereign.voice.openai_stt.openai") as mock_openai:
-            mock_openai.AsyncOpenAI.return_value = mock_client
-            results = []
-            async for text in provider.transcribe_stream(audio_gen()):
-                results.append(text)
+        results = []
+        async for text in provider.transcribe_stream(audio_gen()):
+            results.append(text)
 
         assert len(results) >= 1
         assert all(r.startswith("partial result") for r in results)
@@ -243,15 +225,14 @@ class TestTranscribeStream:
 
         mock_client = AsyncMock()
         mock_client.audio.transcriptions.create = AsyncMock(return_value="final")
+        provider._client = mock_client
 
         async def audio_gen():
             yield b"small chunk"
 
-        with patch("kestrel_sovereign.voice.openai_stt.openai") as mock_openai:
-            mock_openai.AsyncOpenAI.return_value = mock_client
-            results = []
-            async for text in provider.transcribe_stream(audio_gen()):
-                results.append(text)
+        results = []
+        async for text in provider.transcribe_stream(audio_gen()):
+            results.append(text)
 
         assert results == ["final"]
 

@@ -312,6 +312,7 @@ The currently exported `Feature` subclasses discovered from those modules includ
   - `POST /voice/tts`
   - `POST /voice/tts/stream`
   - `POST /voice/stt`
+  - `WebSocket /voice/chat`
 
 ## Authentication Surface
 
