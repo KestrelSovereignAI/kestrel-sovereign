@@ -164,6 +164,8 @@ full = [
 [project.scripts]
 kestrel = "kestrel_sovereign.cli:main"
 
+[project.entry-points.pytest11]
+kestrel = "kestrel_sovereign.testing.fixtures"
 
 [dependency-groups]
 dev = [
