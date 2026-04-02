@@ -44,6 +44,12 @@ class SpawnFeature(Feature):
         self._child_results: dict[str, Any] = {}  # child_name -> latest result
         self._child_tasks: dict[str, asyncio.Task] = {}  # child_name -> running task
 
+    async def post_all_features_loaded(self, agent):
+        """Pre-explore spawn tools so they are immediately available to the orchestrator."""
+        if hasattr(agent, '_register_explored_feature_tools'):
+            agent._register_explored_feature_tools(self)
+            logger.info("SpawnFeature tools pre-explored for direct calling")
+
     def _get_agent_manager(self):
         """Lazily resolve or create an AgentManager.
 
