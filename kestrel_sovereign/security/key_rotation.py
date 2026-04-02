@@ -26,7 +26,7 @@ from typing import Any, Dict, List, Optional
 from cryptography.fernet import Fernet
 
 from kestrel_sovereign.sql_utils import safe_table_name, safe_column_name
-from kestrel_sovereign.storage.encryption import DecryptionError, get_fernet, _read_key_from_file
+from kestrel_sovereign.security.encryption import DecryptionError, get_fernet, _read_key_from_file
 
 logger = logging.getLogger(__name__)
 
@@ -176,7 +176,7 @@ class KeyRotationService:
             raise ValueError("No current key configured (KESTREL_DATA_KEY)")
 
         # Get current key for hashing
-        from kestrel_sovereign.storage.encryption import _get_data_key
+        from kestrel_sovereign.security.encryption import _get_data_key
         old_key = _get_data_key()
         if not old_key:
             raise ValueError("Cannot retrieve current key for hashing")

@@ -47,11 +47,8 @@ def test_privacy_agent_set_mode_reports_canonical_meanings():
     assert "shared and exported publicly" in agent.set_mode("public")
 
 
-def test_command_handler_privacy_status_matches_canonical_descriptions():
-    agent = MagicMock()
-    agent.privacy_agent = MagicMock()
-    handler = CommandHandler(agent)
-
+def test_privacy_agent_handle_get_privacy_mode_matches_canonical_descriptions():
+    """Privacy mode display logic lives in PrivacyAgent.handle_get_privacy_mode()."""
     expectations = {
         PrivacyMode.EPHEMERAL: "Nothing stored, local LLM only",
         PrivacyMode.ISOLATED: "Temporary session storage, local LLM only",
@@ -61,6 +58,17 @@ def test_command_handler_privacy_status_matches_canonical_descriptions():
     }
 
     for mode, expected in expectations.items():
-        agent.privacy_agent.privacy_mode = mode
-        status = handler._cmd_get_privacy_mode("!get-privacy-mode")
-        assert expected in status
+        pa = PrivacyAgent(MagicMock(), initial_mode=mode)
+        status = pa.handle_get_privacy_mode()
+        assert expected in status, f"Expected '{expected}' in status for {mode}, got: {status}"
+
+
+def test_command_handler_delegates_get_privacy_mode_to_privacy_agent():
+    """CommandHandler delegates to PrivacyAgent.handle_get_privacy_mode()."""
+    pa = PrivacyAgent(MagicMock(), initial_mode=PrivacyMode.NORMAL)
+    agent = MagicMock()
+    agent.privacy_agent = pa
+    handler = CommandHandler(agent)
+
+    status = handler._cmd_get_privacy_mode("!get-privacy-mode")
+    assert "Standard persistent storage" in status
