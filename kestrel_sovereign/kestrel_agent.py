@@ -114,6 +114,7 @@ class KestrelAgent(
         *,
         database_url: Optional[str] = None,
         db_backend: Optional[str] = None,
+        allowed_features: Optional[set] = None,
     ):
         """
         Initializes the agent with memory and reasoning capabilities.
@@ -128,10 +129,14 @@ class KestrelAgent(
             database_url: PostgreSQL connection string (for postgres backend).
             db_backend: Database backend type ('sqlite' or 'postgres').
                        Defaults to KESTREL_DB_BACKEND env var or 'sqlite'.
+            allowed_features: Optional set of feature class names to load.
+                       If None, all discovered features are loaded.
+                       Mandatory features always load regardless.
         """
         self.did = did
         self._privacy_mode = privacy_mode
         self.storage_path = storage_path
+        self._allowed_features = allowed_features
 
         # Determine database backend
         self._db_backend = db_backend or os.environ.get("KESTREL_DB_BACKEND", "sqlite")
@@ -381,7 +386,8 @@ class KestrelAgent(
 
             # Auto-discover and register features from features/ directory
             # Features can be disabled via KESTREL_DISABLED_FEATURES env var
-            for feature in discover_features(self):
+            # Per-agent feature profiles filter via allowed_features
+            for feature in discover_features(self, allowed_features=self._allowed_features):
                 await self._register_feature(feature)
 
             # Set up feature references
