@@ -447,6 +447,19 @@ class VoiceFeature(Feature):
         )
 
     # ------------------------------------------------------------------
+    # Dynamic router
+    # ------------------------------------------------------------------
+
+    def get_router(self):
+        """Return the Voice HTTP/WebSocket router for dynamic mounting.
+
+        The router is defined in endpoints/voice.py and mounted by the
+        server only when VoiceFeature is discovered and enabled.
+        """
+        from endpoints.voice import router
+        return router
+
+    # ------------------------------------------------------------------
     # Tools
     # ------------------------------------------------------------------
 

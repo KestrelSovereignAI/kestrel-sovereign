@@ -133,6 +133,7 @@ def _make_agent(voice_feature=None, has_streaming=True):
 def _prepare_app(agent):
     """Prepare FastAPI app with mock agent for testing."""
     from server import app
+    from endpoints.voice import router as voice_router
 
     @asynccontextmanager
     async def noop_lifespan(_app):
@@ -146,6 +147,10 @@ def _prepare_app(agent):
     app.router.lifespan_context = noop_lifespan
     app.state.agent = agent
     app.state.agent_manager = None
+    # Voice router is now feature-contributed; mount it for tests
+    _existing_paths = {getattr(r, "path", "") for r in app.routes}
+    if "/voice/voices" not in _existing_paths:
+        app.include_router(voice_router)
     return app, original
 
 
