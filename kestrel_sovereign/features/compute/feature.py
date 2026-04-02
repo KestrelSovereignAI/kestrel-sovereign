@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
 from kestrel_sovereign.features.base import Feature, tool
+from kestrel_sovereign.hooks.base import Hook
 from kestrel_sovereign.tools.base import ToolCategory
 from kestrel_sovereign.kestrel_config.constants import (
     APPROVAL_TIMEOUT_DEFAULT,
@@ -140,32 +141,31 @@ class ComputeFeature(Feature):
 
         logger.info("ComputeFeature initialized")
     
+    def get_hooks(self) -> List[Hook]:
+        """Return compute security hooks for auto-registration."""
+        hooks: List[Hook] = []
+        if hasattr(self, 'script_store') and hasattr(self, 'signer'):
+            hooks.append(ComputeSecurityHook(
+                script_store=self.script_store,
+                signer=self.signer,
+                priority=5,
+            ))
+            if os.environ.get("KESTREL_COMPUTE_DEBUG") == "true":
+                hooks.append(ComputeDebugHook())
+        return hooks
+
     async def _async_initialize(self):
         """Async initialization tasks."""
         async with self._init_lock:
             if self._initialized:
                 return
-            
+
             # Initialize script store
             await self.script_store.initialize()
-            
-            # Register security hooks
-            if hasattr(self.agent, "hooks_manager") and self.agent.hooks_manager:
-                # Main security hook
-                hook = ComputeSecurityHook(
-                    script_store=self.script_store,
-                    signer=self.signer,
-                    priority=5,
-                )
-                self.agent.hooks_manager.register(hook)
-                logger.info("ComputeSecurityHook registered")
-                
-                # Debug hook (if enabled)
-                if os.environ.get("KESTREL_COMPUTE_DEBUG") == "true":
-                    debug_hook = ComputeDebugHook()
-                    self.agent.hooks_manager.register(debug_hook)
-                    logger.info("ComputeDebugHook registered")
-            
+
+            # NOTE: Hook registration is now handled automatically by the
+            # Feature lifecycle via get_hooks(). No manual registration needed.
+
             self._initialized = True
             logger.info("ComputeFeature async initialization complete")
     

@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional
 
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.observability.hook import ObservabilityHook
+from kestrel_sovereign.hooks.base import Hook
 from kestrel_sovereign.tools.base import ToolCategory
 
 logger = logging.getLogger(__name__)
@@ -28,23 +29,18 @@ class ObservabilityFeature(Feature):
         return "Lifecycle event observability and monitoring"
 
     async def initialize(self):
-        """Register the ObservabilityHook with the agent's hooks manager."""
+        """Create the ObservabilityHook (auto-registered via get_hooks)."""
         self._hook = ObservabilityHook(agent=self.agent)
-        if hasattr(self.agent, "hooks_manager") and self.agent.hooks_manager:
-            self.agent.hooks_manager.register(self._hook)
-            logger.info("ObservabilityHook registered with HooksManager")
-        else:
-            logger.warning(
-                "Agent has no hooks_manager - ObservabilityHook not registered. "
-                "Lifecycle events will not be observed."
-            )
+
+    def get_hooks(self) -> List[Hook]:
+        """Return the observability hook for auto-registration."""
+        if self._hook:
+            return [self._hook]
+        return []
 
     async def shutdown(self):
-        """Unregister the hook on shutdown."""
-        if self._hook:
-            if hasattr(self.agent, "hooks_manager") and self.agent.hooks_manager:
-                self.agent.hooks_manager.unregister(self._hook)
-            self._hook = None
+        """Clean up hook reference on shutdown."""
+        self._hook = None
 
     @tool(
         "obs_status",

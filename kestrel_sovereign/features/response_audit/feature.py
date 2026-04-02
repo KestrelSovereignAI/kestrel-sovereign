@@ -1,7 +1,9 @@
 """Optional per-response LLM integrity audit feature."""
 import logging
 import os
+from typing import List
 from kestrel_sovereign.features.base import Feature, tool
+from kestrel_sovereign.hooks.base import Hook
 from kestrel_sovereign.tools.base import ToolCategory
 
 logger = logging.getLogger(__name__)
@@ -26,9 +28,10 @@ class ResponseAuditFeature(Feature):
             logger.info("ResponseAuditFeature: mode=skip, audit hook NOT registered")
             return
 
-        await self._register_hook(self._mode)
+        self._create_hook(self._mode)
 
-    async def _register_hook(self, mode: str):
+    def _create_hook(self, mode: str):
+        """Create the audit hook instance (registration handled by lifecycle)."""
         from kestrel_sovereign.features.response_audit.hook import ResponseAuditHook
         self._hook = ResponseAuditHook(
             agent=self.agent,
@@ -36,10 +39,21 @@ class ResponseAuditFeature(Feature):
             strategy=self._strategy,
             risk_threshold=self._risk_threshold,
         )
+        self._mode = mode
+        logger.info(f"ResponseAuditHook created: mode={mode}, strategy={self._strategy}")
+
+    def get_hooks(self) -> List[Hook]:
+        """Return the audit hook for auto-registration (if active)."""
+        if self._hook:
+            return [self._hook]
+        return []
+
+    async def _register_hook(self, mode: str):
+        """Dynamic hook registration for runtime enable (after initial lifecycle)."""
+        self._create_hook(mode)
         if hasattr(self.agent, "hooks_manager") and self.agent.hooks_manager:
             self.agent.hooks_manager.register(self._hook)
-            self._mode = mode
-            logger.info(f"ResponseAuditHook registered: mode={mode}, strategy={self._strategy}")
+            logger.info(f"ResponseAuditHook dynamically registered: mode={mode}")
 
     @tool("audit_enable", "Enable per-response audit", category=ToolCategory.SYSTEM, command_prefix="!audit-on")
     async def enable_audit(self, mode: str = "warn"):
