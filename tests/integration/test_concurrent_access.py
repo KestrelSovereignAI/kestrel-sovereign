@@ -207,6 +207,7 @@ class TestConcurrentAPIRequests:
         from kestrel_sovereign.inception_service import create_kestrel_identity
 
         monkeypatch.setattr(storage, "get_default_agent_data_dir", lambda: str(tmp_path))
+        monkeypatch.setenv("KESTREL_DB_PATH", str(tmp_path))
 
         constitution_path = Path(__file__).parent.parent.parent / "docs" / "principles" / "KESTREL_CONSTITUTION.md"
         if constitution_path.exists():
