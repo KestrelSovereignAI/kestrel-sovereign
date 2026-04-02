@@ -313,6 +313,19 @@ The currently exported `Feature` subclasses discovered from those modules includ
   - `POST /voice/tts/stream`
   - `POST /voice/stt`
   - `WebSocket /voice/chat`
+- [`endpoints/features.py`](endpoints/features.py)
+  - `GET /api/features`
+  - `GET /api/features/installed`
+  - `GET /api/features/{name}`
+  - `POST /api/features/{name}/install`
+  - `POST /api/features/{name}/enable`
+  - `POST /api/features/{name}/disable`
+  - `POST /api/features/{name}/remove`
+  - `GET /api/features/{name}/config`
+  - `PATCH /api/features/{name}/config`
+  - `GET /api/features/{name}/skills`
+  - `GET /api/skills`
+  - `GET /api/skills/{skill_id}/schema`
 
 ## Authentication Surface
 
