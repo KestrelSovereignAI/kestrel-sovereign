@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+kestreltalon = pytest.importorskip("kestreltalon")
 from kestreltalon.config import TalonConfig
 from kestreltalon.models import (
     CIStatus,

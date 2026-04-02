@@ -14,9 +14,14 @@ import logging
 from decimal import Decimal
 from typing import Optional
 
-from web3 import Web3
-from web3.exceptions import TransactionNotFound
-from eth_account import Account
+try:
+    from web3 import Web3
+    from web3.exceptions import TransactionNotFound
+    from eth_account import Account
+except ImportError:
+    Web3 = None  # type: ignore[assignment,misc]
+    TransactionNotFound = None  # type: ignore[assignment,misc]
+    Account = None  # type: ignore[assignment,misc]
 
 from .base import (
     ChainAdapter,
@@ -57,6 +62,11 @@ class EVMAdapter(ChainAdapter):
         Args:
             network: Target blockchain network
         """
+        if Web3 is None:
+            raise ImportError(
+                "web3 package is required for EVMAdapter. "
+                "Install it with: pip install kestrel-sovereign[wallet]"
+            )
         super().__init__(network)
         self.w3 = Web3(Web3.HTTPProvider(self.config.rpc_url))
         logger.info(f"EVMAdapter initialized for {network.display_name}")
