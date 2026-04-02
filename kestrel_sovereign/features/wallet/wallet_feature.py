@@ -24,11 +24,13 @@ Chain-specific logic is delegated to mixin modules:
 
 import logging
 from decimal import Decimal, InvalidOperation
-from typing import Optional
+from typing import List, Optional
 
 from kestrel_sovereign.features.base import Feature, tool
+from kestrel_sovereign.hooks.base import Hook
 from kestrel_sovereign.tools.base import ToolCategory
 from .feature import WalletAgent, Currency
+from .transaction_hook import TransactionSecurityHook
 from .economic_gates import EconomicGateMixin
 from .filecoin_tools import FilecoinToolsMixin
 from .multichain_tools import MultichainToolsMixin
@@ -115,6 +117,11 @@ class WalletFeature(
             f"WalletFeature initialized for agent {agent_id}, "
             f"total USD value: ${self.wallet.get_total_balance_usd()}"
         )
+
+    def get_hooks(self) -> List[Hook]:
+        """Return the transaction security hook for auto-registration."""
+        agent_id = getattr(self.agent, 'agent_id', 'default')
+        return [TransactionSecurityHook(agent_id=agent_id)]
 
     async def shutdown(self):
         """Cleanup wallet resources."""

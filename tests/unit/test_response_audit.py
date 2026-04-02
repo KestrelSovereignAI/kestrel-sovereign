@@ -188,15 +188,17 @@ class TestResponseAuditFeature:
         agent.hooks_manager.register.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_feature_warn_mode_registers_hook(self):
-        """In warn mode, initialize should register a hook."""
+    async def test_feature_warn_mode_provides_hook(self):
+        """In warn mode, initialize should create a hook available via get_hooks()."""
         agent = _make_agent()
         with patch.dict("os.environ", {"KESTREL_RESPONSE_AUDIT_MODE": "warn"}, clear=False):
             feature = ResponseAuditFeature(agent)
             await feature.initialize()
 
         assert feature._hook is not None
-        agent.hooks_manager.register.assert_called_once()
+        hooks = feature.get_hooks()
+        assert len(hooks) == 1
+        assert hooks[0] is feature._hook
 
     @pytest.mark.asyncio
     async def test_feature_enable_disable(self):

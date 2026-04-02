@@ -8,12 +8,13 @@ providing CLI commands and API integration.
 import asyncio
 import logging
 from datetime import datetime, timezone
-from typing import Optional
+from typing import List, Optional
 
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.security.permissions import PermissionLevel, PermissionStore
 from kestrel_sovereign.features.security.approval_queue import ApprovalQueue, ApprovalRequest
 from kestrel_sovereign.features.security.hooks import SecurityHook
+from kestrel_sovereign.hooks.base import Hook
 from kestrel_sovereign.tools.base import ToolCategory
 
 logger = logging.getLogger(__name__)
@@ -87,8 +88,14 @@ class SecurityFeature(Feature):
         if not self._initialized:
             await self._async_init()
 
+    def get_hooks(self) -> List[Hook]:
+        """Return the security hook for auto-registration."""
+        if self.security_hook:
+            return [self.security_hook]
+        return []
+
     async def _async_init(self):
-        """Async initialization (database setup, hook registration)."""
+        """Async initialization (database setup)."""
         async with self._init_lock:
             if self._initialized:
                 return
@@ -96,15 +103,8 @@ class SecurityFeature(Feature):
             # Initialize database tables
             await self.permission_store.initialize()
 
-        # Register security hook with agent's hooks manager
-        if hasattr(self.agent, "hooks_manager") and self.agent.hooks_manager:
-            self.agent.hooks_manager.register(self.security_hook)
-            logger.info("SecurityHook registered with HooksManager")
-        else:
-            logger.warning(
-                "Agent has no hooks_manager - security hook not registered. "
-                "Security features will not enforce permissions."
-            )
+        # NOTE: Hook registration is now handled automatically by the
+        # Feature lifecycle via get_hooks(). No manual registration needed.
 
         # NOTE: _register_all_tools() is called by the agent AFTER all
         # features are registered, not here. If called here, features
