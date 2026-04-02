@@ -552,7 +552,7 @@ def cmd_shell(args) -> int:
 async def _run_shell(agent_dir: Path, args) -> int:
     """Run the interactive chat shell for an agent."""
     from kestrel_sovereign.storage import AsyncStorage
-    from kestrel_sovereign.storage.encryption import DecryptionError
+    from kestrel_sovereign.security.encryption import DecryptionError
     from kestrel_sovereign.kestrel_agent import KestrelAgent
     from kestrel_sovereign.llm.service import LLMService
     from kestrel_sovereign.kestrel_config.constants import SHUTDOWN_TIMEOUT

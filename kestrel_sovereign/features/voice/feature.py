@@ -14,7 +14,7 @@ from typing import Any, AsyncIterator, Dict, Optional
 
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.identity.identity_package import PersonalityFingerprint
-from kestrel_sovereign.privacy import PrivacyConfig, PRIVACY_PRESETS
+from kestrel_sovereign.privacy import PrivacyConfig
 from kestrel_sovereign.tools.base import ToolCategory
 from kestrel_sovereign.voice.base import VoiceConfig, VoiceInfo, TTSProvider, STTProvider, match_voice, split_sentences
 from kestrel_sovereign.voice.provider_registry import VoiceProviderRegistry
@@ -74,34 +74,26 @@ class VoiceFeature(Feature):
         return self._voice_registry
 
     # ------------------------------------------------------------------
-    # Privacy gates
+    # Privacy gates — delegate to PrivacyAgent (single decision point)
     # ------------------------------------------------------------------
 
-    def _get_privacy_config(self) -> Optional[PrivacyConfig]:
-        """Get the current privacy config from the agent's privacy agent."""
-        privacy_agent = getattr(self.agent, "privacy_agent", None)
-        if privacy_agent is None:
-            return None
-        return getattr(privacy_agent, "privacy_config", None)
+    def _get_privacy_agent(self):
+        """Get the agent's PrivacyAgent instance, or None."""
+        return getattr(self.agent, "privacy_agent", None)
 
     def _get_privacy_mode_name(self) -> str:
         """Get the current privacy preset name (e.g. 'ephemeral', 'normal')."""
-        config = self._get_privacy_config()
-        if config is None:
+        pa = self._get_privacy_agent()
+        if pa is None:
             return "normal"
-        for name, preset in PRIVACY_PRESETS.items():
-            if (config.storage == preset.storage
-                    and config.llm_location == preset.llm_location
-                    and config.shareable == preset.shareable):
-                return name
-        return "custom"
+        return pa.get_mode_name()
 
     def _cloud_allowed(self) -> bool:
         """Check whether cloud providers are allowed under current privacy mode."""
-        config = self._get_privacy_config()
-        if config is None:
+        pa = self._get_privacy_agent()
+        if pa is None:
             return True
-        return config.allows_cloud_llm()
+        return pa.can_use_cloud()
 
     def _get_audio_storage_policy(self) -> str:
         """Determine audio storage policy based on privacy config.
@@ -112,10 +104,10 @@ class VoiceFeature(Feature):
         - scrubbed: Audio not permanently stored, metadata scrubbed (anonymous).
         - full: Audio may be cached/stored normally (normal/public).
         """
-        config = self._get_privacy_config()
-        if config is None:
+        pa = self._get_privacy_agent()
+        if pa is None:
             return "full"
-        return config.storage
+        return pa.get_storage_policy()
 
     async def _get_tts_provider(self) -> TTSProvider:
         """Get TTS provider respecting privacy mode."""

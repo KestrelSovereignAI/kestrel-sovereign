@@ -1,12 +1,32 @@
 """
-Backward-compatible encryption re-exports.
+Backward-compatible encryption re-exports — DEPRECATED SHIM.
 
-This module re-exports from kestrel_sovereign.security.encryption for backward compatibility.
-New code should import directly from kestrel_sovereign.security.encryption.
+WHY THIS MODULE EXISTS:
+    Encryption was originally implemented here in storage/encryption.py.
+    It was later consolidated into security/encryption.py as the canonical
+    module (single source of truth for all encryption). This shim exists
+    solely to avoid breaking external code or tests that import from the
+    old path. No new code should import from this module.
 
-Deprecated:
-    Import from kestrel_sovereign.security.encryption instead:
+CANONICAL MODULE:
+    kestrel_sovereign.security.encryption
 
+    All encryption functions, exception classes, and key management live
+    there. This includes:
+    - Fernet-based encryption (get_fernet, get_agent_fernet)
+    - Purpose-specific encryption (encrypt, decrypt, encrypt_string, decrypt_string)
+    - Legacy Fernet helpers (encrypt_bytes, decrypt_bytes, encrypt_string_fernet, decrypt_string_fernet)
+    - Key hierarchy (KESTREL_DATA_KEY -> master -> agent -> purpose)
+
+WHY NOT user_key_storage._encrypt_key/_decrypt_key?
+    Those use PBKDF2 + AES-256-GCM for user BYOK (Bring Your Own Key)
+    passphrase-based encryption. That is intentionally separate from
+    the Fernet/HKDF-based data-at-rest encryption in security/encryption.py
+    because they serve different purposes:
+    - security/encryption.py: Platform-managed keys for data at rest
+    - user_key_storage.py: User-managed passphrases for their own API keys
+
+MIGRATION:
     # Old (deprecated)
     from kestrel_sovereign.storage.encryption import get_fernet, DecryptionError
 

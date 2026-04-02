@@ -266,11 +266,127 @@ class PrivacyAgent:
         # For persistent modes - get from storage
         return await self.storage.get_conversation_history(limit, session_id=session_id)
 
+    # === Unified Privacy Decision API ===
+    # All features should consult these methods instead of making
+    # independent privacy decisions based on raw config flags.
+
+    def can_store(self, data_type: str = "conversation") -> bool:
+        """
+        Central "can I store this?" check for all features.
+
+        Features MUST call this before writing any user data to persistent
+        storage. This is the single decision point that replaces ad-hoc
+        privacy checks scattered across features.
+
+        Args:
+            data_type: Type of data being stored. Supported types:
+                - "conversation": Chat messages (default)
+                - "file": Files, audio, images
+                - "metadata": Non-PII structural metadata (always allowed)
+                - "backup": Full backup blobs
+
+        Returns:
+            True if persistent storage is allowed for this data type.
+        """
+        config = self._privacy_config
+
+        # Structural metadata is always allowed (graph nodes, edges, etc.)
+        if data_type == "metadata":
+            return True
+
+        # Ephemeral: nothing persisted
+        if config.is_ephemeral():
+            return False
+
+        # Isolated: only temp storage (not persistent)
+        if config.uses_temp_storage():
+            return False
+
+        # Backups have their own gate
+        if data_type == "backup":
+            return config.allows_persistent_storage() and not config.is_ephemeral()
+
+        # Normal/anonymous/public: persistent storage allowed
+        return config.allows_persistent_storage()
+
+    def can_use_cloud(self) -> bool:
+        """
+        Check whether cloud services (LLM, TTS, STT) are allowed.
+
+        Features MUST call this before sending data to any cloud provider.
+        This is the single decision point for cloud access.
+
+        Returns:
+            True if cloud providers are allowed under the current privacy config.
+        """
+        return self._privacy_config.allows_cloud_llm()
+
+    def get_storage_policy(self) -> str:
+        """
+        Get the current storage policy string.
+
+        Returns one of: "none", "temp", "scrubbed", "full".
+        Features use this to decide HOW to store (not IF — use can_store() for that).
+        """
+        return self._privacy_config.storage
+
+    def requires_anonymization(self) -> bool:
+        """Check if PII scrubbing is required before storage."""
+        return self._privacy_config.requires_anonymization()
+
+    def get_mode_name(self) -> str:
+        """Get the current privacy preset name (e.g. 'ephemeral', 'normal', 'custom')."""
+        return self._get_preset_name(self._privacy_config)
+
+    # === Privacy Command Handlers ===
+    # These methods contain the logic for privacy-related commands.
+    # CommandHandler delegates to these instead of reimplementing.
+
+    def handle_get_privacy_mode(self) -> str:
+        """Format the current privacy mode for display."""
+        mode = self.privacy_mode
+        mode_info = {
+            PrivacyMode.EPHEMERAL: ("\U0001f512", "EPHEMERAL: Nothing stored, local LLM only"),
+            PrivacyMode.ISOLATED: ("\U0001f510", "ISOLATED: Temporary session storage, local LLM only"),
+            PrivacyMode.ANONYMOUS: ("\U0001f3ad", "ANONYMOUS: Stored with PII removed, cloud LLM allowed"),
+            PrivacyMode.NORMAL: ("\U0001f4dd", "NORMAL: Standard persistent storage"),
+            PrivacyMode.PUBLIC: ("\U0001f310", "PUBLIC: Shareable and exportable"),
+        }
+        icon, description = mode_info.get(mode, ("", f"Current mode: {mode.value}"))
+        return f"{icon} {description}"
+
+    def handle_privacy_status(self) -> str:
+        """Format detailed privacy status for display."""
+        status = self.get_detailed_status()
+        return f"""
+Privacy Status Report
+=====================
+Current Mode: {status['privacy_mode'].upper()}
+
+Storage:
+- Messages stored: {status['message_count']}
+- Storage location: {status['storage_location']}
+- Persistent: {status['persistent_storage']}
+- PII filtering: {'Enabled' if status['pii_filtering'] else 'Disabled'}
+
+LLM Providers:
+- Local (Ollama): {'Allowed' if status['llm_providers']['local_ollama'] else 'Disabled'}
+- Cloud (OpenAI): {'Allowed' if status['llm_providers']['cloud_openai'] else 'Disabled'}
+- Cloud (Anthropic): {'Allowed' if status['llm_providers']['cloud_anthropic'] else 'Disabled'}
+
+Backups:
+- Status: {status['backup_status']}
+- Encryption: {status['backup_encryption']}
+
+Sharing:
+- Can share: {status['shareable']}
+"""
+
     def _anonymize_text(self, text: str) -> str:
         """
         PII redaction function for ANONYMOUS mode.
         Uses NER-based detection via spaCy (if available) with regex fallback.
-        
+
         Detects:
         - PERSON names via NER (John Smith, Dr. Jane Doe)
         - ORG names via NER (Acme Corp, Bank of America)
@@ -282,4 +398,4 @@ class PrivacyAgent:
         - Addresses via regex
         - ZIP codes via regex
         """
-        return anonymize_text(text) 
+        return anonymize_text(text)
