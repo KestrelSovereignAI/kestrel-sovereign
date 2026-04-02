@@ -46,11 +46,8 @@ class MemoryFeature(Feature):
         # initialized on the agent after feature registration
         self._consolidator = None
         self._memory_retriever = None
-        # Get agent_id through storage hierarchy
-        self.agent_id = (
-            getattr(self.storage, 'agent_id', '') or
-            getattr(getattr(self.storage, '_storage', None), 'agent_id', '')
-        )
+        # Agent identity (DID is the canonical source of truth)
+        self.agent_id = self.agent.did
         logger.info(f"MemoryFeature initialized for agent: {self.agent_id[:30]}...")
 
     @property
