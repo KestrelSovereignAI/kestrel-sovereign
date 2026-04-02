@@ -5,7 +5,7 @@ import asyncio
 import time
 from datetime import datetime
 from kestrel_sovereign.storage import AsyncStorage, PrivacyEnforcingStorage
-from kestrel_sovereign.storage.encryption import DecryptionError
+from kestrel_sovereign.security.encryption import DecryptionError
 from kestrel_sovereign.llm.service import LLMService
 from kestrel_sovereign.llm.adapter import LLMResponse
 from kestrel_sovereign.config import TRUSTED_AGENTS_DIR

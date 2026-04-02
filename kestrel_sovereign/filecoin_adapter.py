@@ -262,7 +262,7 @@ class FilecoinAdapter:
         Uses the same key derivation as the rest of the system, supporting
         both raw Fernet keys and passphrases (via SHA-256 derivation).
         """
-        from kestrel_sovereign.storage.encryption import get_master_key_bytes
+        from kestrel_sovereign.security.encryption import get_master_key_bytes
 
         key = get_master_key_bytes()
         if key:

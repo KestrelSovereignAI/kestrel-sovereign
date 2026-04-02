@@ -104,6 +104,15 @@ def _make_agent(privacy_preset: str = "normal", has_storage: bool = True):
     privacy_agent = MagicMock()
     config = get_privacy_preset(privacy_preset)
     privacy_agent.privacy_config = config
+    # Wire up the unified PrivacyAgent API methods that VoiceFeature delegates to
+    privacy_agent.can_use_cloud.return_value = config.allows_cloud_llm()
+    privacy_agent.get_mode_name.return_value = privacy_preset
+    privacy_agent.get_storage_policy.return_value = config.storage
+    privacy_agent.can_store.side_effect = lambda data_type="conversation": (
+        not config.is_ephemeral() and not config.uses_temp_storage()
+        if data_type != "metadata" else True
+    )
+    privacy_agent.requires_anonymization.return_value = config.requires_anonymization()
     agent.privacy_agent = privacy_agent
 
     if has_storage:
