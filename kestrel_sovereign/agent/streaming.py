@@ -106,6 +106,15 @@ class StreamingMixin:
         constitution = await self._get_governing_constitution()
 
         # Pass the session-filtered history so context_manager uses it
+        # Fetch reflection guidance for prompt injection
+        reflection_guidance = None
+        reflection_feature = self.features.get("ReflectionFeature") if hasattr(self, 'features') else None
+        if reflection_feature:
+            try:
+                reflection_guidance = await reflection_feature.get_active_guidance()
+            except Exception:
+                pass  # Non-critical — log already handled in feature
+
         context_result = await self.context_manager.build_context(
             query=user_input,
             constitution=constitution,
@@ -114,6 +123,7 @@ class StreamingMixin:
             include_rag=True,
             privacy_mode=privacy_mode,
             conversation_history=history,
+            reflection_guidance=reflection_guidance,
         )
 
         # Build user prompt with context, wrapping user input in boundary markers

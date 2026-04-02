@@ -257,7 +257,7 @@ Use `!constitution article <N>` for specific articles, or `!constitution search 
     def format_conversation_history(
         self,
         history: List[Dict],
-        max_messages: int = 20,
+        max_messages: Optional[int] = None,
         max_tokens: Optional[int] = None,
         max_chars: int = 50000,  # Fallback if no token counting
     ) -> List[Dict[str, str]]:
@@ -269,15 +269,19 @@ Use `!constitution article <N>` for specific articles, or `!constitution search 
 
         Args:
             history: Raw conversation history from storage
-            max_messages: Maximum number of messages to include
+            max_messages: Maximum number of messages to include. If None,
+                          token budget is the sole enforcer (recommended).
             max_tokens: Maximum tokens allowed (preferred over max_chars)
             max_chars: Maximum characters (fallback if no token counting)
 
         Returns:
             List of formatted message dicts with 'role' and 'content' keys
         """
-        # Take the most recent messages first
-        recent = history[-max_messages:] if len(history) > max_messages else history
+        # Take the most recent messages first (only if max_messages is explicitly set)
+        if max_messages is not None:
+            recent = history[-max_messages:] if len(history) > max_messages else history
+        else:
+            recent = history
 
         # Build from NEWEST to OLDEST to preserve most recent context
         # Then reverse to get chronological order

@@ -6,6 +6,7 @@ Works with both SQLite and PostgreSQL backends.
 """
 
 import logging
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from kestrel_sovereign.a2a.types import Task, TaskStatus, TaskState, Artifact, Message
@@ -181,26 +182,27 @@ class TaskStore(UnifiedStoreBase):
         )
 
     async def add_artifact(self, task_id: str, artifact: Artifact) -> None:
-        """Add artifact to task."""
-        # Get current artifacts
-        row = await self._backend.fetch_one(
-            "SELECT artifacts FROM a2a_tasks WHERE id = ?",
-            (task_id,),
-        )
-        if not row:
-            raise ValueError(f"Task not found: {task_id}")
+        """Add artifact to task (transactional to prevent concurrent write races)."""
+        async with self._backend.transaction():
+            # Get current artifacts inside transaction
+            row = await self._backend.fetch_one(
+                "SELECT artifacts FROM a2a_tasks WHERE id = ?",
+                (task_id,),
+            )
+            if not row:
+                raise ValueError(f"Task not found: {task_id}")
 
-        artifacts = json_loads(row[0]) or []
-        artifacts.append(artifact.model_dump())
+            artifacts = json_loads(row[0]) or []
+            artifacts.append(artifact.model_dump())
 
-        await self._backend.execute(
-            f"""
-            UPDATE a2a_tasks
-            SET artifacts = ?, updated_at = {self.now_sql()}
-            WHERE id = ?
-            """,
-            (json_dumps(artifacts), task_id),
-        )
+            await self._backend.execute(
+                f"""
+                UPDATE a2a_tasks
+                SET artifacts = ?, updated_at = {self.now_sql()}
+                WHERE id = ?
+                """,
+                (json_dumps(artifacts), task_id),
+            )
 
     async def list_tasks(
         self,
@@ -244,6 +246,36 @@ class TaskStore(UnifiedStoreBase):
             (task_id,),
         )
         return rows_affected > 0
+
+    async def cleanup_old(
+        self,
+        older_than_days: int = 30,
+        terminal_states: tuple = ("completed", "failed", "canceled"),
+    ) -> int:
+        """
+        Delete old tasks in terminal states.
+
+        Args:
+            older_than_days: Delete tasks updated before this many days ago.
+            terminal_states: Task states eligible for cleanup.
+
+        Returns:
+            Number of tasks deleted.
+        """
+        cutoff = datetime.now(timezone.utc) - timedelta(days=older_than_days)
+        cutoff_str = cutoff.strftime("%Y-%m-%dT%H:%M:%S")
+
+        placeholders = ", ".join("?" for _ in terminal_states)
+        params = list(terminal_states) + [cutoff_str]
+
+        rows_affected = await self._backend.execute(
+            f"DELETE FROM a2a_tasks WHERE status IN ({placeholders}) AND updated_at < ?",
+            tuple(params),
+        )
+        logger.info(
+            f"Cleaned up {rows_affected} old tasks (older than {older_than_days} days)"
+        )
+        return rows_affected
 
     def _row_to_task(self, row: tuple) -> Task:
         """

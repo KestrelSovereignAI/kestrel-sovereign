@@ -494,7 +494,7 @@ class TestSessionCompression:
 
         # Few short messages - low utilization
         messages = [{"role": "user", "content": "Hi"}, {"role": "assistant", "content": "Hello"}]
-        mock_storage.conversation.get_full_history = AsyncMock(return_value=messages)
+        mock_storage.conversation.get_conversation_history = AsyncMock(return_value=messages)
 
         manager = ContextManager(storage=mock_storage, model="gpt-4")
         result = await manager.check_compression_needed(utilization_threshold=70.0)
@@ -515,7 +515,7 @@ class TestSessionCompression:
         long_content = "This is a longer message with substantial content. " * 50
         messages = [{"role": "user", "content": long_content} for _ in range(50)]
 
-        mock_storage.conversation.get_full_history = AsyncMock(return_value=messages)
+        mock_storage.conversation.get_conversation_history = AsyncMock(return_value=messages)
 
         manager = ContextManager(storage=mock_storage, model="gpt-4")
         result = await manager.check_compression_needed(utilization_threshold=70.0)
@@ -531,7 +531,7 @@ class TestSessionCompression:
 
         # Moderate amount of content
         messages = [{"role": "user", "content": "Medium message " * 20} for _ in range(20)]
-        mock_storage.conversation.get_full_history = AsyncMock(return_value=messages)
+        mock_storage.conversation.get_conversation_history = AsyncMock(return_value=messages)
 
         manager = ContextManager(storage=mock_storage, model="gpt-4")
 
