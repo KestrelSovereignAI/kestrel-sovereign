@@ -54,6 +54,7 @@ class HooksManager:
     def __init__(self):
         """Initialize the hooks manager with empty hook registry."""
         self._hooks: Dict[HookEvent, List[Hook]] = {e: [] for e in HookEvent}
+        self._lock = asyncio.Lock()
 
     def register(self, hook: Hook) -> None:
         """
@@ -64,7 +65,18 @@ class HooksManager:
 
         Note:
             Hooks are automatically sorted by priority after registration.
+            This is safe to call synchronously during setup. For registration
+            during async request handling, use register_async() instead.
         """
+        self._register_hook(hook)
+
+    async def register_async(self, hook: Hook) -> None:
+        """Register a hook with async lock protection (safe during request handling)."""
+        async with self._lock:
+            self._register_hook(hook)
+
+    def _register_hook(self, hook: Hook) -> None:
+        """Internal: add hook to registry."""
         for event in hook.events:
             if hook not in self._hooks[event]:
                 self._hooks[event].append(hook)
@@ -174,7 +186,9 @@ class HooksManager:
             - Timeout causes the hook to be skipped with a warning
             - Exceptions cause the hook to be skipped with an error log
         """
-        matching_hooks = self._get_matching_hooks(event, input.tool_name)
+        # Snapshot matching hooks under lock to avoid race with register/unregister
+        async with self._lock:
+            matching_hooks = self._get_matching_hooks(event, input.tool_name)
 
         if not matching_hooks:
             return HookOutput.allow()
@@ -239,7 +253,9 @@ class HooksManager:
         Returns:
             List of HookOutput from all executed hooks
         """
-        matching_hooks = self._get_matching_hooks(event, input.tool_name)
+        # Snapshot matching hooks under lock
+        async with self._lock:
+            matching_hooks = self._get_matching_hooks(event, input.tool_name)
 
         if not matching_hooks:
             return []

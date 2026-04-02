@@ -13,7 +13,10 @@ and the agent's tool system, and provides workflow execution for
 multi-step operations.
 """
 
+import asyncio
+import copy
 import logging
+import re
 import time
 from typing import Dict, Any, Optional, List
 
@@ -21,6 +24,9 @@ from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.tools.base import ToolCategory
 
 logger = logging.getLogger(__name__)
+
+# Pattern for step-output references: {{steps.0.result}}, {{prev.result}}
+_STEP_REF_PATTERN = re.compile(r"\{\{(steps\.(\d+)\.(\w+)|prev\.(\w+))\}\}")
 
 
 class TaskFeature(Feature):
@@ -112,7 +118,9 @@ class TaskFeature(Feature):
             "Steps format: [{\"feature\": \"feature_name\", \"skill\": \"skill_name\", \"args\": {}}]. "
             "Feature names match the tool names shown in your available tools (e.g., model_agent, "
             "memory_feature, wallet_feature). Skill names are the individual tool methods within "
-            "each feature (e.g., list_models, memory_status, check_balance)."
+            "each feature (e.g., list_models, memory_status, check_balance). "
+            "Args can reference prior step outputs with {{steps.N.result}} or {{prev.result}}. "
+            "Steps can optionally include max_retries (default 0) and retry_delay_ms (default 1000)."
         ),
         category=ToolCategory.UTILITY,
         command_prefix="!run-workflow"
@@ -123,6 +131,9 @@ class TaskFeature(Feature):
 
         Args:
             steps: List of workflow steps. Each step is an object with 'feature' (the feature's tool_name like 'model_agent'), 'skill' (the tool method name like 'list_models'), and optional 'args' (dict of arguments to pass).
+                   Args values can include {{steps.N.result}} or {{prev.result}} placeholders
+                   to reference outputs from earlier steps.
+                   Optional 'max_retries' (int, default 0) and 'retry_delay_ms' (int, default 1000).
 
         Returns:
             Consolidated results from all steps with per-step status.
@@ -153,7 +164,9 @@ class TaskFeature(Feature):
 
             feature_name = step.get("feature")
             skill_name = step.get("skill")
-            args = step.get("args", {})
+            raw_args = step.get("args", {})
+            max_retries = step.get("max_retries", 0)
+            retry_delay_ms = step.get("retry_delay_ms", 1000)
 
             if not feature_name or not skill_name:
                 results.append({
@@ -163,51 +176,77 @@ class TaskFeature(Feature):
                 })
                 continue
 
+            # Resolve step-output references in args
+            args = self._resolve_step_refs(
+                raw_args if isinstance(raw_args, dict) else {},
+                results,
+                i,
+            )
+
             step_start = time.time()
-            try:
-                task = await self.task_manager.execute_skill(
-                    agent_id=feature_name,
-                    skill_id=skill_name,
-                    args=args if isinstance(args, dict) else {},
-                    sync=True,
-                )
+            last_error = None
+            attempts = 1 + max(0, int(max_retries))
 
-                # Extract result data from task artifacts
-                result_data = None
-                if task.artifacts:
-                    for artifact in task.artifacts:
-                        if artifact.parts:
-                            for part in artifact.parts:
-                                if hasattr(part, 'data'):
-                                    result_data = part.data
+            for attempt in range(attempts):
+                try:
+                    task = await self.task_manager.execute_skill(
+                        agent_id=feature_name,
+                        skill_id=skill_name,
+                        args=args,
+                        sync=True,
+                    )
 
-                step_duration = int((time.time() - step_start) * 1000)
-                results.append({
-                    "step": i,
-                    "feature": feature_name,
-                    "skill": skill_name,
-                    "status": task.status.state.value,
-                    "result": result_data,
-                    "duration_ms": step_duration,
-                })
-                logger.info(
-                    f"[WORKFLOW] Step {i}: {feature_name}.{skill_name} "
-                    f"-> {task.status.state.value} ({step_duration}ms)"
-                )
+                    # Extract result data from task artifacts
+                    result_data = None
+                    if task.artifacts:
+                        for artifact in task.artifacts:
+                            if artifact.parts:
+                                for part in artifact.parts:
+                                    if hasattr(part, 'data'):
+                                        result_data = part.data
 
-            except Exception as e:
+                    step_duration = int((time.time() - step_start) * 1000)
+                    results.append({
+                        "step": i,
+                        "feature": feature_name,
+                        "skill": skill_name,
+                        "status": task.status.state.value,
+                        "result": result_data,
+                        "duration_ms": step_duration,
+                        "attempts": attempt + 1,
+                    })
+                    logger.info(
+                        f"[WORKFLOW] Step {i}: {feature_name}.{skill_name} "
+                        f"-> {task.status.state.value} ({step_duration}ms, attempt {attempt + 1})"
+                    )
+                    last_error = None
+                    break  # Success — exit retry loop
+
+                except Exception as e:
+                    last_error = e
+                    if attempt < attempts - 1:
+                        delay_s = retry_delay_ms / 1000.0
+                        logger.warning(
+                            f"[WORKFLOW] Step {i}: {feature_name}.{skill_name} "
+                            f"attempt {attempt + 1} failed: {e}, retrying in {delay_s}s"
+                        )
+                        await asyncio.sleep(delay_s)
+
+            # All attempts exhausted
+            if last_error is not None:
                 step_duration = int((time.time() - step_start) * 1000)
                 results.append({
                     "step": i,
                     "feature": feature_name,
                     "skill": skill_name,
                     "status": "failed",
-                    "error": str(e),
+                    "error": str(last_error),
                     "duration_ms": step_duration,
+                    "attempts": attempts,
                 })
                 logger.error(
                     f"[WORKFLOW] Step {i}: {feature_name}.{skill_name} "
-                    f"failed: {e} ({step_duration}ms)"
+                    f"failed after {attempts} attempt(s): {last_error} ({step_duration}ms)"
                 )
 
         total_duration = int((time.time() - workflow_start) * 1000)
@@ -227,6 +266,82 @@ class TaskFeature(Feature):
             "total_duration_ms": total_duration,
             "results": results,
         }
+
+    @staticmethod
+    def _resolve_step_refs(
+        args: Dict[str, Any],
+        prior_results: list,
+        current_step: int,
+    ) -> Dict[str, Any]:
+        """
+        Resolve {{steps.N.field}} and {{prev.field}} references in step args.
+
+        Performs a deep copy so original step definitions are not mutated.
+        Only string values are resolved; non-string values pass through unchanged.
+        """
+        if not prior_results:
+            return args
+
+        resolved = copy.deepcopy(args)
+
+        def _resolve_value(val):
+            if not isinstance(val, str):
+                return val
+
+            def _replacer(match):
+                full = match.group(0)
+                if match.group(2) is not None:
+                    # {{steps.N.field}}
+                    idx = int(match.group(2))
+                    field = match.group(3)
+                else:
+                    # {{prev.field}}
+                    idx = current_step - 1
+                    field = match.group(4)
+
+                if idx < 0 or idx >= len(prior_results):
+                    logger.warning(f"[WORKFLOW] Unresolved ref {full}: step {idx} not available")
+                    return full
+                step_result = prior_results[idx]
+                if field not in step_result:
+                    logger.warning(f"[WORKFLOW] Unresolved ref {full}: field '{field}' not in step {idx}")
+                    return full
+
+                replacement = step_result[field]
+                # If the entire string is a single reference, return the raw value
+                # (preserves dicts/lists instead of stringifying)
+                if match.start() == 0 and match.end() == len(val):
+                    return replacement
+                return str(replacement)
+
+            result = _STEP_REF_PATTERN.sub(_replacer, val)
+            # Handle the case where _replacer returned a non-string (whole-value reference)
+            # re.sub always returns a string, so check if we had a single whole-value ref
+            single_match = _STEP_REF_PATTERN.fullmatch(val)
+            if single_match:
+                return _replacer(single_match)
+            return result
+
+        def _resolve_dict(d):
+            for key, val in d.items():
+                if isinstance(val, str):
+                    d[key] = _resolve_value(val)
+                elif isinstance(val, dict):
+                    _resolve_dict(val)
+                elif isinstance(val, list):
+                    _resolve_list(val)
+
+        def _resolve_list(lst):
+            for i, val in enumerate(lst):
+                if isinstance(val, str):
+                    lst[i] = _resolve_value(val)
+                elif isinstance(val, dict):
+                    _resolve_dict(val)
+                elif isinstance(val, list):
+                    _resolve_list(val)
+
+        _resolve_dict(resolved)
+        return resolved
 
     @tool(
         name="check_task_status",
