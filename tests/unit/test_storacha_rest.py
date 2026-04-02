@@ -3,9 +3,10 @@
 import base64
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import cbor2
 import httpx
 import pytest
+
+cbor2 = pytest.importorskip("cbor2")
 
 from kestrel_sovereign.storage.providers.storacha_rest import (
     StorachaRestClient,

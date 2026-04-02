@@ -15,7 +15,10 @@ import logging
 from decimal import Decimal
 from typing import Optional
 
-from eth_account import Account
+try:
+    from eth_account import Account
+except ImportError:
+    Account = None  # type: ignore[assignment,misc]
 
 from .chain_adapters.base import ChainNetwork, TransactionResult
 from .chain_adapters.evm_adapter import EVMAdapter

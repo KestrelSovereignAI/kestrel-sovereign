@@ -9,8 +9,12 @@ import logging
 from decimal import Decimal
 from typing import Optional
 
-from web3 import Web3
-from eth_account import Account
+try:
+    from web3 import Web3
+    from eth_account import Account
+except ImportError:
+    Web3 = None  # type: ignore[assignment,misc]
+    Account = None  # type: ignore[assignment,misc]
 
 from .base import (
     ChainNetwork,

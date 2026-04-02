@@ -88,6 +88,14 @@ class TestMainnetBlocklist:
         assert 8453 in MAINNET_CHAIN_IDS
 
 
+try:
+    import eth_account as _eth_account
+    _has_web3 = True
+except ImportError:
+    _has_web3 = False
+
+
+@pytest.mark.skipif(not _has_web3, reason="web3 extras not installed")
 class TestBaseL2Wallet:
     """Test BaseL2Wallet initialization and address derivation."""
 

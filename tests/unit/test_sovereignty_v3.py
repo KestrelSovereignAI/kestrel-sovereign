@@ -8,6 +8,14 @@ import hashlib
 import json
 import pytest
 
+try:
+    import cbor2 as _cbor2
+    _has_cbor2 = True
+except ImportError:
+    _has_cbor2 = False
+
+_skip_no_cbor2 = pytest.mark.skipif(not _has_cbor2, reason="cbor2 not installed (wallet extras)")
+
 from kestrel_sovereign.storage.sovereign_adapter import (
     AssetCollector,
     AssetDescriptor,
@@ -136,6 +144,7 @@ class TestAssetCollectorProtocol:
 # CARBuilder external ref (#368)
 # ---------------------------------------------------------------------------
 
+@_skip_no_cbor2
 class TestCARExternalRef:
     def test_add_external_ref(self):
         builder = CARBuilder()
@@ -162,6 +171,7 @@ class TestCARExternalRef:
 # CAR roundtrip with encryption (#368)
 # ---------------------------------------------------------------------------
 
+@_skip_no_cbor2
 class TestCAREncryptedRoundtrip:
     def test_encrypt_pack_unpack_decrypt(self):
         """Verify that encrypted shards survive CAR packing and unpacking."""
@@ -194,6 +204,7 @@ class TestCAREncryptedRoundtrip:
         assert json.loads(restored2) == {"msg": "world"}
 
 
+@_skip_no_cbor2
 class TestCARWithAssets:
     def test_inline_and_external_assets(self):
         """CAR can hold inline asset blocks and external references."""
