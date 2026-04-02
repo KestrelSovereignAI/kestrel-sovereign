@@ -65,7 +65,7 @@ class KeyManagementFeature(Feature):
                 db = self.agent.storage._db
 
         # Get agent DID - REQUIRED for key storage
-        self._agent_did = getattr(self.agent, 'did', None) or getattr(self.agent, 'agent_id', None)
+        self._agent_did = self.agent.did
 
         if not self._agent_did:
             logger.error("KeyManagementFeature: No agent DID available - key storage disabled")

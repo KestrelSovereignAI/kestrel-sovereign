@@ -67,6 +67,7 @@ class MockDB:
 
 class MockAgent:
     def __init__(self, agent_id="did:test:123", agent_name="TestAgent"):
+        self.did = agent_id
         self.agent_id = agent_id
         self._agent_name = agent_name
         self.storage = MockStorage()

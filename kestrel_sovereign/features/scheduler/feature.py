@@ -71,10 +71,8 @@ class SchedulerFeature(Feature):
             if hasattr(raw, "db"):
                 self._db = raw.db
 
-        # Agent ID
-        self._agent_id = getattr(self.agent, "agent_id", "") or getattr(
-            self.agent, "did", "unknown"
-        )
+        # Agent identity (DID is the canonical source of truth)
+        self._agent_id = self.agent.did
 
         if self._db is None:
             logger.warning("SchedulerFeature: no database available, running in no-op mode")
