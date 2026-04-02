@@ -38,6 +38,8 @@ class AgentSkill(BaseModel):
     examples: list[str] | None = None
     inputModes: list[str] | None = None
     outputModes: list[str] | None = None
+    category: str | None = None
+    version: str | None = None
 
 
 class AgentCard(BaseModel):

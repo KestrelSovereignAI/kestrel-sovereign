@@ -20,7 +20,10 @@ import logging
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from kestrel_sovereign.a2a.agent_card import AgentSkill
 
 logger = logging.getLogger(__name__)
 
@@ -139,6 +142,40 @@ class SkillRecord:
         if not data:
             return cls(skill_id="unknown", skill_name="Unknown", skill_type="unknown")
         return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
+
+    @classmethod
+    def from_agent_skill(
+        cls,
+        skill: "AgentSkill",
+        times_used: int = 0,
+        last_used: Optional[str] = None,
+    ) -> "SkillRecord":
+        """Create a SkillRecord from an AgentSkill (the canonical runtime representation).
+
+        Args:
+            skill: AgentSkill instance from the @tool decorator / A2A protocol.
+            times_used: Runtime usage count (from tool registry or metrics).
+            last_used: ISO timestamp of last invocation.
+
+        Returns:
+            Populated SkillRecord with metadata sourced from AgentSkill.
+        """
+        # Derive proficiency from usage: starts at 0.5, grows toward 1.0
+        proficiency = min(1.0, 0.5 + (times_used * 0.01)) if times_used > 0 else 0.5
+
+        return cls(
+            skill_id=skill.id,
+            skill_name=skill.name,
+            skill_type=skill.category or "tool",
+            proficiency=proficiency,
+            times_used=times_used,
+            last_used=last_used,
+            configuration={
+                "description": skill.description,
+                "tags": skill.tags,
+                "version": skill.version,
+            },
+        )
 
 
 @dataclass

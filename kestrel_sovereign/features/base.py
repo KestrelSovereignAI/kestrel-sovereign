@@ -249,19 +249,26 @@ class Feature(ABC):
 
         This allows the Feature to be discovered and called as an A2A agent.
         The AgentCard describes the Feature's capabilities (skills) to other agents.
+
+        Uses the canonical AgentSkill attached by the @tool decorator — same
+        metadata source as get_tools(), no parallel construction.
         """
         skills = []
         for tool in self.get_tools():
-            schema = tool.schema
-            skill = AgentSkill(
-                id=schema.name,
-                name=schema.name,
-                description=schema.description,
-                tags=[schema.category.value] if schema.category else None,
-                inputModes=["application/json"],
-                outputModes=["application/json"],
-            )
-            skills.append(skill)
+            if hasattr(tool, 'agent_skill') and tool.agent_skill is not None:
+                skills.append(tool.agent_skill)
+            else:
+                # Fallback for tools without a decorator-attached AgentSkill
+                schema = tool.schema
+                skills.append(AgentSkill(
+                    id=schema.name,
+                    name=schema.name,
+                    description=schema.description,
+                    tags=[schema.category.value] if schema.category else None,
+                    inputModes=["application/json"],
+                    outputModes=["application/json"],
+                    category=schema.category.value if schema.category else None,
+                ))
 
         return AgentCard(
             name=self.tool_name,
@@ -698,22 +705,27 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
     def get_tools(self) -> List[AgentTool]:
         """
         Auto-discover methods decorated with @tool and return them as AgentTool instances.
+
+        Each returned tool carries the canonical AgentSkill created by the @tool
+        decorator, so get_agent_card() can reuse it without rebuilding metadata.
         """
         tools = []
         for name, method in inspect.getmembers(self, predicate=inspect.ismethod):
             if hasattr(method, "_tool_schema"):
                 schema_data = method._tool_schema
-                
+                agent_skill = getattr(method, "_agent_skill", None)
+
                 # Create a dynamic AgentTool wrapper
                 class DynamicTool(AgentTool):
-                    def __init__(self, func, schema_data):
+                    def __init__(self, func, schema_data, agent_skill):
                         self.func = func
                         self._schema_data = schema_data
-                        
+                        self.agent_skill = agent_skill
+
                     @property
                     def name(self) -> str:
                         return self._schema_data["name"]
-                        
+
                     @property
                     def schema(self) -> ToolSchema:
                         return ToolSchema(
@@ -723,7 +735,7 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
                             parameters=self._schema_data["parameters"],
                             command_prefix=self._schema_data.get("command_prefix")
                         )
-                        
+
                     async def execute(self, **kwargs) -> Dict[str, Any]:
                         try:
                             result = await self.func(**kwargs)
@@ -739,8 +751,8 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
                                 "error": str(e),
                                 "tool": self.name
                             }
-                            
-                tools.append(DynamicTool(method, schema_data))
+
+                tools.append(DynamicTool(method, schema_data, agent_skill))
         return tools
 
 def tool(name: str, description: str, category: ToolCategory = ToolCategory.SYSTEM, command_prefix: str = None):
@@ -828,7 +840,7 @@ def tool(name: str, description: str, category: ToolCategory = ToolCategory.SYST
             "command_prefix": command_prefix
         }
 
-        # Also create AgentSkill metadata for A2A protocol
+        # Also create AgentSkill metadata for A2A protocol — single source of truth
         func._agent_skill = AgentSkill(
             id=name,
             name=name,
@@ -836,6 +848,7 @@ def tool(name: str, description: str, category: ToolCategory = ToolCategory.SYST
             tags=[category.value] if category else None,
             inputModes=["application/json"],
             outputModes=["application/json"],
+            category=category.value if category else None,
         )
 
         return func
