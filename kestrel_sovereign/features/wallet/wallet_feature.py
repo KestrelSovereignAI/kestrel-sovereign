@@ -76,9 +76,8 @@ class WalletFeature(
         # WalletAgent here would overwrite it with the default 100 FIL.
         if hasattr(self.agent, 'wallet') and self.agent.wallet is not None:
             self.wallet = self.agent.wallet
-            agent_id = getattr(self.agent, 'agent_id', 'default')
             logger.info(
-                f"WalletFeature initialized for agent {agent_id}, "
+                f"WalletFeature initialized for agent {self.agent.did}, "
                 f"total USD value: ${self.wallet.get_total_balance_usd()}"
             )
             return
@@ -91,7 +90,7 @@ class WalletFeature(
         elif hasattr(self.agent, 'db_path'):
             db_path = self.agent.db_path
 
-        agent_id = getattr(self.agent, 'agent_id', 'default')
+        agent_id = self.agent.did
 
         # Try to read inception initialBalance from the agent graph node
         initial_balance = Decimal('100.0')

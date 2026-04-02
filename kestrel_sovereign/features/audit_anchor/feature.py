@@ -127,7 +127,7 @@ class AuditAnchorFeature(Feature):
         # Record anchor in database
         anchor_id = str(uuid.uuid4())
         now = datetime.now(timezone.utc).isoformat()
-        agent_id = getattr(self.agent, "agent_id", "")
+        agent_id = self.agent.did
 
         db = self._get_db()
         if db is not None:

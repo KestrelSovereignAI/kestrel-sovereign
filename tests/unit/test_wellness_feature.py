@@ -61,6 +61,7 @@ def _make_db(table_exists_map=None, fetchall_data=None, fetchone_data=None):
 def _make_agent(db=None, agent_id="test-agent"):
     """Create a mock KestrelAgent."""
     agent = MagicMock()
+    agent.did = agent_id
     agent.agent_id = agent_id
 
     storage = MagicMock()

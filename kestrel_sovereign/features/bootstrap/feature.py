@@ -294,7 +294,7 @@ class BootstrapFeature(Feature):
 
         # Persist to DB if available
         db = self._get_db()
-        agent_id = getattr(self.agent, 'agent_id', None)
+        agent_id = self.agent.did
         if db and agent_id:
             try:
                 await loader.save_db_entry(
@@ -351,7 +351,7 @@ class BootstrapFeature(Feature):
 
         # Remove from DB if available
         db = self._get_db()
-        agent_id = getattr(self.agent, 'agent_id', None)
+        agent_id = self.agent.did
         if db and agent_id:
             try:
                 await loader.delete_db_entry(name)

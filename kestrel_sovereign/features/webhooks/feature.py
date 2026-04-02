@@ -68,10 +68,8 @@ class WebhookFeature(Feature):
             if hasattr(raw, "db"):
                 self._db = raw.db
 
-        # Agent ID
-        self._agent_id = getattr(self.agent, "agent_id", "") or getattr(
-            self.agent, "did", "unknown"
-        )
+        # Agent identity (DID is the canonical source of truth)
+        self._agent_id = self.agent.did
 
         # Create tables
         if self._db:
