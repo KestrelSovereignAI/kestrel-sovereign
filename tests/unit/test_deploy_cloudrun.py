@@ -9,6 +9,8 @@ import pytest
 from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
+pytest.importorskip("google.cloud.run_v2", reason="google-cloud-run not installed (cloud extras)")
+
 from kestrel_sovereign.features.deploy.models import (
     DeploymentProfile,
     DeployProviderType,

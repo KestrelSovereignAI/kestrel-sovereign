@@ -3,8 +3,9 @@
 import base64
 import hashlib
 
-import cbor2
 import pytest
+
+cbor2 = pytest.importorskip("cbor2")
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
