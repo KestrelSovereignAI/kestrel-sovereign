@@ -53,6 +53,8 @@ class OpenAISTTProvider(STTProvider):
         """
         config = config or {}
         self._model = config.get("stt_model", "whisper-1")
+        api_key = os.environ.get("OPENAI_API_KEY")
+        self._client = openai.AsyncOpenAI(api_key=api_key) if api_key else None
 
     # ------------------------------------------------------------------
     # STTProvider ABC
@@ -75,7 +77,10 @@ class OpenAISTTProvider(STTProvider):
                 f"Supported: {SUPPORTED_FORMATS}"
             )
 
-        client = openai.AsyncOpenAI()
+        if not self._client:
+            raise RuntimeError("OpenAI API key not configured for STT")
+
+        client = self._client
 
         if len(audio) <= MAX_FILE_SIZE:
             return await self._transcribe_chunk(client, audio, language, audio_format)
@@ -103,7 +108,10 @@ class OpenAISTTProvider(STTProvider):
         transcripts, so we accumulate audio and call ``transcribe`` on the
         buffer at regular intervals (every ~1 MB of audio received).
         """
-        client = openai.AsyncOpenAI()
+        if not self._client:
+            raise RuntimeError("OpenAI API key not configured for STT")
+
+        client = self._client
 
         buffer = bytearray()
         flush_threshold = 1 * 1024 * 1024  # 1 MB
