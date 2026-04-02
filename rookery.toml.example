@@ -39,12 +39,22 @@ port = 8801
 # Start this agent when the host starts (default: true)
 autostart = true
 
+# Optional: Per-agent feature profile.
+# Lists which feature classes this agent should load.
+# Mandatory features (IdentityFeature, SecurityFeature, PeersFeature,
+# ConstitutionFeature) are always loaded regardless of this list.
+# If omitted, ALL discovered features are loaded (sovereign/full agent).
+# features = ["BootstrapFeature", "MemoryFeature", "GitHubFeature"]
+
 [agents.testbot]
 data_dir = "agent_data/testbot"
 port = 8802
 
 # Manual start only (won't auto-start with host)
 autostart = false
+
+# Minimal feature set for test bot
+features = ["BootstrapFeature", "MemoryFeature", "HeartbeatFeature"]
 
 [agents.helper]
 data_dir = "agent_data/helper"
