@@ -43,7 +43,7 @@ class SaveFeature(Feature):
         """Initialize the save feature with required references."""
         self.storage = getattr(self.agent, 'storage', None)
         self.context_manager = getattr(self.agent, 'context_manager', None)
-        self.agent_id = getattr(self.agent, 'agent_id', '')
+        self.agent_id = self.agent.did
         self._saved_items_store = None
 
         if not self.storage:

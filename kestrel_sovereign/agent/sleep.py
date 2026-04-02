@@ -289,9 +289,9 @@ class SleepMixin:
 
         # Get user secret for convergent encryption
         user_secret = os.getenv("KESTREL_USER_SECRET", "default-secret")
-        if hasattr(self, 'agent_id'):
-            # Include agent_id for isolation
-            user_secret = f"{user_secret}:{self.agent_id}"
+        if hasattr(self, 'did') and self.did:
+            # Include DID for isolation
+            user_secret = f"{user_secret}:{self.did}"
 
         # Get the raw database for direct access
         db = None
@@ -312,11 +312,11 @@ class SleepMixin:
             db=db,
             user_secret=user_secret,
             filecoin_adapter=filecoin_adapter,
-            agent_id=getattr(self, 'agent_id', '') or getattr(self, 'did', '')
+            agent_id=getattr(self, 'did', '') or ''
         )
 
         # Export
-        agent_did = getattr(self, 'did', None) or getattr(self, 'agent_id', 'unknown')
+        agent_did = getattr(self, 'did', None) or 'unknown'
         cid = await adapter.export_agent(agent_did, storage_tier=storage_tier)
 
         # Get export stats (from manifest if available)

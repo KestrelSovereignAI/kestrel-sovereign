@@ -262,8 +262,8 @@ class ReflectionFeature(Feature):
         return None
 
     def _get_agent_id(self) -> str:
-        """Get the agent's identifier."""
-        return getattr(self.agent, 'agent_id', '') or getattr(self.agent, 'did', 'unknown')
+        """Get the agent's identifier (DID is the canonical source of truth)."""
+        return self.agent.did
 
     # =========================================================================
     # Core Reflection Tools

@@ -58,10 +58,7 @@ class MemoryAgencyFeature(Feature):
     async def initialize(self):
         """Initialize the memory agency feature and create the memory_pins table."""
         self.storage = self.agent.storage
-        self.agent_id = (
-            getattr(self.storage, "agent_id", "")
-            or getattr(getattr(self.storage, "_storage", None), "agent_id", "")
-        )
+        self.agent_id = self.agent.did
 
         # Pin quota -- configurable per-instance, defaults to module constant
         self.pin_quota = PIN_QUOTA_DEFAULT
