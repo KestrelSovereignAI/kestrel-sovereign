@@ -42,29 +42,31 @@ class MemoryFeature(Feature):
     async def initialize(self):
         """Initialize the memory feature with storage references."""
         self.storage = self.agent.storage
-        # Both consolidator and retriever are lazily loaded since they're
-        # initialized on the agent after feature registration
-        self._consolidator = None
-        self._memory_retriever = None
+        # MemorySystem is the single facade for all memory components.
+        # Lazily loaded since it's initialized on the agent after feature registration.
+        self._memory_system = None
         # Agent identity (DID is the canonical source of truth)
         self.agent_id = self.agent.did
         logger.info(f"MemoryFeature initialized for agent: {self.agent_id[:30]}...")
 
     @property
+    def memory_system(self):
+        """Lazy-load MemorySystem facade from agent (initialized after features)."""
+        if self._memory_system is None:
+            self._memory_system = getattr(self.agent, 'memory_system', None)
+        return self._memory_system
+
+    @property
     def consolidator(self):
-        """Lazy-load consolidator from agent (initialized after features)."""
-        if self._consolidator is None:
-            self._consolidator = getattr(self.agent, 'memory_consolidator', None)
-        return self._consolidator
+        """Access consolidator through MemorySystem facade."""
+        ms = self.memory_system
+        return ms.consolidator if ms else None
 
     @property
     def memory_retriever(self):
-        """Lazy-load memory retriever from memory_system (initialized after features)."""
-        if self._memory_retriever is None:
-            memory_system = getattr(self.agent, 'memory_system', None)
-            if memory_system and hasattr(memory_system, 'retriever'):
-                self._memory_retriever = memory_system.retriever
-        return self._memory_retriever
+        """Access retriever through MemorySystem facade."""
+        ms = self.memory_system
+        return ms.retriever if ms else None
 
     def _get_conversation_store(self):
         """Navigate storage hierarchy to get the conversation store."""
@@ -302,6 +304,11 @@ class MemoryFeature(Feature):
             except Exception:
                 pass
 
+            # Include MemorySystem summary if available
+            memory_system_info = {}
+            if self.memory_system:
+                memory_system_info = self.memory_system.get_summary()
+
             return {
                 "success": True,
                 "total_messages": total_messages,
@@ -309,6 +316,8 @@ class MemoryFeature(Feature):
                 "encryption_enabled": encryption_enabled,
                 "agent_id": (self.agent_id[:30] + "...") if len(self.agent_id) > 30 else self.agent_id,
                 "consolidator_available": self.consolidator is not None,
+                "retriever_available": self.memory_retriever is not None,
+                "memory_system": memory_system_info,
                 "rag": rag_stats
             }
         except (AttributeError, TypeError, KeyError) as e:
@@ -413,42 +422,15 @@ class MemoryFeature(Feature):
     )
     async def full_history_search(self, query: str, limit: int = 20) -> Dict[str, Any]:
         """
-        Get full history and search client-side (works with encryption).
+        Search full conversation history client-side (works with encryption).
 
-        This is slower but works with encrypted content because it retrieves
-        and decrypts all messages before searching.
+        Delegates to search_memory which handles decryption and keyword matching.
 
         Args:
             query: Search term or phrase to find
             limit: Maximum results to return (default 20)
         """
-        try:
-            # Get full decrypted history
-            all_history = await self.storage.get_conversation_history(limit=5000)
-
-            # Search through decrypted content
-            query_lower = query.lower()
-            matches = []
-            for msg in all_history:
-                content = msg.get("content", "")
-                if query_lower in content.lower():
-                    matches.append(msg)
-                    if len(matches) >= limit:
-                        break
-
-            return {
-                "success": True,
-                "results": matches,
-                "count": len(matches),
-                "query": query,
-                "total_searched": len(all_history)
-            }
-        except (AttributeError, TypeError, KeyError) as e:
-            logger.error(f"full_history_search failed: {e}")
-            return {"success": False, "error": str(e)}
-        except Exception as e:
-            logger.error(f"full_history_search failed: {e}", exc_info=True)
-            return {"success": False, "error": str(e)}
+        return await self.search_memory(query, limit)
 
     @tool(
         name="delete_messages",
