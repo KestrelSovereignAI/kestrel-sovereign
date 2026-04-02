@@ -93,6 +93,7 @@ async def kestrel_agent(llm_service, check_docker, build_test_image, temp_db):
     await agent.shutdown()
 
 @pytest.mark.asyncio
+@pytest.mark.docker_mcp
 async def test_agent_mcp_workflow(kestrel_agent):
     """
     Test the agent's ability to manage and use MCP tools via commands.
