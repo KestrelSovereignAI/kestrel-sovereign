@@ -16,6 +16,8 @@ import concurrent.futures
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
+from kestrel_sovereign import storage
+
 
 class TestAsyncStorageConcurrency:
     """Test concurrent access using async storage."""
