@@ -12,7 +12,7 @@ The rookery.toml file defines which agents exist and how to reach them.
 
 import logging
 from pathlib import Path
-from typing import Optional, Union, Literal
+from typing import List, Optional, Union, Literal
 
 import toml
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -23,6 +23,15 @@ DEFAULT_HOST_PORT = 8888
 DEFAULT_AGENT_START_PORT = 8801
 ROOKERY_CONFIG_FILENAME = "rookery.toml"
 AGENT_DATA_DIR = "agent_data"
+
+# Features that must always be loaded for sovereignty guarantees.
+# These cannot be removed from any agent's feature profile.
+MANDATORY_FEATURES = frozenset({
+    "IdentityFeature",
+    "SecurityFeature",
+    "PeersFeature",
+    "ConstitutionFeature",
+})
 
 
 class HostConfig(BaseModel):
@@ -54,6 +63,15 @@ class LocalAgentConfig(BaseModel):
     autostart: bool = Field(
         default=True,
         description="Start this agent when the host starts",
+    )
+    features: Optional[List[str]] = Field(
+        default=None,
+        description=(
+            "Allowed feature class names for this agent. "
+            "If None, all discovered features are loaded (backward compatible). "
+            "Mandatory features (Identity, Security, Peers, Constitution) "
+            "are always loaded regardless of this list."
+        ),
     )
 
     @field_validator("data_dir", mode="before")

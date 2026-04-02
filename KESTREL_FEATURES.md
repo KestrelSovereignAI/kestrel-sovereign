@@ -97,7 +97,7 @@
 
 Feature discovery scans `kestrel_sovereign/features/` for single-file features, package `__init__.py`, and package `feature.py`, then keeps only modules that actually export a discoverable `Feature` subclass. The current discovered module inventory is:
 
-- Current audited snapshot: `41` discoverable modules and `40` exported `Feature` subclasses.
+- Current audited snapshot: `42` discoverable modules and `41` exported `Feature` subclasses.
 
 - `audit_anchor`
 - `bootstrap`
@@ -132,6 +132,7 @@ Feature discovery scans `kestrel_sovereign/features/` for single-file features, 
 - `spawn`
 - `state_of_mind`
 - `strategic_memory`
+- `talon`
 - `tasks`
 - `vastai`
 - `visual_identity`
@@ -176,6 +177,7 @@ The currently exported `Feature` subclasses discovered from those modules includ
 - `SpawnFeature`
 - `StateOfMindFeature`
 - `StrategicMemoryFeature`
+- `TalonCoordinatorFeature`
 - `TaskFeature`
 - `VastAIFeature`
 - `VisualIdentityFeature`
@@ -203,6 +205,8 @@ The currently exported `Feature` subclasses discovered from those modules includ
   - `GET /auth/callback`
   - `GET /auth/logout`
   - `GET /auth/me`
+  - `POST /auth/token`
+  - `GET /auth/verify`
 - [`endpoints/agent.py`](endpoints/agent.py)
   - `POST /agent/invoke`
   - `POST /agent/stream`
@@ -217,6 +221,8 @@ The currently exported `Feature` subclasses discovered from those modules includ
   - `GET /agent/tasks`
   - `GET /agent/heartbeat/status`
   - `POST /agent/heartbeat/trigger`
+  - `POST /agent/mesh`
+  - `GET /agent/mesh/inbox`
 - [`endpoints/conversations.py`](endpoints/conversations.py)
   - `GET /api/sessions`
   - `GET /api/conversations`

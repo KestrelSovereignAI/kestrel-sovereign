@@ -138,6 +138,47 @@ class TestLocalAgentConfig:
         with pytest.raises(ValidationError):
             LocalAgentConfig(data_dir=temp_agent_dir, port=70000)
 
+    def test_features_default_none(self, temp_agent_dir):
+        """Test that features defaults to None (load all)."""
+        config = LocalAgentConfig(data_dir=temp_agent_dir, port=8801)
+        assert config.features is None
+
+    def test_features_explicit_list(self, temp_agent_dir):
+        """Test setting an explicit feature allowlist."""
+        features = ["BootstrapFeature", "MemoryFeature", "GitHubFeature"]
+        config = LocalAgentConfig(
+            data_dir=temp_agent_dir,
+            port=8801,
+            features=features,
+        )
+        assert config.features == features
+
+    def test_features_empty_list(self, temp_agent_dir):
+        """Test that empty list is valid (only mandatory features will load)."""
+        config = LocalAgentConfig(
+            data_dir=temp_agent_dir,
+            port=8801,
+            features=[],
+        )
+        assert config.features == []
+
+
+class TestMandatoryFeatures:
+    """Tests for mandatory features constant."""
+
+    def test_mandatory_features_contains_required(self):
+        """Test that mandatory features include sovereignty guarantees."""
+        from kestrel_sovereign.rookery.config import MANDATORY_FEATURES
+        assert "IdentityFeature" in MANDATORY_FEATURES
+        assert "SecurityFeature" in MANDATORY_FEATURES
+        assert "PeersFeature" in MANDATORY_FEATURES
+        assert "ConstitutionFeature" in MANDATORY_FEATURES
+
+    def test_mandatory_features_is_frozenset(self):
+        """Test that mandatory features cannot be accidentally modified."""
+        from kestrel_sovereign.rookery.config import MANDATORY_FEATURES
+        assert isinstance(MANDATORY_FEATURES, frozenset)
+
 
 class TestRemoteAgentConfig:
     """Tests for RemoteAgentConfig model."""
@@ -271,6 +312,35 @@ class TestRookeryConfigLoading:
         assert config.host.bind == "127.0.0.1"
         assert "test_agent" in config.agents
         assert config.agents["test_agent"].port == 8801
+
+    def test_load_from_file_with_features(self, temp_rookery_config, temp_agent_dir):
+        """Test loading config with per-agent feature profiles."""
+        config_data = {
+            "agents": {
+                "full_agent": {
+                    "data_dir": str(temp_agent_dir),
+                    "port": 8801,
+                    # No features key = load all
+                },
+                "minimal_agent": {
+                    "data_dir": str(temp_agent_dir),
+                    "port": 8802,
+                    "features": [
+                        "BootstrapFeature",
+                        "MemoryFeature",
+                        "HeartbeatFeature",
+                    ],
+                },
+            },
+        }
+        config_path = temp_rookery_config(config_data)
+        config = RookeryConfig.from_file(config_path)
+
+        full = config.agents["full_agent"]
+        minimal = config.agents["minimal_agent"]
+
+        assert full.features is None
+        assert minimal.features == ["BootstrapFeature", "MemoryFeature", "HeartbeatFeature"]
 
     def test_load_missing_file(self, tmp_path):
         """Test loading from a non-existent file raises error."""
