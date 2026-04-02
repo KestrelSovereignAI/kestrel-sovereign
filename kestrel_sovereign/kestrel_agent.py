@@ -878,7 +878,7 @@ Expected Duration: {expected_duration}
             model_override: Optional model to use (e.g., "openai/gpt-5", "ollama/llama3.2")
             session_id: Optional session ID to load conversation context from a specific session
         """
-        logging.info(f"[AGENTIC] process_input called with: {user_input[:100]}...")
+        logging.info(f"[AGENTIC] process_input called ({len(user_input)} chars)")
 
         # CONSTITUTION AUDIT CHECK: Trigger periodic integrity audits
         await self._maybe_audit()
