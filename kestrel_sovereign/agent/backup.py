@@ -68,6 +68,9 @@ class BackupMixin:
             save_msg = await self.privacy_agent.save_isolated_session()
             if save_msg.startswith("Error"):
                 return save_msg
+            # Switch to normal mode so the backup can proceed through the privacy wrapper
+            from kestrel_sovereign.privacy import PrivacyMode
+            await self.set_privacy_mode(PrivacyMode.NORMAL)
         return await self._command_backup(user_input.replace("!promote-backup", "!backup", 1))
 
     async def anchor_memory_state(self):
