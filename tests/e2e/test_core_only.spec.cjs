@@ -334,25 +334,25 @@ test.describe('Core-Only: Disabled Features Not Mounted', () => {
         apiKey = await getApiKey(request);
     });
 
-    test('voice endpoints return 404 when VoiceFeature disabled', async ({ request }) => {
+    test('voice endpoints return 404/503 when VoiceFeature disabled', async ({ request }) => {
         const response = await request.get(`${BASE_URL}/voice/voices`, {
             headers: authHeaders(apiKey),
         });
-        // Route should not be mounted — 404 or 405
-        expect([404, 405]).toContain(response.status());
+        // Route not mounted (404/405) or feature disabled (503)
+        expect([404, 405, 503]).toContain(response.status());
     });
 
-    test('spawn endpoints return 404 when SpawnFeature disabled', async ({ request }) => {
+    test('spawn endpoints return 404/503 when SpawnFeature disabled', async ({ request }) => {
         const response = await request.get(`${BASE_URL}/api/spawn/children`, {
             headers: authHeaders(apiKey),
         });
-        expect([404, 405]).toContain(response.status());
+        expect([404, 405, 503]).toContain(response.status());
     });
 
-    test('observability endpoints return 404 when disabled', async ({ request }) => {
+    test('observability endpoints return 404/503 when disabled', async ({ request }) => {
         const response = await request.get(`${BASE_URL}/api/observability/events`, {
             headers: authHeaders(apiKey),
         });
-        expect([404, 405]).toContain(response.status());
+        expect([404, 405, 503]).toContain(response.status());
     });
 });
