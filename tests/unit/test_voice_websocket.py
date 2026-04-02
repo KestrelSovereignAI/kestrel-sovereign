@@ -364,6 +364,13 @@ class TestVoiceChatStateMachine:
         agent = _make_agent(vf)
         app, orig = _prepare_app(agent)
         try:
+            # Disable VAD so the endpoint uses direct STT passthrough.
+            # VAD requires real 16-bit PCM audio frames; fake bytes cause it
+            # to never detect speech_end, hanging the test indefinitely.
+            import sys
+            vad_key = "kestrel_sovereign.voice.vad"
+            saved_vad = sys.modules.pop(vad_key, None)
+            sys.modules[vad_key] = None  # type: ignore[assignment]
             with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
                 with TestClient(app) as client:
                     with client.websocket_connect(
@@ -417,6 +424,11 @@ class TestVoiceChatStateMachine:
                         # Should return to listening
                         assert status_states[-1] == "listening"
         finally:
+            # Restore VAD module
+            if saved_vad is not None:
+                sys.modules[vad_key] = saved_vad
+            else:
+                sys.modules.pop(vad_key, None)
             _restore_app(app, orig)
 
     def test_client_text_end_message_closes_connection(self):
