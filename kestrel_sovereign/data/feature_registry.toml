@@ -1,0 +1,441 @@
+# Kestrel Feature Registry
+#
+# Static catalog of all feature packages. Maps user-friendly names to packages,
+# class names, and git URLs. Consumed by CLI, API, and Feature Store UI.
+#
+# Status levels (computed at runtime by feature_registry.py):
+#   available  - listed here but not installed
+#   installed  - installed via entry_point but not enabled for this agent
+#   enabled    - loaded and active for this agent
+#   disabled   - explicitly disabled via KESTREL_DISABLED_FEATURES
+#
+# Each feature entry supports:
+#   package     - pip package name
+#   git         - source repository URL
+#   features    - list of Feature class names in this package
+#   description - human-readable summary
+#   tags        - list of tags for filtering
+#   icon        - icon identifier for UI rendering
+#   core        - true if shipped with kestrel-sovereign (not a separate package)
+#   skills      - per-feature skill declarations for static discovery
+
+# =============================================================================
+# CORE FEATURES (shipped with kestrel-sovereign)
+# =============================================================================
+
+[identity]
+package = "kestrel-sovereign"
+git = "https://github.com/KestrelSovereignAI/kestrel-sovereign.git"
+features = ["IdentityFeature"]
+description = "DID-based cryptographic identity management"
+tags = ["core", "identity", "did"]
+icon = "fingerprint"
+core = true
+
+[identity.skills]
+get_identity = { description = "View agent identity and DID", category = "system", tags = ["identity", "did"] }
+update_identity = { description = "Update agent display name or metadata", category = "system", tags = ["identity"] }
+verify_identity = { description = "Verify agent identity integrity", category = "system", tags = ["identity", "did"] }
+
+[security]
+package = "kestrel-sovereign"
+git = "https://github.com/KestrelSovereignAI/kestrel-sovereign.git"
+features = ["SecurityFeature"]
+description = "Permission management, audit logging, and session security"
+tags = ["core", "security", "permissions"]
+icon = "shield"
+core = true
+
+[peers]
+package = "kestrel-sovereign"
+git = "https://github.com/KestrelSovereignAI/kestrel-sovereign.git"
+features = ["PeersFeature"]
+description = "Agent-to-agent discovery and mesh networking"
+tags = ["core", "networking", "a2a"]
+icon = "network"
+core = true
+
+[peers.skills]
+discover_peers = { description = "Discover other agents on the network", category = "communication", tags = ["peers", "discovery"] }
+send_message = { description = "Send a message to a peer agent", category = "communication", tags = ["peers", "messaging"] }
+
+[constitution]
+package = "kestrel-sovereign"
+git = "https://github.com/KestrelSovereignAI/kestrel-sovereign.git"
+features = ["ConstitutionFeature"]
+description = "Constitutional governance, principles, and audit"
+tags = ["core", "governance", "constitution"]
+icon = "scroll"
+core = true
+
+[constitution.skills]
+view_constitution = { description = "View the agent's constitutional principles", category = "system", tags = ["constitution", "governance"] }
+
+[memory]
+package = "kestrel-sovereign"
+git = "https://github.com/KestrelSovereignAI/kestrel-sovereign.git"
+features = ["MemoryFeature", "MemoryAgencyFeature", "StrategicMemoryFeature"]
+description = "Persistent memory, knowledge graph, strategic memory, and memory agency"
+tags = ["core", "memory", "knowledge-graph", "rag"]
+icon = "brain"
+core = true
+
+[memory.skills]
+store_memory = { description = "Store information in the knowledge graph", category = "memory", tags = ["memory", "storage"] }
+recall_memory = { description = "Recall stored memories by query", category = "memory", tags = ["memory", "retrieval"] }
+strategic_reflect = { description = "Perform strategic memory consolidation", category = "memory", tags = ["memory", "reflection"] }
+
+[model]
+package = "kestrel-sovereign"
+git = "https://github.com/KestrelSovereignAI/kestrel-sovereign.git"
+features = ["ModelAgent"]
+description = "LLM model selection, switching, and catalog management"
+tags = ["core", "llm", "model"]
+icon = "cpu"
+core = true
+
+[model.skills]
+list_models = { description = "List available LLM models", category = "model_management", tags = ["model", "llm"] }
+set_model = { description = "Change active LLM model", category = "model_management", tags = ["model", "llm"] }
+model_info = { description = "Get details about a specific model", category = "model_management", tags = ["model", "llm"] }
+
+[bootstrap]
+package = "kestrel-sovereign"
+git = "https://github.com/KestrelSovereignAI/kestrel-sovereign.git"
+features = ["BootstrapFeature"]
+description = "First-run setup, API key configuration, and onboarding"
+tags = ["core", "setup", "onboarding"]
+icon = "rocket"
+core = true
+
+[heartbeat]
+package = "kestrel-sovereign"
+git = "https://github.com/KestrelSovereignAI/kestrel-sovereign.git"
+features = ["HeartbeatFeature"]
+description = "Agent liveness monitoring and health checks"
+tags = ["core", "monitoring", "health"]
+icon = "heart-pulse"
+core = true
+
+[context]
+package = "kestrel-sovereign"
+git = "https://github.com/KestrelSovereignAI/kestrel-sovereign.git"
+features = ["ContextFeature"]
+description = "Context window management, token budgeting, and prompt assembly"
+tags = ["core", "context", "tokens"]
+icon = "layers"
+core = true
+
+[context.skills]
+context_status = { description = "Show context window utilization", category = "system", tags = ["context", "tokens"] }
+context_resize = { description = "Adjust context budget allocation", category = "system", tags = ["context", "tokens"] }
+
+[tasks]
+package = "kestrel-sovereign"
+git = "https://github.com/KestrelSovereignAI/kestrel-sovereign.git"
+features = ["TaskFeature"]
+description = "Background task monitoring and management"
+tags = ["core", "tasks", "async"]
+icon = "list-checks"
+core = true
+
+[sovereignty]
+package = "kestrel-sovereign"
+git = "https://github.com/KestrelSovereignAI/kestrel-sovereign.git"
+features = ["SovereigntyFeature"]
+description = "Data export, import, backup, and sovereignty controls"
+tags = ["core", "sovereignty", "backup", "export"]
+icon = "crown"
+core = true
+
+[keys]
+package = "kestrel-sovereign"
+git = "https://github.com/KestrelSovereignAI/kestrel-sovereign.git"
+features = ["KeyManagementFeature"]
+description = "API key management for LLM providers"
+tags = ["core", "keys", "api"]
+icon = "key"
+core = true
+
+[save]
+package = "kestrel-sovereign"
+git = "https://github.com/KestrelSovereignAI/kestrel-sovereign.git"
+features = ["SaveFeature"]
+description = "Save, pin, and organize items from conversations"
+tags = ["core", "save", "bookmarks"]
+icon = "bookmark"
+core = true
+
+[save.skills]
+save_item = { description = "Save an item from conversation", category = "utility", tags = ["save", "bookmark"] }
+list_saved = { description = "List saved items", category = "utility", tags = ["save", "bookmark"] }
+search_saved = { description = "Search saved items", category = "utility", tags = ["save", "search"] }
+
+# =============================================================================
+# FEATURE PACKAGES (can be split to separate pip packages)
+# =============================================================================
+
+[cloud]
+package = "kestrel-feature-cloud"
+git = "https://github.com/KestrelSovereignAI/kestrel-feature-cloud.git"
+features = ["RunPodFeature", "VastAIFeature", "GCPComputeFeature", "DeployFeature", "ComputeFeature"]
+description = "GPU cloud orchestration (RunPod, Vast.ai, GCP)"
+tags = ["infrastructure", "gpu", "cloud", "compute"]
+icon = "cloud"
+core = true
+
+[cloud.skills]
+list_instances = { description = "List running GPU instances", category = "compute", tags = ["gpu", "cloud"] }
+launch_instance = { description = "Launch a new GPU instance", category = "compute", tags = ["gpu", "cloud"] }
+stop_instance = { description = "Stop a running GPU instance", category = "compute", tags = ["gpu", "cloud"] }
+deploy = { description = "Deploy agent to cloud infrastructure", category = "compute", tags = ["deploy", "cloud"] }
+
+[voice]
+package = "kestrel-feature-voice"
+git = "https://github.com/KestrelSovereignAI/kestrel-feature-voice.git"
+features = ["VoiceFeature"]
+description = "Text-to-speech and speech-to-text (ElevenLabs, Piper, Whisper, Deepgram)"
+tags = ["communication", "voice", "tts", "stt"]
+icon = "microphone"
+core = true
+
+[voice.skills]
+speak = { description = "Convert text to speech audio", category = "communication", tags = ["voice", "tts"] }
+transcribe = { description = "Convert speech audio to text", category = "communication", tags = ["voice", "stt"] }
+
+[mcp]
+package = "kestrel-feature-mcp"
+git = "https://github.com/KestrelSovereignAI/kestrel-feature-mcp.git"
+features = ["MCPAgent"]
+description = "Model Context Protocol server management and tool bridging"
+tags = ["integration", "mcp", "tools"]
+icon = "plug"
+core = true
+
+[mcp.skills]
+list_servers = { description = "List available MCP servers", category = "system", tags = ["mcp", "servers"] }
+connect_server = { description = "Connect to an MCP server", category = "system", tags = ["mcp", "servers"] }
+call_tool = { description = "Call a tool on a connected MCP server", category = "utility", tags = ["mcp", "tools"] }
+
+[github]
+package = "kestrel-feature-github"
+git = "https://github.com/KestrelSovereignAI/kestrel-feature-github.git"
+features = ["GitHubFeature"]
+description = "GitHub integration for issues, PRs, and repository management"
+tags = ["integration", "github", "devtools"]
+icon = "github"
+core = true
+
+[github.skills]
+list_issues = { description = "List GitHub issues", category = "data_access", tags = ["github", "issues"] }
+create_issue = { description = "Create a GitHub issue", category = "data_access", tags = ["github", "issues"] }
+list_prs = { description = "List pull requests", category = "data_access", tags = ["github", "prs"] }
+create_pr = { description = "Create a pull request", category = "data_access", tags = ["github", "prs"] }
+
+[web_search]
+package = "kestrel-feature-web-search"
+git = "https://github.com/KestrelSovereignAI/kestrel-feature-web-search.git"
+features = ["WebSearchFeature"]
+description = "Web search via Brave, SearXNG, or DuckDuckGo"
+tags = ["search", "web", "research"]
+icon = "search"
+core = true
+
+[web_search.skills]
+web_search = { description = "Search the web for information", category = "web_search", tags = ["search", "web"] }
+
+[channels]
+package = "kestrel-feature-channels"
+git = "https://github.com/KestrelSovereignAI/kestrel-feature-channels.git"
+features = ["ChannelFeature"]
+description = "Multi-channel messaging (WhatsApp, Telegram, Discord, Slack)"
+tags = ["communication", "messaging", "channels"]
+icon = "message-square"
+core = true
+
+[channels.skills]
+send_channel_message = { description = "Send a message to a channel", category = "communication", tags = ["channels", "messaging"] }
+list_channels = { description = "List configured channels", category = "communication", tags = ["channels"] }
+
+[spawn]
+package = "kestrel-feature-spawn"
+git = "https://github.com/KestrelSovereignAI/kestrel-feature-spawn.git"
+features = ["SpawnFeature"]
+description = "Child agent spawning, delegation, and lifecycle management"
+tags = ["agents", "spawn", "delegation"]
+icon = "git-branch"
+core = true
+
+[spawn.skills]
+spawn_agent = { description = "Spawn a child agent for a task", category = "agent_management", tags = ["spawn", "agents"] }
+list_children = { description = "List spawned child agents", category = "agent_management", tags = ["spawn", "agents"] }
+terminate_child = { description = "Terminate a child agent", category = "agent_management", tags = ["spawn", "agents"] }
+
+[privacy]
+package = "kestrel-feature-privacy"
+git = "https://github.com/KestrelSovereignAI/kestrel-feature-privacy.git"
+features = ["PrivacyFeature"]
+description = "5-level privacy modes (EPHEMERAL to PUBLIC)"
+tags = ["privacy", "security", "data-protection"]
+icon = "eye-off"
+core = true
+
+[wallet]
+package = "kestrel-feature-wallet"
+git = "https://github.com/KestrelSovereignAI/kestrel-feature-wallet.git"
+features = ["WalletFeature"]
+description = "Multi-currency agent wallet (FIL, USDC, USDT, ETH)"
+tags = ["economics", "wallet", "crypto"]
+icon = "wallet"
+core = true
+
+[observability]
+package = "kestrel-feature-observability"
+git = "https://github.com/KestrelSovereignAI/kestrel-feature-observability.git"
+features = ["ObservabilityFeature"]
+description = "Event tracking, metrics, and observability dashboard"
+tags = ["monitoring", "observability", "metrics"]
+icon = "activity"
+core = true
+
+[scheduler]
+package = "kestrel-feature-scheduler"
+git = "https://github.com/KestrelSovereignAI/kestrel-feature-scheduler.git"
+features = ["SchedulerFeature"]
+description = "Cron-style task scheduling and recurring jobs"
+tags = ["automation", "scheduling", "cron"]
+icon = "clock"
+core = true
+
+[scheduler.skills]
+schedule_task = { description = "Schedule a recurring task", category = "utility", tags = ["scheduler", "cron"] }
+list_schedules = { description = "List scheduled tasks", category = "utility", tags = ["scheduler", "cron"] }
+
+[reflection]
+package = "kestrel-feature-reflection"
+git = "https://github.com/KestrelSovereignAI/kestrel-feature-reflection.git"
+features = ["ReflectionFeature"]
+description = "Self-assessment, personality evolution, and introspection"
+tags = ["ai", "reflection", "personality"]
+icon = "mirror"
+core = true
+
+[reflection.skills]
+reflect = { description = "Trigger self-reflection cycle", category = "system", tags = ["reflection", "introspection"] }
+personality_status = { description = "View personality evolution state", category = "system", tags = ["reflection", "personality"] }
+
+[talon]
+package = "kestrel-feature-talon"
+git = "https://github.com/KestrelSovereignAI/kestrel-feature-talon.git"
+features = ["TalonCoordinatorFeature"]
+description = "Autonomous GitHub issue processing and PR generation"
+tags = ["automation", "github", "devtools"]
+icon = "bot"
+core = true
+
+[talon.skills]
+claim_issue = { description = "Claim and process a GitHub issue", category = "utility", tags = ["talon", "github"] }
+batch_process = { description = "Batch process issues from a PRD", category = "utility", tags = ["talon", "github"] }
+
+[webhooks]
+package = "kestrel-feature-webhooks"
+git = "https://github.com/KestrelSovereignAI/kestrel-feature-webhooks.git"
+features = ["WebhookFeature"]
+description = "Inbound/outbound webhook management and event routing"
+tags = ["integration", "webhooks", "events"]
+icon = "webhook"
+core = true
+
+[webhooks.skills]
+register_webhook = { description = "Register a new webhook endpoint", category = "communication", tags = ["webhooks", "events"] }
+list_webhooks = { description = "List registered webhooks", category = "communication", tags = ["webhooks"] }
+
+[wellness]
+package = "kestrel-feature-wellness"
+git = "https://github.com/KestrelSovereignAI/kestrel-feature-wellness.git"
+features = ["WellnessFeature"]
+description = "Health monitoring, wellness checks, and eldercare support"
+tags = ["health", "wellness", "eldercare"]
+icon = "heart"
+core = true
+
+[visual_identity]
+package = "kestrel-feature-visual-identity"
+git = "https://github.com/KestrelSovereignAI/kestrel-feature-visual-identity.git"
+features = ["VisualIdentityFeature"]
+description = "Avatar generation and visual identity management"
+tags = ["identity", "visual", "avatar"]
+icon = "palette"
+core = true
+
+[consent]
+package = "kestrel-feature-consent"
+git = "https://github.com/KestrelSovereignAI/kestrel-feature-consent.git"
+features = ["ConsentFeature"]
+description = "User consent tracking and data processing agreements"
+tags = ["privacy", "consent", "compliance"]
+icon = "check-square"
+core = true
+
+[council]
+package = "kestrel-feature-council"
+git = "https://github.com/KestrelSovereignAI/kestrel-feature-council.git"
+features = ["CouncilFeature"]
+description = "Multi-agent council deliberation and collective decision-making"
+tags = ["agents", "council", "deliberation"]
+icon = "users"
+core = true
+
+[bridge]
+package = "kestrel-feature-bridge"
+git = "https://github.com/KestrelSovereignAI/kestrel-feature-bridge.git"
+features = ["BridgeFeature"]
+description = "Cross-protocol bridge for external system integration"
+tags = ["integration", "bridge", "interop"]
+icon = "arrow-left-right"
+core = true
+
+[code_edit]
+package = "kestrel-feature-code-edit"
+git = "https://github.com/KestrelSovereignAI/kestrel-feature-code-edit.git"
+features = ["CodeEditFeature"]
+description = "In-agent code editing and file manipulation"
+tags = ["devtools", "code", "editing"]
+icon = "code"
+core = true
+
+[delivery]
+package = "kestrel-feature-delivery"
+git = "https://github.com/KestrelSovereignAI/kestrel-feature-delivery.git"
+features = ["DeliveryFeature"]
+description = "Physical mail delivery and notary services"
+tags = ["delivery", "mail", "notary"]
+icon = "mail"
+core = true
+
+[response_audit]
+package = "kestrel-feature-response-audit"
+git = "https://github.com/KestrelSovereignAI/kestrel-feature-response-audit.git"
+features = ["ResponseAuditFeature"]
+description = "Per-response constitutional audit and compliance checking"
+tags = ["governance", "audit", "compliance"]
+icon = "clipboard-check"
+core = true
+
+[audit_anchor]
+package = "kestrel-feature-audit-anchor"
+git = "https://github.com/KestrelSovereignAI/kestrel-feature-audit-anchor.git"
+features = ["AuditAnchorFeature"]
+description = "Blockchain-anchored audit trail for cryptographic integrity"
+tags = ["governance", "blockchain", "audit"]
+icon = "anchor"
+core = true
+
+[state_of_mind]
+package = "kestrel-feature-state-of-mind"
+git = "https://github.com/KestrelSovereignAI/kestrel-feature-state-of-mind.git"
+features = ["StateOfMindFeature"]
+description = "Emotional state tracking and mood-aware responses"
+tags = ["ai", "emotions", "personality"]
+icon = "smile"
+core = true
