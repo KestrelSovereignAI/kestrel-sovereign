@@ -31,6 +31,7 @@ class MockTokenBudget:
 
     def __init__(self, total_budget: int = 1000):
         self.total_budget = total_budget
+        self.history = int(total_budget * 0.4)  # Match AdaptiveTokenBudget default
 
 
 class MockConversationStore:
