@@ -264,7 +264,7 @@ SUMMARY:"""
                 "message_count": message_count
             }
 
-    async def check_compression_needed(self, counter, model: str, utilization_threshold: float = 70.0) -> Dict[str, Any]:
+    async def check_compression_needed(self, counter, model: str, utilization_threshold: float = 70.0, history: Optional[list] = None) -> Dict[str, Any]:
         """
         Check if session compression is recommended.
 
@@ -272,35 +272,35 @@ SUMMARY:"""
             counter: TokenCounter for token counting
             model: Model name for budget calculation
             utilization_threshold: Percentage at which compression is recommended
+            history: Pre-fetched session-filtered history (same as LLM sees).
+                     If None, fetches limited history to approximate LLM path.
 
         Returns:
             Dict with recommendation and current stats
         """
         from .token_budget import create_budget
 
-        # Use full history for accurate compression assessment
-        conv_store = self._get_conversation_store()
-        if conv_store:
-            history = await conv_store.get_full_history()
-        else:
-            history = await self.get_conversation_history()
+        # Use same data path as LLM — session-filtered, limited
+        if history is None:
+            history = await self.get_conversation_history(limit=50)
         message_count = len(history)
         budget = create_budget(model, message_count, adaptive=True)
 
-        # Calculate approximate utilization
+        # Calculate against the history allocation, not total budget
         total_tokens = sum(
             counter.count(m.get("content", ""))
             for m in history
         )
-        utilization = (total_tokens / budget.total_budget * 100) if budget.total_budget > 0 else 0
+        history_utilization = (total_tokens / budget.history * 100) if budget.history > 0 else 0
 
         return {
-            "compression_recommended": utilization >= utilization_threshold,
-            "utilization_percent": round(utilization, 1),
+            "compression_recommended": history_utilization >= utilization_threshold,
+            "utilization_percent": round(history_utilization, 1),
             "message_count": message_count,
             "total_tokens": total_tokens,
-            "budget_limit": budget.total_budget,
-            "threshold": utilization_threshold
+            "budget_limit": budget.history,
+            "threshold": utilization_threshold,
+            "note": "Utilization measured against history allocation, not total context budget."
         }
 
     async def get_messages_for_selection(

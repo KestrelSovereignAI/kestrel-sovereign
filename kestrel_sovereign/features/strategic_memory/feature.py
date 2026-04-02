@@ -51,6 +51,16 @@ class StrategicMemoryFeature(Feature):
 
     STRATEGY_FILENAME = "STRATEGY.yaml"
 
+    _DEFAULT_TEMPLATE = {
+        "version": 1,
+        "vision": "Define your agent's long-term vision here.",
+        "milestones": [],
+        "stakeholders": [],
+        "decisions": [],
+        "blockers": [],
+        "patterns": [],
+    }
+
     def __init__(self, agent):
         super().__init__(agent)
         self._data: Dict[str, Any] = {}
@@ -86,10 +96,18 @@ class StrategicMemoryFeature(Feature):
                         f"StrategicMemoryFeature loaded: {len(self._data)} top-level keys"
                     )
                 else:
-                    logger.info(
-                        f"No {self.STRATEGY_FILENAME} found at {self._strategy_path} -- "
-                        "strategic memory not active"
-                    )
+                    # Create default template so the agent can start capturing strategy
+                    self._data = dict(self._DEFAULT_TEMPLATE)
+                    self._save()
+                    if self._strategy_path.exists():
+                        logger.info(
+                            f"Created default {self.STRATEGY_FILENAME} at {self._strategy_path}"
+                        )
+                    else:
+                        logger.info(
+                            f"No {self.STRATEGY_FILENAME} at {self._strategy_path} "
+                            "and could not create template -- strategic memory not active"
+                        )
             else:
                 logger.debug("No agent_data_dir available -- strategic memory not active")
 
