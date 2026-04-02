@@ -16,13 +16,27 @@ all MCP servers regardless of their native transport.
 import logging
 import asyncio
 import aiohttp
-import docker
 import time
 from typing import Dict, Any, List, Optional
-from mcp.client.sse import sse_client
-from mcp.client.session import ClientSession
-from docker.models.containers import Container
-from docker.errors import NotFound, DockerException, APIError, ImageNotFound
+
+try:
+    import docker
+    from docker.models.containers import Container
+    from docker.errors import NotFound, DockerException, APIError, ImageNotFound
+except ImportError:
+    docker = None  # type: ignore[assignment]
+    Container = None  # type: ignore[assignment,misc]
+    NotFound = None  # type: ignore[assignment,misc]
+    DockerException = None  # type: ignore[assignment,misc]
+    APIError = None  # type: ignore[assignment,misc]
+    ImageNotFound = None  # type: ignore[assignment,misc]
+
+try:
+    from mcp.client.sse import sse_client
+    from mcp.client.session import ClientSession
+except ImportError:
+    sse_client = None  # type: ignore[assignment]
+    ClientSession = None  # type: ignore[assignment,misc]
 
 from kestrel_sovereign.kestrel_config.constants import (
     SESSION_CONNECT_TIMEOUT_SHORT,
@@ -46,6 +60,11 @@ class MCPToolManager:
     """
 
     def __init__(self):
+        if docker is None:
+            raise ImportError(
+                "docker package is required for MCPToolManager. "
+                "Install it with: pip install kestrel-sovereign[mcp]"
+            )
         try:
             self.docker_client = docker.from_env()
             # Test the connection

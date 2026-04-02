@@ -7,7 +7,9 @@ Tests the exponential backoff healthcheck without requiring Docker.
 import pytest
 import asyncio
 from unittest.mock import Mock, AsyncMock, patch, MagicMock
-from docker.errors import NotFound
+
+docker_errors = pytest.importorskip("docker.errors")
+NotFound = docker_errors.NotFound
 
 
 class TestMCPHealthcheck:

@@ -4,6 +4,8 @@ import hashlib
 
 import pytest
 
+cbor2 = pytest.importorskip("cbor2", reason="cbor2 not installed (wallet extras)")
+
 from kestrel_sovereign.storage.car_builder import (
     CARBuilder,
     CARReader,
