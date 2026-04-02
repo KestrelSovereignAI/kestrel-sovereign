@@ -357,7 +357,7 @@ class ConsentFeature(Feature):
     async def _store_record(self, record: ConsentRecord) -> None:
         """Persist a ConsentRecord to the consent_log table."""
         db = self.agent.storage.db
-        agent_id = getattr(self.agent, 'agent_id', None) or ''
+        agent_id = self.agent.did
         await db.execute(
             "INSERT INTO consent_log "
             "(id, agent_id, action_type, action_details, agent_view, "
