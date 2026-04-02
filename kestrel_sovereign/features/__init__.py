@@ -115,16 +115,22 @@ def find_feature_class(module) -> Optional[Type[Feature]]:
     return None
 
 
-def discover_features(agent) -> List[Feature]:
+def discover_features(agent, allowed_features: Optional[Set[str]] = None) -> List[Feature]:
     """
-    Discover and instantiate all Feature classes.
+    Discover and instantiate Feature classes.
     
     Args:
         agent: The KestrelAgent instance to pass to feature constructors
+        allowed_features: If provided, only load features whose class name
+            is in this set. Mandatory features (from MANDATORY_FEATURES) are
+            always loaded regardless. If None, all features are loaded
+            (backward-compatible default).
         
     Returns:
         List of instantiated Feature objects
     """
+    from kestrel_sovereign.rookery.config import MANDATORY_FEATURES
+
     disabled = get_disabled_features()
     features = []
     discovered_names = set()
@@ -144,6 +150,12 @@ def discover_features(agent) -> List[Feature]:
             if class_name in disabled:
                 logger.info(f"Feature '{class_name}' is disabled via {DISABLED_FEATURES_ENV}")
                 continue
+
+            # Check feature allowlist (mandatory features bypass the check)
+            if allowed_features is not None:
+                if class_name not in allowed_features and class_name not in MANDATORY_FEATURES:
+                    logger.debug(f"Feature '{class_name}' not in agent's allowed profile, skipping")
+                    continue
                 
             # Avoid duplicates (same class from different import paths)
             if class_name in discovered_names:

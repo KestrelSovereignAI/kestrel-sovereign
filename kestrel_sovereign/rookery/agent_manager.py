@@ -90,6 +90,9 @@ class AgentManager:
         # Each agent gets its own LLMService (mutable model state)
         llm_service = LLMService()
 
+        # Build allowed_features set from config (None = load all)
+        allowed_features = set(config.features) if config.features is not None else None
+
         if db_backend.lower() == "postgres" and database_url:
             agent = KestrelAgent(
                 did=agent_did,
@@ -97,12 +100,14 @@ class AgentManager:
                 llm_service=llm_service,
                 database_url=database_url,
                 db_backend="postgres",
+                allowed_features=allowed_features,
             )
         else:
             agent = KestrelAgent(
                 did=agent_did,
                 storage_path=db_path,
                 llm_service=llm_service,
+                allowed_features=allowed_features,
             )
 
         await agent.initialize()
