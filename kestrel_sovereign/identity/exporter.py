@@ -56,7 +56,8 @@ class IdentityExporter:
         self,
         db: "AsyncDatabase",
         agent_id: str,
-        agent_data_dir: Optional[Path] = None
+        agent_data_dir: Optional[Path] = None,
+        agent: Optional[Any] = None,
     ):
         """
         Initialize the exporter.
@@ -65,10 +66,12 @@ class IdentityExporter:
             db: Database connection
             agent_id: The agent's DID
             agent_data_dir: Directory containing agent files (keys, DID document)
+            agent: Optional KestrelAgent instance for runtime skill discovery
         """
         self.db = db
         self.agent_id = agent_id
         self.agent_data_dir = agent_data_dir or self._get_default_data_dir()
+        self._agent = agent
 
     def _get_default_data_dir(self) -> Path:
         """Get the default agent data directory."""
@@ -402,8 +405,15 @@ class IdentityExporter:
         return relationships
 
     async def _get_skills(self) -> List[SkillRecord]:
-        """Get learned skills and capabilities."""
-        # Skills are stored as graph nodes
+        """Get skills from both graph storage and runtime feature tools.
+
+        Graph-stored skills provide persisted usage data (times_used, last_used).
+        Runtime feature tools (via AgentSkill) ensure every registered tool
+        appears in the identity package even if it has never been invoked.
+        Graph data is merged into runtime records where both exist.
+        """
+        # 1. Load persisted skill data from graph (keyed by skill_id)
+        graph_skills: Dict[str, Dict[str, Any]] = {}
         rows = await self.db.fetchall(
             """SELECT node_id, label, properties FROM graph_nodes
                WHERE node_type = 'skill'
@@ -413,18 +423,55 @@ class IdentityExporter:
                )""",
             (self.agent_id,)
         )
-
-        skills = []
         for row in rows:
             props = json.loads(row[2]) if row[2] else {}
+            graph_skills[row[0]] = {
+                "skill_name": row[1],
+                "type": props.get("type", "unknown"),
+                "proficiency": props.get("proficiency", 0.5),
+                "times_used": props.get("times_used", 0),
+                "last_used": props.get("last_used"),
+                "config": props.get("config", {}),
+            }
+
+        # 2. Build SkillRecords from runtime features using AgentSkill as
+        #    the canonical metadata source, enriched with graph usage data.
+        seen_ids: set = set()
+        skills: List[SkillRecord] = []
+
+        agent = getattr(self, '_agent', None)
+        if agent is not None:
+            features = getattr(agent, 'features', {})
+            for feature in features.values():
+                get_tools = getattr(feature, 'get_tools', None)
+                if not get_tools:
+                    continue
+                for tool in get_tools():
+                    agent_skill = getattr(tool, 'agent_skill', None)
+                    if agent_skill is None:
+                        continue
+
+                    graph_data = graph_skills.get(agent_skill.id, {})
+                    skills.append(SkillRecord.from_agent_skill(
+                        agent_skill,
+                        times_used=graph_data.get("times_used", 0),
+                        last_used=graph_data.get("last_used"),
+                    ))
+                    seen_ids.add(agent_skill.id)
+
+        # 3. Include graph-only skills not covered by current runtime features
+        #    (e.g., skills from features that were uninstalled but have history).
+        for skill_id, data in graph_skills.items():
+            if skill_id in seen_ids:
+                continue
             skills.append(SkillRecord(
-                skill_id=row[0],
-                skill_name=row[1],
-                skill_type=props.get("type", "unknown"),
-                proficiency=props.get("proficiency", 0.5),
-                times_used=props.get("times_used", 0),
-                last_used=props.get("last_used"),
-                configuration=props.get("config", {}),
+                skill_id=skill_id,
+                skill_name=data["skill_name"],
+                skill_type=data["type"],
+                proficiency=data["proficiency"],
+                times_used=data["times_used"],
+                last_used=data["last_used"],
+                configuration=data["config"],
             ))
 
         return skills
@@ -517,6 +564,7 @@ async def export_identity(
     db: "AsyncDatabase",
     agent_id: str,
     agent_data_dir: Optional[Path] = None,
+    agent: Optional[Any] = None,
     **kwargs
 ) -> AgentIdentityPackage:
     """
@@ -526,10 +574,11 @@ async def export_identity(
         db: Database connection
         agent_id: The agent's DID
         agent_data_dir: Directory containing agent files
+        agent: Optional KestrelAgent instance for runtime skill discovery
         **kwargs: Additional arguments passed to IdentityExporter.export()
 
     Returns:
         Complete AgentIdentityPackage
     """
-    exporter = IdentityExporter(db, agent_id, agent_data_dir)
+    exporter = IdentityExporter(db, agent_id, agent_data_dir, agent=agent)
     return await exporter.export(**kwargs)
