@@ -644,6 +644,472 @@ def cmd_health(args) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# Feature CLI commands
+# ---------------------------------------------------------------------------
+
+def _load_kestrel_toml(project_dir: Path) -> dict:
+    """Load kestrel.toml from project dir. Returns empty dict if not found."""
+    import toml
+    toml_path = project_dir / "kestrel.toml"
+    if not toml_path.exists():
+        return {}
+    try:
+        return toml.load(toml_path)
+    except Exception:
+        return {}
+
+
+def _save_kestrel_toml(project_dir: Path, data: dict) -> None:
+    """Save data to kestrel.toml in project dir, preserving existing content."""
+    import toml
+    toml_path = project_dir / "kestrel.toml"
+
+    # Load existing content and merge
+    existing = _load_kestrel_toml(project_dir)
+    existing.update(data)
+
+    with open(toml_path, "w", encoding="utf-8") as f:
+        toml.dump(existing, f)
+
+
+def _get_toml_disabled_features(project_dir: Path) -> list:
+    """Read disabled features list from kestrel.toml [features] section."""
+    data = _load_kestrel_toml(project_dir)
+    return data.get("features", {}).get("disabled", [])
+
+
+def _set_toml_disabled_features(project_dir: Path, disabled: list) -> None:
+    """Write disabled features list to kestrel.toml [features] section."""
+    data = _load_kestrel_toml(project_dir)
+    if "features" not in data:
+        data["features"] = {}
+    data["features"]["disabled"] = sorted(set(disabled))
+    _save_kestrel_toml(project_dir, data)
+
+
+def _resolve_feature_name(name: str, registry: dict) -> Optional[str]:
+    """
+    Resolve a user-provided name to a registry package name.
+
+    Accepts: package name ("cloud"), feature class name ("RunPodFeature"),
+    or human-friendly name (case-insensitive match).
+    """
+    # Direct package name match
+    if name in registry:
+        return name
+
+    # Case-insensitive package name match
+    lower = name.lower()
+    for pkg_name in registry:
+        if pkg_name.lower() == lower:
+            return pkg_name
+
+    # Feature class name match
+    for pkg_name, info in registry.items():
+        if name in info.features:
+            return pkg_name
+
+    return None
+
+
+def _status_icon(status) -> str:
+    """Return a status icon for display."""
+    from kestrel_sovereign.feature_registry import FeatureStatus
+    return {
+        FeatureStatus.ENABLED: "\u2713",
+        FeatureStatus.INSTALLED: "\u2713",
+        FeatureStatus.DISABLED: "\u2717",
+        FeatureStatus.AVAILABLE: "\u25cb",
+    }.get(status, "?")
+
+
+def cmd_feature(args) -> int:
+    """Dispatch feature subcommands."""
+    feature_commands = {
+        "list": cmd_feature_list,
+        "install": cmd_feature_install,
+        "enable": cmd_feature_enable,
+        "disable": cmd_feature_disable,
+        "info": cmd_feature_info,
+        "scaffold": cmd_feature_scaffold,
+        "skills": cmd_feature_skills,
+    }
+
+    handler = feature_commands.get(args.feature_command)
+    if handler is None:
+        print("Usage: kestrel feature {list|install|enable|disable|info|scaffold|skills}")
+        return 1
+    return handler(args)
+
+
+def cmd_feature_list(args) -> int:
+    """List all features with installed/enabled status."""
+    from kestrel_sovereign.feature_registry import (
+        get_registry,
+        FeatureStatus,
+    )
+
+    project_dir = _get_project_dir()
+    toml_disabled = set(_get_toml_disabled_features(project_dir))
+
+    registry = get_registry()
+
+    # Override status for features disabled via kestrel.toml
+    for info in registry.values():
+        feature_classes = set(info.features)
+        if feature_classes & toml_disabled:
+            info.status = FeatureStatus.DISABLED
+
+    # Separate installed/core from available-to-install
+    installed = {}
+    available = {}
+    for name, info in sorted(registry.items()):
+        if info.status in (FeatureStatus.ENABLED, FeatureStatus.INSTALLED, FeatureStatus.DISABLED):
+            installed[name] = info
+        else:
+            available[name] = info
+
+    # Print installed features
+    if installed:
+        print()
+        print(f"  {'INSTALLED':<40} {'STATUS'}")
+        print(f"  {'─' * 50}")
+        for name, info in installed.items():
+            icon = _status_icon(info.status)
+            status_str = info.status.value
+            label = info.description if len(info.description) <= 36 else info.description[:33] + "..."
+            core_tag = " (core)" if info.core else ""
+            print(f"  {icon} {name:<38}{core_tag:>7} {status_str}")
+
+    # Print available features
+    if available:
+        print()
+        print(f"  {'AVAILABLE TO INSTALL':<40} {'PACKAGE'}")
+        print(f"  {'─' * 50}")
+        for name, info in available.items():
+            print(f"  \u25cb {name:<38} {info.package}")
+
+    if not installed and not available:
+        print("  No features found in registry")
+
+    print()
+    return 0
+
+
+def cmd_feature_install(args) -> int:
+    """Install a feature package via pip."""
+    from kestrel_sovereign.feature_registry import load_registry
+
+    registry = load_registry()
+    pkg_name = _resolve_feature_name(args.name, registry)
+
+    if pkg_name is None:
+        print(f"Unknown feature: {args.name}")
+        print("Run 'kestrel feature list' to see available features")
+        return 1
+
+    info = registry[pkg_name]
+
+    if info.core:
+        print(f"Feature '{pkg_name}' is a core feature (already included in kestrel-sovereign)")
+        return 0
+
+    package = info.package
+    print(f"Installing {package}...")
+
+    cmd = [sys.executable, "-m", "pip", "install", package]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+
+    if result.returncode != 0:
+        # Try git URL as fallback
+        if info.git:
+            print(f"pip install failed, trying git: {info.git}")
+            cmd = [sys.executable, "-m", "pip", "install", f"git+{info.git}"]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+
+    if result.returncode == 0:
+        print(f"Installed {package}")
+        return 0
+    else:
+        print(f"Failed to install {package}")
+        if result.stderr:
+            # Show last few lines of error
+            lines = result.stderr.strip().split("\n")
+            for line in lines[-5:]:
+                print(f"  {line}")
+        return 1
+
+
+def cmd_feature_enable(args) -> int:
+    """Enable a feature (remove from disabled list in kestrel.toml)."""
+    from kestrel_sovereign.feature_registry import load_registry
+
+    registry = load_registry()
+    pkg_name = _resolve_feature_name(args.name, registry)
+
+    if pkg_name is None:
+        print(f"Unknown feature: {args.name}")
+        return 1
+
+    info = registry[pkg_name]
+    project_dir = _get_project_dir()
+    disabled = _get_toml_disabled_features(project_dir)
+
+    # Remove all feature classes for this package from disabled list
+    removed = []
+    new_disabled = []
+    for feat in disabled:
+        if feat in info.features:
+            removed.append(feat)
+        else:
+            new_disabled.append(feat)
+
+    if not removed:
+        print(f"Feature '{pkg_name}' is not disabled")
+        return 0
+
+    _set_toml_disabled_features(project_dir, new_disabled)
+    print(f"Enabled {pkg_name} (removed {', '.join(removed)} from disabled list)")
+    print("Restart the agent for changes to take effect")
+    return 0
+
+
+def cmd_feature_disable(args) -> int:
+    """Disable a feature (add to disabled list in kestrel.toml)."""
+    from kestrel_sovereign.feature_registry import load_registry
+
+    registry = load_registry()
+    pkg_name = _resolve_feature_name(args.name, registry)
+
+    if pkg_name is None:
+        print(f"Unknown feature: {args.name}")
+        return 1
+
+    info = registry[pkg_name]
+    project_dir = _get_project_dir()
+    disabled = _get_toml_disabled_features(project_dir)
+
+    # Add all feature classes for this package to disabled list
+    added = []
+    for feat in info.features:
+        if feat not in disabled:
+            disabled.append(feat)
+            added.append(feat)
+
+    if not added:
+        print(f"Feature '{pkg_name}' is already disabled")
+        return 0
+
+    _set_toml_disabled_features(project_dir, disabled)
+    print(f"Disabled {pkg_name} (added {', '.join(added)} to disabled list)")
+    print("Restart the agent for changes to take effect")
+    return 0
+
+
+def cmd_feature_info(args) -> int:
+    """Show detailed info about a feature package."""
+    from kestrel_sovereign.feature_registry import get_registry, FeatureStatus
+
+    project_dir = _get_project_dir()
+    toml_disabled = set(_get_toml_disabled_features(project_dir))
+
+    registry = get_registry()
+
+    # Override status for kestrel.toml disabled
+    for info in registry.values():
+        if set(info.features) & toml_disabled:
+            info.status = FeatureStatus.DISABLED
+
+    pkg_name = _resolve_feature_name(args.name, registry)
+    if pkg_name is None:
+        print(f"Unknown feature: {args.name}")
+        return 1
+
+    info = registry[pkg_name]
+
+    print()
+    print(f"  {pkg_name}")
+    print(f"  {'─' * 40}")
+    print(f"  Description:  {info.description}")
+    print(f"  Package:      {info.package}")
+    print(f"  Status:       {info.status.value}")
+    print(f"  Core:         {'yes' if info.core else 'no'}")
+    print(f"  Git:          {info.git}")
+
+    if info.tags:
+        print(f"  Tags:         {', '.join(info.tags)}")
+
+    if info.features:
+        print(f"  Features:     {', '.join(info.features)}")
+
+    if info.skills:
+        print(f"\n  Skills:")
+        for skill in info.skills:
+            tags_str = f" [{', '.join(skill.tags)}]" if skill.tags else ""
+            print(f"    {skill.name:<24} {skill.description}{tags_str}")
+
+    print()
+    return 0
+
+
+def cmd_feature_scaffold(args) -> int:
+    """Generate a feature package project template."""
+    name = args.name.lower().replace("-", "_").replace(" ", "_")
+    pkg_name = f"kestrel_feature_{name}"
+    dir_name = f"kestrel-feature-{name.replace('_', '-')}"
+
+    scaffold_dir = Path(dir_name)
+    if scaffold_dir.exists():
+        print(f"Directory '{dir_name}' already exists")
+        return 1
+
+    # Create directory structure
+    src_dir = scaffold_dir / pkg_name
+    tests_dir = scaffold_dir / "tests"
+
+    src_dir.mkdir(parents=True)
+    tests_dir.mkdir(parents=True)
+
+    # Feature class name
+    class_name = "".join(word.capitalize() for word in name.split("_")) + "Feature"
+
+    # __init__.py
+    (src_dir / "__init__.py").write_text(
+        f'"""Kestrel Feature: {name}"""\n'
+        f"from .feature import {class_name}\n\n"
+        f'__all__ = ["{class_name}"]\n'
+    )
+
+    # feature.py
+    (src_dir / "feature.py").write_text(
+        f'"""{class_name} — TODO: describe your feature."""\n\n'
+        f"from kestrel_sovereign.features.base import Feature\n\n\n"
+        f"class {class_name}(Feature):\n"
+        f'    """TODO: describe what this feature does."""\n\n'
+        f"    @property\n"
+        f"    def name(self) -> str:\n"
+        f'        return "{class_name}"\n\n'
+        f"    @property\n"
+        f"    def description(self) -> str:\n"
+        f'        return "TODO: add description"\n\n'
+        f"    async def initialize(self) -> None:\n"
+        f"        pass\n\n"
+        f"    async def shutdown(self) -> None:\n"
+        f"        pass\n"
+    )
+
+    # pyproject.toml
+    (scaffold_dir / "pyproject.toml").write_text(
+        f'[build-system]\n'
+        f'requires = ["setuptools>=64", "wheel"]\n'
+        f'build-backend = "setuptools.backends._legacy:_Backend"\n\n'
+        f'[project]\n'
+        f'name = "kestrel-feature-{name.replace("_", "-")}"\n'
+        f'version = "0.1.0"\n'
+        f'description = "Kestrel feature: {name}"\n'
+        f'requires-python = ">=3.11"\n'
+        f'dependencies = ["kestrel-sovereign"]\n\n'
+        f'[project.entry-points."kestrel_sovereign.features"]\n'
+        f'{class_name} = "{pkg_name}.feature:{class_name}"\n'
+    )
+
+    # tests/__init__.py
+    (tests_dir / "__init__.py").write_text("")
+
+    # tests/test_feature.py
+    (tests_dir / f"test_{name}.py").write_text(
+        f'"""Tests for {class_name}."""\n\n'
+        f"from {pkg_name}.feature import {class_name}\n\n\n"
+        f"def test_feature_name():\n"
+        f"    # TODO: instantiate with a mock agent\n"
+        f"    pass\n"
+    )
+
+    print(f"Scaffolded feature package: {dir_name}/")
+    print(f"  {pkg_name}/")
+    print(f"    __init__.py")
+    print(f"    feature.py          <- implement {class_name} here")
+    print(f"  tests/")
+    print(f"    test_{name}.py")
+    print(f"  pyproject.toml        <- entry_point registered")
+    print()
+    print(f"Install in dev mode:  pip install -e ./{dir_name}")
+    return 0
+
+
+def cmd_feature_skills(args) -> int:
+    """List skills for a specific feature package."""
+    from kestrel_sovereign.feature_registry import get_skills_for_package, load_registry
+
+    registry = load_registry()
+    pkg_name = _resolve_feature_name(args.name, registry)
+
+    if pkg_name is None:
+        print(f"Unknown feature: {args.name}")
+        return 1
+
+    skills = get_skills_for_package(pkg_name)
+    if not skills:
+        print(f"No skills declared for '{pkg_name}'")
+        return 0
+
+    print()
+    print(f"  Skills for {pkg_name}:")
+    print(f"  {'─' * 50}")
+    for skill in skills:
+        tags_str = f" [{', '.join(skill.tags)}]" if skill.tags else ""
+        print(f"  {skill.name:<24} {skill.description}{tags_str}")
+    print()
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Skills CLI commands
+# ---------------------------------------------------------------------------
+
+def cmd_skills(args) -> int:
+    """Dispatch skills subcommands."""
+    skills_commands = {
+        "search": cmd_skills_search,
+    }
+
+    handler = skills_commands.get(args.skills_command)
+    if handler is None:
+        print("Usage: kestrel skills {search}")
+        return 1
+    return handler(args)
+
+
+def cmd_skills_search(args) -> int:
+    """Search all skills by name or tag."""
+    from kestrel_sovereign.feature_registry import load_registry
+
+    query = args.query.lower()
+    registry = load_registry()
+
+    matches = []
+    for pkg_name, info in registry.items():
+        for skill in info.skills:
+            if (query in skill.name.lower()
+                    or query in skill.description.lower()
+                    or query in skill.category.lower()
+                    or any(query in t.lower() for t in skill.tags)):
+                matches.append((pkg_name, skill))
+
+    if not matches:
+        print(f"No skills matching '{args.query}'")
+        return 0
+
+    print()
+    print(f"  {'SKILL':<24} {'PACKAGE':<16} {'DESCRIPTION'}")
+    print(f"  {'─' * 60}")
+    for pkg_name, skill in matches:
+        print(f"  {skill.name:<24} {pkg_name:<16} {skill.description}")
+    print()
+    return 0
+
+
 def cmd_config(args) -> int:
     """Show or edit agent config."""
     from kestrel_sovereign.agent_config import AgentConfig, find_agent_dir
@@ -743,6 +1209,37 @@ def build_parser() -> argparse.ArgumentParser:
     config_p.add_argument("--set-port", type=int, help="Set port")
     config_p.add_argument("--set-name", type=str, help="Set name")
 
+    # kestrel feature {list|install|enable|disable|info|scaffold|skills}
+    feature_p = subparsers.add_parser("feature", help="Manage features")
+    feature_sub = feature_p.add_subparsers(dest="feature_command")
+
+    feature_sub.add_parser("list", help="List features with status")
+
+    feat_install = feature_sub.add_parser("install", help="Install a feature package")
+    feat_install.add_argument("name", help="Feature name (e.g. cloud, voice)")
+
+    feat_enable = feature_sub.add_parser("enable", help="Enable a disabled feature")
+    feat_enable.add_argument("name", help="Feature or package name")
+
+    feat_disable = feature_sub.add_parser("disable", help="Disable a feature")
+    feat_disable.add_argument("name", help="Feature or package name")
+
+    feat_info = feature_sub.add_parser("info", help="Show feature details")
+    feat_info.add_argument("name", help="Feature or package name")
+
+    feat_scaffold = feature_sub.add_parser("scaffold", help="Generate feature project template")
+    feat_scaffold.add_argument("name", help="Feature name (e.g. myfeature)")
+
+    feat_skills = feature_sub.add_parser("skills", help="List skills in a feature")
+    feat_skills.add_argument("name", help="Feature or package name")
+
+    # kestrel skills {search}
+    skills_p = subparsers.add_parser("skills", help="Search and manage skills")
+    skills_sub = skills_p.add_subparsers(dest="skills_command")
+
+    skills_search = skills_sub.add_parser("search", help="Search skills by name/tag")
+    skills_search.add_argument("query", help="Search query")
+
     return parser
 
 
@@ -765,6 +1262,8 @@ def main() -> int:
         "shell": cmd_shell,
         "health": cmd_health,
         "config": cmd_config,
+        "feature": cmd_feature,
+        "skills": cmd_skills,
     }
 
     handler = commands.get(args.command)
