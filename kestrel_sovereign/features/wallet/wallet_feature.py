@@ -120,8 +120,7 @@ class WalletFeature(
 
     def get_hooks(self) -> List[Hook]:
         """Return the transaction security hook for auto-registration."""
-        agent_id = getattr(self.agent, 'agent_id', 'default')
-        return [TransactionSecurityHook(agent_id=agent_id)]
+        return [TransactionSecurityHook()]
 
     async def shutdown(self):
         """Cleanup wallet resources."""
