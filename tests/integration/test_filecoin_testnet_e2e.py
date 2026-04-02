@@ -260,15 +260,7 @@ class TestWalletFeatureFilecoinCommands:
 
         class MockAgent:
             def __init__(self):
-                self.agent_id = "test_cmd_agent"
-                self.wallet = None
-
-            class MockStorage:
-                def __init__(self, db_path):
-                    self.db_path = db_path
-
-            def __init__(self):
-                self.agent_id = "test_cmd_agent"
+                self.did = "test_cmd_agent"
                 self.wallet = None
                 self.db_path = None
 
@@ -355,7 +347,7 @@ class TestEconomicGateMethods:
 
         class MockAgent:
             def __init__(self):
-                self.agent_id = "paid_tier_test"
+                self.did = "paid_tier_test"
                 self.wallet = None
                 self.storage = type('Storage', (), {'db_path': temp_db_path})()
 
@@ -372,7 +364,7 @@ class TestEconomicGateMethods:
 
         class MockAgent:
             def __init__(self):
-                self.agent_id = "poor_tier_test"
+                self.did = "poor_tier_test"
                 self.wallet = None
                 self.storage = type('Storage', (), {'db_path': temp_db_path})()
 
@@ -398,7 +390,7 @@ class TestEconomicGateMethods:
 
         class MockAgent:
             def __init__(self):
-                self.agent_id = "no_revenue_test"
+                self.did = "no_revenue_test"
                 self.wallet = None
                 self.metadata = None
                 self.storage = type('Storage', (), {'db_path': temp_db_path})()
@@ -415,7 +407,7 @@ class TestEconomicGateMethods:
 
         class MockAgent:
             def __init__(self):
-                self.agent_id = "revenue_test"
+                self.did = "revenue_test"
                 self.wallet = None
                 self.metadata = {"revenue_share_address": "t1abc123"}
                 self.storage = type('Storage', (), {'db_path': temp_db_path})()

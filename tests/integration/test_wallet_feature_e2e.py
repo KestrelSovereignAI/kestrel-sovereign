@@ -30,7 +30,7 @@ class MockAgent:
     """Mock agent for testing WalletFeature in isolation."""
 
     def __init__(self, db_path: str, agent_id: str = "test_agent"):
-        self.agent_id = agent_id
+        self.did = agent_id
         self.db_path = db_path
         self.storage = MagicMock()
         self.storage.db_path = db_path
