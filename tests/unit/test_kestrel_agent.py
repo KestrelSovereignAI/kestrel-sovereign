@@ -949,6 +949,9 @@ class TestInitialize:
         mock_feature = MagicMock()
         mock_feature.name = "TestFeature"
         mock_feature.initialize = AsyncMock()
+        mock_feature.on_enable = AsyncMock()
+        mock_feature.post_all_features_loaded = AsyncMock()
+        mock_feature.get_hooks.return_value = []
         mock_feature.get_tools.return_value = []
         mock_feature.get_agent_card.return_value = MagicMock(name="TestFeature", skills=[])
 

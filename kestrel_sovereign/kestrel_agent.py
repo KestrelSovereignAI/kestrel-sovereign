@@ -390,6 +390,11 @@ class KestrelAgent(
             for feature in discover_features(self, allowed_features=self._allowed_features):
                 await self._register_feature(feature)
 
+            # Notify all features that discovery is complete (cross-feature wiring)
+            for feature in self.features.values():
+                await feature.post_all_features_loaded(self)
+            logging.info("post_all_features_loaded called for all features")
+
             # Set up feature references
             self.mcp_agent = self.features.get("MCPAgent")
             self.model_agent = self.features.get("ModelAgent")
@@ -613,6 +618,15 @@ class KestrelAgent(
         await feature.initialize()
         self.features[feature.name] = feature
 
+        # Auto-register hooks from get_hooks() with the agent's HooksManager
+        if self.hooks_manager:
+            for hook in feature.get_hooks():
+                self.hooks_manager.register(hook)
+                logging.info(f"Auto-registered hook '{hook.name}' from feature '{feature.name}'")
+
+        # Call on_enable lifecycle hook
+        await feature.on_enable()
+
         # Get command prefixes for routing
         command_prefixes = {}
         for tool in feature.get_tools():
@@ -633,6 +647,24 @@ class KestrelAgent(
             # Wire task_manager into features that need it
             if hasattr(feature, 'set_task_manager'):
                 feature.set_task_manager(self.task_manager)
+
+    async def _disable_feature(self, feature_name: str):
+        """Disable a feature: call on_disable, unregister its hooks, remove from features dict."""
+        feature = self.features.get(feature_name)
+        if not feature:
+            logging.warning(f"Cannot disable unknown feature: {feature_name}")
+            return
+
+        # Call on_disable lifecycle hook
+        await feature.on_disable()
+
+        # Auto-unregister hooks from get_hooks()
+        if self.hooks_manager:
+            for hook in feature.get_hooks():
+                self.hooks_manager.unregister(hook)
+                logging.info(f"Auto-unregistered hook '{hook.name}' from feature '{feature_name}'")
+
+        logging.info(f"Feature '{feature_name}' disabled")
 
     async def _setup_default_schedules(self):
         """Register default scheduled tasks for self-improvement.

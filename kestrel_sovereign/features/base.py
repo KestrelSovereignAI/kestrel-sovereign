@@ -3,7 +3,10 @@ import json
 import logging
 import os
 import re
-from typing import Any, Callable, Dict, List, Optional, Type, Union, Protocol, runtime_checkable
+from typing import Any, Callable, Dict, List, Optional, Type, Union, Protocol, runtime_checkable, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from kestrel_sovereign.hooks.base import Hook
 from abc import ABC, abstractmethod
 from kestrel_sovereign.tools.base import ToolSchema, ToolParameter, ToolCategory, AgentTool
 from kestrel_sovereign.a2a.agent_card import AgentCard, AgentSkill, AgentCapabilities
@@ -125,6 +128,86 @@ class Feature(ABC):
 
     async def shutdown(self):
         """Cleanup resources."""
+        pass
+
+    async def on_enable(self):
+        """Called when feature is enabled.
+
+        Register hooks, start background tasks. Hooks returned by
+        ``get_hooks()`` are auto-registered before this method is called,
+        so only use this for additional setup beyond hook registration.
+        """
+        pass
+
+    async def on_disable(self):
+        """Called when feature is disabled.
+
+        Unregister hooks, stop background tasks. Hooks returned by
+        ``get_hooks()`` are auto-unregistered after this method is called,
+        so only use this for additional teardown beyond hook unregistration.
+        """
+        pass
+
+    async def on_remove(self):
+        """Called before feature package is uninstalled. Clean up stored data."""
+        pass
+
+    def get_hooks(self) -> List["Hook"]:
+        """Return hooks this feature wants registered.
+
+        Hooks are auto-registered with the agent's HooksManager when the
+        feature is enabled, and auto-unregistered when disabled. Features
+        that need hooks should override this instead of manually calling
+        ``hooks_manager.register()``.
+
+        Returns:
+            List of Hook instances to register.
+        """
+        return []
+
+    def get_router(self):
+        """Return a FastAPI APIRouter to mount, or None.
+
+        Features that expose HTTP endpoints can override this to return
+        an APIRouter instance. The agent will include the router in the
+        FastAPI app after all features are loaded.
+
+        Returns:
+            Optional APIRouter instance, or None.
+        """
+        return None
+
+    async def post_all_features_loaded(self, agent):
+        """Called after ALL features are discovered and initialized.
+
+        Use this for cross-feature wiring that depends on other features
+        being available. The ``agent.features`` dict is fully populated
+        when this method is called.
+
+        Args:
+            agent: The KestrelAgent instance with all features loaded.
+        """
+        pass
+
+    @property
+    def config_schema(self) -> Optional[Dict]:
+        """JSON Schema for feature configuration.
+
+        UI can render a form from this schema. Return None if the feature
+        has no user-configurable settings.
+        """
+        return None
+
+    async def get_config(self) -> Dict:
+        """Return the feature's current configuration."""
+        return {}
+
+    async def set_config(self, config: Dict) -> None:
+        """Update the feature's configuration.
+
+        Args:
+            config: New configuration values (validated against config_schema).
+        """
         pass
 
     # =========================================================================

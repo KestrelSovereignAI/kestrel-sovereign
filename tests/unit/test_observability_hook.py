@@ -284,16 +284,16 @@ class TestHookExceptionHandling:
 
 class TestFeatureInitialization:
     @pytest.mark.asyncio
-    async def test_feature_registers_hook(self):
+    async def test_feature_provides_hook_via_get_hooks(self):
         agent = _make_agent()
         feature = ObservabilityFeature(agent)
         await feature.initialize()
 
-        agent.hooks_manager.register.assert_called_once()
-        registered_hook = agent.hooks_manager.register.call_args[0][0]
-        assert isinstance(registered_hook, ObservabilityHook)
-        assert registered_hook.name == "observability"
-        assert registered_hook.priority == 999
+        hooks = feature.get_hooks()
+        assert len(hooks) == 1
+        assert isinstance(hooks[0], ObservabilityHook)
+        assert hooks[0].name == "observability"
+        assert hooks[0].priority == 999
 
     @pytest.mark.asyncio
     async def test_feature_handles_no_hooks_manager(self):
@@ -303,13 +303,14 @@ class TestFeatureInitialization:
         await feature.initialize()
 
     @pytest.mark.asyncio
-    async def test_feature_unregisters_on_shutdown(self):
+    async def test_feature_clears_hook_on_shutdown(self):
         agent = _make_agent()
         feature = ObservabilityFeature(agent)
         await feature.initialize()
         await feature.shutdown()
 
-        agent.hooks_manager.unregister.assert_called_once()
+        # After shutdown, get_hooks() returns empty (hook reference cleared)
+        assert feature.get_hooks() == []
 
     def test_feature_tool_description(self):
         agent = _make_agent()
