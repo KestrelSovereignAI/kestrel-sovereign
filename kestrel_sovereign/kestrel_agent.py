@@ -143,7 +143,8 @@ class KestrelAgent(
 
         self.llm_service = llm_service or LLMService()
         self.pg_pool = pg_pool
-        self.agent_id = did
+        # Note: agent_id is a @property that returns self.did (see below).
+        # Do NOT set self.agent_id = ... here; it would shadow the property.
         self.privacy_agent = None  # Will be initialized after storage
         self.lighthouse_provider = None  # Will be initialized after storage if API key available
         self.wallet = None  # Set by WalletFeature.initialize()
@@ -186,6 +187,19 @@ class KestrelAgent(
         self._init_constitution_audit_tracking()
 
     @property
+    def agent_id(self) -> str:
+        """Derived identity alias — always returns self.did.
+
+        DID is the canonical identity for every Kestrel agent.  ``agent_id``
+        exists as a convenience alias so that storage layers and feature
+        packages that accept an ``agent_id`` parameter receive the DID
+        without callers having to translate.
+
+        See: https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/500
+        """
+        return self.did
+
+    @property
     def mcp_agent(self):
         """Lazy lookup for MCPAgent feature."""
         return self.features.get("MCPAgent")
@@ -208,7 +222,7 @@ class KestrelAgent(
                 try:
                     from kestrel_sovereign.storage.sync.targets import LighthouseTarget
 
-                    agent_id = self.did or getattr(self, 'agent_id', None) or "default"
+                    agent_id = self.did or "default"
                     state_dir = Path(self.storage_path).parent
                     target = LighthouseTarget(
                         api_key=os.environ["LIGHTHOUSE_API_KEY"],
@@ -334,7 +348,7 @@ class KestrelAgent(
                         SovereignIPFSTarget, StorachaTarget, LighthouseTarget, GCSTarget,
                     )
 
-                    agent_id = self.did or self.agent_id or "default"
+                    agent_id = self.did or "default"
                     state_dir = Path(self.storage_path).parent if self.storage_path else None
 
                     self._sync_service = SyncService(db_path=self.storage_path)
