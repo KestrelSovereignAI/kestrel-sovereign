@@ -6,6 +6,8 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+runpod = pytest.importorskip("runpod", reason="runpod not installed (cloud extras)")
+
 from kestrel_sovereign.features.gcp_compute.core import (
     GCPComputeEngineManagerCore,
 )

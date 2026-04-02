@@ -8,11 +8,21 @@ import logging
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List
 
-import paramiko
 import requests
-import runpod
-from runpod.cli.utils.rp_info import get_pod_ssh_ip_port
-from runpod.cli.utils.rp_userspace import find_ssh_key_file
+
+try:
+    import paramiko
+except ImportError:
+    paramiko = None  # type: ignore[assignment]
+
+try:
+    import runpod
+    from runpod.cli.utils.rp_info import get_pod_ssh_ip_port
+    from runpod.cli.utils.rp_userspace import find_ssh_key_file
+except ImportError:
+    runpod = None  # type: ignore[assignment]
+    get_pod_ssh_ip_port = None  # type: ignore[assignment]
+    find_ssh_key_file = None  # type: ignore[assignment]
 
 from kestrel_sovereign.kestrel_config.constants import (
     HTTP_TIMEOUT_DEFAULT,
@@ -55,6 +65,11 @@ class DirectRunPodProvider(GPUProvider):
     """Provider that talks to RunPod directly using the runpod SDK."""
 
     def __init__(self, api_key: str, cloud_type: str = "COMMUNITY"):
+        if runpod is None:
+            raise ImportError(
+                "runpod package is required for DirectRunPodProvider. "
+                "Install it with: pip install kestrel-sovereign[cloud]"
+            )
         if not api_key:
             raise RunPodManagerError("RUNPOD_API_KEY is required for direct mode")
         self.api_key = api_key

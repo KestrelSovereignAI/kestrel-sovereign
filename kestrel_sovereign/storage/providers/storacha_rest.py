@@ -20,8 +20,12 @@ w3up protocol:   https://github.com/storacha/w3up
 import logging
 from typing import Any, Dict, List, Optional
 
-import cbor2
 import httpx
+
+try:
+    import cbor2
+except ImportError:
+    cbor2 = None  # type: ignore[assignment]
 
 from kestrel_sovereign.storage.providers.storacha_ucan import (
     StorachaUCAN,

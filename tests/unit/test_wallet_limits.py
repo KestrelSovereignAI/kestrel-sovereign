@@ -9,6 +9,7 @@ Tests critical security mechanisms that prevent financial loss:
 
 import os
 import pytest
+pytest.importorskip("web3", reason="web3 not installed (wallet extras)")
 from decimal import Decimal
 from datetime import date, timedelta
 from pathlib import Path

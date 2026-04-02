@@ -24,7 +24,10 @@ import time
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
-import cbor2
+try:
+    import cbor2
+except ImportError:
+    cbor2 = None  # type: ignore[assignment]
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
@@ -243,6 +246,11 @@ class StorachaUCAN:
             space_did: Space DID (e.g. "did:key:z6Mk...")
             proof:     Base64-encoded CARv1 bytes of the UCAN delegation
         """
+        if cbor2 is None:
+            raise ImportError(
+                "cbor2 package is required for StorachaUCAN. "
+                "Install it with: pip install kestrel-sovereign[wallet]"
+            )
         self._space_did = space_did
         self._private_key = self._load_agent_key(agent_key)
 

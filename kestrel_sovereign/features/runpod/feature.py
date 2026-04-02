@@ -27,7 +27,7 @@ class RunPodFeature(Feature):
     async def initialize(self):
         try:
             self.manager = RunPodManager()
-        except RunPodManagerError as e:
+        except (RunPodManagerError, ImportError) as e:
             logger.warning(f"RunPodFeature disabled: {e}")
             self.manager = None
             self.disabled = True
