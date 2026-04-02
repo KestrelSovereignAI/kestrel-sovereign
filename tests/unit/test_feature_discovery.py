@@ -4,14 +4,16 @@ Tests for the Feature Discovery module.
 
 import pytest
 import os
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, patch, MagicMock
 from kestrel_sovereign.features import (
     discover_features,
     discover_feature_modules,
+    discover_entrypoint_feature_classes,
     get_disabled_features,
     get_feature_by_name,
     find_feature_class,
-    DISABLED_FEATURES_ENV
+    DISABLED_FEATURES_ENV,
+    FEATURE_ENTRY_POINT_GROUP,
 )
 from kestrel_sovereign.features.base import Feature
 
@@ -250,3 +252,187 @@ class TestFeatureProfiles:
         expected = MANDATORY_FEATURES & all_names
 
         assert filtered_names == expected
+
+
+class TestEntryPointDiscovery:
+    """Tests for entry_point-based feature discovery from installed packages."""
+
+    def _make_entry_point(self, name: str, cls: type):
+        """Create a mock entry point that loads to the given class."""
+        ep = MagicMock()
+        ep.name = name
+        ep.value = f"{cls.__module__}:{cls.__name__}"
+        ep.load.return_value = cls
+        return ep
+
+    def test_discovers_entrypoint_features(self):
+        """Test that entry_point features are discovered."""
+        class ExternalFeature(Feature):
+            @property
+            def tool_description(self):
+                return "External"
+            async def initialize(self):
+                pass
+
+        ep = self._make_entry_point("ExternalFeature", ExternalFeature)
+        mock_eps = MagicMock()
+        mock_eps.select.return_value = [ep]
+
+        with patch("kestrel_sovereign.features.importlib.metadata.entry_points", return_value=mock_eps):
+            classes = discover_entrypoint_feature_classes()
+
+        assert "ExternalFeature" in classes
+        assert classes["ExternalFeature"] is ExternalFeature
+
+    def test_skips_non_feature_entrypoints(self):
+        """Test that entry_points not pointing to Feature subclasses are skipped."""
+        class NotAFeature:
+            pass
+
+        ep = self._make_entry_point("NotAFeature", NotAFeature)
+        mock_eps = MagicMock()
+        mock_eps.select.return_value = [ep]
+
+        with patch("kestrel_sovereign.features.importlib.metadata.entry_points", return_value=mock_eps):
+            classes = discover_entrypoint_feature_classes()
+
+        assert len(classes) == 0
+
+    def test_handles_load_failure(self):
+        """Test that failing entry_points are skipped gracefully."""
+        ep = MagicMock()
+        ep.name = "BrokenFeature"
+        ep.load.side_effect = ImportError("missing dependency")
+        mock_eps = MagicMock()
+        mock_eps.select.return_value = [ep]
+
+        with patch("kestrel_sovereign.features.importlib.metadata.entry_points", return_value=mock_eps):
+            classes = discover_entrypoint_feature_classes()
+
+        assert len(classes) == 0
+
+    def test_local_features_win_on_duplicate(self):
+        """Test that local features take priority over entry_point features on name collision."""
+        class DuplicateFeature(Feature):
+            @property
+            def tool_description(self):
+                return "Entry-point version"
+            async def initialize(self):
+                pass
+
+        ep = self._make_entry_point("HeartbeatFeature", DuplicateFeature)
+        # Rename the class to match a real local feature
+        DuplicateFeature.__name__ = "HeartbeatFeature"
+        mock_eps = MagicMock()
+        mock_eps.select.return_value = [ep]
+
+        agent = Mock()
+        agent.storage = Mock()
+        agent.llm_service = Mock()
+
+        with patch("kestrel_sovereign.features.importlib.metadata.entry_points", return_value=mock_eps):
+            features = discover_features(agent)
+
+        # HeartbeatFeature should be the LOCAL version, not the entry_point one
+        heartbeats = [f for f in features if f.__class__.__name__ == "HeartbeatFeature"]
+        assert len(heartbeats) == 1
+        # The local HeartbeatFeature won't be our DuplicateFeature class
+        assert heartbeats[0].__class__ is not DuplicateFeature
+
+    def test_entrypoint_features_loaded_when_no_local_duplicate(self):
+        """Test that entry_point features are loaded when there's no local duplicate."""
+        class UniqueExternalFeature(Feature):
+            @property
+            def tool_description(self):
+                return "Unique external"
+            async def initialize(self):
+                pass
+
+        ep = self._make_entry_point("UniqueExternalFeature", UniqueExternalFeature)
+        mock_eps = MagicMock()
+        mock_eps.select.return_value = [ep]
+
+        agent = Mock()
+        agent.storage = Mock()
+        agent.llm_service = Mock()
+
+        with patch("kestrel_sovereign.features.importlib.metadata.entry_points", return_value=mock_eps):
+            features = discover_features(agent)
+
+        names = {f.__class__.__name__ for f in features}
+        assert "UniqueExternalFeature" in names
+
+    def test_entrypoint_features_respect_disabled(self):
+        """Test that KESTREL_DISABLED_FEATURES applies to entry_point features."""
+        class DisableMe(Feature):
+            @property
+            def tool_description(self):
+                return "Should be disabled"
+            async def initialize(self):
+                pass
+
+        ep = self._make_entry_point("DisableMe", DisableMe)
+        mock_eps = MagicMock()
+        mock_eps.select.return_value = [ep]
+
+        agent = Mock()
+        agent.storage = Mock()
+        agent.llm_service = Mock()
+
+        with patch("kestrel_sovereign.features.importlib.metadata.entry_points", return_value=mock_eps), \
+             patch.dict(os.environ, {DISABLED_FEATURES_ENV: "DisableMe"}):
+            features = discover_features(agent)
+
+        names = {f.__class__.__name__ for f in features}
+        assert "DisableMe" not in names
+
+    def test_entrypoint_features_respect_allowed_features(self):
+        """Test that allowed_features filtering applies to entry_point features."""
+        from kestrel_sovereign.rookery.config import MANDATORY_FEATURES
+
+        class AllowedExternal(Feature):
+            @property
+            def tool_description(self):
+                return "Allowed"
+            async def initialize(self):
+                pass
+
+        class DeniedExternal(Feature):
+            @property
+            def tool_description(self):
+                return "Denied"
+            async def initialize(self):
+                pass
+
+        eps = [
+            self._make_entry_point("AllowedExternal", AllowedExternal),
+            self._make_entry_point("DeniedExternal", DeniedExternal),
+        ]
+        mock_eps = MagicMock()
+        mock_eps.select.return_value = eps
+
+        agent = Mock()
+        agent.storage = Mock()
+        agent.llm_service = Mock()
+
+        allowed = {"AllowedExternal"} | MANDATORY_FEATURES
+        with patch("kestrel_sovereign.features.importlib.metadata.entry_points", return_value=mock_eps):
+            features = discover_features(agent, allowed_features=allowed)
+
+        names = {f.__class__.__name__ for f in features}
+        assert "AllowedExternal" in names
+        assert "DeniedExternal" not in names
+
+    def test_empty_entrypoints_no_error(self):
+        """Test that no entry_points is handled gracefully."""
+        mock_eps = MagicMock()
+        mock_eps.select.return_value = []
+
+        with patch("kestrel_sovereign.features.importlib.metadata.entry_points", return_value=mock_eps):
+            classes = discover_entrypoint_feature_classes()
+
+        assert classes == {}
+
+    def test_entrypoint_group_constant(self):
+        """Test that the entry_point group constant is correct."""
+        assert FEATURE_ENTRY_POINT_GROUP == "kestrel_sovereign.features"
