@@ -136,7 +136,11 @@ def _mount_feature_routers(app: FastAPI) -> None:
     it in the FastAPI app. This allows feature packages (voice, spawn,
     observability, etc.) to contribute HTTP endpoints dynamically —
     disabling a feature cleanly removes its routes.
+
+    Tracks the number of routes added so they can be removed on shutdown
+    via ``_unmount_feature_routers``.
     """
+    routes_before = len(app.routes)
     mounted = []
 
     def _collect_routers_from_agent(agent) -> None:
@@ -165,8 +169,24 @@ def _mount_feature_routers(app: FastAPI) -> None:
             if agent is not None:
                 _collect_routers_from_agent(agent)
 
+    # Record how many routes were added so shutdown can remove them
+    app.state._feature_route_count = len(app.routes) - routes_before
+
     if mounted:
         logger.info("Dynamically mounted routers from features: %s", ", ".join(mounted))
+
+
+def _unmount_feature_routers(app: FastAPI) -> None:
+    """Remove dynamically-mounted feature routes added by ``_mount_feature_routers``.
+
+    This prevents route accumulation when the app lifespan restarts
+    (e.g. across TestClient sessions in the same pytest process).
+    """
+    count = getattr(app.state, "_feature_route_count", 0)
+    if count > 0:
+        del app.routes[-count:]
+        app.state._feature_route_count = 0
+        logger.info("Removed %d dynamically-mounted feature routes", count)
 
 
 @asynccontextmanager
@@ -249,6 +269,7 @@ async def lifespan(app: FastAPI):
 
     # Shutdown
     logger.info("Server shutting down...")
+    _unmount_feature_routers(app)
     if getattr(app.state, 'agent_manager', None):
         await app.state.agent_manager.shutdown_all()
         logger.info("All agents shutdown complete.")
