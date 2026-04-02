@@ -94,6 +94,11 @@ class SecurityFeature(Feature):
             return [self.security_hook]
         return []
 
+    async def post_all_features_loaded(self, agent):
+        """Register all tools with security permissions after all features are loaded."""
+        await self._register_all_tools()
+        logger.info("Security permissions registered for all features")
+
     async def _async_init(self):
         """Async initialization (database setup)."""
         async with self._init_lock:
