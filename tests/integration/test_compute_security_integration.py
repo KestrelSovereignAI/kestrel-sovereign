@@ -62,6 +62,9 @@ async def compute_feature(mock_agent):
     feature = ComputeFeature(mock_agent)
     await feature.initialize()
     mock_agent.features["ComputeFeature"] = feature
+    # Auto-register hooks (mirrors _register_feature in kestrel_agent.py)
+    for hook in feature.get_hooks():
+        mock_agent.hooks_manager.register(hook)
     return feature
 
 
@@ -71,6 +74,9 @@ async def security_feature(mock_agent):
     feature = SecurityFeature(mock_agent)
     await feature.initialize()
     mock_agent.features["SecurityFeature"] = feature
+    # Auto-register hooks (mirrors _register_feature in kestrel_agent.py)
+    for hook in feature.get_hooks():
+        mock_agent.hooks_manager.register(hook)
     return feature
 
 

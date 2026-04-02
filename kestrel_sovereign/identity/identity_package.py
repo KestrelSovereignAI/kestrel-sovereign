@@ -218,6 +218,10 @@ class AgentIdentityPackage:
     wallet_balance: str = "0.0"  # Decimal as string for precision
     wallet_transaction_history: List[Dict[str, Any]] = field(default_factory=list)
 
+    # === LEGAL ENTITY ===
+    # Wyoming DAO LLC or DUNA status (travels across substrate migrations)
+    legal_entity: Optional[Dict[str, Any]] = None
+
     # === MIGRATION METADATA ===
     package_version: str = IDENTITY_PACKAGE_VERSION
     export_timestamp: str = ""
@@ -273,6 +277,9 @@ class AgentIdentityPackage:
             "wallet_balance": self.wallet_balance,
             "wallet_transaction_history": self.wallet_transaction_history,
 
+            # Legal entity
+            "legal_entity": self.legal_entity,
+
             # Voice identity
             "voice_config": self.voice_config,
 
@@ -325,6 +332,7 @@ class AgentIdentityPackage:
             tool_preferences=data.get("tool_preferences", {}),
             wallet_balance=data.get("wallet_balance", "0.0"),
             wallet_transaction_history=data.get("wallet_transaction_history", []),
+            legal_entity=data.get("legal_entity"),
             voice_config=data.get("voice_config"),
             package_version=data.get("package_version", IDENTITY_PACKAGE_VERSION),
             export_timestamp=data.get("export_timestamp", ""),
@@ -385,6 +393,7 @@ class AgentIdentityPackage:
             "migrations_count": len(self.migration_history),
             "is_signed": bool(self.signature),
             "constitution_verified": self.verify_constitution() if self.constitution_text else False,
+            "legal_entity_status": self.legal_entity.get("status") if self.legal_entity else None,
         }
 
 
