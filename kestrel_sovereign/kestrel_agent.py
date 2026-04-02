@@ -13,9 +13,7 @@ from typing import Optional, Dict, List, Any, Union
 import re
 from pathlib import Path
 from kestrel_sovereign.privacy import PrivacyMode
-from decimal import Decimal, getcontext
 from kestrel_sovereign.extensions.app_extension import AppExtension
-from kestrel_sovereign.features.wallet import WalletAgent
 from kestrel_sovereign.features.privacy import PrivacyAgent
 from kestrel_sovereign.features import discover_features, get_feature_by_name
 from kestrel_sovereign.features.base import Feature
@@ -52,9 +50,6 @@ try:
     import ollama
 except ImportError:
     ollama = None
-
-# Set precision for Decimal calculations
-getcontext().prec = 18
 
 # Prompt file locations
 PROMPTS_DIR = Path(__file__).parent / "prompts"
@@ -151,6 +146,8 @@ class KestrelAgent(
         self.agent_id = did
         self.privacy_agent = None  # Will be initialized after storage
         self.lighthouse_provider = None  # Will be initialized after storage if API key available
+        self.wallet = None  # Set by WalletFeature.initialize()
+        self.reflection_hook = None  # Set by ReflectionFeature.post_all_features_loaded()
 
         # TaskManager for A2A unified routing
         self.task_manager: Optional[TaskManager] = None
@@ -187,7 +184,17 @@ class KestrelAgent(
 
         # Initialize constitution audit tracking
         self._init_constitution_audit_tracking()
-    
+
+    @property
+    def mcp_agent(self):
+        """Lazy lookup for MCPAgent feature."""
+        return self.features.get("MCPAgent")
+
+    @property
+    def model_agent(self):
+        """Lazy lookup for ModelAgent feature."""
+        return self.features.get("ModelAgent")
+
     async def initialize(self) -> None:
         """Async initialization of storage and features."""
         if self._raw_storage is None:
@@ -395,29 +402,8 @@ class KestrelAgent(
                 await feature.post_all_features_loaded(self)
             logging.info("post_all_features_loaded called for all features")
 
-            # Set up feature references
-            self.mcp_agent = self.features.get("MCPAgent")
-            self.model_agent = self.features.get("ModelAgent")
-            logging.info("Feature references set up")
-
-            # Pre-explore SpawnFeature so spawn tools are immediately
-            # available to the orchestrator (not behind a subagent hop)
-            spawn_feature = self.features.get("SpawnFeature")
-            if spawn_feature:
-                self._register_explored_feature_tools(spawn_feature)
-                logging.info("SpawnFeature tools pre-explored for direct calling")
-
-            # Register all tools with SecurityFeature AFTER all features are loaded
-            security = self.features.get("SecurityFeature")
-            if security and hasattr(security, '_register_all_tools'):
-                await security._register_all_tools()
-                logging.info("Security permissions registered for all features")
-
-            # Wire reflection into sleep cycle (runs pre/post-consolidation analysis)
-            from kestrel_sovereign.features.reflection.hooks import create_reflection_hook
-            self.reflection_hook = create_reflection_hook(self)
-            if self.reflection_hook:
-                logging.info("Reflection hook enabled for sleep cycle")
+            # Feature references resolved lazily via properties
+            logging.info("Feature references available via lazy properties")
 
             # Initialize state
             self.conversations = {}
@@ -444,7 +430,7 @@ class KestrelAgent(
                 self.audit_enabled = False
                 logging.info("Audit disabled - only mock LLM providers available (demo mode)")
 
-            # Initialize wallet with genesis budget
+            # Ensure agent graph node exists
             logging.info(f"Getting agent node from storage (agent_id={self.agent_id})")
             agent_node = await self.storage.get_node(self.agent_id)
             logging.info(f"Agent node retrieved: {agent_node is not None}")
@@ -498,16 +484,6 @@ class KestrelAgent(
                     logging.warning(f"Could not activate agent OpenRouter key: {e}")
                 except Exception as e:
                     logging.warning(f"Could not activate agent OpenRouter key: {e}", exc_info=True)
-
-            initial_balance_str = agent_node.properties.get("initialBalance", "100.0")
-            logging.info(f"Creating WalletAgent with db_path={self.storage_path}")
-            self.wallet = WalletAgent(
-                agent_id=self.agent_id,
-                initial_balance=Decimal(initial_balance_str),
-                db_path=self.storage_path
-            )
-            await self.wallet.initialize()
-            logging.info("WalletAgent initialized")
 
             # Initialize memory consolidator for episode management
             logging.info("Creating MemoryConsolidator")
@@ -580,8 +556,7 @@ class KestrelAgent(
             if self._heartbeat_config.enabled:
                 await self.heartbeat_runner.start()
 
-            # Auto-schedule reflection + training (idempotent — skips if already scheduled)
-            await self._setup_default_schedules()
+            # Default schedules are now set up by SchedulerFeature.post_all_features_loaded()
 
     @property
     def privacy_mode(self) -> PrivacyMode:
@@ -665,41 +640,6 @@ class KestrelAgent(
                 logging.info(f"Auto-unregistered hook '{hook.name}' from feature '{feature_name}'")
 
         logging.info(f"Feature '{feature_name}' disabled")
-
-    async def _setup_default_schedules(self):
-        """Register default scheduled tasks for self-improvement.
-
-        Idempotent — checks for existing tasks before adding.
-        Requires both SchedulerFeature and ReflectionFeature to be loaded.
-        """
-        scheduler = self.features.get("SchedulerFeature")
-        reflection = self.features.get("ReflectionFeature")
-        if not scheduler or not reflection:
-            return
-
-        # Check what's already scheduled
-        existing = await scheduler.schedule_list()
-        existing_names = {t["task_name"] for t in existing.get("tasks", [])}
-
-        defaults = [
-            ("reflect", "0 */4 * * *", '{"scope":"all","depth":"normal"}'),
-            ("training_cycle", "0 3 * * *", '{"iterations":3,"depth":"normal"}'),
-            ("backup_snapshot", "0 */4 * * *", "{}"),
-            ("morning_signal", "0 8 * * *", "{}"),
-            ("signal_dispatch", "5 8 * * *", "{}"),
-        ]
-
-        for task_name, cron, args in defaults:
-            if task_name in existing_names:
-                logging.debug(f"Schedule '{task_name}' already exists, skipping")
-                continue
-            result = await scheduler.schedule_add(
-                cron_expression=cron, task_name=task_name, args_json=args,
-            )
-            if result.get("success"):
-                logging.info(f"Scheduled '{task_name}' ({cron}), next: {result.get('next_run_at')}")
-            else:
-                logging.warning(f"Failed to schedule '{task_name}': {result.get('error')}")
 
     # Solvency State
     _current_model_preference: Optional[str] = None

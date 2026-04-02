@@ -94,6 +94,13 @@ class ReflectionFeature(Feature):
         self._init_reflection_checkers()
         self._init_optional_services()
 
+    async def post_all_features_loaded(self, agent):
+        """Wire reflection into the sleep cycle after all features are loaded."""
+        from kestrel_sovereign.features.reflection.hooks import create_reflection_hook
+        agent.reflection_hook = create_reflection_hook(agent)
+        if agent.reflection_hook:
+            logger.info("Reflection hook enabled for sleep cycle")
+
     def _init_database(self):
         """Initialize database connection and helper."""
         # Get database from agent

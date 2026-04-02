@@ -89,6 +89,46 @@ class SchedulerFeature(Feature):
         await self._runner.start()
         logger.info("SchedulerFeature initialized")
 
+    async def post_all_features_loaded(self, agent):
+        """Register default scheduled tasks after all features are loaded.
+
+        Idempotent — checks for existing tasks before adding.
+        Only schedules reflection/training if ReflectionFeature is available.
+        """
+        if not self._db:
+            return
+
+        # Check what's already scheduled
+        existing = await self.schedule_list()
+        existing_names = {t["task_name"] for t in existing.get("tasks", [])}
+
+        # Reflection-dependent schedules only if ReflectionFeature is loaded
+        has_reflection = "ReflectionFeature" in agent.features
+
+        defaults = [
+            ("backup_snapshot", "0 */4 * * *", "{}"),
+            ("morning_signal", "0 8 * * *", "{}"),
+            ("signal_dispatch", "5 8 * * *", "{}"),
+        ]
+
+        if has_reflection:
+            defaults.extend([
+                ("reflect", "0 */4 * * *", '{"scope":"all","depth":"normal"}'),
+                ("training_cycle", "0 3 * * *", '{"iterations":3,"depth":"normal"}'),
+            ])
+
+        for task_name, cron, args in defaults:
+            if task_name in existing_names:
+                logger.debug("Schedule '%s' already exists, skipping", task_name)
+                continue
+            result = await self.schedule_add(
+                cron_expression=cron, task_name=task_name, args_json=args,
+            )
+            if result.get("success"):
+                logger.info("Scheduled '%s' (%s), next: %s", task_name, cron, result.get("next_run_at"))
+            else:
+                logger.warning("Failed to schedule '%s': %s", task_name, result.get("error"))
+
     async def shutdown(self):
         """Stop the background runner."""
         if self._runner:
