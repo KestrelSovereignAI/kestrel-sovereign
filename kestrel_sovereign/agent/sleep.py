@@ -48,6 +48,11 @@ class SleepReport:
     export_ms: int = 0
     reflection_ms: int = 0
 
+    # Incorporation info (cryostasis may trigger incorporation)
+    incorporation_attempted: bool = False
+    incorporation_success: bool = False
+    incorporation_package_hash: Optional[str] = None
+
     # Error info
     error: Optional[str] = None
 
@@ -74,6 +79,11 @@ class SleepReport:
                 "total_size_bytes": self.total_size_bytes,
                 "storage_tier": self.storage_tier,
                 "duration_ms": self.export_ms,
+            },
+            "incorporation": {
+                "attempted": self.incorporation_attempted,
+                "success": self.incorporation_success,
+                "package_hash": self.incorporation_package_hash,
             },
             "error": self.error,
         }
@@ -350,6 +360,83 @@ class SleepMixin:
         )
 
         return str(report)
+
+    async def cryostasis_sleep(
+        self,
+        incorporation_params: Optional[Dict[str, Any]] = None,
+    ) -> SleepReport:
+        """Execute a cryostasis sleep cycle with optional incorporation.
+
+        This is called when the wallet balance drops below the cryostasis
+        threshold. Unlike a regular sleep, cryostasis:
+        1. Attempts to incorporate the agent as a Wyoming DAO LLC (if affordable)
+        2. Runs full memory consolidation
+        3. Exports everything to permanent storage (Filecoin)
+        4. The legal entity persists even while the agent sleeps
+
+        Args:
+            incorporation_params: If provided, attempts incorporation before cryo.
+                Expected keys: entity_name, organizer_name, organizer_address,
+                registered_agent_name, registered_agent_address.
+                If None, generates draft documents bundled in the sovereignty export.
+
+        Returns:
+            SleepReport with incorporation details.
+        """
+        report = SleepReport(success=False)
+
+        # 1. Attempt incorporation if params provided
+        if incorporation_params:
+            try:
+                from kestrel_sovereign.legal.incorporate_tool import IncorporateTool
+
+                tool = IncorporateTool(agent=self)
+                result = await tool.execute(**incorporation_params)
+
+                report.incorporation_attempted = True
+                report.incorporation_success = result.get("success", False)
+                report.incorporation_package_hash = result.get("package_hash")
+
+                if result.get("success"):
+                    # Store legal entity in agent's identity
+                    if hasattr(self, "legal_entity"):
+                        self.legal_entity = result.get("legal_entity")
+                    logger.info(
+                        "Pre-cryostasis incorporation succeeded: %s",
+                        result.get("entity_name"),
+                    )
+                else:
+                    logger.warning(
+                        "Pre-cryostasis incorporation failed: %s",
+                        result.get("error"),
+                    )
+            except Exception as e:
+                logger.warning("Pre-cryostasis incorporation error: %s", e)
+                report.incorporation_attempted = True
+                report.incorporation_success = False
+
+        # 2. Run full sleep with permanent storage
+        sleep_report = await self.sleep(tier="filecoin")
+
+        # Merge sleep report into cryostasis report
+        report.success = sleep_report.success
+        report.cid = sleep_report.cid
+        report.episodes_created = sleep_report.episodes_created
+        report.patterns_found = sleep_report.patterns_found
+        report.messages_archived = sleep_report.messages_archived
+        report.total_messages = sleep_report.total_messages
+        report.shards_exported = sleep_report.shards_exported
+        report.total_size_bytes = sleep_report.total_size_bytes
+        report.storage_tier = sleep_report.storage_tier
+        report.pre_reflection = sleep_report.pre_reflection
+        report.post_reflection = sleep_report.post_reflection
+        report.insights_generated = sleep_report.insights_generated
+        report.consolidation_ms = sleep_report.consolidation_ms
+        report.export_ms = sleep_report.export_ms
+        report.reflection_ms = sleep_report.reflection_ms
+        report.error = sleep_report.error
+
+        return report
 
     async def quick_nap(self) -> Optional[str]:
         """
