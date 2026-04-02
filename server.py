@@ -128,6 +128,47 @@ async def verify_api_key(
     )
 
 
+def _mount_feature_routers(app: FastAPI) -> None:
+    """Mount routers contributed by discovered features.
+
+    After agent initialization, iterate over all registered features and
+    call ``feature.get_router()``. If a feature returns a router, include
+    it in the FastAPI app. This allows feature packages (voice, spawn,
+    observability, etc.) to contribute HTTP endpoints dynamically —
+    disabling a feature cleanly removes its routes.
+    """
+    mounted = []
+
+    def _collect_routers_from_agent(agent) -> None:
+        features = getattr(agent, "features", {})
+        if not features:
+            return
+        for name, feature in features.items():
+            try:
+                router = feature.get_router()
+                if router is not None:
+                    app.include_router(router)
+                    mounted.append(name)
+            except Exception as exc:
+                logger.warning("Failed to mount router from feature %s: %s", name, exc)
+
+    # Single-agent mode
+    agent = getattr(app.state, "agent", None)
+    if agent is not None:
+        _collect_routers_from_agent(agent)
+
+    # Multi-agent mode — mount routers from all loaded agents
+    manager = getattr(app.state, "agent_manager", None)
+    if manager is not None:
+        for agent_name in manager.list_agents():
+            agent = manager.get_agent(agent_name)
+            if agent is not None:
+                _collect_routers_from_agent(agent)
+
+    if mounted:
+        logger.info("Dynamically mounted routers from features: %s", ", ".join(mounted))
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage the application's lifespan."""
@@ -198,6 +239,9 @@ async def lifespan(app: FastAPI):
             app.state.agent = None
             _set_startup_error(app, e)
 
+    # Dynamic router mounting: features contribute routers via get_router()
+    _mount_feature_routers(app)
+
     # Initialize OpenTelemetry tracing (no-op if packages not installed)
     setup_tracing(app)
 
@@ -235,7 +279,7 @@ if SERVE_UI:
     app.mount("/shared", StaticFiles(directory=str(STATIC_DIR / "shared")), name="shared")
     app.mount("/utils", StaticFiles(directory=str(STATIC_DIR / "utils")), name="utils")
 
-# Include routers
+# Include core routers (always present, not feature-gated)
 from endpoints import (
     agent_router,
     conversations_router,
@@ -246,11 +290,8 @@ from endpoints import (
     commands_router,
     files_router,
     security_router,
-    observability_router,
     saved_items_router,
     metrics_router,
-    spawn_router,
-    voice_router,
 )
 
 from endpoints.auth_oauth import router as auth_oauth_router, register_oauth, oauth
@@ -266,11 +307,8 @@ app.include_router(models_router)
 app.include_router(commands_router)
 app.include_router(files_router)
 app.include_router(security_router)
-app.include_router(observability_router)
 app.include_router(saved_items_router)
 app.include_router(metrics_router)
-app.include_router(spawn_router)
-app.include_router(voice_router)
 
 
 # --- GitHub API Proxy (for Portfolio Dashboard) ---

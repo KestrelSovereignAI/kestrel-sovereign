@@ -28,6 +28,15 @@ class ObservabilityFeature(Feature):
     def tool_description(self) -> str:
         return "Lifecycle event observability and monitoring"
 
+    def get_router(self):
+        """Return the Observability HTTP router for dynamic mounting.
+
+        The router is defined in endpoints/observability.py and mounted by
+        the server only when ObservabilityFeature is discovered and enabled.
+        """
+        from endpoints.observability import router
+        return router
+
     async def initialize(self):
         """Create the ObservabilityHook (auto-registered via get_hooks)."""
         self._hook = ObservabilityHook(agent=self.agent)
