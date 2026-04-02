@@ -43,7 +43,10 @@ logger = logging.getLogger(__name__)
 # RealVisXL V5.0 in diffusers format - photorealistic, top-rated SDXL model
 # Used for both training (with text encoder) and inference
 DEFAULT_MODEL_PATH = os.environ.get("LOCAL_MPS_MODEL_PATH", "")
-DEFAULT_WORKING_DIR = os.environ.get("LOCAL_MPS_WORKING_DIR", "/Volumes/data2/models/local-training")
+DEFAULT_WORKING_DIR = os.environ.get(
+    "LOCAL_MPS_WORKING_DIR",
+    os.path.join(os.environ.get("KESTREL_DATA_DIR", os.path.expanduser("~")), "kestrel-training"),
+)
 DEFAULT_DIFFUSERS_PATH = os.environ.get("DIFFUSERS_PATH", "")
 
 
