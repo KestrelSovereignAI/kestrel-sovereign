@@ -9,7 +9,6 @@ import io
 import json
 import logging
 import re
-import threading
 from pathlib import Path
 from typing import AsyncIterator, Optional
 
@@ -80,10 +79,13 @@ class PiperTTSProvider(TTSProvider):
         self._data_dir = Path(config.get("data_dir", "/data/models/piper"))
         # Cache: voice_id -> PiperVoice instance
         self._model_cache: dict = {}
-        self._cache_lock = threading.Lock()
+        self._cache_lock = asyncio.Lock()
 
-    def _get_voice_model(self, voice_id: str):
-        """Load or retrieve a cached Piper voice model (not async — called via to_thread).
+    async def _get_voice_model(self, voice_id: str):
+        """Load or retrieve a cached Piper voice model.
+
+        Uses an asyncio lock to prevent concurrent loads of the same model.
+        The actual model loading is offloaded to a thread.
 
         Args:
             voice_id: Voice model name (e.g. "en_US-lessac-medium").
@@ -95,10 +97,16 @@ class PiperTTSProvider(TTSProvider):
             FileNotFoundError: If the ONNX model file doesn't exist.
             ImportError: If piper-tts isn't installed.
         """
-        with self._cache_lock:
+        async with self._cache_lock:
             if voice_id in self._model_cache:
                 return self._model_cache[voice_id]
 
+            voice = await asyncio.to_thread(self._load_voice_model, voice_id)
+            self._model_cache[voice_id] = voice
+            return voice
+
+    def _load_voice_model(self, voice_id: str):
+        """Load a Piper voice model from disk (sync, called via to_thread)."""
         from piper import PiperVoice
 
         model_path = self._data_dir / f"{voice_id}.onnx"
@@ -111,19 +119,17 @@ class PiperTTSProvider(TTSProvider):
             )
 
         config_path_arg = str(config_path) if config_path.exists() else None
-        voice = PiperVoice.load(str(model_path), config_path=config_path_arg)
+        return PiperVoice.load(str(model_path), config_path=config_path_arg)
 
-        with self._cache_lock:
-            self._model_cache[voice_id] = voice
-
-        return voice
-
-    def _synthesize_sync(self, text: str, voice_id: str) -> bytes:
+    def _synthesize_sync(self, text: str, voice) -> bytes:
         """Synchronous synthesis — runs in a thread via asyncio.to_thread().
+
+        Args:
+            text: Text to synthesize.
+            voice: Pre-loaded PiperVoice instance.
 
         Returns raw WAV bytes (16-bit PCM).
         """
-        voice = self._get_voice_model(voice_id)
         wav_buf = io.BytesIO()
         with wave_file(wav_buf, voice.config) as wav:
             voice.synthesize(text, wav)
@@ -183,7 +189,8 @@ class PiperTTSProvider(TTSProvider):
         CPU-bound work is offloaded via asyncio.to_thread().
         """
         vid = voice_id or self._default_voice
-        wav_bytes = await asyncio.to_thread(self._synthesize_sync, text, vid)
+        voice = await self._get_voice_model(vid)
+        wav_bytes = await asyncio.to_thread(self._synthesize_sync, text, voice)
 
         if output_format != "wav":
             wav_bytes = await asyncio.to_thread(
@@ -198,6 +205,7 @@ class PiperTTSProvider(TTSProvider):
         Splits input on sentence boundaries and yields one audio chunk per sentence.
         """
         vid = voice_id or self._default_voice
+        voice = await self._get_voice_model(vid)
         sentences = _SENTENCE_RE.split(text)
 
         for sentence in sentences:
@@ -205,7 +213,7 @@ class PiperTTSProvider(TTSProvider):
             if not sentence:
                 continue
             wav_bytes = await asyncio.to_thread(
-                self._synthesize_sync, sentence, vid
+                self._synthesize_sync, sentence, voice
             )
             if output_format != "wav":
                 wav_bytes = await asyncio.to_thread(

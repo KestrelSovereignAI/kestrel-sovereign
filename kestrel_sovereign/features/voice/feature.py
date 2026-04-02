@@ -314,6 +314,9 @@ class VoiceFeature(Feature):
         output_format = output_format or self._voice_config.output_format or "opus"
 
         tap = AgentStreamTap.get_instance()
+        if not tap.has_stream(request_id):
+            raise ValueError(f"No active agent stream for request_id={request_id}")
+
         buffer = ""
 
         async for text_chunk in tap.subscribe(request_id):

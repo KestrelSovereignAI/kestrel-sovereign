@@ -154,9 +154,11 @@ class TestSynthesize:
         })
 
         wav_data = _make_wav_bytes()
+        mock_voice = MagicMock()
 
-        # Mock _synthesize_sync to return WAV bytes directly
-        with patch.object(provider, "_synthesize_sync", return_value=wav_data):
+        # Mock both model loading and synthesis
+        with patch.object(provider, "_get_voice_model", return_value=mock_voice), \
+             patch.object(provider, "_synthesize_sync", return_value=wav_data):
             result = await provider.synthesize("Hello", "test-voice", output_format="wav")
 
         assert result == wav_data
@@ -171,11 +173,13 @@ class TestSynthesize:
             "data_dir": str(tmp_path),
             "model": "en_US-lessac-medium",
         })
+        mock_voice = MagicMock()
 
-        with patch.object(provider, "_synthesize_sync", return_value=_make_wav_bytes()) as mock_sync:
+        with patch.object(provider, "_get_voice_model", return_value=mock_voice) as mock_get, \
+             patch.object(provider, "_synthesize_sync", return_value=_make_wav_bytes()):
             await provider.synthesize("Hello", "", output_format="wav")
 
-        mock_sync.assert_called_once_with("Hello", "en_US-lessac-medium")
+        mock_get.assert_called_once_with("en_US-lessac-medium")
 
 
 # ---------------------------------------------------------------------------
@@ -191,7 +195,9 @@ class TestSynthesizeStream:
         provider = PiperTTSProvider({"data_dir": str(tmp_path)})
 
         wav_data = _make_wav_bytes()
-        with patch.object(provider, "_synthesize_sync", return_value=wav_data):
+        mock_voice = MagicMock()
+        with patch.object(provider, "_get_voice_model", return_value=mock_voice), \
+             patch.object(provider, "_synthesize_sync", return_value=wav_data):
             chunks = []
             async for chunk in provider.synthesize_stream(
                 "Hello world. How are you? Fine thanks.",
@@ -208,7 +214,9 @@ class TestSynthesizeStream:
         provider = PiperTTSProvider({"data_dir": str(tmp_path)})
 
         wav_data = _make_wav_bytes()
-        with patch.object(provider, "_synthesize_sync", return_value=wav_data):
+        mock_voice = MagicMock()
+        with patch.object(provider, "_get_voice_model", return_value=mock_voice), \
+             patch.object(provider, "_synthesize_sync", return_value=wav_data):
             chunks = []
             async for chunk in provider.synthesize_stream(
                 "Hello world",
@@ -227,21 +235,18 @@ class TestSynthesizeStream:
 class TestModelCaching:
     """Tests for ONNX model caching behavior."""
 
-    def test_cache_returns_same_instance(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_cache_returns_same_instance(self, tmp_path):
         """_get_voice_model() caches and returns the same instance."""
         _create_onnx_model(tmp_path, "test-voice")
         provider = PiperTTSProvider({"data_dir": str(tmp_path)})
 
         mock_voice = MagicMock()
-        mock_voice_cls = MagicMock(return_value=mock_voice)
-        mock_voice_cls.load = MagicMock(return_value=mock_voice)
 
-        with patch.dict("sys.modules", {"piper": MagicMock()}):
-            with patch("kestrel_sovereign.voice.piper_tts.PiperTTSProvider._get_voice_model") as mock_get:
-                mock_get.return_value = mock_voice
-                result1 = provider._get_voice_model("test-voice")
-                result2 = provider._get_voice_model("test-voice")
-                assert result1 is result2
+        with patch.object(provider, "_load_voice_model", return_value=mock_voice):
+            result1 = await provider._get_voice_model("test-voice")
+            result2 = await provider._get_voice_model("test-voice")
+            assert result1 is result2
 
 
 # ---------------------------------------------------------------------------
