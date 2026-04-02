@@ -168,20 +168,20 @@ class TestLocalMPSAdapter:
 
         assert LocalMPSTrainingAdapter.provider_name == "local_mps"
 
-    def test_adapter_instantiation(self):
+    def test_adapter_instantiation(self, tmp_path):
         """Test adapter can be instantiated."""
         from kestrel_sovereign.features.training.adapters import LocalMPSTrainingAdapter
 
-        adapter = LocalMPSTrainingAdapter()
+        adapter = LocalMPSTrainingAdapter(working_dir=str(tmp_path / "training"))
 
         assert adapter.provider_name == "local_mps"
         assert adapter.working_dir.exists()
 
-    def test_is_available_check(self):
+    def test_is_available_check(self, tmp_path):
         """Test availability check doesn't crash."""
         from kestrel_sovereign.features.training.adapters import LocalMPSTrainingAdapter
 
-        adapter = LocalMPSTrainingAdapter()
+        adapter = LocalMPSTrainingAdapter(working_dir=str(tmp_path / "training"))
         available = adapter.is_available()
 
         # Should return bool without crashing
