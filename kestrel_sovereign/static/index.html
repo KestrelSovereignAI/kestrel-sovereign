@@ -880,6 +880,12 @@
             color: white;
         }
 
+        .feature-filter-btn.active {
+            background: var(--accent-color) !important;
+            color: white !important;
+            border-color: var(--accent-color) !important;
+        }
+
         /* Loading state */
         .loading {
             display: flex;
@@ -944,6 +950,7 @@
             <button class="nav-tab" data-panel="resources">Resources</button>
             <button class="nav-tab" data-panel="metrics">Metrics</button>
             <button class="nav-tab" data-panel="spawn">Spawn</button>
+            <button class="nav-tab" data-panel="features">Features</button>
             <button class="nav-tab" data-panel="security">
                 🔒 Security
                 <span id="security-pending-badge" style="
@@ -1578,6 +1585,76 @@
                     <div id="spawn-history-list" style="max-height: 300px; overflow-y: auto;">
                         <p style="color: var(--text-secondary); font-size: 0.85rem; text-align: center;">No spawn events recorded</p>
                     </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Features Panel -->
+        <div class="panel" id="panel-features">
+            <div class="panel-content">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem;">
+                    <h2 style="margin: 0;">Feature Store</h2>
+                    <button onclick="FeatureStore.reload()" class="btn btn-secondary" style="
+                        padding: 0.25rem 0.75rem;
+                        font-size: 0.8rem;
+                    ">↻ Refresh</button>
+                </div>
+                <p style="color: var(--text-secondary); margin-bottom: 1rem; font-size: 0.875rem;">
+                    Browse, install, and manage feature packages for your agent.
+                </p>
+
+                <!-- Search and Filter Bar -->
+                <div style="display: flex; gap: 0.75rem; margin-bottom: 1.25rem; flex-wrap: wrap; align-items: center;">
+                    <input type="text" id="feature-search" placeholder="Search features, tags, skills..."
+                        style="
+                            flex: 1;
+                            min-width: 200px;
+                            padding: 0.5rem 0.75rem;
+                            border: 1px solid var(--border-color);
+                            border-radius: 8px;
+                            background: var(--bg-primary);
+                            color: var(--text-primary);
+                            font-size: 0.875rem;
+                            outline: none;
+                        ">
+                    <div id="feature-store-filters" style="display: flex; gap: 0.25rem;">
+                        <button class="feature-filter-btn active" data-filter="all" style="
+                            padding: 0.375rem 0.75rem;
+                            border: 1px solid var(--border-color);
+                            border-radius: 6px;
+                            background: var(--bg-tertiary);
+                            color: var(--text-primary);
+                            font-size: 0.8rem;
+                            cursor: pointer;
+                        ">All</button>
+                        <button class="feature-filter-btn" data-filter="installed" style="
+                            padding: 0.375rem 0.75rem;
+                            border: 1px solid var(--border-color);
+                            border-radius: 6px;
+                            background: var(--bg-primary);
+                            color: var(--text-secondary);
+                            font-size: 0.8rem;
+                            cursor: pointer;
+                        ">Installed</button>
+                        <button class="feature-filter-btn" data-filter="available" style="
+                            padding: 0.375rem 0.75rem;
+                            border: 1px solid var(--border-color);
+                            border-radius: 6px;
+                            background: var(--bg-primary);
+                            color: var(--text-secondary);
+                            font-size: 0.8rem;
+                            cursor: pointer;
+                        ">Available</button>
+                    </div>
+                </div>
+
+                <!-- Feature Card Grid -->
+                <div id="feature-grid" style="
+                    display: grid;
+                    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+                    gap: 1rem;
+                ">
+                    <div class="loading">Loading features...</div>
                 </div>
             </div>
         </div>
