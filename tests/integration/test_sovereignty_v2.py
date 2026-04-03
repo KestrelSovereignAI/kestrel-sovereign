@@ -95,9 +95,13 @@ async def test_sovereignty_export_v3_car(temp_db):
 class MockLLMService:
     def __init__(self):
         self.providers = [{"name": "mock"}]
+        self._persistence_callback = None
 
     def get_active_model_id(self):
         return "mock-model"
+
+    def set_preference_persistence_callback(self, callback):
+        self._persistence_callback = callback
 
 
 @pytest.mark.asyncio
