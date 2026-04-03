@@ -364,13 +364,13 @@ class TestPreferencePersistence:
 class TestCodexAdapter:
     """Contract: codex adapter raises clearly on inference, lists models."""
 
-    def test_codex_adapter_raises_on_get_response(self):
+    def test_codex_adapter_raises_without_client(self):
         from kestrel_sovereign.llm.codex_adapter import CodexAdapter
 
         adapter = CodexAdapter()
         import asyncio
 
-        with pytest.raises(NotImplementedError, match="Codex backend is not yet implemented"):
+        with pytest.raises(RuntimeError, match="requires an OpenAI client"):
             asyncio.run(adapter.get_response(
                 client=None, model="codex", messages=[]
             ))
@@ -382,9 +382,11 @@ class TestCodexAdapter:
         import asyncio
         models = asyncio.run(adapter.list_models())
 
-        assert len(models) == 1
-        assert models[0].provider == "codex"
-        assert models[0].id == "codex"
+        assert len(models) >= 1
+        assert all(m.provider == "codex" for m in models)
+        # Should include at least the featured model
+        model_ids = [m.id for m in models]
+        assert "gpt-5.4" in model_ids
 
 
 # ===========================================================================
@@ -408,4 +410,6 @@ class TestCodexProviderRegistry:
         assert provider is not None
         assert provider.name == "codex"
         assert provider.model == "codex"
-        assert provider.client is None  # local CLI — no remote client
+        # Codex uses OpenAI Responses API via AsyncOpenAI client
+        from kestrel_sovereign.llm.codex_adapter import CodexAdapter
+        assert isinstance(provider.adapter, CodexAdapter)
