@@ -6,8 +6,13 @@ from kestrel_sovereign.kestrel_agent import KestrelAgent
 from kestrel_sovereign.llm.service import LLMService
 from kestrel_sovereign.privacy import PrivacyMode
 from kestrel_sovereign.features.sovereignty import SovereigntyFeature
-from kestrel_sovereign.features.mcp import MCPAgent
 from kestrel_sovereign.features.model import ModelAgent
+
+try:
+    from kestrel_feature_mcp import MCPAgent
+    HAS_MCP = True
+except ImportError:
+    HAS_MCP = False
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -47,15 +52,16 @@ async def test_feature_registration(kestrel_agent):
     logger.info("Testing Feature Registration...")
 
     # Check if features are in the dictionary
-    assert "MCPAgent" in kestrel_agent.features
     assert "ModelAgent" in kestrel_agent.features
     assert "SovereigntyFeature" in kestrel_agent.features
 
     # Check if tools are registered via TaskManager
     task_manager = kestrel_agent.task_manager
 
-    # MCP Tools - check via command routing
-    assert task_manager.get_agent_for_command("!mcp-list") is not None
+    # MCP Tools - only present when kestrel-feature-mcp is installed
+    if HAS_MCP:
+        assert "MCPAgent" in kestrel_agent.features
+        assert task_manager.get_agent_for_command("!mcp-list") is not None
 
     # Model Tools (actual command is !model-list)
     assert task_manager.get_agent_for_command("!model-list") is not None
@@ -88,6 +94,7 @@ async def test_sovereignty_feature_execution(kestrel_agent):
     assert "No sovereignty exports found" in result["result"]
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(not HAS_MCP, reason="kestrel-feature-mcp not installed")
 async def test_mcp_feature_execution(kestrel_agent):
     """
     Test executing MCP tools via the agent.

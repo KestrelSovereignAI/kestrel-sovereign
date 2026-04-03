@@ -336,22 +336,82 @@ class ProviderRegistry:
         )
 
     def _initialize_codex(self, provider_config: Dict[str, Any]) -> ProviderInfo:
-        """Initialize Codex local CLI provider (stub).
+        """Initialize Codex provider using ChatGPT backend OAuth.
 
-        Codex is a local CLI backend — no API key or client is needed.
-        The adapter is a stub that raises NotImplementedError on actual
-        inference calls, but makes the provider visible for preference
-        routing and model discovery.
+        Reads the OAuth access_token from ~/.codex/auth.json (written by
+        ``codex login``) and uses it against chatgpt.com/backend-api/codex/responses
+        — the same private endpoint that the Codex CLI and OpenClaw use.
+
+        Auth priority:
+        1. CODEX_AUTH_TOKEN env var (explicit OAuth token)
+        2. ~/.codex/auth.json tokens.access_token (from `codex login`)
+        3. provider_config auth_token
         """
-        model = provider_config.get("model", "codex")
+        token, auth_mode = self._read_codex_auth_file()
+
+        # Env vars override file
+        if os.environ.get("CODEX_AUTH_TOKEN"):
+            token = os.environ["CODEX_AUTH_TOKEN"]
+
+        # Config fallback
+        if not token:
+            token = provider_config.get("auth_token")
+
+        if not token:
+            raise ValueError(
+                "Codex authentication not found. Either:\n"
+                "  - Run `codex login` to authenticate via OAuth, or\n"
+                "  - Set CODEX_AUTH_TOKEN env var"
+            )
+
+        logger.info("Using Codex with OAuth token (ChatGPT subscription)")
+
+        model = provider_config.get("model")
+        if not model:
+            logger.warning("No model configured for codex — set model= in llm_config.toml")
+            model = "auto"
+        provider_config["model"] = model
+
+        # Store the token string as "client" — the adapter uses it directly
+        # with httpx against chatgpt.com/backend-api/codex/responses
         adapter = CodexAdapter()
 
         return ProviderInfo(
             name="codex",
-            client=None,  # No remote client — local CLI
+            client=token,  # OAuth token string — adapter uses httpx directly
             adapter=adapter,
             model=model,
         )
+
+    @staticmethod
+    def _read_codex_auth_file() -> tuple:
+        """Read OAuth token from ~/.codex/auth.json (written by `codex login`).
+
+        Returns (token, auth_mode) tuple.
+
+        The file structure nests tokens under a ``tokens`` key::
+
+            {"auth_mode": "chatgpt", "tokens": {"access_token": "...", ...}}
+        """
+        from pathlib import Path
+        import json as _json
+        auth_path = Path.home() / ".codex" / "auth.json"
+        if not auth_path.exists():
+            return None, None
+        try:
+            data = _json.loads(auth_path.read_text())
+            auth_mode = data.get("auth_mode", "")
+
+            # ChatGPT/OAuth mode: access_token from codex login
+            tokens = data.get("tokens", {})
+            token = tokens.get("access_token") or data.get("access_token")
+            if token:
+                return token, auth_mode or "oauth"
+
+            return None, None
+        except Exception as e:
+            logger.warning(f"Failed to read codex auth file: {e}")
+            return None, None
 
     def _initialize_google(self, provider_config: Dict[str, Any]) -> ProviderInfo:
         """Initialize Google/Gemini provider."""
