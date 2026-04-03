@@ -1,0 +1,23 @@
+[project]
+name = "kestrel-voice-openai"
+version = "0.1.0"
+description = "OpenAI TTS + STT voice providers for Kestrel Sovereign"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    "kestrel_sovereign",
+    "openai>=1.93.2",
+]
+
+[project.entry-points."kestrel_sovereign.voice_providers"]
+OpenAITTS = "kestrel_voice_openai.openai_tts:OpenAITTSProvider"
+OpenAISTT = "kestrel_voice_openai.openai_stt:OpenAISTTProvider"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["kestrel_voice_openai"]
