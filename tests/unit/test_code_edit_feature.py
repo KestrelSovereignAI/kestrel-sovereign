@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from kestrel_sovereign.features.code_edit.feature import CodeEditFeature, _run_subprocess
+from kestrel_feature_code.feature import CodeEditFeature, _run_subprocess
 
 
 @pytest.fixture
@@ -93,3 +93,11 @@ async def test_subprocess_calls_are_offloaded_via_to_thread():
         )
         mock_thread.assert_awaited_once()
         assert result.returncode == 0
+
+
+def test_in_tree_reexport():
+    """Verify the in-tree module re-exports from the extracted package."""
+    from kestrel_sovereign.features.code_edit import CodeEditFeature as InTreeClass
+    from kestrel_feature_code import CodeEditFeature as ExtractedClass
+
+    assert InTreeClass is ExtractedClass
