@@ -2,11 +2,17 @@
 Channel Registry -- central manager for channel adapters.
 
 Handles adapter registration, lookup, and inbound message routing.
+
+External packages can register channel adapters via entry_points::
+
+    [project.entry-points."kestrel_sovereign.channel_adapters"]
+    TelegramAdapter = "kestrel_channel_telegram:TelegramAdapter"
 """
 
 import logging
 from typing import Awaitable, Callable, Dict, List, Optional
 
+from kestrel_sovereign.entrypoints import discover_entry_point_classes
 from .adapter import ChannelAdapter
 from .models import ChannelMessage, MessageDirection
 
@@ -14,6 +20,8 @@ logger = logging.getLogger(__name__)
 
 # Callback type for routing inbound messages to an agent/session
 InboundRouter = Callable[[ChannelMessage], Awaitable[None]]
+
+CHANNEL_ADAPTER_ENTRY_POINT_GROUP = "kestrel_sovereign.channel_adapters"
 
 
 class ChannelRegistry:
@@ -25,11 +33,47 @@ class ChannelRegistry:
     - Look up adapters by channel_type
     - List all channels with status
     - Route inbound messages to the correct handler
+    - Discover external adapters via entry_points
     """
 
     def __init__(self):
         self._adapters: Dict[str, ChannelAdapter] = {}
+        self._adapter_classes: Dict[str, type] = {}
         self._inbound_router: Optional[InboundRouter] = None
+        self._discover_entrypoint_adapters()
+
+    # ------------------------------------------------------------------
+    # Entry Point Discovery
+    # ------------------------------------------------------------------
+
+    def _discover_entrypoint_adapters(self) -> None:
+        """Discover external ChannelAdapter classes via entry_points.
+
+        Discovered classes are stored in ``_adapter_classes`` for later
+        instantiation.  They are NOT auto-connected — call
+        ``create_adapter(channel_type, config)`` to instantiate and register.
+        """
+        classes = discover_entry_point_classes(
+            CHANNEL_ADAPTER_ENTRY_POINT_GROUP, ChannelAdapter,
+        )
+        for ep_name, cls in classes.items():
+            self._adapter_classes[ep_name] = cls
+            logger.info("Discovered entry_point channel adapter: %s", ep_name)
+
+    def get_adapter_class(self, name: str) -> Optional[type]:
+        """Get a discovered adapter class by entry point name.
+
+        Args:
+            name: Entry point name (e.g. "telegram", "discord").
+
+        Returns:
+            The ChannelAdapter subclass, or None if not found.
+        """
+        return self._adapter_classes.get(name)
+
+    def list_discovered_adapters(self) -> List[str]:
+        """List names of adapter classes discovered via entry_points."""
+        return list(self._adapter_classes.keys())
 
     # ------------------------------------------------------------------
     # Registration

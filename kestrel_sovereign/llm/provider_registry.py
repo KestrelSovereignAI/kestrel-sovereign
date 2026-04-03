@@ -3,6 +3,14 @@ Provider Registry for LLM Service.
 
 This module extracts the provider initialization and routing logic from LLMService
 to reduce complexity and improve maintainability.
+
+External packages can register LLM providers via entry_points::
+
+    [project.entry-points."kestrel_sovereign.llm_providers"]
+    my_provider = "my_package:MyLLMAdapter"
+
+Entry point classes must be subclasses of ``LLMAdapter``.  They are
+instantiated and wrapped in a ``ProviderInfo`` during initialization.
 """
 import logging
 import os
@@ -18,6 +26,7 @@ try:
 except ImportError:
     ollama = None
 
+from .adapter import LLMAdapter
 from .ollama_adapter import OllamaAdapter
 from .openai_adapter import OpenAIAdapter
 from .anthropic_adapter import AnthropicAdapter
@@ -27,6 +36,8 @@ from .openrouter_adapter import OpenRouterAdapter
 from .claude_max_adapter import ClaudeMaxAdapter
 
 logger = logging.getLogger(__name__)
+
+LLM_PROVIDER_ENTRY_POINT_GROUP = "kestrel_sovereign.llm_providers"
 
 
 @dataclass
@@ -80,12 +91,82 @@ class ProviderRegistry:
             except Exception as e:
                 logger.error(f"Failed to initialize provider '{provider_name}': {e}")
 
+        # Phase 2: Discover external providers via entry_points
+        ep_providers = self._discover_entrypoint_providers()
+        initialized_names = {p.name for p in initialized_providers}
+        for ep_provider in ep_providers:
+            if ep_provider.name in initialized_names:
+                logger.debug(
+                    "Skipping entry_point LLM provider '%s': built-in already registered",
+                    ep_provider.name,
+                )
+                continue
+            initialized_providers.append(ep_provider)
+            initialized_names.add(ep_provider.name)
+            logger.info("Registered entry_point LLM provider: %s", ep_provider.name)
+
         if not initialized_providers:
             raise ProviderInitializationError("No providers could be initialized")
 
         self.providers = initialized_providers
         self._initialized = True
         return self.providers
+
+    def _discover_entrypoint_providers(self) -> List[ProviderInfo]:
+        """Discover LLM providers registered via entry_points.
+
+        Entry points must be subclasses of ``LLMAdapter``.  Each adapter class
+        must expose a ``provider_name`` class attribute and a
+        ``create_provider(config)`` classmethod that returns a ``ProviderInfo``.
+
+        If the classmethod is absent, the adapter is instantiated directly
+        and wrapped with an OpenAI-compatible client using ``base_url`` and
+        ``api_key`` from the provider config section.
+
+        Returns:
+            List of successfully initialized ProviderInfo objects.
+        """
+        from kestrel_sovereign.entrypoints import discover_entry_point_classes
+
+        providers: List[ProviderInfo] = []
+        classes = discover_entry_point_classes(LLM_PROVIDER_ENTRY_POINT_GROUP, LLMAdapter)
+
+        for ep_name, cls in classes.items():
+            try:
+                provider_config = self.config.get(ep_name, {})
+
+                # Prefer a factory classmethod if the adapter provides one
+                if hasattr(cls, "create_provider") and callable(getattr(cls, "create_provider")):
+                    info = cls.create_provider(provider_config)
+                    if info is not None:
+                        providers.append(info)
+                    continue
+
+                # Fallback: treat as OpenAI-compatible with base_url
+                base_url = provider_config.get("base_url")
+                api_key = provider_config.get("api_key") or os.environ.get(
+                    f"{ep_name.upper()}_API_KEY", "external"
+                )
+                model = provider_config.get("model", "auto")
+
+                if base_url:
+                    client = openai.AsyncOpenAI(api_key=api_key, base_url=base_url)
+                else:
+                    client = openai.AsyncOpenAI(api_key=api_key)
+
+                adapter = cls()
+                name = getattr(cls, "provider_name", ep_name)
+
+                providers.append(ProviderInfo(
+                    name=name,
+                    client=client,
+                    adapter=adapter,
+                    model=model,
+                ))
+            except Exception as e:
+                logger.warning("Failed to initialize entry_point LLM provider '%s': %s", ep_name, e)
+
+        return providers
 
     def _initialize_single_provider(self, provider_name: str) -> Optional[ProviderInfo]:
         """Initialize a single provider.
