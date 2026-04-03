@@ -18,7 +18,15 @@ dependencies at package import time.  Import directly when needed:
     from kestrel_sovereign.storage.providers.storacha_provider import StorachaProvider
     from kestrel_sovereign.storage.providers.filebase_provider import FilebaseProvider
     from kestrel_sovereign.storage.providers.lighthouse_provider import LighthouseProvider
+
+External packages can register storage providers via entry_points::
+
+    [project.entry-points."kestrel_sovereign.storage_providers"]
+    MyStorageProvider = "my_storage_package:MyStorageProvider"
 """
+
+import logging
+from typing import Dict, Type
 
 from kestrel_sovereign.storage.providers.base import (
     CryostasisCapable,
@@ -28,10 +36,27 @@ from kestrel_sovereign.storage.providers.base import (
     SyncStatus,
 )
 
+logger = logging.getLogger(__name__)
+
+STORAGE_PROVIDER_ENTRY_POINT_GROUP = "kestrel_sovereign.storage_providers"
+
+
+def discover_storage_providers() -> Dict[str, Type[StorageProvider]]:
+    """Discover storage provider classes from entry_points.
+
+    Returns:
+        Dict mapping entry point name to StorageProvider subclass.
+    """
+    from kestrel_sovereign.entrypoints import discover_entry_point_classes
+    return discover_entry_point_classes(STORAGE_PROVIDER_ENTRY_POINT_GROUP, StorageProvider)
+
+
 __all__ = [
     "CryostasisCapable",
     "StorageProvider",
     "StorageResult",
     "StorageTier",
     "SyncStatus",
+    "STORAGE_PROVIDER_ENTRY_POINT_GROUP",
+    "discover_storage_providers",
 ]
