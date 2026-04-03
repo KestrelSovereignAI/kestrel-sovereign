@@ -1,0 +1,23 @@
+[project]
+name = "kestrel-cloud-azure"
+version = "0.1.0"
+description = "Azure Container Apps cloud provider for Kestrel Sovereign"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    "kestrel_sovereign",
+    "azure-mgmt-appcontainers>=3.0.0",
+    "azure-identity>=1.15.0",
+]
+
+[project.entry-points."kestrel_sovereign.cloud_providers"]
+AzureContainerProvider = "kestrel_cloud_azure.azure_container:AzureContainerProvider"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["kestrel_cloud_azure"]
