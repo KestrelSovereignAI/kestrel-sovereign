@@ -62,15 +62,11 @@ dependencies = [
     # Google Vertex AI (unified SDK for Gemini API and Vertex AI)
     "google-genai>=1.0.0",
     "google-cloud-logging>=3.5.0",
-    # Feature packages (extracted)
-    "kestrel-feature-github",
     # Runtime utilities
     "psutil>=7.1.3",
     "numpy>=2.3.1",
     # CAR file support (sovereignty exports)
     "cbor2>=5.6.0",
-    # Observability feature package (metrics, telemetry, wellness)
-    "kestrel-feature-observability @ {root:uri}/kestrel-feature-observability",
     # LLM provider SDKs (used at runtime via dynamic import)
     "anthropic>=0.75.0",
     "google-generativeai>=0.8.6",
@@ -117,9 +113,12 @@ voice = [
     "webrtcvad>=2.0.10",
 ]
 # Observability (OpenTelemetry tracing + Prometheus metrics)
-# Canonical implementation in kestrel-feature-observability package
 observability = [
-    "kestrel-feature-observability[all]",
+    "opentelemetry-api>=1.20.0",
+    "opentelemetry-sdk>=1.20.0",
+    "opentelemetry-instrumentation-fastapi>=0.41b0",
+    "opentelemetry-exporter-otlp-proto-grpc>=1.20.0",
+    "prometheus-client>=0.21.0",
 ]
 # Feature: Cloud GPU/serverless deployment (RunPod, Vast.ai, GCP, Azure)
 cloud = [
@@ -135,9 +134,11 @@ wallet = [
     "web3>=7.0.0",
     "stripe>=10.0.0",
 ]
-# Feature: MCP (extracted to packages/kestrel-feature-mcp)
+# Feature: MCP (Docker container management, MCP protocol)
 mcp = [
-    "kestrel-feature-mcp",
+    "docker>=7.1.0",
+    "mcp>=1.26.0",
+    "trio>=0.32.0",
 ]
 # Feature: Visual (image generation via Replicate)
 visual = [
@@ -157,10 +158,6 @@ github = [
 search = [
     "tavily-python>=0.3.0",
 ]
-# Feature: Intelligence (reflection + council metacognition)
-intelligence = [
-    "kestrel-feature-intelligence @ {root:uri}/kestrel-feature-intelligence",
-]
 # All feature packages — restores pre-split behavior
 all-features = [
     "kestrel_sovereign[cloud]",
@@ -170,7 +167,6 @@ all-features = [
     "kestrel_sovereign[delivery]",
     "kestrel_sovereign[github]",
     "kestrel_sovereign[search]",
-    "kestrel_sovereign[intelligence]",
     "kestrel_sovereign[local]",
     "kestrel_sovereign[ml]",
     "kestrel_sovereign[voice]",
@@ -231,14 +227,7 @@ build-backend = "hatchling.build"
 allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
-packages = ["kestrel_sovereign"]
+packages = ["kestrel_sovereign", "kestrel_feature_wallet"]
 
 [tool.hatch.build.targets.sdist]
-include = ["kestrel_sovereign/**/*"]
-
-[tool.uv.workspace]
-members = ["packages/*"]
-
-[tool.uv.sources]
-kestrel-feature-github = { path = "kestrel-feature-github", editable = true }
-kestrel-feature-mcp = { workspace = true }
+include = ["kestrel_sovereign/**/*", "kestrel_feature_wallet/**/*"]
