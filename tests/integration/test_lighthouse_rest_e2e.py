@@ -87,6 +87,10 @@ class TestUploadDownload:
 # ---------------------------------------------------------------------------
 # CAR file upload
 # ---------------------------------------------------------------------------
+@pytest.mark.skipif(
+    not importlib.util.find_spec("cbor2"),
+    reason="cbor2 not installed (optional wallet dependency)",
+)
 class TestCARUpload:
     """Upload CAR files to Lighthouse."""
 
