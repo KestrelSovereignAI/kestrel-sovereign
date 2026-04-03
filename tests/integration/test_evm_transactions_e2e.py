@@ -31,7 +31,7 @@ class TestChainNetwork:
 
     def test_network_enum_values(self):
         """Test all network enum values exist."""
-        from kestrel_sovereign.features.wallet.chain_adapters import ChainNetwork
+        from kestrel_feature_wallet.chain_adapters import ChainNetwork
 
         assert ChainNetwork.FILECOIN_CALIBRATION.value == "filecoin_calibration"
         assert ChainNetwork.FILECOIN_MAINNET.value == "filecoin_mainnet"
@@ -42,7 +42,7 @@ class TestChainNetwork:
 
     def test_testnet_detection(self):
         """Test is_testnet property."""
-        from kestrel_sovereign.features.wallet.chain_adapters import ChainNetwork
+        from kestrel_feature_wallet.chain_adapters import ChainNetwork
 
         assert ChainNetwork.FILECOIN_CALIBRATION.is_testnet is True
         assert ChainNetwork.ETHEREUM_SEPOLIA.is_testnet is True
@@ -53,7 +53,7 @@ class TestChainNetwork:
 
     def test_mainnet_detection(self):
         """Test is_mainnet property."""
-        from kestrel_sovereign.features.wallet.chain_adapters import ChainNetwork
+        from kestrel_feature_wallet.chain_adapters import ChainNetwork
 
         assert ChainNetwork.FILECOIN_MAINNET.is_mainnet is True
         assert ChainNetwork.ETHEREUM_MAINNET.is_mainnet is True
@@ -62,7 +62,7 @@ class TestChainNetwork:
 
     def test_display_names(self):
         """Test human-readable display names."""
-        from kestrel_sovereign.features.wallet.chain_adapters import ChainNetwork
+        from kestrel_feature_wallet.chain_adapters import ChainNetwork
 
         assert "Testnet" in ChainNetwork.FILECOIN_CALIBRATION.display_name
         assert "Testnet" in ChainNetwork.ETHEREUM_SEPOLIA.display_name
@@ -74,7 +74,7 @@ class TestNetworkConfig:
 
     def test_get_config_for_all_networks(self):
         """Test config exists for all networks."""
-        from kestrel_sovereign.features.wallet.chain_adapters import ChainNetwork, NetworkConfig
+        from kestrel_feature_wallet.chain_adapters import ChainNetwork, NetworkConfig
 
         for network in ChainNetwork:
             config = NetworkConfig.get_config(network)
@@ -85,7 +85,7 @@ class TestNetworkConfig:
 
     def test_chain_ids_are_correct(self):
         """Test chain IDs match expected values."""
-        from kestrel_sovereign.features.wallet.chain_adapters import ChainNetwork, NetworkConfig
+        from kestrel_feature_wallet.chain_adapters import ChainNetwork, NetworkConfig
 
         assert NetworkConfig.get_config(ChainNetwork.FILECOIN_CALIBRATION).chain_id == 314159
         assert NetworkConfig.get_config(ChainNetwork.FILECOIN_MAINNET).chain_id == 314
@@ -96,7 +96,7 @@ class TestNetworkConfig:
 
     def test_explorer_urls(self):
         """Test explorer URL generation."""
-        from kestrel_sovereign.features.wallet.chain_adapters import ChainNetwork, NetworkConfig
+        from kestrel_feature_wallet.chain_adapters import ChainNetwork, NetworkConfig
 
         config = NetworkConfig.get_config(ChainNetwork.ETHEREUM_SEPOLIA)
         tx_url = config.get_tx_url("0x123abc")
@@ -110,13 +110,13 @@ class TestEVMAdapter:
     @pytest.fixture
     def sepolia_adapter(self):
         """Create adapter for Ethereum Sepolia."""
-        from kestrel_sovereign.features.wallet.chain_adapters import ChainNetwork, EVMAdapter
+        from kestrel_feature_wallet.chain_adapters import ChainNetwork, EVMAdapter
 
         return EVMAdapter(ChainNetwork.ETHEREUM_SEPOLIA)
 
     def test_adapter_initialization(self, sepolia_adapter):
         """Test adapter initializes correctly."""
-        from kestrel_sovereign.features.wallet.chain_adapters import ChainNetwork
+        from kestrel_feature_wallet.chain_adapters import ChainNetwork
 
         assert sepolia_adapter.network == ChainNetwork.ETHEREUM_SEPOLIA
         assert sepolia_adapter.config.chain_id == 11155111
@@ -154,7 +154,7 @@ class TestTransactionRequest:
 
     def test_create_transaction_request(self):
         """Test creating a transaction request."""
-        from kestrel_sovereign.features.wallet.chain_adapters import ChainNetwork, TransactionRequest
+        from kestrel_feature_wallet.chain_adapters import ChainNetwork, TransactionRequest
 
         request = TransactionRequest(
             to_address="0x742d35Cc6634C0532925a3b844Bc9e7595f3E123",
@@ -172,7 +172,7 @@ class TestTransactionSecurityHook:
     @pytest.fixture
     def hook(self):
         """Create transaction security hook."""
-        from kestrel_sovereign.features.wallet.transaction_hook import TransactionSecurityHook
+        from kestrel_feature_wallet.transaction_hook import TransactionSecurityHook
 
         return TransactionSecurityHook(daily_limit_usd=Decimal("100"))
 
@@ -247,7 +247,7 @@ class TestTokenRegistry:
 
     def test_get_known_tokens(self):
         """Test retrieving known token addresses."""
-        from kestrel_sovereign.features.wallet.chain_adapters import ChainNetwork, TokenRegistry
+        from kestrel_feature_wallet.chain_adapters import ChainNetwork, TokenRegistry
 
         usdc = TokenRegistry.get_token("USDC", ChainNetwork.ETHEREUM_SEPOLIA)
         assert usdc is not None
@@ -257,14 +257,14 @@ class TestTokenRegistry:
 
     def test_unknown_token_returns_none(self):
         """Test unknown token returns None."""
-        from kestrel_sovereign.features.wallet.chain_adapters import ChainNetwork, TokenRegistry
+        from kestrel_feature_wallet.chain_adapters import ChainNetwork, TokenRegistry
 
         result = TokenRegistry.get_token("FAKE_TOKEN", ChainNetwork.ETHEREUM_SEPOLIA)
         assert result is None
 
     def test_list_tokens_for_network(self):
         """Test listing all tokens for a network."""
-        from kestrel_sovereign.features.wallet.chain_adapters import ChainNetwork, TokenRegistry
+        from kestrel_feature_wallet.chain_adapters import ChainNetwork, TokenRegistry
 
         tokens = TokenRegistry.list_tokens(ChainNetwork.ETHEREUM_SEPOLIA)
         assert len(tokens) > 0
@@ -278,20 +278,20 @@ class TestERC20Adapter:
     @pytest.fixture
     def erc20_adapter(self):
         """Create ERC-20 adapter for Sepolia."""
-        from kestrel_sovereign.features.wallet.chain_adapters import ChainNetwork, ERC20Adapter
+        from kestrel_feature_wallet.chain_adapters import ChainNetwork, ERC20Adapter
 
         return ERC20Adapter(ChainNetwork.ETHEREUM_SEPOLIA)
 
     def test_adapter_initialization(self, erc20_adapter):
         """Test adapter initializes correctly."""
-        from kestrel_sovereign.features.wallet.chain_adapters import ChainNetwork
+        from kestrel_feature_wallet.chain_adapters import ChainNetwork
 
         assert erc20_adapter.network == ChainNetwork.ETHEREUM_SEPOLIA
 
     @pytest.mark.asyncio
     async def test_get_token_balance(self, erc20_adapter):
         """Test getting token balance."""
-        from kestrel_sovereign.features.wallet.chain_adapters import ChainNetwork, TokenRegistry
+        from kestrel_feature_wallet.chain_adapters import ChainNetwork, TokenRegistry
 
         usdc = TokenRegistry.get_token("USDC", ChainNetwork.ETHEREUM_SEPOLIA)
         if usdc:
@@ -308,7 +308,7 @@ class TestTransactionManager:
     @pytest.fixture
     def manager(self, tmp_path):
         """Create transaction manager with temp database."""
-        from kestrel_sovereign.features.wallet.transaction_manager import TransactionManager
+        from kestrel_feature_wallet.transaction_manager import TransactionManager
 
         db_path = str(tmp_path / "tx_audit.db")
         return TransactionManager(audit_db_path=db_path)
@@ -335,7 +335,7 @@ class TestStripeOnRamp:
     @pytest.fixture
     def onramp(self, tmp_path):
         """Create on-ramp instance with temp database."""
-        from kestrel_sovereign.features.wallet.onramp import StripeOnRamp
+        from kestrel_feature_wallet.onramp import StripeOnRamp
 
         db_path = str(tmp_path / "onramp.db")
         return StripeOnRamp(db_path=db_path)
@@ -376,7 +376,7 @@ class TestWebhookHandler:
     @pytest.fixture
     def handler(self, tmp_path):
         """Create webhook handler with temp database."""
-        from kestrel_sovereign.features.wallet.onramp import StripeOnRamp, StripeWebhookHandler
+        from kestrel_feature_wallet.onramp import StripeOnRamp, StripeWebhookHandler
 
         db_path = str(tmp_path / "onramp.db")
         onramp = StripeOnRamp(db_path=db_path)
@@ -410,7 +410,7 @@ class TestRealTransaction:
     @pytest.mark.asyncio
     async def test_send_sepolia_eth(self):
         """Test sending ETH on Sepolia (requires funded wallet)."""
-        from kestrel_sovereign.features.wallet.chain_adapters import (
+        from kestrel_feature_wallet.chain_adapters import (
             ChainNetwork,
             EVMAdapter,
             TransactionRequest,

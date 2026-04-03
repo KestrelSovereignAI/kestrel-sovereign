@@ -21,7 +21,11 @@ from enum import Enum
 
 import httpx
 
-from kestrel_sovereign.kestrel_config.constants import HTTP_TIMEOUT_DEFAULT
+# HTTP timeout - use framework constant if available, otherwise default to 30s
+try:
+    from kestrel_sovereign.kestrel_config.constants import HTTP_TIMEOUT_DEFAULT
+except ImportError:
+    HTTP_TIMEOUT_DEFAULT = 30
 
 logger = logging.getLogger(__name__)
 

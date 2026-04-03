@@ -2,12 +2,12 @@
 
 import pytest
 
-from kestrel_sovereign.features.wallet.chain_adapters.base import (
+from kestrel_feature_wallet.chain_adapters.base import (
     ChainNetwork,
     NetworkConfig,
 )
-from kestrel_sovereign.features.wallet.chain_adapters.token_registry import TokenRegistry
-from kestrel_sovereign.features.wallet.chain_adapters.evm_adapter import MAINNET_CHAIN_IDS
+from kestrel_feature_wallet.chain_adapters.token_registry import TokenRegistry
+from kestrel_feature_wallet.chain_adapters.evm_adapter import MAINNET_CHAIN_IDS
 
 
 class TestBaseChainNetwork:
@@ -101,7 +101,7 @@ class TestBaseL2Wallet:
 
     def test_address_derivation(self):
         """Test that wallet derives correct EVM address from known key."""
-        from kestrel_sovereign.features.wallet.base_l2_wallet import BaseL2Wallet
+        from kestrel_feature_wallet.base_l2_wallet import BaseL2Wallet
 
         # Known test key (DO NOT use in production)
         test_key = "0x" + "ab" * 32
@@ -112,7 +112,7 @@ class TestBaseL2Wallet:
         assert wallet.network == ChainNetwork.BASE_SEPOLIA
 
     def test_testnet_vs_mainnet(self):
-        from kestrel_sovereign.features.wallet.base_l2_wallet import BaseL2Wallet
+        from kestrel_feature_wallet.base_l2_wallet import BaseL2Wallet
 
         test_key = "ab" * 32
         testnet_wallet = BaseL2Wallet(private_key_hex=test_key, testnet=True)
@@ -125,13 +125,13 @@ class TestBaseL2Wallet:
         assert mainnet_wallet.network == ChainNetwork.BASE_MAINNET
 
     def test_usdc_address(self):
-        from kestrel_sovereign.features.wallet.base_l2_wallet import BaseL2Wallet
+        from kestrel_feature_wallet.base_l2_wallet import BaseL2Wallet
 
         wallet = BaseL2Wallet(private_key_hex="ab" * 32, testnet=True)
         assert wallet.usdc_address == "0x036CbD53842c5426634e7929541eC2318f3dCF7e"
 
     def test_repr(self):
-        from kestrel_sovereign.features.wallet.base_l2_wallet import BaseL2Wallet
+        from kestrel_feature_wallet.base_l2_wallet import BaseL2Wallet
 
         wallet = BaseL2Wallet(private_key_hex="ab" * 32, testnet=True)
         r = repr(wallet)

@@ -1,5 +1,7 @@
 """
-Wallet feature for Kestrel agents.
+Kestrel Feature Wallet — Multi-currency agent wallet with Stripe on-ramp.
+
+Extracted from kestrel-sovereign as a standalone feature package.
 
 NOTE: Some wallet features require optional dependencies:
 - web3: Required for EVM chain support (Ethereum, Polygon, Filecoin FEVM)
