@@ -193,14 +193,16 @@ async def test_streaming_uses_messages_with_history():
     import inspect
     from kestrel_sovereign.agent.streaming import StreamingMixin
 
-    # Get the source of process_input_streaming
+    # process_input_streaming delegates to _process_input_streaming_traced, so check both
     source = inspect.getsource(StreamingMixin.process_input_streaming)
+    traced_source = inspect.getsource(StreamingMixin._process_input_streaming_traced)
+    combined = source + traced_source
 
     # CRITICAL: Must pass messages to the streaming call
     # Streaming uses stream_with_tool_detection(messages=messages, ...)
-    assert "messages=messages" in source, \
-        "process_input_streaming MUST pass messages array to LLM service"
+    assert "messages=messages" in combined, \
+        "process_input_streaming (or its delegate) MUST pass messages array to LLM service"
 
     # Verify we build the messages array with conversation history
-    assert "messages.extend(context_result.messages)" in source or "context_result.messages" in source, \
-        "process_input_streaming MUST include context_result.messages in the messages array"
+    assert "messages.extend(context_result.messages)" in combined or "context_result.messages" in combined, \
+        "process_input_streaming (or its delegate) MUST include context_result.messages in the messages array"
