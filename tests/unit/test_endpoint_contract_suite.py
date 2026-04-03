@@ -132,6 +132,7 @@ def test_saved_items_structured_endpoint_uses_store_contract():
 def test_openai_compatible_endpoints_return_minimal_contracts():
     llm_service = MagicMock()
     llm_service.providers = [{"model": "gpt-5-mini"}]
+    llm_service.get_active_model_id = MagicMock(return_value="gpt-5-mini")
     agent = MagicMock(llm_service=llm_service)
     agent.process_input = AsyncMock(return_value="hello")
 
@@ -150,5 +151,88 @@ def test_openai_compatible_endpoints_return_minimal_contracts():
         assert chat_response.status_code == 200
         assert chat_response.json()["object"] == "chat.completion"
         assert chat_response.json()["choices"][0]["message"]["content"] == "hello"
+    finally:
+        _restore_app(app, original)
+
+
+# ============================================================================
+# Backend-honest model reporting (#426)
+# ============================================================================
+
+
+def test_v1_models_reports_mandated_model_not_provider_default():
+    """When a mandate preference is set, /v1/models should report the mandated
+    model — not the first provider's config default."""
+    llm_service = MagicMock()
+    # First provider's configured model is gpt-5-mini, but the user mandated claude-opus-4-6
+    llm_service.providers = [{"model": "gpt-5-mini", "name": "openai"}]
+    llm_service.get_active_model_id = MagicMock(return_value="claude-opus-4-6")
+    agent = MagicMock(llm_service=llm_service)
+
+    app, original = _prepare_app(agent)
+    try:
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                resp = client.get("/v1/models", headers={"X-API-Key": "test-key"})
+        data = resp.json()
+        assert resp.status_code == 200
+        # Must report the active mandated model, not the provider default
+        assert data["data"][0]["id"] == "claude-opus-4-6"
+    finally:
+        _restore_app(app, original)
+
+
+def test_chat_completions_reports_active_model_not_request_echo():
+    """/v1/chat/completions should report the resolved active model in the
+    response, not just echo back whatever the client sent."""
+    llm_service = MagicMock()
+    llm_service.providers = [{"model": "gpt-5-mini", "name": "openai"}]
+    # The agent is actually routing to claude-opus-4-6 via mandate
+    llm_service.get_active_model_id = MagicMock(return_value="claude-opus-4-6")
+    agent = MagicMock(llm_service=llm_service)
+    agent.process_input = AsyncMock(return_value="hi there")
+
+    app, original = _prepare_app(agent)
+    try:
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                resp = client.post(
+                    "/v1/chat/completions",
+                    headers={"X-API-Key": "test-key"},
+                    json={
+                        "model": "some-client-model",
+                        "messages": [{"role": "user", "content": "hello"}],
+                    },
+                )
+        data = resp.json()
+        assert resp.status_code == 200
+        # Must report what was actually used, not the client's request value
+        assert data["model"] == "claude-opus-4-6"
+    finally:
+        _restore_app(app, original)
+
+
+def test_chat_completions_without_model_field_reports_active():
+    """When the client omits the model field, the response should still report
+    the active model — not fall back to 'kestrel-local'."""
+    llm_service = MagicMock()
+    llm_service.providers = [{"model": "gpt-5-mini", "name": "openai"}]
+    llm_service.get_active_model_id = MagicMock(return_value="gpt-5-mini")
+    agent = MagicMock(llm_service=llm_service)
+    agent.process_input = AsyncMock(return_value="response")
+
+    app, original = _prepare_app(agent)
+    try:
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                resp = client.post(
+                    "/v1/chat/completions",
+                    headers={"X-API-Key": "test-key"},
+                    json={
+                        "messages": [{"role": "user", "content": "hello"}],
+                    },
+                )
+        data = resp.json()
+        assert data["model"] == "gpt-5-mini"
     finally:
         _restore_app(app, original)

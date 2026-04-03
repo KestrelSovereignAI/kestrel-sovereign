@@ -88,17 +88,30 @@ async def check_llm_service(agent) -> Dict[str, Any]:
     try:
         # Check that at least one provider is available
         providers = getattr(llm_service, "providers", None) or []
-        model_pref = None
+
+        # Resolve the active model via the canonical routing source so the
+        # heartbeat reports what the agent will *actually* use, not just
+        # what was configured or defaulted.
+        active_model = None
+        if hasattr(llm_service, "get_active_model_id"):
+            active_model = llm_service.get_active_model_id()
+            if active_model == "auto":
+                active_model = None
+
+        # Also surface the provider from mandate preference when set
+        active_provider = None
         if hasattr(llm_service, "get_model_preference"):
-            model_pref = llm_service.get_model_preference()
+            pref = llm_service.get_model_preference()
+            active_provider = pref.get("provider")
 
         if providers:
             names = [p.get("name", p.get("provider", "?")) for p in providers[:3]]
             msg = f"LLM providers available: {', '.join(names)}"
             if len(providers) > 3:
                 msg += f" (+{len(providers) - 3} more)"
-            if model_pref:
-                msg += f" (preferred: {model_pref})"
+            if active_model:
+                model_label = f"{active_provider}/{active_model}" if active_provider else active_model
+                msg += f" (active: {model_label})"
             return {
                 "name": "llm_service",
                 "status": "pass",
