@@ -202,6 +202,11 @@ DeepgramSTT = "kestrel_voice_deepgram.deepgram_stt:DeepgramSTTProvider"
 OpenAITTS = "kestrel_voice_openai.openai_tts:OpenAITTSProvider"
 OpenAISTT = "kestrel_voice_openai.openai_stt:OpenAISTTProvider"
 
+[project.entry-points."kestrel_sovereign.storage_providers"]
+LighthouseProvider = "kestrel_storage_lighthouse.lighthouse_provider:LighthouseProvider"
+StorachaProvider = "kestrel_storage_storacha.storacha_provider:StorachaProvider"
+FilebaseProvider = "kestrel_storage_filebase.filebase_provider:FilebaseProvider"
+
 [dependency-groups]
 dev = [
     {include-group = "test"},
