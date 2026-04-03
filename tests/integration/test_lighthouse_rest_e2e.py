@@ -8,6 +8,7 @@ Run with:
     LIGHTHOUSE_API_KEY=xxx uv run python -m pytest tests/integration/test_lighthouse_rest_e2e.py -v
 """
 
+import importlib.util
 import os
 import time
 
