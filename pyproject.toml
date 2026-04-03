@@ -195,6 +195,12 @@ kestrel = "kestrel_sovereign.testing.fixtures"
 [project.entry-points."kestrel_sovereign.features"]
 WalletFeature = "kestrel_feature_wallet.wallet_feature:WalletFeature"
 CodeEditFeature = "kestrel_feature_code.feature:CodeEditFeature"
+VastAIFeature = "kestrel_cloud_vastai.feature:VastAIFeature"
+GCPComputeFeature = "kestrel_cloud_gcp.compute.feature:GCPComputeFeature"
+
+[project.entry-points."kestrel_sovereign.cloud_providers"]
+CloudRunProvider = "kestrel_cloud_gcp.cloudrun:CloudRunProvider"
+AzureContainerProvider = "kestrel_cloud_azure.azure_container:AzureContainerProvider"
 
 [project.entry-points."kestrel_sovereign.voice_providers"]
 ElevenLabsTTS = "kestrel_voice_elevenlabs.elevenlabs_tts:ElevenLabsTTSProvider"
@@ -245,7 +251,7 @@ build-backend = "hatchling.build"
 allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
-packages = ["kestrel_sovereign", "kestrel_feature_wallet", "kestrel_voice_elevenlabs", "kestrel_voice_deepgram", "kestrel_voice_openai"]
+packages = ["kestrel_sovereign", "kestrel_feature_wallet", "kestrel_voice_elevenlabs", "kestrel_voice_deepgram", "kestrel_voice_openai", "kestrel_cloud_vastai", "kestrel_cloud_gcp", "kestrel_cloud_azure"]
 
 [tool.hatch.build.targets.sdist]
-include = ["kestrel_sovereign/**/*", "kestrel_feature_wallet/**/*", "kestrel_voice_elevenlabs/**/*", "kestrel_voice_deepgram/**/*", "kestrel_voice_openai/**/*"]
+include = ["kestrel_sovereign/**/*", "kestrel_feature_wallet/**/*", "kestrel_voice_elevenlabs/**/*", "kestrel_voice_deepgram/**/*", "kestrel_voice_openai/**/*", "kestrel_cloud_vastai/**/*", "kestrel_cloud_gcp/**/*", "kestrel_cloud_azure/**/*"]

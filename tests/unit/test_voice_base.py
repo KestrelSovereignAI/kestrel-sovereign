@@ -4,6 +4,8 @@ Unit tests for voice provider abstraction layer.
 Tests VoiceConfig serialization, VoiceProviderRegistry register/get/list,
 local provider filtering, and missing provider behavior.
 """
+import unittest.mock
+
 import pytest
 from typing import AsyncIterator
 
@@ -339,7 +341,9 @@ class TestRegistryInitialize:
             "stt_provider_priority": ["nonexistent_stt"],
         }
         registry = VoiceProviderRegistry(config=config)
-        await registry.initialize()
+        # Patch entry_point discovery so installed packages don't leak in
+        with unittest.mock.patch.object(registry, "_discover_entrypoint_providers", return_value=None):
+            await registry.initialize()
         assert registry.list_tts_providers() == []
         assert registry.list_stt_providers() == []
 
@@ -348,7 +352,9 @@ class TestRegistryInitialize:
         """Calling initialize() twice should not re-initialize."""
         config = {"tts_provider_priority": [], "stt_provider_priority": []}
         registry = VoiceProviderRegistry(config=config)
-        await registry.initialize()
+        # Patch entry_point discovery so installed packages don't interfere
+        with unittest.mock.patch.object(registry, "_discover_entrypoint_providers", return_value=None):
+            await registry.initialize()
         # Manually register after init
         registry.register_tts(FakeTTSLocal())
         await registry.initialize()  # Should be a no-op
