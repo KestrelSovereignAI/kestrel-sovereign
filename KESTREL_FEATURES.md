@@ -95,7 +95,12 @@
 
 ## Feature Module Inventory
 
-Feature discovery scans `kestrel_sovereign/features/` for single-file features, package `__init__.py`, and package `feature.py`, then keeps only modules that actually export a discoverable `Feature` subclass. The current discovered module inventory is:
+Features come from two sources:
+
+1. **Core features** — discovered from `kestrel_sovereign/features/` (single-file modules, package `__init__.py`, and package `feature.py`). Only modules that export a discoverable `Feature` subclass are kept.
+2. **Package features** — installed via pip and registered as `kestrel_sovereign.features` entry points. These are discovered at runtime and extend the core inventory without modifying it. On duplicate class names, core features win.
+
+The inventory below lists **core features only**. Installed feature packages appear at runtime via `discover_entrypoint_feature_classes()` and are not enumerated here.
 
 - Current audited snapshot: `42` discoverable modules and `41` exported `Feature` subclasses.
 
