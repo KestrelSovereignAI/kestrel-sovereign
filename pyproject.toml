@@ -192,6 +192,16 @@ kestrel = "kestrel_sovereign.cli:main"
 [project.entry-points.pytest11]
 kestrel = "kestrel_sovereign.testing.fixtures"
 
+[project.entry-points."kestrel_sovereign.features"]
+WalletFeature = "kestrel_feature_wallet.wallet_feature:WalletFeature"
+CodeEditFeature = "kestrel_feature_code.feature:CodeEditFeature"
+
+[project.entry-points."kestrel_sovereign.voice_providers"]
+ElevenLabsTTS = "kestrel_voice_elevenlabs.elevenlabs_tts:ElevenLabsTTSProvider"
+DeepgramSTT = "kestrel_voice_deepgram.deepgram_stt:DeepgramSTTProvider"
+OpenAITTS = "kestrel_voice_openai.openai_tts:OpenAITTSProvider"
+OpenAISTT = "kestrel_voice_openai.openai_stt:OpenAISTTProvider"
+
 [dependency-groups]
 dev = [
     {include-group = "test"},
