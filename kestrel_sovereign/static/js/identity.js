@@ -41,6 +41,7 @@ let loadTasks = null;
 let loadResources = null;
 let loadMetrics = null;
 let loadSpawn = null;
+let loadFeatureStore = null;
 
 export function setLazyLoaders(loaders) {
     loadConstitution = loaders.loadConstitution;
@@ -50,6 +51,7 @@ export function setLazyLoaders(loaders) {
     loadResources = loaders.loadResources;
     loadMetrics = loaders.loadMetrics;
     loadSpawn = loaders.loadSpawn;
+    loadFeatureStore = loaders.loadFeatureStore;
 }
 
 export function initNavigation() {
@@ -72,6 +74,7 @@ export function initNavigation() {
             if (panelId === 'resources' && loadResources) loadResources();
             if (panelId === 'metrics' && loadMetrics) loadMetrics();
             if (panelId === 'spawn' && loadSpawn) loadSpawn();
+            if (panelId === 'features' && loadFeatureStore) loadFeatureStore();
         });
     });
 }
@@ -631,6 +634,7 @@ window.selectAgent = async function(agentName) {
     if (panel === 'tasks' && loadTasks) loadTasks();
     if (panel === 'resources' && loadResources) loadResources();
     if (panel === 'spawn' && loadSpawn) loadSpawn();
+    if (panel === 'features' && loadFeatureStore) loadFeatureStore();
 };
 
 // ============================================================================
