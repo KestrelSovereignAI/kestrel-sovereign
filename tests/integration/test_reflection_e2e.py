@@ -771,7 +771,7 @@ def test_self_model_manager_requires_available_provider(monkeypatch):
     with pytest.raises(SelfModelConfigError) as exc_info:
         SelfModelManager(mock_provider, "did:pkh:test")
 
-    assert "provider not available" in str(exc_info.value)
+    assert "is not available" in str(exc_info.value)
 
 
 # ============================================================================
