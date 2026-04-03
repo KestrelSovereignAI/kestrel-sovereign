@@ -106,8 +106,12 @@ def _make_agent(cloud_allowed=True, has_storage=True, has_identity=False, voice_
     agent.agent_id = "test-voice-agent"
     agent.config = {"voice": {}}
 
-    # Privacy
+    # Privacy — VoiceFeature consults privacy_agent.can_use_cloud(), etc.
     privacy_agent = MagicMock()
+    privacy_agent.can_use_cloud.return_value = cloud_allowed
+    privacy_agent.get_mode_name.return_value = "normal" if cloud_allowed else "ephemeral"
+    privacy_agent.get_storage_policy.return_value = "full" if cloud_allowed else "none"
+    # Keep privacy_config for any direct access patterns
     privacy_config = MagicMock()
     privacy_config.allows_cloud_llm.return_value = cloud_allowed
     privacy_agent.privacy_config = privacy_config
@@ -225,7 +229,7 @@ class TestListVoices:
     @pytest.mark.asyncio
     async def test_privacy_filters_cloud(self, feature):
         """Cloud voices hidden when privacy blocks cloud."""
-        feature.agent.privacy_agent.privacy_config.allows_cloud_llm.return_value = False
+        feature.agent.privacy_agent.can_use_cloud.return_value = False
         result = await feature.list_voices()
         providers = {v["provider"] for v in result["voices"]}
         assert "fake_cloud" not in providers
@@ -260,7 +264,7 @@ class TestSetVoice:
 
     @pytest.mark.asyncio
     async def test_set_cloud_voice_blocked_by_privacy(self, feature):
-        feature.agent.privacy_agent.privacy_config.allows_cloud_llm.return_value = False
+        feature.agent.privacy_agent.can_use_cloud.return_value = False
         result = await feature.set_voice(voice_id="nova", provider="fake_cloud")
         assert result["success"] is False
         assert "privacy" in result["error"].lower()

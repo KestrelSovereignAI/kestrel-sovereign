@@ -274,7 +274,7 @@ terminate_child = { description = "Terminate a child agent", category = "agent_m
 [privacy]
 package = "kestrel-feature-privacy"
 git = "https://github.com/KestrelSovereignAI/kestrel-feature-privacy.git"
-features = ["PrivacyFeature"]
+features = ["PrivacyAgent"]
 description = "5-level privacy modes (EPHEMERAL to PUBLIC)"
 tags = ["privacy", "security", "data-protection"]
 icon = "eye-off"

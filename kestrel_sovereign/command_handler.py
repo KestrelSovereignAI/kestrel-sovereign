@@ -340,44 +340,12 @@ class CommandHandler:
         return self.agent.privacy_agent.get_status()
     
     def _cmd_get_privacy_mode(self, user_input: str) -> str:
-        """Handle !get-privacy-mode command."""
-        mode = self.agent.privacy_agent.privacy_mode
-        mode_info = {
-            PrivacyMode.EPHEMERAL: ("🔒", "EPHEMERAL: Nothing stored, local LLM only"),
-            PrivacyMode.ISOLATED: ("🔐", "ISOLATED: Temporary session storage, local LLM only"),
-            PrivacyMode.ANONYMOUS: ("🎭", "ANONYMOUS: Stored with PII removed, cloud LLM allowed"),
-            PrivacyMode.NORMAL: ("📝", "NORMAL: Standard persistent storage"),
-            PrivacyMode.PUBLIC: ("🌐", "PUBLIC: Shareable and exportable"),
-        }
-        icon, description = mode_info.get(mode, ("", f"Current mode: {mode.value}"))
-        return f"{icon} {description}"
-    
+        """Handle !get-privacy-mode command. Delegates to PrivacyAgent."""
+        return self.agent.privacy_agent.handle_get_privacy_mode()
+
     def _cmd_privacy_status(self, user_input: str) -> str:
-        """Handle !privacy-status command."""
-        status = self.agent.privacy_agent.get_detailed_status()
-        return f"""
-Privacy Status Report
-=====================
-Current Mode: {status['privacy_mode'].upper()}
-
-Storage:
-- Messages stored: {status['message_count']}
-- Storage location: {status['storage_location']}
-- Persistent: {status['persistent_storage']}
-- PII filtering: {'Enabled' if status['pii_filtering'] else 'Disabled'}
-
-LLM Providers:
-- Local (Ollama): {'Allowed' if status['llm_providers']['local_ollama'] else 'Disabled'}
-- Cloud (OpenAI): {'Allowed' if status['llm_providers']['cloud_openai'] else 'Disabled'}
-- Cloud (Anthropic): {'Allowed' if status['llm_providers']['cloud_anthropic'] else 'Disabled'}
-
-Backups:
-- Status: {status['backup_status']}
-- Encryption: {status['backup_encryption']}
-
-Sharing:
-- Can share: {status['shareable']}
-"""
+        """Handle !privacy-status command. Delegates to PrivacyAgent."""
+        return self.agent.privacy_agent.handle_privacy_status()
     
     async def _cmd_privacy_save(self, user_input: str) -> str:
         """Handle !privacy-save command."""
