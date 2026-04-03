@@ -370,7 +370,7 @@ class TestCodexAdapter:
         adapter = CodexAdapter()
         import asyncio
 
-        with pytest.raises(RuntimeError, match="requires an OpenAI client"):
+        with pytest.raises(RuntimeError, match="requires an OAuth token"):
             asyncio.run(adapter.get_response(
                 client=None, model="codex", messages=[]
             ))
