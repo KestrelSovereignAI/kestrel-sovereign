@@ -1,0 +1,22 @@
+[project]
+name = "kestrel-voice-elevenlabs"
+version = "0.1.0"
+description = "ElevenLabs TTS voice provider for Kestrel Sovereign"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    "kestrel_sovereign",
+    "elevenlabs>=1.0.0",
+]
+
+[project.entry-points."kestrel_sovereign.voice_providers"]
+ElevenLabsTTS = "kestrel_voice_elevenlabs.elevenlabs_tts:ElevenLabsTTSProvider"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["kestrel_voice_elevenlabs"]
