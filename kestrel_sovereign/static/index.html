@@ -880,6 +880,12 @@
             color: white;
         }
 
+        .feature-filter-btn.active {
+            background: var(--accent-color) !important;
+            color: white !important;
+            border-color: var(--accent-color) !important;
+        }
+
         /* Loading state */
         .loading {
             display: flex;
@@ -912,138 +918,6 @@
             .nav-tabs {
                 overflow-x: auto;
             }
-        }
-
-        /* Feature Store */
-        .feature-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
-            gap: 1rem;
-        }
-        .feature-card {
-            background: var(--bg-secondary, #1e1e2e);
-            border: 1px solid var(--border, #333);
-            border-radius: 8px;
-            padding: 1rem;
-            cursor: pointer;
-            transition: border-color 0.15s;
-        }
-        .feature-card:hover {
-            border-color: var(--accent-color, #6c5ce7);
-        }
-        .feature-card-header {
-            display: flex;
-            align-items: center;
-            gap: 0.5rem;
-            margin-bottom: 0.5rem;
-        }
-        .feature-icon { font-size: 1.3rem; }
-        .feature-name { font-weight: 600; }
-        .feature-badge {
-            font-size: 0.65rem;
-            padding: 0.1rem 0.4rem;
-            border-radius: 4px;
-            text-transform: uppercase;
-            font-weight: 600;
-        }
-        .feature-badge.core {
-            background: var(--accent-color, #6c5ce7);
-            color: white;
-        }
-        .feature-desc {
-            color: var(--text-secondary, #999);
-            font-size: 0.85rem;
-            margin-bottom: 0.5rem;
-        }
-        .feature-tools-count {
-            font-size: 0.8rem;
-            color: var(--text-secondary, #666);
-        }
-        .feature-section {
-            margin-top: 1.5rem;
-        }
-        .feature-section h4 {
-            margin: 0 0 0.75rem 0;
-            font-size: 1rem;
-        }
-        .feature-skill-list {
-            list-style: none;
-            padding: 0;
-            margin: 0;
-        }
-        .feature-skill-list li {
-            padding: 0.4rem 0;
-            border-bottom: 1px solid var(--border, #333);
-            font-size: 0.9rem;
-        }
-        .feature-detail-header h3 {
-            margin: 0 0 0.25rem 0;
-        }
-
-        /* Config form */
-        .config-form { max-width: 480px; }
-        .config-field {
-            margin-bottom: 1rem;
-        }
-        .config-label {
-            display: block;
-            font-weight: 600;
-            margin-bottom: 0.25rem;
-            font-size: 0.9rem;
-        }
-        .config-required { color: var(--error, #e74c3c); }
-        .config-description {
-            font-weight: 400;
-            font-size: 0.8rem;
-            color: var(--text-secondary, #999);
-            margin-top: 0.15rem;
-        }
-        .config-input {
-            width: 100%;
-            padding: 0.5rem;
-            background: var(--bg-primary, #121212);
-            color: var(--text-primary, #eee);
-            border: 1px solid var(--border, #333);
-            border-radius: 4px;
-            font-size: 0.9rem;
-            box-sizing: border-box;
-        }
-        .config-input:focus {
-            outline: none;
-            border-color: var(--accent-color, #6c5ce7);
-        }
-        .config-select {
-            appearance: auto;
-        }
-        .config-toggle {
-            position: relative;
-            display: inline-block;
-            width: 44px;
-            height: 24px;
-        }
-        .config-toggle input { opacity: 0; width: 0; height: 0; }
-        .config-toggle-slider {
-            position: absolute;
-            cursor: pointer;
-            top: 0; left: 0; right: 0; bottom: 0;
-            background: var(--border, #555);
-            border-radius: 24px;
-            transition: 0.2s;
-        }
-        .config-toggle-slider::before {
-            content: "";
-            position: absolute;
-            height: 18px; width: 18px;
-            left: 3px; bottom: 3px;
-            background: white;
-            border-radius: 50%;
-            transition: 0.2s;
-        }
-        .config-toggle input:checked + .config-toggle-slider {
-            background: var(--accent-color, #6c5ce7);
-        }
-        .config-toggle input:checked + .config-toggle-slider::before {
-            transform: translateX(20px);
         }
     </style>
 </head>
@@ -1718,12 +1592,69 @@
         <!-- Features Panel -->
         <div class="panel" id="panel-features">
             <div class="panel-content">
-                <h2 style="margin: 0 0 0.5rem 0;">Feature Store</h2>
-                <p style="color: var(--text-secondary); margin-bottom: 1.5rem;">
-                    Manage installed features and configure their settings.
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem;">
+                    <h2 style="margin: 0;">Feature Store</h2>
+                    <button onclick="FeatureStore.reload()" class="btn btn-secondary" style="
+                        padding: 0.25rem 0.75rem;
+                        font-size: 0.8rem;
+                    ">↻ Refresh</button>
+                </div>
+                <p style="color: var(--text-secondary); margin-bottom: 1rem; font-size: 0.875rem;">
+                    Browse, install, and manage feature packages for your agent.
                 </p>
-                <div id="feature-store-content">
-                    <div class="loading"><div class="spinner"></div>Loading features...</div>
+
+                <!-- Search and Filter Bar -->
+                <div style="display: flex; gap: 0.75rem; margin-bottom: 1.25rem; flex-wrap: wrap; align-items: center;">
+                    <input type="text" id="feature-search" placeholder="Search features, tags, skills..."
+                        style="
+                            flex: 1;
+                            min-width: 200px;
+                            padding: 0.5rem 0.75rem;
+                            border: 1px solid var(--border-color);
+                            border-radius: 8px;
+                            background: var(--bg-primary);
+                            color: var(--text-primary);
+                            font-size: 0.875rem;
+                            outline: none;
+                        ">
+                    <div id="feature-store-filters" style="display: flex; gap: 0.25rem;">
+                        <button class="feature-filter-btn active" data-filter="all" style="
+                            padding: 0.375rem 0.75rem;
+                            border: 1px solid var(--border-color);
+                            border-radius: 6px;
+                            background: var(--bg-tertiary);
+                            color: var(--text-primary);
+                            font-size: 0.8rem;
+                            cursor: pointer;
+                        ">All</button>
+                        <button class="feature-filter-btn" data-filter="installed" style="
+                            padding: 0.375rem 0.75rem;
+                            border: 1px solid var(--border-color);
+                            border-radius: 6px;
+                            background: var(--bg-primary);
+                            color: var(--text-secondary);
+                            font-size: 0.8rem;
+                            cursor: pointer;
+                        ">Installed</button>
+                        <button class="feature-filter-btn" data-filter="available" style="
+                            padding: 0.375rem 0.75rem;
+                            border: 1px solid var(--border-color);
+                            border-radius: 6px;
+                            background: var(--bg-primary);
+                            color: var(--text-secondary);
+                            font-size: 0.8rem;
+                            cursor: pointer;
+                        ">Available</button>
+                    </div>
+                </div>
+
+                <!-- Feature Card Grid -->
+                <div id="feature-grid" style="
+                    display: grid;
+                    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+                    gap: 1rem;
+                ">
+                    <div class="loading">Loading features...</div>
                 </div>
             </div>
         </div>
@@ -1827,7 +1758,6 @@
     <script src="shared/markdown/index.js"></script>
     <script src="shared/model-selector/index.js"></script>
     <script type="module" src="js/resources.js"></script>
-    <script src="js/feature-store.js"></script>
     <script type="module" src="js/app.js"></script>
 </body>
 </html>

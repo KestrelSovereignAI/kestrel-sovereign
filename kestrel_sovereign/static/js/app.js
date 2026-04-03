@@ -25,6 +25,7 @@ import { initTasks, loadTasks } from './tasks.js';
 import { loadResources } from './resources.js';
 import { initMetrics, loadMetrics } from './metrics.js';
 import { initSpawn, loadSpawn } from './spawn.js';
+import { initFeatureStore, loadFeatureStore } from './feature-store.js';
 // Import modules with side effects that define window.* functions
 import './database.js';  // Defines window.toggleDbExplorer
 import './ipfs.js';      // Defines window.toggleIpfsStatus
@@ -51,6 +52,7 @@ async function init() {
         loadResources,
         loadMetrics,
         loadSpawn,
+        loadFeatureStore,
     });
 
     // Initialize navigation
@@ -67,6 +69,9 @@ async function init() {
 
     // Initialize spawn component
     initSpawn();
+
+    // Initialize feature store component
+    initFeatureStore();
 
     // Initialize security module
     Security.init();
