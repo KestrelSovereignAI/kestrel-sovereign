@@ -420,6 +420,94 @@ class TestUpdateFeatureConfig:
         assert resp.status_code == 422
         assert "count" in resp.json()["detail"]
 
+    def test_validates_minimum(self):
+        schema = {
+            "type": "object",
+            "properties": {"risk": {"type": "integer", "minimum": 0, "maximum": 10}},
+        }
+        feature = _make_feature(config_schema=schema)
+        agent = _make_agent(features={"TestFeature": feature})
+        app = _make_app(agent)
+
+        with TestClient(app) as client:
+            resp = client.patch(
+                "/api/features/TestFeature/config",
+                json={"config": {"risk": -1}},
+            )
+
+        assert resp.status_code == 422
+        assert ">=" in resp.json()["detail"]
+
+    def test_validates_maximum(self):
+        schema = {
+            "type": "object",
+            "properties": {"risk": {"type": "integer", "minimum": 0, "maximum": 10}},
+        }
+        feature = _make_feature(config_schema=schema)
+        agent = _make_agent(features={"TestFeature": feature})
+        app = _make_app(agent)
+
+        with TestClient(app) as client:
+            resp = client.patch(
+                "/api/features/TestFeature/config",
+                json={"config": {"risk": 11}},
+            )
+
+        assert resp.status_code == 422
+        assert "<=" in resp.json()["detail"]
+
+    def test_validates_enum(self):
+        schema = {
+            "type": "object",
+            "properties": {"mode": {"type": "string", "enum": ["fast", "slow"]}},
+        }
+        feature = _make_feature(config_schema=schema)
+        agent = _make_agent(features={"TestFeature": feature})
+        app = _make_app(agent)
+
+        with TestClient(app) as client:
+            resp = client.patch(
+                "/api/features/TestFeature/config",
+                json={"config": {"mode": "turbo"}},
+            )
+
+        assert resp.status_code == 422
+        assert "one of" in resp.json()["detail"]
+
+    def test_valid_enum_passes(self):
+        schema = {
+            "type": "object",
+            "properties": {"mode": {"type": "string", "enum": ["fast", "slow"]}},
+        }
+        feature = _make_feature(config_schema=schema, config={"mode": "fast"})
+        agent = _make_agent(features={"TestFeature": feature})
+        app = _make_app(agent)
+
+        with TestClient(app) as client:
+            resp = client.patch(
+                "/api/features/TestFeature/config",
+                json={"config": {"mode": "slow"}},
+            )
+
+        assert resp.status_code == 200
+
+    def test_valid_min_max_passes(self):
+        schema = {
+            "type": "object",
+            "properties": {"risk": {"type": "integer", "minimum": 0, "maximum": 10}},
+        }
+        feature = _make_feature(config_schema=schema, config={"risk": 5})
+        agent = _make_agent(features={"TestFeature": feature})
+        app = _make_app(agent)
+
+        with TestClient(app) as client:
+            resp = client.patch(
+                "/api/features/TestFeature/config",
+                json={"config": {"risk": 5}},
+            )
+
+        assert resp.status_code == 200
+
 
 # ---------------------------------------------------------------------------
 # GET /api/features/{name}/skills
