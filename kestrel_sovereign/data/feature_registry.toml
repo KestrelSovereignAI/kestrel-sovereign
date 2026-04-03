@@ -368,6 +368,15 @@ tags = ["identity", "visual", "avatar"]
 icon = "palette"
 core = false
 
+[legal]
+package = "kestrel-feature-legal"
+git = "https://github.com/KestrelSovereignAI/kestrel-feature-legal.git"
+features = ["IncorporateTool"]
+description = "Wyoming DAO LLC formation — articles of organization, operating agreements, incorporation documents"
+tags = ["legal", "incorporation", "wyoming", "dao"]
+icon = "scale"
+core = false
+
 [consent]
 package = "kestrel-feature-consent"
 git = "https://github.com/KestrelSovereignAI/kestrel-feature-consent.git"
