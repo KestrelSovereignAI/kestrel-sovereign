@@ -6,7 +6,7 @@ from kestrel_sovereign.kestrel_agent import KestrelAgent
 from kestrel_sovereign.llm.service import LLMService
 from kestrel_sovereign.privacy import PrivacyMode
 from kestrel_sovereign.features.sovereignty import SovereigntyFeature
-from kestrel_sovereign.features.mcp import MCPAgent
+from kestrel_feature_mcp import MCPAgent
 from kestrel_sovereign.features.model import ModelAgent
 
 # Configure logging
