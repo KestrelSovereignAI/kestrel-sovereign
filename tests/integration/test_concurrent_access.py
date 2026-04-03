@@ -14,6 +14,8 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch, MagicMock
 import concurrent.futures
 
+from kestrel_sovereign import storage
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
 from kestrel_sovereign import storage
