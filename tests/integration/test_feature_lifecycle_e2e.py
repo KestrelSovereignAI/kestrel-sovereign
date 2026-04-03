@@ -707,9 +707,7 @@ class TestAPIEndpointLifecycle:
 
         # Set config via the feature directly (as the API would via PATCH)
         import asyncio
-        asyncio.get_event_loop().run_until_complete(
-            feature.set_config({"max_amount": 777})
-        )
+        asyncio.run(feature.set_config({"max_amount": 777}))
 
         # Disable
         client.post("/api/features/LifecycleTestFeature/disable")
@@ -718,7 +716,7 @@ class TestAPIEndpointLifecycle:
         client.post("/api/features/LifecycleTestFeature/enable")
 
         # Config should be preserved
-        config = asyncio.get_event_loop().run_until_complete(feature.get_config())
+        config = asyncio.run(feature.get_config())
         assert config["max_amount"] == 777
 
     def test_feature_detail_shows_hooks(self, app_with_feature):
