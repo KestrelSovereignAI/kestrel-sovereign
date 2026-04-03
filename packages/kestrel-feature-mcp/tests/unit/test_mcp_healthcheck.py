@@ -5,9 +5,6 @@ Tests the exponential backoff healthcheck without requiring Docker.
 """
 
 import pytest
-
-pytest.importorskip("kestrel_feature_mcp")
-
 import asyncio
 from unittest.mock import Mock, AsyncMock, patch, MagicMock
 

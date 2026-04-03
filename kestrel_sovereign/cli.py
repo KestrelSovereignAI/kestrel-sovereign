@@ -305,6 +305,15 @@ def cmd_stop(args) -> int:
     return 0
 
 
+def cmd_restart(args) -> int:
+    """Restart host and/or agents (stop then start)."""
+    rc = cmd_stop(args)
+    if rc != 0:
+        return rc
+    print()
+    return cmd_start(args)
+
+
 def cmd_status(args) -> int:
     """Show status of host and all agents."""
     project_dir = _get_project_dir()
@@ -1170,6 +1179,14 @@ def build_parser() -> argparse.ArgumentParser:
     stop_p = subparsers.add_parser("stop", help="Stop host and/or agents")
     stop_p.add_argument("name", nargs="?", help="Agent name (omit for all)")
 
+    # kestrel restart [name] [--subprocess]
+    restart_p = subparsers.add_parser("restart", help="Restart host and/or agents")
+    restart_p.add_argument("name", nargs="?", help="Agent name (omit for all)")
+    restart_p.add_argument(
+        "--subprocess", action="store_true",
+        help="Run each agent as a separate process (legacy mode)",
+    )
+
     # kestrel status
     subparsers.add_parser("status", help="Show status of host and agents")
 
@@ -1251,6 +1268,7 @@ def main() -> int:
     commands = {
         "start": cmd_start,
         "stop": cmd_stop,
+        "restart": cmd_restart,
         "status": cmd_status,
         "logs": cmd_logs,
         "list": cmd_list,

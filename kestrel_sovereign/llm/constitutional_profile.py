@@ -71,6 +71,7 @@ class ConstitutionalProfileService:
     # (e.g., claude_max and anthropic both use Anthropic's published constitution).
     PROVIDER_ALIASES: Dict[str, str] = {
         "claude_max": "anthropic",
+        "codex": "openai",
         "openai_mini": "openai",
         "vertex_ai": "google",
         "gemini": "google",

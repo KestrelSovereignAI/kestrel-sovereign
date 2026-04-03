@@ -1,37 +1,69 @@
 """
-Codex Provider Adapter (OpenAI OAuth)
+Codex Provider Adapter (OpenAI ChatGPT Backend)
 
-Adapter for using OpenAI models via Codex OAuth subscription authentication,
-similar to how ClaudeMaxAdapter wraps Anthropic with OAuth token auth.
+Adapter for using OpenAI models via ChatGPT Plus/Pro subscription OAuth,
+hitting the same private backend API that the Codex CLI and OpenClaw use:
+``https://chatgpt.com/backend-api/codex/responses``
 
-Uses the OpenAI Responses API (not Chat Completions) since that's what
-Codex models are optimized for. The OAuth access_token from `codex login`
-is passed as api_key to the OpenAI SDK — both are sent as Bearer tokens.
+This is the OpenAI equivalent of ClaudeMaxAdapter — subscription-included
+usage, not API key billing.
+
+The protocol is the standard OpenAI Responses API but served from the
+ChatGPT backend with OAuth Bearer auth + chatgpt-account-id header.
 
 Requirements:
-- pip install openai
 - Active ChatGPT Plus/Pro subscription
 - `codex login` completed (stores token in ~/.codex/auth.json)
   OR CODEX_AUTH_TOKEN env var set
-
-How it works:
-1. OAuth token from codex login is passed as api_key to the OpenAI SDK
-2. Both API keys and OAuth tokens are sent as `Authorization: Bearer <token>`
-3. Responses API is used instead of Chat Completions for codex-optimized models
 """
+import base64
 import json
 import logging
+import platform
 from typing import Any, Dict, List, Optional, AsyncIterator, Type, Union
 
-import openai
+import httpx
 from pydantic import BaseModel
 
-from .adapter import LLMResponse, ToolCall
+from .adapter import LLMAdapter, LLMResponse, ToolCall
 from .model_metadata import ModelInfo, ModelCategory
-from .openai_adapter import OpenAIAdapter
-from .retry import with_retry
 
 logger = logging.getLogger(__name__)
+
+CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex/responses"
+JWT_CLAIM_PATH = "https://api.openai.com/auth"
+
+
+def _extract_account_id(token: str) -> str:
+    """Extract chatgpt_account_id from the JWT access token claims."""
+    try:
+        parts = token.split(".")
+        if len(parts) != 3:
+            raise ValueError("Invalid JWT token")
+        # Decode JWT payload (base64url)
+        payload_b64 = parts[1]
+        # Add padding
+        payload_b64 += "=" * (-len(payload_b64) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(payload_b64))
+        account_id = payload.get(JWT_CLAIM_PATH, {}).get("chatgpt_account_id")
+        if not account_id:
+            raise ValueError("No chatgpt_account_id in token claims")
+        return account_id
+    except Exception as e:
+        raise ValueError(f"Failed to extract account ID from token: {e}") from e
+
+
+def _build_headers(token: str, account_id: str) -> dict:
+    """Build request headers matching the OpenClaw/Codex protocol."""
+    ua = f"kestrel ({platform.system()} {platform.release()}; {platform.machine()})"
+    return {
+        "Authorization": f"Bearer {token}",
+        "chatgpt-account-id": account_id,
+        "OpenAI-Beta": "responses=experimental",
+        "User-Agent": ua,
+        "Accept": "text/event-stream",
+        "Content-Type": "application/json",
+    }
 
 
 def _extract_instructions_and_input(messages):
@@ -69,13 +101,57 @@ def _convert_tools_to_responses_format(tools):
     return responses_tools or None
 
 
-class CodexAdapter(OpenAIAdapter):
-    """
-    Adapter for OpenAI Codex subscription using OAuth token auth.
+def _build_request_body(
+    model: str,
+    input_messages: list,
+    instructions: Optional[str] = None,
+    tools: Optional[list] = None,
+    stream: bool = True,
+    **kwargs,
+) -> dict:
+    """Build Responses API request body matching the ChatGPT backend protocol."""
+    body: Dict[str, Any] = {
+        "model": model,
+        "store": False,
+        "stream": stream,
+        "input": input_messages,
+        "tool_choice": "auto",
+        "parallel_tool_calls": True,
+        "include": ["reasoning.encrypted_content"],
+    }
+    if instructions:
+        body["instructions"] = instructions
+    if tools:
+        body["tools"] = tools
+    if "max_tokens" in kwargs:
+        body["max_output_tokens"] = kwargs["max_tokens"]
+    if "temperature" in kwargs:
+        body["temperature"] = kwargs["temperature"]
+    if "top_p" in kwargs:
+        body["top_p"] = kwargs["top_p"]
+    return body
 
-    Subclasses OpenAIAdapter — uses the Responses API instead of
-    Chat Completions. Authentication is handled at client creation
-    time in the provider registry (OAuth token passed as api_key).
+
+async def _parse_sse_events(response: httpx.Response):
+    """Parse SSE events from an httpx streaming response."""
+    async for line in response.aiter_lines():
+        if line.startswith("data: "):
+            data = line[6:]
+            if data == "[DONE]":
+                return
+            try:
+                yield json.loads(data)
+            except json.JSONDecodeError:
+                continue
+
+
+class CodexAdapter(LLMAdapter):
+    """
+    Adapter for OpenAI Codex subscription via ChatGPT backend.
+
+    Uses httpx to hit chatgpt.com/backend-api/codex/responses with
+    OAuth Bearer token + chatgpt-account-id header. The response format
+    is the standard OpenAI Responses API SSE stream.
     """
 
     def __init__(self):
@@ -83,7 +159,7 @@ class CodexAdapter(OpenAIAdapter):
 
     async def get_response(
         self,
-        client: openai.AsyncOpenAI,
+        client: Any,  # OAuth token string stored as client
         model: str,
         messages: List[Dict[str, Any]],
         format: Optional[str] = None,
@@ -91,291 +167,269 @@ class CodexAdapter(OpenAIAdapter):
         response_format: Optional[Type[BaseModel]] = None,
         **kwargs
     ) -> LLMResponse:
-        """Get a response using the OpenAI Responses API."""
-        try:
-            if client is None:
-                raise RuntimeError("Codex adapter requires an OpenAI client but none is configured")
+        """Get a response from the ChatGPT backend Responses API.
 
-            instructions, input_messages = _extract_instructions_and_input(messages)
-
-            extra_kwargs: Dict[str, Any] = {}
-            if instructions:
-                extra_kwargs["instructions"] = instructions
-
-            responses_tools = _convert_tools_to_responses_format(tools)
-            if responses_tools:
-                extra_kwargs["tools"] = responses_tools
-
-            if "max_tokens" in kwargs:
-                extra_kwargs["max_output_tokens"] = kwargs["max_tokens"]
-            if "temperature" in kwargs:
-                extra_kwargs["temperature"] = kwargs["temperature"]
-            if "top_p" in kwargs:
-                extra_kwargs["top_p"] = kwargs["top_p"]
-
-            response = await with_retry(
-                client.responses.create,
-                model=model,
-                input=input_messages,
-                **extra_kwargs
+        The ChatGPT backend requires stream=true, so we consume the
+        SSE stream internally and assemble the final response.
+        """
+        token = client  # Provider registry stores token as "client"
+        if not isinstance(token, str):
+            raise RuntimeError(
+                "Codex adapter requires an OAuth token. "
+                "Run `codex login` or set CODEX_AUTH_TOKEN."
             )
 
-            # Extract text and tool calls from output items
-            content = None
-            parsed_tool_calls = None
+        account_id = _extract_account_id(token)
+        headers = _build_headers(token, account_id)
+        instructions, input_messages = _extract_instructions_and_input(messages)
+        responses_tools = _convert_tools_to_responses_format(tools)
 
-            for item in response.output:
-                if item.type == "message":
-                    texts = []
-                    for part in item.content:
-                        if part.type == "output_text":
-                            texts.append(part.text)
-                    if texts:
-                        content = "\n".join(texts)
+        body = _build_request_body(
+            model=model,
+            input_messages=input_messages,
+            instructions=instructions,
+            tools=responses_tools,
+            stream=True,  # ChatGPT backend requires streaming
+            **kwargs,
+        )
 
-                elif item.type == "function_call":
-                    if parsed_tool_calls is None:
-                        parsed_tool_calls = []
-                    try:
-                        args = json.loads(item.arguments) if item.arguments else {}
-                    except json.JSONDecodeError:
-                        args = {"raw": item.arguments}
-                    parsed_tool_calls.append(ToolCall(
-                        id=item.id,
-                        name=item.name,
-                        arguments=args,
-                    ))
+        # Consume SSE stream and assemble final response
+        content_parts: List[str] = []
+        parsed_tool_calls = None
+        func_calls: Dict[int, Dict[str, str]] = {}
+        final_usage: Dict[str, Any] = {}
 
-            # Extract usage
-            input_tokens = None
-            output_tokens = None
-            total_tokens = None
-            if hasattr(response, "usage") and response.usage:
-                input_tokens = response.usage.input_tokens
-                output_tokens = response.usage.output_tokens
-                total_tokens = response.usage.total_tokens
+        async with httpx.AsyncClient(timeout=120) as http:
+            async with http.stream("POST", CODEX_BASE_URL, headers=headers, json=body) as resp:
+                if resp.status_code != 200:
+                    await resp.aread()
+                    error_text = resp.text[:500]
+                    logger.error(f"Codex API error {resp.status_code}: {error_text}")
+                    raise RuntimeError(
+                        f"Codex API returned {resp.status_code}: {error_text}"
+                    )
 
-            return LLMResponse(
-                content=content,
-                tool_calls=parsed_tool_calls,
-                raw=response,
-                input_tokens=input_tokens,
-                output_tokens=output_tokens,
-                total_tokens=total_tokens,
-            )
+                async for event in _parse_sse_events(resp):
+                    event_type = event.get("type", "")
 
-        except openai.AuthenticationError as e:
-            logger.error(
-                f"Codex authentication failed: {e}. "
-                "Run `codex login` to refresh your OAuth token, "
-                "or check CODEX_AUTH_TOKEN env var."
-            )
-            raise
-        except openai.RateLimitError as e:
-            logger.error(f"Codex rate limit exceeded: {e}")
-            raise
-        except openai.APIConnectionError as e:
-            logger.error(f"Codex connection error: {e}")
-            raise
-        except openai.APIError as e:
-            logger.error(f"Codex API error: {e}")
-            raise
-        except Exception as e:
-            logger.error(f"Codex adapter failed: {e}", exc_info=True)
-            raise
+                    if event_type == "response.output_text.delta":
+                        content_parts.append(event.get("delta", ""))
+
+                    elif event_type == "response.output_item.added":
+                        item = event.get("item", {})
+                        if item.get("type") == "function_call":
+                            idx = event.get("output_index", 0)
+                            func_calls[idx] = {
+                                "id": item.get("id", ""),
+                                "name": item.get("name", ""),
+                                "arguments": "",
+                            }
+
+                    elif event_type == "response.function_call_arguments.delta":
+                        idx = event.get("output_index", 0)
+                        if idx not in func_calls:
+                            func_calls[idx] = {"id": "", "name": "", "arguments": ""}
+                        func_calls[idx]["arguments"] += event.get("delta", "")
+
+                    elif event_type == "response.function_call_arguments.done":
+                        idx = event.get("output_index", 0)
+                        if idx not in func_calls:
+                            func_calls[idx] = {"id": "", "name": "", "arguments": ""}
+                        func_calls[idx]["arguments"] = event.get("arguments", "")
+
+                    elif event_type == "response.completed":
+                        resp_data = event.get("response", {})
+                        final_usage = resp_data.get("usage", {})
+
+        content = "".join(content_parts) if content_parts else None
+
+        if func_calls:
+            parsed_tool_calls = []
+            for idx in sorted(func_calls.keys()):
+                fc = func_calls[idx]
+                try:
+                    args = json.loads(fc["arguments"]) if fc["arguments"] else {}
+                except json.JSONDecodeError:
+                    args = {"raw": fc["arguments"]}
+                parsed_tool_calls.append(ToolCall(
+                    id=fc["id"],
+                    name=fc["name"],
+                    arguments=args,
+                ))
+
+        return LLMResponse(
+            content=content,
+            tool_calls=parsed_tool_calls,
+            raw=None,
+            input_tokens=final_usage.get("input_tokens"),
+            output_tokens=final_usage.get("output_tokens"),
+            total_tokens=final_usage.get("total_tokens"),
+        )
 
     async def get_streaming_response(
         self,
-        client: openai.AsyncOpenAI,
+        client: Any,
         model: str,
         messages: List[Dict[str, Any]],
         tools: Optional[List[Dict[str, Any]]] = None,
         response_format: Optional[Type[BaseModel]] = None,
         **kwargs
     ) -> AsyncIterator[str]:
-        """Get a streaming response using the Responses API."""
-        try:
-            instructions, input_messages = _extract_instructions_and_input(messages)
+        """Get a streaming response from the ChatGPT backend."""
+        token = client
+        if not isinstance(token, str):
+            raise RuntimeError("Codex adapter requires an OAuth token.")
 
-            extra_kwargs: Dict[str, Any] = {}
-            if instructions:
-                extra_kwargs["instructions"] = instructions
-            if "max_tokens" in kwargs:
-                extra_kwargs["max_output_tokens"] = kwargs["max_tokens"]
-            if "temperature" in kwargs:
-                extra_kwargs["temperature"] = kwargs["temperature"]
-            if "top_p" in kwargs:
-                extra_kwargs["top_p"] = kwargs["top_p"]
+        account_id = _extract_account_id(token)
+        headers = _build_headers(token, account_id)
+        instructions, input_messages = _extract_instructions_and_input(messages)
 
-            logger.info(f"Starting Codex Responses API stream for model: {model}")
-            stream = await with_retry(
-                client.responses.create,
-                model=model,
-                input=input_messages,
-                stream=True,
-                **extra_kwargs
-            )
+        body = _build_request_body(
+            model=model,
+            input_messages=input_messages,
+            instructions=instructions,
+            stream=True,
+            **kwargs,
+        )
 
-            chunk_count = 0
-            async for event in stream:
-                if event.type == "response.output_text.delta":
-                    chunk_count += 1
-                    yield event.delta
+        logger.info(f"Starting Codex stream for model: {model}")
+        chunk_count = 0
 
-            logger.info(f"Codex stream completed. Total chunks: {chunk_count}")
+        async with httpx.AsyncClient(timeout=120) as http:
+            async with http.stream("POST", CODEX_BASE_URL, headers=headers, json=body) as resp:
+                if resp.status_code != 200:
+                    await resp.aread()
+                    error_text = resp.text[:500]
+                    logger.error(f"Codex stream error {resp.status_code}: {error_text}")
+                    raise RuntimeError(
+                        f"Codex API returned {resp.status_code}: {error_text}"
+                    )
 
-        except openai.AuthenticationError as e:
-            logger.error(
-                f"Codex authentication failed during streaming: {e}. "
-                "Run `codex login` to refresh your OAuth token."
-            )
-            raise
-        except openai.RateLimitError as e:
-            logger.error(f"Codex rate limit exceeded during streaming: {e}")
-            raise
-        except openai.APIConnectionError as e:
-            logger.error(f"Codex connection error during streaming: {e}")
-            raise
-        except openai.APIError as e:
-            logger.error(f"Codex API error during streaming: {e}")
-            raise
-        except Exception as e:
-            logger.error(f"Codex streaming failed: {e}", exc_info=True)
-            raise
+                async for event in _parse_sse_events(resp):
+                    event_type = event.get("type", "")
+                    if event_type == "response.output_text.delta":
+                        chunk_count += 1
+                        yield event.get("delta", "")
+
+        logger.info(f"Codex stream completed. Total chunks: {chunk_count}")
 
     async def get_streaming_response_with_tools(
         self,
-        client: openai.AsyncOpenAI,
+        client: Any,
         model: str,
         messages: List[Dict[str, Any]],
         tools: Optional[List[Dict[str, Any]]] = None,
         response_format: Optional[Type[BaseModel]] = None,
         **kwargs
     ) -> AsyncIterator[Union[str, LLMResponse]]:
-        """Stream response with tool call detection via Responses API."""
-        try:
-            instructions, input_messages = _extract_instructions_and_input(messages)
+        """Stream response with tool call detection."""
+        token = client
+        if not isinstance(token, str):
+            raise RuntimeError("Codex adapter requires an OAuth token.")
 
-            extra_kwargs: Dict[str, Any] = {}
-            if instructions:
-                extra_kwargs["instructions"] = instructions
+        account_id = _extract_account_id(token)
+        headers = _build_headers(token, account_id)
+        instructions, input_messages = _extract_instructions_and_input(messages)
+        responses_tools = _convert_tools_to_responses_format(tools)
 
-            responses_tools = _convert_tools_to_responses_format(tools)
-            if responses_tools:
-                extra_kwargs["tools"] = responses_tools
+        body = _build_request_body(
+            model=model,
+            input_messages=input_messages,
+            instructions=instructions,
+            tools=responses_tools,
+            stream=True,
+            **kwargs,
+        )
 
-            if "max_tokens" in kwargs:
-                extra_kwargs["max_output_tokens"] = kwargs["max_tokens"]
-            if "temperature" in kwargs:
-                extra_kwargs["temperature"] = kwargs["temperature"]
-            if "top_p" in kwargs:
-                extra_kwargs["top_p"] = kwargs["top_p"]
+        logger.info(f"Starting Codex stream with tools for model: {model}")
+        text_content = ""
+        chunk_count = 0
+        func_calls: Dict[int, Dict[str, str]] = {}
+        final_usage: Dict[str, Any] = {}
 
-            logger.info(f"Starting Codex stream with tools for model: {model}")
-            stream = await with_retry(
-                client.responses.create,
-                model=model,
-                input=input_messages,
-                stream=True,
-                **extra_kwargs
+        async with httpx.AsyncClient(timeout=120) as http:
+            async with http.stream("POST", CODEX_BASE_URL, headers=headers, json=body) as resp:
+                if resp.status_code != 200:
+                    await resp.aread()
+                    error_text = resp.text[:500]
+                    raise RuntimeError(
+                        f"Codex API returned {resp.status_code}: {error_text}"
+                    )
+
+                async for event in _parse_sse_events(resp):
+                    event_type = event.get("type", "")
+
+                    if event_type == "response.output_text.delta":
+                        chunk_count += 1
+                        delta = event.get("delta", "")
+                        text_content += delta
+                        yield delta
+
+                    elif event_type == "response.function_call_arguments.delta":
+                        idx = event.get("output_index", 0)
+                        if idx not in func_calls:
+                            func_calls[idx] = {"id": "", "name": "", "arguments": ""}
+                        func_calls[idx]["arguments"] += event.get("delta", "")
+
+                    elif event_type == "response.function_call_arguments.done":
+                        idx = event.get("output_index", 0)
+                        if idx not in func_calls:
+                            func_calls[idx] = {"id": "", "name": "", "arguments": ""}
+                        func_calls[idx]["arguments"] = event.get("arguments", "")
+
+                    elif event_type == "response.output_item.added":
+                        item = event.get("item", {})
+                        if item.get("type") == "function_call":
+                            idx = event.get("output_index", 0)
+                            func_calls[idx] = {
+                                "id": item.get("id", ""),
+                                "name": item.get("name", ""),
+                                "arguments": "",
+                            }
+
+                    elif event_type == "response.completed":
+                        resp_data = event.get("response", {})
+                        usage = resp_data.get("usage", {})
+                        final_usage = usage
+
+        # Yield final tool call response if any
+        if func_calls:
+            parsed_tool_calls = []
+            for idx in sorted(func_calls.keys()):
+                fc = func_calls[idx]
+                try:
+                    args = json.loads(fc["arguments"]) if fc["arguments"] else {}
+                except json.JSONDecodeError:
+                    args = {"raw": fc["arguments"]}
+                parsed_tool_calls.append(ToolCall(
+                    id=fc["id"],
+                    name=fc["name"],
+                    arguments=args,
+                ))
+
+            yield LLMResponse(
+                content=text_content if text_content else None,
+                tool_calls=parsed_tool_calls,
+                raw=None,
+                input_tokens=final_usage.get("input_tokens"),
+                output_tokens=final_usage.get("output_tokens"),
+                total_tokens=final_usage.get("total_tokens"),
             )
 
-            text_content = ""
-            chunk_count = 0
-            func_calls: Dict[int, Dict[str, str]] = {}
-
-            async for event in stream:
-                if event.type == "response.output_text.delta":
-                    chunk_count += 1
-                    text_content += event.delta
-                    yield event.delta
-
-                elif event.type == "response.function_call_arguments.delta":
-                    idx = event.output_index
-                    if idx not in func_calls:
-                        func_calls[idx] = {"id": "", "name": "", "arguments": ""}
-                    func_calls[idx]["arguments"] += event.delta
-
-                elif event.type == "response.function_call_arguments.done":
-                    idx = event.output_index
-                    if idx not in func_calls:
-                        func_calls[idx] = {"id": "", "name": "", "arguments": ""}
-                    func_calls[idx]["arguments"] = event.arguments
-
-                elif event.type == "response.output_item.added":
-                    item = event.item
-                    if hasattr(item, "type") and item.type == "function_call":
-                        idx = event.output_index
-                        func_calls[idx] = {
-                            "id": getattr(item, "id", "") or "",
-                            "name": getattr(item, "name", "") or "",
-                            "arguments": "",
-                        }
-
-                elif event.type == "response.completed":
-                    resp = event.response
-                    input_tokens = None
-                    output_tokens = None
-                    total_tokens = None
-                    if hasattr(resp, "usage") and resp.usage:
-                        input_tokens = resp.usage.input_tokens
-                        output_tokens = resp.usage.output_tokens
-                        total_tokens = resp.usage.total_tokens
-
-                    if func_calls:
-                        parsed_tool_calls = []
-                        for idx in sorted(func_calls.keys()):
-                            fc = func_calls[idx]
-                            try:
-                                args = json.loads(fc["arguments"]) if fc["arguments"] else {}
-                            except json.JSONDecodeError:
-                                args = {"raw": fc["arguments"]}
-                            parsed_tool_calls.append(ToolCall(
-                                id=fc["id"],
-                                name=fc["name"],
-                                arguments=args,
-                            ))
-
-                        yield LLMResponse(
-                            content=text_content if text_content else None,
-                            tool_calls=parsed_tool_calls,
-                            raw=None,
-                            input_tokens=input_tokens,
-                            output_tokens=output_tokens,
-                            total_tokens=total_tokens,
-                        )
-
-            logger.info(
-                f"Codex stream completed. Text chunks: {chunk_count}, "
-                f"Tool calls: {len(func_calls)}"
-            )
-
-        except openai.AuthenticationError as e:
-            logger.error(f"Codex auth failed during streaming with tools: {e}")
-            raise
-        except openai.RateLimitError as e:
-            logger.error(f"Codex rate limit during streaming with tools: {e}")
-            raise
-        except openai.APIError as e:
-            logger.error(f"Codex API error during streaming with tools: {e}")
-            raise
-        except Exception as e:
-            logger.error(f"Codex streaming with tools failed: {e}", exc_info=True)
-            raise
+        logger.info(
+            f"Codex stream completed. Text chunks: {chunk_count}, "
+            f"Tool calls: {len(func_calls)}"
+        )
 
     async def list_models(self) -> List[ModelInfo]:
-        """
-        Return available models for Codex subscription.
-
-        Hardcoded because OAuth tokens lack the api.model.read scope
-        needed for model discovery via API.
-        """
+        """Return available models for Codex subscription."""
         return [
             ModelInfo(
                 id="gpt-5.4",
                 display_name="GPT-5.4 (Codex)",
                 provider="codex",
                 category=ModelCategory.CHAT,
+                context_limit=1_050_000,
                 supports_tools=True,
                 supports_vision=True,
                 supports_streaming=True,

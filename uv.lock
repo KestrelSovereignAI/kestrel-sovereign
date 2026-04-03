@@ -7,6 +7,12 @@ resolution-markers = [
     "python_full_version < '3.12'",
 ]
 
+[manifest]
+members = [
+    "kestrel-feature-mcp",
+    "kestrel-sovereign",
+]
+
 [[package]]
 name = "accelerate"
 version = "1.12.0"
@@ -2567,24 +2573,34 @@ wheels = [
 ]
 
 [[package]]
-name = "kestrel-feature-github"
+name = "kestrel-feature-mcp"
 version = "0.1.0"
-source = { editable = "kestrel-feature-github" }
+source = { editable = "packages/kestrel-feature-mcp" }
 dependencies = [
-    { name = "aiosqlite" },
-    { name = "httpx" },
+    { name = "aiohttp" },
+    { name = "docker" },
     { name = "kestrel-sovereign" },
-    { name = "pyyaml" },
+    { name = "mcp" },
+    { name = "trio" },
+]
+
+[package.optional-dependencies]
+test = [
+    { name = "pytest" },
+    { name = "pytest-asyncio" },
+    { name = "pytest-timeout" },
 ]
 
 [package.metadata]
 requires-dist = [
-    { name = "aiosqlite" },
-    { name = "httpx" },
-    { name = "kestrel-sovereign" },
-    { name = "pytest", marker = "extra == 'test'" },
-    { name = "pytest-asyncio", marker = "extra == 'test'" },
-    { name = "pyyaml" },
+    { name = "aiohttp", specifier = ">=3.13.3" },
+    { name = "docker", specifier = ">=7.1.0" },
+    { name = "kestrel-sovereign", editable = "." },
+    { name = "mcp", specifier = ">=1.26.0" },
+    { name = "pytest", marker = "extra == 'test'", specifier = ">=8.0.0" },
+    { name = "pytest-asyncio", marker = "extra == 'test'", specifier = ">=1.1.0" },
+    { name = "pytest-timeout", marker = "extra == 'test'", specifier = ">=2.3.1" },
+    { name = "trio", specifier = ">=0.32.0" },
 ]
 provides-extras = ["test"]
 
@@ -2614,7 +2630,6 @@ dependencies = [
     { name = "idna" },
     { name = "iniconfig" },
     { name = "itsdangerous" },
-    { name = "kestrel-feature-github" },
     { name = "networkx" },
     { name = "numpy" },
     { name = "ollama" },
@@ -2649,15 +2664,14 @@ all-features = [
     { name = "chromadb" },
     { name = "deepgram-sdk" },
     { name = "diffusers" },
-    { name = "docker" },
     { name = "elevenlabs" },
     { name = "faster-whisper" },
     { name = "google-cloud-compute" },
     { name = "google-cloud-run" },
+    { name = "kestrel-feature-mcp" },
     { name = "kestrel-talon" },
     { name = "langchain" },
     { name = "langchain-community" },
-    { name = "mcp" },
     { name = "numpy" },
     { name = "ollama" },
     { name = "opentelemetry-api" },
@@ -2681,7 +2695,6 @@ all-features = [
     { name = "torchaudio" },
     { name = "torchvision" },
     { name = "transformers" },
-    { name = "trio" },
     { name = "twilio" },
     { name = "vastai-sdk" },
     { name = "web3" },
@@ -2708,15 +2721,14 @@ full = [
     { name = "chromadb" },
     { name = "deepgram-sdk" },
     { name = "diffusers" },
-    { name = "docker" },
     { name = "elevenlabs" },
     { name = "faster-whisper" },
     { name = "google-cloud-compute" },
     { name = "google-cloud-run" },
+    { name = "kestrel-feature-mcp" },
     { name = "kestrel-talon" },
     { name = "langchain" },
     { name = "langchain-community" },
-    { name = "mcp" },
     { name = "numpy" },
     { name = "ollama" },
     { name = "opentelemetry-api" },
@@ -2744,7 +2756,6 @@ full = [
     { name = "torchaudio" },
     { name = "torchvision" },
     { name = "transformers" },
-    { name = "trio" },
     { name = "twilio" },
     { name = "vastai-sdk" },
     { name = "web3" },
@@ -2763,9 +2774,7 @@ local = [
     { name = "spacy" },
 ]
 mcp = [
-    { name = "docker" },
-    { name = "mcp" },
-    { name = "trio" },
+    { name = "kestrel-feature-mcp" },
 ]
 ml = [
     { name = "accelerate" },
@@ -2845,7 +2854,6 @@ requires-dist = [
     { name = "cryptography", specifier = ">=45.0.5" },
     { name = "deepgram-sdk", marker = "extra == 'voice'", specifier = ">=4.0.0" },
     { name = "diffusers", marker = "extra == 'ml'", specifier = ">=0.36.0" },
-    { name = "docker", marker = "extra == 'mcp'", specifier = ">=7.1.0" },
     { name = "elevenlabs", marker = "extra == 'voice'", specifier = ">=1.0.0" },
     { name = "email-validator", specifier = ">=2.3.0" },
     { name = "fastapi", specifier = "==0.128.1" },
@@ -2861,7 +2869,7 @@ requires-dist = [
     { name = "idna", specifier = "==3.11" },
     { name = "iniconfig", specifier = "==2.1.0" },
     { name = "itsdangerous", specifier = ">=2.2.0" },
-    { name = "kestrel-feature-github", editable = "kestrel-feature-github" },
+    { name = "kestrel-feature-mcp", marker = "extra == 'mcp'", editable = "packages/kestrel-feature-mcp" },
     { name = "kestrel-sovereign", extras = ["all-features"], marker = "extra == 'full'" },
     { name = "kestrel-sovereign", extras = ["cloud"], marker = "extra == 'all-features'" },
     { name = "kestrel-sovereign", extras = ["delivery"], marker = "extra == 'all-features'" },
@@ -2878,7 +2886,6 @@ requires-dist = [
     { name = "kestrel-talon", marker = "extra == 'github'", git = "https://github.com/KestrelSovereignAI/kestrel-talon.git" },
     { name = "langchain", marker = "extra == 'local'", specifier = ">=0.3.31" },
     { name = "langchain-community", marker = "extra == 'local'", specifier = ">=0.3.31" },
-    { name = "mcp", marker = "extra == 'mcp'", specifier = ">=1.26.0" },
     { name = "networkx", specifier = "==3.5" },
     { name = "numpy", specifier = ">=2.3.1" },
     { name = "numpy", marker = "extra == 'local'", specifier = "==2.3.1" },
@@ -2928,7 +2935,6 @@ requires-dist = [
     { name = "torchaudio", marker = "extra == 'ml'", specifier = ">=2.9.1" },
     { name = "torchvision", marker = "extra == 'ml'", specifier = ">=0.24.1" },
     { name = "transformers", marker = "extra == 'ml'", specifier = ">=4.57.1" },
-    { name = "trio", marker = "extra == 'mcp'", specifier = ">=0.32.0" },
     { name = "twilio", marker = "extra == 'delivery'", specifier = ">=9.9.1" },
     { name = "urllib3", specifier = ">=2.6.3" },
     { name = "uvicorn", specifier = "==0.35.0" },
