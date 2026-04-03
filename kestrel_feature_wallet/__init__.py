@@ -1,9 +1,7 @@
 """
-Wallet feature for Kestrel agents.
+Kestrel Feature Wallet — Multi-currency agent wallet with Stripe on-ramp.
 
-This is a backward-compatible shim that re-exports from the extracted
-kestrel_feature_wallet package. All wallet code now lives in the
-standalone kestrel-feature-wallet package.
+Extracted from kestrel-sovereign as a standalone feature package.
 
 NOTE: Some wallet features require optional dependencies:
 - web3: Required for EVM chain support (Ethereum, Polygon, Filecoin FEVM)
@@ -13,20 +11,18 @@ If these dependencies are not installed, the affected features will be unavailab
 but the core wallet functionality will still work.
 """
 
-# Re-export everything from the extracted package
-from kestrel_feature_wallet import (  # noqa: F401
-    WalletAgent,
-    WalletFeature,
-    Currency,
-    EconomicGateMixin,
-    FilecoinToolsMixin,
-    MultichainToolsMixin,
-    FilecoinTestnetAdapter,
-    FilecoinNetwork,
-    FilecoinKeyManager,
-    TransactionManager,
-    TransactionAudit,
-    TransactionSecurityHook,
+from .feature import WalletAgent, Currency
+from .wallet_feature import WalletFeature
+from .economic_gates import EconomicGateMixin
+from .filecoin_tools import FilecoinToolsMixin
+from .multichain_tools import MultichainToolsMixin
+from .filecoin_testnet import FilecoinTestnetAdapter, FilecoinNetwork
+from .filecoin_keys import FilecoinKeyManager
+from .transaction_manager import TransactionManager, TransactionAudit
+from .transaction_hook import TransactionSecurityHook
+
+# Import chain adapters (handles web3 optionality internally)
+from .chain_adapters import (
     ChainNetwork,
     ChainAdapter,
     TokenRegistry,
@@ -40,20 +36,15 @@ from kestrel_feature_wallet import (  # noqa: F401
 
 # EVM adapters are optional (require web3)
 if EVM_AVAILABLE:
-    from kestrel_feature_wallet import EVMAdapter, ERC20Adapter  # noqa: F401
+    from .chain_adapters import EVMAdapter, ERC20Adapter
 else:
     EVMAdapter = None  # type: ignore
     ERC20Adapter = None  # type: ignore
 
 # Stripe on-ramp is optional
 try:
-    from kestrel_feature_wallet import (  # noqa: F401
-        StripeOnRamp,
-        OnRampSession,
-        OnRampStatus,
-        StripeWebhookHandler,
-        STRIPE_AVAILABLE,
-    )
+    from .onramp import StripeOnRamp, OnRampSession, OnRampStatus, StripeWebhookHandler
+    STRIPE_AVAILABLE = True
 except ImportError:
     StripeOnRamp = None  # type: ignore
     OnRampSession = None  # type: ignore

@@ -1,19 +1,3 @@
-"""
-Fiat On-Ramp Package for Kestrel Wallet.
-
-Provides integrations for users to fund their agent's wallet
-with fiat currency (credit card, bank transfer, etc.).
-
-Currently supports:
-- Stripe Crypto On-Ramp
-"""
-
-from .stripe_onramp import StripeOnRamp, OnRampSession, OnRampStatus
-from .webhook_handler import StripeWebhookHandler
-
-__all__ = [
-    "StripeOnRamp",
-    "OnRampSession",
-    "OnRampStatus",
-    "StripeWebhookHandler",
-]
+"""Shim: re-exports from kestrel_feature_wallet.onramp."""
+from kestrel_feature_wallet.onramp import *  # noqa: F401,F403
+from kestrel_feature_wallet.onramp import StripeOnRamp, OnRampSession, OnRampStatus, StripeWebhookHandler  # noqa: F401
