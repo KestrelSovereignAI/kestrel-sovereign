@@ -33,10 +33,14 @@ async def agent(temp_db):
 
     # Also update the already-built providers list so _get_local_model_fallback()
     # returns our test model (it checks providers before config)
+    found_ollama = False
     for provider in llm_service.providers:
         if provider.get("name") == "ollama":
             provider["model"] = "test-economy-model"
+            found_ollama = True
             break
+    if not found_ollama:
+        llm_service.providers.append({"name": "ollama", "model": "test-economy-model"})
 
     # Use a dummy DID
     did = "did:pkh:eip155:1:0x1234567890123456789012345678901234567890"
