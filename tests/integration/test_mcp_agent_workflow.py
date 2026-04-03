@@ -14,6 +14,9 @@ Run with: uv run pytest tests/integration/test_mcp_agent_workflow.py -v -x
 """
 
 import pytest
+
+pytest.importorskip("kestrel_feature_mcp")
+
 import pytest_asyncio
 import asyncio
 import logging
