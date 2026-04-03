@@ -894,13 +894,18 @@ async def set_current_model(request: Request):
 
 @router.get("/v1/models")
 def list_models_v1(request: Request):
-    """Return a minimal models list for OpenAI-compatible clients."""
+    """Return a minimal models list for OpenAI-compatible clients.
+
+    Uses get_active_model_id() so the reported model reflects any
+    mandate preference, not just the first provider's config default.
+    """
     try:
         agent = get_agent(request)
         model_id = "kestrel-local"
-        if hasattr(agent, 'llm_service') and agent.llm_service.providers:
-            prov = agent.llm_service.providers[0]
-            model_id = prov.get('model') or model_id
+        if hasattr(agent, 'llm_service') and agent.llm_service:
+            active = agent.llm_service.get_active_model_id()
+            if active and active != "auto":
+                model_id = active
         return {"object": "list", "data": [{"id": model_id, "object": "model"}]}
     except Exception as e:
         logger.error(f"Error listing models: {e}")
@@ -936,11 +941,20 @@ async def chat_completions(request: Request):
             user_input, model_override=model_override
         )
 
+        # Report the model that was actually routed, not just what the
+        # client requested.  get_active_model_id() reflects mandate
+        # preference and provider routing — the honest answer.
+        resolved_model = "kestrel-local"
+        if hasattr(agent, 'llm_service') and agent.llm_service:
+            active = agent.llm_service.get_active_model_id()
+            if active and active != "auto":
+                resolved_model = active
+
         resp = {
             "id": f"chatcmpl-{int(time.time()*1000)}",
             "object": "chat.completion",
             "created": int(time.time()),
-            "model": data.get("model", "kestrel-local"),
+            "model": resolved_model,
             "choices": [
                 {
                     "index": 0,

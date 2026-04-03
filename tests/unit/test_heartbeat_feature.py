@@ -74,6 +74,7 @@ def _make_agent(db=None, agent_id="test-heartbeat-agent"):
     llm_service.get_model_preference = MagicMock(
         return_value={"model": "claude-opus-4-6", "provider": "anthropic"}
     )
+    llm_service.get_active_model_id = MagicMock(return_value="claude-opus-4-6")
     agent.llm_service = llm_service
 
     # No context manager by default
@@ -144,10 +145,37 @@ class TestCheckLLMService:
         assert result["status"] == "warn"
 
     @pytest.mark.asyncio
-    async def test_includes_model_preference(self):
+    async def test_includes_active_model(self):
         agent = _make_agent()
         result = await check_llm_service(agent)
-        assert "claude-opus-4-6" in result["message"]
+        # Heartbeat should report the resolved active model, not a raw dict
+        assert "(active: anthropic/claude-opus-4-6)" in result["message"]
+
+    @pytest.mark.asyncio
+    async def test_reports_mandated_model_not_config_default(self):
+        """When a mandate overrides the provider default, heartbeat should
+        report the mandated model — not the first provider's config."""
+        agent = _make_agent()
+        # Config default is anthropic/claude-opus-4-6, but mandate points to openai/gpt-5
+        agent.llm_service.get_active_model_id = MagicMock(return_value="gpt-5")
+        agent.llm_service.get_model_preference = MagicMock(
+            return_value={"model": "gpt-5", "provider": "openai"}
+        )
+        result = await check_llm_service(agent)
+        assert "(active: openai/gpt-5)" in result["message"]
+        # Must NOT report the config default
+        assert "claude-opus-4-6" not in result["message"].split("(active:")[1]
+
+    @pytest.mark.asyncio
+    async def test_reports_model_without_provider_when_no_mandate_provider(self):
+        """When active model is set but no provider preference, report model only."""
+        agent = _make_agent()
+        agent.llm_service.get_active_model_id = MagicMock(return_value="llama3.2:3b")
+        agent.llm_service.get_model_preference = MagicMock(
+            return_value={"model": None, "provider": None}
+        )
+        result = await check_llm_service(agent)
+        assert "(active: llama3.2:3b)" in result["message"]
 
 
 class TestCheckMemorySystem:
