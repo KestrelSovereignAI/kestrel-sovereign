@@ -330,8 +330,15 @@ async def run_batch(args):
     pool = await get_db_pool()
 
     try:
-        # Initialize adapter
-        from kestrel_sovereign.features.training.adapters.local_mps_adapter import LocalMPSTrainingAdapter
+        # Initialize adapter (moved to kestrel-training private package)
+        try:
+            from kestrel_training.adapters.local_mps_adapter import LocalMPSTrainingAdapter
+        except ImportError:
+            logger.error(
+                "kestrel-training package not installed. Install with:\n"
+                "  pip install kestrel-training"
+            )
+            return
 
         adapter = LocalMPSTrainingAdapter()
         if not adapter.is_available():
