@@ -3,21 +3,25 @@ Kestrel Voice Provider Abstraction Layer.
 
 Provides TTSProvider and STTProvider ABCs plus a VoiceProviderRegistry
 for managing voice capabilities across local and cloud providers.
+
+Core keeps Piper (local TTS) + FasterWhisper (local STT) + interfaces.
+Cloud providers (ElevenLabs, Deepgram, OpenAI) are in separate packages
+that register via the ``kestrel_sovereign.voice_providers`` entry_point group.
 """
 from .base import TTSProvider, STTProvider, VoiceConfig, VoiceInfo
-from .openai_tts import OpenAITTSProvider
-from .openai_stt import OpenAISTTProvider
-from .piper_tts import PiperTTSProvider
 from .provider_registry import VoiceProviderRegistry
-from .elevenlabs_tts import ElevenLabsTTSProvider
-from .faster_whisper_stt import FasterWhisperSTTProvider
 
-# Optional providers — import errors are swallowed so the package works
-# without optional dependencies installed.
+# Local providers — import errors are swallowed so the package works
+# without optional voice-local dependencies installed.
 try:
-    from .deepgram_stt import DeepgramSTTProvider
+    from .piper_tts import PiperTTSProvider
 except ImportError:
-    DeepgramSTTProvider = None  # type: ignore[assignment,misc]
+    PiperTTSProvider = None  # type: ignore[assignment,misc]
+
+try:
+    from .faster_whisper_stt import FasterWhisperSTTProvider
+except ImportError:
+    FasterWhisperSTTProvider = None  # type: ignore[assignment,misc]
 
 __all__ = [
     "TTSProvider",
@@ -25,10 +29,6 @@ __all__ = [
     "VoiceConfig",
     "VoiceInfo",
     "VoiceProviderRegistry",
-    "OpenAITTSProvider",
-    "OpenAISTTProvider",
     "PiperTTSProvider",
-    "ElevenLabsTTSProvider",
     "FasterWhisperSTTProvider",
-    "DeepgramSTTProvider",
 ]
