@@ -2577,6 +2577,7 @@ dependencies = [
     { name = "asyncpg" },
     { name = "authlib" },
     { name = "beautifulsoup4" },
+    { name = "cbor2" },
     { name = "certifi" },
     { name = "charset-normalizer" },
     { name = "cryptography" },
@@ -2622,7 +2623,6 @@ all-features = [
     { name = "accelerate" },
     { name = "azure-identity" },
     { name = "azure-mgmt-appcontainers" },
-    { name = "cbor2" },
     { name = "chromadb" },
     { name = "deepgram-sdk" },
     { name = "diffusers" },
@@ -2682,7 +2682,6 @@ full = [
     { name = "asgi-lifespan" },
     { name = "azure-identity" },
     { name = "azure-mgmt-appcontainers" },
-    { name = "cbor2" },
     { name = "chromadb" },
     { name = "deepgram-sdk" },
     { name = "diffusers" },
@@ -2784,7 +2783,6 @@ voice = [
     { name = "webrtcvad" },
 ]
 wallet = [
-    { name = "cbor2" },
     { name = "stripe" },
     { name = "web3" },
 ]
@@ -2817,7 +2815,7 @@ requires-dist = [
     { name = "azure-identity", marker = "extra == 'cloud'", specifier = ">=1.15.0" },
     { name = "azure-mgmt-appcontainers", marker = "extra == 'cloud'", specifier = ">=3.0.0" },
     { name = "beautifulsoup4", specifier = "==4.13.4" },
-    { name = "cbor2", marker = "extra == 'wallet'", specifier = ">=5.6.0" },
+    { name = "cbor2", specifier = ">=5.6.0" },
     { name = "certifi", specifier = "==2026.1.4" },
     { name = "charset-normalizer", specifier = "==3.4.4" },
     { name = "chromadb", marker = "extra == 'local'", specifier = "==1.0.15" },
