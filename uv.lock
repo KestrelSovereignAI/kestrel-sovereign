@@ -2567,6 +2567,28 @@ wheels = [
 ]
 
 [[package]]
+name = "kestrel-feature-github"
+version = "0.1.0"
+source = { editable = "kestrel-feature-github" }
+dependencies = [
+    { name = "aiosqlite" },
+    { name = "httpx" },
+    { name = "kestrel-sovereign" },
+    { name = "pyyaml" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "aiosqlite" },
+    { name = "httpx" },
+    { name = "kestrel-sovereign" },
+    { name = "pytest", marker = "extra == 'test'" },
+    { name = "pytest-asyncio", marker = "extra == 'test'" },
+    { name = "pyyaml" },
+]
+provides-extras = ["test"]
+
+[[package]]
 name = "kestrel-sovereign"
 version = "0.1.8"
 source = { editable = "." }
@@ -2592,6 +2614,7 @@ dependencies = [
     { name = "idna" },
     { name = "iniconfig" },
     { name = "itsdangerous" },
+    { name = "kestrel-feature-github" },
     { name = "networkx" },
     { name = "numpy" },
     { name = "ollama" },
@@ -2838,6 +2861,7 @@ requires-dist = [
     { name = "idna", specifier = "==3.11" },
     { name = "iniconfig", specifier = "==2.1.0" },
     { name = "itsdangerous", specifier = ">=2.2.0" },
+    { name = "kestrel-feature-github", editable = "kestrel-feature-github" },
     { name = "kestrel-sovereign", extras = ["all-features"], marker = "extra == 'full'" },
     { name = "kestrel-sovereign", extras = ["cloud"], marker = "extra == 'all-features'" },
     { name = "kestrel-sovereign", extras = ["delivery"], marker = "extra == 'all-features'" },
