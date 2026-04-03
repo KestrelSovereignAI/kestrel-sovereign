@@ -20,36 +20,19 @@ Usage:
     if session.outcome == "APPROVED":
         # Proceed with action
         pass
-
-Canonical source: kestrel-feature-intelligence package.
-This module re-exports from the extracted package when installed,
-falling back to local code during the transition.
 """
 
-try:
-    from kestrel_feature_intelligence.council import (  # noqa: F401
-        CouncilMember,
-        Evidence,
-        Verdict,
-        DeliberationRound,
-        CouncilSession,
-        ConsensusRule,
-        compile_evidence,
-        convene_council,
-        CouncilFeature,
-    )
-except ImportError:
-    from .models import (
-        CouncilMember,
-        Evidence,
-        Verdict,
-        DeliberationRound,
-        CouncilSession,
-        ConsensusRule,
-    )
-    from .evidence import compile_evidence
-    from .deliberation import convene_council
-    from .feature import CouncilFeature
+from .models import (
+    CouncilMember,
+    Evidence,
+    Verdict,
+    DeliberationRound,
+    CouncilSession,
+    ConsensusRule,
+)
+from .evidence import compile_evidence
+from .deliberation import convene_council
+from .feature import CouncilFeature
 
 __all__ = [
     "CouncilMember",
