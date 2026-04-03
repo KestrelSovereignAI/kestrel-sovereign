@@ -284,10 +284,18 @@ core = true
 package = "kestrel-feature-wallet"
 git = "https://github.com/KestrelSovereignAI/kestrel-feature-wallet.git"
 features = ["WalletFeature"]
-description = "Multi-currency agent wallet (FIL, USDC, USDT, ETH)"
-tags = ["economics", "wallet", "crypto"]
+description = "Multi-currency agent wallet with Stripe on-ramp (FIL, USDC, USDT, ETH)"
+tags = ["economics", "wallet", "crypto", "stripe", "web3"]
 icon = "wallet"
-core = true
+core = false
+
+[wallet.skills]
+wallet_balance = { description = "Check wallet balances across currencies", category = "system", tags = ["wallet", "balance"] }
+wallet_transfer = { description = "Transfer funds from the main balance", category = "system", tags = ["wallet", "transfer"] }
+wallet_deposit = { description = "Record a deposit to the wallet", category = "system", tags = ["wallet", "deposit"] }
+wallet_status = { description = "Get complete wallet status with cryostasis info", category = "system", tags = ["wallet", "status"] }
+wallet_send = { description = "Send native tokens on EVM chains", category = "system", tags = ["wallet", "evm", "transfer"] }
+wallet_networks = { description = "List available blockchain networks", category = "system", tags = ["wallet", "networks"] }
 
 [observability]
 package = "kestrel-feature-observability"

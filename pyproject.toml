@@ -227,7 +227,7 @@ build-backend = "hatchling.build"
 allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
-packages = ["kestrel_sovereign"]
+packages = ["kestrel_sovereign", "kestrel_feature_wallet"]
 
 [tool.hatch.build.targets.sdist]
-include = ["kestrel_sovereign/**/*"] 
+include = ["kestrel_sovereign/**/*", "kestrel_feature_wallet/**/*"]
