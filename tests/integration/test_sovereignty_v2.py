@@ -99,6 +99,9 @@ class MockLLMService:
     def get_active_model_id(self):
         return "mock-model"
 
+    def set_preference_persistence_callback(self, callback):
+        pass
+
 
 @pytest.mark.asyncio
 async def test_agent_export_command(temp_db, skip_bootstrap):
