@@ -312,8 +312,8 @@ schedule_task = { description = "Schedule a recurring task", category = "utility
 list_schedules = { description = "List scheduled tasks", category = "utility", tags = ["scheduler", "cron"] }
 
 [reflection]
-package = "kestrel-feature-reflection"
-git = "https://github.com/KestrelSovereignAI/kestrel-feature-reflection.git"
+package = "kestrel-feature-intelligence"
+git = "https://github.com/KestrelSovereignAI/kestrel-feature-intelligence.git"
 features = ["ReflectionFeature"]
 description = "Self-assessment, personality evolution, and introspection"
 tags = ["ai", "reflection", "personality"]
@@ -378,8 +378,8 @@ icon = "check-square"
 core = true
 
 [council]
-package = "kestrel-feature-council"
-git = "https://github.com/KestrelSovereignAI/kestrel-feature-council.git"
+package = "kestrel-feature-intelligence"
+git = "https://github.com/KestrelSovereignAI/kestrel-feature-intelligence.git"
 features = ["CouncilFeature"]
 description = "Multi-agent council deliberation and collective decision-making"
 tags = ["agents", "council", "deliberation"]
