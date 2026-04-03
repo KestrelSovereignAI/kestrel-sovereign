@@ -114,7 +114,7 @@ async def test_constitution_retrievable(tmp_path):
         assert isinstance(retrieved_content, bytes), "Retrieved content must be bytes"
         assert len(retrieved_content) > 1000, "Constitution must be substantive (>1000 bytes)"
         assert b"Kestrel Constitution" in retrieved_content, "Content must contain title"
-        assert b"Article I: The Principle of Sovereignty" in retrieved_content, "Content must contain Article I"
+        assert b"Amendment I: Sovereignty" in retrieved_content, "Content must contain Amendment I (Sovereignty)"
 
         # Verify hash is correct (content-addressable)
         computed_hash = hashlib.sha256(retrieved_content).hexdigest()
@@ -262,7 +262,7 @@ async def test_agent_can_access_constitution_via_kestrel_agent(tmp_path):
         assert constitution_text is not None, "Agent must be able to retrieve constitution"
         assert not constitution_text.startswith("Error:"), f"Constitution retrieval failed: {constitution_text}"
         assert "Kestrel Constitution" in constitution_text, "Constitution must contain title"
-        assert "Article I: The Principle of Sovereignty" in constitution_text, "Constitution must contain Article I"
+        assert "Amendment I: Sovereignty" in constitution_text, "Constitution must contain Amendment I (Sovereignty)"
         assert len(constitution_text) > 1000, "Constitution must be substantive"
 
     finally:
