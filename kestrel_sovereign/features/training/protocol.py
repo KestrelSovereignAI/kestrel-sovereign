@@ -7,37 +7,20 @@ This protocol abstracts the differences between:
 
 All providers expose the same interface; session management is hidden internally.
 
+Adapter implementations and TrainingProviderFactory are in the kestrel-training
+private package. This module only contains the protocol (interface) and shared types.
+
 Usage:
-    from kestrel_sovereign.features.training import TrainingProviderFactory, TrainingConfig
-    from kestrel_sovereign.kestrel_config.constants import TRAINING_POLL_INTERVAL_SECONDS
+    from kestrel_sovereign.features.training import TrainingProvider, TrainingConfig
 
-    # Get default provider (auto-detected from environment)
-    provider = TrainingProviderFactory.get_default_provider()
+    # Implement the protocol:
+    class MyProvider:
+        @property
+        def provider_name(self) -> str:
+            return "my_provider"
+        ...
 
-    # Or get specific provider
-    provider = TrainingProviderFactory.get_provider("vertex_ai")
-
-    # Start training
-    job = await provider.start_training(
-        companion_id="abc123",
-        avatar_data=image_bytes,
-        config=TrainingConfig(steps=1000, lora_rank=16)
-    )
-
-    # Poll for completion
-    while True:
-        status = await provider.get_status(job.job_id)
-        if status.state.is_terminal():
-            break
-        await asyncio.sleep(TRAINING_POLL_INTERVAL_SECONDS)
-
-    # Download weights
-    if status.state == TrainingState.COMPLETED:
-        lora_bytes = await provider.download_weights(job.job_id)
-        # Store lora_bytes to database
-
-    # Cleanup (important for session-based providers)
-    await provider.cleanup(job.job_id)
+    assert isinstance(MyProvider(), TrainingProvider)
 """
 
 from typing import Optional, Protocol, runtime_checkable

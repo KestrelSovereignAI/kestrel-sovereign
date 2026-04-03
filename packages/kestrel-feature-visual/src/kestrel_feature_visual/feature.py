@@ -41,16 +41,18 @@ from kestrel_sovereign.kestrel_config.constants import (
 logger = logging.getLogger(__name__)
 
 # Import TrainingProviderFactory for unified provider access
+# Factory is in the kestrel-training private package; None if not installed
 try:
     from kestrel_sovereign.features.training import (
         TrainingProviderFactory,
+        TRAINING_FACTORY_AVAILABLE,
         GenerationConfig,
         GenerationError,
     )
-    TRAINING_FACTORY_AVAILABLE = True
 except ImportError:
+    TrainingProviderFactory = None
     TRAINING_FACTORY_AVAILABLE = False
-    logger.warning("TrainingProviderFactory not available")
+    logger.warning("Training module not available")
 
 # ImageGenerationService requires platform integration
 IMAGE_SERVICE_AVAILABLE = False

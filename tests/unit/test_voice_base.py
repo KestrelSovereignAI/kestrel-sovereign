@@ -332,8 +332,13 @@ class TestProviderMethods:
 
 class TestRegistryInitialize:
     @pytest.mark.asyncio
-    async def test_initialize_skips_unknown_providers(self):
+    async def test_initialize_skips_unknown_providers(self, monkeypatch):
         """Initialize with unknown providers should log warnings but not fail."""
+        # Mock entry_point discovery so installed packages don't interfere
+        monkeypatch.setattr(
+            "kestrel_sovereign.voice.provider_registry.discover_entry_point_classes",
+            lambda *args, **kwargs: {},
+        )
         config = {
             "tts_provider_priority": ["nonexistent_tts"],
             "stt_provider_priority": ["nonexistent_stt"],
@@ -344,8 +349,12 @@ class TestRegistryInitialize:
         assert registry.list_stt_providers() == []
 
     @pytest.mark.asyncio
-    async def test_initialize_idempotent(self):
+    async def test_initialize_idempotent(self, monkeypatch):
         """Calling initialize() twice should not re-initialize."""
+        monkeypatch.setattr(
+            "kestrel_sovereign.voice.provider_registry.discover_entry_point_classes",
+            lambda *args, **kwargs: {},
+        )
         config = {"tts_provider_priority": [], "stt_provider_priority": []}
         registry = VoiceProviderRegistry(config=config)
         await registry.initialize()
