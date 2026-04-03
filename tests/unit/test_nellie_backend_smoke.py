@@ -305,7 +305,7 @@ class TestNellieFailureModes:
 
         adapter = CodexAdapter()
 
-        with pytest.raises(RuntimeError, match="requires an OpenAI client"):
+        with pytest.raises(RuntimeError, match="requires an OAuth token"):
             asyncio.run(adapter.get_response(
                 client=None, model="gpt-5.4", messages=[{"role": "user", "content": "hi"}]
             ))

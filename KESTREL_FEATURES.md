@@ -102,9 +102,7 @@ Features come from two sources:
 
 The inventory below lists **core features only**. Installed feature packages appear at runtime via `discover_entrypoint_feature_classes()` and are not enumerated here.
 
-- Current audited snapshot: `41` discoverable modules and `40` exported `Feature` subclasses.
-- Current audited snapshot: `42` discoverable modules and `39` exported `Feature` subclasses.
-- Current audited snapshot: `41` discoverable modules and `41` exported `Feature` subclasses.
+- Current audited snapshot: `40` discoverable modules and `34` exported `Feature` subclasses.
 
 - `audit_anchor`
 - `bootstrap`
