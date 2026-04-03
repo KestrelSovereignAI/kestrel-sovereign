@@ -12,6 +12,20 @@ def test_canonical_feature_doc_declares_source_of_truth():
     assert "Do not keep stale marketing counts here." in text
 
 
+def test_canonical_feature_doc_distinguishes_core_and_package_features():
+    """KESTREL_FEATURES.md must document both core and entry_point discovery."""
+    text = (PROJECT_ROOT / "KESTREL_FEATURES.md").read_text()
+    assert "Core features" in text
+    assert "Package features" in text
+    assert "entry point" in text.lower() or "entry_point" in text
+
+
+def test_canonical_feature_doc_lists_core_only_inventory():
+    """The inventory section should clarify it lists core features only."""
+    text = (PROJECT_ROOT / "KESTREL_FEATURES.md").read_text()
+    assert "core features only" in text.lower() or "core discoverable modules" in text.lower()
+
+
 def test_legacy_archive_is_marked_historical():
     text = (PROJECT_ROOT / "docs/archive/KESTREL_FEATURES_legacy.md").read_text()
     assert "historical context only" in text
