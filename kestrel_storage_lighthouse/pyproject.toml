@@ -1,0 +1,23 @@
+[project]
+name = "kestrel-storage-lighthouse"
+version = "0.1.0"
+description = "Lighthouse IPFS pinning storage provider for Kestrel Sovereign"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    "kestrel_sovereign",
+    "httpx>=0.27.0",
+    "cryptography>=45.0.5",
+]
+
+[project.entry-points."kestrel_sovereign.storage_providers"]
+LighthouseProvider = "kestrel_storage_lighthouse.lighthouse_provider:LighthouseProvider"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["kestrel_storage_lighthouse"]

@@ -8,7 +8,7 @@ import pytest
 from decimal import Decimal
 from unittest.mock import Mock, patch, AsyncMock
 
-from kestrel_sovereign.storage.providers.lighthouse_provider import (
+from kestrel_storage_lighthouse.lighthouse_provider import (
     LighthouseProvider,
     LIGHTHOUSE_PERPETUAL_COST_PER_GB,
 )

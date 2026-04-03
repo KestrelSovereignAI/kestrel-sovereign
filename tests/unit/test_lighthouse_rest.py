@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 
-from kestrel_sovereign.storage.providers.lighthouse_rest import LighthouseRestClient
+from kestrel_storage_lighthouse.lighthouse_rest import LighthouseRestClient
 
 
 @pytest.fixture

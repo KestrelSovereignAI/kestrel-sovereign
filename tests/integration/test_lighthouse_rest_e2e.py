@@ -28,7 +28,7 @@ pytestmark = [
 @pytest_asyncio.fixture
 async def client():
     """Create a real LighthouseRestClient, close after test."""
-    from kestrel_sovereign.storage.providers.lighthouse_rest import LighthouseRestClient
+    from kestrel_storage_lighthouse.lighthouse_rest import LighthouseRestClient
 
     c = LighthouseRestClient(api_key=LIGHTHOUSE_API_KEY)
     yield c
@@ -199,7 +199,7 @@ class TestClientLifecycle:
 
     async def test_client_reuse(self):
         """Internal httpx client should be reused across calls."""
-        from kestrel_sovereign.storage.providers.lighthouse_rest import LighthouseRestClient
+        from kestrel_storage_lighthouse.lighthouse_rest import LighthouseRestClient
 
         c = LighthouseRestClient(api_key=LIGHTHOUSE_API_KEY)
         try:
@@ -211,7 +211,7 @@ class TestClientLifecycle:
 
     async def test_close_and_reopen(self):
         """After close(), next call should create a new client."""
-        from kestrel_sovereign.storage.providers.lighthouse_rest import LighthouseRestClient
+        from kestrel_storage_lighthouse.lighthouse_rest import LighthouseRestClient
 
         c = LighthouseRestClient(api_key=LIGHTHOUSE_API_KEY)
         c1 = await c._get_client()
@@ -229,7 +229,7 @@ class TestLighthouseProvider:
 
     async def test_provider_store_and_retrieve(self, tmp_path):
         """Store via provider, retrieve, verify round-trip."""
-        from kestrel_sovereign.storage.providers.lighthouse_provider import LighthouseProvider
+        from kestrel_storage_lighthouse.lighthouse_provider import LighthouseProvider
 
         provider = LighthouseProvider(api_key=LIGHTHOUSE_API_KEY)
         provider.cache_dir = tmp_path / "cache"
@@ -245,7 +245,7 @@ class TestLighthouseProvider:
 
     async def test_provider_get_balance(self):
         """Provider.get_balance should return storage usage."""
-        from kestrel_sovereign.storage.providers.lighthouse_provider import LighthouseProvider
+        from kestrel_storage_lighthouse.lighthouse_provider import LighthouseProvider
 
         provider = LighthouseProvider(api_key=LIGHTHOUSE_API_KEY)
         # Use the REST client directly for balance — provider.get_balance

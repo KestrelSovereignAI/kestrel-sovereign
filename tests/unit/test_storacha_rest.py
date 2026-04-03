@@ -8,13 +8,13 @@ import pytest
 
 cbor2 = pytest.importorskip("cbor2")
 
-from kestrel_sovereign.storage.providers.storacha_rest import (
+from kestrel_storage_storacha.storacha_rest import (
     StorachaRestClient,
     StorachaError,
     _cid_str_to_bytes,
     _wrap_in_car,
 )
-from kestrel_sovereign.storage.providers.storacha_ucan import (
+from kestrel_storage_storacha.storacha_ucan import (
     StorachaUCAN,
     build_car,
     cid_to_string,
