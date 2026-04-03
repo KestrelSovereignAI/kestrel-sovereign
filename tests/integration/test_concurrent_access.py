@@ -208,6 +208,7 @@ class TestConcurrentAPIRequests:
         from fastapi.testclient import TestClient
         from server import app
         from kestrel_sovereign.inception_service import create_kestrel_identity
+        from kestrel_sovereign import storage
 
         monkeypatch.setattr(storage, "get_default_agent_data_dir", lambda: str(tmp_path))
         monkeypatch.setenv("KESTREL_DB_PATH", str(tmp_path))

@@ -30,17 +30,43 @@ FEATURE_ENTRY_POINT_GROUP = "kestrel_sovereign.features"
 
 def get_disabled_features() -> Set[str]:
     """
-    Get the set of disabled feature names from environment variable.
-    
-    The KESTREL_DISABLED_FEATURES env var should be a comma-separated list
-    of feature class names to disable.
-    
-    Example: KESTREL_DISABLED_FEATURES=RunPodFeature,CreativeFeature
+    Get the set of disabled feature names from environment and kestrel.toml.
+
+    Sources (merged):
+    1. KESTREL_DISABLED_FEATURES env var (comma-separated class names)
+    2. [features].disabled list in kestrel.toml (project-level config)
+
+    Example env: KESTREL_DISABLED_FEATURES=RunPodFeature,CreativeFeature
+    Example toml:
+        [features]
+        disabled = ["RunPodFeature", "VoiceFeature"]
     """
-    disabled = os.environ.get(DISABLED_FEATURES_ENV, "")
-    if not disabled:
-        return set()
-    return {name.strip() for name in disabled.split(",") if name.strip()}
+    disabled: Set[str] = set()
+
+    # Source 1: environment variable
+    env_val = os.environ.get(DISABLED_FEATURES_ENV, "")
+    if env_val:
+        disabled.update(name.strip() for name in env_val.split(",") if name.strip())
+
+    # Source 2: kestrel.toml [features].disabled
+    try:
+        # Walk up from features/ to find project root (where kestrel.toml lives)
+        project_dir = Path(__file__).parent.parent.parent.resolve()
+        toml_path = project_dir / "kestrel.toml"
+        if toml_path.exists():
+            try:
+                import tomllib
+            except ImportError:
+                import tomli as tomllib
+            with open(toml_path, "rb") as f:
+                data = tomllib.load(f)
+            toml_disabled = data.get("features", {}).get("disabled", [])
+            if isinstance(toml_disabled, list):
+                disabled.update(toml_disabled)
+    except Exception:
+        pass  # Don't break feature loading if toml parsing fails
+
+    return disabled
 
 
 def discover_feature_modules() -> List[str]:
