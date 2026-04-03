@@ -448,6 +448,7 @@ class TestChatCompletionsModelPassthrough:
         # Create a mock llm_service with set_model_preference
         mock_llm_service = MagicMock()
         mock_llm_service.set_model_preference = MagicMock()
+        mock_llm_service.get_active_model_id = MagicMock(return_value="openai/gpt-5-mini")
         mock_agent.llm_service = mock_llm_service
 
         original_lifespan = app.router.lifespan_context
