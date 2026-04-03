@@ -415,7 +415,7 @@ class StorachaProvider(StorageProvider, CryostasisCapable):
 
     def _get_master_key(self) -> bytes:
         """Get master encryption key from centralised encryption module."""
-        from kestrel_sovereign.storage.encryption import get_master_key_bytes
+        from kestrel_sovereign.security.encryption import get_master_key_bytes
 
         key = get_master_key_bytes()
         if key:

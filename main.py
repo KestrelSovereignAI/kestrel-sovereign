@@ -7,7 +7,7 @@ import asyncio
 import os
 from pathlib import Path
 from kestrel_sovereign.storage import AsyncStorage
-from kestrel_sovereign.storage.encryption import DecryptionError
+from kestrel_sovereign.security.encryption import DecryptionError
 from kestrel_sovereign.kestrel_agent import KestrelAgent
 from kestrel_sovereign.llm.service import LLMService
 from kestrel_sovereign.config import load_config, DEFAULT_LLM_CONFIG_PATH
