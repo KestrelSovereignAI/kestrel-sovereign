@@ -32,6 +32,7 @@ from .error_handling import (
     handle_storage_errors,
     LLMError,
     LLMProviderError,
+    LLMProviderUnavailableError,
     LLMAllProvidersFailedError
 )
 from .openai_adapter import OpenAIAdapter
@@ -211,6 +212,129 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
             Dict with 'model' and 'provider' keys, values may be None.
         """
         return self._mandate_preference.copy()
+
+    def resolve_provider_routing(
+        self,
+        *,
+        model_override: Optional[str] = None,
+        force_local_only: bool = False,
+    ) -> tuple[list[dict[str, Any]], Optional[str]]:
+        """Resolve which providers and model to use for the next LLM call.
+
+        This is the **single source of truth** for provider routing.  All
+        code paths (``get_response``, ``generate_stream``,
+        ``stream_response``, ``stream_response_with_tools``) should call
+        this method instead of duplicating the resolution logic.
+
+        Resolution order
+        ----------------
+        1. ``model_override`` — explicit caller override (e.g. ``provider/model``
+           or bare model name).  If it contains a ``/``, the left side is
+           treated as the provider name.
+        2. **Mandate preference** — the agent's persisted preference set via
+           ``set_model_preference()`` (typically from ``!model-set`` or the UI).
+           When a *provider* is specified, **only** that provider is used; the
+           call will **not** silently fall back to a different provider.
+        3. **Default provider order** — the ``provider_priority`` list from
+           ``llm_config.toml``, each provider using its configured model.
+
+        Fallback behaviour
+        ------------------
+        * If the preferred provider is **not** in the initialized provider
+          list **and** the ``_mandate_fallbacks`` list is empty, a
+          ``LLMProviderUnavailableError`` is raised so the caller fails
+          honestly.
+        * If fallbacks *are* configured (via ``add_fallback_model``), they are
+          appended after the preferred provider so the call degrades
+          gracefully.
+        * ``force_local_only=True`` filters the resulting list to local
+          providers only (Ollama, etc.).
+
+        Returns
+        -------
+        ``(providers_to_use, target_model)`` — a list of provider dicts
+        (in priority order) and the model to request.  ``target_model`` may
+        be ``None`` when each provider should use its own configured model.
+        """
+        providers_to_use = list(self.providers)
+        target_model: Optional[str] = None
+
+        # --- 1. Explicit model_override ---
+        if model_override:
+            if "/" in model_override:
+                provider_name, model_name = model_override.split("/", 1)
+                target_model = model_name
+                matching = [p for p in providers_to_use if p["name"] == provider_name]
+                if matching:
+                    providers_to_use = matching
+                else:
+                    raise LLMProviderUnavailableError(
+                        provider_name,
+                        [p["name"] for p in self.providers],
+                    )
+            else:
+                target_model = model_override
+
+        # --- 2. Mandate preference (persisted agent preference) ---
+        elif self._mandate_preference.get("model"):
+            pref_model = self._mandate_preference["model"]
+            pref_provider = self._mandate_preference.get("provider")
+            target_model = pref_model
+
+            if pref_provider:
+                matching = [p for p in providers_to_use if p["name"] == pref_provider]
+                if matching:
+                    providers_to_use = matching
+                    logger.info(
+                        "Provider routing: using mandated provider '%s' with model '%s'",
+                        pref_provider,
+                        pref_model,
+                    )
+                elif self._mandate_fallbacks:
+                    # Preferred provider unavailable but fallbacks exist —
+                    # build a fallback chain.
+                    logger.warning(
+                        "Mandated provider '%s' unavailable; using %d fallback(s)",
+                        pref_provider,
+                        len(self._mandate_fallbacks),
+                    )
+                    fallback_providers = []
+                    for fb in self._mandate_fallbacks:
+                        fb_provider = fb.get("provider")
+                        if fb_provider:
+                            match = next(
+                                (p for p in self.providers if p["name"] == fb_provider),
+                                None,
+                            )
+                            if match:
+                                fallback_providers.append(match)
+                    if fallback_providers:
+                        providers_to_use = fallback_providers
+                        # Use first fallback's model
+                        target_model = self._mandate_fallbacks[0].get("model") or target_model
+                    # else: fall through to full provider list
+                else:
+                    raise LLMProviderUnavailableError(
+                        pref_provider,
+                        [p["name"] for p in self.providers],
+                    )
+            # else: model-only mandate — override model on all providers
+
+        # --- 3. force_local_only filter ---
+        if force_local_only:
+            local_names = self._get_local_provider_names()
+            providers_to_use = [p for p in providers_to_use if p["name"] in local_names]
+            if not providers_to_use:
+                raise RuntimeError("No local providers available.")
+
+            # If target model doesn't belong to a local provider, clear it
+            if target_model and not any(
+                target_model == p["model"] for p in providers_to_use
+            ):
+                logger.info("LOCAL_ONLY: ignoring cloud model '%s', using local model", target_model)
+                target_model = None
+
+        return providers_to_use, target_model
 
     def _convert_providers_format(self, provider_infos: List[ProviderInfo]) -> List[Dict[str, Any]]:
         """Convert ProviderInfo objects to legacy dictionary format.
@@ -688,47 +812,16 @@ No other text or formatting.
         if not self.providers:
             raise RuntimeError("No LLM providers initialized.")
 
-        target_model = model_override if model_override else self._get_model_for_prompt(user_prompt)
+        # Use mandate-aware model from prompt if no explicit override
+        effective_override = model_override if model_override else self._get_model_for_prompt(user_prompt)
 
-        available_providers = self.providers
-        if force_local_only:
-            local_names = self._get_local_provider_names()
-            available_providers = [p for p in self.providers if p["name"] in local_names]
-
-            if not available_providers:
-                raise RuntimeError("No local providers available.")
-
-            # Clear any cloud model override — use the local provider's own model
-            if model_override and not any(
-                model_override == p["model"] for p in available_providers
-            ):
-                logger.info(f"LOCAL_ONLY: ignoring cloud model '{model_override}', using local model")
-                model_override = None
-                target_model = None
-
-            logger.info(f"LOCAL_ONLY mode: {[p['name'] for p in available_providers]}")
+        available_providers, target_model = self.resolve_provider_routing(
+            model_override=effective_override,
+            force_local_only=force_local_only,
+        )
 
         # Strip tools if the target model can't handle them
         tools = self._check_model_tool_support(available_providers, tools, model_override)
-
-        if not target_model:
-            pref_model = self._mandate_preference.get("model")
-            pref_provider = self._mandate_preference.get("provider")
-            if pref_model:
-                target_model = f"{pref_provider}/{pref_model}" if pref_provider else pref_model
-
-        if target_model:
-            resolved = self._resolve_model_selector(target_model, providers=available_providers)
-            target_provider = resolved.get("provider")
-            target_model = resolved.get("model")
-            if target_provider:
-                matching_provider = next(
-                    (provider for provider in available_providers if provider["name"] == target_provider),
-                    None,
-                )
-                if matching_provider:
-                    logger.info(f"Using only provider '{target_provider}' with model '{target_model}'")
-                    available_providers = [matching_provider]
 
         errors = {}
         for provider in available_providers:

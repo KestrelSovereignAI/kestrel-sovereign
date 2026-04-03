@@ -34,6 +34,7 @@ from .google_adapter import GoogleAdapter
 from .vertex_adapter import VertexAIAdapter
 from .openrouter_adapter import OpenRouterAdapter
 from .claude_max_adapter import ClaudeMaxAdapter
+from .codex_adapter import CodexAdapter
 
 logger = logging.getLogger(__name__)
 
@@ -193,6 +194,8 @@ class ProviderRegistry:
             return self._initialize_anthropic(provider_config)
         elif provider_name == "claude_max":
             return self._initialize_claude_max(provider_config)
+        elif provider_name == "codex":
+            return self._initialize_codex(provider_config)
         elif provider_name in ["google", "gemini"]:
             return self._initialize_google(provider_config)
         elif provider_name == "vertex_ai":
@@ -330,6 +333,24 @@ class ProviderRegistry:
             client=client,
             adapter=adapter,
             model=model
+        )
+
+    def _initialize_codex(self, provider_config: Dict[str, Any]) -> ProviderInfo:
+        """Initialize Codex local CLI provider (stub).
+
+        Codex is a local CLI backend — no API key or client is needed.
+        The adapter is a stub that raises NotImplementedError on actual
+        inference calls, but makes the provider visible for preference
+        routing and model discovery.
+        """
+        model = provider_config.get("model", "codex")
+        adapter = CodexAdapter()
+
+        return ProviderInfo(
+            name="codex",
+            client=None,  # No remote client — local CLI
+            adapter=adapter,
+            model=model,
         )
 
     def _initialize_google(self, provider_config: Dict[str, Any]) -> ProviderInfo:

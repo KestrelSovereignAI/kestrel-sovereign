@@ -60,6 +60,9 @@ class MockLLMService:
     def get_model_preference(self) -> str:
         return "mock-model"
 
+    def set_preference_persistence_callback(self, callback) -> None:
+        pass
+
     async def close(self) -> None:
         pass
 
