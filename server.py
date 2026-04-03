@@ -720,7 +720,7 @@ def get_stripe_webhook_handler():
     global _stripe_webhook_handler
     if _stripe_webhook_handler is None:
         try:
-            from kestrel_sovereign.features.wallet.onramp import StripeOnRamp, StripeWebhookHandler
+            from kestrel_feature_wallet.onramp import StripeOnRamp, StripeWebhookHandler
             onramp = StripeOnRamp()
             _stripe_webhook_handler = StripeWebhookHandler(onramp)
             logger.info("Stripe webhook handler initialized")

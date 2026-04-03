@@ -62,7 +62,7 @@ CRITICAL_PATH_PATTERNS: List[str] = [
     "kestrel_sovereign/storage/encryption",  # Key management / encryption
     "kestrel_sovereign/auth",               # Authentication
     "endpoints/auth",                       # Auth endpoints
-    "kestrel_sovereign/features/wallet",     # Wallet / sovereignty
+    "kestrel_feature_wallet",                # Wallet / sovereignty
 ]
 
 

@@ -3,7 +3,7 @@
 import pytest
 from decimal import Decimal
 
-from kestrel_sovereign.features.wallet.feature import Currency, WalletAgent
+from kestrel_feature_wallet.feature import Currency, WalletAgent
 from kestrel_sovereign.spawn.delegated_wallet import (
     BudgetAllocation,
     BudgetExceededError,

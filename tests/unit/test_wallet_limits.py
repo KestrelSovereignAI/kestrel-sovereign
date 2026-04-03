@@ -15,12 +15,12 @@ from datetime import date, timedelta
 from pathlib import Path
 import aiosqlite
 
-from kestrel_sovereign.features.wallet.transaction_manager import (
+from kestrel_feature_wallet.transaction_manager import (
     TransactionManager,
     TransactionAudit,
 )
-from kestrel_sovereign.features.wallet.chain_adapters import ChainNetwork
-from kestrel_sovereign.features.wallet.chain_adapters.evm_adapter import MAINNET_CHAIN_IDS
+from kestrel_feature_wallet.chain_adapters import ChainNetwork
+from kestrel_feature_wallet.chain_adapters.evm_adapter import MAINNET_CHAIN_IDS
 
 
 class TestDailySpendingLimits:
@@ -168,8 +168,8 @@ class TestMainnetBlocking:
     @pytest.mark.asyncio
     async def test_ethereum_mainnet_blocked_without_env_var(self, temp_storage):
         """Ethereum mainnet (chain_id=1) should be blocked by default."""
-        from kestrel_sovereign.features.wallet.chain_adapters.evm_adapter import EVMAdapter
-        from kestrel_sovereign.features.wallet.chain_adapters import TransactionRequest
+        from kestrel_feature_wallet.chain_adapters.evm_adapter import EVMAdapter
+        from kestrel_feature_wallet.chain_adapters import TransactionRequest
 
         # Ensure env var is not set
         if "KESTREL_ALLOW_MAINNET" in os.environ:
@@ -196,8 +196,8 @@ class TestMainnetBlocking:
     @pytest.mark.asyncio
     async def test_polygon_mainnet_blocked_without_env_var(self, temp_storage):
         """Polygon mainnet (chain_id=137) should be blocked by default."""
-        from kestrel_sovereign.features.wallet.chain_adapters.evm_adapter import EVMAdapter
-        from kestrel_sovereign.features.wallet.chain_adapters import TransactionRequest
+        from kestrel_feature_wallet.chain_adapters.evm_adapter import EVMAdapter
+        from kestrel_feature_wallet.chain_adapters import TransactionRequest
 
         if "KESTREL_ALLOW_MAINNET" in os.environ:
             del os.environ["KESTREL_ALLOW_MAINNET"]
@@ -221,8 +221,8 @@ class TestMainnetBlocking:
     @pytest.mark.asyncio
     async def test_filecoin_mainnet_blocked_without_env_var(self, temp_storage):
         """Filecoin mainnet (chain_id=314) should be blocked by default."""
-        from kestrel_sovereign.features.wallet.chain_adapters.evm_adapter import EVMAdapter
-        from kestrel_sovereign.features.wallet.chain_adapters import TransactionRequest
+        from kestrel_feature_wallet.chain_adapters.evm_adapter import EVMAdapter
+        from kestrel_feature_wallet.chain_adapters import TransactionRequest
 
         if "KESTREL_ALLOW_MAINNET" in os.environ:
             del os.environ["KESTREL_ALLOW_MAINNET"]
@@ -247,8 +247,8 @@ class TestMainnetBlocking:
     async def test_testnet_transactions_allowed(self, temp_storage):
         """Testnet transactions should not be blocked by the mainnet check."""
         from unittest.mock import patch, MagicMock
-        from kestrel_sovereign.features.wallet.chain_adapters.evm_adapter import EVMAdapter
-        from kestrel_sovereign.features.wallet.chain_adapters import TransactionRequest
+        from kestrel_feature_wallet.chain_adapters.evm_adapter import EVMAdapter
+        from kestrel_feature_wallet.chain_adapters import TransactionRequest
 
         if "KESTREL_ALLOW_MAINNET" in os.environ:
             del os.environ["KESTREL_ALLOW_MAINNET"]
