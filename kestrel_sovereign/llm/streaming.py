@@ -136,61 +136,16 @@ class StreamingMixin:
         Yields:
             Text chunks as they arrive
         """
-        providers_to_use = self.providers
-
-        if model_override and "/" in model_override:
-            provider_name, model_name = model_override.split("/", 1)
-            override_provider = None
-            other_providers = []
-            for p in self.providers:
-                if p["name"] == provider_name:
-                    override_provider = dict(p)
-                    override_provider["model"] = model_name
-                else:
-                    other_providers.append(p)
-            if override_provider:
-                # Only use the specified provider — don't fall back to
-                # others that won't have the same model
-                providers_to_use = [override_provider]
-            else:
-                raise RuntimeError(
-                    f"Provider '{provider_name}' not available. "
-                    f"Available: {[p['name'] for p in self.providers]}"
-                )
-            logger.info(f"Model override: {provider_name}/{model_name}")
-        elif not model_override:
-            # Check mandate preference (set by !model-set command or UI selection)
-            pref_model = self._mandate_preference.get("model")
-            pref_provider = self._mandate_preference.get("provider")
-            if pref_model:
-                if pref_provider:
-                    # Restrict to the mandated provider and override its model
-                    for p in self.providers:
-                        if p["name"] == pref_provider:
-                            override_provider = dict(p)
-                            override_provider["model"] = pref_model
-                            providers_to_use = [override_provider]
-                            logger.info(f"Model mandate set: using only {pref_provider} with {pref_model}")
-                            break
-                    else:
-                        logger.warning(f"Mandated provider '{pref_provider}' not found in available providers")
-                else:
-                    # Model set without provider — override model on all providers
-                    providers_to_use = [
-                        {**p, "model": pref_model} for p in self.providers
-                    ]
-
-        if force_local_only:
-            local_names = self._get_local_provider_names()
-            providers_to_use = [p for p in providers_to_use if p["name"] in local_names]
-            if not providers_to_use:
-                raise RuntimeError("No local providers available.")
+        providers_to_use, target_model = self.resolve_provider_routing(
+            model_override=model_override,
+            force_local_only=force_local_only,
+        )
 
         last_error = None
         for provider in providers_to_use:
             try:
                 provider_name = provider["name"]
-                model_to_use = provider["model"]
+                model_to_use = target_model or provider["model"]
 
                 logger.info(f"Attempting streaming from {provider_name} with {model_to_use}")
                 messages = provider["adapter"].create_messages(user_prompt=user_prompt, system_prompt=system_prompt)
@@ -339,44 +294,11 @@ class StreamingMixin:
                 logger.warning(f"Remote GPU streaming failed: {exc}, falling back")
                 self._deactivate_remote_backend(reason=str(exc))
 
-        # Fall back to standard providers
-        providers = self.providers
-        if force_local_only:
-            local_names = self._get_local_provider_names()
-            providers = [p for p in providers if p["name"] in local_names]
-            # Clear any cloud model override — use the local provider's own model
-            if model_override and providers and not any(
-                model_override == p["model"] for p in providers
-            ):
-                model_override = None
-
-        # Parse provider/model format from model_override (e.g., "openrouter/gpt-5.1")
-        target_model = None
-        if model_override and "/" in model_override:
-            provider_name, target_model = model_override.split("/", 1)
-            for p in providers:
-                if p["name"] == provider_name:
-                    providers = [p]
-                    logger.info(f"Model override: using only {provider_name} with {target_model}")
-                    break
-            else:
-                logger.warning(f"Override provider '{provider_name}' not found in available providers")
-        elif model_override:
-            target_model = model_override
-        else:
-            # Check mandate preference when no explicit override is given
-            pref_model = self._mandate_preference.get("model")
-            pref_provider = self._mandate_preference.get("provider")
-            if pref_model:
-                target_model = pref_model
-                if pref_provider:
-                    for p in providers:
-                        if p["name"] == pref_provider:
-                            providers = [p]
-                            logger.info(f"Model mandate set: using only {pref_provider} with {pref_model}")
-                            break
-                    else:
-                        logger.warning(f"Mandated provider '{pref_provider}' not found in available providers")
+        # Fall back to standard providers — use centralized routing
+        providers, target_model = self.resolve_provider_routing(
+            model_override=model_override,
+            force_local_only=force_local_only,
+        )
 
         last_error = None
         for provider in providers:
@@ -474,63 +396,14 @@ class StreamingMixin:
                 logger.warning(f"Remote GPU streaming with tools failed: {exc}, falling back")
                 self._deactivate_remote_backend(reason=str(exc))
 
-        # Determine providers to use
-        providers = self.providers
-        if force_local_only:
-            local_names = self._get_local_provider_names()
-            providers = [p for p in providers if p["name"] in local_names]
-            if not providers:
-                raise LLMStreamingError("No local providers available")
-            # Clear any cloud model override — use the local provider's own model
-            if model_override and not any(
-                model_override == p["model"] or model_override.endswith("/" + p["model"])
-                for p in providers
-            ):
-                logger.info(
-                    f"LOCAL_ONLY: ignoring cloud model override '{model_override}', "
-                    f"using local model '{providers[0]['model']}'"
-                )
-                model_override = None
+        # Use centralized provider routing
+        providers, target_model = self.resolve_provider_routing(
+            model_override=model_override,
+            force_local_only=force_local_only,
+        )
 
         # Strip tools if the target model can't handle them
         tools = self._check_model_tool_support(providers, tools, model_override)
-
-        # Handle model override with provider prefix (e.g., "openai/gpt-5-mini")
-        target_provider = None
-        target_model = None
-        if model_override:
-            if "/" in model_override:
-                provider_name, target_model = model_override.split("/", 1)
-                # Find the specified provider
-                for p in providers:
-                    if p["name"] == provider_name:
-                        target_provider = p
-                        break
-                if target_provider:
-                    # Only use the specified provider — don't fall back to
-                    # others that won't have the same model
-                    providers = [target_provider]
-            else:
-                target_model = model_override
-        else:
-            # Check mandate preference (set by !model-set command or UI selection)
-            pref_model = self._mandate_preference.get("model")
-            pref_provider = self._mandate_preference.get("provider")
-            if pref_model:
-                target_model = pref_model
-                if pref_provider:
-                    # When provider is explicitly set, ONLY use that provider
-                    # Don't fall back to others - they won't have the same model
-                    for p in providers:
-                        if p["name"] == pref_provider:
-                            target_provider = p
-                            break
-                    if target_provider:
-                        # Use ONLY the specified provider - no fallbacks with wrong model
-                        providers = [target_provider]
-                        logger.info(f"Model mandate set: using only {pref_provider} with {pref_model}")
-                    else:
-                        logger.warning(f"Mandated provider '{pref_provider}' not found in available providers")
 
         last_error = None
         for provider in providers:

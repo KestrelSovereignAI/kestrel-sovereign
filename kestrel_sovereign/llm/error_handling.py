@@ -44,6 +44,25 @@ class LLMProviderQuotaError(LLMProviderError):
     pass
 
 
+class LLMProviderUnavailableError(LLMError):
+    """Raised when a preferred provider is not in the initialized providers list.
+
+    This is raised when an agent has an explicit provider preference (e.g.,
+    ``claude_max`` or ``codex``) but that provider was not successfully
+    initialized at startup.  Unlike a transient API failure, this indicates a
+    configuration or environment problem that the caller should surface
+    clearly rather than silently falling back to an unrelated provider.
+    """
+
+    def __init__(self, provider: str, available: list[str]):
+        self.provider = provider
+        self.available = available
+        super().__init__(
+            f"Preferred provider '{provider}' is not available. "
+            f"Initialized providers: {available}"
+        )
+
+
 class LLMAllProvidersFailedError(LLMError):
     """All configured providers have failed."""
     def __init__(self, errors: Dict[str, Exception]):
