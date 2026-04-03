@@ -397,9 +397,10 @@ class TestCodexAdapter:
 class TestCodexProviderRegistry:
     """Contract: codex can be initialized via provider_registry."""
 
-    def test_registry_initializes_codex(self):
+    def test_registry_initializes_codex(self, monkeypatch):
         from kestrel_sovereign.llm.provider_registry import ProviderRegistry
 
+        monkeypatch.setenv("CODEX_AUTH_TOKEN", "test-token")
         config = {
             "provider_priority": ["codex"],
             "codex": {"model": "codex"},

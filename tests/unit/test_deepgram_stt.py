@@ -37,7 +37,7 @@ class TestDeepgramAvailability:
     async def test_available_when_sdk_and_key_present(self):
         """Provider is available when SDK installed and API key set."""
         with patch.dict("os.environ", {"DEEPGRAM_API_KEY": "test-key"}):
-            with patch("kestrel_sovereign.voice.deepgram_stt.DEEPGRAM_AVAILABLE", True):
+            with patch("kestrel_voice_deepgram.deepgram_stt.DEEPGRAM_AVAILABLE", True):
                 from kestrel_sovereign.voice.deepgram_stt import DeepgramSTTProvider
                 provider = DeepgramSTTProvider()
                 assert await provider.is_available() is True
@@ -46,7 +46,7 @@ class TestDeepgramAvailability:
     async def test_unavailable_when_sdk_missing(self):
         """Provider is unavailable when deepgram-sdk is not installed."""
         with patch.dict("os.environ", {"DEEPGRAM_API_KEY": "test-key"}):
-            with patch("kestrel_sovereign.voice.deepgram_stt.DEEPGRAM_AVAILABLE", False):
+            with patch("kestrel_voice_deepgram.deepgram_stt.DEEPGRAM_AVAILABLE", False):
                 from kestrel_sovereign.voice.deepgram_stt import DeepgramSTTProvider
                 provider = DeepgramSTTProvider()
                 assert await provider.is_available() is False
@@ -55,7 +55,7 @@ class TestDeepgramAvailability:
     async def test_unavailable_when_key_missing(self):
         """Provider is unavailable when DEEPGRAM_API_KEY is not set."""
         with patch.dict("os.environ", {}, clear=True):
-            with patch("kestrel_sovereign.voice.deepgram_stt.DEEPGRAM_AVAILABLE", True):
+            with patch("kestrel_voice_deepgram.deepgram_stt.DEEPGRAM_AVAILABLE", True):
                 from kestrel_sovereign.voice.deepgram_stt import DeepgramSTTProvider
                 provider = DeepgramSTTProvider()
                 assert await provider.is_available() is False
@@ -64,7 +64,7 @@ class TestDeepgramAvailability:
     async def test_unavailable_when_both_missing(self):
         """Provider is unavailable when both SDK and key are missing."""
         with patch.dict("os.environ", {}, clear=True):
-            with patch("kestrel_sovereign.voice.deepgram_stt.DEEPGRAM_AVAILABLE", False):
+            with patch("kestrel_voice_deepgram.deepgram_stt.DEEPGRAM_AVAILABLE", False):
                 from kestrel_sovereign.voice.deepgram_stt import DeepgramSTTProvider
                 provider = DeepgramSTTProvider()
                 assert await provider.is_available() is False
@@ -138,9 +138,9 @@ class TestDeepgramBatchTranscription:
         mock_client.listen = mock_listen
 
         with patch.dict("os.environ", {"DEEPGRAM_API_KEY": "test-key"}):
-            with patch("kestrel_sovereign.voice.deepgram_stt.DEEPGRAM_AVAILABLE", True):
-                with patch("kestrel_sovereign.voice.deepgram_stt.DeepgramClient", return_value=mock_client):
-                    with patch("kestrel_sovereign.voice.deepgram_stt.PrerecordedOptions", _mock_prerecorded_options):
+            with patch("kestrel_voice_deepgram.deepgram_stt.DEEPGRAM_AVAILABLE", True):
+                with patch("kestrel_voice_deepgram.deepgram_stt.DeepgramClient", return_value=mock_client):
+                    with patch("kestrel_voice_deepgram.deepgram_stt.PrerecordedOptions", _mock_prerecorded_options):
                         provider = DeepgramSTTProvider()
                         result = await provider.transcribe(b"fake_audio", audio_format="wav")
 
@@ -185,9 +185,9 @@ class TestDeepgramBatchTranscription:
         mock_rest_v1.transcribe_file = capture_call
 
         with patch.dict("os.environ", {"DEEPGRAM_API_KEY": "test-key"}):
-            with patch("kestrel_sovereign.voice.deepgram_stt.DEEPGRAM_AVAILABLE", True):
-                with patch("kestrel_sovereign.voice.deepgram_stt.DeepgramClient", return_value=mock_client):
-                    with patch("kestrel_sovereign.voice.deepgram_stt.PrerecordedOptions", _mock_prerecorded_options):
+            with patch("kestrel_voice_deepgram.deepgram_stt.DEEPGRAM_AVAILABLE", True):
+                with patch("kestrel_voice_deepgram.deepgram_stt.DeepgramClient", return_value=mock_client):
+                    with patch("kestrel_voice_deepgram.deepgram_stt.PrerecordedOptions", _mock_prerecorded_options):
                         provider = DeepgramSTTProvider()
                         await provider.transcribe(b"audio", language="es")
 
@@ -198,7 +198,7 @@ class TestDeepgramBatchTranscription:
         """Transcribe raises RuntimeError when SDK not available."""
         from kestrel_sovereign.voice.deepgram_stt import DeepgramSTTProvider
 
-        with patch("kestrel_sovereign.voice.deepgram_stt.DEEPGRAM_AVAILABLE", False):
+        with patch("kestrel_voice_deepgram.deepgram_stt.DEEPGRAM_AVAILABLE", False):
             provider = DeepgramSTTProvider()
             with pytest.raises(RuntimeError, match="not installed"):
                 await provider.transcribe(b"audio")
@@ -209,7 +209,7 @@ class TestDeepgramBatchTranscription:
         from kestrel_sovereign.voice.deepgram_stt import DeepgramSTTProvider
 
         with patch.dict("os.environ", {}, clear=True):
-            with patch("kestrel_sovereign.voice.deepgram_stt.DEEPGRAM_AVAILABLE", True):
+            with patch("kestrel_voice_deepgram.deepgram_stt.DEEPGRAM_AVAILABLE", True):
                 provider = DeepgramSTTProvider()
                 with pytest.raises(RuntimeError, match="DEEPGRAM_API_KEY"):
                     await provider.transcribe(b"audio")
@@ -248,9 +248,9 @@ class TestDeepgramStreamingTranscription:
 
         patches = [
             patch.dict("os.environ", {"DEEPGRAM_API_KEY": "test-key"}),
-            patch("kestrel_sovereign.voice.deepgram_stt.DEEPGRAM_AVAILABLE", True),
-            patch("kestrel_sovereign.voice.deepgram_stt.DeepgramClient", return_value=mock_client),
-            patch("kestrel_sovereign.voice.deepgram_stt.LiveOptions", _mock_live_options),
+            patch("kestrel_voice_deepgram.deepgram_stt.DEEPGRAM_AVAILABLE", True),
+            patch("kestrel_voice_deepgram.deepgram_stt.DeepgramClient", return_value=mock_client),
+            patch("kestrel_voice_deepgram.deepgram_stt.LiveOptions", _mock_live_options),
         ]
         for p in patches:
             p.start()
@@ -311,7 +311,7 @@ class TestDeepgramStreamingTranscription:
         """Stream raises RuntimeError when SDK not available."""
         from kestrel_sovereign.voice.deepgram_stt import DeepgramSTTProvider
 
-        with patch("kestrel_sovereign.voice.deepgram_stt.DEEPGRAM_AVAILABLE", False):
+        with patch("kestrel_voice_deepgram.deepgram_stt.DEEPGRAM_AVAILABLE", False):
             provider = DeepgramSTTProvider()
 
             async def audio_gen():
@@ -327,7 +327,7 @@ class TestDeepgramStreamingTranscription:
         from kestrel_sovereign.voice.deepgram_stt import DeepgramSTTProvider
 
         with patch.dict("os.environ", {}, clear=True):
-            with patch("kestrel_sovereign.voice.deepgram_stt.DEEPGRAM_AVAILABLE", True):
+            with patch("kestrel_voice_deepgram.deepgram_stt.DEEPGRAM_AVAILABLE", True):
                 provider = DeepgramSTTProvider()
 
                 async def audio_gen():
@@ -356,9 +356,9 @@ class TestDeepgramStreamingTranscription:
         mock_client.listen = mock_listen
 
         with patch.dict("os.environ", {"DEEPGRAM_API_KEY": "test-key"}):
-            with patch("kestrel_sovereign.voice.deepgram_stt.DEEPGRAM_AVAILABLE", True):
-                with patch("kestrel_sovereign.voice.deepgram_stt.DeepgramClient", return_value=mock_client):
-                    with patch("kestrel_sovereign.voice.deepgram_stt.LiveOptions", _mock_live_options):
+            with patch("kestrel_voice_deepgram.deepgram_stt.DEEPGRAM_AVAILABLE", True):
+                with patch("kestrel_voice_deepgram.deepgram_stt.DeepgramClient", return_value=mock_client):
+                    with patch("kestrel_voice_deepgram.deepgram_stt.LiveOptions", _mock_live_options):
                         provider = DeepgramSTTProvider()
 
                         async def audio_gen():
@@ -403,7 +403,7 @@ class TestDeepgramRegistryIntegration:
         registry = VoiceProviderRegistry(config=config)
 
         with patch.dict("os.environ", {"DEEPGRAM_API_KEY": "test-key"}):
-            with patch("kestrel_sovereign.voice.deepgram_stt.DEEPGRAM_AVAILABLE", True):
+            with patch("kestrel_voice_deepgram.deepgram_stt.DEEPGRAM_AVAILABLE", True):
                 await registry.initialize()
 
         assert "deepgram" in registry.list_stt_providers()
