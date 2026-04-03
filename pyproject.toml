@@ -69,6 +69,8 @@ dependencies = [
     "numpy>=2.3.1",
     # CAR file support (sovereignty exports)
     "cbor2>=5.6.0",
+    # Observability feature package (metrics, telemetry, wellness)
+    "kestrel-feature-observability @ {root:uri}/kestrel-feature-observability",
     # LLM provider SDKs (used at runtime via dynamic import)
     "anthropic>=0.75.0",
     "google-generativeai>=0.8.6",
@@ -115,12 +117,9 @@ voice = [
     "webrtcvad>=2.0.10",
 ]
 # Observability (OpenTelemetry tracing + Prometheus metrics)
+# Canonical implementation in kestrel-feature-observability package
 observability = [
-    "opentelemetry-api>=1.20.0",
-    "opentelemetry-sdk>=1.20.0",
-    "opentelemetry-instrumentation-fastapi>=0.41b0",
-    "opentelemetry-exporter-otlp-proto-grpc>=1.20.0",
-    "prometheus-client>=0.21.0",
+    "kestrel-feature-observability[all]",
 ]
 # Feature: Cloud GPU/serverless deployment (RunPod, Vast.ai, GCP, Azure)
 cloud = [
