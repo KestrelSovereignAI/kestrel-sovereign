@@ -3,17 +3,22 @@ requires = ["setuptools>=64", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "kestrel-feature-{{name_dashed}}"
+name = "kestrel-feature-github"
 version = "0.1.0"
-description = "Kestrel feature: {{name}}"
+description = "Kestrel feature: GitHub integration for issues, PRs, and repository management"
 requires-python = ">=3.11"
-dependencies = ["kestrel-sovereign"]
+dependencies = [
+    "kestrel-sovereign",
+    "httpx",
+    "pyyaml",
+    "aiosqlite",
+]
 
 [project.optional-dependencies]
 test = ["pytest", "pytest-asyncio"]
 
 [project.entry-points."kestrel_sovereign.features"]
-{{class_name}} = "{{pkg_name}}.feature:{{class_name}}"
+GitHubFeature = "kestrel_feature_github.feature:GitHubFeature"
 
 [tool.setuptools.packages.find]
 where = ["src"]
