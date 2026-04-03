@@ -104,6 +104,7 @@ The inventory below lists **core features only**. Installed feature packages app
 
 - Current audited snapshot: `41` discoverable modules and `40` exported `Feature` subclasses.
 - Current audited snapshot: `42` discoverable modules and `39` exported `Feature` subclasses.
+- Current audited snapshot: `41` discoverable modules and `41` exported `Feature` subclasses.
 
 - `audit_anchor`
 - `bootstrap`
@@ -143,7 +144,6 @@ The inventory below lists **core features only**. Installed feature packages app
 - `vastai`
 - `visual_identity`
 - `voice`
-- `wallet`
 - `web_search`
 - `webhooks`
 - `wellness`

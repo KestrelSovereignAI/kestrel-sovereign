@@ -9,6 +9,14 @@ import shutil
 import tempfile
 import os
 
+try:
+    from kestrel_feature_wallet.feature import Currency
+    HAS_WALLET = True
+except ImportError:
+    HAS_WALLET = False
+
+pytestmark = pytest.mark.skipif(not HAS_WALLET, reason="kestrel-feature-wallet not installed")
+
 @pytest.fixture
 def temp_db():
     """Create a temporary database path for testing."""
@@ -54,7 +62,6 @@ async def agent(temp_db):
 
 def _set_fil_balance(agent, amount: Decimal):
     """Set FIL balance for solvency tests, zeroing audit to avoid interference."""
-    from kestrel_sovereign.features.wallet.feature import Currency
     agent.wallet._balances[Currency.FIL]["main"] = amount
     agent.wallet._balances[Currency.FIL]["audit"] = Decimal("0")
 
@@ -84,7 +91,6 @@ async def test_solvency_yellow_zone(agent):
 async def test_solvency_red_zone(agent):
     """Test solvency check when balance is critical."""
     # 0.05 FIL → $0.275 USD at default $5.50/FIL rate (Red Zone: < $0.50)
-    from kestrel_sovereign.features.wallet.feature import Currency
     _set_fil_balance(agent, Decimal("0.05"))
 
     override = await agent.check_solvency()
