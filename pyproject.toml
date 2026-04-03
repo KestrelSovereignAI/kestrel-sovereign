@@ -65,6 +65,8 @@ dependencies = [
     # Runtime utilities
     "psutil>=7.1.3",
     "numpy>=2.3.1",
+    # CAR file support (sovereignty exports)
+    "cbor2>=5.6.0",
     # LLM provider SDKs (used at runtime via dynamic import)
     "anthropic>=0.75.0",
     "google-generativeai>=0.8.6",
@@ -131,7 +133,6 @@ cloud = [
 wallet = [
     "web3>=7.0.0",
     "stripe>=10.0.0",
-    "cbor2>=5.6.0",
 ]
 # Feature: MCP (Docker container management, MCP protocol)
 mcp = [
