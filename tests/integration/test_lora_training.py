@@ -20,6 +20,7 @@ Run real cloud tests (costs money):
     pytest tests/integration/test_lora_training.py -v --run-cloud -k "real"
 """
 
+import importlib.util
 import os
 import pytest
 import pytest_asyncio
@@ -196,6 +197,10 @@ class TestTrainingWorkflowMocked:
     """Test training workflow with mocked external resources."""
 
     @pytest.mark.asyncio
+    @pytest.mark.skipif(
+        not importlib.util.find_spec("torch"),
+        reason="torch not installed — cannot patch torch.backends.mps",
+    )
     async def test_start_training_creates_config(self, training_config, tmp_path):
         """Test that start_training creates proper config files."""
         torch = pytest.importorskip("torch", reason="torch not installed")
@@ -243,6 +248,10 @@ class TestTrainingWorkflowMocked:
                 assert config_dir.exists()
 
     @pytest.mark.asyncio
+    @pytest.mark.skipif(
+        not importlib.util.find_spec("torch"),
+        reason="torch not installed — cannot patch torch.backends.mps",
+    )
     async def test_get_status_returns_valid_state(self, training_config, tmp_path):
         """Test that get_status returns valid training state."""
         pytest.importorskip("torch", reason="torch not installed")

@@ -367,9 +367,10 @@ async def update_feature_config(
 
 def _validate_config(config: Dict[str, Any], schema: Dict[str, Any]) -> None:
     """
-    Basic JSON Schema validation for feature config.
+    JSON Schema validation for feature config.
 
-    Checks required fields and type constraints from the schema.
+    Checks required fields, type constraints, minimum/maximum bounds, and
+    enum restrictions from the schema.
     Raises HTTPException(422) on validation failure.
     """
     required = schema.get("required", [])
@@ -392,16 +393,43 @@ def _validate_config(config: Dict[str, Any], schema: Dict[str, Any]) -> None:
     }
 
     for key, value in config.items():
-        if key in properties:
-            prop_schema = properties[key]
-            expected_type_name = prop_schema.get("type")
-            if expected_type_name and expected_type_name in type_map:
-                expected = type_map[expected_type_name]
-                if not isinstance(value, expected):
-                    raise HTTPException(
-                        status_code=422,
-                        detail=f"Config field '{key}' must be {expected_type_name}, got {type(value).__name__}",
-                    )
+        if key not in properties:
+            continue
+
+        prop_schema = properties[key]
+
+        # Type check
+        expected_type_name = prop_schema.get("type")
+        if expected_type_name and expected_type_name in type_map:
+            expected = type_map[expected_type_name]
+            if not isinstance(value, expected):
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Config field '{key}' must be {expected_type_name}, got {type(value).__name__}",
+                )
+
+        # Minimum / maximum bounds (for integer and number types)
+        if isinstance(value, (int, float)):
+            minimum = prop_schema.get("minimum")
+            if minimum is not None and value < minimum:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Config field '{key}' must be >= {minimum}, got {value}",
+                )
+            maximum = prop_schema.get("maximum")
+            if maximum is not None and value > maximum:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Config field '{key}' must be <= {maximum}, got {value}",
+                )
+
+        # Enum restriction
+        enum_values = prop_schema.get("enum")
+        if enum_values is not None and value not in enum_values:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Config field '{key}' must be one of {enum_values}, got {value!r}",
+            )
 
 
 # ---------------------------------------------------------------------------

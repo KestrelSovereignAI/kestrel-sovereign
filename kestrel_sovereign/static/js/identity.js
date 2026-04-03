@@ -72,6 +72,7 @@ export function initNavigation() {
             if (panelId === 'resources' && loadResources) loadResources();
             if (panelId === 'metrics' && loadMetrics) loadMetrics();
             if (panelId === 'spawn' && loadSpawn) loadSpawn();
+            if (panelId === 'features' && window.loadFeatureStore) window.loadFeatureStore();
         });
     });
 }
