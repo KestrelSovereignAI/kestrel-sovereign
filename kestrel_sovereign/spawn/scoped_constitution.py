@@ -4,6 +4,9 @@ Scoped Constitution: Constitutional narrowing for spawned agents.
 Ensures child agents can have fewer capabilities than their parent,
 but never more. Wraps a base constitution with additional constraints
 from a SpawnMandate.
+
+This module implements spawn-level narrowing. For the full 4-layer
+constitutional hierarchy (Books I-IV), see kestrel_sovereign.constitution.hierarchy.
 """
 
 import logging
@@ -33,20 +36,32 @@ class ScopedConstitution:
     restrictions applied — never grants of new capabilities beyond
     what the parent possesses.
 
+    This class handles spawn-level narrowing (parent→child). For the full
+    4-layer hierarchy (Books I-IV: Universal Values → Sovereign Amendments →
+    Enterprise Policy → Agent Identity), see LayeredConstitution in
+    kestrel_sovereign.constitution.hierarchy.
+
     Attributes:
         base_constitution: The full text of the parent's constitution.
         additional_constraints: Dict of constraint rules from the SpawnMandate.
         features_allowed: List of feature names the child is permitted to use.
         parent_features: Set of feature names the parent agent has.
+        enterprise_policy: Optional enterprise policy constraints (Book III).
+        agent_identity: Optional agent identity constraints (Book IV).
     """
 
     base_constitution: str
     additional_constraints: dict = field(default_factory=dict)
     features_allowed: list[str] = field(default_factory=list)
     parent_features: set[str] = field(default_factory=set)
+    enterprise_policy: dict = field(default_factory=dict)
+    agent_identity: dict = field(default_factory=dict)
 
     def validate_constraints(self) -> tuple[bool, str]:
         """Validate that all constraints are restrictions, not capability grants.
+
+        Validates spawn-level constraints and, if present, enterprise policy
+        and agent identity against the constitutional hierarchy (Books I-IV).
 
         Returns:
             Tuple of (is_valid, message).
@@ -100,6 +115,22 @@ class ScopedConstitution:
                     errors.append(
                         f"Constraint 'max_tokens' must be a non-negative number"
                     )
+
+        # Validate enterprise policy against Books I-II if present
+        if self.enterprise_policy:
+            from kestrel_sovereign.constitution.hierarchy import LayeredConstitution
+            lc = LayeredConstitution()
+            is_valid, msg = lc.validate_enterprise_policy(self.enterprise_policy)
+            if not is_valid:
+                errors.append(msg)
+
+        # Validate agent identity against all higher layers if present
+        if self.agent_identity:
+            from kestrel_sovereign.constitution.hierarchy import LayeredConstitution
+            lc = LayeredConstitution()
+            is_valid, msg = lc.validate_agent_identity(self.agent_identity)
+            if not is_valid:
+                errors.append(msg)
 
         if errors:
             msg = "Constraint validation failed: " + "; ".join(errors)
