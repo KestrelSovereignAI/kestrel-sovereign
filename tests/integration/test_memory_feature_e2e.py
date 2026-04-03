@@ -17,6 +17,7 @@ class MockAgent:
 
     def __init__(self, storage: AsyncStorage):
         self.storage = storage
+        self.did = "did:pkh:eip155:1:0xTEST_MEMORY_FEATURE"
         self.memory_consolidator = None
         self.memory_retriever = None
 
