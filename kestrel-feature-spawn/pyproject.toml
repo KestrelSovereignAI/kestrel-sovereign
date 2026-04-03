@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kestrel-feature-spawn"
+version = "0.1.0"
+description = "Kestrel feature: multi-agent spawning, delegation, and external bridge gateway"
+requires-python = ">=3.11"
+dependencies = ["kestrel-sovereign"]
+
+[project.optional-dependencies]
+test = ["pytest", "pytest-asyncio"]
+
+[project.entry-points."kestrel_sovereign.features"]
+SpawnFeature = "kestrel_feature_spawn.spawn.feature:SpawnFeature"
+BridgeFeature = "kestrel_feature_spawn.bridge.feature:BridgeFeature"
+
+[tool.setuptools.packages.find]
+where = ["src"]
