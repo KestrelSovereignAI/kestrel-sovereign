@@ -31,6 +31,13 @@ async def agent(temp_db):
     llm_service.config["ollama"]["model"] = "test-economy-model"
     llm_service.config["ollama"]["enabled"] = True
 
+    # Also update the already-built providers list so _get_local_model_fallback()
+    # returns our test model (it checks providers before config)
+    for provider in llm_service.providers:
+        if provider.get("name") == "ollama":
+            provider["model"] = "test-economy-model"
+            break
+
     # Use a dummy DID
     did = "did:pkh:eip155:1:0x1234567890123456789012345678901234567890"
     # Use new API: storage_path instead of storage object
@@ -41,12 +48,16 @@ async def agent(temp_db):
     await agent.shutdown()
     await llm_service.close()
 
+def _set_fil_balance(agent, amount: Decimal):
+    """Set FIL balance for solvency tests, zeroing audit to avoid interference."""
+    from kestrel_sovereign.features.wallet.feature import Currency
+    agent.wallet._balances[Currency.FIL]["main"] = amount
+    agent.wallet._balances[Currency.FIL]["audit"] = Decimal("0")
+
 @pytest.mark.asyncio
 async def test_solvency_green_zone(agent):
     """Test solvency check when balance is high."""
-    # Set balance to 100 FIL (directly set the internal balance)
-    from kestrel_sovereign.features.wallet.feature import Currency
-    agent.wallet._balances[Currency.FIL]["main"] = Decimal("100.0")
+    _set_fil_balance(agent, Decimal("100.0"))
 
     override = await agent.check_solvency()
 
@@ -56,9 +67,8 @@ async def test_solvency_green_zone(agent):
 @pytest.mark.asyncio
 async def test_solvency_yellow_zone(agent):
     """Test solvency check when balance is low (Economy Mode)."""
-    # Set balance to 5 FIL (directly set the internal balance)
-    from kestrel_sovereign.features.wallet.feature import Currency
-    agent.wallet._balances[Currency.FIL]["main"] = Decimal("5.0")
+    # 0.5 FIL → $2.75 USD at default $5.50/FIL rate (Yellow Zone: $0.50-$5.00)
+    _set_fil_balance(agent, Decimal("0.5"))
 
     override = await agent.check_solvency()
 
@@ -69,9 +79,9 @@ async def test_solvency_yellow_zone(agent):
 @pytest.mark.asyncio
 async def test_solvency_red_zone(agent):
     """Test solvency check when balance is critical."""
-    # Set balance to 0.5 FIL (directly set the internal balance)
+    # 0.05 FIL → $0.275 USD at default $5.50/FIL rate (Red Zone: < $0.50)
     from kestrel_sovereign.features.wallet.feature import Currency
-    agent.wallet._balances[Currency.FIL]["main"] = Decimal("0.5")
+    _set_fil_balance(agent, Decimal("0.05"))
 
     override = await agent.check_solvency()
 
@@ -81,27 +91,25 @@ async def test_solvency_red_zone(agent):
 @pytest.mark.asyncio
 async def test_solvency_transitions(agent):
     """Test transitions between solvency states."""
-    from kestrel_sovereign.features.wallet.feature import Currency
-
     # Start High
-    agent.wallet._balances[Currency.FIL]["main"] = Decimal("100.0")
+    _set_fil_balance(agent, Decimal("100.0"))
     await agent.check_solvency()
     assert agent._current_model_preference == "NORMAL"
 
-    # Drop to Economy
-    agent.wallet._balances[Currency.FIL]["main"] = Decimal("5.0")
+    # Drop to Economy (0.5 FIL → $2.75 USD, Yellow Zone)
+    _set_fil_balance(agent, Decimal("0.5"))
     override = await agent.check_solvency()
     assert override == "test-economy-model"
     assert agent._current_model_preference == "ECONOMY"
 
-    # Drop to Critical
-    agent.wallet._balances[Currency.FIL]["main"] = Decimal("0.5")
+    # Drop to Critical (0.05 FIL → $0.275 USD, Red Zone)
+    _set_fil_balance(agent, Decimal("0.05"))
     override = await agent.check_solvency()
     assert override == "test-economy-model"
     assert agent._current_model_preference == "CRITICAL"
 
     # Recover to High
-    agent.wallet._balances[Currency.FIL]["main"] = Decimal("50.0")
+    _set_fil_balance(agent, Decimal("50.0"))
     override = await agent.check_solvency()
     assert override is None
     assert agent._current_model_preference == "NORMAL"
