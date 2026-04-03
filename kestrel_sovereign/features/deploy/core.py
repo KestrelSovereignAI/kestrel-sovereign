@@ -13,6 +13,7 @@ import time
 from typing import Any, Dict, Optional
 
 from kestrel_sovereign.config import load_config
+from kestrel_sovereign.entrypoints import discover_entry_point_classes
 
 from .models import (
     DeployManagerError,
@@ -21,11 +22,11 @@ from .models import (
     DeployProviderType,
     DeployStatus,
 )
-from .providers.azure_container import AzureContainerProvider
 from .providers.base import DeployProvider
-from .providers.cloudrun import CloudRunProvider
 
 logger = logging.getLogger(__name__)
+
+CLOUD_PROVIDER_ENTRY_POINT_GROUP = "kestrel_sovereign.cloud_providers"
 
 
 class DeployManagerCore:
@@ -161,6 +162,11 @@ class DeployManagerCore:
         """
         Get or create a deployment provider instance.
 
+        Providers are discovered via entry_points in the
+        ``kestrel_sovereign.cloud_providers`` group. External packages
+        (kestrel-cloud-gcp, kestrel-cloud-azure, etc.) register their
+        DeployProvider subclasses there.
+
         Args:
             provider_type: Type of provider to get
 
@@ -171,19 +177,63 @@ class DeployManagerCore:
         if provider_type in self._providers:
             return self._providers[provider_type]
 
-        # Create new provider
-        if provider_type == DeployProviderType.CLOUD_RUN:
-            provider = CloudRunProvider(project_id=self.gcp_project_id)
-        elif provider_type == DeployProviderType.AZURE_CONTAINER_APPS:
-            provider = AzureContainerProvider()
-        else:
-            raise DeployManagerError(f"Unknown provider type: {provider_type}")
+        # Discover providers via entry_points
+        provider = self._create_provider_from_entrypoint(provider_type)
+
+        if provider is None:
+            raise DeployManagerError(
+                f"No provider found for {provider_type.value}. "
+                f"Install the appropriate package (e.g. kestrel-cloud-gcp, kestrel-cloud-azure)."
+            )
 
         # Cache for reuse
         self._providers[provider_type] = provider
         logger.debug(f"Created {provider_type.value} provider")
 
         return provider
+
+    def _create_provider_from_entrypoint(
+        self, provider_type: DeployProviderType
+    ) -> DeployProvider | None:
+        """
+        Create a provider instance by discovering it from entry_points.
+
+        Maps DeployProviderType enum values to entry_point names:
+        - CLOUD_RUN -> "CloudRunProvider"
+        - AZURE_CONTAINER_APPS -> "AzureContainerProvider"
+
+        Args:
+            provider_type: Type of provider to create
+
+        Returns:
+            DeployProvider instance or None if not found
+        """
+        ep_classes = discover_entry_point_classes(
+            CLOUD_PROVIDER_ENTRY_POINT_GROUP, DeployProvider,
+        )
+
+        # Map provider types to entry_point names and constructor kwargs
+        provider_map = {
+            DeployProviderType.CLOUD_RUN: (
+                "CloudRunProvider",
+                lambda: {"project_id": self.gcp_project_id},
+            ),
+            DeployProviderType.AZURE_CONTAINER_APPS: (
+                "AzureContainerProvider",
+                lambda: {},
+            ),
+        }
+
+        mapping = provider_map.get(provider_type)
+        if mapping is None:
+            return None
+
+        ep_name, kwargs_fn = mapping
+        cls = ep_classes.get(ep_name)
+        if cls is None:
+            return None
+
+        return cls(**kwargs_fn())
 
     async def _verify_health(
         self,

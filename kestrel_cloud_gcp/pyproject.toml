@@ -1,0 +1,27 @@
+[project]
+name = "kestrel-cloud-gcp"
+version = "0.1.0"
+description = "GCP Compute Engine and Cloud Run cloud providers for Kestrel Sovereign"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    "kestrel_sovereign",
+    "google-cloud-compute>=1.15.0",
+    "google-cloud-run>=0.10.0",
+    "google-cloud-logging>=3.5.0",
+]
+
+[project.entry-points."kestrel_sovereign.features"]
+GCPComputeFeature = "kestrel_cloud_gcp.compute.feature:GCPComputeFeature"
+
+[project.entry-points."kestrel_sovereign.cloud_providers"]
+CloudRunProvider = "kestrel_cloud_gcp.cloudrun:CloudRunProvider"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["kestrel_cloud_gcp"]

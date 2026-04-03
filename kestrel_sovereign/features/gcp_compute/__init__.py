@@ -1,41 +1,15 @@
 """
 GCP Compute Engine GPU management for Kestrel.
 
-Modular structure for the GCP Compute Engine GPU instance manager:
-- models.py: Data models, enums, exceptions
-- core.py: Core SDK operations, authentication, session management
-- ssh_training.py: SSH-based LoRA training methods
-- workflows.py: Convenience workflow methods
-- manager.py: Combined GCPComputeEngineManager class
-
-Key advantages over Vast.ai/RunPod:
-- Enterprise-grade reliability
-- Persistent Disk for model caching (survives instance termination)
-- Spot instances for 60-90% cost savings
-- Shared GCP project (YOUR_PROJECT_ID)
-
-Usage:
-    from kestrel_sovereign.features.gcp_compute import GCPComputeManager, GCPComputeEngineManager
-
-    # Create manager
-    manager = GCPComputeManager()  # or GCPComputeEngineManager()
-
-    # Start training instance
-    session = await manager.start_training_instance("companion-123")
-
-    # Submit and monitor training
-    job_id = await manager.submit_training_job(session, image_url, "companion-123")
-    status = await manager.poll_training_status(session, job_id)
-
-    # Download results
-    lora_data = await manager.download_lora(session, job_id)
-
-    # Clean up
-    await manager.terminate_session(session)
+.. deprecated::
+    This module re-exports from ``kestrel_cloud_gcp.compute``.
+    Import directly from ``kestrel_cloud_gcp`` instead.
 """
 
-from .manager import GCPComputeEngineManager, GCPComputeManager
-from .models import (
+# Backward-compat re-exports from extracted package
+from kestrel_cloud_gcp import (  # noqa: F401
+    GCPComputeEngineManager,
+    GCPComputeManager,
     GCPComputeManagerError,
     GCPComputeSession,
     GPUProfile,
