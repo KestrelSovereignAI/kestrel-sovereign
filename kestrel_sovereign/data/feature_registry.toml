@@ -264,7 +264,7 @@ features = ["SpawnFeature"]
 description = "Child agent spawning, delegation, and lifecycle management"
 tags = ["agents", "spawn", "delegation"]
 icon = "git-branch"
-core = true
+core = false
 
 [spawn.skills]
 spawn_agent = { description = "Spawn a child agent for a task", category = "agent_management", tags = ["spawn", "agents"] }
@@ -396,13 +396,13 @@ icon = "users"
 core = true
 
 [bridge]
-package = "kestrel-feature-bridge"
-git = "https://github.com/KestrelSovereignAI/kestrel-feature-bridge.git"
+package = "kestrel-feature-spawn"
+git = "https://github.com/KestrelSovereignAI/kestrel-feature-spawn.git"
 features = ["BridgeFeature"]
 description = "Cross-protocol bridge for external system integration"
 tags = ["integration", "bridge", "interop"]
 icon = "arrow-left-right"
-core = true
+core = false
 
 [code_edit]
 package = "kestrel-feature-code"

@@ -107,7 +107,7 @@ The inventory below lists **core features only**. Installed feature packages app
 
 - `audit_anchor`
 - `bootstrap`
-- `bridge`
+- `bridge` *(extracted to `kestrel-feature-spawn`; stub re-exports)*
 - `channels`
 - `code_edit`
 - `compute`
@@ -135,7 +135,7 @@ The inventory below lists **core features only**. Installed feature packages app
 - `scheduler`
 - `security`
 - `sovereignty`
-- `spawn`
+- `spawn` *(extracted to `kestrel-feature-spawn`; stub re-exports)*
 - `state_of_mind`
 - `strategic_memory`
 - `talon`
@@ -152,7 +152,6 @@ The currently exported `Feature` subclasses discovered from those modules includ
 
 - `AuditAnchorFeature`
 - `BootstrapFeature`
-- `BridgeFeature`
 - `ChannelFeature`
 - `CodeEditFeature`
 - `ComputeFeature`
@@ -180,7 +179,6 @@ The currently exported `Feature` subclasses discovered from those modules includ
 - `SchedulerFeature`
 - `SecurityFeature`
 - `SovereigntyFeature`
-- `SpawnFeature`
 - `StateOfMindFeature`
 - `StrategicMemoryFeature`
 - `TalonCoordinatorFeature`
