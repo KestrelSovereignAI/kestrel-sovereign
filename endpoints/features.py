@@ -167,7 +167,7 @@ async def get_feature_detail(request: Request, name: str) -> Dict[str, Any]:
             "description": feature.tool_description,
             "status": "enabled",
             "tools": [_tool_to_dict(t) for t in tools],
-            "hooks": [{"name": h.name, "event": h.event} for h in hooks] if hooks else [],
+            "hooks": [{"name": h.name, "events": [e.value for e in h.events]} for h in hooks] if hooks else [],
             "config_schema": feature.config_schema,
         }
         if pkg:
@@ -249,10 +249,17 @@ async def enable_feature(request: Request, name: str) -> Dict[str, Any]:
     """
     Enable a loaded feature.
 
-    Calls the feature's on_enable() lifecycle method.
+    Re-registers hooks with the HooksManager and calls on_enable().
     """
     agent = get_agent(request)
     feature = _get_feature_or_404(agent, name)
+
+    # Re-register hooks with the agent's HooksManager
+    hooks_manager = getattr(agent, "hooks_manager", None)
+    if hooks_manager:
+        for hook in feature.get_hooks():
+            hooks_manager.register(hook)
+            logger.info(f"Re-registered hook '{hook.name}' for feature '{name}'")
 
     await feature.on_enable()
     return {"name": name, "status": "enabled"}
@@ -263,12 +270,21 @@ async def disable_feature(request: Request, name: str) -> Dict[str, Any]:
     """
     Disable a loaded feature.
 
-    Calls the feature's on_disable() lifecycle method.
+    Calls on_disable() and unregisters hooks from the HooksManager.
     """
     agent = get_agent(request)
     feature = _get_feature_or_404(agent, name)
 
+    # Call on_disable lifecycle hook first
     await feature.on_disable()
+
+    # Unregister hooks from the agent's HooksManager
+    hooks_manager = getattr(agent, "hooks_manager", None)
+    if hooks_manager:
+        for hook in feature.get_hooks():
+            hooks_manager.unregister(hook)
+            logger.info(f"Unregistered hook '{hook.name}' for feature '{name}'")
+
     return {"name": name, "status": "disabled"}
 
 
@@ -282,10 +298,17 @@ async def remove_feature(request: Request, name: str) -> Dict[str, Any]:
     """
     agent = get_agent(request)
 
-    # Check if feature is loaded — call on_remove if so
+    # Check if feature is loaded — unregister hooks and call on_remove if so
     features = getattr(agent, "features", {})
     feature = features.get(name)
     if feature is not None:
+        # Unregister hooks before removal
+        hooks_manager = getattr(agent, "hooks_manager", None)
+        if hooks_manager:
+            for hook in feature.get_hooks():
+                hooks_manager.unregister(hook)
+                logger.info(f"Unregistered hook '{hook.name}' during removal of feature '{name}'")
+
         await feature.on_remove()
 
     # Look up package info
