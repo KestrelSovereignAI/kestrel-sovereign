@@ -220,8 +220,8 @@ class TestTrainingWorkflowMocked:
             (tmp_path / "fake-diffusers" / "examples" / "text_to_image").mkdir(parents=True)
             (tmp_path / "fake-diffusers" / "examples" / "text_to_image" / "train_text_to_image_lora_sdxl.py").write_text("")
 
-            # Mock torch.backends.mps
-            with patch('torch.backends.mps.is_available', return_value=True):
+            # Mock adapter.is_available to bypass torch import check
+            with patch.object(adapter, 'is_available', return_value=True):
                 try:
                     job = await adapter.start_training(
                         companion_id="test-123",
@@ -273,7 +273,8 @@ class TestTrainingWorkflowMocked:
             mock_process.poll.return_value = None  # Still running
             mock_popen.return_value = mock_process
 
-            with patch('torch.backends.mps.is_available', return_value=True):
+            # Mock adapter.is_available to bypass torch import check
+            with patch.object(adapter, 'is_available', return_value=True):
                 try:
                     job = await adapter.start_training(
                         companion_id="test-456",
