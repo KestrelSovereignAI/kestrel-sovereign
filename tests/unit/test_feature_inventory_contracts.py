@@ -53,11 +53,14 @@ def test_every_discoverable_feature_module_exports_a_feature_class():
 
 
 def test_discover_features_matches_unique_class_inventory():
-    """Core-only: discover_features returns exactly the classes from local modules."""
+    """discover_features returns exactly the classes from local modules + entry points."""
     classes, missing = _discoverable_feature_classes()
     assert not missing
 
     expected_names = {feature_class.__name__ for _, feature_class in classes}
+    # Entry-point features (extracted packages) are also discovered at runtime
+    for cls in discover_entrypoint_feature_classes().values():
+        expected_names.add(cls.__name__)
     features = discover_features(_mock_agent())
     discovered_names = {feature.__class__.__name__ for feature in features}
 

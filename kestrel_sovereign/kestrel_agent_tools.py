@@ -8,8 +8,6 @@ from typing import Optional, Dict, Any, List
 import asyncpg
 import time
 import json
-from kestrel_sovereign.tools.mcp_manager import MCPToolManager
-
 from kestrel_sovereign.tools import (
     get_web_search_tool,
     get_feedback_tool,

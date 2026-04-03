@@ -210,7 +210,7 @@ features = ["MCPAgent"]
 description = "Model Context Protocol server management and tool bridging"
 tags = ["integration", "mcp", "tools"]
 icon = "plug"
-core = true
+core = false
 
 [mcp.skills]
 list_servers = { description = "List available MCP servers", category = "system", tags = ["mcp", "servers"] }
