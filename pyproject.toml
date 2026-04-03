@@ -103,14 +103,22 @@ local = [
     "langchain-community>=0.3.31",
     "numpy==2.3.1",
 ]
-# Voice (TTS/STT) — local + cloud providers
-voice = [
-    "elevenlabs>=1.0.0",
+# Voice local providers (Piper TTS + Faster-Whisper STT) — heavy deps
+voice-local = [
     "piper-tts>=1.2.0",
     "soundfile>=0.13.0",
     "faster-whisper>=1.1.0",
-    "deepgram-sdk>=4.0.0",
     "webrtcvad>=2.0.10",
+]
+# Voice cloud provider SDK deps (used by kestrel-voice-* entry_point packages)
+voice-cloud = [
+    "elevenlabs>=1.0.0",
+    "deepgram-sdk>=4.0.0",
+]
+# Voice (all providers: local + cloud)
+voice = [
+    "kestrel_sovereign[voice-local]",
+    "kestrel_sovereign[voice-cloud]",
 ]
 # Observability (OpenTelemetry tracing + Prometheus metrics)
 observability = [
@@ -184,6 +192,16 @@ kestrel = "kestrel_sovereign.cli:main"
 [project.entry-points.pytest11]
 kestrel = "kestrel_sovereign.testing.fixtures"
 
+[project.entry-points."kestrel_sovereign.features"]
+WalletFeature = "kestrel_feature_wallet.wallet_feature:WalletFeature"
+CodeEditFeature = "kestrel_feature_code.feature:CodeEditFeature"
+
+[project.entry-points."kestrel_sovereign.voice_providers"]
+ElevenLabsTTS = "kestrel_voice_elevenlabs.elevenlabs_tts:ElevenLabsTTSProvider"
+DeepgramSTT = "kestrel_voice_deepgram.deepgram_stt:DeepgramSTTProvider"
+OpenAITTS = "kestrel_voice_openai.openai_tts:OpenAITTSProvider"
+OpenAISTT = "kestrel_voice_openai.openai_stt:OpenAISTTProvider"
+
 [dependency-groups]
 dev = [
     {include-group = "test"},
@@ -227,7 +245,7 @@ build-backend = "hatchling.build"
 allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
-packages = ["kestrel_sovereign", "kestrel_feature_wallet"]
+packages = ["kestrel_sovereign", "kestrel_feature_wallet", "kestrel_voice_elevenlabs", "kestrel_voice_deepgram", "kestrel_voice_openai"]
 
 [tool.hatch.build.targets.sdist]
-include = ["kestrel_sovereign/**/*", "kestrel_feature_wallet/**/*"]
+include = ["kestrel_sovereign/**/*", "kestrel_feature_wallet/**/*", "kestrel_voice_elevenlabs/**/*", "kestrel_voice_deepgram/**/*", "kestrel_voice_openai/**/*"]

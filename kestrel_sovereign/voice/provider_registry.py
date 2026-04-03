@@ -10,7 +10,6 @@ External packages can register voice providers via entry_points::
     ElevenLabsTTS = "kestrel_voice_elevenlabs:ElevenLabsTTSProvider"
     ElevenLabsSTT = "kestrel_voice_elevenlabs:ElevenLabsSTTProvider"
 """
-import importlib.util
 import logging
 from typing import Optional
 
@@ -121,55 +120,74 @@ class VoiceProviderRegistry:
             except Exception as e:
                 logger.warning(f"Failed to load entry_point STT provider '{ep_name}': {e}")
 
-    def _create_tts_provider(self, name: str) -> Optional[TTSProvider]:
-        """Create a TTS provider by name using importlib for optional deps.
+    # Mapping of provider names to their (package, module, class) for cloud
+    # providers that have been extracted to kestrel_voice_* packages.
+    _CLOUD_TTS_MAP: dict[str, tuple[str, str]] = {
+        "openai": ("kestrel_voice_openai.openai_tts", "OpenAITTSProvider"),
+        "elevenlabs": ("kestrel_voice_elevenlabs.elevenlabs_tts", "ElevenLabsTTSProvider"),
+    }
 
-        Concrete provider implementations will be added as they are developed
-        (e.g., PiperTTSProvider, OpenAITTSProvider).
+    _CLOUD_STT_MAP: dict[str, tuple[str, str]] = {
+        "openai": ("kestrel_voice_openai.openai_stt", "OpenAISTTProvider"),
+        "deepgram": ("kestrel_voice_deepgram.deepgram_stt", "DeepgramSTTProvider"),
+    }
+
+    def _create_tts_provider(self, name: str) -> Optional[TTSProvider]:
+        """Create a TTS provider by name.
+
+        Local providers (piper) are imported from core. Cloud providers
+        (openai, elevenlabs) are imported from kestrel_voice_* packages
+        or discovered via entry_points.
 
         Args:
-            name: Provider name (e.g., "piper", "openai").
+            name: Provider name (e.g., "piper", "openai", "elevenlabs").
 
         Returns:
-            TTSProvider instance or None if unknown.
+            TTSProvider instance or None if unknown/not installed.
         """
         provider_config = self._config.get(name, {})
 
-        if name == "openai":
-            from .openai_tts import OpenAITTSProvider
-            return OpenAITTSProvider(config=provider_config)
-
-        if name == "elevenlabs":
-            if importlib.util.find_spec("elevenlabs") is not None:
-                from .elevenlabs_tts import ElevenLabsTTSProvider
-                provider_config = self._config.get("elevenlabs", {})
-                return ElevenLabsTTSProvider(config=provider_config)
-            else:
-                logger.warning("ElevenLabs TTS requested but 'elevenlabs' package not installed.")
+        if name == "piper":
+            try:
+                from .piper_tts import PiperTTSProvider
+                piper_config = self._config.get("piper", {})
+                return PiperTTSProvider(piper_config)
+            except ImportError:
+                logger.warning("piper-tts package not installed. Skipping piper TTS.")
                 return None
 
-        if name == "piper":
-            from .piper_tts import PiperTTSProvider
-            piper_config = self._config.get("piper", {})
-            return PiperTTSProvider(piper_config)
+        # Try cloud provider from extracted package
+        if name in self._CLOUD_TTS_MAP:
+            module_path, class_name = self._CLOUD_TTS_MAP[name]
+            try:
+                import importlib
+                mod = importlib.import_module(module_path)
+                cls = getattr(mod, class_name)
+                return cls(config=provider_config)
+            except ImportError:
+                logger.warning(
+                    "TTS provider '%s' package not installed. "
+                    "Install kestrel-voice-%s for this provider.", name, name
+                )
+                return None
 
-        logger.warning(f"No TTS provider implementation for '{name}' yet.")
+        logger.warning(f"Unknown TTS provider '{name}'.")
         return None
 
     def _create_stt_provider(self, name: str) -> Optional[STTProvider]:
-        """Create an STT provider by name using importlib for optional deps.
+        """Create an STT provider by name.
+
+        Local providers (faster_whisper) are imported from core. Cloud
+        providers (openai, deepgram) are imported from kestrel_voice_*
+        packages or discovered via entry_points.
 
         Args:
             name: Provider name (e.g., "faster_whisper", "openai", "deepgram").
 
         Returns:
-            STTProvider instance or None if unknown.
+            STTProvider instance or None if unknown/not installed.
         """
         provider_config = self._config.get(name, {})
-
-        if name == "openai":
-            from .openai_stt import OpenAISTTProvider
-            return OpenAISTTProvider(config=provider_config)
 
         if name == "faster_whisper":
             try:
@@ -180,16 +198,22 @@ class VoiceProviderRegistry:
                 logger.warning("faster-whisper package not installed. Skipping faster_whisper STT.")
                 return None
 
-        if name == "deepgram":
+        # Try cloud provider from extracted package
+        if name in self._CLOUD_STT_MAP:
+            module_path, class_name = self._CLOUD_STT_MAP[name]
             try:
-                from .deepgram_stt import DeepgramSTTProvider
-                provider_config = self._config.get("deepgram", {})
-                return DeepgramSTTProvider(config=provider_config)
+                import importlib
+                mod = importlib.import_module(module_path)
+                cls = getattr(mod, class_name)
+                return cls(config=provider_config)
             except ImportError:
-                logger.warning("deepgram-sdk not installed, skipping Deepgram STT provider.")
+                logger.warning(
+                    "STT provider '%s' package not installed. "
+                    "Install kestrel-voice-%s for this provider.", name, name
+                )
                 return None
 
-        logger.warning(f"No STT provider implementation for '{name}' yet.")
+        logger.warning(f"Unknown STT provider '{name}'.")
         return None
 
     def register_tts(self, provider: TTSProvider) -> None:
