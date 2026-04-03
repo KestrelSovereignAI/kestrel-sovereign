@@ -305,20 +305,67 @@ class TestFeatureScaffold:
         assert result == 0
 
         scaffold_dir = tmp_path / "kestrel-feature-myfeature"
+        src_dir = scaffold_dir / "src" / "kestrel_feature_myfeature"
         assert scaffold_dir.exists()
-        assert (scaffold_dir / "kestrel_feature_myfeature" / "__init__.py").exists()
-        assert (scaffold_dir / "kestrel_feature_myfeature" / "feature.py").exists()
+        assert (src_dir / "__init__.py").exists()
+        assert (src_dir / "feature.py").exists()
         assert (scaffold_dir / "pyproject.toml").exists()
         assert (scaffold_dir / "tests" / "test_myfeature.py").exists()
+        assert (scaffold_dir / "tests" / "conftest.py").exists()
+        assert (scaffold_dir / "SKILL.md").exists()
+        assert (scaffold_dir / "README.md").exists()
 
-        # Verify feature class name
-        feature_py = (scaffold_dir / "kestrel_feature_myfeature" / "feature.py").read_text()
+        # Verify feature class name and @tool decorator
+        feature_py = (src_dir / "feature.py").read_text()
         assert "class MyfeatureFeature(Feature):" in feature_py
+        assert "@tool(" in feature_py
+        assert "tool_description" in feature_py
 
         # Verify entry_point in pyproject.toml
         pyproject = (scaffold_dir / "pyproject.toml").read_text()
         assert "kestrel_sovereign.features" in pyproject
         assert "MyfeatureFeature" in pyproject
+        assert 'where = ["src"]' in pyproject
+
+    def test_scaffold_tests_use_mock_agent(self, tmp_path, capsys, monkeypatch):
+        from kestrel_sovereign.cli import cmd_feature_scaffold
+
+        monkeypatch.chdir(tmp_path)
+        args = _make_args(name="myfeature")
+        cmd_feature_scaffold(args)
+
+        test_py = (tmp_path / "kestrel-feature-myfeature" / "tests" / "test_myfeature.py").read_text()
+        assert "MockAgent" in test_py
+        assert "mock_agent" in test_py
+
+    def test_scaffold_skill_md(self, tmp_path, capsys, monkeypatch):
+        from kestrel_sovereign.cli import cmd_feature_scaffold
+
+        monkeypatch.chdir(tmp_path)
+        args = _make_args(name="myfeature")
+        cmd_feature_scaffold(args)
+
+        skill_md = (tmp_path / "kestrel-feature-myfeature" / "SKILL.md").read_text()
+        assert "MyfeatureFeature" in skill_md
+        assert "## Skills" in skill_md
+
+    def test_scaffold_multi_word_name(self, tmp_path, capsys, monkeypatch):
+        from kestrel_sovereign.cli import cmd_feature_scaffold
+
+        monkeypatch.chdir(tmp_path)
+        args = _make_args(name="my_cool_thing")
+        result = cmd_feature_scaffold(args)
+        assert result == 0
+
+        scaffold_dir = tmp_path / "kestrel-feature-my-cool-thing"
+        src_dir = scaffold_dir / "src" / "kestrel_feature_my_cool_thing"
+        assert src_dir.exists()
+
+        feature_py = (src_dir / "feature.py").read_text()
+        assert "class MyCoolThingFeature(Feature):" in feature_py
+
+        pyproject = (scaffold_dir / "pyproject.toml").read_text()
+        assert 'name = "kestrel-feature-my-cool-thing"' in pyproject
 
     def test_scaffold_existing_dir_fails(self, tmp_path, capsys, monkeypatch):
         from kestrel_sovereign.cli import cmd_feature_scaffold

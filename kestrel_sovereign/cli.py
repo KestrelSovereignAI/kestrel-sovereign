@@ -953,86 +953,82 @@ def cmd_feature_info(args) -> int:
     return 0
 
 
+def _load_scaffold_template(template_name: str) -> str:
+    """Load a scaffold template from the data/feature_template directory."""
+    template_dir = Path(__file__).parent / "data" / "feature_template"
+    return (template_dir / template_name).read_text()
+
+
+def _render_template(template: str, variables: dict) -> str:
+    """Render a template by replacing ``{{variable}}`` placeholders.
+
+    Double-brace syntax avoids collisions with Python f-strings and
+    single-brace dicts that may appear in template content.
+    """
+    result = template
+    for key, value in variables.items():
+        result = result.replace("{{" + key + "}}", value)
+    return result
+
+
 def cmd_feature_scaffold(args) -> int:
     """Generate a feature package project template."""
     name = args.name.lower().replace("-", "_").replace(" ", "_")
     pkg_name = f"kestrel_feature_{name}"
-    dir_name = f"kestrel-feature-{name.replace('_', '-')}"
+    name_dashed = name.replace("_", "-")
+    dir_name = f"kestrel-feature-{name_dashed}"
 
     scaffold_dir = Path(dir_name)
     if scaffold_dir.exists():
         print(f"Directory '{dir_name}' already exists")
         return 1
 
-    # Create directory structure
-    src_dir = scaffold_dir / pkg_name
+    # Feature class name: my_feature -> MyFeature + "Feature"
+    class_name = "".join(word.capitalize() for word in name.split("_")) + "Feature"
+
+    # Template variables
+    variables = {
+        "name": name,
+        "name_dashed": name_dashed,
+        "pkg_name": pkg_name,
+        "class_name": class_name,
+    }
+
+    # Create directory structure: src/ layout
+    src_dir = scaffold_dir / "src" / pkg_name
     tests_dir = scaffold_dir / "tests"
 
     src_dir.mkdir(parents=True)
     tests_dir.mkdir(parents=True)
 
-    # Feature class name
-    class_name = "".join(word.capitalize() for word in name.split("_")) + "Feature"
+    # Render templates
+    templates = {
+        src_dir / "__init__.py": "__init__.py.tpl",
+        src_dir / "feature.py": "feature.py.tpl",
+        scaffold_dir / "pyproject.toml": "pyproject.toml.tpl",
+        tests_dir / f"test_{name}.py": "test_feature.py.tpl",
+        tests_dir / "conftest.py": "conftest.py.tpl",
+        scaffold_dir / "SKILL.md": "SKILL.md.tpl",
+        scaffold_dir / "README.md": "README.md.tpl",
+    }
 
-    # __init__.py
-    (src_dir / "__init__.py").write_text(
-        f'"""Kestrel Feature: {name}"""\n'
-        f"from .feature import {class_name}\n\n"
-        f'__all__ = ["{class_name}"]\n'
-    )
+    for output_path, template_name in templates.items():
+        template = _load_scaffold_template(template_name)
+        output_path.write_text(_render_template(template, variables))
 
-    # feature.py
-    (src_dir / "feature.py").write_text(
-        f'"""{class_name} — TODO: describe your feature."""\n\n'
-        f"from kestrel_sovereign.features.base import Feature\n\n\n"
-        f"class {class_name}(Feature):\n"
-        f'    """TODO: describe what this feature does."""\n\n'
-        f"    @property\n"
-        f"    def name(self) -> str:\n"
-        f'        return "{class_name}"\n\n'
-        f"    @property\n"
-        f"    def description(self) -> str:\n"
-        f'        return "TODO: add description"\n\n'
-        f"    async def initialize(self) -> None:\n"
-        f"        pass\n\n"
-        f"    async def shutdown(self) -> None:\n"
-        f"        pass\n"
-    )
-
-    # pyproject.toml
-    (scaffold_dir / "pyproject.toml").write_text(
-        f'[build-system]\n'
-        f'requires = ["setuptools>=64", "wheel"]\n'
-        f'build-backend = "setuptools.backends._legacy:_Backend"\n\n'
-        f'[project]\n'
-        f'name = "kestrel-feature-{name.replace("_", "-")}"\n'
-        f'version = "0.1.0"\n'
-        f'description = "Kestrel feature: {name}"\n'
-        f'requires-python = ">=3.11"\n'
-        f'dependencies = ["kestrel-sovereign"]\n\n'
-        f'[project.entry-points."kestrel_sovereign.features"]\n'
-        f'{class_name} = "{pkg_name}.feature:{class_name}"\n'
-    )
-
-    # tests/__init__.py
+    # tests/__init__.py (empty)
     (tests_dir / "__init__.py").write_text("")
 
-    # tests/test_feature.py
-    (tests_dir / f"test_{name}.py").write_text(
-        f'"""Tests for {class_name}."""\n\n'
-        f"from {pkg_name}.feature import {class_name}\n\n\n"
-        f"def test_feature_name():\n"
-        f"    # TODO: instantiate with a mock agent\n"
-        f"    pass\n"
-    )
-
     print(f"Scaffolded feature package: {dir_name}/")
-    print(f"  {pkg_name}/")
+    print(f"  src/{pkg_name}/")
     print(f"    __init__.py")
     print(f"    feature.py          <- implement {class_name} here")
     print(f"  tests/")
-    print(f"    test_{name}.py")
+    print(f"    test_{name}.py      <- uses MockAgent fixture")
+    print(f"    conftest.py")
     print(f"  pyproject.toml        <- entry_point registered")
+    print(f"  SKILL.md              <- skill descriptions")
+    print(f"  README.md")
     print()
     print(f"Install in dev mode:  pip install -e ./{dir_name}")
     return 0
