@@ -34,26 +34,27 @@ class TestWebSearchTool:
         """Tool should be enabled with API key."""
         tool = WebSearchTool(api_key="test-api-key")
         assert tool.enabled is True
-        assert tool.api_key == "test-api-key"
+        assert tool.get_provider().name == "tavily"
 
     def test_init_from_env(self):
         """Tool should read API key from environment."""
         with patch.dict("os.environ", {"TAVILY_API_KEY": "env-api-key"}):
             tool = WebSearchTool()
             assert tool.enabled is True
-            assert tool.api_key == "env-api-key"
+            assert tool.get_provider().name == "tavily"
 
     @pytest.mark.asyncio
     async def test_search_when_disabled(self):
         """Search should return error when disabled."""
-        tool = WebSearchTool(api_key=None)
-        tool.enabled = False
+        with patch.dict("os.environ", {}, clear=True):
+            tool = WebSearchTool(api_key=None)
+            assert tool.enabled is False
 
-        result = await tool.search("test query")
+            result = await tool.search("test query")
 
-        assert result["success"] is False
-        assert "not enabled" in result["error"]
-        assert result["results"] == []
+            assert result["success"] is False
+            assert "not enabled" in result["error"].lower() or "no provider" in result["error"].lower()
+            assert result["results"] == []
 
     @pytest.mark.asyncio
     async def test_search_success(self):

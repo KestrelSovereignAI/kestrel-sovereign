@@ -1,178 +1,176 @@
 """
-Web Search Tool for Kestrel Agents
-Provides web search capabilities using Tavily API
+Web Search Tool for Kestrel Agents.
+
+Provides web search capabilities via a pluggable provider registry.
+Built-in provider: Tavily. External providers discoverable via entry_points.
+
+External packages register search providers via entry_points::
+
+    [project.entry-points."kestrel_sovereign.search_providers"]
+    BraveSearch = "kestrel_search_brave:BraveSearchProvider"
 """
 
-import os
 import logging
-from typing import Optional, List, Dict, Any
-import httpx
-from datetime import datetime, timezone
+from typing import Dict, Any, List, Optional, Type
 
-from kestrel_sovereign.kestrel_config.constants import HTTP_TIMEOUT_DEFAULT
+from kestrel_sovereign.entrypoints import discover_entry_point_classes
+from .base import SearchProvider
+from .tavily_provider import TavilySearchProvider
 
 logger = logging.getLogger(__name__)
+
+SEARCH_PROVIDER_ENTRY_POINT_GROUP = "kestrel_sovereign.search_providers"
 
 
 class WebSearchTool:
     """
-    Web search tool that integrates with Tavily API
-    Provides real-time web search capabilities for agents
+    Web search tool with pluggable provider registry.
+
+    Discovers search providers from:
+    1. Built-in providers (Tavily)
+    2. Entry_points (external packages)
+
+    The first enabled provider is used as the default.
     """
 
     def __init__(self, api_key: Optional[str] = None):
-        """
-        Initialize web search tool
+        """Initialize web search tool.
 
         Args:
-            api_key: Tavily API key (if not provided, uses TAVILY_API_KEY env var)
+            api_key: Optional Tavily API key (for backward compatibility).
         """
-        self.api_key = api_key or os.getenv("TAVILY_API_KEY")
-        if not self.api_key:
-            logger.warning("No Tavily API key found. Web search will not be available.")
-            self.enabled = False
-        else:
-            self.enabled = True
-            self.base_url = "https://api.tavily.com"
+        self._providers: Dict[str, SearchProvider] = {}
+        self._default_provider: Optional[SearchProvider] = None
+
+        # Phase 1: Register built-in providers
+        tavily = TavilySearchProvider(api_key=api_key)
+        if tavily.enabled:
+            self._providers[tavily.name] = tavily
+            self._default_provider = tavily
+
+        # Phase 2: Discover entry_point providers
+        self._discover_entrypoint_providers()
+
+        # Set default to first enabled if Tavily wasn't available
+        if self._default_provider is None:
+            for provider in self._providers.values():
+                if provider.enabled:
+                    self._default_provider = provider
+                    break
+
+        self.enabled = self._default_provider is not None
+
+    def _discover_entrypoint_providers(self) -> None:
+        """Discover external search providers via entry_points."""
+        classes = discover_entry_point_classes(
+            SEARCH_PROVIDER_ENTRY_POINT_GROUP, SearchProvider,
+        )
+        for ep_name, cls in classes.items():
+            try:
+                provider = cls()
+                if provider.name in self._providers:
+                    logger.debug(
+                        "Skipping entry_point search provider '%s': "
+                        "built-in '%s' already registered",
+                        ep_name, provider.name,
+                    )
+                    continue
+                self._providers[provider.name] = provider
+                logger.info("Registered entry_point search provider: %s", ep_name)
+            except Exception as e:
+                logger.warning(
+                    "Failed to load entry_point search provider '%s': %s",
+                    ep_name, e,
+                )
+
+    def get_provider(self, name: Optional[str] = None) -> Optional[SearchProvider]:
+        """Get a search provider by name, or the default.
+
+        Args:
+            name: Provider name. If None, returns the default.
+
+        Returns:
+            SearchProvider or None.
+        """
+        if name is None:
+            return self._default_provider
+        return self._providers.get(name)
+
+    def list_providers(self) -> List[str]:
+        """List registered search provider names."""
+        return list(self._providers.keys())
 
     async def search(
         self,
         query: str,
         max_results: int = 5,
-        search_depth: str = "basic",
-        include_answer: bool = True,
-        include_raw_content: bool = False,
-        include_images: bool = False
+        provider: Optional[str] = None,
+        **kwargs,
     ) -> Dict[str, Any]:
-        """
-        Perform web search using Tavily API
+        """Perform a web search using the specified or default provider.
 
         Args:
-            query: Search query string
-            max_results: Maximum number of results to return (1-10)
-            search_depth: 'basic' or 'advanced' (advanced uses more credits)
-            include_answer: Include AI-generated answer summary
-            include_raw_content: Include full page content
-            include_images: Include image results
+            query: Search query string.
+            max_results: Maximum results to return.
+            provider: Optional provider name override.
+            **kwargs: Provider-specific options.
 
         Returns:
-            Dictionary with search results and metadata
+            Dict with search results.
         """
-        if not self.enabled:
+        search_provider = self.get_provider(provider)
+        if search_provider is None or not search_provider.enabled:
             return {
                 "success": False,
-                "error": "Web search is not enabled (missing API key)",
-                "results": []
+                "error": "Web search is not enabled (no provider available)",
+                "results": [],
             }
-
-        try:
-            async with httpx.AsyncClient() as client:
-                response = await client.post(
-                    f"{self.base_url}/search",
-                    json={
-                        "api_key": self.api_key,
-                        "query": query,
-                        "max_results": min(max_results, 10),
-                        "search_depth": search_depth,
-                        "include_answer": include_answer,
-                        "include_raw_content": include_raw_content,
-                        "include_images": include_images
-                    },
-                    timeout=HTTP_TIMEOUT_DEFAULT
-                )
-
-                if response.status_code == 200:
-                    data = response.json()
-                    return {
-                        "success": True,
-                        "query": query,
-                        "answer": data.get("answer"),
-                        "results": data.get("results", []),
-                        "images": data.get("images", []) if include_images else [],
-                        "search_depth": search_depth,
-                        "timestamp": datetime.now(timezone.utc).isoformat()
-                    }
-                else:
-                    logger.error(f"Tavily API error: {response.status_code} - {response.text}")
-                    return {
-                        "success": False,
-                        "error": f"API error: {response.status_code}",
-                        "results": []
-                    }
-
-        except httpx.TimeoutException:
-            logger.error(f"Tavily API timeout for query: {query}")
-            return {
-                "success": False,
-                "error": "Search request timed out",
-                "results": []
-            }
-        except Exception as e:
-            logger.error(f"Web search error: {e}")
-            return {
-                "success": False,
-                "error": str(e),
-                "results": []
-            }
+        return await search_provider.search(query, max_results=max_results, **kwargs)
 
     def format_results_for_llm(self, search_result: Dict[str, Any]) -> str:
-        """
-        Format search results into a readable string for LLM consumption
+        """Format search results for LLM consumption.
+
+        Delegates to the default provider's formatter.
 
         Args:
-            search_result: Result dictionary from search()
+            search_result: Result dictionary from search().
 
         Returns:
-            Formatted string with search results
+            Formatted string.
         """
+        provider = self._default_provider
+        if provider is not None:
+            return provider.format_results_for_llm(search_result)
+
+        # Fallback if no provider
         if not search_result.get("success"):
             return f"Search failed: {search_result.get('error', 'Unknown error')}"
-
-        output = []
-
-        # Add AI-generated answer if available
-        if search_result.get("answer"):
-            output.append(f"Summary: {search_result['answer']}\n")
-
-        # Add search results
         results = search_result.get("results", [])
-        if results:
-            output.append(f"Found {len(results)} results:\n")
-            for i, result in enumerate(results, 1):
-                output.append(f"{i}. {result.get('title', 'Untitled')}")
-                output.append(f"   URL: {result.get('url', 'N/A')}")
-                if result.get("content"):
-                    # Truncate long content
-                    content = result["content"][:300]
-                    if len(result["content"]) > 300:
-                        content += "..."
-                    output.append(f"   {content}")
-                output.append("")
-
-        return "\n".join(output)
+        return f"Found {len(results)} results."
 
     async def search_and_format(
         self,
         query: str,
         max_results: int = 5,
-        search_depth: str = "basic"
+        search_depth: str = "basic",
     ) -> str:
-        """
-        Convenience method to search and return formatted results
+        """Search and return formatted results.
+
+        Backward-compatible convenience method.
 
         Args:
-            query: Search query
-            max_results: Maximum results to return
-            search_depth: 'basic' or 'advanced'
+            query: Search query.
+            max_results: Maximum results to return.
+            search_depth: Search depth (Tavily-specific, passed as kwarg).
 
         Returns:
-            Formatted string ready for LLM
+            Formatted string ready for LLM.
         """
         result = await self.search(
             query=query,
             max_results=max_results,
             search_depth=search_depth,
-            include_answer=True
+            include_answer=True,
         )
         return self.format_results_for_llm(result)
 
@@ -182,7 +180,7 @@ _web_search_tool: Optional[WebSearchTool] = None
 
 
 def get_web_search_tool() -> WebSearchTool:
-    """Get or create the singleton web search tool instance"""
+    """Get or create the singleton web search tool instance."""
     global _web_search_tool
     if _web_search_tool is None:
         _web_search_tool = WebSearchTool()
