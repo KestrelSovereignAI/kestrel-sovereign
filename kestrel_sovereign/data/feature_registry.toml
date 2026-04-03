@@ -360,13 +360,13 @@ icon = "heart"
 core = true
 
 [visual_identity]
-package = "kestrel-feature-visual-identity"
-git = "https://github.com/KestrelSovereignAI/kestrel-feature-visual-identity.git"
+package = "kestrel-feature-visual"
+git = "https://github.com/KestrelSovereignAI/kestrel-feature-visual.git"
 features = ["VisualIdentityFeature"]
 description = "Avatar generation and visual identity management"
 tags = ["identity", "visual", "avatar"]
 icon = "palette"
-core = true
+core = false
 
 [consent]
 package = "kestrel-feature-consent"
