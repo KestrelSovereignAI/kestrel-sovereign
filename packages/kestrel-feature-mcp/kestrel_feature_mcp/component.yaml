@@ -1,8 +1,7 @@
 name: mcp
-description: Model Context Protocol (MCP) server management - extracted to kestrel-feature-mcp
+description: Model Context Protocol (MCP) server management - gateway mode for 311+ servers, direct container management
 version: 1.0.0
 entry_point: feature.py
-extracted_to: kestrel-feature-mcp
 
 tools:
   - start_mcp_gateway
@@ -13,5 +12,9 @@ tools:
   - load_mcp_server
   - unload_mcp_server
 
+files:
+  - feature.py
+  - registry.py
+
 dependencies:
-  - kestrel-feature-mcp
+  - docker
