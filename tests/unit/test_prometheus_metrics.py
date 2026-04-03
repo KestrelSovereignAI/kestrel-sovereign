@@ -371,7 +371,7 @@ class TestGracefulDegradation:
 
         hook = ObservabilityHook(agent=agent)
 
-        with patch("kestrel_feature_observability.observability.hook.PROMETHEUS_AVAILABLE", False):
+        with patch("kestrel_sovereign.features.observability.hook.PROMETHEUS_AVAILABLE", False):
             inp = HookInput(session_id="s", hook_event_name="Stop")
             result = await hook.execute(inp)
             assert result.continue_execution is True

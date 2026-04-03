@@ -194,7 +194,7 @@ deploy = { description = "Deploy agent to cloud infrastructure", category = "com
 package = "kestrel-feature-voice"
 git = "https://github.com/KestrelSovereignAI/kestrel-feature-voice.git"
 features = ["VoiceFeature"]
-description = "Text-to-speech and speech-to-text (ElevenLabs, Piper, Whisper, Deepgram)"
+description = "Text-to-speech and speech-to-text (local: Piper, Faster-Whisper; cloud via voice provider packages)"
 tags = ["communication", "voice", "tts", "stt"]
 icon = "microphone"
 core = true
@@ -202,6 +202,33 @@ core = true
 [voice.skills]
 speak = { description = "Convert text to speech audio", category = "communication", tags = ["voice", "tts"] }
 transcribe = { description = "Convert speech audio to text", category = "communication", tags = ["voice", "stt"] }
+
+[voice_elevenlabs]
+package = "kestrel-voice-elevenlabs"
+git = "https://github.com/KestrelSovereignAI/kestrel-voice-elevenlabs.git"
+features = ["ElevenLabsTTSProvider"]
+description = "ElevenLabs cloud TTS voice provider"
+tags = ["communication", "voice", "tts", "cloud", "elevenlabs"]
+icon = "microphone"
+core = false
+
+[voice_deepgram]
+package = "kestrel-voice-deepgram"
+git = "https://github.com/KestrelSovereignAI/kestrel-voice-deepgram.git"
+features = ["DeepgramSTTProvider"]
+description = "Deepgram cloud STT voice provider"
+tags = ["communication", "voice", "stt", "cloud", "deepgram"]
+icon = "microphone"
+core = false
+
+[voice_openai]
+package = "kestrel-voice-openai"
+git = "https://github.com/KestrelSovereignAI/kestrel-voice-openai.git"
+features = ["OpenAITTSProvider", "OpenAISTTProvider"]
+description = "OpenAI cloud TTS + STT voice providers"
+tags = ["communication", "voice", "tts", "stt", "cloud", "openai"]
+icon = "microphone"
+core = false
 
 [mcp]
 package = "kestrel-feature-mcp"
