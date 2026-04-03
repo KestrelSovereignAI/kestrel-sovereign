@@ -6,6 +6,9 @@ Uses REAL Docker containers and REAL MCP SDK connections.
 """
 
 import pytest
+
+pytest.importorskip("kestrel_feature_mcp")
+
 import pytest_asyncio
 import asyncio
 import os
