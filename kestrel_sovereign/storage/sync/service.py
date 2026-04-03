@@ -6,12 +6,13 @@ Snapshots are triggered by lifecycle events (shutdown, scheduled backup)
 rather than continuous WAL polling.
 """
 
+import asyncio
 import json
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Any
+from typing import Callable, Dict, List, Optional, Any
 
 from kestrel_sovereign.storage.sync.targets import SyncTarget, SyncResult, TrustTier
 
@@ -83,11 +84,22 @@ class SyncService:
     No background polling. No WAL watching.
     """
 
-    def __init__(self, db_path: str, state_file: Optional[str] = None):
+    def __init__(
+        self,
+        db_path: str,
+        state_file: Optional[str] = None,
+        wal_sync_interval: Optional[float] = None,
+        on_sync: Optional[Callable] = None,
+        on_error: Optional[Callable] = None,
+    ):
         self.db_path = Path(db_path)
         self.state_file = Path(state_file) if state_file else Path(f"{db_path}.sync")
+        self.wal_sync_interval = wal_sync_interval
+        self.on_sync = on_sync
+        self.on_error = on_error
         self._targets: List[SyncTarget] = []
         self._state: Optional[SyncState] = None
+        self._poll_task: Optional[asyncio.Task] = None
 
     def add_target(self, target: SyncTarget) -> None:
         """Add a sync target."""
@@ -122,8 +134,10 @@ class SyncService:
         return self._state.stats if self._state else None
 
     async def start(self) -> None:
-        """Load state. No background tasks — snapshots are event-driven."""
+        """Load state and optionally start periodic sync if wal_sync_interval is set."""
         await self._load_state()
+        if self.wal_sync_interval and self.wal_sync_interval > 0:
+            self._poll_task = asyncio.create_task(self._periodic_sync())
         logger.info(
             f"Sync service ready for {self.db_path} "
             f"({len(self._targets)} targets: "
@@ -131,9 +145,25 @@ class SyncService:
         )
 
     async def stop(self) -> None:
-        """Save state on shutdown."""
+        """Cancel periodic sync and save state on shutdown."""
+        if self._poll_task and not self._poll_task.done():
+            self._poll_task.cancel()
+            try:
+                await self._poll_task
+            except asyncio.CancelledError:
+                pass
+            self._poll_task = None
         await self._save_state()
         logger.info("Sync service stopped")
+
+    async def _periodic_sync(self) -> None:
+        """Background loop that triggers force_snapshot at wal_sync_interval."""
+        while True:
+            await asyncio.sleep(self.wal_sync_interval)
+            try:
+                await self.force_snapshot()
+            except Exception as e:
+                logger.error(f"Periodic sync error: {e}")
 
     async def force_snapshot(self) -> Dict[str, SyncResult]:
         """Snapshot to all targets. Called on shutdown, scheduled backup, or !backup."""
@@ -143,8 +173,12 @@ class SyncService:
                 result = await target.sync_snapshot(self.db_path)
                 results[target.name] = result
                 self._update_stats(result)
+                if self.on_sync:
+                    self.on_sync(result)
             except Exception as e:
                 logger.error(f"Snapshot failed for {target.name}: {e}")
+                if self.on_error:
+                    self.on_error(target.name, e)
                 results[target.name] = SyncResult(
                     success=False,
                     target_name=target.name,
