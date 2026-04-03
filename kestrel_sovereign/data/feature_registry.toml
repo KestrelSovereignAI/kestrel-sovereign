@@ -396,11 +396,11 @@ icon = "arrow-left-right"
 core = true
 
 [code_edit]
-package = "kestrel-feature-code-edit"
-git = "https://github.com/KestrelSovereignAI/kestrel-feature-code-edit.git"
+package = "kestrel-feature-code"
+git = "https://github.com/KestrelSovereignAI/kestrel-feature-code.git"
 features = ["CodeEditFeature"]
-description = "In-agent code editing and file manipulation"
-tags = ["devtools", "code", "editing"]
+description = "Agent self-modification with constitutional approval (sovereign-only)"
+tags = ["devtools", "code", "editing", "sovereign"]
 icon = "code"
 core = true
 
