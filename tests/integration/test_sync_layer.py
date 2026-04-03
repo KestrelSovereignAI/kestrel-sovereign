@@ -787,6 +787,7 @@ class TestNetworkPartition:
 # 4. Duplicate/Out-of-Order WAL Event Tests
 # =============================================================================
 
+@pytest.mark.skipif(WALListener is None, reason="WALListener not available")
 class TestWALEventHandling:
     """Test WAL event handling edge cases."""
 
@@ -1592,6 +1593,7 @@ class TestSyncState:
 # WALListener Unit Tests
 # =============================================================================
 
+@pytest.mark.skipif(WALListener is None, reason="WALListener not available")
 class TestWALListenerUnit:
     """Unit tests for WALListener."""
 
