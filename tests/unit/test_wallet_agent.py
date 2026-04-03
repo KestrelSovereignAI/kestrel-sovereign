@@ -1,7 +1,7 @@
 import pytest
 import pytest_asyncio
 from decimal import Decimal
-from kestrel_sovereign.features.wallet import WalletAgent, Currency
+from kestrel_feature_wallet import WalletAgent, Currency
 
 
 @pytest.mark.asyncio

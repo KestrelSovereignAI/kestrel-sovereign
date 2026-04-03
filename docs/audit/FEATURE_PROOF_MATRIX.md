@@ -43,7 +43,7 @@ Status meanings:
 | `tasks` | `kestrel_sovereign/features/tasks/` | `tests/unit/test_workflow_executor.py`, `tests/unit/test_a2a_task_manager.py`, `tests/integration/test_orchestration_e2e.py` | Direct |
 | `vastai` | `kestrel_sovereign/features/vastai/` | `tests/unit/test_vastai_feature.py`, `tests/unit/test_cloud_launcher_contracts.py`, `tests/integration/test_vastai_e2e.py` | Direct |
 | `visual_identity` | `kestrel_sovereign/features/visual_identity/` | `tests/unit/test_visual_identity_feature.py` | Direct |
-| `wallet` | `kestrel_sovereign/features/wallet.py` | `tests/unit/test_wallet_agent.py`, `tests/unit/test_wallet_limits.py`, `tests/integration/test_wallet_feature_e2e.py` | Direct |
+| `wallet` | `kestrel_feature_wallet` (external package) | `tests/unit/test_wallet_agent.py`, `tests/unit/test_wallet_limits.py`, `tests/integration/test_wallet_feature_e2e.py` | Direct |
 | `web_search` | `kestrel_sovereign/features/web_search/` | `tests/unit/test_web_search_feature.py` | Direct |
 | `webhooks` | `kestrel_sovereign/features/webhooks.py` | `tests/unit/test_webhooks_feature.py` | Direct |
 | `wellness` | `kestrel_sovereign/features/wellness.py` | `tests/unit/test_wellness_feature.py`, `tests/unit/test_wellness_telemetry_guard.py` | Direct |
