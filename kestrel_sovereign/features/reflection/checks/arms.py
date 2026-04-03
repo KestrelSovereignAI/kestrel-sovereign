@@ -130,7 +130,7 @@ class ArmsChecker(HealthChecker):
         )
 
         try:
-            from kestrel_sovereign.storage.encryption import get_fernet, encrypt_string, decrypt_string
+            from kestrel_sovereign.security.encryption import get_fernet, encrypt_string_fernet, decrypt_string_fernet
 
             fernet = get_fernet()
             if fernet is None:
@@ -141,8 +141,8 @@ class ArmsChecker(HealthChecker):
 
             # Test round-trip
             test_data = "health_check_secret_123"
-            encrypted, _ = encrypt_string(test_data, fernet)
-            decrypted = decrypt_string(encrypted, {"enc": True}, fernet)
+            encrypted, _ = encrypt_string_fernet(test_data, fernet)
+            decrypted = decrypt_string_fernet(encrypted, {"enc": True}, fernet)
 
             if decrypted == test_data:
                 check.status = CheckStatus.PASS

@@ -226,7 +226,11 @@ class TestAzureProviderStub:
         from kestrel_sovereign.features.deploy.core import DeployManagerCore
         from kestrel_sovereign.features.deploy.models import DeployProviderType
 
-        with patch.dict(os.environ, {"GCP_PROJECT_ID": "test-project"}):
+        with patch.dict(os.environ, {
+            "GCP_PROJECT_ID": "test-project",
+            "AZURE_SUBSCRIPTION_ID": "test-subscription-id",
+            "AZURE_RESOURCE_GROUP": "test-resource-group",
+        }):
             config = {
                 "manager": {"gcp_project_id": "test-project"},
                 "profiles": {
