@@ -10,9 +10,6 @@ Transport Types:
 """
 
 import pytest
-
-pytest.importorskip("kestrel_feature_mcp")
-
 import pytest_asyncio
 import asyncio
 import logging

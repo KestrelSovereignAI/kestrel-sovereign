@@ -6,9 +6,6 @@ No Docker required - these test the registry metadata layer only.
 """
 
 import pytest
-
-pytest.importorskip("kestrel_feature_mcp")
-
 from pathlib import Path
 
 from kestrel_feature_mcp.registry import (

@@ -136,11 +136,9 @@ wallet = [
     "web3>=7.0.0",
     "stripe>=10.0.0",
 ]
-# Feature: MCP (Docker container management, MCP protocol)
+# Feature: MCP (extracted to packages/kestrel-feature-mcp)
 mcp = [
-    "docker>=7.1.0",
-    "mcp>=1.26.0",
-    "trio>=0.32.0",
+    "kestrel-feature-mcp",
 ]
 # Feature: Visual (image generation via Replicate)
 visual = [
@@ -239,5 +237,9 @@ packages = ["kestrel_sovereign"]
 [tool.hatch.build.targets.sdist]
 include = ["kestrel_sovereign/**/*"]
 
+[tool.uv.workspace]
+members = ["packages/*"]
+
 [tool.uv.sources]
 kestrel-feature-github = { path = "kestrel-feature-github", editable = true }
+kestrel-feature-mcp = { workspace = true }

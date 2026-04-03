@@ -8,9 +8,6 @@ Run with: uv run pytest tests/integration/test_mcp_gateway.py -v -x
 """
 
 import pytest
-
-pytest.importorskip("kestrel_feature_mcp")
-
 import pytest_asyncio
 
 # Mark all tests in this module as requiring Docker MCP
