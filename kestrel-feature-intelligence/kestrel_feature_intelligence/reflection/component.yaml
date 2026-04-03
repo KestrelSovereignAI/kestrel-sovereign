@@ -1,0 +1,67 @@
+# Reflection Feature Component Manifest
+# Enables agent self-reflection and improvement
+
+name: reflection
+version: 1.0.0
+description: |
+  Agent self-reflection and improvement. Analyzes past interactions,
+  generates insights, and proposes behavioral changes with constitutional approval.
+
+# Feature class location
+module: features.reflection.feature
+class: ReflectionFeature
+
+# Dependencies
+requires:
+  - llm_service      # For analysis via LLM
+  - storage          # For conversation history
+
+optional:
+  - security         # For constitutional approval of changes
+  - memory_consolidator  # For episode-based reflection
+
+# Tools provided
+tools:
+  - name: reflect
+    description: Perform self-reflection on past interactions
+    command: "!reflect"
+
+  - name: get_insights
+    description: Get past insights from reflection sessions
+
+  - name: propose_improvement
+    description: Propose a self-improvement (requires approval)
+    command: "!propose-improvement"
+
+  - name: get_behavior_rules
+    description: Get active behavior rules
+
+# Integration hooks
+hooks:
+  - event: pre_sleep
+    method: on_pre_sleep
+    description: Run shallow reflection before memory consolidation
+
+  - event: post_consolidation
+    method: on_post_consolidation
+    description: Run deeper reflection after memory consolidation
+
+# Configuration
+config:
+  # Default analysis settings
+  default_scope: today
+  default_depth: normal
+
+  # Approval settings
+  require_approval_for_changes: true
+  approval_timeout_seconds: 300
+
+  # Automatic reflection during sleep
+  enable_sleep_reflection: true
+
+# Tags for discovery
+tags:
+  - cognitive
+  - self-improvement
+  - reflection
+  - constitutional
