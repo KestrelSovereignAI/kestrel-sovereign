@@ -158,6 +158,10 @@ github = [
 search = [
     "tavily-python>=0.3.0",
 ]
+# Feature: Intelligence (reflection + council metacognition)
+intelligence = [
+    "kestrel-feature-intelligence @ {root:uri}/kestrel-feature-intelligence",
+]
 # All feature packages — restores pre-split behavior
 all-features = [
     "kestrel_sovereign[cloud]",
@@ -167,6 +171,7 @@ all-features = [
     "kestrel_sovereign[delivery]",
     "kestrel_sovereign[github]",
     "kestrel_sovereign[search]",
+    "kestrel_sovereign[intelligence]",
     "kestrel_sovereign[local]",
     "kestrel_sovereign[ml]",
     "kestrel_sovereign[voice]",
