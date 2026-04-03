@@ -113,9 +113,13 @@ class Feature(ABC):
     with its own LLM context (A2A pattern).
     """
 
+    # Node type used for persisting feature config in the knowledge graph.
+    _CONFIG_NODE_TYPE = "feature_config"
+
     def __init__(self, agent):
         self.agent = agent
         self.name = self.__class__.__name__
+        self.disabled_skills: set = set()
 
     # =========================================================================
     # Lifecycle Methods
@@ -210,6 +214,58 @@ class Feature(ABC):
         """
         pass
 
+    # ------------------------------------------------------------------
+    # Config persistence helpers
+    # ------------------------------------------------------------------
+
+    def _config_node_id(self) -> str:
+        """Return the graph node ID used to persist this feature's config."""
+        return f"feature_config:{self.name}"
+
+    async def load_persisted_config(self) -> Optional[Dict]:
+        """Load persisted config from agent storage (graph store).
+
+        Returns the stored config dict, or None if nothing is persisted.
+        """
+        storage = getattr(self.agent, "storage", None)
+        if storage is None:
+            return None
+        try:
+            node = await storage.get_node(self._config_node_id())
+            if node is not None:
+                config = node.properties.get("config")
+                if isinstance(config, str):
+                    config = json.loads(config)
+                # Restore disabled_skills from persisted config
+                disabled = config.get("disabled_skills") if config else None
+                if isinstance(disabled, list):
+                    self.disabled_skills = set(disabled)
+                return config
+        except Exception as e:
+            logger.warning(f"Failed to load persisted config for {self.name}: {e}")
+        return None
+
+    async def persist_config(self, config: Dict) -> None:
+        """Save config to agent storage (graph store).
+
+        Stores the config as a graph node so it survives restarts.
+        """
+        storage = getattr(self.agent, "storage", None)
+        if storage is None:
+            logger.debug(f"No storage available to persist config for {self.name}")
+            return
+        try:
+            from kestrel_sovereign.storage.async_graph_store import GraphNode
+            node = GraphNode(
+                node_id=self._config_node_id(),
+                node_type=self._CONFIG_NODE_TYPE,
+                label=f"{self.name} config",
+                properties={"config": config},
+            )
+            await storage.add_node(node)
+        except Exception as e:
+            logger.warning(f"Failed to persist config for {self.name}: {e}")
+
     # =========================================================================
     # Feature-as-Subagent Interface (A2A Pattern)
     # =========================================================================
@@ -252,6 +308,8 @@ class Feature(ABC):
 
         Uses the canonical AgentSkill attached by the @tool decorator — same
         metadata source as get_tools(), no parallel construction.
+        Skills in ``self.disabled_skills`` are excluded (get_tools() already
+        filters them, so the card stays in sync).
         """
         skills = []
         for tool in self.get_tools():
@@ -708,11 +766,18 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
 
         Each returned tool carries the canonical AgentSkill created by the @tool
         decorator, so get_agent_card() can reuse it without rebuilding metadata.
+
+        Tools whose names appear in ``self.disabled_skills`` are excluded.
         """
         tools = []
         for name, method in inspect.getmembers(self, predicate=inspect.ismethod):
             if hasattr(method, "_tool_schema"):
                 schema_data = method._tool_schema
+
+                # Skip disabled skills
+                if schema_data["name"] in self.disabled_skills:
+                    continue
+
                 agent_skill = getattr(method, "_agent_skill", None)
 
                 # Create a dynamic AgentTool wrapper

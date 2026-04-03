@@ -7,9 +7,12 @@ Tests the new lifecycle methods on the Feature base class:
 - get_router()
 - post_all_features_loaded()
 - config_schema / get_config / set_config
+- disabled_skills filtering
+- Config persistence via graph store
 """
 
 import asyncio
+import json
 import pytest
 from typing import Dict, List, Optional
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -135,6 +138,25 @@ class ConfigFeature(Feature):
 
     async def set_config(self, config: Dict) -> None:
         self._config.update(config)
+
+
+class ToolFeature(Feature):
+    """Feature with two @tool-decorated methods for testing disabled_skills."""
+
+    @property
+    def tool_description(self) -> str:
+        return "Feature with tools"
+
+    async def initialize(self):
+        pass
+
+    @tool("skill_alpha", "Does alpha", ToolCategory.SYSTEM)
+    async def skill_alpha(self):
+        return "alpha"
+
+    @tool("skill_beta", "Does beta", ToolCategory.SYSTEM)
+    async def skill_beta(self):
+        return "beta"
 
 
 # === Fixtures ===
@@ -399,3 +421,122 @@ class TestObservabilityFeatureGetHooks:
         hooks = feature.get_hooks()
         assert len(hooks) == 1
         assert hooks[0].name == "observability"
+
+
+# === Tests: Disabled Skills ===
+
+class TestDisabledSkills:
+    """Test that disabled_skills filters out tools and agent card skills."""
+
+    def test_all_tools_returned_by_default(self, mock_agent):
+        feature = ToolFeature(mock_agent)
+        tools = feature.get_tools()
+        names = {t.name for t in tools}
+        assert names == {"skill_alpha", "skill_beta"}
+
+    def test_disabled_skill_excluded_from_get_tools(self, mock_agent):
+        feature = ToolFeature(mock_agent)
+        feature.disabled_skills = {"skill_alpha"}
+        tools = feature.get_tools()
+        names = {t.name for t in tools}
+        assert "skill_alpha" not in names
+        assert "skill_beta" in names
+
+    def test_disabled_skill_excluded_from_agent_card(self, mock_agent):
+        feature = ToolFeature(mock_agent)
+        feature.disabled_skills = {"skill_beta"}
+        card = feature.get_agent_card()
+        skill_names = {s.name for s in card.skills}
+        assert "skill_beta" not in skill_names
+        assert "skill_alpha" in skill_names
+
+    def test_disable_all_skills(self, mock_agent):
+        feature = ToolFeature(mock_agent)
+        feature.disabled_skills = {"skill_alpha", "skill_beta"}
+        assert feature.get_tools() == []
+        card = feature.get_agent_card()
+        assert card.skills == []
+
+    def test_disabled_skills_initialized_empty(self, mock_agent):
+        feature = SimpleFeature(mock_agent)
+        assert feature.disabled_skills == set()
+
+
+# === Tests: Config Persistence ===
+
+class TestConfigPersistence:
+    """Test persist_config and load_persisted_config via graph store."""
+
+    def test_config_node_id(self, mock_agent):
+        feature = ConfigFeature(mock_agent)
+        assert feature._config_node_id() == "feature_config:ConfigFeature"
+
+    @pytest.mark.asyncio
+    async def test_persist_config_stores_graph_node(self, mock_agent):
+        storage = MagicMock()
+        storage.add_node = AsyncMock()
+        mock_agent.storage = storage
+
+        feature = ConfigFeature(mock_agent)
+        await feature.persist_config({"threshold": 10, "enabled": False})
+
+        storage.add_node.assert_awaited_once()
+        node = storage.add_node.call_args[0][0]
+        assert node.node_id == "feature_config:ConfigFeature"
+        assert node.node_type == "feature_config"
+        assert node.properties["config"] == {"threshold": 10, "enabled": False}
+
+    @pytest.mark.asyncio
+    async def test_load_persisted_config_returns_stored_values(self, mock_agent):
+        from kestrel_sovereign.storage.async_graph_store import GraphNode
+
+        stored_config = {"threshold": 7, "enabled": True}
+        node = GraphNode(
+            node_id="feature_config:ConfigFeature",
+            node_type="feature_config",
+            label="ConfigFeature config",
+            properties={"config": stored_config},
+        )
+        storage = MagicMock()
+        storage.get_node = AsyncMock(return_value=node)
+        mock_agent.storage = storage
+
+        feature = ConfigFeature(mock_agent)
+        config = await feature.load_persisted_config()
+        assert config == stored_config
+
+    @pytest.mark.asyncio
+    async def test_load_persisted_config_returns_none_without_storage(self, mock_agent):
+        # No storage attribute
+        if hasattr(mock_agent, "storage"):
+            del mock_agent.storage
+        mock_agent.storage = None
+        feature = ConfigFeature(mock_agent)
+        result = await feature.load_persisted_config()
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_load_persisted_config_restores_disabled_skills(self, mock_agent):
+        from kestrel_sovereign.storage.async_graph_store import GraphNode
+
+        stored_config = {"threshold": 5, "disabled_skills": ["skill_a", "skill_b"]}
+        node = GraphNode(
+            node_id="feature_config:ToolFeature",
+            node_type="feature_config",
+            label="ToolFeature config",
+            properties={"config": stored_config},
+        )
+        storage = MagicMock()
+        storage.get_node = AsyncMock(return_value=node)
+        mock_agent.storage = storage
+
+        feature = ToolFeature(mock_agent)
+        await feature.load_persisted_config()
+        assert feature.disabled_skills == {"skill_a", "skill_b"}
+
+    @pytest.mark.asyncio
+    async def test_persist_config_no_storage_no_error(self, mock_agent):
+        mock_agent.storage = None
+        feature = ConfigFeature(mock_agent)
+        # Should not raise
+        await feature.persist_config({"threshold": 1})
