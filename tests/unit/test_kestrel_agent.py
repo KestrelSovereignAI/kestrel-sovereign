@@ -818,32 +818,32 @@ class TestInitialize:
 
         with patch('kestrel_sovereign.kestrel_agent.AsyncStorage') as MockStorage:
             with patch('kestrel_sovereign.kestrel_agent.discover_features', return_value=[]):
-                with patch('kestrel_sovereign.kestrel_agent.MemoryConsolidator'):
-                    with patch('kestrel_sovereign.kestrel_agent.MemorySystem') as MockMemorySystem:
-                        with patch('kestrel_sovereign.kestrel_agent.TaskManager') as MockTaskManager:
-                            mock_storage_instance = AsyncMock()
-                            mock_storage_instance.initialize = AsyncMock()
-                            mock_storage_instance.get_node = AsyncMock(return_value=None)
-                            mock_storage_instance.add_node = AsyncMock()
-                            mock_storage_instance.db = MagicMock()
-                            MockStorage.return_value = mock_storage_instance
+                with patch('kestrel_sovereign.kestrel_agent.MemorySystem') as MockMemorySystem:
+                    with patch('kestrel_sovereign.kestrel_agent.TaskManager') as MockTaskManager:
+                        mock_storage_instance = AsyncMock()
+                        mock_storage_instance.initialize = AsyncMock()
+                        mock_storage_instance.get_node = AsyncMock(return_value=None)
+                        mock_storage_instance.add_node = AsyncMock()
+                        mock_storage_instance.db = MagicMock()
+                        MockStorage.return_value = mock_storage_instance
 
-                            mock_memory_system = AsyncMock()
-                            mock_memory_system.initialize = AsyncMock()
-                            mock_memory_system.retriever = MagicMock()
-                            MockMemorySystem.return_value = mock_memory_system
+                        mock_memory_system = AsyncMock()
+                        mock_memory_system.initialize = AsyncMock()
+                        mock_memory_system.retriever = MagicMock()
+                        mock_memory_system.consolidator = MagicMock()
+                        MockMemorySystem.return_value = mock_memory_system
 
-                            mock_task_manager = AsyncMock()
-                            mock_task_manager.initialize = AsyncMock()
-                            mock_task_manager.register_agent = MagicMock()
-                            MockTaskManager.return_value = mock_task_manager
+                        mock_task_manager = AsyncMock()
+                        mock_task_manager.initialize = AsyncMock()
+                        mock_task_manager.register_agent = MagicMock()
+                        MockTaskManager.return_value = mock_task_manager
 
-                            await agent.initialize()
+                        await agent.initialize()
 
-                            # Verify storage was created and initialized
-                            assert agent._raw_storage is not None
-                            assert agent.storage is not None
-                            mock_storage_instance.initialize.assert_called_once()
+                        # Verify storage was created and initialized
+                        assert agent._raw_storage is not None
+                        assert agent.storage is not None
+                        mock_storage_instance.initialize.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_initialize_creates_memory_system(self, tmp_path):
@@ -855,31 +855,31 @@ class TestInitialize:
 
         with patch('kestrel_sovereign.kestrel_agent.AsyncStorage') as MockStorage:
             with patch('kestrel_sovereign.kestrel_agent.discover_features', return_value=[]):
-                with patch('kestrel_sovereign.kestrel_agent.MemoryConsolidator'):
-                    with patch('kestrel_sovereign.kestrel_agent.MemorySystem') as MockMemorySystem:
-                        with patch('kestrel_sovereign.kestrel_agent.TaskManager') as MockTaskManager:
-                            mock_storage = AsyncMock()
-                            mock_storage.initialize = AsyncMock()
-                            mock_storage.get_node = AsyncMock(return_value=None)
-                            mock_storage.add_node = AsyncMock()
-                            mock_storage.db = MagicMock()
-                            MockStorage.return_value = mock_storage
+                with patch('kestrel_sovereign.kestrel_agent.MemorySystem') as MockMemorySystem:
+                    with patch('kestrel_sovereign.kestrel_agent.TaskManager') as MockTaskManager:
+                        mock_storage = AsyncMock()
+                        mock_storage.initialize = AsyncMock()
+                        mock_storage.get_node = AsyncMock(return_value=None)
+                        mock_storage.add_node = AsyncMock()
+                        mock_storage.db = MagicMock()
+                        MockStorage.return_value = mock_storage
 
-                            mock_memory_system = AsyncMock()
-                            mock_memory_system.initialize = AsyncMock()
-                            mock_memory_system.retriever = MagicMock()
-                            MockMemorySystem.return_value = mock_memory_system
+                        mock_memory_system = AsyncMock()
+                        mock_memory_system.initialize = AsyncMock()
+                        mock_memory_system.retriever = MagicMock()
+                        mock_memory_system.consolidator = MagicMock()
+                        MockMemorySystem.return_value = mock_memory_system
 
-                            mock_task_manager = AsyncMock()
-                            mock_task_manager.initialize = AsyncMock()
-                            mock_task_manager.register_agent = MagicMock()
-                            MockTaskManager.return_value = mock_task_manager
+                        mock_task_manager = AsyncMock()
+                        mock_task_manager.initialize = AsyncMock()
+                        mock_task_manager.register_agent = MagicMock()
+                        MockTaskManager.return_value = mock_task_manager
 
-                            await agent.initialize()
+                        await agent.initialize()
 
-                            # Verify memory system created and initialized
-                            assert agent.memory_system is not None
-                            mock_memory_system.initialize.assert_called_once()
+                        # Verify memory system created and initialized
+                        assert agent.memory_system is not None
+                        mock_memory_system.initialize.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_initialize_creates_agent_node_if_missing(self, tmp_path):
@@ -891,33 +891,33 @@ class TestInitialize:
 
         with patch('kestrel_sovereign.kestrel_agent.AsyncStorage') as MockStorage:
             with patch('kestrel_sovereign.kestrel_agent.discover_features', return_value=[]):
-                with patch('kestrel_sovereign.kestrel_agent.MemoryConsolidator'):
-                    with patch('kestrel_sovereign.kestrel_agent.MemorySystem') as MockMemorySystem:
-                        with patch('kestrel_sovereign.kestrel_agent.TaskManager') as MockTaskManager:
-                            mock_storage = AsyncMock()
-                            mock_storage.initialize = AsyncMock()
-                            mock_storage.get_node = AsyncMock(return_value=None)  # No existing node
-                            mock_storage.add_node = AsyncMock()
-                            mock_storage.db = MagicMock()
-                            MockStorage.return_value = mock_storage
+                with patch('kestrel_sovereign.kestrel_agent.MemorySystem') as MockMemorySystem:
+                    with patch('kestrel_sovereign.kestrel_agent.TaskManager') as MockTaskManager:
+                        mock_storage = AsyncMock()
+                        mock_storage.initialize = AsyncMock()
+                        mock_storage.get_node = AsyncMock(return_value=None)  # No existing node
+                        mock_storage.add_node = AsyncMock()
+                        mock_storage.db = MagicMock()
+                        MockStorage.return_value = mock_storage
 
-                            mock_memory_system = AsyncMock()
-                            mock_memory_system.initialize = AsyncMock()
-                            mock_memory_system.retriever = MagicMock()
-                            MockMemorySystem.return_value = mock_memory_system
+                        mock_memory_system = AsyncMock()
+                        mock_memory_system.initialize = AsyncMock()
+                        mock_memory_system.retriever = MagicMock()
+                        mock_memory_system.consolidator = MagicMock()
+                        MockMemorySystem.return_value = mock_memory_system
 
-                            mock_task_manager = AsyncMock()
-                            mock_task_manager.initialize = AsyncMock()
-                            mock_task_manager.register_agent = MagicMock()
-                            MockTaskManager.return_value = mock_task_manager
+                        mock_task_manager = AsyncMock()
+                        mock_task_manager.initialize = AsyncMock()
+                        mock_task_manager.register_agent = MagicMock()
+                        MockTaskManager.return_value = mock_task_manager
 
-                            await agent.initialize()
+                        await agent.initialize()
 
-                            # Verify add_node was called to create the agent node
-                            mock_storage.add_node.assert_called_once()
-                            call_args = mock_storage.add_node.call_args[0][0]
-                            assert call_args.node_id == "did:test:agent123"
-                            assert call_args.node_type == "agent"
+                        # Verify add_node was called to create the agent node
+                        mock_storage.add_node.assert_called_once()
+                        call_args = mock_storage.add_node.call_args[0][0]
+                        assert call_args.node_id == "did:test:agent123"
+                        assert call_args.node_type == "agent"
 
     @pytest.mark.asyncio
     async def test_initialize_registers_features(self, tmp_path):
@@ -938,29 +938,29 @@ class TestInitialize:
 
         with patch('kestrel_sovereign.kestrel_agent.AsyncStorage') as MockStorage:
             with patch('kestrel_sovereign.kestrel_agent.discover_features', return_value=[mock_feature]):
-                with patch('kestrel_sovereign.kestrel_agent.MemoryConsolidator'):
-                    with patch('kestrel_sovereign.kestrel_agent.MemorySystem') as MockMemorySystem:
-                        with patch('kestrel_sovereign.kestrel_agent.TaskManager') as MockTaskManager:
-                            mock_storage = AsyncMock()
-                            mock_storage.initialize = AsyncMock()
-                            mock_storage.get_node = AsyncMock(return_value=None)
-                            mock_storage.add_node = AsyncMock()
-                            mock_storage.db = MagicMock()
-                            MockStorage.return_value = mock_storage
+                with patch('kestrel_sovereign.kestrel_agent.MemorySystem') as MockMemorySystem:
+                    with patch('kestrel_sovereign.kestrel_agent.TaskManager') as MockTaskManager:
+                        mock_storage = AsyncMock()
+                        mock_storage.initialize = AsyncMock()
+                        mock_storage.get_node = AsyncMock(return_value=None)
+                        mock_storage.add_node = AsyncMock()
+                        mock_storage.db = MagicMock()
+                        MockStorage.return_value = mock_storage
 
-                            mock_memory_system = AsyncMock()
-                            mock_memory_system.initialize = AsyncMock()
-                            mock_memory_system.retriever = MagicMock()
-                            MockMemorySystem.return_value = mock_memory_system
+                        mock_memory_system = AsyncMock()
+                        mock_memory_system.initialize = AsyncMock()
+                        mock_memory_system.retriever = MagicMock()
+                        mock_memory_system.consolidator = MagicMock()
+                        MockMemorySystem.return_value = mock_memory_system
 
-                            mock_task_manager = AsyncMock()
-                            mock_task_manager.initialize = AsyncMock()
-                            mock_task_manager.register_agent = MagicMock()
-                            MockTaskManager.return_value = mock_task_manager
+                        mock_task_manager = AsyncMock()
+                        mock_task_manager.initialize = AsyncMock()
+                        mock_task_manager.register_agent = MagicMock()
+                        MockTaskManager.return_value = mock_task_manager
 
-                            await agent.initialize()
+                        await agent.initialize()
 
-                            # Verify feature was registered
-                            assert "TestFeature" in agent.features
-                            assert agent.features["TestFeature"] is mock_feature
-                            mock_feature.initialize.assert_called_once()
+                        # Verify feature was registered
+                        assert "TestFeature" in agent.features
+                        assert agent.features["TestFeature"] is mock_feature
+                        mock_feature.initialize.assert_called_once()

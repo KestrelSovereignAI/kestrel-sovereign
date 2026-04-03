@@ -34,7 +34,6 @@ from kestrel_sovereign.agent.tool_registry import ToolRegistryMixin
 from kestrel_sovereign.agent.model_preference import ModelPreferenceMixin
 from kestrel_sovereign.agent.event_manager import EventManagerMixin
 from kestrel_sovereign.agent.request_lifecycle import RequestLifecycleMixin
-from kestrel_sovereign.storage.memory_consolidator import MemoryConsolidator
 from kestrel_sovereign.storage.memory_system import MemorySystem
 from kestrel_sovereign.hooks import HooksManager, HookEvent, HookInput, PermissionDecision
 from kestrel_sovereign.bootstrap import BootstrapService, BootstrapState
@@ -499,21 +498,15 @@ class KestrelAgent(
                 except Exception as e:
                     logging.warning(f"Could not activate agent OpenRouter key: {e}", exc_info=True)
 
-            # Initialize memory consolidator for episode management
-            logging.info("Creating MemoryConsolidator")
-            self.memory_consolidator = MemoryConsolidator(
-                db=self._raw_storage.db,
-                agent_id=self.agent_id
-            )
-            logging.info("MemoryConsolidator created")
-
-            # Initialize memory system for semantic/emotional memory retrieval
+            # Initialize memory system (single source of truth for all memory components)
             logging.info("Creating MemorySystem")
             self.memory_system = MemorySystem(
                 storage=self._raw_storage,
                 agent_id=self.agent_id
             )
             await self.memory_system.initialize()
+            # Use MemorySystem's consolidator — it has graph_store for KG episode writing
+            self.memory_consolidator = self.memory_system.consolidator
             logging.info("MemorySystem initialized")
 
             # Initialize command handler and context builder
