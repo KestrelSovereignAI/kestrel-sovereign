@@ -167,16 +167,16 @@ async def test_kestrel_agent_uses_generate_with_messages():
     import inspect
     from kestrel_sovereign.kestrel_agent import KestrelAgent
 
-    # Get the source of process_input
-    source = inspect.getsource(KestrelAgent.process_input)
+    # process_input delegates to _process_input_traced, so check the traced method
+    source = inspect.getsource(KestrelAgent._process_input_traced)
 
     # CRITICAL: Must use generate_with_messages, not generate
     assert "generate_with_messages" in source, \
-        "process_input MUST call generate_with_messages to pass conversation history"
+        "_process_input_traced MUST call generate_with_messages to pass conversation history"
 
     # Verify we build the messages array
     assert "messages.extend(context_result.messages)" in source or "context_result.messages" in source, \
-        "process_input MUST include context_result.messages in the messages array"
+        "_process_input_traced MUST include context_result.messages in the messages array"
 
 
 @pytest.mark.asyncio
