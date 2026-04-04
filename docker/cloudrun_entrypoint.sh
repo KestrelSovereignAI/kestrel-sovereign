@@ -15,12 +15,16 @@ while IFS='=' read -r key val; do
     fi
 done < <(env)
 
-AGENT_DIR="${KESTREL_DB_PATH:-/app/agent_data}"
+AGENT_BASE="${KESTREL_DB_PATH:-/app/agent_data}"
+AGENT_NAME="${KESTREL_AGENT_NAME:-kestrel}"
+AGENT_DIR="${AGENT_BASE}/${AGENT_NAME}"
 PORT="${PORT:-8080}"
 
 # Bootstrap agent identity if none exists
+# Agent lives in a named subdirectory so rookery auto-discovery finds it
+mkdir -p "$AGENT_DIR"
 if ! ls "$AGENT_DIR"/kestrel_*.json &>/dev/null; then
-    echo "No agent identity found. Creating new Kestrel agent..."
+    echo "No agent identity found. Creating new Kestrel agent in ${AGENT_DIR}..."
     /app/.venv/bin/python -c "
 import sys; sys.path.insert(0, '/app')
 from kestrel_sovereign.inception_service import create_kestrel_identity
