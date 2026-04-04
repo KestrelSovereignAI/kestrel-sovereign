@@ -16,6 +16,7 @@ from kestrel_sovereign.features import (
     FEATURE_ENTRY_POINT_GROUP,
 )
 from kestrel_sovereign.features.base import Feature
+from kestrel_sdk.features.base import Feature as _SDKFeature
 
 
 class TestGetDisabledFeatures:
@@ -92,9 +93,12 @@ class TestDiscoverFeatures:
         # Should discover at least one feature
         assert len(features) > 0
         
-        # All returned items should be Feature instances
+        # All returned items should be Feature instances (sovereign or SDK base)
         for feature in features:
-            assert isinstance(feature, Feature)
+            assert isinstance(feature, (Feature, _SDKFeature)), (
+                f"{feature.__class__.__name__} from {feature.__class__.__module__} "
+                f"is not a Feature instance"
+            )
 
     def test_disabled_features_not_loaded(self, mock_agent):
         """Test that disabled features are not loaded."""
