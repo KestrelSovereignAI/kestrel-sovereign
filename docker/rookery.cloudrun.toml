@@ -1,0 +1,35 @@
+# Kestrel Rookery Configuration — Cloud Run
+#
+# Multi-agent configuration for the Falconer demo and staging.
+# Agents auto-discover their data directories under /app/agent_data/.
+# The KESTREL_AGENTS env var provisions agent directories at container start.
+
+[host]
+# Cloud Run injects PORT (usually 8080)
+port = 8080
+bind = "0.0.0.0"
+
+# =============================================================================
+# Kestrel — Full-capability sovereign agent (core)
+# =============================================================================
+[agents.Kestrel]
+data_dir = "/app/agent_data/Kestrel"
+port = 8801
+autostart = true
+# No features key = load all features (sovereign agent)
+
+# =============================================================================
+# kestrel-demo — Minimal demo-safe agent for live presentations
+# =============================================================================
+[agents.kestrel-demo]
+data_dir = "/app/agent_data/kestrel-demo"
+port = 8802
+autostart = true
+features = [
+    "BootstrapFeature",
+    "MemoryFeature",
+    "VoiceFeature",
+    "ContextFeature",
+    "HeartbeatFeature",
+    "SaveFeature",
+]

@@ -31,12 +31,12 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Authenticate to Google Cloud
-        uses: google-github-actions/auth@71f986c55218e9fc2b3f5fcab3a54afe413cead5 # v2.1.8
+        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2.1.13
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
 
       - name: Set up Cloud SDK
-        uses: google-github-actions/setup-gcloud@77e7a554d41e2ee56fc945c0730c9acfbae6c063 # v2.1.4
+        uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2.2.1
 
       - name: Configure Docker for GCR
         run: gcloud auth configure-docker --quiet
@@ -50,7 +50,7 @@ jobs:
             echo "tag=dev-$(echo ${{ github.sha }} | cut -c1-7)" >> $GITHUB_OUTPUT
           fi
 
-      - name: Build and push Docker image
+      - name: Build and push single-agent image
         run: |
           docker build \
             -f docker/Dockerfile.cloudrun \
@@ -59,6 +59,19 @@ jobs:
             .
           docker push gcr.io/${{ env.PROJECT_ID }}/${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.tag }}
           docker push gcr.io/${{ env.PROJECT_ID }}/${{ env.IMAGE_NAME }}:latest
+
+      - name: Build and push rookery (multi-agent) image
+        run: |
+          docker build \
+            -f docker/Dockerfile.rookery \
+            --secret id=github_token,env=GITHUB_TOKEN \
+            -t gcr.io/${{ env.PROJECT_ID }}/${{ env.IMAGE_NAME }}-rookery:${{ steps.tag.outputs.tag }} \
+            -t gcr.io/${{ env.PROJECT_ID }}/${{ env.IMAGE_NAME }}-rookery:latest \
+            .
+          docker push gcr.io/${{ env.PROJECT_ID }}/${{ env.IMAGE_NAME }}-rookery:${{ steps.tag.outputs.tag }}
+          docker push gcr.io/${{ env.PROJECT_ID }}/${{ env.IMAGE_NAME }}-rookery:latest
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_PAT }}
 
   deploy-dev:
     runs-on: ubuntu-latest
@@ -69,15 +82,15 @@ jobs:
 
     steps:
       - name: Authenticate to Google Cloud
-        uses: google-github-actions/auth@71f986c55218e9fc2b3f5fcab3a54afe413cead5 # v2.1.8
+        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2.1.13
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
 
       - name: Deploy to Cloud Run (dev)
-        uses: google-github-actions/deploy-cloudrun@5c4e3e6a7e85077c3a25fedf87b53d0e0b59f971 # v2.7.3
+        uses: google-github-actions/deploy-cloudrun@251330ba9a8a34bfbc1622895f42e1d53fd14522 # v2.7.6
         with:
           service: kestrel-dev
-          image: gcr.io/${{ env.PROJECT_ID }}/${{ env.IMAGE_NAME }}:latest
+          image: gcr.io/${{ env.PROJECT_ID }}/${{ env.IMAGE_NAME }}-rookery:latest
           region: ${{ env.REGION }}
           flags: >-
             --memory=2Gi
@@ -90,15 +103,19 @@ jobs:
             --allow-unauthenticated
           secrets: |
             OPENAI_API_KEY=kestrel-openai-key:latest
+            ANTHROPIC_API_KEY=kestrel-anthropic-key:latest
             KESTREL_API_KEY=kestrel-api-key:latest
             KESTREL_DATA_KEY=kestrel-data-key:latest
             GOOGLE_CLIENT_ID=kestrel-google-client-id:latest
             GOOGLE_CLIENT_SECRET=kestrel-google-client-secret:latest
             KESTREL_SESSION_SECRET=kestrel-session-secret:latest
+            GITHUB_TOKEN=github-read-kestrel:latest
           env_vars: |
             KESTREL_ENV=development
             KESTREL_DB_BACKEND=sqlite
             KESTREL_DB_PATH=/app/agent_data
+            KESTREL_AGENTS=Kestrel,kestrel-demo
+            KESTREL_REQUIRE_OAUTH=true
             KESTREL_ALLOWED_EMAILS=${{ secrets.KESTREL_ALLOWED_EMAILS }}
 
       - name: Show dev URL
@@ -121,12 +138,12 @@ jobs:
 
     steps:
       - name: Authenticate to Google Cloud
-        uses: google-github-actions/auth@71f986c55218e9fc2b3f5fcab3a54afe413cead5 # v2.1.8
+        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2.1.13
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
 
       - name: Deploy to Cloud Run (prod)
-        uses: google-github-actions/deploy-cloudrun@5c4e3e6a7e85077c3a25fedf87b53d0e0b59f971 # v2.7.3
+        uses: google-github-actions/deploy-cloudrun@251330ba9a8a34bfbc1622895f42e1d53fd14522 # v2.7.6
         with:
           service: kestrel-prod
           image: gcr.io/${{ env.PROJECT_ID }}/${{ env.IMAGE_NAME }}:latest
