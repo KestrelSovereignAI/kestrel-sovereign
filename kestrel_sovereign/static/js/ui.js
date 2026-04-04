@@ -36,11 +36,11 @@ document.head.appendChild(styleSheet);
 // ============================================================================
 
 export const PRIVACY_MODES = {
-    ephemeral: { icon: '\u{1F512}', label: 'EPHEMERAL', color: '#dc2626', description: 'Nothing stored, local LLM only' },
-    isolated: { icon: '\u{1F510}', label: 'ISOLATED', color: '#ea580c', description: 'Temporary storage, deleted on session end' },
-    anonymous: { icon: '\u{1F3AD}', label: 'ANONYMOUS', color: '#ca8a04', description: 'Stored without PII, encrypted backups' },
-    normal: { icon: '\u{1F4DD}', label: 'NORMAL', color: '#16a34a', description: 'Standard persistence with all features' },
-    public: { icon: '\u{1F310}', label: 'PUBLIC', color: '#2563eb', description: 'Can be shared and exported publicly' },
+    ephemeral: { icon: kicon('lock'), label: 'EPHEMERAL', color: '#dc2626', description: 'Nothing stored, local LLM only' },
+    isolated: { icon: kicon('lock-key'), label: 'ISOLATED', color: '#ea580c', description: 'Temporary storage, deleted on session end' },
+    anonymous: { icon: kicon('mask'), label: 'ANONYMOUS', color: '#ca8a04', description: 'Stored without PII, encrypted backups' },
+    normal: { icon: kicon('document'), label: 'NORMAL', color: '#16a34a', description: 'Standard persistence with all features' },
+    public: { icon: kicon('globe'), label: 'PUBLIC', color: '#2563eb', description: 'Can be shared and exported publicly' },
 };
 
 // Commands are loaded dynamically from /api/commands
@@ -123,10 +123,10 @@ export const Toast = {
         const toast = document.createElement('div');
 
         const colors = {
-            success: { bg: '#059669', icon: '✓' },
-            error: { bg: '#dc2626', icon: '✕' },
-            warning: { bg: '#d97706', icon: '⚠' },
-            info: { bg: '#2563eb', icon: 'ℹ' }
+            success: { bg: '#059669', icon: kicon('checkmark') },
+            error: { bg: '#dc2626', icon: kicon('x-mark') },
+            warning: { bg: '#d97706', icon: kicon('warning') },
+            info: { bg: '#2563eb', icon: kicon('info') }
         };
         const { bg, icon } = colors[type] || colors.info;
 

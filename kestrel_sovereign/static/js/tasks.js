@@ -467,12 +467,12 @@ window.loadTaskArtifacts = async function(taskId) {
 
 function getStatusIcon(status) {
     switch (status) {
-        case 'completed': return '✅';
-        case 'failed': return '❌';
-        case 'canceled': return '⚠️';
-        case 'working': return '⏳';
-        case 'submitted': return '📥';
-        case 'input_required': return '❓';
+        case 'completed': return kicon('check-circle');
+        case 'failed': return kicon('x-circle');
+        case 'canceled': return kicon('warning');
+        case 'working': return kicon('hourglass');
+        case 'submitted': return kicon('inbox');
+        case 'input_required': return kicon('question');
         default: return '•';
     }
 }
@@ -579,7 +579,7 @@ function renderActivityLog(events) {
 
 function renderActivityItem(event) {
     const typeIcon = getActivityTypeIcon(event.event_type);
-    const statusIcon = event.success ? '✓' : '✗';
+    const statusIcon = event.success ? kicon('checkmark') : kicon('x-mark');
     const statusColor = event.success ? 'rgb(34, 197, 94)' : 'rgb(239, 68, 68)';
     const timestamp = formatActivityTime(event.timestamp);
     const eventId = event.event_id;
@@ -709,12 +709,12 @@ window.toggleActivityDetails = function(eventId) {
 
 function getActivityTypeIcon(eventType) {
     switch (eventType) {
-        case 'tool_call': return '🔧';
-        case 'tool_response': return '📤';
-        case 'agent_response': return '🤖';
-        case 'llm_call': return '🧠';
-        case 'error': return '❌';
-        case 'metric': return '📊';
+        case 'tool_call': return kicon('wrench');
+        case 'tool_response': return kicon('inbox');
+        case 'agent_response': return kicon('robot');
+        case 'llm_call': return kicon('sparkles');
+        case 'error': return kicon('x-circle');
+        case 'metric': return kicon('chart-bar');
         default: return '•';
     }
 }
