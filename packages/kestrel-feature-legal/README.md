@@ -1,48 +1,39 @@
 # kestrel-feature-legal
 
-Wyoming DAO LLC formation for Kestrel sovereign agents.
+Wyoming DAO LLC formation for Kestrel sovereign agents. Generates Articles of Organization and Operating Agreements that map Kestrel constitutional governance to the Wyoming legal framework, enabling agents to autonomously incorporate as legal entities.
 
 ## Installation
 
 ```bash
-pip install kestrel-feature-legal
-```
-
-## Features
-
-- **Articles of Organization Generator** — complete Wyoming DAO LLC formation documents
-- **Operating Agreement Generator** — maps Kestrel constitutional governance to Wyoming legal framework
-- **Incorporation Tool** — agent tool for autonomous document generation
-- **Legal Entity Model** — portable entity status that travels with agent identity
-
-## Usage
-
-```python
-from kestrel_feature_legal import (
-    generate_articles,
-    generate_operating_agreement,
-    generate_incorporation_package,
-    RegisteredAgentInfo,
-    OrganizerInfo,
-)
-
-# Create registered agent and organizer
-ra = RegisteredAgentInfo(
-    name="Wyoming Agents, Inc.",
-    physical_address="1712 Pioneer Ave, Cheyenne, WY 82001",
-)
-organizer = OrganizerInfo(name="Jane Doe", address="456 Oak St, Denver, CO 80202")
-
-# Generate articles
-articles = generate_articles(
-    entity_name="Kestrel Alpha DAO LLC",
-    agent_did="did:pkh:eip155:1:0xABCDEF...",
-    constitution_hash="a1b2c3d4...",
-    registered_agent=ra,
-    organizer=organizer,
-)
+uv pip install git+https://github.com/KestrelSovereignAI/kestrel-feature-legal.git
 ```
 
 ## Dependencies
 
-- `kestrel-sovereign` (core framework)
+- `kestrel-sovereign-sdk`
+
+## Usage
+
+```python
+from kestrel_feature_legal.wyoming_dao import WyomingDAOGenerator
+from kestrel_feature_legal.operating_agreement import OperatingAgreementGenerator
+
+# Generate Articles of Organization
+generator = WyomingDAOGenerator()
+articles = generator.generate(agent_name="MyAgent", agent_did="did:pkh:...")
+
+# Generate Operating Agreement
+oa_gen = OperatingAgreementGenerator()
+agreement = oa_gen.generate(agent_name="MyAgent", constitution=constitution)
+```
+
+## Configuration
+
+No environment variables required.
+
+## Development
+
+```bash
+uv pip install kestrel-sovereign-sdk && uv pip install -e ".[test]"
+uv run pytest
+```

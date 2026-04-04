@@ -1,46 +1,43 @@
 # kestrel-sovereign-sdk
 
-Lightweight interfaces for Kestrel Sovereign feature packages.
+Lightweight SDK providing base interfaces, protocols, and utilities for Kestrel Sovereign feature package development. Feature packages depend on this SDK instead of the full framework, keeping dependencies minimal and development fast.
 
-## Install
+## Installation
 
 ```bash
-pip install kestrel-sovereign-sdk
+uv pip install git+https://github.com/KestrelSovereignAI/kestrel-sovereign-sdk.git
 ```
+
+With encryption helpers:
+
+```bash
+uv pip install "kestrel-sovereign-sdk[crypto] @ git+https://github.com/KestrelSovereignAI/kestrel-sovereign-sdk.git"
+```
+
+## Dependencies
+
+- `pydantic>=2.0`
+- Optional: `cryptography>=42.0` (via `[crypto]` extra)
 
 ## Usage
 
 ```python
-from kestrel_sdk.features.base import Feature, tool
-from kestrel_sdk.hooks.base import Hook, HookEvent
-from kestrel_sdk.tools.base import AgentTool, ToolSchema
+from kestrel_sdk.features.base import Feature, Tool
+
+class MyFeature(Feature):
+    name = "my-feature"
+
+    def get_tools(self):
+        return [Tool(name="my-tool", description="Does something", handler=self.handle)]
 ```
 
-## What's included
+## Configuration
 
-This package contains only abstract base classes, protocols, and data models.
-No heavy dependencies (FastAPI, database drivers, LLM clients, etc.).
+No environment variables required. This is a development-time dependency only.
 
-Feature packages depend on this SDK instead of the full `kestrel-sovereign` framework.
+## Development
 
-### Modules
-
-| Module | Contents |
-|--------|----------|
-| `kestrel_sdk.features.base` | `Feature`, `@tool` decorator, `parse_docstring_params` |
-| `kestrel_sdk.hooks.base` | `Hook`, `HookEvent`, `HookInput`, `HookOutput`, `PermissionDecision` |
-| `kestrel_sdk.tools.base` | `ToolCategory`, `ToolSchema`, `ToolParameter`, `AgentTool` |
-| `kestrel_sdk.voice.base` | `TTSProvider`, `STTProvider`, `VoiceInfo`, `VoiceConfig` |
-| `kestrel_sdk.storage.providers.base` | `StorageProvider`, `StorageTier`, `CryostasisCapable` |
-| `kestrel_sdk.deploy.base` | `DeployProvider` |
-| `kestrel_sdk.deploy.models` | `DeploymentProfile`, `DeployManagerError` |
-| `kestrel_sdk.a2a.agent_card` | `AgentCard`, `AgentSkill`, `AgentCapabilities` |
-| `kestrel_sdk.a2a.types` | `Task`, `TaskState`, `TaskStatus`, etc. |
-| `kestrel_sdk.config.constants` | Timeout/interval constants |
-| `kestrel_sdk.config.defaults` | Service URL and feature flag defaults |
-| `kestrel_sdk.security.encryption` | Fernet helpers (requires `[crypto]` extra) |
-| `kestrel_sdk.security.exceptions` | `SecurityError` hierarchy |
-
-## License
-
-Apache-2.0
+```bash
+uv pip install kestrel-sovereign-sdk && uv pip install -e .
+uv run pytest
+```
