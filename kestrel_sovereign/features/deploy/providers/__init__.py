@@ -11,12 +11,17 @@ They register via the ``kestrel_sovereign.cloud_providers`` entry_point group.
 
 from .base import DeployProvider
 
-# Backward-compat re-exports from extracted packages
-from .cloudrun import CloudRunProvider  # noqa: F401
-from .azure_container import AzureContainerProvider  # noqa: F401
-
 __all__ = [
     "DeployProvider",
-    "CloudRunProvider",
-    "AzureContainerProvider",
 ]
+
+
+def __getattr__(name):
+    """Lazy re-export from extracted cloud provider packages."""
+    if name == "CloudRunProvider":
+        from kestrel_cloud_gcp.cloudrun import CloudRunProvider
+        return CloudRunProvider
+    if name == "AzureContainerProvider":
+        from kestrel_cloud_azure.azure_container import AzureContainerProvider
+        return AzureContainerProvider
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
