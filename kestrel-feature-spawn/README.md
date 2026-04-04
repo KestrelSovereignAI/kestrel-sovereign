@@ -1,29 +1,36 @@
 # kestrel-feature-spawn
 
-Kestrel feature: multi-agent spawning, delegation, and external bridge gateway.
-
-Includes:
-- **SpawnFeature** -- runtime child agent spawning, task delegation, and lifecycle management
-- **BridgeFeature** -- external gateway integration (browser extensions, Discord, Slack, etc.)
+Multi-agent spawning, delegation, and external bridge gateway for Kestrel Sovereign. **SpawnFeature** handles runtime child agent creation with scoped constitutions and task delegation. **BridgeFeature** provides external gateway integration for browser extensions, Discord, Slack, and other platforms.
 
 ## Installation
 
 ```bash
-pip install -e .
+uv pip install git+https://github.com/KestrelSovereignAI/kestrel-feature-spawn.git
 ```
 
-Once installed, the features are automatically discovered by kestrel-sovereign via the
-`kestrel_sovereign.features` entry point.
+With wallet delegation support:
+
+```bash
+uv pip install "kestrel-feature-spawn[wallet] @ git+https://github.com/KestrelSovereignAI/kestrel-feature-spawn.git"
+```
+
+## Dependencies
+
+- `kestrel-sovereign-sdk`
+- `kestrel-sovereign`
+- Optional: `kestrel-feature-wallet` (via `[wallet]`)
+
+## Usage
+
+Once installed, both `SpawnFeature` and `BridgeFeature` are automatically discovered by kestrel-sovereign via the `kestrel_sovereign.features` entry point.
+
+## Configuration
+
+No additional environment variables required.
 
 ## Development
 
 ```bash
-pip install -e ".[test]"
-pytest
+uv pip install kestrel-sovereign-sdk && uv pip install -e ".[test]"
+uv run pytest
 ```
-
-## Usage
-
-After installation, SpawnFeature and BridgeFeature are available as tools in any Kestrel agent.
-
-See [SKILL.md](SKILL.md) for the full skill reference.
