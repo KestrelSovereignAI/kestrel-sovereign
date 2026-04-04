@@ -68,8 +68,8 @@ class StorachaTarget(ManifestManagerMixin, SyncTarget):
         self._manifest_filename = f".storacha_manifest_{self.agent_id}.json"
         self._latest_cid: Optional[str] = None
 
-        from kestrel_sovereign.storage.providers.storacha_ucan import StorachaUCAN
-        from kestrel_sovereign.storage.providers.storacha_rest import StorachaRestClient
+        from kestrel_storage_storacha.storacha_ucan import StorachaUCAN
+        from kestrel_storage_storacha.storacha_rest import StorachaRestClient
         from kestrel_sovereign.kestrel_config.defaults import get_storacha_gateway_url
 
         self._ucan = StorachaUCAN(

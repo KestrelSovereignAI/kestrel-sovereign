@@ -130,7 +130,7 @@ class TestSyncSnapshot:
         ])
 
         with patch(
-            "kestrel_sovereign.storage.providers.lighthouse_rest.LighthouseRestClient",
+            "kestrel_storage_lighthouse.lighthouse_rest.LighthouseRestClient",
             return_value=mock_client,
         ):
             result = await target.sync_snapshot(db_path)
@@ -154,7 +154,7 @@ class TestSyncSnapshot:
         mock_client = _mock_rest_client(upload_error=ConnectionError("network down"))
 
         with patch(
-            "kestrel_sovereign.storage.providers.lighthouse_rest.LighthouseRestClient",
+            "kestrel_storage_lighthouse.lighthouse_rest.LighthouseRestClient",
             return_value=mock_client,
         ):
             result = await target.sync_snapshot(db_path)
@@ -171,7 +171,7 @@ class TestSyncSnapshot:
         mock_client = _mock_rest_client(upload_responses=[{}])
 
         with patch(
-            "kestrel_sovereign.storage.providers.lighthouse_rest.LighthouseRestClient",
+            "kestrel_storage_lighthouse.lighthouse_rest.LighthouseRestClient",
             return_value=mock_client,
         ):
             result = await target.sync_snapshot(db_path)
@@ -193,7 +193,7 @@ class TestSyncSnapshot:
         ])
 
         with patch(
-            "kestrel_sovereign.storage.providers.lighthouse_rest.LighthouseRestClient",
+            "kestrel_storage_lighthouse.lighthouse_rest.LighthouseRestClient",
             return_value=mock_client,
         ):
             result = await target.sync_snapshot(db_path)
@@ -222,7 +222,7 @@ class TestRestoreSnapshot:
 
         with patch.dict("os.environ", {"LIGHTHOUSE_STATE_CID": "QmExplicit123"}):
             with patch(
-                "kestrel_sovereign.storage.providers.lighthouse_rest.LighthouseRestClient",
+                "kestrel_storage_lighthouse.lighthouse_rest.LighthouseRestClient",
                 return_value=mock_client,
             ):
                 result = await target.restore_snapshot(dest)
@@ -243,7 +243,7 @@ class TestRestoreSnapshot:
         mock_client = _mock_rest_client(download_content=db_content)
 
         with patch(
-            "kestrel_sovereign.storage.providers.lighthouse_rest.LighthouseRestClient",
+            "kestrel_storage_lighthouse.lighthouse_rest.LighthouseRestClient",
             return_value=mock_client,
         ):
             result = await target.restore_snapshot(dest)
@@ -274,7 +274,7 @@ class TestRestoreSnapshot:
         mock_client.close = AsyncMock()
 
         with patch(
-            "kestrel_sovereign.storage.providers.lighthouse_rest.LighthouseRestClient",
+            "kestrel_storage_lighthouse.lighthouse_rest.LighthouseRestClient",
             return_value=mock_client,
         ):
             result = await target.restore_snapshot(dest)
@@ -292,7 +292,7 @@ class TestRestoreSnapshot:
         mock_client = _mock_rest_client(download_content=b"data")
 
         with patch(
-            "kestrel_sovereign.storage.providers.lighthouse_rest.LighthouseRestClient",
+            "kestrel_storage_lighthouse.lighthouse_rest.LighthouseRestClient",
             return_value=mock_client,
         ):
             result = await target.restore_snapshot(dest)
@@ -309,7 +309,7 @@ class TestRestoreSnapshot:
         mock_client = _mock_rest_client(download_content=b"")
 
         with patch(
-            "kestrel_sovereign.storage.providers.lighthouse_rest.LighthouseRestClient",
+            "kestrel_storage_lighthouse.lighthouse_rest.LighthouseRestClient",
             return_value=mock_client,
         ):
             result = await target.restore_snapshot(dest)
@@ -385,7 +385,7 @@ class TestQueryUploadsAPI:
         mock_client = _mock_rest_client(uploads_list=uploads)
 
         with patch(
-            "kestrel_sovereign.storage.providers.lighthouse_rest.LighthouseRestClient",
+            "kestrel_storage_lighthouse.lighthouse_rest.LighthouseRestClient",
             return_value=mock_client,
         ):
             cid = await target._query_uploads_api()
@@ -398,7 +398,7 @@ class TestQueryUploadsAPI:
         mock_client = _mock_rest_client(uploads_list=[])
 
         with patch(
-            "kestrel_sovereign.storage.providers.lighthouse_rest.LighthouseRestClient",
+            "kestrel_storage_lighthouse.lighthouse_rest.LighthouseRestClient",
             return_value=mock_client,
         ):
             cid = await target._query_uploads_api()
@@ -413,7 +413,7 @@ class TestQueryUploadsAPI:
         mock_client.close = AsyncMock()
 
         with patch(
-            "kestrel_sovereign.storage.providers.lighthouse_rest.LighthouseRestClient",
+            "kestrel_storage_lighthouse.lighthouse_rest.LighthouseRestClient",
             return_value=mock_client,
         ):
             cid = await target._query_uploads_api()
@@ -458,7 +458,7 @@ class TestHealthCheck:
         mock_client = _mock_rest_client(balance_data={"data": {"dataUsed": "0"}})
 
         with patch(
-            "kestrel_sovereign.storage.providers.lighthouse_rest.LighthouseRestClient",
+            "kestrel_storage_lighthouse.lighthouse_rest.LighthouseRestClient",
             return_value=mock_client,
         ):
             result = await target.health_check()
@@ -474,7 +474,7 @@ class TestHealthCheck:
         mock_client.close = AsyncMock()
 
         with patch(
-            "kestrel_sovereign.storage.providers.lighthouse_rest.LighthouseRestClient",
+            "kestrel_storage_lighthouse.lighthouse_rest.LighthouseRestClient",
             return_value=mock_client,
         ):
             result = await target.health_check()

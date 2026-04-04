@@ -9,7 +9,7 @@ cbor2 = pytest.importorskip("cbor2")
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
-from kestrel_sovereign.storage.providers.storacha_ucan import (
+from kestrel_storage_storacha.storacha_ucan import (
     StorachaUCAN,
     _base58btc_encode,
     _cid_byte_length,
@@ -50,7 +50,7 @@ def _make_seed_and_key():
 def _seed_to_w3_key(seed: bytes) -> str:
     """Encode a 32-byte seed as a `w3 key create`-style multibase string."""
     # ed25519-priv multicodec = 0x1300 → varint [0x80, 0x26]
-    from kestrel_sovereign.storage.providers.storacha_ucan import _encode_varint
+    from kestrel_storage_storacha.storacha_ucan import _encode_varint
     prefix = bytes([0x80, 0x26])  # varint(0x1300)
     raw = prefix + seed
     return "M" + base64.b64encode(raw).decode().rstrip("=")
@@ -146,7 +146,7 @@ class TestCID:
         assert s.startswith("b"), "CIDv1 base32lower must start with 'b'"
 
     def test_cid_to_string_roundtrip(self):
-        from kestrel_sovereign.storage.providers.storacha_rest import _cid_str_to_bytes
+        from kestrel_storage_storacha.storacha_rest import _cid_str_to_bytes
         cid = cid_v1(b"roundtrip content")
         s = cid_to_string(cid)
         recovered = _cid_str_to_bytes(s)
