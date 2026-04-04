@@ -7,7 +7,7 @@ name = "kestrel-feature-spawn"
 version = "0.1.0"
 description = "Kestrel feature: multi-agent spawning, delegation, and external bridge gateway"
 requires-python = ">=3.11"
-dependencies = ["kestrel-sovereign-sdk",
+dependencies = ["kestrel-sovereign-sdk @ git+https://github.com/KestrelSovereignAI/kestrel-sovereign-sdk.git",
     # Cross-feature: rookery, constitution, inception_service, rate_limit (not in SDK)
     "kestrel-sovereign"]
 

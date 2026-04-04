@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Kestrel feature: legal/incorporation — Wyoming DAO LLC filing"
 requires-python = ">=3.11"
 dependencies = [
-    "kestrel-sovereign-sdk",
+    "kestrel-sovereign-sdk @ git+https://github.com/KestrelSovereignAI/kestrel-sovereign-sdk.git",
 ]
 
 [project.optional-dependencies]

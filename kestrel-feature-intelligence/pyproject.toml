@@ -5,7 +5,7 @@ description = "Kestrel Intelligence features — reflection (self-improvement) a
 requires-python = ">=3.11,<3.14"
 license = "Apache-2.0"
 dependencies = [
-    "kestrel-sovereign-sdk",
+    "kestrel-sovereign-sdk @ git+https://github.com/KestrelSovereignAI/kestrel-sovereign-sdk.git",
     # Cross-feature: llm adapters, security, wallet, github (not in SDK)
     "kestrel-sovereign>=0.1.8",
 ]

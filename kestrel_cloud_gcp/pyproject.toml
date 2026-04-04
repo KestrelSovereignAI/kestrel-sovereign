@@ -4,9 +4,9 @@ version = "0.1.0"
 description = "GCP Compute Engine and Cloud Run cloud providers for Kestrel Sovereign"
 requires-python = ">=3.11,<3.14"
 dependencies = [
-    "kestrel-sovereign-sdk",
+    "kestrel-sovereign-sdk @ git+https://github.com/KestrelSovereignAI/kestrel-sovereign-sdk.git",
     # Cross-feature: llm.service, config (not in SDK)
-    "kestrel-sovereign",
+    "kestrel-sovereign @ git+https://github.com/KestrelSovereignAI/kestrel-sovereign.git",
     "google-cloud-compute>=1.15.0",
     "google-cloud-run>=0.10.0",
     "google-cloud-logging>=3.5.0",
