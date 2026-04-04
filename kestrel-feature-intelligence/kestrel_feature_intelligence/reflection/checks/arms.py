@@ -130,7 +130,7 @@ class ArmsChecker(HealthChecker):
         )
 
         try:
-            from kestrel_sovereign.security.encryption import get_fernet, encrypt_string_fernet, decrypt_string_fernet
+            from kestrel_sdk.security.encryption import get_fernet, encrypt_string_fernet, decrypt_string_fernet
 
             fernet = get_fernet()
             if fernet is None:

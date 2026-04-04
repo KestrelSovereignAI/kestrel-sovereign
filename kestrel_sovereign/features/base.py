@@ -14,6 +14,7 @@ from kestrel_sdk.tools.base import ToolSchema, ToolParameter, ToolCategory, Agen
 from kestrel_sdk.a2a.agent_card import AgentCard, AgentSkill, AgentCapabilities
 from kestrel_sdk.a2a.types import Task, TaskState, TaskStatus, Artifact, DataPart, Message, TextPart
 from kestrel_sdk.features.base import (
+    Feature as _SDKFeature,
     parse_docstring_params,
     TaskHandler,
     tool,
@@ -44,22 +45,21 @@ def _serialize_tool_result(result: Any) -> Any:
     return str(result)
 
 
-class Feature(ABC):
+class Feature(_SDKFeature):
     """
     Base class for Kestrel Features - each Feature IS a subagent.
 
     A Feature encapsulates a specific domain of functionality (e.g., Sovereignty, MCP, Models).
     It can expose methods as Tools to the agent, and can be called AS a tool by the orchestrator
     with its own LLM context (A2A pattern).
+
+    Inherits from kestrel_sdk.features.base.Feature so that feature packages
+    using either the SDK or sovereign Feature base class pass issubclass()
+    checks during feature discovery.
     """
 
-    # Node type used for persisting feature config in the knowledge graph.
-    _CONFIG_NODE_TYPE = "feature_config"
-
     def __init__(self, agent):
-        self.agent = agent
-        self.name = self.__class__.__name__
-        self.disabled_skills: set = set()
+        super().__init__(agent)
 
     # =========================================================================
     # Lifecycle Methods

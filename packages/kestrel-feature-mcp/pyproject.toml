@@ -5,7 +5,7 @@ description = "Kestrel Feature: Model Context Protocol (MCP) server management a
 requires-python = ">=3.11,<3.14"
 license = "Apache-2.0"
 dependencies = [
-    "kestrel-sovereign>=0.1.8",
+    "kestrel-sovereign-sdk",
     "docker>=7.1.0",
     "mcp>=1.26.0",
     "trio>=0.32.0",
@@ -30,4 +30,4 @@ build-backend = "hatchling.build"
 packages = ["kestrel_feature_mcp"]
 
 [tool.uv.sources]
-kestrel-sovereign = { workspace = true }
+kestrel-sovereign-sdk = { workspace = true }

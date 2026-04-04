@@ -4,9 +4,7 @@ version = "0.1.0"
 description = "Kestrel observability, wellness metrics, and monitoring feature package"
 requires-python = ">=3.11,<3.14"
 dependencies = [
-    # kestrel_sovereign is a peer dependency — it provides Feature base class,
-    # hooks, tools, etc. Not listed here to avoid circular dependency.
-    # The feature package is installed alongside kestrel_sovereign.
+    "kestrel-sovereign-sdk",
 ]
 
 [project.optional-dependencies]
