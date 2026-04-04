@@ -986,7 +986,7 @@ class TestFilebaseProvider:
         """Test FilebaseProvider creation without credentials."""
         # Import here to avoid import errors if boto3 not installed
         try:
-            from kestrel_sovereign.storage.providers.filebase_provider import FilebaseProvider
+            from kestrel_storage_filebase.filebase_provider import FilebaseProvider
         except ImportError:
             pytest.skip("boto3 not installed")
 
@@ -1003,7 +1003,7 @@ class TestFilebaseProvider:
     async def test_filebase_provider_with_mocked_s3(self):
         """Test FilebaseProvider with mocked boto3 S3 client."""
         try:
-            from kestrel_sovereign.storage.providers.filebase_provider import FilebaseProvider
+            from kestrel_storage_filebase.filebase_provider import FilebaseProvider
         except ImportError:
             pytest.skip("boto3 not installed")
 
@@ -1051,7 +1051,7 @@ class TestFilebaseProvider:
     async def test_filebase_provider_retrieve_with_mock(self):
         """Test retrieving content from Filebase with mock."""
         try:
-            from kestrel_sovereign.storage.providers.filebase_provider import FilebaseProvider
+            from kestrel_storage_filebase.filebase_provider import FilebaseProvider
         except ImportError:
             pytest.skip("boto3 not installed")
 
@@ -1093,7 +1093,7 @@ class TestFilebaseProvider:
     async def test_filebase_provider_list_content(self):
         """Test listing content from Filebase provider."""
         try:
-            from kestrel_sovereign.storage.providers.filebase_provider import FilebaseProvider
+            from kestrel_storage_filebase.filebase_provider import FilebaseProvider
         except ImportError:
             pytest.skip("boto3 not installed")
 
@@ -1124,7 +1124,7 @@ class TestFilebaseProvider:
     async def test_filebase_provider_stats(self):
         """Test getting provider stats."""
         try:
-            from kestrel_sovereign.storage.providers.filebase_provider import FilebaseProvider
+            from kestrel_storage_filebase.filebase_provider import FilebaseProvider
         except ImportError:
             pytest.skip("boto3 not installed")
 
@@ -1149,7 +1149,7 @@ class TestFilebaseProvider:
     async def test_filebase_provider_estimate_cost(self):
         """Test cost estimation."""
         try:
-            from kestrel_sovereign.storage.providers.filebase_provider import FilebaseProvider
+            from kestrel_storage_filebase.filebase_provider import FilebaseProvider
         except ImportError:
             pytest.skip("boto3 not installed")
 
@@ -1170,7 +1170,7 @@ class TestFilebaseProvider:
     async def test_filebase_provider_cid_extraction(self):
         """Test CID extraction from Filebase response."""
         try:
-            from kestrel_sovereign.storage.providers.filebase_provider import FilebaseProvider
+            from kestrel_storage_filebase.filebase_provider import FilebaseProvider
         except ImportError:
             pytest.skip("boto3 not installed")
 
@@ -1205,7 +1205,7 @@ class TestFilebaseProvider:
     async def test_filebase_provider_fallback_to_content_hash_if_no_cid(self):
         """Test fallback to content_hash if CID not in response."""
         try:
-            from kestrel_sovereign.storage.providers.filebase_provider import FilebaseProvider
+            from kestrel_storage_filebase.filebase_provider import FilebaseProvider
         except ImportError:
             pytest.skip("boto3 not installed")
 
