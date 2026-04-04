@@ -272,6 +272,11 @@ class ProcessManager:
         env["KESTREL_SERVE_UI"] = "true" if standalone else "false"
         env["KESTREL_HOST_URL"] = f"http://localhost:{host_port}"
 
+        # Force child agents into single-agent mode. Without this,
+        # server.py detects rookery.toml in the CWD and enters multi-
+        # agent mode, leaving app.state.agent = None → 503 on all endpoints.
+        env["KESTREL_ROOKERY_CONFIG"] = "__none__"
+
         # Per-agent data key: KESTREL_DATA_KEY_CLAW overrides KESTREL_DATA_KEY
         agent_key_var = f"KESTREL_DATA_KEY_{name.upper()}"
         agent_data_key = env.get(agent_key_var)
