@@ -261,6 +261,34 @@ Run the test suite from the activated virtual environment:
 uv run pytest -x tests/test_inception.py::test_successful_inception
 ```
 
+### Clean Install Verification
+
+Kestrel supports multiple installation configurations. Use the verification script to test that clean installs work correctly across all supported scenarios:
+
+```bash
+# Run all 5 install scenarios (creates isolated venvs)
+./scripts/verify_clean_install.sh
+
+# Run specific tests only
+./scripts/verify_clean_install.sh 1 3    # SDK-only and wallet package
+```
+
+The install matrix covers:
+
+| Test | Scenario | Verifies |
+|------|----------|----------|
+| 1 | **SDK only** | `from kestrel_sdk.features.base import Feature` |
+| 2 | **Core sovereign** | `from kestrel_sovereign.features.base import Feature` + `/health` |
+| 3 | **Feature package** | `from kestrel_feature_wallet import WalletFeature` |
+| 4 | **SDK + feature dev mode** | Feature packages can develop against SDK alone |
+| 5 | **Full stack** | Sovereign + wallet + intelligence, entry_point discovery |
+
+Integration tests for the same import paths run as part of the normal test suite:
+
+```bash
+uv run pytest tests/integration/test_clean_install_verification.py -v
+```
+
 ## 🔧 Configuration
 
 ### LLM Configuration (`llm_config.toml`)
