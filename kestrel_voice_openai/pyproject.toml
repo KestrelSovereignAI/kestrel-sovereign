@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "OpenAI TTS + STT voice providers for Kestrel Sovereign"
 requires-python = ">=3.11,<3.14"
 dependencies = [
-    "kestrel-sovereign-sdk",
+    "kestrel-sovereign-sdk @ git+https://github.com/KestrelSovereignAI/kestrel-sovereign-sdk.git",
     "openai>=1.93.2",
 ]
 
