@@ -166,17 +166,17 @@ test.describe.serial('Kestrel Sovereign Technical Demo', () => {
                 const match = options.find(o => o.toLowerCase().includes(pref));
                 if (match) {
                     await providerSelect.selectOption({ label: match });
-                    narrator.narrate(section, `Provider set to: ${match}`);
+                    narrator.narrate(`Provider set to: ${match}`);
                     await demoPause(page, 1000);
                     selected = true;
                     break;
                 }
             }
             if (!selected) {
-                narrator.narrate(section, `Using default provider (available: ${options.join(', ')})`);
+                narrator.narrate(`Using default provider (available: ${options.join(', ')})`);
             }
         } catch (e) {
-            narrator.narrate(section, `Could not set provider: ${e.message}`);
+            narrator.narrate(`Could not set provider: ${e.message}`);
         }
 
         // Send a message that elicits constitutional awareness
