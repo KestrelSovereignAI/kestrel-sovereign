@@ -81,7 +81,7 @@ export const Security = {
                 : '';
 
             Modal.show({
-                title: '🔒 Permission Required',
+                title: kicon('lock') + ' Permission Required',
                 content: `
                     <div class="security-approval">
                         <p style="margin: 0 0 0.5rem 0;">
@@ -98,7 +98,7 @@ export const Security = {
                 `,
                 buttons: [
                     {
-                        label: '✗ Deny',
+                        label: `${kicon('x-mark')} Deny`,
                         type: 'danger',
                         onClick: () => {
                             Modal.hide();
@@ -122,7 +122,7 @@ export const Security = {
                         }
                     },
                     {
-                        label: '✓ Always',
+                        label: `${kicon('checkmark')} Always`,
                         type: 'primary',
                         onClick: () => {
                             Modal.hide();
@@ -253,9 +253,9 @@ export const Security = {
                                         font-size: 0.8rem;
                                         cursor: pointer;
                                     ">
-                                <option value="allow" ${tool.level === 'allow' ? 'selected' : ''}>☑ Allow</option>
-                                <option value="ask" ${tool.level === 'ask' ? 'selected' : ''}>☐ Ask</option>
-                                <option value="deny" ${tool.level === 'deny' ? 'selected' : ''}>☒ Deny</option>
+                                <option value="allow" ${tool.level === 'allow' ? 'selected' : ''}>${kicon('check-box')} Allow</option>
+                                <option value="ask" ${tool.level === 'ask' ? 'selected' : ''}>${kicon('empty-box')} Ask</option>
+                                <option value="deny" ${tool.level === 'deny' ? 'selected' : ''}>${kicon('x-box')} Deny</option>
                             </select>
                         </div>
                     `).join('')}
@@ -267,11 +267,11 @@ export const Security = {
     renderRollupControl(feature) {
         const state = feature.rollup_state;
         const icons = {
-            'allow_all': '☑',
-            'deny_all': '☒',
-            'ask_all': '☐',
-            'session_all': '◑',
-            'mixed': '◐'
+            'allow_all': kicon('check-box'),
+            'deny_all': kicon('x-box'),
+            'ask_all': kicon('empty-box'),
+            'session_all': kicon('half-circle'),
+            'mixed': kicon('half-circle')
         };
         const labels = {
             'allow_all': 'Allow All',
@@ -485,11 +485,11 @@ export const Security = {
 
     _renderDecisionBadge(decision, userChoice) {
         const badges = {
-            'auto_allowed': { icon: '☑', color: 'var(--success)', text: 'Auto-allowed' },
-            'auto_denied': { icon: '☒', color: 'var(--error)', text: 'Auto-denied' },
-            'user_approved': { icon: '✓', color: 'var(--success)', text: `Approved${userChoice ? ` (${userChoice})` : ''}` },
-            'user_denied': { icon: '✗', color: 'var(--error)', text: 'Denied' },
-            'timeout': { icon: '⏱', color: 'var(--warning)', text: 'Timeout' }
+            'auto_allowed': { icon: kicon('check-box'), color: 'var(--success)', text: 'Auto-allowed' },
+            'auto_denied': { icon: kicon('x-box'), color: 'var(--error)', text: 'Auto-denied' },
+            'user_approved': { icon: kicon('checkmark'), color: 'var(--success)', text: `Approved${userChoice ? ` (${userChoice})` : ''}` },
+            'user_denied': { icon: kicon('x-mark'), color: 'var(--error)', text: 'Denied' },
+            'timeout': { icon: kicon('hourglass'), color: 'var(--warning)', text: 'Timeout' }
         };
 
         const badge = badges[decision] || { icon: '?', color: 'var(--text-secondary)', text: decision };
