@@ -21,6 +21,7 @@ if [ -z "$GITHUB_TOKEN" ]; then
 fi
 
 # Multi-arch build + push (amd64 for Cloud Run, arm64 for local/Apple Silicon)
+# Single-agent image
 docker buildx build \
     --platform linux/amd64,linux/arm64 \
     -f docker/Dockerfile.cloudrun \
@@ -31,4 +32,19 @@ docker buildx build \
     .
 
 echo ""
-echo "Done! Image: gcr.io/${PROJECT_ID}/${IMAGE_NAME}:${TAG}"
+echo "Done! Single-agent image: gcr.io/${PROJECT_ID}/${IMAGE_NAME}:${TAG}"
+
+# Rookery (multi-agent) image
+echo ""
+echo "Building Kestrel Rookery (multi-agent) image..."
+docker buildx build \
+    --platform linux/amd64,linux/arm64 \
+    -f docker/Dockerfile.rookery \
+    --secret id=github_token,env=GITHUB_TOKEN \
+    -t "gcr.io/${PROJECT_ID}/${IMAGE_NAME}-rookery:${TAG}" \
+    -t "gcr.io/${PROJECT_ID}/${IMAGE_NAME}-rookery:latest" \
+    --push \
+    .
+
+echo ""
+echo "Done! Rookery image: gcr.io/${PROJECT_ID}/${IMAGE_NAME}-rookery:${TAG}"
