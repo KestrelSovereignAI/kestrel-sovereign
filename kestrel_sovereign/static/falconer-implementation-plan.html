@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Kestrel Falconer — Implementation Plan</title>
+<script src="js/icons.js"></script>
 <style>
   @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
   * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -211,31 +212,31 @@
 
   <div class="status-grid">
     <div class="status-card card-sovereign">
-      <div class="icon">🏛️</div>
+      <div class="icon"><span class="ki ki-classical-building"></span></div>
       <h4>Sovereign</h4>
       <span class="tag tag-built">BUILT</span>
       <p>FastAPI server, DID system, Constitution, Memory (encrypted), 7 LLM providers, Voice (5 STT/TTS providers), Filebase storage, Privacy modes, Rookery multi-agent</p>
     </div>
     <div class="status-card card-claws">
-      <div class="icon">🦅</div>
+      <div class="icon"><span class="ki ki-kestrel"></span></div>
       <h4>Claws</h4>
       <span class="tag tag-built">95% BUILT</span>
       <p>Strategic Memory, Morning Signal, Backlog Hygiene, GitHub scan, Agent Mesh Protocol, Scheduler (APScheduler), Talon Coordinator, Signal-Talon dispatch. Missing: Backlog Constitution</p>
     </div>
     <div class="status-card card-talon">
-      <div class="icon">⚡</div>
+      <div class="icon"><span class="ki ki-lightning"></span></div>
       <h4>Talon</h4>
       <span class="tag tag-built">BUILT</span>
       <p>Autonomous issue claiming, code execution, PR opening. Installed as pip package. Codex backend hardening in progress</p>
     </div>
     <div class="status-card card-eye">
-      <div class="icon">👁️</div>
+      <div class="icon"><span class="ki ki-eye"></span></div>
       <h4>Eye</h4>
       <span class="tag tag-partial">85% BUILT</span>
       <p>CLI, vision providers, reviewer engine, loop runner, reporter, GitHub integration all shipped (11/13 closed). Missing: CI hook, Mesh integration</p>
     </div>
     <div class="status-card card-flight">
-      <div class="icon">🕊️</div>
+      <div class="icon"><span class="ki ki-dove"></span></div>
       <h4>Flight</h4>
       <span class="tag tag-partial">50% BUILT</span>
       <p>Test suite, type safety, validation, cleanup done (10/21 closed). Core extraction (NarrationEngine, screenshot helpers, state persistence) still open</p>
@@ -262,7 +263,7 @@
           <span class="file">rookery.toml</span> — Multi-agent hosting (5 agents configured)
         </td>
         <td>kestrel-sovereign</td>
-        <td><span class="check">✓ Running</span></td>
+        <td><span class="check"><span class="ki ki-checkmark"></span> Running</span></td>
       </tr>
       <tr>
         <td class="comp" style="color:#ce93d8">Claws (PM)</td>
@@ -280,7 +281,7 @@
           <span class="file">heartbeat.py</span> — Periodic self-checks (basic asyncio)
         </td>
         <td>kestrel-sovereign</td>
-        <td><span class="check">✓ 95%</span></td>
+        <td><span class="check"><span class="ki ki-checkmark"></span> 95%</span></td>
       </tr>
       <tr>
         <td class="comp" style="color:#a5d6a7">Talon (Dev)</td>
@@ -289,7 +290,7 @@
           Ticket claiming, code execution, PR submission
         </td>
         <td>kestrel-talon</td>
-        <td><span class="check">✓ Installed</span></td>
+        <td><span class="check"><span class="ki ki-checkmark"></span> Installed</span></td>
       </tr>
       <tr>
         <td class="comp" style="color:#fff59d">Eye (QA)</td>
@@ -301,7 +302,7 @@
           <span class="file">eye-technical.toml</span> + <span class="file">eye-spawn.toml</span> — consumer configs in sovereign
         </td>
         <td>kestrel-eye</td>
-        <td><span class="partial">◐ 85% done</span></td>
+        <td><span class="partial"><span class="ki ki-half-circle"></span> 85% done</span></td>
       </tr>
       <tr>
         <td class="comp" style="color:#90caf9">Flight (PO)</td>
@@ -311,7 +312,7 @@
           <span class="file">tests/e2e/demo_*.cjs</span> — Source Playwright scripts to extract from
         </td>
         <td>kestrel-flight</td>
-        <td><span class="partial">◐ 50% done</span></td>
+        <td><span class="partial"><span class="ki ki-half-circle"></span> 50% done</span></td>
       </tr>
       <tr>
         <td class="comp" style="color:#ce93d8">Claw (SDK)</td>
@@ -320,7 +321,7 @@
           Phase 1 complete, dependency maintenance mode
         </td>
         <td>kestrel-claw</td>
-        <td><span class="partial">◐ Phase 1 done</span></td>
+        <td><span class="partial"><span class="ki ki-half-circle"></span> Phase 1 done</span></td>
       </tr>
     </tbody>
   </table>
@@ -351,7 +352,7 @@
         <td class="comp" style="color:#ce93d8">Agent Mesh Protocol</td>
         <td>Structured message format for bird-to-bird communication. Claws assigns work &rarr; Talon picks up &rarr; Eye reviews &rarr; Flight reports.</td>
         <td><strong style="color:#66bb6a;">DONE (Mar 30)</strong> — MeshMessage dataclass, 5 message types, JSON serialization, /agent/mesh endpoints, 21 tests passing.</td>
-        <td><span class="risk-low">DONE ✓</span></td>
+        <td><span class="risk-low">DONE <span class="ki ki-checkmark"></span></span></td>
       </tr>
       <tr>
         <td class="comp" style="color:#fff59d">Eye CI + Mesh</td>
@@ -387,7 +388,7 @@
         <td class="comp" style="color:#4ecdc4">Scheduler Upgrade</td>
         <td>Replace basic <code>asyncio</code> heartbeat with proper scheduler. Morning Signal at 8am, signal_dispatch at 8:05am.</td>
         <td><strong style="color:#66bb6a;">DONE (Mar 30)</strong> — APScheduler wired in kestrel_agent.py with configurable cron defaults.</td>
-        <td><span class="risk-low">DONE ✓</span></td>
+        <td><span class="risk-low">DONE <span class="ki ki-checkmark"></span></span></td>
       </tr>
     </tbody>
   </table>
@@ -455,16 +456,16 @@
   </div>
 
   <div class="phase phase-0">
-    <h3>Phase 1 — Claws Completion + Agent Mesh Protocol <span style="color:#66bb6a; font-size:14px;">✓ COMPLETE</span></h3>
+    <h3>Phase 1 — Claws Completion + Agent Mesh Protocol <span style="color:#66bb6a; font-size:14px;"><span class="ki ki-checkmark"></span> COMPLETE</span></h3>
     <div class="meta"><strong>Owner:</strong> Gabi + Noel &middot; <strong>Repo:</strong> kestrel-sovereign, signal-and-ship &middot; <strong style="color:#66bb6a;">Completed: March 30, 2026</strong></div>
     <p style="font-size:14px; color:#b0b8c4; margin-bottom:12px;">
       The PM bird now autonomously manages the backlog, enforces quality, and hands off work to Talon. 62 tests passing.
     </p>
     <ul>
       <li><strong>Backlog Constitution (signal-and-ship #2)</strong> — Rules engine that grades issues. <em style="color:#ffa726;">Still open — remaining Phase 1 item.</em></li>
-      <li><strong style="color:#66bb6a;">✓ Agent Mesh Protocol (signal-and-ship #3)</strong> — MeshMessage dataclass with 5 message types (ASSIGN, REVIEW_NEEDED, COMPLETE, REJECT, STATUS_UPDATE), MeshPriority enum, factory functions, JSON serialization. 21 tests. <code>features/peers/mesh.py</code></li>
-      <li><strong style="color:#66bb6a;">✓ Scheduler upgrade</strong> — APScheduler wired into kestrel_agent.py. Morning Signal at 8am, signal_dispatch at 8:05am. Configurable cron defaults.</li>
-      <li><strong style="color:#66bb6a;">✓ Claws &rarr; Talon handoff</strong> — signal_dispatch routes through TalonCoordinatorFeature (mesh preferred, CLI fallback). <code>!dispatch suggest</code> mode shows top issue without executing. <code>features/strategic_memory/talon_handoff.py</code></li>
+      <li><strong style="color:#66bb6a;"><span class="ki ki-checkmark"></span> Agent Mesh Protocol (signal-and-ship #3)</strong> — MeshMessage dataclass with 5 message types (ASSIGN, REVIEW_NEEDED, COMPLETE, REJECT, STATUS_UPDATE), MeshPriority enum, factory functions, JSON serialization. 21 tests. <code>features/peers/mesh.py</code></li>
+      <li><strong style="color:#66bb6a;"><span class="ki ki-checkmark"></span> Scheduler upgrade</strong> — APScheduler wired into kestrel_agent.py. Morning Signal at 8am, signal_dispatch at 8:05am. Configurable cron defaults.</li>
+      <li><strong style="color:#66bb6a;"><span class="ki ki-checkmark"></span> Claws &rarr; Talon handoff</strong> — signal_dispatch routes through TalonCoordinatorFeature (mesh preferred, CLI fallback). <code>!dispatch suggest</code> mode shows top issue without executing. <code>features/strategic_memory/talon_handoff.py</code></li>
     </ul>
   </div>
 
@@ -475,10 +476,10 @@
       Talon is now integrated into the Falconer loop. TalonCoordinatorFeature provides mesh dispatch + CLI fallback. 6 commits pushed, all tests passing.
     </p>
     <ul>
-      <li><strong style="color:#66bb6a;">✓ Package as Kestrel feature plugin (sovereign #301)</strong> — TalonCoordinatorFeature with 5 tools: talon_claim, talon_batch, talon_status, talon_pause, talon_resume. Mesh dispatch preferred, CLI subprocess fallback. 13 tests. <code>features/talon/coordinator.py</code></li>
-      <li><strong style="color:#66bb6a;">✓ DID identity for Talon (sovereign #304)</strong> — parent_did delegation chain. create_agent() accepts and passes parent_did to inception. 3 new tests in test_agent_manager.py.</li>
-      <li><strong style="color:#66bb6a;">✓ Morning Signal &rarr; Talon handoff (sovereign #302)</strong> — signal_dispatch routes through TalonCoordinator when available. Added <code>suggest</code> mode (<code>!dispatch suggest</code> shows top issue without executing). <code>_get_talon_coordinator()</code> helper.</li>
-      <li><strong style="color:#66bb6a;">✓ Session Log integration (sovereign #303)</strong> — Talon PR tracking via <code>_is_talon_pr()</code> (branch prefix + label detection) and <code>_review_latency()</code> (hours between PR created/merged). Talon Outcomes section in reports. 12 tests.</li>
+      <li><strong style="color:#66bb6a;"><span class="ki ki-checkmark"></span> Package as Kestrel feature plugin (sovereign #301)</strong> — TalonCoordinatorFeature with 5 tools: talon_claim, talon_batch, talon_status, talon_pause, talon_resume. Mesh dispatch preferred, CLI subprocess fallback. 13 tests. <code>features/talon/coordinator.py</code></li>
+      <li><strong style="color:#66bb6a;"><span class="ki ki-checkmark"></span> DID identity for Talon (sovereign #304)</strong> — parent_did delegation chain. create_agent() accepts and passes parent_did to inception. 3 new tests in test_agent_manager.py.</li>
+      <li><strong style="color:#66bb6a;"><span class="ki ki-checkmark"></span> Morning Signal &rarr; Talon handoff (sovereign #302)</strong> — signal_dispatch routes through TalonCoordinator when available. Added <code>suggest</code> mode (<code>!dispatch suggest</code> shows top issue without executing). <code>_get_talon_coordinator()</code> helper.</li>
+      <li><strong style="color:#66bb6a;"><span class="ki ki-checkmark"></span> Session Log integration (sovereign #303)</strong> — Talon PR tracking via <code>_is_talon_pr()</code> (branch prefix + label detection) and <code>_review_latency()</code> (hours between PR created/merged). Talon Outcomes section in reports. 12 tests.</li>
       <li><strong>Constitutional governance (sovereign #305)</strong> — Talon checks Constitution before executing. <em style="color:#ffa726;">Still open.</em></li>
       <li><strong>Report active backend model (kestrel-talon #9)</strong> — <em style="color:#ffa726;">Still open.</em></li>
     </ul>
@@ -661,12 +662,12 @@
     <h3>Sprint Zero — Prove the Loop <span style="color:#66bb6a; font-size:14px;">✓ COMPLETE</span></h3>
     <div class="meta"><strong>Owner:</strong> Gabi &middot; <strong>Deliverable:</strong> One complete Claws &rarr; Talon cycle &middot; <strong style="color:#66bb6a;">Completed: March 30, 2026</strong></div>
     <ul>
-      <li><strong style="color:#66bb6a;">✓ Step 1:</strong> Agent Mesh message schema — MeshMessage dataclass, MeshMessageType enum (5 types), MeshPriority, factory functions. <code>features/peers/mesh.py</code></li>
-      <li><strong style="color:#66bb6a;">✓ Step 2:</strong> <code>POST /agent/mesh</code> and <code>GET /agent/mesh/inbox</code> endpoints + send_mesh_message, mesh_inbox, receive_mesh_message tools in PeersFeature.</li>
-      <li><strong style="color:#66bb6a;">✓ Step 3:</strong> signal_dispatch routes Morning Signal top pick through TalonCoordinatorFeature. <code>!dispatch suggest</code> previews without executing.</li>
-      <li><strong style="color:#66bb6a;">✓ Step 4:</strong> TalonCoordinatorFeature.talon_claim dispatches via mesh (preferred) or CLI subprocess (fallback). <code>kestrel-talon claim</code> auto-invoked.</li>
-      <li><strong style="color:#66bb6a;">✓ Step 5:</strong> Mesh COMPLETE message sent back. Session log tracks Talon PRs with <code>_is_talon_pr()</code> + <code>_review_latency()</code>.</li>
-      <li><strong style="color:#66bb6a;">✓ Step 6:</strong> Session log Talon Outcomes section feeds into next Morning Signal. Avg review latency tracked.</li>
+      <li><strong style="color:#66bb6a;"><span class="ki ki-checkmark"></span> Step 1:</strong> Agent Mesh message schema — MeshMessage dataclass, MeshMessageType enum (5 types), MeshPriority, factory functions. <code>features/peers/mesh.py</code></li>
+      <li><strong style="color:#66bb6a;"><span class="ki ki-checkmark"></span> Step 2:</strong> <code>POST /agent/mesh</code> and <code>GET /agent/mesh/inbox</code> endpoints + send_mesh_message, mesh_inbox, receive_mesh_message tools in PeersFeature.</li>
+      <li><strong style="color:#66bb6a;"><span class="ki ki-checkmark"></span> Step 3:</strong> signal_dispatch routes Morning Signal top pick through TalonCoordinatorFeature. <code>!dispatch suggest</code> previews without executing.</li>
+      <li><strong style="color:#66bb6a;"><span class="ki ki-checkmark"></span> Step 4:</strong> TalonCoordinatorFeature.talon_claim dispatches via mesh (preferred) or CLI subprocess (fallback). <code>kestrel-talon claim</code> auto-invoked.</li>
+      <li><strong style="color:#66bb6a;"><span class="ki ki-checkmark"></span> Step 5:</strong> Mesh COMPLETE message sent back. Session log tracks Talon PRs with <code>_is_talon_pr()</code> + <code>_review_latency()</code>.</li>
+      <li><strong style="color:#66bb6a;"><span class="ki ki-checkmark"></span> Step 6:</strong> Session log Talon Outcomes section feeds into next Morning Signal. Avg review latency tracked.</li>
     </ul>
   </div>
 

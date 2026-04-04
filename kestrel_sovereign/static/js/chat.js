@@ -352,10 +352,10 @@ export async function updateContextStatus() {
             icon = '●';
         } else if (utilization_percent < 95) {
             color = '#f97316';  // orange
-            icon = '⚠';
+            icon = kicon('warning');
         } else {
             color = '#ef4444';  // red
-            icon = '⚠';
+            icon = kicon('warning');
         }
 
         contextStatusElement.style.color = color;
@@ -421,7 +421,7 @@ function showContextWarning(warnings) {
         font-size: 0.875rem;
     `;
     div.innerHTML = `
-        <strong>⚠ Context Warning:</strong> ${warnings.join('. ')}
+        <strong>${kicon('warning')} Context Warning:</strong> ${warnings.join('. ')}
         <br><small>Use <code>!compress</code> to summarize older messages, or start fresh with <code>!new-session</code></small>
     `;
     chatContainer.appendChild(div);

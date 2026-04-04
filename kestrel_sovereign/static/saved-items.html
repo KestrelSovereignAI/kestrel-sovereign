@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
     <title>Saved Items - Kestrel</title>
+    <script src="js/icons.js"></script>
     <style>
         :root {
             --font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
@@ -161,11 +162,16 @@
         }
 
         .search-box::before {
-            content: "🔍";
+            content: "";
             position: absolute;
             left: 0.75rem;
             top: 50%;
             transform: translateY(-50%);
+            width: 1em;
+            height: 1em;
+            background: currentColor;
+            -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='white' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='11' cy='11' r='8'/%3E%3Cpath d='M21 21l-4.35-4.35'/%3E%3C/svg%3E") center/contain no-repeat;
+            mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='white' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='11' cy='11' r='8'/%3E%3Cpath d='M21 21l-4.35-4.35'/%3E%3C/svg%3E") center/contain no-repeat;
         }
 
         select {
@@ -566,7 +572,7 @@
                         <p class="item-summary">${escapeHtml(item.summary || item.content?.substring(0, 150) || '')}</p>
                         <div class="item-meta">
                             <span>${formatDate(item.created_at)}</span>
-                            ${item.schema_id ? `<span>📋 ${item.schema_id}</span>` : ''}
+                            ${item.schema_id ? `<span>${kicon('clipboard')} ${item.schema_id}</span>` : ''}
                             ${item.ipfs_cid ? '<span class="ipfs-badge">IPFS</span>' : ''}
                         </div>
                         ${item.tags && item.tags.length > 0 ? `

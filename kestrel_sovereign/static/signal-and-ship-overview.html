@@ -1,0 +1,504 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Signal & Ship — Enterprise Operating Model</title>
+<script src="js/icons.js"></script>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: 'Inter', -apple-system, sans-serif;
+    background: #0a0e17;
+    color: #e8eaed;
+    min-height: 100vh;
+    padding: 40px;
+  }
+
+  .page { max-width: 1100px; margin: 0 auto; }
+
+  /* Header */
+  .header { text-align: center; margin-bottom: 50px; }
+  .header h1 {
+    font-size: 42px; font-weight: 700;
+    background: linear-gradient(135deg, #4ecdc4, #44a8e0);
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+    margin-bottom: 8px;
+  }
+  .header .subtitle {
+    font-size: 18px; color: #8b95a5; font-weight: 300;
+    letter-spacing: 1px;
+  }
+  .header .tagline {
+    font-size: 14px; color: #5a6577; margin-top: 16px;
+    font-style: italic;
+  }
+
+  /* Problem statement */
+  .problem {
+    background: linear-gradient(135deg, #1a1520, #1f1428);
+    border: 1px solid #3d2855;
+    border-radius: 12px;
+    padding: 28px 32px;
+    margin-bottom: 40px;
+    display: flex; align-items: center; gap: 20px;
+  }
+  .problem-icon { font-size: 36px; flex-shrink: 0; }
+  .problem h3 { color: #e57373; font-size: 16px; font-weight: 600; margin-bottom: 6px; }
+  .problem p { color: #b0a0c0; font-size: 14px; line-height: 1.6; }
+
+  /* Main flow */
+  .flow {
+    display: flex; gap: 16px; margin-bottom: 40px;
+    align-items: stretch;
+  }
+
+  .phase {
+    flex: 1;
+    border-radius: 14px;
+    padding: 28px 22px;
+    position: relative;
+    display: flex; flex-direction: column;
+  }
+
+  .phase-signal {
+    background: linear-gradient(180deg, #0d2137, #0a1929);
+    border: 1px solid #1565c0;
+  }
+  .phase-ship {
+    background: linear-gradient(180deg, #0d3729, #0a2920);
+    border: 1px solid #2e7d32;
+  }
+  .phase-measure {
+    background: linear-gradient(180deg, #372d0d, #29220a);
+    border: 1px solid #f9a825;
+  }
+  .phase-govern {
+    background: linear-gradient(180deg, #2d0d37, #220a29);
+    border: 1px solid #8e24aa;
+  }
+
+  .phase-num {
+    font-size: 11px; font-weight: 600;
+    letter-spacing: 2px; text-transform: uppercase;
+    margin-bottom: 10px;
+  }
+  .phase-signal .phase-num { color: #42a5f5; }
+  .phase-ship .phase-num { color: #66bb6a; }
+  .phase-measure .phase-num { color: #fdd835; }
+  .phase-govern .phase-num { color: #ab47bc; }
+
+  .phase h2 {
+    font-size: 22px; font-weight: 700;
+    margin-bottom: 6px;
+  }
+  .phase-signal h2 { color: #90caf9; }
+  .phase-ship h2 { color: #a5d6a7; }
+  .phase-measure h2 { color: #fff59d; }
+  .phase-govern h2 { color: #ce93d8; }
+
+  .phase .one-liner {
+    font-size: 13px; color: #8b95a5;
+    margin-bottom: 18px; font-style: italic;
+    min-height: 36px;
+  }
+
+  .tool {
+    background: rgba(255,255,255,0.05);
+    border-radius: 8px;
+    padding: 12px 14px;
+    margin-bottom: 8px;
+  }
+  .tool-name {
+    font-size: 13px; font-weight: 600; color: #e8eaed;
+    margin-bottom: 4px;
+  }
+  .tool-desc {
+    font-size: 11.5px; color: #8b95a5; line-height: 1.5;
+  }
+
+  .badge {
+    display: inline-block;
+    font-size: 9px; font-weight: 600;
+    padding: 2px 7px; border-radius: 4px;
+    text-transform: uppercase; letter-spacing: 0.5px;
+    margin-left: 6px; vertical-align: middle;
+  }
+  .badge-built { background: #1b5e20; color: #a5d6a7; }
+  .badge-ready { background: #0d47a1; color: #90caf9; }
+  .badge-integration { background: #4a148c; color: #ce93d8; }
+
+  /* Arrow connectors */
+  .arrow-row {
+    display: flex; justify-content: center;
+    gap: 16px; margin-bottom: 40px;
+  }
+  .arrow-connector {
+    display: flex; align-items: center; gap: 8px;
+    color: #5a6577; font-size: 12px;
+  }
+  .arrow-connector svg { flex-shrink: 0; }
+
+  /* Closed loop diagram */
+  .loop-section {
+    margin-bottom: 40px;
+  }
+  .loop-section h3 {
+    text-align: center; font-size: 18px; font-weight: 600;
+    color: #4ecdc4; margin-bottom: 20px;
+  }
+
+  .loop-diagram {
+    display: flex; align-items: center; justify-content: center;
+    gap: 6px; flex-wrap: wrap;
+    padding: 28px;
+    background: linear-gradient(135deg, #0d1520, #0a1218);
+    border: 1px solid #1a3040;
+    border-radius: 14px;
+  }
+  .loop-step {
+    background: rgba(78, 205, 196, 0.08);
+    border: 1px solid rgba(78, 205, 196, 0.25);
+    border-radius: 8px;
+    padding: 14px 18px;
+    text-align: center;
+    min-width: 140px;
+  }
+  .loop-step-name {
+    font-size: 13px; font-weight: 600; color: #4ecdc4;
+  }
+  .loop-step-detail {
+    font-size: 11px; color: #6b8a85; margin-top: 4px;
+  }
+  .loop-arrow {
+    font-size: 22px; color: #2a5a55;
+  }
+  .loop-arrow-down {
+    display: none; /* Hidden on desktop */
+  }
+
+  /* Enterprise value */
+  .value-section { margin-bottom: 40px; }
+  .value-section h3 {
+    text-align: center; font-size: 18px; font-weight: 600;
+    color: #e8eaed; margin-bottom: 20px;
+  }
+
+  .value-grid {
+    display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px;
+  }
+  .value-card {
+    background: linear-gradient(135deg, #111820, #0e1520);
+    border: 1px solid #1e2d3d;
+    border-radius: 10px;
+    padding: 22px;
+    text-align: center;
+  }
+  .value-metric {
+    font-size: 32px; font-weight: 700;
+  }
+  .value-card:nth-child(1) .value-metric { color: #e57373; }
+  .value-card:nth-child(2) .value-metric { color: #4ecdc4; }
+  .value-card:nth-child(3) .value-metric { color: #66bb6a; }
+  .value-label {
+    font-size: 12px; color: #8b95a5; margin-top: 6px;
+  }
+  .value-detail {
+    font-size: 11px; color: #5a6577; margin-top: 4px;
+  }
+
+  /* Dell/SHI context */
+  .enterprise-context {
+    background: linear-gradient(135deg, #111a25, #0e1520);
+    border: 1px solid #1e3040;
+    border-radius: 14px;
+    padding: 28px 32px;
+    margin-bottom: 40px;
+  }
+  .enterprise-context h3 {
+    font-size: 16px; font-weight: 600; color: #44a8e0;
+    margin-bottom: 16px;
+  }
+
+  .scenario-grid {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 20px;
+  }
+  .scenario {
+    padding: 16px;
+    background: rgba(255,255,255,0.02);
+    border-radius: 8px;
+  }
+  .scenario h4 {
+    font-size: 13px; font-weight: 600; margin-bottom: 8px;
+  }
+  .scenario-old h4 { color: #e57373; }
+  .scenario-new h4 { color: #66bb6a; }
+  .scenario ul {
+    list-style: none; padding: 0;
+  }
+  .scenario li {
+    font-size: 12px; color: #8b95a5; padding: 3px 0;
+    padding-left: 16px; position: relative;
+  }
+  .scenario-old li::before {
+    content: "\2717"; position: absolute; left: 0; color: #e57373;
+  }
+  .scenario-new li::before {
+    content: "\2713"; position: absolute; left: 0; color: #66bb6a;
+  }
+
+  /* Defensibility */
+  .moat {
+    display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 12px;
+    margin-bottom: 40px;
+  }
+  .moat-item {
+    text-align: center;
+    padding: 18px 12px;
+    background: linear-gradient(135deg, #111820, #0e1520);
+    border: 1px solid #1e2d3d;
+    border-radius: 10px;
+  }
+  .moat-icon { font-size: 24px; margin-bottom: 8px; }
+  .moat-title { font-size: 12px; font-weight: 600; color: #e8eaed; margin-bottom: 4px; }
+  .moat-desc { font-size: 10.5px; color: #6b7b8d; line-height: 1.5; }
+
+  /* Footer */
+  .footer {
+    text-align: center;
+    padding-top: 20px;
+    border-top: 1px solid #1e2d3d;
+    color: #3a4a5a;
+    font-size: 12px;
+  }
+  .footer a { color: #4ecdc4; text-decoration: none; }
+
+  /* Print styles */
+  @media print {
+    body { background: white; color: #222; padding: 20px; }
+    .phase { border-width: 2px; }
+    .value-metric { color: #333 !important; }
+  }
+</style>
+</head>
+<body>
+<div class="page">
+
+  <!-- Header -->
+  <div class="header">
+    <h1>Signal & Ship</h1>
+    <div class="subtitle">Sprint-Free Enterprise Operating Model</div>
+    <div class="tagline">Transition engineering teams from ceremony-heavy sprints to AI-executed, outcome-driven delivery</div>
+  </div>
+
+  <!-- Problem -->
+  <div class="problem">
+    <div class="problem-icon"><span class="ki ki-warning"></span></div>
+    <div>
+      <h3>The Problem Every Large Enterprise Has</h3>
+      <p>
+        You bought Copilot licenses. Engineers use them for autocomplete. But nothing fundamental changed.
+        Same sprint ceremonies, same standup meetings, same planning poker, same retrospectives.
+        Same cost structure. The AI was never the bottleneck &mdash; <strong>the process is</strong>.
+        At Dell-scale teams (500+ engineers), sprint overhead alone costs millions in lost productivity per year.
+      </p>
+    </div>
+  </div>
+
+  <!-- 4-pillar flow -->
+  <div class="flow">
+
+    <!-- SIGNAL -->
+    <div class="phase phase-signal">
+      <div class="phase-num">Pillar 1</div>
+      <h2>Signal</h2>
+      <div class="one-liner">"Know what to work on &mdash; without a meeting"</div>
+
+      <div class="tool">
+        <div class="tool-name">Morning Signal <span class="badge badge-built">Built</span></div>
+        <div class="tool-desc">Autonomous daily briefing. Scans all repos, surfaces blockers, ranks work items by priority. Replaces standup meetings.</div>
+      </div>
+      <div class="tool">
+        <div class="tool-name">Backlog Hygiene <span class="badge badge-built">Built</span></div>
+        <div class="tool-desc">Continuously ensures every ticket has assignee, milestone, labels, and acceptance criteria. Replaces backlog grooming sessions.</div>
+      </div>
+    </div>
+
+    <!-- SHIP -->
+    <div class="phase phase-ship">
+      <div class="phase-num">Pillar 2</div>
+      <h2>Ship</h2>
+      <div class="one-liner">"AI executes the work &mdash; human reviews the result"</div>
+
+      <div class="tool">
+        <div class="tool-name">Kestrel Talon <span class="badge badge-ready">90% Built</span></div>
+        <div class="tool-desc">Autonomous coding agent. Claims tickets, writes code, runs tests, opens PRs. Supports GitHub + Azure DevOps. Batch + parallel execution.</div>
+      </div>
+      <div class="tool">
+        <div class="tool-name">Quality Gates <span class="badge badge-built">Built</span></div>
+        <div class="tool-desc">Agent runs project-defined tests and linters after every change. If tests fail, it reads the errors and fixes them. Self-correcting.</div>
+      </div>
+    </div>
+
+    <!-- MEASURE -->
+    <div class="phase phase-measure">
+      <div class="phase-num">Pillar 3</div>
+      <h2>Measure</h2>
+      <div class="one-liner">"Track outcomes, not story points"</div>
+
+      <div class="tool">
+        <div class="tool-name">Portfolio Dashboard <span class="badge badge-built">Built</span></div>
+        <div class="tool-desc">Live dashboard: issues closed, PRs merged, bugs fixed, human bottleneck %, contributor rankings. No manual reporting.</div>
+      </div>
+      <div class="tool">
+        <div class="tool-name">Session Log <span class="badge badge-built">Built</span></div>
+        <div class="tool-desc">End-of-day automated collection. Captures what got done, by whom (human vs AI), and at what cost. Replaces retrospectives.</div>
+      </div>
+    </div>
+
+    <!-- GOVERN -->
+    <div class="phase phase-govern">
+      <div class="phase-num">Pillar 4</div>
+      <h2>Govern</h2>
+      <div class="one-liner">"Constitutional guardrails on AI autonomy"</div>
+
+      <div class="tool">
+        <div class="tool-name">Constitutional AI <span class="badge badge-built">Built</span></div>
+        <div class="tool-desc">Every agent has a constitution with 5 articles. Can't force-push, can't access secrets, can't make destructive changes. Auditable.</div>
+      </div>
+      <div class="tool">
+        <div class="tool-name">Sovereign Identity <span class="badge badge-built">Built</span></div>
+        <div class="tool-desc">Every AI agent has a cryptographic identity (DID). Every action is signed and attributable. Full audit trail for compliance.</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Closed Loop -->
+  <div class="loop-section">
+    <h3>The Autonomous Daily Loop</h3>
+    <div class="loop-diagram">
+      <div class="loop-step">
+        <div class="loop-step-name">8:00 AM</div>
+        <div class="loop-step-detail">Morning Signal scans<br>all repos automatically</div>
+      </div>
+      <div class="loop-arrow">&rarr;</div>
+      <div class="loop-step">
+        <div class="loop-step-name">8:05 AM</div>
+        <div class="loop-step-detail">Backlog Hygiene<br>cleans + prioritizes</div>
+      </div>
+      <div class="loop-arrow">&rarr;</div>
+      <div class="loop-step">
+        <div class="loop-step-name">8:10 AM</div>
+        <div class="loop-step-detail">Human reviews<br>top 5 work items</div>
+      </div>
+      <div class="loop-arrow">&rarr;</div>
+      <div class="loop-step">
+        <div class="loop-step-name">8:15 AM &mdash; 5 PM</div>
+        <div class="loop-step-detail">Talon claims + codes<br>Quality gates validate</div>
+      </div>
+      <div class="loop-arrow">&rarr;</div>
+      <div class="loop-step">
+        <div class="loop-step-name">5:00 PM</div>
+        <div class="loop-step-detail">Human reviews PRs<br>Merge or feedback</div>
+      </div>
+      <div class="loop-arrow">&rarr;</div>
+      <div class="loop-step">
+        <div class="loop-step-name">6:00 PM</div>
+        <div class="loop-step-detail">Session Log captures<br>daily outcomes</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Enterprise context -->
+  <div class="enterprise-context">
+    <h3>What Changes for a 500-Engineer Team</h3>
+    <div class="scenario-grid">
+      <div class="scenario scenario-old">
+        <h4>Today (Sprint-Based)</h4>
+        <ul>
+          <li>2-week sprint cycles with planning ceremonies</li>
+          <li>Daily standups (15 min x 50 teams = 12.5 hrs/day)</li>
+          <li>Backlog grooming sessions (2 hrs/sprint x 50 teams)</li>
+          <li>Sprint retrospectives (1 hr/sprint x 50 teams)</li>
+          <li>Story point estimation (hours of debate)</li>
+          <li>Engineers context-switch between meetings and coding</li>
+          <li>Velocity measured in story points (vanity metric)</li>
+          <li>No visibility into AI vs human contribution</li>
+        </ul>
+      </div>
+      <div class="scenario scenario-new">
+        <h4>With Signal &amp; Ship</h4>
+        <ul>
+          <li>Continuous flow &mdash; no sprint boundaries</li>
+          <li>Morning Signal replaces standups (5 min read)</li>
+          <li>Backlog auto-groomed by AI (zero meetings)</li>
+          <li>Session Log replaces retrospectives (auto-generated)</li>
+          <li>Outcomes measured: issues closed, PRs merged, bugs fixed</li>
+          <li>Humans orchestrate, AI executes &mdash; clear separation</li>
+          <li>Velocity measured in delivered outcomes (real metric)</li>
+          <li>Full attribution: which human, which AI, what cost</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+
+  <!-- Value metrics -->
+  <div class="value-section">
+    <h3>Measured Results (Kestrel Internal Dogfooding &mdash; 20+ Sessions)</h3>
+    <div class="value-grid">
+      <div class="value-card">
+        <div class="value-metric">73% &rarr; 20%</div>
+        <div class="value-label">Human Bottleneck Reduction</div>
+        <div class="value-detail">AI was never the bottleneck. Process was.</div>
+      </div>
+      <div class="value-card">
+        <div class="value-metric">0 hrs</div>
+        <div class="value-label">Sprint Ceremony Time</div>
+        <div class="value-detail">No standups. No planning poker. No retros.</div>
+      </div>
+      <div class="value-card">
+        <div class="value-metric">100%</div>
+        <div class="value-label">Backlog Health</div>
+        <div class="value-detail">Every ticket: assignee, milestone, criteria.</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Defensibility moat -->
+  <div>
+    <div class="moat">
+      <div class="moat-item">
+        <div class="moat-icon"><span class="ki ki-lock-key"></span></div>
+        <div class="moat-title">Sovereign Identity</div>
+        <div class="moat-desc">Every AI agent has a cryptographic DID. Not a generic bot &mdash; a verifiable, auditable entity.</div>
+      </div>
+      <div class="moat-item">
+        <div class="moat-icon"><span class="ki ki-scroll"></span></div>
+        <div class="moat-title">Constitutional AI</div>
+        <div class="moat-desc">5-article constitution governs every agent. Enterprise compliance built in, not bolted on.</div>
+      </div>
+      <div class="moat-item">
+        <div class="moat-icon"><span class="ki ki-factory"></span></div>
+        <div class="moat-title">Multi-Platform</div>
+        <div class="moat-desc">GitHub + Azure DevOps. Works where enterprise teams already live. No migration required.</div>
+      </div>
+      <div class="moat-item">
+        <div class="moat-icon"><span class="ki ki-pin"></span></div>
+        <div class="moat-title">Proven Internal Use</div>
+        <div class="moat-desc">20+ sessions of real dogfooding. Built by a team using the product to build the product.</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Footer -->
+  <div class="footer">
+    <p>Kestrel Sovereign AI &mdash; Signal &amp; Ship</p>
+    <p style="margin-top: 6px; color: #2a3a4a;">Confidential &mdash; Partnership Discussion &mdash; March 2026</p>
+  </div>
+
+</div>
+</body>
+</html>

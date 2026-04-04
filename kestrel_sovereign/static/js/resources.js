@@ -45,17 +45,17 @@ async function updateActiveKeySource() {
         const sources = response.sources || {};
 
         if (sources.agent) {
-            source = '🤖 Agent Key';
+            source = kicon('robot') + ' Agent Key';
             color = 'var(--success)';
         } else if (sources.user && byokUnlocked) {
-            source = '👤 Your Key (BYOK)';
+            source = kicon('user') + ' Your Key (BYOK)';
             color = 'var(--accent-color)';
         } else if (sources.platform) {
-            source = '🏢 Platform';
+            source = kicon('building') + ' Platform';
             color = 'var(--warning)';
         }
 
-        badge.textContent = source;
+        badge.innerHTML = source;
         badge.style.background = color;
     } catch (error) {
         badge.textContent = 'Unknown';
@@ -169,7 +169,7 @@ async function refreshUserKeys() {
 function renderUserKeyCard(key) {
     const statusColor = key.is_active ? 'var(--success)' : 'var(--error)';
     const statusText = key.is_active ? (byokUnlocked ? 'Unlocked' : 'Locked') : 'Inactive';
-    const lockIcon = byokUnlocked ? '🔓' : '🔒';
+    const lockIcon = byokUnlocked ? kicon('lock-open') : kicon('lock');
 
     return `
         <div style="background: var(--bg-secondary); border-radius: 8px; padding: 1rem; border: 1px solid var(--border-color);">
@@ -179,7 +179,7 @@ function renderUserKeyCard(key) {
                     <span style="color: ${statusColor}; font-size: 0.875rem;">${lockIcon} ${statusText}</span>
                     <button class="btn btn-secondary" style="font-size: 0.7rem; padding: 0.2rem 0.4rem; color: var(--error);"
                             onclick="window.deleteUserKey('${key.provider}')" title="Delete key">
-                        🗑️
+                        ${kicon('trash')}
                     </button>
                 </div>
             </div>
@@ -190,7 +190,7 @@ function renderUserKeyCard(key) {
             ${!byokUnlocked ? `
                 <div style="margin-top: 0.75rem;">
                     <button class="btn btn-primary" style="font-size: 0.75rem; padding: 0.25rem 0.5rem;" onclick="showUnlockByokModal()">
-                        🔓 Unlock to Use
+                        ${kicon('lock-open')} Unlock to Use
                     </button>
                 </div>
             ` : ''}
@@ -294,7 +294,7 @@ function showAddUserKeyModal() {
                 </div>
             </div>
             <div style="background: var(--warning-bg, rgba(255,200,0,0.1)); border: 1px solid var(--warning, #ffaa00); border-radius: 6px; padding: 0.75rem; margin-top: 1rem; font-size: 0.75rem; color: var(--warning, #ffaa00);">
-                ⚠️ If you forget your passphrase, you'll need to re-add your keys. We cannot recover passphrase-encrypted keys.
+                ${kicon('warning')} If you forget your passphrase, you'll need to re-add your keys. We cannot recover passphrase-encrypted keys.
             </div>
             <div style="display: flex; gap: 0.75rem; margin-top: 1.5rem; justify-content: flex-end;">
                 <button class="btn btn-secondary" onclick="window.closeAddKeyModal()">Cancel</button>
@@ -531,7 +531,7 @@ async function refreshPlatformAccess() {
                         <div style="color: var(--text-secondary); font-size: 0.875rem; margin-top: 0.5rem;">
                             ${provider.pricing_hint ? `<div>${provider.pricing_hint}</div>` : ''}
                             <div style="display: flex; gap: 1rem; margin-top: 0.25rem;">
-                                ${marginText ? `<span>💳 ${marginText}</span>` : ''}
+                                ${marginText ? `<span>${kicon('credit-card')} ${marginText}</span>` : ''}
                                 ${provider.rate_limit_per_companion ? `<span>⏱️ ${provider.rate_limit_per_companion} req/min</span>` : ''}
                             </div>
                         </div>
@@ -578,7 +578,7 @@ function renderKeyCard(key, type) {
                     <span style="color: ${statusColor}; font-size: 0.875rem;">● ${statusText}</span>
                     <button class="btn btn-secondary" style="font-size: 0.7rem; padding: 0.2rem 0.4rem; color: var(--error);"
                             onclick="window.${deleteFunc}('${key.provider}')" title="Delete key">
-                        🗑️
+                        ${kicon('trash')}
                     </button>
                 </div>
             </div>

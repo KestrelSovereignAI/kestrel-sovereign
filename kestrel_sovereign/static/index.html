@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
     <title>Kestrel Sovereign Console</title>
+    <script src="js/icons.js"></script>
     <style>
         /* Theme-aware CSS using system preferences */
         :root {
@@ -952,7 +953,7 @@
             <button class="nav-tab" data-panel="spawn">Spawn</button>
             <button class="nav-tab" data-panel="features">Features</button>
             <button class="nav-tab" data-panel="security">
-                🔒 Security
+                <span class="ki ki-lock"></span> Security
                 <span id="security-pending-badge" style="
                     display: none;
                     background: var(--error);
@@ -1057,8 +1058,8 @@
                     ">
                         <!-- Left: Navigation buttons -->
                         <div style="display: flex; gap: 0.5rem; align-items: center;">
-                            <button id="toggle-history-btn" onclick="toggleHistorySidebar()" class="btn btn-secondary" title="Chat History" style="padding: 0.4rem 0.6rem; font-size: 0.85rem;">📜</button>
-                            <button id="new-chat-btn" onclick="clearChat()" class="btn btn-primary" title="New Chat" style="padding: 0.4rem 0.6rem; font-size: 0.85rem;">✨</button>
+                            <button id="toggle-history-btn" onclick="toggleHistorySidebar()" class="btn btn-secondary" title="Chat History" style="padding: 0.4rem 0.6rem; font-size: 0.85rem;"><span class="ki ki-scroll"></span></button>
+                            <button id="new-chat-btn" onclick="clearChat()" class="btn btn-primary" title="New Chat" style="padding: 0.4rem 0.6rem; font-size: 0.85rem;"><span class="ki ki-sparkles"></span></button>
                         </div>
 
                         <!-- Center: Model Selection (Provider → Model cascading dropdowns) -->
@@ -1161,7 +1162,7 @@
                 <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem;">
                     <h2 style="margin: 0;">Tasks & Activity</h2>
                     <div style="display: flex; gap: 0.5rem;">
-                        <button class="btn btn-secondary" id="btn-refresh-tasks">🔄 Refresh</button>
+                        <button class="btn btn-secondary" id="btn-refresh-tasks"><span class="ki ki-refresh"></span> Refresh</button>
                     </div>
                 </div>
 
@@ -1171,12 +1172,12 @@
                         flex: 1;
                         padding: 0.5rem;
                         font-size: 0.875rem;
-                    ">📋 Background Tasks</button>
+                    "><span class="ki ki-clipboard"></span> Background Tasks</button>
                     <button class="btn btn-secondary" id="btn-view-activity" style="
                         flex: 1;
                         padding: 0.5rem;
                         font-size: 0.875rem;
-                    ">📊 Activity Log</button>
+                    "><span class="ki ki-chart-bar"></span> Activity Log</button>
                 </div>
 
                 <!-- Tasks Container -->
@@ -1239,7 +1240,7 @@
                 <div style="margin-top: 2rem; border-top: 1px solid var(--border-color); padding-top: 1.5rem;">
                     <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem;">
                         <h3 style="margin: 0;">Local Cache</h3>
-                        <button class="btn btn-secondary" id="toggle-file-browser" onclick="toggleFileBrowser()">📁 Browse Local Files</button>
+                        <button class="btn btn-secondary" id="toggle-file-browser" onclick="toggleFileBrowser()"><span class="ki ki-folder"></span> Browse Local Files</button>
                     </div>
                     <p style="color: var(--text-secondary); font-size: 0.875rem; margin-bottom: 1rem;">
                         Browse cached backup files stored locally on your device.
@@ -1255,7 +1256,7 @@
                 <div style="margin-top: 2rem; border-top: 1px solid var(--border-color); padding-top: 1.5rem;">
                     <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem;">
                         <h3 style="margin: 0;">Database Explorer</h3>
-                        <button class="btn btn-secondary" id="toggle-db-explorer" onclick="toggleDbExplorer()">🗄️ Browse Database</button>
+                        <button class="btn btn-secondary" id="toggle-db-explorer" onclick="toggleDbExplorer()"><span class="ki ki-cabinet"></span> Browse Database</button>
                     </div>
                     <p style="color: var(--text-secondary); font-size: 0.875rem; margin-bottom: 1rem;">
                         Read-only view of agent database tables and contents.
@@ -1271,7 +1272,7 @@
                 <div style="margin-top: 2rem; border-top: 1px solid var(--border-color); padding-top: 1.5rem;">
                     <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem;">
                         <h3 style="margin: 0;">IPFS Network</h3>
-                        <button class="btn btn-secondary" id="toggle-ipfs-status" onclick="toggleIpfsStatus()">🌐 Check Status</button>
+                        <button class="btn btn-secondary" id="toggle-ipfs-status" onclick="toggleIpfsStatus()"><span class="ki ki-globe"></span> Check Status</button>
                     </div>
                     <p style="color: var(--text-secondary); font-size: 0.875rem; margin-bottom: 1rem;">
                         Check connectivity to local IPFS node and public gateways.
@@ -1318,7 +1319,7 @@
                 <!-- Agent Keys Section -->
                 <div style="margin-bottom: 2rem;">
                     <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem;">
-                        <h3 style="margin: 0;">🤖 Agent Keys <span style="font-size: 0.75rem; color: var(--text-secondary); font-weight: normal;">(this companion only)</span></h3>
+                        <h3 style="margin: 0;"><span class="ki ki-robot"></span> Agent Keys <span style="font-size: 0.75rem; color: var(--text-secondary); font-weight: normal;">(this companion only)</span></h3>
                         <div style="display: flex; gap: 0.5rem;">
                             <button class="btn btn-primary" onclick="showAddAgentKeyModal()">+ Add Key</button>
                             <button class="btn btn-secondary" onclick="refreshAgentKeys()">Refresh</button>
@@ -1332,14 +1333,14 @@
                 <!-- User BYOK Section -->
                 <div style="margin-bottom: 2rem; border-top: 1px solid var(--border-color); padding-top: 1.5rem;">
                     <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem;">
-                        <h3 style="margin: 0;">👤 Your Keys <span style="font-size: 0.75rem; color: var(--text-secondary); font-weight: normal;">(BYOK - shared across companions)</span></h3>
+                        <h3 style="margin: 0;"><span class="ki ki-user"></span> Your Keys <span style="font-size: 0.75rem; color: var(--text-secondary); font-weight: normal;">(BYOK - shared across companions)</span></h3>
                         <div style="display: flex; gap: 0.5rem;">
                             <button class="btn btn-primary" onclick="showAddUserKeyModal()">+ Add Key</button>
-                            <button class="btn btn-secondary" id="unlock-byok-btn" onclick="showUnlockByokModal()" style="display: none;">🔓 Unlock</button>
+                            <button class="btn btn-secondary" id="unlock-byok-btn" onclick="showUnlockByokModal()" style="display: none;"><span class="ki ki-lock-open"></span> Unlock</button>
                         </div>
                     </div>
                     <div style="background: var(--bg-secondary); padding: 0.75rem; border-radius: 8px; margin-bottom: 1rem; font-size: 0.875rem; color: var(--text-secondary);">
-                        🔒 Keys encrypted with your passphrase. No wallet charges when using your own keys.
+                        <span class="ki ki-lock"></span> Keys encrypted with your passphrase. No wallet charges when using your own keys.
                     </div>
                     <div id="user-keys-list">
                         <div class="loading">Loading keys...</div>
@@ -1349,10 +1350,10 @@
                 <!-- Platform Access Section -->
                 <div style="margin-bottom: 2rem; border-top: 1px solid var(--border-color); padding-top: 1.5rem;">
                     <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem;">
-                        <h3 style="margin: 0;">🏢 Platform Access <span style="font-size: 0.75rem; color: var(--text-secondary); font-weight: normal;">(pay-per-use)</span></h3>
+                        <h3 style="margin: 0;"><span class="ki ki-building"></span> Platform Access <span style="font-size: 0.75rem; color: var(--text-secondary); font-weight: normal;">(pay-per-use)</span></h3>
                     </div>
                     <div style="background: var(--bg-secondary); padding: 0.75rem; border-radius: 8px; margin-bottom: 1rem; font-size: 0.875rem; color: var(--text-secondary);">
-                        💳 Uses your wallet balance + platform margin. Fallback when no personal keys available.
+                        <span class="ki ki-credit-card"></span> Uses your wallet balance + platform margin. Fallback when no personal keys available.
                     </div>
                     <div id="platform-access-list">
                         <div class="loading">Loading platform access...</div>
@@ -1362,7 +1363,7 @@
                 <!-- Wallet Section -->
                 <div style="margin-bottom: 2rem; border-top: 1px solid var(--border-color); padding-top: 1.5rem;">
                     <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem;">
-                        <h3 style="margin: 0;">💰 Wallet</h3>
+                        <h3 style="margin: 0;"><span class="ki ki-wallet"></span> Wallet</h3>
                         <button class="btn btn-secondary" onclick="refreshWallet()">Refresh</button>
                     </div>
                     <div id="wallet-details">
@@ -1372,7 +1373,7 @@
 
                 <!-- Usage Section -->
                 <div style="border-top: 1px solid var(--border-color); padding-top: 1.5rem;">
-                    <h3 style="margin: 0 0 1rem 0;">📊 Usage (Last 30 Days)</h3>
+                    <h3 style="margin: 0 0 1rem 0;"><span class="ki ki-chart-bar"></span> Usage (Last 30 Days)</h3>
                     <div id="usage-details">
                         <div class="loading">Loading usage...</div>
                     </div>
@@ -1670,7 +1671,7 @@
                 <!-- Pending Approvals Section -->
                 <div style="margin-bottom: 2rem;">
                     <h3 style="margin: 0 0 1rem 0; display: flex; align-items: center; gap: 0.5rem;">
-                        ⏳ Pending Approvals
+                        <span class="ki ki-hourglass"></span> Pending Approvals
                         <span id="pending-count-label" style="
                             background: var(--bg-tertiary);
                             padding: 0.125rem 0.5rem;
@@ -1689,7 +1690,7 @@
                 <!-- Permission Tree Section -->
                 <div style="margin-bottom: 2rem;">
                     <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem;">
-                        <h3 style="margin: 0;">🔐 Permission Tree</h3>
+                        <h3 style="margin: 0;"><span class="ki ki-lock-key"></span> Permission Tree</h3>
                         <button onclick="Security.loadPermissionTree()" class="btn btn-secondary" style="
                             padding: 0.25rem 0.75rem;
                             font-size: 0.8rem;
@@ -1701,13 +1702,13 @@
                         </p>
                     </div>
                     <p style="color: var(--text-tertiary); font-size: 0.75rem; margin-top: 0.75rem;">
-                        Legend: ☑ Allow | ☐ Ask | ☒ Deny | ◐ Mixed
+                        Legend: <span class="ki ki-check-box"></span> Allow | <span class="ki ki-empty-box"></span> Ask | <span class="ki ki-x-box"></span> Deny | <span class="ki ki-half-circle"></span> Mixed
                     </p>
                 </div>
 
                 <!-- Session Controls Section -->
                 <div style="margin-bottom: 2rem; border-top: 1px solid var(--border-color); padding-top: 1.5rem;">
-                    <h3 style="margin: 0 0 1rem 0;">⚙️ Session Controls</h3>
+                    <h3 style="margin: 0 0 1rem 0;"><span class="ki ki-gear"></span> Session Controls</h3>
                     <div style="display: flex; gap: 0.75rem; flex-wrap: wrap;">
                         <button onclick="Security.resetSession()" class="btn btn-secondary" style="font-size: 0.85rem;">
                             Reset Session Permissions
@@ -1724,7 +1725,7 @@
                 <!-- Audit Log Section -->
                 <div style="border-top: 1px solid var(--border-color); padding-top: 1.5rem;">
                     <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem;">
-                        <h3 style="margin: 0;">📋 Audit Log</h3>
+                        <h3 style="margin: 0;"><span class="ki ki-clipboard"></span> Audit Log</h3>
                         <button onclick="Security.loadAuditLog()" class="btn btn-secondary" style="
                             padding: 0.25rem 0.75rem;
                             font-size: 0.8rem;

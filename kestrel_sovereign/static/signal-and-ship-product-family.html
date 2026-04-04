@@ -1,0 +1,780 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Signal & Ship — The Kestrel Product Family</title>
+<script src="js/icons.js"></script>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: 'Inter', -apple-system, sans-serif;
+    background: #0a0e17;
+    color: #e8eaed;
+    min-height: 100vh;
+  }
+
+  .page { max-width: 1200px; margin: 0 auto; padding: 50px 40px; }
+
+  /* ===== HERO ===== */
+  .hero {
+    text-align: center;
+    margin-bottom: 60px;
+    padding: 60px 40px;
+    background: radial-gradient(ellipse at center, rgba(78,205,196,0.06) 0%, transparent 70%);
+    border-radius: 20px;
+  }
+  .hero-eyebrow {
+    font-size: 12px; font-weight: 600; letter-spacing: 3px;
+    text-transform: uppercase; color: #4ecdc4; margin-bottom: 16px;
+  }
+  .hero h1 {
+    font-size: 52px; font-weight: 800; line-height: 1.1;
+    background: linear-gradient(135deg, #4ecdc4, #44a8e0, #ab47bc);
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+    margin-bottom: 16px;
+  }
+  .hero .subtitle {
+    font-size: 22px; color: #8b95a5; font-weight: 300;
+    max-width: 700px; margin: 0 auto; line-height: 1.5;
+  }
+  .hero .one-liner {
+    font-size: 15px; color: #5a6577; margin-top: 20px;
+    font-style: italic;
+  }
+
+  /* ===== THESIS ===== */
+  .thesis {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 24px;
+    margin-bottom: 60px;
+  }
+  .thesis-card {
+    padding: 32px;
+    border-radius: 14px;
+    position: relative;
+  }
+  .thesis-problem {
+    background: linear-gradient(135deg, #1a1520, #1f1428);
+    border: 1px solid #3d2855;
+  }
+  .thesis-solution {
+    background: linear-gradient(135deg, #0d2520, #0a2018);
+    border: 1px solid #1b5e20;
+  }
+  .thesis-card h3 {
+    font-size: 14px; font-weight: 600;
+    letter-spacing: 1px; text-transform: uppercase;
+    margin-bottom: 16px;
+  }
+  .thesis-problem h3 { color: #e57373; }
+  .thesis-solution h3 { color: #66bb6a; }
+  .thesis-card p {
+    font-size: 15px; line-height: 1.7; color: #b0b8c4;
+  }
+  .thesis-card p strong { color: #e8eaed; }
+
+  /* ===== THE MODEL ===== */
+  .section-header {
+    text-align: center; margin-bottom: 36px;
+  }
+  .section-header h2 {
+    font-size: 32px; font-weight: 700; color: #e8eaed;
+    margin-bottom: 8px;
+  }
+  .section-header p {
+    font-size: 15px; color: #6b7b8d; max-width: 600px; margin: 0 auto;
+  }
+
+  /* ===== 4 PILLARS ===== */
+  .pillars {
+    display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px;
+    margin-bottom: 60px;
+  }
+  .pillar {
+    border-radius: 14px; padding: 28px 20px;
+    display: flex; flex-direction: column;
+  }
+  .pillar-signal { background: linear-gradient(180deg, #0d2137, #0a1929); border: 1px solid #1565c0; }
+  .pillar-ship { background: linear-gradient(180deg, #0d3729, #0a2920); border: 1px solid #2e7d32; }
+  .pillar-measure { background: linear-gradient(180deg, #372d0d, #29220a); border: 1px solid #f9a825; }
+  .pillar-govern { background: linear-gradient(180deg, #2d0d37, #220a29); border: 1px solid #8e24aa; }
+
+  .pillar-num {
+    font-size: 10px; font-weight: 600; letter-spacing: 2px;
+    text-transform: uppercase; margin-bottom: 8px;
+  }
+  .pillar-signal .pillar-num { color: #42a5f5; }
+  .pillar-ship .pillar-num { color: #66bb6a; }
+  .pillar-measure .pillar-num { color: #fdd835; }
+  .pillar-govern .pillar-num { color: #ab47bc; }
+
+  .pillar h3 { font-size: 22px; font-weight: 700; margin-bottom: 4px; }
+  .pillar-signal h3 { color: #90caf9; }
+  .pillar-ship h3 { color: #a5d6a7; }
+  .pillar-measure h3 { color: #fff59d; }
+  .pillar-govern h3 { color: #ce93d8; }
+
+  .pillar .pillar-tagline {
+    font-size: 12px; color: #6b7b8d; font-style: italic;
+    margin-bottom: 16px; min-height: 32px;
+  }
+
+  .pillar-tool {
+    background: rgba(255,255,255,0.04); border-radius: 8px;
+    padding: 12px 14px; margin-bottom: 8px;
+  }
+  .pillar-tool-name {
+    font-size: 13px; font-weight: 600; color: #e8eaed; margin-bottom: 3px;
+  }
+  .pillar-tool-desc {
+    font-size: 11px; color: #7b8b9d; line-height: 1.5;
+  }
+
+  .badge {
+    display: inline-block; font-size: 8px; font-weight: 700;
+    padding: 2px 6px; border-radius: 3px;
+    text-transform: uppercase; letter-spacing: 0.5px;
+    margin-left: 5px; vertical-align: middle;
+  }
+  .badge-product { background: #0d47a1; color: #90caf9; }
+  .badge-built { background: #1b5e20; color: #a5d6a7; }
+  .badge-building { background: #e65100; color: #ffcc80; }
+
+  /* ===== PRODUCT FAMILY ===== */
+  .family { margin-bottom: 60px; }
+
+  .family-architecture {
+    display: grid; grid-template-rows: auto auto auto;
+    gap: 12px; margin-bottom: 40px;
+  }
+
+  /* Foundation layer */
+  .arch-foundation {
+    background: linear-gradient(135deg, #111a25, #0e1520);
+    border: 2px solid #4ecdc4;
+    border-radius: 14px; padding: 28px 32px;
+    text-align: center;
+  }
+  .arch-foundation h4 {
+    font-size: 20px; font-weight: 700; color: #4ecdc4; margin-bottom: 4px;
+  }
+  .arch-foundation .arch-role {
+    font-size: 13px; color: #6b8a85; margin-bottom: 12px;
+  }
+  .arch-foundation .arch-capabilities {
+    display: flex; justify-content: center; gap: 24px; flex-wrap: wrap;
+  }
+  .arch-cap {
+    font-size: 11px; color: #8b95a5;
+    padding: 6px 14px;
+    background: rgba(78,205,196,0.08);
+    border: 1px solid rgba(78,205,196,0.2);
+    border-radius: 6px;
+  }
+
+  /* Product layer */
+  .arch-products {
+    display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px;
+  }
+  .arch-product {
+    border-radius: 12px; padding: 24px 20px;
+    text-align: center;
+    position: relative;
+  }
+  .arch-product h4 { font-size: 17px; font-weight: 700; margin-bottom: 4px; }
+  .arch-product .arch-role { font-size: 12px; margin-bottom: 10px; }
+  .arch-product .arch-detail { font-size: 11px; color: #7b8b9d; line-height: 1.6; }
+  .arch-product .pillar-badge {
+    position: absolute; top: 10px; right: 12px;
+    font-size: 8px; font-weight: 700; padding: 2px 8px;
+    border-radius: 3px; text-transform: uppercase; letter-spacing: 0.5px;
+  }
+
+  .product-talon {
+    background: linear-gradient(180deg, #0d3729, #0a2920);
+    border: 1px solid #2e7d32;
+  }
+  .product-talon h4 { color: #a5d6a7; }
+  .product-talon .arch-role { color: #5a8a60; }
+  .product-talon .pillar-badge { background: #1b5e20; color: #a5d6a7; }
+
+  .product-eye {
+    background: linear-gradient(180deg, #372d0d, #29220a);
+    border: 1px solid #f9a825;
+  }
+  .product-eye h4 { color: #fff59d; }
+  .product-eye .arch-role { color: #8a8040; }
+  .product-eye .pillar-badge { background: #e65100; color: #ffcc80; }
+
+  .product-flight {
+    background: linear-gradient(180deg, #0d2137, #0a1929);
+    border: 1px solid #1565c0;
+  }
+  .product-flight h4 { color: #90caf9; }
+  .product-flight .arch-role { color: #4a6a8a; }
+  .product-flight .pillar-badge { background: #0d47a1; color: #90caf9; }
+
+  /* Operating model layer */
+  .arch-model {
+    background: linear-gradient(135deg, #15101e, #1a0e20);
+    border: 2px solid #ab47bc;
+    border-radius: 14px; padding: 24px 32px;
+    text-align: center;
+  }
+  .arch-model h4 {
+    font-size: 20px; font-weight: 700; color: #ce93d8; margin-bottom: 4px;
+  }
+  .arch-model .arch-role { font-size: 13px; color: #8a6b95; }
+
+  /* Connector arrows */
+  .arch-connector {
+    text-align: center; color: #2a3a4a; font-size: 18px;
+    padding: 4px 0; letter-spacing: 12px;
+  }
+
+  /* ===== PRODUCT CARDS ===== */
+  .product-cards {
+    display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 20px;
+    margin-bottom: 60px;
+  }
+  .product-card {
+    border-radius: 14px; padding: 30px 24px;
+    position: relative; overflow: hidden;
+  }
+  .product-card::before {
+    content: ''; position: absolute; top: 0; left: 0; right: 0;
+    height: 3px;
+  }
+  .card-talon { background: linear-gradient(180deg, #0d2a1f, #0a1f18); border: 1px solid #1b5e20; }
+  .card-talon::before { background: linear-gradient(90deg, #2e7d32, #66bb6a); }
+  .card-eye { background: linear-gradient(180deg, #2a250d, #1f1c0a); border: 1px solid #f57f17; }
+  .card-eye::before { background: linear-gradient(90deg, #f9a825, #ffee58); }
+  .card-flight { background: linear-gradient(180deg, #0d1a2a, #0a1520); border: 1px solid #0d47a1; }
+  .card-flight::before { background: linear-gradient(90deg, #1565c0, #42a5f5); }
+
+  .product-card .card-pillar {
+    font-size: 9px; font-weight: 700; letter-spacing: 2px;
+    text-transform: uppercase; margin-bottom: 12px;
+  }
+  .card-talon .card-pillar { color: #66bb6a; }
+  .card-eye .card-pillar { color: #fdd835; }
+  .card-flight .card-pillar { color: #42a5f5; }
+
+  .product-card h3 { font-size: 22px; font-weight: 700; margin-bottom: 8px; }
+  .card-talon h3 { color: #a5d6a7; }
+  .card-eye h3 { color: #fff59d; }
+  .card-flight h3 { color: #90caf9; }
+
+  .product-card .card-tagline {
+    font-size: 13px; font-style: italic; margin-bottom: 20px;
+  }
+  .card-talon .card-tagline { color: #5a8a60; }
+  .card-eye .card-tagline { color: #8a8040; }
+  .card-flight .card-tagline { color: #4a6a8a; }
+
+  .card-features { list-style: none; margin-bottom: 20px; }
+  .card-features li {
+    font-size: 12px; color: #8b95a5; padding: 5px 0;
+    padding-left: 20px; position: relative; line-height: 1.5;
+  }
+  .card-features li::before {
+    content: '\2713'; position: absolute; left: 0; font-weight: 700;
+  }
+  .card-talon .card-features li::before { color: #66bb6a; }
+  .card-eye .card-features li::before { color: #fdd835; }
+  .card-flight .card-features li::before { color: #42a5f5; }
+
+  .card-status {
+    font-size: 11px; font-weight: 600;
+    padding: 6px 12px; border-radius: 6px;
+    display: inline-block;
+  }
+  .card-talon .card-status { background: rgba(46,125,50,0.2); color: #66bb6a; }
+  .card-eye .card-status { background: rgba(245,127,23,0.2); color: #ffcc80; }
+  .card-flight .card-status { background: rgba(13,71,161,0.2); color: #64b5f6; }
+
+  /* ===== THE LOOP ===== */
+  .loop-section { margin-bottom: 60px; }
+  .loop {
+    display: flex; align-items: center; justify-content: center;
+    gap: 6px; flex-wrap: wrap; padding: 32px;
+    background: linear-gradient(135deg, #0d1520, #0a1218);
+    border: 1px solid #1a3040; border-radius: 14px;
+  }
+  .loop-step {
+    background: rgba(78,205,196,0.06);
+    border: 1px solid rgba(78,205,196,0.2);
+    border-radius: 8px; padding: 16px 18px;
+    text-align: center; min-width: 150px;
+  }
+  .loop-step-time { font-size: 13px; font-weight: 600; color: #4ecdc4; }
+  .loop-step-what { font-size: 11px; color: #5a7a75; margin-top: 4px; }
+  .loop-step-who { font-size: 9px; font-weight: 600; margin-top: 6px; letter-spacing: 1px; text-transform: uppercase; }
+  .loop-step-who.human { color: #ab47bc; }
+  .loop-step-who.ai { color: #66bb6a; }
+  .loop-arrow { font-size: 22px; color: #2a5a55; }
+
+  /* ===== USE CASES ===== */
+  .use-cases { margin-bottom: 60px; }
+  .use-case-grid {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 16px;
+  }
+  .use-case {
+    background: linear-gradient(135deg, #111a25, #0e1520);
+    border: 1px solid #1e2d3d;
+    border-radius: 12px; padding: 24px;
+  }
+  .use-case-icon { font-size: 28px; margin-bottom: 12px; }
+  .use-case h4 { font-size: 15px; font-weight: 700; color: #e8eaed; margin-bottom: 4px; }
+  .use-case .use-case-audience {
+    font-size: 11px; color: #4ecdc4; font-weight: 600;
+    text-transform: uppercase; letter-spacing: 1px; margin-bottom: 10px;
+  }
+  .use-case p { font-size: 12px; color: #7b8b9d; line-height: 1.6; }
+  .use-case .use-case-products {
+    margin-top: 10px; font-size: 10px; color: #5a6577;
+  }
+
+  /* ===== VALUE METRICS ===== */
+  .metrics { margin-bottom: 60px; }
+  .metrics-grid {
+    display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px;
+  }
+  .metric {
+    text-align: center; padding: 24px 16px;
+    background: linear-gradient(135deg, #111820, #0e1520);
+    border: 1px solid #1e2d3d; border-radius: 10px;
+  }
+  .metric-value { font-size: 28px; font-weight: 800; }
+  .metric:nth-child(1) .metric-value { color: #e57373; }
+  .metric:nth-child(2) .metric-value { color: #4ecdc4; }
+  .metric:nth-child(3) .metric-value { color: #66bb6a; }
+  .metric:nth-child(4) .metric-value { color: #fdd835; }
+  .metric-label { font-size: 11px; color: #8b95a5; margin-top: 6px; }
+  .metric-detail { font-size: 10px; color: #5a6577; margin-top: 3px; }
+
+  /* ===== MOAT ===== */
+  .moat-section { margin-bottom: 60px; }
+  .moat-grid {
+    display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px;
+  }
+  .moat-item {
+    text-align: center; padding: 20px 12px;
+    background: linear-gradient(135deg, #111820, #0e1520);
+    border: 1px solid #1e2d3d; border-radius: 10px;
+  }
+  .moat-icon { font-size: 24px; margin-bottom: 8px; }
+  .moat-title { font-size: 12px; font-weight: 600; color: #e8eaed; margin-bottom: 4px; }
+  .moat-desc { font-size: 10px; color: #6b7b8d; line-height: 1.5; }
+
+  /* ===== FOOTER ===== */
+  .footer {
+    text-align: center; padding-top: 24px;
+    border-top: 1px solid #1e2d3d;
+  }
+  .footer p { font-size: 12px; color: #3a4a5a; }
+  .footer a { color: #4ecdc4; text-decoration: none; }
+
+  @media print {
+    body { background: white; color: #222; }
+    .hero h1 { -webkit-text-fill-color: #1a5a55; }
+    .metric-value { color: #333 !important; }
+  }
+</style>
+</head>
+<body>
+<div class="page">
+
+  <!-- ===== HERO ===== -->
+  <div class="hero">
+    <div class="hero-eyebrow">The Kestrel Product Family</div>
+    <h1>Signal & Ship</h1>
+    <div class="subtitle">
+      The sprint-free operating model for engineering teams
+      where AI executes and humans lead.
+    </div>
+    <div class="one-liner">
+      Not another tool. A complete replacement for how engineering teams operate.
+    </div>
+  </div>
+
+  <!-- ===== THESIS ===== -->
+  <div class="thesis">
+    <div class="thesis-card thesis-problem">
+      <h3><span class="ki ki-warning"></span> The Problem</h3>
+      <p>
+        You bought Copilot licenses. Your engineers use them for autocomplete.
+        But nothing fundamental changed. Same sprint ceremonies. Same standup meetings.
+        Same planning poker. Same retrospectives. Same cost structure.
+        <strong>The AI was never the bottleneck &mdash; the process is.</strong>
+        At enterprise scale, sprint overhead costs millions in lost productivity per year.
+      </p>
+    </div>
+    <div class="thesis-card thesis-solution">
+      <h3><span class="ki ki-checkmark"></span> The Answer</h3>
+      <p>
+        Signal &amp; Ship is a <strong>complete operating model</strong> &mdash; not a point solution.
+        AI agents handle the work: claiming tickets, writing code, running tests, opening PRs.
+        Humans handle the judgment: reviewing, approving, steering.
+        Every agent has a <strong>cryptographic identity</strong> and a <strong>constitution it cannot violate</strong>.
+        The result: sprint-free, outcome-driven delivery with full auditability.
+      </p>
+    </div>
+  </div>
+
+  <!-- ===== THE 4 PILLARS ===== -->
+  <div class="section-header">
+    <h2>Four Pillars. One Loop.</h2>
+    <p>Each pillar is powered by a purpose-built product in the Kestrel family.</p>
+  </div>
+
+  <div class="pillars">
+    <div class="pillar pillar-signal">
+      <div class="pillar-num">Pillar 1</div>
+      <h3>Signal</h3>
+      <div class="pillar-tagline">"Know what to work on &mdash; without a meeting"</div>
+      <div class="pillar-tool">
+        <div class="pillar-tool-name">Morning Signal <span class="badge badge-built">Shipped</span></div>
+        <div class="pillar-tool-desc">Autonomous daily briefing. Scans all repos, surfaces blockers, ranks work by impact. Replaces standups.</div>
+      </div>
+      <div class="pillar-tool">
+        <div class="pillar-tool-name">Backlog Hygiene <span class="badge badge-built">Shipped</span></div>
+        <div class="pillar-tool-desc">Every ticket gets assignee, milestone, labels, acceptance criteria. Replaces grooming sessions.</div>
+      </div>
+      <div class="pillar-tool">
+        <div class="pillar-tool-name">Strategic Memory <span class="badge badge-built">Shipped</span></div>
+        <div class="pillar-tool-desc">Persistent context across sessions. Vision, milestones, decisions, blockers, and patterns &mdash; always loaded.</div>
+      </div>
+    </div>
+
+    <div class="pillar pillar-ship">
+      <div class="pillar-num">Pillar 2</div>
+      <h3>Ship</h3>
+      <div class="pillar-tagline">"AI executes the work &mdash; human reviews the result"</div>
+      <div class="pillar-tool">
+        <div class="pillar-tool-name">Kestrel Talon <span class="badge badge-product">Product</span></div>
+        <div class="pillar-tool-desc">Autonomous coding agent. Claims tickets, writes code, runs tests, opens PRs. GitHub + Azure DevOps.</div>
+      </div>
+      <div class="pillar-tool">
+        <div class="pillar-tool-name">Quality Gates <span class="badge badge-built">Shipped</span></div>
+        <div class="pillar-tool-desc">Project-defined tests as enforcement. If tests fail, the agent reads errors and fixes them. Self-correcting.</div>
+      </div>
+    </div>
+
+    <div class="pillar pillar-measure">
+      <div class="pillar-num">Pillar 3</div>
+      <h3>Measure</h3>
+      <div class="pillar-tagline">"Track outcomes, not story points"</div>
+      <div class="pillar-tool">
+        <div class="pillar-tool-name">Kestrel Eye <span class="badge badge-product">Product</span></div>
+        <div class="pillar-tool-desc">AI-verified QA. Vision model validates screenshots against specifications. Automated acceptance testing.</div>
+      </div>
+      <div class="pillar-tool">
+        <div class="pillar-tool-name">Session Log <span class="badge badge-built">Shipped</span></div>
+        <div class="pillar-tool-desc">End-of-day automated capture. What got done, by whom (human vs AI), at what cost. Replaces retrospectives.</div>
+      </div>
+      <div class="pillar-tool">
+        <div class="pillar-tool-name">Portfolio Dashboard <span class="badge badge-built">Shipped</span></div>
+        <div class="pillar-tool-desc">Issues closed, PRs merged, bugs fixed, human bottleneck %. No manual reporting.</div>
+      </div>
+    </div>
+
+    <div class="pillar pillar-govern">
+      <div class="pillar-num">Pillar 4</div>
+      <h3>Govern</h3>
+      <div class="pillar-tagline">"Constitutional guardrails on AI autonomy"</div>
+      <div class="pillar-tool">
+        <div class="pillar-tool-name">Constitutional AI <span class="badge badge-built">Shipped</span></div>
+        <div class="pillar-tool-desc">5-article constitution governs every agent. Enterprise compliance built in, not bolted on. Auditable enforcement.</div>
+      </div>
+      <div class="pillar-tool">
+        <div class="pillar-tool-name">Sovereign Identity <span class="badge badge-built">Shipped</span></div>
+        <div class="pillar-tool-desc">Every AI agent has a cryptographic DID. Every action is signed. Full audit trail for compliance and attribution.</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== PRODUCT ARCHITECTURE ===== -->
+  <div class="family">
+    <div class="section-header">
+      <h2>The Kestrel Product Family</h2>
+      <p>An operating model, three purpose-built products, one sovereign foundation.</p>
+    </div>
+
+    <div class="family-architecture">
+      <!-- Top: Operating Model -->
+      <div class="arch-model">
+        <h4>Signal &amp; Ship</h4>
+        <div class="arch-role">The Operating Model &mdash; orchestrates the entire delivery loop</div>
+      </div>
+
+      <div class="arch-connector">&#x25BC; &#x25BC; &#x25BC;</div>
+
+      <!-- Middle: Products -->
+      <div class="arch-products">
+        <div class="arch-product product-talon">
+          <div class="pillar-badge">Ship</div>
+          <h4>Kestrel Talon</h4>
+          <div class="arch-role">The Hands</div>
+          <div class="arch-detail">Claims tickets, writes code, runs tests, opens PRs. The autonomous execution engine.</div>
+        </div>
+        <div class="arch-product product-eye">
+          <div class="pillar-badge">Measure</div>
+          <h4>Kestrel Eye</h4>
+          <div class="arch-role">The Eyes</div>
+          <div class="arch-detail">AI-powered visual QA. Validates outputs against specs using vision models. Automated acceptance.</div>
+        </div>
+        <div class="arch-product product-flight">
+          <div class="pillar-badge">Signal</div>
+          <h4>Kestrel Flight</h4>
+          <div class="arch-role">The Voice</div>
+          <div class="arch-detail">Demo narration engine and content delivery. Scalable storytelling for product showcases and onboarding.</div>
+        </div>
+      </div>
+
+      <div class="arch-connector">&#x25BC; &#x25BC; &#x25BC;</div>
+
+      <!-- Bottom: Foundation -->
+      <div class="arch-foundation">
+        <h4>Kestrel Sovereign</h4>
+        <div class="arch-role">The Foundation &mdash; constitutional AI framework with cryptographic identity</div>
+        <div class="arch-capabilities">
+          <span class="arch-cap">DID Identity</span>
+          <span class="arch-cap">Constitution</span>
+          <span class="arch-cap">Sovereign Memory</span>
+          <span class="arch-cap">Multi-LLM Routing</span>
+          <span class="arch-cap">Privacy Modes</span>
+          <span class="arch-cap">Audit Trail</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== PRODUCT DEEP DIVES ===== -->
+  <div class="section-header">
+    <h2>The Products</h2>
+    <p>Each product is standalone. Together, they form a complete AI engineering organization.</p>
+  </div>
+
+  <div class="product-cards">
+    <div class="product-card card-talon">
+      <div class="card-pillar">Ship Pillar &mdash; The Hands</div>
+      <h3>Kestrel Talon</h3>
+      <div class="card-tagline">Autonomous coding agent that turns tickets into pull requests</div>
+      <ul class="card-features">
+        <li>Claims GitHub/Azure DevOps issues autonomously</li>
+        <li>Writes code, runs tests, reads errors, fixes them</li>
+        <li>Opens PRs ready for human review</li>
+        <li>Batch + parallel execution across repos</li>
+        <li>Self-correcting quality gates built in</li>
+        <li>Constitutional limits: can't force-push, can't access secrets</li>
+      </ul>
+      <span class="card-status">90% Built &mdash; Active Development</span>
+    </div>
+
+    <div class="product-card card-eye">
+      <div class="card-pillar">Measure Pillar &mdash; The Eyes</div>
+      <h3>Kestrel Eye</h3>
+      <div class="card-tagline">AI-powered visual verification that sees what humans miss</div>
+      <ul class="card-features">
+        <li>Vision model validates screenshots against specifications</li>
+        <li>Act-by-act demo verification (Identity, Constitution, Chat...)</li>
+        <li>Integrates with CI/CD pipelines</li>
+        <li>Uses cheap models (Haiku) for cost-effective verification</li>
+        <li>Results posted as GitHub labels automatically</li>
+        <li>Replaces manual QA for demo and acceptance flows</li>
+      </ul>
+      <span class="card-status">v1.0 &mdash; Operational</span>
+    </div>
+
+    <div class="product-card card-flight">
+      <div class="card-pillar">Signal Pillar &mdash; The Voice</div>
+      <h3>Kestrel Flight</h3>
+      <div class="card-tagline">Shared narration engine for demos, onboarding, and content</div>
+      <ul class="card-features">
+        <li>Reusable narration infrastructure for product showcases</li>
+        <li>NarrationEngine, highlight, pause, and message primitives</li>
+        <li>Shared between Kestrel demos and Frinz companion</li>
+        <li>Scalable content creation for any product in the family</li>
+        <li>Enterprise onboarding flow automation</li>
+        <li>Designed for zero-friction stakeholder communication</li>
+      </ul>
+      <span class="card-status">v1.0 Core Library &mdash; In Progress</span>
+    </div>
+  </div>
+
+  <!-- ===== THE DAILY LOOP ===== -->
+  <div class="loop-section">
+    <div class="section-header">
+      <h2>The Autonomous Daily Loop</h2>
+      <p>What a day looks like when AI executes and humans lead.</p>
+    </div>
+    <div class="loop">
+      <div class="loop-step">
+        <div class="loop-step-time">8:00 AM</div>
+        <div class="loop-step-what">Morning Signal scans<br>all repos</div>
+        <div class="loop-step-who ai">AI</div>
+      </div>
+      <div class="loop-arrow">&rarr;</div>
+      <div class="loop-step">
+        <div class="loop-step-time">8:05 AM</div>
+        <div class="loop-step-what">Backlog Hygiene<br>cleans + prioritizes</div>
+        <div class="loop-step-who ai">AI</div>
+      </div>
+      <div class="loop-arrow">&rarr;</div>
+      <div class="loop-step">
+        <div class="loop-step-time">8:10 AM</div>
+        <div class="loop-step-what">Human reviews<br>top 5 items</div>
+        <div class="loop-step-who human">Human</div>
+      </div>
+      <div class="loop-arrow">&rarr;</div>
+      <div class="loop-step">
+        <div class="loop-step-time">All Day</div>
+        <div class="loop-step-what">Talon claims + codes<br>Eye validates output</div>
+        <div class="loop-step-who ai">AI</div>
+      </div>
+      <div class="loop-arrow">&rarr;</div>
+      <div class="loop-step">
+        <div class="loop-step-time">5:00 PM</div>
+        <div class="loop-step-what">Human reviews PRs<br>Merge or feedback</div>
+        <div class="loop-step-who human">Human</div>
+      </div>
+      <div class="loop-arrow">&rarr;</div>
+      <div class="loop-step">
+        <div class="loop-step-time">6:00 PM</div>
+        <div class="loop-step-what">Session Log captures<br>daily outcomes</div>
+        <div class="loop-step-who ai">AI</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== USE CASES ===== -->
+  <div class="use-cases">
+    <div class="section-header">
+      <h2>Who It's For</h2>
+      <p>Signal &amp; Ship adapts to the audience. The products stay the same.</p>
+    </div>
+    <div class="use-case-grid">
+      <div class="use-case">
+        <div class="use-case-icon"><span class="ki ki-factory"></span></div>
+        <h4>Enterprise Engineering (CIO/VP)</h4>
+        <div class="use-case-audience">500+ engineer teams</div>
+        <p>
+          Eliminate sprint ceremonies. AI agents execute tickets while engineers focus on architecture
+          and review. Constitutional governance gives compliance teams confidence.
+          Full attribution: which human, which AI, what cost.
+        </p>
+        <div class="use-case-products">Products: Talon + Eye + Signal &amp; Ship operating model</div>
+      </div>
+      <div class="use-case">
+        <div class="use-case-icon"><span class="ki ki-hospital"></span></div>
+        <h4>Healthcare (Clinical Validation)</h4>
+        <div class="use-case-audience">Remote patient monitoring</div>
+        <p>
+          Conversational AI companions for daily wellness check-ins. Constitutional safety gates
+          make it impossible to give medical advice without routing to a nurse.
+          Zero safety failures in pre-launch validation. Caprock Health partnership proves it.
+        </p>
+        <div class="use-case-products">Products: Sovereign (constitution + memory) + Frinz (companion UX)</div>
+      </div>
+      <div class="use-case">
+        <div class="use-case-icon"><span class="ki ki-laptop"></span></div>
+        <h4>Development Teams (Startup to Mid-Market)</h4>
+        <div class="use-case-audience">10-100 engineer teams</div>
+        <p>
+          Start with Talon (autonomous PR author) and Morning Signal (daily briefing).
+          Grow into the full operating model as team scales. Constitutional guardrails
+          give team leads control over what AI can and cannot do.
+        </p>
+        <div class="use-case-products">Products: Talon + Morning Signal (land), full S&amp;S (expand)</div>
+      </div>
+      <div class="use-case">
+        <div class="use-case-icon"><span class="ki ki-user"></span></div>
+        <h4>Consumer (Personal AI Companions)</h4>
+        <div class="use-case-audience">Privacy-first users</div>
+        <p>
+          Frinz: the first AI companion where you own the relationship. Memory stays on your device.
+          Export anytime. No data harvesting. Built on Sovereign's privacy architecture
+          with 5 tiers from ephemeral to public.
+        </p>
+        <div class="use-case-products">Products: Sovereign (privacy + identity) + Frinz (companion)</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== METRICS ===== -->
+  <div class="metrics">
+    <div class="section-header">
+      <h2>Measured Results</h2>
+      <p>Internal dogfooding data from 20+ sessions building Kestrel with Kestrel.</p>
+    </div>
+    <div class="metrics-grid">
+      <div class="metric">
+        <div class="metric-value">73% &rarr; 20%</div>
+        <div class="metric-label">Human Bottleneck Reduction</div>
+        <div class="metric-detail">Process was the bottleneck, not AI</div>
+      </div>
+      <div class="metric">
+        <div class="metric-value">0 hrs</div>
+        <div class="metric-label">Sprint Ceremony Time</div>
+        <div class="metric-detail">No standups, planning poker, or retros</div>
+      </div>
+      <div class="metric">
+        <div class="metric-value">100%</div>
+        <div class="metric-label">Backlog Health</div>
+        <div class="metric-detail">Every ticket: assignee, milestone, criteria</div>
+      </div>
+      <div class="metric">
+        <div class="metric-value">0</div>
+        <div class="metric-label">Safety Incidents</div>
+        <div class="metric-detail">Caprock clinical validation: zero failures</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== DEFENSIBILITY ===== -->
+  <div class="moat-section">
+    <div class="section-header">
+      <h2>Why This Can't Be Copied</h2>
+    </div>
+    <div class="moat-grid">
+      <div class="moat-item">
+        <div class="moat-icon"><span class="ki ki-lock-key"></span></div>
+        <div class="moat-title">Sovereign Identity</div>
+        <div class="moat-desc">Every agent has a cryptographic DID. Not a platform bot &mdash; a verifiable, auditable entity that enterprises can trust.</div>
+      </div>
+      <div class="moat-item">
+        <div class="moat-icon"><span class="ki ki-scroll"></span></div>
+        <div class="moat-title">Constitutional AI</div>
+        <div class="moat-desc">Five articles. Embedded at inception. Can't be overridden at runtime. Compliance built into the architecture.</div>
+      </div>
+      <div class="moat-item">
+        <div class="moat-icon"><span class="ki ki-wrench"></span></div>
+        <div class="moat-title">Integrated Product Family</div>
+        <div class="moat-desc">Talon, Eye, and Flight are purpose-built for S&amp;S. Competitors would need to build the entire stack.</div>
+      </div>
+      <div class="moat-item">
+        <div class="moat-icon"><span class="ki ki-pin"></span></div>
+        <div class="moat-title">Proven Dogfooding</div>
+        <div class="moat-desc">20+ sessions of real use. Built by a team using the product to build the product. Real metrics, not projections.</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== FOOTER ===== -->
+  <div class="footer">
+    <p>Kestrel Sovereign AI &mdash; Signal &amp; Ship Product Family</p>
+    <p style="margin-top: 6px;">
+      <a href="https://github.com/KestrelSovereignAI">github.com/KestrelSovereignAI</a>
+    </p>
+    <p style="margin-top: 8px; color: #2a3a4a; font-size: 11px;">
+      Confidential &mdash; March 2026
+    </p>
+  </div>
+
+</div>
+</body>
+</html>
