@@ -12,7 +12,7 @@ from datetime import datetime
 from typing import Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from kestrel_sovereign.features.github.client import GitHubClient
+    from kestrel_feature_github.client import GitHubClient
     from kestrel_sovereign.features.security.feature import SecurityFeature
     from .models import Insight
 

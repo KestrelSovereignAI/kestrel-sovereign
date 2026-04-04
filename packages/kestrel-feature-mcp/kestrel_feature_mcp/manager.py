@@ -38,7 +38,7 @@ except ImportError:
     sse_client = None  # type: ignore[assignment]
     ClientSession = None  # type: ignore[assignment,misc]
 
-from kestrel_sovereign.kestrel_config.constants import (
+from kestrel_sdk.config.constants import (
     SESSION_CONNECT_TIMEOUT_SHORT,
     SESSION_CONNECT_TIMEOUT_DEFAULT,
 )
@@ -435,7 +435,7 @@ class MCPToolManager:
                 except Exception as e:
                     logger.error(f"Error stopping session task for {container_name}: {e}", exc_info=True)
             
-            from kestrel_sovereign.kestrel_config.constants import MCP_MAX_CONNECTION_ATTEMPTS, MCP_CONNECTION_RETRY_DELAY
+            from kestrel_sdk.config.constants import MCP_MAX_CONNECTION_ATTEMPTS, MCP_CONNECTION_RETRY_DELAY
 
             container = tool_info["container"]
             try:

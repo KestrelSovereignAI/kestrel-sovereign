@@ -9,10 +9,10 @@ commands for querying observability data at runtime.
 import logging
 from typing import Any, Dict, List, Optional
 
-from kestrel_sovereign.features.base import Feature, tool
+from kestrel_sdk.features.base import Feature, tool
 from kestrel_feature_observability.observability.hook import ObservabilityHook
-from kestrel_sovereign.hooks.base import Hook
-from kestrel_sovereign.tools.base import ToolCategory
+from kestrel_sdk.hooks.base import Hook
+from kestrel_sdk.tools.base import ToolCategory
 
 logger = logging.getLogger(__name__)
 

@@ -5,10 +5,15 @@ description = "Kestrel Intelligence features — reflection (self-improvement) a
 requires-python = ">=3.11,<3.14"
 license = "Apache-2.0"
 dependencies = [
+    "kestrel-sovereign-sdk",
+    # Cross-feature: llm adapters, security, wallet, github (not in SDK)
     "kestrel-sovereign>=0.1.8",
 ]
 
 [project.optional-dependencies]
+# Cross-feature deps (TYPE_CHECKING only, not needed at runtime)
+github = ["kestrel-feature-github"]
+wallet = ["kestrel-feature-wallet"]
 test = [
     "pytest>=8.0.0",
     "pytest-asyncio>=1.1.0",

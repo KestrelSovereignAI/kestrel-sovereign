@@ -9,7 +9,7 @@ import uuid
 from datetime import datetime
 from typing import Optional
 
-from kestrel_sovereign.kestrel_config.constants import APPROVAL_TIMEOUT_DEFAULT
+from kestrel_sdk.config.constants import APPROVAL_TIMEOUT_DEFAULT
 
 from .models import ImprovementProposal, BehaviorRule, ChangeType
 from .prompts import format_approval_prompt

@@ -11,7 +11,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from kestrel_sovereign.kestrel_config.constants import (
+from kestrel_sdk.config.constants import (
     HTTP_TIMEOUT_DEFAULT,
     HTTP_TIMEOUT_MEDIUM,
     HTTP_TIMEOUT_DOWNLOAD,
