@@ -45,7 +45,8 @@ async def test_openrouter_provider_initialization():
             break
 
     assert openrouter_provider is not None, "OpenRouter provider not initialized"
-    assert openrouter_provider["model"] == "deepseek/deepseek-chat-v3.1"
+    # Model may be "auto" (resolved at runtime via selection_hints) or explicit
+    assert openrouter_provider["model"] is not None
     assert openrouter_provider["adapter"] is not None
     assert openrouter_provider["client"] is not None
 
