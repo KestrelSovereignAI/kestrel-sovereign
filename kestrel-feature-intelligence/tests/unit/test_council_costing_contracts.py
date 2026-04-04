@@ -8,7 +8,7 @@ from scripts import (
     convene_sqlite_decision,
 )
 
-from kestrel_sovereign.features.council.costing import calculate_estimated_cost
+from kestrel_feature_intelligence.council.costing import calculate_estimated_cost
 
 
 def test_calculate_estimated_cost_uses_provider_level_defaults():

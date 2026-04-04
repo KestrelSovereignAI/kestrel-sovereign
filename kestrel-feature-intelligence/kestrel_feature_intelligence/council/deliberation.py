@@ -19,7 +19,7 @@ import re
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
-from kestrel_sovereign.kestrel_config.defaults import (
+from kestrel_sdk.config.defaults import (
     get_ollama_url,
     get_xai_api_url,
     get_groq_api_url,

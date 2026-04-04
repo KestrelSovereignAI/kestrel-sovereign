@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from kestrel_sovereign.storage.providers.base import StorageProvider
+    from kestrel_sdk.storage.providers.base import StorageProvider
     from kestrel_sovereign.features.security.feature import SecurityFeature
     from .models import Insight, SelfModel
 
@@ -200,7 +200,7 @@ class SelfModelManager:
             raise
 
     async def get_self_model(self) -> Optional["SelfModel"]:
-        """Get the cached self-model or load from kestrel_sovereign.storage.
+        """Get the cached self-model or load from storage.
 
         Returns:
             The current SelfModel or None if not available

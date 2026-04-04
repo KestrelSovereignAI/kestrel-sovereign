@@ -11,8 +11,8 @@ import os
 import time
 from typing import Any, Dict, List, Optional
 
-from kestrel_sovereign.features.deploy.models import DeployManagerError, DeploymentProfile
-from kestrel_sovereign.features.deploy.providers.base import DeployProvider
+from kestrel_sdk.deploy.models import DeployManagerError, DeploymentProfile
+from kestrel_sdk.deploy.base import DeployProvider
 
 logger = logging.getLogger(__name__)
 

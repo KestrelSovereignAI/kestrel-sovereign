@@ -23,7 +23,7 @@ from enum import Enum
 from pathlib import Path
 from typing import List, Optional, Dict, Any
 
-from kestrel_sovereign.kestrel_config.constants import (
+from kestrel_sdk.config.constants import (
     SSH_COMMAND_TIMEOUT_SHORT,
     SSH_COMMAND_TIMEOUT_DEFAULT,
 )
