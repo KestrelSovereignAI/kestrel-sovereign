@@ -30,7 +30,11 @@ TEST_IMAGE = "kestrel-mcp-test-server"
 
 @pytest.fixture
 def check_docker():
-    """Skip test if Docker is not available."""
+    """Skip test if Docker or MCP feature is not available."""
+    try:
+        from kestrel_sovereign.features.mcp.feature import MCPAgent  # noqa: F401
+    except (ImportError, ModuleNotFoundError):
+        pytest.skip("kestrel-feature-mcp not installed")
     try:
         import docker
         from docker.credentials.errors import StoreError
