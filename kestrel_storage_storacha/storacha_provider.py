@@ -36,7 +36,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from kestrel_sovereign.storage.providers.base import (
+from kestrel_sdk.storage.providers.base import (
     CryostasisCapable,
     StorageProvider,
     StorageResult,
@@ -44,7 +44,7 @@ from kestrel_sovereign.storage.providers.base import (
 )
 from kestrel_storage_storacha.storacha_ucan import StorachaUCAN
 from kestrel_storage_storacha.storacha_rest import StorachaRestClient
-from kestrel_sovereign.kestrel_config.defaults import get_storacha_gateway_url
+from kestrel_sdk.config.defaults import get_storacha_gateway_url
 
 logger = logging.getLogger(__name__)
 
@@ -415,7 +415,7 @@ class StorachaProvider(StorageProvider, CryostasisCapable):
 
     def _get_master_key(self) -> bytes:
         """Get master encryption key from centralised encryption module."""
-        from kestrel_sovereign.security.encryption import get_master_key_bytes
+        from kestrel_sdk.security.encryption import get_master_key_bytes
 
         key = get_master_key_bytes()
         if key:

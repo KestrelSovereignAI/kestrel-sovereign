@@ -12,7 +12,7 @@ import shlex
 import tempfile
 from typing import Any, Dict, Optional
 
-from kestrel_sovereign.kestrel_config.constants import (
+from kestrel_sdk.config.constants import (
     SSH_COMMAND_TIMEOUT_DEFAULT,
     SSH_COMMAND_TIMEOUT_MEDIUM,
     SSH_COMMAND_TIMEOUT_SETUP,
@@ -123,7 +123,7 @@ class GCPSSHTrainingMixin:
         Returns:
             Job ID (companion_id)
         """
-        from kestrel_sovereign.kestrel_config.constants import DEFAULT_TRAINING_BATCH_SIZE
+        from kestrel_sdk.config.constants import DEFAULT_TRAINING_BATCH_SIZE
 
         job_id = companion_id
         mount_path = self.disk_config.get("mount_path", "/workspace")

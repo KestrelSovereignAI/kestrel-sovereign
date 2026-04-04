@@ -9,9 +9,9 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
-from kestrel_sovereign.features.base import Feature, tool
+from kestrel_sdk.features.base import Feature, tool
 from kestrel_sovereign.llm.service import BackendType
-from kestrel_sovereign.tools.base import ToolCategory
+from kestrel_sdk.tools.base import ToolCategory
 
 from .manager import GCPComputeEngineManager as GCPComputeManager
 from .models import (

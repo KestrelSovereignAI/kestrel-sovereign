@@ -6,7 +6,7 @@ before Kestrel takes major irreversible actions. This mirrors human governance
 structures (Supreme Court, corporate boards, DAO voting) but with AI participants.
 
 Usage:
-    from kestrel_sovereign.features.council import CouncilFeature, convene_council
+    from kestrel_feature_intelligence.council import CouncilFeature, convene_council
 
     # Load council configuration
     council = CouncilFeature()

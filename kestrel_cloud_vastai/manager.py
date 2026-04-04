@@ -17,7 +17,7 @@ Usage:
 
 from typing import Any, Dict, Optional
 
-from kestrel_sovereign.kestrel_config.constants import VASTAI_POLL_INTERVAL_SECONDS
+from kestrel_sdk.config.constants import VASTAI_POLL_INTERVAL_SECONDS
 
 from .core import VastAIManagerCore
 from .http_api import VastAIHTTPAPIMixin

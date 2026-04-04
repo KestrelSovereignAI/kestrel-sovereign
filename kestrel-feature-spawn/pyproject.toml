@@ -7,9 +7,13 @@ name = "kestrel-feature-spawn"
 version = "0.1.0"
 description = "Kestrel feature: multi-agent spawning, delegation, and external bridge gateway"
 requires-python = ">=3.11"
-dependencies = ["kestrel-sovereign"]
+dependencies = ["kestrel-sovereign-sdk",
+    # Cross-feature: rookery, constitution, inception_service, rate_limit (not in SDK)
+    "kestrel-sovereign"]
 
 [project.optional-dependencies]
+# Cross-feature deps (optional, try/except guarded)
+wallet = ["kestrel-feature-wallet"]
 test = ["pytest", "pytest-asyncio"]
 
 [project.entry-points."kestrel_sovereign.features"]

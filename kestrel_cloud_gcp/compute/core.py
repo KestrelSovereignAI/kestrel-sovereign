@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from kestrel_sovereign.config import load_config
-from kestrel_sovereign.kestrel_config.constants import (
+from kestrel_sdk.config.constants import (
     HTTP_TIMEOUT_SHORT,
     GCP_OPERATION_POLL_INTERVAL,
 )

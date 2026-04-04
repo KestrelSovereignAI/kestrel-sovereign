@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Kestrel feature: GitHub integration for issues, PRs, and repository management"
 requires-python = ">=3.11"
 dependencies = [
-    "kestrel-sovereign",
+    "kestrel-sovereign-sdk",
     "httpx",
     "pyyaml",
     "aiosqlite",

@@ -18,6 +18,7 @@ from kestrel_sovereign.features import (
     get_feature_by_name,
 )
 from kestrel_sovereign.features.base import Feature
+from kestrel_sdk.features.base import Feature as _SDKFeature
 
 
 def _mock_agent():
@@ -66,7 +67,7 @@ def test_discover_features_matches_unique_class_inventory():
 
     assert discovered_names == expected_names
     assert len(features) == len(expected_names)
-    assert all(isinstance(feature, Feature) for feature in features)
+    assert all(isinstance(feature, (Feature, _SDKFeature)) for feature in features)
 
 
 def test_disabled_feature_env_filters_exact_class_names():
@@ -271,4 +272,4 @@ def test_all_features_are_feature_instances_in_combined_mode():
     ):
         features = discover_features(_mock_agent())
 
-    assert all(isinstance(f, Feature) for f in features)
+    assert all(isinstance(f, (Feature, _SDKFeature)) for f in features)
