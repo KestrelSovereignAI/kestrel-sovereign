@@ -30,9 +30,9 @@ from typing import Dict, Any, Optional
 
 import httpx
 
-from kestrel_sovereign.features.base import Feature, tool
-from kestrel_sovereign.tools.base import ToolCategory
-from kestrel_sovereign.kestrel_config.constants import (
+from kestrel_sdk.features.base import Feature, tool
+from kestrel_sdk.tools.base import ToolCategory
+from kestrel_sdk.config.constants import (
     HTTP_TIMEOUT_DEFAULT,
     TRAINING_TIMEOUT_EXTENDED,
     TRAINING_POLL_INTERVAL,

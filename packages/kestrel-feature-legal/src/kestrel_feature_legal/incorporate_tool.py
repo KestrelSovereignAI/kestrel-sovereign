@@ -14,7 +14,7 @@ Usage:
 import logging
 from typing import Any, Dict, Optional
 
-from kestrel_sovereign.tools.base import AgentTool, ToolSchema, ToolParameter, ToolCategory
+from kestrel_sdk.tools.base import AgentTool, ToolSchema, ToolParameter, ToolCategory
 from kestrel_feature_legal.models import (
     IncorporationPackage,
     ManagementType,

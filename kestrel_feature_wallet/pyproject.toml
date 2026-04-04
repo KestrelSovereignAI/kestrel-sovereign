@@ -4,10 +4,9 @@ version = "0.1.0"
 description = "Multi-currency agent wallet with Stripe on-ramp for Kestrel Sovereign"
 requires-python = ">=3.11,<3.14"
 dependencies = [
-    # Framework dependency (provides Feature, Hook, ToolCategory, etc.)
-    # When installed standalone, this pulls in kestrel-sovereign.
-    # When co-located in the monorepo, kestrel-sovereign is already available.
-    "kestrel_sovereign",
+    "kestrel-sovereign-sdk",
+    # Cross-feature: security.key_storage (not in SDK)
+    "kestrel-sovereign",
     # Async SQLite for wallet persistence
     "aiosqlite>=0.21.0",
     # HTTP client for Filecoin RPC

@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Azure Container Apps cloud provider for Kestrel Sovereign"
 requires-python = ">=3.11,<3.14"
 dependencies = [
-    "kestrel_sovereign",
+    "kestrel-sovereign-sdk",
     "azure-mgmt-appcontainers>=3.0.0",
     "azure-identity>=1.15.0",
 ]

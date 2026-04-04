@@ -11,7 +11,7 @@ from typing import AsyncIterator
 
 import openai
 
-from kestrel_sovereign.voice.base import TTSProvider, VoiceInfo
+from kestrel_sdk.voice.base import TTSProvider, VoiceInfo
 
 logger = logging.getLogger(__name__)
 

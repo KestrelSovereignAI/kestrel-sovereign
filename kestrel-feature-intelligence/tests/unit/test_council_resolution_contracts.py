@@ -5,9 +5,9 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from kestrel_sovereign.features.council.deliberation import _initialize_adapters
-from kestrel_sovereign.features.council.feature import CONFIG_PATH
-from kestrel_sovereign.features.council.models import CouncilMember
+from kestrel_feature_intelligence.council.deliberation import _initialize_adapters
+from kestrel_feature_intelligence.council.feature import CONFIG_PATH
+from kestrel_feature_intelligence.council.models import CouncilMember
 
 
 def test_council_feature_uses_repo_root_config_path():
@@ -24,11 +24,11 @@ async def test_initialize_adapters_resolves_auto_models_before_adapter_init():
     )
 
     with patch(
-        "kestrel_sovereign.features.council.deliberation.resolve_provider_default",
+        "kestrel_feature_intelligence.council.deliberation.resolve_provider_default",
         return_value="claude-opus-4-5-20251101",
     ) as mock_resolve:
         with patch(
-            "kestrel_sovereign.features.council.deliberation._get_adapter_for_provider",
+            "kestrel_feature_intelligence.council.deliberation._get_adapter_for_provider",
             new=AsyncMock(return_value=("client", "adapter")),
         ) as mock_get_adapter:
             adapters = await _initialize_adapters([member])

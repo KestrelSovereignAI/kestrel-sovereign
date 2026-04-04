@@ -7,7 +7,7 @@ Manages the creation of GitHub issues from actionable insights.
 import logging
 from typing import Dict, Any, Optional
 
-from kestrel_sovereign.kestrel_config.constants import APPROVAL_TIMEOUT_DEFAULT
+from kestrel_sdk.config.constants import APPROVAL_TIMEOUT_DEFAULT
 
 from .models import Insight
 from .db_helpers import ReflectionDatabaseHelper

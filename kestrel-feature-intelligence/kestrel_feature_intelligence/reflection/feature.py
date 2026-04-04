@@ -17,9 +17,9 @@ import uuid
 from datetime import datetime
 from typing import Dict, Any, Optional, List
 
-from kestrel_sovereign.features.base import Feature, tool
-from kestrel_sovereign.tools.base import ToolCategory
-from kestrel_sovereign.kestrel_config.constants import (
+from kestrel_sdk.features.base import Feature, tool
+from kestrel_sdk.tools.base import ToolCategory
+from kestrel_sdk.config.constants import (
     APPROVAL_TIMEOUT_DEFAULT,
     APPROVAL_TIMEOUT_SHORT,
 )
@@ -96,7 +96,7 @@ class ReflectionFeature(Feature):
 
     async def post_all_features_loaded(self, agent):
         """Wire reflection into the sleep cycle after all features are loaded."""
-        from kestrel_sovereign.features.reflection.hooks import create_reflection_hook
+        from kestrel_feature_intelligence.reflection.hooks import create_reflection_hook
         agent.reflection_hook = create_reflection_hook(agent)
         if agent.reflection_hook:
             logger.info("Reflection hook enabled for sleep cycle")

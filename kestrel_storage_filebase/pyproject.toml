@@ -4,9 +4,9 @@ version = "0.1.0"
 description = "Filebase S3-compatible IPFS storage provider for Kestrel Sovereign"
 requires-python = ">=3.11,<3.14"
 dependencies = [
-    "kestrel_sovereign",
+    "kestrel-sovereign-sdk[crypto]",
     "boto3>=1.35.0",
-    "cryptography>=45.0.5",
+    
 ]
 
 [project.entry-points."kestrel_sovereign.storage_providers"]
