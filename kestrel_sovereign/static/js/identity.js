@@ -448,7 +448,7 @@ window.showPrivacySelector = function() {
                 <div style="flex: 1;">
                     <div style="font-weight: 500; font-size: 0.875rem; display: flex; align-items: center; gap: 0.5rem;">
                         ${config.label}
-                        ${state.privacyMode === mode ? '<span style="font-size: 0.75rem; color: var(--accent-color);">✓ Current</span>' : ''}
+                        ${state.privacyMode === mode ? `<span style="font-size: 0.75rem; color: var(--accent-color);">${kicon('checkmark')} Current</span>` : ''}
                     </div>
                     <div style="font-size: 0.75rem; color: var(--text-secondary);">${config.description}</div>
                 </div>

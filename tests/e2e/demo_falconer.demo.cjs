@@ -196,6 +196,16 @@ test.beforeAll(async ({ request }) => {
     }
 
     apiKey = getApiKey();
+    if (!apiKey) {
+        // Fetch bootstrap key from server (same as Sovereign Console)
+        try {
+            const keyResp = await request.get(`${BASE_URL}/api/auth/key`);
+            if (keyResp.ok()) {
+                const keyData = await keyResp.json();
+                apiKey = keyData.api_key || keyData.key || null;
+            }
+        } catch (e) { /* server may not expose key */ }
+    }
     if (apiKey) {
         narrator.narrate('Setup', 'API key acquired');
     }
@@ -334,50 +344,81 @@ test('Act 2: Meet the Sovereign Flock', async ({ page }) => {
 // ============================================================================
 
 test('Act 3: Morning Signal Briefing', async ({ page }) => {
-    narrator.narrate('Act 3: Morning Signal', 'Opening the Console for the Morning Signal briefing...');
+    narrator.narrate('Act 3: Morning Signal', 'Opening the Falconer Dashboard — the operational command center...');
 
-    await page.goto(BASE_URL);
+    // --- Part 1: Falconer Dashboard ---
+    // Pass API key via query param so the dashboard authenticates automatically
+    // Use the module-level apiKey (fetched in beforeAll), not getApiKey() which only reads env vars
+    const dashUrl = apiKey
+        ? `${BASE_URL}/static/falconer-dashboard.html?key=${encodeURIComponent(apiKey)}`
+        : `${BASE_URL}/static/falconer-dashboard.html`;
+    await page.goto(dashUrl);
     await page.waitForLoadState('domcontentloaded');
-    await demoPause(page, 2000);
+    await demoPause(page, 3000);
 
-    // Navigate to Chat
-    const chatTab = page.locator('nav a, nav button, [data-tab]').filter({ hasText: /chat/i }).first();
-    if (await chatTab.isVisible().catch(() => false)) {
-        await chatTab.click();
-        await demoPause(page, 1000);
+    // KPI grid — the top-level metrics a falconer checks every morning
+    const kpiGrid = page.locator('.kpi-grid, #kpiGrid');
+    if (await kpiGrid.isVisible().catch(() => false)) {
+        narrator.narrate('Act 3: Morning Signal',
+            'The Falconer Dashboard — KPIs at a glance: agents online, active tasks, mesh messages, context health.',
+            'This is the operational nerve center. Before the Morning Signal even runs, the falconer can see flock health in real time.');
+    } else {
+        narrator.narrate('Act 3: Morning Signal',
+            'The Falconer Dashboard — the operational view of the sovereign flock.');
+    }
+    await narrator.screenshot(page, 'morning-signal-dashboard');
+
+    // Flock status cards
+    const flockGrid = page.locator('.flock-grid, #flockGrid');
+    if (await flockGrid.isVisible().catch(() => false)) {
+        await flockGrid.scrollIntoViewIfNeeded();
+        await demoPause(page, 1500);
+        narrator.narrate('Act 3: Morning Signal',
+            'Flock status — each sovereign agent has its own card with health, context usage, and active jobs.',
+            'Claws (PM), Talon (Developer), Eye (QA), Flight (Business PO) — all sovereign, all monitored.');
+        await narrator.screenshot(page, 'morning-signal-flock');
     }
 
-    // Set provider
-    await selectProvider(page, narrator);
-
-    // Send morning signal command
-    narrator.narrate('Act 3: Morning Signal',
-        'Triggering the Morning Signal — Claws scans all GitHub repos, scores milestones, detects blockers...',
-        'This is what the falconer sees at 8:00 AM. Live data from GitHub across all repos in STRATEGY.yaml.');
-
-    const morningResponse = await demoSendMessage(page, '!morning', 180000);
-
-    if (morningResponse) {
-        const text = await morningResponse.textContent().catch(() => '');
-        const charCount = text.length;
-        const hasMilestones = /milestone|caprock|falconer|launch/i.test(text);
-        const hasRepoData = /repo|issues?|PR|pull request/i.test(text);
-        const hasBlockers = /blocker|risk|critical|overdue/i.test(text);
+    // Tasks & Jobs tab — shows scheduled Morning Signal
+    const tasksTab = page.locator('.tab').filter({ hasText: /task/i }).first();
+    if (await tasksTab.isVisible().catch(() => false)) {
+        await tasksTab.click();
+        await demoPause(page, 2000);
 
         narrator.narrate('Act 3: Morning Signal',
-            `Morning Signal generated (${charCount} chars) — milestones: ${hasMilestones}, repo data: ${hasRepoData}, blockers: ${hasBlockers}`,
-            'Live intelligence from GitHub: milestone progress, open issues, PR activity, blocker detection. All automated, zero human triage.');
-    } else {
-        narrator.narrate('Act 3: Morning Signal', 'Morning Signal in progress — agent is processing GitHub data...');
+            'Tasks & Scheduled Jobs — the Morning Signal runs automatically at 7:00 AM every day.',
+            'Claws scans all GitHub repos, scores milestones, detects blockers, and generates a prioritized briefing. No human triggers needed — the flock works autonomously.');
+        await narrator.screenshot(page, 'morning-signal-tasks');
     }
-    await narrator.screenshot(page, 'morning-signal-output');
 
-    // Scroll to see more of the briefing
-    await demoPause(page, 1500);
-    if (morningResponse) {
-        await morningResponse.scrollIntoViewIfNeeded();
+    // Governance tab — constitutional anchor
+    const govTab = page.locator('.tab').filter({ hasText: /governance/i }).first();
+    if (await govTab.isVisible().catch(() => false)) {
+        await govTab.click();
+        await demoPause(page, 2000);
+
+        narrator.narrate('Act 3: Morning Signal',
+            'Governance — every agent action, including the Morning Signal, is governed by the Kestrel Constitution.',
+            'SHA-256 hash verified on every interaction. DID identity, privacy modes, and tool permissions — all visible, all auditable.');
+        await narrator.screenshot(page, 'morning-signal-governance');
     }
-    await narrator.screenshot(page, 'morning-signal-detail');
+
+    // --- Part 2: Daily Loop on the Product Page ---
+    narrator.narrate('Act 3: Morning Signal', 'Now visualizing the daily workflow — where the Morning Signal fits...');
+    await page.goto(`${BASE_URL}/static/kestrel-falconer-v2.html`);
+    await page.waitForLoadState('networkidle');
+    await demoPause(page, 1500);
+
+    // Scroll to the Daily Loop section
+    const loopSection = page.locator('.loop-section');
+    if (await loopSection.isVisible().catch(() => false)) {
+        await loopSection.scrollIntoViewIfNeeded();
+        await demoPause(page, 2000);
+        narrator.narrate('Act 3: Morning Signal',
+            'A Day in the Falconer\'s Life — 7:00 AM: Claws generates Morning Signal → 8:00 AM: Falconer reviews → Talon executes all day → Eye validates → Flight reports.',
+            'The Morning Signal replaces standups, triage meetings, and status emails. One briefing, generated autonomously from live GitHub data across all repos.');
+        await narrator.screenshot(page, 'morning-signal-daily-loop');
+    }
 });
 
 // ============================================================================
