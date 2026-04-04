@@ -368,6 +368,22 @@ test.describe.serial('Kestrel Sovereign Technical Demo', () => {
             await demoScreenshot(narrator, page, OUTPUT_DIR, 'privacy-ephemeral-fallback');
         }
 
+        // Select a local model before sending in EPHEMERAL mode
+        try {
+            const modelSelect = page.locator('#model-selector');
+            const modelOptions = await modelSelect.locator('option').allTextContents();
+            const localModel = modelOptions.find(o =>
+                o.toLowerCase().includes('llama') ||
+                o.toLowerCase().includes('qwen') ||
+                o.toLowerCase().includes('ollama')
+            );
+            if (localModel) {
+                await modelSelect.selectOption({ label: localModel });
+                narrator.narrate(`Selected local model: ${localModel.trim()}`);
+                await demoPause(page, 500);
+            }
+        } catch { /* use whatever model is selected */ }
+
         // Send a simple message in EPHEMERAL mode — proves the agent responds but stores nothing.
         narrator.narrate('Sending a message in EPHEMERAL mode — this should leave zero traces...');
         const ephemeralResponse = await demoSendMessage(page,
@@ -572,6 +588,18 @@ test.describe.serial('Kestrel Sovereign Technical Demo', () => {
         narrator.narrate('The Security panel shows every permission decision in the audit log...');
         await navigateToPanel(page, 'security');
         await demoPause(page, 2000);
+
+        // Force audit log refresh via API, then reload the panel
+        try {
+            await page.evaluate(async () => {
+                // Trigger audit log refresh if the UI has a refresh function
+                if (typeof window.loadAuditLog === 'function') {
+                    await window.loadAuditLog();
+                }
+            });
+            await demoPause(page, 1000);
+        } catch { /* best effort */ }
+
         // Scroll to the audit log section so it's visible in the screenshot
         try {
             await page.locator('#security-audit-log').scrollIntoViewIfNeeded();
@@ -579,6 +607,7 @@ test.describe.serial('Kestrel Sovereign Technical Demo', () => {
         } catch {
             // Audit log section may not exist yet — screenshot will show permissions tree
         }
+        narrator.narrate('Every permission decision is logged: tool name, decision (allow/deny/ask), and timestamp', { callout: true });
         await demoScreenshot(narrator, page, OUTPUT_DIR, 'security-audit');
 
         // Beat 5: Restore permission via UI
