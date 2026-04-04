@@ -77,11 +77,12 @@ async def test_openrouter_model_override():
 
     service = LLMService()
 
-    # Use a different DeepSeek model
+    # Use a specific model via OpenRouter — prefix with provider name
+    # so routing sends it to the openrouter provider, not a nonexistent "deepseek" provider
     response = await service.get_response(
         system_prompt="You are a helpful assistant.",
         user_prompt="Say 'hello' and nothing else.",
-        model_override="deepseek/deepseek-chat-v3.1",
+        model_override="openrouter/deepseek/deepseek-chat-v3.1",
     )
 
     assert response is not None
