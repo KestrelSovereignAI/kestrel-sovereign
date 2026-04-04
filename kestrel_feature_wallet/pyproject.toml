@@ -4,9 +4,9 @@ version = "0.1.0"
 description = "Multi-currency agent wallet with Stripe on-ramp for Kestrel Sovereign"
 requires-python = ">=3.11,<3.14"
 dependencies = [
-    "kestrel-sovereign-sdk",
+    "kestrel-sovereign-sdk @ git+https://github.com/KestrelSovereignAI/kestrel-sovereign-sdk.git",
     # Cross-feature: security.key_storage (not in SDK)
-    "kestrel-sovereign",
+    "kestrel-sovereign @ git+https://github.com/KestrelSovereignAI/kestrel-sovereign.git",
     # Async SQLite for wallet persistence
     "aiosqlite>=0.21.0",
     # HTTP client for Filecoin RPC

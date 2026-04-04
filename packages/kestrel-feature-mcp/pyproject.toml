@@ -5,7 +5,7 @@ description = "Kestrel Feature: Model Context Protocol (MCP) server management a
 requires-python = ">=3.11,<3.14"
 license = "Apache-2.0"
 dependencies = [
-    "kestrel-sovereign-sdk",
+    "kestrel-sovereign-sdk @ git+https://github.com/KestrelSovereignAI/kestrel-sovereign-sdk.git",
     "docker>=7.1.0",
     "mcp>=1.26.0",
     "trio>=0.32.0",

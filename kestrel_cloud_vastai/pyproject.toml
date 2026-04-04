@@ -4,9 +4,9 @@ version = "0.1.0"
 description = "Vast.ai GPU marketplace cloud provider for Kestrel Sovereign"
 requires-python = ">=3.11,<3.14"
 dependencies = [
-    "kestrel-sovereign-sdk",
+    "kestrel-sovereign-sdk @ git+https://github.com/KestrelSovereignAI/kestrel-sovereign-sdk.git",
     # Cross-feature: llm.service, config (not in SDK)
-    "kestrel-sovereign",
+    "kestrel-sovereign @ git+https://github.com/KestrelSovereignAI/kestrel-sovereign.git",
     "vastai-sdk>=0.1.0",
 ]
 
