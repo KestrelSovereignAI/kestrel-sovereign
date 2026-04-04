@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "ElevenLabs TTS voice provider for Kestrel Sovereign"
 requires-python = ">=3.11,<3.14"
 dependencies = [
-    "kestrel_sovereign",
+    "kestrel-sovereign-sdk",
     "elevenlabs>=1.0.0",
 ]
 

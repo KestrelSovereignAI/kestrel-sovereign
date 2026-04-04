@@ -9,7 +9,7 @@ import logging
 import os
 from typing import AsyncIterator
 
-from kestrel_sovereign.voice.base import TTSProvider, VoiceInfo
+from kestrel_sdk.voice.base import TTSProvider, VoiceInfo
 
 logger = logging.getLogger(__name__)
 

@@ -17,7 +17,7 @@ import os
 from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from kestrel_sovereign.features.reflection import (
+from kestrel_feature_intelligence.reflection import (
     ReflectionFeature,
     InteractionAnalyzer,
     Insight,
@@ -33,7 +33,7 @@ from kestrel_sovereign.features.reflection import (
     TicketConfigError,
     SelfModelConfigError,
 )
-from kestrel_sovereign.features.reflection.hooks import ReflectionSleepHook, create_reflection_hook
+from kestrel_feature_intelligence.reflection.hooks import ReflectionSleepHook, create_reflection_hook
 
 
 class MockLLMService:
@@ -844,7 +844,7 @@ async def test_create_improvement_ticket_economic_gate():
     feature._economic_gate = EconomicGate(mock_wallet)
 
     # Create ticket handler with the mocked components
-    from kestrel_sovereign.features.reflection.ticket_handler import TicketHandler
+    from kestrel_feature_intelligence.reflection.ticket_handler import TicketHandler
     feature._ticket_handler = TicketHandler(
         mock_ticket_creator,
         feature._economic_gate,
@@ -876,7 +876,7 @@ async def test_update_self_model_economic_gate():
     feature._economic_gate = EconomicGate(mock_wallet)
 
     # Create self-model handler with the mocked components
-    from kestrel_sovereign.features.reflection.self_model_handler import SelfModelHandler
+    from kestrel_feature_intelligence.reflection.self_model_handler import SelfModelHandler
     feature._self_model_handler = SelfModelHandler(
         mock_manager,
         feature._economic_gate,

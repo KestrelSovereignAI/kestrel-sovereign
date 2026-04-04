@@ -9,7 +9,7 @@ import tomllib
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from kestrel_sovereign.features.base import Feature, tool, ToolCategory
+from kestrel_sdk.features.base import Feature, tool, ToolCategory
 from .models import (
     CouncilConfig,
     CouncilMember,

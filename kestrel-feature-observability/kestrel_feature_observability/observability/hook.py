@@ -9,7 +9,7 @@ anything. Exceptions are swallowed to avoid affecting agent operation.
 import logging
 from typing import Any, Dict
 
-from kestrel_sovereign.hooks.base import Hook, HookEvent, HookInput, HookOutput
+from kestrel_sdk.hooks.base import Hook, HookEvent, HookInput, HookOutput
 from kestrel_feature_observability.metrics import (
     PROMETHEUS_AVAILABLE,
     HOOK_EVENTS,

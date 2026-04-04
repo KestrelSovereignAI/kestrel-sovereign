@@ -37,7 +37,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from kestrel_sovereign.storage.providers.base import (
+from kestrel_sdk.storage.providers.base import (
     StorageProvider,
     StorageResult,
     StorageTier,
@@ -478,7 +478,7 @@ class FilebaseProvider(StorageProvider):
 
     def _get_master_key(self) -> bytes:
         """Get master encryption key from centralized encryption module."""
-        from kestrel_sovereign.security.encryption import get_master_key_bytes
+        from kestrel_sdk.security.encryption import get_master_key_bytes
 
         key = get_master_key_bytes()
         if key:

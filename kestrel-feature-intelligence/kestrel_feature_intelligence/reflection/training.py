@@ -9,7 +9,7 @@ import logging
 import uuid
 from typing import Dict, Any, List
 
-from kestrel_sovereign.kestrel_config.constants import APPROVAL_TIMEOUT_SHORT
+from kestrel_sdk.config.constants import APPROVAL_TIMEOUT_SHORT
 
 from .models import Insight, InsightType
 from .formatters import ReflectionResultFormatter

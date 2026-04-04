@@ -104,7 +104,7 @@ async def get_observability_summary(
 
     try:
         from datetime import timedelta
-        from kestrel_sovereign.kestrel_config.constants import DEFAULT_OBSERVABILITY_LIMIT
+        from kestrel_sdk.config.constants import DEFAULT_OBSERVABILITY_LIMIT
         since = datetime.now(timezone.utc) - timedelta(minutes=minutes)
 
         # Query recent events

@@ -11,7 +11,7 @@ import os
 import shlex
 from typing import Any, Dict, Optional
 
-from kestrel_sovereign.kestrel_config.constants import (
+from kestrel_sdk.config.constants import (
     SSH_COMMAND_TIMEOUT_SHORT,
     SSH_COMMAND_TIMEOUT_DEFAULT,
     SSH_COMMAND_TIMEOUT_MEDIUM,
@@ -116,7 +116,7 @@ class VastAISSHTrainingMixin:
         Returns:
             Job ID (companion_id used as job ID)
         """
-        from kestrel_sovereign.kestrel_config.constants import DEFAULT_TRAINING_BATCH_SIZE
+        from kestrel_sdk.config.constants import DEFAULT_TRAINING_BATCH_SIZE
 
         job_id = companion_id
 

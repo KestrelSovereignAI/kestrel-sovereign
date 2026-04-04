@@ -381,7 +381,7 @@ async def _gather_risks(target: str) -> List[str]:
 
 
 async def _gather_previous_decisions() -> List[str]:
-    """Gather previous council decisions from kestrel_sovereign.storage."""
+    """Gather previous council decisions from storage."""
     decisions = []
 
     # Check for council session files

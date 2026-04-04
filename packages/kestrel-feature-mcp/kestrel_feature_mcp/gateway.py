@@ -23,7 +23,7 @@ import subprocess
 import time
 from typing import List, Optional, Set
 
-from kestrel_sovereign.kestrel_config.constants import (
+from kestrel_sdk.config.constants import (
     SSH_COMMAND_TIMEOUT_SHORT,
     SSH_COMMAND_TIMEOUT_DEFAULT,
     HTTP_TIMEOUT_SHORT,
