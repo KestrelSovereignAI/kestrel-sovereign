@@ -8,9 +8,16 @@ from typing import Any, Callable, Dict, List, Optional, Type, Union, Protocol, r
 if TYPE_CHECKING:
     from kestrel_sovereign.hooks.base import Hook
 from abc import ABC, abstractmethod
-from kestrel_sovereign.tools.base import ToolSchema, ToolParameter, ToolCategory, AgentTool
-from kestrel_sovereign.a2a.agent_card import AgentCard, AgentSkill, AgentCapabilities
-from kestrel_sovereign.a2a.types import Task, TaskState, TaskStatus, Artifact, DataPart, Message, TextPart
+
+# Import from kestrel_sdk (canonical source)
+from kestrel_sdk.tools.base import ToolSchema, ToolParameter, ToolCategory, AgentTool
+from kestrel_sdk.a2a.agent_card import AgentCard, AgentSkill, AgentCapabilities
+from kestrel_sdk.a2a.types import Task, TaskState, TaskStatus, Artifact, DataPart, Message, TextPart
+from kestrel_sdk.features.base import (
+    parse_docstring_params,
+    TaskHandler,
+    tool,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -36,73 +43,6 @@ def _serialize_tool_result(result: Any) -> Any:
         return result.value
     return str(result)
 
-
-@runtime_checkable
-class TaskHandler(Protocol):
-    """Protocol for A2A task handling. Features implement this."""
-    async def handle_task(self, task: Task) -> Task:
-        """Handle an A2A task and return the updated task."""
-        ...
-
-
-def parse_docstring_params(docstring: Optional[str]) -> Dict[str, str]:
-    """
-    Parse parameter descriptions from a docstring.
-    
-    Supports common docstring formats:
-    - Google style: `param_name: Description here`
-    - Sphinx style: `:param param_name: Description here`
-    - NumPy style: `param_name : type\n    Description here`
-    
-    Args:
-        docstring: The docstring to parse
-        
-    Returns:
-        Dict mapping parameter names to their descriptions
-    """
-    if not docstring:
-        return {}
-    
-    param_descriptions = {}
-    
-    # Patterns for different docstring styles
-    patterns = [
-        # Google style: "    param_name: Description"
-        r'^\s*(\w+)\s*:\s*(.+?)(?=\n\s*\w+\s*:|$)',
-        # Sphinx style: ":param param_name: Description"
-        r':param\s+(\w+)\s*:\s*(.+?)(?=\n\s*:|$)',
-        # NumPy style: "param_name : type" followed by indented description
-        r'^\s*(\w+)\s*:\s*\w+.*?\n\s+(.+?)(?=\n\s*\w+\s*:|$)',
-    ]
-    
-    # Try Google/reStructuredText Args section first
-    args_section_match = re.search(
-        r'(?:Args|Arguments|Parameters):\s*\n((?:\s+.+\n?)+)',
-        docstring,
-        re.IGNORECASE | re.MULTILINE
-    )
-    
-    if args_section_match:
-        args_section = args_section_match.group(1)
-        # Parse individual parameters from Args section
-        # Match: "    param_name: description" or "    param_name (type): description"
-        param_pattern = r'^\s+(\w+)\s*(?:\([^)]+\))?\s*:\s*(.+?)(?=\n\s+\w+|\Z)'
-        for match in re.finditer(param_pattern, args_section, re.MULTILINE | re.DOTALL):
-            param_name = match.group(1).strip()
-            description = match.group(2).strip()
-            # Clean up multi-line descriptions
-            description = re.sub(r'\s+', ' ', description)
-            param_descriptions[param_name] = description
-    
-    # Try Sphinx style :param: tags
-    if not param_descriptions:
-        for match in re.finditer(r':param\s+(\w+)\s*:\s*(.+?)(?=\n\s*:|$)', docstring, re.DOTALL):
-            param_name = match.group(1).strip()
-            description = match.group(2).strip()
-            description = re.sub(r'\s+', ' ', description)
-            param_descriptions[param_name] = description
-    
-    return param_descriptions
 
 class Feature(ABC):
     """
@@ -820,101 +760,6 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
                 tools.append(DynamicTool(method, schema_data, agent_skill))
         return tools
 
-def tool(name: str, description: str, category: ToolCategory = ToolCategory.SYSTEM, command_prefix: str = None):
-    """
-    Decorator to mark a method as an agent tool.
-    The method's signature is inspected to generate parameters.
-    Parameter descriptions are extracted from the function's docstring.
-    
-    Supports docstring formats:
-    - Google style: `param_name: Description here`
-    - Sphinx style: `:param param_name: Description here`
-    
-    Example:
-        @tool("my_tool", "Does something useful")
-        async def my_tool(self, file_path: str, count: int = 10):
-            '''
-            Do something with a file.
-            
-            Args:
-                file_path: The path to the file to process
-                count: Number of items to process (default: 10)
-            '''
-            pass
-    """
-    def decorator(func):
-        # Parse docstring for parameter descriptions
-        docstring = func.__doc__
-        param_descriptions = parse_docstring_params(docstring)
-        
-        # Inspect signature to build parameters
-        sig = inspect.signature(func)
-        parameters = []
-        
-        type_map = {
-            str: "string",
-            int: "integer",
-            bool: "boolean",
-            float: "number",
-            list: "array",
-            dict: "object"
-        }
-        
-        for param_name, param in sig.parameters.items():
-            if param_name == 'self':
-                continue
 
-            # Handle typing generics
-            from typing import get_origin, get_args
-            origin = get_origin(param.annotation)
-            items_schema = None
-            if origin is not None:
-                param_type = type_map.get(origin, "string")
-                # For List[X], derive items schema from the type argument
-                if param_type == "array":
-                    type_args = get_args(param.annotation)
-                    if type_args:
-                        inner = type_args[0]
-                        inner_type = type_map.get(inner, None)
-                        if inner_type:
-                            items_schema = {"type": inner_type}
-            else:
-                param_type = type_map.get(param.annotation, "string")
-            required = param.default == inspect.Parameter.empty
-
-            # Get description from parsed docstring, fallback to placeholder
-            param_desc = param_descriptions.get(
-                param_name,
-                f"The {param_name.replace('_', ' ')} parameter"
-            )
-
-            parameters.append(ToolParameter(
-                name=param_name,
-                type=param_type,
-                description=param_desc,
-                required=required,
-                default=None if required else param.default,
-                items=items_schema,
-            ))
-            
-        func._tool_schema = {
-            "name": name,
-            "description": description,
-            "category": category,
-            "parameters": parameters,
-            "command_prefix": command_prefix
-        }
-
-        # Also create AgentSkill metadata for A2A protocol — single source of truth
-        func._agent_skill = AgentSkill(
-            id=name,
-            name=name,
-            description=description,
-            tags=[category.value] if category else None,
-            inputModes=["application/json"],
-            outputModes=["application/json"],
-            category=category.value if category else None,
-        )
-
-        return func
-    return decorator
+# tool decorator and parse_docstring_params are imported from kestrel_sdk.features.base
+# at the top of this file for backward compatibility

@@ -1,0 +1,26 @@
+[project]
+name = "kestrel-sovereign-sdk"
+version = "0.1.0"
+description = "Kestrel Sovereign SDK — lightweight interfaces for feature packages"
+requires-python = ">=3.11,<3.14"
+license = "Apache-2.0"
+readme = "README.md"
+dependencies = [
+    "pydantic>=2.0",
+]
+
+[project.optional-dependencies]
+# For feature packages that need encryption helpers
+crypto = [
+    "cryptography>=42.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["kestrel_sdk"]
+
+[tool.hatch.build.targets.sdist]
+include = ["kestrel_sdk/**/*", "sdk/README.md"]
