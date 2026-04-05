@@ -970,9 +970,15 @@ Expected Duration: {expected_duration}
             # Re-raise to let caller handle (enters safe mode after multiple failures)
             raise
 
-        # Check if episode creation is needed (after 20+ messages or 30-min gap)
+        # Check if episode creation is needed using dual thresholds:
+        # - Every 15 user messages (interaction-based)
+        # - Or when a 30-min time gap is detected (temporal)
+        # Snapshot message IDs before episode creation to avoid races
         session_msg_count = len([m for m in history if m.get('role') == 'user'])
-        if session_msg_count > 0 and session_msg_count % 20 == 0:
+        episode_threshold = int(os.environ.get("KESTREL_EPISODE_THRESHOLD", "15"))
+        if session_msg_count > 0 and session_msg_count % episode_threshold == 0:
+            snapshot_ids = [m.get('id') for m in history if m.get('id')]
+            logging.debug(f"Episode threshold hit ({session_msg_count} msgs), snapshot {len(snapshot_ids)} IDs")
             await self.context_manager.create_episode_if_needed(session_msg_count)
 
         # Build full context with token budget management
@@ -1165,6 +1171,11 @@ Expected Duration: {expected_duration}
         # Store agent response (linked to session for resumed conversations)
         await self.privacy_agent.add_conversation("assistant", response_text, session_id=session_id)
 
+        # Post-response memory pipeline:
+        # Phase 1 (sync): Emotional tagging — CPU-bound, safe inline
+        # Phase 2 (async): Temporal analysis + associative linking — background
+        await self._post_response_pipeline(user_input, response_text, session_id)
+
         # Fire STOP hook (response cycle complete)
         if self.hooks_manager:
             hook_input = HookInput(
@@ -1180,6 +1191,100 @@ Expected Duration: {expected_duration}
             _otel_span.set_attribute("agent.response_length", len(response_text))
 
         return response_text
+
+    async def _post_response_pipeline(
+        self,
+        user_input: str,
+        response_text: str,
+        session_id: Optional[str] = None,
+    ) -> None:
+        """
+        Post-response memory tagging pipeline.
+
+        Runs after the assistant response is stored. Split into two phases:
+
+        Phase 1 (sync, inline): EmotionalTagger enriches both the user and
+        assistant messages with sentiment/importance metadata. This is pure
+        CPU-bound regex work -- no DB writes beyond a single metadata UPDATE
+        per message -- so it is safe to run in the request path.
+
+        Phase 2 (async, background): TemporalAnalyzer pattern detection and
+        AssociativeLinker concept graph updates. These involve DB/graph writes
+        and are fired as a background task so they never block the response.
+        """
+        if not hasattr(self, 'memory_system') or not self.memory_system:
+            return
+
+        # ── Phase 1: Inline emotional tagging (CPU-bound, safe) ─────────
+        # Look up the two most recent messages (user + assistant just stored)
+        try:
+            conv_store = getattr(self._raw_storage, 'conversation', None)
+            if not conv_store:
+                return
+
+            recent = await conv_store.get_full_history_with_ids()
+            if len(recent) < 2:
+                return
+
+            # The last two should be our user + assistant pair
+            last_two = recent[-2:]
+            user_msg = None
+            assistant_msg = None
+            for msg in last_two:
+                if msg.get('role') == 'user':
+                    user_msg = msg
+                elif msg.get('role') == 'assistant':
+                    assistant_msg = msg
+
+            if user_msg and assistant_msg:
+                await self.context_manager.memory_manager.tag_exchange(
+                    user_content=user_input,
+                    assistant_content=response_text,
+                    user_message_id=user_msg.get('id'),
+                    assistant_message_id=assistant_msg.get('id'),
+                    memory_system=self.memory_system,
+                )
+        except Exception as e:
+            logging.error(f"Post-response Phase 1 (emotional tagging) failed: {e}", exc_info=True)
+
+        # ── Phase 2: Background temporal + associative processing ───────
+        # Snapshot IDs before spawning background work to avoid races
+        snapshot_user_msg_id = str(user_msg.get('id', '')) if user_msg else ""
+
+        async def _background_memory_processing():
+            try:
+                # Temporal pattern detection on recent history window
+                if self.memory_system.analyzer:
+                    try:
+                        recent_msgs = await conv_store.get_full_history_with_ids()
+                        # Use last 50 messages as the detection window
+                        window = recent_msgs[-50:] if len(recent_msgs) > 50 else recent_msgs
+                        patterns = await self.memory_system.analyzer.detect_patterns(
+                            messages=window,
+                            agent_id=self.agent_id,
+                        )
+                        if patterns:
+                            await self.memory_system.analyzer.save_patterns(patterns)
+                            logging.debug(f"Post-response: saved {len(patterns)} temporal patterns")
+                    except Exception as e:
+                        logging.error(f"Post-response temporal analysis failed: {e}", exc_info=True)
+
+                # Associative linking (concept graph writes)
+                if self.memory_system.linker:
+                    try:
+                        await self.memory_system.linker.extract_and_link(
+                            message_id=snapshot_user_msg_id,
+                            content=user_input,
+                            agent_id=self.agent_id,
+                        )
+                    except Exception as e:
+                        logging.error(f"Post-response associative linking failed: {e}", exc_info=True)
+
+            except Exception as e:
+                logging.error(f"Post-response Phase 2 (background) failed: {e}", exc_info=True)
+
+        # Fire and forget -- do not await
+        asyncio.ensure_future(_background_memory_processing())
 
     # Tool registry methods provided by ToolRegistryMixin:
     # - _build_feature_tools, _build_all_tools, _register_explored_feature_tools
