@@ -1,3 +1,6 @@
+import pytest  # noqa: E402
+pytest.importorskip('kestrel_storage_lighthouse', reason='Extracted package not installed')
+
 """
 End-to-end integration tests for LighthouseRestClient.
 
