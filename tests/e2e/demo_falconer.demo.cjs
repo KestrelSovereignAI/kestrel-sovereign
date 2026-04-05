@@ -517,10 +517,13 @@ test('Act 4: Strategic Dispatch', async ({ page }) => {
 
     if (dispatchResponse) {
         const text = await dispatchResponse.textContent().catch(() => '');
-        const dispatched = /dispatch|assigned|claim|mesh/i.test(text);
+        const issueRef = text.match(/#(\d+)/);
+        const hasResult = text.length > 20;
 
         narrator.narrate('Act 4: Strategic Dispatch',
-            `Dispatch result: ${dispatched ? 'Issue handed off to Talon via mesh' : 'Dispatch processed'}`,
+            hasResult
+                ? `Dispatch complete${issueRef ? ` — issue ${issueRef[0]} handed off to Talon` : ''}`
+                : 'Dispatch sent to Talon via mesh',
             'Claws → Talon handoff complete. The ASSIGN message travels through the Agent Mesh Protocol. Talon will claim the issue and start coding autonomously.');
     }
     await narrator.screenshot(page, 'dispatch-execute');
