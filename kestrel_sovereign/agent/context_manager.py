@@ -481,9 +481,9 @@ class ContextManager:
         )
 
     # Delegate to ToolContextManager
-    async def get_status(self, history: Optional[list] = None) -> Dict[str, Any]:
+    async def get_status(self, history: Optional[list] = None, context_stats=None) -> Dict[str, Any]:
         """Delegate to ToolContextManager. Pass session-filtered history for accurate reporting."""
-        return await self.tool_context_manager.get_status(self.counter, history=history)
+        return await self.tool_context_manager.get_status(self.counter, history=history, context_stats=context_stats)
 
     def get_budget_status(self, message_count: int = 0) -> Dict[str, Any]:
         """Delegate to ToolContextManager."""
