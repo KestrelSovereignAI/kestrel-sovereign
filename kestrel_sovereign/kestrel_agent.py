@@ -1226,15 +1226,17 @@ Expected Duration: {expected_duration}
             if len(recent) < 2:
                 return
 
-            # The last two should be our user + assistant pair
-            last_two = recent[-2:]
+            # Find OUR user+assistant pair by content match (avoids race
+            # with concurrent requests that might insert between us)
             user_msg = None
             assistant_msg = None
-            for msg in last_two:
-                if msg.get('role') == 'user':
-                    user_msg = msg
-                elif msg.get('role') == 'assistant':
+            for msg in reversed(recent):
+                if not assistant_msg and msg.get('role') == 'assistant' and msg.get('content') == response_text:
                     assistant_msg = msg
+                elif not user_msg and msg.get('role') == 'user' and msg.get('content') == user_input:
+                    user_msg = msg
+                if user_msg and assistant_msg:
+                    break
 
             if user_msg and assistant_msg:
                 await self.context_manager.memory_manager.tag_exchange(
@@ -1283,8 +1285,11 @@ Expected Duration: {expected_duration}
             except Exception as e:
                 logging.error(f"Post-response Phase 2 (background) failed: {e}", exc_info=True)
 
-        # Fire and forget -- do not await
-        asyncio.ensure_future(_background_memory_processing())
+        # Background task — named for debug visibility
+        task = asyncio.create_task(
+            _background_memory_processing(),
+            name="post_response_memory_enrichment",
+        )
 
     # Tool registry methods provided by ToolRegistryMixin:
     # - _build_feature_tools, _build_all_tools, _register_explored_feature_tools
