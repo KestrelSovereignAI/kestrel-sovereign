@@ -14,8 +14,11 @@ replacing scattered context retrieval throughout the codebase.
 Refactored to serve as an orchestration layer that delegates to specialized managers.
 """
 
+import json
 import logging
+import os
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional, TYPE_CHECKING
 
 from .context_builder import ContextBuilder
@@ -240,6 +243,11 @@ class ContextManager:
             budget.use("system", guidance_tokens)
             system_prompt = f"{system_prompt}\n\n{guidance_text}"
             logger.info(f"Injected {len(reflection_guidance)} reflection guidance items into prompt")
+
+        # 1c. Microcompact: clear stale tool results (zero-cost, no LLM)
+        microcompact_savings = self._microcompact_tool_results(history)
+        if microcompact_savings > 0:
+            logger.info(f"Microcompact cleared {microcompact_savings} stale tool results")
 
         # 2. Add episodes for long conversations
         if message_count >= self.EPISODE_THRESHOLD_MESSAGES and self.consolidator:
@@ -485,3 +493,90 @@ class ContextManager:
     def _build_message_chunks(self, messages: List[Dict], chunk_size: int) -> List[str]:
         """Delegate to MemoryManager."""
         return self.memory_manager._build_message_chunks(messages, chunk_size)
+
+    # --- Microcompact: zero-cost tool result clearing ---
+
+    MICROCOMPACT_KEEP_RECENT = int(os.environ.get("KESTREL_MICROCOMPACT_KEEP_RECENT", "5"))
+
+    def _microcompact_tool_results(self, history: List[Dict]) -> int:
+        """
+        Clear stale tool result content from conversation history.
+
+        Replaces old tool result content with JSON markers while preserving
+        tool_call_id pairing (required by LLM APIs). The most recent N
+        tool results are kept intact.
+
+        This runs BEFORE format_conversation_history() normalizes roles,
+        so role="tool" is still identifiable.
+
+        Args:
+            history: Conversation history (mutated in place)
+
+        Returns:
+            Number of tool results cleared
+        """
+        keep_recent = self.MICROCOMPACT_KEEP_RECENT
+        if keep_recent < 1:
+            keep_recent = 1
+
+        # Collect indices of tool result messages (preserving order)
+        tool_indices = []
+        for i, msg in enumerate(history):
+            if msg.get("role") != "tool":
+                continue
+            # Skip protected or already excluded messages
+            meta = msg.get("metadata") or {}
+            if isinstance(meta, str):
+                try:
+                    meta = json.loads(meta)
+                except (json.JSONDecodeError, TypeError):
+                    meta = {}
+            if meta.get("context_priority") == "protected":
+                continue
+            if meta.get("excluded_from_context"):
+                continue
+            if meta.get("decay_protected"):
+                continue
+            tool_indices.append(i)
+
+        if len(tool_indices) <= keep_recent:
+            return 0
+
+        # Keep the last N, clear the rest
+        to_clear = tool_indices[:-keep_recent]
+        cleared = 0
+        now = datetime.now(timezone.utc).isoformat()
+
+        for idx in to_clear:
+            msg = history[idx]
+            content = msg.get("content", "")
+
+            # Already cleared?
+            if isinstance(content, str) and content.startswith('{"cleared":'):
+                continue
+
+            # Build informative marker
+            tool_name = ""
+            summary = ""
+            meta = msg.get("metadata") or {}
+            if isinstance(meta, str):
+                try:
+                    meta = json.loads(meta)
+                except (json.JSONDecodeError, TypeError):
+                    meta = {}
+            tool_name = meta.get("tool_name", "")
+
+            # Extract summary from content (first 100 chars of the result)
+            if isinstance(content, str):
+                summary = content[:100].replace('"', '\\"')
+
+            marker = json.dumps({
+                "cleared": True,
+                "tool_name": tool_name,
+                "summary": summary,
+                "cleared_at": now,
+            })
+            msg["content"] = marker
+            cleared += 1
+
+        return cleared
