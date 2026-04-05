@@ -1,13 +1,16 @@
 """
 Training Provider Module for Kestrel
 
-Provides the TrainingProvider protocol and shared data types for LoRA training.
-Adapter implementations (LocalMPS, RunPod, Vertex AI, GCP Compute, Replicate,
-Vast.ai) and TrainingProviderFactory are available in the kestrel-training
-private package.
+Provides a unified interface for LoRA training across multiple providers:
+- Vertex AI (Google serverless Custom Jobs)
+- GCP Compute Engine (Google VM instances)
+- RunPod (managed GPU pods)
+- Vast.ai (GPU marketplace)
+- Replicate (managed training API)
 
 Usage:
     from kestrel_sovereign.features.training import (
+        TrainingProviderFactory,
         TrainingProvider,
         TrainingJob,
         TrainingStatus,
@@ -15,17 +18,22 @@ Usage:
         TrainingState,
     )
 
-    # Implement the protocol for custom providers:
-    class MyProvider(TrainingProvider):
-        ...
+    # Get best available provider
+    provider = TrainingProviderFactory.get_default_provider()
 
-    # Factory and adapters are in the kestrel-training package:
-    # pip install kestrel-training
-    try:
-        from kestrel_training import TrainingProviderFactory
-        provider = TrainingProviderFactory.get_default_provider()
-    except ImportError:
-        provider = None  # No adapters installed
+    # Start training
+    job = await provider.start_training(
+        companion_id="abc123",
+        avatar_data=avatar_bytes,
+        config=TrainingConfig(steps=1000)
+    )
+
+    # Poll status
+    status = await provider.get_status(job.job_id)
+
+    # Download weights when complete
+    if status.state == TrainingState.COMPLETED:
+        weights = await provider.download_weights(job.job_id)
 """
 
 from .types import (
@@ -34,7 +42,6 @@ from .types import (
     TrainingConfig,
     TrainingJob,
     TrainingStatus,
-    ProviderCapabilities,
     # Generation types
     GenerationState,
     GenerationConfig,
@@ -51,13 +58,7 @@ from .protocol import (
     GenerationError,
 )
 
-# Factory is no longer in core — available from kestrel-training package
-try:
-    from kestrel_training import TrainingProviderFactory  # type: ignore[import-not-found]
-    TRAINING_FACTORY_AVAILABLE = True
-except ImportError:
-    TrainingProviderFactory = None  # type: ignore[assignment,misc]
-    TRAINING_FACTORY_AVAILABLE = False
+from .factory import TrainingProviderFactory
 
 __all__ = [
     # Training Types
@@ -66,7 +67,6 @@ __all__ = [
     "TrainingConfig",
     "TrainingJob",
     "TrainingStatus",
-    "ProviderCapabilities",
     # Generation Types
     "GenerationState",
     "GenerationConfig",
@@ -79,7 +79,6 @@ __all__ = [
     "TrainingStatusError",
     "DownloadError",
     "GenerationError",
-    # Factory (None if kestrel-training not installed)
+    # Factory
     "TrainingProviderFactory",
-    "TRAINING_FACTORY_AVAILABLE",
 ]
