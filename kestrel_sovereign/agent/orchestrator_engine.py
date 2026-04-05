@@ -147,7 +147,16 @@ class ContextStats:
     """
 
     def __init__(self):
+        self._last_session_id: Optional[str] = None
         self.reset()
+
+    def check_session(self, session_id: Optional[str]):
+        """Reset stats if session has changed."""
+        if session_id and session_id != self._last_session_id:
+            if self._last_session_id is not None:
+                logging.debug(f"[CONTEXT_STATS] Session changed, resetting stats")
+            self._last_session_id = session_id
+            self.reset()
 
     def reset(self):
         """Clear all accumulated stats. Call on session change or compression."""
