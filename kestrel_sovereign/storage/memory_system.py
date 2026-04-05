@@ -99,6 +99,41 @@ class MemorySystem:
         self._initialized = True
         logger.info(f"Memory system initialized for agent {self.agent_id}")
 
+    async def tag_message(
+        self,
+        message_id: int,
+        content: str,
+        role: str = "user",
+    ) -> Dict[str, Any]:
+        """
+        Tag a single stored message with emotional metadata (Phase 1 - inline).
+
+        This is CPU-bound keyword matching via EmotionalTagger, safe to call
+        synchronously in the request path. It writes the enriched metadata
+        directly to the message row so it is available for future retrieval.
+
+        Args:
+            message_id: Database row ID of the message to tag
+            content: Message text (already stored; passed to avoid re-read)
+            role: Message role ('user' or 'assistant')
+
+        Returns:
+            The enriched metadata dict that was written
+        """
+        enriched = await self.enrich_metadata(content, role)
+
+        # Write tags back to the stored message
+        conv_store = self.storage.conversation
+        if conv_store:
+            try:
+                await conv_store.update_message_metadata(message_id, enriched)
+            except Exception as e:
+                logger.error(
+                    f"Failed to tag message {message_id}: {e}", exc_info=True
+                )
+
+        return enriched
+
     async def enrich_metadata(
         self,
         content: str,

@@ -50,6 +50,55 @@ class MemoryManager:
         self.consolidator = consolidator
         self.memory_retriever = memory_retriever
 
+    # =========================================================================
+    # Post-Response Memory Tagging
+    # =========================================================================
+
+    async def tag_exchange(
+        self,
+        user_content: str,
+        assistant_content: str,
+        user_message_id: Optional[int] = None,
+        assistant_message_id: Optional[int] = None,
+        memory_system=None,
+    ) -> Dict[str, Any]:
+        """
+        Tag a user+assistant exchange with emotional metadata (Phase 1 sync).
+
+        Called inline after the LLM response is stored. EmotionalTagger is
+        CPU-bound (regex keyword matching) so this is safe to run in the
+        request path without blocking on I/O.
+
+        Args:
+            user_content: The user's message text
+            assistant_content: The assistant's response text
+            user_message_id: DB row ID of the user message (if available)
+            assistant_message_id: DB row ID of the assistant message (if available)
+            memory_system: MemorySystem instance for tag_message()
+
+        Returns:
+            Dict with tagging results for both messages
+        """
+        results: Dict[str, Any] = {"user": None, "assistant": None}
+
+        if not memory_system:
+            logger.debug("No memory_system provided, skipping tag_exchange")
+            return results
+
+        try:
+            if user_message_id is not None:
+                results["user"] = await memory_system.tag_message(
+                    user_message_id, user_content, role="user"
+                )
+            if assistant_message_id is not None:
+                results["assistant"] = await memory_system.tag_message(
+                    assistant_message_id, assistant_content, role="assistant"
+                )
+        except Exception as e:
+            logger.error(f"tag_exchange failed: {e}", exc_info=True)
+
+        return results
+
     async def retrieve_memories(
         self,
         query: str,
