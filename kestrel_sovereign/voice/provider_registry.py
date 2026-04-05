@@ -123,13 +123,13 @@ class VoiceProviderRegistry:
     # Mapping of provider names to their (package, module, class) for cloud
     # providers that have been extracted to kestrel_voice_* packages.
     _CLOUD_TTS_MAP: dict[str, tuple[str, str]] = {
-        "openai": ("kestrel_voice_openai.openai_tts", "OpenAITTSProvider"),
-        "elevenlabs": ("kestrel_voice_elevenlabs.elevenlabs_tts", "ElevenLabsTTSProvider"),
+        "openai": ("kestrel_sovereign.voice.openai_tts", "OpenAITTSProvider"),
+        "elevenlabs": ("kestrel_sovereign.voice.elevenlabs_tts", "ElevenLabsTTSProvider"),
     }
 
     _CLOUD_STT_MAP: dict[str, tuple[str, str]] = {
-        "openai": ("kestrel_voice_openai.openai_stt", "OpenAISTTProvider"),
-        "deepgram": ("kestrel_voice_deepgram.deepgram_stt", "DeepgramSTTProvider"),
+        "openai": ("kestrel_sovereign.voice.openai_stt", "OpenAISTTProvider"),
+        "deepgram": ("kestrel_sovereign.voice.deepgram_stt", "DeepgramSTTProvider"),
     }
 
     def _create_tts_provider(self, name: str) -> Optional[TTSProvider]:

@@ -13,7 +13,7 @@ import tempfile
 import os
 
 try:
-    from kestrel_feature_wallet.feature import Currency
+    from kestrel_sovereign.features.wallet.feature import Currency
     HAS_WALLET = True
 except ImportError:
     HAS_WALLET = False

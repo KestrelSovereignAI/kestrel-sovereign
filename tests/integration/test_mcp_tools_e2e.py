@@ -17,7 +17,7 @@ import shutil
 from pathlib import Path
 import logging
 
-from kestrel_feature_mcp.manager import MCPToolManager
+from kestrel_sovereign.features.mcp.manager import MCPToolManager
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)

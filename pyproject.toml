@@ -192,26 +192,13 @@ kestrel = "kestrel_sovereign.cli:main"
 [project.entry-points.pytest11]
 kestrel = "kestrel_sovereign.testing.fixtures"
 
+# Entry points for external feature packages (when properly extracted)
+# Features in sovereign are discovered locally via features/__init__.py
+# These groups are scanned for packages installed via pip
 [project.entry-points."kestrel_sovereign.features"]
-WalletFeature = "kestrel_feature_wallet.wallet_feature:WalletFeature"
-CodeEditFeature = "kestrel_feature_code.feature:CodeEditFeature"
-VastAIFeature = "kestrel_cloud_vastai.feature:VastAIFeature"
-GCPComputeFeature = "kestrel_cloud_gcp.compute.feature:GCPComputeFeature"
-
 [project.entry-points."kestrel_sovereign.cloud_providers"]
-CloudRunProvider = "kestrel_cloud_gcp.cloudrun:CloudRunProvider"
-AzureContainerProvider = "kestrel_cloud_azure.azure_container:AzureContainerProvider"
-
 [project.entry-points."kestrel_sovereign.voice_providers"]
-ElevenLabsTTS = "kestrel_voice_elevenlabs.elevenlabs_tts:ElevenLabsTTSProvider"
-DeepgramSTT = "kestrel_voice_deepgram.deepgram_stt:DeepgramSTTProvider"
-OpenAITTS = "kestrel_voice_openai.openai_tts:OpenAITTSProvider"
-OpenAISTT = "kestrel_voice_openai.openai_stt:OpenAISTTProvider"
-
 [project.entry-points."kestrel_sovereign.storage_providers"]
-LighthouseProvider = "kestrel_storage_lighthouse.lighthouse_provider:LighthouseProvider"
-StorachaProvider = "kestrel_storage_storacha.storacha_provider:StorachaProvider"
-FilebaseProvider = "kestrel_storage_filebase.filebase_provider:FilebaseProvider"
 
 [dependency-groups]
 dev = [

@@ -320,7 +320,7 @@ class KestrelAgent(
 
             if os.environ.get("STORACHA_SPACE_DID") and os.environ.get("STORACHA_AGENT_KEY"):
                 try:
-                    from kestrel_storage_storacha.storacha_provider import StorachaProvider
+                    from kestrel_sovereign.storage.providers.storacha_provider import StorachaProvider
                     self.storacha_provider = StorachaProvider()
                     if not self.storacha_provider.is_available():
                         self.storacha_provider = None
@@ -329,7 +329,7 @@ class KestrelAgent(
 
             if os.environ.get("LIGHTHOUSE_API_KEY"):
                 try:
-                    from kestrel_storage_lighthouse.lighthouse_provider import LighthouseProvider
+                    from kestrel_sovereign.storage.providers.lighthouse_provider import LighthouseProvider
                     self.lighthouse_provider = LighthouseProvider()
                     if not self.lighthouse_provider.is_available():
                         self.lighthouse_provider = None
