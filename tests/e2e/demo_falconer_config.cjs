@@ -23,9 +23,9 @@ module.exports = defineConfig({
   use: {
     baseURL: process.env.KESTREL_URL || 'http://localhost:8888',
 
-    // Always capture video + trace for the demo
+    // Always capture video; trace only on failure (avoids Windows ENOENT race)
     video: 'on',
-    trace: 'on',
+    trace: 'retain-on-failure',
     screenshot: 'off', // Manual screenshots at specific moments
 
     // Slow motion so actions are visible in recording

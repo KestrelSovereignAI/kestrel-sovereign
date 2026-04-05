@@ -107,6 +107,15 @@ export function createApiClient({
                 log.warn('Kestrel UI: Multi-agent mode but no JWT token found');
             }
 
+            // Allow ?key= query param for convenience (matches dashboard behavior)
+            const params = new URLSearchParams(locationRef.search);
+            if (params.get('key')) {
+                state.apiKey = params.get('key');
+                sessionStore.setItem('kestrel_api_key', state.apiKey);
+                log.log('API key set from URL parameter');
+                return;
+            }
+
             state.apiKey = sessionStore.getItem('kestrel_api_key');
             if (state.apiKey) {
                 log.log('Using cached API key from sessionStorage');
