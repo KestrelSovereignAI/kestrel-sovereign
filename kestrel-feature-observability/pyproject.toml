@@ -1,33 +1,22 @@
 [project]
 name = "kestrel-feature-observability"
 version = "0.1.0"
-description = "Kestrel observability, wellness metrics, and monitoring feature package"
-requires-python = ">=3.11,<3.14"
+description = "Kestrel observability, wellness, metrics"
+requires-python = ">=3.11"
 dependencies = [
     "kestrel-sovereign-sdk @ git+https://github.com/KestrelSovereignAI/kestrel-sovereign-sdk.git",
-]
-
-[project.optional-dependencies]
-opentelemetry = [
-    "opentelemetry-api>=1.20.0",
-    "opentelemetry-sdk>=1.20.0",
-    "opentelemetry-instrumentation-fastapi>=0.41b0",
-    "opentelemetry-exporter-otlp-proto-grpc>=1.20.0",
-]
-prometheus = [
-    "prometheus-client>=0.21.0",
-]
-all = [
-    "kestrel-feature-observability[opentelemetry,prometheus]",
+    "kestrel-sovereign @ git+https://github.com/KestrelSovereignAI/kestrel-sovereign.git",
 ]
 
 [project.entry-points."kestrel_sovereign.features"]
-ObservabilityFeature = "kestrel_feature_observability.observability.feature:ObservabilityFeature"
-WellnessFeature = "kestrel_feature_observability.wellness.feature:WellnessFeature"
+ObservabilityFeature = "kestrel_feature_observability:ObservabilityFeature"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["kestrel_feature_observability"]

@@ -1,24 +1,22 @@
-[build-system]
-requires = ["setuptools>=64", "wheel"]
-build-backend = "setuptools.build_meta"
-
 [project]
 name = "kestrel-feature-spawn"
 version = "0.1.0"
-description = "Kestrel feature: multi-agent spawning, delegation, and external bridge gateway"
+description = "Kestrel spawn + bridge features"
 requires-python = ">=3.11"
-dependencies = ["kestrel-sovereign-sdk @ git+https://github.com/KestrelSovereignAI/kestrel-sovereign-sdk.git",
-    # Cross-feature: rookery, constitution, inception_service, rate_limit (not in SDK)
-    "kestrel-sovereign"]
-
-[project.optional-dependencies]
-# Cross-feature deps (optional, try/except guarded)
-wallet = ["kestrel-feature-wallet"]
-test = ["pytest", "pytest-asyncio"]
+dependencies = [
+    "kestrel-sovereign-sdk @ git+https://github.com/KestrelSovereignAI/kestrel-sovereign-sdk.git",
+    "kestrel-sovereign @ git+https://github.com/KestrelSovereignAI/kestrel-sovereign.git",
+]
 
 [project.entry-points."kestrel_sovereign.features"]
-SpawnFeature = "kestrel_feature_spawn.spawn.feature:SpawnFeature"
-BridgeFeature = "kestrel_feature_spawn.bridge.feature:BridgeFeature"
+SpawnFeature = "kestrel_feature_spawn:SpawnFeature"
 
-[tool.setuptools.packages.find]
-where = ["src"]
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["kestrel_feature_spawn"]
