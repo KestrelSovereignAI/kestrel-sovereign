@@ -21,8 +21,8 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 # Import the classes we're testing
-from kestrel_feature_wallet.wallet_feature import WalletFeature
-from kestrel_feature_wallet.feature import WalletAgent, Currency
+from kestrel_sovereign.features.wallet.wallet_feature import WalletFeature
+from kestrel_sovereign.features.wallet.feature import WalletAgent, Currency
 
 
 # =============================================================================
@@ -450,7 +450,7 @@ class TestFilecoinTestnetAdapter:
     @pytest.mark.asyncio
     async def test_adapter_initialization(self):
         """Adapter should initialize with default calibration network."""
-        from kestrel_feature_wallet.filecoin_testnet import FilecoinTestnetAdapter, FilecoinNetwork
+        from kestrel_sovereign.features.wallet.filecoin_testnet import FilecoinTestnetAdapter, FilecoinNetwork
 
         adapter = FilecoinTestnetAdapter()
         assert adapter.network == FilecoinNetwork.CALIBRATION
@@ -460,7 +460,7 @@ class TestFilecoinTestnetAdapter:
     @pytest.mark.asyncio
     async def test_mainnet_blocked_by_default(self):
         """Mainnet should be blocked unless explicitly enabled."""
-        from kestrel_feature_wallet.filecoin_testnet import FilecoinTestnetAdapter
+        from kestrel_sovereign.features.wallet.filecoin_testnet import FilecoinTestnetAdapter
 
         # Clear any existing env var
         os.environ.pop("FILECOIN_MAINNET_ENABLED", None)
@@ -478,7 +478,7 @@ class TestFilecoinTestnetAdapter:
     @pytest.mark.asyncio
     async def test_real_balance_check(self):
         """Test real balance check on Calibration testnet."""
-        from kestrel_feature_wallet.filecoin_testnet import FilecoinTestnetAdapter
+        from kestrel_sovereign.features.wallet.filecoin_testnet import FilecoinTestnetAdapter
 
         adapter = FilecoinTestnetAdapter()
 
@@ -501,7 +501,7 @@ class TestFilecoinTestnetAdapter:
     @pytest.mark.asyncio
     async def test_network_connectivity(self):
         """Test that we can connect to the testnet RPC."""
-        from kestrel_feature_wallet.filecoin_testnet import FilecoinTestnetAdapter
+        from kestrel_sovereign.features.wallet.filecoin_testnet import FilecoinTestnetAdapter
 
         adapter = FilecoinTestnetAdapter()
 

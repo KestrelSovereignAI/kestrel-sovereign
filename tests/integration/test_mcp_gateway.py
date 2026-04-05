@@ -19,15 +19,15 @@ import asyncio
 import logging
 from pathlib import Path
 
-from kestrel_feature_mcp.gateway import (
+from kestrel_sovereign.features.mcp.gateway import (
     DockerMCPGateway,
     DockerMCPGatewayError,
     DockerMCPNotInstalledError,
     list_available_servers,
     list_enabled_servers,
 )
-from kestrel_feature_mcp.manager import MCPGatewayManager
-from kestrel_feature_mcp.registry import (
+from kestrel_sovereign.features.mcp.manager import MCPGatewayManager
+from kestrel_sovereign.features.mcp.registry import (
     check_docker_mcp_available,
     list_docker_catalog_servers,
     search_docker_catalog,

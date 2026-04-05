@@ -9,7 +9,7 @@ from kestrel_sovereign.features.sovereignty import SovereigntyFeature
 from kestrel_sovereign.features.model import ModelAgent
 
 try:
-    from kestrel_feature_mcp import MCPAgent
+    from kestrel_sovereign.features.mcp import MCPAgent
     HAS_MCP = True
 except ImportError:
     HAS_MCP = False
