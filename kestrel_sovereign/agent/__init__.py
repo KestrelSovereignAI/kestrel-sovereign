@@ -21,7 +21,7 @@ from .context_manager import ContextManager, ContextResult
 from .constitution import ConstitutionMixin
 from .streaming import StreamingMixin
 from .backup import BackupMixin
-from .orchestrator_engine import OrchestratorEngineMixin
+from .orchestrator_engine import OrchestratorEngineMixin, ContextStats
 from .tool_registry import ToolRegistryMixin
 from .model_preference import ModelPreferenceMixin
 from .event_manager import EventManagerMixin
@@ -37,6 +37,7 @@ __all__ = [
     'StreamingMixin',
     'BackupMixin',
     'OrchestratorEngineMixin',
+    'ContextStats',
     'ToolRegistryMixin',
     'ModelPreferenceMixin',
     'EventManagerMixin',
