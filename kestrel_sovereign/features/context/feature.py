@@ -74,7 +74,9 @@ class ContextFeature(Feature):
             return {"success": False, "error": "Context manager not available"}
 
         try:
-            status = await self.context_manager.get_status()
+            # Pass context_stats from the agent for duplicate/attribution analysis
+            context_stats = getattr(self.agent, 'context_stats', None)
+            status = await self.context_manager.get_status(context_stats=context_stats)
             return status
         except (AttributeError, TypeError, ValueError) as e:
             logger.error(f"context_status failed: {e}")
@@ -272,6 +274,11 @@ class ContextFeature(Feature):
                 preserve_recent=keep_recent,
                 force=force
             )
+
+            # Reset context stats after compression (accumulated data is stale)
+            context_stats = getattr(self.agent, 'context_stats', None)
+            if context_stats is not None:
+                context_stats.reset()
 
             return result
 
