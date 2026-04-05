@@ -571,7 +571,7 @@ function renderKPI(agents) {
   document.getElementById('kpiOnline').textContent = `${online}/${total}`;
   document.getElementById('kpiOnlineSub').textContent = online === total ? 'all agents operational' : `${total - online} agent(s) offline`;
 
-  const totalSkills = agents.reduce((s, a) => s + (a.skills?.length || 0), 0);
+  const totalSkills = agents.reduce((s, a) => s + (a.card?.skills?.length || a.skills?.length || 0), 0);
   document.getElementById('kpiSkills').textContent = totalSkills;
 
   let totalTasks = 0;
@@ -623,7 +623,7 @@ function renderFlock(agents) {
     const barColor = utilPct > 80 ? 'red' : utilPct > 50 ? 'yellow' : 'green';
     const taskCount = agent.tasks?.tasks?.length || 0;
     const completedTasks = (agent.tasks?.tasks || []).filter(t => t.status === 'completed').length;
-    const skillCount = agent.skills?.length || 0;
+    const skillCount = agent.card?.skills?.length || agent.skills?.length || 0;
     const featureCount = agent.info?.features?.length || 0;
     const hb = agent.heartbeat || {};
 
