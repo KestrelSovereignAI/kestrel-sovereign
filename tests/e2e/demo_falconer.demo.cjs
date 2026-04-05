@@ -33,6 +33,25 @@ const path = require('path');
 const BASE_URL = process.env.KESTREL_URL || 'http://localhost:8888';
 const OUTPUT_DIR = path.join(__dirname, 'demo-output-falconer');
 
+/** Build a console URL with ?key= param if API key is available. */
+function consoleUrl(pathSuffix = '') {
+    const base = `${BASE_URL}${pathSuffix}`;
+    return apiKey ? `${base}?key=${encodeURIComponent(apiKey)}` : base;
+}
+
+/**
+ * Inject API key into sessionStorage before any page JS runs.
+ * Works even if the deployed api_client.mjs doesn't support ?key= yet,
+ * since api_client.init() checks sessionStorage before /api/auth/key.
+ */
+async function injectApiKey(page) {
+    if (apiKey) {
+        await page.addInitScript((key) => {
+            sessionStorage.setItem('kestrel_api_key', key);
+        }, apiKey);
+    }
+}
+
 // ============================================================================
 // Narration Engine (shared pattern with demo_technical)
 // ============================================================================
@@ -187,10 +206,12 @@ test.beforeAll(async ({ request }) => {
     fs.mkdirSync(OUTPUT_DIR, { recursive: true });
 
     // Verify server is alive
+    let isRookery = false;
     try {
         const resp = await request.get(`${BASE_URL}/health`);
         const data = await resp.json();
-        narrator.narrate('Setup', `Server health: ${data.status}, agents: ${data.agents?.length || '?'}`);
+        isRookery = data.agents && typeof data.agents === 'object' && Object.keys(data.agents).length > 0;
+        narrator.narrate('Setup', `Server health: ${data.status}, agents: ${Object.keys(data.agents || {}).length || '?'}`);
     } catch (e) {
         narrator.narrate('Setup', `Server not reachable: ${e.message}`);
     }
@@ -208,6 +229,32 @@ test.beforeAll(async ({ request }) => {
     }
     if (apiKey) {
         narrator.narrate('Setup', 'API key acquired');
+    }
+
+    // Skip bootstrap/discovery on the primary agent so bang-commands work
+    // immediately.  After a cold start the agent enters discovery mode and
+    // intercepts all non-bootstrap commands, sending them to the LLM instead.
+    if (apiKey) {
+        const invokeUrl = isRookery
+            ? `${BASE_URL}/api/agents/Kestrel/agent/invoke`
+            : `${BASE_URL}/agent/invoke`;
+        try {
+            const statusResp = await request.post(invokeUrl, {
+                headers: { 'X-API-Key': apiKey, 'Content-Type': 'application/json' },
+                data: { input: '!bootstrap-status' },
+            });
+            const statusData = await statusResp.json();
+            if (statusData.response && statusData.response.includes('discovery')) {
+                await request.post(invokeUrl, {
+                    headers: { 'X-API-Key': apiKey, 'Content-Type': 'application/json' },
+                    data: { input: '!skip-discovery' },
+                });
+                narrator.narrate('Setup', 'Skipped agent discovery (cold-start bootstrap)');
+            }
+        } catch (e) {
+            // Non-fatal: commands may work fine if bootstrap already completed
+            narrator.narrate('Setup', `Bootstrap check skipped: ${e.message}`);
+        }
     }
 });
 
@@ -281,7 +328,8 @@ test('Act 1: The Falconer Vision', async ({ page }) => {
 test('Act 2: Meet the Sovereign Flock', async ({ page }) => {
     narrator.narrate('Act 2: The Sovereign Flock', 'Loading the Sovereign Console — the command center...');
 
-    await page.goto(BASE_URL);
+    await injectApiKey(page);
+    await page.goto(consoleUrl());
     await page.waitForLoadState('domcontentloaded');
     await demoPause(page, 3000);
 
@@ -428,7 +476,8 @@ test('Act 3: Morning Signal Briefing', async ({ page }) => {
 test('Act 4: Strategic Dispatch', async ({ page }) => {
     narrator.narrate('Act 4: Strategic Dispatch', 'Now the falconer dispatches — Claws picks the top priority and hands off to Talon...');
 
-    await page.goto(BASE_URL);
+    await injectApiKey(page);
+    await page.goto(consoleUrl());
     await page.waitForLoadState('domcontentloaded');
     await demoPause(page, 2000);
 
@@ -484,7 +533,8 @@ test('Act 4: Strategic Dispatch', async ({ page }) => {
 test('Act 5: Talon Autonomous Execution', async ({ page, request }) => {
     narrator.narrate('Act 5: Talon Execution', 'Checking Talon\'s workload — the autonomous developer agent...');
 
-    await page.goto(BASE_URL);
+    await injectApiKey(page);
+    await page.goto(consoleUrl());
     await page.waitForLoadState('domcontentloaded');
     await demoPause(page, 2000);
 
@@ -541,7 +591,8 @@ test('Act 5: Talon Autonomous Execution', async ({ page, request }) => {
 test('Act 6: Constitutional Governance', async ({ page }) => {
     narrator.narrate('Act 6: Constitutional Governance', 'The trust architecture — why enterprises can deploy this...');
 
-    await page.goto(BASE_URL);
+    await injectApiKey(page);
+    await page.goto(consoleUrl());
     await page.waitForLoadState('domcontentloaded');
     await demoPause(page, 2000);
 
