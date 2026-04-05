@@ -381,3 +381,37 @@ class TestDispatchToolCallRecording:
         assert "test_tool" in analysis["attribution_by_tool"]
         assert analysis["attribution_by_tool"]["test_tool"]["calls"] == 1
         assert analysis["attribution_by_tool"]["test_tool"]["result_chars"] > 0
+
+
+class TestContextStatsSessionReset:
+    """Test that context stats reset on session change."""
+
+    def test_check_session_resets_on_change(self):
+        stats = ContextStats()
+        # Set initial session
+        stats.check_session("session-1")
+
+        stats.record("Read", {"file_path": "/a.txt"}, 100)
+        stats.record("Read", {"file_path": "/b.txt"}, 200)
+        assert stats.get_analysis()["total_tool_calls"] == 2
+
+        # Same session — no reset
+        stats.check_session("session-1")
+        assert stats.get_analysis()["total_tool_calls"] == 2
+
+        # Change session — should reset
+        stats.check_session("session-2")
+        assert stats.get_analysis()["total_tool_calls"] == 0
+
+    def test_check_session_no_reset_same_session(self):
+        stats = ContextStats()
+        stats.check_session("session-1")
+        stats.record("Bash", {"command": "ls"}, 50)
+        stats.check_session("session-1")  # Same session
+        assert stats.get_analysis()["total_tool_calls"] == 1  # Not reset
+
+    def test_check_session_none_does_nothing(self):
+        stats = ContextStats()
+        stats.record("Read", {"file_path": "/a.txt"}, 100)
+        stats.check_session(None)
+        assert stats.get_analysis()["total_tool_calls"] == 1

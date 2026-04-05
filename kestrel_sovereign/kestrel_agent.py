@@ -885,6 +885,10 @@ Expected Duration: {expected_duration}
         """
         logging.info(f"[AGENTIC] process_input called ({len(user_input)} chars)")
 
+        # Reset context stats on session change
+        if hasattr(self, 'context_stats') and session_id:
+            self.context_stats.check_session(session_id)
+
         # CONSTITUTION AUDIT CHECK: Trigger periodic integrity audits
         await self._maybe_audit()
 
