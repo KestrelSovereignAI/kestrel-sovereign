@@ -1,3 +1,6 @@
+import pytest  # noqa: E402
+pytest.importorskip('kestrel_feature_wallet', reason='Extracted package not installed')
+
 """
 End-to-end tests for Filecoin Calibration testnet integration.
 
