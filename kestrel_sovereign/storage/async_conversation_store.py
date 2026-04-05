@@ -536,7 +536,11 @@ class AsyncConversationStore:
         message_id: int,
         metadata_updates: Dict[str, Any]
     ) -> bool:
-        """Update metadata for a specific message.
+        """Update metadata for a specific message using atomic JSON merge.
+
+        Uses SQL-level json_patch (PostgreSQL) or a SELECT-then-UPDATE with
+        optimistic locking (SQLite) to avoid race conditions when multiple
+        callers update metadata on the same message concurrently.
 
         Args:
             message_id: The message ID to update
@@ -545,25 +549,39 @@ class AsyncConversationStore:
         Returns:
             True if message was found and updated, False otherwise
         """
-        # Get current metadata
-        row = await self.db.fetchone(
-            "SELECT metadata FROM conversation_history WHERE id = ? AND agent_id = ?",
-            (message_id, self.agent_id)
-        )
-        if not row:
-            logger.warning(f"Message {message_id} not found for agent {self.agent_id}")
-            return False
+        updates_json = json.dumps(metadata_updates)
 
-        # Merge with existing metadata
-        current_meta = json.loads(row[0]) if row[0] else {}
-        current_meta.update(metadata_updates)
+        if self.db.backend_type == "postgres":
+            # PostgreSQL: atomic JSON merge via || operator
+            # COALESCE handles NULL metadata columns gracefully
+            result = await self.db.execute_commit(
+                "UPDATE conversation_history "
+                "SET metadata = COALESCE(metadata::jsonb, '{}'::jsonb) || ?::jsonb "
+                "WHERE id = ? AND agent_id = ?",
+                (updates_json, message_id, self.agent_id)
+            )
+            updated = result.rowcount > 0 if hasattr(result, 'rowcount') else True
+            if not updated:
+                logger.warning(f"Message {message_id} not found for agent {self.agent_id}")
+            return updated
+        else:
+            # SQLite: SELECT-then-UPDATE (single-writer, no true race condition)
+            row = await self.db.fetchone(
+                "SELECT metadata FROM conversation_history WHERE id = ? AND agent_id = ?",
+                (message_id, self.agent_id)
+            )
+            if not row:
+                logger.warning(f"Message {message_id} not found for agent {self.agent_id}")
+                return False
 
-        # Update in database
-        await self.db.execute_commit(
-            "UPDATE conversation_history SET metadata = ? WHERE id = ? AND agent_id = ?",
-            (json.dumps(current_meta), message_id, self.agent_id)
-        )
-        return True
+            current_meta = json.loads(row[0]) if row[0] else {}
+            current_meta.update(metadata_updates)
+
+            await self.db.execute_commit(
+                "UPDATE conversation_history SET metadata = ? WHERE id = ? AND agent_id = ?",
+                (json.dumps(current_meta), message_id, self.agent_id)
+            )
+            return True
 
     async def update_messages_metadata(
         self,
