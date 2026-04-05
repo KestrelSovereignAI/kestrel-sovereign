@@ -1,0 +1,24 @@
+name: wallet
+description: Multi-currency wallet management - balances, transactions, exchange rates, and cryostasis monitoring
+version: 1.0.0
+entry_point: feature.py
+
+tools:
+  - get_balance
+  - deposit
+  - withdraw
+  - transfer
+  - get_transaction_history
+  - get_exchange_rates
+  - check_cryostasis_status
+
+files:
+  - feature.py
+  - chain_adapters/
+  - transaction_manager.py
+  - transaction_hook.py
+  - onramp/
+
+dependencies:
+  - web3
+  - aiosqlite

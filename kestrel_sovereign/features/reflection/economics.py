@@ -9,7 +9,7 @@ import logging
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from kestrel_feature_wallet.wallet_feature import WalletFeature
+    from kestrel_sovereign.features.wallet.wallet_feature import WalletFeature
 
 logger = logging.getLogger(__name__)
 

@@ -12,11 +12,12 @@ Provider selection order (CLOUD_HOT):
   2. Filebase   — when FILEBASE_API_KEY + FILEBASE_API_KEY_SECRET are set
   3. Lighthouse — when LIGHTHOUSE_API_KEY is set
 
-Provider implementations have been extracted into standalone packages:
+Provider implementations are NOT re-exported here to avoid importing optional
+dependencies at package import time.  Import directly when needed:
 
-    from kestrel_storage_lighthouse.lighthouse_provider import LighthouseProvider
-    from kestrel_storage_storacha.storacha_provider import StorachaProvider
-    from kestrel_storage_filebase.filebase_provider import FilebaseProvider
+    from kestrel_sovereign.storage.providers.storacha_provider import StorachaProvider
+    from kestrel_sovereign.storage.providers.filebase_provider import FilebaseProvider
+    from kestrel_sovereign.storage.providers.lighthouse_provider import LighthouseProvider
 
 External packages can register storage providers via entry_points::
 
