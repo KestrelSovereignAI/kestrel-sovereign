@@ -1,3 +1,6 @@
+import pytest  # noqa: E402
+pytest.importorskip('kestrel_storage_filebase', reason='Extracted package not installed')
+
 """
 Unit tests for Storage Provider Protocol and Implementations.
 
