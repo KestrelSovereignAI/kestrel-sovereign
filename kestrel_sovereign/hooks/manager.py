@@ -198,6 +198,10 @@ class HooksManager:
             f"{f' (tool: {input.tool_name})' if input.tool_name else ''}"
         )
 
+        accumulated_warnings: list[str] = []
+        max_warning_severity: Optional[str] = None
+        severity_order = {"info": 0, "warning": 1, "critical": 2}
+
         for hook in matching_hooks:
             try:
                 output = await asyncio.wait_for(
@@ -211,11 +215,24 @@ class HooksManager:
                     f"continue={output.continue_execution}"
                 )
 
-                # DENY or ASK stops the chain
+                # Accumulate warnings (never short-circuit on warnings)
+                if output.warning_message:
+                    accumulated_warnings.append(output.warning_message)
+                    sev = output.warning_severity or "warning"
+                    if max_warning_severity is None or severity_order.get(sev, 1) > severity_order.get(max_warning_severity, 1):
+                        max_warning_severity = sev
+                    logger.warning(
+                        f"Hook '{hook.name}' advisory [{sev}]: {output.warning_message}"
+                    )
+
+                # DENY or ASK stops the chain (attach accumulated warnings)
                 if output.permission_decision in (
                     PermissionDecision.DENY,
                     PermissionDecision.ASK
                 ):
+                    if accumulated_warnings:
+                        output.warning_message = " | ".join(accumulated_warnings)
+                        output.warning_severity = max_warning_severity
                     return output
 
                 # MODIFY updates input for next hook
@@ -232,7 +249,11 @@ class HooksManager:
                 logger.error(f"Hook '{hook.name}' failed with error: {e}", exc_info=True)
                 continue
 
-        return HookOutput.allow()
+        result = HookOutput.allow()
+        if accumulated_warnings:
+            result.warning_message = " | ".join(accumulated_warnings)
+            result.warning_severity = max_warning_severity
+        return result
 
     async def execute_hooks_parallel(
         self,
