@@ -65,6 +65,14 @@ MAX_TOOL_RESULT_CHARS = int(os.environ.get("KESTREL_MAX_TOOL_RESULT_CHARS", "800
 # Reserve this fraction of context for the LLM response + next tool call
 CONTEXT_RESERVE_FRACTION = 0.2
 
+# Diminishing returns detection — stop loops producing negligible output
+# Minimum output tokens per reasoning-only iteration (no tool calls)
+KESTREL_DIMINISHING_THRESHOLD = int(os.environ.get("KESTREL_DIMINISHING_THRESHOLD", "500"))
+# Consecutive low-delta reasoning-only iterations before stopping
+KESTREL_MAX_LOW_DELTA = int(os.environ.get("KESTREL_MAX_LOW_DELTA", "5"))
+# Stop if iteration count exceeds this percentage of max_iterations budget
+KESTREL_BUDGET_STOP_PCT = int(os.environ.get("KESTREL_BUDGET_STOP_PCT", "90"))
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 

@@ -6,11 +6,13 @@ Extracted from kestrel_agent.py — handles the core orchestrator loop:
 - Non-streaming orchestrator response handling
 - Streaming orchestrator response handling
 - Message pruning for context pressure management
+- Diminishing returns detection (stop loops producing negligible output)
 """
 
 import json
 import logging
 import time
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Union
 
 from kestrel_sovereign.hooks import HookEvent, HookInput, PermissionDecision
@@ -24,16 +26,71 @@ from kestrel_sovereign.telemetry import optional_span
 MAX_TOOL_ITERATIONS = None  # set by _init_constants()
 MAX_TOOL_RESULT_CHARS = None
 CONTEXT_RESERVE_FRACTION = None
+KESTREL_DIMINISHING_THRESHOLD = None
+KESTREL_MAX_LOW_DELTA = None
+KESTREL_BUDGET_STOP_PCT = None
 
 
 def _init_constants():
     """Lazily import constants from kestrel_agent to avoid circular imports."""
     global MAX_TOOL_ITERATIONS, MAX_TOOL_RESULT_CHARS, CONTEXT_RESERVE_FRACTION
+    global KESTREL_DIMINISHING_THRESHOLD, KESTREL_MAX_LOW_DELTA, KESTREL_BUDGET_STOP_PCT
     if MAX_TOOL_ITERATIONS is None:
         from kestrel_sovereign import kestrel_agent as _ka
         MAX_TOOL_ITERATIONS = _ka.MAX_TOOL_ITERATIONS
         MAX_TOOL_RESULT_CHARS = _ka.MAX_TOOL_RESULT_CHARS
         CONTEXT_RESERVE_FRACTION = _ka.CONTEXT_RESERVE_FRACTION
+        KESTREL_DIMINISHING_THRESHOLD = _ka.KESTREL_DIMINISHING_THRESHOLD
+        KESTREL_MAX_LOW_DELTA = _ka.KESTREL_MAX_LOW_DELTA
+        KESTREL_BUDGET_STOP_PCT = _ka.KESTREL_BUDGET_STOP_PCT
+
+
+@dataclass
+class IterationTracker:
+    """Track consecutive low-output reasoning-only iterations for diminishing returns detection.
+
+    Only counts iterations where the LLM produced no tool calls (reasoning-only).
+    Iterations with tool calls are intentionally small text output and are not
+    counted toward the diminishing returns threshold.
+    """
+
+    consecutive_low_delta: int = 0
+    threshold: int = 500       # min output tokens per reasoning-only iteration
+    max_low_delta: int = 5     # consecutive low-delta iterations before stop
+    budget_stop_pct: int = 90  # stop if iteration > this % of max_iterations
+
+    def record(self, response: LLMResponse) -> None:
+        """Record an iteration's output and update the consecutive counter.
+
+        Only reasoning-only iterations (no tool calls) are evaluated.
+        Iterations where the LLM requested tool calls reset the counter.
+        """
+        if response.has_tool_calls:
+            # Tool-call iterations are intentionally small — reset counter
+            self.consecutive_low_delta = 0
+            return
+
+        output_tokens = response.output_tokens
+        if output_tokens is None:
+            # Fallback: estimate tokens from content length
+            content_len = len(response.content or "")
+            output_tokens = content_len // 4
+
+        if output_tokens < self.threshold:
+            self.consecutive_low_delta += 1
+        else:
+            self.consecutive_low_delta = 0
+
+    def should_stop(self, iteration: int, max_iterations: int) -> bool:
+        """Return True if the loop should stop due to diminishing returns."""
+        # Check consecutive low-delta reasoning-only iterations
+        if self.consecutive_low_delta >= self.max_low_delta:
+            return True
+        # Check budget exhaustion
+        budget_limit = max_iterations * self.budget_stop_pct / 100
+        if iteration >= budget_limit:
+            return True
+        return False
 
 
 PREVIEW_HEAD_CHARS = 2000
@@ -552,6 +609,12 @@ class OrchestratorEngineMixin:
         features_by_tool_name = {f.tool_name: f for f in self.features.values()}
         known_tools = set(features_by_tool_name.keys()) | set(self._direct_tools.keys())
 
+        tracker = IterationTracker(
+            threshold=KESTREL_DIMINISHING_THRESHOLD,
+            max_low_delta=KESTREL_MAX_LOW_DELTA,
+            budget_stop_pct=KESTREL_BUDGET_STOP_PCT,
+        )
+
         for iteration in range(max_iterations):
             if iteration >= max_iterations * 0.8:
                 logging.warning(f"[ORCHESTRATOR] Approaching max iterations: {iteration + 1}/{max_iterations}")
@@ -582,6 +645,15 @@ class OrchestratorEngineMixin:
                 final_content = response.content or ""
                 logging.info(f"[ORCHESTRATOR] Final response (no more tool calls): {final_content[:300]}...")
                 return final_content
+
+            # Track diminishing returns on this response before continuing
+            tracker.record(response)
+            if tracker.should_stop(iteration, max_iterations):
+                logging.warning(
+                    f"[ORCHESTRATOR] Diminishing returns detected at iteration {iteration + 1}/{max_iterations} "
+                    f"(consecutive_low_delta={tracker.consecutive_low_delta}). Stopping."
+                )
+                return response.content or "Stopped: diminishing returns detected"
 
             assistant_msg = {"role": "assistant", "content": response.content or ""}
             if response.tool_calls:
@@ -712,6 +784,12 @@ class OrchestratorEngineMixin:
         features_by_tool_name = {f.tool_name: f for f in self.features.values()}
         known_tools = set(features_by_tool_name.keys()) | set(self._direct_tools.keys())
 
+        tracker = IterationTracker(
+            threshold=KESTREL_DIMINISHING_THRESHOLD,
+            max_low_delta=KESTREL_MAX_LOW_DELTA,
+            budget_stop_pct=KESTREL_BUDGET_STOP_PCT,
+        )
+
         for iteration in range(max_iterations):
             for tool_call in response.tool_calls:
                 tool_name = tool_call.name
@@ -754,6 +832,16 @@ class OrchestratorEngineMixin:
                     model_override=effective_model
                 ):
                     yield chunk
+                return
+
+            # Track diminishing returns on this response before continuing
+            tracker.record(response)
+            if tracker.should_stop(iteration, max_iterations):
+                logging.warning(
+                    f"[ORCHESTRATOR-STREAM] Diminishing returns detected at iteration {iteration + 1}/{max_iterations} "
+                    f"(consecutive_low_delta={tracker.consecutive_low_delta}). Stopping."
+                )
+                yield response.content or "Stopped: diminishing returns detected"
                 return
 
             assistant_msg = {"role": "assistant", "content": response.content or ""}
