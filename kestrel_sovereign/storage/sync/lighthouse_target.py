@@ -79,7 +79,7 @@ class LighthouseTarget(ManifestManagerMixin, SyncTarget):
         timestamp = datetime.now(timezone.utc)
 
         try:
-            from kestrel_storage_lighthouse.lighthouse_rest import LighthouseRestClient
+            from kestrel_sovereign.storage.providers.lighthouse_rest import LighthouseRestClient
 
             # Use sqlite3.backup() for consistent snapshot (safe with active WAL)
             content = _create_consistent_snapshot(db_path)
@@ -195,7 +195,7 @@ class LighthouseTarget(ManifestManagerMixin, SyncTarget):
 
             logger.info(f"Restoring snapshot from Lighthouse: {snapshot_cid}")
 
-            from kestrel_storage_lighthouse.lighthouse_rest import LighthouseRestClient
+            from kestrel_sovereign.storage.providers.lighthouse_rest import LighthouseRestClient
 
             client = LighthouseRestClient(api_key=self.api_key)
             content = await client.download(snapshot_cid)
@@ -263,7 +263,7 @@ class LighthouseTarget(ManifestManagerMixin, SyncTarget):
     async def _query_uploads_api(self) -> Optional[str]:
         """Query Lighthouse uploads API to find the latest snapshot."""
         try:
-            from kestrel_storage_lighthouse.lighthouse_rest import LighthouseRestClient
+            from kestrel_sovereign.storage.providers.lighthouse_rest import LighthouseRestClient
 
             client = LighthouseRestClient(api_key=self.api_key)
             result = await client.get_uploads()
@@ -313,7 +313,7 @@ class LighthouseTarget(ManifestManagerMixin, SyncTarget):
     async def _read_manifest_cid(self, manifest_cid: str) -> Optional[str]:
         """Download a manifest file and extract the snapshot CID."""
         try:
-            from kestrel_storage_lighthouse.lighthouse_rest import LighthouseRestClient
+            from kestrel_sovereign.storage.providers.lighthouse_rest import LighthouseRestClient
 
             client = LighthouseRestClient(api_key=self.api_key)
             content = await client.download(manifest_cid)
@@ -351,7 +351,7 @@ class LighthouseTarget(ManifestManagerMixin, SyncTarget):
     async def health_check(self) -> bool:
         """Check Lighthouse API connectivity."""
         try:
-            from kestrel_storage_lighthouse.lighthouse_rest import LighthouseRestClient
+            from kestrel_sovereign.storage.providers.lighthouse_rest import LighthouseRestClient
 
             client = LighthouseRestClient(api_key=self.api_key)
             await client.get_balance()

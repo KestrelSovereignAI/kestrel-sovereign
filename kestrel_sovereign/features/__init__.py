@@ -15,7 +15,6 @@ from pathlib import Path
 from typing import Dict, List, Type, Optional, Set
 
 from kestrel_sovereign.features.base import Feature
-from kestrel_sdk.features.base import Feature as _SDKFeature
 
 logger = logging.getLogger(__name__)
 
@@ -118,18 +117,12 @@ def discover_feature_modules() -> List[str]:
     return modules
 
 
-def _is_feature_class(obj) -> bool:
-    """Check if obj is a Feature subclass (sovereign or SDK base)."""
-    base_classes = (Feature, _SDKFeature)
-    return isinstance(obj, type) and issubclass(obj, base_classes) and obj not in base_classes
-
-
 def find_feature_class(module) -> Optional[Type[Feature]]:
     """
     Find the Feature subclass in a module.
 
     Returns the first class that:
-    1. Is a subclass of Feature (sovereign or SDK base)
+    1. Is a subclass of Feature
     2. Is not Feature itself
     3. Is defined in this module OR is explicitly exported via __all__
 
@@ -140,7 +133,7 @@ def find_feature_class(module) -> Optional[Type[Feature]]:
     module_all = getattr(module, '__all__', [])
 
     for name, obj in inspect.getmembers(module, inspect.isclass):
-        if not _is_feature_class(obj):
+        if not (issubclass(obj, Feature) and obj is not Feature):
             continue
 
         # Check if defined in this module
@@ -183,7 +176,7 @@ def discover_entrypoint_feature_classes() -> Dict[str, Type[Feature]]:
     for ep in feature_eps:
         try:
             cls = ep.load()
-            if not _is_feature_class(cls):
+            if not (isinstance(cls, type) and issubclass(cls, Feature) and cls is not Feature):
                 logger.warning(
                     f"Entry point '{ep.name}' does not point to a Feature subclass, skipping"
                 )

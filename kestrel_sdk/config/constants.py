@@ -156,3 +156,16 @@ MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB maximum file size for store_file()
 MAX_CONVERSATION_HISTORY_LIMIT = 10000  # Maximum conversation history items to retrieve
 DEFAULT_OBSERVABILITY_LIMIT = 1000  # Default limit for observability events
 MAX_PINNED_ITEMS_DISPLAY = 20  # Maximum pinned IPFS items to display
+
+
+# =========================================================================
+# Currency enum — shared between core (delegated_wallet) and wallet feature
+# =========================================================================
+from enum import Enum
+
+class Currency(Enum):
+    """Supported currencies for wallet operations."""
+    FIL = "FIL"
+    USDC = "USDC"
+    USDT = "USDT"
+    USD = "USD"

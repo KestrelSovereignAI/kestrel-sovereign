@@ -1,17 +1,31 @@
 """
 Vast.ai GPU Compute Feature for Kestrel Agents.
 
-.. deprecated::
-    This module re-exports from ``kestrel_cloud_vastai``.
-    Import directly from ``kestrel_cloud_vastai`` instead.
+Modular structure for the Vast.ai GPU instance manager:
+- models.py: Data models, enums, exceptions
+- core.py: Core SDK operations and session management
+- ssh_training.py: SSH-based training methods for Kohya instances
+- http_api.py: HTTP API methods for SimpleTuner containers
+- workflows.py: Convenience workflow methods
+- manager.py: Combined VastAIManager class
+- feature.py: Kestrel feature integration
+
+Usage:
+    from kestrel_sovereign.features.vastai import VastAIManager, VastAIFeature
+
+    # Direct manager usage
+    manager = VastAIManager()
+    session = await manager.start_training_instance("companion-123")
+
+    # Or as a Kestrel feature
+    feature = VastAIFeature(agent)
 """
 
-# Backward-compat re-exports from extracted package
-from kestrel_cloud_vastai import (  # noqa: F401
+from .feature import VastAIFeature
+from .manager import VastAIManager
+from .models import (
     GPUProfile,
     InstanceStatus,
-    VastAIFeature,
-    VastAIManager,
     VastAIManagerError,
     VastAISession,
 )

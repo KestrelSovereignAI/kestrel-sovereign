@@ -14,10 +14,12 @@ import logging
 from typing import Dict, Type
 
 from kestrel_sovereign.entrypoints import discover_entry_point_classes
-from .core import CLOUD_PROVIDER_ENTRY_POINT_GROUP, DeployManagerCore
+from .core import DeployManagerCore
 from .providers.base import DeployProvider
 
 logger = logging.getLogger(__name__)
+
+CLOUD_PROVIDER_ENTRY_POINT_GROUP = "kestrel_sovereign.cloud_providers"
 
 
 class DeployManager(DeployManagerCore):

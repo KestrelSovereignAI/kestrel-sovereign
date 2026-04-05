@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Optional
 
-from kestrel_feature_wallet.feature import Currency, WalletAgent
+from kestrel_sovereign.features.wallet.feature import Currency, WalletAgent
 
 logger = logging.getLogger(__name__)
 

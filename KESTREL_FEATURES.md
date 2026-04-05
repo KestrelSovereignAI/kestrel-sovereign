@@ -102,11 +102,11 @@ Features come from two sources:
 
 The inventory below lists **core features only**. Installed feature packages appear at runtime via `discover_entrypoint_feature_classes()` and are not enumerated here.
 
-- Current audited snapshot: `40` discoverable modules and `37` exported `Feature` subclasses.
+- Current audited snapshot: `42` discoverable modules and `41` exported `Feature` subclasses.
 
 - `audit_anchor`
 - `bootstrap`
-- `bridge` *(extracted to `kestrel-feature-spawn`; stub re-exports)*
+- `bridge`
 - `channels`
 - `code_edit`
 - `compute`
@@ -134,7 +134,7 @@ The inventory below lists **core features only**. Installed feature packages app
 - `scheduler`
 - `security`
 - `sovereignty`
-- `spawn` *(extracted to `kestrel-feature-spawn`; stub re-exports)*
+- `spawn`
 - `state_of_mind`
 - `strategic_memory`
 - `talon`
@@ -142,6 +142,7 @@ The inventory below lists **core features only**. Installed feature packages app
 - `vastai`
 - `visual_identity`
 - `voice`
+- `wallet`
 - `web_search`
 - `webhooks`
 - `wellness`
@@ -150,6 +151,7 @@ The currently exported `Feature` subclasses discovered from those modules includ
 
 - `AuditAnchorFeature`
 - `BootstrapFeature`
+- `BridgeFeature`
 - `ChannelFeature`
 - `CodeEditFeature`
 - `ComputeFeature`
@@ -177,6 +179,7 @@ The currently exported `Feature` subclasses discovered from those modules includ
 - `SchedulerFeature`
 - `SecurityFeature`
 - `SovereigntyFeature`
+- `SpawnFeature`
 - `StateOfMindFeature`
 - `StrategicMemoryFeature`
 - `TalonCoordinatorFeature`
