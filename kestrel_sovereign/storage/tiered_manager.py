@@ -477,7 +477,7 @@ def create_default_manager(
     # Storacha (CLOUD_HOT) — preferred; UCAN/DID-native auth
     if os.environ.get("STORACHA_SPACE_DID") and os.environ.get("STORACHA_AGENT_KEY"):
         try:
-            from kestrel_storage_storacha.storacha_provider import StorachaProvider
+            from kestrel_sovereign.storage.providers.storacha_provider import StorachaProvider
             storacha = StorachaProvider()
             if storacha.is_available():
                 manager.register_provider(StorageTier.CLOUD_HOT, storacha)
@@ -489,7 +489,7 @@ def create_default_manager(
     if StorageTier.CLOUD_HOT not in manager._providers:
         if os.environ.get("FILEBASE_API_KEY") and os.environ.get("FILEBASE_API_KEY_SECRET"):
             try:
-                from kestrel_storage_filebase.filebase_provider import FilebaseProvider
+                from kestrel_sovereign.storage.providers.filebase_provider import FilebaseProvider
                 filebase = FilebaseProvider()
                 if filebase.is_available():
                     manager.register_provider(StorageTier.CLOUD_HOT, filebase)
@@ -499,7 +499,7 @@ def create_default_manager(
 
     # Lighthouse — CLOUD_HOT fallback (if Storacha/Filebase not available) + CLOUD_COLD
     try:
-        from kestrel_storage_lighthouse.lighthouse_provider import LighthouseProvider
+        from kestrel_sovereign.storage.providers.lighthouse_provider import LighthouseProvider
         lighthouse = LighthouseProvider(api_key=lighthouse_api_key)
         if lighthouse.is_available():
             if StorageTier.CLOUD_HOT not in manager._providers:

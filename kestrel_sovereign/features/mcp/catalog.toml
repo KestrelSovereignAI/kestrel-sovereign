@@ -1,0 +1,198 @@
+# MCP Server Catalog
+# This file defines available MCP servers for discovery and loading.
+#
+# Server Types:
+#   - docker: External server running in Docker container
+#   - builtin: Built-in tool implemented locally (no Docker required)
+#
+# Transport Types:
+#   - sse: Server-Sent Events (HTTP-based, can connect directly)
+#   - stdio: Standard I/O (needs wrapper like Supergateway for HTTP access)
+#
+# Categories:
+#   - database, filesystem, web, devtools, search, storage, healthcare, ai, utility
+
+# =============================================================================
+# BUILT-IN SERVERS (No Docker Required)
+# =============================================================================
+# These are implemented locally and work without Docker.
+# They are the "bridge" tools for local file/system access.
+
+[servers.filesystem]
+type = "builtin"
+description = "Local filesystem access - read, write, list, and search files"
+tools = ["read_file", "write_file", "list_directory", "search_files", "get_file_info"]
+categories = ["filesystem", "utility"]
+
+[servers.bash]
+type = "builtin"
+description = "Execute bash commands locally (security-gated)"
+tools = ["execute", "execute_background"]
+categories = ["devtools", "utility"]
+
+# =============================================================================
+# SSE-NATIVE SERVERS (Direct connection, no wrapper needed)
+# =============================================================================
+# These servers natively support SSE transport and can be connected to directly.
+
+[servers.test-server]
+type = "docker"
+transport = "sse"
+image = "kestrel-mcp-test-server:latest"
+description = "Simple test server with echo and add tools (for testing)"
+tools = ["echo", "add"]
+categories = ["utility"]
+port = 8000
+
+# =============================================================================
+# STDIO SERVERS (Require Supergateway wrapper)
+# =============================================================================
+# Official MCP servers from Docker Hub that use stdio transport.
+# These need to be wrapped with Supergateway to expose via SSE.
+# Use: docker run -p 8000:8000 supercorp/supergateway --stdio "mcp-server-xxx"
+
+[servers.fetch]
+type = "docker"
+transport = "stdio"
+image = "mcp/fetch:latest"
+wrapper_image = "supercorp/supergateway:latest"
+description = "Make HTTP requests to fetch web content"
+tools = ["fetch"]
+categories = ["web", "utility"]
+port = 8000
+
+[servers.sqlite]
+type = "docker"
+transport = "stdio"
+image = "mcp/sqlite:latest"
+wrapper_image = "supercorp/supergateway:latest"
+description = "SQLite database operations - query and execute SQL"
+tools = ["read_query", "write_query", "create_table", "list_tables", "describe_table"]
+categories = ["database"]
+env_optional = ["SQLITE_DB_PATH"]
+port = 8000
+
+[servers.postgres]
+type = "docker"
+transport = "stdio"
+image = "mcp/postgres:latest"
+wrapper_image = "supercorp/supergateway:latest"
+description = "PostgreSQL database access"
+tools = ["query"]
+categories = ["database"]
+env_required = ["POSTGRES_CONNECTION_STRING"]
+port = 8000
+
+[servers.memory]
+type = "docker"
+transport = "stdio"
+image = "mcp/memory:latest"
+wrapper_image = "supercorp/supergateway:latest"
+description = "In-memory key-value storage for agent state"
+tools = ["store", "retrieve", "list_keys", "delete"]
+categories = ["storage", "utility"]
+port = 8000
+
+[servers.brave-search]
+type = "docker"
+transport = "stdio"
+image = "mcp/brave-search:latest"
+wrapper_image = "supercorp/supergateway:latest"
+description = "Web search using Brave Search API"
+tools = ["brave_web_search", "brave_local_search"]
+categories = ["search", "web"]
+env_required = ["BRAVE_API_KEY"]
+port = 8000
+
+[servers.github]
+type = "docker"
+transport = "stdio"
+image = "mcp/github:latest"
+wrapper_image = "supercorp/supergateway:latest"
+description = "GitHub API integration - repos, issues, PRs"
+tools = ["search_repositories", "get_file_contents", "create_issue", "list_issues"]
+categories = ["devtools"]
+env_required = ["GITHUB_PERSONAL_ACCESS_TOKEN"]
+port = 8000
+
+[servers.filesystem-docker]
+type = "docker"
+transport = "stdio"
+image = "mcp/filesystem:latest"
+wrapper_image = "supercorp/supergateway:latest"
+description = "Filesystem access via Docker (for sandboxed file operations)"
+tools = ["read_file", "write_file", "list_directory", "search_files"]
+categories = ["filesystem"]
+env_optional = ["ALLOWED_DIRECTORIES"]
+port = 8000
+
+[servers.puppeteer]
+type = "docker"
+transport = "stdio"
+image = "mcp/puppeteer:latest"
+wrapper_image = "supercorp/supergateway:latest"
+description = "Browser automation with Puppeteer"
+tools = ["puppeteer_navigate", "puppeteer_screenshot", "puppeteer_click", "puppeteer_fill", "puppeteer_evaluate"]
+categories = ["web", "devtools"]
+port = 8000
+
+[servers.slack]
+type = "docker"
+transport = "stdio"
+image = "mcp/slack:latest"
+wrapper_image = "supercorp/supergateway:latest"
+description = "Slack integration - send messages, read channels"
+tools = ["slack_post_message", "slack_get_channel_history", "slack_list_channels"]
+categories = ["utility"]
+env_required = ["SLACK_BOT_TOKEN"]
+port = 8000
+
+[servers.time]
+type = "docker"
+transport = "stdio"
+image = "mcp/time:latest"
+wrapper_image = "supercorp/supergateway:latest"
+description = "Time and timezone utilities"
+tools = ["get_current_time", "convert_timezone"]
+categories = ["utility"]
+port = 8000
+
+[servers.sequential-thinking]
+type = "docker"
+transport = "stdio"
+image = "mcp/sequential-thinking:latest"
+wrapper_image = "supercorp/supergateway:latest"
+description = "Step-by-step reasoning assistant"
+tools = ["create_thinking_session", "add_thought", "get_session"]
+categories = ["ai", "utility"]
+port = 8000
+
+# =============================================================================
+# PRIVATE REGISTRY - KESTREL CUSTOM SERVERS
+# =============================================================================
+# These require authentication to gcr.io/YOUR_PROJECT_ID
+# Used for healthcare and custom integrations
+
+[servers.fhir]
+type = "docker"
+transport = "sse"
+image = "mcp-fhir:latest"
+description = "FHIR healthcare data access (HL7 FHIR R4)"
+tools = ["search_patients", "get_patient", "get_observations", "create_observation"]
+categories = ["healthcare"]
+private = true
+registry = "gcr.io/YOUR_PROJECT_ID"
+env_required = ["FHIR_SERVER_URL"]
+env_optional = ["FHIR_AUTH_TOKEN"]
+port = 8000
+
+[servers.kestrel-sovereignty]
+type = "docker"
+transport = "sse"
+image = "mcp-sovereignty:latest"
+description = "Kestrel sovereignty operations - backup, restore, export"
+tools = ["export_sovereignty", "import_sovereignty", "verify_integrity"]
+categories = ["storage", "utility"]
+private = true
+registry = "gcr.io/YOUR_PROJECT_ID"
+port = 8000

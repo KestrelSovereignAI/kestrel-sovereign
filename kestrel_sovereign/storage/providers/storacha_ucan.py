@@ -439,18 +439,11 @@ class StorachaUCAN:
         """
         encoded = encoded.strip()
         if encoded.startswith("M"):
-            # Could be multibase base64pad (w3 key create) OR a raw base64
-            # string that happens to start with "M".  Disambiguate by checking
-            # for the ed25519-priv multicodec prefix after decoding.
+            # Multibase base64pad: strip "M" prefix and decode
             raw = base64.b64decode(_pad_base64(encoded[1:]))
-            if len(raw) >= 2 and raw[0] == 0x80 and raw[1] == 0x26:
-                # Genuine multibase: strip the multicodec varint prefix
-                _, n = _read_varint(raw, 0)
-                seed = raw[n:]
-            else:
-                # Not a real multicodec header — treat the full string as
-                # raw base64-encoded 32-byte seed.
-                seed = base64.b64decode(_pad_base64(encoded))
+            # Strip the multicodec varint prefix ([0x80, 0x26] for ed25519-priv)
+            _, n = _read_varint(raw, 0)
+            seed = raw[n:]
         else:
             # Treat as raw base64-encoded 32-byte seed
             seed = base64.b64decode(_pad_base64(encoded))

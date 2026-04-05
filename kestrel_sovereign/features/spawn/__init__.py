@@ -1,24 +1,3 @@
-"""
-Spawn Feature - Runtime agent spawning as LLM-callable tools.
-
-This module re-exports SpawnFeature from the extracted
-kestrel-feature-spawn package. If the package is not installed,
-falls back to the bundled copy under kestrel-feature-spawn/.
-
-Install the standalone package:
-    pip install kestrel-feature-spawn
-"""
-
-try:
-    from kestrel_feature_spawn.spawn.feature import SpawnFeature
-except ImportError:
-    import sys
-    from pathlib import Path
-
-    _pkg_src = Path(__file__).resolve().parents[3] / "kestrel-feature-spawn" / "src"
-    if _pkg_src.exists() and str(_pkg_src) not in sys.path:
-        sys.path.insert(0, str(_pkg_src))
-
-    from kestrel_feature_spawn.spawn.feature import SpawnFeature  # noqa: F811
+from .feature import SpawnFeature
 
 __all__ = ["SpawnFeature"]
