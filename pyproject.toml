@@ -142,11 +142,9 @@ wallet = [
     "web3>=7.0.0",
     "stripe>=10.0.0",
 ]
-# Feature: MCP (Docker container management, MCP protocol)
+# Feature: MCP (extracted to kestrel-feature-mcp)
 mcp = [
-    "docker>=7.1.0",
-    "mcp>=1.26.0",
-    "trio>=0.32.0",
+    "kestrel-feature-mcp @ git+https://github.com/KestrelSovereignAI/kestrel-feature-mcp.git",
 ]
 # Feature: Visual (image generation via Replicate)
 visual = [

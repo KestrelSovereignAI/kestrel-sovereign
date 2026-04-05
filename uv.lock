@@ -2567,6 +2567,17 @@ wheels = [
 ]
 
 [[package]]
+name = "kestrel-feature-mcp"
+version = "0.1.0"
+source = { git = "https://github.com/KestrelSovereignAI/kestrel-feature-mcp.git#c49620dfa432a4727b7672cce6d8b12b5909a7b9" }
+dependencies = [
+    { name = "aiohttp" },
+    { name = "docker" },
+    { name = "kestrel-sovereign" },
+    { name = "mcp" },
+]
+
+[[package]]
 name = "kestrel-sovereign"
 version = "0.1.8"
 source = { editable = "." }
@@ -2626,15 +2637,14 @@ all-features = [
     { name = "chromadb" },
     { name = "deepgram-sdk" },
     { name = "diffusers" },
-    { name = "docker" },
     { name = "elevenlabs" },
     { name = "faster-whisper" },
     { name = "google-cloud-compute" },
     { name = "google-cloud-run" },
+    { name = "kestrel-feature-mcp" },
     { name = "kestrel-talon" },
     { name = "langchain" },
     { name = "langchain-community" },
-    { name = "mcp" },
     { name = "numpy" },
     { name = "ollama" },
     { name = "opentelemetry-api" },
@@ -2658,7 +2668,6 @@ all-features = [
     { name = "torchaudio" },
     { name = "torchvision" },
     { name = "transformers" },
-    { name = "trio" },
     { name = "twilio" },
     { name = "vastai-sdk" },
     { name = "web3" },
@@ -2685,15 +2694,14 @@ full = [
     { name = "chromadb" },
     { name = "deepgram-sdk" },
     { name = "diffusers" },
-    { name = "docker" },
     { name = "elevenlabs" },
     { name = "faster-whisper" },
     { name = "google-cloud-compute" },
     { name = "google-cloud-run" },
+    { name = "kestrel-feature-mcp" },
     { name = "kestrel-talon" },
     { name = "langchain" },
     { name = "langchain-community" },
-    { name = "mcp" },
     { name = "numpy" },
     { name = "ollama" },
     { name = "opentelemetry-api" },
@@ -2721,7 +2729,6 @@ full = [
     { name = "torchaudio" },
     { name = "torchvision" },
     { name = "transformers" },
-    { name = "trio" },
     { name = "twilio" },
     { name = "vastai-sdk" },
     { name = "web3" },
@@ -2740,9 +2747,7 @@ local = [
     { name = "spacy" },
 ]
 mcp = [
-    { name = "docker" },
-    { name = "mcp" },
-    { name = "trio" },
+    { name = "kestrel-feature-mcp" },
 ]
 ml = [
     { name = "accelerate" },
@@ -2832,7 +2837,6 @@ requires-dist = [
     { name = "cryptography", specifier = ">=45.0.5" },
     { name = "deepgram-sdk", marker = "extra == 'voice-cloud'", specifier = ">=4.0.0" },
     { name = "diffusers", marker = "extra == 'ml'", specifier = ">=0.36.0" },
-    { name = "docker", marker = "extra == 'mcp'", specifier = ">=7.1.0" },
     { name = "elevenlabs", marker = "extra == 'voice-cloud'", specifier = ">=1.0.0" },
     { name = "email-validator", specifier = ">=2.3.0" },
     { name = "fastapi", specifier = "==0.128.1" },
@@ -2848,6 +2852,7 @@ requires-dist = [
     { name = "idna", specifier = "==3.11" },
     { name = "iniconfig", specifier = "==2.1.0" },
     { name = "itsdangerous", specifier = ">=2.2.0" },
+    { name = "kestrel-feature-mcp", marker = "extra == 'mcp'", git = "https://github.com/KestrelSovereignAI/kestrel-feature-mcp.git" },
     { name = "kestrel-sovereign", extras = ["all-features"], marker = "extra == 'full'" },
     { name = "kestrel-sovereign", extras = ["cloud"], marker = "extra == 'all-features'" },
     { name = "kestrel-sovereign", extras = ["delivery"], marker = "extra == 'all-features'" },
@@ -2866,7 +2871,6 @@ requires-dist = [
     { name = "kestrel-talon", marker = "extra == 'github'", git = "https://github.com/KestrelSovereignAI/kestrel-talon.git" },
     { name = "langchain", marker = "extra == 'local'", specifier = ">=0.3.31" },
     { name = "langchain-community", marker = "extra == 'local'", specifier = ">=0.3.31" },
-    { name = "mcp", marker = "extra == 'mcp'", specifier = ">=1.26.0" },
     { name = "networkx", specifier = "==3.5" },
     { name = "numpy", specifier = ">=2.3.1" },
     { name = "numpy", marker = "extra == 'local'", specifier = "==2.3.1" },
@@ -2916,7 +2920,6 @@ requires-dist = [
     { name = "torchaudio", marker = "extra == 'ml'", specifier = ">=2.9.1" },
     { name = "torchvision", marker = "extra == 'ml'", specifier = ">=0.24.1" },
     { name = "transformers", marker = "extra == 'ml'", specifier = ">=4.57.1" },
-    { name = "trio", marker = "extra == 'mcp'", specifier = ">=0.32.0" },
     { name = "twilio", marker = "extra == 'delivery'", specifier = ">=9.9.1" },
     { name = "urllib3", specifier = ">=2.6.3" },
     { name = "uvicorn", specifier = "==0.35.0" },
@@ -4068,18 +4071,6 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/fb/f1/bb2c7223398543dedb3dbf8bb93aaa737b387de61c5feaad6f908841b782/ormsgpack-1.12.2-cp313-cp313-musllinux_1_2_x86_64.whl", hash = "sha256:cec70477d4371cd524534cd16472d8b9cc187e0e3043a8790545a9a9b296c258", size = 425539, upload-time = "2026-01-18T20:55:24.727Z" },
     { url = "https://files.pythonhosted.org/packages/7b/e8/0fb45f57a2ada1fed374f7494c8cd55e2f88ccd0ab0a669aa3468716bf5f/ormsgpack-1.12.2-cp313-cp313-win_amd64.whl", hash = "sha256:21f4276caca5c03a818041d637e4019bc84f9d6ca8baa5ea03e5cc8bf56140e9", size = 117459, upload-time = "2026-01-18T20:55:56.876Z" },
     { url = "https://files.pythonhosted.org/packages/7a/d4/0cfeea1e960d550a131001a7f38a5132c7ae3ebde4c82af1f364ccc5d904/ormsgpack-1.12.2-cp313-cp313-win_arm64.whl", hash = "sha256:baca4b6773d20a82e36d6fd25f341064244f9f86a13dead95dd7d7f996f51709", size = 111577, upload-time = "2026-01-18T20:55:43.605Z" },
-]
-
-[[package]]
-name = "outcome"
-version = "1.3.0.post0"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "attrs" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/98/df/77698abfac98571e65ffeb0c1fba8ffd692ab8458d617a0eed7d9a8d38f2/outcome-1.3.0.post0.tar.gz", hash = "sha256:9dcf02e65f2971b80047b377468e72a268e15c0af3cf1238e6ff14f7f91143b8", size = 21060, upload-time = "2023-10-26T04:26:04.361Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/55/8b/5ab7257531a5d830fc8000c476e63c935488d74609b50f9384a643ec0a62/outcome-1.3.0.post0-py2.py3-none-any.whl", hash = "sha256:e771c5ce06d1415e356078d3bdd68523f284b4ce5419828922b6871e65eda82b", size = 10692, upload-time = "2023-10-26T04:26:02.532Z" },
 ]
 
 [[package]]
@@ -5726,15 +5717,6 @@ wheels = [
 ]
 
 [[package]]
-name = "sortedcontainers"
-version = "2.4.0"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/e8/c4/ba2f8066cceb6f23394729afe52f3bf7adec04bf9ed2c820b39e19299111/sortedcontainers-2.4.0.tar.gz", hash = "sha256:25caa5a06cc30b6b83d11423433f65d1f9d76c4c6a0c90e3379eaa43b9bfdb88", size = 30594, upload-time = "2021-05-16T22:03:42.897Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/32/46/9cb0e58b2deb7f82b84065f37f3bffeb12413f947f9388e4cac22c4621ce/sortedcontainers-2.4.0-py2.py3-none-any.whl", hash = "sha256:a163dcaede0f1c021485e957a39245190e74249897e2ae4b2aa38595db237ee0", size = 29575, upload-time = "2021-05-16T22:03:41.177Z" },
-]
-
-[[package]]
 name = "soundfile"
 version = "0.13.1"
 source = { registry = "https://pypi.org/simple" }
@@ -6289,23 +6271,6 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/d6/68/a39307bcc4116a30b2106f2e689130a48de8bd8a1e635b5e1030e46fcd9e/transformers-4.57.1.tar.gz", hash = "sha256:f06c837959196c75039809636cd964b959f6604b75b8eeec6fdfc0440b89cc55", size = 10142511, upload-time = "2025-10-14T15:39:26.18Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/71/d3/c16c3b3cf7655a67db1144da94b021c200ac1303f82428f2beef6c2e72bb/transformers-4.57.1-py3-none-any.whl", hash = "sha256:b10d05da8fa67dc41644dbbf9bc45a44cb86ae33da6f9295f5fbf5b7890bd267", size = 11990925, upload-time = "2025-10-14T15:39:23.085Z" },
-]
-
-[[package]]
-name = "trio"
-version = "0.32.0"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "attrs" },
-    { name = "cffi", marker = "implementation_name != 'pypy' and os_name == 'nt'" },
-    { name = "idna" },
-    { name = "outcome" },
-    { name = "sniffio" },
-    { name = "sortedcontainers" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/d8/ce/0041ddd9160aac0031bcf5ab786c7640d795c797e67c438e15cfedf815c8/trio-0.32.0.tar.gz", hash = "sha256:150f29ec923bcd51231e1d4c71c7006e65247d68759dd1c19af4ea815a25806b", size = 605323, upload-time = "2025-10-31T07:18:17.466Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/41/bf/945d527ff706233636c73880b22c7c953f3faeb9d6c7e2e85bfbfd0134a0/trio-0.32.0-py3-none-any.whl", hash = "sha256:4ab65984ef8370b79a76659ec87aa3a30c5c7c83ff250b4de88c29a8ab6123c5", size = 512030, upload-time = "2025-10-31T07:18:15.885Z" },
 ]
 
 [[package]]

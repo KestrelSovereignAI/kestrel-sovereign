@@ -18,7 +18,9 @@ def _discover_feature_modules() -> list[str]:
 
 def _discover_exported_feature_classes() -> list[str]:
     names = []
-    pattern = re.compile(r"^class\s+(\w+)\(Feature\):", re.M)
+    # Match both single-line `class Foo(Feature):` and multi-line inheritance
+    # where Feature appears on a subsequent line
+    pattern = re.compile(r"^class\s+(\w+)\([^)]*\bFeature\b[^)]*\):", re.M | re.S)
     for path in FEATURES_ROOT.rglob("*.py"):
         if path.name == "base.py":
             continue
