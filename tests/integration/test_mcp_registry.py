@@ -11,7 +11,7 @@ pytest.importorskip("kestrel_feature_mcp")
 
 from pathlib import Path
 
-from kestrel_feature_mcp.registry import (
+from kestrel_sovereign.features.mcp.registry import (
     MCPRegistry,
     MCPServerEntry,
     ServerType,
@@ -152,7 +152,7 @@ class TestMCPRegistry:
     def registry(self):
         """Get a fresh registry instance loaded from the real catalog."""
         # Reset the singleton
-        import kestrel_feature_mcp.registry as reg_module
+        import kestrel_sovereign.features.mcp.registry as reg_module
         reg_module._registry = None
         return get_registry()
 
@@ -278,7 +278,7 @@ class TestRegistryCatalogContent:
     @pytest.fixture
     def registry(self):
         """Get registry instance."""
-        import kestrel_feature_mcp.registry as reg_module
+        import kestrel_sovereign.features.mcp.registry as reg_module
         reg_module._registry = None
         return get_registry()
 

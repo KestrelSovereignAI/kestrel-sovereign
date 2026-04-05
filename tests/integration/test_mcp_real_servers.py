@@ -18,8 +18,8 @@ import asyncio
 import logging
 from pathlib import Path
 
-from kestrel_feature_mcp.manager import MCPToolManager
-from kestrel_feature_mcp.registry import get_registry, TransportType
+from kestrel_sovereign.features.mcp.manager import MCPToolManager
+from kestrel_sovereign.features.mcp.registry import get_registry, TransportType
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)

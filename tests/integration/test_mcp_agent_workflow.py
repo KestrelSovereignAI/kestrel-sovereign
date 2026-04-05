@@ -21,9 +21,9 @@ import pytest_asyncio
 import asyncio
 import logging
 
-from kestrel_feature_mcp.gateway import DockerMCPGateway
-from kestrel_feature_mcp.manager import MCPGatewayManager
-from kestrel_feature_mcp.registry import (
+from kestrel_sovereign.features.mcp.gateway import DockerMCPGateway
+from kestrel_sovereign.features.mcp.manager import MCPGatewayManager
+from kestrel_sovereign.features.mcp.registry import (
     check_docker_mcp_available,
     search_docker_catalog,
     list_docker_catalog_servers,

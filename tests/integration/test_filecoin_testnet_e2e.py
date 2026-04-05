@@ -19,7 +19,7 @@ import tempfile
 from decimal import Decimal
 from pathlib import Path
 
-from kestrel_feature_wallet import (
+from kestrel_sovereign.features.wallet import (
     WalletAgent,
     WalletFeature,
     Currency,
