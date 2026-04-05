@@ -43,6 +43,9 @@ COPY docker/rookery.cloudrun.toml /app/rookery.toml
 # Create directories for agent data (auto-discover will find subdirs)
 RUN mkdir -p /app/agent_data
 
+# Seed SOUL.md for staging agents so bootstrap skips discovery mode on cold start
+COPY docker/seed_agents/ /app/agent_data/
+
 # Create non-root user and set permissions
 RUN useradd -m -u 1000 kestrel && \
     chown -R kestrel:kestrel /app
