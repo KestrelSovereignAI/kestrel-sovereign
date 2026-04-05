@@ -120,33 +120,16 @@ class VoiceProviderRegistry:
             except Exception as e:
                 logger.warning(f"Failed to load entry_point STT provider '{ep_name}': {e}")
 
-    # Mapping of provider names to their (package, module, class) for cloud
-    # providers that have been extracted to kestrel_voice_* packages.
-    _CLOUD_TTS_MAP: dict[str, tuple[str, str]] = {
-        "openai": ("kestrel_sovereign.voice.openai_tts", "OpenAITTSProvider"),
-        "elevenlabs": ("kestrel_sovereign.voice.elevenlabs_tts", "ElevenLabsTTSProvider"),
-    }
-
-    _CLOUD_STT_MAP: dict[str, tuple[str, str]] = {
-        "openai": ("kestrel_sovereign.voice.openai_stt", "OpenAISTTProvider"),
-        "deepgram": ("kestrel_sovereign.voice.deepgram_stt", "DeepgramSTTProvider"),
-    }
+    # Cloud voice providers (openai, elevenlabs, deepgram) are discovered
+    # via entry_points from their respective packages:
+    #   kestrel-voice-openai, kestrel-voice-elevenlabs, kestrel-voice-deepgram
 
     def _create_tts_provider(self, name: str) -> Optional[TTSProvider]:
         """Create a TTS provider by name.
 
         Local providers (piper) are imported from core. Cloud providers
-        (openai, elevenlabs) are imported from kestrel_voice_* packages
-        or discovered via entry_points.
-
-        Args:
-            name: Provider name (e.g., "piper", "openai", "elevenlabs").
-
-        Returns:
-            TTSProvider instance or None if unknown/not installed.
+        (openai, elevenlabs) are discovered via entry_points.
         """
-        provider_config = self._config.get(name, {})
-
         if name == "piper":
             try:
                 from .piper_tts import PiperTTSProvider
@@ -156,39 +139,16 @@ class VoiceProviderRegistry:
                 logger.warning("piper-tts package not installed. Skipping piper TTS.")
                 return None
 
-        # Try cloud provider from extracted package
-        if name in self._CLOUD_TTS_MAP:
-            module_path, class_name = self._CLOUD_TTS_MAP[name]
-            try:
-                import importlib
-                mod = importlib.import_module(module_path)
-                cls = getattr(mod, class_name)
-                return cls(config=provider_config)
-            except ImportError:
-                logger.warning(
-                    "TTS provider '%s' package not installed. "
-                    "Install kestrel-voice-%s for this provider.", name, name
-                )
-                return None
-
-        logger.warning(f"Unknown TTS provider '{name}'.")
+        # Cloud providers are discovered via entry_points in _discover_entrypoint_providers()
+        logger.debug(f"TTS provider '{name}' not a built-in; will check entry_points.")
         return None
 
     def _create_stt_provider(self, name: str) -> Optional[STTProvider]:
         """Create an STT provider by name.
 
         Local providers (faster_whisper) are imported from core. Cloud
-        providers (openai, deepgram) are imported from kestrel_voice_*
-        packages or discovered via entry_points.
-
-        Args:
-            name: Provider name (e.g., "faster_whisper", "openai", "deepgram").
-
-        Returns:
-            STTProvider instance or None if unknown/not installed.
+        providers (openai, deepgram) are discovered via entry_points.
         """
-        provider_config = self._config.get(name, {})
-
         if name == "faster_whisper":
             try:
                 from .faster_whisper_stt import FasterWhisperSTTProvider
@@ -198,22 +158,8 @@ class VoiceProviderRegistry:
                 logger.warning("faster-whisper package not installed. Skipping faster_whisper STT.")
                 return None
 
-        # Try cloud provider from extracted package
-        if name in self._CLOUD_STT_MAP:
-            module_path, class_name = self._CLOUD_STT_MAP[name]
-            try:
-                import importlib
-                mod = importlib.import_module(module_path)
-                cls = getattr(mod, class_name)
-                return cls(config=provider_config)
-            except ImportError:
-                logger.warning(
-                    "STT provider '%s' package not installed. "
-                    "Install kestrel-voice-%s for this provider.", name, name
-                )
-                return None
-
-        logger.warning(f"Unknown STT provider '{name}'.")
+        # Cloud providers are discovered via entry_points in _discover_entrypoint_providers()
+        logger.debug(f"STT provider '{name}' not a built-in; will check entry_points.")
         return None
 
     def register_tts(self, provider: TTSProvider) -> None:
