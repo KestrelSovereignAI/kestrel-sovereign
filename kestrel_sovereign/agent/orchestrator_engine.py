@@ -7,10 +7,12 @@ Extracted from kestrel_agent.py — handles the core orchestrator loop:
 - Streaming orchestrator response handling
 - Message pruning for context pressure management
 - Diminishing returns detection (stop loops producing negligible output)
+- Context analysis: duplicate detection and token attribution by source
 """
 
 import json
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Union
@@ -131,6 +133,163 @@ def _build_persisted_preview(result_json: str, tool_name: str, original_len: int
         ])
 
     return "\n".join(parts)
+
+
+class ContextStats:
+    """
+    Incremental accumulator for context analysis.
+
+    Records tool calls as they happen during dispatch, enabling O(1) status
+    queries for duplicate detection and token attribution by source.
+
+    Designed to be attached to the agent instance and reset on session change
+    or context compression.
+    """
+
+    def __init__(self):
+        self._last_session_id: Optional[str] = None
+        self.reset()
+
+    def check_session(self, session_id: Optional[str]):
+        """Reset stats if session has changed."""
+        if session_id and session_id != self._last_session_id:
+            if self._last_session_id is not None:
+                logging.debug(f"[CONTEXT_STATS] Session changed, resetting stats")
+            self._last_session_id = session_id
+            self.reset()
+
+    def reset(self):
+        """Clear all accumulated stats. Call on session change or compression."""
+        # List of recorded tool calls in dispatch order
+        self._calls: List[Dict[str, Any]] = []
+        # Set of normalized signatures for duplicate detection
+        self._seen_signatures: set = set()
+        # Counts by tool name
+        self._tool_counts: Dict[str, int] = {}
+        # Total result chars by tool name (proxy for token cost)
+        self._tool_result_chars: Dict[str, int] = {}
+        # Duplicate call entries
+        self._duplicates: List[Dict[str, Any]] = []
+
+    @staticmethod
+    def _normalize_input(tool_name: str, args: dict) -> str:
+        """
+        Build a normalized signature for duplicate detection.
+
+        Normalizes file paths with os.path.abspath and strips whitespace
+        on string values to catch near-duplicate calls.
+        """
+        normalized_args = {}
+        for key, value in sorted(args.items()):
+            if isinstance(value, str):
+                stripped = value.strip()
+                # Normalize anything that looks like a file path
+                if "/" in stripped or "\\" in stripped:
+                    try:
+                        stripped = os.path.abspath(stripped)
+                    except (ValueError, OSError):
+                        pass
+                normalized_args[key] = stripped
+            else:
+                normalized_args[key] = value
+        return f"{tool_name}:{json.dumps(normalized_args, sort_keys=True)}"
+
+    def record(self, tool_name: str, args: dict, result_chars: int):
+        """
+        Record a tool call. Called from _dispatch_tool_call at dispatch time.
+
+        Args:
+            tool_name: Name of the tool that was called.
+            args: Arguments passed to the tool.
+            result_chars: Character count of the serialized result.
+        """
+        signature = self._normalize_input(tool_name, args)
+        is_duplicate = signature in self._seen_signatures
+        self._seen_signatures.add(signature)
+
+        entry = {
+            "tool_name": tool_name,
+            "input_summary": self._summarize_input(args),
+            "result_chars": result_chars,
+            "is_duplicate": is_duplicate,
+            "call_index": len(self._calls),
+        }
+        self._calls.append(entry)
+
+        # Update counters
+        self._tool_counts[tool_name] = self._tool_counts.get(tool_name, 0) + 1
+        self._tool_result_chars[tool_name] = (
+            self._tool_result_chars.get(tool_name, 0) + result_chars
+        )
+
+        if is_duplicate:
+            self._duplicates.append(entry)
+
+    @staticmethod
+    def _summarize_input(args: dict, max_len: int = 120) -> str:
+        """Create a short human-readable summary of tool input args."""
+        if not args:
+            return "(no args)"
+        parts = []
+        for key, value in args.items():
+            val_str = str(value)
+            if len(val_str) > 60:
+                val_str = val_str[:57] + "..."
+            parts.append(f"{key}={val_str}")
+        summary = ", ".join(parts)
+        if len(summary) > max_len:
+            summary = summary[: max_len - 3] + "..."
+        return summary
+
+    def get_analysis(self) -> Dict[str, Any]:
+        """
+        Return the accumulated analysis dict. O(1) — reads pre-computed data.
+
+        Designed to be nested into the existing get_status() response.
+        """
+        total_calls = len(self._calls)
+        duplicate_count = len(self._duplicates)
+        total_result_chars = sum(self._tool_result_chars.values())
+
+        # Build per-tool attribution
+        attribution = {}
+        for tool_name in self._tool_counts:
+            chars = self._tool_result_chars.get(tool_name, 0)
+            attribution[tool_name] = {
+                "calls": self._tool_counts[tool_name],
+                "result_chars": chars,
+                "percent_of_total": (
+                    round(chars / total_result_chars * 100, 1)
+                    if total_result_chars > 0
+                    else 0.0
+                ),
+            }
+
+        # Sort attribution by result_chars descending
+        sorted_attribution = dict(
+            sorted(attribution.items(), key=lambda x: x[1]["result_chars"], reverse=True)
+        )
+
+        return {
+            "total_tool_calls": total_calls,
+            "unique_tool_calls": total_calls - duplicate_count,
+            "duplicate_tool_calls": duplicate_count,
+            "duplicate_percent": (
+                round(duplicate_count / total_calls * 100, 1)
+                if total_calls > 0
+                else 0.0
+            ),
+            "total_result_chars": total_result_chars,
+            "attribution_by_tool": sorted_attribution,
+            "duplicates": [
+                {
+                    "tool_name": d["tool_name"],
+                    "input_summary": d["input_summary"],
+                    "call_index": d["call_index"],
+                }
+                for d in self._duplicates
+            ],
+        }
 
 
 class OrchestratorEngineMixin:
@@ -334,6 +493,11 @@ class OrchestratorEngineMixin:
             "tool_call_id": tool_call.id,
             "content": result_json
         })
+
+        # Record into context stats accumulator (if available on the agent)
+        context_stats = getattr(self, "context_stats", None)
+        if context_stats is not None:
+            context_stats.record(tool_name, args, len(result_json))
 
         return result
 
