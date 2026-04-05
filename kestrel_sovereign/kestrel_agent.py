@@ -29,7 +29,7 @@ from kestrel_sovereign.agent.constitution import ConstitutionMixin
 from kestrel_sovereign.agent.streaming import StreamingMixin
 from kestrel_sovereign.agent.backup import BackupMixin
 from kestrel_sovereign.agent.sleep import SleepMixin
-from kestrel_sovereign.agent.orchestrator_engine import OrchestratorEngineMixin
+from kestrel_sovereign.agent.orchestrator_engine import OrchestratorEngineMixin, ContextStats
 from kestrel_sovereign.agent.tool_registry import ToolRegistryMixin
 from kestrel_sovereign.agent.model_preference import ModelPreferenceMixin
 from kestrel_sovereign.agent.event_manager import EventManagerMixin
@@ -539,6 +539,10 @@ class KestrelAgent(
                 llm_service=self.llm_service,
             )
 
+            # Context stats accumulator for duplicate detection / token attribution.
+            # Resets on session change or compression.
+            self.context_stats = ContextStats()
+
             # Initialize bootstrap service for first-time agent wake-up
             self.bootstrap_service = BootstrapService(
                 db=self._raw_storage.db,
@@ -880,6 +884,10 @@ Expected Duration: {expected_duration}
             session_id: Optional session ID to load conversation context from a specific session
         """
         logging.info(f"[AGENTIC] process_input called ({len(user_input)} chars)")
+
+        # Reset context stats on session change
+        if hasattr(self, 'context_stats') and session_id:
+            self.context_stats.check_session(session_id)
 
         # CONSTITUTION AUDIT CHECK: Trigger periodic integrity audits
         await self._maybe_audit()

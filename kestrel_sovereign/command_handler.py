@@ -442,6 +442,11 @@ class CommandHandler:
         )
 
         if result["success"]:
+            # Reset context stats after compression (accumulated data is stale)
+            context_stats = getattr(self.agent, 'context_stats', None)
+            if context_stats is not None:
+                context_stats.reset()
+
             return (
                 f"✅ Session compressed\n"
                 f"  Messages compressed: {result['messages_compressed']}\n"

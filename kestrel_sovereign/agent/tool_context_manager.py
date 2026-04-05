@@ -58,7 +58,7 @@ class ToolContextManager:
     def model(self, value: str) -> None:
         self._model = value
 
-    async def get_status(self, counter, history: Optional[list] = None, session_id: Optional[str] = None) -> Dict[str, Any]:
+    async def get_status(self, counter, history: Optional[list] = None, session_id: Optional[str] = None, context_stats=None) -> Dict[str, Any]:
         """
         Get detailed context window status for agent introspection.
 
@@ -104,7 +104,7 @@ class ToolContextManager:
         history_utilization = (history_tokens / budget.history * 100) if budget.history > 0 else 0
         total_utilization = (history_tokens / budget.total_budget * 100) if budget.total_budget > 0 else 0
 
-        return {
+        status = {
             "success": True,
             "total_budget": budget.total_budget,
             "total_used": history_tokens,
@@ -139,6 +139,12 @@ class ToolContextManager:
             "model": self.model,
             "note": "Status reflects the same data path used by the LLM (session-filtered, limited to 50 messages)."
         }
+
+        # Nest context analysis from the accumulator (if provided)
+        if context_stats is not None:
+            status["analysis"] = context_stats.get_analysis()
+
+        return status
 
     def get_budget_status(self, message_count: int = 0) -> Dict[str, Any]:
         """
