@@ -148,6 +148,8 @@ class TestRealStreaming:
             '_prune_orchestrator_messages',
             '_build_all_tools',
             '_build_feature_tools',
+            '_execute_tool_batch',
+            '_partition_tool_calls',
         ):
             setattr(mock_agent, method_name,
                     getattr(KestrelAgent, method_name).__get__(mock_agent))

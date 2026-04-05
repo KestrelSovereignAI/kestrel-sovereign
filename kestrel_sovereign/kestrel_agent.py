@@ -65,6 +65,9 @@ MAX_TOOL_RESULT_CHARS = int(os.environ.get("KESTREL_MAX_TOOL_RESULT_CHARS", "800
 # Reserve this fraction of context for the LLM response + next tool call
 CONTEXT_RESERVE_FRACTION = 0.2
 
+# Maximum number of direct tools to execute concurrently (parallel batching)
+MAX_TOOL_CONCURRENCY = int(os.environ.get("KESTREL_MAX_TOOL_CONCURRENCY", "10"))
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 
@@ -554,7 +557,7 @@ class KestrelAgent(
             for feature_name in ("TaskFeature", "PeersFeature"):
                 feature = self.features.get(feature_name)
                 if feature:
-                    self._register_explored_feature_tools(feature)
+                    await self._register_explored_feature_tools(feature)
 
             # Initialize heartbeat system (periodic agent self-checks)
             from kestrel_sovereign.heartbeat import HeartbeatConfig, HeartbeatRunner

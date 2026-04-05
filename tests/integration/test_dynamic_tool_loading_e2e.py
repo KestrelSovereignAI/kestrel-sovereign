@@ -94,7 +94,7 @@ class TestExploreThenDirectFlow:
 
         # Register (same as what _handle_orchestrator_response does after dispatch)
         feature = features["model_agent"]
-        agent._register_explored_feature_tools(feature)
+        await agent._register_explored_feature_tools(feature)
 
         # After exploration: model_agent tools are registered (count increased)
         assert len(agent._direct_tools) > initial_count
@@ -112,7 +112,7 @@ class TestExploreThenDirectFlow:
         feature = features["model_agent"]
 
         # Register tools
-        agent._register_explored_feature_tools(feature)
+        await agent._register_explored_feature_tools(feature)
 
         # Execute list_models directly through _direct_tools
         tool = agent._direct_tools["list_models"]
@@ -267,7 +267,7 @@ class TestMultiFeatureExploration:
         explored = []
         for name in ["model_agent", "memory_feature"]:
             if name in features:
-                agent._register_explored_feature_tools(features[name])
+                await agent._register_explored_feature_tools(features[name])
                 explored.append(name)
 
         assert len(explored) >= 1, f"Expected at least model_agent in features: {list(features.keys())}"

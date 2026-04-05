@@ -6,12 +6,14 @@ Extracted from kestrel_agent.py — handles the core orchestrator loop:
 - Non-streaming orchestrator response handling
 - Streaming orchestrator response handling
 - Message pruning for context pressure management
+- Parallel execution batching for concurrency-safe direct tools
 """
 
+import asyncio
 import json
 import logging
 import time
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from kestrel_sovereign.hooks import HookEvent, HookInput, PermissionDecision
 from kestrel_sovereign.llm.adapter import LLMResponse
@@ -24,16 +26,18 @@ from kestrel_sovereign.telemetry import optional_span
 MAX_TOOL_ITERATIONS = None  # set by _init_constants()
 MAX_TOOL_RESULT_CHARS = None
 CONTEXT_RESERVE_FRACTION = None
+MAX_TOOL_CONCURRENCY = None
 
 
 def _init_constants():
     """Lazily import constants from kestrel_agent to avoid circular imports."""
-    global MAX_TOOL_ITERATIONS, MAX_TOOL_RESULT_CHARS, CONTEXT_RESERVE_FRACTION
+    global MAX_TOOL_ITERATIONS, MAX_TOOL_RESULT_CHARS, CONTEXT_RESERVE_FRACTION, MAX_TOOL_CONCURRENCY
     if MAX_TOOL_ITERATIONS is None:
         from kestrel_sovereign import kestrel_agent as _ka
         MAX_TOOL_ITERATIONS = _ka.MAX_TOOL_ITERATIONS
         MAX_TOOL_RESULT_CHARS = _ka.MAX_TOOL_RESULT_CHARS
         CONTEXT_RESERVE_FRACTION = _ka.CONTEXT_RESERVE_FRACTION
+        MAX_TOOL_CONCURRENCY = _ka.MAX_TOOL_CONCURRENCY
 
 
 class OrchestratorEngineMixin:
@@ -289,7 +293,7 @@ class OrchestratorEngineMixin:
             logging.info(f"{log_tag}Dispatching to feature subagent: {f.tool_name}")
             with optional_span("agent.feature_dispatch", {"feature.name": f.tool_name}):
                 r = await f.execute_as_subagent(task=task, context=context, denied_tools=dt)
-            self._register_explored_feature_tools(f)
+            await self._register_explored_feature_tools(f)
             return r
 
         try:
@@ -463,6 +467,219 @@ class OrchestratorEngineMixin:
             return result
 
     # ------------------------------------------------------------------
+    # Concurrency batching — parallel execution for read-only tools
+    # ------------------------------------------------------------------
+
+    def _partition_tool_calls(
+        self, tool_calls, features_by_tool_name: dict
+    ) -> Tuple[list, list]:
+        """Partition tool calls into sequential and parallel-eligible groups.
+
+        A tool call is parallel-eligible when ALL of the following hold:
+        1. It targets a *direct* tool (already promoted via LRU), not a
+           feature subagent dispatch (subagent dispatches share the LLM).
+        2. The underlying tool's schema has ``is_concurrency_safe=True``.
+
+        Returns:
+            (sequential, parallel) — two lists of tool_call objects.
+            ``sequential`` must run one-at-a-time; ``parallel`` may be
+            batched with asyncio.gather().
+        """
+        sequential = []
+        parallel = []
+        for tc in tool_calls:
+            tool_name = tc.name
+            # Feature subagent dispatches are always sequential
+            if tool_name in features_by_tool_name:
+                sequential.append(tc)
+                continue
+            # Direct tools: check concurrency_safe flag
+            tool = self._direct_tools.get(tool_name)
+            if tool and getattr(tool.schema, "is_concurrency_safe", False):
+                parallel.append(tc)
+            else:
+                sequential.append(tc)
+        return sequential, parallel
+
+    async def _execute_tool_batch(
+        self,
+        tool_calls: list,
+        features_by_tool_name: dict,
+        known_tools: set,
+        messages: list,
+        iteration: int,
+        user_message: Optional[str],
+        *,
+        tool_events: Optional[list] = None,
+        streaming: bool = False,
+    ) -> None:
+        """Execute a batch of tool calls, running parallel-eligible ones concurrently.
+
+        Execution order:
+        1. Fire PRE_TOOL_USE hooks **sequentially** for every parallel-eligible
+           tool call (hooks may have side-effects / ordering requirements).
+        2. Launch parallel tool executions with ``asyncio.gather()``, bounded
+           by an ``asyncio.Semaphore(MAX_TOOL_CONCURRENCY)``.
+        3. Append results to *messages* in the **original request order**.
+        4. Execute remaining sequential tool calls one at a time.
+        """
+        _init_constants()
+        sequential, parallel = self._partition_tool_calls(tool_calls, features_by_tool_name)
+
+        if not parallel:
+            # Fast path: nothing to parallelise, fall through to sequential
+            for tc in tool_calls:
+                await self._dispatch_tool_call(
+                    tc, features_by_tool_name, known_tools, messages,
+                    iteration, user_message,
+                    tool_events=tool_events, streaming=streaming,
+                )
+            return
+
+        logging.info(
+            f"[CONCURRENCY] Batch: {len(parallel)} parallel, "
+            f"{len(sequential)} sequential tool calls"
+        )
+
+        # --- Phase 1: Run PRE_TOOL_USE hooks sequentially for parallel tools ---
+        pre_hook_results: dict = {}  # tc.id -> (allowed: bool, args: dict)
+        for tc in parallel:
+            tool_name = tc.name
+            args = tc.arguments if isinstance(tc.arguments, dict) else {}
+            hook_feature_name = self._tool_to_feature.get(tool_name, tool_name)
+
+            hook_input = HookInput(
+                session_id="orchestrator",
+                hook_event_name=HookEvent.PRE_TOOL_USE.value,
+                tool_name=tool_name,
+                tool_input=args,
+                feature_name=hook_feature_name,
+            )
+            hook_output = await self.hooks_manager.execute_hooks(
+                HookEvent.PRE_TOOL_USE, hook_input
+            )
+            if hook_output.permission_decision == PermissionDecision.DENY:
+                reason = hook_output.permission_reason or "Blocked by security policy"
+                logging.info(f"[CONCURRENCY] Tool denied in pre-hook: {tool_name} - {reason}")
+                pre_hook_results[tc.id] = (False, args, reason)
+            else:
+                updated_args = hook_output.updated_input if hook_output.updated_input else args
+                pre_hook_results[tc.id] = (True, updated_args, None)
+
+        # --- Phase 2: Launch allowed parallel tools via asyncio.gather ---
+        semaphore = asyncio.Semaphore(MAX_TOOL_CONCURRENCY)
+
+        # We store results keyed by tc.id to reassemble in order
+        parallel_results: dict = {}  # tc.id -> (result_json, tool_name)
+
+        async def _run_one(tc):
+            """Execute a single parallel tool call under the semaphore."""
+            allowed, args, deny_reason = pre_hook_results[tc.id]
+            tool_name = tc.name
+
+            if not allowed:
+                result = {"success": False, "error": f"Permission denied: {deny_reason}"}
+                from kestrel_sovereign.features.base import _serialize_tool_result
+                parallel_results[tc.id] = json.dumps(_serialize_tool_result(result))
+                return
+
+            # Validate arguments
+            is_valid, validation_error = validate_tool_arguments(
+                tool_name, args, known_tools=known_tools
+            )
+            if not is_valid:
+                logging.warning(f"[CONCURRENCY] Validation failed: {validation_error}")
+                result = {"success": False, "error": f"Tool validation failed: {validation_error}"}
+                from kestrel_sovereign.features.base import _serialize_tool_result
+                parallel_results[tc.id] = json.dumps(_serialize_tool_result(result))
+                return
+
+            async with semaphore:
+                tool = self._direct_tools[tool_name]
+                hook_feature_name = self._tool_to_feature.get(tool_name, tool_name)
+
+                exec_start = time.time()
+                dispatch_event_id = await self.observability_store.log_tool_call(
+                    agent_name=self.did,
+                    tool_name=f"parallel_direct:{tool_name}",
+                    metadata={"arguments": args, "iteration": iteration},
+                )
+
+                try:
+                    with optional_span("agent.tool_execution", {
+                        "tool.name": tool_name,
+                        "tool.feature": hook_feature_name,
+                        "tool.parallel": True,
+                    }):
+                        result = await tool.execute(**args)
+
+                    exec_duration_ms = int((time.time() - exec_start) * 1000)
+                    await self.observability_store.log_tool_response(
+                        event_id=dispatch_event_id,
+                        success=True,
+                        duration_ms=exec_duration_ms,
+                    )
+                    logging.info(f"[CONCURRENCY] {tool_name} completed ({exec_duration_ms}ms)")
+
+                    if streaming and tool_events is not None:
+                        tool_events.append({"type": "complete", "tool": tool_name, "ms": exec_duration_ms})
+
+                except Exception as e:
+                    exec_duration_ms = int((time.time() - exec_start) * 1000)
+                    logging.error(f"[CONCURRENCY] {tool_name} failed: {e}")
+                    result = {"success": False, "error": str(e)}
+                    await self.observability_store.log_tool_response(
+                        event_id=dispatch_event_id,
+                        success=False,
+                        duration_ms=exec_duration_ms,
+                        error_message=str(e),
+                    )
+                    if streaming and tool_events is not None:
+                        tool_events.append({"type": "error", "tool": tool_name, "error": str(e)[:200]})
+
+                # Fire POST_TOOL_USE hooks (non-blocking)
+                post_hook_input = HookInput(
+                    session_id="orchestrator",
+                    hook_event_name=HookEvent.POST_TOOL_USE.value,
+                    tool_name=tool_name,
+                    tool_input=args,
+                    feature_name=hook_feature_name,
+                    tool_response=result if isinstance(result, dict) else {"result": str(result)},
+                    execution_time_ms=exec_duration_ms,
+                )
+                await self.hooks_manager.execute_hooks_parallel(
+                    HookEvent.POST_TOOL_USE, post_hook_input
+                )
+
+                from kestrel_sovereign.features.base import _serialize_tool_result
+                parallel_results[tc.id] = json.dumps(_serialize_tool_result(result))
+
+        await asyncio.gather(*[_run_one(tc) for tc in parallel])
+
+        # --- Phase 3: Append parallel results in ORIGINAL request order ---
+        for tc in parallel:
+            result_json = parallel_results.get(tc.id, '{"success": false, "error": "No result"}')
+            if len(result_json) > MAX_TOOL_RESULT_CHARS:
+                truncated_len = len(result_json)
+                result_json = (
+                    result_json[:MAX_TOOL_RESULT_CHARS]
+                    + f"\n... [truncated {truncated_len - MAX_TOOL_RESULT_CHARS} chars]"
+                )
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tc.id,
+                "content": result_json,
+            })
+
+        # --- Phase 4: Execute sequential tool calls one at a time ---
+        for tc in sequential:
+            await self._dispatch_tool_call(
+                tc, features_by_tool_name, known_tools, messages,
+                iteration, user_message,
+                tool_events=tool_events, streaming=streaming,
+            )
+
+    # ------------------------------------------------------------------
     # Non-streaming orchestrator response handler
     # ------------------------------------------------------------------
 
@@ -516,11 +733,10 @@ class OrchestratorEngineMixin:
             if iteration >= max_iterations * 0.8:
                 logging.warning(f"[ORCHESTRATOR] Approaching max iterations: {iteration + 1}/{max_iterations}")
 
-            for tool_call in response.tool_calls:
-                await self._dispatch_tool_call(
-                    tool_call, features_by_tool_name, known_tools, messages,
-                    iteration, user_message,
-                )
+            await self._execute_tool_batch(
+                response.tool_calls, features_by_tool_name, known_tools,
+                messages, iteration, user_message,
+            )
 
             # Continue conversation with tool results
             all_tools = self._build_all_tools()
@@ -673,22 +889,15 @@ class OrchestratorEngineMixin:
         known_tools = set(features_by_tool_name.keys()) | set(self._direct_tools.keys())
 
         for iteration in range(max_iterations):
+            # Stream tool start indicators for all tools in this batch
             for tool_call in response.tool_calls:
-                tool_name = tool_call.name
+                yield f"\U0001f527 Calling {tool_call.name}...\n"
 
-                # Stream tool start indicator
-                if tool_events is not None:
-                    pass  # handled in _dispatch_tool_call
-                yield f"\U0001f527 Calling {tool_name}...\n"
-
-                await self._dispatch_tool_call(
-                    tool_call, features_by_tool_name, known_tools, messages,
-                    iteration, user_message,
-                    tool_events=tool_events, streaming=True,
-                )
-
-                # Stream completion indicator
-                # (tool_events already updated by _dispatch_tool_call)
+            await self._execute_tool_batch(
+                response.tool_calls, features_by_tool_name, known_tools,
+                messages, iteration, user_message,
+                tool_events=tool_events, streaming=True,
+            )
 
             all_tools = self._build_all_tools()
             messages = self._prune_orchestrator_messages(messages, all_tools)

@@ -6,6 +6,7 @@ orchestrator LLM, including feature dispatcher tools and directly-promoted
 individual tools with LRU eviction.
 """
 
+import asyncio
 import logging
 from typing import Any, Dict, List
 
@@ -14,6 +15,18 @@ class ToolRegistryMixin:
     """Mixin providing dynamic tool loading and management for KestrelAgent."""
 
     MAX_DIRECT_TOOLS = 60
+
+    # Lock protecting mutations to _direct_tools, _direct_tool_defs,
+    # _explored_features, and _tool_to_feature.  Initialised lazily in
+    # _get_registry_lock() so that the mixin works regardless of __init__
+    # ordering.
+    _registry_lock: asyncio.Lock | None = None
+
+    def _get_registry_lock(self) -> asyncio.Lock:
+        """Return (and lazily create) the registry mutation lock."""
+        if self._registry_lock is None:
+            self._registry_lock = asyncio.Lock()
+        return self._registry_lock
 
     def _build_feature_tools(self) -> List[Dict[str, Any]]:
         """
@@ -58,37 +71,43 @@ class ToolRegistryMixin:
         tools.extend(self._direct_tool_defs)
         return tools
 
-    def _register_explored_feature_tools(self, feature) -> None:
+    async def _register_explored_feature_tools(self, feature) -> None:
         """Register a feature's individual tools for direct calling.
 
         After a successful subagent dispatch, the feature's @tool methods
         become available for the orchestrator to call directly without
         a subagent LLM hop.
+
+        Thread-safe: acquires _registry_lock before mutating shared dicts.
         """
-        if feature.tool_name in self._explored_features:
-            return
-        self._explored_features[feature.tool_name] = True
-        registered = 0
-        for tool in feature.get_tools():
-            if tool.name in self._direct_tools:
-                name = f"{feature.tool_name}__{tool.name}"
-            else:
-                name = tool.name
-            self._direct_tools[name] = tool
-            tool_def = tool.schema.to_openai_format()
-            tool_def["function"]["name"] = name
-            self._direct_tool_defs.append(tool_def)
-            self._tool_to_feature[name] = feature.tool_name
-            registered += 1
-        self._maybe_evict_direct_tools()
-        logging.info(
-            f"[DYNAMIC-TOOLS] Explored {feature.tool_name}, "
-            f"registered {registered} direct tools. "
-            f"Total: {len(self._direct_tools)}"
-        )
+        async with self._get_registry_lock():
+            if feature.tool_name in self._explored_features:
+                return
+            self._explored_features[feature.tool_name] = True
+            registered = 0
+            for tool in feature.get_tools():
+                if tool.name in self._direct_tools:
+                    name = f"{feature.tool_name}__{tool.name}"
+                else:
+                    name = tool.name
+                self._direct_tools[name] = tool
+                tool_def = tool.schema.to_openai_format()
+                tool_def["function"]["name"] = name
+                self._direct_tool_defs.append(tool_def)
+                self._tool_to_feature[name] = feature.tool_name
+                registered += 1
+            self._maybe_evict_direct_tools()
+            logging.info(
+                f"[DYNAMIC-TOOLS] Explored {feature.tool_name}, "
+                f"registered {registered} direct tools. "
+                f"Total: {len(self._direct_tools)}"
+            )
 
     def _maybe_evict_direct_tools(self) -> None:
-        """Evict least-recently-explored feature's tools if over limit."""
+        """Evict least-recently-explored feature's tools if over limit.
+
+        MUST be called while holding _registry_lock.
+        """
         while len(self._direct_tools) > self.MAX_DIRECT_TOOLS:
             oldest = next(iter(self._explored_features))
             del self._explored_features[oldest]

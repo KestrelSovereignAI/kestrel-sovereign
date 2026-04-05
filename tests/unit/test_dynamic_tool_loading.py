@@ -86,12 +86,13 @@ class TestDynamicToolLoadingInit:
 
 class TestRegisterExploredFeatureTools:
 
-    def test_register_populates_direct_tools(self, agent):
+    @pytest.mark.asyncio
+    async def test_register_populates_direct_tools(self, agent):
         """After registration, tools appear in _direct_tools and _direct_tool_defs."""
         tools = [_make_mock_tool("list_models"), _make_mock_tool("get_current_model")]
         feature = _make_mock_feature("model_agent", tools)
 
-        agent._register_explored_feature_tools(feature)
+        await agent._register_explored_feature_tools(feature)
 
         assert "model_agent" in agent._explored_features
         assert "list_models" in agent._direct_tools
@@ -100,23 +101,25 @@ class TestRegisterExploredFeatureTools:
         assert agent._tool_to_feature["list_models"] == "model_agent"
         assert agent._tool_to_feature["get_current_model"] == "model_agent"
 
-    def test_register_idempotent(self, agent):
+    @pytest.mark.asyncio
+    async def test_register_idempotent(self, agent):
         """Registering same feature twice doesn't double tools."""
         tools = [_make_mock_tool("list_models")]
         feature = _make_mock_feature("model_agent", tools)
 
-        agent._register_explored_feature_tools(feature)
-        agent._register_explored_feature_tools(feature)
+        await agent._register_explored_feature_tools(feature)
+        await agent._register_explored_feature_tools(feature)
 
         assert len(agent._direct_tools) == 1
         assert len(agent._direct_tool_defs) == 1
 
-    def test_tool_defs_in_openai_format(self, agent):
+    @pytest.mark.asyncio
+    async def test_tool_defs_in_openai_format(self, agent):
         """Registered tool defs match OpenAI function calling format."""
         tools = [_make_mock_tool("list_models")]
         feature = _make_mock_feature("model_agent", tools)
 
-        agent._register_explored_feature_tools(feature)
+        await agent._register_explored_feature_tools(feature)
 
         tool_def = agent._direct_tool_defs[0]
         assert tool_def["type"] == "function"
@@ -124,15 +127,16 @@ class TestRegisterExploredFeatureTools:
         assert "parameters" in tool_def["function"]
         assert tool_def["function"]["parameters"]["type"] == "object"
 
-    def test_register_multiple_features(self, agent):
+    @pytest.mark.asyncio
+    async def test_register_multiple_features(self, agent):
         """Multiple features register their tools independently."""
         model_tools = [_make_mock_tool("list_models")]
         memory_tools = [_make_mock_tool("search_memory"), _make_mock_tool("memory_status")]
         model_feature = _make_mock_feature("model_agent", model_tools)
         memory_feature = _make_mock_feature("memory_feature", memory_tools)
 
-        agent._register_explored_feature_tools(model_feature)
-        agent._register_explored_feature_tools(memory_feature)
+        await agent._register_explored_feature_tools(model_feature)
+        await agent._register_explored_feature_tools(memory_feature)
 
         assert len(agent._explored_features) == 2
         assert len(agent._direct_tools) == 3
@@ -145,29 +149,31 @@ class TestRegisterExploredFeatureTools:
 
 class TestNameCollision:
 
-    def test_collision_prefixed_with_feature_name(self, agent):
+    @pytest.mark.asyncio
+    async def test_collision_prefixed_with_feature_name(self, agent):
         """Colliding tool names get feature_name__tool_name prefix."""
         tools_a = [_make_mock_tool("status")]
         tools_b = [_make_mock_tool("status")]
         feature_a = _make_mock_feature("model_agent", tools_a)
         feature_b = _make_mock_feature("memory_feature", tools_b)
 
-        agent._register_explored_feature_tools(feature_a)
-        agent._register_explored_feature_tools(feature_b)
+        await agent._register_explored_feature_tools(feature_a)
+        await agent._register_explored_feature_tools(feature_b)
 
         assert "status" in agent._direct_tools
         assert "memory_feature__status" in agent._direct_tools
         assert len(agent._direct_tools) == 2
 
-    def test_collision_tool_def_uses_prefixed_name(self, agent):
+    @pytest.mark.asyncio
+    async def test_collision_tool_def_uses_prefixed_name(self, agent):
         """Prefixed tool's OpenAI def uses the prefixed name."""
         tools_a = [_make_mock_tool("status")]
         tools_b = [_make_mock_tool("status")]
         feature_a = _make_mock_feature("model_agent", tools_a)
         feature_b = _make_mock_feature("memory_feature", tools_b)
 
-        agent._register_explored_feature_tools(feature_a)
-        agent._register_explored_feature_tools(feature_b)
+        await agent._register_explored_feature_tools(feature_a)
+        await agent._register_explored_feature_tools(feature_b)
 
         names = [d["function"]["name"] for d in agent._direct_tool_defs]
         assert "status" in names
@@ -180,14 +186,15 @@ class TestNameCollision:
 
 class TestBuildAllTools:
 
-    def test_explored_feature_replaces_dispatcher_with_direct_tools(self, agent):
+    @pytest.mark.asyncio
+    async def test_explored_feature_replaces_dispatcher_with_direct_tools(self, agent):
         """Once explored, feature dispatch tool is replaced by direct tools."""
         # Add a feature so _build_feature_tools returns something
         feature = _make_mock_feature("model_agent", [_make_mock_tool("list_models")])
         agent.features = {"ModelAgent": feature}
 
         # Register direct tools (promotes tools, skips dispatcher)
-        agent._register_explored_feature_tools(feature)
+        await agent._register_explored_feature_tools(feature)
 
         all_tools = agent._build_all_tools()
 
@@ -234,20 +241,21 @@ class TestDirectToolExecution:
 
 class TestEviction:
 
-    def test_eviction_at_capacity(self, agent):
+    @pytest.mark.asyncio
+    async def test_eviction_at_capacity(self, agent):
         """Oldest feature's tools evicted when over MAX_DIRECT_TOOLS."""
         agent.MAX_DIRECT_TOOLS = 5  # Low cap for testing
 
         # Register feature A with 3 tools
         tools_a = [_make_mock_tool(f"tool_a_{i}") for i in range(3)]
         feature_a = _make_mock_feature("feature_a", tools_a)
-        agent._register_explored_feature_tools(feature_a)
+        await agent._register_explored_feature_tools(feature_a)
         assert len(agent._direct_tools) == 3
 
         # Register feature B with 3 tools -> total 6, exceeds cap of 5
         tools_b = [_make_mock_tool(f"tool_b_{i}") for i in range(3)]
         feature_b = _make_mock_feature("feature_b", tools_b)
-        agent._register_explored_feature_tools(feature_b)
+        await agent._register_explored_feature_tools(feature_b)
 
         # Feature A (oldest) should be evicted
         assert "feature_a" not in agent._explored_features
@@ -257,17 +265,18 @@ class TestEviction:
         assert all(f"tool_b_{i}" in agent._direct_tools for i in range(3))
         assert len(agent._direct_tools) == 3
 
-    def test_eviction_removes_tool_defs(self, agent):
+    @pytest.mark.asyncio
+    async def test_eviction_removes_tool_defs(self, agent):
         """Evicted tools are also removed from _direct_tool_defs."""
         agent.MAX_DIRECT_TOOLS = 3
 
         tools_a = [_make_mock_tool("old_tool_1"), _make_mock_tool("old_tool_2")]
         feature_a = _make_mock_feature("old_feature", tools_a)
-        agent._register_explored_feature_tools(feature_a)
+        await agent._register_explored_feature_tools(feature_a)
 
         tools_b = [_make_mock_tool("new_tool_1"), _make_mock_tool("new_tool_2")]
         feature_b = _make_mock_feature("new_feature", tools_b)
-        agent._register_explored_feature_tools(feature_b)
+        await agent._register_explored_feature_tools(feature_b)
 
         def_names = [d["function"]["name"] for d in agent._direct_tool_defs]
         assert "old_tool_1" not in def_names
@@ -275,13 +284,14 @@ class TestEviction:
         assert "new_tool_1" in def_names
         assert "new_tool_2" in def_names
 
-    def test_no_eviction_under_capacity(self, agent):
+    @pytest.mark.asyncio
+    async def test_no_eviction_under_capacity(self, agent):
         """No eviction when total tools are under the cap."""
         agent.MAX_DIRECT_TOOLS = 60
 
         tools = [_make_mock_tool(f"tool_{i}") for i in range(5)]
         feature = _make_mock_feature("small_feature", tools)
-        agent._register_explored_feature_tools(feature)
+        await agent._register_explored_feature_tools(feature)
 
         assert len(agent._direct_tools) == 5
         assert "small_feature" in agent._explored_features
@@ -293,7 +303,8 @@ class TestEviction:
 
 class TestFeatureDispatchUnaffected:
 
-    def test_feature_dispatch_removed_after_exploration(self, agent):
+    @pytest.mark.asyncio
+    async def test_feature_dispatch_removed_after_exploration(self, agent):
         """Feature dispatch tool is removed when direct tools are registered."""
         feature = _make_mock_feature("model_agent", [_make_mock_tool("list_models")])
         agent.features = {"ModelAgent": feature}
@@ -304,6 +315,6 @@ class TestFeatureDispatchUnaffected:
         assert tools_before[0]["function"]["name"] == "model_agent"
 
         # After exploration — dispatch tool removed (direct tools replace it)
-        agent._register_explored_feature_tools(feature)
+        await agent._register_explored_feature_tools(feature)
         tools_after = agent._build_feature_tools()
         assert len(tools_after) == 0

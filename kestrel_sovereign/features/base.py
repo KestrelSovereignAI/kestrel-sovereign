@@ -798,7 +798,8 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
                             description=self._schema_data["description"],
                             category=self._schema_data["category"],
                             parameters=self._schema_data["parameters"],
-                            command_prefix=self._schema_data.get("command_prefix")
+                            command_prefix=self._schema_data.get("command_prefix"),
+                            is_concurrency_safe=self._schema_data.get("concurrency_safe", False),
                         )
 
                     async def execute(self, **kwargs) -> Dict[str, Any]:
@@ -820,22 +821,38 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
                 tools.append(DynamicTool(method, schema_data, agent_skill))
         return tools
 
-def tool(name: str, description: str, category: ToolCategory = ToolCategory.SYSTEM, command_prefix: str = None):
+def tool(
+    name: str,
+    description: str,
+    category: ToolCategory = ToolCategory.SYSTEM,
+    command_prefix: str = None,
+    concurrency_safe: bool = False,
+):
     """
     Decorator to mark a method as an agent tool.
     The method's signature is inspected to generate parameters.
     Parameter descriptions are extracted from the function's docstring.
-    
+
     Supports docstring formats:
     - Google style: `param_name: Description here`
     - Sphinx style: `:param param_name: Description here`
-    
+
+    Args:
+        name: Unique tool name.
+        description: Human-readable description shown to the LLM.
+        category: ToolCategory for organisation/filtering.
+        command_prefix: Optional ``!command`` prefix for CLI usage.
+        concurrency_safe: When True, this direct tool may be executed in
+            parallel with other concurrency-safe tools.  Only meaningful
+            for *direct* tools (after LRU promotion); feature subagent
+            dispatches always stay sequential because they share the LLM.
+
     Example:
-        @tool("my_tool", "Does something useful")
+        @tool("my_tool", "Does something useful", concurrency_safe=True)
         async def my_tool(self, file_path: str, count: int = 10):
             '''
             Do something with a file.
-            
+
             Args:
                 file_path: The path to the file to process
                 count: Number of items to process (default: 10)
@@ -902,7 +919,8 @@ def tool(name: str, description: str, category: ToolCategory = ToolCategory.SYST
             "description": description,
             "category": category,
             "parameters": parameters,
-            "command_prefix": command_prefix
+            "command_prefix": command_prefix,
+            "concurrency_safe": concurrency_safe,
         }
 
         # Also create AgentSkill metadata for A2A protocol — single source of truth
