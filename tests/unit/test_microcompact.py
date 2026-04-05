@@ -128,6 +128,21 @@ class TestMicrocompactProtection:
         assert history[0]["content"] == "pinned"
 
 
+    def test_malformed_metadata_assumes_protected(self, context_manager):
+        """If metadata JSON is corrupted, assume message is protected — don't clear."""
+        history = [
+            _make_tool_msg("t1", "important result", '{"context_priority": "prot'),  # truncated JSON
+            _make_tool_msg("t2", "old result"),
+            _make_tool_msg("t3", "r1"),
+            _make_tool_msg("t4", "r2"),
+            _make_tool_msg("t5", "r3"),
+        ]
+        cleared = context_manager._microcompact_tool_results(history)
+        # t1 has malformed metadata — should be SKIPPED (assumed protected)
+        assert history[0]["content"] == "important result"
+        assert cleared == 1  # only t2 cleared
+
+
 class TestMicrocompactMarkerFormat:
     def test_marker_is_valid_json(self, context_manager):
         history = [

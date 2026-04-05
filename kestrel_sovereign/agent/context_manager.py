@@ -530,7 +530,8 @@ class ContextManager:
                 try:
                     meta = json.loads(meta)
                 except (json.JSONDecodeError, TypeError):
-                    meta = {}
+                    # Can't read protection flags — assume protected, skip
+                    continue
             if meta.get("context_priority") == "protected":
                 continue
             if meta.get("excluded_from_context"):
