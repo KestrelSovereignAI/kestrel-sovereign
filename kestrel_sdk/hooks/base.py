@@ -130,6 +130,10 @@ class HookOutput:
     # For ASK - queue info
     approval_id: Optional[str] = None
 
+    # Graduated severity — soft advisories that don't block execution
+    warning_message: Optional[str] = None
+    warning_severity: Optional[str] = None  # "info" | "warning" | "critical"
+
     @classmethod
     def allow(cls, reason: str = None) -> "HookOutput":
         """Create an ALLOW output - execution continues."""
@@ -160,6 +164,16 @@ class HookOutput:
         )
 
     @classmethod
+    def warn(cls, message: str, severity: str = "warning") -> "HookOutput":
+        """Create a WARN output — advisory that doesn't block execution."""
+        return cls(
+            continue_execution=True,
+            permission_decision=PermissionDecision.ALLOW,
+            warning_message=message,
+            warning_severity=severity,
+        )
+
+    @classmethod
     def modify(cls, updated_input: Dict[str, Any], reason: str = None) -> "HookOutput":
         """Create a MODIFY output - execution continues with modified args."""
         return cls(
@@ -179,6 +193,8 @@ class HookOutput:
             "permission_reason": self.permission_reason,
             "updated_input": self.updated_input,
             "approval_id": self.approval_id,
+            "warning_message": self.warning_message,
+            "warning_severity": self.warning_severity,
         }
 
 
