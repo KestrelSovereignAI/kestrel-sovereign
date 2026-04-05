@@ -36,6 +36,46 @@ def _init_constants():
         CONTEXT_RESERVE_FRACTION = _ka.CONTEXT_RESERVE_FRACTION
 
 
+PREVIEW_HEAD_CHARS = 2000
+PREVIEW_TAIL_CHARS = 500
+
+
+def _build_persisted_preview(result_json: str, tool_name: str, original_len: int) -> str:
+    """
+    Build a preview for a large tool result.
+
+    Includes the head and tail of the result so the agent sees both
+    the beginning context and any trailing errors/summaries.
+
+    Args:
+        result_json: The full serialized tool result
+        tool_name: Name of the tool that produced the result
+        original_len: Original length in characters
+
+    Returns:
+        Preview string with head, tail, and size metadata
+    """
+    head = result_json[:PREVIEW_HEAD_CHARS]
+    tail = result_json[-PREVIEW_TAIL_CHARS:] if original_len > PREVIEW_HEAD_CHARS + PREVIEW_TAIL_CHARS else ""
+
+    parts = [
+        f"[Large tool output — {original_len:,} chars from {tool_name}]",
+        "",
+        f"Preview (first {PREVIEW_HEAD_CHARS} chars):",
+        head,
+    ]
+    if tail:
+        parts.extend([
+            "",
+            f"... [{original_len - PREVIEW_HEAD_CHARS - PREVIEW_TAIL_CHARS:,} chars omitted] ...",
+            "",
+            f"Tail (last {PREVIEW_TAIL_CHARS} chars):",
+            tail,
+        ])
+
+    return "\n".join(parts)
+
+
 class OrchestratorEngineMixin:
     """Mixin providing orchestrator loop methods for KestrelAgent."""
 
@@ -222,16 +262,16 @@ class OrchestratorEngineMixin:
             if streaming and tool_events is not None:
                 tool_events.append({'type': 'error', 'tool': tool_name, 'error': f'Unknown feature tool: {tool_name}'})
 
-        # Add tool result to messages
+        # Add tool result to messages (with persistence for large results)
         from kestrel_sovereign.features.base import _serialize_tool_result
         result_json = json.dumps(_serialize_tool_result(result))
 
         if len(result_json) > MAX_TOOL_RESULT_CHARS:
-            truncated_len = len(result_json)
-            result_json = result_json[:MAX_TOOL_RESULT_CHARS] + f'\n... [truncated {truncated_len - MAX_TOOL_RESULT_CHARS} chars]'
-            logging.warning(f"{log_prefix} Truncated tool result from {truncated_len} to {MAX_TOOL_RESULT_CHARS} chars")
-
-        logging.info(f"{log_prefix} Tool result ({len(result_json)} chars): {result_json[:200]}...")
+            original_len = len(result_json)
+            result_json = _build_persisted_preview(result_json, tool_name, original_len)
+            logging.info(f"{log_prefix} Large tool result ({original_len} chars) replaced with preview")
+        else:
+            logging.info(f"{log_prefix} Tool result ({len(result_json)} chars): {result_json[:200]}...")
         messages.append({
             "role": "tool",
             "tool_call_id": tool_call.id,
