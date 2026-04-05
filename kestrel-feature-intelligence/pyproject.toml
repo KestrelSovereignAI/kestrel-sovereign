@@ -1,32 +1,23 @@
 [project]
 name = "kestrel-feature-intelligence"
 version = "0.1.0"
-description = "Kestrel Intelligence features — reflection (self-improvement) and council (multi-model governance)"
-requires-python = ">=3.11,<3.14"
-license = "Apache-2.0"
+description = "Kestrel intelligence feature (reflection, council)"
+requires-python = ">=3.11"
 dependencies = [
     "kestrel-sovereign-sdk @ git+https://github.com/KestrelSovereignAI/kestrel-sovereign-sdk.git",
-    # Cross-feature: llm adapters, security, wallet, github (not in SDK)
-    "kestrel-sovereign>=0.1.8",
-]
-
-[project.optional-dependencies]
-# Cross-feature deps (TYPE_CHECKING only, not needed at runtime)
-github = ["kestrel-feature-github"]
-wallet = ["kestrel-feature-wallet"]
-test = [
-    "pytest>=8.0.0",
-    "pytest-asyncio>=1.1.0",
-    "pytest-timeout>=2.3.1",
+    "kestrel-sovereign @ git+https://github.com/KestrelSovereignAI/kestrel-sovereign.git",
 ]
 
 [project.entry-points."kestrel_sovereign.features"]
-ReflectionFeature = "kestrel_feature_intelligence.reflection.feature:ReflectionFeature"
-CouncilFeature = "kestrel_feature_intelligence.council.feature:CouncilFeature"
+ReflectionFeature = "kestrel_feature_intelligence:ReflectionFeature"
+CouncilFeature = "kestrel_feature_intelligence:CouncilFeature"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["kestrel_feature_intelligence"]

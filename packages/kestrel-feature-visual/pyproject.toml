@@ -1,27 +1,22 @@
-[build-system]
-requires = ["setuptools>=64", "wheel"]
-build-backend = "setuptools.backends._legacy:_Backend"
-
 [project]
 name = "kestrel-feature-visual"
 version = "0.1.0"
-description = "Kestrel feature: visual identity — avatar generation, selfies, LoRA training"
+description = "Kestrel visual identity feature"
 requires-python = ">=3.11"
 dependencies = [
     "kestrel-sovereign-sdk @ git+https://github.com/KestrelSovereignAI/kestrel-sovereign-sdk.git",
-    # Cross-feature: features.training (not in SDK)
     "kestrel-sovereign @ git+https://github.com/KestrelSovereignAI/kestrel-sovereign.git",
-    "replicate>=1.0.4",
-    "httpx>=0.27.0",
 ]
 
-[project.optional-dependencies]
-# Cross-feature deps (optional, try/except guarded at runtime)
-training = ["kestrel-sovereign"]
-test = ["pytest", "pytest-asyncio"]
-
 [project.entry-points."kestrel_sovereign.features"]
-VisualIdentityFeature = "kestrel_feature_visual.feature:VisualIdentityFeature"
+VisualIdentityFeature = "kestrel_feature_visual:VisualIdentityFeature"
 
-[tool.setuptools.packages.find]
-where = ["src"]
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["kestrel_feature_visual"]
