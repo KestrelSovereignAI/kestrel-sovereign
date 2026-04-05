@@ -388,10 +388,11 @@ class SleepMixin:
         # 1. Attempt incorporation if params provided
         if incorporation_params:
             try:
-                from kestrel_sovereign.legal.incorporate_tool import IncorporateTool
+                from kestrel_feature_legal import LegalFeature
 
-                tool = IncorporateTool(agent=self)
-                result = await tool.execute(**incorporation_params)
+                feature = LegalFeature(agent=self)
+                await feature.initialize()
+                result = await feature.incorporate(**incorporation_params)
 
                 report.incorporation_attempted = True
                 report.incorporation_success = result.get("success", False)
