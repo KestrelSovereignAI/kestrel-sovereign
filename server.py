@@ -589,8 +589,11 @@ _DEFAULT_CORS_ORIGINS = [
     "http://127.0.0.1:8080",
     "http://localhost:3000",
     "http://127.0.0.1:3000",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
     "http://localhost:8888",
     "http://127.0.0.1:8888",
+    "https://kestrelsovereignai.github.io",
 ]
 _cors_env = os.environ.get("KESTREL_CORS_ORIGINS", "")
 CORS_ORIGINS = [o.strip() for o in _cors_env.split(",") if o.strip()] if _cors_env else _DEFAULT_CORS_ORIGINS
