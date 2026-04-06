@@ -30,6 +30,7 @@ from pathlib import Path
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from contextlib import asynccontextmanager
@@ -185,6 +186,8 @@ async def auth_middleware(request: Request, call_next):
         request.url.path.startswith(p) for p in static_prefixes
     ):
         return await call_next(request)
+    if request.method == "OPTIONS":
+        return await call_next(request)
 
     expected_key = get_api_key()
 
@@ -211,6 +214,30 @@ async def auth_middleware(request: Request, call_next):
         content={"detail": "Invalid or missing API Key"},
         status_code=401,
     )
+
+
+# CORS middleware — added after auth so it runs outermost (before auth).
+# Uses same defaults as server.py. Override via KESTREL_CORS_ORIGINS env var.
+_DEFAULT_CORS_ORIGINS = [
+    "http://localhost:8080",
+    "http://127.0.0.1:8080",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:8888",
+    "http://127.0.0.1:8888",
+    "https://kestrelsovereignai.github.io",
+]
+_cors_env = os.environ.get("KESTREL_CORS_ORIGINS", "")
+CORS_ORIGINS = [o.strip() for o in _cors_env.split(",") if o.strip()] if _cors_env else _DEFAULT_CORS_ORIGINS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=CORS_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization", "X-API-Key"],
+)
 
 
 # --- Routes ---
