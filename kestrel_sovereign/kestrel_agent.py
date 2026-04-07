@@ -873,7 +873,7 @@ Expected Duration: {expected_duration}
         # State is COMPLETE or unknown - proceed to normal processing
         return None
 
-    async def process_input(self, user_input: str, model_override: str = None, session_id: str = None) -> str:
+    async def process_input(self, user_input: str, model_override: str = None, session_id: str = None, include_memories: bool = True) -> str:
         """
         Processes user input by consulting the constitution, retrieving context,
         and generating a response using tool calling for features.
@@ -882,6 +882,9 @@ Expected Duration: {expected_duration}
             user_input: The user's message
             model_override: Optional model to use (e.g., "openai/gpt-5", "ollama/llama3.2")
             session_id: Optional session ID to load conversation context from a specific session
+            include_memories: Whether to include cross-session memory retrieval (default True).
+                              Set to False for multi-tenant sessions (e.g., SMS) to prevent
+                              data leaking between users who share the same agent instance.
         """
         logging.info(f"[AGENTIC] process_input called ({len(user_input)} chars)")
 
@@ -940,10 +943,10 @@ Expected Duration: {expected_duration}
             "agent.input_length": len(user_input),
         }) as _otel_span:
             return await self._process_input_traced(
-                user_input, model_override, session_id, _otel_span
+                user_input, model_override, session_id, _otel_span, include_memories
             )
 
-    async def _process_input_traced(self, user_input: str, model_override: str, session_id: str, _otel_span) -> str:
+    async def _process_input_traced(self, user_input: str, model_override: str, session_id: str, _otel_span, include_memories: bool = True) -> str:
         """Inner process_input logic wrapped in an OTEL span."""
         # Prompt injection detection (log-only, does not block)
         check_prompt_injection(user_input)
@@ -1014,7 +1017,7 @@ Expected Duration: {expected_duration}
             query=user_input,
             constitution=constitution,
             include_briefing=not self._session_briefed,
-            include_memories=True,
+            include_memories=include_memories,
             include_rag=True,
             privacy_mode=self._privacy_mode.value,
             conversation_history=history,
