@@ -510,6 +510,25 @@ async def agent_logs(request: Request, agent_id: str, lines: int = 50):
     return PlainTextResponse(content=log_text)
 
 
+# --- Rasa Webhook Proxy (for RemoteCares RCS integration) ---
+# RCS calls /webhooks/rest/webhook directly; forward to the first agent.
+
+
+@app.post("/webhooks/rest/webhook")
+async def rasa_webhook_proxy(request: Request):
+    """Forward Rasa webhook requests to the first configured agent."""
+    config: RookeryConfig = request.app.state.rookery_config
+    client: httpx.AsyncClient = request.app.state.http_client
+    first_agent = next(iter(config.agents))
+    return await proxy_request_streaming(
+        request=request,
+        agent_id=first_agent,
+        path="webhooks/rest/webhook",
+        config=config,
+        client=client,
+    )
+
+
 # --- Proxy Route (must be AFTER specific routes to avoid path conflicts) ---
 
 
