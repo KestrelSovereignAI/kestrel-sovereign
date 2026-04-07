@@ -179,7 +179,7 @@ if STATIC_DIR.is_dir():
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
     """Global authentication middleware (same pattern as server.py)."""
-    public_paths = {"/health", "/", "/favicon.ico", "/api/auth/key"}
+    public_paths = {"/health", "/", "/favicon.ico", "/api/auth/key", "/webhooks/rest/webhook"}
     static_prefixes = ("/static", "/js/", "/shared/", "/utils/", "/api/github/")
 
     if request.url.path in public_paths or any(
