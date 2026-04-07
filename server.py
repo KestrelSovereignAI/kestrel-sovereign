@@ -315,6 +315,7 @@ from endpoints import (
     metrics_router,
     features_router,
 )
+from endpoints.rasa_shim import router as rasa_shim_router
 
 from endpoints.auth_oauth import router as auth_oauth_router, register_oauth, oauth
 app.include_router(auth_oauth_router)
@@ -332,6 +333,7 @@ app.include_router(security_router)
 app.include_router(saved_items_router)
 app.include_router(metrics_router)
 app.include_router(features_router)
+app.include_router(rasa_shim_router)
 
 
 # --- GitHub API Proxy (for Portfolio Dashboard) ---
@@ -484,7 +486,7 @@ async def auth_middleware(request: Request, call_next):
     1. API key (X-API-Key header, Bearer token, or query param) — for programmatic access
     2. OAuth session cookie — for browser access via Google sign-in
     """
-    public_paths = ["/health", "/health/detailed", "/favicon.ico", "/webhooks/stripe/crypto", "/api/auth/key", "/metrics"]
+    public_paths = ["/health", "/health/detailed", "/favicon.ico", "/webhooks/stripe/crypto", "/webhooks/rest/webhook", "/api/auth/key", "/metrics"]
     auth_paths = ["/auth/login", "/auth/callback", "/auth/logout", "/auth/token"]
     static_prefixes = ["/static", "/js/", "/shared/", "/utils/", "/api/github/"]
 
