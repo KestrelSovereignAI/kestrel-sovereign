@@ -190,13 +190,21 @@ class ConstitutionMixin:
         logging.warning(f"EXITING SAFE MODE. Authorization: {authorization or 'none provided'}")
         return "Safe mode deactivated. Please verify system integrity."
 
-    async def reanchor_constitution(self) -> str:
+    async def reanchor_constitution(self, expected_hash: str = None, authorization: str = None) -> str:
         """Re-anchor the agent to the current constitution on disk.
 
         Use after a legitimate constitution update (e.g. amendment ratification).
-        Reads the current file, stores it, updates the agent's identity node,
-        and exits safe mode if active.
+        Requires the caller to provide the expected hash prefix of the new
+        constitution, proving they know what they're blessing. Does NOT
+        auto-exit safe mode — use !safe-mode exit separately after verifying.
+
+        Args:
+            expected_hash: Required hash prefix (min 8 chars) of the new constitution.
+            authorization: Who authorized this re-anchor (logged in audit trail).
         """
+        if not expected_hash or len(expected_hash) < 8:
+            return "Error: Expected hash required (min 8 characters). Run sha256sum on the constitution file first."
+
         agent_node = await self.storage.get_node(self.agent_id)
         if not agent_node:
             return "Error: Agent identity node not found."
@@ -227,6 +235,17 @@ class ConstitutionMixin:
             return "Error: No constitution file found on disk."
 
         new_hash = hashlib.sha256(constitution_content).hexdigest()
+
+        if not new_hash.startswith(expected_hash):
+            logging.critical(
+                f"REANCHOR REJECTED: expected prefix {expected_hash} "
+                f"does not match file hash {new_hash}"
+            )
+            return (
+                f"Error: Hash mismatch. File hash {new_hash[:16]}... "
+                f"does not start with expected prefix '{expected_hash}'."
+            )
+
         if new_hash == old_hash:
             return f"Constitution already anchored to current version. Hash: {new_hash[:16]}..."
 
@@ -241,11 +260,14 @@ class ConstitutionMixin:
             "old_hash": old_hash,
             "new_hash": stored_hash,
             "path": constitution_path_used,
+            "authorization": authorization or "unspecified",
+            "expected_hash_prefix": expected_hash,
         }
         await self.storage.add_node(agent_node)
 
         logging.warning(
-            f"CONSTITUTION RE-ANCHORED: {old_hash[:16]}... → {stored_hash[:16]}... "
+            f"CONSTITUTION RE-ANCHORED by {authorization or 'unspecified'}: "
+            f"{old_hash[:16]}... → {stored_hash[:16]}... "
             f"from {constitution_path_used}"
         )
 
@@ -256,19 +278,22 @@ class ConstitutionMixin:
                 "event": "constitution_reanchor",
                 "old_hash": old_hash,
                 "new_hash": stored_hash,
+                "authorization": authorization or "unspecified",
                 "timestamp": self._get_timestamp(),
             },
         )
 
+        safe_mode_note = ""
         if self._safe_mode:
-            self._safe_mode = False
-            logging.warning("Safe mode deactivated after constitution re-anchor.")
+            safe_mode_note = "\n\n  Agent remains in SAFE MODE. Run !safe-mode exit to resume operation."
 
         return (
             f"Constitution re-anchored successfully.\n"
             f"  Old hash: {old_hash[:16]}...\n"
             f"  New hash: {stored_hash[:16]}...\n"
-            f"  Source:   {constitution_path_used}"
+            f"  Source:   {constitution_path_used}\n"
+            f"  Auth:     {authorization or 'unspecified'}"
+            f"{safe_mode_note}"
         )
 
     async def _get_governing_constitution(self) -> str:

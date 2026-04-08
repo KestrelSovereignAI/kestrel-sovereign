@@ -27,7 +27,7 @@ BUILTIN_COMMAND_SPECS = [
 
     # Constitution
     {"cmd": "!verify-constitution", "handler": "_cmd_verify_constitution", "description": "Verify constitution integrity", "category": "Constitution"},
-    {"cmd": "!reanchor-constitution", "handler": "_cmd_reanchor_constitution", "description": "Re-anchor to current constitution after legitimate update", "category": "Constitution"},
+    {"cmd": "!reanchor-constitution", "handler": "_cmd_reanchor_constitution", "description": "Re-anchor to current constitution after legitimate update", "args": "<expected_hash>", "category": "Constitution"},
     {"cmd": "!safe-mode", "handler": "_cmd_safe_mode", "description": "Check or exit safe mode", "args": "[exit]", "category": "Constitution"},
 
     # Privacy
@@ -317,8 +317,15 @@ class CommandHandler:
             return f"🚨 {message}\n\nAgent has entered SAFE MODE. Contact administrator."
     
     async def _cmd_reanchor_constitution(self, user_input: str) -> str:
-        """Handle !reanchor-constitution command."""
-        result = await self.agent.reanchor_constitution()
+        """Handle !reanchor-constitution <expected_hash> command."""
+        parts = user_input.split()
+        if len(parts) < 2:
+            return "Usage: !reanchor-constitution <expected_hash_prefix>\n\nGet the hash with: sha256sum docs/principles/KESTREL_CONSTITUTION.md"
+        expected_hash = parts[1]
+        result = await self.agent.reanchor_constitution(
+            expected_hash=expected_hash,
+            authorization="admin_command",
+        )
         if result.startswith("Error:"):
             return f"🚨 {result}"
         return f"✅ {result}"
