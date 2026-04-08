@@ -51,6 +51,7 @@ class ToolSchema:
     parameters: List[ToolParameter] = field(default_factory=list)
     examples: List[Dict[str, Any]] = field(default_factory=list)
     command_prefix: Optional[str] = None  # e.g., "!list-models"
+    is_concurrency_safe: bool = False  # True = read-only, safe to run in parallel
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert schema to dictionary for LLM consumption."""
