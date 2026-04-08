@@ -27,6 +27,7 @@ BUILTIN_COMMAND_SPECS = [
 
     # Constitution
     {"cmd": "!verify-constitution", "handler": "_cmd_verify_constitution", "description": "Verify constitution integrity", "category": "Constitution"},
+    {"cmd": "!reanchor-constitution", "handler": "_cmd_reanchor_constitution", "description": "Re-anchor to current constitution after legitimate update", "category": "Constitution"},
     {"cmd": "!safe-mode", "handler": "_cmd_safe_mode", "description": "Check or exit safe mode", "args": "[exit]", "category": "Constitution"},
 
     # Privacy
@@ -250,8 +251,9 @@ class CommandHandler:
             "  !heartbeat           - Trigger a manual heartbeat check",
             "",
             "Constitution:",
-            "  !verify-constitution - Verify constitution integrity",
-            "  !safe-mode [exit]    - Check or exit safe mode",
+            "  !verify-constitution      - Verify constitution integrity",
+            "  !reanchor-constitution    - Re-anchor after legitimate update",
+            "  !safe-mode [exit]         - Check or exit safe mode",
             "",
             "Privacy:",
             "  !privacy [mode]      - Get or set privacy mode",
@@ -314,6 +316,13 @@ class CommandHandler:
             await self.agent.enter_safe_mode(message)
             return f"🚨 {message}\n\nAgent has entered SAFE MODE. Contact administrator."
     
+    async def _cmd_reanchor_constitution(self, user_input: str) -> str:
+        """Handle !reanchor-constitution command."""
+        result = await self.agent.reanchor_constitution()
+        if result.startswith("Error:"):
+            return f"🚨 {result}"
+        return f"✅ {result}"
+
     def _cmd_safe_mode(self, user_input: str) -> str:
         """Handle !safe-mode command."""
         parts = user_input.split()
