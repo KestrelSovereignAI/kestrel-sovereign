@@ -7,10 +7,11 @@ from kestrel_sovereign.agent.constitution import ConstitutionMixin
 
 
 def _make_agent(stored_hash="oldhash", safe_mode=False):
-    """Create a mock agent with ConstitutionMixin.reanchor_constitution bound."""
+    """Create a mock agent with ConstitutionMixin methods bound."""
     agent = MagicMock(spec=KestrelAgent)
     agent._safe_mode = safe_mode
     agent._get_timestamp = MagicMock(return_value="2026-04-06T00:00:00Z")
+    agent.extension = None
 
     node = MagicMock()
     node.properties = {"constitution_hash": stored_hash}
@@ -22,6 +23,9 @@ def _make_agent(stored_hash="oldhash", safe_mode=False):
     agent.privacy_agent.add_conversation = AsyncMock()
 
     agent.reanchor_constitution = ConstitutionMixin.reanchor_constitution.__get__(
+        agent, KestrelAgent
+    )
+    agent._get_governing_constitution = ConstitutionMixin._get_governing_constitution.__get__(
         agent, KestrelAgent
     )
     return agent, node
@@ -174,3 +178,47 @@ async def test_reanchor_fails_when_no_file_on_disk():
 
     assert "error" in result.lower()
     assert "no constitution file" in result.lower()
+
+
+# --- Governance source: post-reanchor reads from storage, not disk ---
+
+@pytest.mark.asyncio
+async def test_governing_constitution_reads_from_storage_after_reanchor():
+    """After reanchor, _get_governing_constitution reads from anchored storage, not disk."""
+    agent, node = _make_agent(stored_hash="oldhash")
+    agent.storage.store_file = AsyncMock(return_value=FAKE_HASH)
+    agent.agent_id = "test-agent"
+
+    # Step 1: reanchor so node gets the new hash
+    with patch("builtins.open", create=True) as mock_open:
+        mock_open.return_value.__enter__ = lambda s: s
+        mock_open.return_value.__exit__ = MagicMock(return_value=False)
+        mock_open.return_value.read = MagicMock(return_value=FAKE_CONSTITUTION)
+
+        result = await agent.reanchor_constitution(expected_hash=FAKE_HASH[:8])
+
+    assert "re-anchored successfully" in result.lower()
+    assert node.properties["constitution_hash"] == FAKE_HASH
+
+    # Step 2: _get_governing_constitution should retrieve from storage using the new hash
+    agent.storage.retrieve_file = AsyncMock(return_value=b"stored constitution content")
+
+    constitution = await agent._get_governing_constitution()
+
+    agent.storage.retrieve_file.assert_called_once_with(FAKE_HASH)
+    assert constitution == "stored constitution content"
+
+
+@pytest.mark.asyncio
+async def test_governing_constitution_does_not_read_disk_when_hash_exists():
+    """_get_governing_constitution never opens disk files when a hash is anchored."""
+    agent, node = _make_agent(stored_hash=FAKE_HASH)
+    agent.agent_id = "test-agent"
+    agent.storage.retrieve_file = AsyncMock(return_value=FAKE_CONSTITUTION)
+
+    with patch("builtins.open", create=True) as mock_open:
+        constitution = await agent._get_governing_constitution()
+
+    mock_open.assert_not_called()
+    agent.storage.retrieve_file.assert_called_once_with(FAKE_HASH)
+    assert constitution == FAKE_CONSTITUTION.decode("utf-8")
