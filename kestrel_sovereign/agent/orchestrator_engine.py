@@ -10,6 +10,7 @@ Extracted from kestrel_agent.py — handles the core orchestrator loop:
 - Context analysis: duplicate detection and token attribution by source
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -31,6 +32,7 @@ CONTEXT_RESERVE_FRACTION = None
 KESTREL_DIMINISHING_THRESHOLD = None
 KESTREL_MAX_LOW_DELTA = None
 KESTREL_BUDGET_STOP_PCT = None
+MAX_TOOL_CONCURRENCY = int(os.environ.get("KESTREL_MAX_TOOL_CONCURRENCY", "10"))
 
 
 def _init_constants():
@@ -724,6 +726,124 @@ class OrchestratorEngineMixin:
             return result
 
     # ------------------------------------------------------------------
+    # Tool concurrency batching
+    # ------------------------------------------------------------------
+
+    def _is_direct_tool_concurrency_safe(self, tool_name: str) -> bool:
+        """Check if a direct tool (promoted via LRU) is concurrency-safe."""
+        tool = self._direct_tools.get(tool_name)
+        if tool and hasattr(tool, 'schema') and hasattr(tool.schema, 'is_concurrency_safe'):
+            return tool.schema.is_concurrency_safe
+        return False
+
+    def _partition_tool_calls(self, tool_calls, features_by_tool_name: dict) -> list:
+        """
+        Partition tool calls into batches for concurrent/serial execution.
+
+        Consecutive concurrency-safe DIRECT tools are grouped into parallel
+        batches. Feature subagent dispatches and unsafe tools run serially.
+
+        Returns list of (is_parallel, [tool_calls]) tuples.
+        """
+        batches = []
+        current_parallel = []
+
+        for tc in tool_calls:
+            name = tc.name
+            # Feature dispatches are NEVER parallel (they use shared LLM)
+            is_feature = name in features_by_tool_name
+            is_direct_safe = (not is_feature and
+                              name in self._direct_tools and
+                              self._is_direct_tool_concurrency_safe(name))
+
+            if is_direct_safe:
+                current_parallel.append(tc)
+            else:
+                # Flush any pending parallel batch
+                if current_parallel:
+                    batches.append((True, current_parallel))
+                    current_parallel = []
+                batches.append((False, [tc]))
+
+        if current_parallel:
+            batches.append((True, current_parallel))
+
+        return batches
+
+    async def _execute_tool_batch(
+        self,
+        tool_calls,
+        features_by_tool_name: dict,
+        known_tools: set,
+        messages: list,
+        iteration: int,
+        user_message: Optional[str],
+        *,
+        tool_events: Optional[list] = None,
+        streaming: bool = False,
+    ):
+        """
+        Execute a batch of tool calls, using parallelism where safe.
+
+        Partitions into parallel/serial batches. Parallel batches use
+        asyncio.gather with a semaphore. All tool results are appended
+        to messages in the ORIGINAL REQUEST ORDER.
+
+        Key design: parallel tools still go through _dispatch_tool_call(),
+        which handles hooks, observability, context_stats, and result
+        formatting. Nothing is bypassed.
+        """
+        batches = self._partition_tool_calls(tool_calls, features_by_tool_name)
+
+        if len(batches) == 1 and not batches[0][0]:
+            # Single serial batch (most common case) — no overhead
+            for tc in batches[0][1]:
+                await self._dispatch_tool_call(
+                    tc, features_by_tool_name, known_tools, messages,
+                    iteration, user_message,
+                    tool_events=tool_events, streaming=streaming,
+                )
+            return
+
+        semaphore = asyncio.Semaphore(MAX_TOOL_CONCURRENCY)
+
+        for is_parallel, batch_tcs in batches:
+            if not is_parallel or len(batch_tcs) == 1:
+                # Serial execution
+                for tc in batch_tcs:
+                    await self._dispatch_tool_call(
+                        tc, features_by_tool_name, known_tools, messages,
+                        iteration, user_message,
+                        tool_events=tool_events, streaming=streaming,
+                    )
+            else:
+                # Parallel execution of concurrency-safe direct tools
+                logging.info(
+                    f"[CONCURRENCY] Executing {len(batch_tcs)} tools in parallel "
+                    f"(max {MAX_TOOL_CONCURRENCY})"
+                )
+
+                # Each tool dispatches into its own temporary message list
+                # to avoid ordering issues on the shared messages list
+                per_tool_messages = {tc.id: [] for tc in batch_tcs}
+
+                async def _run_one(tc, msg_list):
+                    async with semaphore:
+                        await self._dispatch_tool_call(
+                            tc, features_by_tool_name, known_tools, msg_list,
+                            iteration, user_message,
+                            tool_events=tool_events, streaming=streaming,
+                        )
+
+                await asyncio.gather(
+                    *[_run_one(tc, per_tool_messages[tc.id]) for tc in batch_tcs]
+                )
+
+                # Append results in original request order
+                for tc in batch_tcs:
+                    messages.extend(per_tool_messages[tc.id])
+
+    # ------------------------------------------------------------------
     # Non-streaming orchestrator response handler
     # ------------------------------------------------------------------
 
@@ -783,11 +903,10 @@ class OrchestratorEngineMixin:
             if iteration >= max_iterations * 0.8:
                 logging.warning(f"[ORCHESTRATOR] Approaching max iterations: {iteration + 1}/{max_iterations}")
 
-            for tool_call in response.tool_calls:
-                await self._dispatch_tool_call(
-                    tool_call, features_by_tool_name, known_tools, messages,
-                    iteration, user_message,
-                )
+            await self._execute_tool_batch(
+                response.tool_calls, features_by_tool_name, known_tools,
+                messages, iteration, user_message,
+            )
 
             # Continue conversation with tool results
             all_tools = self._build_all_tools()
@@ -955,22 +1074,15 @@ class OrchestratorEngineMixin:
         )
 
         for iteration in range(max_iterations):
-            for tool_call in response.tool_calls:
-                tool_name = tool_call.name
+            # Stream tool names for user visibility
+            for tc in response.tool_calls:
+                yield f"\U0001f527 Calling {tc.name}...\n"
 
-                # Stream tool start indicator
-                if tool_events is not None:
-                    pass  # handled in _dispatch_tool_call
-                yield f"\U0001f527 Calling {tool_name}...\n"
-
-                await self._dispatch_tool_call(
-                    tool_call, features_by_tool_name, known_tools, messages,
-                    iteration, user_message,
-                    tool_events=tool_events, streaming=True,
-                )
-
-                # Stream completion indicator
-                # (tool_events already updated by _dispatch_tool_call)
+            await self._execute_tool_batch(
+                response.tool_calls, features_by_tool_name, known_tools,
+                messages, iteration, user_message,
+                tool_events=tool_events, streaming=True,
+            )
 
             all_tools = self._build_all_tools()
             messages = self._prune_orchestrator_messages(messages, all_tools)
