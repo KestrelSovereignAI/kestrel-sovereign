@@ -4,6 +4,8 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Kestrel Falconer — Operational Dashboard</title>
+<script src="js/icons.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f172a; color: #e2e8f0; min-height: 100vh; }
@@ -156,6 +158,64 @@
   /* Pulse animation for live dot */
   @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
   .pulse { animation: pulse 2s infinite; }
+
+  /* === Portfolio Dashboard Styles (dark-themed) === */
+
+  /* Charts */
+  .charts-row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 24px; }
+  .chart-box { background: #1e293b; border: 1px solid #334155; border-radius: 10px; padding: 18px; }
+  .chart-box h3 { font-size: 14px; color: #94a3b8; margin-bottom: 14px; font-weight: 600; }
+  .chart-box canvas { max-height: 280px; }
+
+  /* Milestone cards */
+  .milestone-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; margin-bottom: 24px; }
+  .milestone-card { background: #1e293b; border: 1px solid #334155; border-radius: 10px; padding: 18px; }
+  .milestone-card h4 { font-size: 15px; font-weight: 600; color: #f8fafc; margin-bottom: 6px; }
+  .milestone-card .meta { font-size: 12px; color: #64748b; margin-bottom: 10px; }
+  .milestone-bar { height: 6px; background: #0f172a; border-radius: 3px; overflow: hidden; }
+  .milestone-fill { height: 100%; border-radius: 3px; transition: width 0.5s; }
+  .milestone-fill.green { background: #22c55e; }
+  .milestone-fill.blue { background: #818cf8; }
+  .milestone-fill.yellow { background: #f59e0b; }
+  .milestone-fill.red { background: #ef4444; }
+  .milestone-card .stats { display: flex; gap: 16px; margin-top: 10px; font-size: 12px; color: #64748b; }
+  .milestone-card .stats span { display: flex; align-items: center; gap: 4px; }
+
+  /* Badges */
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; }
+  .badge-green { background: rgba(34,197,94,0.15); color: #4ade80; }
+  .badge-blue { background: rgba(129,140,248,0.15); color: #a5b4fc; }
+  .badge-yellow { background: rgba(245,158,11,0.15); color: #fbbf24; }
+  .badge-red { background: rgba(239,68,68,0.15); color: #f87171; }
+  .badge-gray { background: rgba(100,116,139,0.15); color: #94a3b8; }
+
+  /* Blocker alert (dark) */
+  .alert-box { padding: 14px 18px; border-radius: 8px; margin-bottom: 24px; border: 1px solid; }
+  .alert-box.blockers { background: rgba(239,68,68,0.08); border-color: rgba(239,68,68,0.3); }
+  .alert-box.blockers h4 { color: #f87171; font-size: 13px; margin-bottom: 6px; }
+  .alert-box.blockers ul { margin: 0; padding: 0 0 0 18px; }
+  .alert-box.blockers li { font-size: 13px; color: #fca5a5; padding: 2px 0; }
+
+  /* Scoreboard */
+  .scoreboard-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 16px; margin-bottom: 24px; }
+  .score-card { background: #1e293b; border: 1px solid #334155; border-radius: 10px; padding: 18px; position: relative; }
+  .score-card .rank { position: absolute; top: 14px; right: 18px; font-size: 24px; font-weight: 800; color: #334155; }
+  .score-card h4 { font-size: 15px; font-weight: 600; color: #f8fafc; margin-bottom: 4px; }
+  .score-card .role { font-size: 12px; color: #64748b; margin-bottom: 10px; }
+  .score-card .score-bar { display: flex; gap: 12px; font-size: 12px; color: #64748b; }
+  .score-card .score-bar .val { font-weight: 700; color: #f8fafc; }
+
+  /* Budget */
+  .budget-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 24px; }
+  .budget-card { background: #1e293b; border: 1px solid #334155; border-radius: 10px; padding: 18px; }
+  .budget-card h4 { font-size: 14px; font-weight: 600; margin-bottom: 10px; color: #94a3b8; }
+  .budget-row { display: flex; justify-content: space-between; padding: 6px 0; font-size: 13px; border-bottom: 1px solid #1a1a2e; color: #cbd5e1; }
+  .budget-row:last-child { border-bottom: none; }
+  .budget-row .amount { font-weight: 600; color: #f8fafc; }
+
+  @media (max-width: 768px) {
+    .charts-row, .budget-grid { grid-template-columns: 1fr; }
+  }
 </style>
 </head>
 <body>
@@ -164,7 +224,7 @@
 <div class="header">
   <div class="header-left">
     <div>
-      <h1>🦅 Kestrel <span>Falconer</span></h1>
+      <h1><span class="ki ki-kestrel"></span> Kestrel <span>Falconer</span></h1>
       <div class="subtitle">Operational Dashboard — The Sovereign Flock</div>
     </div>
   </div>
@@ -176,16 +236,16 @@
     <span class="refresh-time" id="lastRefresh"></span>
     <span id="authBadge"></span>
     <button class="btn" onclick="refreshAll()">↻ Refresh</button>
-    <button class="btn" onclick="disconnect()" title="Sign out / disconnect">🔓</button>
+    <button class="btn" onclick="disconnect()" title="Sign out / disconnect"><span class="ki ki-lock-open"></span></button>
   </div>
 </div>
 
 <!-- Auth bar (shown when not authenticated) -->
 <div class="token-bar" id="tokenBar">
   <div class="auth-tabs">
-    <div class="auth-tab active" onclick="switchAuthTab('oauth')">🔐 OAuth</div>
-    <div class="auth-tab" onclick="switchAuthTab('jwt')">📧 Email Login</div>
-    <div class="auth-tab" onclick="switchAuthTab('apikey')">🔑 API Key</div>
+    <div class="auth-tab active" onclick="switchAuthTab('oauth')"><span class="ki ki-lock-key"></span> OAuth</div>
+    <div class="auth-tab" onclick="switchAuthTab('jwt')"><span class="ki ki-email"></span> Email Login</div>
+    <div class="auth-tab" onclick="switchAuthTab('apikey')"><span class="ki ki-key"></span> API Key</div>
   </div>
   <!-- OAuth form -->
   <div class="auth-form" id="authForm-oauth">
@@ -200,7 +260,7 @@
   </div>
   <!-- API key form -->
   <div class="auth-form hidden" id="authForm-apikey">
-    <span>🔑</span>
+    <span><span class="ki ki-key"></span></span>
     <input type="password" id="apiKeyInput" placeholder="Enter your KESTREL_API_KEY..." style="flex:1;max-width:400px;padding:6px 10px;border:1px solid #334155;border-radius:4px;font-size:12px;font-family:monospace;background:#0f172a;color:#e2e8f0;" />
     <button class="btn btn-primary" onclick="saveApiKey()">Connect</button>
   </div>
@@ -208,10 +268,14 @@
 
 <!-- Tabs -->
 <div class="tabs">
-  <div class="tab active" onclick="switchTab('flock')">🦅 Flock Status</div>
-  <div class="tab" onclick="switchTab('tasks')">📋 Tasks & Jobs</div>
-  <div class="tab" onclick="switchTab('mesh')">🔗 Mesh Messages</div>
-  <div class="tab" onclick="switchTab('governance')">🛡️ Governance</div>
+  <div class="tab active" onclick="switchTab('flock')"><span class="ki ki-kestrel"></span> Flock Status</div>
+  <div class="tab" onclick="switchTab('tasks')"><span class="ki ki-clipboard"></span> Tasks & Jobs</div>
+  <div class="tab" onclick="switchTab('mesh')"><span class="ki ki-link"></span> Mesh Messages</div>
+  <div class="tab" onclick="switchTab('governance')"><span class="ki ki-shield"></span> Governance</div>
+  <div class="tab" onclick="switchTab('operational')"><span class="ki ki-chart-bar"></span> Operational</div>
+  <div class="tab" onclick="switchTab('strategic')"><span class="ki ki-globe"></span> Strategic</div>
+  <div class="tab" onclick="switchTab('scoreboard')"><span class="ki ki-checkmark"></span> Scoreboard</div>
+  <div class="tab" onclick="switchTab('budget')"><span class="ki ki-wallet"></span> Budget</div>
 </div>
 
 <!-- Tab: Flock Status -->
@@ -224,7 +288,7 @@
     <div class="kpi success"><div class="label">Context Health</div><div class="value" id="kpiContext">—</div><div class="sub" id="kpiContextSub">loading...</div></div>
   </div>
 
-  <div class="section-title">🦅 The Flock <span class="count" id="flockCount"></span></div>
+  <div class="section-title"><span class="ki ki-kestrel"></span> The Flock <span class="count" id="flockCount"></span></div>
   <div class="flock-grid" id="flockGrid">
     <div class="loading"><div class="spinner"></div>Loading flock status...</div>
   </div>
@@ -232,12 +296,12 @@
 
 <!-- Tab: Tasks & Jobs -->
 <div class="content hidden" id="tab-tasks">
-  <div class="section-title">📋 Recent Tasks <span class="count" id="taskCount"></span></div>
+  <div class="section-title"><span class="ki ki-clipboard"></span> Recent Tasks <span class="count" id="taskCount"></span></div>
   <div class="feed" id="taskFeed">
     <div class="loading"><div class="spinner"></div>Loading tasks...</div>
   </div>
 
-  <div class="section-title">⏰ Scheduled Tasks</div>
+  <div class="section-title"><span class="ki ki-hourglass"></span> Scheduled Tasks</div>
   <table id="scheduleTable">
     <thead><tr><th>Task</th><th>Schedule</th><th>Last Run</th><th>Next Run</th><th>Status</th></tr></thead>
     <tbody id="scheduleBody"><tr><td colspan="5" style="text-align:center;color:#475569;">Loading...</td></tr></tbody>
@@ -246,7 +310,7 @@
 
 <!-- Tab: Mesh Messages -->
 <div class="content hidden" id="tab-mesh">
-  <div class="section-title">🔗 Mesh Inbox <span class="count" id="meshCount"></span></div>
+  <div class="section-title"><span class="ki ki-link"></span> Mesh Inbox <span class="count" id="meshCount"></span></div>
   <div class="feed" id="meshFeed">
     <div class="loading"><div class="spinner"></div>Loading mesh messages...</div>
   </div>
@@ -256,22 +320,92 @@
 <div class="content hidden" id="tab-governance">
   <div class="two-col">
     <div>
-      <div class="section-title">🛡️ Constitutional Identity</div>
+      <div class="section-title"><span class="ki ki-shield"></span> Constitutional Identity</div>
       <div class="constitution-panel" id="constitutionPanel">
         <div class="loading"><div class="spinner"></div>Loading identity...</div>
       </div>
     </div>
     <div>
-      <div class="section-title">🔒 Privacy & Model</div>
+      <div class="section-title"><span class="ki ki-lock"></span> Privacy & Model</div>
       <div class="constitution-panel" id="modelPanel">
         <div class="loading"><div class="spinner"></div>Loading model info...</div>
       </div>
     </div>
   </div>
 
-  <div class="section-title">🧩 Agent Features</div>
+  <div class="section-title"><span class="ki ki-puzzle"></span> Agent Features</div>
   <div class="constitution-panel" id="featuresPanel">
     <div class="loading"><div class="spinner"></div>Loading features...</div>
+  </div>
+</div>
+
+<!-- Tab: Operational (Portfolio) -->
+<div class="content hidden" id="tab-operational">
+  <div class="loading" id="opLoading"><div class="spinner"></div>Fetching live data from GitHub...</div>
+  <div id="opContent" style="display:none;">
+    <div class="kpi-grid" id="opKpis"></div>
+    <div id="blockerAlert" class="alert-box blockers" style="display:none;">
+      <h4><span class="ki ki-warning"></span> Active Blockers</h4>
+      <ul id="blockerList"></ul>
+    </div>
+    <div class="charts-row">
+      <div class="chart-box"><h3><span class="ki ki-chart-bar"></span> Open Issues by Repo</h3><canvas id="chartIssuesByRepo"></canvas></div>
+      <div class="chart-box"><h3><span class="ki ki-chart-bar"></span> Backlog Health by Repo</h3><canvas id="chartHealthByRepo"></canvas></div>
+    </div>
+    <div class="section-title"><span class="ki ki-clipboard"></span> Open Pull Requests</div>
+    <table id="prTable"><thead><tr><th>Repo</th><th>PR</th><th>Title</th><th>Author</th><th>Updated</th></tr></thead><tbody id="prBody"></tbody></table>
+    <div class="section-title"><span class="ki ki-lightning"></span> Recent Activity (24h)</div>
+    <table id="activityTable"><thead><tr><th>Repo</th><th>Issue</th><th>Author</th><th>Comment</th></tr></thead><tbody id="activityBody"></tbody></table>
+  </div>
+</div>
+
+<!-- Tab: Strategic (Portfolio) -->
+<div class="content hidden" id="tab-strategic">
+  <div class="loading" id="stLoading"><div class="spinner"></div>Loading milestones...</div>
+  <div id="stContent" style="display:none;">
+    <div class="kpi-grid" id="stKpis"></div>
+    <div class="section-title"><span class="ki ki-globe"></span> Milestones</div>
+    <div class="milestone-grid" id="milestoneGrid"></div>
+    <div class="charts-row">
+      <div class="chart-box"><h3><span class="ki ki-chart-bar"></span> Issue Distribution by Milestone</h3><canvas id="chartMilestones"></canvas></div>
+      <div class="chart-box"><h3><span class="ki ki-lightning"></span> Outcome Velocity Trend</h3><canvas id="chartVelocity"></canvas></div>
+    </div>
+    <div class="section-title"><span class="ki ki-scroll"></span> Decision Log</div>
+    <table><thead><tr><th>Date</th><th>Session</th><th>Decision</th><th>Impact</th></tr></thead><tbody id="decisionBody"></tbody></table>
+  </div>
+</div>
+
+<!-- Tab: Scoreboard (Portfolio) -->
+<div class="content hidden" id="tab-scoreboard">
+  <div class="loading" id="sbLoading"><div class="spinner"></div>Computing outcomes...</div>
+  <div id="sbContent" style="display:none;">
+    <div class="section-title"><span class="ki ki-checkmark"></span> Outcome Scoreboard</div>
+    <p style="font-size:13px; color:#64748b; margin-bottom:16px;">Ranked by delivered outcomes — issues closed, PRs merged, blockers resolved.</p>
+    <div class="scoreboard-grid" id="scoreGrid"></div>
+    <div class="charts-row">
+      <div class="chart-box"><h3><span class="ki ki-chart-bar"></span> Contributions by Person</h3><canvas id="chartContributions"></canvas></div>
+      <div class="chart-box"><h3><span class="ki ki-chart-bar"></span> Activity Type Breakdown</h3><canvas id="chartActivityType"></canvas></div>
+    </div>
+  </div>
+</div>
+
+<!-- Tab: Budget (Portfolio) -->
+<div class="content hidden" id="tab-budget">
+  <div id="budgetContent">
+    <div class="kpi-grid">
+      <div class="kpi accent"><div class="label">Sessions Completed</div><div class="value" id="budgetSessions">17</div><div class="sub">Since Feb 17, 2026</div></div>
+      <div class="kpi success"><div class="label">Equivalent Eng. Cost</div><div class="value" id="budgetEngCost">$0</div><div class="sub">At $150/hr market rate</div></div>
+      <div class="kpi warning"><div class="label">AI Execution Cost</div><div class="value" id="budgetAiCost">$0</div><div class="sub">API usage estimate</div></div>
+      <div class="kpi success"><div class="label">Cost Savings</div><div class="value" id="budgetSavings">$0</div><div class="sub">Eng. cost - AI cost</div></div>
+    </div>
+    <div class="budget-grid">
+      <div class="budget-card"><h4>Cost Breakdown by Category</h4><div id="costBreakdown"></div></div>
+      <div class="budget-card"><h4>Ceremony Cost Saved (Kestrel Falconer)</h4><div id="ceremonyCost"></div></div>
+    </div>
+    <div class="charts-row">
+      <div class="chart-box"><h3><span class="ki ki-chart-bar"></span> Equivalent Engineering Value Over Time</h3><canvas id="chartBudgetTrend"></canvas></div>
+      <div class="chart-box"><h3><span class="ki ki-chart-bar"></span> Human Bottleneck Trend (%)</h3><canvas id="chartBottleneck"></canvas></div>
+    </div>
   </div>
 </div>
 
@@ -292,11 +426,11 @@ let refreshTimer = null;
 function updateAuthBadge() {
   const badge = document.getElementById('authBadge');
   if (authMethod === 'oauth') {
-    badge.innerHTML = `<span class="auth-badge oauth">🔐 OAuth${userInfo?.email ? ' — ' + escapeHtml(userInfo.email) : ''}</span>`;
+    badge.innerHTML = `<span class="auth-badge oauth">${kicon('lock-key')} OAuth${userInfo?.email ? ' \u2014 ' + escapeHtml(userInfo.email) : ''}</span>`;
   } else if (authMethod === 'jwt') {
-    badge.innerHTML = `<span class="auth-badge jwt">📧 JWT${userInfo?.email ? ' — ' + escapeHtml(userInfo.email) : ''}</span>`;
+    badge.innerHTML = `<span class="auth-badge jwt">${kicon('email')} JWT${userInfo?.email ? ' \u2014 ' + escapeHtml(userInfo.email) : ''}</span>`;
   } else if (authMethod === 'apikey') {
-    badge.innerHTML = `<span class="auth-badge apikey">🔑 API Key</span>`;
+    badge.innerHTML = `<span class="auth-badge apikey">${kicon('key')} API Key</span>`;
   } else {
     badge.innerHTML = '';
   }
@@ -318,7 +452,7 @@ function switchAuthTab(name) {
 document.addEventListener('DOMContentLoaded', async () => {
   if (window.location.protocol === 'file:') {
     document.getElementById('flockGrid').innerHTML =
-      '<div class="empty-state"><div class="icon">⚠️</div>Open this dashboard via the server, not from disk:<br><br>' +
+      '<div class="empty-state"><div class="icon">' + kicon('warning', '2em') + '</div>Open this dashboard via the server, not from disk:<br><br>' +
       '<a href="http://localhost:8888/static/falconer-dashboard.html" style="color:#818cf8;">http://localhost:8888/static/falconer-dashboard.html</a></div>';
     return;
   }
@@ -389,7 +523,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   } else {
     // Show auth bar
     document.getElementById('flockGrid').innerHTML =
-      '<div class="empty-state"><div class="icon">🔐</div>Sign in above to connect to the Sovereign Flock</div>';
+      '<div class="empty-state"><div class="icon">' + kicon('lock-key', '2em') + '</div>Sign in above to connect to the Sovereign Flock</div>';
     document.getElementById('tokenBar').style.background = '#1e293b';
     document.getElementById('tokenBar').style.borderColor = '#818cf8';
   }
@@ -481,7 +615,7 @@ function disconnect() {
   document.getElementById('tokenBar').style.borderColor = '#818cf8';
   updateAuthBadge();
   document.getElementById('flockGrid').innerHTML =
-    '<div class="empty-state"><div class="icon">🔐</div>Sign in above to connect to the Sovereign Flock</div>';
+    '<div class="empty-state"><div class="icon">' + kicon('lock-key', '2em') + '</div>Sign in above to connect to the Sovereign Flock</div>';
   showToast('Disconnected');
 }
 
@@ -599,11 +733,11 @@ function renderKPI(agents) {
 
 // ===== RENDER: FLOCK CARDS =====
 const BIRD_MAP = {
-  'Kestrel':       { icon: '🦅', role: 'Sovereign Agent', bird: 'Kestrel' },
-  'kestrel-demo':  { icon: '🪶', role: 'Demo Agent', bird: 'Fledgling' },
-  'gabi':          { icon: '🦉', role: 'CEO / Falconer', bird: 'Great Horned Owl' },
-  'jason':         { icon: '🦊', role: 'Product Strategy', bird: 'Merlin' },
-  'noel':          { icon: '🐦', role: 'CMO', bird: 'Swift' },
+  'Kestrel':       { icon: kicon('kestrel'), role: 'Sovereign Agent', bird: 'Kestrel' },
+  'kestrel-demo':  { icon: kicon('feather'), role: 'Demo Agent', bird: 'Fledgling' },
+  'gabi':          { icon: kicon('owl'), role: 'CEO / Falconer', bird: 'Great Horned Owl' },
+  'jason':         { icon: kicon('user'), role: 'Product Strategy', bird: 'Merlin' },
+  'noel':          { icon: kicon('bird'), role: 'CMO', bird: 'Swift' },
 };
 
 function renderFlock(agents) {
@@ -611,12 +745,12 @@ function renderFlock(agents) {
   document.getElementById('flockCount').textContent = `(${agents.length} agents)`;
 
   if (agents.length === 0) {
-    grid.innerHTML = '<div class="empty-state"><div class="icon">🦅</div>No agents discovered</div>';
+    grid.innerHTML = '<div class="empty-state"><div class="icon">' + kicon('kestrel', '2em') + '</div>No agents discovered</div>';
     return;
   }
 
   grid.innerHTML = agents.map(agent => {
-    const bird = BIRD_MAP[agent.name] || { icon: '🐦', role: 'Agent', bird: 'Unknown' };
+    const bird = BIRD_MAP[agent.name] || { icon: kicon('bird'), role: 'Agent', bird: 'Unknown' };
     const status = agent.online ? 'online' : 'offline';
     const ctx = agent.context || {};
     const utilPct = Math.round(ctx.utilization_percent || 0);
@@ -683,13 +817,13 @@ function renderTasks(agents) {
 
   const feed = document.getElementById('taskFeed');
   if (allTasks.length === 0) {
-    feed.innerHTML = '<div class="empty-state"><div class="icon">📋</div>No tasks recorded yet</div>';
+    feed.innerHTML = '<div class="empty-state"><div class="icon">' + kicon('clipboard', '2em') + '</div>No tasks recorded yet</div>';
   } else {
     feed.innerHTML = allTasks.slice(0, 30).map(t => {
       const statusClass = t.status === 'completed' ? 'completed' : t.status === 'failed' ? 'failed' : t.status === 'running' ? 'running' : 'pending';
       return `
         <div class="feed-item">
-          <div class="feed-icon task">📋</div>
+          <div class="feed-icon task">${kicon('clipboard')}</div>
           <div class="feed-body">
             <div class="title">${escapeHtml(t.skill || t.message || 'Task')}</div>
             <div class="meta">${escapeHtml(t.agentName)} → ${escapeHtml(t.agent_id || '')}</div>
@@ -743,11 +877,11 @@ function renderMesh(agents) {
 
   const feed = document.getElementById('meshFeed');
   if (allMessages.length === 0) {
-    feed.innerHTML = '<div class="empty-state"><div class="icon">🔗</div>No mesh messages in inbox<div style="margin-top:8px;font-size:12px;">Messages appear when agents communicate via the mesh protocol</div></div>';
+    feed.innerHTML = '<div class="empty-state"><div class="icon">' + kicon('link', '2em') + '</div>No mesh messages in inbox<div style="margin-top:8px;font-size:12px;">Messages appear when agents communicate via the mesh protocol</div></div>';
   } else {
     feed.innerHTML = allMessages.slice(0, 50).map(m => `
       <div class="feed-item">
-        <div class="feed-icon mesh">🔗</div>
+        <div class="feed-icon mesh">${kicon('link')}</div>
         <div class="feed-body">
           <div class="title">${escapeHtml(m.type || m.intent || 'Message')}</div>
           <div class="meta">From: ${escapeHtml(m.sender || m.from || '?')} → To: ${escapeHtml(m.agentName)}</div>
@@ -767,7 +901,7 @@ function renderGovernance(agents) {
   agentApi(primary.name, '/api/identity').then(id => {
     document.getElementById('constitutionPanel').innerHTML = `
       <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px;">
-        <span style="font-size:24px;">🛡️</span>
+        <span style="font-size:24px;">${kicon('shield', '1.5em')}</span>
         <div>
           <div style="font-size:15px;font-weight:600;color:#f8fafc;">${escapeHtml(id.name || primary.name)}</div>
           <div class="did-display">${escapeHtml(id.did || '—')}</div>
@@ -812,11 +946,16 @@ function renderGovernance(agents) {
 function switchTab(name) {
   document.querySelectorAll('.content').forEach(el => el.classList.add('hidden'));
   document.querySelectorAll('.tab').forEach(el => el.classList.remove('active'));
-  document.getElementById('tab-' + name).classList.remove('hidden');
+  const tab = document.getElementById('tab-' + name);
+  if (tab) tab.classList.remove('hidden');
   // Find and activate the clicked tab
   const tabs = document.querySelectorAll('.tab');
-  const tabMap = { flock: 0, tasks: 1, mesh: 2, governance: 3 };
+  const tabMap = { flock: 0, tasks: 1, mesh: 2, governance: 3, operational: 4, strategic: 5, scoreboard: 6, budget: 7 };
   if (tabMap[name] !== undefined) tabs[tabMap[name]].classList.add('active');
+  // Lazy-load portfolio data on first click
+  if (['operational', 'strategic', 'scoreboard', 'budget'].includes(name) && !portfolioLoaded) {
+    loadPortfolioData();
+  }
 }
 
 // ===== UTILS =====
@@ -840,6 +979,462 @@ function showToast(msg) {
   toast.textContent = msg;
   toast.classList.add('show');
   setTimeout(() => toast.classList.remove('show'), 3000);
+}
+
+// ========================================================================
+// ===== PORTFOLIO DASHBOARD — GitHub data, charts, scoreboard, budget ===
+// ========================================================================
+
+// ===== PORTFOLIO CONFIG =====
+const REPOS = [
+  'KestrelSovereignAI/kestrel-sovereign',
+  'jaslogic1/RemoteCares',
+  'SaravananDCK/RemoteCares',
+  'KestrelSovereignAI/frinz',
+  'KestrelSovereignAI/signal-and-ship',
+  'KestrelSovereignAI/kestrelclaw',
+];
+
+const SESSION_DATA = [
+  { id: 1,  date: '2026-02-17', focus: 'Caprock integration + crash fixes', prs: 4, bugs: 3, issues: 5, aiHours: 4, bottleneck: null },
+  { id: 2,  date: '2026-02-18', focus: 'PR feedback, branch rules, backlog triage', prs: 1, bugs: 1, issues: 3, aiHours: 2.5, bottleneck: null },
+  { id: 3,  date: '2026-02-19', focus: 'Triage, OData, Redis, metrics pipeline', prs: 4, bugs: 5, issues: 8, aiHours: 5, bottleneck: null },
+  { id: 4,  date: '2026-02-20', focus: 'AppInsights sweep — all 8 exceptions', prs: 2, bugs: 6, issues: 8, aiHours: 3, bottleneck: null },
+  { id: 5,  date: '2026-02-22', focus: 'Windows install, 100% validation pass', prs: 0, bugs: 4, issues: 4, aiHours: 4, bottleneck: null },
+  { id: 6,  date: '2026-02-22', focus: 'RCS integration tests — 17/19 pass', prs: 0, bugs: 0, issues: 2, aiHours: 3.5, bottleneck: null },
+  { id: 7,  date: '2026-02-23', focus: 'Architecture pivot, open source strategy', prs: 0, bugs: 0, issues: 3, aiHours: 5, bottleneck: null },
+  { id: 8,  date: '2026-02-24', focus: 'Go/no-go, founding brief, baseline', prs: 0, bugs: 0, issues: 2, aiHours: 2, bottleneck: null },
+  { id: 11, date: '2026-03-06', focus: 'Post-vacation backlog review, OSS launch', prs: 0, bugs: 0, issues: 5, aiHours: 4, bottleneck: null },
+  { id: 12, date: '2026-03-08', focus: 'Demo prep: hallucination fix, inception', prs: 0, bugs: 1, issues: 2, aiHours: 2, bottleneck: null },
+  { id: 13, date: '2026-03-09', focus: 'Windows 11 validation, audit bug fix', prs: 0, bugs: 1, issues: 3, aiHours: 3, bottleneck: null },
+  { id: 16, date: '2026-03-13', focus: 'SMS confirmed, E2E demo all 5 acts', prs: 0, bugs: 4, issues: 6, aiHours: 3, bottleneck: 32 },
+  { id: 17, date: '2026-03-15', focus: 'Demo hardening for George, Act 6', prs: 5, bugs: 6, issues: 12, aiHours: 5, bottleneck: 25 },
+  { id: 18, date: '2026-03-17', focus: 'OSS sprint, Kestrel Falconer design', prs: 0, bugs: 0, issues: 7, aiHours: 6, bottleneck: 17 },
+  { id: 19, date: '2026-03-18', focus: 'Backlog cleanup, CI, pricing model', prs: 2, bugs: 0, issues: 15, aiHours: 5.5, bottleneck: 21 },
+  { id: 20, date: '2026-03-20', focus: 'Strategic Memory, model cache, LOC→outcomes', prs: 3, bugs: 0, issues: 3, aiHours: 4.25, bottleneck: 29 },
+];
+
+const PORTFOLIO_MILESTONES = [
+  { name: 'Caprock Validation', due: '2026-04-03', owner: 'Jason', status: 'on_track', repos: ['jaslogic1/RemoteCares', 'SaravananDCK/RemoteCares'] },
+  { name: 'Open Source Launch', due: '2026-04-20', owner: 'Gabi', status: 'in_progress', repos: ['KestrelSovereignAI/kestrel-sovereign'] },
+  { name: 'Kestrel Falconer', due: null, owner: 'Jim', status: 'data_collection', repos: ['KestrelSovereignAI/signal-and-ship'] },
+  { name: 'Kestrel Live Demo', due: '2026-03-22', owner: 'Gabi', status: 'complete', repos: ['KestrelSovereignAI/kestrel-sovereign'] },
+  { name: 'IP & Patent Strategy', due: null, owner: 'Gabi', status: 'active', repos: ['KestrelSovereignAI/kestrel-sovereign'] },
+];
+
+const DECISIONS = [
+  { date: '2026-02-23', session: '007', decision: 'Architecture pivot to sovereignty-first', impact: 'Entire codebase restructured. DID + Constitution + Memory pillars.' },
+  { date: '2026-03-06', session: '011', decision: 'Sprint-free execution model adopted', impact: 'No sprints, no velocity tracking. Demo meetings are the only gate.' },
+  { date: '2026-03-15', session: '017', decision: 'Demo format = 6-act presenter guide', impact: 'Demo guide is standard for all presentations.' },
+  { date: '2026-03-17', session: '018', decision: 'Strategic Memory Layer as product feature', impact: '5 new product features designed. Foundation for Morning Signal.' },
+];
+
+const ENG_RATE = 150;
+const AI_COST_PER_SESSION = 12;
+
+let portfolioLoaded = false;
+let portfolioData = {};
+const portfolioCharts = {};
+
+function makePortfolioChart(canvasId, config) {
+  if (portfolioCharts[canvasId]) portfolioCharts[canvasId].destroy();
+  // Apply dark theme defaults to all chart configs
+  const darkDefaults = {
+    color: '#94a3b8',
+    borderColor: '#334155',
+  };
+  config.options = config.options || {};
+  config.options.plugins = config.options.plugins || {};
+  config.options.plugins.legend = { ...{ labels: { color: '#94a3b8' } }, ...(config.options.plugins.legend || {}) };
+  if (config.options.plugins.legend.labels) config.options.plugins.legend.labels.color = '#94a3b8';
+  if (config.options.scales) {
+    for (const axis of Object.values(config.options.scales)) {
+      axis.ticks = { color: '#94a3b8', ...(axis.ticks || {}) };
+      axis.grid = { color: '#1e293b', ...(axis.grid || {}) };
+      if (axis.title) axis.title.color = '#94a3b8';
+    }
+  }
+  portfolioCharts[canvasId] = new Chart(document.getElementById(canvasId), config);
+}
+
+// ===== PORTFOLIO GITHUB API =====
+let ghApiLog = [];
+async function ghAPI(path) {
+  const url = BASE + '/api/github/' + path.replace(/^\//, '');
+  const headers = {};
+  if (authMethod === 'jwt' && jwtToken) headers['Authorization'] = 'Bearer ' + jwtToken;
+  else if (authMethod === 'apikey' && API_KEY) headers['X-API-Key'] = API_KEY;
+  const opts = { headers };
+  if (authMethod === 'oauth') opts.credentials = 'include';
+  try {
+    const resp = await fetch(url, opts);
+    if (!resp.ok) { ghApiLog.push({ path, status: resp.status, ok: false }); return null; }
+    const data = await resp.json();
+    ghApiLog.push({ path, status: resp.status, ok: true, count: Array.isArray(data) ? data.length : 1 });
+    return data;
+  } catch (err) {
+    ghApiLog.push({ path, status: 'ERR', ok: false, error: err.message });
+    return null;
+  }
+}
+
+function shortRepo(repo) {
+  const name = repo.split('/').pop();
+  const dupes = REPOS.filter(r => r.split('/').pop() === name);
+  return dupes.length > 1 ? repo : name;
+}
+
+async function fetchRepoData() {
+  const result = {};
+  const since = new Date();
+  since.setHours(0, 0, 0, 0);
+  const sinceISO = since.toISOString();
+  const promises = REPOS.map(async repo => {
+    const data = { issues: [], prs: [], comments: [], blockedIssues: [] };
+    const [issues, prs, comments] = await Promise.all([
+      ghAPI(`/repos/${repo}/issues?state=open&per_page=100`),
+      ghAPI(`/repos/${repo}/pulls?state=open&per_page=20`),
+      ghAPI(`/repos/${repo}/issues/comments?since=${sinceISO}&sort=updated&direction=desc&per_page=5`),
+    ]);
+    if (Array.isArray(issues)) {
+      data.issues = issues.filter(i => !i.pull_request);
+      data.blockedIssues = data.issues.filter(i => (i.labels || []).some(l => l.name.toLowerCase().includes('block')));
+      data.noAssignee = data.issues.filter(i => !i.assignee).length;
+      data.noMilestone = data.issues.filter(i => !i.milestone).length;
+      data.noLabels = data.issues.filter(i => !i.labels || i.labels.length === 0).length;
+    }
+    if (Array.isArray(prs)) data.prs = prs;
+    if (Array.isArray(comments)) data.comments = comments;
+    result[repo] = data;
+  });
+  await Promise.all(promises);
+  return result;
+}
+
+async function fetchContributors() {
+  const contributors = {};
+  const promises = REPOS.map(async repo => {
+    const [closedIssues, closedPRs] = await Promise.all([
+      ghAPI(`/repos/${repo}/issues?state=closed&per_page=50&sort=updated&direction=desc`),
+      ghAPI(`/repos/${repo}/pulls?state=closed&per_page=30&sort=updated&direction=desc`),
+    ]);
+    if (Array.isArray(closedIssues)) {
+      for (const i of closedIssues.filter(x => !x.pull_request)) {
+        const closer = (i.closed_by || i.user || {}).login || 'unknown';
+        if (!contributors[closer]) contributors[closer] = { closed: 0, prs: 0, comments: 0 };
+        contributors[closer].closed++;
+      }
+    }
+    if (Array.isArray(closedPRs)) {
+      for (const p of closedPRs.filter(x => x.merged_at)) {
+        const author = (p.user || {}).login || 'unknown';
+        if (!contributors[author]) contributors[author] = { closed: 0, prs: 0, comments: 0 };
+        contributors[author].prs++;
+      }
+    }
+  });
+  await Promise.all(promises);
+  return contributors;
+}
+
+// ===== PORTFOLIO RENDER: OPERATIONAL =====
+function renderPortfolioOperational(data) {
+  let totalIssues = 0, totalPRs = 0, totalComments = 0, totalBlocked = 0;
+  let totalNoAssignee = 0, totalCount = 0;
+  for (const [, d] of Object.entries(data)) {
+    totalIssues += d.issues.length;
+    totalPRs += d.prs.length;
+    totalComments += d.comments.length;
+    totalBlocked += d.blockedIssues.length;
+    totalNoAssignee += d.noAssignee || 0;
+    totalCount += d.issues.length;
+  }
+  const healthPct = totalCount > 0 ? Math.round(((totalCount - totalNoAssignee - Object.values(data).reduce((s, d) => s + (d.noMilestone || 0), 0)) / totalCount) * 100) : 100;
+
+  document.getElementById('opKpis').innerHTML = `
+    <div class="kpi accent"><div class="label">Open Issues</div><div class="value">${totalIssues}</div><div class="sub">across ${REPOS.length} repos</div></div>
+    <div class="kpi ${totalPRs > 0 ? 'warning' : 'success'}"><div class="label">Open PRs</div><div class="value">${totalPRs}</div><div class="sub">need review</div></div>
+    <div class="kpi ${totalBlocked > 0 ? 'danger' : 'success'}"><div class="label">Blocked</div><div class="value">${totalBlocked}</div><div class="sub">labeled 'blocked'</div></div>
+    <div class="kpi ${healthPct >= 90 ? 'success' : healthPct >= 70 ? 'warning' : 'danger'}"><div class="label">Backlog Health</div><div class="value">${healthPct}%</div><div class="sub">assigned + milestoned</div></div>
+    <div class="kpi accent"><div class="label">Activity (24h)</div><div class="value">${totalComments}</div><div class="sub">comments today</div></div>
+  `;
+
+  // Blockers
+  const allBlocked = [];
+  for (const [repo, d] of Object.entries(data)) {
+    for (const b of d.blockedIssues) allBlocked.push({ repo: shortRepo(repo), number: b.number, title: b.title });
+  }
+  const blockerAlert = document.getElementById('blockerAlert');
+  if (allBlocked.length > 0) {
+    blockerAlert.style.display = 'block';
+    document.getElementById('blockerList').innerHTML = allBlocked.map(b => `<li><strong>${escapeHtml(b.repo)}#${b.number}</strong>: ${escapeHtml(b.title)}</li>`).join('');
+  } else {
+    blockerAlert.style.display = 'none';
+  }
+
+  // Charts
+  const repoNames = REPOS.map(r => shortRepo(r));
+  const issueCounts = REPOS.map(r => (data[r] || {}).issues ? data[r].issues.length : 0);
+  makePortfolioChart('chartIssuesByRepo', {
+    type: 'bar',
+    data: { labels: repoNames, datasets: [{ label: 'Open Issues', data: issueCounts, backgroundColor: '#818cf8', borderRadius: 4 }] },
+    options: { responsive: true, plugins: { legend: { display: false } }, scales: { y: { beginAtZero: true, ticks: { stepSize: 5 } } } },
+  });
+
+  const healthData = REPOS.map(r => {
+    const d = data[r] || {};
+    const total = d.issues ? d.issues.length : 0;
+    if (total === 0) return 100;
+    const bad = (d.noAssignee || 0) + (d.noMilestone || 0);
+    return Math.round(((total - bad) / total) * 100);
+  });
+  makePortfolioChart('chartHealthByRepo', {
+    type: 'bar',
+    data: { labels: repoNames, datasets: [{ label: 'Health %', data: healthData, backgroundColor: healthData.map(h => h >= 90 ? '#22c55e' : h >= 70 ? '#f59e0b' : '#ef4444'), borderRadius: 4 }] },
+    options: { responsive: true, plugins: { legend: { display: false } }, scales: { y: { beginAtZero: true, max: 100 } } },
+  });
+
+  // PRs table
+  const allPRs = [];
+  for (const [repo, d] of Object.entries(data)) {
+    for (const p of d.prs) allPRs.push({ repo: shortRepo(repo), number: p.number, title: p.title, author: (p.user || {}).login, updated: (p.updated_at || '').slice(0, 10) });
+  }
+  document.getElementById('prBody').innerHTML = allPRs.length > 0
+    ? allPRs.map(p => `<tr><td>${escapeHtml(p.repo)}</td><td>#${p.number}</td><td>${escapeHtml(p.title)}</td><td>@${escapeHtml(p.author)}</td><td>${p.updated}</td></tr>`).join('')
+    : '<tr><td colspan="5" style="text-align:center;color:#475569;">No open PRs</td></tr>';
+
+  // Activity table
+  const allActivity = [];
+  for (const [repo, d] of Object.entries(data)) {
+    for (const c of d.comments.slice(0, 3)) {
+      allActivity.push({ repo: shortRepo(repo), issue: (c.issue_url || '').split('/').pop(), author: (c.user || {}).login, snippet: (c.body || '').replace(/\n/g, ' ').slice(0, 100) });
+    }
+  }
+  document.getElementById('activityBody').innerHTML = allActivity.length > 0
+    ? allActivity.map(a => `<tr><td>${escapeHtml(a.repo)}</td><td>#${a.issue}</td><td>@${escapeHtml(a.author)}</td><td>${escapeHtml(a.snippet)}...</td></tr>`).join('')
+    : '<tr><td colspan="4" style="text-align:center;color:#475569;">No activity in the last 24h</td></tr>';
+}
+
+// ===== PORTFOLIO RENDER: STRATEGIC =====
+function renderPortfolioStrategic(data) {
+  const today = new Date();
+  const totalSessions = SESSION_DATA.length;
+  const totalOutcomes = SESSION_DATA.reduce((s, d) => s + d.issues + d.prs + d.bugs, 0);
+  const totalPRs = SESSION_DATA.reduce((s, d) => s + d.prs, 0);
+  const totalBugs = SESSION_DATA.reduce((s, d) => s + d.bugs, 0);
+  const avgBottleneck = SESSION_DATA.filter(s => s.bottleneck != null);
+  const avgBN = avgBottleneck.length > 0 ? Math.round(avgBottleneck.reduce((s, d) => s + d.bottleneck, 0) / avgBottleneck.length) : null;
+
+  document.getElementById('stKpis').innerHTML = `
+    <div class="kpi accent"><div class="label">Sessions</div><div class="value">${totalSessions}</div><div class="sub">since Feb 17</div></div>
+    <div class="kpi success"><div class="label">Outcomes Delivered</div><div class="value">${totalOutcomes}</div><div class="sub">issues + PRs + bugs</div></div>
+    <div class="kpi accent"><div class="label">PRs Merged</div><div class="value">${totalPRs}</div><div class="sub">across all repos</div></div>
+    <div class="kpi accent"><div class="label">Bugs Fixed</div><div class="value">${totalBugs}</div><div class="sub">production issues</div></div>
+    ${avgBN !== null ? `<div class="kpi ${avgBN <= 25 ? 'success' : 'warning'}"><div class="label">Avg Bottleneck</div><div class="value">${avgBN}%</div><div class="sub">human-blocked time</div></div>` : ''}
+  `;
+
+  // Milestone cards
+  document.getElementById('milestoneGrid').innerHTML = PORTFOLIO_MILESTONES.map(m => {
+    const statusBadge = {
+      'on_track': '<span class="badge badge-green">ON TRACK</span>',
+      'in_progress': '<span class="badge badge-blue">IN PROGRESS</span>',
+      'complete': '<span class="badge badge-green">COMPLETE</span>',
+      'active': '<span class="badge badge-blue">ACTIVE</span>',
+      'data_collection': '<span class="badge badge-yellow">COLLECTING DATA</span>',
+      'at_risk': '<span class="badge badge-red">AT RISK</span>',
+    }[m.status] || '<span class="badge badge-gray">' + escapeHtml(m.status) + '</span>';
+
+    let daysStr = '';
+    let pct = 0;
+    let barColor = 'blue';
+    if (m.status === 'complete') { pct = 100; barColor = 'green'; }
+    else if (m.due) {
+      const due = new Date(m.due + 'T00:00:00');
+      const daysLeft = Math.ceil((due - today) / 86400000);
+      daysStr = daysLeft > 0 ? `${daysLeft} days left` : `${Math.abs(daysLeft)} days overdue`;
+      pct = Math.max(0, Math.min(95, 100 - (daysLeft / 30 * 100)));
+      barColor = daysLeft > 7 ? 'blue' : daysLeft > 0 ? 'yellow' : 'red';
+    }
+    let liveCount = 0;
+    for (const repo of m.repos) { if (data[repo]) liveCount += data[repo].issues.length; }
+
+    return `
+      <div class="milestone-card">
+        <h4>${escapeHtml(m.name)} ${statusBadge}</h4>
+        <div class="meta">${m.due ? 'Due: ' + m.due : 'Ongoing'} &middot; Owner: ${escapeHtml(m.owner)}${daysStr ? ' &middot; ' + daysStr : ''}</div>
+        <div class="milestone-bar"><div class="milestone-fill ${barColor}" style="width:${pct}%"></div></div>
+        <div class="stats"><span>Open issues: <strong>${liveCount}</strong></span></div>
+      </div>`;
+  }).join('');
+
+  // Charts
+  const msLabels = PORTFOLIO_MILESTONES.map(m => m.name);
+  const msCounts = PORTFOLIO_MILESTONES.map(m => { let c = 0; for (const repo of m.repos) { if (data[repo]) c += data[repo].issues.length; } return c; });
+  makePortfolioChart('chartMilestones', {
+    type: 'doughnut',
+    data: { labels: msLabels, datasets: [{ data: msCounts, backgroundColor: ['#818cf8', '#38bdf8', '#f59e0b', '#22c55e', '#a78bfa'] }] },
+    options: { responsive: true, plugins: { legend: { position: 'right' } } },
+  });
+
+  const sessionLabels = SESSION_DATA.map(s => 'S' + String(s.id).padStart(3, '0'));
+  const outcomeData = SESSION_DATA.map(s => s.issues + s.prs + s.bugs);
+  const bugData = SESSION_DATA.map(s => s.bugs);
+  makePortfolioChart('chartVelocity', {
+    type: 'line',
+    data: {
+      labels: sessionLabels,
+      datasets: [
+        { label: 'Outcomes', data: outcomeData, borderColor: '#818cf8', backgroundColor: 'rgba(129,140,248,0.1)', fill: true, tension: 0.3 },
+        { label: 'Bugs Fixed', data: bugData, borderColor: '#ef4444', backgroundColor: 'rgba(239,68,68,0.1)', fill: true, tension: 0.3, yAxisID: 'y1' },
+      ],
+    },
+    options: {
+      responsive: true,
+      scales: {
+        y: { beginAtZero: true, title: { display: true, text: 'Outcomes' } },
+        y1: { beginAtZero: true, position: 'right', title: { display: true, text: 'Bugs' }, grid: { drawOnChartArea: false } },
+      },
+    },
+  });
+
+  // Decision log
+  document.getElementById('decisionBody').innerHTML = DECISIONS.map(d =>
+    `<tr><td>${escapeHtml(d.date)}</td><td>${escapeHtml(d.session)}</td><td>${escapeHtml(d.decision)}</td><td>${escapeHtml(d.impact)}</td></tr>`
+  ).join('');
+}
+
+// ===== PORTFOLIO RENDER: SCOREBOARD =====
+function renderPortfolioScoreboard(contributors) {
+  const sorted = Object.entries(contributors)
+    .map(([name, data]) => ({ name, ...data, total: data.closed + data.prs * 2 }))
+    .sort((a, b) => b.total - a.total);
+
+  const roleMap = { 'gabriela-aquino': 'CEO', 'jaslogic1': 'Product Strategy', 'NoelSchulz-2025': 'CMO', 'scottkillingsworth': 'Contributor' };
+
+  document.getElementById('scoreGrid').innerHTML = sorted.slice(0, 8).map((c, i) => `
+    <div class="score-card">
+      <div class="rank">#${i + 1}</div>
+      <h4>@${escapeHtml(c.name)}</h4>
+      <div class="role">${roleMap[c.name] || 'Contributor'}</div>
+      <div class="score-bar">
+        <span>Issues closed: <span class="val">${c.closed}</span></span>
+        <span>PRs merged: <span class="val">${c.prs}</span></span>
+        <span>Score: <span class="val">${c.total}</span></span>
+      </div>
+    </div>
+  `).join('');
+
+  const topN = sorted.slice(0, 6);
+  makePortfolioChart('chartContributions', {
+    type: 'bar',
+    data: {
+      labels: topN.map(c => '@' + c.name),
+      datasets: [
+        { label: 'Issues Closed', data: topN.map(c => c.closed), backgroundColor: '#818cf8', borderRadius: 4 },
+        { label: 'PRs Merged', data: topN.map(c => c.prs), backgroundColor: '#22c55e', borderRadius: 4 },
+      ],
+    },
+    options: { responsive: true, scales: { x: { stacked: true }, y: { stacked: true, beginAtZero: true } } },
+  });
+
+  const totalClosed = sorted.reduce((s, c) => s + c.closed, 0);
+  const totalPRs = sorted.reduce((s, c) => s + c.prs, 0);
+  makePortfolioChart('chartActivityType', {
+    type: 'pie',
+    data: { labels: ['Issues Closed', 'PRs Merged'], datasets: [{ data: [totalClosed, totalPRs], backgroundColor: ['#818cf8', '#22c55e'] }] },
+    options: { responsive: true, plugins: { legend: { position: 'bottom' } } },
+  });
+}
+
+// ===== PORTFOLIO RENDER: BUDGET =====
+function renderPortfolioBudget() {
+  const totalAiHours = SESSION_DATA.reduce((s, d) => s + d.aiHours, 0);
+  const engCost = Math.round(totalAiHours * ENG_RATE);
+  const aiCost = Math.round(SESSION_DATA.length * AI_COST_PER_SESSION);
+  const savings = engCost - aiCost;
+
+  document.getElementById('budgetSessions').textContent = SESSION_DATA.length;
+  document.getElementById('budgetEngCost').textContent = '$' + engCost.toLocaleString();
+  document.getElementById('budgetAiCost').textContent = '$' + aiCost.toLocaleString();
+  document.getElementById('budgetSavings').textContent = '$' + savings.toLocaleString();
+
+  const categories = [
+    { label: 'AI API Calls (Claude/GPT)', amount: aiCost },
+    { label: 'Ollama (Local)', amount: 0 },
+    { label: 'GitHub (Free tier)', amount: 0 },
+    { label: 'Infrastructure', amount: 0 },
+  ];
+  document.getElementById('costBreakdown').innerHTML = categories.map(c =>
+    `<div class="budget-row"><span>${escapeHtml(c.label)}</span><span class="amount">$${c.amount.toLocaleString()}</span></div>`
+  ).join('');
+
+  const ceremonySaved = [
+    { label: 'Sprint Planning (2hr x 17 sprints)', amount: Math.round(17 * 2 * ENG_RATE) },
+    { label: 'Daily Standups (15min x 30 days)', amount: Math.round(30 * 0.25 * ENG_RATE) },
+    { label: 'Sprint Retros (1hr x 17)', amount: Math.round(17 * 1 * ENG_RATE) },
+    { label: 'Backlog Grooming (1hr x 17)', amount: Math.round(17 * 1 * ENG_RATE) },
+  ];
+  const totalCeremony = ceremonySaved.reduce((s, c) => s + c.amount, 0);
+  document.getElementById('ceremonyCost').innerHTML =
+    ceremonySaved.map(c => `<div class="budget-row"><span>${escapeHtml(c.label)}</span><span class="amount">$${c.amount.toLocaleString()}</span></div>`).join('') +
+    `<div class="budget-row" style="border-top:2px solid #334155;padding-top:8px;"><span><strong>Total Ceremony Cost Saved</strong></span><span class="amount" style="color:#22c55e;"><strong>$${totalCeremony.toLocaleString()}</strong></span></div>`;
+
+  // Charts
+  const cumulative = [];
+  let runningTotal = 0;
+  for (const s of SESSION_DATA) { runningTotal += s.aiHours * ENG_RATE; cumulative.push(runningTotal); }
+  makePortfolioChart('chartBudgetTrend', {
+    type: 'line',
+    data: {
+      labels: SESSION_DATA.map(s => 'S' + String(s.id).padStart(3, '0')),
+      datasets: [{ label: 'Equivalent Eng. Value ($)', data: cumulative, borderColor: '#22c55e', backgroundColor: 'rgba(34,197,94,0.1)', fill: true, tension: 0.3 }],
+    },
+    options: { responsive: true, scales: { y: { beginAtZero: true, ticks: { callback: v => '$' + v.toLocaleString() } } } },
+  });
+
+  const bnSessions = SESSION_DATA.filter(s => s.bottleneck != null);
+  makePortfolioChart('chartBottleneck', {
+    type: 'line',
+    data: {
+      labels: bnSessions.map(s => 'S' + String(s.id).padStart(3, '0')),
+      datasets: [{ label: 'Human Bottleneck %', data: bnSessions.map(s => s.bottleneck), borderColor: '#f59e0b', backgroundColor: 'rgba(245,158,11,0.1)', fill: true, tension: 0.3 }],
+    },
+    options: { responsive: true, scales: { y: { beginAtZero: true, max: 100, title: { display: true, text: 'Bottleneck %' } } } },
+  });
+}
+
+// ===== PORTFOLIO: LOAD ALL =====
+function hidePortfolioLoading() {
+  document.getElementById('opLoading').style.display = 'none';
+  document.getElementById('opContent').style.display = 'block';
+  document.getElementById('stLoading').style.display = 'none';
+  document.getElementById('stContent').style.display = 'block';
+  document.getElementById('sbLoading').style.display = 'none';
+  document.getElementById('sbContent').style.display = 'block';
+}
+
+async function loadPortfolioData() {
+  if (portfolioLoaded) return;
+  portfolioLoaded = true;
+  try {
+    const [repoData, contributors] = await Promise.all([fetchRepoData(), fetchContributors()]);
+    portfolioData = repoData;
+    try { renderPortfolioOperational(repoData); } catch (e) { console.error('Operational render error:', e); }
+    try { renderPortfolioStrategic(repoData); } catch (e) { console.error('Strategic render error:', e); }
+    try { renderPortfolioScoreboard(contributors); } catch (e) { console.error('Scoreboard render error:', e); }
+    try { renderPortfolioBudget(); } catch (e) { console.error('Budget render error:', e); }
+    showToast('Portfolio data loaded');
+  } catch (err) {
+    console.error('Portfolio load error:', err);
+    showToast('Portfolio error: ' + err.message);
+  } finally {
+    hidePortfolioLoading();
+    const ok = ghApiLog.filter(l => l.ok).length;
+    const fail = ghApiLog.filter(l => !l.ok).length;
+    console.log('GitHub API calls:', ok, 'ok,', fail, 'failed');
+    if (fail > 0) console.table(ghApiLog);
+    ghApiLog = [];
+  }
 }
 </script>
 
