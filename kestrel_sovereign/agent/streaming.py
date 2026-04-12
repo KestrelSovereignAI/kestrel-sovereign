@@ -21,7 +21,8 @@ class StreamingMixin:
         user_input: str,
         model_override: str = None,
         audit_before_streaming: bool = False,
-        session_id: str = None
+        session_id: str = None,
+        caller=None,
     ):
         """
         Streaming version of process_input. Yields text chunks as generated.
@@ -37,13 +38,14 @@ class StreamingMixin:
             model_override: Optional model to use
             audit_before_streaming: Deprecated, ignored. Kept for API compat.
             session_id: Optional session ID to load conversation context from a specific session
+            caller: Optional CallerContext with auth identity and role.
         """
         # CONSTITUTION AUDIT CHECK: Trigger periodic integrity audits
         await self._maybe_audit()
 
         # Commands are not streamable - delegate to non-streaming handler
         if user_input.startswith("!"):
-            result = await self.process_input(user_input, model_override, session_id=session_id)
+            result = await self.process_input(user_input, model_override, session_id=session_id, caller=caller)
             yield result
             return
 

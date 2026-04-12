@@ -88,10 +88,12 @@ async def invoke_agent(request: Request):
             model_override = f"{provider_override}/{model_override}"
 
         agent = get_agent(request)
+        caller = getattr(request.state, "caller", None)
         response = await agent.process_input(
             user_input,
             model_override=model_override,
-            session_id=session_id
+            session_id=session_id,
+            caller=caller,
         )
         return {"response": response}
     except HTTPException:
@@ -123,6 +125,7 @@ async def stream_agent_response(request: Request):
             raise HTTPException(status_code=400, detail="Input not provided.")
 
         agent = get_agent(request)
+        caller = getattr(request.state, "caller", None)
 
         # Combine provider and model into provider/model format for routing.
         # The streaming path uses "/" in model_override to identify the provider
@@ -147,7 +150,8 @@ async def stream_agent_response(request: Request):
                     user_input,
                     model_override=model_override,
                     session_id=session_id,
-                    audit_before_streaming=audit_before_streaming
+                    audit_before_streaming=audit_before_streaming,
+                    caller=caller,
                 ):
                     # Check if request was cancelled
                     if agent.is_request_cancelled(request_id):

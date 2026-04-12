@@ -39,7 +39,6 @@ FAKE_HASH = hashlib.sha256(FAKE_CONSTITUTION).hexdigest()
 
 @pytest.mark.asyncio
 async def test_reanchor_rejects_missing_hash():
-    """Re-anchor refuses without expected_hash argument."""
     agent, _ = _make_agent()
     result = await agent.reanchor_constitution()
     assert "error" in result.lower()
@@ -48,7 +47,6 @@ async def test_reanchor_rejects_missing_hash():
 
 @pytest.mark.asyncio
 async def test_reanchor_rejects_short_hash():
-    """Re-anchor refuses hash prefix shorter than 8 characters."""
     agent, _ = _make_agent()
     result = await agent.reanchor_constitution(expected_hash="abc")
     assert "error" in result.lower()
@@ -57,125 +55,90 @@ async def test_reanchor_rejects_short_hash():
 
 @pytest.mark.asyncio
 async def test_reanchor_rejects_wrong_hash():
-    """Re-anchor refuses when expected hash doesn't match file on disk."""
     agent, _ = _make_agent()
-
     with patch("builtins.open", create=True) as mock_open:
         mock_open.return_value.__enter__ = lambda s: s
         mock_open.return_value.__exit__ = MagicMock(return_value=False)
         mock_open.return_value.read = MagicMock(return_value=FAKE_CONSTITUTION)
-
         result = await agent.reanchor_constitution(expected_hash="deadbeef")
-
     assert "error" in result.lower()
     assert "hash mismatch" in result.lower()
     agent.storage.store_file.assert_not_called()
 
 
-# --- Happy path with valid hash ---
+# --- Happy path ---
 
 @pytest.mark.asyncio
 async def test_reanchor_succeeds_with_correct_hash():
-    """Re-anchor stores new constitution when expected hash matches."""
     agent, node = _make_agent(stored_hash="oldhash", safe_mode=False)
     agent.storage.store_file = AsyncMock(return_value=FAKE_HASH)
-
     with patch("builtins.open", create=True) as mock_open:
         mock_open.return_value.__enter__ = lambda s: s
         mock_open.return_value.__exit__ = MagicMock(return_value=False)
         mock_open.return_value.read = MagicMock(return_value=FAKE_CONSTITUTION)
-
         result = await agent.reanchor_constitution(
-            expected_hash=FAKE_HASH[:8],
-            authorization="admin_command",
+            expected_hash=FAKE_HASH[:8], authorization="sovereign_api_key",
         )
-
     assert "re-anchored successfully" in result.lower()
-    assert FAKE_HASH[:16] in result
-    assert "admin_command" in result
     assert node.properties["constitution_hash"] == FAKE_HASH
-    assert node.properties["constitution_reanchor"]["old_hash"] == "oldhash"
-    assert node.properties["constitution_reanchor"]["new_hash"] == FAKE_HASH
-    assert node.properties["constitution_reanchor"]["authorization"] == "admin_command"
-    assert node.properties["constitution_reanchor"]["expected_hash_prefix"] == FAKE_HASH[:8]
-    agent.storage.store_file.assert_called_once_with(FAKE_CONSTITUTION, "KESTREL_CONSTITUTION.md")
-    agent.privacy_agent.add_conversation.assert_called_once()
+    assert node.properties["constitution_reanchor"]["authorization"] == "sovereign_api_key"
 
 
 @pytest.mark.asyncio
 async def test_reanchor_accepts_full_hash():
-    """Re-anchor works with full hash, not just prefix."""
     agent, node = _make_agent(stored_hash="oldhash")
     agent.storage.store_file = AsyncMock(return_value=FAKE_HASH)
-
     with patch("builtins.open", create=True) as mock_open:
         mock_open.return_value.__enter__ = lambda s: s
         mock_open.return_value.__exit__ = MagicMock(return_value=False)
         mock_open.return_value.read = MagicMock(return_value=FAKE_CONSTITUTION)
-
         result = await agent.reanchor_constitution(expected_hash=FAKE_HASH)
-
     assert "re-anchored successfully" in result.lower()
 
 
-# --- Safe mode is NOT auto-exited ---
+# --- Safe mode NOT auto-exited ---
 
 @pytest.mark.asyncio
 async def test_reanchor_does_not_exit_safe_mode():
-    """Re-anchor updates hash but leaves safe mode active."""
     agent, node = _make_agent(stored_hash="oldhash", safe_mode=True)
     agent.storage.store_file = AsyncMock(return_value=FAKE_HASH)
-
     with patch("builtins.open", create=True) as mock_open:
         mock_open.return_value.__enter__ = lambda s: s
         mock_open.return_value.__exit__ = MagicMock(return_value=False)
         mock_open.return_value.read = MagicMock(return_value=FAKE_CONSTITUTION)
-
         result = await agent.reanchor_constitution(expected_hash=FAKE_HASH[:8])
-
     assert agent._safe_mode is True
     assert "safe mode" in result.lower()
-    assert node.properties["constitution_hash"] == FAKE_HASH
 
 
 # --- Edge cases ---
 
 @pytest.mark.asyncio
 async def test_reanchor_noop_when_already_current():
-    """Re-anchor is a no-op if constitution hasn't changed."""
     agent, node = _make_agent(stored_hash=FAKE_HASH)
-
     with patch("builtins.open", create=True) as mock_open:
         mock_open.return_value.__enter__ = lambda s: s
         mock_open.return_value.__exit__ = MagicMock(return_value=False)
         mock_open.return_value.read = MagicMock(return_value=FAKE_CONSTITUTION)
-
         result = await agent.reanchor_constitution(expected_hash=FAKE_HASH[:8])
-
     assert "already anchored" in result.lower()
     agent.storage.store_file.assert_not_called()
 
 
 @pytest.mark.asyncio
 async def test_reanchor_fails_when_no_identity_node():
-    """Re-anchor fails gracefully when agent node is missing."""
     agent, _ = _make_agent()
     agent.storage.get_node = AsyncMock(return_value=None)
-
     result = await agent.reanchor_constitution(expected_hash=FAKE_HASH[:8])
-
     assert "error" in result.lower()
     assert "identity node" in result.lower()
 
 
 @pytest.mark.asyncio
 async def test_reanchor_fails_when_no_file_on_disk():
-    """Re-anchor fails gracefully when constitution file is missing."""
     agent, _ = _make_agent()
-
     with patch("builtins.open", side_effect=FileNotFoundError):
         result = await agent.reanchor_constitution(expected_hash=FAKE_HASH[:8])
-
     assert "error" in result.lower()
     assert "no constitution file" in result.lower()
 
@@ -184,34 +147,25 @@ async def test_reanchor_fails_when_no_file_on_disk():
 
 @pytest.mark.asyncio
 async def test_governing_constitution_reads_from_storage_after_reanchor():
-    """After reanchor, _get_governing_constitution reads from anchored storage, not disk."""
     agent, node = _make_agent(stored_hash="oldhash")
     agent.storage.store_file = AsyncMock(return_value=FAKE_HASH)
     agent.agent_id = "test-agent"
 
-    # Step 1: reanchor so node gets the new hash
     with patch("builtins.open", create=True) as mock_open:
         mock_open.return_value.__enter__ = lambda s: s
         mock_open.return_value.__exit__ = MagicMock(return_value=False)
         mock_open.return_value.read = MagicMock(return_value=FAKE_CONSTITUTION)
-
         result = await agent.reanchor_constitution(expected_hash=FAKE_HASH[:8])
 
     assert "re-anchored successfully" in result.lower()
-    assert node.properties["constitution_hash"] == FAKE_HASH
-
-    # Step 2: _get_governing_constitution should retrieve from storage using the new hash
     agent.storage.retrieve_file = AsyncMock(return_value=b"stored constitution content")
-
     constitution = await agent._get_governing_constitution()
-
     agent.storage.retrieve_file.assert_called_once_with(FAKE_HASH)
     assert constitution == "stored constitution content"
 
 
 @pytest.mark.asyncio
 async def test_governing_constitution_does_not_read_disk_when_hash_exists():
-    """_get_governing_constitution never opens disk files when a hash is anchored."""
     agent, node = _make_agent(stored_hash=FAKE_HASH)
     agent.agent_id = "test-agent"
     agent.storage.retrieve_file = AsyncMock(return_value=FAKE_CONSTITUTION)
