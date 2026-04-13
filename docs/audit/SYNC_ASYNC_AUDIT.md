@@ -41,6 +41,8 @@ First-pass control document for issue `#300`, focused on maintained runtime surf
   - Fixed by offloading read, search, edit, restart-signal, and log file operations via `asyncio.to_thread()`.
 - `local_mps_adapter.py` `generate_image()` was still using `get_event_loop().time()` for elapsed timing.
   - Fixed by replacing it with `time.monotonic()`.
+- `local_mps_adapter.py` still performed local filesystem and process work directly inside async training/generation methods.
+  - Fixed by offloading training setup, process launch/termination, log reads, output scans, LoRA reads, cleanup, generation artifact checks, and artifact reads/writes via `asyncio.to_thread()`.
 
 ### Resolved audit patterns
 
@@ -67,6 +69,7 @@ First-pass control document for issue `#300`, focused on maintained runtime surf
 - `tests/unit/test_consent_caller_contracts.py`
 - `tests/unit/test_agent_runtime_endpoint_contracts.py`
 - `tests/unit/test_code_edit_feature.py` (subprocess offload contract)
+- `tests/unit/test_local_mps_adapter_async_contracts.py`
 - `tests/unit/test_strategic_memory_async_contracts.py`
 - `tests/unit/test_sovereignty_endpoint_contracts.py`
 - `tests/unit/test_security_feature.py`
