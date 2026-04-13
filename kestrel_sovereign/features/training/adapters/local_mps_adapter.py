@@ -51,6 +51,87 @@ DEFAULT_WORKING_DIR = os.environ.get(
 DEFAULT_DIFFUSERS_PATH = os.environ.get("DIFFUSERS_PATH", "")
 
 
+def _prepare_training_files(
+    job_dir: Path,
+    dataset_dir: Path,
+    output_dir: Path,
+    avatar_path: Path,
+    avatar_data: bytes,
+    metadata_path: Path,
+    metadata_content: str,
+) -> None:
+    """Prepare training directories and dataset files synchronously for thread offload."""
+    job_dir.mkdir(parents=True, exist_ok=True)
+    dataset_dir.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    avatar_path.write_bytes(avatar_data)
+    metadata_path.write_text(metadata_content + "\n", encoding="utf-8")
+
+
+def _start_training_process(cmd: list[str], cwd: Path, env: dict[str, str], log_file: Path) -> subprocess.Popen:
+    """Start the background training process with stdout redirected to a log file."""
+    with open(log_file, "w", encoding="utf-8") as log:
+        return subprocess.Popen(
+            cmd,
+            cwd=str(cwd),
+            env=env,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+        )
+
+
+def _read_text_tail(path: Path, chars: int = 500) -> str:
+    """Read the tail of a text file for error reporting."""
+    return path.read_text(encoding="utf-8")[-chars:]
+
+
+def _path_exists(path: Path) -> bool:
+    """Return whether a path exists, for async thread offload call sites."""
+    return path.exists()
+
+
+def _find_lora_files(output_dir: Path) -> list[Path]:
+    """Find LoRA output files."""
+    lora_files = list(output_dir.glob("*.safetensors"))
+    if not lora_files:
+        lora_files = list(output_dir.glob("checkpoint-*/*.safetensors"))
+    return lora_files
+
+
+def _find_any_lora_files(output_dir: Path) -> list[Path]:
+    """Find any LoRA output files beneath a training output directory."""
+    return list(output_dir.glob("**/*.safetensors"))
+
+
+def _read_latest_lora(output_dir: Path) -> bytes | None:
+    """Read the newest LoRA weights file."""
+    lora_files = _find_lora_files(output_dir)
+    if not lora_files:
+        return None
+    lora_path = sorted(lora_files, key=lambda p: p.stat().st_mtime, reverse=True)[0]
+    logger.info(f"Loading LoRA from {lora_path}")
+    return lora_path.read_bytes()
+
+
+def _terminate_process(process: subprocess.Popen, timeout: int = 10) -> None:
+    """Terminate a subprocess, killing it if it does not exit in time."""
+    process.terminate()
+    try:
+        process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        process.kill()
+
+
+def _cleanup_dataset_dir(dataset_dir: Path) -> None:
+    """Remove dataset artifacts while preserving LoRA output."""
+    for img in dataset_dir.glob("*"):
+        img.unlink()
+    try:
+        dataset_dir.rmdir()
+    except OSError:
+        pass
+
+
 class LocalMPSTrainingAdapter(TrainingProvider):
     """
     Local training provider for Apple Silicon using MPS backend.
@@ -164,7 +245,7 @@ class LocalMPSTrainingAdapter(TrainingProvider):
         Returns:
             TrainingJob with job details
         """
-        if not self.is_available():
+        if not await asyncio.to_thread(self.is_available):
             raise TrainingSubmissionError(
                 "Local MPS training not available",
                 provider=self.provider_name,
@@ -175,29 +256,27 @@ class LocalMPSTrainingAdapter(TrainingProvider):
         job_id = str(uuid.uuid4())
         trigger_word = config.trigger_word or f"TOK{companion_id[:8]}"
 
-        # Create directories for this job
+        # Prepare directories and dataset files for this job
         job_dir = self.configs_dir / job_id
-        job_dir.mkdir(parents=True, exist_ok=True)
-
         dataset_dir = self.datasets_dir / job_id
-        dataset_dir.mkdir(parents=True, exist_ok=True)
-
         output_dir = self.output_dir / job_id
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        # Save avatar image
         avatar_filename = f"{trigger_word}_portrait.png"
         avatar_path = dataset_dir / avatar_filename
-        avatar_path.write_bytes(avatar_data)
-
-        # Create metadata.jsonl for HuggingFace datasets format
-        # Caption uses trigger word to bind identity to the token
         metadata_path = dataset_dir / "metadata.jsonl"
         metadata_content = json.dumps({
             "file_name": avatar_filename,
             "text": f"{trigger_word} portrait photo, professional headshot"
         })
-        metadata_path.write_text(metadata_content + "\n")
+        await asyncio.to_thread(
+            _prepare_training_files,
+            job_dir,
+            dataset_dir,
+            output_dir,
+            avatar_path,
+            avatar_data,
+            metadata_path,
+            metadata_content,
+        )
 
         started_at = datetime.now(timezone.utc)
         log_file = job_dir / "training.log"
@@ -241,14 +320,13 @@ class LocalMPSTrainingAdapter(TrainingProvider):
                 f"--rank={lora_rank}",
             ]
 
-            with open(log_file, "w") as log:
-                process = subprocess.Popen(
-                    cmd,
-                    cwd=str(self.diffusers_path),
-                    env=env,
-                    stdout=log,
-                    stderr=subprocess.STDOUT,
-                )
+            process = await asyncio.to_thread(
+                _start_training_process,
+                cmd,
+                self.diffusers_path,
+                env,
+                log_file,
+            )
 
             self._training_processes[job_id] = process
             logger.info(f"Training process started (PID: {process.pid}), logging to {log_file}")
@@ -345,10 +423,10 @@ class LocalMPSTrainingAdapter(TrainingProvider):
                 # Failed - read error from log file
                 log_file = job_info.get("log_file")
                 error_msg = f"Training failed (exit {poll_result})"
-                if log_file and Path(log_file).exists():
-                    log_content = Path(log_file).read_text()
-                    # Get last 500 chars of log
-                    error_msg = f"{error_msg}: {log_content[-500:]}"
+                log_path = Path(log_file) if log_file else None
+                if log_path and await asyncio.to_thread(_path_exists, log_path):
+                    log_tail = await asyncio.to_thread(_read_text_tail, log_path, 500)
+                    error_msg = f"{error_msg}: {log_tail}"
                 return TrainingStatus(
                     job_id=job_id,
                     state=TrainingState.FAILED,
@@ -358,7 +436,7 @@ class LocalMPSTrainingAdapter(TrainingProvider):
                 )
 
         # No process - check for output files
-        lora_files = list(output_dir.glob("**/*.safetensors"))
+        lora_files = await asyncio.to_thread(_find_any_lora_files, output_dir)
         if lora_files:
             return TrainingStatus(
                 job_id=job_id,
@@ -392,21 +470,12 @@ class LocalMPSTrainingAdapter(TrainingProvider):
         job_info = self._active_jobs[job_id]
         output_dir = Path(job_info["output_dir"])
 
-        # Find LoRA files
-        lora_files = list(output_dir.glob("*.safetensors"))
-        if not lora_files:
-            # Check checkpoints
-            lora_files = list(output_dir.glob("checkpoint-*/*.safetensors"))
-
-        if not lora_files:
+        weights = await asyncio.to_thread(_read_latest_lora, output_dir)
+        if weights is None:
             logger.warning(f"No LoRA weights found in {output_dir}")
             return None
 
-        # Get most recent
-        lora_path = sorted(lora_files, key=lambda p: p.stat().st_mtime, reverse=True)[0]
-        logger.info(f"Loading LoRA from {lora_path}")
-
-        return lora_path.read_bytes()
+        return weights
 
     async def cancel(self, job_id: str) -> bool:
         """
@@ -420,11 +489,7 @@ class LocalMPSTrainingAdapter(TrainingProvider):
         """
         process = self._training_processes.get(job_id)
         if process:
-            process.terminate()
-            try:
-                process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                process.kill()
+            await asyncio.to_thread(_terminate_process, process, 10)
             del self._training_processes[job_id]
             logger.info(f"Cancelled training job {job_id[:8]}")
             return True
@@ -445,12 +510,7 @@ class LocalMPSTrainingAdapter(TrainingProvider):
 
             # Clean dataset images (keep LoRA output)
             dataset_dir = Path(job_info["dataset_dir"])
-            for img in dataset_dir.glob("*"):
-                img.unlink()
-            try:
-                dataset_dir.rmdir()
-            except OSError:
-                pass
+            await asyncio.to_thread(_cleanup_dataset_dir, dataset_dir)
 
             del self._active_jobs[job_id]
 
@@ -486,37 +546,40 @@ class LocalMPSTrainingAdapter(TrainingProvider):
         guidance_scale = config.guidance_scale if config else 7.5
         width = config.width if config else 1024
         height = config.height if config else 1024
-
-        # Resolve LoRA path
-        lora_path = None
-        if config and config.lora_path:
-            lora_path = config.lora_path
-            if lora_path.startswith("file://"):
-                lora_path = lora_path[7:]
-        elif lora_bytes:
-            # Save bytes to temp file
-            temp_lora = self.working_dir / "temp_lora.safetensors"
-            temp_lora.write_bytes(lora_bytes)
-            lora_path = str(temp_lora)
-
-        if not lora_path or not Path(lora_path).exists():
-            return GenerationResult(
-                job_id="local-mps", images=[], state=GenerationState.FAILED,
-                error=f"LoRA file not found: {lora_path}",
-            )
-
-        # Use diffusers venv Python for generation (avoids version conflicts)
-        diffusers_python = str(self.diffusers_path / ".venv/bin/python3")
-        if not Path(diffusers_python).exists():
-            return GenerationResult(
-                job_id="local-mps", images=[], state=GenerationState.FAILED,
-                error=f"Diffusers Python not found: {diffusers_python}",
-            )
+        temp_lora: Path | None = None
 
         output_path = self.working_dir / "generated_selfie.png"
 
-        # Inline generation script — runs in the diffusers venv
-        script = f"""
+        try:
+            # Resolve LoRA path
+            lora_path = None
+            if config and config.lora_path:
+                lora_path = config.lora_path
+                if lora_path.startswith("file://"):
+                    lora_path = lora_path[7:]
+            elif lora_bytes:
+                # Save bytes to temp file
+                temp_lora = self.working_dir / "temp_lora.safetensors"
+                await asyncio.to_thread(temp_lora.write_bytes, lora_bytes)
+                lora_path = str(temp_lora)
+
+            lora_file = Path(lora_path) if lora_path else None
+            if not lora_file or not await asyncio.to_thread(_path_exists, lora_file):
+                return GenerationResult(
+                    job_id="local-mps", images=[], state=GenerationState.FAILED,
+                    error=f"LoRA file not found: {lora_path}",
+                )
+
+            # Use diffusers venv Python for generation (avoids version conflicts)
+            diffusers_python = str(self.diffusers_path / ".venv/bin/python3")
+            if not await asyncio.to_thread(_path_exists, Path(diffusers_python)):
+                return GenerationResult(
+                    job_id="local-mps", images=[], state=GenerationState.FAILED,
+                    error=f"Diffusers Python not found: {diffusers_python}",
+                )
+
+            # Inline generation script — runs in the diffusers venv
+            script = f"""
 import torch, base64, sys
 from diffusers import StableDiffusionXLPipeline
 
@@ -541,10 +604,9 @@ image = pipe(
 image.save("{output_path}")
 print("OK")
 """
-        logger.info(f"Generating selfie via subprocess: {prompt[:60]}...")
-        start_time = time.monotonic()
+            logger.info(f"Generating selfie via subprocess: {prompt[:60]}...")
+            start_time = time.monotonic()
 
-        try:
             process = await asyncio.create_subprocess_exec(
                 diffusers_python, "-c", script,
                 stdout=asyncio.subprocess.PIPE,
@@ -567,14 +629,14 @@ print("OK")
                 )
 
             # Read output image and convert to base64
-            if not output_path.exists():
+            if not await asyncio.to_thread(_path_exists, output_path):
                 return GenerationResult(
                     job_id="local-mps", images=[], state=GenerationState.FAILED,
                     error="Generation produced no output file",
                     elapsed_seconds=elapsed,
                 )
 
-            img_bytes = output_path.read_bytes()
+            img_bytes = await asyncio.to_thread(output_path.read_bytes)
             img_base64 = base64.b64encode(img_bytes).decode()
             data_url = f"data:image/png;base64,{img_base64}"
 
@@ -599,8 +661,10 @@ print("OK")
                 error=str(e),
             )
         finally:
-            if output_path.exists():
-                output_path.unlink()
+            if await asyncio.to_thread(_path_exists, output_path):
+                await asyncio.to_thread(output_path.unlink)
+            if temp_lora and await asyncio.to_thread(_path_exists, temp_lora):
+                await asyncio.to_thread(temp_lora.unlink)
 
     async def close(self) -> None:
         """Close resources."""
