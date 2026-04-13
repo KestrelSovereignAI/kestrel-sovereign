@@ -41,6 +41,41 @@ async def _run_subprocess(*args, **kwargs) -> subprocess.CompletedProcess:
     return await asyncio.to_thread(functools.partial(subprocess.run, *args, **kwargs))
 
 
+async def _read_text(path: Path) -> str:
+    """Read text off the event loop."""
+    return await asyncio.to_thread(path.read_text, encoding="utf-8")
+
+
+async def _write_text(path: Path, content: str) -> int:
+    """Write text off the event loop."""
+    return await asyncio.to_thread(path.write_text, content, encoding="utf-8")
+
+
+def _search_file_contents(code_root: Path, resolved: Path, pattern: str, file_pattern: str) -> tuple[list[dict], int]:
+    """Search files synchronously for offloading via asyncio.to_thread."""
+    matches = []
+    total_matches = 0
+
+    for file_path in resolved.rglob(file_pattern):
+        if not file_path.is_file():
+            continue
+        try:
+            content = file_path.read_text(encoding="utf-8")
+            for i, line in enumerate(content.split('\n'), 1):
+                if pattern in line:
+                    total_matches += 1
+                    if len(matches) < 50:
+                        matches.append({
+                            "file": str(file_path.relative_to(code_root)),
+                            "line": i,
+                            "content": line.strip()[:200],
+                        })
+        except (UnicodeDecodeError, PermissionError, OSError):
+            continue  # Skip files that can't be read
+
+    return matches, total_matches
+
+
 class CodeEditFeature(Feature):
     """Feature for self-modification of source code.
     
@@ -160,7 +195,7 @@ class CodeEditFeature(Feature):
             if not resolved.is_file():
                 return {"success": False, "error": f"Not a file: {path}"}
             
-            content = resolved.read_text()
+            content = await _read_text(resolved)
             lines = content.split('\n')
             
             # Handle line range
@@ -174,7 +209,7 @@ class CodeEditFeature(Feature):
                 "success": True,
                 "path": str(resolved.relative_to(self.code_root)),
                 "content": content,
-                "total_lines": len(resolved.read_text().split('\n')),
+                "total_lines": len(content.split('\n')),
                 "shown_lines": len(lines),
             }
         except (FileNotFoundError, PermissionError, OSError) as e:
@@ -215,27 +250,19 @@ class CodeEditFeature(Feature):
             if not resolved.exists():
                 return {"success": False, "error": f"Path not found: {path}"}
             
-            matches = []
-            for file_path in resolved.rglob(file_pattern):
-                if not file_path.is_file():
-                    continue
-                try:
-                    content = file_path.read_text()
-                    for i, line in enumerate(content.split('\n'), 1):
-                        if pattern in line:
-                            matches.append({
-                                "file": str(file_path.relative_to(self.code_root)),
-                                "line": i,
-                                "content": line.strip()[:200],
-                            })
-                except (UnicodeDecodeError, PermissionError, OSError):
-                    continue  # Skip files that can't be read
+            matches, total_matches = await asyncio.to_thread(
+                _search_file_contents,
+                self.code_root,
+                resolved,
+                pattern,
+                file_pattern,
+            )
             
             return {
                 "success": True,
                 "pattern": pattern,
-                "matches": matches[:50],  # Limit results
-                "total_matches": len(matches),
+                "matches": matches,
+                "total_matches": total_matches,
             }
         except (FileNotFoundError, PermissionError, OSError) as e:
             logger.error(f"Error searching: {e}")
@@ -282,7 +309,7 @@ class CodeEditFeature(Feature):
             if not resolved.exists():
                 return {"success": False, "error": f"File not found: {path}"}
             
-            content = resolved.read_text()
+            content = await _read_text(resolved)
             
             # Verify old_text exists exactly once
             count = content.count(old_text)
@@ -316,7 +343,7 @@ class CodeEditFeature(Feature):
             
             # Apply the edit
             new_content = content.replace(old_text, new_text, 1)
-            resolved.write_text(new_content)
+            await _write_text(resolved, new_content)
             
             logger.info(f"Applied code edit to {path}: {description or 'no description'}")
             
@@ -504,7 +531,7 @@ class CodeEditFeature(Feature):
             
             # Write restart signal file
             restart_file = self.code_root / ".restart_requested"
-            restart_file.write_text(reason or "Code changes applied")
+            await _write_text(restart_file, reason or "Code changes applied")
             
             logger.info(f"Restart signaled: {reason}")
             
@@ -688,7 +715,7 @@ class CodeEditFeature(Feature):
                     continue
                 lp = Path(lp)
                 if lp.exists():
-                    log_content = lp.read_text()
+                    log_content = await _read_text(lp)
                     used_path = str(lp)
                     break
             

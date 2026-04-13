@@ -19,6 +19,7 @@ import json
 import logging
 import os
 import subprocess
+import time
 import uuid
 from datetime import datetime, timezone
 from io import BytesIO
@@ -541,7 +542,7 @@ image.save("{output_path}")
 print("OK")
 """
         logger.info(f"Generating selfie via subprocess: {prompt[:60]}...")
-        start_time = asyncio.get_event_loop().time()
+        start_time = time.monotonic()
 
         try:
             process = await asyncio.create_subprocess_exec(
@@ -554,7 +555,7 @@ print("OK")
                 process.communicate(), timeout=300,
             )
 
-            elapsed = asyncio.get_event_loop().time() - start_time
+            elapsed = time.monotonic() - start_time
 
             if process.returncode != 0:
                 error_msg = stderr.decode()[-500:] if stderr else "Unknown error"
