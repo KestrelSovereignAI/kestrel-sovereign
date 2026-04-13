@@ -1,5 +1,6 @@
 """Direct contracts for the CodeEdit feature."""
 
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -7,6 +8,9 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from kestrel_sovereign.features.code_edit.feature import CodeEditFeature, _run_subprocess
+
+
+CODE_EDIT_MODULE = "kestrel_sovereign.features.code_edit.feature"
 
 
 @pytest.fixture
@@ -40,6 +44,24 @@ async def test_code_read_returns_file_contents(feature):
 
 
 @pytest.mark.asyncio
+async def test_code_read_file_io_is_offloaded(feature):
+    feat, root = feature
+    (root / "sample.py").write_text("line1\n", encoding="utf-8")
+    real_to_thread = asyncio.to_thread
+    calls = []
+
+    async def tracking_to_thread(func, *args, **kwargs):
+        calls.append(func)
+        return await real_to_thread(func, *args, **kwargs)
+
+    with patch(f"{CODE_EDIT_MODULE}.asyncio.to_thread", side_effect=tracking_to_thread):
+        result = await feat.code_read("sample.py")
+
+    assert result["success"] is True
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
 async def test_code_search_limits_and_reports_matches(feature):
     feat, root = feature
     (root / "a.py").write_text("alpha\nbeta alpha\n", encoding="utf-8")
@@ -50,6 +72,24 @@ async def test_code_search_limits_and_reports_matches(feature):
     assert result["success"] is True
     assert result["total_matches"] == 2
     assert result["matches"][0]["file"] == "a.py"
+
+
+@pytest.mark.asyncio
+async def test_code_search_file_io_is_offloaded(feature):
+    feat, root = feature
+    (root / "a.py").write_text("alpha\n", encoding="utf-8")
+    real_to_thread = asyncio.to_thread
+    calls = []
+
+    async def tracking_to_thread(func, *args, **kwargs):
+        calls.append(func)
+        return await real_to_thread(func, *args, **kwargs)
+
+    with patch(f"{CODE_EDIT_MODULE}.asyncio.to_thread", side_effect=tracking_to_thread):
+        result = await feat.code_search("alpha")
+
+    assert result["success"] is True
+    assert len(calls) == 1
 
 
 @pytest.mark.asyncio
@@ -76,6 +116,65 @@ async def test_code_edit_applies_change_after_approval(feature):
     assert result["success"] is True
     assert target.read_text(encoding="utf-8") == "new\n"
     assert result["description"] == "replace text"
+
+
+@pytest.mark.asyncio
+async def test_code_edit_file_io_is_offloaded(feature):
+    feat, root = feature
+    target = root / "sample.py"
+    target.write_text("old\n", encoding="utf-8")
+    feat._request_approval = lambda *args, **kwargs: asyncio.sleep(0, result=True)
+    real_to_thread = asyncio.to_thread
+    calls = []
+
+    async def tracking_to_thread(func, *args, **kwargs):
+        calls.append(func)
+        return await real_to_thread(func, *args, **kwargs)
+
+    with patch(f"{CODE_EDIT_MODULE}.asyncio.to_thread", side_effect=tracking_to_thread):
+        result = await feat.code_edit("sample.py", "old", "new")
+
+    assert result["success"] is True
+    assert len(calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_restart_signal_file_io_is_offloaded(feature):
+    feat, root = feature
+    feat._request_approval = lambda *args, **kwargs: asyncio.sleep(0, result=True)
+    real_to_thread = asyncio.to_thread
+    calls = []
+
+    async def tracking_to_thread(func, *args, **kwargs):
+        calls.append(func)
+        return await real_to_thread(func, *args, **kwargs)
+
+    with patch(f"{CODE_EDIT_MODULE}.asyncio.to_thread", side_effect=tracking_to_thread):
+        result = await feat.code_restart("testing restart")
+
+    assert result["success"] is True
+    assert (root / ".restart_requested").read_text(encoding="utf-8") == "testing restart"
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_code_logs_file_io_is_offloaded(feature):
+    feat, root = feature
+    log_file = root / "kestrel.log"
+    log_file.write_text("INFO ok\nERROR bad", encoding="utf-8")
+    real_to_thread = asyncio.to_thread
+    calls = []
+
+    async def tracking_to_thread(func, *args, **kwargs):
+        calls.append(func)
+        return await real_to_thread(func, *args, **kwargs)
+
+    with patch(f"{CODE_EDIT_MODULE}.asyncio.to_thread", side_effect=tracking_to_thread):
+        result = await feat.code_logs(lines=1, log_file=str(log_file))
+
+    assert result["success"] is True
+    assert "ERROR bad" in result["content"]
+    assert len(calls) == 1
 
 
 @pytest.mark.asyncio

@@ -37,8 +37,10 @@ First-pass control document for issue `#300`, focused on maintained runtime surf
   - Fixed by removing `close()` and standardizing on `await agent.shutdown()` for maintained cleanup.
 - `CodeEditFeature` tool methods (`code_diff`, `code_commit`, `code_test`, `code_lint`, `code_rollback`) were calling `subprocess.run()` directly on the event loop.
   - Fixed by introducing `_run_subprocess()` wrapper using `asyncio.to_thread()` and replacing all call sites.
-- `local_mps_adapter.py` `generate_image()` was using `get_event_loop().run_in_executor()`.
-  - Fixed by replacing with `asyncio.to_thread()`.
+- `CodeEditFeature` async tool methods were still reading and writing files directly on the event loop.
+  - Fixed by offloading read, search, edit, restart-signal, and log file operations via `asyncio.to_thread()`.
+- `local_mps_adapter.py` `generate_image()` was still using `get_event_loop().time()` for elapsed timing.
+  - Fixed by replacing it with `time.monotonic()`.
 
 ### Resolved audit patterns
 
