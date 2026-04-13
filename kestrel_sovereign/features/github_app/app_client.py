@@ -156,3 +156,92 @@ class GitHubAppClient:
                 },
                 json={"content": reaction},
             )
+
+    async def get_file_content(
+        self, installation_id: int, repo: str, path: str, ref: str = "main"
+    ) -> Optional[str]:
+        """Read a file from the repo."""
+        token = await self._get_installation_token(installation_id)
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                f"{GITHUB_API_BASE}/repos/{repo}/contents/{path}",
+                params={"ref": ref},
+                headers={
+                    "Authorization": f"token {token}",
+                    "Accept": "application/vnd.github.raw+json",
+                    "X-GitHub-Api-Version": "2022-11-28",
+                },
+            )
+            if resp.status_code == 200:
+                return resp.text
+            return None
+
+    async def search_code(
+        self, installation_id: int, repo: str, query: str, max_results: int = 10
+    ) -> list[dict]:
+        """Search code in the repo. Returns list of {path, text_matches}."""
+        token = await self._get_installation_token(installation_id)
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                f"{GITHUB_API_BASE}/search/code",
+                params={"q": f"{query} repo:{repo}", "per_page": max_results},
+                headers={
+                    "Authorization": f"token {token}",
+                    "Accept": "application/vnd.github.text-match+json",
+                    "X-GitHub-Api-Version": "2022-11-28",
+                },
+            )
+            if resp.status_code != 200:
+                return []
+            items = resp.json().get("items", [])
+            return [
+                {
+                    "path": item["path"],
+                    "text_matches": [
+                        m.get("fragment", "") for m in item.get("text_matches", [])
+                    ],
+                }
+                for item in items
+            ]
+
+    async def get_directory_listing(
+        self, installation_id: int, repo: str, path: str = "", ref: str = "main"
+    ) -> list[str]:
+        """List files in a directory."""
+        token = await self._get_installation_token(installation_id)
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                f"{GITHUB_API_BASE}/repos/{repo}/contents/{path}",
+                params={"ref": ref},
+                headers={
+                    "Authorization": f"token {token}",
+                    "Accept": "application/vnd.github+json",
+                    "X-GitHub-Api-Version": "2022-11-28",
+                },
+            )
+            if resp.status_code != 200:
+                return []
+            items = resp.json()
+            if not isinstance(items, list):
+                return []
+            return [item["path"] for item in items]
+
+    async def get_repo_tree(
+        self, installation_id: int, repo: str, ref: str = "main"
+    ) -> list[str]:
+        """Get the full file tree of the repo (recursive)."""
+        token = await self._get_installation_token(installation_id)
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                f"{GITHUB_API_BASE}/repos/{repo}/git/trees/{ref}",
+                params={"recursive": "1"},
+                headers={
+                    "Authorization": f"token {token}",
+                    "Accept": "application/vnd.github+json",
+                    "X-GitHub-Api-Version": "2022-11-28",
+                },
+            )
+            if resp.status_code != 200:
+                return []
+            tree = resp.json().get("tree", [])
+            return [item["path"] for item in tree if item["type"] == "blob"]
