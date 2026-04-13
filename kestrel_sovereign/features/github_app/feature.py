@@ -131,7 +131,7 @@ class GitHubAppFeature(Feature):
         await self._client.add_reaction(installation_id, repo, issue_number, "eyes")
 
         question = f"Issue #{issue_number}: {title}\n\n{body}"
-        response = await self._generate_response(repo, "issue", question)
+        response = await self._generate_response(repo, "issue", question, installation_id)
 
         if response:
             await self._client.create_issue_comment(
@@ -154,7 +154,7 @@ class GitHubAppFeature(Feature):
         title = issue["title"]
 
         question = f"Issue #{issue_number}: {title}\n\nComment: {comment_body}"
-        response = await self._generate_response(repo, "issue comment", question)
+        response = await self._generate_response(repo, "issue comment", question, installation_id)
 
         if response:
             await self._client.create_issue_comment(
@@ -171,7 +171,7 @@ class GitHubAppFeature(Feature):
         body = discussion.get("body", "") or ""
 
         question = f"Discussion: {title}\n\n{body}"
-        response = await self._generate_response(repo, "discussion", question)
+        response = await self._generate_response(repo, "discussion", question, installation_id)
 
         if response:
             await self._client.create_discussion_comment(
@@ -193,7 +193,7 @@ class GitHubAppFeature(Feature):
         title = discussion["title"]
 
         question = f"Discussion: {title}\n\nComment: {comment_body}"
-        response = await self._generate_response(repo, "discussion comment", question)
+        response = await self._generate_response(repo, "discussion comment", question, installation_id)
 
         if response:
             await self._client.create_discussion_comment(
@@ -201,22 +201,85 @@ class GitHubAppFeature(Feature):
             )
             logger.info("Responded to discussion comment on '%s' on %s", title, repo)
 
-    async def _generate_response(self, repo: str, event_type: str, question: str) -> Optional[str]:
-        """Generate an LLM response to a GitHub question."""
+    async def _generate_response(
+        self, repo: str, event_type: str, question: str,
+        installation_id: Optional[int] = None,
+    ) -> Optional[str]:
+        """Generate an LLM response to a GitHub question with real codebase context."""
         if not self.agent:
             logger.error("GitHubAppFeature: no agent reference")
             return None
+
+        # Gather codebase context
+        context = await self._gather_context(repo, question, installation_id)
 
         system = SYSTEM_PROMPT.format(event_type=event_type, repo=repo)
         if self._soul:
             system = self._soul + "\n\n" + system
 
+        prompt = question
+        if context:
+            prompt = f"{question}\n\n---\n\n**Relevant source code:**\n\n{context}"
+
         try:
             response = await self.agent.llm_service.generate(
-                prompt=question,
+                prompt=prompt,
                 system_prompt=system,
             )
             return response.content if response and response.content else None
         except Exception as e:
             logger.error("GitHubAppFeature LLM error: %s", e, exc_info=True)
             return None
+
+    async def _gather_context(
+        self, repo: str, question: str, installation_id: Optional[int] = None
+    ) -> str:
+        """Search the repo for code relevant to the question."""
+        if not installation_id:
+            return ""
+
+        context_parts = []
+
+        try:
+            # Always include the README and key architecture docs
+            readme = await self._client.get_file_content(installation_id, repo, "README.md")
+            if readme:
+                context_parts.append(f"## README.md\n```\n{readme[:3000]}\n```")
+
+            # Search for code matching keywords from the question
+            # Extract meaningful words (skip common ones)
+            skip_words = {"the", "a", "an", "is", "how", "do", "i", "to", "can", "what", "does", "it", "in", "for", "of", "with", "this", "that"}
+            words = [w.strip("?.,!") for w in question.lower().split() if len(w) > 2 and w.lower() not in skip_words]
+            search_terms = words[:5]  # Top 5 meaningful words
+
+            if search_terms:
+                query = " ".join(search_terms)
+                results = await self._client.search_code(installation_id, repo, query, max_results=5)
+
+                for result in results[:5]:
+                    path = result["path"]
+                    # Read the actual file for more context
+                    content = await self._client.get_file_content(installation_id, repo, path)
+                    if content:
+                        # Truncate large files
+                        if len(content) > 2000:
+                            content = content[:2000] + "\n... (truncated)"
+                        context_parts.append(f"## {path}\n```python\n{content}\n```")
+
+            # If we found nothing via search, include the project structure
+            if len(context_parts) <= 1:
+                tree = await self._client.get_repo_tree(installation_id, repo)
+                if tree:
+                    # Filter to Python files and key dirs
+                    relevant = [p for p in tree if p.endswith(".py") and not p.startswith("tests/")][:50]
+                    context_parts.append(f"## Project structure (Python files)\n```\n" + "\n".join(relevant) + "\n```")
+
+        except Exception as e:
+            logger.warning("GitHubAppFeature context gathering error: %s", e)
+
+        # Cap total context to avoid blowing the context window
+        combined = "\n\n".join(context_parts)
+        if len(combined) > 15000:
+            combined = combined[:15000] + "\n\n... (context truncated)"
+
+        return combined
