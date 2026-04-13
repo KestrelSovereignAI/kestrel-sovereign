@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from scripts import generate_feature_docs
+from kestrel_sovereign.llm.model_metadata import ModelCategory, ModelInfo
 
 
 def test_generator_uses_canonical_source_path():
@@ -34,7 +35,10 @@ def test_generator_uses_provider_default_resolution_for_anthropic():
     with patch.object(generate_feature_docs, "resolve_provider_default", return_value="claude-opus-4-5-20251101"):
         with patch.dict("sys.modules", {"anthropic": fake_anthropic}):
             with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}, clear=True):
-                _, model_name, provider = generate_feature_docs.get_client_and_model(None)
+                _, model_name, provider = generate_feature_docs.get_client_and_model(
+                    None,
+                    refresh_discovery=False,
+                )
 
     assert provider == "anthropic"
     assert model_name == "claude-opus-4-5-20251101"
@@ -45,7 +49,33 @@ def test_generator_uses_provider_default_resolution_for_openai():
     with patch.object(generate_feature_docs, "resolve_provider_default", return_value="gpt-5.1"):
         with patch.dict("sys.modules", {"openai": fake_openai}):
             with patch.dict("os.environ", {"OPENAI_API_KEY": "test-key"}, clear=True):
-                _, model_name, provider = generate_feature_docs.get_client_and_model(None)
+                _, model_name, provider = generate_feature_docs.get_client_and_model(
+                    None,
+                    refresh_discovery=False,
+                )
 
     assert provider == "openai"
     assert model_name == "gpt-5.1"
+
+
+def test_generator_refreshes_provider_discovery_before_default_resolution():
+    fake_anthropic = SimpleNamespace(Anthropic=lambda: object())
+    discovered = [
+        ModelInfo(
+            id="claude-sonnet-4-6",
+            provider="anthropic",
+            display_name="Claude Sonnet 4.6",
+            category=ModelCategory.CHAT,
+        )
+    ]
+
+    with patch.object(generate_feature_docs, "_refresh_provider_cache", return_value=discovered) as refresh:
+        with patch.object(generate_feature_docs, "resolve_provider_default", return_value="claude-sonnet-4-6") as resolve:
+            with patch.dict("sys.modules", {"anthropic": fake_anthropic}):
+                with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}, clear=True):
+                    _, model_name, provider = generate_feature_docs.get_client_and_model(None)
+
+    assert provider == "anthropic"
+    assert model_name == "claude-sonnet-4-6"
+    refresh.assert_called_once_with("anthropic")
+    assert resolve.call_args.kwargs["cached_models"] == discovered
