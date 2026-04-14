@@ -81,14 +81,16 @@ class GitHubAppFeature(Feature):
             if sender.endswith("[bot]"):
                 return Response(status_code=200)
 
-            # Process inline — Cloud Run may kill the instance after response
-            # GitHub allows 10s for webhook response; our LLM call may take longer
-            # but GitHub will retry on timeout, which is fine
+            # Process inline — Cloud Run kills background tasks after response
+            import json as _json
+            diag = {"event": event, "action": payload.get("action"), "sender": sender}
             try:
                 await self._handle_event(event, payload)
+                diag["status"] = "ok"
             except Exception as e:
-                logger.error("GitHub App webhook processing error: %s", e, exc_info=True)
-            return Response(status_code=200)
+                diag["status"] = "error"
+                diag["error"] = str(e)
+            return Response(content=_json.dumps(diag), status_code=200, media_type="application/json")
 
         return router
 
