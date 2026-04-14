@@ -85,11 +85,12 @@ class GitHubAppFeature(Feature):
             import json as _json
             diag = {"event": event, "action": payload.get("action"), "sender": sender}
             try:
-                await self._handle_event(event, payload)
+                result = await self._handle_event(event, payload)
                 diag["status"] = "ok"
+                diag["result"] = result
             except Exception as e:
                 diag["status"] = "error"
-                diag["error"] = str(e)
+                diag["error"] = f"{type(e).__name__}: {e}"
             return Response(content=_json.dumps(diag), status_code=200, media_type="application/json")
 
         return router
@@ -105,31 +106,26 @@ class GitHubAppFeature(Feature):
         ).hexdigest()
         return hmac.compare_digest(signature[7:], expected)
 
-    async def _handle_event(self, event: str, payload: Dict[str, Any]):
-        """Route and process a GitHub event."""
+    async def _handle_event(self, event: str, payload: Dict[str, Any]) -> dict:
+        """Route and process a GitHub event. Returns diagnostic info."""
         try:
-            import sys
-            print(f"GitHubApp: handling event={event} action={payload.get('action')} sender={payload.get('sender', {}).get('login')}", flush=True, file=sys.stderr)
-            logger.info("GitHubApp: handling event=%s action=%s sender=%s",
-                        event, payload.get("action"), payload.get("sender", {}).get("login"))
             installation_id = payload.get("installation", {}).get("id")
             if not installation_id:
-                logger.warning("GitHubApp: no installation ID in payload")
-                return
+                return {"step": "no_installation_id"}
 
             if event == "issues" and payload.get("action") == "opened":
-                await self._handle_issue_opened(installation_id, payload)
+                return await self._handle_issue_opened(installation_id, payload)
             elif event == "issue_comment" and payload.get("action") == "created":
-                await self._handle_issue_comment(installation_id, payload)
+                return await self._handle_issue_comment(installation_id, payload)
             elif event == "discussion" and payload.get("action") == "created":
-                await self._handle_discussion_created(installation_id, payload)
+                return await self._handle_discussion_created(installation_id, payload)
             elif event == "discussion_comment" and payload.get("action") == "created":
-                await self._handle_discussion_comment(installation_id, payload)
+                return await self._handle_discussion_comment(installation_id, payload)
             else:
-                logger.debug("GitHub App webhook: ignoring %s.%s", event, payload.get("action"))
+                return {"step": "ignored", "event": f"{event}.{payload.get('action')}"}
 
         except Exception as e:
-            logger.error("GitHub App webhook handler error: %s", e, exc_info=True)
+            return {"step": "exception", "error": f"{type(e).__name__}: {e}"}
 
     async def _handle_issue_opened(self, installation_id: int, payload: dict):
         """Respond to a newly opened issue."""
@@ -151,35 +147,35 @@ class GitHubAppFeature(Feature):
             )
             logger.info("Responded to issue #%d on %s", issue_number, repo)
 
-    async def _handle_issue_comment(self, installation_id: int, payload: dict):
+    async def _handle_issue_comment(self, installation_id: int, payload: dict) -> dict:
         """Respond to a comment on an issue (only if @mentioned)."""
         comment = payload["comment"]
         comment_body = comment.get("body", "") or ""
 
-        logger.info("GitHubApp: issue_comment received, body=%r, checking for @kestrel", comment_body[:100])
-
-        # Only respond if explicitly mentioned
         if "@kestrel" not in comment_body.lower():
-            logger.info("GitHubApp: no @kestrel mention, skipping")
-            return
+            return {"step": "no_mention"}
 
         repo = payload["repository"]["full_name"]
         issue = payload["issue"]
         issue_number = issue["number"]
         title = issue["title"]
 
-        logger.info("GitHubApp: generating response for issue #%d on %s", issue_number, repo)
         question = f"Issue #{issue_number}: {title}\n\nComment: {comment_body}"
-        response = await self._generate_response(repo, "issue comment", question, installation_id)
+        try:
+            response = await self._generate_response(repo, "issue comment", question, installation_id)
+        except Exception as e:
+            return {"step": "llm_error", "error": f"{type(e).__name__}: {e}"}
 
-        if response:
-            logger.info("GitHubApp: posting response (%d chars) to issue #%d", len(response), issue_number)
+        if not response:
+            return {"step": "no_response", "has_agent": self.agent is not None}
+
+        try:
             await self._client.create_issue_comment(
                 installation_id, repo, issue_number, response
             )
-            logger.info("GitHubApp: responded to comment on issue #%d on %s", issue_number, repo)
-        else:
-            logger.warning("GitHubApp: LLM returned no response for issue #%d", issue_number)
+            return {"step": "commented", "chars": len(response)}
+        except Exception as e:
+            return {"step": "comment_post_error", "error": f"{type(e).__name__}: {e}"}
 
     async def _handle_discussion_created(self, installation_id: int, payload: dict):
         """Respond to a new discussion."""
