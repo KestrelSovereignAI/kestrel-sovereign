@@ -106,6 +106,8 @@ class GitHubAppFeature(Feature):
     async def _handle_event(self, event: str, payload: Dict[str, Any]):
         """Route and process a GitHub event."""
         try:
+            import sys
+            print(f"GitHubApp: handling event={event} action={payload.get('action')} sender={payload.get('sender', {}).get('login')}", flush=True, file=sys.stderr)
             logger.info("GitHubApp: handling event=%s action=%s sender=%s",
                         event, payload.get("action"), payload.get("sender", {}).get("login"))
             installation_id = payload.get("installation", {}).get("id")
@@ -221,12 +223,19 @@ class GitHubAppFeature(Feature):
         installation_id: Optional[int] = None,
     ) -> Optional[str]:
         """Generate an LLM response to a GitHub question with real codebase context."""
+        import sys
+        print(f"GitHubApp._generate_response: agent={self.agent is not None}, repo={repo}", flush=True, file=sys.stderr)
         if not self.agent:
-            logger.error("GitHubAppFeature: no agent reference")
+            print("GitHubApp: NO AGENT REFERENCE", flush=True, file=sys.stderr)
             return None
 
         # Gather codebase context
-        context = await self._gather_context(repo, question, installation_id)
+        try:
+            context = await self._gather_context(repo, question, installation_id)
+            print(f"GitHubApp: context gathered, {len(context)} chars", flush=True, file=sys.stderr)
+        except Exception as e:
+            print(f"GitHubApp: context gathering failed: {e}", flush=True, file=sys.stderr)
+            context = ""
 
         system = SYSTEM_PROMPT.format(event_type=event_type, repo=repo)
         if self._soul:
@@ -237,13 +246,16 @@ class GitHubAppFeature(Feature):
             prompt = f"{question}\n\n---\n\n**Relevant source code:**\n\n{context}"
 
         try:
+            print(f"GitHubApp: calling LLM, prompt={len(prompt)} chars, system={len(system)} chars", flush=True, file=sys.stderr)
             response = await self.agent.llm_service.generate(
                 prompt=prompt,
                 system_prompt=system,
             )
-            return response.content if response and response.content else None
+            result = response.content if response and response.content else None
+            print(f"GitHubApp: LLM returned {len(result) if result else 0} chars", flush=True, file=sys.stderr)
+            return result
         except Exception as e:
-            logger.error("GitHubAppFeature LLM error: %s", e, exc_info=True)
+            print(f"GitHubApp: LLM ERROR: {e}", flush=True, file=sys.stderr)
             return None
 
     async def _gather_context(
