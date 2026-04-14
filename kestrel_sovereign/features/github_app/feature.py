@@ -106,9 +106,11 @@ class GitHubAppFeature(Feature):
     async def _handle_event(self, event: str, payload: Dict[str, Any]):
         """Route and process a GitHub event."""
         try:
+            logger.info("GitHubApp: handling event=%s action=%s sender=%s",
+                        event, payload.get("action"), payload.get("sender", {}).get("login"))
             installation_id = payload.get("installation", {}).get("id")
             if not installation_id:
-                logger.warning("GitHub App webhook: no installation ID in payload")
+                logger.warning("GitHubApp: no installation ID in payload")
                 return
 
             if event == "issues" and payload.get("action") == "opened":
@@ -150,8 +152,11 @@ class GitHubAppFeature(Feature):
         comment = payload["comment"]
         comment_body = comment.get("body", "") or ""
 
+        logger.info("GitHubApp: issue_comment received, body=%r, checking for @kestrel", comment_body[:100])
+
         # Only respond if explicitly mentioned
         if "@kestrel" not in comment_body.lower():
+            logger.info("GitHubApp: no @kestrel mention, skipping")
             return
 
         repo = payload["repository"]["full_name"]
@@ -159,14 +164,18 @@ class GitHubAppFeature(Feature):
         issue_number = issue["number"]
         title = issue["title"]
 
+        logger.info("GitHubApp: generating response for issue #%d on %s", issue_number, repo)
         question = f"Issue #{issue_number}: {title}\n\nComment: {comment_body}"
         response = await self._generate_response(repo, "issue comment", question, installation_id)
 
         if response:
+            logger.info("GitHubApp: posting response (%d chars) to issue #%d", len(response), issue_number)
             await self._client.create_issue_comment(
                 installation_id, repo, issue_number, response
             )
-            logger.info("Responded to comment on issue #%d on %s", issue_number, repo)
+            logger.info("GitHubApp: responded to comment on issue #%d on %s", issue_number, repo)
+        else:
+            logger.warning("GitHubApp: LLM returned no response for issue #%d", issue_number)
 
     async def _handle_discussion_created(self, installation_id: int, payload: dict):
         """Respond to a new discussion."""
