@@ -81,9 +81,14 @@ class GitHubAppFeature(Feature):
             if sender.endswith("[bot]"):
                 return Response(status_code=200)
 
-            # Process async — GitHub expects a fast response
-            asyncio.create_task(self._handle_event(event, payload))
-            return Response(status_code=202)
+            # Process inline — Cloud Run may kill the instance after response
+            # GitHub allows 10s for webhook response; our LLM call may take longer
+            # but GitHub will retry on timeout, which is fine
+            try:
+                await self._handle_event(event, payload)
+            except Exception as e:
+                logger.error("GitHub App webhook processing error: %s", e, exc_info=True)
+            return Response(status_code=200)
 
         return router
 
