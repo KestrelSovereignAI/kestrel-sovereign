@@ -179,12 +179,15 @@ if STATIC_DIR.is_dir():
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
     """Global authentication middleware (same pattern as server.py)."""
-    public_paths = {"/health", "/", "/favicon.ico", "/api/auth/key", "/webhooks/rest/webhook"}
+    public_paths = {"/health", "/", "/favicon.ico", "/api/auth/key"}
     static_prefixes = ("/static", "/js/", "/shared/", "/utils/", "/api/github/")
 
     if request.url.path in public_paths or any(
         request.url.path.startswith(p) for p in static_prefixes
     ):
+        return await call_next(request)
+    # Webhooks authenticate themselves (HMAC, bearer, etc.) — bypass API key auth
+    if request.url.path.startswith("/webhooks/"):
         return await call_next(request)
     if request.method == "OPTIONS":
         return await call_next(request)
@@ -524,6 +527,24 @@ async def rasa_webhook_proxy(request: Request):
         request=request,
         agent_id=first_agent,
         path="webhooks/rest/webhook",
+        config=config,
+        client=client,
+    )
+
+
+# --- GitHub App Webhook Proxy ---
+# Forward GitHub App webhooks to the first agent (which has GitHubAppFeature)
+
+@app.post("/webhooks/github-app")
+async def github_app_webhook_proxy(request: Request):
+    """Forward GitHub App webhook to the first configured agent."""
+    config: RookeryConfig = request.app.state.rookery_config
+    client: httpx.AsyncClient = request.app.state.http_client
+    first_agent = next(iter(config.agents))
+    return await proxy_request_streaming(
+        request=request,
+        agent_id=first_agent,
+        path="webhooks/github-app",
         config=config,
         client=client,
     )
