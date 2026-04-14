@@ -252,12 +252,14 @@ class GitHubAppFeature(Feature):
 
         try:
             response = await self.agent.llm_service.generate(
-                prompt=prompt,
+                user_prompt=prompt,
                 system_prompt=system,
             )
             diag["response_type"] = type(response).__name__ if response else "None"
-            diag["has_content"] = bool(response and response.content)
-            result = response.content if response and response.content else None
+            if isinstance(response, str):
+                result = response or None
+            else:
+                result = response.content if response and response.content else None
             if result:
                 diag["result_chars"] = len(result)
             return result, diag
