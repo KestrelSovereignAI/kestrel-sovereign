@@ -81,17 +81,10 @@ class GitHubAppFeature(Feature):
             if sender.endswith("[bot]"):
                 return Response(status_code=200)
 
-            # Process inline — Cloud Run kills background tasks after response
-            import json as _json
-            diag = {"event": event, "action": payload.get("action"), "sender": sender}
-            try:
-                result = await self._handle_event(event, payload)
-                diag["status"] = "ok"
-                diag["result"] = result
-            except Exception as e:
-                diag["status"] = "error"
-                diag["error"] = f"{type(e).__name__}: {e}"
-            return Response(content=_json.dumps(diag), status_code=200, media_type="application/json")
+            # Return 200 immediately, process in background
+            # Cloud Run needs min-instances=1 to keep the instance alive
+            asyncio.create_task(self._safe_handle_event(event, payload))
+            return Response(status_code=200)
 
         return router
 
@@ -105,6 +98,13 @@ class GitHubAppFeature(Feature):
             hashlib.sha256,
         ).hexdigest()
         return hmac.compare_digest(signature[7:], expected)
+
+    async def _safe_handle_event(self, event: str, payload: Dict[str, Any]):
+        """Wrapper that catches all errors so create_task doesn't lose them."""
+        try:
+            await self._handle_event(event, payload)
+        except Exception as e:
+            logger.error("GitHubApp background task error: %s", e, exc_info=True)
 
     async def _handle_event(self, event: str, payload: Dict[str, Any]) -> dict:
         """Route and process a GitHub event. Returns diagnostic info."""
