@@ -538,16 +538,25 @@ async def rasa_webhook_proxy(request: Request):
 @app.post("/webhooks/github-app")
 async def github_app_webhook_proxy(request: Request):
     """Forward GitHub App webhook to the first configured agent."""
+    import sys
+    print("HOST: /webhooks/github-app received, proxying to first agent", flush=True, file=sys.stderr)
     config: RookeryConfig = request.app.state.rookery_config
     client: httpx.AsyncClient = request.app.state.http_client
     first_agent = next(iter(config.agents))
-    return await proxy_request_streaming(
-        request=request,
-        agent_id=first_agent,
-        path="webhooks/github-app",
-        config=config,
-        client=client,
-    )
+    print(f"HOST: proxying to agent={first_agent}", flush=True, file=sys.stderr)
+    try:
+        result = await proxy_request_streaming(
+            request=request,
+            agent_id=first_agent,
+            path="webhooks/github-app",
+            config=config,
+            client=client,
+        )
+        print(f"HOST: proxy returned status={result.status_code}", flush=True, file=sys.stderr)
+        return result
+    except Exception as e:
+        print(f"HOST: proxy ERROR: {e}", flush=True, file=sys.stderr)
+        raise
 
 
 # --- Proxy Route (must be AFTER specific routes to avoid path conflicts) ---
