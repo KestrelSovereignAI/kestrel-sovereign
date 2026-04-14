@@ -538,12 +538,13 @@ async def rasa_webhook_proxy(request: Request):
 @app.post("/webhooks/github-app")
 async def github_app_webhook_proxy(request: Request):
     """Forward GitHub App webhook to the first configured agent."""
-    import sys
-    print("HOST: /webhooks/github-app received, proxying to first agent", flush=True, file=sys.stderr)
+    import sys, json as _json
+    # Cloud Run captures stdout as structured logs
+    print(_json.dumps({"severity": "WARNING", "message": "HOST: /webhooks/github-app received"}), flush=True)
     config: RookeryConfig = request.app.state.rookery_config
     client: httpx.AsyncClient = request.app.state.http_client
     first_agent = next(iter(config.agents))
-    print(f"HOST: proxying to agent={first_agent}", flush=True, file=sys.stderr)
+    print(_json.dumps({"severity": "WARNING", "message": f"HOST: proxying to agent={first_agent}"}), flush=True)
     try:
         result = await proxy_request_streaming(
             request=request,
@@ -552,10 +553,10 @@ async def github_app_webhook_proxy(request: Request):
             config=config,
             client=client,
         )
-        print(f"HOST: proxy returned status={result.status_code}", flush=True, file=sys.stderr)
+        print(_json.dumps({"severity": "WARNING", "message": f"HOST: proxy returned status={result.status_code}"}), flush=True)
         return result
     except Exception as e:
-        print(f"HOST: proxy ERROR: {e}", flush=True, file=sys.stderr)
+        print(_json.dumps({"severity": "ERROR", "message": f"HOST: proxy ERROR: {e}"}), flush=True)
         raise
 
 
