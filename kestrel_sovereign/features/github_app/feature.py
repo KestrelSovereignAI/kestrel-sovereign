@@ -267,55 +267,72 @@ class GitHubAppFeature(Feature):
             diag["llm_error"] = f"{type(e).__name__}: {e}"
             return None, diag
 
+    # The codebase is deployed on this instance — read it directly from disk
+    _PROJECT_ROOT = Path(__file__).resolve().parents[3]  # kestrel_sovereign/features/github_app -> project root
+
     async def _gather_context(
         self, repo: str, question: str, installation_id: Optional[int] = None
     ) -> str:
-        """Search the repo for code relevant to the question."""
-        if not installation_id:
-            return ""
-
+        """Read relevant source code from the local filesystem."""
+        root = self._PROJECT_ROOT
         context_parts = []
 
         try:
-            # Always include the README and key architecture docs
-            readme = await self._client.get_file_content(installation_id, repo, "README.md")
-            if readme:
-                context_parts.append(f"## README.md\n```\n{readme[:3000]}\n```")
+            # Always include key docs
+            for doc in ["README.md", "CLAUDE.md", "KESTREL_FEATURES.md"]:
+                p = root / doc
+                if p.exists():
+                    text = p.read_text(encoding="utf-8")
+                    context_parts.append(f"## {doc}\n```\n{text[:3000]}\n```")
 
-            # Search for code matching keywords from the question
-            # Extract meaningful words (skip common ones)
-            skip_words = {"the", "a", "an", "is", "how", "do", "i", "to", "can", "what", "does", "it", "in", "for", "of", "with", "this", "that"}
-            words = [w.strip("?.,!") for w in question.lower().split() if len(w) > 2 and w.lower() not in skip_words]
-            search_terms = words[:5]  # Top 5 meaningful words
+            # Search for relevant Python files using grep
+            skip_words = {"the", "a", "an", "is", "how", "do", "i", "to", "can", "what",
+                          "does", "it", "in", "for", "of", "with", "this", "that", "are"}
+            words = [w.strip("?.,!") for w in question.lower().split()
+                     if len(w) > 2 and w.lower() not in skip_words]
 
-            if search_terms:
-                query = " ".join(search_terms)
-                results = await self._client.search_code(installation_id, repo, query, max_results=5)
+            matched_files = set()
+            for word in words[:5]:
+                # Search Python files for the keyword
+                import subprocess
+                result = subprocess.run(
+                    ["grep", "-rl", "--include=*.py", "-i", word,
+                     str(root / "kestrel_sovereign")],
+                    capture_output=True, text=True, timeout=5
+                )
+                for path in result.stdout.strip().split("\n")[:3]:
+                    if path:
+                        matched_files.add(path)
 
-                for result in results[:5]:
-                    path = result["path"]
-                    # Read the actual file for more context
-                    content = await self._client.get_file_content(installation_id, repo, path)
-                    if content:
-                        # Truncate large files
-                        if len(content) > 2000:
-                            content = content[:2000] + "\n... (truncated)"
-                        context_parts.append(f"## {path}\n```python\n{content}\n```")
+            # Read the most relevant files (up to 8)
+            for filepath in sorted(matched_files)[:8]:
+                try:
+                    p = Path(filepath)
+                    rel = p.relative_to(root)
+                    content = p.read_text(encoding="utf-8")
+                    if len(content) > 2000:
+                        content = content[:2000] + "\n... (truncated)"
+                    context_parts.append(f"## {rel}\n```python\n{content}\n```")
+                except Exception:
+                    pass
 
-            # If we found nothing via search, include the project structure
-            if len(context_parts) <= 1:
-                tree = await self._client.get_repo_tree(installation_id, repo)
-                if tree:
-                    # Filter to Python files and key dirs
-                    relevant = [p for p in tree if p.endswith(".py") and not p.startswith("tests/")][:50]
-                    context_parts.append(f"## Project structure (Python files)\n```\n" + "\n".join(relevant) + "\n```")
+            # If nothing matched, include the project structure
+            if len(context_parts) <= 3:
+                py_files = sorted(
+                    str(p.relative_to(root))
+                    for p in (root / "kestrel_sovereign").rglob("*.py")
+                    if "__pycache__" not in str(p)
+                )[:60]
+                context_parts.append(
+                    f"## Project structure ({len(py_files)} Python files)\n```\n"
+                    + "\n".join(py_files) + "\n```"
+                )
 
         except Exception as e:
             logger.warning("GitHubAppFeature context gathering error: %s", e)
 
-        # Cap total context to avoid blowing the context window
         combined = "\n\n".join(context_parts)
-        if len(combined) > 15000:
-            combined = combined[:15000] + "\n\n... (context truncated)"
+        if len(combined) > 20000:
+            combined = combined[:20000] + "\n\n... (context truncated)"
 
         return combined
