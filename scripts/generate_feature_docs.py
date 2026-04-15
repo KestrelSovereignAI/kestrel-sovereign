@@ -12,11 +12,14 @@ Usage:
 """
 
 import argparse
+import asyncio
 import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+from kestrel_sovereign.llm.model_catalog import get_catalog_service
+from kestrel_sovereign.llm.model_metadata import ModelInfo
 from kestrel_sovereign.llm.model_selection import resolve_provider_default
 
 # ---------------------------------------------------------------------------
@@ -81,6 +84,10 @@ AUDIENCES: dict[str, dict] = {
             "- Add a brief executive summary at the top (3-4 sentences)\n"
             "- Use quantitative metrics only when they are explicitly present in the "
             "source document; do not invent or hardcode counts\n"
+            "- Do NOT derive route counts from route lists; say 'documented route families' "
+            "unless the source explicitly states a route count\n"
+            "- Do NOT translate 'current audited snapshot' into 'independently audited' "
+            "or imply external audit unless the source explicitly says so\n"
             "- If you mention privacy presets, use the exact preset names from the source: "
             "`ephemeral`, `isolated`, `anonymous`, `normal`, `public`\n"
             "- If the source names route classes or HTTP methods, preserve those exactly rather than renaming them\n"
@@ -100,9 +107,46 @@ AUDIENCES: dict[str, dict] = {
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 SOURCE_FILE = PROJECT_ROOT / "KESTREL_FEATURES.md"
 OUTPUT_DIR = PROJECT_ROOT / "docs" / "generated"
+_DISCOVERY_REFRESH_CACHE: dict[str, list[ModelInfo]] = {}
 
 
-def get_client_and_model(model_override: str | None) -> tuple:
+async def _discover_provider_models(provider: str) -> list[ModelInfo]:
+    """Discover live models for the selected provider."""
+    if provider == "anthropic":
+        from kestrel_sovereign.llm.anthropic_adapter import AnthropicAdapter
+
+        return await AnthropicAdapter().list_models()
+
+    if provider == "openai":
+        from kestrel_sovereign.llm.openai_adapter import OpenAIAdapter
+
+        return await OpenAIAdapter().list_models()
+
+    return []
+
+
+def _refresh_provider_cache(provider: str) -> list[ModelInfo]:
+    """Refresh model discovery cache for one provider and return enriched models."""
+    if provider in _DISCOVERY_REFRESH_CACHE:
+        return _DISCOVERY_REFRESH_CACHE[provider]
+
+    discovered = asyncio.run(_discover_provider_models(provider))
+    if not discovered:
+        raise RuntimeError(
+            f"Live model discovery returned no models for provider '{provider}'. "
+            "Check API credentials/network before generating audience docs."
+        )
+
+    catalog = get_catalog_service()
+    enriched = catalog.enrich_models(discovered)
+    existing = catalog.load_cache() or []
+    merged = [model for model in existing if model.provider != provider] + enriched
+    catalog.write_cache(merged)
+    _DISCOVERY_REFRESH_CACHE[provider] = enriched
+    return enriched
+
+
+def get_client_and_model(model_override: str | None, refresh_discovery: bool = True) -> tuple:
     """Auto-detect available LLM provider. Returns (call_fn, model_name, provider_name)."""
     api_key_anthropic = os.environ.get("ANTHROPIC_API_KEY")
     api_key_openai = os.environ.get("OPENAI_API_KEY")
@@ -118,7 +162,8 @@ def get_client_and_model(model_override: str | None) -> tuple:
         import anthropic
 
         client = anthropic.Anthropic()
-        model = model_override or f"anthropic/{resolve_provider_default('anthropic')}"
+        refreshed_models = _refresh_provider_cache("anthropic") if refresh_discovery and not model_override else None
+        model = model_override or f"anthropic/{resolve_provider_default('anthropic', cached_models=refreshed_models)}"
         if model.startswith("anthropic/"):
             model = model.split("/", 1)[1]
 
@@ -137,7 +182,8 @@ def get_client_and_model(model_override: str | None) -> tuple:
         import openai
 
         client = openai.OpenAI()
-        model = model_override or f"openai/{resolve_provider_default('openai')}"
+        refreshed_models = _refresh_provider_cache("openai") if refresh_discovery and not model_override else None
+        model = model_override or f"openai/{resolve_provider_default('openai', cached_models=refreshed_models)}"
         if model.startswith("openai/"):
             model = model.split("/", 1)[1]
 
@@ -159,7 +205,12 @@ def get_client_and_model(model_override: str | None) -> tuple:
     sys.exit(1)
 
 
-def generate(audience: str, model_override: str | None = None, dry_run: bool = False) -> Path:
+def generate(
+    audience: str,
+    model_override: str | None = None,
+    dry_run: bool = False,
+    refresh_discovery: bool = True,
+) -> Path:
     """Generate a feature doc for the given audience. Returns output path."""
     if audience not in AUDIENCES:
         print(f"Error: Unknown audience '{audience}'. Choose from: {', '.join(AUDIENCES)}")
@@ -189,7 +240,10 @@ def generate(audience: str, model_override: str | None = None, dry_run: bool = F
     except ImportError:
         pass
 
-    call_fn, model_name, provider = get_client_and_model(model_override)
+    call_fn, model_name, provider = get_client_and_model(
+        model_override,
+        refresh_discovery=refresh_discovery,
+    )
 
     print(f"Generating {audience} version via {provider}/{model_name}...")
     result = call_fn(profile["system"], user_prompt)
@@ -239,6 +293,11 @@ def main():
         help="Print prompts without calling the LLM",
     )
     parser.add_argument(
+        "--skip-discovery-refresh",
+        action="store_true",
+        help="Use the existing discovery cache instead of refreshing live provider models",
+    )
+    parser.add_argument(
         "--list",
         action="store_true",
         help="List available audiences",
@@ -257,9 +316,19 @@ def main():
 
     if args.all:
         for audience in AUDIENCES:
-            generate(audience, model_override=args.model, dry_run=args.dry_run)
+            generate(
+                audience,
+                model_override=args.model,
+                dry_run=args.dry_run,
+                refresh_discovery=not args.skip_discovery_refresh,
+            )
     elif args.audience:
-        generate(args.audience, model_override=args.model, dry_run=args.dry_run)
+        generate(
+            args.audience,
+            model_override=args.model,
+            dry_run=args.dry_run,
+            refresh_discovery=not args.skip_discovery_refresh,
+        )
     else:
         parser.print_help()
         sys.exit(1)

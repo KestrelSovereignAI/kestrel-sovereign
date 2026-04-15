@@ -1,442 +1,402 @@
 <!-- AUTO-GENERATED from KESTREL_FEATURES.md — do not edit manually -->
-<!-- Audience: developer | Generated: 2026-03-17 | Model: anthropic/claude-sonnet-4-5-20250929 -->
+<!-- Audience: developer | Generated: 2026-04-13 | Model: anthropic/claude-sonnet-4-6 -->
 <!-- Regenerate: uv run python scripts/generate_feature_docs.py --audience developer -->
 
-# Kestrel Sovereign Developer Reference
+# Kestrel Sovereign — Developer Feature Reference
 
-**Target audience:** Software engineers and AI agents integrating with or extending Kestrel Sovereign.
-
-**Source of truth:** This document is generated from [`KESTREL_FEATURES.md`](../KESTREL_FEATURES.md). For canonical definitions, refer to the source.
-
----
-
-## Quick Navigation
-
-- [Constitutional & Identity](#constitutional-and-identity-layer) — DID identity, constitution, lifecycle
-- [Agent Runtime](#agent-runtime-and-orchestration) — Core agent, tools, context, streaming
-- [LLM Platform](#multi-llm-platform) — Provider routing, catalog, retry, usage
-- [Privacy & Storage](#privacy-storage-and-memory) — Privacy modes, persistence, memory systems
-- [Feature Modules](#feature-module-inventory) — 36 discoverable features
-- [HTTP API](#http-api-surface) — All public routes and router families
-- [Authentication](#authentication-model) — Route protection classes
+> **Source of truth:** [`KESTREL_FEATURES.md`](KESTREL_FEATURES.md)
+> **Generated docs:** [`docs/generated/README.md`](docs/generated/README.md)
+> **Historical snapshot:** [`docs/archive/KESTREL_FEATURES_legacy.md`](docs/archive/KESTREL_FEATURES_legacy.md)
 
 ---
 
-## Constitutional and Identity Layer
+## Table of Contents
 
-### DID Identity and Signing
-
-- **Inception service:** [`kestrel_sovereign/inception_service.py`](../kestrel_sovereign/inception_service.py)
-- **Identity package:** [`kestrel_sovereign/identity/identity_package.py`](../kestrel_sovereign/identity/identity_package.py)
-- **Signing:** [`kestrel_sovereign/identity/signing.py`](../kestrel_sovereign/identity/signing.py)
-- **Continuity verification:** [`kestrel_sovereign/identity/continuity_verifier.py`](../kestrel_sovereign/identity/continuity_verifier.py)
-
-### Constitution and Governance
-
-- **Constitution document:** [`kestrel_sovereign/data/KESTREL_CONSTITUTION.md`](../kestrel_sovereign/data/KESTREL_CONSTITUTION.md)
-- **Agent integration:** [`kestrel_sovereign/agent/constitution.py`](../kestrel_sovereign/agent/constitution.py)
-- **Feature integration:** [`kestrel_sovereign/features/constitution.py`](../kestrel_sovereign/features/constitution.py)
-
-### Sovereignty Lifecycle
-
-- **Graduation:** [`kestrel_sovereign/graduate_service.py`](../kestrel_sovereign/graduate_service.py)
-- **Retirement:** [`kestrel_sovereign/retirement_service.py`](../kestrel_sovereign/retirement_service.py)
-- **HTTP routes:** [`endpoints/sovereignty.py`](../endpoints/sovereignty.py)
+1. [Architecture Overview](#architecture-overview)
+2. [Maintained Surface](#maintained-surface)
+3. [Feature Module System](#feature-module-system)
+4. [Public HTTP Surface](#public-http-surface)
+5. [Authentication Surface](#authentication-surface)
+6. [Privacy Presets](#privacy-presets)
+7. [Audit & Verification](#audit--verification)
+8. [Known Boundaries](#known-boundaries)
 
 ---
 
-## Agent Runtime and Orchestration
+## Architecture Overview
 
-### Core Agent
+Discovery rules take precedence over any headline numbers:
 
-- **Main orchestrator:** [`kestrel_sovereign/kestrel_agent.py`](../kestrel_sovereign/kestrel_agent.py)
-- **Command handler:** [`kestrel_sovereign/command_handler.py`](../kestrel_sovereign/command_handler.py)
-- **Built-in tools:** [`kestrel_sovereign/kestrel_agent_tools.py`](../kestrel_sovereign/kestrel_agent_tools.py)
-
-**Quick start:** Call `POST /agent/invoke` for synchronous execution or `POST /agent/stream` for streaming responses.
-
-### Context and Token Management
-
-- **Context manager:** [`kestrel_sovereign/agent/context_manager.py`](../kestrel_sovereign/agent/context_manager.py)
-- **Context builder:** [`kestrel_sovereign/agent/context_builder.py`](../kestrel_sovereign/agent/context_builder.py)
-- **Token budgeting:** [`kestrel_sovereign/agent/token_budget.py`](../kestrel_sovereign/agent/token_budget.py)
-
-**Check status:** `GET /agent/context-status`
-
-### Streaming and Lifecycle
-
-- **Streaming:** [`kestrel_sovereign/agent/streaming.py`](../kestrel_sovereign/agent/streaming.py)
-- **HTTP endpoints:** [`endpoints/agent.py`](../endpoints/agent.py)
-
-**SSE endpoint:** `GET /agent/notifications/sse` (supports `?api_key=` query auth)
+- **Feature module discovery** — [`kestrel_sovereign/features/__init__.py`](kestrel_sovereign/features/__init__.py)
+- **HTTP route families** — [`server.py`](server.py) + routers under [`endpoints/`](endpoints)
+- **Doc generation script** — [`scripts/generate_feature_docs.py`](scripts/generate_feature_docs.py)
 
 ---
 
-## Multi-LLM Platform
+## Maintained Surface
 
-### Unified Service and Routing
+### Constitutional and Sovereign Foundation
 
-- **LLM service:** [`kestrel_sovereign/llm/service.py`](../kestrel_sovereign/llm/service.py)
-- **Provider registry:** [`kestrel_sovereign/llm/provider_registry.py`](../kestrel_sovereign/llm/provider_registry.py)
-- **Mandate system:** [`kestrel_sovereign/llm/mandate.py`](../kestrel_sovereign/llm/mandate.py)
+| Concern | Key files |
+|---|---|
+| Constitution & governance | [`kestrel_sovereign/data/KESTREL_CONSTITUTION.md`](kestrel_sovereign/data/KESTREL_CONSTITUTION.md), [`kestrel_sovereign/agent/constitution.py`](kestrel_sovereign/agent/constitution.py), [`kestrel_sovereign/features/constitution.py`](kestrel_sovereign/features/constitution.py) |
+| DID identity & continuity | [`kestrel_sovereign/inception_service.py`](kestrel_sovereign/inception_service.py), [`kestrel_sovereign/identity/identity_package.py`](kestrel_sovereign/identity/identity_package.py), [`kestrel_sovereign/identity/signing.py`](kestrel_sovereign/identity/signing.py), [`kestrel_sovereign/identity/continuity_verifier.py`](kestrel_sovereign/identity/continuity_verifier.py) |
+| Sovereignty lifecycle | [`kestrel_sovereign/graduate_service.py`](kestrel_sovereign/graduate_service.py), [`kestrel_sovereign/retirement_service.py`](kestrel_sovereign/retirement_service.py), [`endpoints/sovereignty.py`](endpoints/sovereignty.py) |
 
-### Supported Providers
+### Agent Runtime and Context Assembly
 
-Adapters present in [`kestrel_sovereign/llm/`](../kestrel_sovereign/llm/):
+| Concern | Key files |
+|---|---|
+| Core agent orchestration | [`kestrel_sovereign/kestrel_agent.py`](kestrel_sovereign/kestrel_agent.py), [`kestrel_sovereign/command_handler.py`](kestrel_sovereign/command_handler.py), [`kestrel_sovereign/kestrel_agent_tools.py`](kestrel_sovereign/kestrel_agent_tools.py) |
+| Context & token budgeting | [`kestrel_sovereign/agent/context_manager.py`](kestrel_sovereign/agent/context_manager.py), [`kestrel_sovereign/agent/context_builder.py`](kestrel_sovereign/agent/context_builder.py), [`kestrel_sovereign/agent/token_budget.py`](kestrel_sovereign/agent/token_budget.py) |
+| Streaming & request lifecycle | [`kestrel_sovereign/agent/streaming.py`](kestrel_sovereign/agent/streaming.py), [`endpoints/agent.py`](endpoints/agent.py) |
 
-- OpenAI
-- Anthropic
-- Claude Max
-- Gemini
-- Vertex AI
-- Ollama
-- OpenRouter
-- Mock (for testing)
+> **Quick start:** To invoke the agent, `POST /agent/invoke` (blocking) or `POST /agent/stream` (SSE). See [`endpoints/agent.py`](endpoints/agent.py).
 
-### Catalog, Metadata, and Tracking
+### Multi-LLM Platform
 
-- **Model catalog:** [`kestrel_sovereign/llm/model_catalog.py`](../kestrel_sovereign/llm/model_catalog.py)
-- **Model metadata:** [`kestrel_sovereign/llm/model_metadata.py`](../kestrel_sovereign/llm/model_metadata.py)
-- **Retry logic:** [`kestrel_sovereign/llm/retry.py`](../kestrel_sovereign/llm/retry.py)
-- **Usage tracking:** [`kestrel_sovereign/llm/usage_tracking.py`](../kestrel_sovereign/llm/usage_tracking.py)
+| Concern | Key files |
+|---|---|
+| Unified service & routing | [`kestrel_sovereign/llm/service.py`](kestrel_sovereign/llm/service.py), [`kestrel_sovereign/llm/provider_registry.py`](kestrel_sovereign/llm/provider_registry.py), [`kestrel_sovereign/llm/mandate.py`](kestrel_sovereign/llm/mandate.py) |
+| Catalog, metadata, retry, usage | [`kestrel_sovereign/llm/model_catalog.py`](kestrel_sovereign/llm/model_catalog.py), [`kestrel_sovereign/llm/model_metadata.py`](kestrel_sovereign/llm/model_metadata.py), [`kestrel_sovereign/llm/retry.py`](kestrel_sovereign/llm/retry.py), [`kestrel_sovereign/llm/usage_tracking.py`](kestrel_sovereign/llm/usage_tracking.py) |
 
-**HTTP endpoints:**
-- `GET /api/models` — list available models
-- `GET /api/model/current` — get current model
-- `POST /api/model/set` — set active model
-- `GET /v1/models` — OpenAI-compatible model list
-- `POST /v1/chat/completions` — OpenAI-compatible completion endpoint
+**Provider adapters** (see [`kestrel_sovereign/llm/`](kestrel_sovereign/llm/)):
+`OpenAI` · `Anthropic` · `Claude Max` · `Gemini` · `Vertex AI` · `Ollama` · `OpenRouter` · `Mock`
+
+> **Quick start:** Enumerate available models at `GET /api/models`. Switch the active model at `POST /api/model/set`. OpenAI-compatible completions available at `POST /v1/chat/completions`.
+
+### Privacy, Storage, and Memory
+
+| Concern | Key files |
+|---|---|
+| Privacy modes & enforcement | [`kestrel_sovereign/privacy.py`](kestrel_sovereign/privacy.py), [`kestrel_sovereign/features/privacy/feature.py`](kestrel_sovereign/features/privacy/feature.py), [`kestrel_sovereign/features/privacy/`](kestrel_sovereign/features/privacy) |
+| Storage & persistence | [`kestrel_sovereign/storage/__init__.py`](kestrel_sovereign/storage/__init__.py), [`kestrel_sovereign/storage/async_storage.py`](kestrel_sovereign/storage/async_storage.py), [`kestrel_sovereign/storage/`](kestrel_sovereign/storage) |
+| Memory systems | [`kestrel_sovereign/agent/memory_manager.py`](kestrel_sovereign/agent/memory_manager.py), [`kestrel_sovereign/features/memory/`](kestrel_sovereign/features/memory), [`kestrel_sovereign/features/memory_agency/`](kestrel_sovereign/features/memory_agency) |
 
 ---
 
-## Privacy, Storage, and Memory
+## Privacy Presets
 
-### Privacy Modes
+Read or set the active preset at `GET /agent/privacy-mode` / `POST /agent/privacy-mode`.
 
-Privacy enforcement: [`kestrel_sovereign/privacy.py`](../kestrel_sovereign/privacy.py), [`kestrel_sovereign/features/privacy/feature.py`](../kestrel_sovereign/features/privacy/feature.py)
-
-**Canonical presets:**
-
-| Preset | Storage | LLM location | Shareable | Use case |
-|--------|---------|--------------|-----------|----------|
-| `ephemeral` | none | local | no | Nothing persisted, local LLM only |
-| `isolated` | temp | local | no | Temporary session storage, local LLM only |
-| `anonymous` | scrubbed | cloud | no | PII removed, cloud LLM allowed |
+| Preset | Storage | LLM location | Shareable | Notes |
+|---|---|---|---|---|
+| `ephemeral` | none | local | no | Nothing stored; local LLM only |
+| `isolated` | temp | local | no | Temporary session storage; local LLM only |
+| `anonymous` | scrubbed | cloud | no | Stored with PII removed; cloud LLM allowed |
 | `normal` | full | cloud | no | Standard persistent storage |
 | `public` | full | cloud | yes | Shareable and exportable |
 
-**HTTP endpoints:**
-- `GET /agent/privacy-mode` — get current mode
-- `POST /agent/privacy-mode` — set privacy mode
+---
 
-### Storage and Persistence
+## Feature Module System
 
-- **Storage root:** [`kestrel_sovereign/storage/__init__.py`](../kestrel_sovereign/storage/__init__.py)
-- **Async storage:** [`kestrel_sovereign/storage/async_storage.py`](../kestrel_sovereign/storage/async_storage.py)
-- **Storage family:** [`kestrel_sovereign/storage/`](../kestrel_sovereign/storage)
+### Discovery
 
-**HTTP endpoints:**
-- `GET /api/storage/stats` — storage statistics
-- `GET /api/sovereignty/exports` — list exports
-- `POST /api/sovereignty/export` — create export
-- `POST /api/sovereignty/import` — import data
+Features are discovered from two sources:
 
-### Memory Systems
+1. **Core features** — modules under `kestrel_sovereign/features/` that export a `Feature` subclass (single-file modules, package `__init__.py`, or package `feature.py`). Only modules with a discoverable `Feature` subclass are retained.
+2. **Entrypoint features** — installed via pip and registered as `kestrel_sovereign.features` entry points. Discovered at runtime via `discover_entrypoint_feature_classes()`. On duplicate class names, core features win.
 
-- **Memory manager:** [`kestrel_sovereign/agent/memory_manager.py`](../kestrel_sovereign/agent/memory_manager.py)
-- **Memory feature:** [`kestrel_sovereign/features/memory/`](../kestrel_sovereign/features/memory)
-- **Memory agency feature:** [`kestrel_sovereign/features/memory_agency/`](../kestrel_sovereign/features/memory_agency)
+> **Note:** Some support packages reside under `kestrel_sovereign/features/` but are not discoverable features because they do not export a `Feature` subclass.
 
-**HTTP endpoints:**
-- `GET /api/memories` — list memories
-- `GET /api/memories/{node_id}` — get specific memory
-- `GET /api/identity-chain` — get identity chain
-- `DELETE /api/memories/{node_id}` — delete memory
+> **Quick start:** Inspect the live feature inventory at `GET /api/features` and `GET /api/features/installed`. Manage individual features at `POST /api/features/{name}/enable` and `POST /api/features/{name}/disable`.
+
+### Core Feature Inventory
+
+Audited snapshot: **42** discoverable modules · **42** exported `Feature` subclasses.
+
+| Module | Exported class |
+|---|---|
+| `audit_anchor` | `AuditAnchorFeature` |
+| `bootstrap` | `BootstrapFeature` |
+| `bridge` | `BridgeFeature` |
+| `channels` | `ChannelFeature` |
+| `code_edit` | `CodeEditFeature` |
+| `compute` | `ComputeFeature` |
+| `consent` | `ConsentFeature` |
+| `constitution` | `ConstitutionFeature` |
+| `context` | `ContextFeature` |
+| `council` | `CouncilFeature` |
+| `delivery` | `DeliveryFeature` |
+| `deploy` | `DeployFeature` |
+| `gcp_compute` | `GCPComputeFeature` |
+| `github` | `GitHubFeature` |
+| `github_app` | `GitHubAppFeature` |
+| `heartbeat` | `HeartbeatFeature` |
+| `identity` | `IdentityFeature` |
+| `keys` | `KeyManagementFeature` |
+| `memory` | `MemoryFeature` |
+| `memory_agency` | `MemoryAgencyFeature` |
+| `model` | `ModelAgent` |
+| `observability` | `ObservabilityFeature` |
+| `peers` | `PeersFeature` |
+| `reflection` | `ReflectionFeature` |
+| `response_audit` | `ResponseAuditFeature` |
+| `runpod` | `RunPodFeature` |
+| `save` | `SaveFeature` |
+| `scheduler` | `SchedulerFeature` |
+| `security` | `SecurityFeature` |
+| `sovereignty` | `SovereigntyFeature` |
+| `spawn` | `SpawnFeature` |
+| `state_of_mind` | `StateOfMindFeature` |
+| `strategic_memory` | `StrategicMemoryFeature` |
+| `talon` | `TalonCoordinatorFeature` |
+| `tasks` | `TaskFeature` |
+| `vastai` | `VastAIFeature` |
+| `visual_identity` | `VisualIdentityFeature` |
+| `voice` | `VoiceFeature` |
+| `wallet` | `WalletFeature` |
+| `web_search` | `WebSearchFeature` |
+| `webhooks` | `WebhookFeature` |
+| `wellness` | `WellnessFeature` |
 
 ---
 
-## Feature Module Inventory
+## Public HTTP Surface
 
-**Discovery mechanism:** Defined in [`kestrel_sovereign/features/__init__.py`](../kestrel_sovereign/features/__init__.py). Scans for single-file features, package `__init__.py`, and package `feature.py`, keeping only modules that export a `Feature` subclass.
+### App-Level Routes (`server.py`)
 
-**Current count:** 36 discoverable feature modules, 36 exported `Feature` subclasses.
-
-### Discovered Feature Modules
-
-- `audit_anchor`
-- `bootstrap`
-- `bridge`
-- `channels`
-- `code_edit`
-- `compute`
-- `consent`
-- `constitution`
-- `context`
-- `council`
-- `delivery`
-- `deploy`
-- `gcp_compute`
-- `github`
-- `heartbeat`
-- `identity`
-- `keys`
-- `mcp`
-- `memory`
-- `memory_agency`
-- `model`
-- `peers`
-- `reflection`
-- `runpod`
-- `save`
-- `scheduler`
-- `security`
-- `sovereignty`
-- `state_of_mind`
-- `tasks`
-- `vastai`
-- `visual_identity`
-- `wallet`
-- `web_search`
-- `webhooks`
-- `wellness`
-
-### Exported Feature Classes
-
-- `AuditAnchorFeature`
-- `BootstrapFeature`
-- `BridgeFeature`
-- `ChannelFeature`
-- `CodeEditFeature`
-- `ComputeFeature`
-- `ConsentFeature`
-- `ConstitutionFeature`
-- `ContextFeature`
-- `CouncilFeature`
-- `DeliveryFeature`
-- `DeployFeature`
-- `GCPComputeFeature`
-- `GitHubFeature`
-- `HeartbeatFeature`
-- `IdentityFeature`
-- `KeyManagementFeature`
-- `MCPAgent`
-- `MemoryAgencyFeature`
-- `MemoryFeature`
-- `ModelAgent`
-- `PeersFeature`
-- `ReflectionFeature`
-- `RunPodFeature`
-- `SaveFeature`
-- `SchedulerFeature`
-- `SecurityFeature`
-- `SovereigntyFeature`
-- `StateOfMindFeature`
-- `TaskFeature`
-- `VastAIFeature`
-- `VisualIdentityFeature`
-- `WalletFeature`
-- `WebSearchFeature`
-- `WebhookFeature`
-- `WellnessFeature`
-
----
-
-## HTTP API Surface
-
-### App-Level Routes
-
-Defined in [`server.py`](../server.py):
-
-- `GET /` — Root endpoint (UI or redirect)
-- `GET /api/auth/key` — API key retrieval (bootstrap mode)
-- `GET /health` — Health check
-- `GET /health/detailed` — Detailed health check
-- `POST /webhooks/stripe/crypto` — Stripe webhook
+| Method | Path |
+|---|---|
+| `GET` | `/` |
+| `GET` | `/api/auth/key` |
+| `GET` | `/api/github/{path:path}` |
+| `GET` | `/health` |
+| `GET` | `/health/detailed` |
+| `POST` | `/webhooks/stripe/crypto` |
 
 ### Router Families
 
-#### Authentication OAuth
+#### [`endpoints/auth_oauth.py`](endpoints/auth_oauth.py)
 
-[`endpoints/auth_oauth.py`](../endpoints/auth_oauth.py)
+| Method | Path |
+|---|---|
+| `GET` | `/auth/login` |
+| `GET` | `/auth/callback` |
+| `GET` | `/auth/logout` |
+| `GET` | `/auth/me` |
+| `POST` | `/auth/token` |
+| `GET` | `/auth/verify` |
 
-- `GET /auth/login`
-- `GET /auth/callback`
-- `GET /auth/logout`
-- `GET /auth/me`
+#### [`endpoints/agent.py`](endpoints/agent.py)
 
-#### Agent
+| Method | Path |
+|---|---|
+| `POST` | `/agent/invoke` |
+| `POST` | `/agent/stream` |
+| `POST` | `/agent/stop` |
+| `GET` | `/agent/info` |
+| `GET` | `/agent/privacy-mode` |
+| `POST` | `/agent/privacy-mode` |
+| `GET` | `/agent/notifications` |
+| `GET` | `/agent/notifications/sse` |
+| `GET` | `/agent/context-status` |
+| `GET` | `/agent/reflection/status` |
+| `GET` | `/agent/tasks` |
+| `GET` | `/agent/heartbeat/status` |
+| `POST` | `/agent/heartbeat/trigger` |
+| `POST` | `/agent/mesh` |
+| `GET` | `/agent/mesh/inbox` |
 
-[`endpoints/agent.py`](../endpoints/agent.py)
+#### [`endpoints/conversations.py`](endpoints/conversations.py)
 
-- `POST /agent/invoke` — Synchronous agent invocation
-- `POST /agent/stream` — Streaming agent invocation
-- `POST /agent/stop` — Stop agent execution
-- `GET /agent/info` — Agent information
-- `GET /agent/privacy-mode` — Get privacy mode
-- `POST /agent/privacy-mode` — Set privacy mode
-- `GET /agent/notifications` — Get notifications
-- `GET /agent/notifications/sse` — SSE notification stream
-- `GET /agent/context-status` — Context status
-- `GET /agent/reflection/status` — Reflection status
-- `GET /agent/tasks` — Get tasks
-- `GET /agent/heartbeat/status` — Heartbeat status
-- `POST /agent/heartbeat/trigger` — Trigger heartbeat
+| Method | Path |
+|---|---|
+| `GET` | `/api/sessions` |
+| `GET` | `/api/conversations` |
+| `GET` | `/api/conversations/{session_id}` |
+| `POST` | `/api/conversations/new` |
+| `DELETE` | `/api/conversations/messages/{message_id}` |
+| `GET` | `/api/conversations/{session_id}/transcript` |
 
-#### Conversations
+#### [`endpoints/memories.py`](endpoints/memories.py)
 
-[`endpoints/conversations.py`](../endpoints/conversations.py)
+| Method | Path |
+|---|---|
+| `GET` | `/api/memories` |
+| `GET` | `/api/memories/{node_id}` |
+| `GET` | `/api/identity-chain` |
+| `DELETE` | `/api/memories/{node_id}` |
 
-- `GET /api/sessions`
-- `GET /api/conversations`
-- `GET /api/conversations/{session_id}`
-- `POST /api/conversations/new`
-- `DELETE /api/conversations/messages/{message_id}`
-- `GET /api/conversations/{session_id}/transcript`
+#### [`endpoints/sovereignty.py`](endpoints/sovereignty.py)
 
-#### Memories
+| Method | Path |
+|---|---|
+| `GET` | `/api/storage/stats` |
+| `GET` | `/api/sovereignty/exports` |
+| `POST` | `/api/sovereignty/export` |
+| `POST` | `/api/sovereignty/import` |
+| `GET` | `/api/sovereignty/files` |
+| `GET` | `/api/sovereignty/files/{filename}` |
+| `GET` | `/api/sovereignty/files/{filename}/preview` |
 
-[`endpoints/memories.py`](../endpoints/memories.py)
+#### [`endpoints/database.py`](endpoints/database.py)
 
-- `GET /api/memories`
-- `GET /api/memories/{node_id}`
-- `GET /api/identity-chain`
-- `DELETE /api/memories/{node_id}`
+| Method | Path |
+|---|---|
+| `GET` | `/api/db/tables` |
+| `GET` | `/api/db/tables/{table_name}` |
 
-#### Sovereignty
+#### [`endpoints/models.py`](endpoints/models.py)
 
-[`endpoints/sovereignty.py`](../endpoints/sovereignty.py)
+| Method | Path |
+|---|---|
+| `GET` | `/api/agents` |
+| `POST` | `/api/agents` |
+| `DELETE` | `/api/agents/{agent_name}` |
+| `GET` | `/api/identity` |
+| `PATCH` | `/api/identity` |
+| `POST` | `/api/identity/avatar` |
+| `POST` | `/api/identity/avatar/generate` |
+| `GET` | `/api/constitution` |
+| `GET` | `/api/ipfs/status` |
+| `GET` | `/api/wallet` |
+| `GET` | `/api/keys` |
+| `POST` | `/api/keys` |
+| `PATCH` | `/api/keys/{provider}` |
+| `DELETE` | `/api/keys/{provider}` |
+| `GET` | `/api/keys/{provider}/usage` |
+| `GET` | `/api/models` |
+| `GET` | `/api/model/current` |
+| `POST` | `/api/model/set` |
+| `GET` | `/v1/models` |
+| `POST` | `/v1/chat/completions` |
 
-- `GET /api/storage/stats`
-- `GET /api/sovereignty/exports`
-- `POST /api/sovereignty/export`
-- `POST /api/sovereignty/import`
-- `GET /api/sovereignty/files`
-- `GET /api/sovereignty/files/{filename}`
-- `GET /api/sovereignty/files/{filename}/preview`
+#### [`endpoints/commands.py`](endpoints/commands.py)
 
-#### Database
+| Method | Path |
+|---|---|
+| `GET` | `/api/commands` |
 
-[`endpoints/database.py`](../endpoints/database.py)
+#### [`endpoints/files.py`](endpoints/files.py)
 
-- `GET /api/db/tables`
-- `GET /api/db/tables/{table_name}`
+| Method | Path |
+|---|---|
+| `GET` | `/api/files/{content_hash}` |
+| `HEAD` | `/api/files/{content_hash}` |
 
-#### Models
+#### [`endpoints/security.py`](endpoints/security.py)
 
-[`endpoints/models.py`](../endpoints/models.py)
+| Method | Path |
+|---|---|
+| `GET` | `/api/security/permissions/tree` |
+| `POST` | `/api/security/permissions` |
+| `POST` | `/api/security/permissions/feature` |
+| `GET` | `/api/security/pending` |
+| `POST` | `/api/security/approve` |
+| `GET` | `/api/security/audit` |
+| `POST` | `/api/security/cancel/{request_id}` |
+| `POST` | `/api/security/cancel-all` |
+| `POST` | `/api/security/reset-session` |
 
-- `GET /api/agents`
-- `POST /api/agents`
-- `DELETE /api/agents/{agent_name}`
-- `GET /api/identity`
-- `GET /api/constitution`
-- `GET /api/ipfs/status`
-- `GET /api/wallet`
-- `GET /api/keys`
-- `POST /api/keys`
-- `PATCH /api/keys/{provider}`
-- `DELETE /api/keys/{provider}`
-- `GET /api/keys/{provider}/usage`
-- `GET /api/models`
-- `GET /api/model/current`
-- `POST /api/model/set`
-- `GET /v1/models` — OpenAI-compatible
-- `POST /v1/chat/completions` — OpenAI-compatible
+#### [`endpoints/metrics.py`](endpoints/metrics.py)
 
-#### Commands
+| Method | Path |
+|---|---|
+| `GET` | `/metrics` |
 
-[`endpoints/commands.py`](../endpoints/commands.py)
+#### [`endpoints/spawn.py`](endpoints/spawn.py)
 
-- `GET /api/commands`
+| Method | Path |
+|---|---|
+| `GET` | `/api/spawn/children` |
 
-#### Files
+#### [`endpoints/observability.py`](endpoints/observability.py)
 
-[`endpoints/files.py`](../endpoints/files.py)
+| Method | Path |
+|---|---|
+| `GET` | `/api/observability/events` |
+| `GET` | `/api/observability/summary` |
 
-- `GET /api/files/{content_hash}`
-- `HEAD /api/files/{content_hash}`
+#### [`endpoints/rasa_shim.py`](endpoints/rasa_shim.py)
 
-#### Security
+| Method | Path |
+|---|---|
+| `POST` | `/webhooks/rest/webhook` |
 
-[`endpoints/security.py`](../endpoints/security.py)
+#### [`endpoints/saved_items.py`](endpoints/saved_items.py)
 
-- `GET /api/security/permissions/tree`
-- `POST /api/security/permissions`
-- `POST /api/security/permissions/feature`
-- `GET /api/security/pending`
-- `POST /api/security/approve`
-- `GET /api/security/audit`
-- `POST /api/security/cancel/{request_id}`
-- `POST /api/security/cancel-all`
-- `POST /api/security/reset-session`
+| Method | Path |
+|---|---|
+| `GET` | `/api/saved-items` |
+| `POST` | `/api/saved-items` |
+| `GET` | `/api/saved-items/stats` |
+| `GET` | `/api/saved-items/schemas` |
+| `GET` | `/api/saved-items/tags` |
+| `GET` | `/api/saved-items/by-tag/{tag}` |
+| `GET` | `/api/saved-items/by-schema/{schema_id}` |
+| `GET` | `/api/saved-items/{item_id}` |
+| `PATCH` | `/api/saved-items/{item_id}` |
+| `DELETE` | `/api/saved-items/{item_id}` |
+| `POST` | `/api/saved-items/structured` |
+| `POST` | `/api/saved-items/search` |
+| `POST` | `/api/saved-items/{item_id}/pin` |
 
-#### Observability
+#### [`endpoints/voice.py`](endpoints/voice.py)
 
-[`endpoints/observability.py`](../endpoints/observability.py)
+| Method | Path |
+|---|---|
+| `GET` | `/voice/voices` |
+| `GET` | `/voice/config` |
+| `POST` | `/voice/config` |
+| `POST` | `/voice/tts` |
+| `POST` | `/voice/tts/stream` |
+| `POST` | `/voice/stt` |
+| `WebSocket` | `/voice/chat` |
 
-- `GET /api/observability/events`
-- `GET /api/observability/summary`
+#### [`endpoints/features.py`](endpoints/features.py)
 
-#### Saved Items
-
-[`endpoints/saved_items.py`](../endpoints/saved_items.py)
-
-- `GET /api/saved-items`
-- `POST /api/saved-items`
-- `GET /api/saved-items/stats`
-- `GET /api/saved-items/schemas`
-- `GET /api/saved-items/tags`
-- `GET /api/saved-items/by-tag/{tag}`
-- `GET /api/saved-items/by-schema/{schema_id}`
-- `GET /api/saved-items/{item_id}`
-- `PATCH /api/saved-items/{item_id}`
-- `DELETE /api/saved-items/{item_id}`
-- `POST /api/saved-items/structured`
-- `POST /api/saved-items/search`
-- `POST /api/saved-items/{item_id}/pin`
+| Method | Path |
+|---|---|
+| `GET` | `/api/features` |
+| `GET` | `/api/features/installed` |
+| `GET` | `/api/features/{name}` |
+| `POST` | `/api/features/{name}/install` |
+| `POST` | `/api/features/{name}/enable` |
+| `POST` | `/api/features/{name}/disable` |
+| `POST` | `/api/features/{name}/remove` |
+| `GET` | `/api/features/{name}/config` |
+| `PATCH` | `/api/features/{name}/config` |
+| `GET` | `/api/features/{name}/skills` |
+| `GET` | `/api/skills` |
+| `GET` | `/api/skills/{skill_id}/schema` |
 
 ---
 
-## Authentication Model
+## Authentication Surface
 
-Routes are protected by different authentication classes:
+Auth is enforced by middleware in `server.py`. The live auth classes are:
 
-| Class | Routes | Description |
-|-------|--------|-------------|
-| `Public` | `/health`, `/health/detailed`, `/favicon.ico`, `/webhooks/stripe/crypto` | No authentication required |
-| `Public-Localhost` | `/api/auth/key` (bootstrap mode) | Public only when bootstrap enabled |
-| `OAuth public entrypoints` | `/auth/login`, `/auth/callback`, `/auth/logout` | OAuth flow entry points |
-| `APIKeyOrSession` | Most `/agent/*` and `/api/*` routes | Protected by API key or session via middleware |
-| `APIKeyOrSession+SSEQuery` | `/agent/stream`, `/agent/notifications/sse` | Also accepts `?api_key=` query parameter |
-| `OAuthSessionSemantic` | `/auth/me` | Accepts API key or session but only returns data for real sessions |
-| `Browser-Conditional` | `/` | Serves UI locally, redirects to OAuth when required |
-
-**Auth middleware:** Defined in [`server.py`](../server.py)
+| Auth class | Applies to |
+|---|---|
+| `Public` | `/health`, `/health/detailed`, `/favicon.ico`, `/webhooks/stripe/crypto` |
+| `Public-Localhost` | `/api/auth/key` (when bootstrap is enabled) |
+| `OAuth public entrypoints` | `/auth/login`, `/auth/callback`, `/auth/logout` |
+| `APIKeyOrSession` | Most protected `/agent/*` and `/api/*` routes |
+| `APIKeyOrSession+SSEQuery` | `/agent/stream`, `/agent/notifications/sse` — also accept `?api_key=` query param |
+| `OAuthSessionSemantic` | `/auth/me` — passes middleware via API key or session, but only returns authenticated data from a real OAuth session |
+| `Browser-Conditional` | `/` — serves UI for local/browser conditions; redirects to OAuth when OAuth-required mode is enabled |
 
 ---
 
-## Testing and Verification
+## Audit & Verification
 
-**Canonical surface proof layers:**
+Audit working papers: [`docs/audit/`](docs/audit)
 
-- [`tests/unit/test_auth_decision_table.py`](../tests/unit/test_auth_decision_table.py) — Auth decision verification
-- [`tests/unit/test_endpoint_contract_suite.py`](../tests/unit/test_endpoint_contract_suite.py) — Endpoint contract tests
-- [`tests/unit/test_feature_doc_canonicality.py`](../tests/unit/test_feature_doc_canonicality.py) — Feature doc canonicality
-- [`tests/unit/test_generate_feature_docs.py`](../tests/unit/test_generate_feature_docs.py) — Doc generation tests
+| Test file | Coverage |
+|---|---|
+| [`tests/unit/test_auth_decision_table.py`](tests/unit/test_auth_decision_table.py) | Auth middleware decision table |
+| [`tests/unit/test_endpoint_contract_suite.py`](tests/unit/test_endpoint_contract_suite.py) | Endpoint contract assertions |
+| [`tests/unit/test_feature_doc_canonicality.py`](tests/unit/test_feature_doc_canonicality.py) | Feature doc vs. discovered classes |
+| [`tests/unit/test_generate_feature_docs.py`](tests/unit/test_generate_feature_docs.py) | Doc generation pipeline |
 
-**Audit working papers:** [`docs/audit/`](../docs/audit)
+> Generated audience docs require an LLM provider key. Dry-run validation (`scripts/generate_feature_docs.py`) must pass even when generation keys are absent.
 
 ---
 
 ## Known Boundaries
 
-- Some support packages under `kestrel_sovereign/features/` do not export a `Feature` subclass and are not discoverable features.
-- Generated audience docs require an LLM provider key for full generation; dry-run validation passes without keys.
-
----
-
-## Related Documents
-
-- **Canonical source:** [`KESTREL_FEATURES.md`](../KESTREL_FEATURES.md)
-- **Generated docs index:** [`docs/generated/README.md`](../docs/generated/README.md)
-- **Historical reference:** [`docs/archive/KESTREL_FEATURES_legacy.md`](../docs/archive/KESTREL_FEATURES_legacy.md)
+- Some packages under `kestrel_sovereign/features/` are support modules, not discoverable features — they do not export a `Feature` subclass and are excluded from the inventory.
+- Entrypoint-installed feature packages extend the runtime inventory without modifying the core. They are not enumerated in this document; inspect them at runtime via `GET /api/features/installed`.
+- If this document and the code disagree, fix the disagreement or mark it explicitly. Do not infer counts from stale marketing material.
