@@ -820,32 +820,16 @@ async def get_current_model(request: Request):
     """
     try:
         agent = get_agent(request)
-        provider = None
-        model_name = None
+        selection = {"model": None, "provider": None, "model_name": None}
 
         if hasattr(agent, 'llm_service') and agent.llm_service:
-            llm_service = agent.llm_service
-            
-            # First check mandate preference (set via !model-set or UI)
-            pref = llm_service.get_model_preference()
-            model_name = pref.get('model')
-            provider = pref.get('provider')
-
-            # If no mandate preference, use the first provider (what actually gets used)
-            if not model_name and llm_service.providers:
-                first_provider = llm_service.providers[0]
-                provider = first_provider.get('name')
-                model_name = first_provider.get('model')
-
-        if model_name:
-            full_model = f"{provider}/{model_name}" if provider else model_name
-        else:
-            full_model = None
+            from kestrel_sovereign.llm.service import resolve_active_model_selection
+            selection = resolve_active_model_selection(agent.llm_service)
 
         return {
-            "model": full_model,
-            "provider": provider,
-            "model_name": model_name
+            "model": selection["model"],
+            "provider": selection["provider"],
+            "model_name": selection["model_name"]
         }
     except Exception as e:
         logger.error(f"Error getting current model: {e}", exc_info=True)

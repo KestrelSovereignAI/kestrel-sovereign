@@ -51,19 +51,8 @@ class ModelPreferenceMixin:
         Returns:
             Current model ID (provider/model format)
         """
-        model_id = self.llm_service.get_active_model_id()
-
-        # Find the provider for this model
-        pref = self.llm_service.get_model_preference()
-        if pref.get("provider"):
-            return f"{pref['provider']}/{model_id}"
-
-        if self.llm_service.providers:
-            provider = self.llm_service.providers[0].get('name', '')
-            if provider:
-                return f"{provider}/{model_id}"
-
-        return model_id
+        from kestrel_sovereign.llm.service import resolve_active_model_selection
+        return resolve_active_model_selection(self.llm_service)["model"]
 
     async def _load_model_preference(self) -> None:
         """Load persisted model preference from agent_metadata table."""

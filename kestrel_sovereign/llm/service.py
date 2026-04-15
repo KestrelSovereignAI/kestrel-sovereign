@@ -53,6 +53,26 @@ from kestrel_sovereign.telemetry import optional_span
 logger = logging.getLogger(__name__)
 
 
+def resolve_active_model_selection(llm_service) -> Dict[str, Optional[str]]:
+    """Resolve canonical current-model metadata for any LLM-service-like object."""
+    pref = llm_service.get_model_preference()
+    model_name = pref.get("model")
+    provider = pref.get("provider")
+
+    providers = getattr(llm_service, "providers", None)
+    if not model_name and providers:
+        first_provider = providers[0]
+        provider = first_provider.get("name")
+        model_name = first_provider.get("model")
+
+    full_model = f"{provider}/{model_name}" if provider and model_name else model_name
+    return {
+        "model": full_model,
+        "provider": provider,
+        "model_name": model_name,
+    }
+
+
 class LLMServiceError(LLMError):
     """Raised when LLM service cannot fulfill a request."""
 
@@ -204,6 +224,15 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
             if model != "auto":
                 return model
         return "auto"
+
+    def get_active_model_selection(self) -> Dict[str, Optional[str]]:
+        """Return canonical current-model metadata for UI, commands, and runtime.
+
+        The provider is only included when it is an explicit part of the
+        selected route, or when no mandate exists and the default provider order
+        determines the active route. A model-only mandate remains model-only.
+        """
+        return resolve_active_model_selection(self)
 
     def get_model_preference(self) -> Dict[str, Optional[str]]:
         """Get the current model preference.
