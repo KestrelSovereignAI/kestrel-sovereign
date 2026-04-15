@@ -3,6 +3,7 @@ import json
 import os
 import asyncio
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from kestrel_sovereign.storage import AsyncStorage, PrivacyEnforcingStorage
 from kestrel_sovereign.security.encryption import DecryptionError
@@ -58,6 +59,17 @@ USER_PROMPT_FILE = PROMPTS_DIR / "user_prompt.md"
 # Maximum tool call iterations (configurable via environment variable)
 # Increased to 50 for long-running tasks like code analysis and multi-step operations
 MAX_TOOL_ITERATIONS = int(os.environ.get("KESTREL_MAX_TOOL_ITERATIONS", "50"))
+
+
+@dataclass
+class PrivacyTransitionResult:
+    """Structured result for privacy-mode transitions across API and command paths."""
+
+    message: str
+    allows_cloud_llm: bool
+    model_switched: Optional[dict] = None
+    voice_switched: Optional[dict] = None
+    biometric_warning: Optional[str] = None
 
 # Maximum chars for a single tool result before truncation
 MAX_TOOL_RESULT_CHARS = int(os.environ.get("KESTREL_MAX_TOOL_RESULT_CHARS", "8000"))
@@ -583,6 +595,11 @@ class KestrelAgent(
         return self._privacy_mode
     
     async def set_privacy_mode(self, mode: PrivacyMode) -> str:
+        """Change privacy mode and return the user-facing status message."""
+        result = await self.set_privacy_mode_with_effects(mode)
+        return result.message
+
+    async def set_privacy_mode_with_effects(self, mode: PrivacyMode) -> PrivacyTransitionResult:
         """
         Change the privacy mode.
 
@@ -603,8 +620,80 @@ class KestrelAgent(
         self._privacy_mode = mode
         self.storage.set_privacy_mode(mode)
         status_message = self.privacy_agent.set_mode(mode)
+
+        config = mode.to_config()
+        model_switched = self._apply_privacy_model_transition(config)
+        voice_switched, biometric_warning = await self._apply_privacy_voice_transition(config)
+
         logging.info(f"Privacy mode changed to: {mode.value}")
-        return status_message
+        return PrivacyTransitionResult(
+            message=status_message,
+            allows_cloud_llm=config.allows_cloud_llm(),
+            model_switched=model_switched,
+            voice_switched=voice_switched,
+            biometric_warning=biometric_warning,
+        )
+
+    def _apply_privacy_model_transition(self, config) -> Optional[dict]:
+        """Apply model routing side effects for a privacy-mode transition."""
+        llm = getattr(self, "llm_service", None)
+        if not llm:
+            return None
+
+        if not config.allows_cloud_llm():
+            local_names = llm._get_local_provider_names()
+            # Save the resolved active cloud route before overriding to local.
+            current_pref = llm.get_model_preference() or {}
+            current_provider = current_pref.get("provider")
+            current_model = current_pref.get("model")
+            if not current_model and getattr(llm, "providers", None):
+                first_provider = llm.providers[0]
+                current_provider = first_provider.get("name")
+                current_model = first_provider.get("model")
+            if current_model and current_provider not in (local_names or []):
+                llm._pre_ephemeral_preference = {
+                    "provider": current_provider,
+                    "model": current_model,
+                }
+
+            local_providers = [p for p in llm.providers if p["name"] in local_names]
+            # Prefer ollama over llama_cpp — ollama is more universally available.
+            local_provider = next(
+                (p for p in local_providers if p["name"] == "ollama"),
+                local_providers[0] if local_providers else None,
+            )
+            if local_provider:
+                llm.set_model_preference(local_provider["model"], local_provider["name"])
+                return {"provider": local_provider["name"], "model": local_provider["model"]}
+            return None
+
+        saved = getattr(llm, "_pre_ephemeral_preference", None)
+        if saved:
+            llm.set_model_preference(saved.get("model", ""), saved.get("provider", ""))
+            llm._pre_ephemeral_preference = None
+            return saved
+        return None
+
+    async def _apply_privacy_voice_transition(self, config) -> tuple[Optional[dict], Optional[str]]:
+        """Apply voice-provider side effects for a privacy-mode transition."""
+        features = getattr(self, "features", {})
+        vf = features.get("VoiceFeature") if features else None
+        if not vf or not hasattr(vf, "on_privacy_mode_changed"):
+            return None, None
+
+        voice_switched = None
+        biometric_warning = None
+        try:
+            voice_switched = await vf.on_privacy_mode_changed()
+        except Exception as ve:
+            logging.warning("Voice auto-switch failed: %s", ve)
+
+        if config.allows_cloud_llm() and hasattr(vf, "biometric_warning"):
+            vc = getattr(vf, "_voice_config", None)
+            if vc and (vc.tts_provider or vc.stt_provider):
+                biometric_warning = vf.biometric_warning()
+
+        return voice_switched, biometric_warning
 
 
     async def _register_feature(self, feature: Feature):
