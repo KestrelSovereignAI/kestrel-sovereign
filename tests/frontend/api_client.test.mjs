@@ -32,6 +32,31 @@ function jsonResponse(status, body) {
     };
 }
 
+function streamResponse(chunks, headers = {}) {
+    const encoded = chunks.map((chunk) => new TextEncoder().encode(chunk));
+    return {
+        ok: true,
+        status: 200,
+        headers: {
+            get(name) {
+                return headers[name] ?? headers[name.toLowerCase()] ?? null;
+            },
+        },
+        body: {
+            getReader() {
+                let index = 0;
+                return {
+                    async read() {
+                        if (index >= encoded.length) return { done: true };
+                        return { done: false, value: encoded[index++] };
+                    },
+                    releaseLock() {},
+                };
+            },
+        },
+    };
+}
+
 function createLogger() {
     const entries = [];
     return {
@@ -144,6 +169,60 @@ test('request with API key refreshes bootstrap key once and retries the original
     assert.equal(fetchFn.calls[2].options.headers['X-API-Key'], 'fresh-key');
 });
 
+test('streamInvoke with JWT clears stored tokens and redirects on 401', async () => {
+    const fetchFn = createFetchQueue(jsonResponse(401, { detail: 'expired stream token' }));
+    const { client, location, localStorage, sessionStorage } = createClient({
+        fetchFn,
+        localInitial: { platform_auth_token: 'jwt-123' },
+        sessionInitial: { token: 'fallback-jwt' },
+    });
+
+    client.setAgentId('did:test:companion');
+    await client.init();
+
+    const chunks = [];
+    for await (const chunk of client.streamInvoke('hello')) {
+        chunks.push(chunk);
+    }
+
+    assert.deepEqual(chunks, []);
+    assert.equal(location.href, '/auth/login');
+    assert.equal(localStorage.getItem('platform_auth_token'), null);
+    assert.equal(sessionStorage.getItem('token'), null);
+    assert.deepEqual(fetchFn.calls.map((call) => call.url), [
+        '/api/kestrel/companions/did%3Atest%3Acompanion/stream',
+    ]);
+});
+
+test('streamInvoke with API key refreshes bootstrap key once and retries the stream', async () => {
+    const fetchFn = createFetchQueue(
+        jsonResponse(401, { detail: 'expired stream key' }),
+        jsonResponse(200, { key: 'fresh-key' }),
+        streamResponse(['hel', 'lo'], { 'X-Request-ID': 'stream-1' }),
+    );
+    const { client, sessionStorage } = createClient({
+        fetchFn,
+        sessionInitial: { kestrel_api_key: 'stale-key' },
+    });
+
+    await client.init();
+
+    const chunks = [];
+    for await (const chunk of client.streamInvoke('hello')) {
+        chunks.push(chunk);
+    }
+
+    assert.deepEqual(chunks, ['hel', 'lo']);
+    assert.equal(sessionStorage.getItem('kestrel_api_key'), 'fresh-key');
+    assert.deepEqual(fetchFn.calls.map((call) => call.url), [
+        '/agent/stream',
+        '/api/auth/key',
+        '/agent/stream',
+    ]);
+    assert.equal(fetchFn.calls[0].options.headers['X-API-Key'], 'stale-key');
+    assert.equal(fetchFn.calls[2].options.headers['X-API-Key'], 'fresh-key');
+});
+
 test('rewriteEndpoint preserves host-level auth routes and rewrites per-agent routes in rookery mode', () => {
     assert.equal(
         rewriteEndpoint('/api/auth/key', { currentAgentId: 'did:test', selectedHostAgent: 'host-a' }),
@@ -163,5 +242,16 @@ test('rewriteEndpoint maps standalone endpoints into companion routes in multi-a
     assert.equal(
         rewriteEndpoint('/api/conversations/session-1', { currentAgentId: 'did:test:agent' }),
         '/api/kestrel/companions/did%3Atest%3Aagent/conversations/session-1',
+    );
+});
+
+test('buildAgentUrl maps notification SSE paths through selected host agents', () => {
+    const { client } = createClient({ fetchFn: createFetchQueue() });
+
+    client.setHostAgent('claw');
+
+    assert.equal(
+        client.buildAgentUrl('/agent/notifications/sse'),
+        '/api/agents/claw/agent/notifications/sse',
     );
 });
