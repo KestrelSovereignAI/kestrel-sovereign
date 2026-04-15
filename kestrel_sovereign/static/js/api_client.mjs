@@ -177,41 +177,9 @@ export function createApiClient({
             });
 
             if (response.status === 401 && !retried) {
-                if (state.jwtToken) {
-                    log.warn('Platform session expired — clearing JWT and redirecting to login');
-                    clearPlatformJwt();
-                    locationRef.href = '/auth/login';
-                    return;
-                }
-
-                log.warn('Authentication failed - refreshing API key...');
-                sessionStore.removeItem('kestrel_api_key');
-                state.apiKey = null;
-
-                try {
-                    const keyResp = await fetchImpl('/api/auth/key');
-                    if (keyResp.ok) {
-                        const data = await keyResp.json();
-                        state.apiKey = data.key;
-                        sessionStore.setItem('kestrel_api_key', state.apiKey);
-                        log.log('API key refreshed - retrying request');
-                        return this.request(endpoint, options, true);
-                    }
-                    if (keyResp.status === 401 || keyResp.status === 403 || keyResp.status === 404) {
-                        if (keyResp.status === 401 || keyResp.status === 404) {
-                            state.bootstrapDisabled = true;
-                        }
-                        log.warn('API key bootstrap unavailable during refresh');
-                    }
-                } catch (error) {
-                    log.error('Failed to refresh API key:', error);
-                }
-
-                if (state.oauthSession) {
-                    log.warn('OAuth session expired — redirecting to login');
-                    locationRef.href = '/auth/login';
-                    return;
-                }
+                const recovery = await recoverFromUnauthorized();
+                if (recovery === 'redirected') return;
+                if (recovery === 'refreshed') return this.request(endpoint, options, true);
 
                 const error = await response.json().catch(() => ({ detail: 'Authentication failed' }));
                 throw new Error(error.detail || 'Authentication failed - please refresh the page');
@@ -301,7 +269,7 @@ export function createApiClient({
         getCurrentStreamRequestId() {
             return state.currentStreamRequestId;
         },
-        async *streamInvoke(input, model = null, sessionId = null, provider = null) {
+        async *streamInvoke(input, model = null, sessionId = null, provider = null, retried = false) {
             const headers = { 'Content-Type': 'application/json' };
             if (state.jwtToken) {
                 headers.Authorization = `Bearer ${state.jwtToken}`;
@@ -320,11 +288,16 @@ export function createApiClient({
                     signal,
                 });
 
-                if (response.status === 401) {
-                    log.warn('Streaming auth failed - clearing cached key');
-                    sessionStore.removeItem('kestrel_api_key');
-                    state.apiKey = null;
-                    throw new Error('Authentication failed - please refresh the page');
+                if (response.status === 401 && !retried) {
+                    const recovery = await recoverFromUnauthorized();
+                    if (recovery === 'redirected') return;
+                    if (recovery === 'refreshed') {
+                        yield* client.streamInvoke(input, model, sessionId, provider, true);
+                        return;
+                    }
+
+                    const error = await response.json().catch(() => ({ detail: 'Authentication failed' }));
+                    throw new Error(error.detail || 'Authentication failed - please refresh the page');
                 }
 
                 if (!response.ok) throw new Error(`HTTP ${response.status}`);
@@ -399,6 +372,54 @@ export function createApiClient({
             headers['X-API-Key'] = state.apiKey;
         }
         return headers;
+    }
+
+    async function recoverFromUnauthorized() {
+        if (state.jwtToken) {
+            log.warn('Platform session expired — clearing JWT and redirecting to login');
+            clearPlatformJwt();
+            locationRef.href = '/auth/login';
+            return 'redirected';
+        }
+
+        if (await refreshApiKey()) {
+            return 'refreshed';
+        }
+
+        if (state.oauthSession) {
+            log.warn('OAuth session expired — redirecting to login');
+            locationRef.href = '/auth/login';
+            return 'redirected';
+        }
+
+        return 'failed';
+    }
+
+    async function refreshApiKey() {
+        log.warn('Authentication failed - refreshing API key...');
+        sessionStore.removeItem('kestrel_api_key');
+        state.apiKey = null;
+
+        try {
+            const keyResp = await fetchImpl('/api/auth/key');
+            if (keyResp.ok) {
+                const data = await keyResp.json();
+                state.apiKey = data.key;
+                sessionStore.setItem('kestrel_api_key', state.apiKey);
+                log.log('API key refreshed - retrying request');
+                return true;
+            }
+            if (keyResp.status === 401 || keyResp.status === 403 || keyResp.status === 404) {
+                if (keyResp.status === 401 || keyResp.status === 404) {
+                    state.bootstrapDisabled = true;
+                }
+                log.warn('API key bootstrap unavailable during refresh');
+            }
+        } catch (error) {
+            log.error('Failed to refresh API key:', error);
+        }
+
+        return false;
     }
 
     function rewrite(endpoint) {
