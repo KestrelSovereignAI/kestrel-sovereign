@@ -2,11 +2,27 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any, Dict, Optional
 
 from kestrel_sovereign.config import load_config
 from kestrel_sovereign.llm.model_catalog import get_catalog_service
 from kestrel_sovereign.llm.model_metadata import ModelCategory, ModelInfo
+
+
+def _numeric_rank(text: str, max_parts: int = 4) -> tuple[int, ...]:
+    """Return descending-sort numeric rank while ignoring date suffixes."""
+    without_dates = re.sub(r"20\d{6}", "", text)
+    numbers = [int(part) for part in re.findall(r"\d+", without_dates)]
+    padded = (numbers + [0] * max_parts)[:max_parts]
+    return tuple(-number for number in padded)
+
+
+def _created_rank(created_at: str | None, max_parts: int = 6) -> tuple[int, ...]:
+    """Return descending-sort rank for provider creation timestamps."""
+    numbers = [int(part) for part in re.findall(r"\d+", created_at or "")]
+    padded = (numbers + [0] * max_parts)[:max_parts]
+    return tuple(-number for number in padded)
 
 
 def _rank_cached_candidates(models: list[ModelInfo]) -> list[ModelInfo]:
@@ -21,6 +37,9 @@ def _rank_cached_candidates(models: list[ModelInfo]) -> list[ModelInfo]:
         return (
             not model.supports_tools,
             previewish,
+            _numeric_rank(model.display_name or model.id),
+            _created_rank(model.created_at),
+            not model.is_featured,
             model.id.lower(),
         )
 

@@ -38,3 +38,39 @@ def test_resolve_provider_default_uses_selection_hints_against_cached_models():
     )
 
     assert resolved == "claude-opus-4-5-20251101"
+
+
+def test_resolve_provider_default_prefers_newest_matching_model_from_discovery():
+    resolved = resolve_provider_default(
+        "anthropic",
+        llm_config={"anthropic": {"model": "auto", "selection_hints": ["sonnet"]}},
+        catalog_config={},
+        cached_models=[
+            ModelInfo(
+                id="claude-sonnet-4-20250514",
+                provider="anthropic",
+                display_name="Claude Sonnet 4",
+                category=ModelCategory.CHAT,
+                supports_tools=True,
+                created_at="2025-05-14T00:00:00Z",
+            ),
+            ModelInfo(
+                id="claude-sonnet-4-5-20250929",
+                provider="anthropic",
+                display_name="Claude Sonnet 4.5",
+                category=ModelCategory.CHAT,
+                supports_tools=True,
+                created_at="2025-09-29T00:00:00Z",
+            ),
+            ModelInfo(
+                id="claude-sonnet-4-6",
+                provider="anthropic",
+                display_name="Claude Sonnet 4.6",
+                category=ModelCategory.CHAT,
+                supports_tools=True,
+                created_at="2026-04-13T00:00:00Z",
+            ),
+        ],
+    )
+
+    assert resolved == "claude-sonnet-4-6"
