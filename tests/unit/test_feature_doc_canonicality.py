@@ -43,3 +43,11 @@ def test_progress_review_script_uses_discovered_inventory_language():
     text = (PROJECT_ROOT / "scripts/convene_progress_review.py").read_text()
     assert "discovered feature module inventory" in text
     assert "28 feature modules" not in text
+
+
+def test_investor_generated_doc_does_not_invent_unverified_metrics():
+    text = (PROJECT_ROOT / "docs/generated/FEATURES_investor.md").read_text().lower()
+    assert "independently audited" not in text
+    assert "externally audited" not in text
+    assert "over 100" not in text
+    assert "more than 100" not in text
