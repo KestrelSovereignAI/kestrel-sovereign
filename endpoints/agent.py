@@ -254,13 +254,17 @@ async def set_privacy_mode(request: Request):
             )
 
         agent = get_agent(request)
-        await agent.set_privacy_mode(new_mode)
+        transition = None
+        if getattr(type(agent), "set_privacy_mode_with_effects", None):
+            transition = await agent.set_privacy_mode_with_effects(new_mode)
+        else:
+            await agent.set_privacy_mode(new_mode)
 
         # If switching to a local-only mode, auto-switch model to a local provider
         # If switching back to cloud-allowed mode, restore the previous model
         config = new_mode.to_config()
-        model_switched = None
-        if hasattr(agent, 'llm_service') and agent.llm_service:
+        model_switched = getattr(transition, "model_switched", None)
+        if transition is None and hasattr(agent, 'llm_service') and agent.llm_service:
             llm = agent.llm_service
             if not config.allows_cloud_llm():
                 local_names = llm._get_local_provider_names()
@@ -299,11 +303,11 @@ async def set_privacy_mode(request: Request):
                     llm._pre_ephemeral_preference = None
 
         # Auto-switch voice providers if VoiceFeature is active
-        voice_switched = None
-        biometric_warning = None
+        voice_switched = getattr(transition, "voice_switched", None)
+        biometric_warning = getattr(transition, "biometric_warning", None)
         features = getattr(agent, "features", {})
         vf = features.get("VoiceFeature") if features else None
-        if vf and hasattr(vf, "on_privacy_mode_changed"):
+        if transition is None and vf and hasattr(vf, "on_privacy_mode_changed"):
             try:
                 voice_switched = await vf.on_privacy_mode_changed()
             except Exception as ve:
