@@ -16,6 +16,14 @@ Create dedicated seam campaigns that red-team cross-domain behavior rather than 
 - SQLite/PostgreSQL parity on storage, sync, and tasking
 - cloud/local drift for Ollama, RunPod, Vast.ai, GCP, Vertex, and Cloud Run
 
+Canonical campaign tracking lives in `docs/audit/SEAM_CAMPAIGNS.md`.
+
+Current campaign status:
+
+- `Proven`: bootstrap/auth/session interactions in browser and SSE flows.
+- `Partial`: privacy transitions (#593), mandate/fallback routing (#592), export/import/encryption (#595), cloud/local drift (#597).
+- `Planned`: permission bypass through MCP/A2A/tools/commands (#596), SQLite/PostgreSQL storage/sync/tasking parity (#594).
+
 ## Required Proof
 
 - integration and adversarial-first coverage
