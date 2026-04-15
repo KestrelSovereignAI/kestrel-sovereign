@@ -278,6 +278,7 @@ class TaskManager:
             raise ValueError(f"Unknown agent: {agent_id}")
 
         _, handler = self._agents[agent_id]
+        hook_feature_name = getattr(handler, "name", None) or agent_id
 
         # Create task
         task_id = uuid4().hex
@@ -292,7 +293,7 @@ class TaskManager:
                 hook_event_name=HookEvent.PRE_TOOL_USE.value,
                 tool_name=skill_id,
                 tool_input=args,
-                feature_name=agent_id,
+                feature_name=hook_feature_name,
             )
 
             hook_output = await self.hooks_manager.execute_hooks(
@@ -372,7 +373,7 @@ class TaskManager:
                     hook_event_name=HookEvent.POST_TOOL_USE.value,
                     tool_name=skill_id,
                     tool_input=args,
-                    feature_name=agent_id,
+                    feature_name=hook_feature_name,
                     tool_response={"task_id": task.id, "state": task.status.state.value},
                 )
                 # Post hooks run in parallel (non-blocking)
