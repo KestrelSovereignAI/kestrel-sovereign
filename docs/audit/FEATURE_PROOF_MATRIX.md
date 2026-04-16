@@ -27,7 +27,7 @@ Status meanings:
 | `heartbeat` | `kestrel_sovereign/features/heartbeat.py` | `tests/unit/test_heartbeat_feature.py`, `tests/unit/test_heartbeat.py` | Direct |
 | `identity` | `kestrel_sovereign/features/identity/` | `tests/unit/test_identity_package.py`, `tests/unit/test_identity_constitution_endpoint_contracts.py`, `tests/integration/test_identity_export_import.py` | Direct |
 | `keys` | `kestrel_sovereign/features/keys.py` | `tests/unit/test_key_resolution_security.py`, `tests/integration/test_key_management.py` | Direct |
-| `mcp` | `kestrel_sovereign/features/mcp.py` | `tests/integration/test_mcp_gateway.py`, `tests/integration/test_mcp_tools_e2e.py`, `tests/integration/test_mcp_agent_workflow.py` | Direct |
+| `mcp` | `kestrel-feature-mcp` optional package via `kestrel_sovereign.features` entry point | `tests/unit/test_extracted_feature_boundary_contracts.py`, `tests/integration/test_dynamic_features.py`, `tests/integration/test_orchestration_e2e.py` | Boundary |
 | `memory` | `kestrel_sovereign/features/memory.py` | `tests/unit/test_memory_manager.py`, `tests/unit/test_memory_system.py`, `tests/integration/test_memory_feature_e2e.py` | Direct |
 | `memory_agency` | `kestrel_sovereign/features/memory_agency.py` | `tests/unit/test_memory_agency_feature.py` | Direct |
 | `model` | `kestrel_sovereign/features/model/feature.py` | `tests/unit/test_model_selection_contracts.py`, `tests/unit/test_model_set_openrouter.py`, `tests/integration/test_model_set_routing_e2e.py` | Direct |
@@ -51,6 +51,6 @@ Status meanings:
 ## Highest-priority remaining feature-level proof gaps
 
 - No module is currently in `Gap` status in this first-pass feature proof matrix.
-- Remaining work is deeper than simple feature presence: tighten direct proof quality for `mcp`, `reflection`, and deployment/cloud workflows, and keep driving endpoint/adversarial coverage under the umbrella audit.
+- Remaining work is deeper than simple feature presence: tighten core/extracted boundary proof for `mcp`, direct proof quality for `reflection`, and deployment/cloud workflows, and keep driving endpoint/adversarial coverage under the umbrella audit.
 
 This matrix should stay aligned with `FEATURE_MODULE_MATRIX.md` and should be used to drive the next round of gap-closing work.
