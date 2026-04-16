@@ -76,3 +76,47 @@ async def test_export_persists_receipt_with_import_and_audit_provenance():
     }
     storage.record_backup_artifact.assert_awaited_once_with("did:kestrel:test", storage_result)
     wallet.transfer.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (FileNotFoundError("missing key material"), "missing key material"),
+        (ValueError("rotated key cannot decrypt backup"), "rotated key cannot decrypt backup"),
+    ],
+)
+async def test_import_fails_closed_when_backup_key_material_is_missing_or_rotated(
+    error,
+    expected,
+):
+    backup_node = SimpleNamespace(
+        node_id="hash123",
+        properties={
+            "ipfs_cid": "bafybackup",
+            "encrypted": True,
+            "encryption_key_hash": "keyhash123",
+        },
+    )
+    storage = MagicMock()
+    storage.get_nodes_by_type = AsyncMock(return_value=[backup_node])
+    storage.restore_from_backup_blob = AsyncMock()
+
+    agent = SimpleNamespace(storage=storage)
+    adapter = MagicMock()
+    adapter.retrieve_content.side_effect = error
+
+    with patch(
+        "kestrel_sovereign.features.sovereignty.feature.FilecoinAdapter",
+        return_value=adapter,
+    ):
+        result = await SovereigntyFeature(agent).import_sovereignty("bafybackup")
+
+    assert result.startswith("❌ Error during import:")
+    assert expected in result
+    adapter.retrieve_content.assert_called_once_with(
+        "bafybackup",
+        ipfs_cid="bafybackup",
+        key_hash="keyhash123",
+    )
+    storage.restore_from_backup_blob.assert_not_awaited()
