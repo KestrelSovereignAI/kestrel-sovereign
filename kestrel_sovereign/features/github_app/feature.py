@@ -139,7 +139,7 @@ class GitHubAppFeature(Feature):
         await self._client.add_reaction(installation_id, repo, issue_number, "eyes")
 
         question = f"Issue #{issue_number}: {title}\n\n{body}"
-        response = await self._generate_response(repo, "issue", question, installation_id)
+        response, _ = await self._generate_response(repo, "issue", question, installation_id)
 
         if response:
             await self._client.create_issue_comment(
@@ -186,7 +186,7 @@ class GitHubAppFeature(Feature):
         body = discussion.get("body", "") or ""
 
         question = f"Discussion: {title}\n\n{body}"
-        response = await self._generate_response(repo, "discussion", question, installation_id)
+        response, _ = await self._generate_response(repo, "discussion", question, installation_id)
 
         if response:
             await self._client.create_discussion_comment(
@@ -208,7 +208,7 @@ class GitHubAppFeature(Feature):
         title = discussion["title"]
 
         question = f"Discussion: {title}\n\nComment: {comment_body}"
-        response = await self._generate_response(repo, "discussion comment", question, installation_id)
+        response, _ = await self._generate_response(repo, "discussion comment", question, installation_id)
 
         if response:
             await self._client.create_discussion_comment(
