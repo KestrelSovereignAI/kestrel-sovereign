@@ -173,22 +173,13 @@ class ModelAgent(Feature):
         if model:
             return await self.set_model(model)
 
-        # Get current model from mandate preference
-        pref = self.llm_service.get_model_preference()
-        model_name = pref.get('model')
-        provider = pref.get('provider')
-
-        # If no mandate preference, use the first provider (what actually gets used)
-        if not model_name and self.llm_service.providers:
-            first_provider = self.llm_service.providers[0]
-            provider = first_provider.get('name')
-            model_name = first_provider.get('model')
-
-        model_str = f"{provider}/{model_name}" if provider else model_name
+        from kestrel_sovereign.llm.service import resolve_active_model_selection
+        selection = resolve_active_model_selection(self.llm_service)
+        model_str = selection["model"]
         return {
             "current_model": model_str,
-            "provider": provider,
-            "model_name": model_name,
+            "provider": selection["provider"],
+            "model_name": selection["model_name"],
             "message": f"Current model: {model_str}\n\nUse `!model <provider/model>` to change.\nUse `!model-list` to list available models."
         }
 
