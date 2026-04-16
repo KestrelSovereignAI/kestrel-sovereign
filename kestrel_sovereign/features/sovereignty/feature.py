@@ -82,31 +82,39 @@ class SovereigntyFeature(Feature):
         if fee_main > 0:
             await self.agent.wallet.transfer(fee_main, memo=f"backup:{tier_enum.value}:{node_id}")
 
+        audit_anchors = None
+        try:
+            for feature in getattr(self.agent, 'features', {}).values():
+                if type(feature).__name__ == 'AuditAnchorFeature':
+                    status = await feature.anchor_status()
+                    audit_anchors = status.get("result", status)
+                    break
+        except Exception:
+            logger.debug("Failed to attach audit anchors to sovereignty receipt", exc_info=True)
+
+        receipt_properties = {
+            "cid": result.ipfs_cid,
+            "ipfs_cid": result.ipfs_cid,
+            "content_hash": result.content_hash,
+            "storage_tier": result.storage_tier.value,
+            "provider": getattr(result, "provider", None),
+            "encrypted": result.encrypted,
+            "encryption_key_hash": result.encryption_key_hash,
+            "size_bytes": getattr(result, "size_bytes", 0) or len(backup_blob),
+            "created_at": datetime.now().isoformat(),
+            "node_id": node_id,
+        }
+        if audit_anchors is not None:
+            receipt_properties["audit_anchors"] = audit_anchors
+
         # Create receipt node
         receipt_node = GraphNode(
             node_id=f"sovereignty_receipt_{result.ipfs_cid or datetime.now().timestamp()}",
             node_type="sovereignty_receipt",
             label="Sovereignty Export Receipt",
-            properties={
-                "cid": result.ipfs_cid,
-                "storage_tier": tier_enum.value,
-                "encrypted": encrypt,
-                "size_bytes": len(backup_blob),
-                "created_at": datetime.now().isoformat(),
-                "node_id": node_id
-            }
+            properties=receipt_properties
         )
         await self.agent.storage.add_node(receipt_node)
-
-        # Include audit anchors in sovereignty export
-        try:
-            for feature in getattr(self.agent, 'features', {}).values():
-                if type(feature).__name__ == 'AuditAnchorFeature':
-                    status = await feature.anchor_status()
-                    receipt_node.properties["audit_anchors"] = status.get("result", status)
-                    break
-        except Exception:
-            pass  # Don't fail export on anchor failure
 
         return f"""✅ Sovereignty Export Complete.
 CID: {result.ipfs_cid or result.content_hash}
