@@ -65,6 +65,9 @@ def resolve_active_model_selection(llm_service) -> Dict[str, Optional[str]]:
         provider = first_provider.get("name")
         model_name = first_provider.get("model")
 
+    if not model_name:
+        model_name = "auto"
+
     full_model = f"{provider}/{model_name}" if provider and model_name else model_name
     return {
         "model": full_model,

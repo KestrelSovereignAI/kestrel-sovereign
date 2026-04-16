@@ -62,6 +62,19 @@ def test_llm_service_exposes_canonical_current_model_selection_for_provider_pref
     }
 
 
+def test_llm_service_exposes_auto_when_no_preference_or_providers():
+    svc = _make_llm_service()
+    svc.providers = []
+
+    selection = svc.get_active_model_selection()
+
+    assert selection == {
+        "model": "auto",
+        "provider": None,
+        "model_name": "auto",
+    }
+
+
 def test_current_model_paths_agree_for_model_only_preference():
     svc = _make_llm_service({"model": "gpt-5-mini", "provider": None})
     model_agent = ModelAgent(MagicMock(llm_service=svc))
