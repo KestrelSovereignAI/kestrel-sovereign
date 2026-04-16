@@ -333,6 +333,18 @@ class TestNoFeatureCrashes:
         assert "commands" in data
         assert isinstance(data["commands"], list)
 
+    def test_commands_endpoint_does_not_advertise_extracted_mcp_commands(self, client: TestClient):
+        """Core-only command inventory must not expose extracted MCP commands."""
+        response = client.get("/api/commands")
+        assert response.status_code == 200
+        data = response.json()
+        commands = {entry["cmd"] for entry in data["commands"]}
+
+        assert "!mcp-load" not in commands
+        assert "!mcp-list" not in commands
+        assert "!mcp-unload" not in commands
+        assert "!mcp-call" not in commands
+
     def test_db_tables_endpoint_works(self, client: TestClient):
         """Database explorer works without non-core features."""
         response = client.get("/api/db/tables")
