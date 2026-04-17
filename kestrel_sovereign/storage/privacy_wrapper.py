@@ -22,6 +22,7 @@ from enum import Enum
 from dataclasses import dataclass
 
 from kestrel_sovereign.privacy import PrivacyMode, PrivacyConfig, get_privacy_preset
+from kestrel_sovereign.storage.conversation_ids import coerce_persistent_message_id
 
 # Lazy import to avoid circular dependency with features.privacy
 # Note: This global cache is shared across all instances and async contexts.
@@ -455,9 +456,13 @@ class PrivacyEnforcingStorage:
                 pass
             return None
 
+        row_id = coerce_persistent_message_id(message_id)
+        if row_id is None:
+            return None
+
         return await self._storage.db.fetchone(
             "SELECT created_at FROM conversation_history WHERE id = ? AND agent_id = ?",
-            (message_id, agent_id)
+            (row_id, agent_id)
         )
 
     async def query_conversation_messages(
@@ -541,10 +546,14 @@ class PrivacyEnforcingStorage:
                 pass
             return False
 
+        row_id = coerce_persistent_message_id(message_id)
+        if row_id is None:
+            return False
+
         await self._check_write_permission("delete_conversation_message")
         result = await self._storage.db.execute_commit(
             "DELETE FROM conversation_history WHERE id = ? AND agent_id = ?",
-            (message_id, agent_id)
+            (row_id, agent_id)
         )
         deleted = result.rowcount > 0 if hasattr(result, 'rowcount') else True
 
@@ -553,7 +562,7 @@ class PrivacyEnforcingStorage:
         if deleted:
             await self._storage.db.execute_commit(
                 "DELETE FROM memory_pins WHERE message_id = ? AND agent_id = ?",
-                (message_id, agent_id)
+                (row_id, agent_id)
             )
 
         return deleted

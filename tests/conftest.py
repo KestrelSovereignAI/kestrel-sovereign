@@ -503,10 +503,14 @@ async def db_backend(request, tmp_path):
             pytest.skip("PostgresBackend not available")
             return
 
-        postgres_url = os.environ.get("TEST_POSTGRES_URL")
+        postgres_url = (
+            os.environ.get("TEST_POSTGRES_URL")
+            or os.environ.get("KESTREL_DATABASE_URL")
+            or os.environ.get("DATABASE_URL")
+        )
         if not postgres_url:
             pytest.skip(
-                "TEST_POSTGRES_URL environment variable required for PostgreSQL tests.\n"
+                "TEST_POSTGRES_URL, KESTREL_DATABASE_URL, or DATABASE_URL required for PostgreSQL tests.\n"
                 "Example: export TEST_POSTGRES_URL='postgresql://user:pass@localhost:5433/kestrel_test'"
             )
             return
@@ -544,6 +548,5 @@ async def sqlite_backend(tmp_path):
     await backend.connect()
     yield backend
     await backend.close()
-
 
 
