@@ -16,6 +16,7 @@ import os
 from typing import Dict, Optional, List, Any
 
 from .async_database import AsyncDatabase
+from .conversation_ids import coerce_persistent_message_id
 from .encryption import (
     get_fernet, get_agent_fernet, encrypt_string, decrypt_string, remove_enc_flag,
     DecryptionError
@@ -225,9 +226,13 @@ class AsyncConversationStore:
         SESSION_GAP_MINUTES = 30
 
         # Get the start time of this session (if session_id is a message ID)
+        row_id = coerce_persistent_message_id(session_id)
+        if row_id is None:
+            return []
+
         start_row = await self.db.fetchone(
             "SELECT created_at FROM conversation_history WHERE id = ? AND agent_id = ?",
-            (session_id, self.agent_id)
+            (row_id, self.agent_id)
         )
 
         # If session_id is a message ID, get messages from that timestamp forward
