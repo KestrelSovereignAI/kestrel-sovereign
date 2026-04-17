@@ -424,6 +424,16 @@ class TestPrivacyAwareQueries:
         result = await wrapper.query_conversation_start("1", "agent-1")
         assert result == ("2026-01-01 12:00:00",)
         mock_storage.db.fetchone.assert_called_once()
+        assert mock_storage.db.fetchone.call_args.args[1] == (1, "agent-1")
+
+    @pytest.mark.asyncio
+    async def test_query_conversation_start_rejects_invalid_message_id(self, mock_storage):
+        """NORMAL mode should not send non-row ids to persistent storage."""
+        wrapper = PrivacyEnforcingStorage(mock_storage, PrivacyMode.NORMAL)
+
+        result = await wrapper.query_conversation_start("not-a-row-id", "agent-1")
+        assert result is None
+        mock_storage.db.fetchone.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_query_conversation_start_ephemeral_returns_none(self, mock_storage):
