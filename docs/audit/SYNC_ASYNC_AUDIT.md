@@ -48,13 +48,15 @@ audit in issue `#624`, focused on maintained runtime surfaces.
   - Fixed by tracking webhook event tasks, removing completed tasks from the set, and cancelling/awaiting any in-flight handlers during feature shutdown.
 - `KestrelAgent._post_response_pipeline()` launched post-response memory enrichment as an unowned background task, which could still be touching storage while shutdown closed storage.
   - Fixed by adding agent-owned background task tracking and cancelling/awaiting those tasks before sync and storage shutdown.
+- `MemoryRetriever.retrieve()` launched rehearsal-effect access-count writes with bare `asyncio.create_task()`, so storage writes could outlive retrieval and agent shutdown.
+  - Fixed by making `MemoryRetriever` own those update tasks, adding deterministic drain/shutdown methods, and wiring `MemorySystem.shutdown()` into `KestrelAgent.shutdown()` before storage closes.
 
 ### Resolved audit patterns
 
 - Conflicting close/shutdown contracts: resolved. Agent cleanup contract is `await agent.shutdown()`. MCPToolManager's sync `close()` is correctly called from async `shutdown()`.
 - Command/API parity: verified. `CommandHandler.handle()` properly dispatches both sync and async results.
 - Blocking subprocess/file work on async paths: resolved. All maintained tool paths now offload via `asyncio.to_thread()`.
-- Background-task and scheduler paths: refreshed. Scheduler, heartbeat, GitHub App webhook handling, and agent post-response enrichment use owned async task patterns with shutdown cleanup.
+- Background-task and scheduler paths: refreshed. Scheduler, heartbeat, GitHub App webhook handling, agent post-response enrichment, and memory rehearsal-effect writes use owned async task patterns with shutdown cleanup.
 - `get_event_loop()` elimination: zero remaining calls in maintained source (`kestrel_sovereign/` and `endpoints/`).
 
 ## Initial high-risk surfaces
@@ -84,14 +86,17 @@ audit in issue `#624`, focused on maintained runtime surfaces.
 
 ## Audit status
 
-The sync/async boundary audit is materially complete for the maintained runtime surface:
+The sync/async boundary audit has resolved the highest-confidence maintained runtime violations found so far, but the remaining `create_task()` inventory is still being classified rather than declared complete:
 
-- All identified async-boundary violations have been fixed with root-cause changes.
-- All identified blocking I/O on async paths has been offloaded via `asyncio.to_thread()`.
+- Identified command/API awaitability violations have been fixed with root-cause changes.
+- Identified blocking I/O on maintained async tool paths has been offloaded via `asyncio.to_thread()`.
 - All `get_event_loop()` usage has been eliminated from maintained source code.
-- No remaining sync methods are known to invoke async work without proper handling.
 - Direct contract tests cover each corrected seam.
+- Remaining task-spawn sites must be categorized as owned lifecycle tasks, request-scoped tasks, deprecated/extracted workflow code, or defects before issue `#624` can close truthfully.
 
-Remaining lower-priority items:
-- Some `datetime.utcnow()` deprecation warnings exist but are not async-boundary issues.
-- Future feature additions should follow the pattern: async tools offload blocking work via `asyncio.to_thread()`.
+Remaining classification targets:
+- A2A task manager/worker task ownership.
+- Key rotation background execution ownership.
+- LLM preference persistence callback ownership.
+- Voice request-scoped VAD task behavior.
+- Training adapter task spawns, currently lower priority because those workflows are being extracted from core.
