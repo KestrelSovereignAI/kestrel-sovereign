@@ -212,6 +212,7 @@ class KestrelAgent(
 
         # Pending task completion notifications (for background tasks)
         self._pending_task_notifications: List[str] = []
+        self._background_tasks: set[asyncio.Task] = set()
 
         # Cancellation tracking for stop button functionality
         self._current_request_id: Optional[str] = None
@@ -1435,11 +1436,30 @@ Expected Duration: {expected_duration}
             except Exception as e:
                 logging.error(f"Post-response Phase 2 (background) failed: {e}", exc_info=True)
 
-        # Background task — named for debug visibility
-        task = asyncio.create_task(
+        # Background task — named for debug visibility and owned by shutdown.
+        self._track_background_task(
             _background_memory_processing(),
             name="post_response_memory_enrichment",
         )
+
+    def _track_background_task(self, coro, *, name: str) -> asyncio.Task:
+        """Start agent-owned background work and remove it when complete."""
+        task = asyncio.create_task(coro, name=name)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return task
+
+    async def _shutdown_background_tasks(self) -> None:
+        tasks = set(self._background_tasks)
+        if not tasks:
+            return
+
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+
+        await asyncio.gather(*tasks, return_exceptions=True)
+        self._background_tasks.clear()
 
     # Tool registry methods provided by ToolRegistryMixin:
     # - _build_feature_tools, _build_all_tools, _register_explored_feature_tools
@@ -1627,6 +1647,14 @@ Expected Duration: {expected_duration}
                 logging.warning(f"Error closing TaskManager: {e}")
             except Exception as e:
                 logging.warning(f"Error closing TaskManager: {e}", exc_info=True)
+
+        # Cancel agent-owned background work before storage/sync shutdown.
+        try:
+            await self._shutdown_background_tasks()
+        except asyncio.CancelledError:
+            logging.debug("Background task shutdown cancelled")
+        except Exception as e:
+            logging.warning(f"Error shutting down background tasks: {e}", exc_info=True)
 
         # Final snapshot to all sync targets before closing storage
         if getattr(self, '_sync_service', None) and self._sync_service.is_running:
