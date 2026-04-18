@@ -99,6 +99,11 @@ class MemorySystem:
         self._initialized = True
         logger.info(f"Memory system initialized for agent {self.agent_id}")
 
+    async def shutdown(self) -> None:
+        """Shut down owned memory background work before storage closes."""
+        if self.retriever:
+            await self.retriever.shutdown()
+
     async def tag_message(
         self,
         message_id: int,

@@ -118,8 +118,7 @@ class TestRetrieveTriggersAccessUpdate:
             limit=2,
         )
 
-        # Give the fire-and-forget tasks time to run
-        await asyncio.sleep(0.05)
+        await retriever.drain_access_updates()
 
         assert len(results) > 0, "retrieve returned no results to verify against"
         # Each surfaced memory should have triggered an access update
@@ -127,6 +126,41 @@ class TestRetrieveTriggersAccessUpdate:
         called_ids = {call[0] for call in update_access_calls}
         result_ids = {r["id"] for r in results}
         assert called_ids == result_ids
+
+    @pytest.mark.asyncio
+    async def test_shutdown_cancels_pending_access_updates(self):
+        """Access-count bookkeeping is owned and cancelled during shutdown."""
+        conv_store = MagicMock()
+        conv_store.agent_id = "test-agent"
+        conv_store.get_conversation_history = AsyncMock(return_value=[
+            {"id": 1, "role": "assistant", "content": "I love sunny days",
+             "metadata": {"importance": 0.8}, "created_at": "2026-04-18T10:00:00Z"},
+        ])
+
+        retriever = MemoryRetriever(conversation_store=conv_store)
+        started = asyncio.Event()
+
+        async def never_finishes(message_id, agent_id):
+            started.set()
+            await asyncio.Event().wait()
+
+        retriever.update_access = never_finishes
+
+        await retriever.retrieve(
+            query="sunny weather",
+            agent_id="test-agent",
+            min_score=0.0,
+            limit=1,
+        )
+        await started.wait()
+
+        task = next(iter(retriever._access_update_tasks))
+
+        await retriever.shutdown()
+
+        assert task.done()
+        assert task.cancelled()
+        assert retriever._access_update_tasks == set()
 
 
 class TestMemoryConsolidateToolExists:
