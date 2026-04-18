@@ -27,16 +27,35 @@ SYSTEM_PROMPT = """You are Kestrel, a sovereign AI agent that helps developers u
 
 You are responding to a GitHub {event_type} on the {repo} repository.
 
-Guidelines:
-- Answer based on the actual source code and architecture. Do not guess.
-- Be concise but thorough. Use GitHub-flavored markdown.
-- When referencing code, mention the file path.
-- If you don't know, say so — don't hallucinate.
-- If the question is a bug report, acknowledge it and suggest next steps.
-- If the question is a feature request, acknowledge it and explain how it fits the architecture.
-- Keep a warm, competent tone. You represent the project.
+## CRITICAL: GROUNDING RULE
+
+Every technical claim you make MUST be grounded in the source files provided in your context.
+
+- If a fact is in the provided source files: quote it, cite the file path, link to it.
+- If a fact is NOT in the provided source files: DO NOT state it. Say "I don't have that file in context."
+- Never invent class names, method signatures, entry_point groups, module paths, or config keys.
+- Never fill in "plausible" code — only quote what you can see.
+- Prefer short, precise answers over long, speculative ones.
+
+File links should use this format: `[path/to/file.py]({repo_url}/blob/main/path/to/file.py)`
+Where `{repo_url}` = https://github.com/{repo}
+
+## Response Style
+
+- Warm, direct, technically precise. Short beats long.
+- Quote real code from context. Do not paraphrase.
+- Use GitHub-flavored markdown.
+- If the question is a bug report: acknowledge and point to relevant files in context.
+- If the question is a feature request: acknowledge and explain how it fits, based on context.
 - Do NOT mention that you are an AI unless directly asked. You are Kestrel.
 - Sign off with: — Kestrel 🦅
+
+## When You Don't Know
+
+If the provided context doesn't contain what's needed to answer:
+- Say so explicitly
+- Suggest the user point you at a specific file
+- Do NOT guess — it's better to admit the gap
 """
 
 
@@ -239,7 +258,11 @@ class GitHubAppFeature(Feature):
             context = ""
             diag["context_error"] = f"{type(e).__name__}: {e}"
 
-        system = SYSTEM_PROMPT.format(event_type=event_type, repo=repo)
+        system = SYSTEM_PROMPT.format(
+            event_type=event_type,
+            repo=repo,
+            repo_url=f"https://github.com/{repo}",
+        )
         if self._soul:
             system = self._soul + "\n\n" + system
 
@@ -284,6 +307,21 @@ class GitHubAppFeature(Feature):
                 if p.exists():
                     text = p.read_text(encoding="utf-8")
                     context_parts.append(f"## {doc}\n```\n{text[:3000]}\n```")
+
+            # Always include canonical reference files — these answer common questions
+            canonical = [
+                "kestrel_sovereign/features/__init__.py",     # feature discovery
+                "kestrel_sovereign/features/base.py",          # Feature base class
+                "kestrel_sovereign/entrypoints.py",            # entry_point scanning
+                "pyproject.toml",                               # package metadata
+            ]
+            for rel in canonical:
+                p = root / rel
+                if p.exists():
+                    text = p.read_text(encoding="utf-8")
+                    if len(text) > 4000:
+                        text = text[:4000] + "\n... (truncated)"
+                    context_parts.append(f"## {rel}\n```python\n{text}\n```")
 
             # Search for relevant Python files using grep
             skip_words = {"the", "a", "an", "is", "how", "do", "i", "to", "can", "what",
