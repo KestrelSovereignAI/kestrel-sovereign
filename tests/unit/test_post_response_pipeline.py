@@ -310,8 +310,15 @@ class TestPostResponsePipeline:
     @pytest.fixture
     def mock_agent(self):
         """Build a minimal mock of KestrelAgent with pipeline dependencies."""
+        from kestrel_sovereign.kestrel_agent import KestrelAgent
+
         agent = MagicMock()
         agent.agent_id = "did:pkh:test"
+        agent._background_tasks = set()
+        agent._track_background_task = KestrelAgent._track_background_task.__get__(
+            agent,
+            KestrelAgent,
+        )
 
         # Memory system
         agent.memory_system = MagicMock()

@@ -46,13 +46,15 @@ audit in issue `#624`, focused on maintained runtime surfaces.
   - Fixed by offloading training setup, process launch/termination, log reads, output scans, LoRA reads, cleanup, generation artifact checks, and artifact reads/writes via `asyncio.to_thread()`.
 - `GitHubAppFeature` accepted webhooks and launched event handlers with bare `asyncio.create_task()`, leaving in-flight tasks unowned during shutdown.
   - Fixed by tracking webhook event tasks, removing completed tasks from the set, and cancelling/awaiting any in-flight handlers during feature shutdown.
+- `KestrelAgent._post_response_pipeline()` launched post-response memory enrichment as an unowned background task, which could still be touching storage while shutdown closed storage.
+  - Fixed by adding agent-owned background task tracking and cancelling/awaiting those tasks before sync and storage shutdown.
 
 ### Resolved audit patterns
 
 - Conflicting close/shutdown contracts: resolved. Agent cleanup contract is `await agent.shutdown()`. MCPToolManager's sync `close()` is correctly called from async `shutdown()`.
 - Command/API parity: verified. `CommandHandler.handle()` properly dispatches both sync and async results.
 - Blocking subprocess/file work on async paths: resolved. All maintained tool paths now offload via `asyncio.to_thread()`.
-- Background-task and scheduler paths: refreshed. Scheduler, heartbeat, and GitHub App webhook handling use owned async task patterns with shutdown cleanup.
+- Background-task and scheduler paths: refreshed. Scheduler, heartbeat, GitHub App webhook handling, and agent post-response enrichment use owned async task patterns with shutdown cleanup.
 - `get_event_loop()` elimination: zero remaining calls in maintained source (`kestrel_sovereign/` and `endpoints/`).
 
 ## Initial high-risk surfaces

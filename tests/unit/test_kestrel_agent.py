@@ -776,6 +776,53 @@ class TestLifecycle:
         # Should not raise exception
         await agent.shutdown()
 
+    @pytest.mark.asyncio
+    async def test_background_task_removed_after_completion(self, tmp_path):
+        """Agent-owned background tasks are removed when they finish."""
+        agent = KestrelAgent(
+            did="did:test:123",
+            storage_path=str(tmp_path / "test.db")
+        )
+
+        async def complete():
+            return None
+
+        task = agent._track_background_task(complete(), name="test_complete")
+
+        await task
+        await asyncio.sleep(0)
+
+        assert agent._background_tasks == set()
+
+    @pytest.mark.asyncio
+    async def test_shutdown_cancels_background_tasks_before_storage_close(self, tmp_path):
+        """shutdown() cancels agent-owned background tasks before closing storage."""
+        agent = KestrelAgent(
+            did="did:test:123",
+            storage_path=str(tmp_path / "test.db")
+        )
+        started = asyncio.Event()
+
+        async def never_finishes():
+            started.set()
+            await asyncio.Event().wait()
+
+        task = agent._track_background_task(never_finishes(), name="test_pending")
+        await started.wait()
+
+        agent.features = {}
+        agent.llm_service = None
+        agent.task_manager = None
+        mock_storage = AsyncMock()
+        mock_storage.close = AsyncMock()
+        agent.storage = mock_storage
+
+        await agent.shutdown()
+
+        assert task.done()
+        assert agent._background_tasks == set()
+        mock_storage.close.assert_called_once()
+
 
 # =============================================================================
 # Tests for Error Handling
