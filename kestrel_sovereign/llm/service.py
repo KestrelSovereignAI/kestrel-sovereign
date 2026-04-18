@@ -154,6 +154,7 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         # Persistence callback for model preference (writes to database)
         # Set via set_preference_persistence_callback() after initialization
         self._preference_persistence_callback = None
+        self._preference_persistence_tasks: set[asyncio.Task[None]] = set()
 
     def set_preference_persistence_callback(self, callback) -> None:
         """Set the persistence callback for model preference.
@@ -190,13 +191,7 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
 
         # Persist to database if callback is registered
         if self._preference_persistence_callback:
-            import asyncio
-            try:
-                loop = asyncio.get_running_loop()
-                loop.create_task(self._preference_persistence_callback(model, provider))
-            except RuntimeError:
-                # No running loop — skip persistence (happens in tests/sync contexts)
-                pass
+            self._schedule_preference_persistence(model, provider)
 
     def clear_model_preference(self) -> None:
         """Clear any mandated model preference, returning to default behavior."""
@@ -205,12 +200,58 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
 
         # Persist the cleared preference
         if self._preference_persistence_callback:
-            import asyncio
-            try:
-                loop = asyncio.get_running_loop()
-                loop.create_task(self._preference_persistence_callback(None, None))
-            except RuntimeError:
-                pass
+            self._schedule_preference_persistence(None, None)
+
+    def _schedule_preference_persistence(
+        self,
+        model: Optional[str],
+        provider: Optional[str],
+    ) -> Optional[asyncio.Task[None]]:
+        """Own preference persistence callbacks so close() can await them."""
+        if not self._preference_persistence_callback:
+            return None
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # No running loop — skip persistence (happens in tests/sync contexts)
+            return None
+
+        task = loop.create_task(
+            self._preference_persistence_callback(model, provider),
+            name="llm-preference-persistence",
+        )
+        self._preference_persistence_tasks.add(task)
+        task.add_done_callback(self._handle_preference_persistence_done)
+        return task
+
+    def _handle_preference_persistence_done(self, task: asyncio.Task[None]) -> None:
+        self._preference_persistence_tasks.discard(task)
+        if task.cancelled():
+            return
+        try:
+            exc = task.exception()
+        except asyncio.CancelledError:
+            return
+        if exc:
+            logger.warning(
+                "Model preference persistence failed: %s",
+                exc,
+                exc_info=(type(exc), exc, exc.__traceback__),
+            )
+
+    async def drain_preference_persistence(self, *, cancel: bool = False) -> None:
+        """Wait for scheduled model-preference persistence callbacks."""
+        tasks = set(self._preference_persistence_tasks)
+        if not tasks:
+            return
+
+        if cancel:
+            for task in tasks:
+                task.cancel()
+
+        await asyncio.gather(*tasks, return_exceptions=True)
+        self._preference_persistence_tasks.difference_update(tasks)
 
     def get_active_model_id(self) -> str:
         """Get the resolved model ID currently in use.
@@ -985,7 +1026,7 @@ No other text or formatting.
 
     async def close(self):
         """Close all async HTTP clients properly."""
-        import asyncio
+        await self.drain_preference_persistence()
 
         for provider in self.providers:
             client = provider.get("client")
