@@ -823,6 +823,36 @@ class TestLifecycle:
         assert agent._background_tasks == set()
         mock_storage.close.assert_called_once()
 
+    @pytest.mark.asyncio
+    async def test_shutdown_stops_memory_system_before_storage_close(self, tmp_path):
+        """Memory-owned background work is stopped before storage closes."""
+        agent = KestrelAgent(
+            did="did:test:123",
+            storage_path=str(tmp_path / "test.db")
+        )
+        call_order = []
+
+        async def shutdown_memory():
+            call_order.append("memory")
+
+        async def close_storage():
+            call_order.append("storage")
+
+        agent.features = {}
+        agent.llm_service = None
+        agent.task_manager = None
+        agent.memory_system = MagicMock()
+        agent.memory_system.shutdown = AsyncMock(side_effect=shutdown_memory)
+        mock_storage = AsyncMock()
+        mock_storage.close = AsyncMock(side_effect=close_storage)
+        agent.storage = mock_storage
+
+        await agent.shutdown()
+
+        agent.memory_system.shutdown.assert_called_once()
+        mock_storage.close.assert_called_once()
+        assert call_order == ["memory", "storage"]
+
 
 # =============================================================================
 # Tests for Error Handling

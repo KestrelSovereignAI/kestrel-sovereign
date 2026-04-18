@@ -1656,6 +1656,16 @@ Expected Duration: {expected_duration}
         except Exception as e:
             logging.warning(f"Error shutting down background tasks: {e}", exc_info=True)
 
+        # Stop memory-owned bookkeeping before storage/sync shutdown.
+        memory_system = getattr(self, "memory_system", None)
+        if memory_system and hasattr(memory_system, "shutdown"):
+            try:
+                await memory_system.shutdown()
+            except asyncio.CancelledError:
+                logging.debug("Memory system shutdown cancelled")
+            except Exception as e:
+                logging.warning(f"Error shutting down memory system: {e}", exc_info=True)
+
         # Final snapshot to all sync targets before closing storage
         if getattr(self, '_sync_service', None) and self._sync_service.is_running:
             try:
