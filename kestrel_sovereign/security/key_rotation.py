@@ -18,10 +18,10 @@ import logging
 import os
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Coroutine, Dict, List, Optional
 
 from cryptography.fernet import Fernet
 
@@ -107,6 +107,7 @@ class KeyRotationService:
         """
         self.storage = storage
         self._current_rotation: Optional[RotationRecord] = None
+        self._rotation_tasks: set[asyncio.Task[None]] = set()
 
     async def initialize(self):
         """Create rotation tracking tables if they don't exist."""
@@ -184,7 +185,7 @@ class KeyRotationService:
         # Create rotation record
         rotation = RotationRecord(
             id=str(uuid.uuid4()),
-            started_at=datetime.utcnow(),
+            started_at=datetime.now(timezone.utc),
             old_key_hash=_hash_key(old_key),
             new_key_hash=_hash_key(new_key),
             status=RotationStatus.IN_PROGRESS,
@@ -202,8 +203,10 @@ class KeyRotationService:
             f"{rotation.records_total} records to process"
         )
 
-        # Start rotation in background
-        asyncio.create_task(self._execute_rotation(rotation, old_fernet, new_fernet))
+        self._track_rotation_task(
+            self._execute_rotation(rotation, old_fernet, new_fernet),
+            rotation.id,
+        )
 
         return rotation.id
 
@@ -255,9 +258,45 @@ class KeyRotationService:
         new_fernet = _validate_key(new_key)
 
         self._current_rotation = rotation
-        asyncio.create_task(self._execute_rotation(rotation, old_fernet, new_fernet))
+        self._track_rotation_task(
+            self._execute_rotation(rotation, old_fernet, new_fernet),
+            rotation.id,
+        )
 
         return True
+
+    def _track_rotation_task(
+        self,
+        coro: Coroutine[Any, Any, None],
+        rotation_id: str,
+    ) -> asyncio.Task[None]:
+        """Own background rotation tasks so shutdown cannot orphan DB writes."""
+        task = asyncio.create_task(coro, name=f"key-rotation-{rotation_id}")
+        self._rotation_tasks.add(task)
+        task.add_done_callback(self._rotation_tasks.discard)
+        return task
+
+    async def drain_rotations(self, *, cancel: bool = False) -> None:
+        """Wait for tracked rotation tasks, optionally cancelling for shutdown."""
+        tasks = set(self._rotation_tasks)
+        if not tasks:
+            return
+
+        if cancel:
+            for task in tasks:
+                task.cancel()
+
+        await asyncio.gather(*tasks, return_exceptions=True)
+        self._rotation_tasks.difference_update(tasks)
+
+    async def shutdown(self) -> None:
+        """
+        Stop owned rotation tasks before storage closes.
+
+        Cancelled rotations remain in-progress in the tracking table and can be
+        resumed through the existing resume path.
+        """
+        await self.drain_rotations(cancel=True)
 
     async def _execute_rotation(
         self,
@@ -285,7 +324,7 @@ class KeyRotationService:
 
             # Rotation complete
             rotation.status = RotationStatus.COMPLETED
-            rotation.completed_at = datetime.utcnow()
+            rotation.completed_at = datetime.now(timezone.utc)
             await self._save_rotation(rotation)
 
             logger.info(
@@ -296,7 +335,7 @@ class KeyRotationService:
         except Exception as e:
             rotation.status = RotationStatus.FAILED
             rotation.error_message = str(e)
-            rotation.completed_at = datetime.utcnow()
+            rotation.completed_at = datetime.now(timezone.utc)
             await self._save_rotation(rotation)
             logger.error(f"Key rotation {rotation.id} failed: {e}")
 
@@ -351,7 +390,7 @@ class KeyRotationService:
                 # Mark as rotated
                 await self.storage.database.execute(
                     "INSERT INTO rotation_progress (rotation_id, table_name, record_id, rotated_at) VALUES (?, ?, ?, ?)",
-                    (rotation.id, table, record_id_str, datetime.utcnow().isoformat())
+                    (rotation.id, table, record_id_str, datetime.now(timezone.utc).isoformat())
                 )
 
                 rotation.records_processed += 1
