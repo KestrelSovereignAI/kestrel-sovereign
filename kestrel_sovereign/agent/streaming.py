@@ -56,10 +56,12 @@ class StreamingMixin:
         })
 
         try:
-            async for chunk in self._process_input_streaming_traced(
-                user_input, model_override, session_id, _otel_span
-            ):
-                yield chunk
+            transition_lock = self._get_privacy_transition_lock()
+            async with transition_lock:
+                async for chunk in self._process_input_streaming_traced(
+                    user_input, model_override, session_id, _otel_span
+                ):
+                    yield chunk
         except Exception as exc:
             end_span(_otel_span, error=exc)
             raise
