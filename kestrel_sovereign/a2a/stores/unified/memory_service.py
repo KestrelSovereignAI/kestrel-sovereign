@@ -1,12 +1,40 @@
 """
-Unified MemoryService - Backend-Agnostic Long-term Memory.
+Unified MemoryService — Task Completion Archive.
 
-Provides persistent, searchable long-term memory for agents:
+Provides persistent, searchable archival storage for completed agent tasks:
 - Full-text search via FTS5 (SQLite) or GIN (PostgreSQL)
 - Tag-based filtering
 - Session history linkage
 
 Works with both SQLite and PostgreSQL backends.
+
+THIS IS NOT THE COGNITIVE MEMORY SYSTEM
+---------------------------------------
+Despite the "Memory" name, this service is NOT the same as the cognitive
+memory system in `kestrel_sovereign/storage/memory_system.py`. The naming
+is historical and confusing — see #623 for context.
+
+This service archives **completed A2A tasks** for audit/replay purposes:
+- Written to once per task completion (`task_manager._save_to_memory`)
+- Reads exposed via API but currently unused in production code
+- Stores full task conversation transcripts with FTS indexing
+
+The cognitive memory system (MemorySystem) handles:
+- Per-message emotional tagging
+- Ebbinghaus decay
+- Mood-congruent retrieval
+- Episode consolidation
+
+WHEN TO USE WHICH:
+- **Task completion archival / audit** → MemoryService (this module)
+- **Cognitive memory / message recall** → MemorySystem
+- **Document / RAG search** → AsyncRAGStore
+
+See docs/architecture/MEMORY_SYSTEM.md for the full decision matrix.
+
+A future refactor may rename this to `TaskArchiveService` to reduce
+confusion, but the current name is preserved for backward compatibility
+with the A2A protocol surface.
 """
 
 import logging
