@@ -492,6 +492,25 @@ class TestBackendLifecycle:
         await llm_service.close()
 
     @pytest.mark.asyncio
+    async def test_close_accepts_sync_provider_close(self, llm_service, caplog):
+        """Provider clients may expose synchronous close() methods."""
+        sync_client = Mock()
+        sync_client.close = Mock(return_value=None)
+
+        llm_service.providers = [{
+            "name": "sync_provider",
+            "client": sync_client,
+            "adapter": Mock(),
+            "model": "test",
+        }]
+
+        caplog.set_level("WARNING")
+        await llm_service.close()
+
+        sync_client.close.assert_called_once()
+        assert "Unexpected error closing sync_provider client" not in caplog.text
+
+    @pytest.mark.asyncio
     async def test_set_observability_store(self, llm_service):
         """Test setting observability store."""
         mock_store = Mock()
