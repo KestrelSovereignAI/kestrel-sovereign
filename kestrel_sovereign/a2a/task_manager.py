@@ -13,7 +13,7 @@ This is the primary API for working with A2A tasks.
 import asyncio
 import logging
 from datetime import datetime
-from typing import Any, AsyncGenerator, Callable, Optional
+from typing import Any, AsyncGenerator, Callable, Coroutine, Optional
 
 from kestrel_sovereign.kestrel_config.constants import HTTP_TIMEOUT_DEFAULT
 
@@ -110,6 +110,9 @@ class TaskManager:
         # Command prefix -> (agent_id, skill_id) mapping
         self._command_to_skill: dict[str, tuple[str, str]] = {}
 
+        # Background skill executions started by execute_skill(sync=False).
+        self._execution_tasks: set[asyncio.Task[None]] = set()
+
     async def initialize(self) -> None:
         """Initialize all stores."""
         await self.task_store.initialize()
@@ -127,6 +130,8 @@ class TaskManager:
         This must be called during shutdown to prevent thread leaks from
         aiosqlite connections.
         """
+        await self.drain_execution_tasks(cancel=True)
+
         # Close all stores in reverse order of initialization
         if self.feedback_store:
             try:
@@ -384,9 +389,28 @@ class TaskManager:
 
             return task
         else:
-            # Return immediately, execute in background
-            asyncio.create_task(self._execute_async(handler, task))
+            self._track_execution_task(self._execute_async(handler, task), task.id)
             return task
+
+    def _track_execution_task(self, coro: Coroutine[Any, Any, None], task_id: str) -> asyncio.Task[None]:
+        """Own background task execution so close() can cancel and await it."""
+        task = asyncio.create_task(coro, name=f"a2a-task-{task_id}")
+        self._execution_tasks.add(task)
+        task.add_done_callback(self._execution_tasks.discard)
+        return task
+
+    async def drain_execution_tasks(self, *, cancel: bool = False) -> None:
+        """Wait for tracked background executions, optionally cancelling them."""
+        tasks = set(self._execution_tasks)
+        if not tasks:
+            return
+
+        if cancel:
+            for task in tasks:
+                task.cancel()
+
+        await asyncio.gather(*tasks, return_exceptions=True)
+        self._execution_tasks.difference_update(tasks)
 
     async def _execute_async(self, handler: TaskHandler, task: Task) -> None:
         """Execute a task asynchronously and update the store."""
@@ -394,6 +418,14 @@ class TaskManager:
             task = await handler.handle_task(task)
             await self.task_store.save(task)
             await self._notify_status_update(task, final=True)
+        except asyncio.CancelledError:
+            task.status = TaskStatus(
+                state=TaskState.CANCELED,
+                message=Message(role="agent", parts=[TextPart(text="Task cancelled during shutdown")])
+            )
+            await self.task_store.save(task)
+            await self._notify_status_update(task, final=True)
+            raise
         except Exception as e:
             logger.error(f"Async task execution failed: {e}")
             task.status = TaskStatus(
