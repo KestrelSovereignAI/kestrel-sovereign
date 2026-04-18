@@ -57,9 +57,11 @@ class AsyncConversationStore:
         """Backward compatibility - return agent fernet or global."""
         return self._agent_fernet or self._global_fernet
 
-    # 30-min inactivity = new implicit session. Matches the SESSION_GAP_MINUTES
-    # constant defined independently in memory_consolidator.py and wellness/metrics.py.
-    _IMPLICIT_SESSION_GAP_MINUTES = 30
+    # Session boundary constant: see kestrel_sdk.config.constants
+    @property
+    def _IMPLICIT_SESSION_GAP_MINUTES(self) -> int:
+        from kestrel_sdk.config.constants import SESSION_GAP_MINUTES
+        return SESSION_GAP_MINUTES
 
     async def _derive_implicit_session_id(self) -> Optional[str]:
         """
@@ -291,8 +293,7 @@ class AsyncConversationStore:
             List of raw rows (id, role, content, metadata, created_at)
         """
         from datetime import datetime
-
-        SESSION_GAP_MINUTES = 30
+        from kestrel_sdk.config.constants import SESSION_GAP_MINUTES
 
         # Try to interpret session_id as a message ID for time-based grouping.
         # If it isn't (e.g. a UUID-based implicit session_id), skip this path

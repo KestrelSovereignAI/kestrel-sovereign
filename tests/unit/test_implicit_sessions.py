@@ -183,3 +183,44 @@ class TestErrorIsolation:
 
         # Insert was still attempted
         db.execute_commit.assert_called_once()
+
+
+class TestSessionGapMinutesCentralized:
+    """Verify all three subsystems read SESSION_GAP_MINUTES from the
+    central SDK constant, not local copies.
+
+    Previous state: 3 files independently defined SESSION_GAP_MINUTES = 30
+    (storage/async_conversation_store.py, storage/memory_consolidator.py,
+    features/wellness/metrics.py). If any one drifted, sessions would
+    fragment differently across subsystems.
+    """
+
+    def test_sdk_constant_exists(self):
+        from kestrel_sdk.config.constants import SESSION_GAP_MINUTES
+        assert SESSION_GAP_MINUTES == 30
+
+    def test_async_conversation_store_uses_sdk_constant(self, monkeypatch):
+        """Patch the SDK constant; AsyncConversationStore must follow."""
+        import kestrel_sdk.config.constants as sdk_constants
+        from kestrel_sovereign.storage.async_conversation_store import AsyncConversationStore
+        monkeypatch.setattr(sdk_constants, "SESSION_GAP_MINUTES", 99)
+
+        # Use a minimal stub to access the property
+        store = AsyncConversationStore.__new__(AsyncConversationStore)
+        assert store._IMPLICIT_SESSION_GAP_MINUTES == 99
+
+    def test_memory_consolidator_uses_sdk_constant(self, monkeypatch):
+        import kestrel_sdk.config.constants as sdk_constants
+        from kestrel_sovereign.storage.memory_consolidator import MemoryConsolidator
+        monkeypatch.setattr(sdk_constants, "SESSION_GAP_MINUTES", 77)
+
+        consolidator = MemoryConsolidator.__new__(MemoryConsolidator)
+        assert consolidator.SESSION_GAP_MINUTES == 77
+
+    def test_wellness_metrics_uses_sdk_constant(self, monkeypatch):
+        import kestrel_sdk.config.constants as sdk_constants
+        from kestrel_sovereign.features.wellness.metrics import SessionContinuityCalculator
+        monkeypatch.setattr(sdk_constants, "SESSION_GAP_MINUTES", 55)
+
+        calc = SessionContinuityCalculator.__new__(SessionContinuityCalculator)
+        assert calc.SESSION_GAP_MINUTES == 55
