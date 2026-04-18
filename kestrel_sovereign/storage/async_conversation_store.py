@@ -57,6 +57,70 @@ class AsyncConversationStore:
         """Backward compatibility - return agent fernet or global."""
         return self._agent_fernet or self._global_fernet
 
+    # 30-min inactivity = new implicit session. Matches the SESSION_GAP_MINUTES
+    # constant defined independently in memory_consolidator.py and wellness/metrics.py.
+    _IMPLICIT_SESSION_GAP_MINUTES = 30
+
+    async def _derive_implicit_session_id(self) -> Optional[str]:
+        """
+        Derive an implicit session_id from the time-gap heuristic.
+
+        Returns the previous message's session_id if it was within
+        the last 30 minutes; otherwise mints a new UUID for a new
+        implicit session.
+
+        This makes the implicit session boundaries already used by
+        MemoryConsolidator and wellness metrics observable in metadata,
+        so callers that filter by session_id get sensible groupings
+        even when no explicit session_id is provided.
+        """
+        try:
+            row = await self.db.fetchone(
+                "SELECT metadata, created_at FROM conversation_history "
+                "WHERE agent_id = ? ORDER BY id DESC LIMIT 1",
+                (self.agent_id,),
+            )
+            if not row:
+                # First message ever — start a new session
+                return self._new_session_id()
+
+            prev_metadata_str, prev_created_at = row
+            prev_meta = json.loads(prev_metadata_str) if prev_metadata_str else {}
+
+            # If the previous message has no session_id (legacy data), start fresh
+            prev_sid = prev_meta.get("session_id")
+            if not prev_sid:
+                return self._new_session_id()
+
+            # Compare gap; reuse if within window
+            from datetime import datetime, timezone, timedelta
+            if isinstance(prev_created_at, str):
+                try:
+                    prev_dt = datetime.fromisoformat(prev_created_at.replace("Z", "+00:00"))
+                except ValueError:
+                    return self._new_session_id()
+            else:
+                return self._new_session_id()
+
+            if prev_dt.tzinfo is None:
+                prev_dt = prev_dt.replace(tzinfo=timezone.utc)
+
+            now = datetime.now(timezone.utc)
+            gap = now - prev_dt
+            if gap < timedelta(minutes=self._IMPLICIT_SESSION_GAP_MINUTES):
+                return prev_sid
+            return self._new_session_id()
+        except Exception as e:
+            # Never let implicit-session derivation block the write
+            logger.warning(f"Implicit session derivation failed: {e}")
+            return None
+
+    @staticmethod
+    def _new_session_id() -> str:
+        """Mint a new implicit session_id (UUID4)."""
+        import uuid
+        return str(uuid.uuid4())
+
     async def add_conversation(self, role: str, content: str,
                                metadata: Optional[Dict] = None,
                                session_id: Optional[str] = None) -> None:
@@ -68,10 +132,15 @@ class AsyncConversationStore:
             metadata: Optional metadata dict
             session_id: If provided, link this message to a specific session.
                        This allows resuming old conversations beyond the 30-min gap.
+                       If not provided, an implicit session_id is derived from
+                       the time-gap heuristic (30 min inactivity = new session).
         """
         meta = dict(metadata) if metadata else {}
 
-        # Store session_id in metadata for session continuity
+        # Resolve session_id: explicit wins; otherwise derive from time gap
+        if not session_id:
+            session_id = await self._derive_implicit_session_id()
+
         if session_id:
             meta['session_id'] = session_id
 
@@ -225,28 +294,28 @@ class AsyncConversationStore:
 
         SESSION_GAP_MINUTES = 30
 
-        # Get the start time of this session (if session_id is a message ID)
-        row_id = coerce_persistent_message_id(session_id)
-        if row_id is None:
-            return []
-
-        start_row = await self.db.fetchone(
-            "SELECT created_at FROM conversation_history WHERE id = ? AND agent_id = ?",
-            (row_id, self.agent_id)
-        )
-
-        # If session_id is a message ID, get messages from that timestamp forward
+        # Try to interpret session_id as a message ID for time-based grouping.
+        # If it isn't (e.g. a UUID-based implicit session_id), skip this path
+        # and fall through to the metadata-based lookup below.
         all_rows = []
-        if start_row:
-            start_time = start_row[0]
-            all_rows = await self.db.fetchall(
-                """SELECT id, role, content, metadata, created_at
-                   FROM conversation_history
-                   WHERE agent_id = ? AND created_at >= ?
-                   ORDER BY created_at ASC
-                   LIMIT ?""",
-                (self.agent_id, start_time, limit * 2)  # Fetch extra in case of filtering
+        row_id = coerce_persistent_message_id(session_id)
+        if row_id is not None:
+            start_row = await self.db.fetchone(
+                "SELECT created_at FROM conversation_history WHERE id = ? AND agent_id = ?",
+                (row_id, self.agent_id)
             )
+
+            # If session_id is a message ID, get messages from that timestamp forward
+            if start_row:
+                start_time = start_row[0]
+                all_rows = await self.db.fetchall(
+                    """SELECT id, role, content, metadata, created_at
+                       FROM conversation_history
+                       WHERE agent_id = ? AND created_at >= ?
+                       ORDER BY created_at ASC
+                       LIMIT ?""",
+                    (self.agent_id, start_time, limit * 2)  # Fetch extra in case of filtering
+                )
 
         # Also get messages that explicitly belong to this session (resumed conversations)
         # These are messages with session_id in metadata that may come after a time gap
