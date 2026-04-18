@@ -566,9 +566,11 @@ turn boundaries.
 
 ### A2A protocol sessions (`a2a_sessions` table)
 
-Defined for the agent-to-agent protocol layer. Currently empty in
-single-agent deployments — populated when agents coordinate over
-the A2A task protocol.
+Populated by `TaskManager.create_task()` whenever an A2A task arrives
+(`a2a/task_manager.py:511`). Single-agent deployments that only receive
+`/agent/invoke` requests will see this table empty — that's expected,
+not a bug. The wiring is correct; the table populates when other
+agents start coordinating tasks via the A2A protocol.
 
 ### Why the multiple concepts?
 
@@ -581,9 +583,11 @@ Each session table answers a different question:
 | `reflection_sessions` | "When did the agent last reflect?" |
 | `a2a_sessions` | "What multi-agent task is this part of?" |
 
-They are not redundant; they serve different layers. The drift risk is
-in the shared `SESSION_GAP_MINUTES = 30` constant defined in three
-files independently. A future refactor could centralize that.
+They are not redundant; they serve different layers. The
+`SESSION_GAP_MINUTES` constant is centralized in
+`kestrel_sdk.config.constants`; AsyncConversationStore,
+MemoryConsolidator, and SessionContinuityCalculator all read from
+that single source so the three subsystems can't drift apart.
 
 ---
 

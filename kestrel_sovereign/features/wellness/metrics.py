@@ -261,8 +261,11 @@ class SessionContinuityCalculator:
     the agent's engagement has been.
     """
 
-    # Gap in minutes that defines a new session
-    SESSION_GAP_MINUTES = 30
+    @property
+    def SESSION_GAP_MINUTES(self) -> int:  # noqa: N802 (kept uppercase for back-compat)
+        """Session boundary constant — see kestrel_sdk.config.constants."""
+        from kestrel_sdk.config.constants import SESSION_GAP_MINUTES as _GAP
+        return _GAP
 
     async def measure(
         self, db, agent_id: str, lookback_days: int = 30
