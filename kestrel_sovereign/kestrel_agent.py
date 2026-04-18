@@ -191,6 +191,7 @@ class KestrelAgent(
         self._current_request_id: Optional[str] = None
         self._active_request_ids: set[str] = set()
         self._cancelled_requests: set = set()
+        self._privacy_transition_lock = asyncio.Lock()
 
         # Session state
         self._session_briefed = False
@@ -593,6 +594,14 @@ class KestrelAgent(
     def privacy_mode(self) -> PrivacyMode:
         """Get current privacy mode."""
         return self._privacy_mode
+
+    def _get_privacy_transition_lock(self) -> asyncio.Lock:
+        """Return the lock that serializes privacy transitions with active streams."""
+        lock = getattr(self, "_privacy_transition_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._privacy_transition_lock = lock
+        return lock
     
     async def set_privacy_mode(self, mode: PrivacyMode) -> str:
         """Change privacy mode and return the user-facing status message."""
@@ -606,6 +615,11 @@ class KestrelAgent(
         This updates both the storage wrapper and the privacy agent.
         Note: Changing to a more restrictive mode does NOT delete existing data.
         """
+        async with self._get_privacy_transition_lock():
+            return await self._set_privacy_mode_with_effects_locked(mode)
+
+    async def _set_privacy_mode_with_effects_locked(self, mode: PrivacyMode) -> PrivacyTransitionResult:
+        """Apply a privacy-mode transition while holding the transition lock."""
         # Record agent consent before applying the change
         consent = self.features.get("ConsentFeature") if hasattr(self, 'features') else None
         if consent:
