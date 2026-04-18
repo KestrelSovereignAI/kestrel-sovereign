@@ -508,10 +508,14 @@ class MemoryFeature(Feature):
         """
         try:
             memory_system = getattr(self.agent, "memory_system", None)
-            if not memory_system or not getattr(memory_system, "consolidator", None):
-                return {"success": False, "error": "MemoryConsolidator not available on agent"}
+            if not memory_system:
+                return {"success": False, "error": "MemorySystem not available on agent"}
 
-            result = await memory_system.consolidator.run_consolidation()
+            # Go through the MemorySystem facade so None-safety is consistent
+            # with all other consolidate callers (sleep cycle, etc.)
+            result = await memory_system.consolidate()
+            if "error" in result:
+                return {"success": False, **result}
             return {"success": True, **result}
         except Exception as e:
             logger.error(f"memory_consolidate failed: {e}", exc_info=True)

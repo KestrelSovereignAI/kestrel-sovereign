@@ -40,8 +40,8 @@ class TestMemoryConsolidateEndToEnd:
         feature.agent = MagicMock()
         feature.disabled_skills = set()  # required by Feature.get_tools()
         feature.agent.memory_system = MagicMock()
-        feature.agent.memory_system.consolidator = MagicMock()
-        feature.agent.memory_system.consolidator.run_consolidation = AsyncMock(
+        # The tool now goes through MemorySystem.consolidate() facade
+        feature.agent.memory_system.consolidate = AsyncMock(
             return_value={
                 "episodes_created": 2,
                 "patterns_found": 1,
@@ -65,7 +65,7 @@ class TestMemoryConsolidateEndToEnd:
         assert "episodes_created" in str(result) or (
             isinstance(result, dict) and result.get("episodes_created") == 2
         )
-        feature.agent.memory_system.consolidator.run_consolidation.assert_awaited_once()
+        feature.agent.memory_system.consolidate.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_memory_consolidate_returns_failure_when_no_consolidator(self):
