@@ -13,6 +13,7 @@ import json
 import os
 import time
 import asyncio
+import inspect
 from kestrel_sovereign.kestrel_config.constants import STORAGE_CACHE_TTL_SECONDS
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Any, Optional, Union, Type, TYPE_CHECKING
@@ -51,6 +52,12 @@ from kestrel_sovereign.config import load_config
 from kestrel_sovereign.telemetry import optional_span
 
 logger = logging.getLogger(__name__)
+
+
+async def _wait_for_close_result(result: Any) -> None:
+    """Await asynchronous close results while accepting synchronous close APIs."""
+    if inspect.isawaitable(result):
+        await asyncio.wait_for(asyncio.shield(result), timeout=CLIENT_CLOSE_TIMEOUT)
 
 
 def resolve_active_model_selection(llm_service) -> Dict[str, Optional[str]]:
@@ -989,20 +996,14 @@ No other text or formatting.
                 if hasattr(client, "close") and callable(client.close):
                     # Wrap in shield and timeout to handle cancellation gracefully
                     try:
-                        await asyncio.wait_for(
-                            asyncio.shield(client.close()),
-                            timeout=CLIENT_CLOSE_TIMEOUT
-                        )
+                        await _wait_for_close_result(client.close())
                     except asyncio.TimeoutError:
                         logger.debug(f"Timeout closing {provider.get('name')} client")
                     except asyncio.CancelledError:
                         logger.debug(f"Cancelled while closing {provider.get('name')} client")
                 elif hasattr(client, "_client") and hasattr(client._client, "aclose"):
                     try:
-                        await asyncio.wait_for(
-                            asyncio.shield(client._client.aclose()),
-                            timeout=CLIENT_CLOSE_TIMEOUT
-                        )
+                        await _wait_for_close_result(client._client.aclose())
                     except (asyncio.TimeoutError, asyncio.CancelledError):
                         pass
             except (ConnectionError, OSError) as e:
