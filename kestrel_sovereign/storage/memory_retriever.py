@@ -11,6 +11,7 @@ Retrieves memories using human-like weighting:
 This creates retrieval that feels like human memory:
 emotionally charged, important events stick better.
 """
+import asyncio
 import logging
 from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Any, Optional, Tuple
@@ -137,6 +138,13 @@ class MemoryRetriever:
             result = dict(msg)
             result["retrieval_score"] = round(score, 4)
             results.append(result)
+
+        # Rehearsal effect: bump access_count on the messages we actually
+        # surfaced. Fire-and-forget so it never blocks retrieval.
+        for result in results:
+            msg_id = result.get("id")
+            if msg_id is not None:
+                asyncio.create_task(self.update_access(msg_id, agent_id))
 
         return results
 
@@ -412,15 +420,39 @@ class MemoryRetriever:
         Update access count for a retrieved message.
 
         Called when a message is retrieved to strengthen the memory.
-        This implements the rehearsal effect.
+        This implements the rehearsal effect — accessed memories
+        decay slower (see calculate_decay below).
 
         Args:
             message_id: Database ID of the message
-            agent_id: Agent ID for verification
+            agent_id: Agent ID for verification (currently unused; store is
+                      already agent-scoped)
         """
-        # This would need to update the metadata in conversation_history
-        # For now, just log it - actual implementation depends on store API
-        logger.debug(f"Access update for message {message_id} (agent {agent_id})")
+        if not self.conversations or message_id is None:
+            return
+
+        try:
+            # Read current access_count atomically via the conversation store
+            row = await self.conversations.db.fetchone(
+                "SELECT metadata FROM conversation_history WHERE id = ? AND agent_id = ?",
+                (message_id, self.conversations.agent_id),
+            )
+            if not row:
+                return
+
+            current_meta = json.loads(row[0]) if row[0] else {}
+            new_count = (current_meta.get("access_count") or 0) + 1
+
+            await self.conversations.update_message_metadata(
+                message_id,
+                {
+                    "access_count": new_count,
+                    "last_accessed": datetime.now(timezone.utc).isoformat(),
+                },
+            )
+        except Exception as e:
+            # Never let rehearsal-effect bookkeeping break retrieval
+            logger.warning(f"update_access failed for message {message_id}: {e}")
 
 
 def calculate_decay(

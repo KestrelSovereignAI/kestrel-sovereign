@@ -47,7 +47,12 @@ class MemoryConsolidator:
     MIN_EPISODE_MESSAGES = 3       # Minimum messages for an episode
     MAX_EPISODE_HOURS = 24         # Maximum episode time span
     SESSION_EPISODE_THRESHOLD = 20 # Create episode after N messages in session
-    SESSION_GAP_MINUTES = 30       # Minutes of inactivity = session end
+
+    @property
+    def SESSION_GAP_MINUTES(self) -> int:  # noqa: N802 (kept uppercase for back-compat)
+        """Session boundary constant — see kestrel_sdk.config.constants."""
+        from kestrel_sdk.config.constants import SESSION_GAP_MINUTES as _GAP
+        return _GAP
 
     def __init__(self, db: AsyncDatabase, agent_id: str, graph_store=None):
         """

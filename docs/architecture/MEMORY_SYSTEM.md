@@ -4,6 +4,16 @@
 > *actually remembers*. Not just the facts -- the feelings, the weight,
 > the way a conversation mattered.
 
+> **Honest status (2026-04-18):** This document describes the cognitive
+> memory architecture as designed *and* as actually deployed. Subsystem
+> sections include "Deployment note" callouts where the deployed
+> behavior diverged from the design — for example, until #633 the
+> nightly consolidator never ran in production and `access_count`
+> was never incremented despite the rehearsal-effect math depending
+> on it. Each callout cites the PR that closed the gap.
+> If you find a section without evidence that the described behavior
+> actually runs in deployment, treat it as aspirational until verified.
+
 Kestrel's memory system is modeled on how human memory works. Memories
 are not stored in a flat database and retrieved by keyword match. They
 are emotionally tagged, importance-weighted, temporally decayed, and
@@ -21,10 +31,11 @@ for the right reasons.
 5. [Retrieval Scoring](#retrieval-scoring)
 6. [Associative Linking](#associative-linking)
 7. [Memory Consolidation](#memory-consolidation)
-8. [Memory Pinning (Agent Agency)](#memory-pinning-agent-agency)
-9. [Privacy Integration](#privacy-integration)
-10. [Configuration Reference](#configuration-reference)
-11. [Source Files](#source-files)
+8. [Sessions](#sessions)
+9. [Memory Pinning (Agent Agency)](#memory-pinning-agent-agency)
+10. [Privacy Integration](#privacy-integration)
+11. [Configuration Reference](#configuration-reference)
+12. [Source Files](#source-files)
 
 ---
 
@@ -354,6 +365,15 @@ Diminishing returns: the first few accesses matter most, matching the
 psychological finding that spaced repetition is more effective than
 massed repetition.
 
+> **Deployment note:** Until #633, `MemoryRetriever.update_access()`
+> was a stub that just called `logger.debug()` and returned. As a
+> result `access_count` stayed at 0 on every message in deployed agents
+> and the rehearsal-effect math always evaluated to `access_score = 0`.
+> The 10% access weight effectively contributed nothing to retrieval.
+> #633 implemented `update_access` against the atomic
+> `update_message_metadata` seam and wired it into `retrieve()` as a
+> fire-and-forget task for every surfaced memory.
+
 ### Minimum Score Threshold
 
 Results below `min_score` (default 0.1) are filtered out before sorting.
@@ -421,6 +441,13 @@ visualization and understanding how the agent's knowledge is structured.
 The `MemoryConsolidator` (`storage/memory_consolidator.py`) runs
 periodically -- analogous to how human memory consolidation occurs
 during sleep. It performs three operations.
+
+> **Deployment note:** Until #633, the consolidator existed in code but
+> nothing in production invoked it on a schedule, so `memory_episodes`
+> was empty in deployed agents. The `memory_consolidate` cron task and
+> the corresponding `MemoryFeature.memory_consolidate` tool were added
+> in that PR; consolidation now runs nightly at 04:00 when the
+> `MemoryFeature` is loaded.
 
 ### 1. Episode Creation
 
@@ -512,6 +539,75 @@ Episodes can also be created mid-session:
 | `MAX_EPISODE_HOURS` | 24 | Maximum episode time span |
 | `SESSION_EPISODE_THRESHOLD` | 20 | Auto-create episode after N messages |
 | `SESSION_GAP_MINUTES` | 30 | Inactivity = session end |
+
+---
+
+## Sessions
+
+Kestrel has multiple concepts called "session" that serve different purposes.
+This section maps them honestly.
+
+### Conversation sessions (implicit)
+
+The deployed conversation memory uses **time-gap-derived implicit sessions**.
+When a message is added without an explicit `session_id`,
+`AsyncConversationStore.add_conversation` derives one:
+
+- If the previous message was within `SESSION_GAP_MINUTES` (30 min), reuse
+  its `session_id`
+- Otherwise mint a fresh UUID4
+
+The `session_id` is stored in the message's metadata JSON. Callers that
+need session-scoped retrieval can pass the same `session_id` to
+`get_conversation_history(session_id=...)`. Explicit `session_id` from
+clients (e.g. via the `/agent/invoke` endpoint body) always wins over
+implicit derivation.
+
+> **Deployment note:** Before #633 there was no implicit derivation, so
+> `session_id` was effectively never populated unless a client explicitly
+> sent it (and no production client did). All messages had no session
+> marker even though three independent files defined `SESSION_GAP_MINUTES`
+> and the retrieval path supported session filtering.
+
+### Episode sessions (`memory_episodes` table)
+
+Created by `MemoryConsolidator.create_session_episode()` when a session
+has at least `MIN_EPISODE_MESSAGES` (3) messages and crosses the
+`SESSION_EPISODE_THRESHOLD` (20) or hits a 30-min gap. Each episode has
+`timespan_start` and `timespan_end`, effectively making episodes a
+session-summary table.
+
+### Reflection sessions (`reflection_sessions` table)
+
+Tracked by the reflection feature whenever a reflection cycle runs
+(every ~4 hours via the `reflect` cron). These are *meta*-sessions
+about the agent's self-reflection cadence, not about conversation
+turn boundaries.
+
+### A2A protocol sessions (`a2a_sessions` table)
+
+Populated by `TaskManager.create_task()` whenever an A2A task arrives
+(`a2a/task_manager.py:511`). Single-agent deployments that only receive
+`/agent/invoke` requests will see this table empty — that's expected,
+not a bug. The wiring is correct; the table populates when other
+agents start coordinating tasks via the A2A protocol.
+
+### Why the multiple concepts?
+
+Each session table answers a different question:
+
+| Table | Question it answers |
+|-------|---------------------|
+| `conversation_history.metadata.session_id` | "Which messages belong to the same conversation thread?" |
+| `memory_episodes` | "What was the narrative arc of that conversation?" |
+| `reflection_sessions` | "When did the agent last reflect?" |
+| `a2a_sessions` | "What multi-agent task is this part of?" |
+
+They are not redundant; they serve different layers. The
+`SESSION_GAP_MINUTES` constant is centralized in
+`kestrel_sdk.config.constants`; AsyncConversationStore,
+MemoryConsolidator, and SessionContinuityCalculator all read from
+that single source so the three subsystems can't drift apart.
 
 ---
 
