@@ -1,6 +1,7 @@
 # Sync/Async Audit
 
-First-pass control document for issue `#300`, focused on maintained runtime surfaces.
+Control document for the original issue `#300` and the refreshed current-runtime
+audit in issue `#624`, focused on maintained runtime surfaces.
 
 ## Boundary model
 
@@ -43,13 +44,15 @@ First-pass control document for issue `#300`, focused on maintained runtime surf
   - Fixed by replacing it with `time.monotonic()`.
 - `local_mps_adapter.py` still performed local filesystem and process work directly inside async training/generation methods.
   - Fixed by offloading training setup, process launch/termination, log reads, output scans, LoRA reads, cleanup, generation artifact checks, and artifact reads/writes via `asyncio.to_thread()`.
+- `GitHubAppFeature` accepted webhooks and launched event handlers with bare `asyncio.create_task()`, leaving in-flight tasks unowned during shutdown.
+  - Fixed by tracking webhook event tasks, removing completed tasks from the set, and cancelling/awaiting any in-flight handlers during feature shutdown.
 
 ### Resolved audit patterns
 
 - Conflicting close/shutdown contracts: resolved. Agent cleanup contract is `await agent.shutdown()`. MCPToolManager's sync `close()` is correctly called from async `shutdown()`.
 - Command/API parity: verified. `CommandHandler.handle()` properly dispatches both sync and async results.
 - Blocking subprocess/file work on async paths: resolved. All maintained tool paths now offload via `asyncio.to_thread()`.
-- Background-task and scheduler paths: verified. Scheduler and heartbeat use clean async task patterns with no event-loop assumptions.
+- Background-task and scheduler paths: refreshed. Scheduler, heartbeat, and GitHub App webhook handling use owned async task patterns with shutdown cleanup.
 - `get_event_loop()` elimination: zero remaining calls in maintained source (`kestrel_sovereign/` and `endpoints/`).
 
 ## Initial high-risk surfaces
@@ -72,6 +75,7 @@ First-pass control document for issue `#300`, focused on maintained runtime surf
 - `tests/unit/test_local_mps_adapter_async_contracts.py`
 - `tests/unit/test_strategic_memory_async_contracts.py`
 - `tests/unit/test_sovereignty_endpoint_contracts.py`
+- `tests/unit/test_github_app_feature.py`
 - `tests/unit/test_security_feature.py`
 - `tests/unit/test_context_builder.py`
 - `tests/unit/test_kestrel_agent.py`

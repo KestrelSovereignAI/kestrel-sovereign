@@ -69,12 +69,33 @@ class GitHubAppFeature(Feature):
     async def initialize(self):
         self._client = GitHubAppClient()
         self._soul = ""
+        self._event_tasks: set[asyncio.Task] = set()
         if _SOUL_PATH.exists():
             self._soul = _SOUL_PATH.read_text(encoding="utf-8")
         if self._client.is_configured:
             logger.info("GitHubAppFeature initialized (App ID: %s)", self._client._app_id)
         else:
             logger.warning("GitHubAppFeature: GITHUB_APP_ID or GITHUB_APP_PRIVATE_KEY not set")
+
+    async def shutdown(self):
+        tasks = set(getattr(self, "_event_tasks", set()))
+        if not tasks:
+            return
+
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+
+        await asyncio.gather(*tasks, return_exceptions=True)
+        self._event_tasks.clear()
+
+    def _schedule_event_handling(self, event: str, payload: Dict[str, Any]) -> None:
+        task = asyncio.create_task(
+            self._safe_handle_event(event, payload),
+            name=f"github-app-webhook:{event or 'unknown'}",
+        )
+        self._event_tasks.add(task)
+        task.add_done_callback(self._event_tasks.discard)
 
     def get_router(self) -> Optional[APIRouter]:
         """Register the webhook endpoint."""
@@ -102,7 +123,7 @@ class GitHubAppFeature(Feature):
 
             # Return 200 immediately, process in background
             # Cloud Run needs min-instances=1 to keep the instance alive
-            asyncio.create_task(self._safe_handle_event(event, payload))
+            self._schedule_event_handling(event, payload)
             return Response(status_code=200)
 
         return router
