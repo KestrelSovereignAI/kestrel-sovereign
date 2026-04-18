@@ -73,7 +73,6 @@ class TestMemoryFeatureDiscovery:
             "search_case_law",
             "get_episodes",
             "memory_status",
-            "full_history_search",
             "recall_emotional",
         }
         assert expected.issubset(tool_names), f"Missing tools: {expected - tool_names}"
@@ -154,23 +153,25 @@ class TestMemoryStatus:
         assert "consolidator_available" in result
 
 
-class TestFullHistorySearch:
-    """Tests for full_history_search tool."""
+class TestSearchMemoryEncryptionAware:
+    """Tests for the encryption-aware search path that was previously
+    exposed as full_history_search. Merged into search_memory in
+    PR #633 — this class verifies the merged tool still covers the
+    same use cases."""
 
     @pytest.mark.asyncio
-    async def test_full_search_finds_content(self, memory_feature):
-        """Should find content via full history search."""
-        result = await memory_feature.full_history_search("blue", limit=5)
+    async def test_search_finds_content(self, memory_feature):
+        """Should find content via the encryption-aware search."""
+        result = await memory_feature.search_memory("blue", limit=5)
 
         assert result["success"] is True
         assert result["count"] >= 1
         assert result["query"] == "blue"
-        assert "total_searched" in result
 
     @pytest.mark.asyncio
-    async def test_full_search_case_insensitive(self, memory_feature):
+    async def test_search_case_insensitive(self, memory_feature):
         """Search should be case insensitive."""
-        result = await memory_feature.full_history_search("BLUE", limit=5)
+        result = await memory_feature.search_memory("BLUE", limit=5)
 
         assert result["success"] is True
         assert result["count"] >= 1

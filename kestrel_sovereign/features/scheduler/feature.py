@@ -99,6 +99,12 @@ class SchedulerFeature(Feature):
             ("signal_dispatch", "5 8 * * *", "{}"),
         ]
 
+        # Memory consolidation only if MemoryFeature is loaded (it owns the tool)
+        if "MemoryFeature" in agent.features:
+            defaults.append(
+                ("memory_consolidate", "0 4 * * *", "{}"),  # nightly at 4am
+            )
+
         if has_reflection:
             defaults.extend([
                 ("reflect", "0 */4 * * *", '{"scope":"all","depth":"normal"}'),
