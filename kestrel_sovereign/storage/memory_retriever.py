@@ -10,6 +10,27 @@ Retrieves memories using human-like weighting:
 
 This creates retrieval that feels like human memory:
 emotionally charged, important events stick better.
+
+WHEN TO USE THIS vs AsyncRAGStore
+---------------------------------
+Use MemoryRetriever (this module) when:
+  - Searching CONVERSATION HISTORY and message-level memories
+  - You want emotional weighting, importance, and Ebbinghaus decay applied
+  - Content is experiential/episodic (what was said, felt, remembered)
+  - Examples: "recall what we discussed about X", "find emotionally important moments",
+    "what does the user typically feel about Y"
+
+Use AsyncRAGStore (storage/async_rag_store.py) when:
+  - Searching INDEXED DOCUMENTS (uploaded files, ingested knowledge bases)
+  - You need vector similarity search over chunks of static content
+  - Content is referential/factual (not conversational)
+  - Examples: "find sections of the user guide about X", "search uploaded PDFs"
+
+The two systems intentionally do NOT share an interface — they answer
+different questions about different data. RAG = "what does the document say?"
+Memory = "what did we experience together?"
+
+See docs/architecture/MEMORY_SYSTEM.md for the full decision matrix.
 """
 import logging
 from datetime import datetime, timezone, timedelta

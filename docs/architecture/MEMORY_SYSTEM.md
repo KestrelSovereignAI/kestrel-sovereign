@@ -16,15 +16,16 @@ for the right reasons.
 
 1. [What Makes This Different](#what-makes-this-different)
 2. [Architecture Overview](#architecture-overview)
-3. [Emotional Tagging](#emotional-tagging)
-4. [The Ebbinghaus Decay Curve](#the-ebbinghaus-decay-curve)
-5. [Retrieval Scoring](#retrieval-scoring)
-6. [Associative Linking](#associative-linking)
-7. [Memory Consolidation](#memory-consolidation)
-8. [Memory Pinning (Agent Agency)](#memory-pinning-agent-agency)
-9. [Privacy Integration](#privacy-integration)
-10. [Configuration Reference](#configuration-reference)
-11. [Source Files](#source-files)
+3. [Memory vs RAG: When to Use Which](#memory-vs-rag-when-to-use-which)
+4. [Emotional Tagging](#emotional-tagging)
+5. [The Ebbinghaus Decay Curve](#the-ebbinghaus-decay-curve)
+6. [Retrieval Scoring](#retrieval-scoring)
+7. [Associative Linking](#associative-linking)
+8. [Memory Consolidation](#memory-consolidation)
+9. [Memory Pinning (Agent Agency)](#memory-pinning-agent-agency)
+10. [Privacy Integration](#privacy-integration)
+11. [Configuration Reference](#configuration-reference)
+12. [Source Files](#source-files)
 
 ---
 
@@ -115,6 +116,63 @@ orchestrating all components behind a single interface.
   tagger falls back to keyword-based analysis. If the associative linker
   has no graph store, retrieval still works on the other four scoring
   dimensions.
+
+---
+
+## Memory vs RAG: When to Use Which
+
+Kestrel has **two distinct retrieval systems** that answer different questions
+about different data. They intentionally do not share an interface.
+
+### MemoryRetriever (`storage/memory_retriever.py`)
+
+Searches **conversation history and message-level memories** with
+human-like weighting. Returns memories scored by emotional relevance,
+importance, recency (with Ebbinghaus decay), and access frequency.
+
+**Use when you want to answer:**
+- "What did the user say about X?"
+- "What emotionally important moments involve Y?"
+- "What does the user typically feel about Z?"
+- "Find memories from the last conversation"
+
+### AsyncRAGStore (`storage/async_rag_store.py`)
+
+Searches **indexed documents and ingested knowledge bases** using hybrid
+vector embeddings + BM25 keyword search. Returns document chunks ranked
+by content similarity.
+
+**Use when you want to answer:**
+- "What does the user guide say about X?"
+- "Find relevant sections of the uploaded PDFs"
+- "Which docs mention Y?"
+- "Search the knowledge base for Z"
+
+### Decision Matrix
+
+| Question | Use |
+|----------|-----|
+| "What did we discuss?" | **MemoryRetriever** |
+| "What does the document say?" | **AsyncRAGStore** |
+| "How does the user feel about X?" | **MemoryRetriever** |
+| "Find facts about X" | **AsyncRAGStore** |
+| "What was the most important moment?" | **MemoryRetriever** |
+| "Search uploaded files" | **AsyncRAGStore** |
+| "Recall yesterday's conversation" | **MemoryRetriever** |
+| "Look up procedure documentation" | **AsyncRAGStore** |
+
+### Why Two Systems?
+
+A search engine and a friend answer different questions. Documents are
+*referential* — they tell you what is true. Memories are *experiential* —
+they tell you what mattered. Conflating these would force one of:
+
+1. **Apply emotional weighting to documents** — meaningless (a PDF doesn't
+   have feelings about its content)
+2. **Apply pure vector search to memories** — loses everything that makes
+   memory human (the emotional charge, the importance, the decay)
+
+Keeping them separate preserves the cognitive metaphor.
 
 ---
 
