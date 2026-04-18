@@ -102,6 +102,26 @@ flowchart TD
 The `MemorySystem` class in `storage/memory_system.py` acts as a facade,
 orchestrating all components behind a single interface.
 
+### Note on the A2A "MemoryService"
+
+There is a separate class also called `MemoryService` in
+`a2a/stores/unified/memory_service.py`. **This is not the cognitive
+memory system described above.** Despite the shared "Memory" name, it
+serves a different purpose: archiving completed A2A tasks for audit
+and potential replay.
+
+| | MemorySystem (cognitive) | MemoryService (A2A archive) |
+|--|--|--|
+| Purpose | Per-message emotional/episodic memory | Task completion archive |
+| Granularity | Individual messages | Whole task transcripts |
+| Decay | Ebbinghaus curve | None (permanent until cleanup) |
+| Retrieval | 5-signal weighted scoring | Full-text search (FTS5/tsvector) |
+| Used by | Agent context assembly | Task completion only (write-only in practice) |
+| Module | `storage/memory_system.py` | `a2a/stores/unified/memory_service.py` |
+
+The naming overlap is historical and a future refactor may rename
+the A2A version to `TaskArchiveService`. See #623 for context.
+
 ### Key Design Decisions
 
 - **No schema changes.** All emotional/importance/decay fields are stored
