@@ -34,6 +34,11 @@ async def async_client(monkeypatch):
         monkeypatch.setenv("KESTREL_DB_PATH", agent_dir)
         # Set encryption key for backup tests
         monkeypatch.setenv("KESTREL_DATA_KEY", "test-key-for-backup-encryption")
+        # Prove local backup tests are isolated from ambient cloud sync credentials.
+        monkeypatch.setenv("LIGHTHOUSE_API_KEY", "test-lighthouse-key")
+        monkeypatch.setenv("GCS_BACKUP_BUCKET", "test-backup-bucket")
+        monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", str(Path(agent_dir) / "missing-gcs-creds.json"))
+        monkeypatch.setenv("KESTREL_SYNC_ENABLED", "false")
 
         # Ensure server.Storage uses our temp directory
         monkeypatch.setattr(storage_pkg, "get_default_agent_data_dir", lambda: agent_dir)
@@ -75,6 +80,15 @@ async def test_backup_local_tier_via_api(async_client: AsyncClient, api_key: str
     agent = app.state.agent
     backups = await agent.storage.get_nodes_by_type("backup_artifact")
     assert len(backups) >= 1
+
+
+@pytest.mark.asyncio
+async def test_backup_e2e_disables_ambient_sync_targets(async_client: AsyncClient):
+    agent = app.state.agent
+
+    assert os.environ["LIGHTHOUSE_API_KEY"] == "test-lighthouse-key"
+    assert os.environ["GCS_BACKUP_BUCKET"] == "test-backup-bucket"
+    assert getattr(agent, "_sync_service", None) is None
 
 
 @pytest.mark.asyncio

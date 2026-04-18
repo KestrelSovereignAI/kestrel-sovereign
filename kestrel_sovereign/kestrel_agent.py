@@ -103,6 +103,28 @@ def _load_prompt_file(filepath: Path, fallback: str = "") -> str:
         return fallback
 
 
+def _resolve_sync_enabled(explicit: Optional[bool] = None) -> bool:
+    """Resolve whether lifecycle SyncService side effects are enabled."""
+    if explicit is not None:
+        return explicit
+
+    env_val = os.environ.get("KESTREL_SYNC_ENABLED")
+    if env_val is None:
+        return True
+
+    normalized = env_val.strip().lower()
+    if normalized in ("0", "false", "no", "off"):
+        return False
+    if normalized in ("1", "true", "yes", "on"):
+        return True
+
+    logging.warning(
+        "Invalid KESTREL_SYNC_ENABLED value %r; defaulting to enabled",
+        env_val,
+    )
+    return True
+
+
 class KestrelAgent(
     ConstitutionMixin,
     StreamingMixin,
@@ -129,6 +151,7 @@ class KestrelAgent(
         database_url: Optional[str] = None,
         db_backend: Optional[str] = None,
         allowed_features: Optional[set] = None,
+        sync_enabled: Optional[bool] = None,
     ):
         """
         Initializes the agent with memory and reasoning capabilities.
@@ -146,11 +169,14 @@ class KestrelAgent(
             allowed_features: Optional set of feature class names to load.
                        If None, all discovered features are loaded.
                        Mandatory features always load regardless.
+            sync_enabled: Enables lifecycle SyncService snapshots. Defaults to
+                       KESTREL_SYNC_ENABLED env var, or enabled when unset.
         """
         self.did = did
         self._privacy_mode = privacy_mode
         self.storage_path = storage_path
         self._allowed_features = allowed_features
+        self._sync_enabled = _resolve_sync_enabled(sync_enabled)
 
         # Determine database backend
         self._db_backend = db_backend or os.environ.get("KESTREL_DB_BACKEND", "sqlite")
@@ -361,7 +387,7 @@ class KestrelAgent(
             # Targets are ordered by trust: Sovereign → Federated → Delegated → Expedient.
             # Snapshots fire on shutdown, scheduled backup, or explicit !backup command.
             self._sync_service = None
-            if self._db_backend.lower() != "postgres":
+            if self._db_backend.lower() != "postgres" and self._sync_enabled:
                 try:
                     from kestrel_sovereign.storage.sync.service import SyncService
                     from kestrel_sovereign.storage.sync.targets import (
@@ -416,6 +442,8 @@ class KestrelAgent(
                 except Exception as e:
                     logging.warning(f"Sync service init failed: {e}", exc_info=True)
                     self._sync_service = None
+            elif not self._sync_enabled:
+                logging.info("Sync service disabled by configuration")
 
             # Resolve agent name BEFORE features so features can use it
             # (e.g. PeersFeature._get_own_name() reads self._agent_name)
