@@ -456,19 +456,47 @@ class AsyncConversationStore:
             history.append(entry)
         return history
 
-    async def search_history(self, query: str, limit: int = 20) -> List[Dict[str, Any]]:
+    async def search_history(
+        self,
+        query: str,
+        limit: int = 20,
+        session_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         """Search conversation history.
 
         Fetches and decrypts messages, then filters client-side.
         This approach works correctly with encrypted storage.
+
+        Args:
+            query: Substring to search for (case-insensitive).
+            limit: Maximum results to return.
+            session_id: If provided, restrict search to messages tagged
+                with this session_id in metadata. Useful for "what did
+                we discuss in this session" queries.
         """
-        # Fetch all messages (up to 5000) and search client-side after decryption
-        # SQL LIKE doesn't work on encrypted content, so we must decrypt first
-        rows = await self.db.fetchall(
-            "SELECT id, role, content, metadata FROM conversation_history "
-            "WHERE agent_id = ? ORDER BY id DESC LIMIT 5000",
-            (self.agent_id,)
-        )
+        # SQL pre-filter when session_id is provided. We can match against
+        # the metadata JSON because session_id is plaintext (not encrypted).
+        # Falls back to full scan when no session_id is given.
+        if session_id:
+            # Match both `"session_id": "X"` and `"session_id":"X"` formats
+            rows = await self.db.fetchall(
+                "SELECT id, role, content, metadata FROM conversation_history "
+                "WHERE agent_id = ? AND (metadata LIKE ? OR metadata LIKE ?) "
+                "ORDER BY id DESC LIMIT 5000",
+                (
+                    self.agent_id,
+                    f'%"session_id": "{session_id}"%',
+                    f'%"session_id":"{session_id}"%',
+                ),
+            )
+        else:
+            # Fetch all messages (up to 5000) and search client-side after decryption
+            # SQL LIKE doesn't work on encrypted content, so we must decrypt first
+            rows = await self.db.fetchall(
+                "SELECT id, role, content, metadata FROM conversation_history "
+                "WHERE agent_id = ? ORDER BY id DESC LIMIT 5000",
+                (self.agent_id,)
+            )
 
         query_lower = query.lower()
         results = []
