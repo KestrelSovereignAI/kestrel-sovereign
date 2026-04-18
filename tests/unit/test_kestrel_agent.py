@@ -176,6 +176,39 @@ class TestKestrelAgentInit:
         assert agent._cancelled_requests == set()
         assert agent._current_request_id is None
 
+    def test_init_defaults_sync_service_enabled(self, tmp_path):
+        """Sync service is enabled by default for production behavior."""
+        agent = KestrelAgent(
+            did="did:test:123",
+            storage_path=str(tmp_path / "test.db"),
+            llm_service=MagicMock(),
+        )
+
+        assert agent._sync_enabled is True
+
+    def test_init_accepts_explicit_sync_disabled(self, tmp_path):
+        """Callers can explicitly disable sync side effects."""
+        agent = KestrelAgent(
+            did="did:test:123",
+            storage_path=str(tmp_path / "test.db"),
+            llm_service=MagicMock(),
+            sync_enabled=False,
+        )
+
+        assert agent._sync_enabled is False
+
+    def test_init_reads_sync_disabled_env(self, tmp_path, monkeypatch):
+        """Environment can disable sync without removing provider credentials."""
+        monkeypatch.setenv("KESTREL_SYNC_ENABLED", "false")
+
+        agent = KestrelAgent(
+            did="did:test:123",
+            storage_path=str(tmp_path / "test.db"),
+            llm_service=MagicMock(),
+        )
+
+        assert agent._sync_enabled is False
+
 
 # =============================================================================
 # Tests for Privacy Mode - getter/setter behavior
