@@ -190,6 +190,56 @@ class TestModelPreference:
         assert pref["provider"] is None
 
     @pytest.mark.asyncio
+    async def test_model_preference_persistence_tasks_are_owned(self, llm_service):
+        """Preference persistence is scheduled through owned service tasks."""
+        calls = []
+
+        async def persist(model, provider):
+            calls.append((model, provider))
+
+        llm_service.set_preference_persistence_callback(persist)
+        llm_service.set_model_preference("gpt-5", provider="openai")
+
+        assert len(llm_service._preference_persistence_tasks) == 1
+
+        await llm_service.drain_preference_persistence()
+
+        assert calls == [("gpt-5", "openai")]
+        assert llm_service._preference_persistence_tasks == set()
+
+    @pytest.mark.asyncio
+    async def test_close_waits_for_preference_persistence(self, llm_service):
+        """close() waits for pending preference persistence before cleanup returns."""
+        calls = []
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def persist(model, provider):
+            calls.append(("start", model, provider))
+            started.set()
+            await release.wait()
+            calls.append(("done", model, provider))
+
+        llm_service.providers = []
+        llm_service.set_preference_persistence_callback(persist)
+        llm_service.set_model_preference("gpt-5", provider="openai")
+        await started.wait()
+
+        close_task = asyncio.create_task(llm_service.close())
+        await asyncio.sleep(0)
+
+        assert not close_task.done()
+
+        release.set()
+        await close_task
+
+        assert calls == [
+            ("start", "gpt-5", "openai"),
+            ("done", "gpt-5", "openai"),
+        ]
+        assert llm_service._preference_persistence_tasks == set()
+
+    @pytest.mark.asyncio
     async def test_get_model_preference_default(self, llm_service):
         """Test getting model preference returns dict with None values by default."""
         pref = llm_service.get_model_preference()
