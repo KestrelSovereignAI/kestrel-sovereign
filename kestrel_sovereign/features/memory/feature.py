@@ -79,41 +79,47 @@ class MemoryFeature(Feature):
 
     @tool(
         name="search_memory",
-        description="Search conversation history for matching content. Decrypts and searches all messages client-side for reliable results.",
+        description="PRIMARY TOOL for recalling past conversations. Use this when asked 'do you remember', 'what did we discuss', or any question about past conversations. Decrypts and searches conversation history client-side for reliable results. Pass session_id to scope to a single conversation thread.",
         category=ToolCategory.MEMORY,
         command_prefix="!memory search"
     )
-    async def search_memory(self, query: str, limit: int = 10) -> Dict[str, Any]:
+    async def search_memory(
+        self,
+        query: str,
+        limit: int = 20,
+        session_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """
         Search conversation history for matching content.
 
-        Uses client-side decryption and search to work reliably with encrypted storage.
+        Uses the conversation store's encryption-aware search_history,
+        which decrypts client-side before matching. Optionally scope to
+        a single session.
 
         Args:
             query: Search term or phrase to find in past conversations
-            limit: Maximum number of results to return (default 10)
+            limit: Maximum number of results to return (default 20)
+            session_id: If provided, only search messages tagged with this
+                session_id. Useful for "what did we discuss in this
+                conversation" queries.
         """
         try:
-            # Get full decrypted history and search client-side
-            # This works with encryption because we decrypt before searching
-            all_history = await self.storage.get_conversation_history(limit=5000)
+            conv_store = self._get_conversation_store()
+            if not conv_store:
+                return {"success": False, "error": "Conversation store unavailable"}
 
-            # Search through decrypted content
-            query_lower = query.lower()
-            matches = []
-            for msg in all_history:
-                content = msg.get("content", "")
-                if query_lower in content.lower():
-                    matches.append(msg)
-                    if len(matches) >= limit:
-                        break
+            results = await conv_store.search_history(
+                query=query,
+                limit=limit,
+                session_id=session_id,
+            )
 
             return {
                 "success": True,
-                "results": matches,
-                "count": len(matches),
+                "results": results,
+                "count": len(results),
                 "query": query,
-                "total_searched": len(all_history)
+                "session_id": session_id,
             }
         except (AttributeError, TypeError, KeyError) as e:
             logger.error(f"search_memory failed: {e}")
@@ -331,7 +337,7 @@ class MemoryFeature(Feature):
 
     @tool(
         name="recall_emotional",
-        description="Recall memories with human-like weighting (importance, emotion, recency). Use alongside full_history_search for emotionally-aware recall. Scores memories like a human would - important moments and emotionally-charged memories surface first.",
+        description="Recall memories with human-like weighting (importance, emotion, recency). Use alongside search_memory for emotionally-aware recall. Scores memories like a human would - important moments and emotionally-charged memories surface first.",
         category=ToolCategory.MEMORY,
         command_prefix="!memory recall"
     )
@@ -415,24 +421,6 @@ class MemoryFeature(Feature):
         except Exception as e:
             logger.error(f"recall_emotional failed: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
-
-    @tool(
-        name="full_history_search",
-        description="PRIMARY TOOL for recalling past conversations. Use this when asked 'do you remember', 'what did we discuss', or any question about past conversations. Decrypts and searches all conversation history reliably.",
-        category=ToolCategory.MEMORY,
-        command_prefix="!memory fullsearch"
-    )
-    async def full_history_search(self, query: str, limit: int = 20) -> Dict[str, Any]:
-        """
-        Search full conversation history client-side (works with encryption).
-
-        Delegates to search_memory which handles decryption and keyword matching.
-
-        Args:
-            query: Search term or phrase to find
-            limit: Maximum results to return (default 20)
-        """
-        return await self.search_memory(query, limit)
 
     @tool(
         name="delete_messages",

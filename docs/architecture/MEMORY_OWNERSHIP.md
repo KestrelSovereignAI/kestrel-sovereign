@@ -95,5 +95,5 @@ Features access memory through:
 ## Changes Made (Issue #501)
 
 1. **Eliminated duplicate MemoryConsolidator**: Agent now uses `memory_system.consolidator` instead of creating a separate one. The standalone consolidator lacked `graph_store`, causing episodes not to appear in the Knowledge Graph.
-2. **Merged duplicate search methods**: `full_history_search` and `search_memory` in MemoryFeature were identical. `full_history_search` now delegates to `search_memory`.
+2. **Merged duplicate search methods**: `full_history_search` and `search_memory` in MemoryFeature were identical (the former just delegated to the latter). PR #633 fully merged them — `full_history_search` was removed and `search_memory` gained an optional `session_id` parameter for session-scoped queries.
 3. **MemoryFeature uses MemorySystem facade**: Instead of reaching through to raw retriever/consolidator.

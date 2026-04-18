@@ -11,7 +11,8 @@ tools:
   - get_episodes
   - memory_status
   - recall_emotional
-  - full_history_search
+  - delete_messages
+  - memory_consolidate
 
 files:
   - feature.py

@@ -374,30 +374,31 @@ The MemoryFeature provides tools for active memory search. When the agent needs 
 
 | Tool | Description | When to Use |
 |------|-------------|-------------|
-| `search_memory` | Database-level keyword search | Quick search, may miss encrypted content |
-| `full_history_search` | Decrypts all history, searches client-side | When encryption is enabled or `search_memory` returns nothing |
+| `search_memory` | Encryption-aware keyword search; optionally session-scoped | "Do you remember", "what did we discuss" — primary recall tool |
 | `recall_emotional` | Human-like weighted retrieval | Recalling with emotional context (sad memories surface when sad) |
 | `recall_recent` | Get recent N messages | "What did we just discuss?" |
 | `search_documents` | Search RAG document chunks | Finding info from uploaded files/knowledge |
 | `search_case_law` | Search audit decisions | Finding precedent for governance |
 | `get_episodes` | Get consolidated memory episodes | High-level narrative recall |
 | `memory_status` | System health check | Debugging/diagnostics |
+| `memory_consolidate` | Run the consolidation pipeline | Scheduled nightly; manually as fallback |
 
 ### Tool Details
 
 #### search_memory
 ```python
-await feature.search_memory(query="Wyoming", limit=10)
-# Returns: {"success": True, "results": [...], "count": N}
-```
-**Note:** With encryption enabled, this searches encrypted content which may not match. Use `full_history_search` instead.
+# Search all conversation history
+await feature.search_memory(query="Wyoming", limit=20)
 
-#### full_history_search
-```python
-await feature.full_history_search(query="Wyoming", limit=20)
-# Retrieves and decrypts ALL messages, then searches client-side
-# Slower but works with encryption
+# Search within a single session
+await feature.search_memory(query="Wyoming", limit=20, session_id="<uuid>")
+
+# Returns: {"success": True, "results": [...], "count": N, "session_id": ...}
 ```
+Decrypts each message client-side before matching, so it works correctly
+with per-agent encryption. Previously this was split into a duplicated
+`full_history_search` tool that just delegated back here; PR #633 merged
+them and added the `session_id` parameter for session-scoped queries.
 
 #### recall_emotional
 ```python

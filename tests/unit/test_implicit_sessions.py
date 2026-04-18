@@ -224,3 +224,38 @@ class TestSessionGapMinutesCentralized:
 
         calc = SessionContinuityCalculator.__new__(SessionContinuityCalculator)
         assert calc.SESSION_GAP_MINUTES == 55
+
+
+class TestSearchHistorySessionScoping:
+    """Verify search_history(session_id=...) actually scopes results."""
+
+    @pytest.mark.asyncio
+    async def test_search_filters_to_session(self, store):
+        """A search with session_id should only return matches from that session."""
+        # Add two messages in session A
+        await store.add_conversation("user", "blue sky", session_id="session-A")
+        await store.add_conversation("assistant", "blue ocean", session_id="session-A")
+        # Add two messages in session B
+        await store.add_conversation("user", "blue mountain", session_id="session-B")
+        await store.add_conversation("assistant", "blue river", session_id="session-B")
+
+        # Search in session A only
+        results = await store.search_history("blue", session_id="session-A")
+        assert len(results) == 2
+        contents = {r["content"] for r in results}
+        assert contents == {"blue sky", "blue ocean"}
+
+    @pytest.mark.asyncio
+    async def test_search_without_session_id_returns_all(self, store):
+        """Backward compatibility: no session_id arg = search all history."""
+        await store.add_conversation("user", "alpha", session_id="s1")
+        await store.add_conversation("user", "alpha again", session_id="s2")
+
+        results = await store.search_history("alpha")
+        assert len(results) == 2
+
+    @pytest.mark.asyncio
+    async def test_search_unknown_session_returns_empty(self, store):
+        await store.add_conversation("user", "hello")
+        results = await store.search_history("hello", session_id="nonexistent-session")
+        assert results == []
