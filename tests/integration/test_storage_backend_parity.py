@@ -1,10 +1,12 @@
 """SQLite/PostgreSQL semantic parity contracts for storage seams."""
 
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
 
+from endpoints.database import _get_table_columns, _list_table_names
 from kestrel_sovereign.a2a.stores.unified import TaskStore
 from kestrel_sovereign.a2a.types import (
     Artifact,
@@ -14,6 +16,7 @@ from kestrel_sovereign.a2a.types import (
     TaskStatus,
     TextPart,
 )
+from kestrel_sovereign.features.webhooks.feature import WebhookFeature
 from kestrel_sovereign.privacy import PrivacyMode
 from kestrel_sovereign.storage.async_storage import AsyncStorage
 from kestrel_sovereign.storage.privacy_wrapper import PrivacyEnforcingStorage
@@ -169,3 +172,67 @@ async def test_a2a_task_store_filters_and_payloads_are_backend_neutral(db_backen
 
     assert await store.delete(task_a) is True
     assert await store.get(task_a) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_database_introspection_helpers_are_backend_neutral(db_backend):
+    storage = AsyncStorage.from_backend(db_backend)
+    await storage.initialize()
+
+    table_names = await _list_table_names(storage.db)
+    assert "conversation_history" in table_names
+    assert "graph_nodes" in table_names
+
+    columns = await _get_table_columns(storage.db, "conversation_history")
+    by_name = {column["name"]: column for column in columns}
+
+    assert by_name["id"]["pk"] is True
+    assert by_name["agent_id"]["nullable"] is False
+    assert by_name["role"]["nullable"] is False
+    assert by_name["content"]["type"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_webhook_registration_and_audit_history_are_backend_neutral(db_backend):
+    storage = AsyncStorage.from_backend(db_backend)
+    await storage.initialize()
+
+    agent_id = f"did:test:{uuid4()}"
+    agent = SimpleNamespace(
+        did=agent_id,
+        agent_id=agent_id,
+        storage=SimpleNamespace(db=storage.db),
+        _raw_storage=None,
+        features=[],
+    )
+    feature = WebhookFeature(agent)
+    await feature.initialize()
+
+    webhook_name = f"audit-{uuid4().hex}"
+    registered = await feature.webhooks_register(
+        name=webhook_name,
+        auth_type="none",
+        event_type="sync",
+        rate_limit=0,
+    )
+    assert registered["success"] is True
+
+    listed = await feature.webhooks_list()
+    assert listed["count"] == 1
+    assert listed["webhooks"][0]["name"] == webhook_name
+
+    await feature.log_webhook_event(
+        webhook_name=webhook_name,
+        source_ip="127.0.0.1",
+        authenticated=True,
+        status_code=200,
+        payload_hash="abc123",
+    )
+
+    history = await feature.webhooks_history(limit=5)
+    assert history["count"] == 1
+    assert history["events"][0]["webhook_name"] == webhook_name
+    assert history["events"][0]["authenticated"] is True
+    assert history["events"][0]["payload_hash"] == "abc123"
