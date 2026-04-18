@@ -24,6 +24,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from kestrel_sovereign.features.base import Feature, tool
+from kestrel_sovereign.features.storage_access import resolve_feature_database
 from kestrel_sovereign.tools.base import ToolCategory
 
 from .checks import (
@@ -65,43 +66,6 @@ def _derive_overall_status(checks: List[Dict[str, Any]]) -> str:
     return "healthy"
 
 
-def _resolve_database_handle(agent) -> Optional[Any]:
-    """Resolve the feature DB handle without touching privacy-wrapper properties."""
-    raw_storage = getattr(agent, "_raw_storage", None)
-    if raw_storage is not None:
-        db = getattr(raw_storage, "db", None)
-        if db is not None:
-            return db
-
-    storage = getattr(agent, "storage", None)
-    if storage is None:
-        return None
-
-    storage_vars = getattr(storage, "__dict__", {})
-    storage_module = getattr(type(storage), "__module__", "")
-    if storage_module == "unittest.mock":
-        return storage_vars.get("database") or storage_vars.get("db")
-
-    wrapped_storage = (
-        getattr(storage, "_storage", None)
-        if "_storage" in storage_vars
-        else None
-    )
-    if wrapped_storage is not None:
-        db = getattr(wrapped_storage, "db", None)
-        if db is not None:
-            return db
-
-    database = getattr(storage, "database", None)
-    if database is not None:
-        return database
-
-    if isinstance(getattr(type(storage), "db", None), property):
-        return None
-
-    return getattr(storage, "db", None)
-
-
 class HeartbeatFeature(Feature):
     """
     Periodic agent system health check feature.
@@ -132,7 +96,7 @@ class HeartbeatFeature(Feature):
         self._in_memory_history: List[Dict[str, Any]] = []
         self._start_time = time.monotonic()
 
-        self._db = _resolve_database_handle(self.agent)
+        self._db = resolve_feature_database(self.agent)
 
         # Agent identity (DID is the canonical source of truth)
         self._agent_id = self.agent.did

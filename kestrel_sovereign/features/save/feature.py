@@ -16,6 +16,7 @@ import logging
 from typing import Any, Dict, List, Optional
 
 from kestrel_sovereign.features.base import Feature, tool
+from kestrel_sovereign.features.storage_access import resolve_feature_database
 from kestrel_sovereign.tools.base import ToolCategory
 from kestrel_sovereign.storage.saved_items_store import (
     SavedItemsStore, SavedItemType, SourceType
@@ -42,6 +43,7 @@ class SaveFeature(Feature):
     async def initialize(self):
         """Initialize the save feature with required references."""
         self.storage = getattr(self.agent, 'storage', None)
+        self._db = resolve_feature_database(self.agent)
         self.context_manager = getattr(self.agent, 'context_manager', None)
         self.agent_id = self.agent.did
         self._saved_items_store = None
@@ -53,10 +55,8 @@ class SaveFeature(Feature):
 
     def _get_store(self) -> Optional[SavedItemsStore]:
         """Get or create the saved items store."""
-        if self._saved_items_store is None and self.storage:
-            db = getattr(self.storage, 'db', None)
-            if db:
-                self._saved_items_store = SavedItemsStore(db, self.agent_id)
+        if self._saved_items_store is None and self._db:
+            self._saved_items_store = SavedItemsStore(self._db, self.agent_id)
         return self._saved_items_store
 
     @tool(

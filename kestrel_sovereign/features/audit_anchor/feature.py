@@ -19,6 +19,7 @@ from typing import Any, Dict, Optional
 
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.audit_anchor.hasher import AuditHasher
+from kestrel_sovereign.features.storage_access import resolve_feature_database
 from kestrel_sovereign.tools.base import ToolCategory
 
 logger = logging.getLogger(__name__)
@@ -309,13 +310,7 @@ class AuditAnchorFeature(Feature):
 
     def _get_db(self):
         """Get the main AsyncDatabase instance, or None if unavailable."""
-        try:
-            storage = getattr(self.agent, "storage", None)
-            if storage is not None:
-                return getattr(storage, "db", None)
-        except Exception:
-            pass
-        return None
+        return resolve_feature_database(self.agent)
 
     def _get_permission_store(self):
         """

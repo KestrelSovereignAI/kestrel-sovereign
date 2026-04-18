@@ -24,6 +24,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict
 
 from kestrel_sovereign.features.base import Feature, tool
+from kestrel_sovereign.features.storage_access import resolve_feature_database
 from kestrel_sovereign.tools.base import ToolCategory
 
 logger = logging.getLogger(__name__)
@@ -58,13 +59,16 @@ class MemoryAgencyFeature(Feature):
     async def initialize(self):
         """Initialize the memory agency feature and create the memory_pins table."""
         self.storage = self.agent.storage
+        self._db = resolve_feature_database(self.agent)
+        if self._db is None:
+            raise RuntimeError("MemoryAgencyFeature requires database storage")
         self.agent_id = self.agent.did
 
         # Pin quota -- configurable per-instance, defaults to module constant
         self.pin_quota = PIN_QUOTA_DEFAULT
 
         # Create the memory_pins tracking table
-        await self.storage.db.execute(
+        await self._db.execute(
             """CREATE TABLE IF NOT EXISTS memory_pins (
                 id TEXT PRIMARY KEY,
                 message_id INTEGER NOT NULL,
@@ -87,7 +91,7 @@ class MemoryAgencyFeature(Feature):
     async def _active_pin_count(self) -> int:
         """Return the number of currently active (non-released) pins."""
         return (
-            await self.storage.db.fetchval(
+            await self._db.fetchval(
                 "SELECT COUNT(*) FROM memory_pins WHERE released_at IS NULL",
             )
             or 0
@@ -96,7 +100,7 @@ class MemoryAgencyFeature(Feature):
     async def _pin_ratio(self) -> float:
         """Return the ratio of pinned memories to total memories."""
         total = (
-            await self.storage.db.fetchval(
+            await self._db.fetchval(
                 "SELECT COUNT(*) FROM conversation_history WHERE agent_id = ?",
                 (self.agent_id,),
             )
@@ -132,7 +136,7 @@ class MemoryAgencyFeature(Feature):
             message_id: The database ID of the message to pin
             reason: Optional reason for pinning this memory
         """
-        db = self.storage.db
+        db = self._db
 
         # ----- Quota enforcement -----
         # Check whether this message already has an active pin (idempotent
@@ -241,7 +245,7 @@ class MemoryAgencyFeature(Feature):
         Args:
             message_id: The database ID of the message to release
         """
-        db = self.storage.db
+        db = self._db
 
         # Fetch the message
         row = await db.fetchone(
@@ -293,7 +297,7 @@ class MemoryAgencyFeature(Feature):
         Joins memory_pins with conversation_history to show message
         content alongside pin metadata.
         """
-        db = self.storage.db
+        db = self._db
 
         rows = await db.fetchall(
             """SELECT mp.id, mp.message_id, mp.pin_reason, mp.pinned_at,
@@ -344,7 +348,7 @@ class MemoryAgencyFeature(Feature):
         Returns:
             Number of pins overridden.
         """
-        db = self.storage.db
+        db = self._db
 
         if message_ids:
             placeholders = ",".join("?" for _ in message_ids)
@@ -394,7 +398,7 @@ class MemoryAgencyFeature(Feature):
         Used by :meth:`sovereign_override_pins` to ensure the metadata flag
         is consistent with the pin record removal.
         """
-        db = self.storage.db
+        db = self._db
 
         row = await db.fetchone(
             "SELECT metadata FROM conversation_history WHERE id = ? AND agent_id = ?",
@@ -436,7 +440,7 @@ class MemoryAgencyFeature(Feature):
         oldest/average pin age, and an alert when the ratio exceeds
         the configured threshold.
         """
-        db = self.storage.db
+        db = self._db
 
         total_messages = await db.fetchval(
             "SELECT COUNT(*) FROM conversation_history WHERE agent_id = ?",
@@ -607,7 +611,7 @@ class MemoryAgencyFeature(Feature):
         ``decay_protected`` on the corresponding messages.  This is an
         administrative override intended for sovereign/admin use.
         """
-        db = self.storage.db
+        db = self._db
         now = datetime.now(timezone.utc).isoformat()
 
         # Fetch all active pin message IDs before releasing
@@ -668,7 +672,7 @@ class MemoryAgencyFeature(Feature):
         Args:
             count: Number of oldest pins to release
         """
-        db = self.storage.db
+        db = self._db
         now = datetime.now(timezone.utc).isoformat()
 
         # Fetch the N oldest active pins

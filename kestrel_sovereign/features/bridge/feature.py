@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from kestrel_sovereign.features.base import Feature, tool
+from kestrel_sovereign.features.storage_access import resolve_feature_database
 from kestrel_sovereign.tools.base import ToolCategory
 
 from .protocol import BridgeSession, ChannelType
@@ -60,17 +61,7 @@ class BridgeFeature(Feature):
         self._invocation_count = 0
         self._start_time = time.monotonic()
 
-        # Resolve database handle (same pattern as HeartbeatFeature)
-        if hasattr(self.agent, "storage") and self.agent.storage:
-            if hasattr(self.agent.storage, "db"):
-                self._db = self.agent.storage.db
-            elif hasattr(self.agent.storage, "database"):
-                self._db = self.agent.storage.database
-
-        if self._db is None and hasattr(self.agent, "_raw_storage"):
-            raw = self.agent._raw_storage
-            if hasattr(raw, "db"):
-                self._db = raw.db
+        self._db = resolve_feature_database(self.agent)
 
         # Agent identity (DID is the canonical source of truth)
         self._agent_id = self.agent.did

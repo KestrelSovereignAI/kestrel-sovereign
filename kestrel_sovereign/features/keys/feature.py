@@ -18,6 +18,7 @@ import logging
 from typing import Any, Dict, Optional
 
 from kestrel_sovereign.features.base import Feature, tool
+from kestrel_sovereign.features.storage_access import resolve_feature_database
 from kestrel_sovereign.tools.base import ToolCategory
 from kestrel_sovereign.kestrel_config.constants import APPROVAL_TIMEOUT_DEFAULT
 from kestrel_sovereign.security.service_key_storage import (
@@ -54,15 +55,7 @@ class KeyManagementFeature(Feature):
         self._storage: Optional[ServiceKeyStorage] = None
         self._agent_did: Optional[str] = None
 
-        # Get database from agent
-        db = None
-        if hasattr(self.agent, 'storage') and self.agent.storage:
-            if hasattr(self.agent.storage, 'db'):
-                db = self.agent.storage.db
-            elif hasattr(self.agent.storage, 'database'):
-                db = self.agent.storage.database
-            elif hasattr(self.agent.storage, '_db'):
-                db = self.agent.storage._db
+        db = resolve_feature_database(self.agent)
 
         # Get agent DID - REQUIRED for key storage
         self._agent_did = self.agent.did
