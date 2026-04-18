@@ -483,3 +483,36 @@ class MemoryFeature(Feature):
         except Exception as e:
             logger.error(f"delete_messages failed: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
+
+    @tool(
+        name="memory_consolidate",
+        description="Consolidate recent messages into narrative episodes, detect temporal patterns, and archive decayed memories. Runs the cognitive memory pipeline that turns raw conversation into structured long-term memory. Safe to schedule periodically (e.g. nightly).",
+        category=ToolCategory.MEMORY,
+        command_prefix="!memory consolidate"
+    )
+    async def memory_consolidate(self) -> Dict[str, Any]:
+        """
+        Run the memory consolidation pipeline.
+
+        Invokes MemoryConsolidator.run_consolidation() which:
+        - Creates narrative episodes from recent message clusters
+        - Detects temporal behavioral patterns
+        - Archives memories whose decay strength has fallen below threshold
+
+        This is the missing automatic invocation — without this tool being
+        scheduled, memory_episodes table stays empty and the cognitive
+        memory layer never compounds beyond the raw conversation history.
+
+        Returns:
+            Dict with episodes_created, patterns_found, messages_archived counts
+        """
+        try:
+            memory_system = getattr(self.agent, "memory_system", None)
+            if not memory_system or not getattr(memory_system, "consolidator", None):
+                return {"success": False, "error": "MemoryConsolidator not available on agent"}
+
+            result = await memory_system.consolidator.run_consolidation()
+            return {"success": True, **result}
+        except Exception as e:
+            logger.error(f"memory_consolidate failed: {e}", exc_info=True)
+            return {"success": False, "error": str(e)}
