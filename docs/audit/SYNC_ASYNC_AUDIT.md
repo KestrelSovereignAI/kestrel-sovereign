@@ -50,13 +50,19 @@ audit in issue `#624`, focused on maintained runtime surfaces.
   - Fixed by adding agent-owned background task tracking and cancelling/awaiting those tasks before sync and storage shutdown.
 - `MemoryRetriever.retrieve()` launched rehearsal-effect access-count writes with bare `asyncio.create_task()`, so storage writes could outlive retrieval and agent shutdown.
   - Fixed by making `MemoryRetriever` own those update tasks, adding deterministic drain/shutdown methods, and wiring `MemorySystem.shutdown()` into `KestrelAgent.shutdown()` before storage closes.
+- `KeyRotationService.start_rotation()` and `resume_rotation()` launched long-running database mutation work with bare `asyncio.create_task()`.
+  - Fixed by tracking rotation tasks in the service, adding drain/shutdown hooks, and preserving resume semantics for cancelled in-progress rotations.
+- `TaskManager.execute_skill(sync=False)` launched A2A background skill execution without lifecycle ownership.
+  - Fixed by tracking execution tasks, cancelling/awaiting them in `TaskManager.close()`, and saving a terminal `canceled` task state before stores close.
+- `LLMService` model preference persistence used loop-created tasks with no owner, so preference writes could outlive service cleanup.
+  - Fixed by tracking persistence tasks, draining them in `LLMService.close()`, and logging callback failures through a done callback.
 
 ### Resolved audit patterns
 
 - Conflicting close/shutdown contracts: resolved. Agent cleanup contract is `await agent.shutdown()`. MCPToolManager's sync `close()` is correctly called from async `shutdown()`.
 - Command/API parity: verified. `CommandHandler.handle()` properly dispatches both sync and async results.
 - Blocking subprocess/file work on async paths: resolved. All maintained tool paths now offload via `asyncio.to_thread()`.
-- Background-task and scheduler paths: refreshed. Scheduler, heartbeat, GitHub App webhook handling, agent post-response enrichment, and memory rehearsal-effect writes use owned async task patterns with shutdown cleanup.
+- Background-task and scheduler paths: refreshed. Scheduler, heartbeat, GitHub App webhook handling, agent post-response enrichment, memory rehearsal-effect writes, key rotation, A2A background execution, and LLM preference persistence use owned async task patterns with shutdown cleanup.
 - `get_event_loop()` elimination: zero remaining calls in maintained source (`kestrel_sovereign/` and `endpoints/`).
 
 ## Initial high-risk surfaces
@@ -83,6 +89,10 @@ audit in issue `#624`, focused on maintained runtime surfaces.
 - `tests/unit/test_security_feature.py`
 - `tests/unit/test_context_builder.py`
 - `tests/unit/test_kestrel_agent.py`
+- `tests/unit/test_memory_wiring.py`
+- `tests/unit/test_key_rotation.py`
+- `tests/unit/test_a2a_task_manager.py`
+- `tests/unit/test_llm_service.py`
 
 ## Audit status
 
@@ -95,8 +105,6 @@ The sync/async boundary audit has resolved the highest-confidence maintained run
 - Remaining task-spawn sites must be categorized as owned lifecycle tasks, request-scoped tasks, deprecated/extracted workflow code, or defects before issue `#624` can close truthfully.
 
 Remaining classification targets:
-- A2A task manager/worker task ownership.
-- Key rotation background execution ownership.
-- LLM preference persistence callback ownership.
 - Voice request-scoped VAD task behavior.
 - Training adapter task spawns, currently lower priority because those workflows are being extracted from core.
+- Existing owned task loops that should stay documented as acceptable patterns, including `TaskWorker`, storage sync service, delivery queue, spawn lifecycle TTL, heartbeat, and scheduler runner.
