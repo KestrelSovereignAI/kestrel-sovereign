@@ -587,6 +587,30 @@ class TestHeartbeatInterval:
 
 class TestLifecycle:
     @pytest.mark.asyncio
+    async def test_initialize_prefers_raw_storage_without_touching_wrapper_db(self):
+        """Privacy-wrapped storage.db must not be touched during initialization."""
+        db = _make_db(table_exists_map={"heartbeat_log": True})
+
+        class PrivacyWrappedStorage:
+            @property
+            def db(self):
+                raise AssertionError("wrapper db property should not be accessed")
+
+        agent = _make_agent(db=None)
+        agent.storage = PrivacyWrappedStorage()
+        agent._raw_storage = MagicMock(db=db)
+        feat = HeartbeatFeature(agent)
+
+        def fake_create_task(coro):
+            coro.close()
+            return _make_awaitable_task()
+
+        with patch("asyncio.create_task", side_effect=fake_create_task):
+            await feat.initialize()
+
+        assert feat._db is db
+
+    @pytest.mark.asyncio
     async def test_shutdown_stops_background_task(self):
         """shutdown() cancels the background task."""
         db = _make_db(table_exists_map={"heartbeat_log": True})
