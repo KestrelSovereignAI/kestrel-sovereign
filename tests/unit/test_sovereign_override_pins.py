@@ -267,6 +267,7 @@ def _make_feature(fake_db, agent_id=AGENT_ID):
 
     feature = MemoryAgencyFeature(agent)
     feature.storage = storage
+    feature._db = fake_db
     feature.agent_id = agent_id
     feature.pin_quota = 100  # Set by initialize() in production
     return feature
