@@ -3,6 +3,26 @@ Async RAG Store for Kestrel Storage.
 
 Provides async document chunking and retrieval for RAG operations.
 Uses hybrid search: Ollama embeddings (primary) + BM25 keyword search (fallback/boost).
+
+WHEN TO USE THIS vs MemoryRetriever
+-----------------------------------
+Use AsyncRAGStore (this module) when:
+  - Searching INDEXED DOCUMENTS (uploaded files, ingested knowledge bases)
+  - You need vector similarity search over chunks of static content
+  - Content is referential/factual (not conversational)
+  - Examples: "find sections of the user guide about X", "search uploaded PDFs"
+
+Use MemoryRetriever (storage/memory_retriever.py) when:
+  - Searching CONVERSATION HISTORY and message-level memories
+  - You want emotional weighting, importance, and decay applied
+  - Content is experiential/episodic (what was said, felt, remembered)
+  - Examples: "recall what we discussed about X", "find emotionally important moments"
+
+The two systems intentionally do NOT share an interface — they answer
+different questions about different data. RAG = "what does the document say?"
+Memory = "what did we experience together?"
+
+See docs/architecture/MEMORY_SYSTEM.md for the full decision matrix.
 """
 import logging
 import struct
