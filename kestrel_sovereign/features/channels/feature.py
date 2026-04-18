@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from kestrel_sovereign.features.base import Feature, tool
+from kestrel_sovereign.features.storage_access import resolve_feature_database
 from kestrel_sovereign.tools.base import ToolCategory
 
 from .models import (
@@ -88,11 +89,7 @@ class ChannelFeature(Feature):
     async def initialize(self):
         """Set up DB tables and the channel registry."""
         # Database handle (may be None in tests or ephemeral mode)
-        self._db = getattr(self.agent.storage, "db", None)
-        if self._db is None:
-            raw = getattr(self.agent, "_raw_storage", None)
-            if raw:
-                self._db = getattr(raw, "db", None)
+        self._db = resolve_feature_database(self.agent)
 
         # Resolve agent_id from storage hierarchy
         storage = self.agent.storage
