@@ -7,6 +7,7 @@ Tests task lifecycle management and background processing.
 import asyncio
 import os
 import tempfile
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -20,6 +21,7 @@ from kestrel_sovereign.a2a.types import (
     TaskSendParams,
 )
 from kestrel_sovereign.a2a.task_manager import TaskManager, create_task_manager
+from kestrel_sovereign.a2a.agent_card import AgentCapabilities, AgentCard, AgentSkill
 from kestrel_sovereign.a2a.task_worker import (
     TaskWorker,
     TaskHandler,
@@ -111,6 +113,86 @@ class TestTaskManager:
         assert manager.task_store is not None
         assert manager.session_service is not None
         assert manager.observability_store is not None
+
+    @pytest.mark.asyncio
+    async def test_async_execute_skill_task_is_owned_and_cancelled_on_close(self):
+        """Background skill execution must be cancelled before stores close."""
+        call_order = []
+
+        task_store = MagicMock()
+
+        async def save_task(task):
+            call_order.append(f"save:{task.status.state.value}")
+
+        async def close_task_store():
+            call_order.append("close:task_store")
+
+        task_store.save = AsyncMock(side_effect=save_task)
+        task_store.close = AsyncMock(side_effect=close_task_store)
+        session_service = MagicMock()
+        session_service.close = AsyncMock()
+        observability_store = MagicMock()
+        observability_store.close = AsyncMock()
+
+        manager = TaskManager(
+            task_store=task_store,
+            session_service=session_service,
+            observability_store=observability_store,
+        )
+
+        class BlockingHandler:
+            name = "blocking-handler"
+
+            def __init__(self):
+                self.started = asyncio.Event()
+
+            async def handle_task(self, task):
+                self.started.set()
+                await asyncio.Event().wait()
+
+            def get_skill_for_command(self, command):
+                return None
+
+        handler = BlockingHandler()
+        manager.register_agent(
+            AgentCard(
+                name="agent",
+                url="/agents/agent",
+                version="1.0.0",
+                capabilities=AgentCapabilities(),
+                skills=[
+                    AgentSkill(
+                        id="slow_skill",
+                        name="slow_skill",
+                        description="Slow skill",
+                    )
+                ],
+            ),
+            handler,
+        )
+
+        task = await manager.execute_skill(
+            agent_id="agent",
+            skill_id="slow_skill",
+            args={},
+            sync=False,
+        )
+        await handler.started.wait()
+
+        assert len(manager._execution_tasks) == 1
+
+        execution_task = next(iter(manager._execution_tasks))
+
+        await manager.close()
+
+        assert execution_task.done()
+        assert execution_task.cancelled()
+        assert manager._execution_tasks == set()
+        assert call_order == [
+            "save:submitted",
+            "save:canceled",
+            "close:task_store",
+        ]
 
     @pytest.mark.asyncio
     async def test_create_task(self, task_manager):
