@@ -18,6 +18,10 @@ from datetime import datetime
 from typing import Dict, Any, Optional, List
 
 from kestrel_sovereign.features.base import Feature, tool
+from kestrel_sovereign.features.storage_access import (
+    resolve_feature_conversation_store,
+    resolve_feature_database,
+)
 from kestrel_sovereign.tools.base import ToolCategory
 from kestrel_sovereign.kestrel_config.constants import (
     APPROVAL_TIMEOUT_DEFAULT,
@@ -103,17 +107,7 @@ class ReflectionFeature(Feature):
 
     def _init_database(self):
         """Initialize database connection and helper."""
-        # Get database from agent
-        if hasattr(self.agent, 'storage') and self.agent.storage:
-            if hasattr(self.agent.storage, 'db'):
-                self._db = self.agent.storage.db
-            elif hasattr(self.agent.storage, 'database'):
-                self._db = self.agent.storage.database
-
-        # Get raw storage if available
-        if hasattr(self.agent, '_raw_storage') and self.agent._raw_storage:
-            if hasattr(self.agent._raw_storage, 'db'):
-                self._db = self.agent._raw_storage.db
+        self._db = resolve_feature_database(self.agent)
 
         # Initialize database helper
         if self._db:
@@ -146,12 +140,10 @@ class ReflectionFeature(Feature):
 
     def _init_analyzer(self):
         """Initialize the interaction analyzer."""
-        # Get conversation store
-        conversation_store = None
-        if hasattr(self.agent, 'storage') and hasattr(self.agent.storage, 'conversation'):
-            conversation_store = self.agent.storage.conversation
-        elif hasattr(self.agent, 'conversation_store'):
-            conversation_store = self.agent.conversation_store
+        conversation_store = (
+            resolve_feature_conversation_store(self.agent)
+            or getattr(self.agent, 'conversation_store', None)
+        )
 
         # Get episode store (from memory consolidator)
         episode_store = None

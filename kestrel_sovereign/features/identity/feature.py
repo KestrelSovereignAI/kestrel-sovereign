@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from kestrel_sovereign.features.base import Feature, tool
+from kestrel_sovereign.features.storage_access import resolve_feature_database
 from kestrel_sovereign.tools.base import ToolCategory
 
 logger = logging.getLogger(__name__)
@@ -75,9 +76,13 @@ class IdentityFeature(Feature):
             )
             from kestrel_sovereign.filecoin_adapter import FilecoinAdapter, StorageTier
 
+            db = resolve_feature_database(self.agent)
+            if db is None:
+                return "Export failed: database not available"
+
             # Export identity
             exporter = IdentityExporter(
-                db=self.agent.storage.db,
+                db=db,
                 agent_id=self.agent.agent_id,
             )
             package = await exporter.export(include_wallet_history=include_wallet)
@@ -221,9 +226,13 @@ Use `!identity import {filepath}` to restore this identity.
             if not hash_ok:
                 return "Import failed: Content hash verification failed (package may be corrupted)"
 
+            db = resolve_feature_database(self.agent)
+            if db is None:
+                return "Import failed: database not available"
+
             # Import
             importer = IdentityImporter(
-                db=self.agent.storage.db,
+                db=db,
                 target_agent_id=self.agent.agent_id,
             )
             result = await importer.import_package(
@@ -435,8 +444,12 @@ Note: Full capability mapping will be expanded in Phase 3 of substrate portabili
         Show migration audit trail.
         """
         try:
+            db = resolve_feature_database(self.agent)
+            if db is None:
+                return "No migration history found"
+
             # Get migration records from graph
-            rows = await self.agent.storage.db.fetchall(
+            rows = await db.fetchall(
                 """SELECT node_id, properties FROM graph_nodes
                    WHERE node_type = 'migration_record'
                    AND node_id IN (

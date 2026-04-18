@@ -246,6 +246,7 @@ def _make_feature(fake_db, agent_id="test-agent", pin_quota=None):
 
     feature = MemoryAgencyFeature(agent)
     feature.storage = storage
+    feature._db = fake_db
     feature.agent_id = agent_id
     feature.pin_quota = pin_quota if pin_quota is not None else PIN_QUOTA_DEFAULT
     return feature
