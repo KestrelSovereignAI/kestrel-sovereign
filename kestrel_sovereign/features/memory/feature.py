@@ -16,6 +16,10 @@ import logging
 from typing import Any, Dict, List, Optional
 
 from kestrel_sovereign.features.base import Feature, tool
+from kestrel_sovereign.features.storage_access import (
+    resolve_feature_conversation_store,
+    resolve_feature_database,
+)
 from kestrel_sovereign.tools.base import ToolCategory
 
 logger = logging.getLogger(__name__)
@@ -42,6 +46,7 @@ class MemoryFeature(Feature):
     async def initialize(self):
         """Initialize the memory feature with storage references."""
         self.storage = self.agent.storage
+        self._db = resolve_feature_database(self.agent)
         # MemorySystem is the single facade for all memory components.
         # Lazily loaded since it's initialized on the agent after feature registration.
         self._memory_system = None
@@ -70,10 +75,7 @@ class MemoryFeature(Feature):
 
     def _get_conversation_store(self):
         """Navigate storage hierarchy to get the conversation store."""
-        return (
-            getattr(self.storage, 'conversation', None) or
-            getattr(getattr(self.storage, '_storage', None), 'conversation', None)
-        )
+        return resolve_feature_conversation_store(self.agent)
 
     @tool(
         name="search_memory",
@@ -286,7 +288,7 @@ class MemoryFeature(Feature):
                 rag = self.storage.rag
                 # Try to get chunk count
                 try:
-                    count_result = await self.storage.db.fetchone(
+                    count_result = await self._db.fetchone(
                         "SELECT COUNT(*) FROM document_chunks"
                     )
                     rag_stats["document_chunks"] = count_result[0] if count_result else 0
@@ -296,7 +298,7 @@ class MemoryFeature(Feature):
             # Get file count
             file_count = 0
             try:
-                file_result = await self.storage.db.fetchone(
+                file_result = await self._db.fetchone(
                     "SELECT COUNT(*) FROM files WHERE agent_id = ?",
                     (self.agent_id,)
                 )

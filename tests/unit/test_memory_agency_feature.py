@@ -188,14 +188,44 @@ def _make_feature(fake_db, agent_id="test-agent", graph_store=None):
 
     feature = MemoryAgencyFeature(agent)
     feature.storage = storage
+    feature._db = fake_db
     feature.agent_id = agent_id
     feature.pin_quota = PIN_QUOTA_DEFAULT
     return feature
 
 
+class PrivacyWrappedStorage:
+    def __init__(self, raw_storage):
+        self._storage = raw_storage
+
+    @property
+    def db(self):
+        raise AssertionError("deprecated wrapper db property was touched")
+
+
 # --------------------------------------------------------------------------
 # Tests
 # --------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_initialize_uses_raw_storage_without_touching_wrapper_db():
+    """Initialization must not trip PrivacyEnforcingStorage.db."""
+    from kestrel_sovereign.features.memory_agency.feature import MemoryAgencyFeature
+
+    db = FakeDB()
+    raw_storage = MagicMock(db=db)
+    agent = MagicMock()
+    agent.did = "test-agent"
+    agent.storage = PrivacyWrappedStorage(raw_storage)
+    agent._raw_storage = raw_storage
+
+    feature = MemoryAgencyFeature(agent)
+
+    await feature.initialize()
+
+    assert feature._db is db
+
 
 @pytest.mark.asyncio
 async def test_pin_memory_sets_decay_protected():

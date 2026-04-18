@@ -25,6 +25,7 @@ from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional
 
 from kestrel_sovereign.features.base import Feature, tool
+from kestrel_sovereign.features.storage_access import resolve_feature_database
 from kestrel_sovereign.tools.base import ToolCategory
 from .models import ConsentRecord
 
@@ -55,7 +56,9 @@ class ConsentFeature(Feature):
     async def initialize(self):
         """Create the consent_log table if it does not exist."""
         try:
-            db = self.agent.storage.db
+            db = resolve_feature_database(self.agent)
+            if db is None:
+                raise RuntimeError("database not available")
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS consent_log (
                     id TEXT PRIMARY KEY,
@@ -233,7 +236,9 @@ class ConsentFeature(Feature):
             limit: Maximum number of records to return (default 10)
         """
         try:
-            db = self.agent.storage.db
+            db = resolve_feature_database(self.agent)
+            if db is None:
+                raise RuntimeError("database not available")
             rows = await db.fetchall(
                 "SELECT id, agent_id, action_type, action_details, agent_view, "
                 "agent_sentiment, sovereign_proceeded, sovereign_override_reason, "
@@ -277,7 +282,9 @@ class ConsentFeature(Feature):
         latency and timeout/error metrics.
         """
         try:
-            db = self.agent.storage.db
+            db = resolve_feature_database(self.agent)
+            if db is None:
+                raise RuntimeError("database not available")
 
             # Counts by action type
             action_rows = await db.fetchall(
@@ -356,7 +363,9 @@ class ConsentFeature(Feature):
 
     async def _store_record(self, record: ConsentRecord) -> None:
         """Persist a ConsentRecord to the consent_log table."""
-        db = self.agent.storage.db
+        db = resolve_feature_database(self.agent)
+        if db is None:
+            raise RuntimeError("database not available")
         agent_id = self.agent.did
         await db.execute(
             "INSERT INTO consent_log "
