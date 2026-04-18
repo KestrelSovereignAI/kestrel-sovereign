@@ -81,6 +81,7 @@ class MemoryRetriever:
         """
         self.conversations = conversation_store
         self.linker = linker
+        self._access_update_tasks: set[asyncio.Task[None]] = set()
 
     async def retrieve(
         self,
@@ -160,14 +161,39 @@ class MemoryRetriever:
             result["retrieval_score"] = round(score, 4)
             results.append(result)
 
-        # Rehearsal effect: bump access_count on the messages we actually
-        # surfaced. Fire-and-forget so it never blocks retrieval.
         for result in results:
             msg_id = result.get("id")
             if msg_id is not None:
-                asyncio.create_task(self.update_access(msg_id, agent_id))
+                self._schedule_access_update(msg_id, agent_id)
 
         return results
+
+    def _schedule_access_update(self, message_id: int, agent_id: str) -> asyncio.Task[None]:
+        """Own rehearsal-effect bookkeeping tasks so shutdown can await them."""
+        task = asyncio.create_task(
+            self.update_access(message_id, agent_id),
+            name=f"memory-access-update-{message_id}",
+        )
+        self._access_update_tasks.add(task)
+        task.add_done_callback(self._access_update_tasks.discard)
+        return task
+
+    async def drain_access_updates(self, *, cancel: bool = False) -> None:
+        """Wait for scheduled access-count updates before storage lifecycle changes."""
+        tasks = set(self._access_update_tasks)
+        if not tasks:
+            return
+
+        if cancel:
+            for task in tasks:
+                task.cancel()
+
+        await asyncio.gather(*tasks, return_exceptions=True)
+        self._access_update_tasks.difference_update(tasks)
+
+    async def shutdown(self) -> None:
+        """Cancel pending rehearsal-effect writes during component shutdown."""
+        await self.drain_access_updates(cancel=True)
 
     def _calculate_score(
         self,
