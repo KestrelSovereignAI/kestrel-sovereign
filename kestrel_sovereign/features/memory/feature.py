@@ -508,3 +508,326 @@ class MemoryFeature(Feature):
         except Exception as e:
             logger.error(f"memory_consolidate failed: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
+
+    # ------------------------------------------------------------------
+    # Schema-aware recall tools (#628)
+    # These read from the typed stores populated by SchemaRouter during
+    # message enrichment. Empty results in EPHEMERAL/ISOLATED modes where
+    # routing never ran.
+    # ------------------------------------------------------------------
+
+    @tool(
+        name="recall_action_items",
+        description="Retrieve action items the user committed to. Filters: status, creation-date window (days), assignee.",
+        category=ToolCategory.MEMORY,
+        command_prefix="!memory actions",
+    )
+    async def recall_action_items(
+        self,
+        status: Optional[str] = None,
+        days: Optional[int] = None,
+        assignee_concept_id: Optional[str] = None,
+        limit: int = 25,
+    ) -> Dict[str, Any]:
+        """Query action_item graph nodes with optional property filters.
+
+        Action items live as graph nodes of type `action_item` (no
+        separate SQL table). The graph's `node_type` index makes the
+        initial scan fast; remaining filters run in memory over
+        at-most a few thousand nodes per agent.
+
+        Args:
+            status: Filter by status ("pending", "done", "cancelled").
+                If None, all statuses are returned.
+            days: If set, only return items whose `created_at` is within
+                the last N days. Note: this is a creation-date window,
+                not a due-date window — use update_action_item to set
+                a due_date explicitly if you need that.
+            assignee_concept_id: Optional person concept id to filter by.
+            limit: Max rows returned (1-200, default 25).
+        """
+        storage = getattr(self.agent, "storage", None)
+        if storage is None or not hasattr(storage, "graph"):
+            return {"success": False, "error": "Graph store not available"}
+
+        try:
+            limit = int(limit)
+        except (TypeError, ValueError):
+            return {"success": False, "error": f"limit must be an integer, got {limit!r}"}
+        if limit < 1 or limit > 200:
+            return {"success": False, "error": "limit must be in [1, 200]"}
+
+        if status is not None and status not in ("pending", "done", "cancelled"):
+            return {"success": False, "error": f"status must be pending/done/cancelled, got {status!r}"}
+
+        since: Optional[str] = None
+        if days is not None:
+            try:
+                days = int(days)
+            except (TypeError, ValueError):
+                return {"success": False, "error": f"days must be an integer, got {days!r}"}
+            if days < 1 or days > 3650:
+                return {"success": False, "error": "days must be in [1, 3650]"}
+            from datetime import datetime, timezone, timedelta
+            since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+
+        try:
+            nodes = await storage.graph.get_nodes_by_type("action_item")
+        except Exception as e:
+            logger.error("recall_action_items query failed: %s", e)
+            return {"success": False, "error": str(e)}
+
+        matching = []
+        for n in nodes:
+            props = n.properties or {}
+            if props.get("agent_id") != self.agent_id:
+                continue
+            if status is not None and props.get("status") != status:
+                continue
+            if since is not None and (props.get("created_at") or "") < since:
+                continue
+            if assignee_concept_id is not None and props.get("assignee_concept_id") != assignee_concept_id:
+                continue
+            matching.append({
+                "id": n.node_id,
+                "source_message_id": props.get("source_message_id"),
+                "text": props.get("text"),
+                "status": props.get("status"),
+                "assignee_concept_id": props.get("assignee_concept_id"),
+                "due_date": props.get("due_date"),
+                "confidence": props.get("confidence"),
+                "created_at": props.get("created_at"),
+            })
+
+        matching.sort(key=lambda d: d.get("created_at") or "", reverse=True)
+        return {"action_items": matching[:limit], "count": min(len(matching), limit)}
+
+    @tool(
+        name="update_action_item",
+        description="Update an action item's status (pending/done/cancelled), due date, or assignee.",
+        category=ToolCategory.MEMORY,
+        command_prefix="!memory action update",
+    )
+    async def update_action_item(
+        self,
+        item_id: str,
+        status: Optional[str] = None,
+        due_date: Optional[str] = None,
+        assignee_concept_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Update a single action item graph node. Null fields are preserved."""
+        storage = getattr(self.agent, "storage", None)
+        if storage is None or not hasattr(storage, "graph"):
+            return {"success": False, "error": "Graph store not available"}
+
+        if status is not None and status not in ("pending", "done", "cancelled"):
+            return {"success": False, "error": f"status must be pending/done/cancelled, got {status!r}"}
+
+        if due_date is not None:
+            # Accept ISO-8601 date or datetime strings.
+            from datetime import datetime as _dt
+            try:
+                _dt.fromisoformat(due_date)
+            except (TypeError, ValueError):
+                return {
+                    "success": False,
+                    "error": f"due_date must be ISO-8601 (YYYY-MM-DD or full datetime), got {due_date!r}",
+                }
+
+        if status is None and due_date is None and assignee_concept_id is None:
+            return {"success": False, "error": "no fields to update"}
+
+        try:
+            node = await storage.graph.get_node(item_id)
+        except Exception as e:
+            logger.error("update_action_item lookup failed: %s", e)
+            return {"success": False, "error": str(e)}
+        if node is None or node.node_type != "action_item":
+            return {"success": False, "error": f"Action item {item_id} not found"}
+
+        props = dict(node.properties or {})
+        if props.get("agent_id") != self.agent_id:
+            # Don't leak cross-agent mutations.
+            return {"success": False, "error": f"Action item {item_id} not found"}
+
+        if status is not None:
+            props["status"] = status
+        if due_date is not None:
+            props["due_date"] = due_date
+        if assignee_concept_id is not None:
+            props["assignee_concept_id"] = assignee_concept_id
+        props["updated_at"] = _utc_now_iso()
+
+        from kestrel_sovereign.storage.async_graph_store import GraphNode
+        try:
+            await storage.graph.add_node(GraphNode(
+                node_id=node.node_id,
+                node_type=node.node_type,
+                label=node.label,
+                properties=props,
+            ))
+        except Exception as e:
+            logger.error("update_action_item write failed: %s", e)
+            return {"success": False, "error": str(e)}
+        return {"success": True, "item_id": item_id}
+
+    @tool(
+        name="recall_decisions",
+        description="Retrieve decisions the user has recorded (stored as graph nodes of type 'decision').",
+        category=ToolCategory.MEMORY,
+        command_prefix="!memory decisions",
+    )
+    async def recall_decisions(self, limit: int = 25) -> Dict[str, Any]:
+        """List decisions from the graph."""
+        storage = getattr(self.agent, "storage", None)
+        if storage is None or not hasattr(storage, "graph"):
+            return {"success": False, "error": "Graph store not available"}
+
+        try:
+            limit = int(limit)
+        except (TypeError, ValueError):
+            return {"success": False, "error": f"limit must be an integer, got {limit!r}"}
+        if limit < 1 or limit > 200:
+            return {"success": False, "error": "limit must be in [1, 200]"}
+
+        try:
+            nodes = await storage.graph.get_nodes_by_type("decision")
+        except Exception as e:
+            logger.error("recall_decisions failed: %s", e)
+            return {"success": False, "error": str(e)}
+
+        own = [
+            {
+                "id": n.node_id,
+                "label": n.label,
+                "text": (n.properties or {}).get("text"),
+                "source_message_id": (n.properties or {}).get("source_message_id"),
+                "confidence": (n.properties or {}).get("confidence"),
+                "created_at": (n.properties or {}).get("created_at"),
+            }
+            for n in nodes
+            if (n.properties or {}).get("agent_id") == self.agent_id
+        ]
+        own.sort(key=lambda d: d.get("created_at") or "", reverse=True)
+        return {"decisions": own[:limit], "count": min(len(own), limit)}
+
+    @tool(
+        name="recall_interactions",
+        description="List recent message→person interactions for a given person concept, with sentiment and topics.",
+        category=ToolCategory.MEMORY,
+        command_prefix="!memory interactions",
+    )
+    async def recall_interactions(
+        self,
+        person_concept_id: str,
+        limit: int = 25,
+    ) -> Dict[str, Any]:
+        """Return recent mentions edges pointing at a person concept."""
+        storage = getattr(self.agent, "storage", None)
+        if storage is None or not hasattr(storage, "graph"):
+            return {"success": False, "error": "Graph store not available"}
+
+        try:
+            limit = int(limit)
+        except (TypeError, ValueError):
+            return {"success": False, "error": f"limit must be an integer, got {limit!r}"}
+        if limit < 1 or limit > 200:
+            return {"success": False, "error": "limit must be in [1, 200]"}
+
+        try:
+            edges = await storage.graph.get_edges(person_concept_id, direction="in")
+        except Exception as e:
+            logger.error("recall_interactions failed: %s", e)
+            return {"success": False, "error": str(e)}
+
+        # Message nodes are namespaced by agent id: `message:{agent_id}:{msg}`.
+        # Without this guard, a caller passing a shared concept id could
+        # retrieve edges from other agents' messages.
+        agent_prefix = f"message:{self.agent_id}:"
+        interactions = [
+            {
+                "message_node_id": e.source_id,
+                "properties": e.properties or {},
+            }
+            for e in edges
+            if e.label == "mentions" and e.source_id.startswith(agent_prefix)
+        ]
+        interactions.sort(
+            key=lambda i: (i.get("properties") or {}).get("recorded_at") or "",
+            reverse=True,
+        )
+        return {"interactions": interactions[:limit], "count": min(len(interactions), limit)}
+
+    @tool(
+        name="confirm_person_match",
+        description="Resolve an ambiguous person mention by confirming which existing concept it refers to.",
+        category=ToolCategory.MEMORY,
+        command_prefix="!memory confirm-person",
+    )
+    async def confirm_person_match(
+        self,
+        message_id: str,
+        mentioned_label: str,
+        concept_id: str,
+    ) -> Dict[str, Any]:
+        """Resolve an ambiguous person mention.
+
+        Removes the ambiguous label-based mentions edge
+        (message → concept:{agent}:{mentioned_label}) and writes a canonical
+        mentions edge pointing at the confirmed concept id. After this runs,
+        recall_interactions on the confirmed concept includes the message;
+        recall on the ambiguous label-concept does not.
+        """
+        storage = getattr(self.agent, "storage", None)
+        if storage is None or not hasattr(storage, "graph"):
+            return {"success": False, "error": "Graph store not available"}
+
+        target = await storage.graph.get_node(concept_id)
+        if target is None:
+            return {"success": False, "error": f"Concept {concept_id} not found"}
+
+        message_node = f"message:{self.agent_id}:{message_id}"
+        # The ambiguous edge was written by SchemaRouter using the same
+        # deterministic id shape the linker uses. Normalize the label the
+        # same way the linker/router did (lowercased, stripped) so we can
+        # find and delete it.
+        ambiguous_target = (
+            f"concept:{self.agent_id}:{mentioned_label.strip().lower()}"
+        )
+
+        try:
+            # Write the canonical edge first so we never have a window
+            # where neither edge exists.
+            await storage.graph.add_edge(
+                message_node,
+                concept_id,
+                "mentions",
+                properties={
+                    "resolved_from": mentioned_label,
+                    "confirmed": True,
+                    "confirmed_at": _utc_now_iso(),
+                },
+            )
+            # Then remove the ambiguous one — but only if it's different
+            # from the canonical target. Otherwise we would be deleting
+            # the edge we just wrote.
+            removed = False
+            if ambiguous_target != concept_id:
+                await storage.graph.delete_edge(
+                    message_node, ambiguous_target, "mentions"
+                )
+                removed = True
+        except Exception as e:
+            logger.error("confirm_person_match failed: %s", e)
+            return {"success": False, "error": str(e)}
+        return {
+            "success": True,
+            "message_id": message_id,
+            "resolved_to": concept_id,
+            "ambiguous_edge_removed": removed,
+        }
+
+
+def _utc_now_iso() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat()
