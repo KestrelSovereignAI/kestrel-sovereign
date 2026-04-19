@@ -391,7 +391,7 @@ class SchemaRouter:
             "pending_person_matches": [],
         }
 
-        # 1. Action items (table)
+        # 1. Action items (graph nodes)
         try:
             items = self.action_extractor.extract(content)
             if items:
