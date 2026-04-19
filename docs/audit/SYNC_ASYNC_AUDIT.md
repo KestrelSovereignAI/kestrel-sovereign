@@ -56,13 +56,15 @@ audit in issue `#624`, focused on maintained runtime surfaces.
   - Fixed by tracking execution tasks, cancelling/awaiting them in `TaskManager.close()`, and saving a terminal `canceled` task state before stores close.
 - `LLMService` model preference persistence used loop-created tasks with no owner, so preference writes could outlive service cleanup.
   - Fixed by tracking persistence tasks, draining them in `LLMService.close()`, and logging callback failures through a done callback.
+- Voice websocket VAD processing uses `asyncio.create_task()` inside the request handler.
+  - Classified as acceptable request-scoped concurrency: the websocket `finally` path signals the VAD queue, cancels the task, and awaits it before the request exits. Added a disconnect test proving the VAD generator cleans up.
 
 ### Resolved audit patterns
 
 - Conflicting close/shutdown contracts: resolved. Agent cleanup contract is `await agent.shutdown()`. MCPToolManager's sync `close()` is correctly called from async `shutdown()`.
 - Command/API parity: verified. `CommandHandler.handle()` properly dispatches both sync and async results.
 - Blocking subprocess/file work on async paths: resolved. All maintained tool paths now offload via `asyncio.to_thread()`.
-- Background-task and scheduler paths: refreshed. Scheduler, heartbeat, GitHub App webhook handling, agent post-response enrichment, memory rehearsal-effect writes, key rotation, A2A background execution, and LLM preference persistence use owned async task patterns with shutdown cleanup.
+- Background-task and scheduler paths: refreshed. Scheduler, heartbeat, GitHub App webhook handling, agent post-response enrichment, memory rehearsal-effect writes, key rotation, A2A background execution, and LLM preference persistence use owned async task patterns with shutdown cleanup. Voice VAD is request-scoped and awaited by the websocket cleanup path.
 - `get_event_loop()` elimination: zero remaining calls in maintained source (`kestrel_sovereign/` and `endpoints/`).
 
 ## Initial high-risk surfaces
@@ -93,6 +95,7 @@ audit in issue `#624`, focused on maintained runtime surfaces.
 - `tests/unit/test_key_rotation.py`
 - `tests/unit/test_a2a_task_manager.py`
 - `tests/unit/test_llm_service.py`
+- `tests/unit/test_voice_websocket.py`
 
 ## Audit status
 
@@ -105,6 +108,5 @@ The sync/async boundary audit has resolved the highest-confidence maintained run
 - Remaining task-spawn sites must be categorized as owned lifecycle tasks, request-scoped tasks, deprecated/extracted workflow code, or defects before issue `#624` can close truthfully.
 
 Remaining classification targets:
-- Voice request-scoped VAD task behavior.
 - Training adapter task spawns, currently lower priority because those workflows are being extracted from core.
 - Existing owned task loops that should stay documented as acceptable patterns, including `TaskWorker`, storage sync service, delivery queue, spawn lifecycle TTL, heartbeat, and scheduler runner.
