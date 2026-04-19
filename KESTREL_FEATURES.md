@@ -102,7 +102,7 @@ Features come from two sources:
 
 The inventory below lists **core features only**. Installed feature packages appear at runtime via `discover_entrypoint_feature_classes()` and are not enumerated here.
 
-- Current audited snapshot: `42` discoverable modules and `42` exported `Feature` subclasses.
+- Current audited snapshot: `43` discoverable modules and `43` exported `Feature` subclasses.
 
 - `audit_anchor`
 - `bootstrap`
@@ -133,6 +133,7 @@ The inventory below lists **core features only**. Installed feature packages app
 - `save`
 - `scheduler`
 - `security`
+- `skills`
 - `sovereignty`
 - `spawn`
 - `state_of_mind`
@@ -178,6 +179,7 @@ The currently exported `Feature` subclasses discovered from those modules includ
 - `SaveFeature`
 - `SchedulerFeature`
 - `SecurityFeature`
+- `SkillsFeature`
 - `SovereigntyFeature`
 - `SpawnFeature`
 - `StateOfMindFeature`
