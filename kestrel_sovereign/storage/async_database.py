@@ -29,6 +29,9 @@ CREATE TABLE IF NOT EXISTS graph_nodes (
     properties TEXT
 );
 
+CREATE INDEX IF NOT EXISTS idx_graph_nodes_type ON graph_nodes(node_type);
+CREATE INDEX IF NOT EXISTS idx_graph_nodes_type_label ON graph_nodes(node_type, label);
+
 CREATE TABLE IF NOT EXISTS graph_edges (
     source_id TEXT NOT NULL,
     target_id TEXT NOT NULL,
@@ -36,6 +39,9 @@ CREATE TABLE IF NOT EXISTS graph_edges (
     properties TEXT,
     PRIMARY KEY (source_id, target_id, label)
 );
+
+CREATE INDEX IF NOT EXISTS idx_graph_edges_target ON graph_edges(target_id, label);
+CREATE INDEX IF NOT EXISTS idx_graph_edges_label ON graph_edges(label);
 
 CREATE TABLE IF NOT EXISTS document_chunks (
     chunk_id INTEGER PRIMARY KEY AUTOINCREMENT,
