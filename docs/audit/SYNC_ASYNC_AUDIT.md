@@ -97,16 +97,19 @@ audit in issue `#624`, focused on maintained runtime surfaces.
 - `tests/unit/test_llm_service.py`
 - `tests/unit/test_voice_websocket.py`
 
-## Audit status
+## Final classification
 
-The sync/async boundary audit has resolved the highest-confidence maintained runtime violations found so far, but the remaining `create_task()` inventory is still being classified rather than declared complete:
+The sync/async boundary audit is complete for the maintained core runtime surface covered by issue `#624`:
 
 - Identified command/API awaitability violations have been fixed with root-cause changes.
 - Identified blocking I/O on maintained async tool paths has been offloaded via `asyncio.to_thread()`.
 - All `get_event_loop()` usage has been eliminated from maintained source code.
 - Direct contract tests cover each corrected seam.
-- Remaining task-spawn sites must be categorized as owned lifecycle tasks, request-scoped tasks, deprecated/extracted workflow code, or defects before issue `#624` can close truthfully.
+- Remaining maintained `create_task()` sites have been classified as owned lifecycle tasks or request-scoped tasks.
 
-Remaining classification targets:
-- Training adapter task spawns, currently lower priority because those workflows are being extracted from core.
-- Existing owned task loops that should stay documented as acceptable patterns, including `TaskWorker`, storage sync service, delivery queue, spawn lifecycle TTL, heartbeat, and scheduler runner.
+Accepted task-spawn patterns:
+- Owned lifecycle loops: `TaskWorker`, storage sync service, delivery queue, spawn lifecycle TTL, heartbeat, scheduler runner, GitHub App event handling, memory access updates, key rotation, A2A background execution, and LLM preference persistence.
+- Request-scoped concurrency: voice websocket VAD processing, which is cancelled and awaited by the websocket cleanup path.
+
+Deferred/extracted workflow code:
+- Training adapter task spawns in `features/training/adapters/` are intentionally excluded from this core runtime closure because LoRA/training workflows are being extracted from core. They should be handled with the non-core feature extraction work rather than used to keep issue `#624` open.
