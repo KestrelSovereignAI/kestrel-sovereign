@@ -217,20 +217,20 @@ class TestRecallInteractions:
     async def test_returns_mention_edges_with_properties(self, feature):
         edges = [
             Edge(
-                source_id="message:agent-1:msg-1",
-                target_id="concept:agent-1:alice",
+                source_id="message:did:test:recall-agent:msg-1",
+                target_id="concept:did:test:recall-agent:alice",
                 label="mentions",
                 properties={"sentiment": "positive", "topics": ["weekend"]},
             ),
             Edge(
-                source_id="message:agent-1:msg-2",
-                target_id="concept:agent-1:alice",
+                source_id="message:did:test:recall-agent:msg-2",
+                target_id="concept:did:test:recall-agent:alice",
                 label="other_edge",
                 properties={},
             ),
         ]
         feature.agent.storage.graph.get_edges = AsyncMock(return_value=edges)
-        result = await feature.recall_interactions(person_concept_id="concept:agent-1:alice")
+        result = await feature.recall_interactions(person_concept_id="concept:did:test:recall-agent:alice")
         # Only 'mentions' edges are interactions
         assert result["count"] == 1
         assert result["interactions"][0]["properties"]["sentiment"] == "positive"
@@ -251,15 +251,16 @@ class TestConfirmPersonMatch:
     @pytest.mark.asyncio
     async def test_resolves_ambiguous_match(self, feature):
         feature.agent.storage.graph.get_node = AsyncMock(return_value=GraphNode(
-            node_id="concept:agent-1:alice-smith",
+            node_id="concept:did:test:recall-agent:alice-smith",
             node_type="concept",
             label="Alice Smith",
             properties={},
         ))
+        feature.agent.storage.graph.delete_edge = AsyncMock()
         result = await feature.confirm_person_match(
             message_id="msg-1",
             mentioned_label="alice",
-            concept_id="concept:agent-1:alice-smith",
+            concept_id="concept:did:test:recall-agent:alice-smith",
         )
         assert result["success"] is True
         # A mentions edge must be written with the canonical concept
@@ -271,6 +272,52 @@ class TestConfirmPersonMatch:
         assert props.get("resolved_from") == "alice"
 
     @pytest.mark.asyncio
+    async def test_actually_removes_ambiguous_edge(self, feature):
+        """Critical: confirmation must supersede the ambiguous edge, not
+        accumulate parallel edges. After confirm, recall on the ambiguous
+        label-concept must not return this message."""
+        feature.agent.storage.graph.get_node = AsyncMock(return_value=GraphNode(
+            node_id="concept:did:test:recall-agent:alice-smith",
+            node_type="concept",
+            label="Alice Smith",
+            properties={},
+        ))
+        feature.agent.storage.graph.delete_edge = AsyncMock()
+        result = await feature.confirm_person_match(
+            message_id="msg-1",
+            mentioned_label="alice",
+            concept_id="concept:did:test:recall-agent:alice-smith",
+        )
+        assert result["success"] is True
+        assert result["ambiguous_edge_removed"] is True
+        # delete_edge called with the ambiguous (guessed) target
+        feature.agent.storage.graph.delete_edge.assert_awaited_once()
+        del_call = feature.agent.storage.graph.delete_edge.await_args
+        assert del_call.args[0] == "message:did:test:recall-agent:msg-1"
+        assert del_call.args[1] == "concept:did:test:recall-agent:alice"
+        assert del_call.args[2] == "mentions"
+
+    @pytest.mark.asyncio
+    async def test_no_self_delete_when_ambiguous_matches_canonical(self, feature):
+        """If the label-concept and confirmed concept happen to resolve
+        to the same node id, we must not delete the edge we just wrote."""
+        feature.agent.storage.graph.get_node = AsyncMock(return_value=GraphNode(
+            node_id="concept:did:test:recall-agent:alice",
+            node_type="concept",
+            label="Alice",
+            properties={},
+        ))
+        feature.agent.storage.graph.delete_edge = AsyncMock()
+        result = await feature.confirm_person_match(
+            message_id="msg-1",
+            mentioned_label="alice",
+            concept_id="concept:did:test:recall-agent:alice",
+        )
+        assert result["success"] is True
+        assert result["ambiguous_edge_removed"] is False
+        feature.agent.storage.graph.delete_edge.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_unknown_concept(self, feature):
         feature.agent.storage.graph.get_node = AsyncMock(return_value=None)
         result = await feature.confirm_person_match(
@@ -279,6 +326,71 @@ class TestConfirmPersonMatch:
             concept_id="concept:agent-1:ghost",
         )
         assert result["success"] is False
+
+
+# =============================================================================
+# due_date validation
+# =============================================================================
+
+
+class TestDueDateValidation:
+
+    @pytest.mark.asyncio
+    async def test_rejects_invalid_due_date(self, feature):
+        feature._db.fetchone = AsyncMock(return_value=("action_1",))
+        result = await feature.update_action_item(
+            item_id="action_1", due_date="not-a-date"
+        )
+        assert result["success"] is False
+        assert "iso-8601" in result["error"].lower()
+
+    @pytest.mark.asyncio
+    async def test_accepts_iso_date(self, feature):
+        feature._db.fetchone = AsyncMock(return_value=("action_1",))
+        result = await feature.update_action_item(
+            item_id="action_1", due_date="2026-05-01"
+        )
+        assert result["success"] is True
+
+    @pytest.mark.asyncio
+    async def test_accepts_iso_datetime(self, feature):
+        feature._db.fetchone = AsyncMock(return_value=("action_1",))
+        result = await feature.update_action_item(
+            item_id="action_1", due_date="2026-05-01T14:00:00+00:00"
+        )
+        assert result["success"] is True
+
+
+# =============================================================================
+# recall_interactions agent scoping
+# =============================================================================
+
+
+class TestRecallInteractionsAgentScope:
+
+    @pytest.mark.asyncio
+    async def test_filters_out_other_agents_message_edges(self, feature):
+        """Person concept ids can be shared across agents in theory; the
+        recall tool must only return edges whose source message node is
+        prefixed with this agent's id."""
+        edges = [
+            Edge(
+                source_id="message:did:test:recall-agent:my-msg",
+                target_id="concept:x:alice",
+                label="mentions",
+                properties={"sentiment": "positive"},
+            ),
+            Edge(
+                source_id="message:did:other-agent:their-msg",
+                target_id="concept:x:alice",
+                label="mentions",
+                properties={"sentiment": "negative"},
+            ),
+        ]
+        feature.agent.storage.graph.get_edges = AsyncMock(return_value=edges)
+        result = await feature.recall_interactions(person_concept_id="concept:x:alice")
+        assert result["count"] == 1
+        assert result["interactions"][0]["message_node_id"].endswith("my-msg")
 
 
 if __name__ == "__main__":

@@ -24,6 +24,7 @@ skip routing entirely because the underlying storage shouldn't exist.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -58,11 +59,17 @@ ACTION_ITEM_PATTERNS = [
 ]
 
 DECISION_PATTERNS = [
-    r"\bI(?:'ve)? decided (?:to )?([^.!?\n]+)",
+    # Anchor on an explicit decision verb or noun to keep precision up.
+    # Plain future tense ("I'm going to X") is captured by the action-item
+    # extractor; promoting it to a decision here would double-classify
+    # most commitments and dilute decision recall.
+    r"\bI(?:'ve)? decided (?:to |that |on )?([^.!?\n]+)",
+    r"\bwe(?:'ve)? decided (?:to |that |on )?([^.!?\n]+)",
     r"\bmy decision (?:is |was )([^.!?\n]+)",
-    r"\bI('m| am) going (?:to |with )([^.!?\n]+)",
-    r"\bwe(?:'ve)? decided (?:to )?([^.!?\n]+)",
-    r"\bgoing forward,?\s+([^.!?\n]+)",
+    r"\bgoing with ([^.!?\n]+)",
+    r"\bsticking with ([^.!?\n]+)",
+    r"\bcommitting to ([^.!?\n]+)",
+    r"\bwe'?re going with ([^.!?\n]+)",
 ]
 
 # Naive positive/negative sentiment cues for interaction enrichment.
@@ -196,12 +203,26 @@ def _normalize_person_name(name: str) -> str:
 
 
 def _first_name_matches(first: str, label: str) -> bool:
-    """True if the first token of `label` starts with or equals `first`."""
+    """True if the first token of `label` matches `first` with enough evidence.
+
+    To avoid false merges like "Al" → "Alice" we require at least 3
+    characters of shared prefix, regardless of which side is shorter.
+    """
     candidate_first = _normalize_person_name(label).split()
     if not candidate_first:
         return False
     cand = candidate_first[0]
-    return cand == first or cand.startswith(first) or first.startswith(cand) and len(first) >= 3
+    min_shared = 3
+    if len(first) < min_shared or len(cand) < min_shared:
+        # Too little evidence to fuzzy-link.
+        return cand == first
+    if cand == first:
+        return True
+    if cand.startswith(first) and len(first) >= min_shared:
+        return True
+    if first.startswith(cand) and len(cand) >= min_shared:
+        return True
+    return False
 
 
 # =============================================================================
@@ -429,9 +450,19 @@ class SchemaRouter:
         items: List[str],
         message_id: Optional[str],
     ) -> None:
+        """Idempotent insert: skip if an action item for this (message, text)
+        is already on file. Reprocessing the same message must not duplicate
+        rows — replay/retry/backfill are all real operational scenarios.
+        """
         now_iso = datetime.now(timezone.utc).isoformat()
         for text in items:
-            item_id = f"action_{uuid.uuid4().hex[:12]}"
+            item_id = _deterministic_id("action", message_id, text)
+            existing = await self.db.fetchone(
+                "SELECT id FROM action_items WHERE id = ? AND agent_id = ?",
+                (item_id, self.agent_id),
+            )
+            if existing:
+                continue
             await self.db.execute(
                 """
                 INSERT INTO action_items
@@ -451,9 +482,16 @@ class SchemaRouter:
         decisions: List[str],
         message_id: Optional[str],
     ) -> None:
+        """Idempotent decision node creation.
+
+        Uses a deterministic node id from (agent, message, text) so that
+        reprocessing the same message upserts the same node instead of
+        creating parallel nodes. Graph upsert semantics (INSERT OR REPLACE
+        on node_id) guarantee at-most-one node per (message, decision text).
+        """
         now_iso = datetime.now(timezone.utc).isoformat()
         for text in decisions:
-            node_id = f"decision:{self.agent_id}:{uuid.uuid4().hex[:12]}"
+            node_id = _deterministic_decision_node_id(self.agent_id, message_id, text)
             await self.graph.add_node(GraphNode(
                 node_id=node_id,
                 node_type=DECISION_NODE_TYPE,
@@ -566,6 +604,36 @@ _NON_PERSON_KEYWORDS = frozenset([
     "love", "hate", "miss", "worry", "fear",
     "stress", "peace", "calm", "chaos",
 ])
+
+
+def _deterministic_id(kind: str, message_id: Optional[str], text: str) -> str:
+    """Generate a stable id from (kind, message, text) so re-routing the
+    same message does not produce duplicate rows.
+
+    Falls back to a random id if there's no message_id — in that case
+    the caller is routing out-of-band content and has to accept that
+    every call creates a new row.
+    """
+    if message_id is None:
+        return f"{kind}_{uuid.uuid4().hex[:12]}"
+    digest = hashlib.sha1(
+        f"{message_id}\x00{text.strip().lower()}".encode("utf-8")
+    ).hexdigest()[:16]
+    return f"{kind}_{digest}"
+
+
+def _deterministic_decision_node_id(
+    agent_id: str,
+    message_id: Optional[str],
+    text: str,
+) -> str:
+    """Stable node id for decision nodes. Same input → same id → upsert."""
+    if message_id is None:
+        return f"decision:{agent_id}:{uuid.uuid4().hex[:12]}"
+    digest = hashlib.sha1(
+        f"{message_id}\x00{text.strip().lower()}".encode("utf-8")
+    ).hexdigest()[:16]
+    return f"decision:{agent_id}:{digest}"
 
 
 def _looks_like_person(concept: str) -> bool:

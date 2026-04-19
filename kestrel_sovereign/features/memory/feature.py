@@ -631,6 +631,16 @@ class MemoryFeature(Feature):
             updates.append("status = ?")
             params.append(status)
         if due_date is not None:
+            # Accept ISO-8601 date or datetime strings. Rejecting junk here
+            # keeps the table's date-range index useful.
+            from datetime import datetime as _dt
+            try:
+                _dt.fromisoformat(due_date)
+            except (TypeError, ValueError):
+                return {
+                    "success": False,
+                    "error": f"due_date must be ISO-8601 (YYYY-MM-DD or full datetime), got {due_date!r}",
+                }
             updates.append("due_date = ?")
             params.append(due_date)
         if assignee_concept_id is not None:
@@ -727,13 +737,17 @@ class MemoryFeature(Feature):
             logger.error("recall_interactions failed: %s", e)
             return {"success": False, "error": str(e)}
 
+        # Message nodes are namespaced by agent id: `message:{agent_id}:{msg}`.
+        # Without this guard, a caller passing a shared concept id could
+        # retrieve edges from other agents' messages.
+        agent_prefix = f"message:{self.agent_id}:"
         interactions = [
             {
                 "message_node_id": e.source_id,
                 "properties": e.properties or {},
             }
             for e in edges
-            if e.label == "mentions"
+            if e.label == "mentions" and e.source_id.startswith(agent_prefix)
         ]
         interactions.sort(
             key=lambda i: (i.get("properties") or {}).get("recorded_at") or "",
@@ -753,22 +767,34 @@ class MemoryFeature(Feature):
         mentioned_label: str,
         concept_id: str,
     ) -> Dict[str, Any]:
-        """Re-link a specific message→person mentions edge to the confirmed
-        concept id, replacing the ambiguous label-based edge with a
-        canonical one pointing at the resolved person.
+        """Resolve an ambiguous person mention.
+
+        Removes the ambiguous label-based mentions edge
+        (message → concept:{agent}:{mentioned_label}) and writes a canonical
+        mentions edge pointing at the confirmed concept id. After this runs,
+        recall_interactions on the confirmed concept includes the message;
+        recall on the ambiguous label-concept does not.
         """
         storage = getattr(self.agent, "storage", None)
         if storage is None or not hasattr(storage, "graph"):
             return {"success": False, "error": "Graph store not available"}
-
-        from kestrel_sovereign.storage.async_graph_store import GraphNode
 
         target = await storage.graph.get_node(concept_id)
         if target is None:
             return {"success": False, "error": f"Concept {concept_id} not found"}
 
         message_node = f"message:{self.agent_id}:{message_id}"
+        # The ambiguous edge was written by SchemaRouter using the same
+        # deterministic id shape the linker uses. Normalize the label the
+        # same way the linker/router did (lowercased, stripped) so we can
+        # find and delete it.
+        ambiguous_target = (
+            f"concept:{self.agent_id}:{mentioned_label.strip().lower()}"
+        )
+
         try:
+            # Write the canonical edge first so we never have a window
+            # where neither edge exists.
             await storage.graph.add_edge(
                 message_node,
                 concept_id,
@@ -779,6 +805,15 @@ class MemoryFeature(Feature):
                     "confirmed_at": _utc_now_iso(),
                 },
             )
+            # Then remove the ambiguous one — but only if it's different
+            # from the canonical target. Otherwise we would be deleting
+            # the edge we just wrote.
+            removed = False
+            if ambiguous_target != concept_id:
+                await storage.graph.delete_edge(
+                    message_node, ambiguous_target, "mentions"
+                )
+                removed = True
         except Exception as e:
             logger.error("confirm_person_match failed: %s", e)
             return {"success": False, "error": str(e)}
@@ -786,6 +821,7 @@ class MemoryFeature(Feature):
             "success": True,
             "message_id": message_id,
             "resolved_to": concept_id,
+            "ambiguous_edge_removed": removed,
         }
 
 

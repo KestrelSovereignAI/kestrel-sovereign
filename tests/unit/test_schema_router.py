@@ -161,6 +161,18 @@ class TestPersonResolverPasses:
         assert m.concept_id == "concept:agent-1:robert"
 
     @pytest.mark.asyncio
+    async def test_fuzzy_requires_minimum_evidence(self):
+        """'Al' → 'Alice' is NOT enough evidence. Guards against false merges."""
+        graph = _make_mock_graph([
+            ("concept:agent-1:alice", "Alice"),
+        ])
+        resolver = PersonResolver(graph)
+        m = await resolver.resolve("Al", "agent-1")
+        # 2-char input is below the min shared prefix length
+        assert m.status == "new"
+        assert m.concept_id is None
+
+    @pytest.mark.asyncio
     async def test_collision_pass_3_flags_pending(self):
         graph = _make_mock_graph([
             ("concept:agent-1:alice a", "Alice A"),
@@ -295,6 +307,76 @@ class TestSchemaRouterOrchestration:
         assert summary["decisions"] == 1
 
     @pytest.mark.asyncio
+    async def test_is_idempotent_on_duplicate_message_processing(self, router):
+        """Re-routing the same message must not duplicate action items or
+        decisions. Deterministic IDs from (message_id, text) are the guard."""
+        content = "I need to ship the feature. I've decided to use Postgres."
+
+        # First pass: both lanes write.
+        router.db.fetchone = AsyncMock(return_value=None)
+        s1 = await router.route(
+            message_id="msg-idempotent",
+            content=content,
+            concepts=[],
+            role="user",
+        )
+        assert s1["action_items"] == 1
+        assert s1["decisions"] == 1
+
+        insert_count_first = len([
+            c for c in router.db.execute.call_args_list
+            if "INSERT INTO action_items" in c[0][0]
+        ])
+        add_node_count_first = router.graph.add_node.await_count
+
+        # Simulate the stored row coming back on the second pass.
+        router.db.fetchone = AsyncMock(return_value=("action_some",))
+
+        s2 = await router.route(
+            message_id="msg-idempotent",
+            content=content,
+            concepts=[],
+            role="user",
+        )
+
+        insert_count_second = len([
+            c for c in router.db.execute.call_args_list
+            if "INSERT INTO action_items" in c[0][0]
+        ])
+        # No new INSERT on second pass — action_item was deduplicated.
+        assert insert_count_second == insert_count_first
+
+        # Decisions use a deterministic node_id so re-add is an upsert,
+        # not a duplicate. The call count may go up, but the graph store's
+        # INSERT OR REPLACE guarantees one node per (message, text).
+        # We assert the node_id on both passes is the same.
+        all_nodes = [
+            c.args[0] for c in router.graph.add_node.await_args_list
+            if c.args[0].node_type == "decision"
+        ]
+        assert len(all_nodes) >= 2
+        assert all_nodes[0].node_id == all_nodes[-1].node_id
+
+    @pytest.mark.asyncio
+    async def test_concept_node_id_matches_linker_shape(self, router):
+        """Interaction enrichment writes to concept ids of the exact shape
+        AssociativeLinker produces — `concept:{agent_id}:{lowered_label}`.
+        This test pins that contract so future linker refactors must update
+        the router together."""
+        await router.route(
+            message_id="msg-shape",
+            content="mom called.",
+            concepts=["mom"],
+            role="user",
+        )
+        # Collect all edge target ids written
+        edge_targets = [
+            c.args[1] for c in router.graph.add_edge.await_args_list
+            if c.args[2] == "mentions"
+        ]
+        assert "concept:agent-1:mom" in edge_targets
+
+    @pytest.mark.asyncio
     async def test_pending_person_match_surfaced_in_summary(self, router):
         # Two Alice concepts exist — mentioning "Alice" should flag pending.
         router.graph.db.fetchall = AsyncMock(return_value=[
@@ -311,6 +393,56 @@ class TestSchemaRouterOrchestration:
         pending = summary["pending_person_matches"][0]
         assert pending["mentioned_label"] == "alice"
         assert len(pending["candidates"]) == 2
+
+
+# =============================================================================
+# Privacy suppression hook
+# =============================================================================
+
+
+class TestRoutingSuppression:
+    """The `skip_schema_routing` metadata flag must prevent the router from
+    running in process_message. EPHEMERAL/ISOLATED callers set this to
+    avoid persisting routing output to storage they don't want to keep."""
+
+    def test_suppressed_helper_true(self):
+        from kestrel_sovereign.storage.memory_system import _routing_suppressed
+        assert _routing_suppressed({"skip_schema_routing": True}) is True
+
+    def test_suppressed_helper_false(self):
+        from kestrel_sovereign.storage.memory_system import _routing_suppressed
+        assert _routing_suppressed({}) is False
+        assert _routing_suppressed(None) is False
+        assert _routing_suppressed({"skip_schema_routing": False}) is False
+
+    def test_suppressed_helper_truthy_coercion(self):
+        from kestrel_sovereign.storage.memory_system import _routing_suppressed
+        # Any truthy value suppresses — string values from settings files
+        # often come through as strings rather than bools.
+        assert _routing_suppressed({"skip_schema_routing": "yes"}) is True
+
+
+# =============================================================================
+# Upsert semantics verification
+# =============================================================================
+
+
+class TestUpsertSemantics:
+    """Pins the contract the router depends on: graph.add_edge upserts by
+    (source, target, label). If that ever changes, interaction enrichment
+    would silently start duplicating instead of updating."""
+
+    def test_edge_upsert_sql_is_insert_or_replace_or_on_conflict(self):
+        import inspect
+        from kestrel_sovereign.storage.async_graph_store import AsyncGraphStore
+        source = inspect.getsource(AsyncGraphStore._upsert_edge_sql)
+        assert "INSERT OR REPLACE" in source or "ON CONFLICT" in source
+
+    def test_node_upsert_sql_is_insert_or_replace_or_on_conflict(self):
+        import inspect
+        from kestrel_sovereign.storage.async_graph_store import AsyncGraphStore
+        source = inspect.getsource(AsyncGraphStore._upsert_node_sql)
+        assert "INSERT OR REPLACE" in source or "ON CONFLICT" in source
 
 
 if __name__ == "__main__":
