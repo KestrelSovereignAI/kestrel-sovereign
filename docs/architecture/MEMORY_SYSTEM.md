@@ -191,6 +191,32 @@ by content similarity.
 | "Search uploaded files" | **AsyncRAGStore** |
 | "Recall yesterday's conversation" | **MemoryRetriever** |
 | "Look up procedure documentation" | **AsyncRAGStore** |
+| "What action items do I have?" | **Schema router** (`recall_action_items`) |
+| "What did I decide about X?" | **Schema router** (`recall_decisions`) |
+| "How did I interact with Alice?" | **Schema router** (`recall_interactions`) |
+
+### Schema-aware routing
+
+The **[SchemaRouter](../../kestrel_sovereign/storage/schema_router.py)**
+runs after concept linking in the message pipeline and promotes extracted
+structure to typed storage:
+
+- **Action items** go to a dedicated `action_items` SQL table because their
+  query shape (filter by status, due-date range, assignee) benefits from
+  real indexes.
+- **Decisions** become graph nodes of type `decision`, so they participate
+  in associative recall and live alongside skills, concepts, and episodes.
+- **Interactions** (per-person sentiment + topics) are stored as properties
+  on the existing `mentions` edges between message and person concept
+  nodes — no new table, just enriched edge data.
+
+Person resolution is **three-pass**: exact match → fuzzy first-name match
+→ collision detection. Ambiguous matches are flagged `status=pending`
+for human confirmation via `confirm_person_match` rather than silently
+merging. See `PersonResolver` in `schema_router.py`.
+
+The router is gated on privacy mode: EPHEMERAL and ISOLATED skip routing
+entirely because the underlying storage is not persistent.
 
 ### Why Two Systems?
 

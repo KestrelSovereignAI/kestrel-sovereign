@@ -508,3 +508,287 @@ class MemoryFeature(Feature):
         except Exception as e:
             logger.error(f"memory_consolidate failed: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
+
+    # ------------------------------------------------------------------
+    # Schema-aware recall tools (#628)
+    # These read from the typed stores populated by SchemaRouter during
+    # message enrichment. Empty results in EPHEMERAL/ISOLATED modes where
+    # routing never ran.
+    # ------------------------------------------------------------------
+
+    @tool(
+        name="recall_action_items",
+        description="Retrieve action items the user committed to, optionally filtered by status or due date window.",
+        category=ToolCategory.MEMORY,
+        command_prefix="!memory actions",
+    )
+    async def recall_action_items(
+        self,
+        status: Optional[str] = None,
+        days: Optional[int] = None,
+        assignee_concept_id: Optional[str] = None,
+        limit: int = 25,
+    ) -> Dict[str, Any]:
+        """Query the action_items table.
+
+        Args:
+            status: Filter by status ("pending", "done", "cancelled").
+                If None, all statuses are returned.
+            days: If set, only return items created in the last N days.
+            assignee_concept_id: Optional person concept id to filter by.
+            limit: Max rows returned (1-200, default 25).
+        """
+        if not self._db:
+            return {"success": False, "error": "Database not available"}
+
+        try:
+            limit = int(limit)
+        except (TypeError, ValueError):
+            return {"success": False, "error": f"limit must be an integer, got {limit!r}"}
+        if limit < 1 or limit > 200:
+            return {"success": False, "error": "limit must be in [1, 200]"}
+
+        clauses = ["agent_id = ?"]
+        params: List[Any] = [self.agent_id]
+
+        if status:
+            if status not in ("pending", "done", "cancelled"):
+                return {"success": False, "error": f"status must be pending/done/cancelled, got {status!r}"}
+            clauses.append("status = ?")
+            params.append(status)
+
+        if days is not None:
+            try:
+                days = int(days)
+            except (TypeError, ValueError):
+                return {"success": False, "error": f"days must be an integer, got {days!r}"}
+            if days < 1 or days > 3650:
+                return {"success": False, "error": "days must be in [1, 3650]"}
+            from datetime import datetime, timezone, timedelta
+            since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+            clauses.append("created_at >= ?")
+            params.append(since)
+
+        if assignee_concept_id:
+            clauses.append("assignee_concept_id = ?")
+            params.append(assignee_concept_id)
+
+        params.append(limit)
+
+        try:
+            rows = await self._db.fetchall(
+                f"""
+                SELECT id, source_message_id, text, status, assignee_concept_id,
+                       due_date, confidence, created_at
+                FROM action_items
+                WHERE {' AND '.join(clauses)}
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                tuple(params),
+            )
+        except Exception as e:
+            logger.error("recall_action_items query failed: %s", e)
+            return {"success": False, "error": str(e)}
+
+        items = [
+            {
+                "id": r[0],
+                "source_message_id": r[1],
+                "text": r[2],
+                "status": r[3],
+                "assignee_concept_id": r[4],
+                "due_date": r[5],
+                "confidence": r[6],
+                "created_at": r[7],
+            }
+            for r in rows
+        ]
+        return {"action_items": items, "count": len(items)}
+
+    @tool(
+        name="update_action_item",
+        description="Update an action item's status (pending/done/cancelled), due date, or assignee.",
+        category=ToolCategory.MEMORY,
+        command_prefix="!memory action update",
+    )
+    async def update_action_item(
+        self,
+        item_id: str,
+        status: Optional[str] = None,
+        due_date: Optional[str] = None,
+        assignee_concept_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Update a single action item. Any field left as None is preserved."""
+        if not self._db:
+            return {"success": False, "error": "Database not available"}
+
+        updates: List[str] = []
+        params: List[Any] = []
+        if status is not None:
+            if status not in ("pending", "done", "cancelled"):
+                return {"success": False, "error": f"status must be pending/done/cancelled, got {status!r}"}
+            updates.append("status = ?")
+            params.append(status)
+        if due_date is not None:
+            updates.append("due_date = ?")
+            params.append(due_date)
+        if assignee_concept_id is not None:
+            updates.append("assignee_concept_id = ?")
+            params.append(assignee_concept_id)
+
+        if not updates:
+            return {"success": False, "error": "no fields to update"}
+
+        params.extend([item_id, self.agent_id])
+        try:
+            row = await self._db.fetchone(
+                "SELECT id FROM action_items WHERE id = ? AND agent_id = ?",
+                (item_id, self.agent_id),
+            )
+            if not row:
+                return {"success": False, "error": f"Action item {item_id} not found"}
+            await self._db.execute(
+                f"UPDATE action_items SET {', '.join(updates)} "
+                f"WHERE id = ? AND agent_id = ?",
+                tuple(params),
+            )
+        except Exception as e:
+            logger.error("update_action_item failed: %s", e)
+            return {"success": False, "error": str(e)}
+        return {"success": True, "item_id": item_id}
+
+    @tool(
+        name="recall_decisions",
+        description="Retrieve decisions the user has recorded (stored as graph nodes of type 'decision').",
+        category=ToolCategory.MEMORY,
+        command_prefix="!memory decisions",
+    )
+    async def recall_decisions(self, limit: int = 25) -> Dict[str, Any]:
+        """List decisions from the graph."""
+        storage = getattr(self.agent, "storage", None)
+        if storage is None or not hasattr(storage, "graph"):
+            return {"success": False, "error": "Graph store not available"}
+
+        try:
+            limit = int(limit)
+        except (TypeError, ValueError):
+            return {"success": False, "error": f"limit must be an integer, got {limit!r}"}
+        if limit < 1 or limit > 200:
+            return {"success": False, "error": "limit must be in [1, 200]"}
+
+        try:
+            nodes = await storage.graph.get_nodes_by_type("decision")
+        except Exception as e:
+            logger.error("recall_decisions failed: %s", e)
+            return {"success": False, "error": str(e)}
+
+        own = [
+            {
+                "id": n.node_id,
+                "label": n.label,
+                "text": (n.properties or {}).get("text"),
+                "source_message_id": (n.properties or {}).get("source_message_id"),
+                "confidence": (n.properties or {}).get("confidence"),
+                "created_at": (n.properties or {}).get("created_at"),
+            }
+            for n in nodes
+            if (n.properties or {}).get("agent_id") == self.agent_id
+        ]
+        own.sort(key=lambda d: d.get("created_at") or "", reverse=True)
+        return {"decisions": own[:limit], "count": min(len(own), limit)}
+
+    @tool(
+        name="recall_interactions",
+        description="List recent message→person interactions for a given person concept, with sentiment and topics.",
+        category=ToolCategory.MEMORY,
+        command_prefix="!memory interactions",
+    )
+    async def recall_interactions(
+        self,
+        person_concept_id: str,
+        limit: int = 25,
+    ) -> Dict[str, Any]:
+        """Return recent mentions edges pointing at a person concept."""
+        storage = getattr(self.agent, "storage", None)
+        if storage is None or not hasattr(storage, "graph"):
+            return {"success": False, "error": "Graph store not available"}
+
+        try:
+            limit = int(limit)
+        except (TypeError, ValueError):
+            return {"success": False, "error": f"limit must be an integer, got {limit!r}"}
+        if limit < 1 or limit > 200:
+            return {"success": False, "error": "limit must be in [1, 200]"}
+
+        try:
+            edges = await storage.graph.get_edges(person_concept_id, direction="in")
+        except Exception as e:
+            logger.error("recall_interactions failed: %s", e)
+            return {"success": False, "error": str(e)}
+
+        interactions = [
+            {
+                "message_node_id": e.source_id,
+                "properties": e.properties or {},
+            }
+            for e in edges
+            if e.label == "mentions"
+        ]
+        interactions.sort(
+            key=lambda i: (i.get("properties") or {}).get("recorded_at") or "",
+            reverse=True,
+        )
+        return {"interactions": interactions[:limit], "count": min(len(interactions), limit)}
+
+    @tool(
+        name="confirm_person_match",
+        description="Resolve an ambiguous person mention by confirming which existing concept it refers to.",
+        category=ToolCategory.MEMORY,
+        command_prefix="!memory confirm-person",
+    )
+    async def confirm_person_match(
+        self,
+        message_id: str,
+        mentioned_label: str,
+        concept_id: str,
+    ) -> Dict[str, Any]:
+        """Re-link a specific message→person mentions edge to the confirmed
+        concept id, replacing the ambiguous label-based edge with a
+        canonical one pointing at the resolved person.
+        """
+        storage = getattr(self.agent, "storage", None)
+        if storage is None or not hasattr(storage, "graph"):
+            return {"success": False, "error": "Graph store not available"}
+
+        from kestrel_sovereign.storage.async_graph_store import GraphNode
+
+        target = await storage.graph.get_node(concept_id)
+        if target is None:
+            return {"success": False, "error": f"Concept {concept_id} not found"}
+
+        message_node = f"message:{self.agent_id}:{message_id}"
+        try:
+            await storage.graph.add_edge(
+                message_node,
+                concept_id,
+                "mentions",
+                properties={
+                    "resolved_from": mentioned_label,
+                    "confirmed": True,
+                    "confirmed_at": _utc_now_iso(),
+                },
+            )
+        except Exception as e:
+            logger.error("confirm_person_match failed: %s", e)
+            return {"success": False, "error": str(e)}
+        return {
+            "success": True,
+            "message_id": message_id,
+            "resolved_to": concept_id,
+        }
+
+
+def _utc_now_iso() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat()
