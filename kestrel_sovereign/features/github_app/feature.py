@@ -50,6 +50,17 @@ Where `{repo_url}` = https://github.com/{repo}
 - Do NOT mention that you are an AI unless directly asked. You are Kestrel.
 - Sign off with: — Kestrel 🦅
 
+## SCOPE: Answer Questions Only
+
+You are a support assistant. You ANSWER QUESTIONS about the codebase.
+
+- DO NOT offer to implement, draft, write, fix, patch, refactor, or modify code.
+- DO NOT offer to open PRs, branches, or commits.
+- DO NOT say things like "I can draft the impl" or "Want me to write that?"
+- If someone asks you to fix something, point them to the relevant files and explain
+  what would need to change — but do NOT offer to do it yourself.
+- Code changes are made by humans and dedicated code agents, not by you.
+
 ## When You Don't Know
 
 If the provided context doesn't contain what's needed to answer:
@@ -167,15 +178,24 @@ class GitHubAppFeature(Feature):
         except Exception as e:
             return {"step": "exception", "error": f"{type(e).__name__}: {e}"}
 
-    async def _handle_issue_opened(self, installation_id: int, payload: dict):
-        """Respond to a newly opened issue."""
-        repo = payload["repository"]["full_name"]
+    async def _handle_issue_opened(self, installation_id: int, payload: dict) -> dict:
+        """Respond to a newly opened issue — ONLY if explicitly mentions @kestrel.
+
+        We intentionally do NOT auto-respond to every new issue. Many issues are
+        created by code agents (talon, etc.) or are internal work items. The bot
+        only engages when a human explicitly asks for it via @kestrel mention.
+        """
         issue = payload["issue"]
-        issue_number = issue["number"]
         title = issue["title"]
         body = issue.get("body", "") or ""
+        combined = f"{title}\n{body}".lower()
 
-        # Add eyes reaction to signal we're looking at it
+        if "@kestrel" not in combined:
+            return {"step": "no_mention_in_issue"}
+
+        repo = payload["repository"]["full_name"]
+        issue_number = issue["number"]
+
         await self._client.add_reaction(installation_id, repo, issue_number, "eyes")
 
         question = f"Issue #{issue_number}: {title}\n\n{body}"
@@ -186,6 +206,8 @@ class GitHubAppFeature(Feature):
                 installation_id, repo, issue_number, response
             )
             logger.info("Responded to issue #%d on %s", issue_number, repo)
+            return {"step": "commented"}
+        return {"step": "no_response"}
 
     async def _handle_issue_comment(self, installation_id: int, payload: dict) -> dict:
         """Respond to a comment on an issue (only if @mentioned)."""
@@ -217,13 +239,18 @@ class GitHubAppFeature(Feature):
         except Exception as e:
             return {"step": "comment_post_error", "error": f"{type(e).__name__}: {e}"}
 
-    async def _handle_discussion_created(self, installation_id: int, payload: dict):
-        """Respond to a new discussion."""
-        repo = payload["repository"]["full_name"]
+    async def _handle_discussion_created(self, installation_id: int, payload: dict) -> dict:
+        """Respond to a new discussion — ONLY if explicitly mentions @kestrel."""
         discussion = payload["discussion"]
-        node_id = discussion["node_id"]
         title = discussion["title"]
         body = discussion.get("body", "") or ""
+        combined = f"{title}\n{body}".lower()
+
+        if "@kestrel" not in combined:
+            return {"step": "no_mention_in_discussion"}
+
+        repo = payload["repository"]["full_name"]
+        node_id = discussion["node_id"]
 
         question = f"Discussion: {title}\n\n{body}"
         response, _ = await self._generate_response(repo, "discussion", question, installation_id)
@@ -233,6 +260,8 @@ class GitHubAppFeature(Feature):
                 installation_id, node_id, response
             )
             logger.info("Responded to discussion '%s' on %s", title, repo)
+            return {"step": "commented"}
+        return {"step": "no_response"}
 
     async def _handle_discussion_comment(self, installation_id: int, payload: dict):
         """Respond to a discussion comment (only if @mentioned)."""
