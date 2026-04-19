@@ -110,7 +110,9 @@ class MemorySystem:
 
         # Schema-aware routing: promote extracted structure (action items,
         # decisions, person-interaction enrichment) after concept linking.
-        # Ensure the action_items table exists before the pipeline runs.
+        # Everything typed lives in the graph now, so table creation is a
+        # no-op — the call is kept for forward-compat if a later router
+        # variant needs setup.
         self.router = SchemaRouter(
             graph=self.storage.graph,
             db=self.storage.db,
@@ -119,7 +121,7 @@ class MemorySystem:
         try:
             await self.router.ensure_tables()
         except Exception as e:
-            logger.warning("SchemaRouter table init failed: %s", e)
+            logger.warning("SchemaRouter init failed: %s", e)
             self.router = None
 
         self._initialized = True

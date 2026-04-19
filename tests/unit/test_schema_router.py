@@ -348,25 +348,45 @@ class TestSchemaRouterOrchestration:
     @pytest.mark.asyncio
     async def test_idempotent_action_preserves_user_status(self, router):
         """If the user marked an action done, reprocessing must not reset
-        status to 'pending'."""
-        # Simulate existing node with status=done.
+        status to 'pending'. The preservation must happen only when
+        get_node is called with the SAME deterministic id the router would
+        produce — not whenever get_node is called at all."""
         from kestrel_sovereign.storage.async_graph_store import GraphNode as GN
-        existing = GN(
-            node_id="action:agent-1:existing",
-            node_type="action_item",
-            label="Ship PR",
-            properties={
-                "status": "done",
-                "agent_id": "agent-1",
-                "created_at": "2026-04-01T00:00:00+00:00",
-                "text": "Ship PR",
-            },
+        from kestrel_sovereign.storage.schema_router import (
+            _deterministic_action_node_id,
         )
-        router.graph.get_node = AsyncMock(return_value=existing)
+
+        content = "I need to Ship PR."
+        # Extract the text the way the extractor would, then compute the
+        # deterministic id the router will use.
+        extracted = router.action_extractor.extract(content)
+        assert extracted, "extractor precondition for this test"
+        text = extracted[0]
+        expected_id = _deterministic_action_node_id("agent-1", "msg-repeat", text)
+
+        # Mock get_node to return existing state ONLY when asked for the
+        # matching id. A different id must return None — otherwise the test
+        # proves nothing about identity stability.
+        async def _get_node(node_id):
+            if node_id == expected_id:
+                return GN(
+                    node_id=expected_id,
+                    node_type="action_item",
+                    label="stale label",
+                    properties={
+                        "status": "done",
+                        "agent_id": "agent-1",
+                        "created_at": "2026-04-01T00:00:00+00:00",
+                        "text": text,
+                    },
+                )
+            return None
+
+        router.graph.get_node = AsyncMock(side_effect=_get_node)
 
         await router.route(
             message_id="msg-repeat",
-            content="I need to Ship PR.",
+            content=content,
             concepts=[],
             role="user",
         )
@@ -375,8 +395,36 @@ class TestSchemaRouterOrchestration:
             if c.args[0].node_type == "action_item"
         ]
         assert persisted
+        assert persisted[-1].node_id == expected_id
         assert persisted[-1].properties["status"] == "done"
         assert persisted[-1].properties["created_at"] == "2026-04-01T00:00:00+00:00"
+
+    @pytest.mark.asyncio
+    async def test_unrelated_existing_node_does_not_pollute_new_action(self, router):
+        """Regression guard: if get_node is called with the new action's id
+        and the store has no such node, preservation must not accidentally
+        inherit from some other action item."""
+        from kestrel_sovereign.storage.async_graph_store import GraphNode as GN
+
+        async def _get_node(node_id):
+            # Unrelated existing node with a different id
+            return None
+
+        router.graph.get_node = AsyncMock(side_effect=_get_node)
+
+        await router.route(
+            message_id="msg-first-time",
+            content="I need to file taxes.",
+            concepts=[],
+            role="user",
+        )
+        persisted = [
+            c.args[0] for c in router.graph.add_node.await_args_list
+            if c.args[0].node_type == "action_item"
+        ]
+        assert persisted
+        # New node → default status pending, no inherited done state
+        assert persisted[-1].properties["status"] == "pending"
 
     @pytest.mark.asyncio
     async def test_concept_node_id_matches_linker_shape(self, router):

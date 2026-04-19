@@ -518,7 +518,7 @@ class MemoryFeature(Feature):
 
     @tool(
         name="recall_action_items",
-        description="Retrieve action items the user committed to, optionally filtered by status or due date window.",
+        description="Retrieve action items the user committed to. Filters: status, creation-date window (days), assignee.",
         category=ToolCategory.MEMORY,
         command_prefix="!memory actions",
     )
@@ -539,7 +539,10 @@ class MemoryFeature(Feature):
         Args:
             status: Filter by status ("pending", "done", "cancelled").
                 If None, all statuses are returned.
-            days: If set, only return items created in the last N days.
+            days: If set, only return items whose `created_at` is within
+                the last N days. Note: this is a creation-date window,
+                not a due-date window — use update_action_item to set
+                a due_date explicitly if you need that.
             assignee_concept_id: Optional person concept id to filter by.
             limit: Max rows returned (1-200, default 25).
         """

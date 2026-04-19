@@ -328,16 +328,18 @@ _TOPIC_STOPWORDS = frozenset([
 
 
 class SchemaRouter:
-    """Promote extracted structure to typed storage.
+    """Promote extracted structure to typed graph nodes.
 
     Runs after concept linking in the message pipeline. Reads the message
     content plus the concept list the linker produced, and writes:
 
-    - action_items rows
-    - decision graph nodes
-    - enriched properties on the existing mentions edges
+    - `action_item` graph nodes with status/due_date/assignee properties
+    - `decision` graph nodes
+    - enriched properties on the existing `mentions` edges
 
     Never creates new concept nodes — operates on what the linker built.
+    All artifacts share one storage model (graph_nodes + graph_edges)
+    so the architecture has one typed-entity pattern, not two.
     """
 
     def __init__(
