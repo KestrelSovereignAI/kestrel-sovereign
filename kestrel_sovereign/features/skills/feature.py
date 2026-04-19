@@ -5,11 +5,29 @@ reflection feature's insights table for non-obvious discoveries
 (actionable patterns/improvements with high confidence) and promotes
 them into structured skill files that future sessions can find.
 
-Skills live in two places simultaneously:
-- A per-agent skills directory (`<agent_data>/skills/<id>.md`) so they
-  survive without the database and can be read by humans.
-- A graph node of type "skill" so associative recall can surface the
-  skill when a related concept comes up.
+## Storage authority
+
+Skills have **one primary record** and **one best-effort secondary index**:
+
+- **Primary (authoritative): markdown file** at `<agent_data>/skills/<id>.md`.
+  Every read operation (`skill_list`, `skill_show`) reads from disk. Loss of
+  the file is loss of the skill; loss of the graph node is not. Writes are
+  atomic via tmp + rename so crash/interruption cannot leave truncated files.
+- **Secondary (best-effort): graph node** of type "skill". Enables associative
+  recall when a related concept comes up, but the feature never relies on
+  the node's presence for correctness. A failed graph write does not fail
+  the save — the file is still the source of truth.
+
+This asymmetry is intentional. Dual-write transactional semantics across a
+filesystem and a DB would need real 2PC; we would rather have honest drift
+than pretended consistency.
+
+## Uniqueness
+
+Dedup has two layers:
+1. Preflight normalized-title check in `skill_extract_candidates` (advisory).
+2. Hard collision guard at write time in `skill_save` — if the target file
+   already exists, the save fails rather than silently overwriting.
 
 Per the Incubator Principle, extraction is never automatic — it is
 triggered by an explicit tool call. Governed agents without this feature
@@ -20,6 +38,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -117,12 +136,28 @@ class SkillsFeature(Feature):
         """Find actionable, high-confidence insights that aren't already skills.
 
         Deduplication: skips insights whose `suggested_action` would normalize
-        to the same title as an existing skill (local dir + graph).
+        to the same title as an existing skill (local dir + graph). Dedup is
+        a preflight check — the authoritative uniqueness gate is in skill_save
+        where a collision on the target file path hard-fails.
 
         Args:
-            min_confidence: Lower bound on insight confidence (default 0.7)
-            limit: Maximum number of candidates to return
+            min_confidence: Lower bound on insight confidence, in [0.0, 1.0]
+            limit: Maximum number of candidates to return, in [1, 500]
         """
+        try:
+            min_confidence = float(min_confidence)
+        except (TypeError, ValueError):
+            return {"success": False, "error": f"min_confidence must be numeric, got {min_confidence!r}"}
+        if not (0.0 <= min_confidence <= 1.0):
+            return {"success": False, "error": "min_confidence must be in [0.0, 1.0]"}
+
+        try:
+            limit = int(limit)
+        except (TypeError, ValueError):
+            return {"success": False, "error": f"limit must be an integer, got {limit!r}"}
+        if limit < 1 or limit > 500:
+            return {"success": False, "error": "limit must be in [1, 500]"}
+
         if not self._db:
             return {"success": False, "error": "Database not available"}
 
@@ -400,12 +435,40 @@ class SkillsFeature(Feature):
             return None
 
     async def _save_skill(self, skill: Skill) -> None:
-        """Persist skill to disk AND the graph."""
+        """Persist skill to disk atomically, then update the graph.
+
+        File is primary: if the file write fails the save fails. The graph
+        node is best-effort — a graph failure is logged but does not fail
+        the save, because losing an associative index entry is recoverable
+        while losing the skill content is not.
+
+        Collision: we refuse to overwrite an existing file. The dedup pass
+        in `skill_save` should catch most duplicates before we get here,
+        but a concurrent save of the same title would slip past that check.
+        The existence check + atomic rename is the real uniqueness gate.
+        """
         if self._skills_dir is None:
             raise RuntimeError("No skills directory configured — agent has no data path")
 
         path = self._skill_path(skill.id)
-        path.write_text(skill.to_markdown(), encoding="utf-8")
+        if path.exists():
+            raise FileExistsError(f"skill file already exists: {path.name}")
+
+        # Atomic write: write to a sibling tmp file then rename. If the
+        # process dies mid-write we leave a .tmp behind but never a
+        # truncated .md. The rename is atomic on POSIX when source and
+        # destination are on the same filesystem.
+        tmp_path = path.with_suffix(path.suffix + ".tmp")
+        try:
+            tmp_path.write_text(skill.to_markdown(), encoding="utf-8")
+            os.replace(tmp_path, path)
+        except Exception:
+            # Clean up the tmp file if it exists so we don't accumulate cruft.
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
 
         storage = getattr(self.agent, "storage", None)
         if storage is None or not hasattr(storage, "add_node"):

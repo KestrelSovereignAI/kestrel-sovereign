@@ -422,5 +422,171 @@ class TestModuleConstants:
         assert "improvement" in CANDIDATE_INSIGHT_TYPES
 
 
+# =============================================================================
+# Input validation
+# =============================================================================
+
+
+class TestInputValidation:
+
+    @pytest.mark.asyncio
+    async def test_min_confidence_rejects_out_of_range(self, feature):
+        for bad in (-0.1, 1.5, 2.0):
+            result = await feature.skill_extract_candidates(min_confidence=bad)
+            assert result["success"] is False
+            assert "[0.0, 1.0]" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_min_confidence_rejects_non_numeric(self, feature):
+        result = await feature.skill_extract_candidates(min_confidence="high")
+        assert result["success"] is False
+        assert "numeric" in result["error"].lower()
+
+    @pytest.mark.asyncio
+    async def test_limit_rejects_out_of_range(self, feature):
+        for bad in (0, -1, 10_000):
+            result = await feature.skill_extract_candidates(limit=bad)
+            assert result["success"] is False
+            assert "[1, 500]" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_limit_rejects_non_numeric(self, feature):
+        result = await feature.skill_extract_candidates(limit="lots")
+        assert result["success"] is False
+
+
+# =============================================================================
+# Atomic writes + write-time collision guard
+# =============================================================================
+
+
+class TestAtomicWriteAndCollision:
+
+    @pytest.mark.asyncio
+    async def test_write_is_atomic_via_temp_rename(self, feature, tmp_path, monkeypatch):
+        """Simulate a crash mid-rename and prove no partial .md file is left."""
+        from kestrel_sovereign.features.skills import feature as mod
+
+        feature._db.fetchone = AsyncMock(return_value=(
+            "ins-a", "sess", "pattern", "t", "d", 0.85, 1, "Atomic write skill",
+        ))
+
+        real_replace = mod.os.replace
+
+        def _boom(src, dst):
+            raise OSError("simulated crash during rename")
+
+        monkeypatch.setattr(mod.os, "replace", _boom)
+
+        result = await feature.skill_save(
+            insight_id="ins-a",
+            steps_json='["step a"]',
+            verification="v",
+        )
+        assert result["success"] is False
+
+        skills_dir = tmp_path / "skills"
+        # No .md file at the target, and no .tmp left behind.
+        assert list(skills_dir.glob("*.md")) == []
+        assert list(skills_dir.glob("*.md.tmp")) == []
+
+        # Restore and confirm a clean save works afterwards.
+        monkeypatch.setattr(mod.os, "replace", real_replace)
+        result = await feature.skill_save(
+            insight_id="ins-a",
+            steps_json='["step a"]',
+            verification="v",
+        )
+        assert result["success"] is True
+
+    @pytest.mark.asyncio
+    async def test_collision_guard_refuses_overwrite(self, feature, tmp_path):
+        """If preflight dedup misses (e.g. a file present but preflight
+        didn't see it), the write-time existence check must refuse to
+        clobber an existing skill file."""
+        title = "Pre-existing skill"
+        existing_id = skill_id_from_title(title)
+        existing_path = tmp_path / "skills" / f"{existing_id}.md"
+        # Write an unparseable file so preflight's normalized-title set
+        # doesn't include this title — simulating dedup drift.
+        existing_path.write_text("--- existing content ---", encoding="utf-8")
+
+        feature.agent.storage.get_nodes_by_type = AsyncMock(return_value=[])
+        feature._db.fetchone = AsyncMock(return_value=(
+            "ins-collide", "s", "pattern", "t", "d", 0.85, 1, title,
+        ))
+
+        result = await feature.skill_save(
+            insight_id="ins-collide",
+            steps_json='["s"]',
+            verification="v",
+        )
+        assert result["success"] is False
+        # File was NOT overwritten
+        assert "existing content" in existing_path.read_text(encoding="utf-8")
+
+
+# =============================================================================
+# Partial-failure behavior
+# =============================================================================
+
+
+class TestPartialFailures:
+
+    @pytest.mark.asyncio
+    async def test_graph_add_failure_does_not_fail_save(self, feature, tmp_path):
+        """Graph is best-effort. A graph write error must not fail the save —
+        the file is the primary record."""
+        feature._db.fetchone = AsyncMock(return_value=(
+            "ins-g", "s", "pattern", "t", "d", 0.85, 1, "Survives graph failure",
+        ))
+        feature.agent.storage.add_node = AsyncMock(side_effect=Exception("graph down"))
+
+        result = await feature.skill_save(
+            insight_id="ins-g",
+            steps_json='["step"]',
+            verification="v",
+        )
+        assert result["success"] is True
+
+        skill_path = tmp_path / "skills" / f"{result['skill_id']}.md"
+        assert skill_path.exists()
+        assert "Survives graph failure" in skill_path.read_text(encoding="utf-8")
+
+    @pytest.mark.asyncio
+    async def test_delete_reports_partial_removal(self, feature, tmp_path):
+        """File present but graph already lost it: delete still succeeds
+        and signals partial state via flags."""
+        s = Skill(
+            id="skill_partial",
+            title="Partial",
+            trigger="t", steps=["x"], verification="v",
+        )
+        (tmp_path / "skills" / f"{s.id}.md").write_text(s.to_markdown(), encoding="utf-8")
+
+        feature.agent.storage.delete_node = AsyncMock(side_effect=Exception("not in graph"))
+        result = await feature.skill_delete(skill_id="skill_partial")
+        assert result["success"] is True
+        assert result["removed_file"] is True
+        assert result["removed_node"] is False
+
+    @pytest.mark.asyncio
+    async def test_list_skips_unparseable_files(self, feature, tmp_path):
+        """A human-edited file that broke the parser must not poison listing."""
+        good = Skill(
+            id="skill_good",
+            title="Good skill",
+            trigger="t", steps=["x"], verification="v",
+        )
+        (tmp_path / "skills" / f"{good.id}.md").write_text(good.to_markdown(), encoding="utf-8")
+        (tmp_path / "skills" / "skill_bad.md").write_text(
+            "just a plain note, not a skill\n", encoding="utf-8"
+        )
+
+        result = await feature.skill_list()
+        titles = [s["title"] for s in result["skills"]]
+        assert "Good skill" in titles
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
