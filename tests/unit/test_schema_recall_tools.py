@@ -55,40 +55,90 @@ async def feature():
 # =============================================================================
 
 
+def _action_node(node_id, text, status="pending", agent_id="did:test:recall-agent",
+                 created_at="2026-04-19T10:00:00+00:00", assignee=None, due_date=None,
+                 source_message_id=None):
+    return GraphNode(
+        node_id=node_id,
+        node_type="action_item",
+        label=text[:120],
+        properties={
+            "text": text,
+            "status": status,
+            "agent_id": agent_id,
+            "created_at": created_at,
+            "assignee_concept_id": assignee,
+            "due_date": due_date,
+            "source_message_id": source_message_id,
+            "confidence": 0.7,
+        },
+    )
+
+
 class TestRecallActionItems:
 
     @pytest.mark.asyncio
-    async def test_returns_rows(self, feature):
-        feature._db.fetchall = AsyncMock(return_value=[
-            ("action_1", "msg-1", "Call mom", "pending", None, None, 0.7, "2026-04-19T10:00:00"),
-            ("action_2", "msg-2", "Ship PR", "done", None, "2026-04-20", 0.9, "2026-04-19T09:00:00"),
+    async def test_returns_own_items(self, feature):
+        feature.agent.storage.graph.get_nodes_by_type = AsyncMock(return_value=[
+            _action_node("action:did:test:recall-agent:a", "Call mom"),
+            _action_node("action:did:test:recall-agent:b", "Ship PR", status="done",
+                         created_at="2026-04-19T09:00:00+00:00"),
         ])
         result = await feature.recall_action_items()
         assert result["count"] == 2
+        # Sorted by created_at desc
         assert result["action_items"][0]["text"] == "Call mom"
         assert result["action_items"][1]["status"] == "done"
 
     @pytest.mark.asyncio
     async def test_filters_by_status(self, feature):
-        feature._db.fetchall = AsyncMock(return_value=[])
-        await feature.recall_action_items(status="pending")
-        sql = feature._db.fetchall.call_args[0][0]
-        params = feature._db.fetchall.call_args[0][1]
-        assert "status = ?" in sql
-        assert "pending" in params
+        feature.agent.storage.graph.get_nodes_by_type = AsyncMock(return_value=[
+            _action_node("a1", "Pending one", status="pending"),
+            _action_node("a2", "Done one", status="done"),
+        ])
+        result = await feature.recall_action_items(status="pending")
+        assert result["count"] == 1
+        assert result["action_items"][0]["text"] == "Pending one"
+
+    @pytest.mark.asyncio
+    async def test_filters_by_assignee(self, feature):
+        feature.agent.storage.graph.get_nodes_by_type = AsyncMock(return_value=[
+            _action_node("a1", "Call mom", assignee="concept:agent:alice"),
+            _action_node("a2", "Call dad", assignee="concept:agent:bob"),
+        ])
+        result = await feature.recall_action_items(assignee_concept_id="concept:agent:alice")
+        assert result["count"] == 1
+        assert result["action_items"][0]["assignee_concept_id"] == "concept:agent:alice"
+
+    @pytest.mark.asyncio
+    async def test_filters_by_days_window(self, feature):
+        from datetime import datetime, timezone, timedelta
+        recent = datetime.now(timezone.utc).isoformat()
+        old = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+        feature.agent.storage.graph.get_nodes_by_type = AsyncMock(return_value=[
+            _action_node("a1", "Recent", created_at=recent),
+            _action_node("a2", "Old", created_at=old),
+        ])
+        result = await feature.recall_action_items(days=7)
+        assert result["count"] == 1
+        assert result["action_items"][0]["text"] == "Recent"
+
+    @pytest.mark.asyncio
+    async def test_cross_agent_isolation(self, feature):
+        """Action items belonging to other agents must not leak."""
+        feature.agent.storage.graph.get_nodes_by_type = AsyncMock(return_value=[
+            _action_node("a-mine", "Mine"),
+            _action_node("a-theirs", "Theirs", agent_id="did:other"),
+        ])
+        result = await feature.recall_action_items()
+        assert result["count"] == 1
+        assert result["action_items"][0]["text"] == "Mine"
 
     @pytest.mark.asyncio
     async def test_rejects_invalid_status(self, feature):
         result = await feature.recall_action_items(status="nonsense")
         assert result["success"] is False
         assert "pending/done/cancelled" in result["error"]
-
-    @pytest.mark.asyncio
-    async def test_filters_by_days_window(self, feature):
-        feature._db.fetchall = AsyncMock(return_value=[])
-        await feature.recall_action_items(days=7)
-        sql = feature._db.fetchall.call_args[0][0]
-        assert "created_at >= ?" in sql
 
     @pytest.mark.asyncio
     async def test_rejects_invalid_days(self, feature):
@@ -112,24 +162,41 @@ class TestUpdateActionItem:
 
     @pytest.mark.asyncio
     async def test_updates_status(self, feature):
-        feature._db.fetchone = AsyncMock(return_value=("action_1",))
+        feature.agent.storage.graph.get_node = AsyncMock(return_value=_action_node(
+            "action_1", "Call mom"
+        ))
         result = await feature.update_action_item(item_id="action_1", status="done")
         assert result["success"] is True
-        update_call = next(
-            c for c in feature._db.execute.call_args_list
-            if "UPDATE action_items" in c[0][0]
-        )
-        sql = update_call[0][0]
-        params = update_call[0][1]
-        assert "status = ?" in sql
-        assert "done" in params
+        # Must have upserted a node with the new status
+        feature.agent.storage.graph.add_node.assert_awaited()
+        persisted = feature.agent.storage.graph.add_node.await_args[0][0]
+        assert persisted.properties["status"] == "done"
 
     @pytest.mark.asyncio
     async def test_missing_item(self, feature):
-        feature._db.fetchone = AsyncMock(return_value=None)
+        feature.agent.storage.graph.get_node = AsyncMock(return_value=None)
         result = await feature.update_action_item(item_id="missing", status="done")
         assert result["success"] is False
         assert "not found" in result["error"].lower()
+
+    @pytest.mark.asyncio
+    async def test_wrong_node_type(self, feature):
+        feature.agent.storage.graph.get_node = AsyncMock(return_value=GraphNode(
+            node_id="some-decision", node_type="decision", label="x", properties={},
+        ))
+        result = await feature.update_action_item(item_id="some-decision", status="done")
+        assert result["success"] is False
+        assert "not found" in result["error"].lower()
+
+    @pytest.mark.asyncio
+    async def test_cross_agent_mutation_blocked(self, feature):
+        """Mutating another agent's action item via known node_id must fail."""
+        feature.agent.storage.graph.get_node = AsyncMock(return_value=_action_node(
+            "action_x", "Their item", agent_id="did:other",
+        ))
+        result = await feature.update_action_item(item_id="action_x", status="done")
+        assert result["success"] is False
+        feature.agent.storage.graph.add_node.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_rejects_invalid_status(self, feature):
@@ -144,7 +211,9 @@ class TestUpdateActionItem:
 
     @pytest.mark.asyncio
     async def test_multi_field_update(self, feature):
-        feature._db.fetchone = AsyncMock(return_value=("action_1",))
+        feature.agent.storage.graph.get_node = AsyncMock(return_value=_action_node(
+            "action_1", "Do thing"
+        ))
         result = await feature.update_action_item(
             item_id="action_1",
             status="pending",
@@ -152,13 +221,10 @@ class TestUpdateActionItem:
             assignee_concept_id="concept:agent-1:alice",
         )
         assert result["success"] is True
-        update_call = next(
-            c for c in feature._db.execute.call_args_list
-            if "UPDATE action_items" in c[0][0]
-        )
-        sql = update_call[0][0]
-        # All three fields should appear in the SET clause
-        assert sql.count("?") >= 5  # 3 updates + item_id + agent_id
+        persisted = feature.agent.storage.graph.add_node.await_args[0][0]
+        assert persisted.properties["status"] == "pending"
+        assert persisted.properties["due_date"] == "2026-05-01"
+        assert persisted.properties["assignee_concept_id"] == "concept:agent-1:alice"
 
 
 # =============================================================================
@@ -337,7 +403,9 @@ class TestDueDateValidation:
 
     @pytest.mark.asyncio
     async def test_rejects_invalid_due_date(self, feature):
-        feature._db.fetchone = AsyncMock(return_value=("action_1",))
+        feature.agent.storage.graph.get_node = AsyncMock(return_value=_action_node(
+            "action_1", "t"
+        ))
         result = await feature.update_action_item(
             item_id="action_1", due_date="not-a-date"
         )
@@ -346,7 +414,9 @@ class TestDueDateValidation:
 
     @pytest.mark.asyncio
     async def test_accepts_iso_date(self, feature):
-        feature._db.fetchone = AsyncMock(return_value=("action_1",))
+        feature.agent.storage.graph.get_node = AsyncMock(return_value=_action_node(
+            "action_1", "t"
+        ))
         result = await feature.update_action_item(
             item_id="action_1", due_date="2026-05-01"
         )
@@ -354,7 +424,9 @@ class TestDueDateValidation:
 
     @pytest.mark.asyncio
     async def test_accepts_iso_datetime(self, feature):
-        feature._db.fetchone = AsyncMock(return_value=("action_1",))
+        feature.agent.storage.graph.get_node = AsyncMock(return_value=_action_node(
+            "action_1", "t"
+        ))
         result = await feature.update_action_item(
             item_id="action_1", due_date="2026-05-01T14:00:00+00:00"
         )

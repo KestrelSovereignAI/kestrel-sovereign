@@ -2,17 +2,15 @@
 
 Inspired by OB1's schema-aware routing pattern. Runs after the existing
 emotional/importance/temporal tagging and concept linking, and routes
-extracted structure to:
+extracted structure to typed graph nodes:
 
-- `action_items` SQL table — state-machine data with date/status/assignee
-  queries. A table because SQL indexes matter for "what's pending this
-  week" and "what did I promise Alice" query shapes.
-- `decision` graph nodes — mirrors the "skill" pattern from #643. The
-  graph is already the right home for nodes with associative recall
-  value, and decisions are structurally closer to nodes than rows.
-- Enriched `mentions` edge properties — sentiment and topics. No new
-  table: the existing message→concept mentions edge is already the
-  "interaction" record. We just add properties to what's there.
+- `action_item` nodes — state-machine entities with status / assignee /
+  due_date properties. Everything typed lives in the graph for
+  consistency; node_type is indexed so `get_nodes_by_type` is fast.
+- `decision` nodes — mirrors the skill pattern from #643.
+- Enriched `mentions` edge properties — sentiment and topics on the
+  existing message→concept edge. No new edge label: the existing
+  mentions edge IS the interaction record.
 
 Person resolution uses a 3-pass matcher (exact → fuzzy first-name →
 collision detection) and flags ambiguous matches as `status=pending`
@@ -42,7 +40,10 @@ logger = logging.getLogger(__name__)
 # Constants
 # =============================================================================
 
+ACTION_ITEM_NODE_TYPE = "action_item"
 DECISION_NODE_TYPE = "decision"
+
+ACTION_ITEM_STATUSES = ("pending", "done", "cancelled")
 
 # Extractors are regex/keyword based for the first cut. An LLM-powered
 # extractor can replace these later without changing the routing surface.
@@ -353,38 +354,16 @@ class SchemaRouter:
         self.person_resolver = PersonResolver(graph)
 
     async def ensure_tables(self) -> None:
-        """Create the action_items table.
+        """No-op.
 
-        action_items is the only new SQL table — decisions are graph nodes
-        and interactions are edge properties.
+        Action items, decisions, and interactions all live in the graph
+        (graph_nodes and graph_edges). The core schema in async_database.py
+        creates those tables plus the node_type/label indexes the router
+        depends on for fast typed-entity lookup. This method exists so
+        MemorySystem.initialize can call it unconditionally in case a
+        future router variant needs setup.
         """
-        await self.db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS action_items (
-                id TEXT PRIMARY KEY,
-                agent_id TEXT NOT NULL,
-                source_message_id TEXT,
-                text TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending',
-                assignee_concept_id TEXT,
-                due_date TEXT,
-                confidence REAL DEFAULT 0.5,
-                created_at TEXT NOT NULL
-            )
-            """
-        )
-        await self.db.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_action_items_agent_status
-            ON action_items(agent_id, status, due_date)
-            """
-        )
-        await self.db.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_action_items_assignee
-            ON action_items(agent_id, assignee_concept_id)
-            """
-        )
+        return None
 
     async def route(
         self,
@@ -450,28 +429,43 @@ class SchemaRouter:
         items: List[str],
         message_id: Optional[str],
     ) -> None:
-        """Idempotent insert: skip if an action item for this (message, text)
-        is already on file. Reprocessing the same message must not duplicate
-        rows — replay/retry/backfill are all real operational scenarios.
+        """Idempotent action item persistence as graph nodes.
+
+        Deterministic node_id from (agent, message, text) means reprocessing
+        the same message upserts the same node — the graph's
+        INSERT OR REPLACE on node_id guarantees at-most-one node per
+        (message, text). No separate table, no separate migration.
         """
         now_iso = datetime.now(timezone.utc).isoformat()
         for text in items:
-            item_id = _deterministic_id("action", message_id, text)
-            existing = await self.db.fetchone(
-                "SELECT id FROM action_items WHERE id = ? AND agent_id = ?",
-                (item_id, self.agent_id),
-            )
-            if existing:
-                continue
-            await self.db.execute(
-                """
-                INSERT INTO action_items
-                    (id, agent_id, source_message_id, text, status,
-                     assignee_concept_id, due_date, confidence, created_at)
-                VALUES (?, ?, ?, ?, 'pending', NULL, NULL, 0.7, ?)
-                """,
-                (item_id, self.agent_id, message_id, text, now_iso),
-            )
+            node_id = _deterministic_action_node_id(self.agent_id, message_id, text)
+
+            # Preserve existing status / assignee / due_date if the node
+            # already exists — an earlier extraction might have been
+            # updated by the user (marked done, assigned to a person).
+            existing = await self.graph.get_node(node_id)
+            existing_props = (existing.properties if existing else {}) or {}
+
+            properties = {
+                "text": text,
+                "status": existing_props.get("status", "pending"),
+                "assignee_concept_id": existing_props.get("assignee_concept_id"),
+                "due_date": existing_props.get("due_date"),
+                "confidence": 0.7,
+                "source_message_id": message_id,
+                "agent_id": self.agent_id,
+                "created_at": existing_props.get("created_at", now_iso),
+                "updated_at": now_iso,
+            }
+            await self.graph.add_node(GraphNode(
+                node_id=node_id,
+                node_type=ACTION_ITEM_NODE_TYPE,
+                label=text[:120],
+                properties=properties,
+            ))
+            if message_id:
+                source = f"message:{self.agent_id}:{message_id}"
+                await self.graph.add_edge(source, node_id, "records_action")
 
     # ------------------------------------------------------------------
     # Decisions
@@ -606,22 +600,6 @@ _NON_PERSON_KEYWORDS = frozenset([
 ])
 
 
-def _deterministic_id(kind: str, message_id: Optional[str], text: str) -> str:
-    """Generate a stable id from (kind, message, text) so re-routing the
-    same message does not produce duplicate rows.
-
-    Falls back to a random id if there's no message_id — in that case
-    the caller is routing out-of-band content and has to accept that
-    every call creates a new row.
-    """
-    if message_id is None:
-        return f"{kind}_{uuid.uuid4().hex[:12]}"
-    digest = hashlib.sha1(
-        f"{message_id}\x00{text.strip().lower()}".encode("utf-8")
-    ).hexdigest()[:16]
-    return f"{kind}_{digest}"
-
-
 def _deterministic_decision_node_id(
     agent_id: str,
     message_id: Optional[str],
@@ -634,6 +612,20 @@ def _deterministic_decision_node_id(
         f"{message_id}\x00{text.strip().lower()}".encode("utf-8")
     ).hexdigest()[:16]
     return f"decision:{agent_id}:{digest}"
+
+
+def _deterministic_action_node_id(
+    agent_id: str,
+    message_id: Optional[str],
+    text: str,
+) -> str:
+    """Stable node id for action item nodes."""
+    if message_id is None:
+        return f"action:{agent_id}:{uuid.uuid4().hex[:12]}"
+    digest = hashlib.sha1(
+        f"{message_id}\x00{text.strip().lower()}".encode("utf-8")
+    ).hexdigest()[:16]
+    return f"action:{agent_id}:{digest}"
 
 
 def _looks_like_person(concept: str) -> bool:

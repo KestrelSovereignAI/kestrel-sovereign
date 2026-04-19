@@ -529,7 +529,12 @@ class MemoryFeature(Feature):
         assignee_concept_id: Optional[str] = None,
         limit: int = 25,
     ) -> Dict[str, Any]:
-        """Query the action_items table.
+        """Query action_item graph nodes with optional property filters.
+
+        Action items live as graph nodes of type `action_item` (no
+        separate SQL table). The graph's `node_type` index makes the
+        initial scan fast; remaining filters run in memory over
+        at-most a few thousand nodes per agent.
 
         Args:
             status: Filter by status ("pending", "done", "cancelled").
@@ -538,8 +543,9 @@ class MemoryFeature(Feature):
             assignee_concept_id: Optional person concept id to filter by.
             limit: Max rows returned (1-200, default 25).
         """
-        if not self._db:
-            return {"success": False, "error": "Database not available"}
+        storage = getattr(self.agent, "storage", None)
+        if storage is None or not hasattr(storage, "graph"):
+            return {"success": False, "error": "Graph store not available"}
 
         try:
             limit = int(limit)
@@ -548,15 +554,10 @@ class MemoryFeature(Feature):
         if limit < 1 or limit > 200:
             return {"success": False, "error": "limit must be in [1, 200]"}
 
-        clauses = ["agent_id = ?"]
-        params: List[Any] = [self.agent_id]
+        if status is not None and status not in ("pending", "done", "cancelled"):
+            return {"success": False, "error": f"status must be pending/done/cancelled, got {status!r}"}
 
-        if status:
-            if status not in ("pending", "done", "cancelled"):
-                return {"success": False, "error": f"status must be pending/done/cancelled, got {status!r}"}
-            clauses.append("status = ?")
-            params.append(status)
-
+        since: Optional[str] = None
         if days is not None:
             try:
                 days = int(days)
@@ -566,45 +567,37 @@ class MemoryFeature(Feature):
                 return {"success": False, "error": "days must be in [1, 3650]"}
             from datetime import datetime, timezone, timedelta
             since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
-            clauses.append("created_at >= ?")
-            params.append(since)
-
-        if assignee_concept_id:
-            clauses.append("assignee_concept_id = ?")
-            params.append(assignee_concept_id)
-
-        params.append(limit)
 
         try:
-            rows = await self._db.fetchall(
-                f"""
-                SELECT id, source_message_id, text, status, assignee_concept_id,
-                       due_date, confidence, created_at
-                FROM action_items
-                WHERE {' AND '.join(clauses)}
-                ORDER BY created_at DESC
-                LIMIT ?
-                """,
-                tuple(params),
-            )
+            nodes = await storage.graph.get_nodes_by_type("action_item")
         except Exception as e:
             logger.error("recall_action_items query failed: %s", e)
             return {"success": False, "error": str(e)}
 
-        items = [
-            {
-                "id": r[0],
-                "source_message_id": r[1],
-                "text": r[2],
-                "status": r[3],
-                "assignee_concept_id": r[4],
-                "due_date": r[5],
-                "confidence": r[6],
-                "created_at": r[7],
-            }
-            for r in rows
-        ]
-        return {"action_items": items, "count": len(items)}
+        matching = []
+        for n in nodes:
+            props = n.properties or {}
+            if props.get("agent_id") != self.agent_id:
+                continue
+            if status is not None and props.get("status") != status:
+                continue
+            if since is not None and (props.get("created_at") or "") < since:
+                continue
+            if assignee_concept_id is not None and props.get("assignee_concept_id") != assignee_concept_id:
+                continue
+            matching.append({
+                "id": n.node_id,
+                "source_message_id": props.get("source_message_id"),
+                "text": props.get("text"),
+                "status": props.get("status"),
+                "assignee_concept_id": props.get("assignee_concept_id"),
+                "due_date": props.get("due_date"),
+                "confidence": props.get("confidence"),
+                "created_at": props.get("created_at"),
+            })
+
+        matching.sort(key=lambda d: d.get("created_at") or "", reverse=True)
+        return {"action_items": matching[:limit], "count": min(len(matching), limit)}
 
     @tool(
         name="update_action_item",
@@ -619,20 +612,16 @@ class MemoryFeature(Feature):
         due_date: Optional[str] = None,
         assignee_concept_id: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Update a single action item. Any field left as None is preserved."""
-        if not self._db:
-            return {"success": False, "error": "Database not available"}
+        """Update a single action item graph node. Null fields are preserved."""
+        storage = getattr(self.agent, "storage", None)
+        if storage is None or not hasattr(storage, "graph"):
+            return {"success": False, "error": "Graph store not available"}
 
-        updates: List[str] = []
-        params: List[Any] = []
-        if status is not None:
-            if status not in ("pending", "done", "cancelled"):
-                return {"success": False, "error": f"status must be pending/done/cancelled, got {status!r}"}
-            updates.append("status = ?")
-            params.append(status)
+        if status is not None and status not in ("pending", "done", "cancelled"):
+            return {"success": False, "error": f"status must be pending/done/cancelled, got {status!r}"}
+
         if due_date is not None:
-            # Accept ISO-8601 date or datetime strings. Rejecting junk here
-            # keeps the table's date-range index useful.
+            # Accept ISO-8601 date or datetime strings.
             from datetime import datetime as _dt
             try:
                 _dt.fromisoformat(due_date)
@@ -641,30 +630,41 @@ class MemoryFeature(Feature):
                     "success": False,
                     "error": f"due_date must be ISO-8601 (YYYY-MM-DD or full datetime), got {due_date!r}",
                 }
-            updates.append("due_date = ?")
-            params.append(due_date)
-        if assignee_concept_id is not None:
-            updates.append("assignee_concept_id = ?")
-            params.append(assignee_concept_id)
 
-        if not updates:
+        if status is None and due_date is None and assignee_concept_id is None:
             return {"success": False, "error": "no fields to update"}
 
-        params.extend([item_id, self.agent_id])
         try:
-            row = await self._db.fetchone(
-                "SELECT id FROM action_items WHERE id = ? AND agent_id = ?",
-                (item_id, self.agent_id),
-            )
-            if not row:
-                return {"success": False, "error": f"Action item {item_id} not found"}
-            await self._db.execute(
-                f"UPDATE action_items SET {', '.join(updates)} "
-                f"WHERE id = ? AND agent_id = ?",
-                tuple(params),
-            )
+            node = await storage.graph.get_node(item_id)
         except Exception as e:
-            logger.error("update_action_item failed: %s", e)
+            logger.error("update_action_item lookup failed: %s", e)
+            return {"success": False, "error": str(e)}
+        if node is None or node.node_type != "action_item":
+            return {"success": False, "error": f"Action item {item_id} not found"}
+
+        props = dict(node.properties or {})
+        if props.get("agent_id") != self.agent_id:
+            # Don't leak cross-agent mutations.
+            return {"success": False, "error": f"Action item {item_id} not found"}
+
+        if status is not None:
+            props["status"] = status
+        if due_date is not None:
+            props["due_date"] = due_date
+        if assignee_concept_id is not None:
+            props["assignee_concept_id"] = assignee_concept_id
+        props["updated_at"] = _utc_now_iso()
+
+        from kestrel_sovereign.storage.async_graph_store import GraphNode
+        try:
+            await storage.graph.add_node(GraphNode(
+                node_id=node.node_id,
+                node_type=node.node_type,
+                label=node.label,
+                properties=props,
+            ))
+        except Exception as e:
+            logger.error("update_action_item write failed: %s", e)
             return {"success": False, "error": str(e)}
         return {"success": True, "item_id": item_id}
 

@@ -13,6 +13,7 @@ import pytest_asyncio
 
 from kestrel_sovereign.storage.async_graph_store import GraphNode
 from kestrel_sovereign.storage.schema_router import (
+    ACTION_ITEM_NODE_TYPE,
     ActionItemExtractor,
     DecisionExtractor,
     DECISION_NODE_TYPE,
@@ -223,14 +224,14 @@ async def router():
 class TestSchemaRouterOrchestration:
 
     @pytest.mark.asyncio
-    async def test_ensure_tables_creates_action_items(self, router):
+    async def test_ensure_tables_is_noop(self, router):
+        """Action items now live as graph nodes; no per-feature table creation."""
         await router.ensure_tables()
-        sqls = [c[0][0] for c in router.db.execute.call_args_list]
-        assert any("CREATE TABLE IF NOT EXISTS action_items" in s for s in sqls)
-        assert any("idx_action_items_agent_status" in s for s in sqls)
+        # No DDL executed
+        router.db.execute.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_route_user_message_writes_action_items(self, router):
+    async def test_route_user_message_writes_action_items_as_graph_nodes(self, router):
         summary = await router.route(
             message_id="msg-1",
             content="I need to finalize the RFC by Friday.",
@@ -238,11 +239,14 @@ class TestSchemaRouterOrchestration:
             role="user",
         )
         assert summary["action_items"] == 1
-        insert_calls = [
-            c for c in router.db.execute.call_args_list
-            if "INSERT INTO action_items" in c[0][0]
+        action_node_calls = [
+            c.args[0] for c in router.graph.add_node.await_args_list
+            if c.args[0].node_type == ACTION_ITEM_NODE_TYPE
         ]
-        assert len(insert_calls) == 1
+        assert len(action_node_calls) == 1
+        node = action_node_calls[0]
+        assert node.properties["status"] == "pending"
+        assert node.properties["agent_id"] == "agent-1"
 
     @pytest.mark.asyncio
     async def test_route_user_message_writes_decisions_as_graph_nodes(self, router):
@@ -285,17 +289,17 @@ class TestSchemaRouterOrchestration:
         )
         assert summary["action_items"] == 0
         assert summary["decisions"] == 0
-        router.db.execute.assert_not_called()
         router.graph.add_node.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_route_failure_in_one_lane_does_not_block_others(self, router):
-        """Best-effort routing: action item write fails, decisions still persist."""
-        async def _exec(sql, *args):
-            if "INSERT INTO action_items" in sql:
-                raise Exception("db down for actions only")
+        """Best-effort routing: action_item node write fails, decisions
+        should still persist."""
+        async def _add_node(node):
+            if node.node_type == ACTION_ITEM_NODE_TYPE:
+                raise Exception("graph down for actions only")
 
-        router.db.execute = AsyncMock(side_effect=_exec)
+        router.graph.add_node = AsyncMock(side_effect=_add_node)
         summary = await router.route(
             message_id="msg-5",
             content="I need to buy milk. I've decided to skip the meeting.",
@@ -308,54 +312,71 @@ class TestSchemaRouterOrchestration:
 
     @pytest.mark.asyncio
     async def test_is_idempotent_on_duplicate_message_processing(self, router):
-        """Re-routing the same message must not duplicate action items or
-        decisions. Deterministic IDs from (message_id, text) are the guard."""
+        """Re-routing the same message must upsert the same action_item and
+        decision nodes, not create new ones. Deterministic node_ids from
+        (message_id, text) are the guard; graph upsert-by-node_id is the
+        mechanism."""
         content = "I need to ship the feature. I've decided to use Postgres."
 
-        # First pass: both lanes write.
-        router.db.fetchone = AsyncMock(return_value=None)
-        s1 = await router.route(
+        await router.route(
             message_id="msg-idempotent",
             content=content,
             concepts=[],
             role="user",
         )
-        assert s1["action_items"] == 1
-        assert s1["decisions"] == 1
-
-        insert_count_first = len([
-            c for c in router.db.execute.call_args_list
-            if "INSERT INTO action_items" in c[0][0]
-        ])
-        add_node_count_first = router.graph.add_node.await_count
-
-        # Simulate the stored row coming back on the second pass.
-        router.db.fetchone = AsyncMock(return_value=("action_some",))
-
-        s2 = await router.route(
+        await router.route(
             message_id="msg-idempotent",
             content=content,
             concepts=[],
             role="user",
         )
 
-        insert_count_second = len([
-            c for c in router.db.execute.call_args_list
-            if "INSERT INTO action_items" in c[0][0]
-        ])
-        # No new INSERT on second pass — action_item was deduplicated.
-        assert insert_count_second == insert_count_first
-
-        # Decisions use a deterministic node_id so re-add is an upsert,
-        # not a duplicate. The call count may go up, but the graph store's
-        # INSERT OR REPLACE guarantees one node per (message, text).
-        # We assert the node_id on both passes is the same.
-        all_nodes = [
-            c.args[0] for c in router.graph.add_node.await_args_list
+        action_ids = [
+            c.args[0].node_id for c in router.graph.add_node.await_args_list
+            if c.args[0].node_type == "action_item"
+        ]
+        decision_ids = [
+            c.args[0].node_id for c in router.graph.add_node.await_args_list
             if c.args[0].node_type == "decision"
         ]
-        assert len(all_nodes) >= 2
-        assert all_nodes[0].node_id == all_nodes[-1].node_id
+        # Two passes → two calls each, but both passes produce the same id.
+        assert len(action_ids) >= 2
+        assert len(set(action_ids)) == 1
+        assert len(decision_ids) >= 2
+        assert len(set(decision_ids)) == 1
+
+    @pytest.mark.asyncio
+    async def test_idempotent_action_preserves_user_status(self, router):
+        """If the user marked an action done, reprocessing must not reset
+        status to 'pending'."""
+        # Simulate existing node with status=done.
+        from kestrel_sovereign.storage.async_graph_store import GraphNode as GN
+        existing = GN(
+            node_id="action:agent-1:existing",
+            node_type="action_item",
+            label="Ship PR",
+            properties={
+                "status": "done",
+                "agent_id": "agent-1",
+                "created_at": "2026-04-01T00:00:00+00:00",
+                "text": "Ship PR",
+            },
+        )
+        router.graph.get_node = AsyncMock(return_value=existing)
+
+        await router.route(
+            message_id="msg-repeat",
+            content="I need to Ship PR.",
+            concepts=[],
+            role="user",
+        )
+        persisted = [
+            c.args[0] for c in router.graph.add_node.await_args_list
+            if c.args[0].node_type == "action_item"
+        ]
+        assert persisted
+        assert persisted[-1].properties["status"] == "done"
+        assert persisted[-1].properties["created_at"] == "2026-04-01T00:00:00+00:00"
 
     @pytest.mark.asyncio
     async def test_concept_node_id_matches_linker_shape(self, router):
