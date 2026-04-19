@@ -176,11 +176,24 @@ class SchedulerRunner:
         try:
             raw = await self._executor(task.task_name, task.args)
             # Executors may return either a plain string or a (text, signal) tuple.
-            # The signal is a float in [0.0, 1.0] reporting downstream engagement.
+            # The signal must be numeric in [0.0, 1.0]; we clamp and drop non-
+            # numeric values rather than propagating garbage to the DB.
             if isinstance(raw, tuple) and len(raw) == 2:
-                result_text, outcome_signal = raw[0], raw[1]
+                result_text = raw[0] if isinstance(raw[0], str) else (str(raw[0]) if raw[0] is not None else None)
+                signal_raw = raw[1]
+                if signal_raw is None:
+                    outcome_signal = None
+                else:
+                    try:
+                        outcome_signal = max(0.0, min(1.0, float(signal_raw)))
+                    except (TypeError, ValueError):
+                        logger.warning(
+                            "Task %s (%s) returned non-numeric outcome signal %r; dropping",
+                            task.id, task.task_name, signal_raw,
+                        )
+                        outcome_signal = None
             else:
-                result_text = raw
+                result_text = raw if isinstance(raw, str) else (str(raw) if raw is not None else None)
         except Exception as e:
             status = "failed"
             result_text = str(e)
@@ -204,34 +217,56 @@ class SchedulerRunner:
         except Exception as e:
             logger.warning("Failed to record execution for task %s: %s", task.id, e)
 
-        # Re-read the task row in case the cron expression was updated
-        # mid-flight by schedule_update. Recomputing from the stale in-memory
-        # task would ignore the user's change.
+        # Re-read the task row in case cron or enabled changed mid-flight.
+        # If the task was paused or deleted while running, we must not compute
+        # a new next_run_at — the pause intent wins over the runner's stale
+        # in-memory snapshot.
+        task_still_live = True
+        cron_expr = task.cron_expression
         try:
             fresh = await self._db.fetchone(
-                "SELECT cron_expression FROM scheduled_tasks WHERE id = ?",
+                "SELECT cron_expression, enabled FROM scheduled_tasks WHERE id = ?",
                 (task.id,),
             )
-            cron_expr = fresh[0] if fresh else task.cron_expression
-        except Exception:
-            cron_expr = task.cron_expression
+            if fresh is None:
+                # Deleted mid-flight — don't try to reschedule.
+                task_still_live = False
+            else:
+                cron_expr = fresh[0]
+                if not bool(fresh[1]):
+                    task_still_live = False
+        except Exception as e:
+            logger.warning("Failed to re-read task %s: %s", task.id, e)
 
-        try:
-            nxt = next_run(cron_expr, after=now)
-            next_iso = nxt.isoformat()
-        except CronParseError:
-            next_iso = None
-            logger.warning("Could not compute next_run for task %s", task.id)
+        next_iso: Optional[str] = None
+        if task_still_live:
+            try:
+                nxt = next_run(cron_expr, after=now)
+                next_iso = nxt.isoformat()
+            except CronParseError:
+                logger.warning("Could not compute next_run for task %s", task.id)
 
+        # Always record last_run_at even if the task was paused/deleted —
+        # execution actually happened. Only touch next_run_at when still live.
         try:
-            await self._db.execute(
-                """
-                UPDATE scheduled_tasks
-                SET last_run_at = ?, next_run_at = ?
-                WHERE id = ?
-                """,
-                (now_iso, next_iso, task.id),
-            )
+            if task_still_live:
+                await self._db.execute(
+                    """
+                    UPDATE scheduled_tasks
+                    SET last_run_at = ?, next_run_at = ?
+                    WHERE id = ? AND enabled = 1
+                    """,
+                    (now_iso, next_iso, task.id),
+                )
+            else:
+                await self._db.execute(
+                    """
+                    UPDATE scheduled_tasks
+                    SET last_run_at = ?
+                    WHERE id = ?
+                    """,
+                    (now_iso, task.id),
+                )
         except Exception as e:
             logger.warning("Failed to update task %s after execution: %s", task.id, e)
 
@@ -282,13 +317,27 @@ class SchedulerRunner:
             """
         )
         # Additive migration for pre-existing databases that lack outcome_signal.
+        # Only swallow the specific "column already exists" case; anything else
+        # (locked DB, permission errors, schema corruption) is a real problem
+        # and must be surfaced — silently continuing could let inserts fail
+        # later with confusing "no such column" errors.
         try:
             await self._db.execute(
                 "ALTER TABLE task_execution_log ADD COLUMN outcome_signal REAL"
             )
-        except Exception:
-            # Column already exists — expected on fresh installs and second runs.
-            pass
+            logger.info("Applied outcome_signal column migration")
+        except Exception as e:
+            msg = str(e).lower()
+            is_duplicate = (
+                "duplicate column" in msg
+                or "already exists" in msg
+                or "column outcome_signal" in msg
+            )
+            if is_duplicate:
+                logger.debug("outcome_signal column already present — migration skipped")
+            else:
+                logger.error("Unexpected failure applying outcome_signal migration: %s", e)
+                raise
         await self._db.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_task_execution_log_task

@@ -558,7 +558,10 @@ class SchedulerFeature(Feature):
         if not self._db:
             return {"success": False, "error": "Database not available"}
 
-        clamped = max(0.0, min(1.0, float(signal)))
+        try:
+            clamped = max(0.0, min(1.0, float(signal)))
+        except (TypeError, ValueError):
+            return {"success": False, "error": f"signal must be numeric, got {signal!r}"}
 
         try:
             row = await self._db.fetchone(
@@ -594,11 +597,18 @@ class SchedulerFeature(Feature):
         useful for diagnosing dead loops.
 
         Args:
-            days: Look-back window in days (default: 7)
+            days: Look-back window in days (1-365, default: 7)
 
         Returns:
             Dict with per-task aggregates
         """
+        try:
+            days = int(days)
+        except (TypeError, ValueError):
+            return {"success": False, "error": f"days must be an integer, got {days!r}"}
+        if days < 1 or days > 365:
+            return {"success": False, "error": "days must be in [1, 365]"}
+
         if not self._db:
             return {"success": False, "error": "Database not available"}
 
