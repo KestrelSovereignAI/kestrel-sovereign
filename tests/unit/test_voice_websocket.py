@@ -2,6 +2,9 @@
 
 import asyncio
 import json
+import sys
+import threading
+import types
 from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -539,4 +542,53 @@ class TestVoiceChatDisconnect:
                         # Close from client side — should not raise
                         ws.close()
         finally:
+            _restore_app(app, orig)
+
+    def test_vad_task_exits_on_client_disconnect(self):
+        """VAD processing is request-scoped and awaited during disconnect cleanup."""
+        started = threading.Event()
+        cleaned_up = threading.Event()
+
+        class FakeVAD:
+            async def detect_utterances(self, stream):
+                try:
+                    async for _frame in stream:
+                        started.set()
+                        yield "speech_start", b""
+                        await asyncio.Event().wait()
+                finally:
+                    cleaned_up.set()
+
+        fake_vad_module = types.ModuleType("kestrel_sovereign.voice.vad")
+        fake_vad_module.VoiceActivityDetector = lambda **_kwargs: FakeVAD()
+        fake_vad_module.load_vad_config = lambda _config: {
+            "aggressiveness": 1,
+            "silence_threshold_ms": 100,
+            "pre_speech_padding_ms": 20,
+        }
+
+        vf = _make_voice_feature()
+        agent = _make_agent(vf)
+        app, orig = _prepare_app(agent)
+        vad_key = "kestrel_sovereign.voice.vad"
+        saved_vad = sys.modules.get(vad_key)
+
+        try:
+            sys.modules[vad_key] = fake_vad_module
+            with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+                with TestClient(app) as client:
+                    with client.websocket_connect(
+                        "/voice/chat?api_key=test-key"
+                    ) as ws:
+                        ws.receive_bytes()
+                        ws.send_bytes(b"\x00\x01fake-audio")
+                        assert started.wait(timeout=1)
+                        ws.close()
+
+            assert cleaned_up.wait(timeout=1)
+        finally:
+            if saved_vad is not None:
+                sys.modules[vad_key] = saved_vad
+            else:
+                sys.modules.pop(vad_key, None)
             _restore_app(app, orig)
