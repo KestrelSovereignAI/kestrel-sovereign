@@ -359,6 +359,22 @@ core = true
 reflect = { description = "Trigger self-reflection cycle", category = "system", tags = ["reflection", "introspection"] }
 personality_status = { description = "View personality evolution state", category = "system", tags = ["reflection", "personality"] }
 
+[skills]
+package = "kestrel-sovereign"
+git = "https://github.com/KestrelSovereignAI/kestrel-sovereign.git"
+features = ["SkillsFeature"]
+description = "Extract reusable procedural skills from reflection insights (Claudeception pattern)"
+tags = ["ai", "reflection", "skills", "self-improvement"]
+icon = "bookmark"
+core = true
+
+[skills.skills]
+skill_list = { description = "List all extracted skills", category = "utility", tags = ["skills"] }
+skill_show = { description = "Show a skill's full content", category = "utility", tags = ["skills"] }
+skill_extract_candidates = { description = "Find insights that could become skills", category = "utility", tags = ["skills", "reflection"] }
+skill_save = { description = "Promote an insight into a saved skill", category = "utility", tags = ["skills", "reflection"] }
+skill_delete = { description = "Delete a saved skill", category = "utility", tags = ["skills"] }
+
 [talon]
 package = "kestrel-feature-talon"
 git = "https://github.com/KestrelSovereignAI/kestrel-feature-talon.git"
