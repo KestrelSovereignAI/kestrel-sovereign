@@ -191,6 +191,49 @@ by content similarity.
 | "Search uploaded files" | **AsyncRAGStore** |
 | "Recall yesterday's conversation" | **MemoryRetriever** |
 | "Look up procedure documentation" | **AsyncRAGStore** |
+| "What action items do I have?" | **Schema router** (`recall_action_items`) |
+| "What did I decide about X?" | **Schema router** (`recall_decisions`) |
+| "How did I interact with Alice?" | **Schema router** (`recall_interactions`) |
+
+### Schema-aware routing
+
+The **[SchemaRouter](../../kestrel_sovereign/storage/schema_router.py)**
+runs after concept linking in the message pipeline and promotes extracted
+structure to typed **graph nodes** — one consistent storage model, not
+a mix of SQL tables and graph nodes:
+
+- **Action items** become graph nodes of type `action_item` with
+  properties `status` / `assignee_concept_id` / `due_date` / `confidence`.
+  Recall tools filter by `node_type` (indexed) then apply property
+  filters in memory.
+- **Decisions** become graph nodes of type `decision`, same pattern
+  as skills from [#643](https://github.com/KestrelSovereignAI/kestrel-sovereign/pull/643).
+- **Interactions** (per-person sentiment + topics) are stored as
+  properties on the existing `mentions` edges between message and
+  person concept nodes — no new edge type.
+
+### Why everything in the graph
+
+The earlier design had `action_items` as a dedicated SQL table because
+of state-machine + date-range + assignee query shapes. After discussion
+([#628 / #646](https://github.com/KestrelSovereignAI/kestrel-sovereign/pull/646)),
+we landed on consistency: the graph already holds concepts, messages,
+skills, and decisions; having one more typed entity pattern just for
+action items was spackle.
+
+The baseline cost of making the graph act as typed storage is two
+indexes on `graph_nodes` (`node_type` and `(node_type, label)`) plus
+two on `graph_edges` (`(target_id, label)` and `label`). These are
+created in [async_database.py](../../kestrel_sovereign/storage/async_database.py).
+
+Person resolution is **three-pass**: exact match → fuzzy first-name match
+(with minimum 3 chars shared prefix) → collision detection. Ambiguous
+matches are flagged `status=pending` for human confirmation via
+`confirm_person_match` rather than silently merging. See `PersonResolver`
+in `schema_router.py`.
+
+The router is gated on privacy mode: EPHEMERAL and ISOLATED skip routing
+entirely because the underlying storage is not persistent.
 
 ### Why Two Systems?
 

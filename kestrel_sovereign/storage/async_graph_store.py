@@ -110,10 +110,21 @@ class AsyncGraphStore:
     
     async def add_edge(self, source_id: str, target_id: str, label: str,
                        properties: Optional[Dict] = None) -> None:
-        """Add an edge between nodes."""
+        """Add an edge between nodes.
+
+        Upserts by (source_id, target_id, label) — calling add_edge twice
+        with the same triple updates the properties, not duplicates the edge.
+        """
         await self.db.execute_commit(
             self._upsert_edge_sql(),
             (source_id, target_id, label, json.dumps(properties) if properties else None)
+        )
+
+    async def delete_edge(self, source_id: str, target_id: str, label: str) -> None:
+        """Remove a specific edge by its (source, target, label) triple."""
+        await self.db.execute_commit(
+            "DELETE FROM graph_edges WHERE source_id = ? AND target_id = ? AND label = ?",
+            (source_id, target_id, label),
         )
     
     async def get_edges(self, node_id: str, direction: str = "both") -> List[Edge]:

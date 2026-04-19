@@ -34,9 +34,20 @@ from .temporal_analyzer import TemporalAnalyzer
 from .associative_linker import AssociativeLinker
 from .memory_retriever import MemoryRetriever
 from .memory_consolidator import MemoryConsolidator
+from .schema_router import SchemaRouter
 from .async_storage import AsyncStorage
 
 logger = logging.getLogger(__name__)
+
+
+def _routing_suppressed(metadata: Optional[Dict[str, Any]]) -> bool:
+    """Callers (e.g. MemoryFeature in EPHEMERAL privacy mode) can opt out
+    of schema routing by setting `skip_schema_routing=True` in metadata.
+    The primary gate is privacy_wrapper — this flag is a belt-and-braces
+    fallback for callers that know routing should not persist structure."""
+    if not metadata:
+        return False
+    return bool(metadata.get("skip_schema_routing"))
 
 
 class MemorySystem:
@@ -70,6 +81,7 @@ class MemorySystem:
         self.linker: Optional[AssociativeLinker] = None
         self.retriever: Optional[MemoryRetriever] = None
         self.consolidator: Optional[MemoryConsolidator] = None
+        self.router: Optional[SchemaRouter] = None
 
         self._initialized = False
 
@@ -95,6 +107,22 @@ class MemorySystem:
             self.agent_id,
             graph_store=self.storage.graph,
         )
+
+        # Schema-aware routing: promote extracted structure (action items,
+        # decisions, person-interaction enrichment) after concept linking.
+        # Everything typed lives in the graph now, so table creation is a
+        # no-op — the call is kept for forward-compat if a later router
+        # variant needs setup.
+        self.router = SchemaRouter(
+            graph=self.storage.graph,
+            db=self.storage.db,
+            agent_id=self.agent_id,
+        )
+        try:
+            await self.router.ensure_tables()
+        except Exception as e:
+            logger.warning("SchemaRouter init failed: %s", e)
+            self.router = None
 
         self._initialized = True
         logger.info(f"Memory system initialized for agent {self.agent_id}")
@@ -192,6 +220,7 @@ class MemorySystem:
         enriched = await self.enrich_metadata(content, role, metadata)
 
         # Extract concepts and link in graph (for user messages)
+        concepts: List[str] = []
         if role == "user" and self.linker:
             message_id = enriched.get("memory_message_id", str(uuid.uuid4()))
             concepts = await self.linker.extract_and_link(
@@ -200,6 +229,24 @@ class MemorySystem:
                 self.agent_id
             )
             enriched["extracted_concepts"] = concepts
+
+            # Schema-aware routing: action items / decisions / interaction
+            # enrichment. Best-effort — a failure here never blocks the
+            # message save or other enrichment. Privacy gating happens at
+            # the MemoryFeature layer via skip_schema_routing in metadata;
+            # EPHEMERAL/ISOLATED agents never reach this code path because
+            # the underlying storage is not persistent.
+            if self.router and not _routing_suppressed(metadata):
+                try:
+                    routing_summary = await self.router.route(
+                        message_id=message_id,
+                        content=content,
+                        concepts=concepts,
+                        role=role,
+                    )
+                    enriched["schema_routing"] = routing_summary
+                except Exception as e:
+                    logger.warning("Schema routing failed for message: %s", e)
 
         return enriched
 
