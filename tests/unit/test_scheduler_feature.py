@@ -93,6 +93,9 @@ class TestSchedulerTools:
         assert "schedule_pause" in tool_names
         assert "schedule_resume" in tool_names
         assert "schedule_history" in tool_names
+        assert "schedule_update" in tool_names
+        assert "schedule_record_outcome" in tool_names
+        assert "schedule_engagement" in tool_names
 
     @pytest.mark.asyncio
     async def test_tool_description(self, feature):
@@ -303,13 +306,15 @@ class TestScheduleHistory:
     @pytest.mark.asyncio
     async def test_history_returns_records(self, feature):
         feature._db.fetchall = AsyncMock(return_value=[
-            ("exec-1", "task-1", "success", '{"result": "ok"}', 150, "2026-03-05T10:00:00", "wellness_check"),
-            ("exec-2", "task-2", "failed", "Connection timeout", 5000, "2026-03-05T09:00:00", "audit_anchor"),
+            ("exec-1", "task-1", "success", '{"result": "ok"}', 150, "2026-03-05T10:00:00", "wellness_check", 0.9),
+            ("exec-2", "task-2", "failed", "Connection timeout", 5000, "2026-03-05T09:00:00", "audit_anchor", None),
         ])
         result = await feature.schedule_history()
         assert result["count"] == 2
         assert result["executions"][0]["status"] == "success"
+        assert result["executions"][0]["outcome_signal"] == 0.9
         assert result["executions"][1]["task_name"] == "audit_anchor"
+        assert result["executions"][1]["outcome_signal"] is None
 
     @pytest.mark.asyncio
     async def test_history_respects_limit(self, feature):
@@ -333,8 +338,29 @@ class TestSchedulerRunner:
         runner = SchedulerRunner(db, "test-agent", executor)
         await runner._ensure_tables()
 
-        # Should have created 2 tables and 2 indexes = 4 execute calls
-        assert db.execute.call_count == 4
+        # Expected DDL: scheduled_tasks table + index, task_execution_log
+        # table + additive ALTER for outcome_signal + index = 5 statements.
+        sqls = [call[0][0] for call in db.execute.call_args_list]
+        assert any("CREATE TABLE IF NOT EXISTS scheduled_tasks" in s for s in sqls)
+        assert any("CREATE TABLE IF NOT EXISTS task_execution_log" in s for s in sqls)
+        assert any("ALTER TABLE task_execution_log" in s for s in sqls)
+        assert any("outcome_signal" in s for s in sqls)
+
+    @pytest.mark.asyncio
+    async def test_ensure_tables_is_idempotent_when_column_exists(self):
+        """ALTER TABLE ADD COLUMN fails if the column already exists — that
+        error must be swallowed so re-running _ensure_tables stays safe."""
+        db = _make_mock_db()
+
+        async def _exec(sql, *args):
+            if "ALTER TABLE" in sql:
+                raise Exception("duplicate column name: outcome_signal")
+
+        db.execute = AsyncMock(side_effect=_exec)
+        executor = AsyncMock(return_value="ok")
+        runner = SchedulerRunner(db, "test-agent", executor)
+        # Must not raise even though ALTER fails
+        await runner._ensure_tables()
 
     @pytest.mark.asyncio
     async def test_tick_no_due_tasks(self):
@@ -506,6 +532,229 @@ class TestTaskExecutor:
         feature.agent.features = {}
         with pytest.raises(ValueError, match="Unknown task"):
             await feature._execute_scheduled_task("nonexistent_task", {})
+
+
+# =========================================================================
+# schedule_update
+# =========================================================================
+
+
+class TestScheduleUpdate:
+
+    @pytest.mark.asyncio
+    async def test_update_existing(self, feature):
+        feature._db.fetchone = AsyncMock(return_value=("@daily", 1))
+        result = await feature.schedule_update(
+            task_id="task-id", cron_expression="@hourly"
+        )
+        assert result["success"] is True
+        assert result["status"] == "updated"
+        assert result["old_cron"] == "@daily"
+        assert result["cron_expression"] == "@hourly"
+        assert result["next_run_at"] is not None
+
+    @pytest.mark.asyncio
+    async def test_update_unchanged_is_noop(self, feature):
+        feature._db.fetchone = AsyncMock(return_value=("@hourly", 1))
+        result = await feature.schedule_update(
+            task_id="task-id", cron_expression="@hourly"
+        )
+        assert result["success"] is True
+        assert result["status"] == "unchanged"
+        # Must not UPDATE when nothing changed
+        feature._db.execute.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_update_invalid_cron(self, feature):
+        result = await feature.schedule_update(
+            task_id="task-id", cron_expression="not a cron"
+        )
+        assert result["success"] is False
+        assert "invalid cron" in result["error"].lower()
+
+    @pytest.mark.asyncio
+    async def test_update_not_found(self, feature):
+        feature._db.fetchone = AsyncMock(return_value=None)
+        result = await feature.schedule_update(
+            task_id="missing", cron_expression="@daily"
+        )
+        assert result["success"] is False
+        assert "not found" in result["error"].lower()
+
+    @pytest.mark.asyncio
+    async def test_update_disabled_task_leaves_next_run_null(self, feature):
+        feature._db.fetchone = AsyncMock(return_value=("@daily", 0))
+        result = await feature.schedule_update(
+            task_id="task-id", cron_expression="@hourly"
+        )
+        assert result["success"] is True
+        # Paused task must not compute a next_run
+        assert result["next_run_at"] is None
+
+    @pytest.mark.asyncio
+    async def test_update_no_db(self, feature_no_db):
+        result = await feature_no_db.schedule_update(
+            task_id="any", cron_expression="@daily"
+        )
+        assert result["success"] is False
+
+
+# =========================================================================
+# schedule_record_outcome
+# =========================================================================
+
+
+class TestRecordOutcome:
+
+    @pytest.mark.asyncio
+    async def test_record_signal(self, feature):
+        feature._db.fetchone = AsyncMock(return_value=("exec-id",))
+        result = await feature.schedule_record_outcome(
+            execution_id="exec-id", signal=0.8
+        )
+        assert result["success"] is True
+        assert result["signal"] == 0.8
+
+    @pytest.mark.asyncio
+    async def test_signal_clamped_upper(self, feature):
+        feature._db.fetchone = AsyncMock(return_value=("exec-id",))
+        result = await feature.schedule_record_outcome(
+            execution_id="exec-id", signal=2.5
+        )
+        assert result["signal"] == 1.0
+
+    @pytest.mark.asyncio
+    async def test_signal_clamped_lower(self, feature):
+        feature._db.fetchone = AsyncMock(return_value=("exec-id",))
+        result = await feature.schedule_record_outcome(
+            execution_id="exec-id", signal=-0.5
+        )
+        assert result["signal"] == 0.0
+
+    @pytest.mark.asyncio
+    async def test_record_not_found(self, feature):
+        feature._db.fetchone = AsyncMock(return_value=None)
+        result = await feature.schedule_record_outcome(
+            execution_id="missing", signal=0.5
+        )
+        assert result["success"] is False
+        assert "not found" in result["error"].lower()
+
+
+# =========================================================================
+# schedule_engagement
+# =========================================================================
+
+
+class TestScheduleEngagement:
+
+    @pytest.mark.asyncio
+    async def test_empty(self, feature):
+        feature._db.fetchall = AsyncMock(return_value=[])
+        result = await feature.schedule_engagement(days=7)
+        assert result["window_days"] == 7
+        assert result["tasks"] == []
+        assert result["count"] == 0
+
+    @pytest.mark.asyncio
+    async def test_aggregates(self, feature):
+        feature._db.fetchall = AsyncMock(return_value=[
+            ("task-1", "morning_signal", "0 8 * * *", 7, 5, 0.62),
+            ("task-2", "reflect", "0 */4 * * *", 42, 0, None),
+        ])
+        result = await feature.schedule_engagement(days=7)
+        assert result["count"] == 2
+        assert result["tasks"][0]["mean_signal"] == 0.62
+        assert result["tasks"][0]["signals"] == 5
+        # Second task has executions but zero signals — downstream isn't
+        # reporting back. mean_signal must be None, not 0.
+        assert result["tasks"][1]["mean_signal"] is None
+        assert result["tasks"][1]["signals"] == 0
+
+
+# =========================================================================
+# Runner outcome signal + mid-flight cron reload
+# =========================================================================
+
+
+class TestRunnerOutcomeSignal:
+
+    @pytest.mark.asyncio
+    async def test_tuple_return_captures_signal(self):
+        db = _make_mock_db()
+        now_iso = datetime.now(timezone.utc).isoformat()
+        db.fetchall = AsyncMock(return_value=[
+            ("task-1", "test-agent", "morning_signal", "0 8 * * *", "{}",
+             1, None, now_iso, "2026-03-04T00:00:00"),
+        ])
+        executor = AsyncMock(return_value=("dispatched", 0.75))
+        runner = SchedulerRunner(db, "test-agent", executor)
+        await runner._tick()
+
+        insert_call = db.execute.call_args_list[0]
+        insert_params = insert_call[0][1]
+        # outcome_signal is the 8th positional arg in the INSERT
+        assert insert_params[7] == 0.75
+
+    @pytest.mark.asyncio
+    async def test_plain_string_return_has_null_signal(self):
+        db = _make_mock_db()
+        now_iso = datetime.now(timezone.utc).isoformat()
+        db.fetchall = AsyncMock(return_value=[
+            ("task-1", "test-agent", "backup_snapshot", "0 */4 * * *", "{}",
+             1, None, now_iso, "2026-03-04T00:00:00"),
+        ])
+        executor = AsyncMock(return_value="ok")
+        runner = SchedulerRunner(db, "test-agent", executor)
+        await runner._tick()
+
+        insert_params = db.execute.call_args_list[0][0][1]
+        assert insert_params[7] is None
+
+
+class TestRunnerCronReload:
+
+    @pytest.mark.asyncio
+    async def test_uses_fresh_cron_for_next_run(self):
+        """
+        If schedule_update changes cron while the task is executing, the
+        runner must honor the new expression when computing next_run_at,
+        not the stale in-memory copy.
+        """
+        db = _make_mock_db()
+        now_iso = datetime.now(timezone.utc).isoformat()
+        db.fetchall = AsyncMock(return_value=[
+            # Task fires with old daily cron
+            ("task-1", "test-agent", "test_task", "@daily", "{}",
+             1, None, now_iso, "2026-03-04T00:00:00"),
+        ])
+        # Simulate the user/reflection updating cron to every 5 min
+        # between the runner's SELECT and the post-execution recompute.
+        db.fetchone = AsyncMock(return_value=("*/5 * * * *",))
+        executor = AsyncMock(return_value="ok")
+        runner = SchedulerRunner(db, "test-agent", executor)
+        await runner._tick()
+
+        # Runner should have fetched the fresh cron expression
+        db.fetchone.assert_called()
+        fetch_sql = db.fetchone.call_args[0][0]
+        assert "cron_expression" in fetch_sql
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_stale_cron_when_row_missing(self):
+        """If the task row was deleted mid-execution, recompute from the
+        in-memory copy rather than crashing."""
+        db = _make_mock_db()
+        now_iso = datetime.now(timezone.utc).isoformat()
+        db.fetchall = AsyncMock(return_value=[
+            ("task-1", "test-agent", "test_task", "@daily", "{}",
+             1, None, now_iso, "2026-03-04T00:00:00"),
+        ])
+        db.fetchone = AsyncMock(return_value=None)
+        executor = AsyncMock(return_value="ok")
+        runner = SchedulerRunner(db, "test-agent", executor)
+        # Must not raise
+        await runner._tick()
 
 
 # =========================================================================

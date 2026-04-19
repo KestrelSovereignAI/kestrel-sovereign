@@ -171,9 +171,16 @@ class SchedulerRunner:
         now_iso = now.isoformat()
         status = "success"
         result_text: Optional[str] = None
+        outcome_signal: Optional[float] = None
 
         try:
-            result_text = await self._executor(task.task_name, task.args)
+            raw = await self._executor(task.task_name, task.args)
+            # Executors may return either a plain string or a (text, signal) tuple.
+            # The signal is a float in [0.0, 1.0] reporting downstream engagement.
+            if isinstance(raw, tuple) and len(raw) == 2:
+                result_text, outcome_signal = raw[0], raw[1]
+            else:
+                result_text = raw
         except Exception as e:
             status = "failed"
             result_text = str(e)
@@ -181,23 +188,36 @@ class SchedulerRunner:
 
         duration_ms = int((time.monotonic() - start) * 1000)
 
-        # Record execution
+        # Record execution — keep the generated id so executors can attach
+        # outcome signals after the fact (e.g. when a user responds to a
+        # dispatched message minutes later).
         record_id = str(uuid.uuid4())
         try:
             await self._db.execute(
                 """
                 INSERT INTO task_execution_log
-                    (id, task_id, agent_id, status, result_text, duration_ms, executed_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                    (id, task_id, agent_id, status, result_text, duration_ms, executed_at, outcome_signal)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (record_id, task.id, self._agent_id, status, result_text, duration_ms, now_iso),
+                (record_id, task.id, self._agent_id, status, result_text, duration_ms, now_iso, outcome_signal),
             )
         except Exception as e:
             logger.warning("Failed to record execution for task %s: %s", task.id, e)
 
-        # Compute next run time and update the task row
+        # Re-read the task row in case the cron expression was updated
+        # mid-flight by schedule_update. Recomputing from the stale in-memory
+        # task would ignore the user's change.
         try:
-            nxt = next_run(task.cron_expression, after=now)
+            fresh = await self._db.fetchone(
+                "SELECT cron_expression FROM scheduled_tasks WHERE id = ?",
+                (task.id,),
+            )
+            cron_expr = fresh[0] if fresh else task.cron_expression
+        except Exception:
+            cron_expr = task.cron_expression
+
+        try:
+            nxt = next_run(cron_expr, after=now)
             next_iso = nxt.isoformat()
         except CronParseError:
             next_iso = None
@@ -216,8 +236,8 @@ class SchedulerRunner:
             logger.warning("Failed to update task %s after execution: %s", task.id, e)
 
         logger.info(
-            "Scheduled task %s (%s) executed: %s (%dms)",
-            task.id, task.task_name, status, duration_ms,
+            "Scheduled task %s (%s) executed: %s (%dms, signal=%s)",
+            task.id, task.task_name, status, duration_ms, outcome_signal,
         )
 
     # ------------------------------------------------------------------
@@ -256,10 +276,19 @@ class SchedulerRunner:
                 status TEXT NOT NULL,
                 result_text TEXT,
                 duration_ms INTEGER NOT NULL,
-                executed_at TEXT NOT NULL
+                executed_at TEXT NOT NULL,
+                outcome_signal REAL
             )
             """
         )
+        # Additive migration for pre-existing databases that lack outcome_signal.
+        try:
+            await self._db.execute(
+                "ALTER TABLE task_execution_log ADD COLUMN outcome_signal REAL"
+            )
+        except Exception:
+            # Column already exists — expected on fresh installs and second runs.
+            pass
         await self._db.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_task_execution_log_task

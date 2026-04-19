@@ -445,6 +445,201 @@ class SchedulerFeature(Feature):
             return {"success": False, "error": str(e)}
 
     @tool(
+        "schedule_update",
+        "Update the cron expression of an existing scheduled task",
+        category=ToolCategory.UTILITY,
+        command_prefix="!schedule update",
+    )
+    async def schedule_update(
+        self,
+        task_id: str,
+        cron_expression: str,
+    ) -> Dict[str, Any]:
+        """
+        Update the cron expression on an existing scheduled task and recompute
+        its next_run_at. Used by dynamic/self-adjusting schedulers (e.g. the
+        reflection loop) to change task cadence without removing and re-adding.
+
+        Args:
+            task_id: The UUID of the task to update
+            cron_expression: New cron expression (5 fields or alias)
+
+        Returns:
+            Dict with success, task_id, old_cron, new_cron, next_run_at
+        """
+        if not self._db:
+            return {"success": False, "error": "Database not available"}
+
+        # Validate new cron expression
+        try:
+            parse(cron_expression)
+        except CronParseError as e:
+            return {"success": False, "error": f"Invalid cron expression: {e}"}
+
+        try:
+            row = await self._db.fetchone(
+                "SELECT cron_expression, enabled FROM scheduled_tasks WHERE id = ? AND agent_id = ?",
+                (task_id, self._agent_id),
+            )
+            if not row:
+                return {"success": False, "error": f"Task {task_id} not found"}
+
+            old_cron = row[0]
+            enabled = bool(row[1])
+
+            if old_cron == cron_expression:
+                return {
+                    "success": True,
+                    "task_id": task_id,
+                    "status": "unchanged",
+                    "cron_expression": cron_expression,
+                }
+
+            now = datetime.now(timezone.utc)
+            next_run_at: Optional[str] = None
+            if enabled:
+                try:
+                    next_run_at = next_run(cron_expression, after=now).isoformat()
+                except CronParseError as e:
+                    return {"success": False, "error": f"Cannot compute next run: {e}"}
+
+            await self._db.execute(
+                """
+                UPDATE scheduled_tasks
+                SET cron_expression = ?, next_run_at = ?
+                WHERE id = ? AND agent_id = ?
+                """,
+                (cron_expression, next_run_at, task_id, self._agent_id),
+            )
+
+            logger.info(
+                "Scheduled task updated: %s cron: %s -> %s (next=%s)",
+                task_id, old_cron, cron_expression, next_run_at,
+            )
+            return {
+                "success": True,
+                "task_id": task_id,
+                "status": "updated",
+                "old_cron": old_cron,
+                "cron_expression": cron_expression,
+                "next_run_at": next_run_at,
+            }
+
+        except Exception as e:
+            logger.error("Failed to update task %s: %s", task_id, e)
+            return {"success": False, "error": str(e)}
+
+    @tool(
+        "schedule_record_outcome",
+        "Attach an engagement signal (0.0-1.0) to a past task execution",
+        category=ToolCategory.UTILITY,
+        command_prefix="!schedule outcome",
+    )
+    async def schedule_record_outcome(
+        self,
+        execution_id: str,
+        signal: float,
+    ) -> Dict[str, Any]:
+        """
+        Record an engagement signal on a past execution. Used when the
+        downstream outcome is only known later — e.g. a morning_signal
+        dispatched at 8am that the user replied to at 9:15am scores 1.0
+        when the reply arrives.
+
+        Signal is clamped to [0.0, 1.0].
+
+        Args:
+            execution_id: The id returned by schedule_history
+            signal: Engagement score in [0.0, 1.0]
+
+        Returns:
+            Dict with success, execution_id, signal
+        """
+        if not self._db:
+            return {"success": False, "error": "Database not available"}
+
+        clamped = max(0.0, min(1.0, float(signal)))
+
+        try:
+            row = await self._db.fetchone(
+                "SELECT id FROM task_execution_log WHERE id = ? AND agent_id = ?",
+                (execution_id, self._agent_id),
+            )
+            if not row:
+                return {"success": False, "error": f"Execution {execution_id} not found"}
+
+            await self._db.execute(
+                "UPDATE task_execution_log SET outcome_signal = ? WHERE id = ? AND agent_id = ?",
+                (clamped, execution_id, self._agent_id),
+            )
+            return {"success": True, "execution_id": execution_id, "signal": clamped}
+
+        except Exception as e:
+            logger.error("Failed to record outcome for %s: %s", execution_id, e)
+            return {"success": False, "error": str(e)}
+
+    @tool(
+        "schedule_engagement",
+        "Report aggregate engagement scores per scheduled task",
+        category=ToolCategory.UTILITY,
+        command_prefix="!schedule engagement",
+    )
+    async def schedule_engagement(self, days: int = 7) -> Dict[str, Any]:
+        """
+        Aggregate recent outcome signals per task.
+
+        Returns one row per task with execution count, signal count (non-null),
+        and mean signal over the window. A task with many executions but few
+        signals indicates the downstream integration isn't reporting back —
+        useful for diagnosing dead loops.
+
+        Args:
+            days: Look-back window in days (default: 7)
+
+        Returns:
+            Dict with per-task aggregates
+        """
+        if not self._db:
+            return {"success": False, "error": "Database not available"}
+
+        try:
+            from datetime import timedelta
+            since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+            rows = await self._db.fetchall(
+                """
+                SELECT
+                    st.id, st.task_name, st.cron_expression,
+                    COUNT(el.id) AS executions,
+                    COUNT(el.outcome_signal) AS signals,
+                    AVG(el.outcome_signal) AS mean_signal
+                FROM scheduled_tasks st
+                LEFT JOIN task_execution_log el
+                    ON el.task_id = st.id AND el.executed_at >= ?
+                WHERE st.agent_id = ?
+                GROUP BY st.id, st.task_name, st.cron_expression
+                ORDER BY st.task_name
+                """,
+                (since, self._agent_id),
+            )
+
+            tasks = [
+                {
+                    "task_id": row[0],
+                    "task_name": row[1],
+                    "cron_expression": row[2],
+                    "executions": row[3] or 0,
+                    "signals": row[4] or 0,
+                    "mean_signal": float(row[5]) if row[5] is not None else None,
+                }
+                for row in rows
+            ]
+            return {"window_days": days, "tasks": tasks, "count": len(tasks)}
+
+        except Exception as e:
+            logger.error("Failed to aggregate engagement: %s", e)
+            return {"success": False, "error": str(e)}
+
+    @tool(
         "schedule_history",
         "Show recent task execution history",
         category=ToolCategory.UTILITY,
@@ -467,7 +662,7 @@ class SchedulerFeature(Feature):
             rows = await self._db.fetchall(
                 """
                 SELECT el.id, el.task_id, el.status, el.result_text,
-                       el.duration_ms, el.executed_at, st.task_name
+                       el.duration_ms, el.executed_at, st.task_name, el.outcome_signal
                 FROM task_execution_log el
                 LEFT JOIN scheduled_tasks st ON st.id = el.task_id
                 WHERE el.agent_id = ?
@@ -487,6 +682,7 @@ class SchedulerFeature(Feature):
                     "duration_ms": row[4],
                     "executed_at": row[5],
                     "task_name": row[6],
+                    "outcome_signal": row[7],
                 })
 
             return {"executions": records, "count": len(records)}
