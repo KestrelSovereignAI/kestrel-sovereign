@@ -486,9 +486,9 @@ class TestAtomicWriteAndCollision:
         assert result["success"] is False
 
         skills_dir = tmp_path / "skills"
-        # No .md file at the target, and no .tmp left behind.
+        # No .md at the target, and no per-writer .tmp.* files left behind.
         assert list(skills_dir.glob("*.md")) == []
-        assert list(skills_dir.glob("*.md.tmp")) == []
+        assert list(skills_dir.glob("*.md.tmp.*")) == []
 
         # Restore and confirm a clean save works afterwards.
         monkeypatch.setattr(mod.os, "replace", real_replace)
@@ -498,6 +498,50 @@ class TestAtomicWriteAndCollision:
             verification="v",
         )
         assert result["success"] is True
+
+    @pytest.mark.asyncio
+    async def test_tmp_path_is_per_writer_not_deterministic(self, feature, tmp_path, monkeypatch):
+        """Two writers targeting the same skill must not collide on the tmp
+        path. The remaining race (both pass path.exists, both os.replace) is
+        documented as last-writer-wins and out of scope here."""
+        from kestrel_sovereign.features.skills import feature as mod
+
+        observed_tmps: list[str] = []
+        real_write_text = mod.Path.write_text
+
+        def _capture_write(self, *args, **kwargs):
+            observed_tmps.append(self.name)
+            return real_write_text(self, *args, **kwargs)
+
+        monkeypatch.setattr(mod.Path, "write_text", _capture_write)
+
+        feature._db.fetchone = AsyncMock(return_value=(
+            "ins-p1", "s", "pattern", "t", "d", 0.85, 1, "Parallel title",
+        ))
+
+        r1 = await feature.skill_save(
+            insight_id="ins-p1",
+            steps_json='["s1"]',
+            verification="v1",
+        )
+        assert r1["success"] is True
+
+        # Remove the persisted file so the second save passes the collision
+        # guard; the point of the test is the tmp-name uniqueness, not the
+        # final-file race.
+        (tmp_path / "skills" / f"{r1['skill_id']}.md").unlink()
+
+        r2 = await feature.skill_save(
+            insight_id="ins-p1",
+            steps_json='["s2"]',
+            verification="v2",
+        )
+        assert r2["success"] is True
+
+        # Both writes used distinct tmp filenames — no clobber possible.
+        tmp_names = [n for n in observed_tmps if ".tmp." in n]
+        assert len(tmp_names) == 2
+        assert tmp_names[0] != tmp_names[1]
 
     @pytest.mark.asyncio
     async def test_collision_guard_refuses_overwrite(self, feature, tmp_path):

@@ -40,6 +40,7 @@ import json
 import logging
 import os
 import re
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -454,11 +455,14 @@ class SkillsFeature(Feature):
         if path.exists():
             raise FileExistsError(f"skill file already exists: {path.name}")
 
-        # Atomic write: write to a sibling tmp file then rename. If the
-        # process dies mid-write we leave a .tmp behind but never a
-        # truncated .md. The rename is atomic on POSIX when source and
-        # destination are on the same filesystem.
-        tmp_path = path.with_suffix(path.suffix + ".tmp")
+        # Atomic write: write to a per-writer tmp file then rename. A uuid
+        # suffix on the tmp path means two concurrent writers do not clobber
+        # each other's tmp content. (The remaining race — both writers pass
+        # path.exists() then both os.replace — is last-writer-wins on the
+        # final file, which is a semantic choice rather than corruption.
+        # See follow-up ticket for the full flock/UNIQUE fix if concurrent
+        # skill_save turns out to be a real use case.)
+        tmp_path = path.with_suffix(path.suffix + f".tmp.{uuid.uuid4().hex[:8]}")
         try:
             tmp_path.write_text(skill.to_markdown(), encoding="utf-8")
             os.replace(tmp_path, path)
