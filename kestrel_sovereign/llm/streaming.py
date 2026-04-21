@@ -38,8 +38,8 @@ class StreamingMixin:
 
     # Cloud providers always support tools — only gate local models
     _CLOUD_PROVIDERS = frozenset({
-        "openai", "anthropic", "claude_plan", "claude_max",
-        "openai_plan", "codex", "vertex_ai", "google",
+        "openai", "anthropic", "claude_plan",
+        "openai_plan", "vertex_ai", "google",
         "openrouter", "runpod", "xai", "groq", "together",
         "mistral", "perplexity", "fireworks", "azure_openai",
     })

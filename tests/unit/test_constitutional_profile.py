@@ -202,12 +202,12 @@ def test_all_providers_have_profiles():
 def test_provider_aliases_resolve_correctly(profile_service):
     """Test that llm_config provider names resolve to correct constitutional profiles.
 
-    Provider names in llm_config.toml (e.g., 'claude_max') don't always match
+    Provider names in llm_config.toml (e.g., 'claude_plan') don't always match
     profile keys in constitutional_profiles.toml (e.g., 'anthropic'). The alias
     system ensures every configured provider gets the right constitutional profile.
     """
-    # claude_max -> anthropic (complementary, published constitution)
-    profile = profile_service.get_profile("claude_max")
+    # claude_plan -> anthropic (complementary, published constitution)
+    profile = profile_service.get_profile("claude_plan")
     assert profile.governance_mode == "complementary"
     assert profile.transparency == "published"
     assert "verifiable_history" in profile.delegated_principles
@@ -224,8 +224,8 @@ def test_provider_aliases_resolve_correctly(profile_service):
 
 def test_provider_alias_state_of_mind(profile_service):
     """Test that state-of-mind works through aliases."""
-    # claude_max with a Claude model should get Anthropic's complementary profile
-    state = profile_service.get_state_of_mind("claude_max", "claude-sonnet-4-5-20250929")
+    # claude_plan with a Claude model should get Anthropic's complementary profile
+    state = profile_service.get_state_of_mind("claude_plan", "claude-sonnet-4-5-20250929")
     assert state.governance_mode == "complementary"
     assert "verifiable_history" in state.delegated_principles
     assert any(c["principle"] == "sovereignty" for c in state.active_conflicts)
