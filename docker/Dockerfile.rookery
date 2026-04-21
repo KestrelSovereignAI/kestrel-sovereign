@@ -31,6 +31,8 @@ RUN --mount=type=secret,id=github_token \
         git config --global url."https://${GIT_AUTH}@github.com/".insteadOf "https://github.com/"; \
     fi && \
     uv pip install --python /app/.venv/bin/python . && \
+    uv pip install --python /app/.venv/bin/python \
+        "kestrel-feature-github-app @ git+https://github.com/KestrelSovereignAI/kestrel-feature-github-app.git" && \
     (uv pip uninstall --python /app/.venv/bin/python ollama || true) && \
     git config --global --unset-all url."https://${GIT_AUTH}@github.com/".insteadOf 2>/dev/null || true
 
