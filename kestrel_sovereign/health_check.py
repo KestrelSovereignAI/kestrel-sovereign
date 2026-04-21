@@ -3,8 +3,35 @@ import requests
 import sqlite3
 import sys
 
+from kestrel_sovereign.config import load_config
 from kestrel_sovereign.kestrel_config.constants import HTTP_TIMEOUT_SHORT
 from kestrel_sovereign.kestrel_config.defaults import get_ollama_url
+from kestrel_sovereign.llm.model_selection import resolve_provider_default
+
+
+def _resolve_expected_ollama_model(installed_models: list[str]) -> str | None:
+    """Resolve the Ollama model Kestrel is configured to use."""
+    llm_config = load_config("llm_config.toml")
+    ollama_config = llm_config.get("ollama", {}) or {}
+    configured_model = ollama_config.get("model")
+
+    if configured_model and configured_model != "auto":
+        return str(configured_model)
+
+    try:
+        return resolve_provider_default("ollama", llm_config=llm_config)
+    except Exception:
+        selection_hints = ollama_config.get("selection_hints", []) or []
+        for hint in selection_hints:
+            hint_lower = str(hint).lower()
+            for model_id in installed_models:
+                if hint_lower in model_id.lower():
+                    return model_id
+
+    if len(installed_models) == 1:
+        return installed_models[0]
+
+    return None
 
 def run_health_check():
     """
@@ -33,6 +60,19 @@ def run_health_check():
         if resp.status_code == 200:
             models = resp.json().get('models', [])
             print(f"Ollama: ✅ Running ({len(models)} models)")
+            installed_model_ids = [model.get('name', '') for model in models if model.get('name')]
+            expected_model = _resolve_expected_ollama_model(installed_model_ids)
+
+            if expected_model:
+                if expected_model in installed_model_ids:
+                    print(f"  Configured model: ✅ {expected_model}")
+                else:
+                    print(f"  Configured model: ⚠️  {expected_model} is not installed")
+                    print(f"  Run: ollama pull {expected_model}")
+                    if installed_model_ids:
+                        print(f"  Installed models: {', '.join(installed_model_ids[:5])}")
+            elif installed_model_ids:
+                print("  Configured model: ⚠️  Unable to resolve active Ollama model from llm_config.toml")
         else:
             print(f"Ollama: ❌ Responded with status {resp.status_code}")
     except requests.exceptions.RequestException:
