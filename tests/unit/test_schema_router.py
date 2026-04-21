@@ -435,7 +435,7 @@ class TestSchemaRouterOrchestration:
         """Router must use LinkedConcept.node_id as-is instead of
         reconstructing it from the label. This replaces the old pinning
         test from #646 — the coupling is gone because the linker now
-        provides the canonical node_id."""
+        provides the canonical-by-convention node_id."""
         await router.route(
             message_id="msg-shape",
             content="mom called.",
