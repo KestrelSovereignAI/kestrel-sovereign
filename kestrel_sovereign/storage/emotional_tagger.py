@@ -208,6 +208,18 @@ class EmotionalTagger:
         r"\blooking at\b",
     ]
 
+    INFERRED_CUES = [
+        r"\btherefore\b",
+        r"\bso that means\b",
+        r"\bwhich means\b",
+        r"\bi(?:'m)? (?:guessing|inferring|deducing|concluding)\b",
+        r"\bit follows that\b",
+        r"\bbased on\b",
+        r"\bgiven that\b",
+        r"\bimplies\b",
+        r"\bmust be\b",
+    ]
+
     # Intensity amplifiers
     INTENSITY_AMPLIFIERS = [
         r"\b(very|really|extremely|incredibly|absolutely|totally|completely|utterly)\b",
@@ -503,11 +515,19 @@ class EmotionalTagger:
             1 for p in self.OBSERVED_CUES
             if re.search(p, content_lower)
         )
+        inferred_hits = sum(
+            1 for p in self.INFERRED_CUES
+            if re.search(p, content_lower)
+        )
 
-        if hearsay_hits > observed_hits:
-            result["claim_source"] = "hearsay"
-        elif observed_hits > hearsay_hits:
-            result["claim_source"] = "observed"
+        source_counts = {
+            "hearsay": hearsay_hits,
+            "observed": observed_hits,
+            "inferred": inferred_hits,
+        }
+        best_source = max(source_counts, key=source_counts.get)
+        if source_counts[best_source] > 0:
+            result["claim_source"] = best_source
         elif "claim_certainty" in result:
             # Has certainty cues but no specific source indicator → direct
             result["claim_source"] = "direct"

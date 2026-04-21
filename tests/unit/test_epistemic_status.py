@@ -136,6 +136,18 @@ class TestEpistemicDetection:
         )
         assert result.get("claim_source") == "observed"
 
+    def test_inferred_source_detection(self):
+        result = self.tagger._detect_epistemic_status(
+            "Based on the metrics, therefore the migration must be working."
+        )
+        assert result.get("claim_source") == "inferred"
+
+    def test_inferred_source_deduction(self):
+        result = self.tagger._detect_epistemic_status(
+            "Given that the tests pass, I'm concluding the fix is correct."
+        )
+        assert result.get("claim_source") == "inferred"
+
     def test_direct_source_for_assertions(self):
         result = self.tagger._detect_epistemic_status(
             "I've decided to take the job offer."
