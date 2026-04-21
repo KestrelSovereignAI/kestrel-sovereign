@@ -243,6 +243,7 @@ class MemorySystem:
                         content=content,
                         concepts=concepts,
                         role=role,
+                        metadata=enriched,
                     )
                     enriched["schema_routing"] = routing_summary
                 except Exception as e:

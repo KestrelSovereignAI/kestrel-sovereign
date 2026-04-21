@@ -373,6 +373,7 @@ class SchemaRouter:
         content: str,
         concepts: List[str],
         role: str = "user",
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Route extracted structure from a message.
 
@@ -380,9 +381,28 @@ class SchemaRouter:
         metadata. Best-effort: a failure in one lane doesn't block the
         others — the routing pass is advisory enrichment, not critical
         path for storing the message.
+
+        Args:
+            message_id: Unique id of the source message.
+            content: Raw message text.
+            concepts: Concept labels the linker extracted.
+            role: Message role (only "user" messages are routed).
+            metadata: Optional enriched metadata dict (from EmotionalTagger).
+                If present, ``claim_source``, ``claim_certainty``, and
+                ``temporal_validity`` are propagated to decision and
+                action_item nodes so epistemic provenance flows from the
+                message to the claim node.
         """
         if role != "user":
             return {"action_items": 0, "decisions": 0, "interactions": 0}
+
+        # Extract epistemic fields from message metadata for claim nodes.
+        epistemic: Dict[str, Any] = {}
+        if metadata:
+            for key in ("claim_source", "claim_certainty", "temporal_validity"):
+                val = metadata.get(key)
+                if val is not None:
+                    epistemic[key] = val
 
         summary: Dict[str, Any] = {
             "action_items": 0,
@@ -395,7 +415,7 @@ class SchemaRouter:
         try:
             items = self.action_extractor.extract(content)
             if items:
-                await self._persist_action_items(items, message_id)
+                await self._persist_action_items(items, message_id, epistemic)
                 summary["action_items"] = len(items)
         except Exception as e:
             logger.warning("Action item routing failed: %s", e)
@@ -404,7 +424,7 @@ class SchemaRouter:
         try:
             decisions = self.decision_extractor.extract(content)
             if decisions:
-                await self._persist_decisions(decisions, message_id)
+                await self._persist_decisions(decisions, message_id, epistemic)
                 summary["decisions"] = len(decisions)
         except Exception as e:
             logger.warning("Decision routing failed: %s", e)
@@ -430,6 +450,7 @@ class SchemaRouter:
         self,
         items: List[str],
         message_id: Optional[str],
+        epistemic: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Idempotent action item persistence as graph nodes.
 
@@ -437,6 +458,10 @@ class SchemaRouter:
         the same message upserts the same node — the graph's
         INSERT OR REPLACE on node_id guarantees at-most-one node per
         (message, text). No separate table, no separate migration.
+
+        When ``epistemic`` is provided (from the message's MemoryMetadata),
+        claim_source / claim_certainty / temporal_validity are stored on the
+        node so epistemic provenance flows from message to claim.
         """
         now_iso = datetime.now(timezone.utc).isoformat()
         for text in items:
@@ -459,6 +484,11 @@ class SchemaRouter:
                 "created_at": existing_props.get("created_at", now_iso),
                 "updated_at": now_iso,
             }
+            # Epistemic provenance from message metadata (#670 fix #2)
+            if epistemic:
+                for key in ("claim_source", "claim_certainty", "temporal_validity"):
+                    if key in epistemic:
+                        properties[key] = epistemic[key]
             await self.graph.add_node(GraphNode(
                 node_id=node_id,
                 node_type=ACTION_ITEM_NODE_TYPE,
@@ -477,6 +507,7 @@ class SchemaRouter:
         self,
         decisions: List[str],
         message_id: Optional[str],
+        epistemic: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Idempotent decision node creation.
 
@@ -484,21 +515,31 @@ class SchemaRouter:
         reprocessing the same message upserts the same node instead of
         creating parallel nodes. Graph upsert semantics (INSERT OR REPLACE
         on node_id) guarantee at-most-one node per (message, decision text).
+
+        When ``epistemic`` is provided (from the message's MemoryMetadata),
+        claim_source / claim_certainty / temporal_validity are stored on the
+        node so epistemic provenance flows from message to claim.
         """
         now_iso = datetime.now(timezone.utc).isoformat()
         for text in decisions:
             node_id = _deterministic_decision_node_id(self.agent_id, message_id, text)
+            properties: Dict[str, Any] = {
+                "text": text,
+                "source_message_id": message_id,
+                "confidence": 0.7,
+                "created_at": now_iso,
+                "agent_id": self.agent_id,
+            }
+            # Epistemic provenance from message metadata (#670 fix #2)
+            if epistemic:
+                for key in ("claim_source", "claim_certainty", "temporal_validity"):
+                    if key in epistemic:
+                        properties[key] = epistemic[key]
             await self.graph.add_node(GraphNode(
                 node_id=node_id,
                 node_type=DECISION_NODE_TYPE,
                 label=text[:120],
-                properties={
-                    "text": text,
-                    "source_message_id": message_id,
-                    "confidence": 0.7,
-                    "created_at": now_iso,
-                    "agent_id": self.agent_id,
-                },
+                properties=properties,
             ))
             if message_id:
                 source = f"message:{self.agent_id}:{message_id}"
@@ -554,6 +595,109 @@ class SchemaRouter:
                 })
 
         return enriched_count, pending
+
+
+# =============================================================================
+# Supersession
+# =============================================================================
+
+# Node types that represent claims and can be superseded.
+CLAIM_NODE_TYPES = frozenset({ACTION_ITEM_NODE_TYPE, DECISION_NODE_TYPE})
+
+
+async def mark_superseded(
+    graph: AsyncGraphStore,
+    old_node_id: str,
+    new_node_id: str,
+    reason: str = "",
+) -> Dict[str, Any]:
+    """Mark a claim node as superseded by another.
+
+    Only ``decision`` and ``action_item`` nodes can be superseded. Attempting
+    to supersede any other node type (e.g. a concept or skill) returns a
+    structured error.
+
+    Creates a ``supersedes`` edge from *new_node* → *old_node* (direction:
+    "new supersedes old"). Updates the old node's properties:
+
+    - ``superseded_by``: the id of the new node
+    - ``contradicted_by``: list of node ids that contradict this node.
+      The new node is appended to the list. The field name explicitly
+      encodes the direction: "this node is contradicted BY those nodes."
+
+    Args:
+        graph: The async graph store.
+        old_node_id: Node being replaced.
+        new_node_id: Node that replaces it.
+        reason: Human-readable reason for supersession.
+
+    Returns:
+        ``{"success": True, ...}`` on success, or
+        ``{"success": False, "error": ..., "error_code": ...}`` on failure.
+    """
+    old_node = await graph.get_node(old_node_id)
+    if old_node is None:
+        return {
+            "success": False,
+            "error": f"Node {old_node_id} not found",
+            "error_code": "NODE_NOT_FOUND",
+        }
+
+    if old_node.node_type not in CLAIM_NODE_TYPES:
+        return {
+            "success": False,
+            "error": (
+                f"Cannot supersede node of type '{old_node.node_type}'. "
+                f"Only claim nodes ({', '.join(sorted(CLAIM_NODE_TYPES))}) "
+                f"can be superseded."
+            ),
+            "error_code": "INVALID_NODE_TYPE",
+            "node_type": old_node.node_type,
+        }
+
+    new_node = await graph.get_node(new_node_id)
+    if new_node is None:
+        return {
+            "success": False,
+            "error": f"Node {new_node_id} not found",
+            "error_code": "NODE_NOT_FOUND",
+        }
+
+    if new_node.node_type not in CLAIM_NODE_TYPES:
+        return {
+            "success": False,
+            "error": (
+                f"Superseding node must be a claim type, got '{new_node.node_type}'."
+            ),
+            "error_code": "INVALID_NODE_TYPE",
+            "node_type": new_node.node_type,
+        }
+
+    # Update old node properties.
+    props = dict(old_node.properties or {})
+    props["superseded_by"] = new_node_id
+    contradicted_by = props.get("contradicted_by") or []
+    if new_node_id not in contradicted_by:
+        contradicted_by.append(new_node_id)
+    props["contradicted_by"] = contradicted_by
+
+    await graph.add_node(GraphNode(
+        node_id=old_node.node_id,
+        node_type=old_node.node_type,
+        label=old_node.label,
+        properties=props,
+    ))
+
+    # Edge: new → old, label "supersedes"
+    edge_props: Dict[str, Any] = {"reason": reason}
+    await graph.add_edge(new_node_id, old_node_id, "supersedes", properties=edge_props)
+
+    return {
+        "success": True,
+        "old_node_id": old_node_id,
+        "new_node_id": new_node_id,
+        "superseded_by": new_node_id,
+    }
 
 
 # =============================================================================

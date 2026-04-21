@@ -13,7 +13,13 @@ import logging
 from datetime import datetime
 from typing import List, Tuple, Dict, Any, Optional
 
-from .memory_models import MemoryMetadata, EmotionalCategory
+from .memory_models import (
+    MemoryMetadata,
+    EmotionalCategory,
+    ClaimSource,
+    TemporalValidity,
+    DEFAULT_CERTAINTY_BY_SOURCE,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -149,6 +155,63 @@ class EmotionalTagger:
         r"\b(maybe|perhaps|possibly)\b",
     ]
 
+    # ─────────────────────────────────────────────────────────────────
+    # Epistemic Status Patterns
+    # ─────────────────────────────────────────────────────────────────
+
+    # Hedging cues that lower certainty (suggest inference, not direct knowledge)
+    HEDGING_PATTERNS = [
+        (r"\bi think\b", -0.15),
+        (r"\bi guess\b", -0.2),
+        (r"\bi believe\b", -0.1),
+        (r"\bi feel like\b", -0.15),
+        (r"\bit seems?\b", -0.15),
+        (r"\bprobably\b", -0.15),
+        (r"\bmaybe\b", -0.2),
+        (r"\bperhaps\b", -0.2),
+        (r"\bpossibly\b", -0.2),
+        (r"\bmight\b", -0.1),
+        (r"\bnot sure\b", -0.25),
+        (r"\bnot certain\b", -0.25),
+    ]
+
+    # Hearsay patterns that indicate second-hand information
+    HEARSAY_PATTERNS = [
+        r"\bapparently\b",
+        r"\bi heard\b",
+        r"\bthey said\b",
+        r"\bsomeone told me\b",
+        r"\bsupposedly\b",
+        r"\brumor\b",
+        r"\baccording to\b",
+        r"\bpeople say\b",
+    ]
+
+    # Non-claim patterns: questions, greetings, commands — not claims at all.
+    NON_CLAIM_PATTERNS = [
+        r"^\s*(?:hi|hello|hey|yo|sup|good morning|good afternoon|good evening)\b",
+        r"^\s*(?:how are you|what's up|how's it going)\b",
+        r"^\s*(?:thanks|thank you|thx|bye|goodbye|see you|later)\b",
+    ]
+
+    # Ephemeral temporal patterns (short-lived claims)
+    EPHEMERAL_PATTERNS = [
+        r"\bright now\b",
+        r"\bat the moment\b",
+        r"\bcurrently\b",
+        r"\btoday\b",
+        r"\bthis morning\b",
+        r"\bthis afternoon\b",
+        r"\bthis evening\b",
+    ]
+
+    # Moment patterns (instantaneous)
+    MOMENT_PATTERNS = [
+        r"\bjust now\b",
+        r"\bjust\s+\w+ed\b",
+        r"\bi'm about to\b",
+    ]
+
     def __init__(self, use_spacy: bool = False):
         """
         Initialize the emotional tagger.
@@ -198,6 +261,9 @@ class EmotionalTagger:
         time_of_day = self._get_time_of_day()
         day_of_week = self._get_day_of_week()
 
+        # Detect epistemic status for claim provenance
+        epistemic = self._detect_epistemic_status(content, role)
+
         return MemoryMetadata(
             emotional_valence=valence,
             emotional_intensity=intensity,
@@ -206,6 +272,9 @@ class EmotionalTagger:
             importance_reasons=reasons,
             time_of_day=time_of_day,
             day_of_week=day_of_week,
+            claim_source=epistemic.get("claim_source") if epistemic else None,
+            claim_certainty=epistemic.get("claim_certainty") if epistemic else None,
+            temporal_validity=epistemic.get("temporal_validity") if epistemic else None,
         )
 
     def _analyze_sentiment(self, content: str) -> Tuple[float, float]:
@@ -402,6 +471,82 @@ class EmotionalTagger:
         """
         dt = dt or datetime.now()
         return dt.strftime("%A").lower()
+
+    def _detect_epistemic_status(
+        self,
+        content: str,
+        role: str = "user",
+    ) -> Optional[Dict[str, Any]]:
+        """Detect epistemic status (claim provenance) from message content.
+
+        Returns ``None`` for non-user messages and for messages that are
+        clearly not claims (questions, greetings, farewells). For all
+        other user messages, returns a dict with:
+
+        - ``claim_source``: one of ``direct``, ``observed``, ``inferred``,
+          ``hearsay``. All user statements start at ``direct`` certainty;
+          linguistic cues (hedging, hearsay markers) downgrade the source.
+        - ``claim_certainty``: float 0.0–1.0. Starts at the default for the
+          detected source (0.9 for direct) and is reduced by hedging cues.
+          Clamped to [0.05, 1.0].
+        - ``temporal_validity``: one of ``durable``, ``ephemeral``,
+          ``moment``, or ``None`` if no temporal cue was detected.
+        """
+        if role != "user":
+            return None
+
+        content_lower = content.lower().strip()
+
+        # Pure questions (content is entirely a question) are not claims.
+        if content_lower.endswith("?") and not re.search(r"[.!]\s", content):
+            return None
+
+        # Greetings and farewells are not claims.
+        for pattern in self.NON_CLAIM_PATTERNS:
+            if re.search(pattern, content_lower, re.IGNORECASE):
+                return None
+
+        # Start with direct source.
+        source = ClaimSource.DIRECT.value
+        certainty = DEFAULT_CERTAINTY_BY_SOURCE[source]
+
+        # Check hearsay first — it changes the source classification.
+        for pattern in self.HEARSAY_PATTERNS:
+            if re.search(pattern, content_lower, re.IGNORECASE):
+                source = ClaimSource.HEARSAY.value
+                certainty = DEFAULT_CERTAINTY_BY_SOURCE[source]
+                break
+
+        # If not hearsay, check for hedging cues → inference.
+        if source == ClaimSource.DIRECT.value:
+            for pattern, penalty in self.HEDGING_PATTERNS:
+                if re.search(pattern, content_lower, re.IGNORECASE):
+                    if source == ClaimSource.DIRECT.value:
+                        source = ClaimSource.INFERRED.value
+                        certainty = DEFAULT_CERTAINTY_BY_SOURCE[source]
+                    certainty += penalty  # penalties are negative
+                    break  # take the first match to avoid over-penalizing
+
+        # Clamp certainty
+        certainty = max(0.05, min(1.0, certainty))
+
+        # Temporal validity detection
+        temporal = None
+        for pattern in self.MOMENT_PATTERNS:
+            if re.search(pattern, content_lower, re.IGNORECASE):
+                temporal = TemporalValidity.MOMENT.value
+                break
+        if temporal is None:
+            for pattern in self.EPHEMERAL_PATTERNS:
+                if re.search(pattern, content_lower, re.IGNORECASE):
+                    temporal = TemporalValidity.EPHEMERAL.value
+                    break
+
+        return {
+            "claim_source": source,
+            "claim_certainty": round(certainty, 2),
+            "temporal_validity": temporal,
+        }
 
     async def analyze_batch(
         self,

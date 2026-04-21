@@ -26,6 +26,31 @@ class EmotionalCategory(Enum):
     FRUSTRATION = "frustration"
 
 
+class ClaimSource(Enum):
+    """How the speaker came to hold this claim."""
+    DIRECT = "direct"        # First-hand experience: "I saw", "I did"
+    OBSERVED = "observed"    # Witnessed but not participated: "I noticed"
+    INFERRED = "inferred"    # Deduced: "I think", "it seems like"
+    HEARSAY = "hearsay"      # Second-hand: "they said", "apparently"
+
+
+class TemporalValidity(Enum):
+    """How long the claim is expected to remain true."""
+    DURABLE = "durable"      # Long-lasting: "I live in Austin"
+    EPHEMERAL = "ephemeral"  # Short-lived: "I'm at the store right now"
+    MOMENT = "moment"        # Instantaneous: "I just sneezed"
+
+
+# Default certainty scores by source type. Direct experience is highest;
+# hearsay is lowest.
+DEFAULT_CERTAINTY_BY_SOURCE: Dict[str, float] = {
+    ClaimSource.DIRECT.value: 0.9,
+    ClaimSource.OBSERVED.value: 0.75,
+    ClaimSource.INFERRED.value: 0.5,
+    ClaimSource.HEARSAY.value: 0.3,
+}
+
+
 @dataclass
 class MemoryMetadata:
     """
@@ -66,6 +91,11 @@ class MemoryMetadata:
     stash_name: Optional[str] = None        # Human-readable name for the stash
     stashed_at: Optional[str] = None        # ISO format timestamp
 
+    # Epistemic layer (claim provenance)
+    claim_source: Optional[str] = None      # ClaimSource value or None for non-claims
+    claim_certainty: Optional[float] = None # 0.0-1.0 confidence, None for non-claims
+    temporal_validity: Optional[str] = None # TemporalValidity value or None
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dict for JSON storage in metadata column."""
         return {
@@ -91,6 +121,10 @@ class MemoryMetadata:
             "stash_id": self.stash_id,
             "stash_name": self.stash_name,
             "stashed_at": self.stashed_at,
+            # Epistemic fields
+            "claim_source": self.claim_source,
+            "claim_certainty": self.claim_certainty,
+            "temporal_validity": self.temporal_validity,
         }
 
     @classmethod
@@ -121,6 +155,10 @@ class MemoryMetadata:
             stash_id=data.get("stash_id"),
             stash_name=data.get("stash_name"),
             stashed_at=data.get("stashed_at"),
+            # Epistemic fields
+            claim_source=data.get("claim_source"),
+            claim_certainty=data.get("claim_certainty"),
+            temporal_validity=data.get("temporal_validity"),
         )
 
     def merge_with(self, existing_meta: Dict[str, Any]) -> Dict[str, Any]:
