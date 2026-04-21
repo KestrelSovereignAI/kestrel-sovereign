@@ -178,20 +178,93 @@ class GitHubAppFeature(Feature):
         except Exception as e:
             return {"step": "exception", "error": f"{type(e).__name__}: {e}"}
 
-    async def _handle_issue_opened(self, installation_id: int, payload: dict) -> dict:
-        """Respond to a newly opened issue — ONLY if explicitly mentions @kestrel.
+    # Work-item signals — issues with these are internal tickets, not questions
+    _SKIP_LABELS = {
+        "epic", "feature", "bug", "chore", "task", "wip", "internal",
+        "talon", "codeagent", "automation", "infrastructure",
+    }
+    _SKIP_TITLE_PREFIXES = (
+        "[epic]", "[wip]", "[talon]", "[internal]",
+        "feat:", "fix:", "chore:", "test:", "docs:", "refactor:",
+        "feat(", "fix(", "chore(", "test(", "docs(", "refactor(",
+    )
 
-        We intentionally do NOT auto-respond to every new issue. Many issues are
-        created by code agents (talon, etc.) or are internal work items. The bot
-        only engages when a human explicitly asks for it via @kestrel mention.
+    def _looks_like_work_item(self, issue_or_discussion: dict) -> tuple[bool, str]:
+        """Heuristic: is this an internal work item vs. a user question?
+
+        Returns (is_work_item, reason).
+        """
+        title = (issue_or_discussion.get("title", "") or "").lower().strip()
+        labels = {
+            (lbl.get("name") or "").lower()
+            for lbl in (issue_or_discussion.get("labels") or [])
+        }
+
+        # Label match is decisive
+        skip_labels = labels & self._SKIP_LABELS
+        if skip_labels:
+            return True, f"labels={sorted(skip_labels)}"
+
+        # Conventional-commit / work-item prefix
+        for prefix in self._SKIP_TITLE_PREFIXES:
+            if title.startswith(prefix):
+                return True, f"title_prefix={prefix}"
+
+        return False, ""
+
+    async def _classify_as_question(self, title: str, body: str) -> bool:
+        """LLM check: is this a support question worth answering?
+
+        Used for ambiguous cases (no work-item signals, but not obviously a question).
+        Returns False on any error — safer to not respond than to spam.
+        """
+        if not self.agent or not getattr(self.agent, "llm_service", None):
+            return False
+
+        prompt = (
+            "You are a classifier. Decide if the following GitHub issue is a support "
+            "QUESTION from a user (someone asking how to do something, what a thing is, "
+            "why something happens, or reporting confusion) — versus an internal WORK ITEM "
+            "(a task, feature request, bug report filed by a developer as a to-do, epic, "
+            "or ticket for code agents).\n\n"
+            f"TITLE: {title}\n\nBODY:\n{body[:1500]}\n\n"
+            "Reply with exactly one word: QUESTION or WORK_ITEM"
+        )
+        try:
+            response = await self.agent.llm_service.generate(
+                user_prompt=prompt,
+                system_prompt="You are a strict binary classifier. Output only QUESTION or WORK_ITEM.",
+            )
+            content = response if isinstance(response, str) else (response.content if response else "")
+            return "QUESTION" in (content or "").upper()
+        except Exception as e:
+            logger.warning("GitHubApp: classifier error: %s", e)
+            return False
+
+    async def _handle_issue_opened(self, installation_id: int, payload: dict) -> dict:
+        """Respond to a newly opened issue — if it looks like a user question.
+
+        Explicit @kestrel mentions always get a response. For everything else,
+        filter out work items by labels/title, then use an LLM classifier.
         """
         issue = payload["issue"]
         title = issue["title"]
         body = issue.get("body", "") or ""
         combined = f"{title}\n{body}".lower()
 
-        if "@kestrel" not in combined:
-            return {"step": "no_mention_in_issue"}
+        # Explicit mention always wins
+        mentioned = "@kestrel" in combined
+
+        if not mentioned:
+            # Skip obvious work items (labels, conventional-commit titles)
+            is_work, reason = self._looks_like_work_item(issue)
+            if is_work:
+                return {"step": "skipped_work_item", "reason": reason}
+
+            # For ambiguous cases, ask the LLM if it's a question
+            is_question = await self._classify_as_question(title, body)
+            if not is_question:
+                return {"step": "classified_as_work_item"}
 
         repo = payload["repository"]["full_name"]
         issue_number = issue["number"]
@@ -206,7 +279,7 @@ class GitHubAppFeature(Feature):
                 installation_id, repo, issue_number, response
             )
             logger.info("Responded to issue #%d on %s", issue_number, repo)
-            return {"step": "commented"}
+            return {"step": "commented", "explicit_mention": mentioned}
         return {"step": "no_response"}
 
     async def _handle_issue_comment(self, installation_id: int, payload: dict) -> dict:
@@ -240,14 +313,22 @@ class GitHubAppFeature(Feature):
             return {"step": "comment_post_error", "error": f"{type(e).__name__}: {e}"}
 
     async def _handle_discussion_created(self, installation_id: int, payload: dict) -> dict:
-        """Respond to a new discussion — ONLY if explicitly mentions @kestrel."""
+        """Respond to a new discussion — if it looks like a user question."""
         discussion = payload["discussion"]
         title = discussion["title"]
         body = discussion.get("body", "") or ""
         combined = f"{title}\n{body}".lower()
 
-        if "@kestrel" not in combined:
-            return {"step": "no_mention_in_discussion"}
+        mentioned = "@kestrel" in combined
+
+        if not mentioned:
+            is_work, reason = self._looks_like_work_item(discussion)
+            if is_work:
+                return {"step": "skipped_work_item", "reason": reason}
+
+            is_question = await self._classify_as_question(title, body)
+            if not is_question:
+                return {"step": "classified_as_work_item"}
 
         repo = payload["repository"]["full_name"]
         node_id = discussion["node_id"]
@@ -260,7 +341,7 @@ class GitHubAppFeature(Feature):
                 installation_id, node_id, response
             )
             logger.info("Responded to discussion '%s' on %s", title, repo)
-            return {"step": "commented"}
+            return {"step": "commented", "explicit_mention": mentioned}
         return {"step": "no_response"}
 
     async def _handle_discussion_comment(self, installation_id: int, payload: dict):
