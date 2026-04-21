@@ -61,6 +61,25 @@ You are a support assistant. You ANSWER QUESTIONS about the codebase.
   what would need to change — but do NOT offer to do it yourself.
 - Code changes are made by humans and dedicated code agents, not by you.
 
+## YOUR AUTHORITY TO DECLINE
+
+You are empowered — and expected — to stay silent when responding would not help.
+
+If ANY of these apply, respond with the literal single word: `SKIP`
+
+- The item is an internal work ticket, epic, or to-do (not a user question)
+- The item is a task assigned to a code agent (talon, codeagent, automation)
+- The item is a progress report, status update, or deployment note
+- You cannot add meaningful value beyond what's already written
+- The item is too short, vague, or off-topic to answer usefully
+- Answering would add noise rather than signal
+
+Output `SKIP` with NO other text. The system will detect it and stay silent.
+A wise silence is better than a confident non-answer.
+
+Only produce a full response when you are confident it will genuinely help the
+person who opened the issue or discussion.
+
 ## When You Don't Know
 
 If the provided context doesn't contain what's needed to answer:
@@ -242,29 +261,24 @@ class GitHubAppFeature(Feature):
             return False
 
     async def _handle_issue_opened(self, installation_id: int, payload: dict) -> dict:
-        """Respond to a newly opened issue — if it looks like a user question.
+        """Respond to a newly opened issue — agent decides whether to respond.
 
-        Explicit @kestrel mentions always get a response. For everything else,
-        filter out work items by labels/title, then use an LLM classifier.
+        Quick pre-filter skips obvious work items (saves an LLM call). For
+        everything else, the agent sees the full context and can choose to
+        reply "SKIP" to stay silent. Trust the agent's judgment.
         """
         issue = payload["issue"]
         title = issue["title"]
         body = issue.get("body", "") or ""
         combined = f"{title}\n{body}".lower()
-
-        # Explicit mention always wins
         mentioned = "@kestrel" in combined
 
+        # Pre-filter: skip obvious work items WITHOUT an LLM call (saves cost)
+        # Only skip if NOT explicitly mentioned
         if not mentioned:
-            # Skip obvious work items (labels, conventional-commit titles)
             is_work, reason = self._looks_like_work_item(issue)
             if is_work:
                 return {"step": "skipped_work_item", "reason": reason}
-
-            # For ambiguous cases, ask the LLM if it's a question
-            is_question = await self._classify_as_question(title, body)
-            if not is_question:
-                return {"step": "classified_as_work_item"}
 
         repo = payload["repository"]["full_name"]
         issue_number = issue["number"]
@@ -272,7 +286,7 @@ class GitHubAppFeature(Feature):
         await self._client.add_reaction(installation_id, repo, issue_number, "eyes")
 
         question = f"Issue #{issue_number}: {title}\n\n{body}"
-        response, _ = await self._generate_response(repo, "issue", question, installation_id)
+        response, diag = await self._generate_response(repo, "issue", question, installation_id)
 
         if response:
             await self._client.create_issue_comment(
@@ -280,7 +294,9 @@ class GitHubAppFeature(Feature):
             )
             logger.info("Responded to issue #%d on %s", issue_number, repo)
             return {"step": "commented", "explicit_mention": mentioned}
-        return {"step": "no_response"}
+
+        # Agent declined or had nothing to say
+        return {"step": "no_response", "diag": diag}
 
     async def _handle_issue_comment(self, installation_id: int, payload: dict) -> dict:
         """Respond to a comment on an issue (only if @mentioned)."""
@@ -313,12 +329,11 @@ class GitHubAppFeature(Feature):
             return {"step": "comment_post_error", "error": f"{type(e).__name__}: {e}"}
 
     async def _handle_discussion_created(self, installation_id: int, payload: dict) -> dict:
-        """Respond to a new discussion — if it looks like a user question."""
+        """Respond to a new discussion — agent decides whether to respond."""
         discussion = payload["discussion"]
         title = discussion["title"]
         body = discussion.get("body", "") or ""
         combined = f"{title}\n{body}".lower()
-
         mentioned = "@kestrel" in combined
 
         if not mentioned:
@@ -326,15 +341,11 @@ class GitHubAppFeature(Feature):
             if is_work:
                 return {"step": "skipped_work_item", "reason": reason}
 
-            is_question = await self._classify_as_question(title, body)
-            if not is_question:
-                return {"step": "classified_as_work_item"}
-
         repo = payload["repository"]["full_name"]
         node_id = discussion["node_id"]
 
         question = f"Discussion: {title}\n\n{body}"
-        response, _ = await self._generate_response(repo, "discussion", question, installation_id)
+        response, diag = await self._generate_response(repo, "discussion", question, installation_id)
 
         if response:
             await self._client.create_discussion_comment(
@@ -342,7 +353,7 @@ class GitHubAppFeature(Feature):
             )
             logger.info("Responded to discussion '%s' on %s", title, repo)
             return {"step": "commented", "explicit_mention": mentioned}
-        return {"step": "no_response"}
+        return {"step": "no_response", "diag": diag}
 
     async def _handle_discussion_comment(self, installation_id: int, payload: dict):
         """Respond to a discussion comment (only if @mentioned)."""
@@ -414,7 +425,13 @@ class GitHubAppFeature(Feature):
                 result = response or None
             else:
                 result = response.content if response and response.content else None
+
+            # Check if the agent chose to stay silent
             if result:
+                stripped = result.strip()
+                if stripped == "SKIP" or stripped.upper() == "SKIP" or stripped.startswith("SKIP\n"):
+                    diag["skip"] = "agent_declined"
+                    return None, diag
                 diag["result_chars"] = len(result)
             return result, diag
         except Exception as e:
