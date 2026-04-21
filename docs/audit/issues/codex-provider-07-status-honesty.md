@@ -8,7 +8,7 @@ Sovereign should not repeat that mistake for agent state, diagnostics, or model-
 
 ## Goal
 
-Audit and correct sovereign status surfaces so they report the active provider/model truthfully for `openai`, `claude_max`, and `codex`.
+Audit and correct sovereign status surfaces so they report the active provider/model truthfully for `openai`, `claude_plan`, and `openai_plan`.
 
 ## Scope
 

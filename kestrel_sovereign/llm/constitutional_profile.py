@@ -68,12 +68,10 @@ class ConstitutionalProfileService:
 
     # Maps llm_config.toml provider names to constitutional profile keys.
     # Multiple providers may share the same constitutional profile
-    # (e.g., claude_max and anthropic both use Anthropic's published constitution).
+    # (e.g., claude_plan and anthropic both use Anthropic's published constitution).
     PROVIDER_ALIASES: Dict[str, str] = {
         "claude_plan": "anthropic",
-        "claude_max": "anthropic",
         "openai_plan": "openai",
-        "codex": "openai",
         "openai_mini": "openai",
         "vertex_ai": "google",
         "gemini": "google",
@@ -191,7 +189,7 @@ class ConstitutionalProfileService:
         Get constitutional profile for a provider.
 
         Args:
-            provider: Provider name (e.g., "anthropic", "openai", "claude_max")
+            provider: Provider name (e.g., "anthropic", "openai", "claude_plan")
 
         Returns:
             ConstitutionalProfile for the provider, or a default profile if not found
