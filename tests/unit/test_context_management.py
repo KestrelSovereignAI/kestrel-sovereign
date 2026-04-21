@@ -1507,12 +1507,12 @@ class TestLLMServiceCheapModel:
 
         assert result is None
 
-    def test_get_cheap_model_returns_matched_provider(self):
-        """Test that get_cheap_model returns first matched cheap provider."""
+    def test_get_cheap_model_returns_matched_provider_from_config_hints(self):
+        """Test that get_cheap_model uses config-owned cheap_model_hints."""
         from kestrel_sovereign.llm.service import LLMService
 
         service = MagicMock(spec=LLMService)
-        service.mandate_config = {"defaults": {}}
+        service.mandate_config = {"defaults": {"cheap_model_hints": ["haiku", "mini"]}}
         service.providers = []
 
         mock_registry = MagicMock()
@@ -1544,15 +1544,15 @@ class TestLLMServiceCheapModel:
 
         assert result == "gpt-4-mini"
 
-    def test_get_cheap_model_finds_mini_variant(self):
-        """Test that get_cheap_model finds mini/fast variants."""
+    def test_get_cheap_model_returns_none_without_config_hints(self):
+        """Test that get_cheap_model does not invent cheap-model policy in code."""
         from kestrel_sovereign.llm.service import LLMService
 
         service = MagicMock(spec=LLMService)
         service.mandate_config = {"defaults": {}}
         service.providers = []
 
-        # Mock provider_registry to return a flash model
+        # Even if the registry could match something, no config hints means no override.
         mock_registry = MagicMock()
         mock_flash_provider = MagicMock()
         mock_flash_provider.model = "gemini-1.5-flash"
@@ -1563,4 +1563,4 @@ class TestLLMServiceCheapModel:
         service.get_cheap_model = LLMService.get_cheap_model.__get__(service)
         result = service.get_cheap_model()
 
-        assert result == "gemini-1.5-flash"  # flash is a cheap pattern
+        assert result is None

@@ -661,7 +661,10 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         - Answering questions about stashed content
         - Hierarchical compression leaf nodes
 
-        The model is selected from config, falling back to haiku or mini variants.
+        The model policy is config-driven:
+        - `defaults.cheap_model` can name an explicit selector
+        - `defaults.cheap_model_hints` can describe the desired cheap family
+        - otherwise there is no cheap override and callers use the default route
 
         Returns:
             Model identifier for cheap model, or None to use default
@@ -674,15 +677,11 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
             resolved = self._resolve_model_selector(cheap_selector)
             return resolved.get("model") or cheap_selector
 
-        # Look for cheap variants in configured providers using discovery-backed hints.
-        cheap_patterns = defaults.get("cheap_model_hints") or [
-            "haiku",
-            "mini",
-            "flash",
-            "instant",
-            "small",
-            "fast",
-        ]
+        # Discovery resolves what exists; config owns the cheap-model policy.
+        cheap_patterns = defaults.get("cheap_model_hints") or []
+        if not cheap_patterns:
+            return None
+
         cheap_providers = self.provider_registry.get_providers_with_pattern(cheap_patterns)
 
         if cheap_providers:
