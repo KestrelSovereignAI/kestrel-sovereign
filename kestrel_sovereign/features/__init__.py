@@ -15,6 +15,11 @@ from pathlib import Path
 from typing import Dict, List, Type, Optional, Set
 
 from kestrel_sovereign.features.base import Feature
+# Discovery checks against the SDK base so extracted package features
+# (which inherit from kestrel_sdk.features.base.Feature) are recognized.
+# Sovereign's Feature is itself a subclass of _SdkFeature, so internal
+# features continue to pass the issubclass check too.
+from kestrel_sdk.features.base import Feature as _SdkFeature
 
 logger = logging.getLogger(__name__)
 
@@ -133,7 +138,9 @@ def find_feature_class(module) -> Optional[Type[Feature]]:
     module_all = getattr(module, '__all__', [])
 
     for name, obj in inspect.getmembers(module, inspect.isclass):
-        if not (issubclass(obj, Feature) and obj is not Feature):
+        # Accept any subclass of the SDK Feature base (covers both sovereign
+        # internal features and extracted package features)
+        if not (issubclass(obj, _SdkFeature) and obj is not _SdkFeature and obj is not Feature):
             continue
 
         # Check if defined in this module
@@ -176,7 +183,12 @@ def discover_entrypoint_feature_classes() -> Dict[str, Type[Feature]]:
     for ep in feature_eps:
         try:
             cls = ep.load()
-            if not (isinstance(cls, type) and issubclass(cls, Feature) and cls is not Feature):
+            if not (
+                isinstance(cls, type)
+                and issubclass(cls, _SdkFeature)
+                and cls is not _SdkFeature
+                and cls is not Feature
+            ):
                 logger.warning(
                     f"Entry point '{ep.name}' does not point to a Feature subclass, skipping"
                 )

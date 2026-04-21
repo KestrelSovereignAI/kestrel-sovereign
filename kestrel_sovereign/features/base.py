@@ -12,6 +12,12 @@ from kestrel_sovereign.tools.base import ToolSchema, ToolParameter, ToolCategory
 from kestrel_sovereign.a2a.agent_card import AgentCard, AgentSkill, AgentCapabilities
 from kestrel_sovereign.a2a.types import Task, TaskState, TaskStatus, Artifact, DataPart, Message, TextPart
 
+# The SDK Feature is the canonical base class for feature packages.
+# Sovereign's richer Feature inherits from it so extracted packages that
+# subclass kestrel_sdk.features.base.Feature are also recognized as
+# kestrel_sovereign.features.base.Feature at runtime (issubclass passes).
+from kestrel_sdk.features.base import Feature as _SdkFeature
+
 logger = logging.getLogger(__name__)
 
 # Maximum tool call iterations (configurable via environment variable)
@@ -104,9 +110,14 @@ def parse_docstring_params(docstring: Optional[str]) -> Dict[str, str]:
     
     return param_descriptions
 
-class Feature(ABC):
+class Feature(_SdkFeature):
     """
     Base class for Kestrel Features - each Feature IS a subagent.
+
+    Extends the SDK's minimal Feature interface with sovereign-specific runtime
+    behavior (LLM calls, subagent execution, hook enforcement). Packages that
+    subclass kestrel_sdk.features.base.Feature are ALSO recognized as sovereign
+    Features at discovery time because of this inheritance chain.
 
     A Feature encapsulates a specific domain of functionality (e.g., Sovereignty, MCP, Models).
     It can expose methods as Tools to the agent, and can be called AS a tool by the orchestrator
