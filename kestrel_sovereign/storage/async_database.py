@@ -296,6 +296,30 @@ CREATE INDEX IF NOT EXISTS idx_saved_items_type ON saved_items(agent_id, item_ty
 CREATE INDEX IF NOT EXISTS idx_saved_items_hash ON saved_items(content_hash);
 """
 
+# Backend-specific JSON-path indexes on graph_nodes properties.
+# These cannot go through normalize_schema because the JSON extraction
+# syntax differs fundamentally between SQLite and PostgreSQL.
+_SQLITE_JSON_INDEXES = """
+CREATE INDEX IF NOT EXISTS idx_graph_nodes_agent
+  ON graph_nodes(node_type, json_extract(properties, '$.agent_id'));
+CREATE INDEX IF NOT EXISTS idx_graph_nodes_action_status
+  ON graph_nodes(json_extract(properties, '$.status'))
+  WHERE node_type = 'action_item';
+CREATE INDEX IF NOT EXISTS idx_graph_nodes_action_created
+  ON graph_nodes(json_extract(properties, '$.created_at'))
+  WHERE node_type = 'action_item';
+"""
+
+_POSTGRES_JSON_INDEXES = """
+CREATE INDEX IF NOT EXISTS idx_graph_nodes_agent
+  ON graph_nodes(node_type, (properties::jsonb->>'agent_id'));
+CREATE INDEX IF NOT EXISTS idx_graph_nodes_action_status
+  ON graph_nodes((properties::jsonb->>'status'))
+  WHERE node_type = 'action_item';
+CREATE INDEX IF NOT EXISTS idx_graph_nodes_properties_gin
+  ON graph_nodes USING GIN ((properties::jsonb));
+"""
+
 
 class AsyncDatabase:
     """
@@ -394,13 +418,24 @@ class AsyncDatabase:
     async def _init_schema(self) -> None:
         """Create database tables if they don't exist."""
         schema = normalize_schema(CORE_SCHEMA, self.backend_type)
-        
+
         # Execute each statement separately for PostgreSQL compatibility
         for statement in schema.split(';'):
             statement = statement.strip()
             if statement:
                 await self._backend.execute(statement)
-        
+
+        # JSON-path indexes use backend-specific syntax that cannot be
+        # normalised by simple regex, so we pick the right DDL block here.
+        json_indexes = (
+            _POSTGRES_JSON_INDEXES if self.backend_type == "postgres"
+            else _SQLITE_JSON_INDEXES
+        )
+        for statement in json_indexes.split(';'):
+            statement = statement.strip()
+            if statement:
+                await self._backend.execute(statement)
+
         logger.debug(f"Database schema initialized ({self.backend_type})")
     
     # ─────────────────────────────────────────────────────────────────
