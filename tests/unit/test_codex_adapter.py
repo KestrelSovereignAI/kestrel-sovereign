@@ -14,7 +14,6 @@ from kestrel_sovereign.llm.codex_adapter import (
     _build_headers,
 )
 from kestrel_sovereign.llm.adapter import LLMAdapter
-from kestrel_sovereign.llm.model_metadata import ModelCategory
 from kestrel_sovereign.llm.provider_registry import ProviderRegistry
 
 
@@ -28,9 +27,9 @@ class TestCodexAdapterClass:
         adapter = CodexAdapter()
         assert isinstance(adapter, LLMAdapter)
 
-    def test_name_is_codex(self):
+    def test_name_is_openai_plan(self):
         adapter = CodexAdapter()
-        assert adapter.name == "codex"
+        assert adapter.name == "openai_plan"
 
 
 # ---------------------------------------------------------------------------
@@ -40,43 +39,10 @@ class TestCodexAdapterClass:
 class TestCodexListModels:
 
     @pytest.mark.asyncio
-    async def test_returns_codex_models(self):
+    async def test_list_models_is_not_supported_directly(self):
         adapter = CodexAdapter()
-        models = await adapter.list_models()
-        ids = [m.id for m in models]
-        assert "gpt-5.4" in ids
-        assert "gpt-5.4-mini" in ids
-        assert "gpt-5.3-codex" in ids
-
-    @pytest.mark.asyncio
-    async def test_all_models_have_codex_provider(self):
-        adapter = CodexAdapter()
-        models = await adapter.list_models()
-        for m in models:
-            assert m.provider == "codex"
-
-    @pytest.mark.asyncio
-    async def test_featured_models(self):
-        adapter = CodexAdapter()
-        models = await adapter.list_models()
-        featured = [m for m in models if m.is_featured]
-        featured_ids = {m.id for m in featured}
-        assert "gpt-5.4" in featured_ids
-        assert "gpt-5.4-mini" in featured_ids
-
-    @pytest.mark.asyncio
-    async def test_models_support_streaming(self):
-        adapter = CodexAdapter()
-        models = await adapter.list_models()
-        for m in models:
-            assert m.supports_streaming is True
-
-    @pytest.mark.asyncio
-    async def test_models_category_is_chat(self):
-        adapter = CodexAdapter()
-        models = await adapter.list_models()
-        for m in models:
-            assert m.category == ModelCategory.CHAT
+        with pytest.raises(NotImplementedError, match="canonical openai provider"):
+            await adapter.list_models()
 
 
 # ---------------------------------------------------------------------------

@@ -83,6 +83,41 @@ def service_with_providers():
         return svc
 
 
+@pytest.fixture
+def service_with_openai_plan():
+    """Create an LLMService using the new plan-provider naming."""
+    mock_config = {
+        "provider_priority": ["openai", "openai_plan"],
+        "openai": {"model": "gpt-5.4"},
+        "openai_plan": {"model": "gpt-5.4"},
+    }
+    mock_mandate_config = {"defaults": {}, "mandates": {}}
+
+    openai_info = _make_provider_info("openai", "gpt-5.4")
+    openai_plan_info = _make_provider_info("openai_plan", "gpt-5.4")
+
+    mock_registry = Mock()
+    mock_registry.initialize_providers = Mock(
+        return_value=[openai_info, openai_plan_info]
+    )
+    mock_registry.get_providers_with_pattern = Mock(return_value=[])
+    mock_registry.get_local_providers = Mock(return_value=[])
+    mock_registry.update_provider_client = Mock(return_value=True)
+
+    with patch("kestrel_sovereign.llm.service.load_config") as mock_load, \
+         patch("kestrel_sovereign.llm.service.ProviderRegistry") as mock_reg_cls:
+        mock_load.side_effect = lambda path: (
+            mock_config if "llm_config" in path else mock_mandate_config
+        )
+        mock_reg_cls.return_value = mock_registry
+        svc = LLMService(config_path="llm_config.toml")
+        svc._usage_db = None
+        svc._db_initialized = False
+        svc._usage_database_url = None
+        svc._db_backend = "sqlite"
+        return svc
+
+
 # ===========================================================================
 # 1. Provider preference round-trip
 # ===========================================================================
@@ -122,6 +157,20 @@ class TestPreferenceRoundTrip:
 
         pref = svc.get_model_preference()
         assert pref["model"] is None
+        assert pref["provider"] is None
+
+
+class TestLegacyAliasCompatibility:
+    """Old provider aliases still route to the new canonical execution providers."""
+
+    def test_legacy_codex_alias_routes_to_openai_plan(self, service_with_openai_plan):
+        svc = service_with_openai_plan
+        svc.set_model_preference("gpt-5.4", provider="codex")
+
+        providers, target = svc.resolve_provider_routing()
+
+        assert providers[0]["name"] == "openai_plan"
+        assert target == "gpt-5.4"
 
 
 # ===========================================================================
@@ -362,7 +411,7 @@ class TestPreferencePersistence:
 
 
 class TestCodexAdapter:
-    """Contract: codex adapter raises clearly on inference, lists models."""
+    """Contract: plan adapter raises clearly and delegates model discovery."""
 
     def test_codex_adapter_raises_without_client(self):
         from kestrel_sovereign.llm.codex_adapter import CodexAdapter
@@ -375,18 +424,13 @@ class TestCodexAdapter:
                 client=None, model="codex", messages=[]
             ))
 
-    def test_codex_adapter_lists_models(self):
+    def test_codex_adapter_does_not_list_models(self):
         from kestrel_sovereign.llm.codex_adapter import CodexAdapter
 
         adapter = CodexAdapter()
         import asyncio
-        models = asyncio.run(adapter.list_models())
-
-        assert len(models) >= 1
-        assert all(m.provider == "codex" for m in models)
-        # Should include at least the featured model
-        model_ids = [m.id for m in models]
-        assert "gpt-5.4" in model_ids
+        with pytest.raises(NotImplementedError, match="canonical openai provider"):
+            asyncio.run(adapter.list_models())
 
 
 # ===========================================================================

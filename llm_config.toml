@@ -4,21 +4,21 @@
 # 2. The 'provider_priority' list determines the fallback order.
 # 3. For OpenAI, set the OPENAI_API_KEY environment variable.
 
-provider_priority = ["openrouter", "llama_cpp", "ollama", "claude_max", "codex", "openai", "openai_mini", "anthropic", "vertex_ai", "runpod", "xai"]
+provider_priority = ["openrouter", "llama_cpp", "ollama", "claude_plan", "openai_plan", "openai", "openai_mini", "anthropic", "vertex_ai", "runpod", "xai"]
 
-# Claude Max - Use your Claude Max subscription ($100/$200/month) for API access
+# Claude plan - Use your Claude subscription session for API access
 # Requires: pip install claude-agent-sdk && claude login
 # This uses subscription authentication, not API key billing
-[claude_max]
+[claude_plan]
 model = "auto"
 selection_hints = ["sonnet", "opus"]  # Prefer Sonnet family, then Opus, from discovery/cache
 
-# Codex - Use your ChatGPT Plus/Pro subscription for API access via OAuth
+# OpenAI plan - Use your ChatGPT/OpenAI plan session for API access via OAuth
 # Requires: codex login (OAuth authentication, stores token in ~/.codex/auth.json)
 # This uses subscription authentication, not API key billing
-[codex]
+[openai_plan]
 model = "auto"
-selection_hints = ["gpt-5.4", "codex"]
+selection_hints = ["gpt-5.4", "mini"]
 
 # OpenRouter - Primary provider with crypto payments (agents can fund themselves)
 # Supports: ETH (chain_id=1), Polygon (137), Base (8453)
