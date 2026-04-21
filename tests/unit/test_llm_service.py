@@ -256,14 +256,13 @@ class TestModelPreference:
         assert cheap_model == "claude-haiku-4-5"
 
     @pytest.mark.asyncio
-    async def test_get_cheap_model_fallback(self, llm_service, mock_provider_registry):
-        """Test get_cheap_model falls back to haiku pattern when not configured."""
+    async def test_get_cheap_model_returns_none_without_config_hints(self, llm_service, mock_provider_registry):
+        """Test get_cheap_model requires config hints instead of hidden code defaults."""
         # Clear the config
         llm_service.mandate_config = {"defaults": {}}
 
         cheap_model = llm_service.get_cheap_model()
-        # Should use the registry pattern match
-        assert cheap_model is not None
+        assert cheap_model is None
 
 
 # =============================================================================
