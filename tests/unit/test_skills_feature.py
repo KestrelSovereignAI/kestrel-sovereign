@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import os
+import threading
+import time
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -11,6 +15,7 @@ import pytest_asyncio
 
 from kestrel_sovereign.features.skills.feature import (
     CANDIDATE_INSIGHT_TYPES,
+    CLAIM_STALENESS_SECONDS,
     MIN_CANDIDATE_CONFIDENCE,
     SKILL_NODE_TYPE,
     SkillsFeature,
@@ -464,19 +469,26 @@ class TestAtomicWriteAndCollision:
 
     @pytest.mark.asyncio
     async def test_write_is_atomic_via_temp_rename(self, feature, tmp_path, monkeypatch):
-        """Simulate a crash mid-rename and prove no partial .md file is left."""
+        """Simulate a crash during finalization (the second os.link call)
+        and prove no partial .md file is left, and the claim is cleaned up
+        since this writer owns it."""
         from kestrel_sovereign.features.skills import feature as mod
 
         feature._db.fetchone = AsyncMock(return_value=(
             "ins-a", "sess", "pattern", "t", "d", 0.85, 1, "Atomic write skill",
         ))
 
-        real_replace = mod.os.replace
+        real_link = os.link
+        link_count = [0]
 
-        def _boom(src, dst):
-            raise OSError("simulated crash during rename")
+        def _boom_on_finalize(src, dst):
+            link_count[0] += 1
+            if link_count[0] == 2:
+                # Second link call is finalization — simulate crash.
+                raise OSError("simulated crash during finalization")
+            return real_link(src, dst)
 
-        monkeypatch.setattr(mod.os, "replace", _boom)
+        monkeypatch.setattr(mod.os, "link", _boom_on_finalize)
 
         result = await feature.skill_save(
             insight_id="ins-a",
@@ -486,12 +498,13 @@ class TestAtomicWriteAndCollision:
         assert result["success"] is False
 
         skills_dir = tmp_path / "skills"
-        # No .md at the target, and no per-writer .tmp.* files left behind.
+        # No .md at the target, and no leftover tmp or claim files.
         assert list(skills_dir.glob("*.md")) == []
         assert list(skills_dir.glob("*.md.tmp.*")) == []
+        assert list(skills_dir.glob("*.md.claim")) == []
 
         # Restore and confirm a clean save works afterwards.
-        monkeypatch.setattr(mod.os, "replace", real_replace)
+        monkeypatch.setattr(mod.os, "link", real_link)
         result = await feature.skill_save(
             insight_id="ins-a",
             steps_json='["step a"]',
@@ -568,6 +581,231 @@ class TestAtomicWriteAndCollision:
         assert result["success"] is False
         # File was NOT overwritten
         assert "existing content" in existing_path.read_text(encoding="utf-8")
+
+    @pytest.mark.asyncio
+    async def test_concurrent_save_exactly_one_wins(self, tmp_path):
+        """Two real threads attempt os.link on the same claim path
+        simultaneously. Exactly one must win; the other gets an error."""
+        from kestrel_sovereign.features.skills.models import Skill
+
+        agent = _make_mock_agent(tmp_path)
+        skills_dir = tmp_path / "skills"
+        skills_dir.mkdir(exist_ok=True)
+
+        barrier = threading.Barrier(2, timeout=5)
+        results: list[dict] = [None, None]  # type: ignore[list-item]
+
+        def _writer(idx: int):
+            feat = SkillsFeature(agent)
+            # Manually set the internals without async initialize.
+            feat._db = agent.storage.db
+            feat._skills_dir = skills_dir
+
+            skill = Skill(
+                id="skill_race",
+                title=f"Race writer {idx}",
+                trigger="t", steps=["s"], verification="v",
+                source_insight_id=f"ins-{idx}",
+                confidence=0.9,
+            )
+            barrier.wait()
+            loop = asyncio.new_event_loop()
+            try:
+                loop.run_until_complete(feat._save_skill(skill))
+                results[idx] = {"won": True}
+            except (FileExistsError, OSError) as e:
+                results[idx] = {"won": False, "error": str(e)}
+            finally:
+                loop.close()
+
+        t0 = threading.Thread(target=_writer, args=(0,))
+        t1 = threading.Thread(target=_writer, args=(1,))
+        t0.start(); t1.start()
+        t0.join(timeout=10); t1.join(timeout=10)
+
+        wins = [r for r in results if r and r["won"]]
+        losses = [r for r in results if r and not r["won"]]
+        assert len(wins) == 1, f"Expected exactly one winner: {results}"
+        assert len(losses) == 1, f"Expected exactly one loser: {results}"
+        # The final file must exist and be valid.
+        assert (skills_dir / "skill_race.md").exists()
+        # No claim or tmp files left behind.
+        assert list(skills_dir.glob("*.claim")) == []
+        assert list(skills_dir.glob("*.tmp.*")) == []
+
+    @pytest.mark.asyncio
+    async def test_loser_cannot_delete_winners_claim(self, tmp_path):
+        """Force the interleaving where the loser's cleanup runs after the
+        winner's os.link succeeded. The winner's claim must survive."""
+        from kestrel_sovereign.features.skills import feature as mod
+
+        agent = _make_mock_agent(tmp_path)
+        skills_dir = tmp_path / "skills"
+        skills_dir.mkdir(exist_ok=True)
+
+        claim_path = skills_dir / "skill_interleave.md.claim"
+
+        winner_linked = threading.Event()
+        loser_may_cleanup = threading.Event()
+
+        real_link = os.link
+
+        def _controlled_link(src, dst):
+            """Intercept os.link to synchronize the two writers."""
+            if str(dst).endswith(".claim"):
+                try:
+                    real_link(src, dst)
+                    # Winner succeeded — signal the loser may now try cleanup.
+                    winner_linked.set()
+                except FileExistsError:
+                    # Loser — wait until test explicitly lets us proceed
+                    # to the cleanup phase.
+                    winner_linked.wait(timeout=5)
+                    loser_may_cleanup.set()
+                    raise
+            else:
+                real_link(src, dst)
+
+        results: list[dict] = [None, None]  # type: ignore[list-item]
+        barrier = threading.Barrier(2, timeout=5)
+
+        def _writer(idx: int):
+            from kestrel_sovereign.features.skills.models import Skill
+
+            feat = SkillsFeature(agent)
+            feat._db = agent.storage.db
+            feat._skills_dir = skills_dir
+
+            skill = Skill(
+                id="skill_interleave",
+                title=f"Interleave writer {idx}",
+                trigger="t", steps=["s"], verification="v",
+                source_insight_id=f"ins-{idx}",
+                confidence=0.9,
+            )
+            barrier.wait()
+            loop = asyncio.new_event_loop()
+            try:
+                loop.run_until_complete(feat._save_skill(skill))
+                results[idx] = {"won": True}
+            except (FileExistsError, OSError) as e:
+                results[idx] = {"won": False, "error": str(e)}
+            finally:
+                loop.close()
+
+        import unittest.mock
+        with unittest.mock.patch.object(mod.os, "link", side_effect=_controlled_link):
+            t0 = threading.Thread(target=_writer, args=(0,))
+            t1 = threading.Thread(target=_writer, args=(1,))
+            t0.start(); t1.start()
+            t0.join(timeout=10); t1.join(timeout=10)
+
+        # Exactly one winner, one loser.
+        wins = [r for r in results if r and r["won"]]
+        losses = [r for r in results if r and not r["won"]]
+        assert len(wins) == 1, f"Expected one winner: {results}"
+        assert len(losses) == 1, f"Expected one loser: {results}"
+
+        # The critical assertion: the final file exists (winner's work
+        # survived the loser's cleanup).
+        assert (skills_dir / "skill_interleave.md").exists()
+
+    @pytest.mark.asyncio
+    async def test_finalization_refuses_overwrite_via_link(self, feature, tmp_path, monkeypatch):
+        """Finalization uses os.link (not os.replace), so if the target file
+        appeared between preflight and finalization, the save fails instead
+        of silently overwriting."""
+        from kestrel_sovereign.features.skills import feature as mod
+
+        real_link = os.link
+
+        created_claim = threading.Event()
+
+        def _sneaky_link(src, dst):
+            """After claim succeeds, plant the final file before finalization."""
+            real_link(src, dst)
+            if str(dst).endswith(".claim"):
+                created_claim.set()
+                # Simulate another process creating the final file.
+                final = Path(str(dst).replace(".md.claim", ".md"))
+                final.write_text("planted by another process", encoding="utf-8")
+
+        monkeypatch.setattr(mod.os, "link", _sneaky_link)
+
+        feature._db.fetchone = AsyncMock(return_value=(
+            "ins-sneak", "s", "pattern", "t", "d", 0.85, 1, "Sneaky overwrite test",
+        ))
+
+        result = await feature.skill_save(
+            insight_id="ins-sneak",
+            steps_json='["step"]',
+            verification="v",
+        )
+        assert result["success"] is False
+        # The original planted file is preserved, not overwritten.
+        skill_id = skill_id_from_title("Sneaky overwrite test")
+        final = tmp_path / "skills" / f"{skill_id}.md"
+        assert "planted by another process" in final.read_text(encoding="utf-8")
+
+
+# =============================================================================
+# Stale claim reclamation
+# =============================================================================
+
+
+class TestStaleClaimReclamation:
+
+    @pytest.mark.asyncio
+    async def test_stale_claim_is_reclaimed(self, feature, tmp_path, monkeypatch):
+        """A claim file older than the staleness threshold is removed and
+        the new writer can proceed."""
+        from kestrel_sovereign.features.skills import feature as mod
+
+        feature._db.fetchone = AsyncMock(return_value=(
+            "ins-stale", "s", "pattern", "t", "d", 0.85, 1, "Stale claim skill",
+        ))
+
+        skill_id = skill_id_from_title("Stale claim skill")
+        claim_path = tmp_path / "skills" / f"{skill_id}.md.claim"
+        claim_path.write_text("orphaned claim", encoding="utf-8")
+
+        # Make the claim appear old enough to reclaim.
+        stale_mtime = time.time() - CLAIM_STALENESS_SECONDS - 10
+        os.utime(claim_path, (stale_mtime, stale_mtime))
+
+        result = await feature.skill_save(
+            insight_id="ins-stale",
+            steps_json='["step"]',
+            verification="v",
+        )
+        assert result["success"] is True
+        # Final file written, no leftover claim.
+        final = tmp_path / "skills" / f"{skill_id}.md"
+        assert final.exists()
+        assert not claim_path.exists()
+
+    @pytest.mark.asyncio
+    async def test_fresh_claim_blocks_new_writer(self, feature, tmp_path):
+        """A claim file that is NOT stale blocks the new writer."""
+        feature._db.fetchone = AsyncMock(return_value=(
+            "ins-fresh", "s", "pattern", "t", "d", 0.85, 1, "Fresh claim skill",
+        ))
+
+        skill_id = skill_id_from_title("Fresh claim skill")
+        claim_path = tmp_path / "skills" / f"{skill_id}.md.claim"
+        claim_path.write_text("active claim", encoding="utf-8")
+        # Freshly created — not stale.
+
+        result = await feature.skill_save(
+            insight_id="ins-fresh",
+            steps_json='["step"]',
+            verification="v",
+        )
+        assert result["success"] is False
+        assert "concurrent" in result["error"].lower() or "in progress" in result["error"].lower()
+        # Claim file was NOT removed by the blocked writer.
+        assert claim_path.exists()
+        assert claim_path.read_text(encoding="utf-8") == "active claim"
 
 
 # =============================================================================
