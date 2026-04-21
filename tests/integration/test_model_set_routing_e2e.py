@@ -287,9 +287,11 @@ class TestModelSetResponseFormat:
 
         result = await model_agent.set_model("google/gemini-3-pro-preview")
 
-        # Extract JSON from MODEL_CHANGED:
+        # Extract only the marker payload, not any surrounding message text.
         message = result["message"]
-        json_str = message.split("MODEL_CHANGED:")[1]
+        marker = "MODEL_CHANGED:"
+        json_start = message.index(marker) + len(marker)
+        json_str = message[json_start:].strip()
         sync_data = json.loads(json_str)
 
         assert sync_data["provider"] == "openrouter"
