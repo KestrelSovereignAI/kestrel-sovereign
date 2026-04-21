@@ -61,6 +61,9 @@ from .memory_models import (
     TemporalPattern,
     MemoryEpisode,
     EmotionalCategory,
+    ClaimSource,
+    TemporalValidity,
+    DEFAULT_CERTAINTY_BY_SOURCE,
 )
 from .emotional_tagger import EmotionalTagger, analyze_message
 from .temporal_analyzer import TemporalAnalyzer

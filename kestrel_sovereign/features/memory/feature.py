@@ -518,7 +518,7 @@ class MemoryFeature(Feature):
 
     @tool(
         name="recall_action_items",
-        description="Retrieve action items the user committed to. Filters: status, creation-date window (days), assignee.",
+        description="Retrieve action items the user committed to. Filters: status, creation-date window (days), assignee. Superseded items are hidden by default.",
         category=ToolCategory.MEMORY,
         command_prefix="!memory actions",
     )
@@ -528,6 +528,7 @@ class MemoryFeature(Feature):
         days: Optional[int] = None,
         assignee_concept_id: Optional[str] = None,
         limit: int = 25,
+        include_superseded: bool = False,
     ) -> Dict[str, Any]:
         """Query action_item graph nodes with optional property filters.
 
@@ -545,6 +546,8 @@ class MemoryFeature(Feature):
                 a due_date explicitly if you need that.
             assignee_concept_id: Optional person concept id to filter by.
             limit: Max rows returned (1-200, default 25).
+            include_superseded: If False (default), items with a
+                ``superseded_by`` property are filtered out.
         """
         storage = getattr(self.agent, "storage", None)
         if storage is None or not hasattr(storage, "graph"):
@@ -582,6 +585,8 @@ class MemoryFeature(Feature):
             props = n.properties or {}
             if props.get("agent_id") != self.agent_id:
                 continue
+            if not include_superseded and props.get("superseded_by"):
+                continue
             if status is not None and props.get("status") != status:
                 continue
             if since is not None and (props.get("created_at") or "") < since:
@@ -597,6 +602,9 @@ class MemoryFeature(Feature):
                 "due_date": props.get("due_date"),
                 "confidence": props.get("confidence"),
                 "created_at": props.get("created_at"),
+                "claim_certainty": props.get("claim_certainty"),
+                "claim_source": props.get("claim_source"),
+                "superseded_by": props.get("superseded_by"),
             })
 
         matching.sort(key=lambda d: d.get("created_at") or "", reverse=True)
@@ -673,12 +681,12 @@ class MemoryFeature(Feature):
 
     @tool(
         name="recall_decisions",
-        description="Retrieve decisions the user has recorded (stored as graph nodes of type 'decision').",
+        description="Retrieve decisions the user has recorded (stored as graph nodes of type 'decision'). Superseded decisions are hidden by default.",
         category=ToolCategory.MEMORY,
         command_prefix="!memory decisions",
     )
-    async def recall_decisions(self, limit: int = 25) -> Dict[str, Any]:
-        """List decisions from the graph."""
+    async def recall_decisions(self, limit: int = 25, include_superseded: bool = False) -> Dict[str, Any]:
+        """List decisions from the graph. Superseded decisions filtered by default."""
         storage = getattr(self.agent, "storage", None)
         if storage is None or not hasattr(storage, "graph"):
             return {"success": False, "error": "Graph store not available"}
@@ -696,24 +704,30 @@ class MemoryFeature(Feature):
             logger.error("recall_decisions failed: %s", e)
             return {"success": False, "error": str(e)}
 
-        own = [
-            {
+        own = []
+        for n in nodes:
+            props = n.properties or {}
+            if props.get("agent_id") != self.agent_id:
+                continue
+            if not include_superseded and props.get("superseded_by"):
+                continue
+            own.append({
                 "id": n.node_id,
                 "label": n.label,
-                "text": (n.properties or {}).get("text"),
-                "source_message_id": (n.properties or {}).get("source_message_id"),
-                "confidence": (n.properties or {}).get("confidence"),
-                "created_at": (n.properties or {}).get("created_at"),
-            }
-            for n in nodes
-            if (n.properties or {}).get("agent_id") == self.agent_id
-        ]
+                "text": props.get("text"),
+                "source_message_id": props.get("source_message_id"),
+                "confidence": props.get("confidence"),
+                "created_at": props.get("created_at"),
+                "claim_certainty": props.get("claim_certainty"),
+                "claim_source": props.get("claim_source"),
+                "superseded_by": props.get("superseded_by"),
+            })
         own.sort(key=lambda d: d.get("created_at") or "", reverse=True)
         return {"decisions": own[:limit], "count": min(len(own), limit)}
 
     @tool(
         name="recall_interactions",
-        description="List recent message→person interactions for a given person concept, with sentiment and topics.",
+        description="List recent message→person interactions for a given person concept, with sentiment and topics. Superseded interactions hidden by default.",
         category=ToolCategory.MEMORY,
         command_prefix="!memory interactions",
     )
@@ -721,6 +735,7 @@ class MemoryFeature(Feature):
         self,
         person_concept_id: str,
         limit: int = 25,
+        include_superseded: bool = False,
     ) -> Dict[str, Any]:
         """Return recent mentions edges pointing at a person concept."""
         storage = getattr(self.agent, "storage", None)
@@ -744,19 +759,72 @@ class MemoryFeature(Feature):
         # Without this guard, a caller passing a shared concept id could
         # retrieve edges from other agents' messages.
         agent_prefix = f"message:{self.agent_id}:"
-        interactions = [
-            {
+        interactions = []
+        for e in edges:
+            if e.label != "mentions" or not e.source_id.startswith(agent_prefix):
+                continue
+            props = e.properties or {}
+            if not include_superseded and props.get("superseded_by"):
+                continue
+            interactions.append({
                 "message_node_id": e.source_id,
-                "properties": e.properties or {},
-            }
-            for e in edges
-            if e.label == "mentions" and e.source_id.startswith(agent_prefix)
-        ]
+                "properties": props,
+            })
         interactions.sort(
             key=lambda i: (i.get("properties") or {}).get("recorded_at") or "",
             reverse=True,
         )
         return {"interactions": interactions[:limit], "count": min(len(interactions), limit)}
+
+    @tool(
+        name="mark_claim_superseded",
+        description="Mark a decision or action item as superseded by a newer one. Writes a 'supersedes' edge and hides the old claim from default recall.",
+        category=ToolCategory.MEMORY,
+        command_prefix="!memory supersede",
+    )
+    async def mark_claim_superseded(
+        self,
+        old_id: str,
+        new_id: str,
+        reason: str,
+    ) -> Dict[str, Any]:
+        """Mark old_id as superseded by new_id with the given reason.
+
+        Args:
+            old_id: Node id of the claim being replaced.
+            new_id: Node id of the replacement claim.
+            reason: Human-readable reason for the supersession.
+        """
+        storage = getattr(self.agent, "storage", None)
+        if storage is None or not hasattr(storage, "graph"):
+            return {"success": False, "error": "Graph store not available"}
+
+        if not old_id or not new_id:
+            return {"success": False, "error": "old_id and new_id are required"}
+        if not reason:
+            return {"success": False, "error": "reason is required"}
+
+        # Build a SchemaRouter for the mark_superseded helper
+        from kestrel_sovereign.storage.schema_router import SchemaRouter
+        router = SchemaRouter(
+            graph=storage.graph,
+            db=getattr(storage, "db", None),
+            agent_id=self.agent_id,
+        )
+        try:
+            await router.mark_superseded(old_id, new_id, reason)
+        except ValueError as e:
+            return {"success": False, "error": str(e)}
+        except Exception as e:
+            logger.error("mark_claim_superseded failed: %s", e)
+            return {"success": False, "error": str(e)}
+
+        return {
+            "success": True,
+            "old_id": old_id,
+            "new_id": new_id,
+            "reason": reason,
+        }
 
     @tool(
         name="confirm_person_match",

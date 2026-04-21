@@ -13,7 +13,7 @@ import logging
 from datetime import datetime
 from typing import List, Tuple, Dict, Any, Optional
 
-from .memory_models import MemoryMetadata, EmotionalCategory
+from .memory_models import MemoryMetadata, EmotionalCategory, ClaimSource, DEFAULT_CERTAINTY_BY_SOURCE
 
 logger = logging.getLogger(__name__)
 
@@ -149,6 +149,57 @@ class EmotionalTagger:
         r"\b(maybe|perhaps|possibly)\b",
     ]
 
+    # ─────────────────────────────────────────────────────────────────
+    # Epistemic Cue Patterns (#650)
+    # ─────────────────────────────────────────────────────────────────
+
+    # Hedging cues lower certainty
+    HEDGE_PATTERNS = [
+        (r"\bi think\b", -0.15),
+        (r"\bi believe\b", -0.10),
+        (r"\bmaybe\b", -0.20),
+        (r"\bperhaps\b", -0.20),
+        (r"\bprobably\b", -0.10),
+        (r"\bmight\b", -0.10),
+        (r"\bnot sure\b", -0.20),
+        (r"\bi guess\b", -0.20),
+        (r"\bpossibly\b", -0.15),
+    ]
+
+    # Hearsay cues shift source to hearsay
+    HEARSAY_PATTERNS = [
+        r"\bapparently\b",
+        r"\bi heard\b",
+        r"\bsomeone told me\b",
+        r"\bsupposedly\b",
+        r"\bthey say\b",
+        r"\bpeople say\b",
+        r"\b\w+ told me\b",
+        r"\b\w+ said\b",
+        r"\b\w+ mentioned\b",
+        r"\baccording to\b",
+        r"\brumor\b",
+    ]
+
+    # Temporal validity cues
+    EPHEMERAL_PATTERNS = [
+        r"\bright now\b",
+        r"\bat the moment\b",
+        r"\bcurrently\b",
+        r"\btoday\b",
+        r"\bthis week\b",
+        r"\bi'?m feeling\b",
+        r"\bi feel\b",
+        r"\bfor now\b",
+    ]
+
+    MOMENT_PATTERNS = [
+        r"\bjust now\b",
+        r"\bjust happened\b",
+        r"\bthis second\b",
+        r"\bthis instant\b",
+    ]
+
     def __init__(self, use_spacy: bool = False):
         """
         Initialize the emotional tagger.
@@ -176,7 +227,7 @@ class EmotionalTagger:
 
     async def analyze(self, content: str, role: str = "user") -> MemoryMetadata:
         """
-        Full analysis: emotional + importance + temporal.
+        Full analysis: emotional + importance + temporal + epistemic.
 
         Args:
             content: The message content to analyze
@@ -198,6 +249,9 @@ class EmotionalTagger:
         time_of_day = self._get_time_of_day()
         day_of_week = self._get_day_of_week()
 
+        # Detect epistemic status (#650)
+        claim_source, claim_certainty, temporal_validity = self._detect_epistemic_status(content, role)
+
         return MemoryMetadata(
             emotional_valence=valence,
             emotional_intensity=intensity,
@@ -206,7 +260,63 @@ class EmotionalTagger:
             importance_reasons=reasons,
             time_of_day=time_of_day,
             day_of_week=day_of_week,
+            claim_certainty=claim_certainty,
+            claim_source=claim_source,
+            temporal_validity=temporal_validity,
         )
+
+    def _detect_epistemic_status(
+        self,
+        content: str,
+        role: str = "user",
+    ) -> Tuple[Optional[str], Optional[float], Optional[str]]:
+        """
+        Detect epistemic status from linguistic cues.
+
+        Returns:
+            Tuple of (claim_source, claim_certainty, temporal_validity).
+            All Optional — None when the message has no claim-like content.
+        """
+        if role != "user":
+            # Assistant messages are not claims about the world
+            return None, None, None
+
+        content_lower = content.lower()
+
+        # 1. Determine source: hearsay cues override default "direct"
+        source = ClaimSource.DIRECT.value
+        for pattern in self.HEARSAY_PATTERNS:
+            if re.search(pattern, content_lower):
+                source = ClaimSource.HEARSAY.value
+                break
+
+        # 2. Start with default certainty for the source
+        certainty = DEFAULT_CERTAINTY_BY_SOURCE[source]
+
+        # 3. Apply hedge modifiers
+        for pattern, modifier in self.HEDGE_PATTERNS:
+            if re.search(pattern, content_lower):
+                certainty += modifier
+
+        # Clamp to [0.0, 1.0]
+        certainty = max(0.0, min(1.0, certainty))
+
+        # 4. Detect temporal validity
+        temporal_validity: Optional[str] = None
+        for pattern in self.MOMENT_PATTERNS:
+            if re.search(pattern, content_lower):
+                temporal_validity = "moment"
+                break
+        if temporal_validity is None:
+            for pattern in self.EPHEMERAL_PATTERNS:
+                if re.search(pattern, content_lower):
+                    temporal_validity = "ephemeral"
+                    break
+
+        # Default to "durable" for life-event-shaped messages, else leave None
+        # (callers treat None as "not classified")
+
+        return source, round(certainty, 2), temporal_validity
 
     def _analyze_sentiment(self, content: str) -> Tuple[float, float]:
         """

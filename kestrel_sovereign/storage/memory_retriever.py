@@ -58,11 +58,12 @@ class MemoryRetriever:
     """
 
     # Scoring weights (must sum to 1.0)
-    WEIGHT_SEMANTIC = 0.30
-    WEIGHT_EMOTIONAL = 0.25
-    WEIGHT_IMPORTANCE = 0.20
-    WEIGHT_RECENCY = 0.15
+    WEIGHT_SEMANTIC = 0.28
+    WEIGHT_EMOTIONAL = 0.24
+    WEIGHT_IMPORTANCE = 0.19
+    WEIGHT_RECENCY = 0.14
     WEIGHT_ACCESS = 0.10
+    WEIGHT_CERTAINTY = 0.05  # Epistemic certainty (#650)
 
     # Decay parameters (Ebbinghaus-inspired)
     DECAY_HALF_LIFE_DAYS = 30  # Memory strength halves every 30 days
@@ -240,13 +241,17 @@ class MemoryRetriever:
         # 5. Access score (rehearsal effect)
         access = self._score_access(metadata)
 
+        # 6. Epistemic certainty score (#650)
+        certainty = self._score_certainty(metadata)
+
         # Weighted combination
         total = (
             semantic * self.WEIGHT_SEMANTIC +
             emotional * self.WEIGHT_EMOTIONAL +
             importance * self.WEIGHT_IMPORTANCE +
             recency * self.WEIGHT_RECENCY +
-            access * self.WEIGHT_ACCESS
+            access * self.WEIGHT_ACCESS +
+            certainty * self.WEIGHT_CERTAINTY
         )
 
         return total
@@ -378,6 +383,19 @@ class MemoryRetriever:
         if access_count <= 0:
             return 0.0
         return min(1.0, math.log10(access_count + 1) / 2)
+
+    def _score_certainty(self, metadata: Dict[str, Any]) -> float:
+        """
+        Score based on epistemic certainty (#650).
+
+        Messages with higher claim_certainty are slightly preferred.
+        Returns 0.5 (neutral) when certainty is not set, so the weight
+        doesn't penalize legacy messages that pre-date the epistemic layer.
+        """
+        certainty = metadata.get("claim_certainty")
+        if certainty is None:
+            return 0.5  # Neutral for messages without epistemic tagging
+        return float(certainty)
 
     async def retrieve_by_emotion(
         self,

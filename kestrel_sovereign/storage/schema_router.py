@@ -32,6 +32,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from .async_graph_store import AsyncGraphStore, GraphNode
+from .memory_models import ClaimSource, DEFAULT_CERTAINTY_BY_SOURCE
 
 logger = logging.getLogger(__name__)
 
@@ -458,6 +459,18 @@ class SchemaRouter:
                 "agent_id": self.agent_id,
                 "created_at": existing_props.get("created_at", now_iso),
                 "updated_at": now_iso,
+                # Epistemic status (#650) — preserve if already set
+                "claim_certainty": existing_props.get(
+                    "claim_certainty",
+                    DEFAULT_CERTAINTY_BY_SOURCE[ClaimSource.DIRECT.value],
+                ),
+                "claim_source": existing_props.get(
+                    "claim_source", ClaimSource.DIRECT.value
+                ),
+                "temporal_validity": existing_props.get("temporal_validity"),
+                "superseded_by": existing_props.get("superseded_by"),
+                "verified_at": existing_props.get("verified_at"),
+                "contradicts": existing_props.get("contradicts", []),
             }
             await self.graph.add_node(GraphNode(
                 node_id=node_id,
@@ -498,11 +511,81 @@ class SchemaRouter:
                     "confidence": 0.7,
                     "created_at": now_iso,
                     "agent_id": self.agent_id,
+                    # Epistemic status (#650)
+                    "claim_certainty": DEFAULT_CERTAINTY_BY_SOURCE[ClaimSource.DIRECT.value],
+                    "claim_source": ClaimSource.DIRECT.value,
+                    "temporal_validity": "durable",
+                    "superseded_by": None,
+                    "verified_at": None,
+                    "contradicts": [],
                 },
             ))
             if message_id:
                 source = f"message:{self.agent_id}:{message_id}"
                 await self.graph.add_edge(source, node_id, "records_decision")
+
+    # ------------------------------------------------------------------
+    # Supersession (#650)
+    # ------------------------------------------------------------------
+
+    async def mark_superseded(
+        self,
+        old_id: str,
+        new_id: str,
+        reason: str,
+    ) -> None:
+        """Mark a claim-shaped node as superseded by a newer one.
+
+        Writes a ``supersedes`` edge from new → old, sets ``superseded_by``
+        on the old node, and records the new node in the old node's
+        ``contradicts`` list. The reason is stored on the edge for
+        audit trail.
+
+        Raises ValueError if either node is missing or doesn't belong
+        to this agent.
+        """
+        old_node = await self.graph.get_node(old_id)
+        if old_node is None:
+            raise ValueError(f"Old node {old_id} not found")
+        new_node = await self.graph.get_node(new_id)
+        if new_node is None:
+            raise ValueError(f"New node {new_id} not found")
+
+        # Agent scoping
+        old_props = old_node.properties or {}
+        new_props = new_node.properties or {}
+        if old_props.get("agent_id") != self.agent_id:
+            raise ValueError(f"Node {old_id} does not belong to agent {self.agent_id}")
+        if new_props.get("agent_id") != self.agent_id:
+            raise ValueError(f"Node {new_id} does not belong to agent {self.agent_id}")
+
+        # 1. Write supersedes edge: new → old
+        now_iso = datetime.now(timezone.utc).isoformat()
+        await self.graph.add_edge(
+            new_id,
+            old_id,
+            "supersedes",
+            properties={
+                "reason": reason,
+                "created_at": now_iso,
+            },
+        )
+
+        # 2. Update old node: set superseded_by, append to contradicts
+        updated_props = dict(old_props)
+        updated_props["superseded_by"] = new_id
+        contradicts = list(updated_props.get("contradicts") or [])
+        if new_id not in contradicts:
+            contradicts.append(new_id)
+        updated_props["contradicts"] = contradicts
+        updated_props["updated_at"] = now_iso
+
+        await self.graph.add_node(GraphNode(
+            node_id=old_node.node_id,
+            node_type=old_node.node_type,
+            label=old_node.label,
+            properties=updated_props,
+        ))
 
     # ------------------------------------------------------------------
     # Interactions (enrich existing mentions edges) + person resolution

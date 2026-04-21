@@ -320,6 +320,97 @@ These tags feed into temporal pattern detection during consolidation.
 
 ---
 
+## Epistemic Status Layer
+
+Added in #650. The emotional/importance layers answer "how did this feel?" and
+"how significant was this?" The epistemic layer answers a different question:
+**"should the agent trust this claim, and is it still current?"**
+
+### Per-Message Fields (MemoryMetadata)
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `claim_certainty` | `float?` | `None` | 0.0–1.0. How reliable the claim is, independent of extraction confidence. |
+| `claim_source` | `str?` | `None` | `"direct"` / `"observed"` / `"inferred"` / `"hearsay"` |
+| `temporal_validity` | `str?` | `None` | `"durable"` / `"ephemeral"` / `"moment"` |
+
+All fields are optional with `None` defaults for backward compatibility.
+
+### Default Certainty by Source
+
+| Source | Default | Examples |
+|--------|---------|----------|
+| `direct` | 0.85 | User said it themselves |
+| `observed` | 0.75 | Agent saw the action happen |
+| `inferred` | 0.50 | Deduced from pattern/context |
+| `hearsay` | 0.35 | Third party mentioned it |
+
+### Linguistic Modifiers
+
+The `EmotionalTagger` adjusts certainty and source based on cues:
+
+- **Hedges** lower certainty: "I think" (−0.15), "maybe" (−0.20), "probably"
+  (−0.10), "not sure" (−0.20)
+- **Hearsay cues** shift source to `hearsay`: "apparently", "I heard",
+  "someone told me", "supposedly", "according to"
+- **Temporal cues** set `temporal_validity`: "right now" / "currently" →
+  `ephemeral`; "just happened" → `moment`
+
+### Graph Node Properties (Decisions, Action Items)
+
+Claim-shaped graph nodes carry the same three fields plus supersession
+tracking:
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `claim_certainty` | `float` | Inherited from source or set by extractor |
+| `claim_source` | `str` | Source classification |
+| `temporal_validity` | `str?` | Validity window |
+| `superseded_by` | `str?` | Node ID of the claim that replaced this one |
+| `verified_at` | `str?` | ISO timestamp of last user confirmation |
+| `contradicts` | `list[str]` | Node IDs this claim explicitly contradicts |
+
+### Supersession
+
+When a newer claim replaces an older one, `mark_superseded(old_id, new_id,
+reason)` in `SchemaRouter`:
+
+1. Writes a `supersedes` edge from new → old (with reason in edge properties)
+2. Sets `superseded_by` on the old node
+3. Appends to the old node's `contradicts` list
+
+The `recall_decisions`, `recall_action_items`, and `recall_interactions` tools
+filter out superseded claims by default. Pass `include_superseded=True` to
+see history.
+
+### Retrieval Weighting
+
+`MemoryRetriever` includes `claim_certainty` as a 6th scoring signal at 5%
+weight. Messages without epistemic tagging score 0.5 (neutral) so legacy
+data is not penalized.
+
+Updated weight distribution:
+
+| Signal | Weight |
+|--------|--------|
+| Semantic relevance | 28% |
+| Emotional congruence | 24% |
+| Importance | 19% |
+| Recency (decay) | 14% |
+| Access frequency | 10% |
+| Epistemic certainty | 5% |
+
+### Non-Goals
+
+- **Not a truth-maintenance system.** No Bayesian updates or automatic
+  consistency checking.
+- **Not LLM-driven contradiction detection.** Supersession is explicit —
+  user or reflection must call `mark_claim_superseded`.
+- **Does not replace `confidence`.** Extraction confidence ("did we find
+  something?") and epistemic certainty ("is it true?") are separate signals.
+
+---
+
 ## The Ebbinghaus Decay Curve
 
 Kestrel implements a forgetting curve inspired by Hermann Ebbinghaus's

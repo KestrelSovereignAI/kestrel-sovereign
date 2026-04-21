@@ -10,6 +10,30 @@ from typing import List, Dict, Any, Optional
 from enum import Enum
 
 
+class ClaimSource(Enum):
+    """How the claim originated."""
+    DIRECT = "direct"        # User stated it themselves
+    OBSERVED = "observed"    # Agent saw the action happen
+    INFERRED = "inferred"    # Agent deduced from pattern/context
+    HEARSAY = "hearsay"      # Third party mentioned it
+
+
+class TemporalValidity(Enum):
+    """How long the claim is expected to remain true."""
+    DURABLE = "durable"      # Stable life-fact (e.g. "I have a sister")
+    EPHEMERAL = "ephemeral"  # Current state that naturally expires (e.g. "I'm tired")
+    MOMENT = "moment"        # Context-bound, already historical (e.g. "I'm at the store")
+
+
+# Default certainty by source (issue #650 table)
+DEFAULT_CERTAINTY_BY_SOURCE: Dict[str, float] = {
+    ClaimSource.DIRECT.value: 0.85,
+    ClaimSource.OBSERVED.value: 0.75,
+    ClaimSource.INFERRED.value: 0.50,
+    ClaimSource.HEARSAY.value: 0.35,
+}
+
+
 class EmotionalCategory(Enum):
     """Categories of emotions that can be detected in messages."""
     JOY = "joy"
@@ -66,6 +90,11 @@ class MemoryMetadata:
     stash_name: Optional[str] = None        # Human-readable name for the stash
     stashed_at: Optional[str] = None        # ISO format timestamp
 
+    # Epistemic status layer (#650)
+    claim_certainty: Optional[float] = None   # 0.0–1.0, how reliable the claim is
+    claim_source: Optional[str] = None        # "direct" | "inferred" | "hearsay" | "observed"
+    temporal_validity: Optional[str] = None   # "durable" | "ephemeral" | "moment"
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dict for JSON storage in metadata column."""
         return {
@@ -91,6 +120,10 @@ class MemoryMetadata:
             "stash_id": self.stash_id,
             "stash_name": self.stash_name,
             "stashed_at": self.stashed_at,
+            # Epistemic status fields
+            "claim_certainty": self.claim_certainty,
+            "claim_source": self.claim_source,
+            "temporal_validity": self.temporal_validity,
         }
 
     @classmethod
@@ -121,6 +154,10 @@ class MemoryMetadata:
             stash_id=data.get("stash_id"),
             stash_name=data.get("stash_name"),
             stashed_at=data.get("stashed_at"),
+            # Epistemic status fields
+            claim_certainty=data.get("claim_certainty"),
+            claim_source=data.get("claim_source"),
+            temporal_validity=data.get("temporal_validity"),
         )
 
     def merge_with(self, existing_meta: Dict[str, Any]) -> Dict[str, Any]:
