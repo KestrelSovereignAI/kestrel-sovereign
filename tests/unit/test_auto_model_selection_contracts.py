@@ -98,6 +98,55 @@ def test_auto_resolution_avoids_preview_models_when_choosing_fallback():
     assert harness.providers[0]["model"] == "gemini-3-pro"
 
 
+def test_auto_resolution_uses_canonical_discovery_for_plan_provider():
+    harness = _DiscoveryHarness(
+        config={"claude_plan": {"selection_hints": ["sonnet"]}},
+        providers=[{"name": "claude_plan", "model": "auto"}],
+    )
+    models = [
+        ModelInfo(
+            id="claude-sonnet-4-6",
+            provider="anthropic",
+            display_name="Claude Sonnet 4.6",
+            category=ModelCategory.CHAT,
+            supports_tools=True,
+        ),
+        ModelInfo(
+            id="claude-opus-4-6",
+            provider="anthropic",
+            display_name="Claude Opus 4.6",
+            category=ModelCategory.CHAT,
+            supports_tools=True,
+        ),
+    ]
+
+    harness._resolve_auto_providers(models)
+
+    assert harness.providers[0]["model"] == "claude-sonnet-4-6"
+
+
+def test_discovery_alias_projection_builds_plan_provider_models():
+    harness = _DiscoveryHarness(
+        config={"openai_plan": {"selection_hints": ["gpt-5.4"]}},
+        providers=[{"name": "openai_plan", "model": "auto"}],
+    )
+    models = [
+        ModelInfo(
+            id="gpt-5.4",
+            provider="openai",
+            display_name="GPT-5.4",
+            category=ModelCategory.CHAT,
+            supports_tools=True,
+        ),
+    ]
+
+    projected = harness._build_alias_discovery_models(models)
+
+    assert len(projected) == 1
+    assert projected[0].provider == "openai_plan"
+    assert projected[0].id == "gpt-5.4"
+
+
 def test_shipped_llm_config_uses_auto_models_for_primary_providers():
     import tomllib
 
@@ -105,7 +154,8 @@ def test_shipped_llm_config_uses_auto_models_for_primary_providers():
         config = tomllib.load(handle)
 
     for provider_name in [
-        "claude_max",
+        "claude_plan",
+        "openai_plan",
         "openrouter",
         "openai",
         "openai_mini",

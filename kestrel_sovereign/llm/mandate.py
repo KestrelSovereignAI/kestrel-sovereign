@@ -3,6 +3,7 @@ import logging
 from typing import Dict, Any, Optional, List
 
 from kestrel_sovereign.config import load_config
+from .provider_names import normalize_provider_name, provider_name_candidates
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +41,7 @@ class ModelMandateMixin:
 
         if "/" in selector:
             provider_name, model_name = selector.split("/", 1)
+            provider_name = normalize_provider_name(provider_name)
             return {
                 "selector": selector,
                 "provider": provider_name,
@@ -47,12 +49,13 @@ class ModelMandateMixin:
             }
 
         for provider in providers:
-            if provider.get("name") == selector:
+            if provider.get("name") in provider_name_candidates(selector):
                 model_name = provider.get("model")
-                normalized = f"{selector}/{model_name}" if model_name else selector
+                provider_name = provider.get("name")
+                normalized = f"{provider_name}/{model_name}" if model_name else provider_name
                 return {
                     "selector": normalized,
-                    "provider": selector,
+                    "provider": provider_name,
                     "model": model_name,
                 }
 

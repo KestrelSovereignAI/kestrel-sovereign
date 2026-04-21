@@ -8,6 +8,7 @@ from typing import Any, Dict, Optional
 from kestrel_sovereign.config import load_config
 from kestrel_sovereign.llm.model_catalog import get_catalog_service
 from kestrel_sovereign.llm.model_metadata import ModelCategory, ModelInfo
+from kestrel_sovereign.llm.provider_names import resolve_discovery_provider
 
 
 def _numeric_rank(text: str, max_parts: int = 4) -> tuple[int, ...]:
@@ -57,6 +58,7 @@ def resolve_provider_default(
     catalog_config = catalog_config or load_config("model_catalog.toml")
 
     provider_config = llm_config.get(provider_name, {}) or {}
+    discovery_provider = resolve_discovery_provider(provider_name)
     configured_model = provider_config.get("model")
     if configured_model and configured_model != "auto":
         return configured_model
@@ -66,7 +68,7 @@ def resolve_provider_default(
 
     provider_models = [
         model for model in cached_models
-        if model.provider == provider_name
+        if model.provider == discovery_provider
         and model.category == ModelCategory.CHAT
         and not model.is_hidden
     ]

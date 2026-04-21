@@ -74,3 +74,29 @@ def test_resolve_provider_default_prefers_newest_matching_model_from_discovery()
     )
 
     assert resolved == "claude-sonnet-4-6"
+
+
+def test_resolve_provider_default_uses_canonical_discovery_for_plan_provider():
+    resolved = resolve_provider_default(
+        "openai_plan",
+        llm_config={"openai_plan": {"model": "auto", "selection_hints": ["gpt-5.4"]}},
+        catalog_config={},
+        cached_models=[
+            ModelInfo(
+                id="gpt-5.4",
+                provider="openai",
+                display_name="GPT-5.4",
+                category=ModelCategory.CHAT,
+                supports_tools=True,
+            ),
+            ModelInfo(
+                id="gpt-5.4-mini",
+                provider="openai",
+                display_name="GPT-5.4 Mini",
+                category=ModelCategory.CHAT,
+                supports_tools=True,
+            ),
+        ],
+    )
+
+    assert resolved == "gpt-5.4"
