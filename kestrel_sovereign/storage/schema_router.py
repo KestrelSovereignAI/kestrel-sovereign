@@ -31,6 +31,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
+from .associative_linker import LinkedConcept
 from .async_graph_store import AsyncGraphStore, GraphNode
 
 logger = logging.getLogger(__name__)
@@ -371,10 +372,15 @@ class SchemaRouter:
         self,
         message_id: str,
         content: str,
-        concepts: List[str],
+        concepts: List[LinkedConcept],
         role: str = "user",
     ) -> Dict[str, Any]:
         """Route extracted structure from a message.
+
+        Args:
+            concepts: Typed concept objects from AssociativeLinker.
+                Each carries its graph node_id and category so the
+                router never needs to reconstruct IDs or guess categories.
 
         Returns a summary dict for inclusion in the message's enriched
         metadata. Best-effort: a failure in one lane doesn't block the
@@ -510,14 +516,18 @@ class SchemaRouter:
 
     async def _enrich_person_interactions(
         self,
-        concepts: List[str],
+        concepts: List[LinkedConcept],
         content: str,
         message_id: Optional[str],
     ) -> Tuple[int, List[Dict[str, Any]]]:
         """Enrich message→person mentions edges with sentiment + topics.
 
-        Also runs person resolution against each person concept; ambiguous
-        matches are returned so callers can surface a confirmation UI.
+        Uses ``concept.category`` from the linker to identify person
+        concepts — no local keyword heuristics needed. Also uses
+        ``concept.node_id`` directly instead of reconstructing it.
+
+        Ambiguous person matches are returned so callers can surface a
+        confirmation UI.
         """
         if not message_id:
             return 0, []
@@ -528,10 +538,9 @@ class SchemaRouter:
 
         message_node = f"message:{self.agent_id}:{message_id}"
 
-        for concept_label in concepts:
-            if not _looks_like_person(concept_label):
+        for concept in concepts:
+            if concept.category != "person":
                 continue
-            concept_node_id = f"concept:{self.agent_id}:{concept_label}"
 
             # Attach interaction properties to the existing mentions edge.
             properties = {
@@ -540,15 +549,15 @@ class SchemaRouter:
                 "recorded_at": datetime.now(timezone.utc).isoformat(),
             }
             await self.graph.add_edge(
-                message_node, concept_node_id, "mentions", properties=properties
+                message_node, concept.node_id, "mentions", properties=properties
             )
             enriched_count += 1
 
             # 3-pass resolution against other person concepts of this agent.
-            match = await self.person_resolver.resolve(concept_label, self.agent_id)
+            match = await self.person_resolver.resolve(concept.label, self.agent_id)
             if match.status == "pending":
                 pending.append({
-                    "mentioned_label": concept_label,
+                    "mentioned_label": concept.label,
                     "candidates": match.candidates,
                     "message_id": message_id,
                 })
@@ -561,45 +570,6 @@ class SchemaRouter:
 # =============================================================================
 
 
-# Keywords from the existing AssociativeLinker that indicate person concepts.
-# Duplicated here rather than imported so a later redesign of the linker's
-# category taxonomy doesn't accidentally silence the router.
-_PERSON_KEYWORDS = frozenset([
-    "mom", "mother", "mama", "mommy", "dad", "father", "papa", "daddy",
-    "wife", "husband", "spouse", "partner", "son", "daughter", "child",
-    "kid", "baby", "brother", "sister", "sibling", "grandma", "grandmother",
-    "nana", "granny", "grandpa", "grandfather", "gramps", "friend", "buddy",
-    "bestie", "pal", "boss", "manager", "coworker", "colleague", "doctor",
-    "therapist", "counselor",
-])
-
-
-# Concepts the linker produces that are definitely NOT people — covers the
-# linker's place/time/activity/emotion categories so we don't mis-enrich
-# mentions edges as interactions.
-_NON_PERSON_KEYWORDS = frozenset([
-    # Places
-    "home", "house", "apartment", "place", "work", "office", "job",
-    "workplace", "school", "college", "university", "class", "hospital",
-    "clinic", "church", "temple", "mosque", "synagogue",
-    # Time
-    "morning", "afternoon", "evening", "night", "monday", "tuesday",
-    "wednesday", "thursday", "friday", "saturday", "sunday",
-    "january", "february", "march", "april", "may", "june", "july",
-    "august", "september", "october", "november", "december",
-    "christmas", "thanksgiving", "birthday", "anniversary", "holiday",
-    "childhood", "teenager", "adult", "elderly", "young",
-    # Activities
-    "cooking", "baking", "gardening", "reading", "writing",
-    "running", "walking", "exercise", "workout", "gym",
-    "music", "singing", "dancing", "playing",
-    "travel", "vacation", "trip", "visit",
-    "meeting", "project", "deadline",
-    # Emotions
-    "happy", "sad", "angry", "scared", "anxious", "excited",
-    "love", "hate", "miss", "worry", "fear",
-    "stress", "peace", "calm", "chaos",
-])
 
 
 def _deterministic_decision_node_id(
@@ -630,22 +600,3 @@ def _deterministic_action_node_id(
     return f"action:{agent_id}:{digest}"
 
 
-def _looks_like_person(concept: str) -> bool:
-    """Heuristic: is this concept label likely a person reference?
-
-    The AssociativeLinker does not annotate concepts with their category,
-    so we reconstruct the category by matching against the linker's
-    keyword sets. A cleaner fix would be to have the linker emit typed
-    concepts; deferred to a follow-up so this PR doesn't sprawl.
-    """
-    if not concept:
-        return False
-    lower = concept.lower()
-    if lower in _PERSON_KEYWORDS:
-        return True
-    if lower in _NON_PERSON_KEYWORDS:
-        return False
-    # Otherwise: treat alphabetic multi-character concepts as probable
-    # proper names. Concepts from the linker are lowercased but proper
-    # nouns still end up here via the capitalized-word extraction path.
-    return len(concept) >= 3 and concept.isalpha()
