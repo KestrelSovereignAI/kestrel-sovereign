@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 import pytest_asyncio
 
+from kestrel_sovereign.storage.associative_linker import LinkedConcept
 from kestrel_sovereign.storage.async_graph_store import GraphNode
 from kestrel_sovereign.storage.schema_router import (
     ACTION_ITEM_NODE_TYPE,
@@ -267,7 +268,10 @@ class TestSchemaRouterOrchestration:
         summary = await router.route(
             message_id="msg-3",
             content="I love when mom calls on Sundays.",
-            concepts=["mom", "sunday"],
+            concepts=[
+                LinkedConcept(node_id="concept:agent-1:mom", label="mom", category="person"),
+                LinkedConcept(node_id="concept:agent-1:sunday", label="sunday", category="time"),
+            ],
             role="user",
         )
         # Only 'mom' is person-shaped; 'sunday' is temporal.
@@ -427,18 +431,23 @@ class TestSchemaRouterOrchestration:
         assert persisted[-1].properties["status"] == "pending"
 
     @pytest.mark.asyncio
-    async def test_concept_node_id_matches_linker_shape(self, router):
-        """Interaction enrichment writes to concept ids of the exact shape
-        AssociativeLinker produces — `concept:{agent_id}:{lowered_label}`.
-        This test pins that contract so future linker refactors must update
-        the router together."""
+    async def test_router_uses_concept_node_id_directly(self, router):
+        """Router must use LinkedConcept.node_id as-is instead of
+        reconstructing it from the label. This replaces the old pinning
+        test from #646 — the coupling is gone because the linker now
+        provides the canonical node_id."""
         await router.route(
             message_id="msg-shape",
             content="mom called.",
-            concepts=["mom"],
+            concepts=[
+                LinkedConcept(
+                    node_id="concept:agent-1:mom",
+                    label="mom",
+                    category="person",
+                ),
+            ],
             role="user",
         )
-        # Collect all edge target ids written
         edge_targets = [
             c.args[1] for c in router.graph.add_edge.await_args_list
             if c.args[2] == "mentions"
@@ -455,7 +464,13 @@ class TestSchemaRouterOrchestration:
         summary = await router.route(
             message_id="msg-6",
             content="Thanks so much Alice for everything.",
-            concepts=["alice"],
+            concepts=[
+                LinkedConcept(
+                    node_id="concept:agent-1:alice",
+                    label="alice",
+                    category="person",
+                ),
+            ],
             role="user",
         )
         assert len(summary["pending_person_matches"]) == 1
