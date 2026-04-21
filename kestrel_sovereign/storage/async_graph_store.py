@@ -4,10 +4,13 @@ Async Graph Store for Kestrel Storage.
 Provides async knowledge graph storage with nodes and edges.
 """
 import json
-from typing import Dict, Optional, List, Any
+import logging
+from typing import Dict, Optional, List, Any, Tuple
 from dataclasses import dataclass
 
 from .async_database import AsyncDatabase
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -95,7 +98,83 @@ class AsyncGraphStore:
             )
             for row in rows
         ]
-    
+
+    # -----------------------------------------------------------------
+    # Property-level query helpers (use JSON-path indexes)
+    # -----------------------------------------------------------------
+
+    def _json_extract(self, column: str, path: str) -> str:
+        """Return backend-appropriate JSON extraction SQL.
+
+        SQLite:     json_extract(column, '$.path')
+        PostgreSQL: (column::jsonb)->>'path'
+        """
+        if self.db.backend_type == "postgres":
+            return f"({column}::jsonb)->>'{path}'"
+        return f"json_extract({column}, '$.{path}')"
+
+    async def query_nodes_by_type_and_property(
+        self,
+        node_type: str,
+        filters: Optional[Dict[str, Any]] = None,
+        *,
+        created_since: Optional[str] = None,
+        order_by_created: bool = True,
+        limit: int = 200,
+    ) -> List[GraphNode]:
+        """Query graph nodes by type with property-level SQL filters.
+
+        Pushes equality and range filters into SQL so the database can
+        use the JSON-path partial indexes (``idx_graph_nodes_agent``,
+        ``idx_graph_nodes_action_status``, ``idx_graph_nodes_action_created``).
+
+        Args:
+            node_type: Required ``node_type`` value (e.g. ``"action_item"``).
+            filters: Dict of ``{property_name: value}`` for equality checks
+                pushed into ``WHERE json_extract(properties, '$.key') = ?``.
+            created_since: ISO-8601 timestamp lower bound on
+                ``properties->>'created_at'``.  Uses ``>=`` comparison.
+            order_by_created: If True (default), results are ordered by
+                ``properties->>'created_at' DESC``.
+            limit: Maximum rows returned (clamped to 1-10000).
+
+        Returns:
+            List of matching :class:`GraphNode` instances.
+        """
+        limit = max(1, min(limit, 10000))
+        clauses: List[str] = ["node_type = ?"]
+        params: List[Any] = [node_type]
+
+        for key, value in (filters or {}).items():
+            clauses.append(f"{self._json_extract('properties', key)} = ?")
+            params.append(value)
+
+        if created_since is not None:
+            clauses.append(f"{self._json_extract('properties', 'created_at')} >= ?")
+            params.append(created_since)
+
+        where = " AND ".join(clauses)
+        order = ""
+        if order_by_created:
+            order = f" ORDER BY {self._json_extract('properties', 'created_at')} DESC"
+
+        sql = (
+            f"SELECT node_id, node_type, label, properties "
+            f"FROM graph_nodes WHERE {where}{order} LIMIT ?"
+        )
+        params.append(limit)
+
+        rows = await self.db.fetchall(sql, tuple(params))
+        return [
+            GraphNode(
+                node_id=row[0],
+                node_type=row[1],
+                label=row[2],
+                properties=json.loads(row[3]) if row[3] else {},
+            )
+            for row in rows
+        ]
+
     async def delete_node(self, node_id: str) -> None:
         """Delete a node and its edges."""
         async with self.db.transaction():

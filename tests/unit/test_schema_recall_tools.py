@@ -37,6 +37,7 @@ def _make_agent(db=None):
     agent.storage.graph.get_node = AsyncMock(return_value=None)
     agent.storage.graph.get_edges = AsyncMock(return_value=[])
     agent.storage.graph.get_nodes_by_type = AsyncMock(return_value=[])
+    agent.storage.graph.query_nodes_by_type_and_property = AsyncMock(return_value=[])
     agent.bootstrap_service = MagicMock()
     agent.bootstrap_service.agent_data_path = None
     return agent
@@ -79,22 +80,21 @@ class TestRecallActionItems:
 
     @pytest.mark.asyncio
     async def test_returns_own_items(self, feature):
-        feature.agent.storage.graph.get_nodes_by_type = AsyncMock(return_value=[
+        feature.agent.storage.graph.query_nodes_by_type_and_property = AsyncMock(return_value=[
             _action_node("action:did:test:recall-agent:a", "Call mom"),
             _action_node("action:did:test:recall-agent:b", "Ship PR", status="done",
                          created_at="2026-04-19T09:00:00+00:00"),
         ])
         result = await feature.recall_action_items()
         assert result["count"] == 2
-        # Sorted by created_at desc
+        # Sorted by created_at desc (SQL ORDER BY)
         assert result["action_items"][0]["text"] == "Call mom"
         assert result["action_items"][1]["status"] == "done"
 
     @pytest.mark.asyncio
     async def test_filters_by_status(self, feature):
-        feature.agent.storage.graph.get_nodes_by_type = AsyncMock(return_value=[
+        feature.agent.storage.graph.query_nodes_by_type_and_property = AsyncMock(return_value=[
             _action_node("a1", "Pending one", status="pending"),
-            _action_node("a2", "Done one", status="done"),
         ])
         result = await feature.recall_action_items(status="pending")
         assert result["count"] == 1
@@ -102,9 +102,8 @@ class TestRecallActionItems:
 
     @pytest.mark.asyncio
     async def test_filters_by_assignee(self, feature):
-        feature.agent.storage.graph.get_nodes_by_type = AsyncMock(return_value=[
+        feature.agent.storage.graph.query_nodes_by_type_and_property = AsyncMock(return_value=[
             _action_node("a1", "Call mom", assignee="concept:agent:alice"),
-            _action_node("a2", "Call dad", assignee="concept:agent:bob"),
         ])
         result = await feature.recall_action_items(assignee_concept_id="concept:agent:alice")
         assert result["count"] == 1
@@ -112,27 +111,27 @@ class TestRecallActionItems:
 
     @pytest.mark.asyncio
     async def test_filters_by_days_window(self, feature):
-        from datetime import datetime, timezone, timedelta
+        from datetime import datetime, timezone
         recent = datetime.now(timezone.utc).isoformat()
-        old = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
-        feature.agent.storage.graph.get_nodes_by_type = AsyncMock(return_value=[
+        feature.agent.storage.graph.query_nodes_by_type_and_property = AsyncMock(return_value=[
             _action_node("a1", "Recent", created_at=recent),
-            _action_node("a2", "Old", created_at=old),
         ])
         result = await feature.recall_action_items(days=7)
         assert result["count"] == 1
         assert result["action_items"][0]["text"] == "Recent"
 
     @pytest.mark.asyncio
-    async def test_cross_agent_isolation(self, feature):
-        """Action items belonging to other agents must not leak."""
-        feature.agent.storage.graph.get_nodes_by_type = AsyncMock(return_value=[
-            _action_node("a-mine", "Mine"),
-            _action_node("a-theirs", "Theirs", agent_id="did:other"),
-        ])
-        result = await feature.recall_action_items()
-        assert result["count"] == 1
-        assert result["action_items"][0]["text"] == "Mine"
+    async def test_passes_filters_to_query(self, feature):
+        """Verify that agent_id, status, and created_since are pushed into SQL filters."""
+        feature.agent.storage.graph.query_nodes_by_type_and_property = AsyncMock(return_value=[])
+        await feature.recall_action_items(status="pending", days=7, assignee_concept_id="concept:x:alice")
+        call = feature.agent.storage.graph.query_nodes_by_type_and_property.await_args
+        assert call.args[0] == "action_item"
+        filters = call.kwargs.get("filters") or call.args[1] if len(call.args) > 1 else call.kwargs["filters"]
+        assert filters["agent_id"] == "did:test:recall-agent"
+        assert filters["status"] == "pending"
+        assert filters["assignee_concept_id"] == "concept:x:alice"
+        assert call.kwargs.get("created_since") is not None
 
     @pytest.mark.asyncio
     async def test_rejects_invalid_status(self, feature):
@@ -247,29 +246,32 @@ class TestRecallDecisions:
                 "confidence": 0.8,
             },
         )
-        node_other = GraphNode(
-            node_id="decision:did:other:xyz",
-            node_type="decision",
-            label="Other agent's decision",
-            properties={
-                "agent_id": "did:other",
-                "created_at": "2026-04-19T10:00:00",
-            },
-        )
-        feature.agent.storage.graph.get_nodes_by_type = AsyncMock(
-            return_value=[node_mine, node_other]
+        # query_nodes_by_type_and_property filters by agent_id in SQL,
+        # so only the agent's own nodes are returned.
+        feature.agent.storage.graph.query_nodes_by_type_and_property = AsyncMock(
+            return_value=[node_mine]
         )
 
         result = await feature.recall_decisions()
         labels = [d["label"] for d in result["decisions"]]
         assert "Move to Brooklyn" in labels
-        assert "Other agent's decision" not in labels
+        assert result["count"] == 1
 
     @pytest.mark.asyncio
     async def test_empty(self, feature):
         result = await feature.recall_decisions()
         assert result["decisions"] == []
         assert result["count"] == 0
+
+    @pytest.mark.asyncio
+    async def test_passes_agent_filter_to_query(self, feature):
+        """Verify agent_id filter is pushed into SQL."""
+        feature.agent.storage.graph.query_nodes_by_type_and_property = AsyncMock(return_value=[])
+        await feature.recall_decisions()
+        call = feature.agent.storage.graph.query_nodes_by_type_and_property.await_args
+        assert call.args[0] == "decision"
+        filters = call.kwargs.get("filters") or call.args[1] if len(call.args) > 1 else call.kwargs["filters"]
+        assert filters["agent_id"] == "did:test:recall-agent"
 
 
 # =============================================================================
