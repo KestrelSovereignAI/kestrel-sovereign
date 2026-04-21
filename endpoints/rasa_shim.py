@@ -81,7 +81,6 @@ async def rasa_webhook(payload: RasaWebhookRequest, request: Request):
             response_text = await agent.process_input(
                 user_input=enriched_input,
                 session_id=f"sms:{sender}",  # namespace prevents collision with UI sessions
-                model_override="anthropic/claude-sonnet-4-20250514",
                 include_memories=False,  # HIPAA: prevent cross-patient memory leakage
             )
         logger.info(f"[rasa-shim] sender={sender} msg_len={len(message)} resp_len={len(response_text)}")
