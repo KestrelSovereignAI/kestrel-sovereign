@@ -230,6 +230,7 @@ markers = [
     "docker: Tests that require Docker",
     "docker_mcp: Tests that require Docker MCP Toolkit (excluded in CI)",
     "slow: Slow-running tests",
+    "bench: Performance benchmarks (excluded from default CI)",
     "anyio",
 ]
 

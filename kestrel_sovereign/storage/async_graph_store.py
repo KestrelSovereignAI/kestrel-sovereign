@@ -2,6 +2,19 @@
 Async Graph Store for Kestrel Storage.
 
 Provides async knowledge graph storage with nodes and edges.
+
+Sortable-timestamp invariant
+----------------------------
+The ``query_nodes_by_type_and_property`` method supports ``created_since``
+range filtering and ``ORDER BY created_at DESC`` sorting.  Both rely on
+lexicographic SQL comparison, which produces correct results **only** when
+every ``created_at`` value stored in ``graph_nodes.properties`` is a
+UTC ISO-8601 string whose text sort order matches chronological order —
+i.e. ``YYYY-MM-DDTHH:MM:SS+00:00``.
+
+All code paths that persist ``created_at`` MUST use
+``datetime.now(timezone.utc).isoformat()`` (or an equivalent that
+produces a fixed-offset ``+00:00`` suffix, never a bare naive string).
 """
 import json
 import logging
