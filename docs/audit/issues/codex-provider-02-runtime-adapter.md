@@ -1,21 +1,21 @@
-# Add a first-pass `codex_provider` runtime adapter to `kestrel-sovereign`
+# Add a first-pass `openai_plan` runtime adapter to `kestrel-sovereign`
 
-Parent: Codex provider design issue
+Parent: OpenAI plan provider design issue
 
 ## Problem
 
-Sovereign has no first-class runtime provider path for Codex yet, even though Codex is now a real execution lane elsewhere in the ecosystem.
+Sovereign has no first-class runtime provider path for the OpenAI plan lane yet, even though that subscription-backed lane is now a real execution path elsewhere in the ecosystem.
 
 ## Goal
 
-Add a minimal but real `codex_provider` / `codex_adapter` path to the sovereign runtime.
+Add a minimal but real `openai_plan` runtime path to the sovereign runtime.
 
 ## Scope
 
-- add a Codex adapter module under `kestrel_sovereign/llm/`
+- add the subscription-backed adapter module under `kestrel_sovereign/llm/`
 - register it in `provider_registry.py`
 - support config-driven provider initialization
-- use the local Codex CLI as the first implementation surface
+- use the local OpenAI plan session as the first implementation surface
 - support text generation path needed for normal agent runtime
 
 ## Non-goals
@@ -26,17 +26,17 @@ Add a minimal but real `codex_provider` / `codex_adapter` path to the sovereign 
 
 ## Acceptance criteria
 
-- `provider_priority = ["codex", ...]` is a valid config path
-- sovereign can initialize the Codex provider when the CLI/session is available
+- `provider_priority = ["openai_plan", ...]` is a valid config path
+- sovereign can initialize the OpenAI plan provider when the session is available
 - the adapter can complete a basic text-generation smoke path
-- failures degrade clearly when Codex CLI/auth is unavailable
+- failures degrade clearly when subscription auth is unavailable
 
 ## References
 
 - `kestrel_sovereign/llm/provider_registry.py`
 - `kestrel_sovereign/llm/adapter.py`
 - `kestrel_sovereign/llm/service.py`
-- `kestrel-talon` Codex backend implementation
+- `kestrel-talon` OpenAI plan backend implementation
 
 ## Talon note
 

@@ -48,7 +48,7 @@ class LLMProviderUnavailableError(LLMError):
     """Raised when a preferred provider is not in the initialized providers list.
 
     This is raised when an agent has an explicit provider preference (e.g.,
-    ``claude_max`` or ``codex``) but that provider was not successfully
+    ``claude_plan`` or ``openai_plan``) but that provider was not successfully
     initialized at startup.  Unlike a transient API failure, this indicates a
     configuration or environment problem that the caller should surface
     clearly rather than silently falling back to an unrelated provider.
