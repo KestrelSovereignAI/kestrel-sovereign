@@ -7,12 +7,14 @@ Provides in-memory caching and disk-based cache for fast startup.
 """
 import asyncio
 import logging
+from dataclasses import replace
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Set
 
 from .model_metadata import ModelInfo, ModelCategory
 from .model_catalog import get_catalog_service, ModelCatalogService
 from .model_cache import get_shared_model_cache
+from .provider_names import resolve_discovery_provider
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +80,9 @@ class ModelDiscoveryMixin:
             elif isinstance(result, list):
                 all_models.extend(result)
 
+        # Subscription execution providers borrow discovery from canonical API providers.
+        all_models.extend(self._build_alias_discovery_models(all_models))
+
         # Add configured provider models (from llm_config.toml) that weren't discovered
         # This ensures models like xai/grok show up even without API discovery
         discovered_ids = set(m.id for m in all_models)
@@ -136,6 +141,37 @@ class ModelDiscoveryMixin:
             providers=providers
         )
 
+    def _build_alias_discovery_models(self, discovered_models: list[ModelInfo]) -> list[ModelInfo]:
+        """Project canonical discovery onto execution-alias providers.
+
+        Example: ``claude_plan`` can expose Anthropic-discovered Claude models
+        without owning a separate model catalog in its adapter.
+        """
+        if not hasattr(self, "providers") or not isinstance(self.providers, list):
+            return []
+
+        alias_models: list[ModelInfo] = []
+        seen = {(model.provider, model.id) for model in discovered_models}
+
+        for provider in self.providers:
+            provider_name = provider.get("name")
+            discovery_provider = resolve_discovery_provider(provider_name)
+            if not provider_name or not discovery_provider or provider_name == discovery_provider:
+                continue
+
+            for model in discovered_models:
+                if model.provider != discovery_provider:
+                    continue
+
+                alias_key = (provider_name, model.id)
+                if alias_key in seen:
+                    continue
+
+                alias_models.append(replace(model, provider=provider_name))
+                seen.add(alias_key)
+
+        return alias_models
+
     def _resolve_auto_providers(self, models: list) -> None:
         """Resolve providers with model='auto' using config hints and discovered models.
 
@@ -149,7 +185,11 @@ class ModelDiscoveryMixin:
                 provider_name = provider.get("name")
                 provider_models = [
                     m for m in models
-                    if m.provider == provider_name and m.category == ModelCategory.CHAT and not m.is_hidden
+                    if (
+                        m.provider == resolve_discovery_provider(provider_name)
+                        and m.category == ModelCategory.CHAT
+                        and not m.is_hidden
+                    )
                 ]
                 selected_model = self._select_auto_model(provider_name, provider_models)
                 if selected_model:

@@ -26,8 +26,7 @@ import httpx
 from pydantic import BaseModel
 
 from .adapter import LLMAdapter, LLMResponse, ToolCall
-from .model_metadata import ModelInfo, ModelCategory
-
+from .model_metadata import ModelInfo
 logger = logging.getLogger(__name__)
 
 CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex/responses"
@@ -155,7 +154,7 @@ class CodexAdapter(LLMAdapter):
     """
 
     def __init__(self):
-        self.name = "codex"
+        self.name = "openai_plan"
 
     async def get_response(
         self,
@@ -422,59 +421,7 @@ class CodexAdapter(LLMAdapter):
         )
 
     async def list_models(self) -> List[ModelInfo]:
-        """Return available models for Codex subscription."""
-        return [
-            ModelInfo(
-                id="gpt-5.4",
-                display_name="GPT-5.4 (Codex)",
-                provider="codex",
-                category=ModelCategory.CHAT,
-                context_limit=1_050_000,
-                supports_tools=True,
-                supports_vision=True,
-                supports_streaming=True,
-                is_featured=True,
-            ),
-            ModelInfo(
-                id="gpt-5.4-mini",
-                display_name="GPT-5.4 Mini (Codex)",
-                provider="codex",
-                category=ModelCategory.CHAT,
-                supports_tools=True,
-                supports_vision=True,
-                supports_streaming=True,
-                is_featured=True,
-            ),
-            ModelInfo(
-                id="gpt-5.3-codex",
-                display_name="GPT-5.3 Codex",
-                provider="codex",
-                category=ModelCategory.CHAT,
-                supports_tools=True,
-                supports_streaming=True,
-            ),
-            ModelInfo(
-                id="gpt-5.2-codex",
-                display_name="GPT-5.2 Codex",
-                provider="codex",
-                category=ModelCategory.CHAT,
-                supports_tools=True,
-                supports_streaming=True,
-            ),
-            ModelInfo(
-                id="gpt-5.1-codex-max",
-                display_name="GPT-5.1 Codex Max",
-                provider="codex",
-                category=ModelCategory.CHAT,
-                supports_tools=True,
-                supports_streaming=True,
-            ),
-            ModelInfo(
-                id="gpt-5.1-codex-mini",
-                display_name="GPT-5.1 Codex Mini",
-                provider="codex",
-                category=ModelCategory.CHAT,
-                supports_tools=True,
-                supports_streaming=True,
-            ),
-        ]
+        """OpenAI plan uses canonical OpenAI discovery; this wrapper has no catalog."""
+        raise NotImplementedError(
+            "OpenAI plan model discovery is provided by the canonical openai provider."
+        )

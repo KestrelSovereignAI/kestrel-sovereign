@@ -44,6 +44,7 @@ from .usage_tracking import UsageTrackingMixin
 from .streaming import StreamingMixin
 from .constitutional_awareness import ConstitutionalAwarenessMixin
 from .remote_backend import RemoteBackendMixin, BackendType, RemoteGPUConfig
+from .provider_names import normalize_provider_name, provider_name_candidates
 from kestrel_sovereign.kestrel_config.constants import (
     HTTP_TIMEOUT_MEDIUM,
     CLIENT_CLOSE_TIMEOUT,
@@ -343,8 +344,12 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         if model_override:
             if "/" in model_override:
                 provider_name, model_name = model_override.split("/", 1)
+                provider_name = normalize_provider_name(provider_name)
                 target_model = model_name
-                matching = [p for p in providers_to_use if p["name"] == provider_name]
+                matching = [
+                    p for p in providers_to_use
+                    if p["name"] in provider_name_candidates(provider_name)
+                ]
                 if matching:
                     providers_to_use = matching
                 else:
@@ -362,7 +367,11 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
             target_model = pref_model
 
             if pref_provider:
-                matching = [p for p in providers_to_use if p["name"] == pref_provider]
+                pref_provider = normalize_provider_name(pref_provider)
+                matching = [
+                    p for p in providers_to_use
+                    if p["name"] in provider_name_candidates(pref_provider)
+                ]
                 if matching:
                     providers_to_use = matching
                     logger.info(
@@ -382,8 +391,12 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
                     for fb in self._mandate_fallbacks:
                         fb_provider = fb.get("provider")
                         if fb_provider:
+                            fb_provider = normalize_provider_name(fb_provider)
                             match = next(
-                                (p for p in self.providers if p["name"] == fb_provider),
+                                (
+                                    p for p in self.providers
+                                    if p["name"] in provider_name_candidates(fb_provider)
+                                ),
                                 None,
                             )
                             if match:
