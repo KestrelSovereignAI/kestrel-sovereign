@@ -280,7 +280,10 @@ class ModelSelector {
         if (!content?.includes('MODEL_CHANGED:')) return false;
 
         try {
-            const jsonStr = content.split('MODEL_CHANGED:')[1];
+            const jsonStr = this._extractModelChangedPayload(content);
+            if (!jsonStr) {
+                return false;
+            }
             const syncData = JSON.parse(jsonStr);
 
             if (syncData.provider && syncData.model) {
@@ -311,6 +314,59 @@ class ModelSelector {
         }
 
         return false;
+    }
+
+    /**
+     * Extract the JSON object that follows a MODEL_CHANGED marker.
+     * Allows normal response text before and after the marker payload.
+     * @param {string} content
+     * @returns {string|null}
+     */
+    _extractModelChangedPayload(content) {
+        const marker = 'MODEL_CHANGED:';
+        const markerIndex = content.indexOf(marker);
+        if (markerIndex === -1) return null;
+
+        const jsonStart = content.indexOf('{', markerIndex + marker.length);
+        if (jsonStart === -1) return null;
+
+        let depth = 0;
+        let inString = false;
+        let escapeNext = false;
+
+        for (let i = jsonStart; i < content.length; i++) {
+            const char = content[i];
+
+            if (escapeNext) {
+                escapeNext = false;
+                continue;
+            }
+
+            if (char === '\\' && inString) {
+                escapeNext = true;
+                continue;
+            }
+
+            if (char === '"') {
+                inString = !inString;
+                continue;
+            }
+
+            if (inString) {
+                continue;
+            }
+
+            if (char === '{') {
+                depth += 1;
+            } else if (char === '}') {
+                depth -= 1;
+                if (depth === 0) {
+                    return content.slice(jsonStart, i + 1);
+                }
+            }
+        }
+
+        return null;
     }
 
     /**
