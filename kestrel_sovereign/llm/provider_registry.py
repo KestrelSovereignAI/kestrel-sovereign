@@ -188,8 +188,6 @@ class ProviderRegistry:
             logger.warning(f"Config for provider '{provider_name}' not found. Skipping.")
             return None
 
-        execution_name = provider_name if provider_name != canonical_name else canonical_name
-
         if canonical_name == "openai":
             return self._initialize_openai(provider_config)
         elif canonical_name == "ollama":
@@ -197,9 +195,9 @@ class ProviderRegistry:
         elif canonical_name == "anthropic":
             return self._initialize_anthropic(provider_config)
         elif canonical_name == "claude_plan":
-            return self._initialize_claude_plan(provider_config, execution_name=execution_name)
+            return self._initialize_claude_plan(provider_config)
         elif canonical_name == "openai_plan":
-            return self._initialize_openai_plan(provider_config, execution_name=execution_name)
+            return self._initialize_openai_plan(provider_config)
         elif canonical_name in ["google", "gemini"]:
             return self._initialize_google(provider_config)
         elif canonical_name == "vertex_ai":
@@ -308,8 +306,6 @@ class ProviderRegistry:
     def _initialize_claude_plan(
         self,
         provider_config: Dict[str, Any],
-        *,
-        execution_name: str = "claude_plan",
     ) -> ProviderInfo:
         """Initialize Claude plan provider using OAuth token auth.
 
@@ -330,7 +326,7 @@ class ProviderRegistry:
 
         model = provider_config.get("model")
         if not model:
-            logger.warning("No model configured for %s — set model= in llm_config.toml", execution_name)
+            logger.warning("No model configured for claude_plan — set model= in llm_config.toml")
             model = "auto"
         provider_config["model"] = model
 
@@ -338,7 +334,7 @@ class ProviderRegistry:
         adapter = ClaudeMaxAdapter()
 
         return ProviderInfo(
-            name=execution_name,
+            name="claude_plan",
             client=client,
             adapter=adapter,
             model=model
@@ -347,8 +343,6 @@ class ProviderRegistry:
     def _initialize_openai_plan(
         self,
         provider_config: Dict[str, Any],
-        *,
-        execution_name: str = "openai_plan",
     ) -> ProviderInfo:
         """Initialize OpenAI plan provider using ChatGPT backend OAuth.
 
@@ -382,7 +376,7 @@ class ProviderRegistry:
 
         model = provider_config.get("model")
         if not model:
-            logger.warning("No model configured for %s — set model= in llm_config.toml", execution_name)
+            logger.warning("No model configured for openai_plan — set model= in llm_config.toml")
             model = "auto"
         provider_config["model"] = model
 
@@ -391,19 +385,11 @@ class ProviderRegistry:
         adapter = CodexAdapter()
 
         return ProviderInfo(
-            name=execution_name,
+            name="openai_plan",
             client=token,  # OAuth token string — adapter uses httpx directly
             adapter=adapter,
             model=model,
         )
-
-    def _initialize_claude_max(self, provider_config: Dict[str, Any]) -> ProviderInfo:
-        """Backward-compatible wrapper for the old Claude subscription provider name."""
-        return self._initialize_claude_plan(provider_config, execution_name="claude_max")
-
-    def _initialize_codex(self, provider_config: Dict[str, Any]) -> ProviderInfo:
-        """Backward-compatible wrapper for the old OpenAI subscription provider name."""
-        return self._initialize_openai_plan(provider_config, execution_name="codex")
 
     @staticmethod
     def _read_codex_auth_file() -> tuple:

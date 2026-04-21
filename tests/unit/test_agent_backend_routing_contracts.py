@@ -1,39 +1,12 @@
-"""Contract tests for agent-specific backend routing (issue #425).
+"""Contract tests for agent-specific backend routing (issue #425)."""
 
-These tests verify:
-- Per-agent provider preference survives set/get round-trip
-- resolve_provider_routing() honours provider + model preferences
-- Unavailable providers fail honestly (LLMProviderUnavailableError)
-- Fallback models are used when configured
-- claude_max and codex are explicitly routable
-- Preference persistence round-trip (set → get → routing)
-"""
-
-import json
+import asyncio
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
-import pytest_asyncio
 
 from kestrel_sovereign.llm.error_handling import LLMProviderUnavailableError
 from kestrel_sovereign.llm.service import LLMService
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _make_provider(name: str, model: str = "auto") -> dict:
-    """Create a minimal provider dict for testing."""
-    adapter = Mock()
-    adapter.create_messages = Mock(return_value=[])
-    adapter.get_response = AsyncMock()
-    return {
-        "name": name,
-        "client": AsyncMock(),
-        "adapter": adapter,
-        "model": model,
-    }
 
 
 def _make_provider_info(name: str, model: str = "auto"):
@@ -48,29 +21,30 @@ def _make_provider_info(name: str, model: str = "auto"):
 
 @pytest.fixture
 def service_with_providers():
-    """Create an LLMService with mocked providers."""
+    """Create an LLMService with canonical execution providers."""
     mock_config = {
-        "provider_priority": ["openai", "anthropic", "claude_max"],
+        "provider_priority": ["openai", "anthropic", "claude_plan"],
         "openai": {"model": "gpt-5-mini"},
         "anthropic": {"model": "claude-sonnet-4-6"},
-        "claude_max": {"model": "claude-sonnet-4-6"},
+        "claude_plan": {"model": "claude-sonnet-4-6"},
     }
     mock_mandate_config = {"defaults": {}, "mandates": {}}
 
     openai_info = _make_provider_info("openai", "gpt-5-mini")
     anthropic_info = _make_provider_info("anthropic", "claude-sonnet-4-6")
-    claude_max_info = _make_provider_info("claude_max", "claude-sonnet-4-6")
+    claude_plan_info = _make_provider_info("claude_plan", "claude-sonnet-4-6")
 
     mock_registry = Mock()
     mock_registry.initialize_providers = Mock(
-        return_value=[openai_info, anthropic_info, claude_max_info]
+        return_value=[openai_info, anthropic_info, claude_plan_info]
     )
     mock_registry.get_providers_with_pattern = Mock(return_value=[])
     mock_registry.get_local_providers = Mock(return_value=[])
     mock_registry.update_provider_client = Mock(return_value=True)
 
-    with patch("kestrel_sovereign.llm.service.load_config") as mock_load, \
-         patch("kestrel_sovereign.llm.service.ProviderRegistry") as mock_reg_cls:
+    with patch("kestrel_sovereign.llm.service.load_config") as mock_load, patch(
+        "kestrel_sovereign.llm.service.ProviderRegistry"
+    ) as mock_reg_cls:
         mock_load.side_effect = lambda path: (
             mock_config if "llm_config" in path else mock_mandate_config
         )
@@ -85,7 +59,7 @@ def service_with_providers():
 
 @pytest.fixture
 def service_with_openai_plan():
-    """Create an LLMService using the new plan-provider naming."""
+    """Create an LLMService with API and subscription-backed OpenAI providers."""
     mock_config = {
         "provider_priority": ["openai", "openai_plan"],
         "openai": {"model": "gpt-5.4"},
@@ -104,8 +78,9 @@ def service_with_openai_plan():
     mock_registry.get_local_providers = Mock(return_value=[])
     mock_registry.update_provider_client = Mock(return_value=True)
 
-    with patch("kestrel_sovereign.llm.service.load_config") as mock_load, \
-         patch("kestrel_sovereign.llm.service.ProviderRegistry") as mock_reg_cls:
+    with patch("kestrel_sovereign.llm.service.load_config") as mock_load, patch(
+        "kestrel_sovereign.llm.service.ProviderRegistry"
+    ) as mock_reg_cls:
         mock_load.side_effect = lambda path: (
             mock_config if "llm_config" in path else mock_mandate_config
         )
@@ -118,32 +93,27 @@ def service_with_openai_plan():
         return svc
 
 
-# ===========================================================================
-# 1. Provider preference round-trip
-# ===========================================================================
-
-
 class TestPreferenceRoundTrip:
-    """Verify that set → get → routing is consistent."""
+    """Verify that set -> get -> routing stays coherent."""
 
     def test_set_provider_and_model(self, service_with_providers):
         svc = service_with_providers
-        svc.set_model_preference("claude-sonnet-4-6", provider="claude_max")
+        svc.set_model_preference("claude-sonnet-4-6", provider="claude_plan")
 
         pref = svc.get_model_preference()
         assert pref["model"] == "claude-sonnet-4-6"
-        assert pref["provider"] == "claude_max"
+        assert pref["provider"] == "claude_plan"
 
     def test_preference_survives_get_active_model_id(self, service_with_providers):
         svc = service_with_providers
-        svc.set_model_preference("claude-sonnet-4-6", provider="claude_max")
+        svc.set_model_preference("claude-sonnet-4-6", provider="claude_plan")
 
         active = svc.get_active_model_id()
         assert active == "claude-sonnet-4-6"
 
     def test_clear_preference_returns_to_default(self, service_with_providers):
         svc = service_with_providers
-        svc.set_model_preference("claude-sonnet-4-6", provider="claude_max")
+        svc.set_model_preference("claude-sonnet-4-6", provider="claude_plan")
         svc.clear_model_preference()
 
         pref = svc.get_model_preference()
@@ -151,7 +121,6 @@ class TestPreferenceRoundTrip:
         assert pref["provider"] is None
 
     def test_auto_model_is_ignored(self, service_with_providers):
-        """Setting model='auto' should not create a real preference."""
         svc = service_with_providers
         svc.set_model_preference("auto", provider="openai")
 
@@ -160,31 +129,11 @@ class TestPreferenceRoundTrip:
         assert pref["provider"] is None
 
 
-class TestLegacyAliasCompatibility:
-    """Old provider aliases still route to the new canonical execution providers."""
-
-    def test_legacy_codex_alias_routes_to_openai_plan(self, service_with_openai_plan):
-        svc = service_with_openai_plan
-        svc.set_model_preference("gpt-5.4", provider="codex")
-
-        providers, target = svc.resolve_provider_routing()
-
-        assert providers[0]["name"] == "openai_plan"
-        assert target == "gpt-5.4"
-
-
-# ===========================================================================
-# 2. resolve_provider_routing — explicit provider selection
-# ===========================================================================
-
-
 class TestResolveProviderRouting:
     """Contract: resolve_provider_routing is the single routing authority."""
 
     def test_no_preference_returns_all_providers(self, service_with_providers):
-        svc = service_with_providers
-        providers, target = svc.resolve_provider_routing()
-
+        providers, target = service_with_providers.resolve_provider_routing()
         assert len(providers) == 3
         assert target is None
 
@@ -198,19 +147,18 @@ class TestResolveProviderRouting:
         assert target == "gpt-5-mini"
 
     def test_provider_preference_restricts_to_single_provider(self, service_with_providers):
-        """When provider is set, ONLY that provider should be returned."""
         svc = service_with_providers
-        svc.set_model_preference("claude-sonnet-4-6", provider="claude_max")
+        svc.set_model_preference("claude-sonnet-4-6", provider="claude_plan")
 
         providers, target = svc.resolve_provider_routing()
 
         assert len(providers) == 1
-        assert providers[0]["name"] == "claude_max"
+        assert providers[0]["name"] == "claude_plan"
         assert target == "claude-sonnet-4-6"
 
     def test_model_override_takes_precedence(self, service_with_providers):
         svc = service_with_providers
-        svc.set_model_preference("claude-sonnet-4-6", provider="claude_max")
+        svc.set_model_preference("claude-sonnet-4-6", provider="claude_plan")
 
         providers, target = svc.resolve_provider_routing(
             model_override="openai/gpt-5-mini"
@@ -221,9 +169,7 @@ class TestResolveProviderRouting:
         assert target == "gpt-5-mini"
 
     def test_bare_model_override_keeps_all_providers(self, service_with_providers):
-        svc = service_with_providers
-
-        providers, target = svc.resolve_provider_routing(
+        providers, target = service_with_providers.resolve_provider_routing(
             model_override="gpt-5-mini"
         )
 
@@ -231,139 +177,83 @@ class TestResolveProviderRouting:
         assert target == "gpt-5-mini"
 
 
-# ===========================================================================
-# 3. Unavailable provider — honest failure
-# ===========================================================================
-
-
 class TestUnavailableProviderFails:
-    """Contract: requesting a provider that isn't initialized raises clearly."""
+    """Contract: requesting a provider that is not initialized raises clearly."""
 
     def test_mandate_preference_for_missing_provider_raises(self, service_with_providers):
         svc = service_with_providers
-        svc.set_model_preference("codex", provider="codex")
+        svc.set_model_preference("gpt-5.4", provider="openai_plan")
 
         with pytest.raises(LLMProviderUnavailableError) as exc_info:
             svc.resolve_provider_routing()
 
-        assert "codex" in str(exc_info.value)
-        assert "openai" in str(exc_info.value)  # shows available providers
+        assert "openai_plan" in str(exc_info.value)
+        assert "openai" in str(exc_info.value)
 
     def test_model_override_for_missing_provider_raises(self, service_with_providers):
-        svc = service_with_providers
-
         with pytest.raises(LLMProviderUnavailableError) as exc_info:
-            svc.resolve_provider_routing(model_override="codex/codex")
+            service_with_providers.resolve_provider_routing(
+                model_override="openai_plan/gpt-5.4"
+            )
 
-        assert "codex" in str(exc_info.value)
+        assert "openai_plan" in str(exc_info.value)
 
     def test_unavailable_with_fallbacks_degrades_gracefully(self, service_with_providers):
-        """When fallbacks are configured, use them instead of raising."""
         svc = service_with_providers
-        svc.set_model_preference("codex", provider="codex")
+        svc.set_model_preference("gpt-5.4", provider="openai_plan")
         svc.add_fallback_model("gpt-5-mini", provider="openai")
 
         providers, target = svc.resolve_provider_routing()
 
-        # Should fall back to openai, not raise
         assert len(providers) == 1
         assert providers[0]["name"] == "openai"
+        assert target == "gpt-5-mini"
 
 
-# ===========================================================================
-# 4. claude_max routing
-# ===========================================================================
+class TestClaudePlanRouting:
+    """Contract: claude_plan is distinct from anthropic."""
 
-
-class TestClaudeMaxRouting:
-    """Contract: claude_max is a first-class provider distinct from anthropic."""
-
-    def test_claude_max_is_distinct_from_anthropic(self, service_with_providers):
+    def test_claude_plan_is_distinct_from_anthropic(self, service_with_providers):
         svc = service_with_providers
-        svc.set_model_preference("claude-sonnet-4-6", provider="claude_max")
+        svc.set_model_preference("claude-sonnet-4-6", provider="claude_plan")
 
-        providers, target = svc.resolve_provider_routing()
+        providers, _ = svc.resolve_provider_routing()
 
         assert len(providers) == 1
-        assert providers[0]["name"] == "claude_max"
-        # NOT anthropic — even though the model name is the same
+        assert providers[0]["name"] == "claude_plan"
         assert providers[0]["name"] != "anthropic"
 
-    def test_anthropic_preference_does_not_use_claude_max(self, service_with_providers):
+    def test_anthropic_preference_does_not_use_claude_plan(self, service_with_providers):
         svc = service_with_providers
         svc.set_model_preference("claude-sonnet-4-6", provider="anthropic")
 
-        providers, target = svc.resolve_provider_routing()
+        providers, _ = svc.resolve_provider_routing()
 
         assert len(providers) == 1
         assert providers[0]["name"] == "anthropic"
 
 
-# ===========================================================================
-# 5. codex routing (stub — provider registered but not yet functional)
-# ===========================================================================
+class TestOpenAIPlanRouting:
+    """Contract: openai_plan is routable when registered."""
 
-
-class TestCodexRouting:
-    """Contract: codex provider is routable when registered."""
-
-    @pytest.fixture
-    def service_with_codex(self):
-        """Service that includes codex in the provider list."""
-        mock_config = {
-            "provider_priority": ["openai", "codex"],
-            "openai": {"model": "gpt-5-mini"},
-            "codex": {"model": "codex"},
-        }
-        mock_mandate_config = {"defaults": {}, "mandates": {}}
-
-        openai_info = _make_provider_info("openai", "gpt-5-mini")
-        codex_info = _make_provider_info("codex", "codex")
-
-        mock_registry = Mock()
-        mock_registry.initialize_providers = Mock(
-            return_value=[openai_info, codex_info]
-        )
-        mock_registry.get_providers_with_pattern = Mock(return_value=[])
-        mock_registry.get_local_providers = Mock(return_value=[])
-
-        with patch("kestrel_sovereign.llm.service.load_config") as mock_load, \
-             patch("kestrel_sovereign.llm.service.ProviderRegistry") as mock_reg_cls:
-            mock_load.side_effect = lambda path: (
-                mock_config if "llm_config" in path else mock_mandate_config
-            )
-            mock_reg_cls.return_value = mock_registry
-            svc = LLMService(config_path="llm_config.toml")
-            svc._usage_db = None
-            svc._db_initialized = False
-            svc._usage_database_url = None
-            svc._db_backend = "sqlite"
-            return svc
-
-    def test_codex_preference_routes_to_codex(self, service_with_codex):
-        svc = service_with_codex
-        svc.set_model_preference("codex", provider="codex")
+    def test_openai_plan_preference_routes_to_openai_plan(self, service_with_openai_plan):
+        svc = service_with_openai_plan
+        svc.set_model_preference("gpt-5.4", provider="openai_plan")
 
         providers, target = svc.resolve_provider_routing()
 
         assert len(providers) == 1
-        assert providers[0]["name"] == "codex"
-        assert target == "codex"
+        assert providers[0]["name"] == "openai_plan"
+        assert target == "gpt-5.4"
 
-    def test_codex_override_routes_to_codex(self, service_with_codex):
-        svc = service_with_codex
-
-        providers, target = svc.resolve_provider_routing(
-            model_override="codex/codex"
+    def test_openai_plan_override_routes_to_openai_plan(self, service_with_openai_plan):
+        providers, target = service_with_openai_plan.resolve_provider_routing(
+            model_override="openai_plan/gpt-5.4"
         )
 
         assert len(providers) == 1
-        assert providers[0]["name"] == "codex"
-
-
-# ===========================================================================
-# 6. Preference persistence contract
-# ===========================================================================
+        assert providers[0]["name"] == "openai_plan"
+        assert target == "gpt-5.4"
 
 
 class TestPreferencePersistence:
@@ -374,24 +264,18 @@ class TestPreferencePersistence:
         callback = AsyncMock()
         svc.set_preference_persistence_callback(callback)
 
-        # We need a running event loop for the fire-and-forget task
-        import asyncio
-
         async def _run():
-            svc.set_model_preference("claude-sonnet-4-6", provider="claude_max")
-            # Give the fire-and-forget task a chance to run
+            svc.set_model_preference("claude-sonnet-4-6", provider="claude_plan")
             await asyncio.sleep(0.01)
 
         asyncio.run(_run())
 
-        callback.assert_awaited_once_with("claude-sonnet-4-6", "claude_max")
+        callback.assert_awaited_once_with("claude-sonnet-4-6", "claude_plan")
 
     def test_persistence_callback_called_on_clear(self, service_with_providers):
         svc = service_with_providers
         callback = AsyncMock()
         svc.set_preference_persistence_callback(callback)
-
-        import asyncio
 
         async def _run():
             svc.set_model_preference("gpt-5", provider="openai")
@@ -400,61 +284,48 @@ class TestPreferencePersistence:
             await asyncio.sleep(0.01)
 
         asyncio.run(_run())
-
-        # Last call should be (None, None)
         assert callback.await_args_list[-1].args == (None, None)
 
 
-# ===========================================================================
-# 7. Codex adapter contract
-# ===========================================================================
+class TestOpenAIPlanAdapter:
+    """Contract: plan adapter raises clearly and delegates discovery."""
 
-
-class TestCodexAdapter:
-    """Contract: plan adapter raises clearly and delegates model discovery."""
-
-    def test_codex_adapter_raises_without_client(self):
+    def test_openai_plan_adapter_raises_without_client(self):
         from kestrel_sovereign.llm.codex_adapter import CodexAdapter
 
         adapter = CodexAdapter()
-        import asyncio
 
         with pytest.raises(RuntimeError, match="requires an OAuth token"):
             asyncio.run(adapter.get_response(
-                client=None, model="codex", messages=[]
+                client=None, model="gpt-5.4", messages=[]
             ))
 
-    def test_codex_adapter_does_not_list_models(self):
+    def test_openai_plan_adapter_does_not_list_models(self):
         from kestrel_sovereign.llm.codex_adapter import CodexAdapter
 
         adapter = CodexAdapter()
-        import asyncio
         with pytest.raises(NotImplementedError, match="canonical openai provider"):
             asyncio.run(adapter.list_models())
 
 
-# ===========================================================================
-# 8. Provider registry — codex initialization
-# ===========================================================================
+class TestOpenAIPlanProviderRegistry:
+    """Contract: openai_plan can be initialized via provider_registry."""
 
-
-class TestCodexProviderRegistry:
-    """Contract: codex can be initialized via provider_registry."""
-
-    def test_registry_initializes_codex(self, monkeypatch):
+    def test_registry_initializes_openai_plan(self, monkeypatch):
         from kestrel_sovereign.llm.provider_registry import ProviderRegistry
 
         monkeypatch.setenv("CODEX_AUTH_TOKEN", "test-token")
         config = {
-            "provider_priority": ["codex"],
-            "codex": {"model": "codex"},
+            "provider_priority": ["openai_plan"],
+            "openai_plan": {"model": "gpt-5.4"},
         }
         registry = ProviderRegistry(config)
-        provider = registry._initialize_single_provider("codex")
+        provider = registry._initialize_single_provider("openai_plan")
 
         assert provider is not None
-        assert provider.name == "codex"
-        assert provider.model == "codex"
-        # Codex uses OpenAI Responses API via AsyncOpenAI client
+        assert provider.name == "openai_plan"
+        assert provider.model == "gpt-5.4"
+
         from kestrel_sovereign.llm.codex_adapter import CodexAdapter
+
         assert isinstance(provider.adapter, CodexAdapter)

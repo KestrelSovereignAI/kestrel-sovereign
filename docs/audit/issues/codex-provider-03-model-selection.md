@@ -1,27 +1,27 @@
-# Integrate `codex_provider` with sovereign model selection and mandate flows
+# Integrate `openai_plan` with sovereign model selection and mandate flows
 
-Parent: Codex provider runtime adapter
+Parent: OpenAI plan provider runtime adapter
 
 ## Problem
 
-Even if a Codex adapter exists, it will remain second-class unless model preference, routing, and mandate-aware selection can reason about it consistently.
+Even if an OpenAI plan adapter exists, it will remain second-class unless model preference, routing, and mandate-aware selection can reason about it consistently.
 
 ## Goal
 
-Make `codex_provider` a coherent participant in sovereign’s model selection path.
+Make `openai_plan` a coherent participant in sovereign’s model selection path.
 
 ## Scope
 
-- integrate Codex provider naming into model preference flow
-- support explicit selections like `codex/gpt-5.4` if appropriate
+- integrate OpenAI plan provider naming into model preference flow
+- support explicit selections like `openai_plan/gpt-5.4` if appropriate
 - ensure current-model reporting and routing behave sensibly
 - update any provider/mandate metadata that assumes only current provider families
 
 ## Acceptance criteria
 
-- sovereign can persist and load a Codex-backed model preference
+- sovereign can persist and load an OpenAI-plan-backed model preference
 - current-model introspection behaves coherently
-- routing logic does not treat Codex as an alien special case
+- routing logic does not treat the subscription-backed provider as an alien special case
 
 ## References
 

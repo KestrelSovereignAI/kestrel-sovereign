@@ -5,14 +5,14 @@
 For Nellie specifically, we now have three distinct realities:
 
 - `openai` via API key
-- `claude_max` via OAuth token / Max subscription
-- planned `codex` via local CLI/session
+- `claude_plan` via OAuth token / Claude plan
+- `openai_plan` via local/session-backed OpenAI plan auth
 
 Without a clear routing contract, agent identity can say one thing while the runtime silently uses another.
 
 ## Goal
 
-Make agent-specific provider and model routing explicit for backends like `claude_max` and `codex`.
+Make agent-specific provider and model routing explicit for backends like `claude_plan` and `openai_plan`.
 
 ## Scope
 
@@ -29,7 +29,7 @@ Make agent-specific provider and model routing explicit for backends like `claud
 
 - per-agent backend selection is explicit and test-covered
 - unavailable providers fail honestly or fall back according to a documented rule
-- Nellie can be pinned to `claude_max` or `codex` without ambiguity
+- Nellie can be pinned to `claude_plan` or `openai_plan` without ambiguity
 
 ## References
 
