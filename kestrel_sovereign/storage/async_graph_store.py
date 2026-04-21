@@ -4,10 +4,58 @@ Async Graph Store for Kestrel Storage.
 Provides async knowledge graph storage with nodes and edges.
 """
 import json
-from typing import Dict, Optional, List, Any
+import logging
+from typing import Dict, Optional, List, Any, Tuple
 from dataclasses import dataclass
 
 from .async_database import AsyncDatabase
+
+logger = logging.getLogger(__name__)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Backend-specific JSON property indexes on graph_nodes.
+#
+# These accelerate property-level queries (agent_id, status, created_at)
+# without requiring a separate table.  Each backend needs its own syntax
+# for extracting values from the JSON ``properties`` column.
+#
+# **PostgreSQL parity**: all three property indexes (agent_id, status,
+# created_at) are present for *both* backends.  The Postgres indexes use
+# expression indexes on ``(properties::jsonb ->> 'key')``.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_SQLITE_JSON_INDEXES: List[str] = [
+    # agent isolation — every query_nodes_by_type_and_property call filters
+    # on agent_id first.
+    """CREATE INDEX IF NOT EXISTS idx_graph_nodes_agent
+       ON graph_nodes(node_type, json_extract(properties, '$.agent_id'))""",
+    # action_item status filter (partial — only action_item rows)
+    """CREATE INDEX IF NOT EXISTS idx_graph_nodes_action_status
+       ON graph_nodes(json_extract(properties, '$.status'))
+       WHERE node_type = 'action_item'""",
+    # created_at range / ORDER BY (partial — only action_item rows)
+    """CREATE INDEX IF NOT EXISTS idx_graph_nodes_action_created
+       ON graph_nodes(json_extract(properties, '$.created_at'))
+       WHERE node_type = 'action_item'""",
+]
+
+_POSTGRES_JSON_INDEXES: List[str] = [
+    # agent isolation
+    """CREATE INDEX IF NOT EXISTS idx_graph_nodes_agent
+       ON graph_nodes(node_type, ((properties::jsonb)->>'agent_id'))""",
+    # action_item status filter (partial)
+    """CREATE INDEX IF NOT EXISTS idx_graph_nodes_action_status
+       ON graph_nodes(((properties::jsonb)->>'status'))
+       WHERE node_type = 'action_item'""",
+    # created_at range / ORDER BY (partial)
+    """CREATE INDEX IF NOT EXISTS idx_graph_nodes_action_created
+       ON graph_nodes(((properties::jsonb)->>'created_at'))
+       WHERE node_type = 'action_item'""",
+    # GIN index for ad-hoc JSONB containment queries
+    """CREATE INDEX IF NOT EXISTS idx_graph_nodes_properties_gin
+       ON graph_nodes USING gin ((properties::jsonb))""",
+]
 
 
 @dataclass
@@ -33,6 +81,96 @@ class AsyncGraphStore:
 
     def __init__(self, db: AsyncDatabase):
         self.db = db
+
+    # ─────────────────────────────────────────────────────────────────
+    # Backend-agnostic helpers
+    # ─────────────────────────────────────────────────────────────────
+
+    def _json_extract(self, column: str, path: str) -> str:
+        """Return backend-appropriate SQL for extracting a JSON property.
+
+        SQLite:     ``json_extract(column, '$.path')``
+        PostgreSQL: ``(column::jsonb)->>'path'``
+        """
+        if self.db.backend_type == "postgres":
+            return f"({column}::jsonb)->>'{path}'"
+        return f"json_extract({column}, '$.{path}')"
+
+    async def ensure_property_indexes(self) -> None:
+        """Create backend-specific JSON property indexes on graph_nodes.
+
+        Safe to call multiple times — every statement uses
+        ``CREATE INDEX IF NOT EXISTS``.
+        """
+        stmts = (
+            _POSTGRES_JSON_INDEXES
+            if self.db.backend_type == "postgres"
+            else _SQLITE_JSON_INDEXES
+        )
+        for stmt in stmts:
+            try:
+                await self.db.execute(stmt)
+            except Exception:
+                logger.debug("Index creation skipped (may already exist): %s", stmt[:80])
+
+    # ─────────────────────────────────────────────────────────────────
+    # Property-level queries
+    # ─────────────────────────────────────────────────────────────────
+
+    async def query_nodes_by_type_and_property(
+        self,
+        node_type: str,
+        *,
+        filters: Optional[Dict[str, str]] = None,
+        created_since: Optional[str] = None,
+        order_by_created: str = "DESC",
+        limit: int = 100,
+    ) -> List[GraphNode]:
+        """Query graph nodes by type with optional JSON property filters.
+
+        Args:
+            node_type: Required node_type filter (uses the B-tree index).
+            filters: Equality filters on JSON properties, e.g.
+                ``{"agent_id": "a1", "status": "pending"}``.
+            created_since: ISO-8601 lower bound for ``created_at``
+                (lexicographic comparison — see *sortable-timestamp
+                invariant* in ``schema_router.py``).
+            order_by_created: ``"DESC"`` (default) or ``"ASC"``.
+            limit: Max rows to return.
+
+        Returns:
+            List of matching GraphNode objects.
+        """
+        clauses: List[str] = ["node_type = ?"]
+        params: List[Any] = [node_type]
+
+        for key, value in (filters or {}).items():
+            clauses.append(f"{self._json_extract('properties', key)} = ?")
+            params.append(value)
+
+        if created_since:
+            clauses.append(f"{self._json_extract('properties', 'created_at')} >= ?")
+            params.append(created_since)
+
+        direction = "ASC" if order_by_created.upper() == "ASC" else "DESC"
+        sql = (
+            "SELECT node_id, node_type, label, properties FROM graph_nodes"
+            f" WHERE {' AND '.join(clauses)}"
+            f" ORDER BY {self._json_extract('properties', 'created_at')} {direction}"
+            f" LIMIT ?"
+        )
+        params.append(limit)
+
+        rows = await self.db.fetchall(sql, tuple(params))
+        return [
+            GraphNode(
+                node_id=row[0],
+                node_type=row[1],
+                label=row[2],
+                properties=json.loads(row[3]) if row[3] else {},
+            )
+            for row in rows
+        ]
 
     def _upsert_node_sql(self) -> str:
         """Get upsert SQL for nodes based on database backend."""

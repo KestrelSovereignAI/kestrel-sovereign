@@ -18,6 +18,26 @@ for human confirmation rather than auto-merging.
 
 Per #628, runs only when privacy mode allows — EPHEMERAL and ISOLATED
 skip routing entirely because the underlying storage shouldn't exist.
+
+Sortable-Timestamp Invariant
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The ``created_at`` property on action_item and decision nodes **must** be
+a lexicographically sortable UTC ISO-8601 string produced by
+``datetime.now(timezone.utc).isoformat()``, e.g.
+``2026-04-21T09:00:00+00:00``.
+
+Range queries (``created_since``) and ``ORDER BY created_at`` in
+``AsyncGraphStore.query_nodes_by_type_and_property`` rely on plain
+string comparison against the JSON-extracted value.  If a future writer
+stores ``created_at`` in a non-sortable format (e.g. ``Apr 21 2026`` or
+a local timezone without offset), those queries will silently return
+wrong results.
+
+**Rules:**
+1. Always use ``datetime.now(timezone.utc).isoformat()`` — never
+   ``str(datetime.now())`` or custom strftime patterns.
+2. The value must round-trip through ``datetime.fromisoformat()``.
+3. The value must contain a timezone offset (``+00:00``).
 """
 
 from __future__ import annotations
