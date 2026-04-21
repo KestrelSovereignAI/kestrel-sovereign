@@ -154,7 +154,10 @@ def _start_inprocess_mode(project_dir: Path, rookery, pm: ProcessManager) -> int
         pm.clear_pid(host_pid_file)
 
     if pm.is_port_in_use(rookery.host.port):
-        print(f"   Port {rookery.host.port} already in use")
+        orphans = pm.find_pids_on_port(rookery.host.port)
+        print(f"   Port {rookery.host.port} already in use"
+              + (f" by PID(s) {orphans}" if orphans else ""))
+        print(f"   Run: kestrel stop   (add --force if it doesn't die)")
         return 1
 
     env = pm._load_env()
@@ -212,7 +215,10 @@ def _start_subprocess_mode(project_dir: Path, rookery, pm: ProcessManager) -> in
             pm.clear_pid(host_pid_file)
 
         if pm.is_port_in_use(rookery.host.port):
-            print(f"   Host port {rookery.host.port} already in use")
+            orphans = pm.find_pids_on_port(rookery.host.port)
+            print(f"   Host port {rookery.host.port} already in use"
+                  + (f" by PID(s) {orphans}" if orphans else ""))
+            print(f"   Run: kestrel stop   (add --force if it doesn't die)")
             return 1
 
         env = pm._load_env()
@@ -252,11 +258,31 @@ def _start_subprocess_mode(project_dir: Path, rookery, pm: ProcessManager) -> in
     return 0
 
 
+def _reap_orphans_on_port(port: int, label: str, force: bool) -> bool:
+    """Kill untracked listeners on `port`. Returns True if any were killed."""
+    orphans = ProcessManager.find_pids_on_port(port)
+    if not orphans:
+        return False
+    print(f"   {label}: orphan listener(s) on :{port} {orphans} — killing")
+    for opid in orphans:
+        ProcessManager.kill_process(opid, force=force)
+    for _ in range(10):
+        if not ProcessManager.is_port_in_use(port):
+            return True
+        time.sleep(0.3)
+    if ProcessManager.is_port_in_use(port):
+        for opid in orphans:
+            ProcessManager.kill_process(opid, force=True)
+        time.sleep(0.3)
+    return True
+
+
 def cmd_stop(args) -> int:
     """Stop host and/or agents."""
     project_dir = _get_project_dir()
     rookery = RookeryConfig.load(project_dir / ROOKERY_CONFIG_FILENAME)
     pm = ProcessManager(project_dir)
+    force = getattr(args, "force", False)
 
     if args.name:
         # Stop a single agent
@@ -272,6 +298,10 @@ def cmd_stop(args) -> int:
             print(f"   Stopping {args.name} (PID: {ap.pid})...")
             pm.stop_agent(args.name)
             print(f"   {args.name} stopped")
+        elif _reap_orphans_on_port(agent_cfg.port, args.name, force):
+            print(f"   {args.name} stopped (orphan)")
+        else:
+            print(f"   {args.name} is not running")
         return 0
 
     # Stop everything: agents first, then host
@@ -284,13 +314,15 @@ def cmd_stop(args) -> int:
             print(f"   Stopping {name} (PID: {ap.pid})...")
             pm.stop_agent(name)
             print(f"   {name} stopped")
+        else:
+            _reap_orphans_on_port(cfg.port, name, force)
 
     # Stop host
     host_pid_file = _host_pid_file(project_dir)
     host_pid = pm.read_pid(host_pid_file)
     if host_pid and pm.is_process_running(host_pid):
         print(f"   Stopping host (PID: {host_pid})...")
-        pm.kill_process(host_pid, force=False)
+        pm.kill_process(host_pid, force=force)
         for _ in range(10):
             if not pm.is_process_running(host_pid):
                 break
@@ -300,6 +332,10 @@ def cmd_stop(args) -> int:
             time.sleep(0.5)
         pm.clear_pid(host_pid_file)
         print("   host stopped")
+    else:
+        if host_pid:
+            pm.clear_pid(host_pid_file)
+        _reap_orphans_on_port(rookery.host.port, "host", force)
 
     print("\u2705 Rookery stopped")
     return 0
@@ -1175,16 +1211,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run each agent as a separate process (legacy mode)",
     )
 
-    # kestrel stop [name]
+    # kestrel stop [name] [--force]
     stop_p = subparsers.add_parser("stop", help="Stop host and/or agents")
     stop_p.add_argument("name", nargs="?", help="Agent name (omit for all)")
+    stop_p.add_argument(
+        "--force", action="store_true",
+        help="Send SIGKILL instead of SIGTERM (also used when reaping orphans)",
+    )
 
-    # kestrel restart [name] [--subprocess]
+    # kestrel restart [name] [--subprocess] [--force]
     restart_p = subparsers.add_parser("restart", help="Restart host and/or agents")
     restart_p.add_argument("name", nargs="?", help="Agent name (omit for all)")
     restart_p.add_argument(
         "--subprocess", action="store_true",
         help="Run each agent as a separate process (legacy mode)",
+    )
+    restart_p.add_argument(
+        "--force", action="store_true",
+        help="Force-kill existing processes during the stop phase",
     )
 
     # kestrel status

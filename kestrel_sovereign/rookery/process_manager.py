@@ -72,6 +72,52 @@ class ProcessManager:
             return s.connect_ex(("localhost", port)) == 0
 
     @staticmethod
+    def find_pids_on_port(port: int) -> list[int]:
+        """Return PIDs of processes currently listening on `port`.
+
+        Used by `kestrel stop` to reap orphans — servers whose PID file was
+        lost or never written, which would otherwise block a subsequent start.
+        Returns an empty list on any failure (tool missing, parse error).
+        """
+        try:
+            import psutil
+            pids: set[int] = set()
+            for c in psutil.net_connections(kind="inet"):
+                if (
+                    c.status == psutil.CONN_LISTEN
+                    and c.laddr
+                    and c.laddr.port == port
+                    and c.pid is not None
+                ):
+                    pids.add(c.pid)
+            return sorted(pids)
+        except (ImportError, Exception):
+            pass
+
+        if sys.platform == "win32":
+            try:
+                out = subprocess.run(
+                    ["netstat", "-ano", "-p", "TCP"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                pids: set[int] = set()
+                for line in out.stdout.splitlines():
+                    parts = line.split()
+                    if len(parts) >= 5 and parts[-1].isdigit() and f":{port}" in parts[1] and parts[3].upper() == "LISTENING":
+                        pids.add(int(parts[-1]))
+                return sorted(pids)
+            except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+                return []
+        try:
+            out = subprocess.run(
+                ["lsof", "-iTCP:%d" % port, "-sTCP:LISTEN", "-t", "-Pn"],
+                capture_output=True, text=True, timeout=5,
+            )
+            return sorted({int(p) for p in out.stdout.split() if p.isdigit()})
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+            return []
+
+    @staticmethod
     def is_process_running(pid: int) -> bool:
         """Check if a process with the given PID is alive."""
         if sys.platform == "win32":
