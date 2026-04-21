@@ -9,12 +9,31 @@ Example: "Mom" triggers "Sunday calls", "Brooklyn", "her garden"
 """
 import re
 import logging
-from typing import List, Set, Dict, Any, Optional
+from dataclasses import dataclass
+from typing import List, Literal, Set, Dict, Any, Optional
 from datetime import datetime, timezone
 
 from .async_graph_store import AsyncGraphStore, GraphNode, Edge
 
 logger = logging.getLogger(__name__)
+
+
+ConceptCategory = Literal[
+    "person", "place", "time", "activity", "emotion", "proper_noun"
+]
+
+
+@dataclass
+class LinkedConcept:
+    """A concept extracted by AssociativeLinker with its graph node ID and category.
+
+    This is the contract between the linker and downstream consumers
+    (e.g. SchemaRouter). Consumers should use ``node_id`` directly
+    instead of reconstructing it from the label.
+    """
+    node_id: str
+    label: str
+    category: ConceptCategory
 
 
 class AssociativeLinker:
@@ -95,7 +114,7 @@ class AssociativeLinker:
         message_id: str,
         content: str,
         agent_id: str
-    ) -> List[str]:
+    ) -> List[LinkedConcept]:
         """
         Extract concepts from message and create graph links.
 
@@ -105,77 +124,98 @@ class AssociativeLinker:
             agent_id: Agent ID for scoping
 
         Returns:
-            List of concept strings extracted
+            List of LinkedConcept objects with node_id, label, and category
         """
-        concepts = self._extract_concepts(content)
+        categorized = self._extract_concepts_categorized(content)
 
-        if not concepts:
+        if not categorized:
             return []
 
+        labels = [label for label, _ in categorized]
+
         # Create/update concept nodes
-        for concept in concepts:
-            await self._ensure_concept_node(concept, agent_id)
+        for label in labels:
+            await self._ensure_concept_node(label, agent_id)
 
         # Create message → concept links
         message_node_id = f"message:{agent_id}:{message_id}"
         await self._ensure_message_node(message_node_id, message_id)
 
-        for concept in concepts:
-            concept_node_id = f"concept:{agent_id}:{concept}"
+        linked: List[LinkedConcept] = []
+        for label, category in categorized:
+            concept_node_id = f"concept:{agent_id}:{label}"
             await self.graph.add_edge(
                 message_node_id,
                 concept_node_id,
                 "mentions"
             )
+            linked.append(LinkedConcept(
+                node_id=concept_node_id,
+                label=label,
+                category=category,
+            ))
 
         # Strengthen co-occurring concept associations
-        await self._strengthen_cooccurrences(concepts, agent_id)
+        await self._strengthen_cooccurrences(labels, agent_id)
 
-        logger.debug(f"Extracted {len(concepts)} concepts: {concepts}")
-        return concepts
+        logger.debug(f"Extracted {len(linked)} concepts: {[c.label for c in linked]}")
+        return linked
 
     def _extract_concepts(self, content: str) -> List[str]:
         """
-        Extract key concepts from text.
+        Extract key concepts from text (bare-string form).
+
+        Backward-compatible helper that returns only labels.
+        Prefer ``_extract_concepts_categorized`` for typed results.
 
         Returns:
             List of normalized concept strings (lowercase)
         """
-        concepts: Set[str] = set()
+        return [label for label, _ in self._extract_concepts_categorized(content)]
+
+    def _extract_concepts_categorized(
+        self, content: str
+    ) -> List[tuple[str, ConceptCategory]]:
+        """
+        Extract key concepts from text with their categories.
+
+        Returns:
+            List of (normalized_label, category) tuples
+        """
+        seen: Set[str] = set()
+        results: List[tuple[str, ConceptCategory]] = []
         content_lower = content.lower()
 
-        # Extract from each pattern category
-        all_patterns = (
-            self.PERSON_PATTERNS +
-            self.PLACE_PATTERNS +
-            self.TIME_PATTERNS +
-            self.ACTIVITY_PATTERNS +
-            self.EMOTION_PATTERNS
-        )
+        category_patterns: List[tuple[ConceptCategory, List[str]]] = [
+            ("person", self.PERSON_PATTERNS),
+            ("place", self.PLACE_PATTERNS),
+            ("time", self.TIME_PATTERNS),
+            ("activity", self.ACTIVITY_PATTERNS),
+            ("emotion", self.EMOTION_PATTERNS),
+        ]
 
-        for pattern in all_patterns:
-            matches = re.findall(pattern, content_lower, re.I)
-            for match in matches:
-                # Handle tuple matches from groups
-                if isinstance(match, tuple):
-                    match = match[0]
-                # Normalize: lowercase, strip
-                normalized = match.lower().strip()
-                if len(normalized) >= 2:  # Skip very short matches
-                    concepts.add(normalized)
+        for category, patterns in category_patterns:
+            for pattern in patterns:
+                matches = re.findall(pattern, content_lower, re.I)
+                for match in matches:
+                    if isinstance(match, tuple):
+                        match = match[0]
+                    normalized = match.lower().strip()
+                    if len(normalized) >= 2 and normalized not in seen:
+                        seen.add(normalized)
+                        results.append((normalized, category))
 
         # Also extract proper nouns (capitalized words that aren't sentence starters)
         words = content.split()
         for i, word in enumerate(words):
-            # Skip first word of sentences
             if i > 0 and words[i-1][-1] not in ".!?":
-                # Check if capitalized and not common word
                 if word[0].isupper() and len(word) > 2:
                     clean = re.sub(r"[^\w]", "", word).lower()
-                    if clean and clean not in ["the", "and", "but", "for"]:
-                        concepts.add(clean)
+                    if clean and clean not in ["the", "and", "but", "for"] and clean not in seen:
+                        seen.add(clean)
+                        results.append((clean, "proper_noun"))
 
-        return list(concepts)
+        return results
 
     async def _ensure_concept_node(
         self,

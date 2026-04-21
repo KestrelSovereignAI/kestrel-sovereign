@@ -64,7 +64,7 @@ from .memory_models import (
 )
 from .emotional_tagger import EmotionalTagger, analyze_message
 from .temporal_analyzer import TemporalAnalyzer
-from .associative_linker import AssociativeLinker
+from .associative_linker import AssociativeLinker, LinkedConcept
 from .memory_retriever import MemoryRetriever, calculate_decay
 from .memory_consolidator import MemoryConsolidator
 from .memory_system import MemorySystem

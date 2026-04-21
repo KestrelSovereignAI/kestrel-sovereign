@@ -220,15 +220,15 @@ class MemorySystem:
         enriched = await self.enrich_metadata(content, role, metadata)
 
         # Extract concepts and link in graph (for user messages)
-        concepts: List[str] = []
         if role == "user" and self.linker:
             message_id = enriched.get("memory_message_id", str(uuid.uuid4()))
-            concepts = await self.linker.extract_and_link(
+            linked_concepts = await self.linker.extract_and_link(
                 message_id,
                 content,
                 self.agent_id
             )
-            enriched["extracted_concepts"] = concepts
+            # Store bare labels for backward compat in metadata
+            enriched["extracted_concepts"] = [c.label for c in linked_concepts]
 
             # Schema-aware routing: action items / decisions / interaction
             # enrichment. Best-effort — a failure here never blocks the
@@ -241,7 +241,7 @@ class MemorySystem:
                     routing_summary = await self.router.route(
                         message_id=message_id,
                         content=content,
-                        concepts=concepts,
+                        concepts=linked_concepts,
                         role=role,
                     )
                     enriched["schema_routing"] = routing_summary
