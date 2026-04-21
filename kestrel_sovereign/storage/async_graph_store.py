@@ -18,7 +18,7 @@ produces a fixed-offset ``+00:00`` suffix, never a bare naive string).
 """
 import json
 import logging
-from typing import Dict, Optional, List, Any, Tuple
+from typing import Dict, Optional, List, Any
 from dataclasses import dataclass
 
 from .async_database import AsyncDatabase
