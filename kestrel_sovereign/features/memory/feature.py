@@ -571,36 +571,38 @@ class MemoryFeature(Feature):
             from datetime import datetime, timezone, timedelta
             since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
 
+        filters: dict = {"agent_id": self.agent_id}
+        if status is not None:
+            filters["status"] = status
+        if assignee_concept_id is not None:
+            filters["assignee_concept_id"] = assignee_concept_id
+
         try:
-            nodes = await storage.graph.get_nodes_by_type("action_item")
+            nodes = await storage.graph.query_nodes_by_type_and_property(
+                "action_item",
+                filters=filters,
+                created_since=since,
+                order_by_created=True,
+                limit=limit,
+            )
         except Exception as e:
             logger.error("recall_action_items query failed: %s", e)
             return {"success": False, "error": str(e)}
 
-        matching = []
-        for n in nodes:
-            props = n.properties or {}
-            if props.get("agent_id") != self.agent_id:
-                continue
-            if status is not None and props.get("status") != status:
-                continue
-            if since is not None and (props.get("created_at") or "") < since:
-                continue
-            if assignee_concept_id is not None and props.get("assignee_concept_id") != assignee_concept_id:
-                continue
-            matching.append({
+        matching = [
+            {
                 "id": n.node_id,
-                "source_message_id": props.get("source_message_id"),
-                "text": props.get("text"),
-                "status": props.get("status"),
-                "assignee_concept_id": props.get("assignee_concept_id"),
-                "due_date": props.get("due_date"),
-                "confidence": props.get("confidence"),
-                "created_at": props.get("created_at"),
-            })
-
-        matching.sort(key=lambda d: d.get("created_at") or "", reverse=True)
-        return {"action_items": matching[:limit], "count": min(len(matching), limit)}
+                "source_message_id": (n.properties or {}).get("source_message_id"),
+                "text": (n.properties or {}).get("text"),
+                "status": (n.properties or {}).get("status"),
+                "assignee_concept_id": (n.properties or {}).get("assignee_concept_id"),
+                "due_date": (n.properties or {}).get("due_date"),
+                "confidence": (n.properties or {}).get("confidence"),
+                "created_at": (n.properties or {}).get("created_at"),
+            }
+            for n in nodes
+        ]
+        return {"action_items": matching, "count": len(matching)}
 
     @tool(
         name="update_action_item",
@@ -691,7 +693,12 @@ class MemoryFeature(Feature):
             return {"success": False, "error": "limit must be in [1, 200]"}
 
         try:
-            nodes = await storage.graph.get_nodes_by_type("decision")
+            nodes = await storage.graph.query_nodes_by_type_and_property(
+                "decision",
+                filters={"agent_id": self.agent_id},
+                order_by_created=True,
+                limit=limit,
+            )
         except Exception as e:
             logger.error("recall_decisions failed: %s", e)
             return {"success": False, "error": str(e)}
@@ -706,10 +713,8 @@ class MemoryFeature(Feature):
                 "created_at": (n.properties or {}).get("created_at"),
             }
             for n in nodes
-            if (n.properties or {}).get("agent_id") == self.agent_id
         ]
-        own.sort(key=lambda d: d.get("created_at") or "", reverse=True)
-        return {"decisions": own[:limit], "count": min(len(own), limit)}
+        return {"decisions": own, "count": len(own)}
 
     @tool(
         name="recall_interactions",
