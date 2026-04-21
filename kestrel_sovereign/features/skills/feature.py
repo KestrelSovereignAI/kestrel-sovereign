@@ -24,10 +24,15 @@ than pretended consistency.
 
 ## Uniqueness
 
-Dedup has two layers:
+Dedup has three layers:
 1. Preflight normalized-title check in `skill_extract_candidates` (advisory).
-2. Hard collision guard at write time in `skill_save` — if the target file
-   already exists, the save fails rather than silently overwriting.
+2. Atomic claim via ``os.link()`` — first concurrent writer to hardlink a
+   ``.claim`` file wins; the second gets ``FileExistsError``.
+3. Non-overwriting finalization via ``os.link()`` to the final path — if the
+   target file already exists, the save fails rather than silently overwriting.
+
+Stale claim files (orphaned by a crashed process) are automatically reclaimed
+after ``CLAIM_STALENESS_SECONDS`` (default 60 s).
 
 Per the Incubator Principle, extraction is never automatic — it is
 triggered by an explicit tool call. Governed agents without this feature
@@ -40,6 +45,7 @@ import json
 import logging
 import os
 import re
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -60,6 +66,10 @@ SKILLS_SUBDIR = "skills"
 # Default filter for what counts as a "non-obvious discovery" worth extracting.
 MIN_CANDIDATE_CONFIDENCE = 0.7
 CANDIDATE_INSIGHT_TYPES = ("pattern", "improvement")
+
+# Claim files older than this are assumed to be from a crashed process and
+# eligible for reclamation.  See issue #667 item 4.
+CLAIM_STALENESS_SECONDS = 60
 
 
 class SkillsFeature(Feature):
@@ -443,10 +453,16 @@ class SkillsFeature(Feature):
         the save, because losing an associative index entry is recoverable
         while losing the skill content is not.
 
-        Collision: we refuse to overwrite an existing file. The dedup pass
-        in `skill_save` should catch most duplicates before we get here,
-        but a concurrent save of the same title would slip past that check.
-        The existence check + atomic rename is the real uniqueness gate.
+        Concurrency: uses an ``os.link()`` claim-and-swap protocol so that
+        two concurrent writers targeting the same skill ID are serialized
+        atomically — the first writer to hardlink wins, the second gets
+        EEXIST. Both preflight existence check and finalization use
+        ``os.link`` (not ``os.replace``), so save fails rather than
+        silently overwriting an existing file at any stage.
+
+        Claim ownership is tracked per-writer: a losing writer never deletes
+        the winning writer's claim file.  Stale claim files (from a crashed
+        process) are reclaimed after ``CLAIM_STALENESS_SECONDS``.
         """
         if self._skills_dir is None:
             raise RuntimeError("No skills directory configured — agent has no data path")
@@ -455,24 +471,66 @@ class SkillsFeature(Feature):
         if path.exists():
             raise FileExistsError(f"skill file already exists: {path.name}")
 
-        # Atomic write: write to a per-writer tmp file then rename. A uuid
-        # suffix on the tmp path means two concurrent writers do not clobber
-        # each other's tmp content. (The remaining race — both writers pass
-        # path.exists() then both os.replace — is last-writer-wins on the
-        # final file, which is a semantic choice rather than corruption.
-        # See follow-up ticket for the full flock/UNIQUE fix if concurrent
-        # skill_save turns out to be a real use case.)
+        # -- Phase 1: write content to a per-writer tmp file ---------------
         tmp_path = path.with_suffix(path.suffix + f".tmp.{uuid.uuid4().hex[:8]}")
+        i_own_claim = False
+        claim_path = path.with_suffix(path.suffix + ".claim")
+
         try:
             tmp_path.write_text(skill.to_markdown(), encoding="utf-8")
-            os.replace(tmp_path, path)
+
+            # -- Phase 2: atomic claim via os.link -------------------------
+            # First writer to link wins; second gets FileExistsError.
+            try:
+                os.link(tmp_path, claim_path)
+                i_own_claim = True
+            except FileExistsError:
+                # A claim file exists — check if it's stale (orphaned by a
+                # crashed process).
+                if self._is_stale_claim(claim_path):
+                    logger.info("Reclaiming stale claim file: %s", claim_path)
+                    try:
+                        claim_path.unlink()
+                    except OSError:
+                        pass
+                    # Retry the link after removing the stale claim.
+                    os.link(tmp_path, claim_path)
+                    i_own_claim = True
+                else:
+                    raise FileExistsError(
+                        f"concurrent write in progress for {path.name}"
+                    )
+
+            # tmp is now redundant (claim holds the same content via hardlink).
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+
+            # -- Phase 3: finalize — promote claim to final path -----------
+            # Uses os.link so finalization fails if the final file appeared
+            # between our preflight check and now (no silent overwrite).
+            os.link(claim_path, path)
+
         except Exception:
-            # Clean up the tmp file if it exists so we don't accumulate cruft.
+            # Only clean up files this writer owns.
             try:
                 tmp_path.unlink(missing_ok=True)
             except OSError:
                 pass
+            if i_own_claim:
+                try:
+                    claim_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
             raise
+
+        # Claim is no longer needed — the final file is the record.
+        if i_own_claim:
+            try:
+                claim_path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
         storage = getattr(self.agent, "storage", None)
         if storage is None or not hasattr(storage, "add_node"):
@@ -495,6 +553,20 @@ class SkillsFeature(Feature):
         except Exception as e:
             # Graph persistence is best-effort — the file is the primary record.
             logger.warning("Could not persist graph node for %s: %s", skill.id, e)
+
+    @staticmethod
+    def _is_stale_claim(claim_path: Path) -> bool:
+        """Return True if *claim_path* is older than the staleness threshold.
+
+        A claim file left behind by a process that crashed after ``os.link``
+        but before finalization would block future saves for that skill_id
+        forever.  This check lets the next writer reclaim the slot.
+        """
+        try:
+            age = time.time() - claim_path.stat().st_mtime
+        except OSError:
+            return False
+        return age > CLAIM_STALENESS_SECONDS
 
     def _agent_id(self) -> str:
         did = getattr(self.agent, "did", None)
