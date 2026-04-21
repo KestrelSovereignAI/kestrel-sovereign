@@ -24,10 +24,14 @@ than pretended consistency.
 
 ## Uniqueness
 
-Dedup has two layers:
+Dedup has three layers:
 1. Preflight normalized-title check in `skill_extract_candidates` (advisory).
 2. Hard collision guard at write time in `skill_save` — if the target file
    already exists, the save fails rather than silently overwriting.
+3. ``os.link()`` claim file — the first concurrent writer to hardlink its
+   tmp file to ``<id>.md.claim`` wins; the second gets EEXIST. This
+   eliminates the last-writer-wins race where two writers both pass the
+   ``path.exists()`` check before either has written the final file.
 
 Per the Incubator Principle, extraction is never automatic — it is
 triggered by an explicit tool call. Governed agents without this feature
@@ -443,10 +447,11 @@ class SkillsFeature(Feature):
         the save, because losing an associative index entry is recoverable
         while losing the skill content is not.
 
-        Collision: we refuse to overwrite an existing file. The dedup pass
-        in `skill_save` should catch most duplicates before we get here,
-        but a concurrent save of the same title would slip past that check.
-        The existence check + atomic rename is the real uniqueness gate.
+        Concurrency: two writers targeting the same skill ID are serialized
+        via an ``os.link()`` claim file. The first writer to hardlink its
+        tmp file to ``<id>.md.claim`` wins; the second gets EEXIST and
+        receives a structured conflict error. No lock file, no contention
+        window — ``os.link()`` is atomic on POSIX.
         """
         if self._skills_dir is None:
             raise RuntimeError("No skills directory configured — agent has no data path")
@@ -455,24 +460,41 @@ class SkillsFeature(Feature):
         if path.exists():
             raise FileExistsError(f"skill file already exists: {path.name}")
 
-        # Atomic write: write to a per-writer tmp file then rename. A uuid
-        # suffix on the tmp path means two concurrent writers do not clobber
-        # each other's tmp content. (The remaining race — both writers pass
-        # path.exists() then both os.replace — is last-writer-wins on the
-        # final file, which is a semantic choice rather than corruption.
-        # See follow-up ticket for the full flock/UNIQUE fix if concurrent
-        # skill_save turns out to be a real use case.)
+        # Write content to a per-writer tmp file (uuid suffix avoids tmp-
+        # file clobber between concurrent writers).
         tmp_path = path.with_suffix(path.suffix + f".tmp.{uuid.uuid4().hex[:8]}")
+        claim_path = path.with_suffix(path.suffix + ".claim")
         try:
             tmp_path.write_text(skill.to_markdown(), encoding="utf-8")
-            os.replace(tmp_path, path)
+
+            # Claim: hardlink is atomic — second writer raises FileExistsError.
+            try:
+                os.link(tmp_path, claim_path)
+            except FileExistsError:
+                raise FileExistsError(
+                    f"skill already claimed by concurrent writer: {path.name}"
+                )
+
+            # We won the claim — promote to final path.
+            os.replace(claim_path, path)
         except Exception:
             # Clean up the tmp file if it exists so we don't accumulate cruft.
             try:
                 tmp_path.unlink(missing_ok=True)
             except OSError:
                 pass
+            try:
+                claim_path.unlink(missing_ok=True)
+            except OSError:
+                pass
             raise
+        finally:
+            # The winner's tmp is now a dangling hardlink (same inode as
+            # the claim that was renamed to final). Remove it quietly.
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
         storage = getattr(self.agent, "storage", None)
         if storage is None or not hasattr(storage, "add_node"):

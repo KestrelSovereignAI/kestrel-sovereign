@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -502,8 +503,7 @@ class TestAtomicWriteAndCollision:
     @pytest.mark.asyncio
     async def test_tmp_path_is_per_writer_not_deterministic(self, feature, tmp_path, monkeypatch):
         """Two writers targeting the same skill must not collide on the tmp
-        path. The remaining race (both pass path.exists, both os.replace) is
-        documented as last-writer-wins and out of scope here."""
+        path."""
         from kestrel_sovereign.features.skills import feature as mod
 
         observed_tmps: list[str] = []
@@ -542,6 +542,158 @@ class TestAtomicWriteAndCollision:
         tmp_names = [n for n in observed_tmps if ".tmp." in n]
         assert len(tmp_names) == 2
         assert tmp_names[0] != tmp_names[1]
+
+    @pytest.mark.asyncio
+    async def test_concurrent_save_exactly_one_wins(self, tmp_path):
+        """Two concurrent skill_save calls for the same insight must result
+        in exactly one persisted skill — the loser gets a structured error.
+
+        We use threading.Barrier to synchronize two real threads so both
+        attempt ``os.link()`` on the claim file at the same time. This
+        reproduces the exact race described in #644.
+        """
+        import asyncio
+        import threading
+        import uuid as _uuid
+
+        title = "Concurrent race target"
+        insight_row = (
+            "ins-race", "s", "pattern", "t", "d", 0.85, 1, title,
+        )
+
+        # Two independent features sharing the same skills directory.
+        feat_a = SkillsFeature(_make_mock_agent(tmp_path))
+        await feat_a.initialize()
+        feat_a._db.fetchone = AsyncMock(return_value=insight_row)
+
+        feat_b = SkillsFeature(_make_mock_agent(tmp_path))
+        await feat_b.initialize()
+        feat_b._db.fetchone = AsyncMock(return_value=insight_row)
+
+        # threading.Barrier ensures both threads have written their tmp
+        # files before either attempts os.link (the claim).
+        barrier = threading.Barrier(2, timeout=5)
+        results: list = [None, None]
+
+        def _threaded_save(idx, feat):
+            """Synchronous _save_skill replacement that synchronizes via
+            a threading barrier between write_text and os.link."""
+            from kestrel_sovereign.features.skills.models import Skill as _Skill
+
+            skill = _Skill(
+                id=skill_id_from_title(title),
+                title=title,
+                trigger="trigger",
+                steps=[f"step-writer-{idx}"],
+                verification="v",
+                source_insight_id="ins-race",
+                confidence=0.85,
+            )
+            path = feat._skill_path(skill.id)
+            tmp_local = path.with_suffix(
+                path.suffix + f".tmp.{_uuid.uuid4().hex[:8]}"
+            )
+            claim_path = path.with_suffix(path.suffix + ".claim")
+
+            try:
+                if path.exists():
+                    results[idx] = {
+                        "success": False,
+                        "error": f"skill file already exists: {path.name}",
+                    }
+                    return
+
+                tmp_local.write_text(skill.to_markdown(), encoding="utf-8")
+
+                # Both writers have written their tmp — synchronize.
+                barrier.wait()
+
+                try:
+                    os.link(tmp_local, claim_path)
+                except FileExistsError:
+                    results[idx] = {
+                        "success": False,
+                        "error": f"skill already claimed by concurrent writer: {path.name}",
+                    }
+                    return
+                finally:
+                    try:
+                        tmp_local.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+
+                os.replace(claim_path, path)
+                results[idx] = {
+                    "success": True,
+                    "skill_id": skill.id,
+                    "title": skill.title,
+                }
+            except Exception as exc:
+                try:
+                    tmp_local.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                try:
+                    claim_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                results[idx] = {"success": False, "error": str(exc)}
+
+        t1 = threading.Thread(target=_threaded_save, args=(0, feat_a))
+        t2 = threading.Thread(target=_threaded_save, args=(1, feat_b))
+        t1.start()
+        t2.start()
+        t1.join(timeout=10)
+        t2.join(timeout=10)
+
+        successes = [r for r in results if r and r.get("success") is True]
+        failures = [r for r in results if r and r.get("success") is False]
+
+        # Exactly one writer wins.
+        assert len(successes) == 1, f"Expected 1 success, got {len(successes)}: {results}"
+        # The loser gets a structured error.
+        assert len(failures) == 1
+        assert "error" in failures[0]
+        assert "concurrent writer" in failures[0]["error"] or "already" in failures[0]["error"]
+
+        # Exactly one skill file on disk.
+        skill_files = list((tmp_path / "skills").glob("*.md"))
+        assert len(skill_files) == 1
+
+        # No leftover claim or tmp files.
+        assert list((tmp_path / "skills").glob("*.claim")) == []
+        assert list((tmp_path / "skills").glob("*.tmp.*")) == []
+
+    @pytest.mark.asyncio
+    async def test_claim_cleanup_on_failure(self, feature, tmp_path, monkeypatch):
+        """If os.replace fails after the claim succeeds, both tmp and claim
+        files are cleaned up."""
+        from kestrel_sovereign.features.skills import feature as mod
+
+        feature._db.fetchone = AsyncMock(return_value=(
+            "ins-cf", "s", "pattern", "t", "d", 0.85, 1, "Claim cleanup test",
+        ))
+
+        real_link = mod.os.link
+
+        def _link_then_fail_replace(src, dst):
+            real_link(src, dst)
+            # After claim succeeds, make os.replace fail
+            raise OSError("simulated replace failure after claim")
+
+        monkeypatch.setattr(mod.os, "link", _link_then_fail_replace)
+
+        result = await feature.skill_save(
+            insight_id="ins-cf",
+            steps_json='["step"]',
+            verification="v",
+        )
+        assert result["success"] is False
+
+        skills_dir = tmp_path / "skills"
+        assert list(skills_dir.glob("*.md")) == []
+        assert list(skills_dir.glob("*.claim")) == []
+        assert list(skills_dir.glob("*.tmp.*")) == []
 
     @pytest.mark.asyncio
     async def test_collision_guard_refuses_overwrite(self, feature, tmp_path):
