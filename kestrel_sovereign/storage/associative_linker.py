@@ -9,10 +9,30 @@ Example: "Mom" triggers "Sunday calls", "Brooklyn", "her garden"
 """
 import re
 import logging
+from dataclasses import dataclass
 from typing import List, Set, Dict, Any, Optional
 from datetime import datetime, timezone
 
 from .async_graph_store import AsyncGraphStore, GraphNode, Edge
+
+
+@dataclass(frozen=True)
+class LinkedConcept:
+    """Typed concept returned by :meth:`AssociativeLinker.extract_and_link`.
+
+    Provides canonical-by-convention node IDs so downstream consumers
+    (e.g. SchemaRouter) can reference graph nodes without reconstructing
+    the ID format themselves.
+
+    Attributes:
+        node_id: Deterministic graph node ID (``concept:{agent_id}:{label}``).
+        label: Original extracted text, normalised to lowercase.
+        category: One of ``person``, ``place``, ``time``, ``activity``,
+            ``emotion``, ``proper_noun``.
+    """
+    node_id: str
+    label: str
+    category: str
 
 logger = logging.getLogger(__name__)
 
@@ -95,9 +115,13 @@ class AssociativeLinker:
         message_id: str,
         content: str,
         agent_id: str
-    ) -> List[str]:
+    ) -> List[LinkedConcept]:
         """
         Extract concepts from message and create graph links.
+
+        The linker provides canonical-by-convention node IDs — downstream
+        consumers can reference graph nodes directly without reconstructing
+        the deterministic ID format.
 
         Args:
             message_id: Unique ID of the message
@@ -105,64 +129,100 @@ class AssociativeLinker:
             agent_id: Agent ID for scoping
 
         Returns:
-            List of concept strings extracted
+            List of :class:`LinkedConcept` with ``node_id``, ``label``,
+            and ``category`` for each extracted concept.
         """
-        concepts = self._extract_concepts(content)
+        categorized = self._extract_concepts_categorized(content)
 
-        if not concepts:
+        if not categorized:
             return []
 
+        labels = [label for label, _cat in categorized]
+
         # Create/update concept nodes
-        for concept in concepts:
-            await self._ensure_concept_node(concept, agent_id)
+        for label in labels:
+            await self._ensure_concept_node(label, agent_id)
 
         # Create message → concept links
         message_node_id = f"message:{agent_id}:{message_id}"
         await self._ensure_message_node(message_node_id, message_id)
 
-        for concept in concepts:
-            concept_node_id = f"concept:{agent_id}:{concept}"
+        linked: List[LinkedConcept] = []
+        for label, category in categorized:
+            concept_node_id = f"concept:{agent_id}:{label}"
             await self.graph.add_edge(
                 message_node_id,
                 concept_node_id,
                 "mentions"
             )
+            linked.append(LinkedConcept(
+                node_id=concept_node_id,
+                label=label,
+                category=category,
+            ))
 
         # Strengthen co-occurring concept associations
-        await self._strengthen_cooccurrences(concepts, agent_id)
+        await self._strengthen_cooccurrences(labels, agent_id)
 
-        logger.debug(f"Extracted {len(concepts)} concepts: {concepts}")
-        return concepts
+        logger.debug(f"Extracted {len(linked)} concepts: {[lc.label for lc in linked]}")
+        return linked
+
+    async def extract_and_link_labels(
+        self,
+        message_id: str,
+        content: str,
+        agent_id: str
+    ) -> List[str]:
+        """Backward-compatible wrapper returning bare label strings.
+
+        Callers that only need concept labels (not the full typed data)
+        can use this instead of :meth:`extract_and_link`.
+        """
+        linked = await self.extract_and_link(message_id, content, agent_id)
+        return [lc.label for lc in linked]
+
+    # Mapping from pattern list attribute → category name.
+    _PATTERN_CATEGORIES = [
+        ("PERSON_PATTERNS", "person"),
+        ("PLACE_PATTERNS", "place"),
+        ("TIME_PATTERNS", "time"),
+        ("ACTIVITY_PATTERNS", "activity"),
+        ("EMOTION_PATTERNS", "emotion"),
+    ]
 
     def _extract_concepts(self, content: str) -> List[str]:
         """
-        Extract key concepts from text.
+        Extract key concepts from text (labels only).
 
         Returns:
             List of normalized concept strings (lowercase)
         """
-        concepts: Set[str] = set()
+        return [label for label, _cat in self._extract_concepts_categorized(content)]
+
+    def _extract_concepts_categorized(self, content: str) -> List[tuple]:
+        """
+        Extract key concepts from text with their category.
+
+        Returns:
+            List of ``(label, category)`` tuples. ``label`` is normalised
+            to lowercase. ``category`` is one of ``person``, ``place``,
+            ``time``, ``activity``, ``emotion``, or ``proper_noun``.
+        """
+        # Map label → category; first match wins (pattern categories
+        # are checked in order, then proper nouns).
+        seen: Dict[str, str] = {}
         content_lower = content.lower()
 
-        # Extract from each pattern category
-        all_patterns = (
-            self.PERSON_PATTERNS +
-            self.PLACE_PATTERNS +
-            self.TIME_PATTERNS +
-            self.ACTIVITY_PATTERNS +
-            self.EMOTION_PATTERNS
-        )
-
-        for pattern in all_patterns:
-            matches = re.findall(pattern, content_lower, re.I)
-            for match in matches:
-                # Handle tuple matches from groups
-                if isinstance(match, tuple):
-                    match = match[0]
-                # Normalize: lowercase, strip
-                normalized = match.lower().strip()
-                if len(normalized) >= 2:  # Skip very short matches
-                    concepts.add(normalized)
+        for attr, category in self._PATTERN_CATEGORIES:
+            patterns = getattr(self, attr)
+            for pattern in patterns:
+                matches = re.findall(pattern, content_lower, re.I)
+                for match in matches:
+                    if isinstance(match, tuple):
+                        match = match[0]
+                    normalized = match.lower().strip()
+                    if len(normalized) >= 2 and normalized not in seen:
+                        seen[normalized] = category
 
         # Also extract proper nouns (capitalized words that aren't sentence starters)
         words = content.split()
@@ -173,9 +233,10 @@ class AssociativeLinker:
                 if word[0].isupper() and len(word) > 2:
                     clean = re.sub(r"[^\w]", "", word).lower()
                     if clean and clean not in ["the", "and", "but", "for"]:
-                        concepts.add(clean)
+                        if clean not in seen:
+                            seen[clean] = "proper_noun"
 
-        return list(concepts)
+        return list(seen.items())
 
     async def _ensure_concept_node(
         self,

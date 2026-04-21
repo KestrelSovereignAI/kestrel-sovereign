@@ -633,10 +633,16 @@ def _deterministic_action_node_id(
 def _looks_like_person(concept: str) -> bool:
     """Heuristic: is this concept label likely a person reference?
 
-    The AssociativeLinker does not annotate concepts with their category,
-    so we reconstruct the category by matching against the linker's
-    keyword sets. A cleaner fix would be to have the linker emit typed
-    concepts; deferred to a follow-up so this PR doesn't sprawl.
+    The AssociativeLinker now emits :class:`LinkedConcept` with a
+    ``category`` field, but this router receives bare label strings
+    (extracted from the linked results by callers). We keep the
+    keyword-based heuristic here as a safety net; callers that have
+    access to the typed ``LinkedConcept`` should prefer checking
+    ``category in ("person", "proper_noun")`` directly.
+
+    Both ``person`` (keyword-matched family/role terms like "mom") and
+    ``proper_noun`` (capitalized names like "Alice") should be treated
+    as enrichable for interaction tracking.
     """
     if not concept:
         return False

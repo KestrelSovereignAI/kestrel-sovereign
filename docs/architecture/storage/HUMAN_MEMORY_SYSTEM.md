@@ -149,11 +149,16 @@ Builds concept associations in the knowledge graph.
 from storage import AssociativeLinker
 
 linker = AssociativeLinker(graph_store)
-concepts = await linker.extract_and_link(message_id, content, agent_id)
+linked = await linker.extract_and_link(message_id, content, agent_id)
+# Returns List[LinkedConcept] with canonical-by-convention node IDs:
+#   LinkedConcept(node_id="concept:agent:mom", label="mom", category="person")
+
+# Backward-compat helper returning bare strings:
+labels = await linker.extract_and_link_labels(message_id, content, agent_id)
 
 # Get related concepts
 associated = await linker.get_associated_concepts("mom", agent_id)
-# Returns: ["sunday", "phone", "brooklyn", ...]
+# Returns: [{"concept": "sunday", "strength": 0.3}, ...]
 ```
 
 ---

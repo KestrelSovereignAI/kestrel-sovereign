@@ -21,6 +21,7 @@ from kestrel_sovereign.storage import (
     EmotionalTagger,
     TemporalAnalyzer,
     AssociativeLinker,
+    LinkedConcept,
     MemoryRetriever,
     calculate_decay,
 )
@@ -199,6 +200,189 @@ class TestAssociativeLinker:
         concepts = linker._extract_concepts(text)
         assert "happy" in concepts
         assert "scared" in concepts
+
+    def test_extract_concepts_categorized_person(self, linker):
+        """Categorized extraction should tag person keywords."""
+        categorized = linker._extract_concepts_categorized(
+            "I called mom yesterday and she mentioned grandma"
+        )
+        cat_map = {label: cat for label, cat in categorized}
+        assert cat_map.get("mom") == "person"
+        assert cat_map.get("grandma") == "person"
+
+    def test_extract_concepts_categorized_proper_noun(self, linker):
+        """Capitalized names not in keyword sets get 'proper_noun'."""
+        categorized = linker._extract_concepts_categorized(
+            "I talked to Alice about her trip"
+        )
+        cat_map = {label: cat for label, cat in categorized}
+        assert cat_map.get("alice") == "proper_noun"
+
+    def test_extract_concepts_categorized_all_categories(self, linker):
+        """All six categories should be assignable."""
+        text = (
+            "My mom took me to work on Christmas morning. "
+            "I was cooking and felt so happy. "
+            "Then Alice walked in."
+        )
+        categorized = linker._extract_concepts_categorized(text)
+        categories_found = {cat for _label, cat in categorized}
+        assert "person" in categories_found
+        assert "place" in categories_found
+        assert "time" in categories_found
+        assert "activity" in categories_found
+        assert "emotion" in categories_found
+        assert "proper_noun" in categories_found
+
+
+VALID_CATEGORIES = {"person", "place", "time", "activity", "emotion", "proper_noun"}
+
+
+class TestExtractAndLinkTyped:
+    """Tests for AssociativeLinker.extract_and_link() typed return shape."""
+
+    @pytest.fixture
+    def mock_graph(self):
+        graph = AsyncMock()
+        graph.get_node = AsyncMock(return_value=None)
+        graph.add_node = AsyncMock()
+        graph.add_edge = AsyncMock()
+        graph.get_edges = AsyncMock(return_value=[])
+        return graph
+
+    @pytest.fixture
+    def linker(self, mock_graph):
+        return AssociativeLinker(mock_graph)
+
+    @pytest.mark.asyncio
+    async def test_returns_linked_concepts(self, linker):
+        """extract_and_link should return List[LinkedConcept]."""
+        result = await linker.extract_and_link(
+            "msg-1", "I called mom yesterday", "agent-1"
+        )
+        assert isinstance(result, list)
+        assert all(isinstance(lc, LinkedConcept) for lc in result)
+
+    @pytest.mark.asyncio
+    async def test_node_id_matches_graph_write(self, linker, mock_graph):
+        """Each LinkedConcept.node_id should match the node written to graph."""
+        result = await linker.extract_and_link(
+            "msg-1", "I called mom yesterday", "agent-1"
+        )
+        mom_lc = next((lc for lc in result if lc.label == "mom"), None)
+        assert mom_lc is not None
+        assert mom_lc.node_id == "concept:agent-1:mom"
+
+        # Verify the graph got the same node_id
+        written_ids = [
+            call.args[0].node_id
+            for call in mock_graph.add_node.call_args_list
+            if hasattr(call.args[0], "node_id")
+        ]
+        assert mom_lc.node_id in written_ids
+
+    @pytest.mark.asyncio
+    async def test_label_preserves_extracted_text(self, linker):
+        """LinkedConcept.label should be the normalised extracted text."""
+        result = await linker.extract_and_link(
+            "msg-1", "My grandma loves Christmas morning", "agent-1"
+        )
+        labels = {lc.label for lc in result}
+        assert "grandma" in labels
+        assert "christmas" in labels
+        assert "morning" in labels
+
+    @pytest.mark.asyncio
+    async def test_category_is_valid_enum(self, linker):
+        """Each LinkedConcept.category must be a documented value."""
+        result = await linker.extract_and_link(
+            "msg-1",
+            "Mom and Alice went to work on Christmas morning cooking happily",
+            "agent-1",
+        )
+        assert len(result) > 0
+        for lc in result:
+            assert lc.category in VALID_CATEGORIES, (
+                f"{lc.label!r} has unexpected category {lc.category!r}"
+            )
+
+    @pytest.mark.asyncio
+    async def test_mentions_edges_written(self, linker, mock_graph):
+        """Message→concept 'mentions' edges should still be written."""
+        await linker.extract_and_link(
+            "msg-1", "I called mom from work", "agent-1"
+        )
+        edge_calls = [
+            (call.args[0], call.args[1], call.args[2])
+            for call in mock_graph.add_edge.call_args_list
+            if len(call.args) >= 3 and call.args[2] == "mentions"
+        ]
+        message_node = "message:agent-1:msg-1"
+        targets = {target for src, target, label in edge_calls if src == message_node}
+        assert "concept:agent-1:mom" in targets
+        assert "concept:agent-1:work" in targets
+
+    @pytest.mark.asyncio
+    async def test_empty_content_returns_empty(self, linker):
+        """No concepts → empty list, no crash."""
+        result = await linker.extract_and_link(
+            "msg-1", "the quick brown fox", "agent-1"
+        )
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_extract_and_link_labels_backward_compat(self, linker):
+        """extract_and_link_labels returns bare strings for backward compat."""
+        result = await linker.extract_and_link_labels(
+            "msg-1", "I called mom yesterday", "agent-1"
+        )
+        assert isinstance(result, list)
+        assert all(isinstance(s, str) for s in result)
+        assert "mom" in result
+
+
+class TestPersonNameCategorization:
+    """Regression: both keyword persons and proper-noun names get categorized.
+
+    "mom" matches a PERSON_PATTERN keyword → category "person".
+    "Alice" is a capitalized word not in any keyword set → category "proper_noun".
+
+    SchemaRouter should treat both ``person`` and ``proper_noun`` as
+    enrichable for interaction tracking. This test documents that
+    intentional distinction so interaction enrichment doesn't silently
+    regress for named people.
+    """
+
+    @pytest.fixture
+    def linker(self):
+        return AssociativeLinker(None)
+
+    def test_mom_is_person_category(self, linker):
+        categorized = linker._extract_concepts_categorized(
+            "I called mom this morning"
+        )
+        cat_map = {label: cat for label, cat in categorized}
+        assert cat_map["mom"] == "person"
+
+    def test_alice_is_proper_noun_category(self, linker):
+        categorized = linker._extract_concepts_categorized(
+            "I talked to Alice about the project"
+        )
+        cat_map = {label: cat for label, cat in categorized}
+        assert cat_map["alice"] == "proper_noun"
+
+    def test_both_person_and_proper_noun_are_enrichable(self, linker):
+        """Both categories should be treated as person-like for interactions."""
+        categorized = linker._extract_concepts_categorized(
+            "I told Alice that mom was coming to visit"
+        )
+        cat_map = {label: cat for label, cat in categorized}
+        assert cat_map["mom"] == "person"
+        assert cat_map["alice"] == "proper_noun"
+        # Both should be accepted by _looks_like_person in schema_router
+        from kestrel_sovereign.storage.schema_router import _looks_like_person
+        assert _looks_like_person("mom") is True
+        assert _looks_like_person("alice") is True
 
 
 class TestMemoryRetriever:

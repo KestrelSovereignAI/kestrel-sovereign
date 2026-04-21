@@ -223,11 +223,12 @@ class MemorySystem:
         concepts: List[str] = []
         if role == "user" and self.linker:
             message_id = enriched.get("memory_message_id", str(uuid.uuid4()))
-            concepts = await self.linker.extract_and_link(
+            linked = await self.linker.extract_and_link(
                 message_id,
                 content,
                 self.agent_id
             )
+            concepts = [lc.label for lc in linked]
             enriched["extracted_concepts"] = concepts
 
             # Schema-aware routing: action items / decisions / interaction
