@@ -136,6 +136,78 @@ class EmotionalTagger:
         ],
     }
 
+    # ─────────────────────────────────────────────────────────────────
+    # Epistemic Status Patterns (claim certainty cues)
+    # ─────────────────────────────────────────────────────────────────
+
+    # High-certainty linguistic cues (0.8-1.0)
+    HIGH_CERTAINTY_CUES = [
+        r"\bi(?:'ve)? decided\b",
+        r"\bwe(?:'ve)? decided\b",
+        r"\bi(?:'m)? certain\b",
+        r"\bi(?:'m)? sure\b",
+        r"\bdefinitely\b",
+        r"\babsolutely\b",
+        r"\bwithout a doubt\b",
+        r"\bno question\b",
+        r"\bfor sure\b",
+        r"\bi know (?:that |for )",
+        r"\bcommitting to\b",
+        r"\bsticking with\b",
+    ]
+
+    # Medium-certainty cues (0.5-0.7)
+    MEDIUM_CERTAINTY_CUES = [
+        r"\bi think\b",
+        r"\bi believe\b",
+        r"\bprobably\b",
+        r"\blikely\b",
+        r"\bit seems\b",
+        r"\bapparently\b",
+        r"\bi(?:'m)? fairly (?:sure|certain|confident)\b",
+        r"\bfrom what i(?:'ve)? (?:heard|seen|read)\b",
+        r"\bgoing with\b",
+    ]
+
+    # Low-certainty cues (0.1-0.4)
+    LOW_CERTAINTY_CUES = [
+        r"\bmaybe\b",
+        r"\bperhaps\b",
+        r"\bi(?:'m)? not sure\b",
+        r"\bi(?:'m)? not certain\b",
+        r"\bmight\b",
+        r"\bcould be\b",
+        r"\bpossibly\b",
+        r"\bi guess\b",
+        r"\bi wonder\b",
+        r"\bi(?:'m)? unsure\b",
+        r"\bsupposedly\b",
+    ]
+
+    # Non-claim patterns — questions, greetings, etc.
+    NON_CLAIM_PATTERNS = [
+        r"^\s*(?:hi|hello|hey|good (?:morning|afternoon|evening)|thanks|thank you)\s*[.!]?\s*$",
+        r"^\s*(?:how are you|what'?s up|what do you think)\s*[?]?\s*$",
+        r"^[^.!]*\?\s*$",  # Messages that are purely questions
+    ]
+
+    # Claim source inference patterns
+    HEARSAY_CUES = [
+        r"\b(?:someone|somebody) (?:told|said|mentioned)\b",
+        r"\bi(?:'ve)? heard (?:that )?\b",
+        r"\baccording to\b",
+        r"\bthey say\b",
+        r"\brumor has it\b",
+        r"\bapparently\b",
+    ]
+
+    OBSERVED_CUES = [
+        r"\bi (?:saw|noticed|observed|witnessed)\b",
+        r"\bi(?:'ve)? seen\b",
+        r"\bwatching\b",
+        r"\blooking at\b",
+    ]
+
     # Intensity amplifiers
     INTENSITY_AMPLIFIERS = [
         r"\b(very|really|extremely|incredibly|absolutely|totally|completely|utterly)\b",
@@ -176,7 +248,7 @@ class EmotionalTagger:
 
     async def analyze(self, content: str, role: str = "user") -> MemoryMetadata:
         """
-        Full analysis: emotional + importance + temporal.
+        Full analysis: emotional + importance + temporal + epistemic.
 
         Args:
             content: The message content to analyze
@@ -198,6 +270,9 @@ class EmotionalTagger:
         time_of_day = self._get_time_of_day()
         day_of_week = self._get_day_of_week()
 
+        # Detect epistemic status (certainty, source, temporal validity)
+        epistemic = self._detect_epistemic_status(content)
+
         return MemoryMetadata(
             emotional_valence=valence,
             emotional_intensity=intensity,
@@ -206,6 +281,9 @@ class EmotionalTagger:
             importance_reasons=reasons,
             time_of_day=time_of_day,
             day_of_week=day_of_week,
+            claim_certainty=epistemic.get("claim_certainty"),
+            claim_source=epistemic.get("claim_source"),
+            temporal_validity=epistemic.get("temporal_validity"),
         )
 
     def _analyze_sentiment(self, content: str) -> Tuple[float, float]:
@@ -373,6 +451,99 @@ class EmotionalTagger:
         score = min(1.0, score)
 
         return (score, reasons)
+
+    def _detect_epistemic_status(self, content: str) -> Dict[str, Any]:
+        """Infer epistemic status from linguistic cues in the message.
+
+        Returns a dict with optional keys:
+        - claim_certainty (float 0.0-1.0)
+        - claim_source ("direct" | "inferred" | "hearsay" | "observed")
+        - temporal_validity ("durable" | "ephemeral" | "moment")
+
+        Returns an empty dict for non-claim messages (questions, greetings)
+        so that None values on MemoryMetadata signal "not a claim".
+        """
+        content_lower = content.lower().strip()
+
+        # Check for non-claim patterns first — return empty for questions/greetings
+        for pattern in self.NON_CLAIM_PATTERNS:
+            if re.search(pattern, content_lower, re.IGNORECASE):
+                return {}
+
+        result: Dict[str, Any] = {}
+
+        # --- Claim certainty ---
+        high_hits = sum(
+            1 for p in self.HIGH_CERTAINTY_CUES
+            if re.search(p, content_lower)
+        )
+        medium_hits = sum(
+            1 for p in self.MEDIUM_CERTAINTY_CUES
+            if re.search(p, content_lower)
+        )
+        low_hits = sum(
+            1 for p in self.LOW_CERTAINTY_CUES
+            if re.search(p, content_lower)
+        )
+
+        total_hits = high_hits + medium_hits + low_hits
+        if total_hits > 0:
+            # Weighted average of certainty tiers
+            certainty = (
+                high_hits * 0.9 + medium_hits * 0.6 + low_hits * 0.25
+            ) / total_hits
+            result["claim_certainty"] = round(min(1.0, max(0.0, certainty)), 2)
+
+        # --- Claim source ---
+        hearsay_hits = sum(
+            1 for p in self.HEARSAY_CUES
+            if re.search(p, content_lower)
+        )
+        observed_hits = sum(
+            1 for p in self.OBSERVED_CUES
+            if re.search(p, content_lower)
+        )
+
+        if hearsay_hits > observed_hits:
+            result["claim_source"] = "hearsay"
+        elif observed_hits > hearsay_hits:
+            result["claim_source"] = "observed"
+        elif "claim_certainty" in result:
+            # Has certainty cues but no specific source indicator → direct
+            result["claim_source"] = "direct"
+
+        # --- Temporal validity ---
+        # Moment indicators
+        moment_patterns = [
+            r"\bright now\b", r"\bat the moment\b", r"\bcurrently\b",
+            r"\bjust now\b", r"\btoday\b",
+        ]
+        # Ephemeral indicators
+        ephemeral_patterns = [
+            r"\bfor now\b", r"\btemporarily\b", r"\bfor the time being\b",
+            r"\buntil\b", r"\bthis week\b", r"\bthis month\b",
+        ]
+        # Durable indicators
+        durable_patterns = [
+            r"\balways\b", r"\bforever\b", r"\bpermanently\b",
+            r"\bfrom now on\b", r"\bdecided\b", r"\bcommitting\b",
+        ]
+
+        moment_count = sum(1 for p in moment_patterns if re.search(p, content_lower))
+        ephemeral_count = sum(1 for p in ephemeral_patterns if re.search(p, content_lower))
+        durable_count = sum(1 for p in durable_patterns if re.search(p, content_lower))
+
+        if durable_count > ephemeral_count and durable_count > moment_count:
+            result["temporal_validity"] = "durable"
+        elif moment_count > ephemeral_count:
+            result["temporal_validity"] = "moment"
+        elif ephemeral_count > 0:
+            result["temporal_validity"] = "ephemeral"
+        elif "claim_certainty" in result:
+            # Default for claims without explicit temporal cues
+            result["temporal_validity"] = "durable"
+
+        return result
 
     def _get_time_of_day(self, dt: Optional[datetime] = None) -> str:
         """

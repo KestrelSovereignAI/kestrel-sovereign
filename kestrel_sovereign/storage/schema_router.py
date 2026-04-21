@@ -374,6 +374,7 @@ class SchemaRouter:
         content: str,
         concepts: List[LinkedConcept],
         role: str = "user",
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Route extracted structure from a message.
 
@@ -381,6 +382,9 @@ class SchemaRouter:
             concepts: Typed concept objects from AssociativeLinker.
                 Each carries its graph node_id and category so the
                 router never needs to reconstruct IDs or guess categories.
+            metadata: Enriched message metadata from EmotionalTagger.
+                Epistemic fields (claim_certainty, claim_source,
+                temporal_validity) are inherited by claim-shaped nodes.
 
         Returns a summary dict for inclusion in the message's enriched
         metadata. Best-effort: a failure in one lane doesn't block the
@@ -397,11 +401,14 @@ class SchemaRouter:
             "pending_person_matches": [],
         }
 
+        # Extract epistemic provenance from message metadata for claim nodes
+        epistemic = _extract_epistemic_fields(metadata)
+
         # 1. Action items (graph nodes)
         try:
             items = self.action_extractor.extract(content)
             if items:
-                await self._persist_action_items(items, message_id)
+                await self._persist_action_items(items, message_id, epistemic)
                 summary["action_items"] = len(items)
         except Exception as e:
             logger.warning("Action item routing failed: %s", e)
@@ -410,7 +417,7 @@ class SchemaRouter:
         try:
             decisions = self.decision_extractor.extract(content)
             if decisions:
-                await self._persist_decisions(decisions, message_id)
+                await self._persist_decisions(decisions, message_id, epistemic)
                 summary["decisions"] = len(decisions)
         except Exception as e:
             logger.warning("Decision routing failed: %s", e)
@@ -436,6 +443,7 @@ class SchemaRouter:
         self,
         items: List[str],
         message_id: Optional[str],
+        epistemic: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Idempotent action item persistence as graph nodes.
 
@@ -465,6 +473,11 @@ class SchemaRouter:
                 "created_at": existing_props.get("created_at", now_iso),
                 "updated_at": now_iso,
             }
+            # Inherit epistemic provenance from message metadata
+            if epistemic:
+                for key in ("claim_certainty", "claim_source", "temporal_validity"):
+                    if epistemic.get(key) is not None:
+                        properties[key] = epistemic[key]
             await self.graph.add_node(GraphNode(
                 node_id=node_id,
                 node_type=ACTION_ITEM_NODE_TYPE,
@@ -483,6 +496,7 @@ class SchemaRouter:
         self,
         decisions: List[str],
         message_id: Optional[str],
+        epistemic: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Idempotent decision node creation.
 
@@ -494,17 +508,23 @@ class SchemaRouter:
         now_iso = datetime.now(timezone.utc).isoformat()
         for text in decisions:
             node_id = _deterministic_decision_node_id(self.agent_id, message_id, text)
+            properties = {
+                "text": text,
+                "source_message_id": message_id,
+                "confidence": 0.7,
+                "created_at": now_iso,
+                "agent_id": self.agent_id,
+            }
+            # Inherit epistemic provenance from message metadata
+            if epistemic:
+                for key in ("claim_certainty", "claim_source", "temporal_validity"):
+                    if epistemic.get(key) is not None:
+                        properties[key] = epistemic[key]
             await self.graph.add_node(GraphNode(
                 node_id=node_id,
                 node_type=DECISION_NODE_TYPE,
                 label=text[:120],
-                properties={
-                    "text": text,
-                    "source_message_id": message_id,
-                    "confidence": 0.7,
-                    "created_at": now_iso,
-                    "agent_id": self.agent_id,
-                },
+                properties=properties,
             ))
             if message_id:
                 source = f"message:{self.agent_id}:{message_id}"
@@ -570,6 +590,21 @@ class SchemaRouter:
 # =============================================================================
 
 
+
+
+def _extract_epistemic_fields(metadata: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Extract epistemic provenance fields from enriched message metadata."""
+    if not metadata:
+        return None
+    fields = {}
+    for key in ("claim_certainty", "claim_source", "temporal_validity"):
+        val = metadata.get(key)
+        if val is not None:
+            fields[key] = val
+    return fields if fields else None
+
+
+CLAIM_SHAPED_NODE_TYPES = frozenset({ACTION_ITEM_NODE_TYPE, DECISION_NODE_TYPE})
 
 
 def _deterministic_decision_node_id(
