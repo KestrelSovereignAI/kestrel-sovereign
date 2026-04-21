@@ -70,7 +70,9 @@ class ConstitutionalProfileService:
     # Multiple providers may share the same constitutional profile
     # (e.g., claude_max and anthropic both use Anthropic's published constitution).
     PROVIDER_ALIASES: Dict[str, str] = {
+        "claude_plan": "anthropic",
         "claude_max": "anthropic",
+        "openai_plan": "openai",
         "codex": "openai",
         "openai_mini": "openai",
         "vertex_ai": "google",

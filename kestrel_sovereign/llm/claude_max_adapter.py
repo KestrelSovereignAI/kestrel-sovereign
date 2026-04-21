@@ -20,10 +20,8 @@ How it works:
 3. Everything else (messages, tools, streaming) is identical to AnthropicAdapter
 """
 import logging
-from typing import List
 
 from .anthropic_adapter import AnthropicAdapter
-from .model_metadata import ModelInfo, ModelCategory
 
 logger = logging.getLogger(__name__)
 
@@ -38,34 +36,8 @@ class ClaudeMaxAdapter(AnthropicAdapter):
     and structured output are inherited from AnthropicAdapter.
     """
 
-    async def list_models(self) -> List[ModelInfo]:
-        """
-        Return available models for Claude Max subscription.
-
-        Hardcoded because model discovery requires an API key header,
-        and Max subscriptions use OAuth tokens instead.
-        """
-        return [
-            ModelInfo(
-                id="claude-sonnet-4-6",
-                display_name="Claude Sonnet 4.6 (Max)",
-                provider="claude_max",
-                category=ModelCategory.CHAT,
-                context_limit=200000,
-                supports_tools=True,
-                supports_vision=True,
-                supports_streaming=True,
-                is_featured=True,
-            ),
-            ModelInfo(
-                id="claude-opus-4-6",
-                display_name="Claude Opus 4.6 (Max)",
-                provider="claude_max",
-                category=ModelCategory.CHAT,
-                context_limit=200000,
-                supports_tools=True,
-                supports_vision=True,
-                supports_streaming=True,
-                is_featured=True,
-            ),
-        ]
+    async def list_models(self):
+        """Claude plan uses Anthropic discovery; this execution wrapper has no catalog."""
+        raise NotImplementedError(
+            "Claude plan model discovery is provided by the canonical anthropic provider."
+        )
