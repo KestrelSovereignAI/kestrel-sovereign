@@ -350,10 +350,11 @@ class MemoryFeature(Feature):
         Retrieve memories with human-like weighting.
 
         Uses the MemoryRetriever which scores memories on:
-        - Semantic relevance (30%)
-        - Emotional congruence (25%) - matches current mood
+        - Semantic relevance (25%)
+        - Emotional congruence (20%) - matches current mood
         - Importance (20%) - life events, personal disclosures
         - Recency (15%) - with Ebbinghaus decay curve
+        - Certainty (10%) - epistemic confidence weight
         - Access frequency (10%) - rehearsal strengthens memory
 
         Args:
@@ -517,7 +518,7 @@ class MemoryFeature(Feature):
 
     @tool(
         name="recall_action_items",
-        description="Retrieve action items the user committed to. Filters: status, creation-date window (days), assignee.",
+        description="Retrieve action items the user committed to. Filters: status, creation-date window (days), assignee. Superseded items are excluded by default; pass include_superseded=True to see them.",
         category=ToolCategory.MEMORY,
         command_prefix="!memory actions",
     )
@@ -527,6 +528,7 @@ class MemoryFeature(Feature):
         days: Optional[int] = None,
         assignee_concept_id: Optional[str] = None,
         limit: int = 25,
+        include_superseded: bool = False,
     ) -> Dict[str, Any]:
         """Query action_item graph nodes with optional property filters.
 
@@ -544,6 +546,8 @@ class MemoryFeature(Feature):
                 a due_date explicitly if you need that.
             assignee_concept_id: Optional person concept id to filter by.
             limit: Max rows returned (1-200, default 25).
+            include_superseded: If False (default), excludes items that
+                have been superseded by a newer claim.
         """
         storage = getattr(self.agent, "storage", None)
         if storage is None or not hasattr(storage, "graph"):
@@ -588,19 +592,25 @@ class MemoryFeature(Feature):
             logger.error("recall_action_items query failed: %s", e)
             return {"success": False, "error": str(e)}
 
-        matching = [
-            {
+        matching = []
+        for n in nodes:
+            props = n.properties or {}
+            if not include_superseded and props.get("superseded_by"):
+                continue
+            matching.append({
                 "id": n.node_id,
-                "source_message_id": (n.properties or {}).get("source_message_id"),
-                "text": (n.properties or {}).get("text"),
-                "status": (n.properties or {}).get("status"),
-                "assignee_concept_id": (n.properties or {}).get("assignee_concept_id"),
-                "due_date": (n.properties or {}).get("due_date"),
-                "confidence": (n.properties or {}).get("confidence"),
-                "created_at": (n.properties or {}).get("created_at"),
-            }
-            for n in nodes
-        ]
+                "source_message_id": props.get("source_message_id"),
+                "text": props.get("text"),
+                "status": props.get("status"),
+                "assignee_concept_id": props.get("assignee_concept_id"),
+                "due_date": props.get("due_date"),
+                "confidence": props.get("confidence"),
+                "created_at": props.get("created_at"),
+                "claim_certainty": props.get("claim_certainty"),
+                "claim_source": props.get("claim_source"),
+                "temporal_validity": props.get("temporal_validity"),
+                "superseded_by": props.get("superseded_by"),
+            })
         return {"action_items": matching, "count": len(matching)}
 
     @tool(
@@ -674,11 +684,15 @@ class MemoryFeature(Feature):
 
     @tool(
         name="recall_decisions",
-        description="Retrieve decisions the user has recorded (stored as graph nodes of type 'decision').",
+        description="Retrieve decisions the user has recorded (stored as graph nodes of type 'decision'). Superseded decisions are excluded by default; pass include_superseded=True to see them.",
         category=ToolCategory.MEMORY,
         command_prefix="!memory decisions",
     )
-    async def recall_decisions(self, limit: int = 25) -> Dict[str, Any]:
+    async def recall_decisions(
+        self,
+        limit: int = 25,
+        include_superseded: bool = False,
+    ) -> Dict[str, Any]:
         """List decisions from the graph."""
         storage = getattr(self.agent, "storage", None)
         if storage is None or not hasattr(storage, "graph"):
@@ -702,17 +716,23 @@ class MemoryFeature(Feature):
             logger.error("recall_decisions failed: %s", e)
             return {"success": False, "error": str(e)}
 
-        own = [
-            {
+        own = []
+        for n in nodes:
+            props = n.properties or {}
+            if not include_superseded and props.get("superseded_by"):
+                continue
+            own.append({
                 "id": n.node_id,
                 "label": n.label,
-                "text": (n.properties or {}).get("text"),
-                "source_message_id": (n.properties or {}).get("source_message_id"),
-                "confidence": (n.properties or {}).get("confidence"),
-                "created_at": (n.properties or {}).get("created_at"),
-            }
-            for n in nodes
-        ]
+                "text": props.get("text"),
+                "source_message_id": props.get("source_message_id"),
+                "confidence": props.get("confidence"),
+                "created_at": props.get("created_at"),
+                "claim_certainty": props.get("claim_certainty"),
+                "claim_source": props.get("claim_source"),
+                "temporal_validity": props.get("temporal_validity"),
+                "superseded_by": props.get("superseded_by"),
+            })
         return {"decisions": own, "count": len(own)}
 
     @tool(
@@ -829,6 +849,106 @@ class MemoryFeature(Feature):
             "message_id": message_id,
             "resolved_to": concept_id,
             "ambiguous_edge_removed": removed,
+        }
+
+
+    @tool(
+        name="mark_superseded",
+        description="Mark a claim node (decision or action_item) as superseded by a newer one. Creates a 'supersedes' edge from new to old and sets superseded_by on the old node.",
+        category=ToolCategory.MEMORY,
+        command_prefix="!memory supersede",
+    )
+    async def mark_superseded(
+        self,
+        old_id: str,
+        new_id: str,
+        reason: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Mark old_id as superseded by new_id.
+
+        Only claim-shaped node types (decision, action_item) can be
+        superseded. Both nodes must belong to this agent.
+
+        Args:
+            old_id: Node ID of the claim being replaced.
+            new_id: Node ID of the replacing claim.
+            reason: Optional human-readable reason for the supersession.
+        """
+        from kestrel_sovereign.storage.schema_router import CLAIM_SHAPED_NODE_TYPES
+
+        storage = getattr(self.agent, "storage", None)
+        if storage is None or not hasattr(storage, "graph"):
+            return {"success": False, "error": "Graph store not available"}
+
+        # Fetch both nodes
+        try:
+            old_node = await storage.graph.get_node(old_id)
+            new_node = await storage.graph.get_node(new_id)
+        except Exception as e:
+            logger.error("mark_superseded lookup failed: %s", e)
+            return {"success": False, "error": str(e)}
+
+        # Validate old node exists and belongs to this agent
+        if old_node is None:
+            return {"success": False, "error": f"Node {old_id} not found"}
+        old_props = old_node.properties or {}
+        if old_props.get("agent_id") != self.agent_id:
+            return {"success": False, "error": f"Node {old_id} not found"}
+
+        # Validate new node exists and belongs to this agent
+        if new_node is None:
+            return {"success": False, "error": f"Node {new_id} not found"}
+        new_props = new_node.properties or {}
+        if new_props.get("agent_id") != self.agent_id:
+            return {"success": False, "error": f"Node {new_id} not found"}
+
+        # Restrict to claim-shaped node types
+        if old_node.node_type not in CLAIM_SHAPED_NODE_TYPES:
+            return {
+                "success": False,
+                "error": f"Cannot supersede node of type '{old_node.node_type}'. "
+                         f"Only {sorted(CLAIM_SHAPED_NODE_TYPES)} nodes can be superseded.",
+            }
+        if new_node.node_type not in CLAIM_SHAPED_NODE_TYPES:
+            return {
+                "success": False,
+                "error": f"Replacement node must be a claim type ({sorted(CLAIM_SHAPED_NODE_TYPES)}), "
+                         f"got '{new_node.node_type}'.",
+            }
+
+        # Write the supersedes edge: new → old
+        edge_props = {"reason": reason, "superseded_at": _utc_now_iso()}
+        try:
+            await storage.graph.add_edge(
+                new_id, old_id, "supersedes", properties=edge_props
+            )
+        except Exception as e:
+            logger.error("mark_superseded edge write failed: %s", e)
+            return {"success": False, "error": str(e)}
+
+        # Set superseded_by property on the old node
+        old_props["superseded_by"] = new_id
+        old_props["superseded_at"] = edge_props["superseded_at"]
+        if reason:
+            old_props["superseded_reason"] = reason
+
+        from kestrel_sovereign.storage.async_graph_store import GraphNode
+        try:
+            await storage.graph.add_node(GraphNode(
+                node_id=old_node.node_id,
+                node_type=old_node.node_type,
+                label=old_node.label,
+                properties=old_props,
+            ))
+        except Exception as e:
+            logger.error("mark_superseded property update failed: %s", e)
+            return {"success": False, "error": str(e)}
+
+        return {
+            "success": True,
+            "old_id": old_id,
+            "new_id": new_id,
+            "reason": reason,
         }
 
 
