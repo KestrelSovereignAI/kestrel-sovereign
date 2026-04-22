@@ -70,7 +70,9 @@ class OpenRouterAdapter(OpenAIAdapter):
             default_headers={
                 "HTTP-Referer": self.site_url,
                 "X-Title": self.app_name,
-            }
+            },
+            # max_retries=0: llm/retry.py is the single retry owner.
+            max_retries=0,
         )
 
     async def get_response(

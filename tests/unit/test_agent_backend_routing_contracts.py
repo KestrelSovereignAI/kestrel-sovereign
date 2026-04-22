@@ -98,35 +98,36 @@ class TestPreferenceRoundTrip:
 
     def test_set_provider_and_model(self, service_with_providers):
         svc = service_with_providers
-        svc.set_model_preference("claude-sonnet-4-6", provider="claude_plan")
+        svc.set_model_preference("claude-sonnet-4-6", vendor="anthropic", route="plan")
 
         pref = svc.get_model_preference()
         assert pref["model"] == "claude-sonnet-4-6"
-        assert pref["provider"] == "claude_plan"
+        assert pref["vendor"] == "anthropic"
+        assert pref["route"] == "plan"
 
     def test_preference_survives_get_active_model_id(self, service_with_providers):
         svc = service_with_providers
-        svc.set_model_preference("claude-sonnet-4-6", provider="claude_plan")
+        svc.set_model_preference("claude-sonnet-4-6", vendor="anthropic", route="plan")
 
         active = svc.get_active_model_id()
         assert active == "claude-sonnet-4-6"
 
     def test_clear_preference_returns_to_default(self, service_with_providers):
         svc = service_with_providers
-        svc.set_model_preference("claude-sonnet-4-6", provider="claude_plan")
+        svc.set_model_preference("claude-sonnet-4-6", vendor="anthropic", route="plan")
         svc.clear_model_preference()
 
         pref = svc.get_model_preference()
         assert pref["model"] is None
-        assert pref["provider"] is None
+        assert pref["vendor"] is None
 
     def test_auto_model_is_ignored(self, service_with_providers):
         svc = service_with_providers
-        svc.set_model_preference("auto", provider="openai")
+        svc.set_model_preference("auto", vendor="openai")
 
         pref = svc.get_model_preference()
         assert pref["model"] is None
-        assert pref["provider"] is None
+        assert pref["vendor"] is None
 
 
 class TestResolveProviderRouting:
@@ -148,7 +149,7 @@ class TestResolveProviderRouting:
 
     def test_provider_preference_restricts_to_single_provider(self, service_with_providers):
         svc = service_with_providers
-        svc.set_model_preference("claude-sonnet-4-6", provider="claude_plan")
+        svc.set_model_preference("claude-sonnet-4-6", vendor="anthropic", route="plan")
 
         providers, target = svc.resolve_provider_routing()
 
@@ -158,7 +159,7 @@ class TestResolveProviderRouting:
 
     def test_model_override_takes_precedence(self, service_with_providers):
         svc = service_with_providers
-        svc.set_model_preference("claude-sonnet-4-6", provider="claude_plan")
+        svc.set_model_preference("claude-sonnet-4-6", vendor="anthropic", route="plan")
 
         providers, target = svc.resolve_provider_routing(
             model_override="openai/gpt-5-mini"
@@ -182,7 +183,7 @@ class TestUnavailableProviderFails:
 
     def test_mandate_preference_for_missing_provider_raises(self, service_with_providers):
         svc = service_with_providers
-        svc.set_model_preference("gpt-5.4", provider="openai_plan")
+        svc.set_model_preference("gpt-5.4", vendor="openai", route="plan")
 
         with pytest.raises(LLMProviderUnavailableError) as exc_info:
             svc.resolve_provider_routing()
@@ -200,7 +201,7 @@ class TestUnavailableProviderFails:
 
     def test_unavailable_with_fallbacks_degrades_gracefully(self, service_with_providers):
         svc = service_with_providers
-        svc.set_model_preference("gpt-5.4", provider="openai_plan")
+        svc.set_model_preference("gpt-5.4", vendor="openai", route="plan")
         svc.add_fallback_model("gpt-5-mini", provider="openai")
 
         providers, target = svc.resolve_provider_routing()
@@ -215,7 +216,7 @@ class TestClaudePlanRouting:
 
     def test_claude_plan_is_distinct_from_anthropic(self, service_with_providers):
         svc = service_with_providers
-        svc.set_model_preference("claude-sonnet-4-6", provider="claude_plan")
+        svc.set_model_preference("claude-sonnet-4-6", vendor="anthropic", route="plan")
 
         providers, _ = svc.resolve_provider_routing()
 
@@ -225,7 +226,7 @@ class TestClaudePlanRouting:
 
     def test_anthropic_preference_does_not_use_claude_plan(self, service_with_providers):
         svc = service_with_providers
-        svc.set_model_preference("claude-sonnet-4-6", provider="anthropic")
+        svc.set_model_preference("claude-sonnet-4-6", vendor="anthropic")
 
         providers, _ = svc.resolve_provider_routing()
 
@@ -238,7 +239,7 @@ class TestOpenAIPlanRouting:
 
     def test_openai_plan_preference_routes_to_openai_plan(self, service_with_openai_plan):
         svc = service_with_openai_plan
-        svc.set_model_preference("gpt-5.4", provider="openai_plan")
+        svc.set_model_preference("gpt-5.4", vendor="openai", route="plan")
 
         providers, target = svc.resolve_provider_routing()
 
@@ -265,7 +266,7 @@ class TestPreferencePersistence:
         svc.set_preference_persistence_callback(callback)
 
         async def _run():
-            svc.set_model_preference("claude-sonnet-4-6", provider="claude_plan")
+            svc.set_model_preference("claude-sonnet-4-6", vendor="anthropic", route="plan")
             await asyncio.sleep(0.01)
 
         asyncio.run(_run())
@@ -278,7 +279,7 @@ class TestPreferencePersistence:
         svc.set_preference_persistence_callback(callback)
 
         async def _run():
-            svc.set_model_preference("gpt-5", provider="openai")
+            svc.set_model_preference("gpt-5", vendor="openai")
             await asyncio.sleep(0.01)
             svc.clear_model_preference()
             await asyncio.sleep(0.01)

@@ -2,7 +2,7 @@
 from fastapi import APIRouter, HTTPException, Request, Query, UploadFile, File
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
-from typing import Optional, List
+from typing import Optional, List, Dict
 import aiohttp
 import httpx
 import re
@@ -782,27 +782,39 @@ async def list_agent_models(
         # Convert to dicts for JSON response
         models_data = [m.to_dict() for m in models]
 
-        # Group by provider
-        by_provider = {}
+        # Group by vendor. `ModelInfo.provider` is the vendor field; the name
+        # was kept for backward-file-compat but the semantic is vendor.
+        by_vendor: Dict[str, List[Dict]] = {}
         for model in models:
-            if model.provider not in by_provider:
-                by_provider[model.provider] = []
-            by_provider[model.provider].append(model.to_dict())
+            by_vendor.setdefault(model.provider, []).append(model.to_dict())
 
-        # Get featured models
+        # Featured models (computed per ModelCatalogService rules)
         featured = [m.to_dict() for m in models if m.is_featured]
 
-        # Get effective default model from the same routing source used at runtime.
+        # Effective default model from the runtime routing source.
         default_model = None
         if hasattr(agent, 'llm_service') and agent.llm_service:
             default_model = agent.llm_service.get_active_model_id()
 
+        # Surface the routes (vendor,route pairs) configured on this agent so
+        # the UI can show a per-vendor route selector without extra round-trips.
+        routes = []
+        if hasattr(agent, 'llm_service') and agent.llm_service:
+            for p in agent.llm_service.providers:
+                routes.append({
+                    "vendor": p.get("vendor"),
+                    "route": p.get("route"),
+                    "is_local": p.get("is_local"),
+                    "model": p.get("model"),
+                })
+
         return {
-            "by_provider": by_provider,
+            "by_vendor": by_vendor,
             "featured": featured,
             "all": models_data,
             "default": default_model,
             "count": len(models_data),
+            "routes": routes,
         }
     except HTTPException:
         raise
@@ -813,14 +825,10 @@ async def list_agent_models(
 
 @router.get("/api/model/current")
 async def get_current_model(request: Request):
-    """Get the currently active model for UI sync.
-    
-    Returns the model/provider from mandate preference if set,
-    otherwise falls back to the first provider's default model.
-    """
+    """Return the currently active ``{vendor, model, route}`` selection."""
     try:
         agent = get_agent(request)
-        selection = {"model": None, "provider": None, "model_name": None}
+        selection = {"model": None, "vendor": None, "route": None, "model_name": None}
 
         if hasattr(agent, 'llm_service') and agent.llm_service:
             from kestrel_sovereign.llm.service import resolve_active_model_selection
@@ -828,8 +836,9 @@ async def get_current_model(request: Request):
 
         return {
             "model": selection["model"],
-            "provider": selection["provider"],
-            "model_name": selection["model_name"]
+            "vendor": selection["vendor"],
+            "route": selection["route"],
+            "model_name": selection["model_name"],
         }
     except Exception as e:
         logger.error(f"Error getting current model: {e}", exc_info=True)
@@ -838,11 +847,14 @@ async def get_current_model(request: Request):
 
 @router.post("/api/model/set")
 async def set_current_model(request: Request):
-    """Set the active model and provider for this session.
+    """Set the active ``{vendor, model, route?}`` for this session.
 
-    Accepts JSON body: {"model": "gpt-5-mini", "provider": "openai"}
-    The provider is optional. If omitted, auto-detection is used.
-    Also accepts combined format: {"model": "openai/gpt-5-mini"}.
+    Accepts JSON body: ``{"vendor": "anthropic", "model": "claude-sonnet-4-6", "route": "plan"}``.
+    ``vendor`` and ``route`` are optional — omitting vendor lets routing scan
+    all configured vendors for the model; omitting route uses the first
+    configured route for that vendor. Also accepts combined forms in the
+    ``model`` field: ``"anthropic/claude-sonnet-4-6"`` or
+    ``"anthropic:plan/claude-sonnet-4-6"``.
     """
     try:
         data = await request.json()
@@ -854,20 +866,33 @@ async def set_current_model(request: Request):
         if not hasattr(agent, 'llm_service') or not agent.llm_service:
             raise HTTPException(status_code=503, detail="LLM service not available.")
 
-        provider = data.get("provider")
+        vendor = data.get("vendor")
+        route = data.get("route")
         model_name = model
 
-        # Support combined "provider/model" format in the model field
-        if "/" in model and not provider:
-            provider, model_name = model.split("/", 1)
+        # Combined forms in the model field.
+        if "/" in model_name and not vendor:
+            left, model_name = model_name.split("/", 1)
+            if ":" in left:
+                vendor, route = left.split(":", 1)
+            else:
+                vendor = left
 
-        agent.llm_service.set_model_preference(model_name, provider)
+        agent.llm_service.set_model_preference(model_name, vendor, route)
+
+        if vendor and route:
+            full = f"{vendor}:{route}/{model_name}"
+        elif vendor:
+            full = f"{vendor}/{model_name}"
+        else:
+            full = model_name
 
         return {
             "success": True,
+            "vendor": vendor,
+            "route": route,
             "model": model_name,
-            "provider": provider,
-            "full_model": f"{provider}/{model_name}" if provider else model_name,
+            "full_model": full,
         }
     except HTTPException:
         raise

@@ -267,38 +267,50 @@ async def set_privacy_mode(request: Request):
         if transition is None and hasattr(agent, 'llm_service') and agent.llm_service:
             llm = agent.llm_service
             if not config.allows_cloud_llm():
-                local_names = llm._get_local_provider_names()
-                # Save the resolved active cloud route before overriding to local.
-                # A user may be running on the default provider/model without an
-                # explicit mandate preference, and that effective route still needs
-                # to be restored when leaving local-only privacy modes.
+                # Save the resolved active cloud selection before overriding to local,
+                # so we can restore it when privacy allows cloud again.
                 current_pref = llm.get_model_preference() or {}
-                current_provider = current_pref.get("provider")
+                current_vendor = current_pref.get("vendor")
                 current_model = current_pref.get("model")
+                current_route = current_pref.get("route")
                 if not current_model and getattr(llm, "providers", None):
-                    first_provider = llm.providers[0]
-                    current_provider = first_provider.get("name")
-                    current_model = first_provider.get("model")
-                if current_model and current_provider not in (local_names or []):
+                    first = llm.providers[0]
+                    current_vendor = first.get("vendor")
+                    current_model = first.get("model")
+                    current_route = first.get("route")
+                if current_model and not (
+                    next((p for p in llm.providers if p.get("vendor") == current_vendor and p.get("is_local")), None)
+                ):
                     llm._pre_ephemeral_preference = {
-                        "provider": current_provider,
+                        "vendor": current_vendor,
                         "model": current_model,
+                        "route": current_route,
                     }
 
-                local_providers = [p for p in llm.providers if p["name"] in local_names]
+                local_routes = [p for p in llm.providers if p.get("is_local")]
                 # Prefer ollama over llama_cpp — ollama is more universally available
-                local_provider = next(
-                    (p for p in local_providers if p["name"] == "ollama"),
-                    local_providers[0] if local_providers else None,
+                local_route = next(
+                    (p for p in local_routes if p.get("vendor") == "ollama"),
+                    local_routes[0] if local_routes else None,
                 )
-                if local_provider:
-                    llm.set_model_preference(local_provider["model"], local_provider["name"])
-                    model_switched = {"provider": local_provider["name"], "model": local_provider["model"]}
+                if local_route:
+                    llm.set_model_preference(
+                        local_route["model"], local_route.get("vendor"), local_route.get("route")
+                    )
+                    model_switched = {
+                        "vendor": local_route.get("vendor"),
+                        "route": local_route.get("route"),
+                        "model": local_route["model"],
+                    }
             elif config.allows_cloud_llm():
                 # Restore previous cloud preference if we saved one
                 saved = getattr(llm, '_pre_ephemeral_preference', None)
                 if saved:
-                    llm.set_model_preference(saved.get("model", ""), saved.get("provider", ""))
+                    llm.set_model_preference(
+                        saved.get("model", ""),
+                        saved.get("vendor"),
+                        saved.get("route"),
+                    )
                     model_switched = saved
                     llm._pre_ephemeral_preference = None
 
@@ -492,42 +504,64 @@ async def get_context_status(
         counter = get_token_counter(current_model)
         context_limit = counter.get_context_limit()
 
-        # 3. Get conversation history for the specified session and count actual tokens
+        # 3. Get conversation history for the specified session
         history = await agent.storage.get_conversation_history(limit=MAX_CONVERSATION_HISTORY_LIMIT, session_id=session_id)
         message_count = len(history)
 
-        total_tokens = sum(
-            counter.count(msg.get("content", ""))
-            for msg in history
-        )
+        # 4. Compute effective tokens the LLM call path would actually send
+        # (uses the same pruning + per-message cap as format_conversation_history)
+        ctx_builder = getattr(agent, 'context_builder', None)
+        if ctx_builder is None:
+            from kestrel_sovereign.agent.context_builder import ContextBuilder
+            ctx_builder = ContextBuilder(storage=agent.storage)
 
-        # 4. Calculate utilization
+        est = ctx_builder.estimate_effective_history_tokens(history, current_model)
+
+        # 5. Utilization is based on what the next LLM call would actually send,
+        # not naive raw history. This matches what the user will experience.
+        effective_tokens = est['effective_tokens']
+        raw_tokens = est['raw_tokens']
+        history_budget = est['history_budget']
+
         response_reserve = RESPONSE_RESERVE
         total_budget = context_limit - response_reserve
-        utilization = (total_tokens / total_budget * 100) if total_budget > 0 else 0
 
-        # 5. Determine status and warnings
+        # Utilization of the history slice. Cap at 100% for display —
+        # tiny overshoots from truncation markers should not read as 120%.
+        history_utilization = (effective_tokens / history_budget * 100) if history_budget > 0 else 0
+        history_utilization = min(history_utilization, 100.0)
+
+        # 6. Determine status and warnings based on effective (post-pruning) figures
         warnings = []
-        if utilization < 50:
+        if history_utilization < 50:
             status_str = "healthy"
-        elif utilization < 70:
+        elif history_utilization < 70:
             status_str = "normal"
-        elif utilization < 85:
+        elif history_utilization < 85:
             status_str = "warning"
-            warnings.append(f"Context {utilization:.0f}% full - consider using !compress")
+            warnings.append(f"History budget {history_utilization:.0f}% full - consider using !compress")
         else:
             status_str = "critical"
-            warnings.append(f"Context {utilization:.0f}% full - compression strongly recommended")
+            warnings.append(f"History budget {history_utilization:.0f}% full - compression strongly recommended")
+
+        # Note: raw tokens >> effective tokens means oversized messages were
+        # capped or old messages pruned. That's expected behavior, not a warning.
+        if raw_tokens > total_budget and effective_tokens <= history_budget:
+            # Informational: some messages were pruned/capped, but the call is fine
+            pass
 
         return {
             "model": current_model,
             "message_count": message_count,
-            "total_tokens": total_tokens,
+            "messages_kept_after_pruning": est['messages_kept'],
+            "total_tokens": effective_tokens,  # what LLM will actually see
+            "total_tokens_raw": raw_tokens,     # unpruned sum (debug)
             "context_limit": context_limit,
             "response_reserve": response_reserve,
             "total_budget": total_budget,
-            "utilization_percent": round(utilization, 1),
-            "compression_recommended": utilization >= 70,
+            "history_budget": history_budget,
+            "utilization_percent": round(history_utilization, 1),
+            "compression_recommended": history_utilization >= 70,
             "status": status_str,
             "warnings": warnings
         }

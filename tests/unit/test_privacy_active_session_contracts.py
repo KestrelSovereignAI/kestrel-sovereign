@@ -59,7 +59,7 @@ class _LLMService:
     def get_model_preference(self):
         return {"provider": "openai", "model": "gpt-5-mini"}
 
-    def set_model_preference(self, model, provider=None):
+    def set_model_preference(self, model, vendor=None, route=None):
         self.model_preference = {"provider": provider, "model": model}
 
 

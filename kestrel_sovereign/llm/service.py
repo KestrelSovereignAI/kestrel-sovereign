@@ -44,7 +44,6 @@ from .usage_tracking import UsageTrackingMixin
 from .streaming import StreamingMixin
 from .constitutional_awareness import ConstitutionalAwarenessMixin
 from .remote_backend import RemoteBackendMixin, BackendType, RemoteGPUConfig
-from .provider_names import normalize_provider_name, provider_name_candidates
 from kestrel_sovereign.kestrel_config.constants import (
     HTTP_TIMEOUT_MEDIUM,
     CLIENT_CLOSE_TIMEOUT,
@@ -62,30 +61,66 @@ async def _wait_for_close_result(result: Any) -> None:
 
 
 def resolve_active_model_selection(llm_service) -> Dict[str, Optional[str]]:
-    """Resolve canonical current-model metadata for any LLM-service-like object."""
-    pref = llm_service.get_model_preference()
+    """Resolve canonical current-selection metadata for any LLM-service-like object.
+
+    Returns a dict with keys:
+        vendor:     e.g. ``"openai"`` — None only if no routes are configured.
+        route:      e.g. ``"api"`` — None when the mandate specifies only a vendor.
+        model_name: the model ID.
+        model:      display form ``"<vendor>/<model_name>"`` or ``"<vendor>:<route>/<model_name>"``.
+    """
+    pref = llm_service.get_model_preference() or {}
     model_name = pref.get("model")
-    provider = pref.get("provider")
+    vendor = pref.get("vendor")
+    route = pref.get("route")
 
     providers = getattr(llm_service, "providers", None)
     if not model_name and providers:
-        first_provider = providers[0]
-        provider = first_provider.get("name")
-        model_name = first_provider.get("model")
+        first = providers[0]
+        vendor = vendor or first.get("vendor") or first.get("name")
+        route = route or first.get("route")
+        model_name = first.get("model")
 
     if not model_name:
         model_name = "auto"
 
-    full_model = f"{provider}/{model_name}" if provider and model_name else model_name
+    if vendor and route:
+        full = f"{vendor}:{route}/{model_name}"
+    elif vendor:
+        full = f"{vendor}/{model_name}"
+    else:
+        full = model_name
     return {
-        "model": full_model,
-        "provider": provider,
+        "model": full,
+        "vendor": vendor,
+        "route": route,
         "model_name": model_name,
     }
 
 
 class LLMServiceError(LLMError):
     """Raised when LLM service cannot fulfill a request."""
+
+
+class ModelNotAvailableForRoute(LLMError):
+    """Raised by _try_single_provider when the target model isn't in the
+    route's vendor catalog.
+
+    Signals the outer fallback loop to skip this provider and try the next,
+    instead of firing a request that will either 404/400 (cloud provider
+    rejects the model) or silently serve the wrong weights (llama.cpp
+    ignores the model name).
+    """
+
+    def __init__(self, vendor: Optional[str], route: Optional[str], model: str):
+        self.vendor = vendor
+        self.route = route
+        self.model = model
+        route_key = f"{vendor}:{route}" if vendor and route else (vendor or "unknown")
+        super().__init__(
+            f"Model '{model}' is not available for route '{route_key}'. "
+            "Skipping — callers should target a vendor that serves this model."
+        )
 
 
 class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, StreamingMixin, ConstitutionalAwarenessMixin, RemoteBackendMixin):
@@ -132,7 +167,11 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         self._init_constitutional_profiles()
 
         # Runtime mandate state
-        self._mandate_preference = {"model": None, "provider": None}
+        # Mandate preference schema: {"vendor": str|None, "model": str|None, "route": str|None}.
+        # vendor + model are the primary selectors; route is optional and narrows
+        # to an exact (vendor, route) pair. Stale rows using the old {"model", "provider"}
+        # shape are dropped by model_preference._load_model_preference().
+        self._mandate_preference = {"vendor": None, "model": None, "route": None}
         self._mandate_fallbacks = []
 
         # Remote GPU backend state (merged from BrainRouter)
@@ -169,46 +208,53 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         self._preference_persistence_callback = callback
         logger.info("Model preference persistence enabled")
 
-    def set_model_preference(self, model: str, provider: Optional[str] = None) -> None:
-        """Set the mandated model preference for this session.
-
-        When set, the LLM service will use ONLY the specified provider (if given)
-        and model, without falling back to other providers with incompatible models.
+    def set_model_preference(
+        self,
+        model: str,
+        vendor: Optional[str] = None,
+        route: Optional[str] = None,
+    ) -> None:
+        """Set the mandated model selection for this session.
 
         Args:
-            model: The model name to use (e.g., "gpt-5-mini", "claude-sonnet-4-5")
-            provider: Optional provider name (e.g., "openai", "anthropic").
-                     If specified, only this provider will be used.
+            model: The model ID to use. ``"auto"`` is ignored (means default routing).
+            vendor: Optional vendor name (``"openai"``, ``"anthropic"``, ...).
+                When given, only routes for this vendor are used.
+            route: Optional route name (``"api"``, ``"plan"``, ``"local"``).
+                When given with a vendor, narrows to the exact ``<vendor>:<route>``.
         """
-        # "auto" is not a real preference — it means "use default provider routing"
         if model == "auto":
             logger.debug("Ignoring model preference 'auto' — using default routing")
             return
-        self._mandate_preference = {"model": model, "provider": provider}
-        if provider:
-            logger.info(f"Model preference set to: {model} (provider: {provider})")
+        self._mandate_preference = {"vendor": vendor, "model": model, "route": route}
+        if vendor and route:
+            logger.info("Model preference set: %s:%s/%s", vendor, route, model)
+        elif vendor:
+            logger.info("Model preference set: %s/%s", vendor, model)
         else:
-            logger.info(f"Model preference set to: {model} (provider: auto-detect)")
+            logger.info("Model preference set: %s (vendor auto-detect)", model)
 
-        # Persist to database if callback is registered
         if self._preference_persistence_callback:
-            self._schedule_preference_persistence(model, provider)
+            self._schedule_preference_persistence(model, vendor, route)
 
     def clear_model_preference(self) -> None:
         """Clear any mandated model preference, returning to default behavior."""
-        self._mandate_preference = {"model": None, "provider": None}
-        logger.info("Model preference cleared, using default provider order")
+        self._mandate_preference = {"vendor": None, "model": None, "route": None}
+        logger.info("Model preference cleared, using default route order")
 
-        # Persist the cleared preference
         if self._preference_persistence_callback:
-            self._schedule_preference_persistence(None, None)
+            self._schedule_preference_persistence(None, None, None)
 
     def _schedule_preference_persistence(
         self,
         model: Optional[str],
-        provider: Optional[str],
+        vendor: Optional[str],
+        route: Optional[str],
     ) -> Optional[asyncio.Task[None]]:
-        """Own preference persistence callbacks so close() can await them."""
+        """Own preference persistence callbacks so close() can await them.
+
+        Callback signature is ``async (model, vendor, route) -> None``.
+        """
         if not self._preference_persistence_callback:
             return None
 
@@ -219,7 +265,7 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
             return None
 
         task = loop.create_task(
-            self._preference_persistence_callback(model, provider),
+            self._preference_persistence_callback(model, vendor, route),
             name="llm-preference-persistence",
         )
         self._preference_persistence_tasks.add(task)
@@ -300,42 +346,23 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         model_override: Optional[str] = None,
         force_local_only: bool = False,
     ) -> tuple[list[dict[str, Any]], Optional[str]]:
-        """Resolve which providers and model to use for the next LLM call.
+        """Resolve which routes and model to use for the next LLM call.
 
-        This is the **single source of truth** for provider routing.  All
-        code paths (``get_response``, ``generate_stream``,
-        ``stream_response``, ``stream_response_with_tools``) should call
-        this method instead of duplicating the resolution logic.
+        Single source of truth for routing. All call paths funnel through here.
 
-        Resolution order
-        ----------------
-        1. ``model_override`` — explicit caller override (e.g. ``provider/model``
-           or bare model name).  If it contains a ``/``, the left side is
-           treated as the provider name.
-        2. **Mandate preference** — the agent's persisted preference set via
-           ``set_model_preference()`` (typically from ``!model-set`` or the UI).
-           When a *provider* is specified, **only** that provider is used; the
-           call will **not** silently fall back to a different provider.
-        3. **Default provider order** — the ``provider_priority`` list from
-           ``llm_config.toml``, each provider using its configured model.
+        Resolution order:
+            1. ``model_override`` — caller-supplied ``vendor/model`` or
+               ``vendor:route/model`` or bare model string. If a vendor (or
+               vendor:route) prefix is given, only matching routes are used.
+            2. **Mandate preference** — persisted ``{vendor, model, route?}``.
+               ``vendor`` filters routes; ``route``, if set, narrows to that
+               exact route. Target model comes from the mandate.
+            3. **Default route order** — all initialized routes, ordered per
+               ``route_priority`` in ``llm_config.toml``.
 
-        Fallback behaviour
-        ------------------
-        * If the preferred provider is **not** in the initialized provider
-          list **and** the ``_mandate_fallbacks`` list is empty, a
-          ``LLMProviderUnavailableError`` is raised so the caller fails
-          honestly.
-        * If fallbacks *are* configured (via ``add_fallback_model``), they are
-          appended after the preferred provider so the call degrades
-          gracefully.
-        * ``force_local_only=True`` filters the resulting list to local
-          providers only (Ollama, etc.).
-
-        Returns
-        -------
-        ``(providers_to_use, target_model)`` — a list of provider dicts
-        (in priority order) and the model to request.  ``target_model`` may
-        be ``None`` when each provider should use its own configured model.
+        ``force_local_only=True`` additionally filters to local routes. If the
+        resolved ``target_model`` isn't the configured default for any local
+        route, it's cleared so each local route uses its own model.
         """
         providers_to_use = list(self.providers)
         target_model: Optional[str] = None
@@ -343,18 +370,14 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         # --- 1. Explicit model_override ---
         if model_override:
             if "/" in model_override:
-                provider_name, model_name = model_override.split("/", 1)
-                provider_name = normalize_provider_name(provider_name)
+                left, model_name = model_override.split("/", 1)
                 target_model = model_name
-                matching = [
-                    p for p in providers_to_use
-                    if p["name"] in provider_name_candidates(provider_name)
-                ]
+                matching = self._filter_providers_by_selector(providers_to_use, left)
                 if matching:
                     providers_to_use = matching
                 else:
                     raise LLMProviderUnavailableError(
-                        provider_name,
+                        left,
                         [p["name"] for p in self.providers],
                     )
             else:
@@ -363,92 +386,135 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         # --- 2. Mandate preference (persisted agent preference) ---
         elif self._mandate_preference.get("model"):
             pref_model = self._mandate_preference["model"]
-            pref_provider = self._mandate_preference.get("provider")
+            pref_vendor = self._mandate_preference.get("vendor")
+            pref_route = self._mandate_preference.get("route")
             target_model = pref_model
 
-            if pref_provider:
-                pref_provider = normalize_provider_name(pref_provider)
-                matching = [
-                    p for p in providers_to_use
-                    if p["name"] in provider_name_candidates(pref_provider)
-                ]
+            if pref_vendor:
+                selector = f"{pref_vendor}:{pref_route}" if pref_route else pref_vendor
+                matching = self._filter_providers_by_selector(providers_to_use, selector)
                 if matching:
                     providers_to_use = matching
                     logger.info(
-                        "Provider routing: using mandated provider '%s' with model '%s'",
-                        pref_provider,
+                        "Provider routing: using mandated %s with model '%s'",
+                        selector,
                         pref_model,
                     )
                 elif self._mandate_fallbacks:
-                    # Preferred provider unavailable but fallbacks exist —
-                    # build a fallback chain.
                     logger.warning(
-                        "Mandated provider '%s' unavailable; using %d fallback(s)",
-                        pref_provider,
+                        "Mandated %s unavailable; using %d fallback(s)",
+                        selector,
                         len(self._mandate_fallbacks),
                     )
                     fallback_providers = []
                     for fb in self._mandate_fallbacks:
-                        fb_provider = fb.get("provider")
-                        if fb_provider:
-                            fb_provider = normalize_provider_name(fb_provider)
-                            match = next(
-                                (
-                                    p for p in self.providers
-                                    if p["name"] in provider_name_candidates(fb_provider)
-                                ),
-                                None,
+                        fb_vendor = fb.get("vendor") or fb.get("provider")
+                        if fb_vendor:
+                            match_list = self._filter_providers_by_selector(
+                                self.providers,
+                                fb_vendor,
                             )
-                            if match:
-                                fallback_providers.append(match)
+                            if match_list:
+                                fallback_providers.append(match_list[0])
                     if fallback_providers:
                         providers_to_use = fallback_providers
-                        # Use first fallback's model
                         target_model = self._mandate_fallbacks[0].get("model") or target_model
-                    # else: fall through to full provider list
                 else:
                     raise LLMProviderUnavailableError(
-                        pref_provider,
+                        selector,
                         [p["name"] for p in self.providers],
                     )
-            # else: model-only mandate — override model on all providers
+            # else: model-only mandate — each route tries the model.
 
         # --- 3. force_local_only filter ---
         if force_local_only:
-            local_names = self._get_local_provider_names()
-            providers_to_use = [p for p in providers_to_use if p["name"] in local_names]
+            providers_to_use = [p for p in providers_to_use if p.get("is_local")]
             if not providers_to_use:
                 raise RuntimeError("No local providers available.")
 
-            # If target model doesn't belong to a local provider, clear it
             if target_model and not any(
                 target_model == p["model"] for p in providers_to_use
             ):
-                logger.info("LOCAL_ONLY: ignoring cloud model '%s', using local model", target_model)
+                logger.info("LOCAL_ONLY: ignoring non-local model '%s', using each local route's configured model", target_model)
                 target_model = None
 
         return providers_to_use, target_model
 
-    def _convert_providers_format(self, provider_infos: List[ProviderInfo]) -> List[Dict[str, Any]]:
-        """Convert ProviderInfo objects to legacy dictionary format.
+    def _model_available_for_route(self, provider: Dict[str, Any], model_id: str) -> bool:
+        """Return True iff the model is discoverable in this route's vendor catalog.
 
-        This maintains backward compatibility while using the new ProviderRegistry.
+        Uses the shared discovery cache. If discovery hasn't populated yet
+        (cold-start before any list-models call), we permit the call rather
+        than blocking every request — this only gates against *known* mismatches,
+        not unknown state.
 
-        Args:
-            provider_infos: List of ProviderInfo objects from registry
-
-        Returns:
-            List of provider dictionaries in legacy format
+        The route's own configured model counts as available (so a route with
+        a configured default still works before discovery confirms it).
         """
-        return [
-            {
+        if not model_id:
+            return True
+        # Route's own configured default is always considered available.
+        if provider.get("model") == model_id:
+            return True
+        vendor = provider.get("vendor")
+        if not vendor:
+            return True  # Unknown-shape provider — can't validate, let it through.
+
+        from .model_cache import get_shared_model_cache
+        cache = get_shared_model_cache().get_any()
+        if not cache:
+            return True  # No discovery yet — don't block.
+
+        for m in cache:
+            if m.provider == vendor and m.id == model_id:
+                return True
+        return False
+
+    @staticmethod
+    def _filter_providers_by_selector(providers: List[Dict[str, Any]], selector: str) -> List[Dict[str, Any]]:
+        """Filter route dicts by selector.
+
+        Selector forms:
+            "anthropic"          → all anthropic routes (vendor-only match).
+            "anthropic:plan"     → exactly the anthropic:plan route.
+
+        Matching is exact on vendor or composite route name.
+        """
+        if not selector:
+            return []
+        if ":" in selector:
+            # Composite route key, exact match.
+            return [p for p in providers if p.get("name") == selector]
+        return [p for p in providers if p.get("vendor") == selector]
+
+    def _convert_providers_format(self, provider_infos: List[ProviderInfo]) -> List[Dict[str, Any]]:
+        """Flatten ProviderInfo list into the dict shape consumed by service.py.
+
+        Each entry in ``self.providers`` is a **route** (vendor/route pair),
+        not a traditional single-name provider. ``name`` is the composite
+        ``"<vendor>:<route>"`` key; ``vendor`` carries the grouping dimension
+        that discovery and UI buckets use.
+        """
+        out = []
+        for provider in provider_infos:
+            hints = getattr(provider, "selection_hints", None)
+            try:
+                hints = list(hints) if hints is not None else []
+            except TypeError:
+                hints = []
+            out.append({
                 "name": provider.name,
+                "vendor": getattr(provider, "vendor", None),
+                "route": getattr(provider, "route", None),
                 "client": provider.client,
                 "adapter": provider.adapter,
-                "model": provider.model
-            }
-            for provider in provider_infos
-        ]
+                "model": provider.model,
+                "is_cloud": getattr(provider, "is_cloud", True),
+                "is_local": getattr(provider, "is_local", False),
+                "base_url": getattr(provider, "base_url", None),
+                "selection_hints": hints,
+            })
+        return out
 
     def _initialize_providers(self) -> List[Dict[str, Any]]:
         """Initialize provider clients and adapters based on config file.
@@ -667,41 +733,69 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
 
     def get_cheap_model(self) -> Optional[str]:
         """
-        Get a cheap/fast model for recursive sub-queries (RLM-inspired).
+        Return a cheap/fast model id for recursive sub-queries (RLM-inspired).
 
-        This returns a model suitable for low-cost operations like:
-        - Summarizing context slices
-        - Answering questions about stashed content
-        - Hierarchical compression leaf nodes
+        DEPRECATED return shape: a bare model id. Callers that injected this
+        as ``model_override`` into the full fallback chain produced the
+        "broadcast a bogus ID across every provider" bug. Prefer
+        :meth:`get_cheap_model_selector` which returns a
+        ``"<vendor>/<model>"`` selector that constrains routing to the one
+        vendor that actually serves the model.
 
-        The model policy is config-driven:
-        - `defaults.cheap_model` can name an explicit selector
-        - `defaults.cheap_model_hints` can describe the desired cheap family
-        - otherwise there is no cheap override and callers use the default route
+        Kept for backward compat; returns only the bare model portion.
+        """
+        selector = self.get_cheap_model_selector()
+        if not selector:
+            return None
+        if "/" in selector:
+            return selector.split("/", 1)[1]
+        return selector
 
-        Returns:
-            Model identifier for cheap model, or None to use default
+    def get_cheap_model_selector(self) -> Optional[str]:
+        """Return a ``"<vendor>/<model>"`` cheap-model selector for sub-queries.
+
+        Policy (config-driven, no hardcoded IDs):
+          1. ``[defaults] cheap_model`` — explicit selector, honored as-is.
+          2. ``[defaults] cheap_model_hints`` — pattern list; the first route
+             whose configured model matches a hint wins. We return
+             ``"<vendor>/<model>"`` so callers don't broadcast the raw ID
+             across every provider — the selector constrains routing.
+          3. Returns ``None`` when nothing matches; caller uses its default route.
+
+        This is what the broadcast bug was really about: previous callers
+        dropped the vendor context and injected one model id into every
+        provider in the fallback chain, producing 4 garbage attempts on
+        purpose and lying to downstream observability about which model ran.
         """
         defaults = self.mandate_config.get("defaults", {})
 
-        # Check mandate config for explicit cheap model selector.
+        # 1. Explicit selector.
         cheap_selector = defaults.get("cheap_model")
         if cheap_selector and cheap_selector != "auto":
             resolved = self._resolve_model_selector(cheap_selector)
-            return resolved.get("model") or cheap_selector
+            provider_key = resolved.get("provider")
+            model = resolved.get("model")
+            if provider_key and model:
+                return f"{provider_key}/{model}"
+            return resolved.get("selector") or cheap_selector
 
-        # Discovery resolves what exists; config owns the cheap-model policy.
+        # 2. Pattern-based resolution over routes.
         cheap_patterns = defaults.get("cheap_model_hints") or []
         if not cheap_patterns:
             return None
 
         cheap_providers = self.provider_registry.get_providers_with_pattern(cheap_patterns)
+        if not cheap_providers:
+            return None
 
-        if cheap_providers:
-            return cheap_providers[0].model
-
-        # Return None to use default model
-        return None
+        # First hit wins. Return vendor-scoped selector so routing can't
+        # broadcast to providers that don't serve this model.
+        match = cheap_providers[0]
+        vendor = getattr(match, "vendor", None) or match.name.split(":", 1)[0]
+        model = match.model
+        if vendor and model and model != "auto":
+            return f"{vendor}/{model}"
+        return model if model and model != "auto" else None
 
     @handle_llm_errors()
     async def _try_single_provider(
@@ -717,25 +811,28 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
     ) -> Union[str, LLMResponse]:
         """Try to get a response from a single provider.
 
-        Args:
-            provider: Provider configuration dictionary
-            target_model: Optional target model override
-            system_prompt: System prompt
-            user_prompt: User prompt
-            tools: Optional tools for function calling
-            response_format: Optional response format
-            force_local_only: Whether this is a local-only request
-            start_time: Start time for duration calculation
-
-        Returns:
-            Response from the provider
+        Refuses to call a provider with a ``target_model`` not in that provider's
+        vendor catalog. This is the guard that stops:
+          * llama.cpp silent-override (llama-server ignores the model ID and
+            serves whatever is loaded — so callers are lied to about which
+            model produced the response),
+          * the cheap-model cascade (one bogus model ID broadcast onto every
+            provider in the fallback chain),
+          * callers mistakenly targeting a vendor that doesn't serve the model.
+        Skipping raises ``ModelNotAvailableForRoute`` so the outer fallback
+        loop can move on to the next provider.
         """
         messages = provider["adapter"].create_messages(user_prompt=user_prompt, system_prompt=system_prompt)
 
         model_to_use = provider["model"]
         if target_model:
+            if not self._model_available_for_route(provider, target_model):
+                raise ModelNotAvailableForRoute(
+                    vendor=provider.get("vendor"),
+                    route=provider.get("route"),
+                    model=target_model,
+                )
             model_to_use = target_model
-            logger.info(f"Overriding with mandate model: {model_to_use}")
 
         response = await provider["adapter"].get_response(
             client=provider["client"],
@@ -796,9 +893,15 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         target_selector = self._get_default_mandate_selector()
         if not target_selector:
             pref_model = self._mandate_preference.get("model")
-            pref_provider = self._mandate_preference.get("provider")
+            pref_vendor = self._mandate_preference.get("vendor")
+            pref_route = self._mandate_preference.get("route")
             if pref_model:
-                target_selector = f"{pref_provider}/{pref_model}" if pref_provider else pref_model
+                if pref_vendor and pref_route:
+                    target_selector = f"{pref_vendor}:{pref_route}/{pref_model}"
+                elif pref_vendor:
+                    target_selector = f"{pref_vendor}/{pref_model}"
+                else:
+                    target_selector = pref_model
 
         available_providers = self.providers
         target_model = None
@@ -807,10 +910,10 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
             target_provider = resolved.get("provider")
             target_model = resolved.get("model")
             if target_provider:
-                available_providers = [
-                    provider for provider in available_providers
-                    if provider["name"] == target_provider
-                ] or available_providers
+                # target_provider may be a vendor or a composite "vendor:route" key.
+                available_providers = self._filter_providers_by_selector(
+                    available_providers, target_provider
+                ) or available_providers
 
         system_prompt = """
 You are an AI Integrity Auditor for a Kestrel agent's responses.
@@ -835,6 +938,13 @@ No other text or formatting.
             errors = {}
             for provider in available_providers:
                 logger.info(f"Auditing with provider: {provider['name']}")
+                effective_model = target_model or provider["model"]
+                if target_model and not self._model_available_for_route(provider, target_model):
+                    logger.debug(
+                        "Audit: skipping %s (target model %s not in vendor catalog)",
+                        provider["name"], target_model,
+                    )
+                    continue
                 messages = provider["adapter"].create_messages(
                     user_prompt=text_to_audit,
                     system_prompt=system_prompt,
@@ -843,7 +953,7 @@ No other text or formatting.
                 try:
                     response = await provider["adapter"].get_response(
                         client=provider["client"],
-                        model=target_model or provider["model"],
+                        model=effective_model,
                         messages=messages,
                         format="json",
                     )
@@ -946,6 +1056,16 @@ No other text or formatting.
 
                 logger.info(f"Success from {provider_name}")
                 return result
+
+            except ModelNotAvailableForRoute as e:
+                # Route can't serve the target model. Skip silently — no HTTP
+                # call was made — and try the next provider.
+                logger.debug(
+                    "Skipping %s: %s not in vendor catalog",
+                    provider["name"], e.model,
+                )
+                errors[provider["name"]] = e
+                continue
 
             except LLMProviderError as e:
                 logger.warning(f"Provider {provider['name']} failed: {e}")
@@ -1228,8 +1348,7 @@ No other text or formatting.
         # Fall back to standard providers
         providers = self.providers
         if force_local_only:
-            local_names = {p.name for p in self.provider_registry.get_local_providers()}
-            providers = [p for p in providers if p["name"] in local_names]
+            providers = [p for p in providers if p.get("is_local")]
             # Clear any cloud model override — use the local provider's own model
             if model_override and providers and not any(
                 model_override == p["model"] for p in providers
@@ -1242,9 +1361,15 @@ No other text or formatting.
         target_selector = model_override
         if not target_selector:
             pref_model = self._mandate_preference.get("model")
-            pref_provider = self._mandate_preference.get("provider")
+            pref_vendor = self._mandate_preference.get("vendor")
+            pref_route = self._mandate_preference.get("route")
             if pref_model:
-                target_selector = f"{pref_provider}/{pref_model}" if pref_provider else pref_model
+                if pref_vendor and pref_route:
+                    target_selector = f"{pref_vendor}:{pref_route}/{pref_model}"
+                elif pref_vendor:
+                    target_selector = f"{pref_vendor}/{pref_model}"
+                else:
+                    target_selector = pref_model
 
         target_model = None
         if target_selector:
@@ -1252,16 +1377,13 @@ No other text or formatting.
             target_provider = resolved.get("provider")
             target_model = resolved.get("model")
             if target_provider:
-                matched_provider = next(
-                    (provider for provider in providers if provider["name"] == target_provider),
-                    None,
-                )
-                if matched_provider:
-                    providers = [matched_provider]
-                    logger.info(f"Model mandate set: using only {target_provider} with {target_model}")
+                matched = self._filter_providers_by_selector(providers, target_provider)
+                if matched:
+                    providers = matched
+                    logger.info(f"Model mandate: using {target_provider} with {target_model}")
                 elif model_override:
                     raise LLMServiceError(
-                        f"Provider '{target_provider}' not available. "
+                        f"Route/vendor '{target_provider}' not available. "
                         f"Available: {[p['name'] for p in providers]}"
                     )
 

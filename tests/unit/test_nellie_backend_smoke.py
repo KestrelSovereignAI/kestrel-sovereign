@@ -67,15 +67,15 @@ class TestNellieClaudePlan:
 
     def test_pin_nellie_to_claude_plan(self, nellie_service):
         svc = nellie_service
-        svc.set_model_preference("claude-sonnet-4-6", provider="claude_plan")
+        svc.set_model_preference("claude-sonnet-4-6", vendor="anthropic", route="plan")
 
         pref = svc.get_model_preference()
-        assert pref["provider"] == "claude_plan"
+        assert pref["vendor"] == "claude_plan"
         assert pref["model"] == "claude-sonnet-4-6"
 
     def test_routing_uses_only_claude_plan(self, nellie_service):
         svc = nellie_service
-        svc.set_model_preference("claude-sonnet-4-6", provider="claude_plan")
+        svc.set_model_preference("claude-sonnet-4-6", vendor="anthropic", route="plan")
 
         providers, target = svc.resolve_provider_routing()
 
@@ -85,7 +85,7 @@ class TestNellieClaudePlan:
 
     def test_active_model_id_matches_preference(self, nellie_service):
         svc = nellie_service
-        svc.set_model_preference("claude-sonnet-4-6", provider="claude_plan")
+        svc.set_model_preference("claude-sonnet-4-6", vendor="anthropic", route="plan")
 
         active = svc.get_active_model_id()
         pref = svc.get_model_preference()
@@ -94,21 +94,21 @@ class TestNellieClaudePlan:
 
     def test_backend_identity_matches_runtime(self, nellie_service):
         svc = nellie_service
-        svc.set_model_preference("claude-sonnet-4-6", provider="claude_plan")
+        svc.set_model_preference("claude-sonnet-4-6", vendor="anthropic", route="plan")
 
         pref = svc.get_model_preference()
         providers, target = svc.resolve_provider_routing()
 
-        assert pref["provider"] == providers[0]["name"]
+        assert pref["vendor"] == providers[0]["name"]
         assert pref["model"] == target
 
     def test_claude_plan_not_confused_with_anthropic(self, nellie_service):
         svc = nellie_service
 
-        svc.set_model_preference("claude-sonnet-4-6", provider="claude_plan")
+        svc.set_model_preference("claude-sonnet-4-6", vendor="anthropic", route="plan")
         providers_plan, _ = svc.resolve_provider_routing()
 
-        svc.set_model_preference("claude-sonnet-4-6", provider="anthropic")
+        svc.set_model_preference("claude-sonnet-4-6", vendor="anthropic")
         providers_api, _ = svc.resolve_provider_routing()
 
         assert providers_plan[0]["name"] == "claude_plan"
@@ -121,7 +121,7 @@ class TestNellieClaudePlan:
         svc.set_preference_persistence_callback(callback)
 
         async def _run():
-            svc.set_model_preference("claude-sonnet-4-6", provider="claude_plan")
+            svc.set_model_preference("claude-sonnet-4-6", vendor="anthropic", route="plan")
             await asyncio.sleep(0.01)
 
         asyncio.run(_run())
@@ -140,15 +140,15 @@ class TestNellieOpenAIPlan:
 
     def test_pin_nellie_to_openai_plan(self, nellie_service):
         svc = nellie_service
-        svc.set_model_preference("gpt-5.4", provider="openai_plan")
+        svc.set_model_preference("gpt-5.4", vendor="openai", route="plan")
 
         pref = svc.get_model_preference()
-        assert pref["provider"] == "openai_plan"
+        assert pref["vendor"] == "openai_plan"
         assert pref["model"] == "gpt-5.4"
 
     def test_routing_uses_only_openai_plan(self, nellie_service):
         svc = nellie_service
-        svc.set_model_preference("gpt-5.4", provider="openai_plan")
+        svc.set_model_preference("gpt-5.4", vendor="openai", route="plan")
 
         providers, target = svc.resolve_provider_routing()
 
@@ -158,7 +158,7 @@ class TestNellieOpenAIPlan:
 
     def test_active_model_id_matches_preference(self, nellie_service):
         svc = nellie_service
-        svc.set_model_preference("gpt-5.4", provider="openai_plan")
+        svc.set_model_preference("gpt-5.4", vendor="openai", route="plan")
 
         active = svc.get_active_model_id()
         pref = svc.get_model_preference()
@@ -167,21 +167,21 @@ class TestNellieOpenAIPlan:
 
     def test_backend_identity_matches_runtime(self, nellie_service):
         svc = nellie_service
-        svc.set_model_preference("gpt-5.4", provider="openai_plan")
+        svc.set_model_preference("gpt-5.4", vendor="openai", route="plan")
 
         pref = svc.get_model_preference()
         providers, target = svc.resolve_provider_routing()
 
-        assert pref["provider"] == providers[0]["name"]
+        assert pref["vendor"] == providers[0]["name"]
         assert pref["model"] == target
 
     def test_openai_plan_not_confused_with_openai(self, nellie_service):
         svc = nellie_service
 
-        svc.set_model_preference("gpt-5.4", provider="openai_plan")
+        svc.set_model_preference("gpt-5.4", vendor="openai", route="plan")
         providers_plan, _ = svc.resolve_provider_routing()
 
-        svc.set_model_preference("gpt-5-mini", provider="openai")
+        svc.set_model_preference("gpt-5-mini", vendor="openai")
         providers_openai, _ = svc.resolve_provider_routing()
 
         assert providers_plan[0]["name"] == "openai_plan"
@@ -207,7 +207,7 @@ class TestNellieFailureModes:
 
     def test_openai_plan_missing_raises_with_provider_name(self, nellie_without_openai_plan):
         svc = nellie_without_openai_plan
-        svc.set_model_preference("gpt-5.4", provider="openai_plan")
+        svc.set_model_preference("gpt-5.4", vendor="openai", route="plan")
 
         with pytest.raises(LLMProviderUnavailableError) as exc_info:
             svc.resolve_provider_routing()
@@ -218,7 +218,7 @@ class TestNellieFailureModes:
 
     def test_claude_plan_missing_raises_with_provider_name(self, nellie_without_claude_plan):
         svc = nellie_without_claude_plan
-        svc.set_model_preference("claude-sonnet-4-6", provider="claude_plan")
+        svc.set_model_preference("claude-sonnet-4-6", vendor="anthropic", route="plan")
 
         with pytest.raises(LLMProviderUnavailableError) as exc_info:
             svc.resolve_provider_routing()
@@ -228,7 +228,7 @@ class TestNellieFailureModes:
 
     def test_error_message_lists_available_providers(self, nellie_without_openai_plan):
         svc = nellie_without_openai_plan
-        svc.set_model_preference("gpt-5.4", provider="openai_plan")
+        svc.set_model_preference("gpt-5.4", vendor="openai", route="plan")
 
         with pytest.raises(LLMProviderUnavailableError) as exc_info:
             svc.resolve_provider_routing()
@@ -276,11 +276,11 @@ class TestNellieBackendSwitch:
     def test_switch_claude_plan_to_openai_plan(self, nellie_service):
         svc = nellie_service
 
-        svc.set_model_preference("claude-sonnet-4-6", provider="claude_plan")
+        svc.set_model_preference("claude-sonnet-4-6", vendor="anthropic", route="plan")
         providers, _ = svc.resolve_provider_routing()
         assert providers[0]["name"] == "claude_plan"
 
-        svc.set_model_preference("gpt-5.4", provider="openai_plan")
+        svc.set_model_preference("gpt-5.4", vendor="openai", route="plan")
         providers, target = svc.resolve_provider_routing()
         assert providers[0]["name"] == "openai_plan"
         assert target == "gpt-5.4"
@@ -288,11 +288,11 @@ class TestNellieBackendSwitch:
     def test_switch_openai_plan_to_claude_plan(self, nellie_service):
         svc = nellie_service
 
-        svc.set_model_preference("gpt-5.4", provider="openai_plan")
+        svc.set_model_preference("gpt-5.4", vendor="openai", route="plan")
         providers, _ = svc.resolve_provider_routing()
         assert providers[0]["name"] == "openai_plan"
 
-        svc.set_model_preference("claude-sonnet-4-6", provider="claude_plan")
+        svc.set_model_preference("claude-sonnet-4-6", vendor="anthropic", route="plan")
         providers, target = svc.resolve_provider_routing()
         assert providers[0]["name"] == "claude_plan"
         assert target == "claude-sonnet-4-6"
@@ -300,7 +300,7 @@ class TestNellieBackendSwitch:
     def test_clear_preference_returns_to_all_providers(self, nellie_service):
         svc = nellie_service
 
-        svc.set_model_preference("gpt-5.4", provider="openai_plan")
+        svc.set_model_preference("gpt-5.4", vendor="openai", route="plan")
         providers, _ = svc.resolve_provider_routing()
         assert len(providers) == 1
 
@@ -317,14 +317,14 @@ class TestNellieBackendSwitch:
             ("openai_plan", "gpt-5.4"),
             ("openai", "gpt-5-mini"),
         ]:
-            svc.set_model_preference(model, provider=provider)
+            svc.set_model_preference(model, vendor=provider)
 
             active = svc.get_active_model_id()
             pref = svc.get_model_preference()
             providers, target = svc.resolve_provider_routing()
 
             assert active == model
-            assert pref["provider"] == provider
+            assert pref["vendor"] == provider
             assert pref["model"] == model
             assert providers[0]["name"] == provider
             assert target == model

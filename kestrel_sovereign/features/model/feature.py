@@ -176,11 +176,19 @@ class ModelAgent(Feature):
         from kestrel_sovereign.llm.service import resolve_active_model_selection
         selection = resolve_active_model_selection(self.llm_service)
         model_str = selection["model"]
+        vendor = selection.get("vendor")
+        route = selection.get("route")
+        model_name = selection.get("model_name")
         return {
             "current_model": model_str,
-            "provider": selection["provider"],
-            "model_name": selection["model_name"],
-            "message": f"Current model: {model_str}\n\nUse `!model <provider/model>` to change.\nUse `!model-list` to list available models."
+            "vendor": vendor,
+            "route": route,
+            "model_name": model_name,
+            "message": (
+                f"Current model: {model_str}\n\n"
+                "Use `!model-set <vendor[:route]> <model>` to change. "
+                "Use `!model-list` to list available models."
+            ),
         }
 
     @tool(
@@ -189,72 +197,87 @@ class ModelAgent(Feature):
         category=ToolCategory.MODEL_MANAGEMENT,
         command_prefix="!model-set"
     )
-    async def set_model(self, provider_or_model: str, model: Optional[str] = None) -> Dict[str, Any]:
+    async def set_model(self, vendor_or_model: str, model: Optional[str] = None) -> Dict[str, Any]:
         """
-        Set the active model with UI sync support.
+        Set the active ``{vendor, model, route?}`` with UI sync support.
 
-        Supports two formats:
-        - Two args: !model-set <provider> <model> (UI dropdowns)
-        - One arg: !model-set <model> (direct command input)
+        Supports two invocation styles:
+        - Two args: ``!model-set <vendor[:route]> <model>`` (UI dropdowns)
+        - One arg:  ``!model-set <vendor[:route]/model>`` or ``!model-set <model>``
 
         Args:
-            provider_or_model: Provider name (e.g., "openrouter") OR model ID if single arg
-            model: Model ID (e.g., "google/gemini-3-pro-preview"). If omitted, first arg is model.
+            vendor_or_model: Vendor (``"openai"``), composite ``"vendor:route"``
+                (``"anthropic:plan"``), or model ID if single arg.
+            model: Model ID. If omitted, first arg is parsed as ``vendor/model``
+                or ``vendor:route/model`` or a bare model.
 
         Returns:
-            Dict with success status and MODEL_CHANGED marker for UI sync
+            Dict with success status and MODEL_CHANGED marker for UI sync.
         """
         import json
-        from kestrel_sovereign.agent.token_counter import get_token_counter
 
-        # Determine provider and model based on argument pattern
+        # Parse vendor/route/model from args.
+        vendor: Optional[str] = None
+        route: Optional[str] = None
         if model is not None:
-            # Two-arg format: !model-set openrouter google/gemini-3-pro-preview
-            # Provider is explicitly specified - use it directly
-            provider = provider_or_model
+            # Two-arg: first is vendor or "vendor:route".
+            left = vendor_or_model
+            if ":" in left:
+                vendor, route = left.split(":", 1)
+            else:
+                vendor = left
             model_name = model
         else:
-            # One-arg format: !model-set google/gemini-3-pro-preview
-            model_id = provider_or_model
-
-            # Check if this model belongs to OpenRouter (meta-provider)
+            # One-arg.
+            model_id = vendor_or_model
             is_openrouter_model = await self._is_openrouter_model(model_id)
-
             if is_openrouter_model:
-                # OpenRouter model - keep full ID, use openrouter as provider
-                provider = "openrouter"
-                model_name = model_id  # Keep full ID like "google/gemini-3-pro-preview"
-            elif '/' in model_id:
-                # Direct provider format like "openai/gpt-5" or "ollama/llama3.2"
-                provider, model_name = model_id.split('/', 1)
+                vendor = "openrouter"
+                model_name = model_id  # Keep full vendor/model ID as-is.
+            elif "/" in model_id:
+                left, model_name = model_id.split("/", 1)
+                if ":" in left:
+                    vendor, route = left.split(":", 1)
+                else:
+                    vendor = left
             else:
-                # Simple model name without provider
-                provider = None
                 model_name = model_id
 
         try:
-            # Context safety check: ensure history fits in new model's context
-            new_counter = get_token_counter(model_name)
-            new_limit = new_counter.get_context_limit()
-            new_budget = new_limit - 1024  # Reserve for response
-
-            # Count current conversation tokens (limit=50 matches what chat actually sends)
+            # Context safety check: use the same pruning logic the actual LLM
+            # call path uses. If format_conversation_history can fit the history
+            # into the new model's history budget (after per-message cap and
+            # pruning), the switch is safe.
             if hasattr(self, 'agent') and self.agent and hasattr(self.agent, 'storage'):
                 history = await self.agent.storage.get_conversation_history(limit=50)
-                total_tokens = sum(new_counter.count(m.get("content", "")) for m in history)
 
-                if total_tokens > new_budget:
-                    overflow = total_tokens - new_budget
-                    utilization = (total_tokens / new_budget * 100)
+                # Use the agent's context_builder if available; otherwise
+                # construct a temporary one — it just needs the token counter.
+                ctx_builder = getattr(self.agent, 'context_builder', None)
+                if ctx_builder is None:
+                    from kestrel_sovereign.agent.context_builder import ContextBuilder
+                    ctx_builder = ContextBuilder(storage=self.agent.storage)
+
+                est = ctx_builder.estimate_effective_history_tokens(history, model_name)
+
+                # The switch fails only if, after pruning, the effective history
+                # exceeds the history budget by more than 5% slack (absorbs
+                # truncation marker overhead and per-message rounding).
+                overflow_tolerance = max(int(est['history_budget'] * 0.05), 256)
+                if est['effective_tokens'] > est['history_budget'] + overflow_tolerance:
+                    overflow = est['effective_tokens'] - est['history_budget']
+                    utilization = (est['effective_tokens'] / est['history_budget'] * 100)
                     return {
                         "success": False,
                         "error": "context_overflow",
                         "message": (
-                            f"⚠️ Cannot switch to {model_name}: context overflow detected.\n\n"
-                            f"Current history: {total_tokens:,} tokens\n"
-                            f"New model limit: {new_budget:,} tokens\n"
+                            f"⚠️ Cannot switch to {model_name}: context too small even after pruning.\n\n"
+                            f"Effective history after pruning: {est['effective_tokens']:,} tokens\n"
+                            f"History budget on new model: {est['history_budget']:,} tokens\n"
+                            f"Raw history (for reference): {est['raw_tokens']:,} tokens\n"
                             f"Overflow: {overflow:,} tokens ({utilization:.1f}%)\n\n"
-                            f"Run `!compress` first to reduce context, then try again."
+                            f"The new model's context window ({est['context_limit']:,}) is too small for this conversation.\n"
+                            f"Try a model with a larger context, or run `!compress` to reduce history."
                         )
                     }
 
@@ -266,21 +289,32 @@ class ModelAgent(Feature):
                     current_model = current_pref.get('model', 'unknown')
                     await consent.request_consent(
                         "model_change",
-                        {"from": current_model, "to": model_name, "provider": provider},
+                        {"from": current_model, "to": model_name, "vendor": vendor, "route": route},
                     )
                 except Exception:
                     pass  # Never block on consent failure
 
             # Safe to switch
-            self.llm_service.set_model_preference(model_name, provider)
-            full_model = f"{provider}/{model_name}" if provider else model_name
+            self.llm_service.set_model_preference(model_name, vendor, route)
+            if vendor and route:
+                full_model = f"{vendor}:{route}/{model_name}"
+            elif vendor:
+                full_model = f"{vendor}/{model_name}"
+            else:
+                full_model = model_name
 
             # Return with MODEL_CHANGED marker for UI sync
-            sync_data = json.dumps({"model": full_model, "provider": provider})
+            sync_data = json.dumps({
+                "model": full_model,
+                "vendor": vendor,
+                "route": route,
+                "model_name": model_name,
+            })
             return {
                 "success": True,
                 "model": full_model,
-                "provider": provider,
+                "vendor": vendor,
+                "route": route,
                 "model_name": model_name,
                 "message": f"✓ Model set to: {full_model}\n\nMODEL_CHANGED:{sync_data}"
             }
@@ -342,26 +376,30 @@ class ModelAgent(Feature):
 
     def set_model_preference(self, model_id: str) -> str:
         """
-        Set the preferred model for the agent.
+        Set the preferred model for the agent from a combined string.
 
-        DEPRECATED: Use llm_service.set_model_preference(model, provider) directly.
-        This wrapper exists only for backward compatibility with callers that
-        pass a single "provider/model" string.
+        DEPRECATED: Use ``llm_service.set_model_preference(model, vendor, route)``
+        directly. This wrapper exists only for callers that pass a single
+        ``"vendor/model"`` or ``"vendor:route/model"`` string.
         """
         import warnings
         warnings.warn(
             "ModelAgent.set_model_preference() is deprecated. "
-            "Use llm_service.set_model_preference(model, provider) directly.",
+            "Use llm_service.set_model_preference(model, vendor, route) directly.",
             DeprecationWarning,
             stacklevel=2,
         )
-        # Parse provider from model_id if present
-        provider = None
+        vendor: Optional[str] = None
+        route: Optional[str] = None
         model = model_id
-        if '/' in model_id:
-            provider, model = model_id.split('/', 1)
+        if "/" in model_id:
+            left, model = model_id.split("/", 1)
+            if ":" in left:
+                vendor, route = left.split(":", 1)
+            else:
+                vendor = left
 
-        self.llm_service.set_model_preference(model, provider)
+        self.llm_service.set_model_preference(model, vendor, route)
         logger.info(f"Model preference set to: {model_id}")
         return f"Model preference set to {model_id}"
 
@@ -382,7 +420,12 @@ class ModelAgent(Feature):
         )
         pref = self.llm_service.get_model_preference()
         if pref.get("model"):
-            provider = pref.get("provider")
+            vendor = pref.get("vendor")
+            route = pref.get("route")
             model = pref.get("model")
-            return f"{provider}/{model}" if provider else model
+            if vendor and route:
+                return f"{vendor}:{route}/{model}"
+            if vendor:
+                return f"{vendor}/{model}"
+            return model
         return None

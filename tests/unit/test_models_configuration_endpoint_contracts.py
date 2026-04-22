@@ -295,7 +295,7 @@ def test_models_endpoint_groups_results_and_rejects_invalid_category():
         payload = ok_response.json()
         assert payload["count"] == 2
         assert payload["default"] == "openai/gpt-5-mini"
-        assert set(payload["by_provider"]) == {"openai", "anthropic"}
+        assert set(payload["by_vendor"]) == {"openai", "anthropic"}
         assert payload["featured"] == [{"id": "gpt-5-mini", "provider": "openai"}]
         llm_service.discover_all_models.assert_awaited_once()
         assert bad_response.status_code == 400
@@ -307,9 +307,11 @@ def test_models_endpoint_groups_results_and_rejects_invalid_category():
 def test_current_and_set_model_endpoints_share_runtime_preference_contract():
     llm_service = MagicMock()
     llm_service.get_model_preference = MagicMock(
-        return_value={"provider": "openai", "model": "gpt-5-mini"}
+        return_value={"vendor": "openai", "model": "gpt-5-mini", "route": None}
     )
-    llm_service.providers = [{"name": "anthropic", "model": "claude-sonnet"}]
+    llm_service.providers = [
+        {"name": "anthropic:api", "vendor": "anthropic", "route": "api", "model": "claude-sonnet"}
+    ]
     llm_service.set_model_preference = MagicMock()
     agent = MagicMock(llm_service=llm_service)
 
@@ -323,6 +325,11 @@ def test_current_and_set_model_endpoints_share_runtime_preference_contract():
                     headers=_api_headers(),
                     json={"model": "anthropic/claude-opus"},
                 )
+                set_composite_response = client.post(
+                    "/api/model/set",
+                    headers=_api_headers(),
+                    json={"model": "anthropic:plan/claude-opus"},
+                )
                 missing_response = client.post(
                     "/api/model/set",
                     headers=_api_headers(),
@@ -331,12 +338,18 @@ def test_current_and_set_model_endpoints_share_runtime_preference_contract():
         assert current_response.status_code == 200
         assert current_response.json() == {
             "model": "openai/gpt-5-mini",
-            "provider": "openai",
+            "vendor": "openai",
+            "route": None,
             "model_name": "gpt-5-mini",
         }
         assert set_response.status_code == 200
         assert set_response.json()["full_model"] == "anthropic/claude-opus"
-        llm_service.set_model_preference.assert_called_once_with("claude-opus", "anthropic")
+        assert set_composite_response.status_code == 200
+        assert set_composite_response.json()["full_model"] == "anthropic:plan/claude-opus"
+        # Vendor-only and composite-route forms both call set_model_preference
+        # with the parsed vendor/route/model triple.
+        llm_service.set_model_preference.assert_any_call("claude-opus", "anthropic", None)
+        llm_service.set_model_preference.assert_any_call("claude-opus", "anthropic", "plan")
         assert missing_response.status_code == 400
         assert missing_response.json()["detail"] == "'model' field is required."
     finally:

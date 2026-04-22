@@ -18,12 +18,16 @@ MAX_RETRIES = 5
 BASE_DELAY = 1.0  # seconds
 MAX_DELAY = LLM_RETRY_MAX_DELAY_SECONDS
 
-# HTTP status codes that warrant retry
+# HTTP status codes that warrant retry. 401/403/404 are permanent and MUST
+# NOT appear here — retrying a dead API key burns wall-time on an error that
+# will never recover.
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 
-# Error message patterns that indicate retryable errors
+# HTTP status codes that MUST NOT retry (caller error or auth failure).
+NON_RETRYABLE_STATUS_CODES = {400, 401, 403, 404, 422}
+
+# Error message patterns that indicate retryable (transient) errors.
 RETRYABLE_PATTERNS = [
-    "429",
     "rate",
     "timeout",
     "resource_exhausted",
@@ -34,31 +38,67 @@ RETRYABLE_PATTERNS = [
     "try again",
 ]
 
+# Error message patterns that indicate permanent failure. Matched FIRST —
+# takes precedence over RETRYABLE_PATTERNS to prevent a 401 message that
+# happens to contain "internal server error text" from being retried.
+NON_RETRYABLE_PATTERNS = [
+    "user not found",          # OpenRouter dead-key / anti-abuse
+    "invalid api key",
+    "invalid_api_key",
+    "authentication",
+    "unauthorized",
+    "permission_denied",
+    "permission denied",
+    "quota exceeded",           # Distinct from rate-limit: permanent until refill
+    "model_not_found",
+    "model not found",
+    "insufficient_quota",
+]
+
 T = TypeVar('T')
 
 
 def is_retryable_error(error: Exception) -> bool:
     """
-    Check if an error is retryable.
+    Check if an error is transient and should be retried.
 
-    Args:
-        error: The exception to check
+    Order of checks:
+      1. NON_RETRYABLE_STATUS_CODES (401/403/404/422/400) → no retry.
+      2. NON_RETRYABLE_PATTERNS (auth/quota/invalid) → no retry.
+      3. RETRYABLE_STATUS_CODES (429/5xx) → retry.
+      4. RETRYABLE_PATTERNS (rate/timeout/etc) → retry.
+      5. Default → no retry.
 
-    Returns:
-        True if the error is transient and should be retried
+    Permanent-failure checks win first so a 401 error message that happens
+    to contain the word "internal" in a nested detail doesn't trigger a
+    misguided retry loop.
     """
     error_str = str(error).lower()
 
-    # Check for retryable patterns in error message
-    for pattern in RETRYABLE_PATTERNS:
-        if pattern in error_str:
-            return True
+    # 1. Hard non-retryable status codes — word-boundary check to avoid
+    #    matching "429" inside a 64-character token or hash.
+    for code in NON_RETRYABLE_STATUS_CODES:
+        token = str(code)
+        # Match "401 - ..." or "code: 401" or "401,"/"401 " etc.
+        if f" {token}" in error_str or f"{token} " in error_str or f"{token}:" in error_str or f"{token}," in error_str or f"{token}-" in error_str or f"code: {token}" in error_str or error_str.startswith(f"{token}"):
+            return False
 
-    # Check for status codes in error message
+    # 2. Explicit non-retryable message patterns.
+    for pattern in NON_RETRYABLE_PATTERNS:
+        if pattern in error_str:
+            return False
+
+    # 3. Retryable status codes.
     for code in RETRYABLE_STATUS_CODES:
         if str(code) in error_str:
             return True
 
+    # 4. Retryable message patterns.
+    for pattern in RETRYABLE_PATTERNS:
+        if pattern in error_str:
+            return True
+
+    # 5. Default: don't retry unknown errors.
     return False
 
 

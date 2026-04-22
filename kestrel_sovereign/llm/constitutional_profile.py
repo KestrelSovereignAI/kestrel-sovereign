@@ -66,19 +66,18 @@ class ConstitutionalProfileService:
     by provider/model. Follows ModelCatalogService pattern (lazy-load singleton).
     """
 
-    # Maps llm_config.toml provider names to constitutional profile keys.
-    # Multiple providers may share the same constitutional profile
-    # (e.g., claude_plan and anthropic both use Anthropic's published constitution).
-    PROVIDER_ALIASES: Dict[str, str] = {
-        "claude_plan": "anthropic",
-        "openai_plan": "openai",
-        "openai_mini": "openai",
+    # Maps vendor names (and legacy hosted-vendor aliases) to the constitutional
+    # profile key that governs their weights. Not "pseudo-provider" entries —
+    # those are gone. Entries here only exist because the profile author covers
+    # multiple vendors with a single profile (e.g. Vertex AI serves Gemini,
+    # so its profile is the Google one).
+    VENDOR_TO_PROFILE: Dict[str, str] = {
         "vertex_ai": "google",
         "gemini": "google",
         "azure_openai": "openai",
-        "runpod": "ollama",  # RunPod typically runs open models
-        "together": "ollama",  # Together AI runs open models
-        "fireworks": "ollama",  # Fireworks runs open models
+        "runpod": "ollama",     # RunPod typically runs open-weights models.
+        "together": "ollama",
+        "fireworks": "ollama",
     }
 
     def __init__(self, config_path: Optional[Path] = None):
@@ -181,8 +180,14 @@ class ConstitutionalProfileService:
             self.load()
 
     def _resolve_provider(self, provider: str) -> str:
-        """Resolve provider aliases to canonical profile keys."""
-        return self.PROVIDER_ALIASES.get(provider, provider)
+        """Map a vendor (or ``"vendor:route"`` composite) to a profile key.
+
+        Route suffix is ignored — the vendor's constitution governs regardless
+        of the route used to reach it.
+        """
+        if provider and ":" in provider:
+            provider = provider.split(":", 1)[0]
+        return self.VENDOR_TO_PROFILE.get(provider, provider)
 
     def get_profile(self, provider: str) -> ConstitutionalProfile:
         """
