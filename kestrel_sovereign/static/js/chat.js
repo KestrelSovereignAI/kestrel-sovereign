@@ -571,19 +571,51 @@ export async function loadModels() {
             return key ? { 'X-API-Key': key } : {};
         },
         onModelChange: async (vendor, model, isInitialLoad, route) => {
-            // Persist vendor/route/model in chat state.
+            if (isInitialLoad) return;
+
+            // Direct REST call to /api/model/set — NOT a chat message. The old
+            // flow (write "!model-set ..." to messageInput, sendMessage) went
+            // through the chat stream, so switching agents mid-stream left the
+            // response's MODEL_CHANGED marker to land on whatever selector was
+            // currently visible, corrupting state across agents.
+            //
+            // We capture the host agent at dispatch time and discard the
+            // response if the user has switched agents before it lands.
+            const dispatchAgent = API.getHostAgent();
+
+            // Persist vendor/route/model in chat state immediately so the UI
+            // reflects the user's intent without waiting for the round-trip.
             state.selectedModel = model;
-            state.selectedProvider = vendor;    // name retained for legacy consumers
+            state.selectedProvider = vendor;    // legacy name retained
             state.selectedVendor = vendor;
             state.selectedRoute = route || null;
 
-            // !model-set accepts <vendor[:route]> <model>. When the user picked
-            // a specific route from the route selector, include it so routing
-            // is unambiguous.
-            if (messageInput) {
-                const selector = route ? `${vendor}:${route}` : vendor;
-                messageInput.value = `!model-set ${selector} ${model}`;
-                await sendMessage();
+            const body = { vendor, model };
+            if (route) body.route = route;
+            const headers = { 'Content-Type': 'application/json' };
+            const key = API.getApiKey();
+            if (key) headers['X-API-Key'] = key;
+
+            try {
+                const resp = await fetch(API.buildAgentUrl('/api/model/set'), {
+                    method: 'POST',
+                    headers,
+                    body: JSON.stringify(body),
+                });
+                if (!resp.ok) {
+                    console.warn(`set model failed (${dispatchAgent}): HTTP ${resp.status}`);
+                    return;
+                }
+                if (API.getHostAgent() !== dispatchAgent) {
+                    // User switched agents before the server acked. Silently
+                    // succeed — the change on dispatchAgent is persisted; don't
+                    // overwrite the NEW agent's state.
+                    return;
+                }
+                // No UI update needed here: the selector already reflects the
+                // user's click; the server is the source of truth from here on.
+            } catch (e) {
+                console.warn(`set model request error (${dispatchAgent}):`, e);
             }
         }
     });
