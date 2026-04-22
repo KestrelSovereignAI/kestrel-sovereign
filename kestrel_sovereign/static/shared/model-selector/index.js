@@ -1,15 +1,18 @@
 /**
  * Shared Two-Dropdown Model Selector Component
  *
- * Features:
- * - Two cascading dropdowns: Provider → Model
- * - Featured model sorting (★ prefix)
- * - localStorage state persistence
- * - Explicit provider passing to backend
- * - Server sync support
+ * Groups models by **vendor** (see /api/models response shape:
+ * {by_vendor, routes, featured, all, default}). An optional route selector is
+ * shown when a vendor has more than one route configured (e.g. anthropic:api
+ * vs anthropic:plan). Featured models sort first with a ★ prefix.
+ *
+ * Historical note: the component and its chat.js consumer still use
+ * "provider" as a variable name in many places — that name is the vendor
+ * semantically. Renaming everything in one pass is deferred; the API
+ * contract is vendor/route/model.
  */
 
-const PROVIDER_NAMES = {
+const VENDOR_NAMES = {
     'openai': 'OpenAI',
     'anthropic': 'Anthropic',
     'ollama': 'Ollama (Local)',
@@ -22,7 +25,10 @@ const PROVIDER_NAMES = {
     'mistral': 'Mistral',
     'deepseek': 'DeepSeek',
     'runpod': 'RunPod',
+    'llama_cpp': 'llama.cpp (Local)',
 };
+// Back-compat alias for any caller reading the old name.
+const PROVIDER_NAMES = VENDOR_NAMES;
 
 class ModelSelector {
     /**
@@ -40,6 +46,10 @@ class ModelSelector {
     constructor(options = {}) {
         this.providerSelect = document.getElementById(options.providerSelectId);
         this.modelSelect = document.getElementById(options.modelSelectId);
+        // Optional route selector — appears when a vendor has >1 configured route.
+        this.routeSelect = options.routeSelectId
+            ? document.getElementById(options.routeSelectId)
+            : null;
         this.apiEndpoint = options.apiEndpoint || '/api/models';
         // Use 'in' check to allow explicit null (disables server sync)
         this.currentModelEndpoint = 'currentModelEndpoint' in options
@@ -53,6 +63,7 @@ class ModelSelector {
         this.allModelsData = null;
         this.selectedProvider = '';
         this.selectedModel = '';
+        this.selectedRoute = '';
         this.isInitialLoad = true;
 
         this._loadState();
@@ -64,6 +75,7 @@ class ModelSelector {
     _loadState() {
         this.selectedProvider = localStorage.getItem(`${this.storagePrefix}_selected_provider`) || '';
         this.selectedModel = localStorage.getItem(`${this.storagePrefix}_selected_model`) || '';
+        this.selectedRoute = localStorage.getItem(`${this.storagePrefix}_selected_route`) || '';
     }
 
     /**
@@ -75,6 +87,11 @@ class ModelSelector {
         }
         if (this.selectedModel) {
             localStorage.setItem(`${this.storagePrefix}_selected_model`, this.selectedModel);
+        }
+        if (this.selectedRoute) {
+            localStorage.setItem(`${this.storagePrefix}_selected_route`, this.selectedRoute);
+        } else {
+            localStorage.removeItem(`${this.storagePrefix}_selected_route`);
         }
     }
 
@@ -97,6 +114,9 @@ class ModelSelector {
         }
         if (this.modelSelect) {
             this.modelSelect.addEventListener('change', () => this._handleModelChange());
+        }
+        if (this.routeSelect) {
+            this.routeSelect.addEventListener('change', () => this._handleRouteChange());
         }
     }
 
@@ -132,45 +152,83 @@ class ModelSelector {
     }
 
     /**
-     * Populate provider dropdown
+     * Populate vendor dropdown
      */
     _populateProviders() {
-        if (!this.allModelsData?.by_provider) return;
+        const buckets = this.allModelsData?.by_vendor;
+        if (!buckets) return;
 
-        const providers = Object.keys(this.allModelsData.by_provider).sort((a, b) => {
-            // Sort by display name
-            const nameA = PROVIDER_NAMES[a] || a;
-            const nameB = PROVIDER_NAMES[b] || b;
+        const vendors = Object.keys(buckets).sort((a, b) => {
+            const nameA = VENDOR_NAMES[a] || a;
+            const nameB = VENDOR_NAMES[b] || b;
             return nameA.localeCompare(nameB);
         });
 
-        // Build provider options with model counts
-        this.providerSelect.innerHTML = providers.map(p => {
-            const displayName = PROVIDER_NAMES[p] || p.charAt(0).toUpperCase() + p.slice(1);
-            const count = this.allModelsData.by_provider[p]?.length || 0;
-            return `<option value="${p}">${displayName} (${count})</option>`;
+        this.providerSelect.innerHTML = vendors.map(v => {
+            const displayName = VENDOR_NAMES[v] || v.charAt(0).toUpperCase() + v.slice(1);
+            const count = buckets[v]?.length || 0;
+            return `<option value="${v}">${displayName} (${count})</option>`;
         }).join('');
 
-        // Restore saved provider or use first
-        if (this.selectedProvider && providers.includes(this.selectedProvider)) {
+        // Restore saved vendor or use first.
+        if (this.selectedProvider && vendors.includes(this.selectedProvider)) {
             this.providerSelect.value = this.selectedProvider;
-        } else if (providers.length > 0) {
-            this.providerSelect.value = providers[0];
-            this.selectedProvider = providers[0];
+        } else if (vendors.length > 0) {
+            this.providerSelect.value = vendors[0];
+            this.selectedProvider = vendors[0];
         }
 
-        // Populate models for selected provider (don't trigger command on initial load)
+        this._populateRoutes();
         this._populateModels();
     }
 
     /**
-     * Populate model dropdown based on selected provider
+     * Populate the route selector for the currently-selected vendor.
+     *
+     * Hidden when the vendor has <=1 configured route (99% case). Visible
+     * with a real selector when a vendor has multiple routes — e.g.
+     * anthropic:api (metered API key) vs anthropic:plan (Claude Max OAuth).
+     * Discovery-driven: reads the `routes` array from /api/models.
+     */
+    _populateRoutes() {
+        if (!this.routeSelect) return;
+        const vendor = this.providerSelect?.value;
+        const routes = (this.allModelsData?.routes || [])
+            .filter(r => r.vendor === vendor)
+            .map(r => r.route)
+            .filter(Boolean);
+
+        if (routes.length <= 1) {
+            this.routeSelect.style.display = 'none';
+            this.routeSelect.innerHTML = '';
+            this.selectedRoute = '';
+            return;
+        }
+
+        this.routeSelect.style.display = '';
+        this.routeSelect.innerHTML = routes.map(r => {
+            const label = r.charAt(0).toUpperCase() + r.slice(1);
+            return `<option value="${r}">${label}</option>`;
+        }).join('');
+
+        if (this.selectedRoute && routes.includes(this.selectedRoute)) {
+            this.routeSelect.value = this.selectedRoute;
+        } else {
+            // Default to the first route for this vendor (priority-ordered by the server).
+            this.routeSelect.value = routes[0];
+            this.selectedRoute = routes[0];
+        }
+    }
+
+    /**
+     * Populate model dropdown based on selected vendor
      */
     _populateModels() {
-        const provider = this.providerSelect?.value;
-        if (!provider || !this.allModelsData?.by_provider) return;
+        const vendor = this.providerSelect?.value;
+        const buckets = this.allModelsData?.by_vendor;
+        if (!vendor || !buckets) return;
 
-        const models = [...(this.allModelsData.by_provider[provider] || [])];
+        const models = [...(buckets[vendor] || [])];
 
         if (models.length === 0) {
             this.modelSelect.innerHTML = '<option value="">No models available</option>';
@@ -201,30 +259,43 @@ class ModelSelector {
     }
 
     /**
-     * Handle provider dropdown change
+     * Vendor dropdown change.
+     *
+     * IMPORTANT: does NOT fire ``onModelChange``. A vendor change alone is
+     * not a user commit — it's a navigation step. The user still has to
+     * pick a model (and optionally a route). Firing here is the bug that
+     * sent ``!model-set anthropic haiku`` before the user had a chance
+     * to click opus.
      */
     _handleProviderChange() {
         this.selectedProvider = this.providerSelect.value;
+        // Vendor changed — drop stale route so the default picks.
+        this.selectedRoute = '';
         this._saveState();
+        this._populateRoutes();
         this._populateModels();
-
-        // Update selected model to first in new provider
         this.selectedModel = this.modelSelect.value;
         this._saveState();
-
-        // Always notify callback, pass isInitialLoad so caller can decide
-        this.onModelChange(this.selectedProvider, this.selectedModel, this.isInitialLoad);
+        // No onModelChange here — waiting for the user to commit via model or route.
     }
 
     /**
-     * Handle model dropdown change
+     * Model dropdown change — this IS a user commit.
      */
     _handleModelChange() {
         this.selectedModel = this.modelSelect.value;
         this._saveState();
+        this.onModelChange(this.selectedProvider, this.selectedModel, this.isInitialLoad, this.selectedRoute);
+    }
 
-        // Always notify callback, pass isInitialLoad so caller can decide
-        this.onModelChange(this.selectedProvider, this.selectedModel, this.isInitialLoad);
+    /**
+     * Route dropdown change — also a user commit. Keeps the current model,
+     * just changes the dispatch route (auth/endpoint).
+     */
+    _handleRouteChange() {
+        this.selectedRoute = this.routeSelect.value;
+        this._saveState();
+        this.onModelChange(this.selectedProvider, this.selectedModel, this.isInitialLoad, this.selectedRoute);
     }
 
     /**
@@ -246,25 +317,39 @@ class ModelSelector {
             const data = await response.json();
             if (!data.model) return;
 
-            // Use bare model name (without provider/ prefix) for matching
+            // Canonical shape: /api/model/current returns
+            //   {vendor, route, model_name, model: "<vendor>[:<route>]/<model_name>"}
             const bareModel = data.model_name || data.model.split('/').pop();
+            const targetVendor = data.vendor;
+            const targetRoute = data.route || '';
 
-            // Find which provider this model belongs to
-            if (this.allModelsData?.by_provider) {
-                for (const [provider, models] of Object.entries(this.allModelsData.by_provider)) {
-                    if (models.some(m => m.id === bareModel)) {
-                        // Update provider if different
-                        if (this.providerSelect.value !== provider) {
-                            this.providerSelect.value = provider;
-                            this.selectedProvider = provider;
-                            this._populateModels();
-                        }
-                        // Update model
-                        this.modelSelect.value = bareModel;
-                        this.selectedModel = bareModel;
-                        this._saveState();
-                        break;
+            const buckets = this.allModelsData?.by_vendor;
+            if (!buckets) return;
+
+            const search = targetVendor && buckets[targetVendor]
+                ? [[targetVendor, buckets[targetVendor]]]
+                : Object.entries(buckets);
+
+            for (const [vendor, models] of search) {
+                if (models.some(m => m.id === bareModel)) {
+                    if (this.providerSelect.value !== vendor) {
+                        this.providerSelect.value = vendor;
+                        this.selectedProvider = vendor;
+                        this._populateRoutes();
+                        this._populateModels();
                     }
+                    this.modelSelect.value = bareModel;
+                    this.selectedModel = bareModel;
+                    if (this.routeSelect && targetRoute) {
+                        // Only set if visible and this route is an option.
+                        const opts = Array.from(this.routeSelect.options).map(o => o.value);
+                        if (opts.includes(targetRoute)) {
+                            this.routeSelect.value = targetRoute;
+                            this.selectedRoute = targetRoute;
+                        }
+                    }
+                    this._saveState();
+                    break;
                 }
             }
         } catch (e) {
@@ -279,34 +364,68 @@ class ModelSelector {
     checkForModelChange(content) {
         if (!content?.includes('MODEL_CHANGED:')) return false;
 
+        // The payload can arrive as plain JSON (``{"vendor":"..."}``) or as
+        // JSON-stringified escapes (``{\"vendor\":\"...\"}``) when an upstream
+        // layer double-encodes the agent message. Detect the escape-shape by
+        // looking at the first few chars after the marker and unescape the
+        // whole content before extraction — otherwise the string-aware
+        // extractor treats escaped quotes as string body and never finds the
+        // closing brace.
+        let effective = content;
+        const markerIdx = content.indexOf('MODEL_CHANGED:');
+        const probeIdx = markerIdx + 'MODEL_CHANGED:'.length;
+        const probe = content.slice(probeIdx, probeIdx + 3);
+        if (probe.startsWith('{\\"') || probe.startsWith('{\\\'')) {
+            effective = content
+                .replace(/\\"/g, '"')
+                .replace(/\\n/g, '\n')
+                .replace(/\\\\/g, '\\');
+        }
+
         try {
-            const jsonStr = this._extractModelChangedPayload(content);
-            if (!jsonStr) {
+            const rawJson = this._extractModelChangedPayload(effective);
+            if (!rawJson) {
                 return false;
             }
-            const syncData = JSON.parse(jsonStr);
+            let syncData;
+            try {
+                syncData = JSON.parse(rawJson);
+            } catch (firstErr) {
+                // Last-chance unescape if the heuristic above didn't catch it.
+                const unescaped = rawJson
+                    .replace(/\\"/g, '"')
+                    .replace(/\\n/g, '\n')
+                    .replace(/\\\\/g, '\\');
+                syncData = JSON.parse(unescaped);
+            }
 
-            if (syncData.provider && syncData.model) {
-                // Extract actual model ID (remove provider prefix if present)
-                let modelId = syncData.model;
-                if (modelId.startsWith(syncData.provider + '/')) {
-                    modelId = modelId.slice(syncData.provider.length + 1);
-                }
+            // MODEL_CHANGED payload (new shape): {vendor, route, model, model_name}
+            const vendor = syncData.vendor || syncData.provider;
+            const route = syncData.route || '';
+            const bareModel = syncData.model_name
+                || (syncData.model && syncData.model.includes('/')
+                    ? syncData.model.split('/').pop()
+                    : syncData.model);
 
-                // Update provider dropdown
-                if (this.providerSelect && this.providerSelect.value !== syncData.provider) {
-                    this.providerSelect.value = syncData.provider;
-                    this.selectedProvider = syncData.provider;
+            if (vendor && bareModel) {
+                if (this.providerSelect && this.providerSelect.value !== vendor) {
+                    this.providerSelect.value = vendor;
+                    this.selectedProvider = vendor;
+                    this._populateRoutes();
                     this._populateModels();
                 }
-
-                // Update model dropdown
                 if (this.modelSelect) {
-                    this.modelSelect.value = modelId;
-                    this.selectedModel = modelId;
-                    this._saveState();
+                    this.modelSelect.value = bareModel;
+                    this.selectedModel = bareModel;
                 }
-
+                if (this.routeSelect && route) {
+                    const opts = Array.from(this.routeSelect.options).map(o => o.value);
+                    if (opts.includes(route)) {
+                        this.routeSelect.value = route;
+                        this.selectedRoute = route;
+                    }
+                }
+                this._saveState();
                 return true;
             }
         } catch (e) {
@@ -370,13 +489,18 @@ class ModelSelector {
     }
 
     /**
-     * Get current selection
-     * @returns {{provider: string, model: string}}
+     * Get current selection.
+     *
+     * Returns {vendor, route, model}. The ``provider`` alias is retained
+     * for callers that still pass it through as a bare string — prefer
+     * ``vendor`` in new code.
      */
     getSelection() {
         return {
-            provider: this.selectedProvider,
-            model: this.selectedModel
+            vendor: this.selectedProvider,
+            route: this.selectedRoute || null,
+            model: this.selectedModel,
+            provider: this.selectedProvider,  // alias for back-compat
         };
     }
 
@@ -395,16 +519,18 @@ class ModelSelector {
      * @param {string} model - Model ID
      * @returns {Promise<boolean>} - Whether the request succeeded
      */
-    async setModelOnServer(endpoint, provider, model) {
+    async setModelOnServer(endpoint, vendor, model, route) {
         try {
             const headers = {
                 'Content-Type': 'application/json',
                 ...this.getAuthHeader()
             };
+            const body = { vendor, model };
+            if (route) body.route = route;
             const response = await fetch(endpoint, {
                 method: 'POST',
                 headers,
-                body: JSON.stringify({ provider, model })
+                body: JSON.stringify(body)
             });
             return response.ok;
         } catch (e) {
@@ -441,9 +567,10 @@ class ModelSelector {
 
 // Export for ES modules
 if (typeof module !== 'undefined' && module.exports) {
-    module.exports = { ModelSelector, PROVIDER_NAMES };
+    module.exports = { ModelSelector, VENDOR_NAMES, PROVIDER_NAMES };
 }
 
 // Export globally for script tag usage
 window.SharedModelSelector = ModelSelector;
+window.VENDOR_NAMES = VENDOR_NAMES;
 window.PROVIDER_NAMES = PROVIDER_NAMES;

@@ -1062,10 +1062,16 @@
                             <button id="new-chat-btn" onclick="clearChat()" class="btn btn-primary" title="New Chat" style="padding: 0.4rem 0.6rem; font-size: 0.85rem;"><span class="ki ki-sparkles"></span></button>
                         </div>
 
-                        <!-- Center: Model Selection (Provider → Model cascading dropdowns) -->
+                        <!-- Center: Model Selection (Vendor → [Route] → Model).
+                             The route selector is populated only when the selected
+                             vendor has >1 configured route (e.g. anthropic:api vs
+                             anthropic:plan). Hidden otherwise. -->
                         <div style="display: flex; gap: 0.5rem; align-items: center; flex: 1; justify-content: center;">
-                            <select id="provider-selector" class="model-selector" title="Select provider" style="min-width: 120px;">
-                                <option value="">Provider...</option>
+                            <select id="provider-selector" class="model-selector" title="Select vendor" style="min-width: 120px;">
+                                <option value="">Vendor...</option>
+                            </select>
+                            <select id="route-selector" class="model-selector" title="Select route (auth/endpoint)" style="min-width: 90px; display: none;">
+                                <option value="">Route...</option>
                             </select>
                             <select id="model-selector" class="model-selector" title="Select model" style="min-width: 180px;">
                                 <option value="">Model...</option>

@@ -561,23 +561,28 @@ export async function loadModels() {
     // Use API.buildAgentUrl() for proper rookery routing and pass auth headers
     sharedModelSelector = new window.SharedModelSelector({
         providerSelectId: 'provider-selector',
+        routeSelectId: 'route-selector',
         modelSelectId: 'model-selector',
         apiEndpoint: API.buildAgentUrl('/api/models'),
         currentModelEndpoint: API.buildAgentUrl('/api/model/current'),
-        storagePrefix: 'kestrel',
+        storagePrefix: `kestrel_${API.getHostAgent() || 'default'}`,
         getAuthHeader: () => {
             const key = API.getApiKey();
             return key ? { 'X-API-Key': key } : {};
         },
-        onModelChange: async (provider, model) => {
-            // Update state with both provider and model
+        onModelChange: async (vendor, model, isInitialLoad, route) => {
+            // Persist vendor/route/model in chat state.
             state.selectedModel = model;
-            state.selectedProvider = provider;
+            state.selectedProvider = vendor;    // name retained for legacy consumers
+            state.selectedVendor = vendor;
+            state.selectedRoute = route || null;
 
-            // Send model-set command to agent with explicit provider
-            // Format: !model-set <provider> <model>
+            // !model-set accepts <vendor[:route]> <model>. When the user picked
+            // a specific route from the route selector, include it so routing
+            // is unambiguous.
             if (messageInput) {
-                messageInput.value = `!model-set ${provider} ${model}`;
+                const selector = route ? `${vendor}:${route}` : vendor;
+                messageInput.value = `!model-set ${selector} ${model}`;
                 await sendMessage();
             }
         }
