@@ -4,7 +4,19 @@ Covers:
 - Backend-aware JSON-path index creation (SQLite)
 - query_nodes_by_type_and_property with equality / range filters
 - _json_extract helper for SQLite and PostgreSQL SQL generation
-- Benchmark: 50k action_item nodes, per-agent pending query < 50ms
+- Structural index-usage verification via EXPLAIN QUERY PLAN
+- Sortable-timestamp invariant for created_at values
+
+Sortable-timestamp invariant
+----------------------------
+Range queries on ``properties->>'created_at'`` rely on lexicographic
+comparison in SQL (``>=``, ``ORDER BY … DESC``).  This works **only**
+when every stored value is a UTC ISO-8601 string whose text sort order
+matches chronological order — i.e. ``YYYY-MM-DDTHH:MM:SS+00:00``.
+
+All code paths that persist ``created_at`` MUST use
+``datetime.now(timezone.utc).isoformat()`` (or an equivalent that
+produces a fixed-offset ``+00:00`` suffix, never a bare naive string).
 """
 
 from __future__ import annotations
@@ -89,6 +101,27 @@ class TestJsonPathIndexes:
             "SELECT name FROM sqlite_master WHERE type='index' AND name = 'idx_graph_nodes_agent'",
         )
         assert len(rows) == 1
+
+
+# =====================================================================
+# PostgreSQL index parity
+# =====================================================================
+
+
+class TestPostgresIndexParity:
+    """Verify that _POSTGRES_JSON_INDEXES defines the same logical indexes
+    as the SQLite block, including the created_at expression index."""
+
+    def test_postgres_has_created_at_index(self):
+        from kestrel_sovereign.storage.async_database import _POSTGRES_JSON_INDEXES
+        assert "idx_graph_nodes_action_created" in _POSTGRES_JSON_INDEXES
+
+    def test_postgres_created_at_targets_action_item(self):
+        from kestrel_sovereign.storage.async_database import _POSTGRES_JSON_INDEXES
+        # The index should be a partial index filtered to action_item
+        assert "node_type = 'action_item'" in _POSTGRES_JSON_INDEXES.split(
+            "idx_graph_nodes_action_created"
+        )[1].split(";")[0]
 
 
 # =====================================================================
@@ -223,12 +256,50 @@ class TestQueryNodesByTypeAndProperty:
 
 
 # =====================================================================
+# Structural index-usage verification (replaces timing-based benchmark)
+# =====================================================================
+
+
+class TestIndexUsage:
+    """Verify that SQLite's query planner uses the JSON-path indexes
+    rather than performing a full table scan.  This is a structural
+    check that is deterministic and CI-safe (no wall-clock assertions).
+    """
+
+    @pytest.mark.asyncio
+    async def test_agent_status_query_uses_index(self, db, graph):
+        """EXPLAIN QUERY PLAN should reference an index, not SCAN TABLE."""
+        # Insert a handful of rows so the planner has something to consider
+        for i in range(20):
+            await graph.add_node(_make_action("agent-A", status="pending"))
+
+        je = graph._json_extract
+        sql = (
+            "EXPLAIN QUERY PLAN "
+            "SELECT node_id, node_type, label, properties "
+            "FROM graph_nodes "
+            f"WHERE node_type = 'action_item' "
+            f"AND {je('properties', 'agent_id')} = 'agent-A' "
+            f"AND {je('properties', 'status')} = 'pending' "
+            f"ORDER BY {je('properties', 'created_at')} DESC "
+            "LIMIT 25"
+        )
+        rows = await db.fetchall(sql)
+        plan_text = " ".join(str(row) for row in rows).upper()
+        # SQLite EXPLAIN QUERY PLAN reports "USING INDEX <name>" when an
+        # index is used.  A full table scan shows "SCAN TABLE".
+        assert "INDEX" in plan_text, f"Expected index usage, got: {plan_text}"
+
+
+# =====================================================================
 # Benchmark: 50k action_item nodes across 10 agents
+# Marked 'bench' — excluded from default CI via `-m "not bench"`.
 # =====================================================================
 
 
 class TestBenchmark:
 
+    @pytest.mark.bench
     @pytest.mark.asyncio
     async def test_50k_nodes_per_agent_query_under_50ms(self, graph):
         """Insert 50k action_item nodes across 10 agents, then query
@@ -271,6 +342,67 @@ class TestBenchmark:
         assert all(r.properties["agent_id"] == "agent-0" for r in results)
         assert all(r.properties["status"] == "pending" for r in results)
         assert elapsed_ms < 50, f"Query took {elapsed_ms:.1f}ms, expected < 50ms"
+
+
+# =====================================================================
+# Sortable-timestamp invariant: created_at must parse & sort correctly
+# =====================================================================
+
+
+class TestCreatedAtInvariant:
+    """Verify that stored created_at values are valid UTC ISO-8601 strings
+    whose lexicographic order matches chronological order.
+
+    The sortable-timestamp invariant is documented in the module docstring.
+    """
+
+    @pytest.mark.asyncio
+    async def test_stored_created_at_parses_via_fromisoformat(self, graph):
+        """Every created_at value persisted via _make_action (which mirrors
+        the production SchemaRouter path) must be parseable by
+        datetime.fromisoformat and carry a UTC offset.
+        """
+        timestamps = [
+            datetime.now(timezone.utc).isoformat(),
+            (datetime.now(timezone.utc) - timedelta(days=30)).isoformat(),
+            "2026-01-15T08:30:00+00:00",
+        ]
+        for ts in timestamps:
+            await graph.add_node(_make_action("agent-A", created_at=ts))
+
+        results = await graph.query_nodes_by_type_and_property(
+            "action_item", filters={"agent_id": "agent-A"},
+        )
+        assert len(results) == len(timestamps)
+        for node in results:
+            raw = node.properties["created_at"]
+            parsed = datetime.fromisoformat(raw)
+            assert parsed.tzinfo is not None, (
+                f"created_at must be timezone-aware, got naive: {raw}"
+            )
+
+    @pytest.mark.asyncio
+    async def test_lexicographic_order_matches_chronological(self, graph):
+        """ISO-8601 UTC strings must sort lexicographically in the same
+        order as their chronological meaning — this is what makes the
+        SQL ``>=`` and ``ORDER BY`` comparisons correct.
+        """
+        t_early = "2025-06-01T00:00:00+00:00"
+        t_mid = "2026-01-15T12:00:00+00:00"
+        t_late = "2026-07-20T23:59:59+00:00"
+
+        # Lexicographic sort must equal chronological sort
+        assert sorted([t_late, t_early, t_mid]) == [t_early, t_mid, t_late]
+
+        # Verify through the database round-trip (ORDER BY DESC)
+        for ts in [t_early, t_mid, t_late]:
+            await graph.add_node(_make_action("agent-A", created_at=ts))
+
+        results = await graph.query_nodes_by_type_and_property(
+            "action_item", filters={"agent_id": "agent-A"},
+        )
+        returned = [n.properties["created_at"] for n in results]
+        assert returned == [t_late, t_mid, t_early]
 
 
 if __name__ == "__main__":
