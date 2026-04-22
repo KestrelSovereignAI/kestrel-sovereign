@@ -106,6 +106,7 @@ __all__ = [
     "analyze_message",
     "TemporalAnalyzer",
     "AssociativeLinker",
+    "LinkedConcept",
     "MemoryRetriever",
     "calculate_decay",
     "MemoryConsolidator",
