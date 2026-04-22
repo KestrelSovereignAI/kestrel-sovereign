@@ -123,12 +123,19 @@ class CommandHandler:
         for spec in BUILTIN_COMMAND_SPECS:
             self._command_handlers[spec["cmd"]] = getattr(self, spec["handler"])
     
-    async def handle(self, user_input: str) -> Optional[str]:
+    # Commands that require sovereign (API key) authority to execute.
+    SOVEREIGN_COMMANDS = frozenset([
+        "!reanchor-constitution",
+        "!safe-mode",
+    ])
+
+    async def handle(self, user_input: str, caller=None) -> Optional[str]:
         """
         Handle a command input.
 
         Args:
             user_input: The raw user input starting with '!'
+            caller: Optional CallerContext with auth identity and role.
 
         Returns:
             Command result string, or None if command not recognized
@@ -138,6 +145,20 @@ class CommandHandler:
             return None
 
         command = parts[0].lower()
+
+        # Authority gate: sovereign-only commands require API key auth
+        if command in self.SOVEREIGN_COMMANDS:
+            from kestrel_sovereign.auth import CallerContext
+            if caller is None or not caller.is_sovereign:
+                identity = caller.identity if caller else "unknown"
+                logging.warning(
+                    f"GOVERNANCE COMMAND REJECTED: {command} by {identity} "
+                    f"(role={caller.role.value if caller else 'none'})"
+                )
+                return (
+                    f"🚨 Unauthorized: {command} requires sovereign authority (API key).\n"
+                    f"Caller: {identity} ({caller.role.value if caller else 'no context'})"
+                )
 
         # Check built-in handlers
         if command in self._command_handlers:
@@ -252,8 +273,8 @@ class CommandHandler:
             "",
             "Constitution:",
             "  !verify-constitution      - Verify constitution integrity",
-            "  !reanchor-constitution    - Re-anchor after legitimate update",
-            "  !safe-mode [exit]         - Check or exit safe mode",
+            "  !reanchor-constitution    - Re-anchor after legitimate update [sovereign]",
+            "  !safe-mode [exit]         - Check or exit safe mode [sovereign for exit]",
             "",
             "Privacy:",
             "  !privacy [mode]      - Get or set privacy mode",
@@ -322,9 +343,10 @@ class CommandHandler:
         if len(parts) < 2:
             return "Usage: !reanchor-constitution <expected_hash_prefix>\n\nGet the hash with: sha256sum docs/principles/KESTREL_CONSTITUTION.md"
         expected_hash = parts[1]
+        # Caller identity already verified by SOVEREIGN_COMMANDS gate in handle()
         result = await self.agent.reanchor_constitution(
             expected_hash=expected_hash,
-            authorization="admin_command",
+            authorization="sovereign_api_key",
         )
         if result.startswith("Error:"):
             return f"🚨 {result}"
@@ -334,7 +356,8 @@ class CommandHandler:
         """Handle !safe-mode command."""
         parts = user_input.split()
         if len(parts) > 1 and parts[1].lower() == "exit":
-            return self.agent.exit_safe_mode(authorization="user_command")
+            # Caller identity already verified by SOVEREIGN_COMMANDS gate in handle()
+            return self.agent.exit_safe_mode(authorization="sovereign_api_key")
         if self.agent._safe_mode:
             return "🚨 SAFE MODE ACTIVE: Agent functionality restricted due to integrity failure."
         return "✅ Normal operation mode. No integrity issues detected."
