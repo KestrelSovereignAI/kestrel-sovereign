@@ -1029,14 +1029,14 @@ Expected Duration: {expected_duration}
 
         # SAFE MODE CHECK: If in safe mode, only allow diagnostic commands
         if self._safe_mode:
-            safe_mode_commands = ["!safe-mode", "!verify-constitution", "!status", "!help"]
+            safe_mode_commands = ["!safe-mode", "!verify-constitution", "!reanchor-constitution", "!status", "!help"]
             if user_input.startswith("!"):
                 cmd = user_input.split()[0]
                 if cmd not in safe_mode_commands:
                     return (
                         "🚨 SAFE MODE ACTIVE\\n\\n"
                         "The agent has detected an integrity issue and is operating in restricted mode.\\n"
-                        "Only diagnostic commands are available: !safe-mode, !verify-constitution, !status\\n\\n"
+                        "Only diagnostic commands are available: !safe-mode, !verify-constitution, !reanchor-constitution, !status\\n\\n"
                         "Please contact your administrator to resolve the integrity issue."
                     )
             else:
