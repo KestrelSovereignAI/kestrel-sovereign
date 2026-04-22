@@ -44,7 +44,7 @@ Download and install from [ollama.ai](https://ollama.ai), then:
 
 ```bash
 ollama serve              # start Ollama (keep this terminal open)
-ollama pull llama3.2:3b   # ~2GB download
+ollama pull llama3.2      # installs llama3.2:latest used by the default config
 ```
 
 > **Want to use OpenAI instead?** Skip to Step 4b. You can always switch later.
