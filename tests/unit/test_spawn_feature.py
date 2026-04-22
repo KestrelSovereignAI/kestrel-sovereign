@@ -8,6 +8,7 @@ from pathlib import Path
 
 from kestrel_sovereign.features.spawn.feature import SpawnFeature
 from kestrel_sovereign.rookery.agent_manager import AgentManager
+from kestrel_sovereign.spawn.lifecycle import SpawnedAgentLifecycle
 from kestrel_sovereign.spawn.mandate import SpawnMandate
 
 
@@ -181,6 +182,8 @@ class TestSpawnFeatureWithManager:
         manager = MagicMock()
         manager.get_agent = MagicMock(return_value=child)
         manager.get_children = MagicMock(return_value=["helper"])
+        manager._lifecycle = SpawnedAgentLifecycle(manager)
+        manager._lifecycle.report_result = AsyncMock()
 
         feature = _make_spawn_feature(parent_agent=parent, manager=manager)
         result = await feature.delegate_task(child_name="helper", task="analyze data")
@@ -191,6 +194,7 @@ class TestSpawnFeatureWithManager:
         # Wait briefly for the async task to start
         await asyncio.sleep(0.1)
         assert "helper" in feature._child_tasks
+        manager._lifecycle.report_result.assert_awaited()
 
     @pytest.mark.asyncio
     async def test_delegate_task_not_our_child(self):
@@ -222,6 +226,25 @@ class TestSpawnFeatureWithManager:
         # Delegate and wait for completion
         await feature.delegate_task(child_name="helper", task="analyze")
         await asyncio.sleep(0.2)  # Let the task complete
+
+        result = await feature.get_child_result(child_name="helper")
+        assert result["ready"] is True
+        assert result["result"] == "analysis complete: 42"
+
+    @pytest.mark.asyncio
+    async def test_delegate_task_ignores_non_lifecycle_manager_attr(self):
+        parent = _make_mock_agent("did:parent")
+        child = _make_mock_agent("did:child")
+        child.process_input = AsyncMock(return_value="analysis complete: 42")
+
+        manager = MagicMock()
+        manager.get_agent = MagicMock(return_value=child)
+        manager.get_children = MagicMock(return_value=["helper"])
+
+        feature = _make_spawn_feature(parent_agent=parent, manager=manager)
+
+        await feature.delegate_task(child_name="helper", task="analyze")
+        await asyncio.sleep(0.2)
 
         result = await feature.get_child_result(child_name="helper")
         assert result["ready"] is True
@@ -265,6 +288,25 @@ class TestSpawnFeatureWithManager:
 
         manager = MagicMock()
         manager.get_children = MagicMock(return_value=["helper"])
+        manager._lifecycle = SpawnedAgentLifecycle(manager)
+        manager._lifecycle.terminate = AsyncMock(return_value=SimpleNamespace())
+
+        feature = _make_spawn_feature(parent_agent=parent, manager=manager)
+        result = await feature.terminate_child(child_name="helper")
+
+        assert result["terminated"] is True
+        manager._lifecycle.terminate.assert_awaited_once_with(
+            child_name="helper",
+            reason="explicit termination",
+        )
+
+    @pytest.mark.asyncio
+    async def test_terminate_child_falls_back_without_lifecycle(self):
+        parent = _make_mock_agent("did:parent")
+
+        manager = MagicMock()
+        manager.get_children = MagicMock(return_value=["helper"])
+        manager._lifecycle = None
         manager.terminate_child = AsyncMock(return_value=True)
 
         feature = _make_spawn_feature(parent_agent=parent, manager=manager)
