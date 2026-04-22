@@ -526,6 +526,10 @@ class SchemaRouter:
         concepts — no local keyword heuristics needed. Also uses
         ``concept.node_id`` directly instead of reconstructing it.
 
+        Both ``person`` (keyword matches like "mom") and ``proper_noun``
+        (capitalized names like "Alice") are treated as enrichable for
+        interaction edges.
+
         Ambiguous person matches are returned so callers can surface a
         confirmation UI.
         """
@@ -538,8 +542,9 @@ class SchemaRouter:
 
         message_node = f"message:{self.agent_id}:{message_id}"
 
+        _person_categories = {"person", "proper_noun"}
         for concept in concepts:
-            if concept.category != "person":
+            if concept.category not in _person_categories:
                 continue
 
             # Attach interaction properties to the existing mentions edge.
