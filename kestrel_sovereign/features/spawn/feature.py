@@ -105,6 +105,15 @@ class SpawnFeature(Feature):
         """Explicitly set the AgentManager (used in testing)."""
         self._agent_manager = manager
 
+    def _get_lifecycle(self, manager):
+        """Return the lifecycle manager when it is fully wired."""
+        from kestrel_sovereign.spawn.lifecycle import SpawnedAgentLifecycle
+
+        lifecycle = getattr(manager, "_lifecycle", None)
+        if isinstance(lifecycle, SpawnedAgentLifecycle):
+            return lifecycle
+        return None
+
     @tool(
         name="spawn_agent",
         description=(
@@ -270,6 +279,7 @@ class SpawnFeature(Feature):
 
         # Run the task asynchronously via the child agent's chat method
         async def _run_child_task():
+            lifecycle = self._get_lifecycle(manager)
             try:
                 result = await child_agent.process_input(task)
                 self._child_results[child_name] = {
@@ -277,6 +287,11 @@ class SpawnFeature(Feature):
                     "result": result,
                     "completed_at": time.time(),
                 }
+                if lifecycle is not None:
+                    await lifecycle.report_result(
+                        child_name=child_name,
+                        output_artifacts={"result": result},
+                    )
             except Exception as e:
                 logger.error(f"Child '{child_name}' task failed: {e}")
                 self._child_results[child_name] = {
@@ -284,6 +299,13 @@ class SpawnFeature(Feature):
                     "error": str(e),
                     "completed_at": time.time(),
                 }
+                if lifecycle is not None:
+                    from kestrel_sovereign.spawn.lifecycle import SpawnStatus
+                    await lifecycle.report_result(
+                        child_name=child_name,
+                        output_artifacts={"error": str(e)},
+                        status=SpawnStatus.FAILED,
+                    )
 
         # Cancel any existing task for this child
         if child_name in self._child_tasks and not self._child_tasks[child_name].done():
@@ -365,7 +387,15 @@ class SpawnFeature(Feature):
         self._child_results.pop(child_name, None)
 
         # Remove from manager (handles shutdown + cascading child termination)
-        removed = await manager.terminate_child(parent_did, child_name)
+        lifecycle = self._get_lifecycle(manager)
+        if lifecycle is not None:
+            result = await lifecycle.terminate(
+                child_name=child_name,
+                reason="explicit termination",
+            )
+            removed = result is not None
+        else:
+            removed = await manager.terminate_child(parent_did, child_name)
         if removed:
             return {"terminated": True, "child_name": child_name}
 
