@@ -1005,7 +1005,7 @@ Expected Duration: {expected_duration}
         # State is COMPLETE or unknown - proceed to normal processing
         return None
 
-    async def process_input(self, user_input: str, model_override: str = None, session_id: str = None, include_memories: bool = True) -> str:
+    async def process_input(self, user_input: str, model_override: str = None, session_id: str = None, include_memories: bool = True, caller=None) -> str:
         """
         Processes user input by consulting the constitution, retrieving context,
         and generating a response using tool calling for features.
@@ -1017,6 +1017,7 @@ Expected Duration: {expected_duration}
             include_memories: Whether to include cross-session memory retrieval (default True).
                               Set to False for multi-tenant sessions (e.g., SMS) to prevent
                               data leaking between users who share the same agent instance.
+            caller: Optional CallerContext with auth identity and role.
         """
         logging.info(f"[AGENTIC] process_input called ({len(user_input)} chars)")
 
@@ -1064,7 +1065,7 @@ Expected Duration: {expected_duration}
             if user_input.strip().lower() == "!continue":
                 user_input = "Please continue from where you left off."
             else:
-                response = await self.command_handler.handle(user_input)
+                response = await self.command_handler.handle(user_input, caller=caller)
                 if response:
                     return response
 

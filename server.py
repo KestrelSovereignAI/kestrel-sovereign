@@ -503,9 +503,12 @@ async def auth_middleware(request: Request, call_next):
     try:
         expected_key = get_api_key()
 
+        from kestrel_sovereign.auth import CallerContext, AuthMethod
+
         # Check X-API-Key header
         api_key_header = request.headers.get(API_KEY_NAME)
         if api_key_header and secrets.compare_digest(api_key_header, expected_key):
+            request.state.caller = CallerContext.sovereign(AuthMethod.API_KEY)
             return await call_next(request)
 
         # Check Bearer token (API key OR JWT)
@@ -514,12 +517,17 @@ async def auth_middleware(request: Request, call_next):
             token = auth_header[7:]
             # First try: API key match
             if secrets.compare_digest(token, expected_key):
+                request.state.caller = CallerContext.sovereign(AuthMethod.API_KEY)
                 return await call_next(request)
             # Second try: JWT token
             try:
                 from endpoints.auth_oauth import _verify_jwt
                 jwt_payload = _verify_jwt(token)
                 if jwt_payload:
+                    request.state.caller = CallerContext.authenticated(
+                        identity=jwt_payload.get("sub", "unknown"),
+                        auth_method=AuthMethod.JWT,
+                    )
                     return await call_next(request)
             except Exception:
                 pass
@@ -529,11 +537,16 @@ async def auth_middleware(request: Request, call_next):
         api_key_query = request.query_params.get("api_key")
         if api_key_query and any(request.url.path.endswith(p) for p in SSE_PATHS):
             if secrets.compare_digest(api_key_query, expected_key):
+                request.state.caller = CallerContext.sovereign(AuthMethod.API_KEY)
                 return await call_next(request)
 
         # Check OAuth session cookie
         user_email = request.session.get("user_email") if hasattr(request, "session") else None
         if user_email:
+            request.state.caller = CallerContext.authenticated(
+                identity=user_email,
+                auth_method=AuthMethod.OAUTH_SESSION,
+            )
             return await call_next(request)
 
         # No valid auth — for the root page in a browser:

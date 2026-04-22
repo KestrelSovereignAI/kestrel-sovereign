@@ -27,7 +27,7 @@ class TestStreamingBasics:
             chunks.append(chunk)
 
         mock_agent._maybe_audit.assert_called_once()
-        mock_agent.process_input.assert_called_once_with("!help", None, session_id=None)
+        mock_agent.process_input.assert_called_once_with("!help", None, session_id=None, caller=None)
         assert "Command executed" in "".join(chunks)
 
 
