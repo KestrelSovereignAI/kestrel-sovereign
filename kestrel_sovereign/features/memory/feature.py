@@ -13,7 +13,7 @@ Integrates with the human-like memory system:
 """
 
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.storage_access import (
@@ -291,7 +291,6 @@ class MemoryFeature(Feature):
             # Get RAG stats if available
             rag_stats = {}
             if hasattr(self.storage, 'rag'):
-                rag = self.storage.rag
                 # Try to get chunk count
                 try:
                     count_result = await self._db.fetchone(
