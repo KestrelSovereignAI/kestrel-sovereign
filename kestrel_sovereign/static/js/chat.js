@@ -274,11 +274,13 @@ export async function sendMessage() {
     // Get current session ID for context-aware conversation
     const sessionId = state.currentSessionId || null;
 
-    // Send both provider and model so the backend can route to the correct provider.
-    // Without provider, the backend iterates ALL providers with just the model name,
-    // causing failures on providers that don't have that model.
-    const selectedModel = state.selectedModel || null;
-    const selectedProvider = state.selectedProvider || null;
+    // DO NOT send model/provider overrides from the chat UI. The server
+    // already knows each agent's persisted mandate (set via POST
+    // /api/model/set when the user picked from the dropdown). Sending
+    // state.selectedModel/selectedProvider here was a bug: those vars
+    // don't update when the user switches agents, so a stale override
+    // from the previous agent would silently reroute the new agent's
+    // chat to a different model. Source of truth: server mandate.
 
     try {
         if (state.useStreaming) {
@@ -286,7 +288,7 @@ export async function sendMessage() {
             let fullContent = '';
 
             try {
-                for await (const chunk of API.streamInvoke(text, selectedModel, sessionId, selectedProvider)) {
+                for await (const chunk of API.streamInvoke(text, null, sessionId, null)) {
                     fullContent += chunk;
                     updateStreamingMessage(msgDiv, fullContent);
                 }
@@ -297,7 +299,7 @@ export async function sendMessage() {
                     console.log('Streaming not available, falling back to standard invoke');
                     state.useStreaming = false;
                     msgDiv.remove();
-                    const response = await API.invoke(text, selectedModel, sessionId, selectedProvider);
+                    const response = await API.invoke(text, null, sessionId, null);
                     await addMessage('agent', response.response);
                     await checkForModelChange(response.response);
                 } else {
@@ -305,7 +307,7 @@ export async function sendMessage() {
                 }
             }
         } else {
-            const response = await API.invoke(text, selectedModel, sessionId, selectedProvider);
+            const response = await API.invoke(text, null, sessionId, null);
             await addMessage('agent', response.response);
             await checkForModelChange(response.response);
         }
