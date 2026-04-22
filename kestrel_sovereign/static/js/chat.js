@@ -557,6 +557,20 @@ export async function loadModels() {
         return;
     }
 
+    // Blank the dropdowns IMMEDIATELY before building the new selector. Without
+    // this, the previous agent's options remain in the DOM while the async
+    // /api/models + /api/model/current round-trips for the new agent complete,
+    // and the user briefly sees the previous agent's vendor/model (the "flash"
+    // Jason saw when switching agents).
+    for (const id of ['provider-selector', 'route-selector', 'model-selector']) {
+        const el = document.getElementById(id);
+        if (el) {
+            el.innerHTML = '<option value="">Loading…</option>';
+            el.value = '';
+            if (id === 'route-selector') el.style.display = 'none';
+        }
+    }
+
     // Create the shared model selector instance
     // Use API.buildAgentUrl() for proper rookery routing and pass auth headers
     sharedModelSelector = new window.SharedModelSelector({

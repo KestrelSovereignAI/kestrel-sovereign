@@ -259,43 +259,68 @@ class ModelSelector {
     }
 
     /**
-     * Vendor dropdown change.
+     * Commit gate: fire ``onModelChange`` when and only when the dropdowns
+     * have settled on a complete ``(vendor, route?, model)`` triple that
+     * differs from the last state the server confirmed.
      *
-     * IMPORTANT: does NOT fire ``onModelChange``. A vendor change alone is
-     * not a user commit — it's a navigation step. The user still has to
-     * pick a model (and optionally a route). Firing here is the bug that
-     * sent ``!model-set anthropic haiku`` before the user had a chance
-     * to click opus.
+     * This replaces the "vendor change never commits" rule that missed the
+     * case where a vendor has a single route + single model (llama_cpp/Kimi,
+     * ollama/llama3.2). In that case the vendor pick IS unambiguous and
+     * should commit. In the ambiguous case (vendor has many models, auto-
+     * selection picks the first), a subsequent model click will commit the
+     * real choice — the intermediate commit is cheap and correct on reload.
      */
+    _maybeCommit() {
+        if (this.isInitialLoad) return;
+        const vendor = this.selectedProvider;
+        const model = this.selectedModel;
+        if (!vendor || !model) return;
+
+        // Route normalization: when a vendor has exactly one route, a null
+        // selectedRoute and that route's literal name are equivalent — the
+        // server will pick the only route either way. Without this, diffing
+        // a synced {route: "plan"} against a freshly-populated {route: null}
+        // would fire a redundant commit for every same-vendor repick.
+        const routeForVendor = (v) => (this.allModelsData?.routes || [])
+            .filter(r => r.vendor === v)
+            .map(r => r.route);
+        const canon = (r, v) => {
+            if (r) return r;
+            const rs = routeForVendor(v);
+            return rs.length === 1 ? rs[0] : null;
+        };
+
+        const route = canon(this.selectedRoute || null, vendor);
+        const last = this._lastSyncedSelection || {};
+        const lastRoute = canon(last.route || null, last.vendor);
+        if (last.vendor === vendor && last.model === model && lastRoute === route) {
+            return;  // state matches server — no POST
+        }
+        this._lastSyncedSelection = { vendor, model, route };
+        this.onModelChange(vendor, model, this.isInitialLoad, route);
+    }
+
     _handleProviderChange() {
         this.selectedProvider = this.providerSelect.value;
-        // Vendor changed — drop stale route so the default picks.
         this.selectedRoute = '';
         this._saveState();
         this._populateRoutes();
         this._populateModels();
         this.selectedModel = this.modelSelect.value;
         this._saveState();
-        // No onModelChange here — waiting for the user to commit via model or route.
+        this._maybeCommit();
     }
 
-    /**
-     * Model dropdown change — this IS a user commit.
-     */
     _handleModelChange() {
         this.selectedModel = this.modelSelect.value;
         this._saveState();
-        this.onModelChange(this.selectedProvider, this.selectedModel, this.isInitialLoad, this.selectedRoute);
+        this._maybeCommit();
     }
 
-    /**
-     * Route dropdown change — also a user commit. Keeps the current model,
-     * just changes the dispatch route (auth/endpoint).
-     */
     _handleRouteChange() {
         this.selectedRoute = this.routeSelect.value;
         this._saveState();
-        this.onModelChange(this.selectedProvider, this.selectedModel, this.isInitialLoad, this.selectedRoute);
+        this._maybeCommit();
     }
 
     /**
@@ -341,7 +366,6 @@ class ModelSelector {
                     this.modelSelect.value = bareModel;
                     this.selectedModel = bareModel;
                     if (this.routeSelect && targetRoute) {
-                        // Only set if visible and this route is an option.
                         const opts = Array.from(this.routeSelect.options).map(o => o.value);
                         if (opts.includes(targetRoute)) {
                             this.routeSelect.value = targetRoute;
@@ -349,6 +373,13 @@ class ModelSelector {
                         }
                     }
                     this._saveState();
+                    // Record the server's confirmed state so _maybeCommit has
+                    // something to diff user-driven changes against.
+                    this._lastSyncedSelection = {
+                        vendor: this.selectedProvider,
+                        model: this.selectedModel,
+                        route: this.selectedRoute || null,
+                    };
                     break;
                 }
             }
@@ -426,6 +457,14 @@ class ModelSelector {
                     }
                 }
                 this._saveState();
+                // This path reflects a CONFIRMED server-side change (agent
+                // emitted MODEL_CHANGED in its chat response). Record it as
+                // lastSynced so the next user interaction diffs correctly.
+                this._lastSyncedSelection = {
+                    vendor: this.selectedProvider,
+                    model: this.selectedModel,
+                    route: this.selectedRoute || null,
+                };
                 return true;
             }
         } catch (e) {

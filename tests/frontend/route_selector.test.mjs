@@ -117,43 +117,111 @@ test('route selector is visible with options when vendor has multiple routes', (
 });
 
 
-test('REGRESSION: vendor change does NOT fire onModelChange', () => {
-    // The bug that caused this test: when the user changed the vendor dropdown
-    // to Anthropic, the component auto-populated the model list with the first
-    // featured model (haiku, alphabetical on canonical aliases) and fired
-    // onModelChange immediately. The chat then sent `!model-set anthropic haiku`
-    // before the user had a chance to pick opus.
-    const { selector, providerSelect, modelSelect, commits } = loadSelector();
+test('vendor change with single-model vendor commits immediately', () => {
+    // REGRESSION: Jason picked llama_cpp, Kimi auto-populated as the only
+    // model and local auto-selected as the only route, but because the old
+    // handler refused to fire onModelChange on vendor changes, the server
+    // never learned about it. Clicking away and back showed the prior
+    // server state (anthropic:plan/opus), not llama_cpp/Kimi.
+    const { selector, providerSelect, modelSelect, routeSelect, commits } = loadSelector();
     selector.allModelsData = {
         by_vendor: {
             anthropic: [
-                { id: 'claude-haiku-4-5', provider: 'anthropic', is_featured: true },
-                { id: 'claude-opus-4-7',  provider: 'anthropic', is_featured: true },
+                { id: 'claude-opus-4-7', provider: 'anthropic', is_featured: true },
             ],
-            openai: [{ id: 'gpt-5', provider: 'openai', is_featured: true }],
+            llama_cpp: [
+                { id: 'Kimi-K2.5.gguf', provider: 'llama_cpp', is_featured: true },
+            ],
         },
-        routes: [{ vendor: 'anthropic', route: 'api' }, { vendor: 'openai', route: 'api' }],
+        routes: [
+            { vendor: 'anthropic', route: 'plan' },
+            { vendor: 'anthropic', route: 'api' },
+            { vendor: 'llama_cpp', route: 'local', is_local: true },
+        ],
     };
-    providerSelect.value = 'anthropic';
+    // Simulate the sync that ran when the agent was first viewed.
+    selector.isInitialLoad = false;
+    selector._lastSyncedSelection = {
+        vendor: 'anthropic', model: 'claude-opus-4-7', route: 'plan',
+    };
+
+    providerSelect.value = 'llama_cpp';
     selector._handleProviderChange();
-    assert.equal(commits.length, 0, 'vendor change must NOT commit — wait for user to pick a model');
+
+    assert.equal(commits.length, 1, 'single-model vendor switch must commit');
+    const [vendor, model, , route] = commits[0];
+    assert.equal(vendor, 'llama_cpp');
+    assert.equal(model, 'Kimi-K2.5.gguf');
+    assert.equal(route, 'local');
 });
 
 
-test('model change DOES fire onModelChange (user commit)', () => {
+test('vendor change does NOT double-commit when state already matches server', () => {
+    // User picks a vendor they're already on — no redundant POST.
+    const { selector, providerSelect, commits } = loadSelector();
+    selector.allModelsData = {
+        by_vendor: {
+            anthropic: [
+                { id: 'claude-opus-4-7', provider: 'anthropic', is_featured: true },
+            ],
+        },
+        routes: [{ vendor: 'anthropic', route: 'plan' }],
+    };
+    selector.isInitialLoad = false;
+    selector._lastSyncedSelection = {
+        vendor: 'anthropic', model: 'claude-opus-4-7', route: 'plan',
+    };
+
+    providerSelect.value = 'anthropic';
+    selector._handleProviderChange();
+    assert.equal(commits.length, 0, 'no commit when dropdowns settle to server state');
+});
+
+
+test('isInitialLoad suppresses auto-commit during constructor/sync', () => {
+    // During the initial page render, syncWithServer may adjust the
+    // dropdowns to match server state. Those adjustments must not trigger
+    // their own commits back.
+    const { selector, providerSelect, commits } = loadSelector();
+    selector.allModelsData = {
+        by_vendor: {
+            anthropic: [
+                { id: 'claude-opus-4-7', provider: 'anthropic', is_featured: true },
+            ],
+        },
+        routes: [{ vendor: 'anthropic', route: 'plan' }],
+    };
+    // isInitialLoad defaults to true in the constructor.
+    providerSelect.value = 'anthropic';
+    selector._handleProviderChange();
+    assert.equal(commits.length, 0, 'no commits during initial load');
+});
+
+
+test('model change commits with new model but same vendor', () => {
     const { selector, providerSelect, modelSelect, commits } = loadSelector();
+    selector.isInitialLoad = false;
+    selector._lastSyncedSelection = {
+        vendor: 'anthropic', model: 'claude-sonnet-4-6', route: 'api',
+    };
     selector.selectedProvider = 'anthropic';
+    selector.selectedRoute = 'api';
     modelSelect.value = 'claude-opus-4-7';
     selector._handleModelChange();
     assert.equal(commits.length, 1);
     const [vendor, model, , route] = commits[0];
     assert.equal(vendor, 'anthropic');
     assert.equal(model, 'claude-opus-4-7');
+    assert.equal(route, 'api');
 });
 
 
-test('route change DOES fire onModelChange and keeps the current model', () => {
-    const { selector, providerSelect, modelSelect, routeSelect, commits } = loadSelector();
+test('route change commits, keeps current model', () => {
+    const { selector, routeSelect, commits } = loadSelector();
+    selector.isInitialLoad = false;
+    selector._lastSyncedSelection = {
+        vendor: 'anthropic', model: 'claude-opus-4-7', route: 'api',
+    };
     selector.selectedProvider = 'anthropic';
     selector.selectedModel = 'claude-opus-4-7';
     routeSelect.value = 'plan';
@@ -161,7 +229,7 @@ test('route change DOES fire onModelChange and keeps the current model', () => {
     assert.equal(commits.length, 1);
     const [vendor, model, , route] = commits[0];
     assert.equal(vendor, 'anthropic');
-    assert.equal(model, 'claude-opus-4-7', 'route change must preserve the current model');
+    assert.equal(model, 'claude-opus-4-7', 'route change must preserve the model');
     assert.equal(route, 'plan');
 });
 
