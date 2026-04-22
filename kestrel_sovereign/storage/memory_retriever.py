@@ -50,19 +50,21 @@ class MemoryRetriever:
     Retrieves memories using human-like weighting.
 
     Scoring breakdown:
-    - semantic: 30% - How relevant is this to the query
-    - emotional: 25% - Does the emotional tone match
+    - semantic: 25% - How relevant is this to the query
+    - emotional: 20% - Does the emotional tone match
     - importance: 20% - How important was this marked
     - recency: 15% - How recent, with decay curve
+    - certainty: 10% - How certain the claim is (epistemic weight)
     - access: 10% - How often accessed (rehearsal effect)
     """
 
     # Scoring weights (must sum to 1.0)
-    WEIGHT_SEMANTIC = 0.30
-    WEIGHT_EMOTIONAL = 0.25
+    WEIGHT_SEMANTIC = 0.25
+    WEIGHT_EMOTIONAL = 0.20
     WEIGHT_IMPORTANCE = 0.20
     WEIGHT_RECENCY = 0.15
     WEIGHT_ACCESS = 0.10
+    WEIGHT_CERTAINTY = 0.10
 
     # Decay parameters (Ebbinghaus-inspired)
     DECAY_HALF_LIFE_DAYS = 30  # Memory strength halves every 30 days
@@ -208,10 +210,11 @@ class MemoryRetriever:
         Calculate weighted retrieval score.
 
         Components:
-        - semantic: 30% (keyword + concept overlap)
-        - emotional: 25% (mood match)
+        - semantic: 25% (keyword + concept overlap)
+        - emotional: 20% (mood match)
         - importance: 20% (from metadata)
         - recency: 15% (with decay)
+        - certainty: 10% (epistemic weight)
         - access: 10% (rehearsal effect)
         """
         # Parse metadata if string
@@ -240,13 +243,17 @@ class MemoryRetriever:
         # 5. Access score (rehearsal effect)
         access = self._score_access(metadata)
 
+        # 6. Certainty score (epistemic weight)
+        certainty = self._score_certainty(metadata)
+
         # Weighted combination
         total = (
             semantic * self.WEIGHT_SEMANTIC +
             emotional * self.WEIGHT_EMOTIONAL +
             importance * self.WEIGHT_IMPORTANCE +
             recency * self.WEIGHT_RECENCY +
-            access * self.WEIGHT_ACCESS
+            access * self.WEIGHT_ACCESS +
+            certainty * self.WEIGHT_CERTAINTY
         )
 
         return total
@@ -378,6 +385,18 @@ class MemoryRetriever:
         if access_count <= 0:
             return 0.0
         return min(1.0, math.log10(access_count + 1) / 2)
+
+    def _score_certainty(self, metadata: Dict[str, Any]) -> float:
+        """Score based on epistemic certainty.
+
+        Higher-certainty claims score higher — the agent is more
+        confident in them and they should surface more readily.
+        Messages without epistemic metadata get a neutral 0.5.
+        """
+        claim_certainty = metadata.get("claim_certainty")
+        if claim_certainty is None:
+            return 0.5
+        return float(claim_certainty)
 
     async def retrieve_by_emotion(
         self,
