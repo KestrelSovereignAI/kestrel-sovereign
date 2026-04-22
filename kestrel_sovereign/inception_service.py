@@ -564,7 +564,19 @@ def build_cli_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _ensure_utf8_stdio() -> None:
+    """Reconfigure stdout/stderr to UTF-8 to prevent emoji prints from
+    crashing on Windows consoles defaulting to cp1252."""
+    import sys as _sys
+    for stream in (_sys.stdout, _sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
+        except (AttributeError, ValueError):
+            pass
+
+
 def main():
+    _ensure_utf8_stdio()
     parser = build_cli_parser()
     args = parser.parse_args()
 
