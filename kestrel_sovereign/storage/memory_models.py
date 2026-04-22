@@ -66,6 +66,11 @@ class MemoryMetadata:
     stash_name: Optional[str] = None        # Human-readable name for the stash
     stashed_at: Optional[str] = None        # ISO format timestamp
 
+    # Epistemic status layer
+    claim_certainty: Optional[float] = None    # 0.0 (uncertain) to 1.0 (certain)
+    claim_source: Optional[str] = None         # "direct" | "inferred" | "hearsay" | "observed"
+    temporal_validity: Optional[str] = None    # "durable" | "ephemeral" | "moment"
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dict for JSON storage in metadata column."""
         return {
@@ -91,6 +96,10 @@ class MemoryMetadata:
             "stash_id": self.stash_id,
             "stash_name": self.stash_name,
             "stashed_at": self.stashed_at,
+            # Epistemic status fields
+            "claim_certainty": self.claim_certainty,
+            "claim_source": self.claim_source,
+            "temporal_validity": self.temporal_validity,
         }
 
     @classmethod
@@ -121,6 +130,10 @@ class MemoryMetadata:
             stash_id=data.get("stash_id"),
             stash_name=data.get("stash_name"),
             stashed_at=data.get("stashed_at"),
+            # Epistemic status fields
+            claim_certainty=data.get("claim_certainty"),
+            claim_source=data.get("claim_source"),
+            temporal_validity=data.get("temporal_validity"),
         )
 
     def merge_with(self, existing_meta: Dict[str, Any]) -> Dict[str, Any]:

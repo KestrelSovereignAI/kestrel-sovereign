@@ -243,6 +243,7 @@ class MemorySystem:
                         content=content,
                         concepts=linked_concepts,
                         role=role,
+                        metadata=enriched,
                     )
                     enriched["schema_routing"] = routing_summary
                 except Exception as e:
@@ -475,6 +476,7 @@ class MemorySystem:
                 "emotional": MemoryRetriever.WEIGHT_EMOTIONAL,
                 "importance": MemoryRetriever.WEIGHT_IMPORTANCE,
                 "recency": MemoryRetriever.WEIGHT_RECENCY,
+                "certainty": MemoryRetriever.WEIGHT_CERTAINTY,
                 "access": MemoryRetriever.WEIGHT_ACCESS,
             },
             "decay_half_life_days": MemoryRetriever.DECAY_HALF_LIFE_DAYS,
