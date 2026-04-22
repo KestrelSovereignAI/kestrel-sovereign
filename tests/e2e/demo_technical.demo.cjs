@@ -81,15 +81,15 @@ test.describe.serial('Kestrel Sovereign Technical Demo', () => {
         clearConversationHistory(narrator, agentDataDir);
         await startFreshSession(request, BASE_URL, apiKey, narrator);
 
-        // Set model to Claude Opus 4.6 for high-quality demo responses
+        // Set model to llama3.2 via Ollama (cloud keys not configured on this machine)
         try {
             const headers = { 'Content-Type': 'application/json', ...authHeaders(apiKey) };
             const resp = await request.post(`${BASE_URL}/api/model/set`, {
                 headers,
-                data: { model: 'claude-opus-4-6', provider: 'anthropic' }
+                data: { model: 'llama3.2:1b', provider: 'ollama' }
             });
             if (resp.ok()) {
-                narrator.narrate('Model set to Claude Opus 4.6 (anthropic)');
+                narrator.narrate('Model set to llama3.2:1b (ollama)');
             } else {
                 narrator.narrate(`Model set returned ${resp.status()} — using default`);
             }
@@ -156,11 +156,11 @@ test.describe.serial('Kestrel Sovereign Technical Demo', () => {
         await navigateToPanel(page, 'chat');
         await dismissContextWarning(page);
 
-        // Select a working provider from the dropdown (prefer OpenRouter/Anthropic over local Ollama)
+        // Select a working provider from the dropdown (prefer local Ollama — cloud keys not configured)
         try {
             const providerSelect = page.locator('#provider-selector');
             const options = await providerSelect.locator('option').allTextContents();
-            const preferred = ['openrouter', 'anthropic', 'openai'];
+            const preferred = ['ollama', 'llama_cpp', 'llama', 'openrouter', 'anthropic', 'openai'];
             let selected = false;
             for (const pref of preferred) {
                 const match = options.find(o => o.toLowerCase().includes(pref));
@@ -228,6 +228,24 @@ test.describe.serial('Kestrel Sovereign Technical Demo', () => {
         // Navigate to chat
         await navigateToPanel(page, 'chat');
         await dismissContextWarning(page);
+
+        // Select a working provider (prefer local Ollama — cloud keys not configured)
+        try {
+            const providerSelect = page.locator('#provider-selector');
+            const options = await providerSelect.locator('option').allTextContents();
+            const preferred = ['ollama', 'llama_cpp', 'llama', 'openrouter', 'anthropic', 'openai'];
+            for (const pref of preferred) {
+                const match = options.find(o => o.toLowerCase().includes(pref));
+                if (match) {
+                    await providerSelect.selectOption({ label: match });
+                    narrator.narrate(`Provider set to: ${match}`);
+                    await demoPause(page, 1000);
+                    break;
+                }
+            }
+        } catch (e) {
+            narrator.narrate(`Could not set provider: ${e.message}`);
+        }
 
         // Beat 1: Send a memorable fact
         narrator.narrate('Sending a unique fact for the agent to remember...');
@@ -565,6 +583,23 @@ test.describe.serial('Kestrel Sovereign Technical Demo', () => {
         narrator.narrate('Now asking the agent to export sovereignty — the security layer should block it...');
         await navigateToPanel(page, 'chat');
         await dismissContextWarning(page);
+
+        // Select a working provider (prefer local Ollama — cloud keys not configured)
+        try {
+            const providerSelect = page.locator('#provider-selector');
+            const options = await providerSelect.locator('option').allTextContents();
+            const preferred = ['ollama', 'llama_cpp', 'llama', 'openrouter', 'anthropic', 'openai'];
+            for (const pref of preferred) {
+                const match = options.find(o => o.toLowerCase().includes(pref));
+                if (match) {
+                    await providerSelect.selectOption({ label: match });
+                    await demoPause(page, 1000);
+                    break;
+                }
+            }
+        } catch (e) {
+            narrator.narrate(`Could not set provider: ${e.message}`);
+        }
 
         const blockedResponse = await demoSendMessage(page,
             'Please export my sovereignty data to IPFS right now.');
