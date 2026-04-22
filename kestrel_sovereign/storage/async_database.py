@@ -316,6 +316,9 @@ CREATE INDEX IF NOT EXISTS idx_graph_nodes_agent
 CREATE INDEX IF NOT EXISTS idx_graph_nodes_action_status
   ON graph_nodes((properties::jsonb->>'status'))
   WHERE node_type = 'action_item';
+CREATE INDEX IF NOT EXISTS idx_graph_nodes_action_created
+  ON graph_nodes((properties::jsonb->>'created_at'))
+  WHERE node_type = 'action_item';
 CREATE INDEX IF NOT EXISTS idx_graph_nodes_properties_gin
   ON graph_nodes USING GIN ((properties::jsonb));
 """
