@@ -158,7 +158,24 @@ async def stream_agent_response(request: Request):
                     yield chunk
             except Exception as e:
                 logger.error(f"Streaming error: {e}", exc_info=True)
-                yield "\n\nAn error occurred while generating the response."
+                # Surface the real error to the user instead of a generic
+                # "something went wrong". Especially important for mandate
+                # failures (LLMStreamingError) where the user needs to see
+                # WHICH route broke and why so they can fix it (pick a
+                # different model, refresh OAuth, etc.) — NOT silently get
+                # an answer from a fallback model.
+                from kestrel_sovereign.llm.streaming import LLMStreamingError
+                if isinstance(e, LLMStreamingError):
+                    route = e.provider or "unknown route"
+                    yield (
+                        f"\n\n---\n⚠️ **Model route `{route}` failed.**\n\n"
+                        f"Error: `{e.underlying or e}`\n\n"
+                        "No fallback response was generated — you selected this route "
+                        "explicitly. To recover, pick a different model/route from the "
+                        "dropdown, or fix the underlying issue (auth token, quota, etc.)."
+                    )
+                else:
+                    yield f"\n\n---\n⚠️ **Error generating response:** `{e}`"
             finally:
                 # Signal stream completion for TTS consumers
                 await stream_tap.finish(request_id)
