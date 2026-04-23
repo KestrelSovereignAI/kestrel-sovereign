@@ -131,11 +131,9 @@ export function createApiClient({
                     log.log('API key retrieved and cached');
                     return;
                 }
-                if (resp.status === 401 || resp.status === 404) {
+                if (resp.status === 401 || resp.status === 404 || resp.status === 403) {
                     state.bootstrapDisabled = true;
-                    log.log('API key bootstrap disabled — checking OAuth session');
-                } else if (resp.status === 403) {
-                    log.log('API key bootstrap forbidden — checking OAuth session');
+                    log.log('API key bootstrap unavailable — checking OAuth session');
                 } else {
                     log.error('Failed to get API key:', resp.status);
                 }
