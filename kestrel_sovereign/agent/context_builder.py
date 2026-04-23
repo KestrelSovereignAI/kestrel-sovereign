@@ -18,6 +18,7 @@ from typing import List, Dict, Optional, Any, TYPE_CHECKING
 
 from .token_counter import TokenCounter, get_token_counter
 from .token_budget import TokenBudget, AdaptiveTokenBudget, create_budget
+from kestrel_sovereign.security.input_guardrails import wrap_user_input
 
 if TYPE_CHECKING:
     from storage import AsyncStorage
@@ -352,6 +353,22 @@ Use `!constitution article <N>` for specific articles, or `!constitution search 
             # Normalize role names for OpenAI API
             if role not in ('user', 'assistant', 'system'):
                 role = 'user' if role == 'human' else 'assistant'
+
+            # Wrap user messages in <user_input> tags on load.  This pairs
+            # with the anti-injection system prompt (which instructs the
+            # model to treat <user_input> contents as untrusted data) and,
+            # critically, makes the wrapped form byte-identical to what was
+            # sent as the current-turn user message at the previous turn.
+            # That byte-identity is what lets downstream prompt caches
+            # (llama.cpp KV, OpenAI prefix, Anthropic cache_control) hit on
+            # the history portion of the prompt across turns.
+            if role == 'user':
+                wrapped = wrap_user_input(content)
+                # Budget was accounted pre-wrap; add the small wrap overhead
+                # so the caller sees an honest token count.
+                wrap_overhead = self.counter.count(wrapped) - content_tokens
+                msg_tokens += max(0, wrap_overhead)
+                content = wrapped
 
             formatted.append({
                 'role': role,
