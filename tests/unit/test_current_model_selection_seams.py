@@ -14,10 +14,10 @@ from kestrel_sovereign.llm.service import LLMService
 def _make_llm_service(preference=None):
     svc = LLMService.__new__(LLMService)
     svc.providers = [
-        {"name": "openai", "model": "gpt-5-mini"},
-        {"name": "anthropic", "model": "claude-sonnet-4-6"},
+        {"name": "openai:api", "vendor": "openai", "route": "api", "model": "gpt-5-mini"},
+        {"name": "anthropic:api", "vendor": "anthropic", "route": "api", "model": "claude-sonnet-4-6"},
     ]
-    svc._mandate_preference = preference or {"model": None, "provider": None}
+    svc._mandate_preference = preference or {"model": None, "vendor": None, "route": None}
     return svc
 
 
@@ -50,14 +50,32 @@ def _restore_app(app, original):
     app.state.agent_manager = original["manager"]
 
 
-def test_llm_service_exposes_canonical_current_model_selection_for_provider_preference():
-    svc = _make_llm_service({"model": "claude-sonnet-4-6", "provider": "anthropic"})
+def test_llm_service_exposes_canonical_current_model_selection_for_vendor_preference():
+    svc = _make_llm_service(
+        {"model": "claude-sonnet-4-6", "vendor": "anthropic", "route": None}
+    )
 
     selection = svc.get_active_model_selection()
 
     assert selection == {
         "model": "anthropic/claude-sonnet-4-6",
-        "provider": "anthropic",
+        "vendor": "anthropic",
+        "route": None,
+        "model_name": "claude-sonnet-4-6",
+    }
+
+
+def test_llm_service_exposes_canonical_current_model_selection_for_vendor_route_preference():
+    svc = _make_llm_service(
+        {"model": "claude-sonnet-4-6", "vendor": "anthropic", "route": "plan"}
+    )
+
+    selection = svc.get_active_model_selection()
+
+    assert selection == {
+        "model": "anthropic:plan/claude-sonnet-4-6",
+        "vendor": "anthropic",
+        "route": "plan",
         "model_name": "claude-sonnet-4-6",
     }
 
@@ -70,13 +88,14 @@ def test_llm_service_exposes_auto_when_no_preference_or_providers():
 
     assert selection == {
         "model": "auto",
-        "provider": None,
+        "vendor": None,
+        "route": None,
         "model_name": "auto",
     }
 
 
 def test_current_model_paths_agree_for_model_only_preference():
-    svc = _make_llm_service({"model": "gpt-5-mini", "provider": None})
+    svc = _make_llm_service({"model": "gpt-5-mini", "vendor": None, "route": None})
     model_agent = ModelAgent(MagicMock(llm_service=svc))
     model_agent.llm_service = svc
     agent = _Agent(svc)
@@ -100,6 +119,7 @@ def test_current_model_paths_agree_for_model_only_preference():
     assert mixin_result == "gpt-5-mini"
     assert response.json() == {
         "model": "gpt-5-mini",
-        "provider": None,
+        "vendor": None,
+        "route": None,
         "model_name": "gpt-5-mini",
     }
