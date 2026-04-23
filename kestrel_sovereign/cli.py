@@ -1300,8 +1300,25 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _ensure_utf8_stdio() -> None:
+    """Reconfigure stdout/stderr to UTF-8 so emoji output doesn't crash on
+    Windows consoles that default to cp1252.
+
+    Without this, ``kestrel create`` and other commands that print emoji
+    raise ``UnicodeEncodeError: 'charmap' codec can't encode character ...``
+    on stock Windows PowerShell / cmd. Safe no-op on Linux/macOS.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
+        except (AttributeError, ValueError):
+            # Older Python or already-detached stream — nothing to do.
+            pass
+
+
 def main() -> int:
     """Main entry point for the kestrel CLI."""
+    _ensure_utf8_stdio()
     parser = build_parser()
     args = parser.parse_args()
 
