@@ -504,3 +504,28 @@ class ProviderRegistry:
             if any(p.lower() in model_lower for p in patterns):
                 out.append(provider)
         return out
+
+
+# --------------------------------------------------------------------------
+# Module-level helpers shared across service.py and streaming.py
+# --------------------------------------------------------------------------
+
+# Vendors that understand llama.cpp's `cache_prompt` body extension.  Setting
+# it for other OpenAI-compatible proxies (OpenAI, OpenRouter, RunPod, xAI,
+# Groq, Cerebras, …) can error on strict implementations, so we gate tightly.
+# See issue #704.
+_CACHE_PROMPT_VENDORS = frozenset({"llama_cpp"})
+
+
+def provider_cache_body(provider: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Return extra_body kwargs for providers that accept explicit prompt-
+    cache signaling on the request body.  Today only llama.cpp (llama-server)
+    qualifies; Anthropic uses `cache_control` markers instead (see #705) and
+    Gemini uses a separate CachedContent API.
+
+    Returns None when the provider has no such extension — the adapter's
+    extra_body passthrough then does nothing.
+    """
+    if provider.get("vendor") in _CACHE_PROMPT_VENDORS:
+        return {"cache_prompt": True}
+    return None

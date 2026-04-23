@@ -26,6 +26,7 @@ from pydantic import BaseModel
 
 from .adapter import LLMResponse
 from .error_handling import LLMError
+from .provider_registry import provider_cache_body
 
 logger = logging.getLogger(__name__)
 
@@ -190,7 +191,8 @@ class StreamingMixin:
                                 client=provider["client"],
                                 model=model_to_use,
                                 messages=messages,
-                                response_format=response_format
+                                response_format=response_format,
+                                extra_body=provider_cache_body(provider),
                             ):
                                 yield chunk
                             logger.info(f"Streaming completed from {provider_name}")
@@ -204,7 +206,8 @@ class StreamingMixin:
                     client=provider["client"],
                     model=model_to_use,
                     messages=messages,
-                    response_format=response_format
+                    response_format=response_format,
+                    extra_body=provider_cache_body(provider),
                 )
                 # Yield content as string (LLMResponse.content) to match streaming behavior
                 yield response.content or ""
@@ -354,6 +357,7 @@ class StreamingMixin:
                         client=provider["client"],
                         model=model,
                         messages=messages,
+                        extra_body=provider_cache_body(provider),
                     ):
                         yield chunk
                     return
@@ -363,6 +367,7 @@ class StreamingMixin:
                         client=provider["client"],
                         model=model,
                         messages=messages,
+                        extra_body=provider_cache_body(provider),
                     )
                     yield response.content if hasattr(response, 'content') else str(response)
                     return
@@ -477,6 +482,9 @@ class StreamingMixin:
                     kwargs = {}
                     if provider_name == "anthropic" and system_prompt:
                         kwargs["system_prompt"] = system_prompt
+                    cache_body = provider_cache_body(provider)
+                    if cache_body:
+                        kwargs["extra_body"] = cache_body
 
                     async for item in adapter.get_streaming_response_with_tools(
                         client=provider["client"],
@@ -497,6 +505,7 @@ class StreamingMixin:
                             model=model,
                             messages=messages,
                             tools=tools,
+                            extra_body=provider_cache_body(provider),
                         )
                         if response.has_tool_calls:
                             yield response
@@ -511,6 +520,7 @@ class StreamingMixin:
                             client=provider["client"],
                             model=model,
                             messages=messages,
+                            extra_body=provider_cache_body(provider),
                         ):
                             yield chunk
                         return

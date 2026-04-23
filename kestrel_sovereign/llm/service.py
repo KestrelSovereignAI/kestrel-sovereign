@@ -26,7 +26,12 @@ if TYPE_CHECKING:
 from dotenv import load_dotenv
 from pydantic import BaseModel
 
-from .provider_registry import ProviderRegistry, ProviderInfo, ProviderInitializationError
+from .provider_registry import (
+    ProviderRegistry,
+    ProviderInfo,
+    ProviderInitializationError,
+    provider_cache_body,
+)
 from .error_handling import (
     handle_llm_errors,
     handle_observability_errors,
@@ -922,7 +927,8 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
             model=model_to_use,
             messages=messages,
             tools=tools,
-            response_format=response_format
+            response_format=response_format,
+            extra_body=provider_cache_body(provider),
         )
 
         # Calculate duration and log to observability
@@ -1213,7 +1219,8 @@ No other text or formatting.
             response = await provider_for_model["adapter"].get_response(
                 client=provider_for_model["client"],
                 model=model_id,
-                messages=messages
+                messages=messages,
+                extra_body=provider_cache_body(provider_for_model),
             )
 
             # Track model usage with token count
@@ -1489,6 +1496,7 @@ No other text or formatting.
                     messages=messages,
                     tools=tools,
                     response_format=response_format,
+                    extra_body=provider_cache_body(provider),
                 )
                 if tools is not None or response_format is not None:
                     return response
