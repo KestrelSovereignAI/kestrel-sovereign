@@ -3,7 +3,6 @@ import logging
 from typing import Dict, Any, Optional, List
 
 from kestrel_sovereign.config import load_config
-from .provider_names import normalize_provider_name, provider_name_candidates
 
 logger = logging.getLogger(__name__)
 
@@ -16,13 +15,19 @@ class ModelMandateMixin:
         selector: Optional[str],
         providers: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Optional[str]]:
-        """Resolve a mandate selector to a provider/model pair.
+        """Resolve a mandate selector to a ``(provider-selector, model)`` pair.
+
+        The returned ``provider`` may be a vendor (``"anthropic"``) or a
+        composite route key (``"anthropic:plan"``). Callers downstream
+        feed it to ``_filter_providers_by_selector``.
 
         Supported selectors:
-        - provider name: ``anthropic``
-        - provider/model: ``anthropic/claude-sonnet-4-6``
-        - exact model id: ``gpt-5-mini``
-        - alias: ``cheap``
+            - vendor: ``anthropic``
+            - vendor:route: ``anthropic:plan``
+            - vendor/model: ``anthropic/claude-sonnet-4-6``
+            - vendor:route/model: ``anthropic:plan/claude-sonnet-4-6``
+            - bare model id: ``gpt-5-mini``
+            - alias: ``cheap`` (defers to ``get_cheap_model``)
         """
         providers = providers or self.providers
 
@@ -40,32 +45,33 @@ class ModelMandateMixin:
             return self._resolve_model_selector(cheap_model, providers=providers)
 
         if "/" in selector:
-            provider_name, model_name = selector.split("/", 1)
-            provider_name = normalize_provider_name(provider_name)
+            left, model_name = selector.split("/", 1)
             return {
                 "selector": selector,
-                "provider": provider_name,
+                "provider": left,  # vendor or "vendor:route"
                 "model": model_name,
             }
 
+        # Vendor-only or composite-route-only match (no model supplied).
         for provider in providers:
-            if provider.get("name") in provider_name_candidates(selector):
+            if provider.get("vendor") == selector or provider.get("name") == selector:
                 model_name = provider.get("model")
-                provider_name = provider.get("name")
-                normalized = f"{provider_name}/{model_name}" if model_name else provider_name
+                match_key = selector  # pass back what was asked for; caller filters
+                normalized = f"{match_key}/{model_name}" if model_name else match_key
                 return {
                     "selector": normalized,
-                    "provider": provider_name,
+                    "provider": match_key,
                     "model": model_name,
                 }
 
+        # Bare model id — find a route whose default model matches.
         for provider in providers:
             if provider.get("model") == selector:
-                provider_name = provider.get("name")
-                normalized = f"{provider_name}/{selector}" if provider_name else selector
+                vendor = provider.get("vendor") or provider.get("name")
+                normalized = f"{vendor}/{selector}" if vendor else selector
                 return {
                     "selector": normalized,
-                    "provider": provider_name,
+                    "provider": vendor,
                     "model": selector,
                 }
 
@@ -93,17 +99,25 @@ class ModelMandateMixin:
     def get_current_mandate(self) -> Dict[str, Any]:
         """Get the current model mandate configuration."""
         preference_model = self._mandate_preference.get("model")
-        preference_provider = self._mandate_preference.get("provider")
+        preference_vendor = self._mandate_preference.get("vendor")
+        preference_route = self._mandate_preference.get("route")
 
         if preference_model is None:
             resolved_default = self._resolve_model_selector(self._get_default_mandate_selector())
             preference_model = resolved_default.get("model")
-            preference_provider = resolved_default.get("provider")
+            # resolved.get("provider") may be vendor or vendor:route — keep the
+            # vendor slot populated from it, and try to split route if composite.
+            provider_field = resolved_default.get("provider")
+            if provider_field and ":" in provider_field:
+                preference_vendor, preference_route = provider_field.split(":", 1)
+            else:
+                preference_vendor = provider_field
 
         return {
             "preference": {
                 "model": preference_model,
-                "provider": preference_provider
+                "vendor": preference_vendor,
+                "route": preference_route,
             },
             "fallbacks": self._mandate_fallbacks.copy(),
             "banned": self.mandate_config.get("defaults", {}).get("banned", []),
@@ -125,7 +139,10 @@ class ModelMandateMixin:
     def clear_mandate(self):
         """Reset the mandate to defaults from the TOML file."""
         self.mandate_config = load_config("model_mandate.toml")
-        self._mandate_preference = {"model": None, "provider": None}
+        # Match the vendor/route/model schema used by set_model_preference
+        # and clear_model_preference — previously left {"model", "provider"},
+        # which desynced the mandate shape mid-session.
+        self._mandate_preference = {"vendor": None, "model": None, "route": None}
         self._mandate_fallbacks = []
         logger.info("Model mandate cleared, reset to TOML defaults")
 

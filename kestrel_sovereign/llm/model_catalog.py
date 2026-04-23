@@ -10,6 +10,8 @@ Everything else comes from API discovery.
 import json
 import logging
 import os
+import re
+from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Optional, Set
 
@@ -19,6 +21,56 @@ except ImportError:
     import tomli as tomllib
 
 from .model_metadata import ModelInfo, ModelCategory
+
+
+# ID fragments that signal a dated snapshot (vendor-specific pinned version):
+#   * `...-20250929` — ISO-date suffix (Anthropic-style)
+#   * `...-2026-03-17` — dashed-date suffix (OpenAI-style dated releases)
+#   * `...-0613`, `...-1106` — MMDD snapshots (older OpenAI)
+#   * `...-preview-MMDD` — dated preview tags
+#
+# Pattern is purely structural; no specific model IDs are encoded.
+_DATE_SUFFIX_RE = re.compile(r"-(?:\d{8}|\d{4}-\d{2}-\d{2}|\d{4})$")
+
+
+def _strip_date_suffix(model_id: str) -> str:
+    """Return the lineage root for an ID by stripping trailing date snapshots."""
+    return _DATE_SUFFIX_RE.sub("", model_id)
+
+
+def _has_date_suffix(model_id: str) -> bool:
+    return bool(_DATE_SUFFIX_RE.search(model_id))
+
+
+def _mark_canonical_aliases(models: List[ModelInfo]) -> None:
+    """Mark each model's ``is_canonical_alias`` using lineage analysis.
+
+    Within a vendor, an ID is a *canonical alias* when it has no date suffix
+    and another ID exists whose date-stripped form equals it. That's the
+    vendor's moving pointer to the current default in that lineage.
+
+    Pure string analysis — no per-model IDs are embedded anywhere.
+    """
+    by_vendor: dict[str, list[ModelInfo]] = defaultdict(list)
+    for m in models:
+        by_vendor[m.provider].append(m)
+
+    for vendor_models in by_vendor.values():
+        # Lineage root -> set of models sharing that root.
+        lineages: dict[str, list[ModelInfo]] = defaultdict(list)
+        for m in vendor_models:
+            lineages[_strip_date_suffix(m.id)].append(m)
+
+        for root, members in lineages.items():
+            if len(members) < 2:
+                continue
+            # Canonical = no date suffix in the ID.
+            undated = [m for m in members if not _has_date_suffix(m.id)]
+            if undated:
+                for m in undated:
+                    m.is_canonical_alias = True
+                    # Canonical alias auto-features in the chat dropdown.
+                    m.is_featured = True
 
 logger = logging.getLogger(__name__)
 
@@ -147,7 +199,7 @@ class ModelCatalogService:
         """
         self._ensure_loaded()
 
-        for category_name in ["embedding", "image", "audio"]:
+        for category_name in ["embedding", "image", "audio", "completion"]:
             category_config = self._categories.get(category_name, {})
             provider_models = category_config.get(provider, [])
             if model_id in provider_models:
@@ -217,15 +269,29 @@ class ModelCatalogService:
 
         return None
 
+    # Deprecation keywords that, when present in a vendor's description, mark
+    # the model is_deprecated. Config-driven terms would overwrite this; the
+    # default covers the wording every major vendor uses.
+    _DEPRECATION_KEYWORDS = (
+        "deprecated",
+        "legacy",
+        "will be retired",
+        "retired on",
+        "end of life",
+        "eol",
+        "sunset",
+    )
+
     def enrich_model(self, model: ModelInfo) -> ModelInfo:
         """
-        Enrich a ModelInfo with catalog overrides.
+        Enrich a ModelInfo with catalog + heuristic signals.
 
-        Applies: hidden, category, display_name, context_limit, tool_support.
+        Applies (in order): hidden override, category override (including
+        ``completion``), display name, context limit, tool support, deprecation
+        from description.
 
-        Featured status uses OR logic: if the model was already marked featured
-        (e.g., because it's a configured provider model), that status is preserved.
-        The legacy [featured] TOML section can add featured status but never remove it.
+        Featured status is OR-additive (legacy ``[featured]`` can promote but
+        never demote).
         """
         self._ensure_loaded()
 
@@ -234,35 +300,45 @@ class ModelCatalogService:
             model.is_featured = True
         # If not in legacy featured list, preserve existing is_featured value
 
-        # Hidden: always apply
+        # Hidden: emergency override from [hidden].
         model.is_hidden = self.is_hidden(model.provider, model.id)
 
-        # Only override category if catalog explicitly knows about this model
-        # This preserves adapter-detected categories (e.g., Ollama embedding detection)
+        # Category: only override when the catalog explicitly knows about this
+        # model. Preserves adapter-detected categories (e.g. Ollama embedding).
         catalog_category = self._get_explicit_category(model.provider, model.id)
         if catalog_category is not None:
             model.category = catalog_category
 
-        # Apply display name override if exists
+        # Display name override
         override = self._display_names.get(model.id)
         if override:
             model.display_name = override
 
-        # Set context limit from catalog
+        # Context limit override
         context_limit = self.get_context_limit(model.id)
         if context_limit is not None:
             model.context_limit = context_limit
 
-        # Override tool support if explicitly configured (catalog wins over adapter)
+        # Tool support override
         tool_support = self.get_tool_support(model.id)
         if tool_support is not None:
             model.supports_tools = tool_support
 
+        # Deprecation from vendor-reported description.
+        if model.description:
+            desc_lower = model.description.lower()
+            if any(kw in desc_lower for kw in self._DEPRECATION_KEYWORDS):
+                model.is_deprecated = True
+
         return model
 
     def enrich_models(self, models: List[ModelInfo]) -> List[ModelInfo]:
-        """Enrich a list of models with catalog data."""
-        return [self.enrich_model(m) for m in models]
+        """Enrich a list of models. Runs per-model enrichment, then adds
+        cross-model signals (canonical-alias detection) that need the full list.
+        """
+        enriched = [self.enrich_model(m) for m in models]
+        _mark_canonical_aliases(enriched)
+        return enriched
 
     def get_featured_models(self, provider: str) -> Set[str]:
         """Get the set of featured model IDs for a provider.

@@ -1,127 +1,166 @@
-# LLM provider configuration for Kestrel.
+# LLM configuration for Kestrel — vendor/route/model architecture.
 #
-# 1. Copy this file to "llm_config.toml" if it doesn't exist.
-# 2. The 'provider_priority' list determines the fallback order.
-# 3. For OpenAI, set the OPENAI_API_KEY environment variable.
+# A **vendor** is who makes the weights (openai, anthropic, ollama, ...).
+# A **route** is how to reach them (base_url + auth + adapter). A vendor may
+# have several routes (e.g. anthropic:api via API key, anthropic:plan via
+# Claude Max OAuth). Discovery runs once per vendor; routing is per route.
+#
+# See docs/architecture/LLM_SERVICE_ARCHITECTURE.md for the canonical spec.
 
-provider_priority = ["openrouter", "llama_cpp", "ollama", "claude_plan", "openai_plan", "openai", "openai_mini", "anthropic", "vertex_ai", "runpod", "xai"]
+# Fallback order. Each entry is "<vendor>:<route>". The first available route
+# is used unless a mandate specifies otherwise.
+route_priority = [
+    "anthropic:plan",
+    "openai:plan",
+    "openrouter:api",
+    "anthropic:api",
+    "openai:api",
+    "vertex_ai:api",
+    "llama_cpp:local",
+    "ollama:local",
+    "xai:api",
+    "runpod:api",
+    "groq:api",
+]
 
-# Claude plan - Use your Claude subscription session for API access
-# Requires: pip install claude-agent-sdk && claude login
-# This uses subscription authentication, not API key billing
-[claude_plan]
-model = "auto"
-selection_hints = ["sonnet", "opus"]  # Prefer Sonnet family, then Opus, from discovery/cache
 
-# OpenAI plan - Use your ChatGPT/OpenAI plan session for API access via OAuth
-# Requires: codex login (OAuth authentication, stores token in ~/.codex/auth.json)
-# This uses subscription authentication, not API key billing
-[openai_plan]
-model = "auto"
-selection_hints = ["gpt-5.4", "mini"]
+# =============================================================================
+# Anthropic
+# =============================================================================
 
-# OpenRouter - Primary provider with crypto payments (agents can fund themselves)
-# Supports: ETH (chain_id=1), Polygon (137), Base (8453)
-# Crypto API: POST /api/v1/credits/coinbase {amount, sender, chain_id}
-# Models: deepseek-r1 $0.30/$1.20, llama-3.3-70b $0.10/$0.32, claude-3.5-sonnet $6/$30
-# Uses dedicated OpenRouterAdapter with proper model discovery
-[openrouter]
-type = "openai_compatible"
-base_url = "https://openrouter.ai/api/v1"
-model = "auto"
-selection_hints = ["deepseek", "chat"]  # Prefer the configured family from discovery/cache
+[vendors.anthropic]
+is_cloud = true
 
-# OpenAI (cloud) - Primary provider for GPT-5.1
-[openai]
-model = "auto"
-selection_hints = ["gpt-5"]  # Prefer GPT-5 family from discovery/cache
+[vendors.anthropic.routes.api]
+# Metered API key billing.
+adapter        = "AnthropicAdapter"
+api_key_env    = "ANTHROPIC_API_KEY"
+model          = "auto"
+selection_hints = ["sonnet", "haiku", "opus"]
 
-# OpenAI mini model for auditing (lower cost, fast)
-[openai_mini]
-type = "openai_compatible"
-base_url = "https://api.openai.com/v1"
-model = "auto"
-selection_hints = ["mini", "gpt-5"]  # Prefer mini/cheap GPT-5 family from discovery/cache
-api_key_env = "OPENAI_API_KEY"
+[vendors.anthropic.routes.plan]
+# Claude Max subscription via OAuth token (from `claude setup-token`).
+adapter        = "ClaudeMaxAdapter"
+auth_token_env = "ANTHROPIC_AUTH_TOKEN"
+model          = "auto"
+selection_hints = ["sonnet", "opus"]
 
-# Anthropic (Claude) - Constitutional reviewer and complex reasoning
-[anthropic]
-model = "auto"
-selection_hints = ["sonnet", "haiku", "opus"]  # Prefer Sonnet family from discovery/cache
-api_key_env = "ANTHROPIC_API_KEY"
 
-# Vertex AI / Google AI Studio (Gemini) - Uses GOOGLE_API_KEY
-[vertex_ai]
-model = "auto"
-selection_hints = ["gemini", "pro", "flash"]  # Prefer Gemini Pro family, then Flash, from discovery/cache
+# =============================================================================
+# OpenAI
+# =============================================================================
 
-# RunPod (OpenAI-compatible) - Alternative cloud provider
-[runpod]
-type = "openai_compatible"
-base_url = "https://api.runpod.ai/v2/vllm-2f8vdgn/openai/v1"
-model = "auto"
-selection_hints = ["llama", "instruct"]  # Prefer chat/instruct models from discovery/cache
-api_key_env = "RUNPOD_API_KEY"
+[vendors.openai]
+is_cloud = true
 
-# llama.cpp - Local server (start with ~/models/start-kimi.sh)
-# Model discovery via /v1/models endpoint; context_limit auto-detected from /props
-[llama_cpp]
-type = "openai_compatible"
-base_url = "http://localhost:8001/v1"
-local = true  # No API key required
-model = "auto"
-# context_limit = 131072  # Override if auto-detection fails
+[vendors.openai.routes.api]
+# Metered API key billing against api.openai.com.
+adapter        = "OpenAIAdapter"
+api_key_env    = "OPENAI_API_KEY"
+model          = "auto"
+selection_hints = ["gpt-5"]
 
-# Ollama - Privacy mode and local/cloud GPU fallback
-# Host is configured via OLLAMA_HOST env var:
-#   Local dev:  http://localhost:11434 (default)
-#   Cloud Run:  https://1wj2bh67ppdimv-11434.proxy.runpod.net (RunPod RTX 4090)
-# Available models on cloud: deepseek-r1:14b, phi4, qwen2.5:14b
-[ollama]
-host = "http://localhost:11434"  # Overridden by OLLAMA_HOST env var
-model = "auto"
-selection_hints = ["latest", "llama3.2", "qwen"]  # Prefer tool-capable local models from discovery/cache
+[vendors.openai.routes.plan]
+# ChatGPT subscription via OAuth token (from `codex login`).
+adapter        = "CodexAdapter"
+# Token auto-read from ~/.codex/auth.json, or from CODEX_AUTH_TOKEN env var.
+auth_token_env = "CODEX_AUTH_TOKEN"
+model          = "auto"
+selection_hints = ["mini"]
 
-[xai]
-type = "openai_compatible"
-base_url = "https://api.x.ai/v1"
-model = "auto"
-selection_hints = ["fast", "grok"]  # Prefer fast chat models from discovery/cache
-api_key_env = "XAI_API_KEY"
 
-#[azure_openai]
-#type = "openai_compatible"
-#base_url = "https://YOUR_RESOURCE.openai.azure.com"
-#model = "gpt-5"
-#api_key_env = "AZURE_OPENAI_API_KEY"
+# =============================================================================
+# OpenRouter — meta-vendor aggregating many upstreams
+# =============================================================================
 
-[groq]
-type = "openai_compatible"
-base_url = "https://api.groq.com/openai/v1"
-model = "auto"
-selection_hints = ["versatile", "llama"]  # Prefer versatile chat models from discovery/cache
-api_key_env = "GROQ_API_KEY"
+[vendors.openrouter]
+is_cloud = true
 
-#[together]
-#type = "openai_compatible"
-#base_url = "https://api.together.xyz/v1"
-#model = "meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo"
-#api_key_env = "TOGETHER_API_KEY"
+[vendors.openrouter.routes.api]
+adapter        = "OpenRouterAdapter"
+base_url       = "https://openrouter.ai/api/v1"
+api_key_env    = "OPENROUTER_API_KEY"
+model          = "auto"
+selection_hints = ["deepseek", "chat"]
 
-#[mistral]
-#type = "openai_compatible"
-#base_url = "https://api.mistral.ai/v1"
-#model = "mistral-large-latest"
-#api_key_env = "MISTRAL_API_KEY"
 
-#[perplexity]
-#type = "openai_compatible"
-#base_url = "https://api.perplexity.ai"
-#model = "sonar-large-chat"
-#api_key_env = "PERPLEXITY_API_KEY"
+# =============================================================================
+# Google Vertex AI / AI Studio (Gemini)
+# =============================================================================
 
-#[fireworks]
-#type = "openai_compatible"
-#base_url = "https://api.fireworks.ai/inference/v1"
-#model = "accounts/fireworks/models/llama-v3p1-70b-instruct"
-#api_key_env = "FIREWORKS_API_KEY"
+[vendors.vertex_ai]
+is_cloud = true
+
+[vendors.vertex_ai.routes.api]
+adapter        = "VertexAIAdapter"
+api_key_env    = "GOOGLE_API_KEY"
+model          = "auto"
+selection_hints = ["gemini", "pro", "flash"]
+
+
+# =============================================================================
+# Ollama — local or remote (via OLLAMA_HOST env var) tool-capable models
+# =============================================================================
+
+[vendors.ollama]
+is_cloud = false
+
+[vendors.ollama.routes.local]
+adapter        = "OllamaAdapter"
+# host = default; OLLAMA_HOST env var overrides (RunPod proxy, FRP tunnel, etc.)
+host           = "http://localhost:11434"
+model          = "auto"
+selection_hints = ["latest", "qwen"]
+
+
+# =============================================================================
+# llama.cpp — local OpenAI-compatible server (start with ~/models/start-kimi.sh)
+# =============================================================================
+
+[vendors.llama_cpp]
+is_cloud = false
+
+[vendors.llama_cpp.routes.local]
+adapter        = "OpenAIAdapter"
+base_url       = "http://localhost:8001/v1"
+local          = true
+model          = "auto"
+# context_limit auto-detected from /props; override only if detection fails.
+# context_limit = 131072
+
+
+# =============================================================================
+# Other OpenAI-compatible remote providers
+# =============================================================================
+
+[vendors.xai]
+is_cloud = true
+
+[vendors.xai.routes.api]
+adapter        = "OpenAIAdapter"
+base_url       = "https://api.x.ai/v1"
+api_key_env    = "XAI_API_KEY"
+model          = "auto"
+selection_hints = ["fast", "grok"]
+
+
+[vendors.runpod]
+is_cloud = true
+
+[vendors.runpod.routes.api]
+adapter        = "OpenAIAdapter"
+base_url       = "https://api.runpod.ai/v2/vllm-2f8vdgn/openai/v1"
+api_key_env    = "RUNPOD_API_KEY"
+model          = "auto"
+selection_hints = ["llama", "instruct"]
+
+
+[vendors.groq]
+is_cloud = true
+
+[vendors.groq.routes.api]
+adapter        = "OpenAIAdapter"
+base_url       = "https://api.groq.com/openai/v1"
+api_key_env    = "GROQ_API_KEY"
+model          = "auto"
+selection_hints = ["versatile", "llama"]

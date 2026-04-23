@@ -98,19 +98,26 @@ async def check_llm_service(agent) -> Dict[str, Any]:
             if active_model == "auto":
                 active_model = None
 
-        # Also surface the provider from mandate preference when set
-        active_provider = None
+        # Also surface the vendor (and route, if set) from mandate preference.
+        active_vendor = None
+        active_route = None
         if hasattr(llm_service, "get_model_preference"):
             pref = llm_service.get_model_preference()
-            active_provider = pref.get("provider")
+            active_vendor = pref.get("vendor")
+            active_route = pref.get("route")
 
         if providers:
-            names = [p.get("name", p.get("provider", "?")) for p in providers[:3]]
+            names = [p.get("name", p.get("vendor", "?")) for p in providers[:3]]
             msg = f"LLM providers available: {', '.join(names)}"
             if len(providers) > 3:
                 msg += f" (+{len(providers) - 3} more)"
             if active_model:
-                model_label = f"{active_provider}/{active_model}" if active_provider else active_model
+                if active_vendor and active_route:
+                    model_label = f"{active_vendor}:{active_route}/{active_model}"
+                elif active_vendor:
+                    model_label = f"{active_vendor}/{active_model}"
+                else:
+                    model_label = active_model
                 msg += f" (active: {model_label})"
             return {
                 "name": "llm_service",

@@ -10,11 +10,12 @@ from typing import Optional
 
 
 class ModelCategory(str, Enum):
-    """Model category for filtering."""
+    """Model category for filtering. The chat dropdown only shows CHAT."""
     CHAT = "chat"
     EMBEDDING = "embedding"
     IMAGE = "image"
     AUDIO = "audio"
+    COMPLETION = "completion"  # legacy base-completion models (pre-chat API)
 
 
 @dataclass
@@ -31,9 +32,12 @@ class ModelInfo:
     display_name: str           # Human-readable name (from API or config override)
     category: ModelCategory = ModelCategory.CHAT  # chat, embedding, image, audio
 
-    # Presentation flags (set by ModelCatalogService)
-    is_featured: bool = False   # In featured list for this provider
-    is_hidden: bool = False     # Truly broken/useless models to hide
+    # Presentation flags (set by ModelCatalogService + discovery enrichment).
+    is_featured: bool = False   # Sorted above non-featured in dropdowns; "★" prefix.
+    is_hidden: bool = False     # Never shown in the dropdown, even in "Show more".
+    is_deprecated: bool = False # Vendor description / cache-disappearance signal.
+    is_canonical_alias: bool = False  # ID has no date suffix; a moving pointer to
+                                      # the vendor's current default in a lineage.
 
     # Usage tracking (populated from DB)
     frecency_score: float = 0.0  # MRU with decay
@@ -64,6 +68,8 @@ class ModelInfo:
             "category": self.category.value,
             "is_featured": self.is_featured,
             "is_hidden": self.is_hidden,
+            "is_deprecated": self.is_deprecated,
+            "is_canonical_alias": self.is_canonical_alias,
             "frecency_score": self.frecency_score,
             "last_used": self.last_used.isoformat() if self.last_used else None,
             "use_count": self.use_count,
@@ -86,6 +92,8 @@ class ModelInfo:
             category=ModelCategory(data.get("category", "chat")),
             is_featured=data.get("is_featured", False),
             is_hidden=data.get("is_hidden", False),
+            is_deprecated=data.get("is_deprecated", False),
+            is_canonical_alias=data.get("is_canonical_alias", False),
             frecency_score=data.get("frecency_score", 0.0),
             last_used=datetime.fromisoformat(data["last_used"]) if data.get("last_used") else None,
             use_count=data.get("use_count", 0),

@@ -121,23 +121,46 @@ class TestBuildHeaders:
 
 
 class TestOpenAIPlanProviderRegistry:
+    """Vendor/route registry initializes the openai:plan route correctly."""
+
+    def _plan_config(self, *, auth_token_env="CODEX_AUTH_TOKEN", inline_auth=None):
+        route_cfg = {"adapter": "CodexAdapter"}
+        if auth_token_env:
+            route_cfg["auth_token_env"] = auth_token_env
+        if inline_auth is not None:
+            route_cfg["auth_token"] = inline_auth
+        return {
+            "route_priority": ["openai:plan"],
+            "vendors": {
+                "openai": {
+                    "is_cloud": True,
+                    "routes": {"plan": route_cfg},
+                },
+            },
+        }
+
     def test_openai_plan_requires_auth(self):
         with patch.dict("os.environ", {}, clear=True):
             with patch.object(
                 ProviderRegistry, "_read_codex_auth_file", return_value=(None, None)
             ):
-                registry = ProviderRegistry.__new__(ProviderRegistry)
-                with pytest.raises(ValueError, match="Codex authentication not found"):
-                    registry._initialize_openai_plan({})
+                registry = ProviderRegistry(self._plan_config())
+                # No providers initialize → raises.
+                with pytest.raises(Exception, match="No routes could be initialized"):
+                    registry.initialize_providers()
 
     def test_openai_plan_uses_env_token(self):
         with patch.dict("os.environ", {"CODEX_AUTH_TOKEN": "test-oauth-token"}):
             with patch.object(
                 ProviderRegistry, "_read_codex_auth_file", return_value=(None, None)
             ):
-                registry = ProviderRegistry.__new__(ProviderRegistry)
-                info = registry._initialize_openai_plan({})
-                assert info.name == "openai_plan"
+                registry = ProviderRegistry(self._plan_config())
+                providers = registry.initialize_providers()
+                assert len(providers) == 1
+                info = providers[0]
+                assert info.name == "openai:plan"
+                assert info.vendor == "openai"
+                assert info.route == "plan"
                 assert isinstance(info.adapter, CodexAdapter)
                 assert info.client == "test-oauth-token"
 
@@ -148,9 +171,11 @@ class TestOpenAIPlanProviderRegistry:
                 "_read_codex_auth_file",
                 return_value=("file-oauth-token", "chatgpt"),
             ):
-                registry = ProviderRegistry.__new__(ProviderRegistry)
-                info = registry._initialize_openai_plan({})
-                assert info.name == "openai_plan"
+                registry = ProviderRegistry(self._plan_config())
+                providers = registry.initialize_providers()
+                assert len(providers) == 1
+                info = providers[0]
+                assert info.name == "openai:plan"
                 assert info.client == "file-oauth-token"
 
     def test_openai_plan_config_auth_token(self):
@@ -158,9 +183,13 @@ class TestOpenAIPlanProviderRegistry:
             with patch.object(
                 ProviderRegistry, "_read_codex_auth_file", return_value=(None, None)
             ):
-                registry = ProviderRegistry.__new__(ProviderRegistry)
-                info = registry._initialize_openai_plan({"auth_token": "config-token"})
-                assert info.name == "openai_plan"
+                registry = ProviderRegistry(
+                    self._plan_config(auth_token_env=None, inline_auth="config-token")
+                )
+                providers = registry.initialize_providers()
+                assert len(providers) == 1
+                info = providers[0]
+                assert info.name == "openai:plan"
                 assert info.client == "config-token"
 
     def test_openai_plan_model_defaults_to_auto(self):
@@ -168,9 +197,9 @@ class TestOpenAIPlanProviderRegistry:
             with patch.object(
                 ProviderRegistry, "_read_codex_auth_file", return_value=(None, None)
             ):
-                registry = ProviderRegistry.__new__(ProviderRegistry)
-                info = registry._initialize_openai_plan({})
-                assert info.model == "auto"
+                registry = ProviderRegistry(self._plan_config())
+                providers = registry.initialize_providers()
+                assert providers[0].model == "auto"
 
 
 class TestReadCodexAuthFile:

@@ -70,9 +70,11 @@ def _make_agent(db=None, agent_id="test-heartbeat-agent"):
 
     # LLM service — providers list matches real LLMService.providers structure
     llm_service = MagicMock()
-    llm_service.providers = [{"name": "anthropic", "model": "claude-opus-4-6"}]
+    llm_service.providers = [
+        {"name": "anthropic:api", "vendor": "anthropic", "route": "api", "model": "claude-opus-4-6"},
+    ]
     llm_service.get_model_preference = MagicMock(
-        return_value={"model": "claude-opus-4-6", "provider": "anthropic"}
+        return_value={"model": "claude-opus-4-6", "vendor": "anthropic", "route": None}
     )
     llm_service.get_active_model_id = MagicMock(return_value="claude-opus-4-6")
     agent.llm_service = llm_service
@@ -153,13 +155,13 @@ class TestCheckLLMService:
 
     @pytest.mark.asyncio
     async def test_reports_mandated_model_not_config_default(self):
-        """When a mandate overrides the provider default, heartbeat should
-        report the mandated model — not the first provider's config."""
+        """When a mandate overrides the vendor default, heartbeat should
+        report the mandated model — not the first route's config."""
         agent = _make_agent()
         # Config default is anthropic/claude-opus-4-6, but mandate points to openai/gpt-5
         agent.llm_service.get_active_model_id = MagicMock(return_value="gpt-5")
         agent.llm_service.get_model_preference = MagicMock(
-            return_value={"model": "gpt-5", "provider": "openai"}
+            return_value={"model": "gpt-5", "vendor": "openai", "route": None}
         )
         result = await check_llm_service(agent)
         assert "(active: openai/gpt-5)" in result["message"]
@@ -167,12 +169,23 @@ class TestCheckLLMService:
         assert "claude-opus-4-6" not in result["message"].split("(active:")[1]
 
     @pytest.mark.asyncio
-    async def test_reports_model_without_provider_when_no_mandate_provider(self):
-        """When active model is set but no provider preference, report model only."""
+    async def test_reports_vendor_route_when_mandated(self):
+        """Mandate including a route should surface vendor:route/model."""
+        agent = _make_agent()
+        agent.llm_service.get_active_model_id = MagicMock(return_value="claude-sonnet-4-6")
+        agent.llm_service.get_model_preference = MagicMock(
+            return_value={"model": "claude-sonnet-4-6", "vendor": "anthropic", "route": "plan"}
+        )
+        result = await check_llm_service(agent)
+        assert "(active: anthropic:plan/claude-sonnet-4-6)" in result["message"]
+
+    @pytest.mark.asyncio
+    async def test_reports_model_without_vendor_when_no_mandate_vendor(self):
+        """When active model is set but no vendor preference, report model only."""
         agent = _make_agent()
         agent.llm_service.get_active_model_id = MagicMock(return_value="llama3.2:3b")
         agent.llm_service.get_model_preference = MagicMock(
-            return_value={"model": None, "provider": None}
+            return_value={"model": None, "vendor": None, "route": None}
         )
         result = await check_llm_service(agent)
         assert "(active: llama3.2:3b)" in result["message"]

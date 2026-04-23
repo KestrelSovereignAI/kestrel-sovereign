@@ -1489,6 +1489,15 @@ class TestContextFeature:
 class TestLLMServiceCheapModel:
     """Tests for LLMService.get_cheap_model()."""
 
+    @staticmethod
+    def _wire_real(service):
+        """Wire the real LLMService cheap-model methods onto a spec mock."""
+        from kestrel_sovereign.llm.service import LLMService
+
+        service._resolve_model_selector = LLMService._resolve_model_selector.__get__(service)
+        service.get_cheap_model_selector = LLMService.get_cheap_model_selector.__get__(service)
+        service.get_cheap_model = LLMService.get_cheap_model.__get__(service)
+
     def test_get_cheap_model_returns_none_when_no_cheap_provider(self):
         """Test that get_cheap_model returns None when no cheap provider found."""
         from kestrel_sovereign.llm.service import LLMService
@@ -1501,8 +1510,7 @@ class TestLLMServiceCheapModel:
         mock_registry.get_providers_with_pattern.return_value = []
         service.provider_registry = mock_registry
 
-        service._resolve_model_selector = LLMService._resolve_model_selector.__get__(service)
-        service.get_cheap_model = LLMService.get_cheap_model.__get__(service)
+        self._wire_real(service)
         result = service.get_cheap_model()
 
         assert result is None
@@ -1518,14 +1526,15 @@ class TestLLMServiceCheapModel:
         mock_registry = MagicMock()
         mock_haiku = MagicMock()
         mock_haiku.model = "claude-haiku-4-5"
+        mock_haiku.vendor = "anthropic"
+        mock_haiku.name = "anthropic:api"
         mock_registry.get_providers_with_pattern.return_value = [mock_haiku]
         service.provider_registry = mock_registry
 
-        service._resolve_model_selector = LLMService._resolve_model_selector.__get__(service)
-        service.get_cheap_model = LLMService.get_cheap_model.__get__(service)
-        result = service.get_cheap_model()
-
-        assert result == "claude-haiku-4-5"
+        self._wire_real(service)
+        # get_cheap_model returns bare model id; selector returns "vendor/model".
+        assert service.get_cheap_model() == "claude-haiku-4-5"
+        assert service.get_cheap_model_selector() == "anthropic/claude-haiku-4-5"
 
     def test_get_cheap_model_from_config(self):
         """Test that get_cheap_model respects config."""
@@ -1538,8 +1547,7 @@ class TestLLMServiceCheapModel:
         # Mock provider_registry (won't be used since config has cheap_model)
         service.provider_registry = MagicMock()
 
-        service._resolve_model_selector = LLMService._resolve_model_selector.__get__(service)
-        service.get_cheap_model = LLMService.get_cheap_model.__get__(service)
+        self._wire_real(service)
         result = service.get_cheap_model()
 
         assert result == "gpt-4-mini"
@@ -1556,11 +1564,12 @@ class TestLLMServiceCheapModel:
         mock_registry = MagicMock()
         mock_flash_provider = MagicMock()
         mock_flash_provider.model = "gemini-1.5-flash"
+        mock_flash_provider.vendor = "google"
+        mock_flash_provider.name = "google:api"
         mock_registry.get_providers_with_pattern.return_value = [mock_flash_provider]
         service.provider_registry = mock_registry
 
-        service._resolve_model_selector = LLMService._resolve_model_selector.__get__(service)
-        service.get_cheap_model = LLMService.get_cheap_model.__get__(service)
+        self._wire_real(service)
         result = service.get_cheap_model()
 
         assert result is None

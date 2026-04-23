@@ -1,21 +1,44 @@
 """
 Provider Registry for LLM Service.
 
-This module extracts the provider initialization and routing logic from LLMService
-to reduce complexity and improve maintainability.
+Vendor/route/model data model:
+    - A **vendor** is who makes the weights (openai, anthropic, ollama, ...).
+    - A **route** is how to reach that vendor: base_url + auth + adapter class.
+      One vendor may have multiple routes (api, plan, local, ...).
+    - A **model** lives inside a vendor; all routes for that vendor share the
+      model catalog.
 
-External packages can register LLM providers via entry_points::
+Config shape (llm_config.toml):
 
-    [project.entry-points."kestrel_sovereign.llm_providers"]
-    my_provider = "my_package:MyLLMAdapter"
+    route_priority = ["anthropic:plan", "openai:api", ...]
 
-Entry point classes must be subclasses of ``LLMAdapter``.  They are
-instantiated and wrapped in a ``ProviderInfo`` during initialization.
+    [vendors.anthropic]
+    is_cloud = true
+
+    [vendors.anthropic.routes.api]
+    adapter        = "AnthropicAdapter"
+    api_key_env    = "ANTHROPIC_API_KEY"
+    model          = "auto"
+
+    [vendors.anthropic.routes.plan]
+    adapter        = "ClaudeMaxAdapter"
+    auth_token_env = "ANTHROPIC_AUTH_TOKEN"
+    model          = "auto"
+
+Each successfully initialized route becomes one ``ProviderInfo`` entry in
+``self.providers`` with a composite name ``"<vendor>:<route>"``. Downstream
+code iterates ``self.providers`` as routes; discovery groups by
+``provider.vendor`` to produce per-vendor catalogs.
+
+Entry-point providers (external packages) register under their advertised
+``provider_name``; they become a single-route vendor with route ``api``.
 """
 import logging
 import os
 from typing import List, Dict, Any, Optional
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from pathlib import Path
+import json as _json
 
 import openai
 
@@ -35,20 +58,44 @@ from .vertex_adapter import VertexAIAdapter
 from .openrouter_adapter import OpenRouterAdapter
 from .claude_max_adapter import ClaudeMaxAdapter
 from .codex_adapter import CodexAdapter
-from .provider_names import normalize_provider_name, provider_name_candidates
 
 logger = logging.getLogger(__name__)
 
 LLM_PROVIDER_ENTRY_POINT_GROUP = "kestrel_sovereign.llm_providers"
 
 
+# Adapter class name (string in config) → class object. No hardcoded per-vendor
+# logic here; the config names its own adapter.
+_ADAPTER_REGISTRY: Dict[str, type] = {
+    "OpenAIAdapter": OpenAIAdapter,
+    "AnthropicAdapter": AnthropicAdapter,
+    "ClaudeMaxAdapter": ClaudeMaxAdapter,
+    "CodexAdapter": CodexAdapter,
+    "OpenRouterAdapter": OpenRouterAdapter,
+    "OllamaAdapter": OllamaAdapter,
+    "GoogleAdapter": GoogleAdapter,
+    "VertexAIAdapter": VertexAIAdapter,
+}
+
+
 @dataclass
 class ProviderInfo:
-    """Information about an initialized provider."""
-    name: str
+    """Information about one initialized route for a vendor.
+
+    A ProviderInfo represents a (vendor, route) pair. ``name`` is the composite
+    key ``"<vendor>:<route>"`` used for routing lookups. Discovery groups by
+    ``vendor``.
+    """
+    name: str                # "anthropic:plan", "openai:api", ...
+    vendor: str              # "anthropic"
+    route: str               # "plan"
     client: Any
     adapter: Any
-    model: str
+    model: str               # default model for this route ("auto" resolves via discovery)
+    is_cloud: bool = True
+    is_local: bool = False
+    base_url: Optional[str] = None
+    selection_hints: List[str] = field(default_factory=list)
 
 
 class ProviderInitializationError(Exception):
@@ -57,76 +104,315 @@ class ProviderInitializationError(Exception):
 
 
 class ProviderRegistry:
-    """Manages LLM provider initialization and routing."""
+    """Initialize route-scoped providers from a vendor/route config."""
 
     def __init__(self, config: Dict[str, Any]):
         """Initialize the provider registry.
 
         Args:
-            config: Configuration dictionary containing provider settings
+            config: Top-level config dict. Expected to contain ``route_priority``
+                and a ``vendors`` map. Test configs with the legacy flat shape
+                (``provider_priority`` + flat sections) are no longer supported.
         """
         self.config = config
         self.providers: List[ProviderInfo] = []
         self._initialized = False
 
     def initialize_providers(self) -> List[ProviderInfo]:
-        """Initialize provider clients and adapters based on config file.
+        """Initialize all routes declared under ``vendors``.
 
         Returns:
-            List of successfully initialized providers
+            List of successfully initialized routes.
 
         Raises:
-            ProviderInitializationError: If no providers could be initialized
+            ProviderInitializationError: if no routes could be brought up.
         """
         if self._initialized:
             return self.providers
 
-        initialized_providers = []
-        priority_list = self.config.get("provider_priority", [])
+        vendors_cfg = self.config.get("vendors") or {}
+        route_priority = list(self.config.get("route_priority") or [])
 
-        for provider_name in priority_list:
-            try:
-                provider_info = self._initialize_single_provider(provider_name)
-                if provider_info:
-                    initialized_providers.append(provider_info)
-                    logger.info("Initialized provider: %s", provider_info.name)
-            except Exception as e:
-                logger.error(f"Failed to initialize provider '{provider_name}': {e}")
-
-        # Phase 2: Discover external providers via entry_points
-        ep_providers = self._discover_entrypoint_providers()
-        initialized_names = {p.name for p in initialized_providers}
-        for ep_provider in ep_providers:
-            if ep_provider.name in initialized_names:
-                logger.debug(
-                    "Skipping entry_point LLM provider '%s': built-in already registered",
-                    ep_provider.name,
-                )
+        # Walk every declared (vendor, route) pair.
+        all_keys: List[str] = []
+        for vendor_name, vendor_cfg in vendors_cfg.items():
+            if not isinstance(vendor_cfg, dict):
                 continue
-            initialized_providers.append(ep_provider)
-            initialized_names.add(ep_provider.name)
-            logger.info("Registered entry_point LLM provider: %s", ep_provider.name)
+            routes_cfg = vendor_cfg.get("routes") or {}
+            for route_name in routes_cfg:
+                all_keys.append(f"{vendor_name}:{route_name}")
 
-        if not initialized_providers:
-            raise ProviderInitializationError("No providers could be initialized")
+        # Deterministic order: priority list first, then any remainder.
+        ordered_keys: List[str] = []
+        seen = set()
+        for key in route_priority:
+            if key in all_keys and key not in seen:
+                ordered_keys.append(key)
+                seen.add(key)
+        for key in all_keys:
+            if key not in seen:
+                ordered_keys.append(key)
+                seen.add(key)
 
-        self.providers = initialized_providers
+        initialized: List[ProviderInfo] = []
+        for key in ordered_keys:
+            vendor_name, route_name = key.split(":", 1)
+            vendor_cfg = vendors_cfg.get(vendor_name) or {}
+            route_cfg = (vendor_cfg.get("routes") or {}).get(route_name) or {}
+            try:
+                info = self._build_route(vendor_name, route_name, vendor_cfg, route_cfg)
+                if info is not None:
+                    initialized.append(info)
+                    logger.info("Initialized route: %s", info.name)
+            except Exception as e:
+                logger.warning("Failed to initialize route '%s': %s", key, e)
+
+        # Discover external adapters registered via entry_points. They declare
+        # a ``provider_name``; we treat it as a single-route vendor.
+        ep_routes = self._discover_entrypoint_providers()
+        existing = {p.name for p in initialized}
+        for ep in ep_routes:
+            if ep.name in existing:
+                logger.debug("Skipping entry_point route '%s': already registered", ep.name)
+                continue
+            initialized.append(ep)
+            existing.add(ep.name)
+            logger.info("Registered entry_point route: %s", ep.name)
+
+        if not initialized:
+            raise ProviderInitializationError(
+                "No routes could be initialized. Check vendor auth envs "
+                "(e.g. ANTHROPIC_API_KEY, OPENAI_API_KEY) and llm_config.toml."
+            )
+
+        self.providers = initialized
         self._initialized = True
         return self.providers
+
+    # ------------------------------------------------------------------ routes
+
+    def _build_route(
+        self,
+        vendor: str,
+        route: str,
+        vendor_cfg: Dict[str, Any],
+        route_cfg: Dict[str, Any],
+    ) -> Optional[ProviderInfo]:
+        """Instantiate the adapter + client for one (vendor, route) pair."""
+        adapter_name = route_cfg.get("adapter")
+        if not adapter_name:
+            raise ValueError(f"Route {vendor}:{route} missing 'adapter' field")
+        adapter_cls = _ADAPTER_REGISTRY.get(adapter_name)
+        if adapter_cls is None:
+            raise ValueError(f"Unknown adapter class '{adapter_name}' for {vendor}:{route}")
+
+        is_local = bool(route_cfg.get("local", False)) or not vendor_cfg.get("is_cloud", True)
+        is_cloud = not is_local
+
+        client, adapter = self._build_client_and_adapter(
+            vendor=vendor,
+            route=route,
+            adapter_cls=adapter_cls,
+            vendor_cfg=vendor_cfg,
+            route_cfg=route_cfg,
+        )
+        if client is None:
+            return None
+
+        model = route_cfg.get("model") or "auto"
+        hints = list(route_cfg.get("selection_hints") or [])
+        base_url = route_cfg.get("base_url")
+
+        return ProviderInfo(
+            name=f"{vendor}:{route}",
+            vendor=vendor,
+            route=route,
+            client=client,
+            adapter=adapter,
+            model=model,
+            is_cloud=is_cloud,
+            is_local=is_local,
+            base_url=base_url,
+            selection_hints=hints,
+        )
+
+    def _build_client_and_adapter(
+        self,
+        vendor: str,
+        route: str,
+        adapter_cls: type,
+        vendor_cfg: Dict[str, Any],
+        route_cfg: Dict[str, Any],
+    ):
+        """Instantiate (client, adapter) for the given adapter class.
+
+        Adapter-class-specific logic is here, NOT per-vendor. Adding a new
+        vendor that reuses OpenAIAdapter requires no code changes — just config.
+        """
+        # --- Anthropic SDK (api key or OAuth) ---
+        if adapter_cls in (AnthropicAdapter, ClaudeMaxAdapter):
+            try:
+                import anthropic
+            except ImportError:
+                raise ImportError("anthropic package not installed.")
+            api_key = self._resolve_secret(route_cfg, "api_key_env", "api_key")
+            auth_token = self._resolve_secret(route_cfg, "auth_token_env", "auth_token")
+            if auth_token:
+                client = anthropic.AsyncAnthropic(auth_token=auth_token)
+                logger.info("%s:%s using OAuth token", vendor, route)
+            elif api_key:
+                client = anthropic.AsyncAnthropic(api_key=api_key)
+            else:
+                raise ValueError(
+                    f"{vendor}:{route} requires api_key_env or auth_token_env "
+                    "(ANTHROPIC_API_KEY for API-key routes, ANTHROPIC_AUTH_TOKEN for OAuth)"
+                )
+            return client, adapter_cls()
+
+        # --- Codex / ChatGPT subscription backend (raw OAuth token string) ---
+        if adapter_cls is CodexAdapter:
+            token = self._resolve_secret(route_cfg, "auth_token_env", "auth_token")
+            if not token:
+                token, _ = self._read_codex_auth_file()
+            if not token:
+                raise ValueError(
+                    f"{vendor}:{route} OAuth token not found. "
+                    "Run `codex login` or set CODEX_AUTH_TOKEN."
+                )
+            # Adapter uses httpx directly; client slot holds the token string.
+            return token, adapter_cls()
+
+        # --- OpenRouter (OpenAI-compatible client, custom adapter) ---
+        if adapter_cls is OpenRouterAdapter:
+            api_key = self._resolve_secret(route_cfg, "api_key_env", "api_key")
+            if not api_key:
+                raise ValueError(f"{vendor}:{route} requires OPENROUTER_API_KEY")
+            base_url = route_cfg.get("base_url") or get_openrouter_api_base()
+            # max_retries=0: the OpenAI SDK has its own retry layer that
+            # duplicates (and contradicts) our llm/retry.py policy. One retry
+            # owner only.
+            client = openai.AsyncOpenAI(api_key=api_key, base_url=base_url, max_retries=0)
+            return client, adapter_cls()
+
+        # --- Ollama (local or remote via OLLAMA_HOST) ---
+        if adapter_cls is OllamaAdapter:
+            if ollama is None:
+                raise ImportError("ollama package not installed.")
+            host = os.environ.get("OLLAMA_HOST") or route_cfg.get("host") or get_ollama_url()
+            client = ollama.AsyncClient(host=host)
+            return client, adapter_cls()
+
+        # --- Google Gemini (legacy generativeai SDK) ---
+        if adapter_cls is GoogleAdapter:
+            try:
+                import google.generativeai as genai
+            except ImportError:
+                raise ImportError("google-generativeai package not installed.")
+            api_key = self._resolve_secret(route_cfg, "api_key_env", "api_key") \
+                or os.environ.get("GOOGLE_API_KEY")
+            if not api_key:
+                raise ValueError(f"{vendor}:{route} requires GOOGLE_API_KEY")
+            genai.configure(api_key=api_key)
+            # Client is lazily constructed per call; adapter carries the model name.
+            return genai, adapter_cls()
+
+        # --- Vertex AI (new google-genai SDK, api-key or service-account) ---
+        if adapter_cls is VertexAIAdapter:
+            try:
+                from google import genai as _genai
+            except ImportError:
+                raise ImportError("google-genai package not installed.")
+            api_key = self._resolve_secret(route_cfg, "api_key_env", "api_key") \
+                or os.environ.get("GOOGLE_API_KEY")
+            if api_key:
+                client = _genai.Client(api_key=api_key)
+                return client, adapter_cls()
+            project_id = (
+                route_cfg.get("project_id")
+                or os.environ.get("GCP_PROJECT_ID")
+                or os.environ.get("GOOGLE_CLOUD_PROJECT")
+            )
+            location = (
+                route_cfg.get("location")
+                or os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
+            )
+            if not project_id:
+                raise ValueError(
+                    f"{vendor}:{route} requires GOOGLE_API_KEY or GCP_PROJECT_ID"
+                )
+            client = _genai.Client(vendorai=True, project=project_id, location=location)
+            adapter = adapter_cls(project_id=project_id, location=location)
+            return client, adapter
+
+        # --- Generic OpenAI-compatible (OpenAI itself, xAI, Groq, RunPod, llama.cpp, ...) ---
+        if adapter_cls is OpenAIAdapter:
+            # Default base_url: OpenAI if not specified. For OpenAI-proper we
+            # use the SDK default (no base_url override).
+            base_url = route_cfg.get("base_url")
+            api_key = self._resolve_secret(route_cfg, "api_key_env", "api_key")
+            is_local = bool(route_cfg.get("local", False))
+            if not api_key:
+                api_key = os.environ.get(f"{vendor.upper()}_API_KEY")
+            if not api_key and is_local:
+                api_key = "local"
+            if not api_key:
+                raise ValueError(
+                    f"{vendor}:{route} requires an API key "
+                    f"(set {route_cfg.get('api_key_env') or vendor.upper() + '_API_KEY'})"
+                )
+            # max_retries=0: single retry owner (llm/retry.py). See note in
+            # the OpenRouter branch above.
+            kwargs = {"api_key": api_key, "max_retries": 0}
+            if base_url:
+                kwargs["base_url"] = base_url
+            client = openai.AsyncOpenAI(**kwargs)
+            return client, adapter_cls()
+
+        # --- Fallback: try plain instantiation; let adapter fail at call time ---
+        logger.warning("No client builder for adapter %s — using adapter-only", adapter_cls.__name__)
+        return None, adapter_cls()
+
+    @staticmethod
+    def _resolve_secret(route_cfg: Dict[str, Any], env_key: str, inline_key: str) -> Optional[str]:
+        """Read a secret from env (named by ``env_key`` in route_cfg) or inline."""
+        env_name = route_cfg.get(env_key)
+        if env_name:
+            val = os.environ.get(env_name)
+            if val:
+                return val
+        inline = route_cfg.get(inline_key)
+        return inline or None
+
+    @staticmethod
+    def _read_codex_auth_file() -> tuple:
+        """Read OAuth token from ~/.codex/auth.json (written by `codex login`).
+
+        Returns (token, auth_mode) tuple or (None, None) if not found/readable.
+        """
+        auth_path = Path.home() / ".codex" / "auth.json"
+        if not auth_path.exists():
+            return None, None
+        try:
+            data = _json.loads(auth_path.read_text())
+            auth_mode = data.get("auth_mode", "")
+            tokens = data.get("tokens", {})
+            token = tokens.get("access_token") or data.get("access_token")
+            if token:
+                return token, auth_mode or "oauth"
+            return None, None
+        except Exception as e:
+            logger.warning(f"Failed to read codex auth file: {e}")
+            return None, None
+
+    # ------------------------------------------------------ entry-point providers
 
     def _discover_entrypoint_providers(self) -> List[ProviderInfo]:
         """Discover LLM providers registered via entry_points.
 
-        Entry points must be subclasses of ``LLMAdapter``.  Each adapter class
-        must expose a ``provider_name`` class attribute and a
-        ``create_provider(config)`` classmethod that returns a ``ProviderInfo``.
-
-        If the classmethod is absent, the adapter is instantiated directly
-        and wrapped with an OpenAI-compatible client using ``base_url`` and
-        ``api_key`` from the provider config section.
-
-        Returns:
-            List of successfully initialized ProviderInfo objects.
+        Each external adapter is treated as a single-route vendor (route=``api``).
+        The adapter's advertised ``provider_name`` becomes the vendor name; if the
+        adapter exposes a ``create_provider(config)`` factory we accept whatever
+        ProviderInfo it returns (normalizing ``vendor``/``route``/``name`` fields).
         """
         from kestrel_sovereign.entrypoints import discover_entry_point_classes
 
@@ -135,489 +421,86 @@ class ProviderRegistry:
 
         for ep_name, cls in classes.items():
             try:
-                provider_config = self.config.get(ep_name, {})
+                provider_config = (self.config.get("vendors") or {}).get(ep_name) or {}
+                route_cfg = ((provider_config.get("routes") or {}).get("api")) or {}
 
-                # Prefer a factory classmethod if the adapter provides one
                 if hasattr(cls, "create_provider") and callable(getattr(cls, "create_provider")):
-                    info = cls.create_provider(provider_config)
-                    if info is not None:
-                        providers.append(info)
+                    info = cls.create_provider(route_cfg)
+                    if info is None:
+                        continue
+                    # Normalize legacy ProviderInfo returned by external adapters.
+                    vendor = getattr(info, "vendor", None) or info.name
+                    route = getattr(info, "route", None) or "api"
+                    info.vendor = vendor
+                    info.route = route
+                    info.name = f"{vendor}:{route}"
+                    providers.append(info)
                     continue
 
-                # Fallback: treat as OpenAI-compatible with base_url
-                base_url = provider_config.get("base_url")
-                api_key = provider_config.get("api_key") or os.environ.get(
-                    f"{ep_name.upper()}_API_KEY", "external"
+                # Fallback: OpenAI-compatible client with base_url from config.
+                base_url = route_cfg.get("base_url")
+                api_key = (
+                    self._resolve_secret(route_cfg, "api_key_env", "api_key")
+                    or os.environ.get(f"{ep_name.upper()}_API_KEY", "external")
                 )
-                model = provider_config.get("model", "auto")
+                model = route_cfg.get("model", "auto")
 
+                client_kwargs: Dict[str, Any] = {"api_key": api_key, "max_retries": 0}
                 if base_url:
-                    client = openai.AsyncOpenAI(api_key=api_key, base_url=base_url)
-                else:
-                    client = openai.AsyncOpenAI(api_key=api_key)
-
-                adapter = cls()
-                name = getattr(cls, "provider_name", ep_name)
+                    client_kwargs["base_url"] = base_url
+                client = openai.AsyncOpenAI(**client_kwargs)
 
                 providers.append(ProviderInfo(
-                    name=name,
+                    name=f"{ep_name}:api",
+                    vendor=ep_name,
+                    route="api",
                     client=client,
-                    adapter=adapter,
+                    adapter=cls(),
                     model=model,
+                    is_cloud=True,
+                    is_local=False,
+                    base_url=base_url,
                 ))
             except Exception as e:
                 logger.warning("Failed to initialize entry_point LLM provider '%s': %s", ep_name, e)
 
         return providers
 
-    def _initialize_single_provider(self, provider_name: str) -> Optional[ProviderInfo]:
-        """Initialize a single provider.
-
-        Args:
-            provider_name: Name of the provider to initialize
-
-        Returns:
-            ProviderInfo if successful, None if provider config not found
-
-        Raises:
-            Exception: If provider initialization fails
-        """
-        canonical_name = normalize_provider_name(provider_name)
-        provider_config = self.config.get(canonical_name) or self.config.get(provider_name)
-        if not provider_config:
-            logger.warning(f"Config for provider '{provider_name}' not found. Skipping.")
-            return None
-
-        if canonical_name == "openai":
-            return self._initialize_openai(provider_config)
-        elif canonical_name == "ollama":
-            return self._initialize_ollama(provider_config)
-        elif canonical_name == "anthropic":
-            return self._initialize_anthropic(provider_config)
-        elif canonical_name == "claude_plan":
-            return self._initialize_claude_plan(provider_config)
-        elif canonical_name == "openai_plan":
-            return self._initialize_openai_plan(provider_config)
-        elif canonical_name in ["google", "gemini"]:
-            return self._initialize_google(provider_config)
-        elif canonical_name == "vertex_ai":
-            return self._initialize_vertex_ai(provider_config)
-        elif canonical_name == "openrouter":
-            return self._initialize_openrouter(provider_config)
-        elif (provider_config.get("type") == "openai_compatible" or
-              canonical_name in ["azure_openai", "xai", "groq", "together", "mistral", "perplexity", "fireworks"]):
-            return self._initialize_openai_compatible(canonical_name, provider_config)
-        else:
-            logger.warning(f"Unknown provider '{canonical_name}'. Skipping.")
-            return None
-
-    def _initialize_openai(self, provider_config: Dict[str, Any]) -> ProviderInfo:
-        """Initialize OpenAI provider."""
-        api_key = os.environ.get("OPENAI_API_KEY")
-        if not api_key:
-            raise ValueError("OpenAI API key not found.")
-
-        model = os.environ.get("OPENAI_MODEL") or provider_config.get("model")
-        if not model:
-            logger.warning("No model configured for openai — set model= in llm_config.toml or OPENAI_MODEL env var")
-            model = "auto"
-        provider_config["model"] = model
-
-        client = openai.AsyncOpenAI(api_key=api_key)
-        adapter = OpenAIAdapter()
-
-        return ProviderInfo(
-            name="openai",
-            client=client,
-            adapter=adapter,
-            model=model
-        )
-
-    def _initialize_ollama(self, provider_config: Dict[str, Any]) -> ProviderInfo:
-        """Initialize Ollama provider."""
-        if ollama is None:
-            raise ImportError("ollama package not installed.")
-
-        # Use get_ollama_url() for canonical URL resolution
-        # Support legacy OLLAMA_HOST env var for backwards compatibility
-        host = os.environ.get("OLLAMA_HOST") or provider_config.get("host") or get_ollama_url()
-        model = os.environ.get("OLLAMA_MODEL") or provider_config.get("model")
-        if not model:
-            logger.warning("No model configured for ollama — set model= in llm_config.toml or OLLAMA_MODEL env var")
-            model = "auto"
-        provider_config["host"] = host
-        provider_config["model"] = model
-
-        client = ollama.AsyncClient(host=host)
-        adapter = OllamaAdapter()
-
-        return ProviderInfo(
-            name="ollama",
-            client=client,
-            adapter=adapter,
-            model=model
-        )
-
-    def _initialize_anthropic(self, provider_config: Dict[str, Any]) -> ProviderInfo:
-        """Initialize Anthropic provider.
-        
-        Supports two authentication methods:
-        1. API key: Set ANTHROPIC_API_KEY env var
-        2. OAuth token (Claude Max): Set ANTHROPIC_AUTH_TOKEN env var
-           (get token via `claude setup-token` CLI command)
-        """
-        try:
-            import anthropic
-        except ImportError:
-            raise ImportError("anthropic package not installed.")
-
-        api_key = os.environ.get("ANTHROPIC_API_KEY") or provider_config.get("api_key")
-        auth_token = os.environ.get("ANTHROPIC_AUTH_TOKEN") or provider_config.get("auth_token")
-        
-        if not api_key and not auth_token:
-            raise ValueError(
-                "Anthropic authentication not found. Set either:\n"
-                "  - ANTHROPIC_API_KEY for API key auth, or\n"
-                "  - ANTHROPIC_AUTH_TOKEN for OAuth/Max subscription (from `claude setup-token`)"
-            )
-
-        # Prefer OAuth token if both are set (Max subscription is "free" usage)
-        if auth_token:
-            logger.info("Using Anthropic OAuth token (Claude Max subscription)")
-            client = anthropic.AsyncAnthropic(auth_token=auth_token)
-        else:
-            client = anthropic.AsyncAnthropic(api_key=api_key)
-        
-        model = os.environ.get("ANTHROPIC_MODEL") or provider_config.get("model")
-        if not model:
-            logger.warning("No model configured for anthropic — set model= in llm_config.toml or ANTHROPIC_MODEL env var")
-            model = "auto"
-        provider_config["model"] = model
-
-        adapter = AnthropicAdapter()
-
-        return ProviderInfo(
-            name="anthropic",
-            client=client,
-            adapter=adapter,
-            model=model
-        )
-
-    def _initialize_claude_plan(
-        self,
-        provider_config: Dict[str, Any],
-    ) -> ProviderInfo:
-        """Initialize Claude plan provider using OAuth token auth.
-
-        Uses the standard Anthropic SDK with auth_token instead of api_key.
-        The token comes from ANTHROPIC_AUTH_TOKEN env var (via `claude login`).
-        """
-        auth_token = os.environ.get("ANTHROPIC_AUTH_TOKEN") or provider_config.get("auth_token")
-        if not auth_token:
-            raise ValueError(
-                "ANTHROPIC_AUTH_TOKEN not set. "
-                "Run `claude login` and export the token, or set auth_token in llm_config.toml."
-            )
-
-        try:
-            import anthropic
-        except ImportError:
-            raise ImportError("anthropic package not installed. Run: pip install anthropic")
-
-        model = provider_config.get("model")
-        if not model:
-            logger.warning("No model configured for claude_plan — set model= in llm_config.toml")
-            model = "auto"
-        provider_config["model"] = model
-
-        client = anthropic.AsyncAnthropic(auth_token=auth_token)
-        adapter = ClaudeMaxAdapter()
-
-        return ProviderInfo(
-            name="claude_plan",
-            client=client,
-            adapter=adapter,
-            model=model
-        )
-
-    def _initialize_openai_plan(
-        self,
-        provider_config: Dict[str, Any],
-    ) -> ProviderInfo:
-        """Initialize OpenAI plan provider using ChatGPT backend OAuth.
-
-        Reads the OAuth access_token from ~/.codex/auth.json (written by
-        ``codex login``) and uses it against chatgpt.com/backend-api/codex/responses
-        — the same private endpoint that the Codex CLI and OpenClaw use.
-
-        Auth priority:
-        1. CODEX_AUTH_TOKEN env var (explicit OAuth token)
-        2. ~/.codex/auth.json tokens.access_token (from `codex login`)
-        3. provider_config auth_token
-        """
-        token, auth_mode = self._read_codex_auth_file()
-
-        # Env vars override file
-        if os.environ.get("CODEX_AUTH_TOKEN"):
-            token = os.environ["CODEX_AUTH_TOKEN"]
-
-        # Config fallback
-        if not token:
-            token = provider_config.get("auth_token")
-
-        if not token:
-            raise ValueError(
-                "Codex authentication not found. Either:\n"
-                "  - Run `codex login` to authenticate via OAuth, or\n"
-                "  - Set CODEX_AUTH_TOKEN env var"
-            )
-
-        logger.info("Using Codex with OAuth token (ChatGPT subscription)")
-
-        model = provider_config.get("model")
-        if not model:
-            logger.warning("No model configured for openai_plan — set model= in llm_config.toml")
-            model = "auto"
-        provider_config["model"] = model
-
-        # Store the token string as "client" — the adapter uses it directly
-        # with httpx against chatgpt.com/backend-api/codex/responses
-        adapter = CodexAdapter()
-
-        return ProviderInfo(
-            name="openai_plan",
-            client=token,  # OAuth token string — adapter uses httpx directly
-            adapter=adapter,
-            model=model,
-        )
-
-    @staticmethod
-    def _read_codex_auth_file() -> tuple:
-        """Read OAuth token from ~/.codex/auth.json (written by `codex login`).
-
-        Returns (token, auth_mode) tuple.
-
-        The file structure nests tokens under a ``tokens`` key::
-
-            {"auth_mode": "chatgpt", "tokens": {"access_token": "...", ...}}
-        """
-        from pathlib import Path
-        import json as _json
-        auth_path = Path.home() / ".codex" / "auth.json"
-        if not auth_path.exists():
-            return None, None
-        try:
-            data = _json.loads(auth_path.read_text())
-            auth_mode = data.get("auth_mode", "")
-
-            # ChatGPT/OAuth mode: access_token from codex login
-            tokens = data.get("tokens", {})
-            token = tokens.get("access_token") or data.get("access_token")
-            if token:
-                return token, auth_mode or "oauth"
-
-            return None, None
-        except Exception as e:
-            logger.warning(f"Failed to read codex auth file: {e}")
-            return None, None
-
-    def _initialize_google(self, provider_config: Dict[str, Any]) -> ProviderInfo:
-        """Initialize Google/Gemini provider."""
-        try:
-            import google.generativeai as genai
-        except ImportError:
-            raise ImportError("google-generativeai package not installed.")
-
-        api_key = os.environ.get("GOOGLE_API_KEY") or provider_config.get("api_key")
-        if not api_key:
-            raise ValueError("Google API key not found.")
-
-        model = os.environ.get("GOOGLE_MODEL") or provider_config.get("model")
-        if not model:
-            logger.warning("No model configured for google — set model= in llm_config.toml or GOOGLE_MODEL env var")
-            model = "auto"
-        provider_config["model"] = model
-
-        genai.configure(api_key=api_key)
-        client = genai.GenerativeModel(model)
-        adapter = GoogleAdapter()
-
-        return ProviderInfo(
-            name="google",
-            client=client,
-            adapter=adapter,
-            model=model
-        )
-
-    def _initialize_vertex_ai(self, provider_config: Dict[str, Any]) -> ProviderInfo:
-        """Initialize Vertex AI provider."""
-        try:
-            from google import genai
-        except ImportError:
-            raise ImportError("google-genai package not installed.")
-
-        model = os.environ.get("VERTEX_AI_MODEL") or provider_config.get("model")
-        if not model:
-            logger.warning("No model configured for vertex_ai — set model= in llm_config.toml or VERTEX_AI_MODEL env var")
-            model = "auto"
-        provider_config["model"] = model
-
-        # Prefer API key (AI Studio) over service account (Vertex AI)
-        api_key = os.environ.get("GOOGLE_API_KEY")
-        if api_key:
-            client = genai.Client(api_key=api_key)
-            adapter = VertexAIAdapter()
-        else:
-            project_id = (provider_config.get("project_id") or
-                         os.environ.get("GCP_PROJECT_ID") or
-                         os.environ.get("GOOGLE_CLOUD_PROJECT"))
-            location = provider_config.get("location") or os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
-
-            if not project_id:
-                raise ValueError("Vertex AI requires GOOGLE_API_KEY or GCP_PROJECT_ID.")
-
-            client = genai.Client(
-                vertexai=True,
-                project=project_id,
-                location=location,
-            )
-            adapter = VertexAIAdapter(project_id=project_id, location=location)
-
-        return ProviderInfo(
-            name="vertex_ai",
-            client=client,
-            adapter=adapter,
-            model=model
-        )
-
-    def _initialize_openrouter(self, provider_config: Dict[str, Any]) -> ProviderInfo:
-        """Initialize OpenRouter provider."""
-        api_key = os.environ.get("OPENROUTER_API_KEY") or provider_config.get("api_key")
-        if not api_key:
-            raise ValueError("OpenRouter API key not found (set OPENROUTER_API_KEY).")
-
-        base_url = provider_config.get("base_url") or get_openrouter_api_base()
-        model = os.environ.get("OPENROUTER_MODEL") or provider_config.get("model")
-        if not model:
-            logger.warning("No model configured for openrouter — set model= in llm_config.toml or OPENROUTER_MODEL env var")
-            model = "auto"
-        provider_config["model"] = model
-
-        client = openai.AsyncOpenAI(api_key=api_key, base_url=base_url)
-        adapter = OpenRouterAdapter()
-
-        return ProviderInfo(
-            name="openrouter",
-            client=client,
-            adapter=adapter,
-            model=model
-        )
-
-    def _initialize_openai_compatible(self, provider_name: str, provider_config: Dict[str, Any]) -> ProviderInfo:
-        """Initialize OpenAI-compatible provider."""
-        base_url = provider_config.get("base_url")
-        if not base_url:
-            raise ValueError(f"base_url must be set for '{provider_name}'.")
-
-        is_local = provider_config.get("local", False)
-        api_key_env = provider_config.get("api_key_env")
-        api_key = None
-        if api_key_env:
-            api_key = os.environ.get(api_key_env)
-        if not api_key:
-            env_fallback = os.environ.get(f"{provider_name.upper()}_API_KEY")
-            api_key = env_fallback or provider_config.get("api_key")
-        if not api_key:
-            if is_local:
-                api_key = "local"  # Local servers don't need auth
-            else:
-                raise ValueError(f"API key not provided for '{provider_name}'.")
-
-        client = openai.AsyncOpenAI(api_key=api_key, base_url=base_url)
-        adapter = OpenAIAdapter()
-
-        model = provider_config.get("model", "auto")
-
-        return ProviderInfo(
-            name=provider_name,
-            client=client,
-            adapter=adapter,
-            model=model
-        )
+    # --------------------------------------------------------------- lookups
 
     def get_provider_by_name(self, name: str) -> Optional[ProviderInfo]:
-        """Get a provider by name.
-
-        Args:
-            name: Provider name to search for
-
-        Returns:
-            ProviderInfo if found, None otherwise
-        """
-        candidates = provider_name_candidates(name)
+        """Exact-match lookup by composite name (``"vendor:route"``) or vendor."""
         for provider in self.providers:
-            if provider.name in candidates:
+            if provider.name == name:
+                return provider
+        # Vendor-only match: return the first route for that vendor.
+        for provider in self.providers:
+            if provider.vendor == name:
                 return provider
         return None
 
+    def get_providers_for_vendor(self, vendor: str) -> List[ProviderInfo]:
+        """All routes for a given vendor, in priority order."""
+        return [p for p in self.providers if p.vendor == vendor]
+
     def get_provider_for_model(self, model: str) -> Optional[ProviderInfo]:
-        """Get the first provider that supports the specified model.
-
-        Args:
-            model: Model name to search for
-
-        Returns:
-            ProviderInfo if found, None otherwise
-        """
+        """First route whose configured model matches."""
         for provider in self.providers:
-            if model in provider.model or provider.name in model:
+            if model and provider.model and model in provider.model:
                 return provider
         return None
 
     def get_local_providers(self) -> List[ProviderInfo]:
-        """Get all local providers (Ollama, llama.cpp, etc).
-
-        Returns:
-            List of local providers
-        """
-        local_names = {"ollama"}
-        # Check config for providers marked as local
-        for name, cfg in self.config.items():
-            if isinstance(cfg, dict) and cfg.get("local", False):
-                local_names.add(name)
-        return [p for p in self.providers if p.name in local_names]
+        """All routes marked local (Ollama, llama.cpp, ...)."""
+        return [p for p in self.providers if p.is_local]
 
     def get_providers_with_pattern(self, patterns: List[str]) -> List[ProviderInfo]:
-        """Get providers whose models match any of the given patterns.
-
-        Args:
-            patterns: List of patterns to match against model names
-
-        Returns:
-            List of matching providers
-        """
-        matching_providers = []
+        """Routes whose model string contains any of the given patterns."""
+        if not patterns:
+            return []
+        out: List[ProviderInfo] = []
         for provider in self.providers:
-            model_lower = provider.model.lower()
-            for pattern in patterns:
-                if pattern in model_lower:
-                    matching_providers.append(provider)
-                    break
-        return matching_providers
-
-    def update_provider_client(self, provider_name: str, new_client: Any) -> bool:
-        """Update a provider's client (e.g., when switching to agent keys).
-
-        Args:
-            provider_name: Name of the provider to update
-            new_client: New client instance
-
-        Returns:
-            True if provider was found and updated, False otherwise
-        """
-        provider = self.get_provider_by_name(provider_name)
-        if provider:
-            provider.client = new_client
-            logger.info(f"Updated client for provider: {provider_name}")
-            return True
-        return False
+            model_lower = (provider.model or "").lower()
+            if any(p.lower() in model_lower for p in patterns):
+                out.append(provider)
+        return out

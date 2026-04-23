@@ -55,26 +55,53 @@ class ModelPreferenceMixin:
         return resolve_active_model_selection(self.llm_service)["model"]
 
     async def _load_model_preference(self) -> None:
-        """Load persisted model preference from agent_metadata table."""
+        """Load persisted model preference from agent_metadata table.
+
+        Persistence schema: ``{"vendor": str, "model": str, "route": str|None}``.
+        Rows using the legacy ``{"model", "provider"}`` shape are dropped
+        silently — the agent starts with no mandate and the user re-selects
+        via the UI.
+        """
         try:
             result = await self._raw_storage.db.fetchall(
                 "SELECT value FROM agent_metadata WHERE agent_id = ? AND key = ?",
                 (self.agent_id, self.MODEL_PREFERENCE_KEY),
             )
-            if result:
-                pref = json.loads(result[0][0])
-                model = pref.get("model")
-                provider = pref.get("provider")
-                if model and model != "auto":
-                    self.llm_service.set_model_preference(model, provider)
-                    logging.info(f"Loaded persisted model preference: {provider}/{model}" if provider else f"Loaded persisted model preference: {model}")
+            if not result:
+                return
+            pref = json.loads(result[0][0])
+            # New shape.
+            model = pref.get("model")
+            vendor = pref.get("vendor")
+            route = pref.get("route")
+            if vendor is None and "provider" in pref:
+                # Legacy row — drop it. User re-selects via UI.
+                logging.warning(
+                    "Ignoring legacy model_preference row for %s (old shape {model, provider}); "
+                    "re-select via the UI to persist in the new {vendor, model, route} shape.",
+                    self.agent_id,
+                )
+                return
+            if model and model != "auto":
+                self.llm_service.set_model_preference(model, vendor, route)
+                if vendor and route:
+                    logging.info("Loaded persisted model preference: %s:%s/%s", vendor, route, model)
+                elif vendor:
+                    logging.info("Loaded persisted model preference: %s/%s", vendor, model)
+                else:
+                    logging.info("Loaded persisted model preference: %s", model)
         except Exception as e:
             logging.warning(f"Failed to load model preference: {e}")
 
-    async def _persist_model_preference(self, model: str | None, provider: str | None) -> None:
+    async def _persist_model_preference(
+        self,
+        model: str | None,
+        vendor: str | None,
+        route: str | None,
+    ) -> None:
         """Persist model preference to agent_metadata table."""
         try:
-            value = json.dumps({"model": model, "provider": provider})
+            value = json.dumps({"vendor": vendor, "model": model, "route": route})
             await self._raw_storage.db.execute(
                 """INSERT OR REPLACE INTO agent_metadata (agent_id, key, value, updated_at)
                    VALUES (?, ?, ?, ?)""",

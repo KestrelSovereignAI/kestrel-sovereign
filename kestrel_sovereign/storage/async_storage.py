@@ -319,10 +319,13 @@ class AsyncStorage:
             raise ValueError("Cannot backup an in-memory database")
 
         # Checkpoint WAL before closing - this ensures all data is written to main DB file
-        # Without this, the backup would be missing any uncommitted WAL data
+        # Without this, the backup would be missing any uncommitted WAL data.
+        # Use fetchone so aiosqlite consumes the cursor fully — execute() then
+        # auto-commit would raise "cannot commit transaction - SQL statements
+        # in progress" because the PRAGMA's result cursor is still open.
         was_initialized = self._initialized
         if was_initialized and self.db:
-            await self.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            await self.db.fetchone("PRAGMA wal_checkpoint(TRUNCATE)")
             await self.close()
         
         try:

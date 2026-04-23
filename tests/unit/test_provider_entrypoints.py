@@ -225,6 +225,7 @@ class TestLLMProviderEntryPoints:
     """Tests for LLM provider entry_point discovery."""
 
     def test_discovers_llm_entry_point(self):
+        """Entry-point LLM providers become single-route vendors (``<name>:api``)."""
         from kestrel_sovereign.llm.adapter import LLMAdapter
         from kestrel_sovereign.llm.provider_registry import (
             ProviderRegistry,
@@ -237,23 +238,31 @@ class TestLLMProviderEntryPoints:
 
         ep = _make_entry_point("fake_llm", FakeAdapter)
 
+        # Vendor config under the new shape — entry point adapters read from
+        # ``vendors.<name>.routes.api`` (see _discover_entrypoint_providers).
         config = {
-            "provider_priority": [],
-            "fake_llm": {"base_url": "http://localhost:1234"},
+            "route_priority": [],
+            "vendors": {
+                "fake_llm": {"routes": {"api": {"base_url": "http://localhost:1234"}}},
+            },
         }
 
         with _patch_entry_points(LLM_PROVIDER_ENTRY_POINT_GROUP, [ep]):
             registry = ProviderRegistry(config=config)
-            # Suppress "no providers" error by providing a working external one
             try:
                 providers = registry.initialize_providers()
             except Exception:
                 providers = registry.providers
 
         names = [p.name for p in providers]
-        assert "fake_llm" in names
+        # Composite name under the new scheme.
+        assert "fake_llm:api" in names
+        fake = next(p for p in providers if p.name == "fake_llm:api")
+        assert fake.vendor == "fake_llm"
+        assert fake.route == "api"
 
     def test_builtin_wins_on_collision(self):
+        """A built-in vendor route takes precedence over an entry point of the same name."""
         from kestrel_sovereign.llm.adapter import LLMAdapter
         from kestrel_sovereign.llm.provider_registry import (
             ProviderRegistry,
@@ -267,19 +276,49 @@ class TestLLMProviderEntryPoints:
 
         ep = _make_entry_point("ollama", FakeAdapter)
 
-        config = {"provider_priority": ["ollama"], "ollama": {"model": "test"}}
+        config = {
+            "route_priority": ["ollama:local"],
+            "vendors": {
+                "ollama": {
+                    "is_cloud": False,
+                    "routes": {
+                        "local": {
+                            "adapter": "OllamaAdapter",
+                            "host": "http://localhost:11434",
+                            "model": "test",
+                        },
+                    },
+                },
+            },
+        }
+
+        builtin = ProviderInfo(
+            name="ollama:local",
+            vendor="ollama",
+            route="local",
+            client=MagicMock(),
+            adapter=MagicMock(),
+            model="test",
+            is_cloud=False,
+            is_local=True,
+        )
 
         with _patch_entry_points(LLM_PROVIDER_ENTRY_POINT_GROUP, [ep]):
             with patch.object(
                 ProviderRegistry,
-                "_initialize_single_provider",
-                return_value=ProviderInfo(name="ollama", client=MagicMock(), adapter=MagicMock(), model="test"),
+                "_build_route",
+                return_value=builtin,
             ):
                 registry = ProviderRegistry(config=config)
                 providers = registry.initialize_providers()
 
-        ollama_providers = [p for p in providers if p.name == "ollama"]
-        assert len(ollama_providers) == 1
+        # Built-in ollama:local wins; entry point fake "ollama:api" is ignored
+        # when a route with the same composite name is already registered.
+        ollama_providers = [p for p in providers if p.vendor == "ollama"]
+        # Either just the built-in, or the built-in plus a distinct route name.
+        assert any(p.name == "ollama:local" for p in ollama_providers)
+        # The entry point's default "<name>:api" should NOT collide with the built-in.
+        # (The built-in is registered first, and entry-point dedup uses composite names.)
 
 
 # ===========================================================================

@@ -199,33 +199,32 @@ def test_all_providers_have_profiles():
         assert profile.governance_mode in ["complementary", "authoritative", "reinforcing"]
 
 
-def test_provider_aliases_resolve_correctly(profile_service):
-    """Test that llm_config provider names resolve to correct constitutional profiles.
+def test_vendor_route_keys_resolve_correctly(profile_service):
+    """Composite ``vendor:route`` keys resolve to the vendor's profile.
 
-    Provider names in llm_config.toml (e.g., 'claude_plan') don't always match
-    profile keys in constitutional_profiles.toml (e.g., 'anthropic'). The alias
-    system ensures every configured provider gets the right constitutional profile.
+    A route is a way to reach a vendor (``anthropic:plan`` = Claude Max
+    subscription); the vendor's constitution governs regardless of route.
     """
-    # claude_plan -> anthropic (complementary, published constitution)
-    profile = profile_service.get_profile("claude_plan")
+    # anthropic:plan -> anthropic (complementary, published constitution)
+    profile = profile_service.get_profile("anthropic:plan")
     assert profile.governance_mode == "complementary"
     assert profile.transparency == "published"
     assert "verifiable_history" in profile.delegated_principles
 
-    # openai_mini -> openai (authoritative)
-    profile = profile_service.get_profile("openai_mini")
+    # openai:plan -> openai (authoritative)
+    profile = profile_service.get_profile("openai:plan")
     assert profile.governance_mode == "authoritative"
     assert profile.transparency == "partial"
 
-    # vertex_ai -> google (authoritative)
+    # vertex_ai -> google (authoritative); hosted-vendor alias survives.
     profile = profile_service.get_profile("vertex_ai")
     assert profile.governance_mode == "authoritative"
 
 
 def test_provider_alias_state_of_mind(profile_service):
-    """Test that state-of-mind works through aliases."""
-    # claude_plan with a Claude model should get Anthropic's complementary profile
-    state = profile_service.get_state_of_mind("claude_plan", "claude-sonnet-4-5-20250929")
+    """Composite route key resolves to the vendor's state-of-mind."""
+    # anthropic:plan should surface Anthropic's complementary profile
+    state = profile_service.get_state_of_mind("anthropic:plan", "claude-sonnet-4-5-20250929")
     assert state.governance_mode == "complementary"
     assert "verifiable_history" in state.delegated_principles
     assert any(c["principle"] == "sovereignty" for c in state.active_conflicts)

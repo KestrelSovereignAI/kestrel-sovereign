@@ -17,8 +17,8 @@ class _DiscoveryHarness(ModelDiscoveryMixin):
 
 def test_auto_resolution_uses_selection_hints_over_discovery_order():
     harness = _DiscoveryHarness(
-        config={"anthropic": {"selection_hints": ["sonnet", "haiku"]}},
-        providers=[{"name": "anthropic", "model": "auto"}],
+        config={},
+        providers=[{"name": "anthropic", "vendor": "anthropic", "route": "api", "model": "auto", "selection_hints": ["sonnet", "haiku"]}],
     )
     models = [
         ModelInfo(
@@ -45,7 +45,7 @@ def test_auto_resolution_uses_selection_hints_over_discovery_order():
 def test_auto_resolution_prefers_featured_when_no_selection_hints_exist():
     harness = _DiscoveryHarness(
         config={"openai": {}},
-        providers=[{"name": "openai", "model": "auto"}],
+        providers=[{"name": "openai", "vendor": "openai", "route": "api", "model": "auto"}],
     )
     models = [
         ModelInfo(
@@ -74,7 +74,7 @@ def test_auto_resolution_prefers_featured_when_no_selection_hints_exist():
 def test_auto_resolution_avoids_preview_models_when_choosing_fallback():
     harness = _DiscoveryHarness(
         config={"vertex_ai": {}},
-        providers=[{"name": "vertex_ai", "model": "auto"}],
+        providers=[{"name": "vertex_ai", "vendor": "vertex_ai", "route": "api", "model": "auto"}],
     )
     models = [
         ModelInfo(
@@ -98,10 +98,22 @@ def test_auto_resolution_avoids_preview_models_when_choosing_fallback():
     assert harness.providers[0]["model"] == "gemini-3-pro"
 
 
-def test_auto_resolution_uses_canonical_discovery_for_plan_provider():
+def test_auto_resolution_for_subscription_route_shares_vendor_catalog():
+    """A subscription-style route (``anthropic:plan``) shares the vendor's catalog.
+
+    Under the vendor/route architecture, the route is ``plan`` but the vendor
+    is ``anthropic`` — and the model catalog is keyed on vendor. The resolver
+    reads ``provider["vendor"]`` to find candidate models.
+    """
     harness = _DiscoveryHarness(
-        config={"claude_plan": {"selection_hints": ["sonnet"]}},
-        providers=[{"name": "claude_plan", "model": "auto"}],
+        config={},
+        providers=[{
+            "name": "anthropic:plan",
+            "vendor": "anthropic",
+            "route": "plan",
+            "model": "auto",
+            "selection_hints": ["sonnet"],
+        }],
     )
     models = [
         ModelInfo(
@@ -125,47 +137,21 @@ def test_auto_resolution_uses_canonical_discovery_for_plan_provider():
     assert harness.providers[0]["model"] == "claude-sonnet-4-6"
 
 
-def test_discovery_alias_projection_builds_plan_provider_models():
-    harness = _DiscoveryHarness(
-        config={"openai_plan": {"selection_hints": ["gpt-5.4"]}},
-        providers=[{"name": "openai_plan", "model": "auto"}],
-    )
-    models = [
-        ModelInfo(
-            id="gpt-5.4",
-            provider="openai",
-            display_name="GPT-5.4",
-            category=ModelCategory.CHAT,
-            supports_tools=True,
-        ),
-    ]
+def test_shipped_llm_config_uses_auto_models_for_primary_routes():
+    """Every shipped route in llm_config.toml has ``model = "auto"``.
 
-    projected = harness._build_alias_discovery_models(models)
-
-    assert len(projected) == 1
-    assert projected[0].provider == "openai_plan"
-    assert projected[0].id == "gpt-5.4"
-
-
-def test_shipped_llm_config_uses_auto_models_for_primary_providers():
+    Concrete IDs are never hardcoded in config; they resolve from discovery.
+    """
     import tomllib
 
     with open(PROJECT_ROOT / "llm_config.toml", "rb") as handle:
         config = tomllib.load(handle)
 
-    for provider_name in [
-        "claude_plan",
-        "openai_plan",
-        "openrouter",
-        "openai",
-        "openai_mini",
-        "anthropic",
-        "vertex_ai",
-        "runpod",
-        "llama_cpp",
-        "ollama",
-        "xai",
-        "groq",
-    ]:
-        assert config[provider_name]["model"] == "auto"
-        assert "selection_hints" in config[provider_name] or provider_name == "llama_cpp"
+    vendors = config.get("vendors") or {}
+    # Walk every (vendor, route) pair and assert it asks discovery to pick.
+    for vendor_name, vendor_cfg in vendors.items():
+        for route_name, route_cfg in (vendor_cfg.get("routes") or {}).items():
+            assert route_cfg.get("model") == "auto", (
+                f"{vendor_name}:{route_name} must use model='auto' — "
+                "no hardcoded model IDs in config."
+            )

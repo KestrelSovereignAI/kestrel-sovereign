@@ -37,14 +37,14 @@ async def test_openrouter_provider_initialization():
 
     service = LLMService()
 
-    # Find OpenRouter provider
-    openrouter_provider = None
-    for p in service.providers:
-        if p["name"] == "openrouter":
-            openrouter_provider = p
-            break
+    # Find OpenRouter route. Provider names are composite "<vendor>:<route>"
+    # under the vendor/route/model schema; match by vendor field.
+    openrouter_provider = next(
+        (p for p in service.providers if p.get("vendor") == "openrouter"),
+        None,
+    )
 
-    assert openrouter_provider is not None, "OpenRouter provider not initialized"
+    assert openrouter_provider is not None, "OpenRouter route not initialized"
     # Model may be "auto" (resolved at runtime via selection_hints) or explicit
     assert openrouter_provider["model"] is not None
     assert openrouter_provider["adapter"] is not None
@@ -118,15 +118,16 @@ async def test_openrouter_is_primary_provider():
 
     service = LLMService()
 
-    # Check provider order - use registry if available, fallback to providers list
+    # Vendor/route/model schema: provider names are composite "<vendor>:<route>".
+    # Match by vendor so a vendor with multiple routes (or just the api route)
+    # both count as "openrouter available".
     if hasattr(service, 'provider_registry') and service.provider_registry:
-        provider_names = [p.name for p in service.provider_registry.providers]
+        vendors = {getattr(p, "vendor", None) for p in service.provider_registry.providers}
     else:
-        provider_names = [p["name"] for p in service.providers]
+        vendors = {p.get("vendor") for p in service.providers}
 
-    # OpenRouter should be available (position may vary based on config)
-    assert "openrouter" in provider_names, \
-        f"OpenRouter should be in providers, got: {provider_names}"
+    assert "openrouter" in vendors, \
+        f"OpenRouter vendor should be initialized, got: {sorted(v for v in vendors if v)}"
 
 
 @pytest.mark.asyncio

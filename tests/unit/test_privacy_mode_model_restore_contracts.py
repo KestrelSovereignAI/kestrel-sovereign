@@ -37,19 +37,21 @@ def _restore_app(app, original):
 class _FakeLLMService:
     def __init__(self):
         self.providers = [
-            {"name": "openai", "model": "gpt-5-mini"},
-            {"name": "ollama", "model": "llama3.2:3b"},
+            {"name": "openai:api", "vendor": "openai", "route": "api",
+             "model": "gpt-5-mini", "is_cloud": True, "is_local": False},
+            {"name": "ollama:local", "vendor": "ollama", "route": "local",
+             "model": "llama3.2:3b", "is_cloud": False, "is_local": True},
         ]
-        self._pref = {"model": None, "provider": None}
+        self._pref = {"vendor": None, "model": None, "route": None}
         self._pre_ephemeral_preference = None
         self.calls = []
 
     def get_model_preference(self):
         return dict(self._pref)
 
-    def set_model_preference(self, model, provider=None):
-        self.calls.append((model, provider))
-        self._pref = {"model": model, "provider": provider}
+    def set_model_preference(self, model, vendor=None, route=None):
+        self.calls.append((model, vendor, route))
+        self._pref = {"vendor": vendor, "model": model, "route": route}
 
     def get_active_model_id(self):
         if self._pref.get("model"):
@@ -57,7 +59,7 @@ class _FakeLLMService:
         return self.providers[0]["model"]
 
     def _get_local_provider_names(self):
-        return ["ollama"]
+        return {"ollama:local"}
 
 
 class _FakeStorage:
@@ -102,17 +104,19 @@ def test_privacy_mode_restores_default_cloud_model_after_local_only_transition()
                 )
         assert isolated_response.status_code == 200
         assert isolated_response.json()["model_switched"] == {
-            "provider": "ollama",
+            "vendor": "ollama",
+            "route": "local",
             "model": "llama3.2:3b",
         }
         assert normal_response.status_code == 200
         assert normal_response.json()["model_switched"] == {
-            "provider": "openai",
+            "vendor": "openai",
+            "route": "api",
             "model": "gpt-5-mini",
         }
         assert llm_service.calls == [
-            ("llama3.2:3b", "ollama"),
-            ("gpt-5-mini", "openai"),
+            ("llama3.2:3b", "ollama", "local"),
+            ("gpt-5-mini", "openai", "api"),
         ]
     finally:
         _restore_app(app, original)
@@ -120,7 +124,7 @@ def test_privacy_mode_restores_default_cloud_model_after_local_only_transition()
 
 def test_privacy_mode_restores_explicit_cloud_preference_after_local_only_transition():
     llm_service = _FakeLLMService()
-    llm_service._pref = {"model": "claude-sonnet-4-5", "provider": "anthropic"}
+    llm_service._pref = {"vendor": "anthropic", "model": "claude-sonnet-4-5", "route": "api"}
     privacy_agent = MagicMock()
     privacy_agent.privacy_config.allows_cloud_llm.return_value = True
     agent = MagicMock(llm_service=llm_service, privacy_agent=privacy_agent)
@@ -142,10 +146,11 @@ def test_privacy_mode_restores_explicit_cloud_preference_after_local_only_transi
                 )
         assert response.status_code == 200
         assert response.json()["model_switched"] == {
-            "provider": "anthropic",
+            "vendor": "anthropic",
+            "route": "api",
             "model": "claude-sonnet-4-5",
         }
-        assert llm_service.calls[-1] == ("claude-sonnet-4-5", "anthropic")
+        assert llm_service.calls[-1] == ("claude-sonnet-4-5", "anthropic", "api")
     finally:
         _restore_app(app, original)
 
@@ -160,12 +165,14 @@ def test_agent_level_privacy_transition_switches_to_local_model():
 
     assert result.message == "Privacy mode changed from normal to isolated."
     assert result.model_switched == {
-        "provider": "ollama",
+        "vendor": "ollama",
+        "route": "local",
         "model": "llama3.2:3b",
     }
-    assert llm_service.calls == [("llama3.2:3b", "ollama")]
+    assert llm_service.calls == [("llama3.2:3b", "ollama", "local")]
     assert llm_service._pre_ephemeral_preference == {
-        "provider": "openai",
+        "vendor": "openai",
+        "route": "api",
         "model": "gpt-5-mini",
     }
 
@@ -180,4 +187,4 @@ def test_privacy_command_path_uses_agent_level_model_transition():
     result = asyncio.run(handler._cmd_privacy("!privacy isolated"))
 
     assert result == "Privacy mode changed from normal to isolated."
-    assert llm_service.calls == [("llama3.2:3b", "ollama")]
+    assert llm_service.calls == [("llama3.2:3b", "ollama", "local")]
