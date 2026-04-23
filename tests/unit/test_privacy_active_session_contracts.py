@@ -85,10 +85,16 @@ def _make_streaming_agent():
     agent.features = {}
     agent.hooks_manager = None
     agent.context_manager = MagicMock()
+    # ContextResult now carries dynamic_user_context (issue #703) — per-turn
+    # retrieved content that belongs in the user message, not system.
     agent.context_manager.build_context = AsyncMock(
-        return_value=SimpleNamespace(system_prompt="system", messages=[])
+        return_value=SimpleNamespace(
+            system_prompt="system",
+            messages=[],
+            dynamic_user_context="",
+        )
     )
-    agent.user_prompt_template = "{query}"
+    agent.user_prompt_template = "{context}{query}"
     agent._cached_features_prompt = ""
     agent.extension = None
     agent.observability_store = _ObservabilityStore()

@@ -48,6 +48,12 @@ class ContextResult:
     memory_count: int = 0
     rag_chunks: int = 0
     warnings: List[str] = field(default_factory=list)
+    # Query-dependent context retrieved for this turn (memories + RAG).
+    # Lives OUTSIDE the system message so the system prefix stays stable
+    # across turns and downstream LLM prompt caches (llama.cpp per-slot KV,
+    # OpenAI prefix cache, Anthropic cache_control) can actually hit.
+    # Callers prepend this to the current user message content.
+    dynamic_user_context: str = ""
 
 
 class ContextManager:
@@ -231,6 +237,9 @@ class ContextManager:
         episode_count = 0
         memory_count = 0
         rag_chunks = 0
+        # Per-turn retrieved context (memories + RAG). Kept OUT of system_prompt
+        # so the system prefix stays stable across turns and prompt caches hit.
+        dynamic_blocks: List[str] = []
 
         # 1b. Inject reflection guidance into system prompt
         if reflection_guidance:
@@ -263,7 +272,8 @@ class ContextManager:
                 episode_count = episode_context.count("**") // 2
                 logger.debug(f"Added {episode_count} episodes to context")
 
-        # 3. Add emotionally-weighted memories
+        # 3. Retrieve emotionally-weighted memories (placed in dynamic user
+        # context, not system, so the system prefix stays cacheable).
         if include_memories and self.memory_retriever:
             try:
                 memories = await self.memory_manager.retrieve_memories(
@@ -276,14 +286,14 @@ class ContextManager:
                     memory_tokens = self.counter.count(memories)
                     if budget.can_fit("memories", memory_tokens):
                         budget.use("memories", memory_tokens)
-                        system_prompt = f"{system_prompt}\n\n{memories}"
+                        dynamic_blocks.append(f"<memories>\n{memories}\n</memories>")
                         memory_count = memories.count("[Memory")
-                        logger.debug(f"Added {memory_count} memories to context")
+                        logger.debug(f"Added {memory_count} memories to dynamic context")
             except Exception as e:
                 logger.warning(f"Memory retrieval failed: {e}")
                 warnings.append(f"Memory retrieval unavailable: {e}")
 
-        # 4. Add RAG context
+        # 4. Retrieve RAG context (placed in dynamic user context, not system).
         if include_rag:
             try:
                 rag_context = await self.context_builder.retrieve_context(query)
@@ -291,17 +301,28 @@ class ContextManager:
                     rag_tokens = self.counter.count(rag_context)
                     if budget.can_fit("rag", rag_tokens):
                         budget.use("rag", rag_tokens)
-                        system_prompt = (
-                            f"{system_prompt}\n\n"
-                            f"--- RELEVANT DOCUMENTS (from indexed files, not current conversation) ---\n"
+                        dynamic_blocks.append(
+                            "<documents>\n"
                             f"{rag_context}\n"
-                            f"--- END DOCUMENTS ---"
+                            "</documents>"
                         )
                         rag_chunks = rag_context.count("[Document") or rag_context.count("Source:")
-                        logger.debug(f"Added {rag_chunks} RAG chunks to context")
+                        logger.debug(f"Added {rag_chunks} RAG chunks to dynamic context")
             except Exception as e:
                 logger.warning(f"RAG retrieval failed: {e}")
                 warnings.append(f"Document search unavailable: {e}")
+
+        # Assemble the per-turn retrieved-context block. Empty string when
+        # nothing was retrieved — caller can use this as-is in a format()
+        # without producing dangling wrapper tags.
+        if dynamic_blocks:
+            dynamic_user_context = (
+                "<retrieved_context>\n"
+                + "\n".join(dynamic_blocks)
+                + "\n</retrieved_context>"
+            )
+        else:
+            dynamic_user_context = ""
 
         # 5. Format conversation history with remaining budget
         formatted_history = self.context_builder.format_conversation_history(
@@ -352,6 +373,7 @@ class ContextManager:
             memory_count=memory_count,
             rag_chunks=rag_chunks,
             warnings=warnings,
+            dynamic_user_context=dynamic_user_context,
         )
 
     async def _build_ephemeral_context(
