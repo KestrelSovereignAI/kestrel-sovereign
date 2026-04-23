@@ -8,13 +8,11 @@ Kestrel is a production-ready framework for creating autonomous AI agents with c
 
 | Pillar | What it means |
 |--------|--------------|
-| **Sovereignty** | DID-based cryptographic identity. The agent belongs to its user — exportable, self-hostable, cloud-optional. |
-| **Constitution** | Every agent runs under an audited set of principles it cannot violate. Genesis audit on creation. Amendment requires cryptographic signature. |
-| **Memory** | SQLite-backed knowledge graph with full-text search and RAG. Conversations, documents, relationships — all searchable, portable, and encrypted at rest. |
+| **Portable DID identity** | Cryptographic identity the agent's user owns. Exportable, self-hostable, cloud-optional — the agent is not bound to any provider. |
+| **Persistent memory you own** | SQLite-backed knowledge graph with full-text search and RAG. Conversations, documents, relationships — all searchable, portable, and encrypted at rest. |
+| **Constitutional governance** | Every agent runs under an audited set of principles enforced *above* the LLM. Genesis audit on creation. Amendment requires cryptographic signature. |
 
 > **In production:** Kestrel powers the AI Companion layer at Caprock Health, replacing static RPM bots with constitutional AI agents for remote patient monitoring.
-
-For the maintained implementation surface, use [`KESTREL_FEATURES.md`](KESTREL_FEATURES.md) as the canonical inventory. Generated audience docs belong under `docs/generated/`, and historical catalogs belong under `docs/archive/`.
 
 ## 🚀 Quick Start
 
@@ -68,6 +66,8 @@ Your agent is now running at `http://localhost:8888`.
 > **Port conflict?** Each agent has its own config. Edit `agent_data/myagent/kestrel.toml` to change the port, or use `--port 8899` on the command line.
 
 > **Test it:** Visit `http://localhost:8888` in your browser to open the built-in **Sovereign Console** (web UI with Chat, Identity, Constitution, Memories, and more). Or check `http://localhost:8888/health` for a quick health check.
+
+> **Windows users:** the CLI prints emoji. If you see `UnicodeEncodeError: 'charmap' codec can't encode character ...`, run `chcp 65001` once in your PowerShell session to switch the console to UTF-8. (As of v0.1.9 the CLI auto-reconfigures stdout, so a fresh install should not hit this.)
 
 ### CLI Commands (Cross-Platform)
 
@@ -165,15 +165,21 @@ Kestrel agents are built on several key components:
 ## 📁 Project Structure
 
 ```
-kestrel/
-├── main.py                    # CLI entry point
-├── kestrel_agent.py          # Core agent class
-├── storage.py       # Memory and knowledge management
-├── inception_service.py      # Agent creation service
-├── config.py                 # Configuration management
-├── llm/                      # LLM adapters and services
-├── features/                 # Detailed feature documentation
-└── tests/                    # Test suite
+kestrel-sovereign/
+├── kestrel_cli.py             # `kestrel` CLI entry point
+├── server.py                  # FastAPI agent server
+├── main.py                    # Direct interactive chat
+├── kestrel_sovereign/         # Core sovereign package
+│   ├── kestrel_agent.py      # Core agent class
+│   ├── inception_service.py  # Agent creation (DID + genesis audit)
+│   ├── agent_config.py       # Per-agent config loader
+│   └── ...
+├── kestrel_sdk/               # Public SDK for feature authors
+├── packages/                  # Extracted feature packages
+├── features/                  # Built-in feature documentation
+├── llm/                       # LLM adapters and services
+├── docs/                      # Architecture & guides
+└── tests/                     # Test suite
 ```
 
 ## 🎯 Core Features
@@ -245,13 +251,12 @@ Detailed documentation is available in the `docs/` directory:
 
 ## 💡 Example Applications
 
-The Kestrel framework is a bedrock for sovereign AI, with the Sovereign Companion as primary focus:
-- **Kestrel App (Romantic/Friendship Companion)**: User-owned for private intimacy, human-led sharing without loss.
-- **Elderly Companion**: Human storytelling collection, health assistance, 'picture frame' legacies.
-- **General Counsel Assistant**: Ethical info provision, bound by Constitution.
-- **Healthcare Assistant**: ONC-compliant data ownership.
-- **Sovereign Mail Services**: Physical mail/notary for tangible anchors.
-Bedrock ensures no companion 'loss' via sovereignty; apps extend for specific human-AI symbiosis, leading to potential agentic independence.
+Kestrel is a foundation for AI agents that need to outlive any single vendor, deployment, or owner. Concrete deployments and good-fit use cases:
+
+- **Healthcare RPM agents** — Already running in a clinical study at Caprock Health: constitutional governance over an LLM, persistent patient-owned memory, audit trail for every clinically-relevant action.
+- **Long-running personal research agents** — Memory accumulates across months without dependency on a single provider's chat history.
+- **Custodial agents for sensitive document workflows** — Privacy-mode tiers (EPHEMERAL → PUBLIC) let one agent handle both an off-the-record consult and a fully-anchored long-term contract.
+- **Multi-agent A2A networks** — JSON-RPC 2.0 agent-to-agent protocol lets sovereign agents collaborate without surrendering their identity to a central broker.
 
 ## 🧪 Testing
 
