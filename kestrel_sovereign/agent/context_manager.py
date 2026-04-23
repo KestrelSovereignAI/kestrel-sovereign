@@ -87,6 +87,7 @@ class ContextManager:
         consolidator: Optional["MemoryConsolidator"] = None,
         memory_retriever: Optional["MemoryRetriever"] = None,
         llm_service: Optional["LLMService"] = None,
+        context_builder: Optional[ContextBuilder] = None,
     ):
         """
         Initialize the context manager.
@@ -98,6 +99,14 @@ class ContextManager:
             consolidator: MemoryConsolidator for episode access
             memory_retriever: MemoryRetriever for emotional memory access
             llm_service: LLMService for model identity and constitutional awareness
+            context_builder: Pre-configured ContextBuilder to use (dependency
+                injection).  Production callers (KestrelAgent) pass their own
+                instance, which has bootstrap files (SOUL.md, AGENTS.md, …)
+                loaded into it — that's how the agent's identity flows into
+                the system prompt.  When None, a minimal ContextBuilder is
+                built here; that fallback is for isolated test contexts and
+                will NOT carry bootstrap content, so any production path
+                that omits this argument is wrong.
         """
         self.storage = storage
         self._llm_service = llm_service
@@ -110,13 +119,20 @@ class ContextManager:
         # Keep public reference for constitutional awareness (used by build_context)
         self.llm_service = llm_service
 
-        # Initialize sub-components — pass llm_service for lazy model resolution
-        self.context_builder = ContextBuilder(
-            storage=storage,
-            consolidator=consolidator,
-            llm_service=llm_service,
-            model=model,
-        )
+        # Initialize sub-components.  Prefer the injected ContextBuilder —
+        # that's the one the agent pre-loaded SOUL.md into.  Constructing a
+        # fresh one here would leave its BootstrapLoader empty, which is
+        # exactly the bug that caused the agent to not know its own name
+        # when asked in chat.
+        if context_builder is not None:
+            self.context_builder = context_builder
+        else:
+            self.context_builder = ContextBuilder(
+                storage=storage,
+                consolidator=consolidator,
+                llm_service=llm_service,
+                model=model,
+            )
 
         # Initialize specialized managers
         self.conversation_manager = ConversationManager(storage, agent_id)
