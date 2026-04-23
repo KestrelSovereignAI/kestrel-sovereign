@@ -165,6 +165,25 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Kestrel Host", lifespan=lifespan)
 
+# --- OAuth setup (Google sign-in for browser sessions) ---
+# Mirrors server.py wiring so rookery mode supports the same auth flow.
+from endpoints.auth_oauth import (
+    router as auth_oauth_router,
+    register_oauth,
+    oauth,
+)
+
+app.include_router(auth_oauth_router)
+register_oauth(app)
+
+
+def _oauth_required() -> bool:
+    """Whether OAuth is required (same env flag as server.py)."""
+    return os.environ.get("KESTREL_REQUIRE_OAUTH", "").lower() in {
+        "1", "true", "yes", "on"
+    }
+
+
 # Mount static files
 STATIC_DIR = Path(__file__).parent / "kestrel_sovereign" / "static"
 if STATIC_DIR.is_dir():
@@ -179,18 +198,32 @@ if STATIC_DIR.is_dir():
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
     """Global authentication middleware (same pattern as server.py)."""
-    public_paths = {"/health", "/", "/favicon.ico", "/api/auth/key"}
+    public_paths = {"/health", "/", "/favicon.ico"}
+    # /api/auth/key only when OAuth is NOT required (so the frontend can
+    # bootstrap). When OAuth IS required, hitting it returns 403 and the
+    # frontend redirects to /auth/login.
+    if not _oauth_required():
+        public_paths.add("/api/auth/key")
+    # OAuth endpoints must be reachable without existing auth
+    auth_paths = {"/auth/login", "/auth/callback", "/auth/logout", "/auth/me", "/auth/token"}
     static_prefixes = ("/static", "/js/", "/shared/", "/utils/", "/api/github/")
 
-    if request.url.path in public_paths or any(
-        request.url.path.startswith(p) for p in static_prefixes
-    ):
+    if request.url.path in public_paths or request.url.path in auth_paths:
+        return await call_next(request)
+    if any(request.url.path.startswith(p) for p in static_prefixes):
         return await call_next(request)
     # Webhooks authenticate themselves (HMAC, bearer, etc.) — bypass API key auth
     if request.url.path.startswith("/webhooks/"):
         return await call_next(request)
     if request.method == "OPTIONS":
         return await call_next(request)
+
+    # When OAuth is required, bootstrap key is forbidden
+    if request.url.path == "/api/auth/key" and _oauth_required():
+        return JSONResponse(
+            content={"detail": "API key bootstrap disabled — OAuth required"},
+            status_code=403,
+        )
 
     expected_key = get_api_key()
 
@@ -206,6 +239,11 @@ async def auth_middleware(request: Request, call_next):
         if secrets.compare_digest(token, expected_key):
             return await call_next(request)
 
+    # Check OAuth session cookie
+    user_email = request.session.get("user_email") if hasattr(request, "session") else None
+    if user_email:
+        return await call_next(request)
+
     # Check query parameter for SSE endpoints only (EventSource can't send headers)
     # Restricted to SSE paths to avoid leaking keys in URL logs on other endpoints
     api_key_query = request.query_params.get("api_key")
@@ -213,10 +251,43 @@ async def auth_middleware(request: Request, call_next):
         if secrets.compare_digest(api_key_query, expected_key):
             return await call_next(request)
 
+    # No valid auth — for the root page in a browser, redirect to OAuth login
+    if request.url.path == "/":
+        accept = request.headers.get("accept", "")
+        if "text/html" in accept and _oauth_required() and "google" in oauth._clients:
+            from fastapi.responses import RedirectResponse
+            return RedirectResponse(url="/auth/login", status_code=302)
+
     return JSONResponse(
         content={"detail": "Invalid or missing API Key"},
         status_code=401,
     )
+
+
+# Session middleware must be added AFTER auth_middleware so it's outermost
+# (Starlette processes middleware in reverse order of addition). This gives
+# auth_middleware access to request.session when checking the OAuth cookie.
+from starlette.middleware.sessions import SessionMiddleware
+
+
+def _get_session_secret() -> str:
+    secret = os.environ.get("KESTREL_SESSION_SECRET") or os.environ.get("KESTREL_API_KEY")
+    if not secret:
+        secret = secrets.token_urlsafe(32)
+        logger.warning(
+            "No KESTREL_SESSION_SECRET set — using random ephemeral secret"
+        )
+    return secret
+
+
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=_get_session_secret(),
+    session_cookie="kestrel_session",
+    max_age=7 * 24 * 3600,
+    same_site="lax",
+    https_only=os.environ.get("KESTREL_ENV", "development") == "production",
+)
 
 
 # CORS middleware — added after auth so it runs outermost (before auth).
