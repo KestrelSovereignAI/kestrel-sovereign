@@ -216,26 +216,84 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
     ) -> None:
         """Set the mandated model selection for this session.
 
+        When ``vendor`` is omitted, we resolve it from the discovery catalog
+        before persisting. A bare model id with no vendor would otherwise
+        broadcast across every provider in priority order on the next request
+        (anthropic:plan → openai:plan → openrouter:api → ...), eventually
+        landing on whichever backend happens to serve *something* with a
+        matching id — which is how a "switch to gpt-5-mini" call ended up
+        routing to OpenRouter's Gemini. The mandate must name a vendor.
+
         Args:
             model: The model ID to use. ``"auto"`` is ignored (means default routing).
             vendor: Optional vendor name (``"openai"``, ``"anthropic"``, ...).
-                When given, only routes for this vendor are used.
+                When given, only routes for this vendor are used. When
+                omitted, auto-resolved from discovery.
             route: Optional route name (``"api"``, ``"plan"``, ``"local"``).
                 When given with a vendor, narrows to the exact ``<vendor>:<route>``.
+
+        Raises:
+            ValueError: if vendor is omitted and the discovery catalog has
+                zero matches (unknown model) or multiple matches (ambiguous).
         """
         if model == "auto":
             logger.debug("Ignoring model preference 'auto' — using default routing")
             return
+
+        if vendor is None:
+            resolved = self._resolve_vendor_for_model(model)
+            if isinstance(resolved, list):
+                raise ValueError(
+                    f"Model '{model}' is ambiguous — served by {resolved}. "
+                    f"Specify vendor explicitly via set_model_preference("
+                    f"'{model}', vendor='{resolved[0]}'), or use the "
+                    f"'<vendor>/<model>' form."
+                )
+            if resolved is None:
+                # Catalog has no match. This is the broadcast-bug entry point
+                # (LLM-tool calling set_model with a hallucinated name, UI
+                # sending a stale model id, etc.). Refuse rather than persist
+                # a vendor-less mandate and let the next request broadcast.
+                raise ValueError(
+                    f"Cannot set model '{model}' without a vendor: the "
+                    f"discovery catalog has no match. Specify vendor "
+                    f"explicitly, or run model discovery first."
+                )
+            vendor = resolved
+            logger.info(
+                "Auto-resolved vendor '%s' for model '%s' from discovery catalog",
+                vendor, model,
+            )
+
         self._mandate_preference = {"vendor": vendor, "model": model, "route": route}
-        if vendor and route:
+        if route:
             logger.info("Model preference set: %s:%s/%s", vendor, route, model)
-        elif vendor:
-            logger.info("Model preference set: %s/%s", vendor, model)
         else:
-            logger.info("Model preference set: %s (vendor auto-detect)", model)
+            logger.info("Model preference set: %s/%s", vendor, model)
 
         if self._preference_persistence_callback:
             self._schedule_preference_persistence(model, vendor, route)
+
+    def _resolve_vendor_for_model(self, model: str) -> Optional[Any]:
+        """Resolve which vendor serves a given model id from discovery.
+
+        Returns:
+            - ``str`` — the single vendor that serves the model.
+            - ``list[str]`` — multiple vendors serve this id (ambiguous);
+              caller must specify.
+            - ``None`` — catalog has no match (unknown model, or discovery
+              hasn't populated yet).
+        """
+        from .model_cache import get_shared_model_cache
+        cache = get_shared_model_cache().get_any()
+        if not cache:
+            return None
+        vendors = sorted({m.provider for m in cache if m.id == model and m.provider})
+        if not vendors:
+            return None
+        if len(vendors) == 1:
+            return vendors[0]
+        return vendors
 
     def clear_model_preference(self) -> None:
         """Clear any mandated model preference, returning to default behavior."""

@@ -153,26 +153,21 @@ class ModelAgent(Feature):
 
     @tool(
         name="get_current_model",
-        description="Show the currently active AI model. If a model argument is provided, set that model instead.",
+        description="Report the currently active AI model. Read-only; takes no arguments.",
         category=ToolCategory.MODEL_MANAGEMENT,
         command_prefix="!model"
     )
-    async def get_current_model(self, model: Optional[str] = None) -> Dict[str, Any]:
+    async def get_current_model(self) -> Dict[str, Any]:
+        """Report the currently active ``{vendor, model, route}``.
+
+        Pure read — never mutates mandate state. The tool used to accept an
+        optional ``model`` argument and delegate to ``set_model`` when one was
+        given ("dual-purpose"), but the LLM could and did invoke this tool
+        with a hallucinated model argument when asked to *report* its model —
+        silently rewriting the mandate to a vendor-less bare id and sending
+        the next request into a broadcast cascade across every provider.
+        Setting is now only reachable via the separate ``set_model`` tool.
         """
-        Show current model or set a new one if model argument is provided.
-
-        Args:
-            model: Optional model to set (format: provider/model or just model name)
-
-        Returns:
-            Dict with current model info and optional MODEL_CHANGED marker for UI sync
-        """
-        import json
-
-        # If model argument provided, delegate to set_model
-        if model:
-            return await self.set_model(model)
-
         from kestrel_sovereign.llm.service import resolve_active_model_selection
         selection = resolve_active_model_selection(self.llm_service)
         model_str = selection["model"]

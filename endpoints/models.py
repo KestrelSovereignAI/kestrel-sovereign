@@ -878,20 +878,35 @@ async def set_current_model(request: Request):
             else:
                 vendor = left
 
-        agent.llm_service.set_model_preference(model_name, vendor, route)
+        try:
+            agent.llm_service.set_model_preference(model_name, vendor, route)
+        except ValueError as ve:
+            # set_model_preference raises ValueError for bare models that
+            # can't be auto-resolved (unknown or ambiguous). Surface the
+            # reason so the caller — especially an LLM using the set_model
+            # tool — sees *why* and can try again with a vendor-qualified
+            # form instead of silently failing.
+            raise HTTPException(status_code=400, detail=str(ve))
 
-        if vendor and route:
-            full = f"{vendor}:{route}/{model_name}"
-        elif vendor:
-            full = f"{vendor}/{model_name}"
+        # Re-read the persisted selection so the response reflects any
+        # vendor auto-resolution that happened inside set_model_preference.
+        pref = agent.llm_service.get_model_preference()
+        final_vendor = pref.get("vendor")
+        final_route = pref.get("route")
+        final_model = pref.get("model") or model_name
+
+        if final_vendor and final_route:
+            full = f"{final_vendor}:{final_route}/{final_model}"
+        elif final_vendor:
+            full = f"{final_vendor}/{final_model}"
         else:
-            full = model_name
+            full = final_model
 
         return {
             "success": True,
-            "vendor": vendor,
-            "route": route,
-            "model": model_name,
+            "vendor": final_vendor,
+            "route": final_route,
+            "model": final_model,
             "full_model": full,
         }
     except HTTPException:

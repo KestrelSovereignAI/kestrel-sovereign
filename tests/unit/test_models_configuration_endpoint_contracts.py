@@ -305,14 +305,22 @@ def test_models_endpoint_groups_results_and_rejects_invalid_category():
 
 
 def test_current_and_set_model_endpoints_share_runtime_preference_contract():
+    # Simulate a realistic set→get roundtrip: the endpoint now re-reads the
+    # persisted mandate after set_model_preference (so auto-resolution or
+    # normalization inside the service is reflected in the response).
+    _state = {"vendor": "openai", "model": "gpt-5-mini", "route": None}
+
+    def _set(model, vendor=None, route=None):
+        _state["vendor"] = vendor
+        _state["model"] = model
+        _state["route"] = route
+
     llm_service = MagicMock()
-    llm_service.get_model_preference = MagicMock(
-        return_value={"vendor": "openai", "model": "gpt-5-mini", "route": None}
-    )
+    llm_service.get_model_preference = MagicMock(side_effect=lambda: dict(_state))
     llm_service.providers = [
         {"name": "anthropic:api", "vendor": "anthropic", "route": "api", "model": "claude-sonnet"}
     ]
-    llm_service.set_model_preference = MagicMock()
+    llm_service.set_model_preference = MagicMock(side_effect=_set)
     agent = MagicMock(llm_service=llm_service)
 
     app, original = _prepare_app(agent)

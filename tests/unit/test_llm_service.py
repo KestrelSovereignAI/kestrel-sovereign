@@ -211,14 +211,26 @@ class TestModelPreference:
         assert pref["model"] == "claude-sonnet-4-6"
 
     @pytest.mark.asyncio
-    async def test_set_model_preference_without_vendor(self, llm_service):
-        """Setting model without vendor leaves vendor auto-detect (None)."""
-        llm_service.set_model_preference("claude-sonnet-4-5")
+    async def test_set_model_preference_without_vendor_resolves_or_refuses(self, llm_service):
+        """Bare model with no vendor must auto-resolve from catalog or raise.
+
+        A bare mandate (``vendor=None``) used to persist as-is and broadcast
+        to every provider on the next request — the cascade that caused a
+        "switch to gpt-5-mini" to end up served by OpenRouter as a Gemini
+        model. Now, set_model_preference either resolves the vendor via
+        discovery or raises ValueError. The mandate must name a vendor.
+        """
+        from unittest.mock import MagicMock, patch
+
+        # Empty discovery cache → refusal, mandate untouched.
+        cache = MagicMock()
+        cache.get_any = MagicMock(return_value=None)
+        with patch("kestrel_sovereign.llm.model_cache.get_shared_model_cache", return_value=cache):
+            with pytest.raises(ValueError):
+                llm_service.set_model_preference("claude-sonnet-4-5")
 
         pref = llm_service.get_model_preference()
-        assert pref["model"] == "claude-sonnet-4-5"
-        assert pref["vendor"] is None
-        assert pref["route"] is None
+        assert pref == {"vendor": None, "model": None, "route": None}
 
     @pytest.mark.asyncio
     async def test_clear_model_preference(self, llm_service):

@@ -175,14 +175,36 @@ class TestResolveProviderRouting:
         assert len(providers) == 3
         assert target is None
 
-    def test_model_only_preference_keeps_all_providers(self, service_with_providers):
+    def test_bare_model_preference_requires_vendor_resolution(self, service_with_providers):
+        """A bare model with no vendor must resolve via discovery, not broadcast.
+
+        Before #688 fix, set_model_preference("gpt-5-mini") persisted
+        {vendor: None, model: "gpt-5-mini"} and resolve_provider_routing
+        would return ALL providers with target_model="gpt-5-mini" — a
+        broadcast cascade that ended up serving the request from whichever
+        provider happened to recognize the id (OpenRouter → Gemini in one
+        live incident). Now, a bare model requires the catalog to identify
+        a single vendor, or set_model_preference raises ValueError.
+        """
         svc = service_with_providers
-        svc.set_model_preference("gpt-5-mini")
 
+        # With an empty discovery cache, the refusal bubbles up — no
+        # vendor-less mandate can be persisted.
+        from unittest.mock import MagicMock, patch as _patch
+        empty_cache = MagicMock()
+        empty_cache.get_any = MagicMock(return_value=None)
+        with _patch(
+            "kestrel_sovereign.llm.model_cache.get_shared_model_cache",
+            return_value=empty_cache,
+        ):
+            with pytest.raises(ValueError):
+                svc.set_model_preference("gpt-5-mini")
+
+        # Mandate is unchanged (defaults), so routing returns all providers
+        # with no target — the normal "no mandate" path.
         providers, target = svc.resolve_provider_routing()
-
         assert len(providers) == 3
-        assert target == "gpt-5-mini"
+        assert target is None
 
     def test_vendor_route_preference_restricts_to_single_route(self, service_with_providers):
         svc = service_with_providers
