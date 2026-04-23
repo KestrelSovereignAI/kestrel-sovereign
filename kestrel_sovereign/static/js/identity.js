@@ -785,7 +785,16 @@ document.addEventListener('DOMContentLoaded', () => {
     if (newConversationSidebarBtn) {
         newConversationSidebarBtn.addEventListener('click', async () => {
             try {
-                await API.newConversation();
+                // Delegate to the canonical start-new-conversation flow so we
+                // update state.currentSessionId, clear the chat, refresh the
+                // context-status footer, and reload the sidebar in one shot.
+                // Duplicating partial logic here left the footer showing the
+                // old conversation's message count and utilization.
+                if (typeof window.startNewConversation === 'function') {
+                    await window.startNewConversation();
+                } else {
+                    await API.newConversation();
+                }
                 if (selectedAgentName) {
                     await loadConversations(selectedAgentName);
                 }
