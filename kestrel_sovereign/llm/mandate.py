@@ -139,7 +139,10 @@ class ModelMandateMixin:
     def clear_mandate(self):
         """Reset the mandate to defaults from the TOML file."""
         self.mandate_config = load_config("model_mandate.toml")
-        self._mandate_preference = {"model": None, "provider": None}
+        # Match the vendor/route/model schema used by set_model_preference
+        # and clear_model_preference — previously left {"model", "provider"},
+        # which desynced the mandate shape mid-session.
+        self._mandate_preference = {"vendor": None, "model": None, "route": None}
         self._mandate_fallbacks = []
         logger.info("Model mandate cleared, reset to TOML defaults")
 

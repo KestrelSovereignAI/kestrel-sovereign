@@ -594,21 +594,24 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         provider: str = "openrouter",
     ) -> bool:
         """
-        Switch to using an agent's provisioned API key.
+        Switch to using an agent's provisioned API key for a given vendor.
 
         This replaces the shared key with the agent's own key for billing isolation.
         The agent's key was created at inception and stored encrypted.
 
+        Under the vendor/route/model schema, ``provider`` names a **vendor**
+        (e.g. ``"openrouter"``); every route belonging to that vendor has its
+        client swapped. Base URL is read from the route config or from the
+        existing client so we don't need a legacy flat ``config[provider]``.
+
         Args:
             agent_did: The agent's DID
             db: Database connection for ServiceKeyStorage
-            provider: Provider name (default: openrouter)
+            provider: Vendor name (default: ``"openrouter"``)
 
         Returns:
-            True if key was activated, False if agent has no key
-
-        Raises:
-            KeyNotConfiguredError: If key retrieval fails
+            True if key was activated, False if agent has no key or no
+            matching routes are initialized.
         """
         from kestrel_sovereign.security.service_key_storage import ServiceKeyStorage, KeyNotConfiguredError
 
@@ -619,28 +622,50 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
             logger.debug(f"Agent {agent_did[:20]}... has no {provider} key, using shared key")
             return False
 
-        # Get base_url from config
-        provider_config = self.config.get(provider, {})
-        base_url = provider_config.get("base_url")
+        # Find every route for this vendor and rebuild its client with the
+        # agent key. Multiple routes per vendor is the whole point of the
+        # refactor — don't stop after the first match.
+        matched_any = False
+        for p in self.providers:
+            if p.get("vendor") != provider:
+                continue
+            # Pull base_url from the route (set by ProviderRegistry) or fall
+            # back to the current client's base_url attribute for adapters
+            # that don't carry it explicitly.
+            base_url = p.get("base_url")
+            if not base_url:
+                existing = p.get("client")
+                base_url = getattr(existing, "base_url", None)
+                if base_url is not None:
+                    base_url = str(base_url)
+            if not base_url:
+                logger.warning(
+                    "No base_url for vendor %s route %s — skipping key swap",
+                    provider, p.get("route"),
+                )
+                continue
 
-        if not base_url:
-            logger.warning(f"No base_url for provider {provider}")
-            return False
-
-        # Create new client with agent's key
-        new_client = openai.AsyncOpenAI(api_key=agent_key, base_url=base_url)
-
-        # Update the provider's client through registry
-        if self.provider_registry.update_provider_client(provider, new_client):
-            # Also update the legacy format for backward compatibility
-            for p in self.providers:
-                if p["name"] == provider:
-                    p["client"] = new_client
+            new_client = openai.AsyncOpenAI(
+                api_key=agent_key, base_url=base_url, max_retries=0,
+            )
+            p["client"] = new_client
+            # Keep the registry's ProviderInfo in sync so later code paths
+            # that walk self.provider_registry.providers see the new client.
+            for info in getattr(self.provider_registry, "providers", []):
+                if getattr(info, "vendor", None) == provider \
+                        and getattr(info, "route", None) == p.get("route"):
+                    info.client = new_client
                     break
-            logger.info(f"Activated agent key for {provider} (DID: {agent_did[:20]}...)")
+            matched_any = True
+
+        if matched_any:
+            logger.info(
+                "Activated agent key for vendor %s (DID: %s...)",
+                provider, agent_did[:20],
+            )
             return True
 
-        logger.warning(f"Provider {provider} not found in initialized providers")
+        logger.warning("Vendor %s has no initialized routes — agent key not activated", provider)
         return False
 
     def _get_model_for_prompt(self, user_prompt: str) -> Optional[str]:

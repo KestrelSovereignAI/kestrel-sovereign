@@ -25,12 +25,14 @@ class TestModelMandateMethods:
         return LLMService()
 
     def test_get_current_mandate_returns_structure(self, llm_service):
-        """get_current_mandate() returns expected structure."""
+        """get_current_mandate() returns expected structure under the
+        vendor/route/model schema."""
         mandate = llm_service.get_current_mandate()
 
         assert "preference" in mandate
         assert "model" in mandate["preference"]
-        assert "provider" in mandate["preference"]
+        assert "vendor" in mandate["preference"]
+        assert "route" in mandate["preference"]
         assert "fallbacks" in mandate
         assert "banned" in mandate
         assert "mandates" in mandate
@@ -48,20 +50,28 @@ class TestModelMandateMethods:
         assert mandate["preference"] is not None
 
     def test_set_model_preference(self, llm_service):
-        """set_model_preference() changes preference."""
-        llm_service.set_model_preference("test-model-123", "test-provider")
+        """set_model_preference() changes preference under {vendor, model, route}."""
+        llm_service.set_model_preference(
+            "test-model-123", vendor="test-vendor", route="api"
+        )
 
         mandate = llm_service.get_current_mandate()
         assert mandate["preference"]["model"] == "test-model-123"
-        assert mandate["preference"]["provider"] == "test-provider"
+        assert mandate["preference"]["vendor"] == "test-vendor"
+        assert mandate["preference"]["route"] == "api"
 
-    def test_set_model_preference_without_provider(self, llm_service):
-        """set_model_preference() works without provider."""
-        llm_service.set_model_preference("solo-model")
+    def test_set_model_preference_without_vendor_refuses_unknown_id(self, llm_service):
+        """Bare model id with no vendor must resolve via catalog or raise.
 
-        mandate = llm_service.get_current_mandate()
-        assert mandate["preference"]["model"] == "solo-model"
-        assert mandate["preference"]["provider"] is None
+        A "solo-model" that isn't in the discovery catalog can't auto-resolve,
+        so set_model_preference raises instead of persisting a vendor-less
+        mandate (which would broadcast across every provider on the next
+        request — the "answered as Gemini" bug).
+        """
+        import pytest
+
+        with pytest.raises(ValueError):
+            llm_service.set_model_preference("solo-model-not-in-catalog")
 
     def test_add_fallback_model(self, llm_service):
         """add_fallback_model() adds to fallback list."""
@@ -83,8 +93,8 @@ class TestModelMandateMethods:
 
     def test_clear_mandate_resets_preference(self, llm_service):
         """clear_mandate() resets to TOML defaults."""
-        # Set custom preference
-        llm_service.set_model_preference("custom-model")
+        # Set custom preference with explicit vendor (required by the new schema).
+        llm_service.set_model_preference("custom-model", vendor="custom-vendor")
         llm_service.add_fallback_model("custom-fallback")
 
         # Verify it was set
@@ -141,14 +151,14 @@ class TestModelDiscoveryAPI:
             app.router.lifespan_context = original_lifespan
             app.state.agent = None
 
-    def test_api_models_returns_by_provider(self, client):
-        """GET /api/models returns by_provider grouped format."""
+    def test_api_models_returns_by_vendor(self, client):
+        """GET /api/models returns by_vendor grouped format (vendor/route/model schema)."""
         response = client.get("/api/models")
 
         assert response.status_code == 200
         data = response.json()
-        assert "by_provider" in data
-        assert isinstance(data["by_provider"], dict)
+        assert "by_vendor" in data
+        assert isinstance(data["by_vendor"], dict)
 
     def test_api_models_returns_all_list(self, client):
         """GET /api/models returns all models list."""
@@ -368,22 +378,22 @@ class TestModelSetEndpoint:
             app.router.lifespan_context = original_lifespan
             app.state.agent = None
 
-    def test_set_model_with_provider(self, client):
-        """POST /api/model/set with explicit model and provider."""
+    def test_set_model_with_vendor(self, client):
+        """POST /api/model/set with explicit model and vendor."""
         response = client.post("/api/model/set", json={
             "model": "gpt-5-mini",
-            "provider": "openai",
+            "vendor": "openai",
         })
 
         assert response.status_code == 200
         data = response.json()
         assert data["success"] is True
         assert data["model"] == "gpt-5-mini"
-        assert data["provider"] == "openai"
+        assert data["vendor"] == "openai"
         assert data["full_model"] == "openai/gpt-5-mini"
 
     def test_set_model_combined_format(self, client):
-        """POST /api/model/set with combined provider/model format."""
+        """POST /api/model/set with combined vendor/model format."""
         response = client.post("/api/model/set", json={
             "model": "anthropic/claude-sonnet-4-5",
         })
@@ -392,19 +402,37 @@ class TestModelSetEndpoint:
         data = response.json()
         assert data["success"] is True
         assert data["model"] == "claude-sonnet-4-5"
-        assert data["provider"] == "anthropic"
+        assert data["vendor"] == "anthropic"
 
-    def test_set_model_without_provider(self, client):
-        """POST /api/model/set with model only (auto-detect)."""
+    def test_set_model_with_vendor_route_composite(self, client):
+        """POST /api/model/set with vendor:route/model composite form."""
         response = client.post("/api/model/set", json={
-            "model": "gpt-5-mini",
+            "model": "anthropic:plan/claude-sonnet-4-6",
         })
 
         assert response.status_code == 200
         data = response.json()
         assert data["success"] is True
-        assert data["model"] == "gpt-5-mini"
-        assert data["provider"] is None
+        assert data["vendor"] == "anthropic"
+        assert data["route"] == "plan"
+        assert data["model"] == "claude-sonnet-4-6"
+        assert data["full_model"] == "anthropic:plan/claude-sonnet-4-6"
+
+    def test_set_model_without_vendor_refuses_unknown(self, client):
+        """Bare model with no vendor must resolve via catalog or raise 400.
+
+        A hallucinated/unknown id has no catalog match, so the endpoint
+        responds 400 with the specific reason — the broadcast-bug guard at
+        the HTTP boundary. (A known id like "gpt-5-mini" would auto-resolve
+        to openai; this test proves the *refusal* path for unknown ids.)
+        """
+        response = client.post("/api/model/set", json={
+            "model": "nonexistent-model-xyz-9000",
+        })
+
+        assert response.status_code == 400
+        detail = response.json().get("detail", "")
+        assert "nonexistent-model-xyz-9000" in detail
 
     def test_set_model_missing_field(self, client):
         """POST /api/model/set without model field returns 400."""
@@ -417,7 +445,7 @@ class TestModelSetEndpoint:
         # Set the model
         client.post("/api/model/set", json={
             "model": "gpt-5-mini",
-            "provider": "openai",
+            "vendor": "openai",
         })
 
         # Verify it's reflected
@@ -425,7 +453,7 @@ class TestModelSetEndpoint:
         assert response.status_code == 200
         data = response.json()
         assert data["model_name"] == "gpt-5-mini"
-        assert data["provider"] == "openai"
+        assert data["vendor"] == "openai"
 
 
 class TestChatCompletionsModelPassthrough:

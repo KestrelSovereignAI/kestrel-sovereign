@@ -75,14 +75,12 @@ async def test_llm_service_use_agent_key():
 
             assert activated is True
 
-            # Verify the provider was updated
-            openrouter_provider = None
-            for p in service.providers:
-                if p["name"] == "openrouter":
-                    openrouter_provider = p
-                    break
-
-            assert openrouter_provider is not None
+            # Verify at least one openrouter route was updated. Under the
+            # vendor/route/model schema, provider names are composite
+            # ``"<vendor>:<route>"`` and a single vendor may have multiple
+            # routes — use_agent_key now swaps all of them.
+            openrouter_routes = [p for p in service.providers if p.get("vendor") == "openrouter"]
+            assert openrouter_routes, "Expected at least one openrouter route to be initialized"
 
         finally:
             # Always clean up the OpenRouter key
