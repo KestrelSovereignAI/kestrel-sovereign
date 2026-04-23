@@ -24,6 +24,99 @@ from kestrel_sovereign.kestrel_config.constants import HTTP_TIMEOUT_DEFAULT
 logger = logging.getLogger(__name__)
 
 
+# --------------------------------------------------------------------------
+# Prompt caching helpers (issue #705)
+# --------------------------------------------------------------------------
+# Anthropic's prompt cache is opt-in via `cache_control: {"type": "ephemeral"}`
+# markers attached to content blocks.  Up to 4 breakpoints per request.
+# Cache hits are charged at 0.1× input tokens; misses at 1× ; writes at
+# 1.25× .  Default TTL is 5 min (1 hour opt-in).
+#
+# Anthropic silently no-ops when the prefix is below the per-model minimum
+# (1024 tokens for Opus/Sonnet, 2048 for Haiku), so the marker placement
+# code doesn't need its own threshold check — Anthropic handles it.
+
+CACHE_CONTROL_EPHEMERAL = {"type": "ephemeral"}
+
+
+def _attach_cache_control(block: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a copy of `block` with ``cache_control: {"type":"ephemeral"}``
+    attached.  Input blocks are not mutated so callers passing shared
+    structures (e.g. tool schemas reused across requests) are safe.
+    """
+    new_block = dict(block)
+    new_block["cache_control"] = CACHE_CONTROL_EPHEMERAL
+    return new_block
+
+
+def _system_as_cacheable_array(system_text: str) -> List[Dict[str, Any]]:
+    """Convert the plain-string system prompt to the content-block array
+    form that Anthropic requires for `cache_control` attachment, with the
+    marker on the single (and therefore final) block.  Covers marker #1:
+    end-of-system.
+    """
+    return [
+        {
+            "type": "text",
+            "text": system_text,
+            "cache_control": CACHE_CONTROL_EPHEMERAL,
+        }
+    ]
+
+
+def _tools_with_final_cache_marker(
+    tools: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Return a new list of tools with `cache_control` attached to the
+    final tool — covers marker #2: end-of-tools.  Caching tool schemas is
+    valuable because they rarely change across turns in a conversation.
+    """
+    if not tools:
+        return tools
+    marked = list(tools[:-1])
+    marked.append(_attach_cache_control(tools[-1]))
+    return marked
+
+
+def _messages_with_penultimate_cache_marker(
+    messages: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Attach `cache_control` to the last message BEFORE the current user
+    turn — covers marker #3: end-of-history.  The current user turn is
+    never cache-marked because it changes every request by definition.
+
+    If `messages` has < 2 entries the final entry IS the current user
+    turn — no history to cache, so returned unchanged.
+
+    Anthropic requires the marker on a content BLOCK.  When a message's
+    content is a plain string we convert it to the single-text-block
+    array form first, matching how the caching docs describe it.
+    """
+    if len(messages) < 2:
+        return messages
+    out = list(messages[:-2])
+    penult = dict(messages[-2])
+    content = penult.get("content")
+    if isinstance(content, str):
+        penult["content"] = [
+            {
+                "type": "text",
+                "text": content,
+                "cache_control": CACHE_CONTROL_EPHEMERAL,
+            }
+        ]
+    elif isinstance(content, list) and content:
+        # Attach marker to the final block in the list.
+        blocks = list(content[:-1])
+        blocks.append(_attach_cache_control(content[-1]))
+        penult["content"] = blocks
+    # Else: content is None/empty — no safe place to anchor the marker,
+    # skip it rather than emit a malformed request.
+    out.append(penult)
+    out.append(messages[-1])
+    return out
+
+
 class AnthropicAdapter(LLMAdapter):
     """
     Adapter for Anthropic Claude API.
@@ -31,6 +124,48 @@ class AnthropicAdapter(LLMAdapter):
     Note: Anthropic uses a different message format than OpenAI.
     The system prompt is passed separately, not in messages.
     """
+
+    @staticmethod
+    def _apply_cache_control(
+        api_params: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Attach ``cache_control: ephemeral`` markers at the canonical
+        positions in the Anthropic request, respecting the 4-breakpoint
+        limit.  Takes and returns a new ``api_params`` dict so callers
+        keep their input intact for logging/retry.
+
+        Markers placed:
+            1. End of ``system`` (converts string → content-block array).
+            2. End of ``tools`` (final tool gets the marker).
+            3. End of conversation history, i.e. the message just before
+               the final user turn.  The current user turn is never
+               marked — it's new content every request.
+
+        The 4th breakpoint is intentionally unused; reserving it lets
+        callers (or future extensions) add a non-standard marker without
+        exceeding Anthropic's per-request cap.
+
+        Anthropic silently no-ops markers whose prefix is below the
+        per-model minimum (1024 tokens for Opus/Sonnet, 2048 for Haiku),
+        so no explicit threshold check is needed here.
+        """
+        updated = dict(api_params)
+
+        system = updated.get("system")
+        if isinstance(system, str) and system:
+            updated["system"] = _system_as_cacheable_array(system)
+
+        tools = updated.get("tools")
+        if isinstance(tools, list) and tools:
+            updated["tools"] = _tools_with_final_cache_marker(tools)
+
+        messages = updated.get("messages")
+        if isinstance(messages, list) and len(messages) >= 2:
+            updated["messages"] = _messages_with_penultimate_cache_marker(
+                messages
+            )
+
+        return updated
 
     def create_messages(
         self,
@@ -264,6 +399,13 @@ class AnthropicAdapter(LLMAdapter):
                 # Convert and add tools
                 api_params["tools"] = self._convert_tools_to_anthropic_format(tools)
 
+            # Apply prompt-cache markers at up to three positions:
+            # end-of-system, end-of-tools, and end-of-history (the message
+            # just before the current user turn).  See issue #705 and the
+            # helper docstrings in this module.  Anthropic silently no-ops
+            # below the per-model minimum cache size, so we don't gate.
+            api_params = self._apply_cache_control(api_params)
+
             response = await with_retry(client.messages.create, **api_params)
 
             # Parse response
@@ -421,6 +563,9 @@ class AnthropicAdapter(LLMAdapter):
             # Note: response_format not implemented for streaming as it requires
             # tool_use which doesn't work well with streaming text output
 
+            # Attach cache_control markers — see issue #705 and _apply_cache_control.
+            api_params = self._apply_cache_control(api_params)
+
             async with client.messages.stream(**api_params) as stream:
                 async for text in stream.text_stream:
                     yield text
@@ -561,6 +706,9 @@ class AnthropicAdapter(LLMAdapter):
                 api_params["tool_choice"] = {"type": "tool", "name": structured_output_tool_name}
             elif tools:
                 api_params["tools"] = self._convert_tools_to_anthropic_format(tools)
+
+            # Attach cache_control markers — see issue #705 and _apply_cache_control.
+            api_params = self._apply_cache_control(api_params)
 
             logger.info(f"Starting Anthropic stream with tools for model: {model}")
 
