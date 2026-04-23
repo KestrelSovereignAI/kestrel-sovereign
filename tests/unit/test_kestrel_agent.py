@@ -385,13 +385,17 @@ class TestMemoryAnchoring:
         conversation.add_log_anchor.assert_called_once_with("hash-123", "tx-abc")
 
     def test_get_current_model_with_preference_set(self, tmp_path):
-        """get_current_model() returns provider/model when preference set."""
+        """get_current_model() returns vendor/model when preference set."""
         mock_llm = MagicMock()
         mock_llm.get_active_model_id.return_value = "gpt-5"
         mock_llm.get_model_preference.return_value = {
-            "provider": "openai",
-            "model": "gpt-5"
+            "vendor": "openai",
+            "model": "gpt-5",
+            "route": None,
         }
+        mock_llm.providers = [
+            {"name": "openai:api", "vendor": "openai", "route": "api", "model": "gpt-5"},
+        ]
 
         agent = KestrelAgent(
             did="did:test:123",
@@ -403,16 +407,17 @@ class TestMemoryAnchoring:
 
         assert result == "openai/gpt-5"
 
-    def test_get_current_model_falls_back_to_first_provider(self, tmp_path):
-        """get_current_model() falls back to first provider when no preference."""
+    def test_get_current_model_with_route_preference_set(self, tmp_path):
+        """get_current_model() returns vendor:route/model when route mandated."""
         mock_llm = MagicMock()
-        mock_llm.get_active_model_id.return_value = "claude-sonnet-4-5"
+        mock_llm.get_active_model_id.return_value = "claude-sonnet-4-6"
         mock_llm.get_model_preference.return_value = {
-            "provider": None,
-            "model": None
+            "vendor": "anthropic",
+            "model": "claude-sonnet-4-6",
+            "route": "plan",
         }
         mock_llm.providers = [
-            {"name": "anthropic", "model": "claude-sonnet-4-5"}
+            {"name": "anthropic:plan", "vendor": "anthropic", "route": "plan", "model": "claude-sonnet-4-6"},
         ]
 
         agent = KestrelAgent(
@@ -423,15 +428,39 @@ class TestMemoryAnchoring:
 
         result = agent.get_current_model()
 
-        assert result == "anthropic/claude-sonnet-4-5"
+        assert result == "anthropic:plan/claude-sonnet-4-6"
+
+    def test_get_current_model_falls_back_to_first_provider(self, tmp_path):
+        """get_current_model() falls back to first route when no preference."""
+        mock_llm = MagicMock()
+        mock_llm.get_active_model_id.return_value = "claude-sonnet-4-5"
+        mock_llm.get_model_preference.return_value = {
+            "vendor": None,
+            "model": None,
+            "route": None,
+        }
+        mock_llm.providers = [
+            {"name": "anthropic:api", "vendor": "anthropic", "route": "api", "model": "claude-sonnet-4-5"},
+        ]
+
+        agent = KestrelAgent(
+            did="did:test:123",
+            storage_path=str(tmp_path / "test.db"),
+            llm_service=mock_llm
+        )
+
+        result = agent.get_current_model()
+
+        assert result == "anthropic:api/claude-sonnet-4-5"
 
     def test_get_current_model_returns_auto_when_no_providers(self, tmp_path):
         """get_current_model() returns 'auto' when no providers available."""
         mock_llm = MagicMock()
         mock_llm.get_active_model_id.return_value = "auto"
         mock_llm.get_model_preference.return_value = {
-            "provider": None,
-            "model": None
+            "vendor": None,
+            "model": None,
+            "route": None,
         }
         mock_llm.providers = []
 

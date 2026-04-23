@@ -95,24 +95,53 @@ def mock_provider_registry(mock_openai_client, mock_adapter):
     """Mock ProviderRegistry."""
     registry = Mock()
 
-    # Mock ProviderInfo objects
-    provider_info_openai = Mock()
-    provider_info_openai.name = "openai"
+    # Mock ProviderInfo objects. Under the vendor/route architecture each
+    # entry represents a route; `name` is the composite "vendor:route" key,
+    # `vendor` carries the grouping dimension, `route` the per-route identity.
+    provider_info_openai = Mock(spec=[
+        "name", "vendor", "route", "client", "adapter", "model",
+        "is_cloud", "is_local", "base_url", "selection_hints",
+    ])
+    provider_info_openai.name = "openai:api"
+    provider_info_openai.vendor = "openai"
+    provider_info_openai.route = "api"
     provider_info_openai.client = mock_openai_client
     provider_info_openai.adapter = mock_adapter
     provider_info_openai.model = "gpt-5-mini"
+    provider_info_openai.is_cloud = True
+    provider_info_openai.is_local = False
+    provider_info_openai.base_url = None
+    provider_info_openai.selection_hints = []
 
-    provider_info_anthropic = Mock()
-    provider_info_anthropic.name = "anthropic"
+    provider_info_anthropic = Mock(spec=[
+        "name", "vendor", "route", "client", "adapter", "model",
+        "is_cloud", "is_local", "base_url", "selection_hints",
+    ])
+    provider_info_anthropic.name = "anthropic:api"
+    provider_info_anthropic.vendor = "anthropic"
+    provider_info_anthropic.route = "api"
     provider_info_anthropic.client = AsyncMock()
     provider_info_anthropic.adapter = mock_adapter
     provider_info_anthropic.model = "claude-sonnet-4-5"
+    provider_info_anthropic.is_cloud = True
+    provider_info_anthropic.is_local = False
+    provider_info_anthropic.base_url = None
+    provider_info_anthropic.selection_hints = []
 
-    provider_info_cheap = Mock()
-    provider_info_cheap.name = "anthropic"
+    provider_info_cheap = Mock(spec=[
+        "name", "vendor", "route", "client", "adapter", "model",
+        "is_cloud", "is_local", "base_url", "selection_hints",
+    ])
+    provider_info_cheap.name = "anthropic:api"
+    provider_info_cheap.vendor = "anthropic"
+    provider_info_cheap.route = "api"
     provider_info_cheap.client = AsyncMock()
     provider_info_cheap.adapter = mock_adapter
     provider_info_cheap.model = "claude-haiku-4-5"
+    provider_info_cheap.is_cloud = True
+    provider_info_cheap.is_local = False
+    provider_info_cheap.base_url = None
+    provider_info_cheap.selection_hints = []
 
     registry.initialize_providers = Mock(return_value=[
         provider_info_openai,
@@ -162,49 +191,74 @@ class TestModelPreference:
     """Tests for model preference methods."""
 
     @pytest.mark.asyncio
-    async def test_set_model_preference_with_provider(self, llm_service):
-        """Test setting model preference with explicit provider."""
-        llm_service.set_model_preference("gpt-5", provider="openai")
+    async def test_set_model_preference_with_vendor(self, llm_service):
+        """Setting with an explicit vendor stores it in the mandate."""
+        llm_service.set_model_preference("gpt-5", vendor="openai")
 
         pref = llm_service.get_model_preference()
         assert pref["model"] == "gpt-5"
-        assert pref["provider"] == "openai"
+        assert pref["vendor"] == "openai"
+        assert pref["route"] is None
 
     @pytest.mark.asyncio
-    async def test_set_model_preference_without_provider(self, llm_service):
-        """Test setting model preference without provider (auto-detect)."""
-        llm_service.set_model_preference("claude-sonnet-4-5")
+    async def test_set_model_preference_with_vendor_and_route(self, llm_service):
+        """Route narrows routing to the exact <vendor>:<route> entry."""
+        llm_service.set_model_preference("claude-sonnet-4-6", vendor="anthropic", route="plan")
 
         pref = llm_service.get_model_preference()
-        assert pref["model"] == "claude-sonnet-4-5"
-        assert pref["provider"] is None
+        assert pref["vendor"] == "anthropic"
+        assert pref["route"] == "plan"
+        assert pref["model"] == "claude-sonnet-4-6"
+
+    @pytest.mark.asyncio
+    async def test_set_model_preference_without_vendor_resolves_or_refuses(self, llm_service):
+        """Bare model with no vendor must auto-resolve from catalog or raise.
+
+        A bare mandate (``vendor=None``) used to persist as-is and broadcast
+        to every provider on the next request — the cascade that caused a
+        "switch to gpt-5-mini" to end up served by OpenRouter as a Gemini
+        model. Now, set_model_preference either resolves the vendor via
+        discovery or raises ValueError. The mandate must name a vendor.
+        """
+        from unittest.mock import MagicMock, patch
+
+        # Empty discovery cache → refusal, mandate untouched.
+        cache = MagicMock()
+        cache.get_any = MagicMock(return_value=None)
+        with patch("kestrel_sovereign.llm.model_cache.get_shared_model_cache", return_value=cache):
+            with pytest.raises(ValueError):
+                llm_service.set_model_preference("claude-sonnet-4-5")
+
+        pref = llm_service.get_model_preference()
+        assert pref == {"vendor": None, "model": None, "route": None}
 
     @pytest.mark.asyncio
     async def test_clear_model_preference(self, llm_service):
-        """Test clearing model preference."""
-        llm_service.set_model_preference("gpt-5", provider="openai")
+        """Clearing returns all three slots to None."""
+        llm_service.set_model_preference("gpt-5", vendor="openai")
         llm_service.clear_model_preference()
 
         pref = llm_service.get_model_preference()
         assert pref["model"] is None
-        assert pref["provider"] is None
+        assert pref["vendor"] is None
+        assert pref["route"] is None
 
     @pytest.mark.asyncio
     async def test_model_preference_persistence_tasks_are_owned(self, llm_service):
         """Preference persistence is scheduled through owned service tasks."""
         calls = []
 
-        async def persist(model, provider):
-            calls.append((model, provider))
+        async def persist(model, vendor, route):
+            calls.append((model, vendor, route))
 
         llm_service.set_preference_persistence_callback(persist)
-        llm_service.set_model_preference("gpt-5", provider="openai")
+        llm_service.set_model_preference("gpt-5", vendor="openai")
 
         assert len(llm_service._preference_persistence_tasks) == 1
 
         await llm_service.drain_preference_persistence()
 
-        assert calls == [("gpt-5", "openai")]
+        assert calls == [("gpt-5", "openai", None)]
         assert llm_service._preference_persistence_tasks == set()
 
     @pytest.mark.asyncio
@@ -214,15 +268,15 @@ class TestModelPreference:
         started = asyncio.Event()
         release = asyncio.Event()
 
-        async def persist(model, provider):
-            calls.append(("start", model, provider))
+        async def persist(model, vendor, route):
+            calls.append(("start", model, vendor, route))
             started.set()
             await release.wait()
-            calls.append(("done", model, provider))
+            calls.append(("done", model, vendor, route))
 
         llm_service.providers = []
         llm_service.set_preference_persistence_callback(persist)
-        llm_service.set_model_preference("gpt-5", provider="openai")
+        llm_service.set_model_preference("gpt-5", vendor="openai")
         await started.wait()
 
         close_task = asyncio.create_task(llm_service.close())
@@ -234,20 +288,20 @@ class TestModelPreference:
         await close_task
 
         assert calls == [
-            ("start", "gpt-5", "openai"),
-            ("done", "gpt-5", "openai"),
+            ("start", "gpt-5", "openai", None),
+            ("done", "gpt-5", "openai", None),
         ]
         assert llm_service._preference_persistence_tasks == set()
 
     @pytest.mark.asyncio
     async def test_get_model_preference_default(self, llm_service):
-        """Test getting model preference returns dict with None values by default."""
+        """Default preference has None for all three slots (vendor, model, route)."""
         pref = llm_service.get_model_preference()
         assert isinstance(pref, dict)
-        assert "model" in pref
-        assert "provider" in pref
+        assert set(pref.keys()) == {"vendor", "model", "route"}
+        assert pref["vendor"] is None
         assert pref["model"] is None
-        assert pref["provider"] is None
+        assert pref["route"] is None
 
     @pytest.mark.asyncio
     async def test_get_cheap_model_from_config(self, llm_service):
@@ -353,12 +407,18 @@ class TestCoreGeneration:
     @pytest.mark.asyncio
     async def test_get_response_force_local_only(self, llm_service):
         """Test get_response with force_local_only flag."""
-        # Add a local provider
+        # Add a local route — the force_local_only filter now uses is_local.
         local_provider = {
-            "name": "ollama",
+            "name": "ollama:local",
+            "vendor": "ollama",
+            "route": "local",
             "client": AsyncMock(),
             "adapter": Mock(),
             "model": "llama3.2:3b",
+            "is_cloud": False,
+            "is_local": True,
+            "base_url": None,
+            "selection_hints": [],
         }
         local_provider["adapter"].create_messages = Mock(return_value=[])
         local_provider["adapter"].get_response = AsyncMock(
@@ -451,7 +511,7 @@ class TestCoreGeneration:
     @pytest.mark.asyncio
     async def test_generate_with_model_mandate(self, llm_service):
         """Test that model mandate preference is respected in generate_with_messages."""
-        llm_service.set_model_preference("claude-sonnet-4-5", provider="anthropic")
+        llm_service.set_model_preference("claude-sonnet-4-5", vendor="anthropic")
 
         messages = [{"role": "user", "content": "Test"}]
         response = await llm_service.generate_with_messages(messages=messages)
@@ -701,7 +761,7 @@ class TestStreamingMandatePreference:
     async def test_get_streaming_response_uses_mandate(self, llm_service, mock_adapter):
         """Test that get_streaming_response respects mandate preference."""
         # Set mandate to anthropic/claude-sonnet-4-5
-        llm_service.set_model_preference("claude-sonnet-4-5", provider="anthropic")
+        llm_service.set_model_preference("claude-sonnet-4-5", vendor="anthropic")
 
         # Mock streaming response
         async def mock_streaming(*args, **kwargs):
@@ -727,7 +787,7 @@ class TestStreamingMandatePreference:
     async def test_stream_with_messages_uses_mandate(self, llm_service, mock_adapter):
         """Test that stream_with_messages respects mandate preference."""
         # Set mandate to anthropic/claude-sonnet-4-5
-        llm_service.set_model_preference("claude-sonnet-4-5", provider="anthropic")
+        llm_service.set_model_preference("claude-sonnet-4-5", vendor="anthropic")
 
         # Mock streaming response
         async def mock_streaming(*args, **kwargs):
@@ -777,7 +837,7 @@ class TestStreamingMandatePreference:
     async def test_streaming_override_takes_precedence_over_mandate(self, llm_service, mock_adapter):
         """Test that explicit model_override takes precedence over mandate."""
         # Set mandate to anthropic
-        llm_service.set_model_preference("claude-sonnet-4-5", provider="anthropic")
+        llm_service.set_model_preference("claude-sonnet-4-5", vendor="anthropic")
 
         async def mock_streaming(*args, **kwargs):
             yield "Override response"

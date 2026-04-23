@@ -5,6 +5,19 @@ Extracted from service.py to reduce file size. These methods handle:
 - Streaming with pre-built message arrays
 - Streaming with tool call detection and assembly
 - Unified streaming with remote GPU fallback
+
+No-silent-fallback rule
+-----------------------
+When ``resolve_provider_routing`` narrows the candidate list by an explicit
+mandate or ``model_override``, the streaming loop must NOT silently fall
+through to a different provider on failure. The user selected a specific
+backend; answering from a different one without saying so is lying. We
+enforce this by failing loudly (``LLMStreamingError``) whenever the
+provider list has exactly one entry — that covers every mandate-restricted
+or override-restricted case. Multi-provider default chains still retry
+through the list, but the fallback happens in server logs, not by
+injecting a ``[Provider X unavailable, trying next...]`` note into the
+chat stream where it corrupts the agent's response.
 """
 import logging
 from typing import List, Dict, Any, Optional, Union, Type, AsyncIterator
@@ -18,7 +31,23 @@ logger = logging.getLogger(__name__)
 
 
 class LLMStreamingError(LLMError):
-    """Raised when streaming operation fails."""
+    """Raised when streaming operation fails.
+
+    Carries the failing provider's composite name and the underlying error
+    so callers (and ultimately the user) get a specific actionable message
+    instead of ``"all providers failed"``.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        provider: Optional[str] = None,
+        underlying: Optional[BaseException] = None,
+    ):
+        super().__init__(message)
+        self.provider = provider
+        self.underlying = underlying
 
 
 class StreamingMixin:
@@ -36,14 +65,6 @@ class StreamingMixin:
     - _deactivate_remote_backend(reason: Optional[str]) -> None
     """
 
-    # Cloud providers always support tools — only gate local models
-    _CLOUD_PROVIDERS = frozenset({
-        "openai", "anthropic", "claude_plan",
-        "openai_plan", "vertex_ai", "google",
-        "openrouter", "runpod", "xai", "groq", "together",
-        "mistral", "perplexity", "fireworks", "azure_openai",
-    })
-
     def _check_model_tool_support(
         self,
         providers: list,
@@ -52,24 +73,23 @@ class StreamingMixin:
     ) -> Optional[list]:
         """Check if the target model supports tools; strip them if not.
 
-        Uses discovered ModelInfo from the model cache to make the decision.
-        Cloud providers always support tools. This only gates local models
-        (Ollama) where small models can't handle tool calling.
-
-        Returns:
-            The tools list (unchanged) if supported, or None if not.
+        Cloud routes always support tools (every cloud vendor's chat API does).
+        Local routes may run small models that can't tool-call — we fall
+        through to the discovered ``ModelInfo.supports_tools`` flag.
         """
         if not tools:
             return tools
 
-        # Determine target provider — cloud providers always support tools
-        target_provider = None
-        if providers:
-            p = providers[0]
-            target_provider = p["name"] if isinstance(p, dict) else getattr(p, "name", None)
-
-        if target_provider in self._CLOUD_PROVIDERS:
-            return tools  # Cloud providers always support tools
+        if not providers:
+            return tools
+        target_route = providers[0]
+        is_cloud = (
+            target_route.get("is_cloud")
+            if isinstance(target_route, dict)
+            else getattr(target_route, "is_cloud", True)
+        )
+        if is_cloud:
+            return tools  # Cloud routes always support tools.
 
         # Resolve which model we'll actually use
         target_model = model_override
@@ -101,19 +121,20 @@ class StreamingMixin:
         return tools  # Model not in cache, pass tools through
 
     def _get_local_provider_names(self) -> set:
-        """Get names of all local providers (ollama, llama_cpp, etc).
+        """Route keys (``"vendor:route"``) for all local routes.
 
-        Uses provider_registry.get_local_providers() which checks for
-        providers marked with local=true in config, not just hardcoded names.
+        Retained as a convenience for call sites that pre-date the
+        ``is_local`` flag on provider dicts; prefer reading ``p["is_local"]``
+        directly in new code.
         """
         try:
             if hasattr(self, 'provider_registry') and self.provider_registry:
-                local_providers = self.provider_registry.get_local_providers()
-                if local_providers:
-                    return {p.name for p in local_providers}
+                locals_ = self.provider_registry.get_local_providers()
+                if locals_:
+                    return {p.name for p in locals_}
         except (TypeError, AttributeError):
             pass
-        return {"ollama"}  # Safe fallback if registry not available
+        return set()
 
     async def get_streaming_response(
         self,
@@ -141,11 +162,14 @@ class StreamingMixin:
             model_override=model_override,
             force_local_only=force_local_only,
         )
+        mandate_restricted = len(providers_to_use) == 1
 
         last_error = None
+        last_provider_name = None
         for provider in providers_to_use:
             try:
                 provider_name = provider["name"]
+                last_provider_name = provider_name
                 model_to_use = target_model or provider["model"]
 
                 logger.info(f"Attempting streaming from {provider_name} with {model_to_use}")
@@ -190,15 +214,30 @@ class StreamingMixin:
             except Exception as e:
                 logger.error(f"Provider {provider['name']} failed: {e}")
                 last_error = e
-                # Surface failure to user via stream — but NOT for structured output
-                # where injected text would corrupt the JSON that the caller parses
-                if response_format is None:
-                    yield f"\n[Provider {provider['name']} unavailable, trying next...]\n"
+                if mandate_restricted:
+                    # No silent fallthrough when the user has explicitly narrowed
+                    # routing. Fail loudly — the caller / agent / user must see
+                    # the specific error, not a response from a different model.
+                    raise LLMStreamingError(
+                        f"Selected route {provider_name} failed: {e}",
+                        provider=provider_name,
+                        underlying=e,
+                    )
+                # Default multi-provider chain: log the fallback server-side;
+                # don't corrupt the stream with a note about it.
+                logger.warning(
+                    "Falling through from %s to next provider in chain: %s",
+                    provider_name, e,
+                )
                 continue
 
         provider_type = "local" if force_local_only else "all"
         logger.error(f"All {provider_type} providers failed for streaming. Last error: {last_error}")
-        raise RuntimeError(f"All {provider_type} providers failed for streaming.")
+        raise LLMStreamingError(
+            f"All {provider_type} providers failed: {last_error}",
+            provider=last_provider_name,
+            underlying=last_error,
+        )
 
     async def generate_stream(
         self,
@@ -300,10 +339,13 @@ class StreamingMixin:
             model_override=model_override,
             force_local_only=force_local_only,
         )
+        mandate_restricted = len(providers) == 1
 
         last_error = None
+        last_provider_name = None
         for provider in providers:
             try:
+                last_provider_name = provider["name"]
                 adapter = provider["adapter"]
                 model = target_model or provider["model"]
 
@@ -327,11 +369,23 @@ class StreamingMixin:
             except Exception as e:
                 logger.error(f"Provider {provider['name']} failed: {e}")
                 last_error = e
-                yield f"\n[Provider {provider['name']} unavailable, trying next...]\n"
+                if mandate_restricted:
+                    raise LLMStreamingError(
+                        f"Selected route {provider['name']} failed: {e}",
+                        provider=provider["name"],
+                        underlying=e,
+                    )
+                logger.warning(
+                    "Falling through from %s: %s", provider["name"], e,
+                )
                 continue
 
         logger.error(f"All providers failed for stream_with_messages: {last_error}")
-        raise LLMStreamingError("All providers failed for stream_with_messages.")
+        raise LLMStreamingError(
+            f"All providers failed: {last_error}",
+            provider=last_provider_name,
+            underlying=last_error,
+        )
 
     async def stream_with_tool_detection(
         self,
@@ -402,11 +456,13 @@ class StreamingMixin:
             model_override=model_override,
             force_local_only=force_local_only,
         )
+        mandate_restricted = len(providers) == 1
 
         # Strip tools if the target model can't handle them
         tools = self._check_model_tool_support(providers, tools, model_override)
 
         last_error = None
+        last_provider_name = None
         for provider in providers:
             try:
                 adapter = provider["adapter"]
@@ -462,8 +518,21 @@ class StreamingMixin:
             except Exception as e:
                 logger.error(f"Provider {provider['name']} failed: {e}")
                 last_error = e
-                yield f"\n[Provider {provider['name']} unavailable, trying next...]\n"
+                last_provider_name = provider["name"]
+                if mandate_restricted:
+                    raise LLMStreamingError(
+                        f"Selected route {provider['name']} failed: {e}",
+                        provider=provider["name"],
+                        underlying=e,
+                    )
+                logger.warning(
+                    "Falling through from %s: %s", provider["name"], e,
+                )
                 continue
 
         logger.error(f"All providers failed for stream_with_tool_detection: {last_error}")
-        raise LLMStreamingError("All providers failed for stream_with_tool_detection.")
+        raise LLMStreamingError(
+            f"All providers failed: {last_error}",
+            provider=last_provider_name,
+            underlying=last_error,
+        )

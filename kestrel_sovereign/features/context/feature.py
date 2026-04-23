@@ -885,9 +885,16 @@ QUESTION: {query}
 
 ANSWER:"""
 
-            # Use cheap model if requested
+            # Use cheap model if requested. We pull the vendor-scoped selector
+            # ("<vendor>/<model>") so routing constrains to the one vendor that
+            # serves the cheap model — preventing the old "broadcast one model
+            # id across every provider" cascade.
             model_override = None
-            if use_cheap_model and hasattr(self.llm_service, 'get_cheap_model'):
+            if use_cheap_model and hasattr(self.llm_service, "get_cheap_model_selector"):
+                model_override = self.llm_service.get_cheap_model_selector()
+            elif use_cheap_model and hasattr(self.llm_service, "get_cheap_model"):
+                # Older services only expose the bare id — caller's behavior
+                # without vendor scoping is best-effort.
                 model_override = self.llm_service.get_cheap_model()
 
             # Generate response

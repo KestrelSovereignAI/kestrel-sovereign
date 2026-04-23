@@ -1,484 +1,266 @@
 # Kestrel LLM Service Architecture
 
-> **Last Updated**: December 31, 2025
+> **Canonical spec for every change touching the LLM service, provider registry, discovery, or routing.** If this doc contradicts code, the code wins — and this doc is a bug. Update it in the same change, not later.
 >
-> This document describes the complete LLM service architecture including multi-provider routing, remote Ollama hosting, and the crypto-native LLM proxy.
+> **Last major rewrite:** 2026-04 — replaced the single-string "provider" model with vendor / route / model. See GitHub epic #688 and the CLAUDE.md case study "Model Selection System — What NOT to Do".
 
-## Overview
+## Principles
 
-Kestrel's LLM service is designed around three principles:
-1. **Model Independence** - No vendor lock-in, switch providers anytime
-2. **Self-Hosting First** - Run Ollama locally or remotely without cloud dependencies
-3. **Crypto-Native Payments** - USDC payments via x402 or prepaid balance (no credit cards)
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    CLIENT APPLICATIONS                       │
-│         (Mobile App, Web UI, Agent SDK, CLI)                │
-└─────────────────────────────┬───────────────────────────────┘
-                              │ HTTPS
-                              ▼
-┌─────────────────────────────────────────────────────────────┐
-│                    KESTREL LLM PROXY                         │
-│  • x402 Payment Middleware (pay-per-request)                │
-│  • Prepaid Balance System (USDC deposits)                   │
-│  • Wallet-Based Rate Limiting (Free/Starter/Pro/Unlimited)  │
-│  • 10% Margin on All Requests                               │
-└─────────────────────────────┬───────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────┐
-│                    LLM SERVICE (BrainRouter)                 │
-│  • Dynamic backend switching (CLOUD/LOCAL/REMOTE_GPU)       │
-│  • Automatic fallback on provider failure                   │
-│  • Model discovery across all providers                     │
-│  • Privacy-aware routing (force_local_only mode)            │
-└────────┬───────────────┬───────────────┬────────────────────┘
-         │               │               │
-         ▼               ▼               ▼
-    ┌─────────┐    ┌─────────┐    ┌─────────────┐
-    │  CLOUD  │    │  LOCAL  │    │ REMOTE GPU  │
-    │ OpenAI  │    │ Ollama  │    │   RunPod    │
-    │Anthropic│    │(localhost│    │  Vast.ai   │
-    │ Google  │    │ or FRP) │    │             │
-    └─────────┘    └─────────┘    └─────────────┘
-```
+1. **Three orthogonal dimensions.** An LLM call is a (vendor, route, model) triple. Collapsing any two into one string is the antipattern that motivated this rewrite.
+2. **Model independence.** Users and agents switch vendors, routes, and models at runtime without restart.
+3. **No hardcoded model IDs in code.** Discovery is the source of truth. Config holds patterns and routes, never specific IDs.
+4. **Discovery-driven visibility.** The UI's model list reflects what the vendor's API actually serves, not a maintained allowlist.
 
 ---
 
-## Component Documentation
+## The three dimensions
 
-| Component | Document | Description |
-|-----------|----------|-------------|
-| LLM Proxy | [LLM_PROXY_PLAN.md](../plans/LLM_PROXY_PLAN.md) | Crypto-native payment system |
-| Remote Ollama | [remote_ollama.md](../remote_ollama.md) | FRP reverse tunnel setup |
-| LLM Management | [06-llm-management.md](../diagrams/06-llm-management.md) | Architecture diagrams |
-| GPU Integration | [RUNPOD_TRAINING.md](RUNPOD_LORA_TRAINING.md) | RunPod for training/inference |
+### 1. Vendor
 
----
+Who makes the weights. Examples: `openai`, `anthropic`, `google`, `ollama`, `openrouter`.
 
-## 1. LLM Service Core
-
-### Provider Adapters
-
-All providers implement a common interface:
+Each vendor owns exactly one model catalog. Discovery runs per vendor; all routes for that vendor share the catalog. When grouping models for the UI, we group by vendor.
 
 ```python
-class LLMAdapter(ABC):
-    async def generate_response(self, messages: List[dict], **kwargs) -> str
-    async def get_streaming_response(self, messages: List[dict], **kwargs) -> AsyncIterator[str]
-    async def is_available(self) -> bool
-    async def list_models(self) -> List[ModelInfo]
-```
-
-**Supported Providers:**
-
-| Provider | Adapter | Models | Use Case |
-|----------|---------|--------|----------|
-| OpenAI | `OpenAIAdapter` | GPT-4o, GPT-4o-mini | Cloud default |
-| Anthropic | `AnthropicAdapter` | Claude 3.5 Sonnet | Complex reasoning |
-| Google | `GoogleAdapter` | Gemini Pro | Multimodal |
-| Ollama | `OllamaAdapter` | Llama 3.2, Mistral, etc. | Local/self-hosted |
-
-### Fallback Chain
-
-```
-User Query
-    │
-    ▼
-┌───────────┐
-│  OpenAI   │──✅──► Response
-└─────┬─────┘
-      │ ❌
-      ▼
-┌───────────┐
-│ Anthropic │──✅──► Response
-└─────┬─────┘
-      │ ❌
-      ▼
-┌───────────┐
-│  Google   │──✅──► Response
-└─────┬─────┘
-      │ ❌
-      ▼
-┌───────────┐
-│  Ollama   │──✅──► Response
-└─────┬─────┘
-      │ ❌
-      ▼
-All providers failed
-```
-
-### Configuration
-
-```toml
-# llm_config.toml
-
-provider_priority = ["openai", "anthropic", "ollama"]
-
-[openai]
-api_key = "sk-..."
-model = "gpt-4o"
-
-[anthropic]
-api_key = "sk-ant-..."
-model = "claude-3-5-sonnet"
-
-[ollama]
-host = "http://localhost:11434"  # or remote URL via FRP
-model = "llama3.2"
-```
-
----
-
-## 2. BrainRouter - Dynamic Backend Switching
-
-The BrainRouter enables hot-swapping between backends without restart:
-
-```
-┌────────────────────────────────────────┐
-│            BrainRouter                  │
-│                                        │
-│  ┌─────────────────────────────────┐  │
-│  │ Current Backend: CLOUD          │  │
-│  │ Available: [CLOUD, LOCAL, GPU]  │  │
-│  └─────────────────────────────────┘  │
-│                                        │
-│  Methods:                              │
-│  • switch_backend(target)             │
-│  • get_current_backend()              │
-│  • auto_fallback_on_failure()         │
-└────────────────────────────────────────┘
-```
-
-**Backend Types:**
-
-| Backend | Description | When to Use |
-|---------|-------------|-------------|
-| `CLOUD` | OpenAI/Anthropic/Google | Default, best quality |
-| `LOCAL` | Local Ollama | Privacy mode, no API costs |
-| `REMOTE_GPU` | RunPod/Vast.ai | Fine-tuned models, fast inference |
-
-**State Machine:**
-
-```
-            ┌──────────────┐
-            │    CLOUD     │ ◄─── Default startup
-            └──────┬───────┘
-                   │
-    force_local_only │ !gpu on
-                   │
-    ┌──────────────┴──────────────┐
-    ▼                              ▼
-┌────────┐                   ┌──────────┐
-│ LOCAL  │                   │REMOTE_GPU│
-└────────┘                   └────┬─────┘
-                                  │
-                         TTL expired / Pod crashed
-                                  │
-                                  ▼
-                            Auto-fallback to CLOUD
-```
-
----
-
-## 3. Self-Hosted Ollama Options
-
-### Option A: Cloud GPU (RunPod/Vast.ai) - Recommended for Production
-
-Same infrastructure pattern as LoRA training - separate containers for different concerns:
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                           KESTREL GPU INFRASTRUCTURE                         │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│  IMAGE/LORA STACK                      LLM STACK                            │
-│  ─────────────────                     ─────────────                        │
-│                                                                             │
-│  ┌─────────────────┐                   ┌─────────────────┐                  │
-│  │ Training        │ GPU               │ Ollama          │ GPU              │
-│  │ Container       │ A100              │ Container       │ A4000/L4         │
-│  │ (SimpleTuner)   │ $1.89/hr          │ (llama, mistral)│ $0.20-0.40/hr    │
-│  └────────┬────────┘                   └────────┬────────┘                  │
-│           │                                     │                           │
-│  ┌────────┴────────┐                   ┌────────┴────────┐                  │
-│  │ Generation      │ GPU               │ LLM Router      │ NO GPU           │
-│  │ Container       │ A100              │ Container       │ Cloud Run        │
-│  │ (FLUX.2-dev)    │ $1.89/hr          │ (Kestrel/Proxy)   │ ~$0.00/idle      │
-│  └─────────────────┘                   └─────────────────┘                  │
-│                                                                             │
-│  Network Volume:                       Network Volume:                      │
-│  /workspace/huggingface (FLUX.2)       /workspace/ollama (models)           │
-│  /workspace/trained_loras              Pre-pulled: llama3.2, mistral, etc.  │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
-
-**Ollama Container (TODO):**
-- `docker/Dockerfile.ollama` - Pre-pulled models
-- `features/ollama/ollama_manager.py` - Pod lifecycle (like `runpod_manager.py`)
-- `ollama_config.toml` - Profiles for RunPod/Vast.ai
-- Network volume at `/workspace/ollama` for model caching
-
-**Cold start mitigation:**
-| Approach | Startup Time | Cost When Idle |
-|----------|--------------|----------------|
-| Persistent pod (resume) | 10-30s | ~$0.20-0.40/hr |
-| Network volume (cold) | 30-60s | $0 |
-| Pre-baked image | 6-12s | $0 (but large image) |
-
-**GPU requirements by model:**
-| Model | VRAM | Recommended GPU | Cost/hr |
-|-------|------|-----------------|---------|
-| llama3.2:3b | 4GB | RTX 3090 | $0.20 |
-| llama3.2:7b | 8GB | RTX 4090 | $0.35 |
-| mistral:7b | 8GB | RTX 4090 | $0.35 |
-| qwen2.5:14b | 16GB | A4000 | $0.40 |
-| llama3.2:70b | 48GB | A100 40GB | $1.50 |
-
-### Option B: Home Ollama via FRP (Development/Personal Use)
-
-For running Ollama on a home machine accessible from anywhere, use FRP (Fast Reverse Proxy):
-
-```
-Phone/App                VPS                     Home Mac
-    │                     │                         │
-    │ HTTPS               │                         │
-    └─────────────────────┤                         │
-                          │                         │
-               ┌──────────┴──────────┐              │
-               │       Caddy         │              │
-               │ (Let's Encrypt TLS) │              │
-               └──────────┬──────────┘              │
-                          │                         │
-               ┌──────────┴──────────┐              │
-               │        frps         │◄─────────────┤ Outbound tunnel
-               │   (FRP server)      │    frpc      │
-               └─────────────────────┘   (client)   │
-                                                    │
-                                         ┌──────────┴──────────┐
-                                         │      Ollama         │
-                                         │  localhost:11434    │
-                                         └─────────────────────┘
-```
-
-**Key Benefits:**
-- No port forwarding on home router
-- HTTPS with Let's Encrypt
-- All FOSS (FRP is Apache 2.0)
-- VPS can be $5/month (just proxies traffic)
-- Uses your own GPU (if available)
-
-**Setup Guide:** See [remote_ollama.md](../remote_ollama.md) for complete Docker Compose configuration.
-
----
-
-## 4. LLM Proxy (Crypto-Native Payments)
-
-The LLM Proxy adds a payment layer on top of the LLM service:
-
-### Payment Modes
-
-**Mode 1: x402 Pay-Per-Request**
-```
-Client                              Kestrel                         LLM
-   │                                   │                             │
-   │ POST /v1/chat/completions         │                             │
-   │ (no payment)                      │                             │
-   ├──────────────────────────────────►│                             │
-   │                                   │                             │
-   │◄──────────────────────────────────┤                             │
-   │ 402 Payment Required              │                             │
-   │ X-Payment-Required: 0.005         │                             │
-   │ X-Payment-Token: USDC             │                             │
-   │ X-Payment-Network: base           │                             │
-   │                                   │                             │
-   │ POST /v1/chat/completions         │                             │
-   │ X-Payment: <signed-payment>       │                             │
-   ├──────────────────────────────────►│                             │
-   │                                   │ Verify via Coinbase         │
-   │                                   │ Facilitator                 │
-   │                                   ├────────────────────────────►│
-   │                                   │◄────────────────────────────┤
-   │◄──────────────────────────────────┤                             │
-   │ 200 OK                            │                             │
-   │ X-Cost-USD: 0.0042                │                             │
-```
-
-**Mode 2: Prepaid Balance**
-```
-1. GET /v1/wallet/{address}/deposit-address
-   → Returns USDC deposit address on Base
-
-2. User sends USDC to deposit address
-
-3. POST /v1/wallet/{address}/deposits/verify?tx_hash=0x...
-   → Balance credited, tier upgraded
-
-4. POST /v1/chat/completions
-   X-Wallet-Address: 0x...
-   → Balance debited, response returned with X-Balance-USD header
-```
-
-### Rate Limit Tiers
-
-| Tier | RPM | Tokens/Day | Concurrent | Min Deposit |
-|------|-----|------------|------------|-------------|
-| Free | 10 | 100K | 1 | $0 |
-| Starter | 60 | 1M | 3 | $10 |
-| Pro | 300 | 10M | 10 | $100 |
-| Unlimited | ∞ | ∞ | 50 | $1,000 |
-
-### Implementation Files
-
-| File | Purpose |
-|------|---------|
-| `kestrel/middleware/x402_payment.py` | Dual-mode payment middleware |
-| `kestrel/middleware/rate_limiter.py` | Wallet-based rate limiting |
-| `kestrel/services/proxy_wallet_service.py` | Wallet balance management |
-| `kestrel/services/x402_client.py` | Coinbase Facilitator client |
-| `kestrel/endpoints/proxy_pricing.py` | Public pricing API |
-| `kestrel/endpoints/proxy_deposits.py` | Deposit/wallet endpoints |
-| `kestrel/endpoints/proxy_usage.py` | Usage history/dashboard |
-
-**Full Plan:** See [LLM_PROXY_PLAN.md](../plans/LLM_PROXY_PLAN.md)
-
----
-
-## 5. GPU Integration (RunPod/Vast.ai)
-
-For fine-tuned models or fast inference, spin up GPU instances on-demand:
-
-```bash
-# From chat
-!gpu on llama-70b --ttl 30m
-
-# What happens:
-# 1. RunPodManager provisions pod
-# 2. Wait for READY status
-# 3. BrainRouter switches to REMOTE_GPU
-# 4. All inference goes through GPU
-# 5. After TTL (or !gpu off), auto-fallback to CLOUD
-```
-
-**Lifecycle:**
-
-```
-┌─────────┐     ┌──────────────┐     ┌─────────┐     ┌──────────┐
-│!gpu on  │────►│ Provision    │────►│  READY  │────►│ Inference│
-└─────────┘     │ RunPod       │     │         │     │ via GPU  │
-                └──────────────┘     └─────────┘     └────┬─────┘
-                                                          │
-                                          TTL expired / !gpu off
-                                                          │
-                                                          ▼
-                                                   ┌──────────────┐
-                                                   │ Auto-fallback│
-                                                   │  to CLOUD    │
-                                                   └──────────────┘
-```
-
----
-
-## 6. Model Discovery
-
-The system discovers models from all providers in parallel:
-
-```python
-# ModelInfo dataclass
 @dataclass
 class ModelInfo:
-    id: str                    # "gpt-4o"
-    provider: str              # "openai"
-    display_name: str          # "GPT-4o"
-    category: ModelCategory    # CHAT, EMBEDDING, IMAGE, AUDIO
-    is_featured: bool          # Show in default list
-    is_hidden: bool            # Hide from UI
+    id: str           # "<some model id>" — vendor decides
+    provider: str     # the vendor name (field name retained for file-format compatibility;
+                      # the *semantic* is vendor, not "execution provider")
+    display_name: str
+    category: ModelCategory   # chat | embedding | image | audio
+    is_featured: bool
+    is_hidden: bool
+    created_at: Optional[str]
+    supports_tools: bool
+    supports_vision: bool
+    ...
 ```
 
-**API:**
+### 2. Route
 
-```
-GET /api/models
-GET /api/models?featured_only=true
-GET /api/models?category=chat&providers=openai,ollama
-```
+How to reach a vendor. A route bundles: `base_url` + auth method + adapter class + per-route defaults.
 
-**Catalog Configuration:**
+One vendor can have **several** routes. For example:
+
+| Route | Auth | Adapter | Purpose |
+|---|---|---|---|
+| `anthropic:api` | API key (`ANTHROPIC_API_KEY`) | `AnthropicAdapter` | Metered API billing |
+| `anthropic:plan` | OAuth (`ANTHROPIC_AUTH_TOKEN`) | `ClaudeMaxAdapter` | Claude Max subscription |
+| `openai:api` | API key (`OPENAI_API_KEY`) | `OpenAIAdapter` | Metered API billing |
+| `openai:plan` | OAuth (`CODEX_AUTH_TOKEN` / `~/.codex/auth.json`) | `CodexAdapter` | ChatGPT subscription |
+| `ollama:local` | none | `OllamaAdapter` | localhost (or `OLLAMA_HOST`) |
+
+A route's composite key is `"<vendor>:<route>"`. The route key is the routing identity; the vendor is the grouping identity.
+
+### 3. Model
+
+Which weights. Lives inside a vendor. Always an opaque ID string — **never** a literal in Python.
+
+---
+
+## Configuration shape
+
+Canonical `llm_config.toml`:
 
 ```toml
-# model_catalog.toml
-
-featured_models = [
-    "gpt-4o",
-    "claude-3-5-sonnet",
-    "llama3.2:70b"
+# Fallback order at the route level. Each entry is "<vendor>:<route>".
+route_priority = [
+    "anthropic:plan",
+    "openai:plan",
+    "openrouter:api",
+    "anthropic:api",
+    "openai:api",
+    "ollama:local",
 ]
 
-[display_overrides]
-"gpt-4o" = "GPT-4o (Latest)"
-"claude-3-5-sonnet-20241022" = "Claude 3.5 Sonnet"
+[vendors.anthropic]
+is_cloud = true
+
+[vendors.anthropic.routes.api]
+adapter        = "AnthropicAdapter"
+api_key_env    = "ANTHROPIC_API_KEY"
+model          = "auto"
+selection_hints = ["sonnet", "haiku", "opus"]
+
+[vendors.anthropic.routes.plan]
+adapter        = "ClaudeMaxAdapter"
+auth_token_env = "ANTHROPIC_AUTH_TOKEN"
+model          = "auto"
+
+[vendors.openai]
+is_cloud = true
+
+[vendors.openai.routes.api]
+adapter        = "OpenAIAdapter"
+api_key_env    = "OPENAI_API_KEY"
+model          = "auto"
+
+[vendors.openai.routes.plan]
+adapter        = "CodexAdapter"
+auth_token_env = "CODEX_AUTH_TOKEN"
+model          = "auto"
+
+[vendors.ollama]
+is_cloud = false
+
+[vendors.ollama.routes.local]
+adapter        = "OllamaAdapter"
+host           = "http://localhost:11434"
+model          = "auto"
+
+[vendors.openrouter]
+is_cloud = true
+
+[vendors.openrouter.routes.api]
+adapter        = "OpenRouterAdapter"
+base_url       = "https://openrouter.ai/api/v1"
+api_key_env    = "OPENROUTER_API_KEY"
+model          = "auto"
+selection_hints = ["chat"]
 ```
+
+### Rules
+
+- `model = "auto"` means "resolve via discovery using `selection_hints`." Never hardcode a specific ID.
+- `selection_hints` are substring patterns (e.g. `"sonnet"`, `"mini"`), not full IDs.
+- `is_cloud` on a vendor defaults to `true`; set to `false` for local-only vendors (Ollama, llama.cpp). Used by streaming gating and privacy routing.
+- `is_local` on a route flags local endpoints (currently only llama.cpp's `local = true`).
+
+### Adding a vendor or route
+
+No code changes required unless the vendor needs a new adapter class. Add a `[vendors.<name>.routes.<route>]` block with the adapter name; it appears in the dropdown automatically.
+
+### Adding a new adapter class
+
+1. Write the adapter as a subclass of `LLMAdapter` (see `kestrel_sovereign/llm/adapter.py`).
+2. Register it in `_ADAPTER_REGISTRY` in [provider_registry.py](../../kestrel_sovereign/llm/provider_registry.py).
+3. Implement `list_models()` to return models tagged with the correct vendor — or raise `NotImplementedError` and let the adapter share a canonical route's discovery via the per-vendor rule below.
+
+### Per-vendor discovery rule
+
+Multiple routes can target the same vendor. Discovery runs **once per vendor**: we pick the first route whose adapter implements `list_models()`. Subscription adapters (`ClaudeMaxAdapter`, `CodexAdapter`) raise `NotImplementedError` — their routes share the api-route's catalog by virtue of being under the same vendor.
+
+This means `openai:plan` shows the same model list as `openai:api`, without alias tables.
 
 ---
 
-## 7. Environment Variables
+## Mandate preference schema
+
+The user's "which model" selection is stored per agent as a `{vendor, model, route?}` dict. `vendor` and `route` may be null; `model` is the model ID.
+
+Persistence lives in `agent_metadata.model_preference` as JSON:
+
+```json
+{"vendor": "anthropic", "model": "<model-id>", "route": "plan"}
+```
+
+- **Vendor unset:** routing tries all vendors for this model in `route_priority` order.
+- **Route unset:** first configured route for that vendor is used.
+- **Both set:** exactly that `<vendor>:<route>` route is used, no fallback unless `_mandate_fallbacks` is configured.
+
+Stale rows using the deprecated `{model, provider}` shape are dropped silently on load. The agent starts with no mandate; user re-selects via UI once.
+
+---
+
+## Routing
+
+All routing funnels through `LLMService.resolve_provider_routing`:
+
+1. **Explicit `model_override`**:
+   - `"<vendor>/<model>"` — vendor filter, specific model.
+   - `"<vendor>:<route>/<model>"` — exact route, specific model.
+   - `"<model>"` — model only, all routes try it.
+2. **Mandate preference** — same semantics as model_override, read from `_mandate_preference`.
+3. **Default** — all routes, in `route_priority` order.
+
+`force_local_only=True` filters to routes where `is_local=True`.
+
+Nothing in routing code hardcodes vendor or model names. The `_filter_providers_by_selector` helper matches on the `vendor` attribute (vendor-only selector) or the composite `name` attribute (full route key).
+
+---
+
+## API surface
+
+| Endpoint | Returns / accepts |
+|---|---|
+| `GET /api/models` | `{by_vendor: {openai: [...], anthropic: [...], ...}, routes: [{vendor, route, model, is_local}, ...], default, featured, all, count}` |
+| `GET /api/model/current` | `{vendor, route, model, model_name}` |
+| `POST /api/model/set` | body: `{vendor?, route?, model}`, or combined `{"model": "<vendor>[:<route>]/<model>"}` |
+
+The frontend groups the dropdown by vendor. When a vendor has more than one route, the UI exposes a route selector; otherwise it's hidden.
+
+---
+
+## Visibility
+
+No maintained "always show" or "always hide" allowlists. Capability and usage signals drive curation.
+
+### Auto-hide (computed from discovered metadata)
+
+- `category != "chat"` — filtered out of chat dropdowns. Covered by `[categories.embedding|image|audio|completion]` in `model_catalog.toml`.
+- Vendor-reported `description` contains "deprecated" | "legacy" | "will be retired" — marked hidden at enrichment.
+- Present in the previous discovery cache but absent from today's run — marked deprecated (structural signal; vendor retired it).
+
+### Auto-feature (computed)
+
+- `frecency_score > 0` — you've used it, it floats up.
+- **Canonical alias:** the ID has no date suffix in a lineage where dated siblings exist. Pure string analysis, no config.
+- Newest `created_at` in a lineage + `supports_tools` + not preview.
+
+### Emergency overrides
+
+`model_catalog.toml` carries a `[hidden]` section keyed by vendor. Empty by default. Use only when a vendor mislabels something. There is **no** `[always_show]` or `[pinned]` counterpart — pinning a specific ID is user-state, not catalog-state.
+
+### Two dials, not lists
+
+- `visibility_auto_hide_deprecated_months` — grace period before truly removing deprecated models from the cache.
+- `visibility_preview_demotion_terms` — substrings that demote a model from featured (default: `["preview", "beta", "experimental", "exp"]`).
+
+---
+
+## No hardcoded model IDs in code
+
+Model identifiers must never appear as literals inside `kestrel_sovereign/**/*.py`, `endpoints/**/*.py`, or frontend JS.
+
+### Allowed locations
+
+- `model_catalog.toml` — `featured_models`, `display_overrides`, `[hidden]`. Config.
+- `model_mandate.toml` — `defaults.preferred`, `defaults.cheap_model`, role mandates. Config.
+- `llm_config.toml` — `selection_hints` (substring patterns, not IDs), `model = "auto"`. Config.
+- Parameterized test fixtures — documented as historical examples.
+- This spec, when giving an example — marked as "example as of YYYY-MM; consult discovery" so the doc never becomes a source of truth for specific IDs.
+
+### Not allowed
+
+- `if model == "<some-id>": ...` in adapter or service code.
+- Enum members or module constants naming specific models.
+- Default values that substitute a literal ID when config is missing (log a warning and let discovery pick instead).
+- Per-vendor ID lists in code.
+
+Verification:
 
 ```bash
-# LLM Providers
-OPENAI_API_KEY=sk-...
-ANTHROPIC_API_KEY=sk-ant-...
-GOOGLE_API_KEY=...
-
-# Ollama (local or remote)
-OLLAMA_HOST=http://localhost:11434
-# Or for remote via FRP:
-# OLLAMA_HOST=https://ollama.yourdomain.com
-
-# LLM Proxy Payments
-X402_FACILITATOR_URL=https://api.cdp.coinbase.com/platform/v2/x402
-X402_PAY_TO_ADDRESS=0x...
-X402_NETWORK=base
-kestrel_LLM_MARGIN_PCT=0.10
-
-# RunPod GPU
-RUNPOD_API_KEY=...
+rg -n '"(gpt-|claude-|gemini-|llama[0-9]|mistral-|deepseek-|qwen|kimi-)' \
+  kestrel_sovereign/ endpoints/ \
+  --glob '!*.toml' --glob '!*.md'
 ```
+
+New hits in service / adapter / endpoint code fail review.
 
 ---
 
-## 8. Quick Reference
+## Related files
 
-### Agent Commands
+- [provider_registry.py](../../kestrel_sovereign/llm/provider_registry.py) — vendor/route initialization.
+- [service.py](../../kestrel_sovereign/llm/service.py) — `LLMService`, `_mandate_preference`, `resolve_provider_routing`.
+- [model_discovery.py](../../kestrel_sovereign/llm/model_discovery.py) — per-vendor discovery, dispatcher.
+- [model_catalog.py](../../kestrel_sovereign/llm/model_catalog.py) — enrichment, overrides.
+- [mandate.py](../../kestrel_sovereign/llm/mandate.py) — selector resolution for role mandates.
+- [endpoints/models.py](../../endpoints/models.py) — `/api/models`, `/api/model/current`, `/api/model/set`.
+- [agent/model_preference.py](../../kestrel_sovereign/agent/model_preference.py) — persistence.
 
-```
-!list-models           - List available models
-!use-model <name>      - Switch to a specific model
-!model-status          - Current model and provider
+## Related decisions
 
-!gpu on [model] [ttl]  - Spin up GPU instance
-!gpu off               - Release GPU
-!gpu status            - GPU pod status
-```
-
-### API Endpoints
-
-| Endpoint | Method | Auth | Description |
-|----------|--------|------|-------------|
-| `/v1/models` | GET | None | List models |
-| `/v1/chat/completions` | POST | x402/Balance | Chat |
-| `/v1/pricing` | GET | None | Model pricing |
-| `/v1/pricing/estimate` | POST | None | Cost estimate |
-| `/v1/wallet/{addr}` | GET | None | Wallet info |
-| `/v1/wallet/{addr}/usage` | GET | None | Usage history |
-
----
-
-## Related Documentation
-
-- [LLM Proxy Plan](../plans/LLM_PROXY_PLAN.md) - Complete implementation plan
-- [Remote Ollama Setup](../remote_ollama.md) - FRP reverse tunnel guide
-- [LLM Management Diagrams](../diagrams/06-llm-management.md) - Visual architecture
-- [RunPod Training](RUNPOD_LORA_TRAINING.md) - GPU training workflows
-- [Privacy Modes](PRIVACY_MODES.md) - force_local_only and privacy routing
+- CLAUDE.md "Model Selection System — What NOT to Do" — the case study this refactor closes out.
+- GitHub epic [#688](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/688) — the umbrella ticket for this architecture change.

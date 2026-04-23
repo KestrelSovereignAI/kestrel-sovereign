@@ -892,6 +892,18 @@ class OrchestratorEngineMixin:
 
         features_by_tool_name = {f.tool_name: f for f in self.features.values()}
         known_tools = set(features_by_tool_name.keys()) | set(self._direct_tools.keys())
+        # Also accept direct calls to each feature's @tool-decorated sub-tools
+        # (e.g. ``get_current_model`` under the ModelAgent feature). Without
+        # this, the top-level LLM sees a sub-tool in the exposed tool list,
+        # emits a call by that name, the guardrail silently rejects it, and
+        # the agent hallucinates a "result" from training data.
+        for _feat in self.features.values():
+            if hasattr(_feat, "get_tools"):
+                try:
+                    for _t in _feat.get_tools():
+                        known_tools.add(_t.name)
+                except Exception:
+                    pass
 
         tracker = IterationTracker(
             threshold=KESTREL_DIMINISHING_THRESHOLD,
@@ -1066,6 +1078,18 @@ class OrchestratorEngineMixin:
 
         features_by_tool_name = {f.tool_name: f for f in self.features.values()}
         known_tools = set(features_by_tool_name.keys()) | set(self._direct_tools.keys())
+        # Also accept direct calls to each feature's @tool-decorated sub-tools
+        # (e.g. ``get_current_model`` under the ModelAgent feature). Without
+        # this, the top-level LLM sees a sub-tool in the exposed tool list,
+        # emits a call by that name, the guardrail silently rejects it, and
+        # the agent hallucinates a "result" from training data.
+        for _feat in self.features.values():
+            if hasattr(_feat, "get_tools"):
+                try:
+                    for _t in _feat.get_tools():
+                        known_tools.add(_t.name)
+                except Exception:
+                    pass
 
         tracker = IterationTracker(
             threshold=KESTREL_DIMINISHING_THRESHOLD,
