@@ -1387,7 +1387,16 @@ No other text or formatting.
                         f"Available: {[p['name'] for p in providers]}"
                     )
 
+        # Same no-silent-fallback rule as the streaming paths: if routing
+        # was narrowed to one provider (by mandate, route, or override),
+        # failure raises with the *specific* provider+error. No cascade to
+        # an unrelated backend. Never hand the caller a response from a
+        # model they didn't ask for.
+        mandate_restricted = len(providers) == 1
+        last_error = None
+        last_provider_name = None
         for provider in providers:
+            last_provider_name = provider["name"]
             try:
                 model = target_model or provider["model"]
                 logger.info(f"Attempting provider: {provider['name']} with model: {model}")
@@ -1408,20 +1417,23 @@ No other text or formatting.
                 # Don't fall back — the request itself is broken, not the provider.
                 logger.error(f"Provider {provider['name']} rejected request (400): {e}")
                 raise LLMServiceError(f"Request rejected by {provider['name']}: {e}") from e
-            except (openai.APIError, openai.APIConnectionError, openai.RateLimitError, openai.AuthenticationError) as e:
-                logger.error(f"Provider {provider['name']} failed: {e}")
-                continue
-            except (httpx.HTTPError, ConnectionError, TimeoutError, asyncio.TimeoutError) as e:
-                logger.error(f"Provider {provider['name']} failed: {e}")
-                continue
-            except LLMProviderError as e:
-                logger.error(f"Provider {provider['name']} failed: {e}")
-                continue
             except Exception as e:
                 logger.error(f"Provider {provider['name']} failed: {e}")
+                last_error = e
+                if mandate_restricted:
+                    raise LLMServiceError(
+                        f"Selected route {provider['name']} failed: {e}"
+                    ) from e
+                logger.warning(
+                    "Falling through from %s in generate_with_messages: %s",
+                    provider["name"], e,
+                )
                 continue
 
-        raise LLMServiceError("All providers failed for generate_with_messages")
+        raise LLMServiceError(
+            f"All providers failed for generate_with_messages "
+            f"(last: {last_provider_name}): {last_error}"
+        )
 
     # generate_stream, stream_with_messages, and stream_with_tool_detection
     # are provided by StreamingMixin
