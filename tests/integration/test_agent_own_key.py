@@ -215,14 +215,13 @@ async def test_kestrel_agent_activates_key_on_initialize():
             )
             await agent.initialize()
 
-            # The agent should now be using its own key
-            openrouter_provider = None
-            for p in llm_service.providers:
-                if p["name"] == "openrouter":
-                    openrouter_provider = p
-                    break
-
-            assert openrouter_provider is not None
+            # The agent should now be using its own key. Under the
+            # vendor/route/model schema a single vendor may have multiple
+            # routes — match by vendor field, not a bare composite name.
+            openrouter_routes = [
+                p for p in llm_service.providers if p.get("vendor") == "openrouter"
+            ]
+            assert openrouter_routes, "No openrouter route initialized"
 
             await agent.shutdown()
 

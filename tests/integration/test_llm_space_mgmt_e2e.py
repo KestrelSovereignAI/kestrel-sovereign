@@ -101,10 +101,11 @@ class TestSpaceManagement:
     @pytest.mark.asyncio
     async def test_protected_models_not_deleted(self, llm_service, skip_if_no_ollama):
         """Verify protected models are never deleted"""
-        # Get protected models from config
+        # Get protected models from config. Match by vendor field — provider
+        # names are composite "<vendor>:<route>" under the new schema.
         protected_models = set()
         for provider in llm_service.providers:
-            if provider["name"] == "ollama":
+            if provider.get("vendor") == "ollama":
                 protected_models.add(provider["model"])
 
         if llm_service.mandate_config:

@@ -463,9 +463,11 @@ class TestOpenRouterViaLLMService:
 
         service = LLMService()
 
-        # Verify OpenRouter is being used
-        provider_names = [p["name"] for p in service.providers]
-        assert "openrouter" in provider_names, f"OpenRouter not in providers: {provider_names}"
+        # Verify OpenRouter is being used. Provider names are composite
+        # "<vendor>:<route>" under the vendor/route/model schema — match by
+        # vendor field instead of a bare name.
+        vendors = {p.get("vendor") for p in service.providers}
+        assert "openrouter" in vendors, f"OpenRouter vendor not initialized: {vendors}"
 
         # Call with tools
         response = await service.generate(
