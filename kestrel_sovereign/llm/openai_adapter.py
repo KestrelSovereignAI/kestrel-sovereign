@@ -97,6 +97,14 @@ class OpenAIAdapter(LLMAdapter):
                 if key in kwargs:
                     extra_kwargs[key] = kwargs[key]
 
+            # Provider-specific body extensions (e.g. llama.cpp's `cache_prompt`,
+            # which tells llama-server to be aggressive about retaining the
+            # slot's KV cache for prefix matching).  The service layer decides
+            # when to set this and passes it through via `extra_body` kwarg.
+            # See issue #704.
+            if "extra_body" in kwargs and kwargs["extra_body"]:
+                extra_kwargs["extra_body"] = kwargs["extra_body"]
+
             response = await with_retry(
                 client.chat.completions.create,
                 model=model,
@@ -250,6 +258,10 @@ class OpenAIAdapter(LLMAdapter):
                 if key in kwargs:
                     extra_kwargs[key] = kwargs[key]
 
+            # Provider-specific body extensions (issue #704).  See get_response().
+            if "extra_body" in kwargs and kwargs["extra_body"]:
+                extra_kwargs["extra_body"] = kwargs["extra_body"]
+
             logger.info(f"Starting OpenAI stream for model: {model}")
             stream = await with_retry(
                 client.chat.completions.create,
@@ -347,6 +359,10 @@ class OpenAIAdapter(LLMAdapter):
             for key in ["temperature", "top_p", "frequency_penalty", "presence_penalty"]:
                 if key in kwargs:
                     extra_kwargs[key] = kwargs[key]
+
+            # Provider-specific body extensions (issue #704).  See get_response().
+            if "extra_body" in kwargs and kwargs["extra_body"]:
+                extra_kwargs["extra_body"] = kwargs["extra_body"]
 
             # Request streaming with usage stats
             extra_kwargs["stream_options"] = {"include_usage": True}
