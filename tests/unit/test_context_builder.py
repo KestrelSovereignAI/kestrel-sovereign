@@ -95,30 +95,40 @@ class TestContextBuilder:
         assert result == []
 
     def test_format_conversation_history_basic(self, context_builder):
-        """Test format_conversation_history with basic messages."""
+        """Test format_conversation_history with basic messages.
+
+        User messages are wrapped in <user_input> tags on load (issue #703)
+        so the history form sent to the LLM is byte-identical to what was
+        sent as the current-turn user message at the prior turn — which is
+        what enables prompt-cache hits on the history prefix across turns.
+        Assistant messages are returned unchanged.
+        """
         history = [
             {"role": "user", "content": "Hello"},
             {"role": "assistant", "content": "Hi there"},
         ]
-        
+
         result = context_builder.format_conversation_history(history)
-        
+
         assert len(result) == 2
         assert result[0]["role"] == "user"
-        assert result[0]["content"] == "Hello"
+        assert result[0]["content"] == "<user_input>\nHello\n</user_input>"
         assert result[1]["role"] == "assistant"
         assert result[1]["content"] == "Hi there"
 
     def test_format_conversation_history_max_messages(self, context_builder):
         """Test format_conversation_history respects max_messages limit."""
         history = [{"role": "user", "content": f"Message {i}"} for i in range(100)]
-        
+
         result = context_builder.format_conversation_history(history, max_messages=10)
-        
+
         assert len(result) == 10
-        # Should keep the most recent messages
-        assert result[0]["content"] == "Message 90"
-        assert result[9]["content"] == "Message 99"
+        # Should keep the most recent messages (wrapped in <user_input> tags
+        # per issue #703 — substring check instead of exact match).
+        assert "Message 90" in result[0]["content"]
+        assert "Message 99" in result[9]["content"]
+        assert result[0]["content"].startswith("<user_input>\n")
+        assert result[9]["content"].endswith("\n</user_input>")
 
     def test_format_conversation_history_max_tokens(self, context_builder):
         """Test format_conversation_history respects max_tokens limit."""
@@ -174,11 +184,47 @@ class TestContextBuilder:
             {"role": "human", "content": "Hello"},
             {"role": "bot", "content": "Hi there"},
         ]
-        
+
         result = context_builder.format_conversation_history(history)
-        
+
         assert result[0]["role"] == "user"  # human -> user
         assert result[1]["role"] == "assistant"  # bot -> assistant
+
+    def test_format_conversation_history_wraps_user_messages(self, context_builder):
+        """Issue #703: user messages MUST be wrapped in <user_input> tags
+        on load.  The wrap string must be byte-identical to what
+        `security.input_guardrails.wrap_user_input()` produces, because at
+        the prior turn THAT function wrapped the current-turn user message
+        — and the prior sent form must equal the history-loaded form for
+        prompt caching to hit on the history prefix.
+        """
+        from kestrel_sovereign.security.input_guardrails import wrap_user_input
+
+        history = [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi"},
+            {"role": "user", "content": "multi\nline\ninput"},
+        ]
+        result = context_builder.format_conversation_history(history)
+
+        assert result[0]["content"] == wrap_user_input("hello")
+        # assistant pass-through — no wrapping
+        assert result[1]["content"] == "hi"
+        # multiline content preserved inside the wrap
+        assert result[2]["content"] == wrap_user_input("multi\nline\ninput")
+
+    def test_format_conversation_history_wrapping_matches_wrap_user_input_exact(
+        self, context_builder
+    ):
+        """Stronger invariant: the wrap format must be BYTE-IDENTICAL to
+        what wrap_user_input() produces for a current-turn message.  Even
+        a trailing-newline difference would break cache matching.
+        """
+        from kestrel_sovereign.security.input_guardrails import wrap_user_input
+
+        history = [{"role": "user", "content": "q"}]
+        result = context_builder.format_conversation_history(history)
+        assert result[0]["content"] == wrap_user_input("q")
 
     def test_build_system_prompt_basic(self, context_builder):
         """Test build_system_prompt with basic constitution."""

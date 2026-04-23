@@ -1195,9 +1195,11 @@ Expected Duration: {expected_duration}
         # Log system prompt length for debugging memory access issues
         logging.debug(f"[CONTEXT] System prompt length: {len(context_result.system_prompt)} chars")
 
-        # Build user prompt with context, wrapping user input in boundary markers
+        # Build user prompt. `context` carries the per-turn retrieved content
+        # (memories + RAG) — kept OUT of the system message so the system prefix
+        # is stable across turns and prompt caches can hit (see issue #703).
         prompt = self.user_prompt_template.format(
-            context="[Context included in system prompt]",
+            context=context_result.dynamic_user_context,
             query=wrap_user_input(user_input)
         )
 
