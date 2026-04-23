@@ -330,6 +330,39 @@ class TestStorachaUCAN:
         pk = StorachaUCAN._load_agent_key(raw_b64)
         assert pk is not None
 
+    def test_load_raw_base64_key_starting_with_M_is_accepted(self):
+        """Regression: ~1/64 random 32-byte seeds produce a base64 encoding
+        whose first character is 'M'.  The legacy loader hardcoded
+        ``startswith("M")`` as a signal for w3-key-create multibase format
+        and therefore misinterpreted those seeds, failing with a length
+        mismatch.  The loader must now accept raw seeds regardless of
+        their leading base64 character.
+        """
+        import os as _os
+
+        # Construct a raw 32-byte seed whose base64 encoding starts with 'M'.
+        # 'M' in base64 = index 12; first byte's high 6 bits = 12 → first
+        # byte in 0x30..0x33.
+        raw = bytes([0x30]) + _os.urandom(31)
+        raw_b64 = base64.b64encode(raw).decode()
+        assert raw_b64.startswith("M"), "test setup precondition"
+
+        pk = StorachaUCAN._load_agent_key(raw_b64)
+        assert pk is not None
+
+    def test_load_raw_base64_key_exhaustive_first_chars(self):
+        """Exercise every base64 first-character bucket so the legacy
+        ``startswith("M")`` regression cannot sneak back in under any
+        other leading character.  Uses deterministic seeds so failures
+        are reproducible.
+        """
+        for high_six in range(64):
+            first_byte = (high_six << 2) & 0xFF
+            raw = bytes([first_byte]) + bytes(range(31))
+            raw_b64 = base64.b64encode(raw).decode()
+            pk = StorachaUCAN._load_agent_key(raw_b64)
+            assert pk is not None, f"failed on first-char bucket {high_six}"
+
     def test_load_w3_key_format(self):
         """The multibase 'M...' format from `w3 key create` must be supported."""
         seed, _ = _make_seed_and_key()
