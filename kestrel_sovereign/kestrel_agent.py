@@ -678,41 +678,53 @@ class KestrelAgent(
         )
 
     def _apply_privacy_model_transition(self, config) -> Optional[dict]:
-        """Apply model routing side effects for a privacy-mode transition."""
+        """Apply route-routing side effects for a privacy-mode transition."""
         llm = getattr(self, "llm_service", None)
         if not llm:
             return None
 
         if not config.allows_cloud_llm():
-            local_names = llm._get_local_provider_names()
-            # Save the resolved active cloud route before overriding to local.
+            # Save the current {vendor, model, route} before overriding to local.
             current_pref = llm.get_model_preference() or {}
-            current_provider = current_pref.get("provider")
+            current_vendor = current_pref.get("vendor")
             current_model = current_pref.get("model")
+            current_route = current_pref.get("route")
             if not current_model and getattr(llm, "providers", None):
-                first_provider = llm.providers[0]
-                current_provider = first_provider.get("name")
-                current_model = first_provider.get("model")
-            if current_model and current_provider not in (local_names or []):
+                first = llm.providers[0]
+                current_vendor = first.get("vendor")
+                current_model = first.get("model")
+                current_route = first.get("route")
+            if current_model and not any(
+                p.get("vendor") == current_vendor and p.get("is_local")
+                for p in (llm.providers or [])
+            ):
                 llm._pre_ephemeral_preference = {
-                    "provider": current_provider,
+                    "vendor": current_vendor,
                     "model": current_model,
+                    "route": current_route,
                 }
 
-            local_providers = [p for p in llm.providers if p["name"] in local_names]
-            # Prefer ollama over llama_cpp — ollama is more universally available.
-            local_provider = next(
-                (p for p in local_providers if p["name"] == "ollama"),
-                local_providers[0] if local_providers else None,
+            local_routes = [p for p in (llm.providers or []) if p.get("is_local")]
+            local_route = next(
+                (p for p in local_routes if p.get("vendor") == "ollama"),
+                local_routes[0] if local_routes else None,
             )
-            if local_provider:
-                llm.set_model_preference(local_provider["model"], local_provider["name"])
-                return {"provider": local_provider["name"], "model": local_provider["model"]}
+            if local_route:
+                llm.set_model_preference(
+                    local_route["model"], local_route.get("vendor"), local_route.get("route")
+                )
+                return {
+                    "vendor": local_route.get("vendor"),
+                    "route": local_route.get("route"),
+                    "model": local_route["model"],
+                }
             return None
 
         saved = getattr(llm, "_pre_ephemeral_preference", None)
         if saved:
-            llm.set_model_preference(saved.get("model", ""), saved.get("provider", ""))
+            llm.set_model_preference(
+                saved.get("model", ""), saved.get("vendor"), saved.get("route")
+            )
             llm._pre_ephemeral_preference = None
             return saved
         return None

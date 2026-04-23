@@ -7,14 +7,12 @@ Provides in-memory caching and disk-based cache for fast startup.
 """
 import asyncio
 import logging
-from dataclasses import replace
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Set
 
 from .model_metadata import ModelInfo, ModelCategory
 from .model_catalog import get_catalog_service, ModelCatalogService
 from .model_cache import get_shared_model_cache
-from .provider_names import resolve_discovery_provider
 
 logger = logging.getLogger(__name__)
 
@@ -59,29 +57,26 @@ class ModelDiscoveryMixin:
                     providers=providers
                 )
 
-        logger.info("Discovering models from all providers...")
+        logger.info("Discovering models per vendor...")
         all_models: List[ModelInfo] = []
         catalog = get_catalog_service()
 
-        # Collect models from all adapters in parallel
+        # Discovery runs PER VENDOR, not per route. A vendor may have multiple
+        # routes (anthropic:api + anthropic:plan); they share the catalog, so
+        # we pick the first route per vendor whose adapter can list models.
         discovery_tasks = []
-
-        for adapter_name, adapter in self._get_adapters().items():
+        for vendor, route in self._select_discovery_routes():
             discovery_tasks.append(
-                self._discover_from_adapter(adapter_name, adapter)
+                self._discover_for_vendor_route(vendor, route)
             )
 
-        # Wait for all discoveries
         results = await asyncio.gather(*discovery_tasks, return_exceptions=True)
 
         for result in results:
             if isinstance(result, Exception):
-                logger.warning(f"Model discovery failed: {result}")
+                logger.warning(f"Vendor discovery failed: {result}")
             elif isinstance(result, list):
                 all_models.extend(result)
-
-        # Subscription execution providers borrow discovery from canonical API providers.
-        all_models.extend(self._build_alias_discovery_models(all_models))
 
         # Add configured provider models (from llm_config.toml) that weren't discovered
         # This ensures models like xai/grok show up even without API discovery
@@ -141,95 +136,61 @@ class ModelDiscoveryMixin:
             providers=providers
         )
 
-    def _build_alias_discovery_models(self, discovered_models: list[ModelInfo]) -> list[ModelInfo]:
-        """Project canonical discovery onto execution-alias providers.
-
-        Example: ``claude_plan`` can expose Anthropic-discovered Claude models
-        without owning a separate model catalog in its adapter.
-        """
-        if not hasattr(self, "providers") or not isinstance(self.providers, list):
-            return []
-
-        alias_models: list[ModelInfo] = []
-        seen = {(model.provider, model.id) for model in discovered_models}
-
-        for provider in self.providers:
-            provider_name = provider.get("name")
-            discovery_provider = resolve_discovery_provider(provider_name)
-            if not provider_name or not discovery_provider or provider_name == discovery_provider:
-                continue
-
-            for model in discovered_models:
-                if model.provider != discovery_provider:
-                    continue
-
-                alias_key = (provider_name, model.id)
-                if alias_key in seen:
-                    continue
-
-                alias_models.append(replace(model, provider=provider_name))
-                seen.add(alias_key)
-
-        return alias_models
-
     def _resolve_auto_providers(self, models: list) -> None:
-        """Resolve providers with model='auto' using config hints and discovered models.
+        """Resolve routes whose configured model is ``"auto"`` using discovered models.
 
-        Called after both API discovery and cache loading so that
-        get_active_model_id() returns the real model ID immediately.
+        Each route inherits the model catalog of its vendor. Selection is driven
+        by the route's ``selection_hints`` (config), then by rank heuristics.
         """
         if not hasattr(self, 'providers') or not isinstance(self.providers, list):
             return
         for provider in self.providers:
-            if provider.get("model") == "auto":
-                provider_name = provider.get("name")
-                provider_models = [
-                    m for m in models
-                    if (
-                        m.provider == resolve_discovery_provider(provider_name)
-                        and m.category == ModelCategory.CHAT
-                        and not m.is_hidden
-                    )
-                ]
-                selected_model = self._select_auto_model(provider_name, provider_models)
-                if selected_model:
-                    provider["model"] = selected_model.id
-                    logger.info(f"Auto-resolved model for {provider_name}: {provider['model']}")
-                else:
-                    logger.warning(f"No chat models discovered for {provider_name} — 'auto' unresolved")
+            if provider.get("model") != "auto":
+                continue
+            vendor = provider.get("vendor") or provider.get("name", "").split(":", 1)[0]
+            route_key = provider.get("name")
+            candidates = [
+                m for m in models
+                if m.provider == vendor
+                and m.category == ModelCategory.CHAT
+                and not m.is_hidden
+            ]
+            hints = list(provider.get("selection_hints") or [])
+            selected = self._select_auto_model_for_route(candidates, hints)
+            if selected:
+                provider["model"] = selected.id
+                logger.info(f"Auto-resolved model for {route_key}: {provider['model']}")
+            else:
+                logger.warning(f"No chat models discovered for {route_key} (vendor={vendor}) — 'auto' unresolved")
 
-    def _select_auto_model(self, provider_name: str, provider_models: list[ModelInfo]) -> Optional[ModelInfo]:
-        """Select a concrete model for an auto-configured provider.
+    def _select_auto_model_for_route(
+        self,
+        candidates: list[ModelInfo],
+        selection_hints: list[str],
+    ) -> Optional[ModelInfo]:
+        """Pick one model for a route: hint-matched first, then ranked.
 
-        Selection order:
-        1. Config `selection_hints` pattern match
-        2. Featured models
-        3. Ranked discovered models
+        ``selection_hints`` are substring patterns (e.g. ``"mini"``, ``"sonnet"``)
+        that live in config; no specific model IDs are hardcoded here.
         """
-        if not provider_models:
+        if not candidates:
             return None
-
-        provider_config = {}
-        if hasattr(self, "config") and isinstance(self.config, dict):
-            provider_config = self.config.get(provider_name, {}) or {}
-
-        selection_hints = provider_config.get("selection_hints", []) or []
         for hint in selection_hints:
             hint_lower = str(hint).lower()
             matches = [
-                m for m in provider_models
+                m for m in candidates
                 if hint_lower in m.id.lower() or hint_lower in (m.display_name or "").lower()
             ]
             ranked_matches = self._rank_auto_candidates(matches)
             if ranked_matches:
                 return ranked_matches[0]
 
-        featured = [m for m in provider_models if m.is_featured]
+        featured = [m for m in candidates if m.is_featured]
         ranked_featured = self._rank_auto_candidates(featured)
         if ranked_featured:
             return ranked_featured[0]
 
-        ranked_all = self._rank_auto_candidates(provider_models)
+        ranked_all = self._rank_auto_candidates(candidates)
         return ranked_all[0] if ranked_all else None
 
     def _rank_auto_candidates(self, models: list[ModelInfo]) -> list[ModelInfo]:
@@ -299,52 +260,74 @@ class ModelDiscoveryMixin:
             return True
         return False
 
-    async def _discover_from_adapter(
-        self,
-        adapter_name: str,
-        adapter: Any
-    ) -> List[ModelInfo]:
+    def _select_discovery_routes(self) -> list[tuple[str, dict]]:
+        """Pick one route per vendor to drive discovery.
+
+        Discovery is per-vendor; routes share the catalog. We prefer routes
+        whose adapter actually implements ``list_models`` (subscription
+        adapters like ClaudeMaxAdapter/CodexAdapter raise NotImplementedError).
         """
-        Discover models from a single adapter.
-
-        Args:
-            adapter_name: Name of the adapter (for logging)
-            adapter: The adapter instance
-
-        Returns:
-            List of ModelInfo objects from this adapter
-        """
-        # Skip adapter-based discovery for OpenAI-compatible providers that reuse
-        # OpenAIAdapter — they'd incorrectly return OpenAI's model list.
-        # Local providers (llama_cpp etc.) are discovered via direct /v1/models query below.
-        SKIP_DISCOVERY = {'runpod', 'xai', 'groq', 'together', 'mistral', 'perplexity', 'fireworks', 'azure_openai'}
-
-        # Also skip local providers that reuse OpenAIAdapter — discover them directly
-        if hasattr(self, 'config') and isinstance(self.config, dict):
-            provider_config = self.config.get(adapter_name, {})
-            if isinstance(provider_config, dict) and provider_config.get("local"):
-                return await self._discover_local_openai_compatible(adapter_name, provider_config)
-
-        if adapter_name in SKIP_DISCOVERY:
-            provider_config = self.config.get(adapter_name, {}) if hasattr(self, 'config') and isinstance(self.config, dict) else {}
-            if isinstance(provider_config, dict):
-                return await self._discover_openai_compatible_remote(adapter_name, provider_config)
+        if not hasattr(self, 'providers') or not isinstance(self.providers, list):
             return []
 
+        from .claude_max_adapter import ClaudeMaxAdapter
+        from .codex_adapter import CodexAdapter
+
+        routes_by_vendor: dict[str, list[dict]] = {}
+        for provider in self.providers:
+            vendor = provider.get("vendor") or provider.get("name", "").split(":", 1)[0]
+            routes_by_vendor.setdefault(vendor, []).append(provider)
+
+        chosen: list[tuple[str, dict]] = []
+        for vendor, routes in routes_by_vendor.items():
+            # Prefer a route whose adapter is not a subscription wrapper.
+            non_sub = [r for r in routes if not isinstance(r.get("adapter"), (ClaudeMaxAdapter, CodexAdapter))]
+            chosen.append((vendor, (non_sub or routes)[0]))
+        return chosen
+
+    async def _discover_for_vendor_route(self, vendor: str, route: dict) -> List[ModelInfo]:
+        """Run discovery for one vendor using the chosen route.
+
+        Dispatches based on adapter class + route config:
+          * ``OpenAIAdapter`` with a ``base_url`` (not canonical OpenAI) → query
+            that server's ``/models`` with the route's API key, tagged by vendor.
+          * ``OpenAIAdapter`` with ``is_local=True`` → query local ``/v1/models``.
+          * Any other adapter → ``adapter.list_models()``; tolerate
+            ``NotImplementedError`` for subscription-only wrappers.
+        """
+        from .openai_adapter import OpenAIAdapter
+
+        adapter = route.get("adapter")
+        base_url = route.get("base_url")
+        is_local = route.get("is_local")
+        route_cfg = dict(route)
+
+        # OpenAI-compatible clients (xai, runpod, groq, llama.cpp, ...) must be
+        # queried by base_url. OpenAIAdapter.list_models() is hardcoded to
+        # OPENAI_API_KEY, which would return OpenAI's catalog for every such route.
+        if isinstance(adapter, OpenAIAdapter):
+            if vendor == "openai" and not base_url:
+                # Canonical OpenAI — adapter's list_models hits api.openai.com correctly.
+                return await self._safe_list_models(vendor, adapter)
+            if base_url and is_local:
+                return await self._discover_local_openai_compatible(vendor, route_cfg)
+            if base_url:
+                return await self._discover_openai_compatible_remote(vendor, route_cfg)
+
+        return await self._safe_list_models(vendor, adapter)
+
+    async def _safe_list_models(self, vendor: str, adapter) -> List[ModelInfo]:
+        """Call adapter.list_models() with full error tolerance."""
         try:
             if hasattr(adapter, 'list_models'):
                 models = await adapter.list_models()
-                logger.debug(f"{adapter_name}: discovered {len(models)} models")
+                logger.debug("%s: discovered %d models", vendor, len(models))
                 return models
-            else:
-                logger.debug(f"{adapter_name}: list_models not implemented")
-                return []
         except NotImplementedError:
-            logger.debug(f"{adapter_name}: list_models not implemented")
-            return []
+            logger.debug("%s: adapter.list_models not implemented", vendor)
         except Exception as e:
-            logger.warning(f"{adapter_name}: model discovery failed: {e}")
-            return []
+            logger.warning("%s: model discovery failed: %s", vendor, e)
+        return []
 
     async def _discover_local_openai_compatible(
         self, provider_name: str, provider_config: dict

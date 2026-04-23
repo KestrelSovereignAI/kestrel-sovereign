@@ -32,18 +32,21 @@ class ConstitutionalAwarenessMixin:
             Tuple of (provider_name, model_id)
         """
         pref = self.get_model_preference()
-        provider = pref.get("provider")
+        # Mandate preference schema is {vendor, model, route}. Constitutional
+        # profiles are keyed per-vendor (routes under the same vendor share
+        # the same profile), so ``vendor`` is what we want here.
+        vendor = pref.get("vendor")
         model = pref.get("model")
 
-        if not provider or not model:
+        if not vendor or not model:
             if self.providers and len(self.providers) > 0:
-                provider = provider or self.providers[0].get("name", "openai")
+                vendor = vendor or self.providers[0].get("vendor") or self.providers[0].get("name", "openai")
                 model = model or self.providers[0].get("model", "auto")
             else:
-                provider = provider or "openai"
+                vendor = vendor or "openai"
                 model = model or "auto"
 
-        return provider, model
+        return vendor, model
 
     def get_constitutional_profile(
         self,

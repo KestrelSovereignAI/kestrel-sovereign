@@ -254,6 +254,42 @@ Use `!constitution article <N>` for specific articles, or `!constitution search 
 """
         return briefing
 
+    # Per-message hard cap applied before budget accounting. One oversized
+    # message can't monopolize the history budget. In-memory truncation only —
+    # the full content stays in conversation_history and can be retrieved by
+    # row id via storage tools, RAG search, or saved_items.
+    MAX_MESSAGE_TOKENS = 20_000
+    MESSAGE_HEAD_TOKENS = 2_000
+    MESSAGE_TAIL_TOKENS = 500
+
+    def _cap_oversized_message(
+        self,
+        content: str,
+        msg_id: Optional[int],
+    ) -> tuple[str, int]:
+        """Truncate a single message if it exceeds MAX_MESSAGE_TOKENS.
+
+        Keeps the head and tail with a marker pointing to the DB row id so
+        the agent can retrieve full content via storage tools.
+
+        Returns (possibly-truncated content, token count of result).
+        """
+        raw_tokens = self.counter.count(content)
+        if raw_tokens <= self.MAX_MESSAGE_TOKENS:
+            return content, raw_tokens
+
+        head = self.counter.truncate_to_tokens(content, self.MESSAGE_HEAD_TOKENS)
+        # Tail: take the last portion by character approximation (tokens ≈ chars/4)
+        tail_chars = self.MESSAGE_TAIL_TOKENS * 4
+        tail = content[-tail_chars:] if len(content) > tail_chars else ""
+
+        removed = raw_tokens - self.MESSAGE_HEAD_TOKENS - self.MESSAGE_TAIL_TOKENS
+        id_ref = f"db id={msg_id}" if msg_id is not None else "full content in conversation_history"
+        marker = f"\n\n...[truncated — ~{removed:,} tokens removed, {id_ref}]...\n\n"
+
+        truncated = head + marker + tail
+        return truncated, self.counter.count(truncated)
+
     def format_conversation_history(
         self,
         history: List[Dict],
@@ -265,7 +301,9 @@ Use `!constitution article <N>` for specific articles, or `!constitution search 
         Format conversation history for LLM context.
 
         Applies token-based limits to prevent context overflow while preserving
-        the most recent and relevant messages.
+        the most recent and relevant messages. Oversized single messages
+        (> MAX_MESSAGE_TOKENS) are truncated in-memory before budget accounting;
+        the database is not modified.
 
         Args:
             history: Raw conversation history from storage
@@ -293,9 +331,11 @@ Use `!constitution article <N>` for specific articles, or `!constitution search 
         for msg in reversed(recent):
             role = msg.get('role', 'user')
             content = msg.get('content', '')
+            msg_id = msg.get('id')
 
-            # Count tokens for this message
-            msg_tokens = self.counter.count(content) + MESSAGE_OVERHEAD
+            # Per-message hard cap before budget accounting
+            content, content_tokens = self._cap_oversized_message(content, msg_id)
+            msg_tokens = content_tokens + MESSAGE_OVERHEAD
 
             # Check if adding this message would exceed limit
             if max_tokens and total_tokens + msg_tokens > max_tokens:
@@ -327,6 +367,67 @@ Use `!constitution article <N>` for specific articles, or `!constitution search 
             f"{total_tokens} tokens"
         )
         return formatted
+
+    def estimate_effective_history_tokens(
+        self,
+        history: List[Dict],
+        model_name: str,
+    ) -> Dict[str, int]:
+        """Estimate what history tokens the LLM call path would actually send.
+
+        Runs the same format_conversation_history pipeline the live call uses,
+        with a budget derived from the target model's context limit and the
+        same adaptive allocation rule used by the real build path. Returns a
+        dict with the figures pre-flight checks should use.
+
+        Args:
+            history: Raw conversation history from storage
+            model_name: Target model (drives context_limit lookup)
+
+        Returns:
+            {
+                'effective_tokens': int,  # what the LLM would see
+                'raw_tokens': int,        # naive unpruned sum (debug)
+                'history_budget': int,    # the slice allocated to history
+                'context_limit': int,     # full model limit
+                'messages_kept': int,     # how many messages survive pruning
+                'messages_total': int,    # input history length
+            }
+        """
+        from .token_counter import get_token_counter
+        from .token_budget import create_budget
+
+        counter = get_token_counter(model_name)
+        context_limit = counter.get_context_limit()
+        # create_budget picks adaptive allocation based on message count
+        budget = create_budget(model_name, message_count=len(history))
+
+        history_budget = budget.history
+
+        # Run the real formatter as a dry-run
+        formatted = self.format_conversation_history(
+            history,
+            max_tokens=history_budget,
+        )
+
+        # Count using the same formula format_conversation_history uses internally:
+        # content tokens + MESSAGE_OVERHEAD per message. This keeps the estimate
+        # consistent with the limit format_conversation_history honored.
+        MESSAGE_OVERHEAD = 4
+        effective = sum(
+            counter.count(m.get('content', '') or '') + MESSAGE_OVERHEAD
+            for m in formatted
+        )
+        raw = sum(counter.count(m.get('content', '') or '') for m in history)
+
+        return {
+            'effective_tokens': effective,
+            'raw_tokens': raw,
+            'history_budget': history_budget,
+            'context_limit': context_limit,
+            'messages_kept': len(formatted),
+            'messages_total': len(history),
+        }
 
     def build_system_prompt(
         self,

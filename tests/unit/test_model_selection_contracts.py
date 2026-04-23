@@ -76,10 +76,27 @@ def test_resolve_provider_default_prefers_newest_matching_model_from_discovery()
     assert resolved == "claude-sonnet-4-6"
 
 
-def test_resolve_provider_default_uses_canonical_discovery_for_plan_provider():
+def test_resolve_provider_default_uses_vendor_catalog_for_subscription_route():
+    """A vendor's routes share the discovery catalog.
+
+    Under the vendor/route architecture, ``openai:plan`` (ChatGPT subscription)
+    is a route on the ``openai`` vendor — not a separate provider. Model
+    selection must read the vendor's catalog, not look for a separate
+    pseudo-provider.
+    """
     resolved = resolve_provider_default(
-        "openai_plan",
-        llm_config={"openai_plan": {"model": "auto", "selection_hints": ["gpt-5.4"]}},
+        "openai:plan",
+        llm_config={
+            "vendors": {
+                "openai": {
+                    "routes": {
+                        "api": {"model": "auto", "adapter": "OpenAIAdapter"},
+                        "plan": {"model": "auto", "adapter": "CodexAdapter",
+                                 "selection_hints": ["gpt-5.4"]},
+                    }
+                }
+            }
+        },
         catalog_config={},
         cached_models=[
             ModelInfo(

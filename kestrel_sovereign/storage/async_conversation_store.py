@@ -263,6 +263,7 @@ class AsyncConversationStore:
                     logger.warning(f"Migration failed for message {row_id}: {e}")
 
             entry = {
+                'id': row_id,
                 'role': row[1],
                 'content': content,
                 'created_at': row[4]

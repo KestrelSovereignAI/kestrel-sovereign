@@ -274,11 +274,13 @@ export async function sendMessage() {
     // Get current session ID for context-aware conversation
     const sessionId = state.currentSessionId || null;
 
-    // Send both provider and model so the backend can route to the correct provider.
-    // Without provider, the backend iterates ALL providers with just the model name,
-    // causing failures on providers that don't have that model.
-    const selectedModel = state.selectedModel || null;
-    const selectedProvider = state.selectedProvider || null;
+    // DO NOT send model/provider overrides from the chat UI. The server
+    // already knows each agent's persisted mandate (set via POST
+    // /api/model/set when the user picked from the dropdown). Sending
+    // state.selectedModel/selectedProvider here was a bug: those vars
+    // don't update when the user switches agents, so a stale override
+    // from the previous agent would silently reroute the new agent's
+    // chat to a different model. Source of truth: server mandate.
 
     try {
         if (state.useStreaming) {
@@ -286,7 +288,7 @@ export async function sendMessage() {
             let fullContent = '';
 
             try {
-                for await (const chunk of API.streamInvoke(text, selectedModel, sessionId, selectedProvider)) {
+                for await (const chunk of API.streamInvoke(text, null, sessionId, null)) {
                     fullContent += chunk;
                     updateStreamingMessage(msgDiv, fullContent);
                 }
@@ -297,7 +299,7 @@ export async function sendMessage() {
                     console.log('Streaming not available, falling back to standard invoke');
                     state.useStreaming = false;
                     msgDiv.remove();
-                    const response = await API.invoke(text, selectedModel, sessionId, selectedProvider);
+                    const response = await API.invoke(text, null, sessionId, null);
                     await addMessage('agent', response.response);
                     await checkForModelChange(response.response);
                 } else {
@@ -305,7 +307,7 @@ export async function sendMessage() {
                 }
             }
         } else {
-            const response = await API.invoke(text, selectedModel, sessionId, selectedProvider);
+            const response = await API.invoke(text, null, sessionId, null);
             await addMessage('agent', response.response);
             await checkForModelChange(response.response);
         }
@@ -557,28 +559,79 @@ export async function loadModels() {
         return;
     }
 
+    // Blank the dropdowns IMMEDIATELY before building the new selector. Without
+    // this, the previous agent's options remain in the DOM while the async
+    // /api/models + /api/model/current round-trips for the new agent complete,
+    // and the user briefly sees the previous agent's vendor/model (the "flash"
+    // Jason saw when switching agents).
+    for (const id of ['provider-selector', 'route-selector', 'model-selector']) {
+        const el = document.getElementById(id);
+        if (el) {
+            el.innerHTML = '<option value="">Loading…</option>';
+            el.value = '';
+            if (id === 'route-selector') el.style.display = 'none';
+        }
+    }
+
     // Create the shared model selector instance
     // Use API.buildAgentUrl() for proper rookery routing and pass auth headers
     sharedModelSelector = new window.SharedModelSelector({
         providerSelectId: 'provider-selector',
+        routeSelectId: 'route-selector',
         modelSelectId: 'model-selector',
         apiEndpoint: API.buildAgentUrl('/api/models'),
         currentModelEndpoint: API.buildAgentUrl('/api/model/current'),
-        storagePrefix: 'kestrel',
+        storagePrefix: `kestrel_${API.getHostAgent() || 'default'}`,
         getAuthHeader: () => {
             const key = API.getApiKey();
             return key ? { 'X-API-Key': key } : {};
         },
-        onModelChange: async (provider, model) => {
-            // Update state with both provider and model
-            state.selectedModel = model;
-            state.selectedProvider = provider;
+        onModelChange: async (vendor, model, isInitialLoad, route) => {
+            if (isInitialLoad) return;
 
-            // Send model-set command to agent with explicit provider
-            // Format: !model-set <provider> <model>
-            if (messageInput) {
-                messageInput.value = `!model-set ${provider} ${model}`;
-                await sendMessage();
+            // Direct REST call to /api/model/set — NOT a chat message. The old
+            // flow (write "!model-set ..." to messageInput, sendMessage) went
+            // through the chat stream, so switching agents mid-stream left the
+            // response's MODEL_CHANGED marker to land on whatever selector was
+            // currently visible, corrupting state across agents.
+            //
+            // We capture the host agent at dispatch time and discard the
+            // response if the user has switched agents before it lands.
+            const dispatchAgent = API.getHostAgent();
+
+            // Persist vendor/route/model in chat state immediately so the UI
+            // reflects the user's intent without waiting for the round-trip.
+            state.selectedModel = model;
+            state.selectedProvider = vendor;    // legacy name retained
+            state.selectedVendor = vendor;
+            state.selectedRoute = route || null;
+
+            const body = { vendor, model };
+            if (route) body.route = route;
+            const headers = { 'Content-Type': 'application/json' };
+            const key = API.getApiKey();
+            if (key) headers['X-API-Key'] = key;
+
+            try {
+                const resp = await fetch(API.buildAgentUrl('/api/model/set'), {
+                    method: 'POST',
+                    headers,
+                    body: JSON.stringify(body),
+                });
+                if (!resp.ok) {
+                    console.warn(`set model failed (${dispatchAgent}): HTTP ${resp.status}`);
+                    return;
+                }
+                if (API.getHostAgent() !== dispatchAgent) {
+                    // User switched agents before the server acked. Silently
+                    // succeed — the change on dispatchAgent is persisted; don't
+                    // overwrite the NEW agent's state.
+                    return;
+                }
+                // No UI update needed here: the selector already reflects the
+                // user's click; the server is the source of truth from here on.
+            } catch (e) {
+                console.warn(`set model request error (${dispatchAgent}):`, e);
             }
         }
     });

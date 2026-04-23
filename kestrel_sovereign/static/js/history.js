@@ -312,6 +312,11 @@ window.startNewConversation = async function() {
 
         await loadConversationHistory();
 
+        // Refresh the context status for the new (empty) session so the
+        // footer stops reporting stale message count / utilization from the
+        // previous conversation.
+        updateContextStatus();
+
         Toast.success('New conversation started');
     } catch (e) {
         Toast.error(`Failed to start new conversation: ${e.message}`);

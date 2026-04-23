@@ -5,13 +5,15 @@
 #
 # This file contains ONLY data that APIs don't provide reliably.
 
-# Hidden models (truly broken/useless — won't show even in "Show More")
-# Keep this minimal — old models are still useful for some users
+# Hidden models (emergency override only — empty in the common case).
+# Visibility is discovery-driven: capability signals + deprecation keywords +
+# canonical-alias detection decide what's shown by default. Add an entry here
+# only when the vendor's own metadata is wrong.
 [hidden]
-openai = ["babbage-002", "davinci-002"]
+# openai = []
 
-# Category overrides — APIs don't consistently indicate chat vs embedding
-# Models not listed here default to "chat"
+# Category overrides — APIs don't consistently indicate which endpoint a model
+# belongs on. Anything listed here is filtered out of the chat dropdown.
 [categories.embedding]
 openai = ["text-embedding-3-small", "text-embedding-3-large", "text-embedding-ada-002"]
 ollama = ["nomic-embed-text", "mxbai-embed-large", "all-minilm"]
@@ -21,6 +23,11 @@ openai = ["dall-e-3", "dall-e-2"]
 
 [categories.audio]
 openai = ["whisper-1", "tts-1", "tts-1-hd"]
+
+# Legacy base-completion models (pre-chat API). They appear in /v1/models but
+# only accept /v1/completions, so they don't belong in the chat dropdown.
+[categories.completion]
+openai = ["babbage-002", "davinci-002"]
 
 # Context limit overrides (tokens)
 # ONLY for providers whose APIs don't return context window sizes:

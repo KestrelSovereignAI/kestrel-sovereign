@@ -41,18 +41,37 @@ class TestPrivacyConsentCaller:
         agent.privacy_agent.set_mode.assert_called_once_with(PrivacyMode.EPHEMERAL)
 
 
+def _make_ctx_builder_stub():
+    """Context-builder stub for set_model() pre-switch safety check.
+
+    The real code calls ``estimate_effective_history_tokens`` to decide whether
+    switching to the target model would overflow its history budget. Return a
+    generous budget so the switch is considered safe.
+    """
+    ctx = MagicMock()
+    ctx.estimate_effective_history_tokens = MagicMock(return_value={
+        "effective_tokens": 0,
+        "raw_tokens": 0,
+        "history_budget": 100000,
+        "context_limit": 200000,
+        "messages_kept": 0,
+    })
+    return ctx
+
+
 class TestModelConsentCaller:
     @pytest.mark.asyncio
     async def test_model_change_requests_consent_before_switch(self):
         parent_agent = MagicMock()
         parent_agent.storage = MagicMock()
         parent_agent.storage.get_conversation_history = AsyncMock(return_value=[])
+        parent_agent.context_builder = _make_ctx_builder_stub()
         parent_agent.features = {"ConsentFeature": _make_consent()}
 
         model_agent = ModelAgent(agent=parent_agent)
         model_agent.llm_service = MagicMock()
         model_agent.llm_service.get_model_preference = MagicMock(
-            return_value={"provider": "openai", "model": "gpt-5"}
+            return_value={"vendor": "openai", "model": "gpt-5", "route": None}
         )
         model_agent.llm_service.set_model_preference = MagicMock()
         # Bypass OpenRouter cache lookup — this test proves consent plumbing,
@@ -64,15 +83,18 @@ class TestModelConsentCaller:
         assert result["success"] is True
         parent_agent.features["ConsentFeature"].request_consent.assert_awaited_once_with(
             "model_change",
-            {"from": "gpt-5", "to": "gpt-5-mini", "provider": "openai"},
+            {"from": "gpt-5", "to": "gpt-5-mini", "vendor": "openai", "route": None},
         )
-        model_agent.llm_service.set_model_preference.assert_called_once_with("gpt-5-mini", "openai")
+        model_agent.llm_service.set_model_preference.assert_called_once_with(
+            "gpt-5-mini", "openai", None
+        )
 
     @pytest.mark.asyncio
     async def test_model_change_proceeds_when_consent_fails(self):
         parent_agent = MagicMock()
         parent_agent.storage = MagicMock()
         parent_agent.storage.get_conversation_history = AsyncMock(return_value=[])
+        parent_agent.context_builder = _make_ctx_builder_stub()
         consent = _make_consent()
         consent.request_consent = AsyncMock(side_effect=RuntimeError("consent unavailable"))
         parent_agent.features = {"ConsentFeature": consent}
@@ -80,7 +102,7 @@ class TestModelConsentCaller:
         model_agent = ModelAgent(agent=parent_agent)
         model_agent.llm_service = MagicMock()
         model_agent.llm_service.get_model_preference = MagicMock(
-            return_value={"provider": "openai", "model": "gpt-5"}
+            return_value={"vendor": "openai", "model": "gpt-5", "route": None}
         )
         model_agent.llm_service.set_model_preference = MagicMock()
         model_agent._is_openrouter_model = AsyncMock(return_value=False)
@@ -88,7 +110,9 @@ class TestModelConsentCaller:
         result = await model_agent.set_model("openai/gpt-5-mini")
 
         assert result["success"] is True
-        model_agent.llm_service.set_model_preference.assert_called_once_with("gpt-5-mini", "openai")
+        model_agent.llm_service.set_model_preference.assert_called_once_with(
+            "gpt-5-mini", "openai", None
+        )
 
 
 class _ConstitutionHarness(ConstitutionMixin):

@@ -84,13 +84,13 @@ class TestModelsEndpoint:
         data = response.json()
 
         # Check required fields
-        assert "by_provider" in data
+        assert "by_vendor" in data
         assert "featured" in data
         assert "all" in data
         assert "default" in data
         assert "count" in data
 
-        assert isinstance(data["by_provider"], dict)
+        assert isinstance(data["by_vendor"], dict)
         assert isinstance(data["featured"], list)
         assert isinstance(data["all"], list)
         assert isinstance(data["count"], int)
@@ -157,11 +157,11 @@ class TestModelsEndpoint:
 
         data_all = response_all.json()
 
-        if not data_all["by_provider"]:
+        if not data_all["by_vendor"]:
             pytest.skip("No providers available")
 
         # Pick first provider
-        provider = list(data_all["by_provider"].keys())[0]
+        provider = list(data_all["by_vendor"].keys())[0]
 
         # Filter to that provider
         response = client.get(f"/api/models?providers={provider}&featured_only=false")
@@ -193,8 +193,8 @@ class TestModelsEndpoint:
         assert "is_featured" in model
         assert "is_hidden" in model
 
-    def test_models_endpoint_by_provider_grouping(self, client: TestClient):
-        """Test that by_provider groups correctly"""
+    def test_models_endpoint_by_vendor_grouping(self, client: TestClient):
+        """Test that by_vendor groups correctly"""
         response = client.get("/api/models?featured_only=false")
 
         if response.status_code != 200:
@@ -203,7 +203,7 @@ class TestModelsEndpoint:
         data = response.json()
 
         # Check that models are grouped correctly
-        for provider, models in data["by_provider"].items():
+        for provider, models in data["by_vendor"].items():
             for model in models:
                 assert model.get("provider") == provider
 
@@ -271,6 +271,9 @@ class TestCurrentModelEndpoint:
         if response.status_code == 200:
             data = response.json()
 
+            # Vendor/route/model schema: /api/model/current returns
+            # {model, vendor, route, model_name}. No "provider" key.
             assert "model" in data
-            assert "provider" in data
+            assert "vendor" in data
+            assert "route" in data
             assert "model_name" in data

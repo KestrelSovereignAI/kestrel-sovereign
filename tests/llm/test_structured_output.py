@@ -434,7 +434,7 @@ class TestStructuredOutputEdgeCases:
 
         # OpenAI doesn't support Optional fields in structured output
         # All fields must be in the 'required' array
-        if provider in ["openai", "openai_mini"]:
+        if provider == "openai":
             pytest.skip("OpenAI doesn't support optional fields in structured output")
 
         class OptionalResponse(BaseModel):

@@ -58,6 +58,17 @@ def test_context_status_reports_token_budget_and_warning_band():
     agent.get_current_model = MagicMock(return_value="gpt-5")
     agent.storage.get_conversation_history = AsyncMock(return_value=history)
 
+    # endpoints/agent.py now delegates to ContextBuilder.estimate_effective_history_tokens
+    # for the pruning + per-message cap accounting. Stub it here.
+    ctx_builder = MagicMock()
+    ctx_builder.estimate_effective_history_tokens = MagicMock(return_value={
+        "effective_tokens": 2900,
+        "raw_tokens": 2900,
+        "history_budget": 2976,   # 4000 - 1024 response reserve
+        "messages_kept": 3,
+    })
+    agent.context_builder = ctx_builder
+
     app, original = _prepare_app(agent)
     try:
         with patch(
@@ -84,6 +95,9 @@ def test_context_status_reports_token_budget_and_warning_band():
         agent.storage.get_conversation_history.assert_awaited_once_with(
             limit=10000,
             session_id="session-1",
+        )
+        ctx_builder.estimate_effective_history_tokens.assert_called_once_with(
+            history, "gpt-5",
         )
     finally:
         _restore_app(app, original)

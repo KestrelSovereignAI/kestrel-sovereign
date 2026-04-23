@@ -5,6 +5,7 @@ on:
     tags:
       - 'v[0-9]+.[0-9]+.[0-9]+'  # Run on version tags like v1.0.0, v2.3.4
     branches:
+      - 'main'     # Run on main pushes — lint-and-imports only (see `if:` on heavier jobs)
       - 'issue-*'  # Run on kestrel-talon feature branches
   pull_request:
     branches: [main]  # Run on PRs targeting main
@@ -63,9 +64,15 @@ jobs:
           KESTREL_AUDIT_MODE: skip
 
   # Integration tests (with services)
+  # Skipped on main-branch pushes — by then the PR that landed this code
+  # already ran integration-tests against the merge commit. Re-running on
+  # the squash-merge adds cost without new signal. The integration +
+  # llm-tests suite is also the heaviest (services, GPUs, API credits),
+  # more suited to local verification and special cases. See #682.
   integration-tests:
     runs-on: ubuntu-latest
     needs: unit-tests
+    if: github.event_name != 'push' || github.ref != 'refs/heads/main'
     services:
       postgres:
         image: pgvector/pgvector:pg15

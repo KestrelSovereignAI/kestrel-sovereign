@@ -292,12 +292,23 @@ class TestCatalogWithRealConfig:
 
         assert service._loaded
 
-    def test_real_config_has_hidden_models(self):
-        """Test that real config has hidden models configured"""
+    def test_real_config_filters_legacy_completion_models_via_category(self):
+        """babbage-002 / davinci-002 are filtered from chat via category, not [hidden].
+
+        Per the vendor/route/model refactor (#688): visibility is discovery-driven,
+        so these legacy /v1/completions models are classified as category=completion
+        rather than listed in [hidden]. Chat UI only shows category=chat.
+        """
+        from kestrel_sovereign.llm.model_catalog import ModelCategory
+
         service = ModelCatalogService()
         service.load()
 
-        assert service.is_hidden("openai", "babbage-002")
+        assert service.get_category("openai", "babbage-002") == ModelCategory.COMPLETION
+        assert service.get_category("openai", "davinci-002") == ModelCategory.COMPLETION
+        # And they are NOT in the [hidden] list (no maintained list for this).
+        assert not service.is_hidden("openai", "babbage-002")
+        assert not service.is_hidden("openai", "davinci-002")
 
     def test_real_config_embedding_models_explicit_only(self):
         """Test that catalog only matches explicitly listed embedding models."""
