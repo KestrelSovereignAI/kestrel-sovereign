@@ -45,9 +45,21 @@ import statistics
 import sys
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Callable, List, Optional
 
 import httpx
+
+# Load API keys from a local .env (symlink or real file) in the repo root
+# so the bench can be run directly without exporting keys manually.  Silent
+# no-op if the file is absent — cloud providers then get marked "skipped".
+try:
+    from dotenv import load_dotenv as _load_dotenv
+    _env_path = Path(__file__).resolve().parent.parent / ".env"
+    if _env_path.exists():
+        _load_dotenv(_env_path, override=False)
+except ImportError:
+    pass
 
 
 STABLE_SYSTEM = (
