@@ -18,6 +18,7 @@ CAR v1 spec:         https://ipld.io/specs/transport/car/carv1/
 """
 
 import base64
+import binascii
 import hashlib
 import logging
 import time
@@ -436,24 +437,43 @@ class StorachaUCAN:
         - "M..." multibase base64pad with ed25519-priv multicodec prefix
           (output of `w3 key create`)
         - Raw base64url or base64 of 32-byte seed (for testing)
+
+        The "starts with M" check is not by itself reliable — 1/64 random
+        32-byte seeds produce a base64 encoding whose first character IS
+        'M', which made the prior naive branch misinterpret a raw seed as
+        multibase, strip a phantom varint prefix, and fail with a length
+        mismatch.  We now try both interpretations and accept whichever
+        yields a valid 32-byte seed.
         """
         encoded = encoded.strip()
-        if encoded.startswith("M"):
-            # Multibase base64pad: strip "M" prefix and decode
-            raw = base64.b64decode(_pad_base64(encoded[1:]))
-            # Strip the multicodec varint prefix ([0x80, 0x26] for ed25519-priv)
-            _, n = _read_varint(raw, 0)
-            seed = raw[n:]
-        else:
-            # Treat as raw base64-encoded 32-byte seed
-            seed = base64.b64decode(_pad_base64(encoded))
+        candidates: List[bytes] = []
 
-        if len(seed) != 32:
-            raise ValueError(
-                f"Expected a 32-byte Ed25519 seed, got {len(seed)} bytes. "
-                "Use the key produced by `w3 key create` for STORACHA_AGENT_KEY."
-            )
-        return Ed25519PrivateKey.from_private_bytes(seed)
+        # Candidate 1: multibase base64pad ("M" prefix stripped, then
+        # varint-prefixed payload).  Only attempt when the encoded string
+        # actually starts with "M" — the canonical w3 key create output.
+        if encoded.startswith("M"):
+            try:
+                raw = base64.b64decode(_pad_base64(encoded[1:]))
+                _, n = _read_varint(raw, 0)
+                candidates.append(raw[n:])
+            except (ValueError, IndexError, binascii.Error):
+                pass
+
+        # Candidate 2: raw base64 / base64url of the seed itself.
+        try:
+            candidates.append(base64.b64decode(_pad_base64(encoded)))
+        except (ValueError, binascii.Error):
+            pass
+
+        for seed in candidates:
+            if len(seed) == 32:
+                return Ed25519PrivateKey.from_private_bytes(seed)
+
+        got = ", ".join(str(len(c)) for c in candidates) if candidates else "none"
+        raise ValueError(
+            f"Expected a 32-byte Ed25519 seed; decoded candidate lengths: {got}. "
+            "Use the key produced by `w3 key create` for STORACHA_AGENT_KEY."
+        )
 
 
 # ---------------------------------------------------------------------------
