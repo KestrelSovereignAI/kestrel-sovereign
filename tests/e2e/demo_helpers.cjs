@@ -68,7 +68,7 @@ function authHeaders(apiKey) {
  * @param {string} message
  * @param {number} [timeout=90000]
  */
-async function demoSendMessage(page, message, timeout = 90000) {
+async function demoSendMessage(page, message, timeout = 300000) {
   try {
     const initialCount = await page.locator('.agent-message').count();
     await page.locator('#message-input').fill(message);
@@ -78,12 +78,15 @@ async function demoSendMessage(page, message, timeout = 90000) {
         const msgs = document.querySelectorAll('.agent-message');
         if (msgs.length <= count) return false;
         const last = msgs[msgs.length - 1];
-        return (last.textContent || '').trim().length > 5 &&
-               !last.querySelector('.streaming');
+        if ((last.textContent || '').trim().length <= 5) return false;
+        if (last.querySelector('.streaming')) return false;
+        return true;
       },
       initialCount,
       { timeout }
     );
+    // Wait for the global thinking indicator to fully disappear after the response finalizes
+    await page.waitForSelector('#thinking-indicator', { state: 'hidden', timeout: 30000 }).catch(() => {});
     return page.locator('.agent-message').last();
   } catch (e) {
     console.warn(`[DEMO] Message send/wait issue: ${e.message}`);
@@ -164,8 +167,22 @@ async function scrollChatToBottom(page) {
  */
 function clearConversationHistory(narrator, agentDataDir) {
   try {
-    const dbs = execSync(`find "${agentDataDir}" -name "kestrel_prime.db" -maxdepth 3 2>/dev/null`)
-      .toString().trim().split('\n').filter(Boolean);
+    // Cross-platform DB discovery: use Node's glob-style walk instead of Unix `find`
+    const fs = require('fs');
+    const path = require('path');
+    function findDbs(dir, depth = 0) {
+      if (depth > 3) return [];
+      let results = [];
+      try {
+        for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+          const full = path.join(dir, entry.name);
+          if (entry.isDirectory()) results = results.concat(findDbs(full, depth + 1));
+          else if (entry.name === 'kestrel_prime.db') results.push(full);
+        }
+      } catch { /* permission denied or missing */ }
+      return results;
+    }
+    const dbs = findDbs(agentDataDir);
     for (const db of dbs) {
       try {
         execSync(`sqlite3 "${db}" "DELETE FROM conversation_history;"`);

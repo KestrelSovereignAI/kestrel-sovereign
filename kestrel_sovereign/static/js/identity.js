@@ -477,11 +477,13 @@ window.showPrivacySelector = function() {
                         localStorage.setItem('kestrel_saved_cloud_provider', current.provider);
                         localStorage.setItem('kestrel_saved_cloud_model', current.model);
                     }
+                    // Server returns 'vendor'; fall back to 'provider' for forward-compat
+                    const switchedProvider = result.model_switched.vendor || result.model_switched.provider;
                     window._sharedModelSelector.setSelection(
-                        result.model_switched.provider,
+                        switchedProvider,
                         result.model_switched.model
                     );
-                    Toast.success(`Privacy: ${PRIVACY_MODES[mode]?.label || mode} — switched to ${result.model_switched.provider} (local only)`);
+                    Toast.success(`Privacy: ${PRIVACY_MODES[mode]?.label || mode} — switched to ${switchedProvider} (local only)`);
                 } else if (result.allows_cloud_llm !== false) {
                     // Switching back to cloud-allowing mode — restore saved cloud selection
                     const savedProvider = localStorage.getItem('kestrel_saved_cloud_provider');

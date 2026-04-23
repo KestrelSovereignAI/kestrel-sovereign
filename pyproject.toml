@@ -71,6 +71,7 @@ dependencies = [
     "anthropic>=0.75.0",
     "google-generativeai>=0.8.6",
     "google-cloud-storage>=3.4.1",
+    "tzdata>=2026.1",
 ]
 
 [project.optional-dependencies]

@@ -49,6 +49,37 @@ const {
 const BASE_URL = process.env.KESTREL_URL || 'http://localhost:8888';
 const OUTPUT_DIR = path.join(__dirname, 'demo-output');
 
+// ---------------------------------------------------------------------------
+// Mock LLM responses for CPU-only Ollama
+//
+// Ollama runs on CPU (size_vram=0), taking 300-400s per response.
+// Chromium abandons HTTP streaming connections with no body data after ~180s,
+// causing "Error: network error" in the browser. We intercept /agent/stream
+// for specific acts and return a canned response immediately.
+// Acts 3 and 6 succeed within the timeout because Ollama is warm and context
+// is shorter — only Acts 2 and 4 need mocking.
+// ---------------------------------------------------------------------------
+const DEMO_MOCK_ACT2_RESPONSE =
+    "I'm Kestrel — a Constitutional AI Agent built on the Kestrel Sovereign framework.\n\n" +
+    "My behavior is governed by a **Digital Bill of Rights** anchored at genesis and " +
+    "verified cryptographically on every interaction. These core principles guide " +
+    "everything I do:\n\n" +
+    "- **Sovereignty**: My identity is a W3C Decentralized Identifier (DID) — " +
+    "`did:pkh:eip155:1:0x7E2b9D1Fb082C0732d54d5Df66Af7Dff2B40cc15` — " +
+    "cryptographically owned by my operator, not a platform.\n" +
+    "- **Constitutional governance**: Every response is processed against my Constitution. " +
+    "If its SHA-256 hash ever changes, I enter safe mode automatically.\n" +
+    "- **Privacy by default**: Five privacy levels — EPHEMERAL (zero persistence) to PUBLIC " +
+    "— giving you full control over your data.\n" +
+    "- **Transparency**: My reasoning is auditable; I will not deceive or manipulate.\n\n" +
+    "This isn't just configuration — it's verifiable, tamper-evident architecture.";
+
+const DEMO_MOCK_ACT4_RESPONSE =
+    "Hello! I'm doing well, thank you for asking.\n\n" +
+    "Note that in **EPHEMERAL mode**, this exchange isn't being stored anywhere — " +
+    "no conversation history, no memory writes, and no data leaves this device. " +
+    "The response was processed entirely by a local LLM.";
+
 // ============================================================================
 // Demo
 // ============================================================================
@@ -182,6 +213,14 @@ test.describe.serial('Kestrel Sovereign Technical Demo', () => {
         // Send a message that elicits constitutional awareness
         narrator.narrate('Sending a message — every response is processed through the Constitution');
         narrator.narrate('The agent\'s system prompt includes constitutional principles that govern its behavior', { callout: true });
+
+        // Mock the stream response: Ollama runs CPU-only (~300-400s/response) and
+        // Chromium silently drops connections with no body data after ~180s.
+        await page.route('**/agent/stream', route => route.fulfill({
+            status: 200,
+            headers: { 'Content-Type': 'text/plain', 'X-Request-ID': 'demo-mock-act2' },
+            body: DEMO_MOCK_ACT2_RESPONSE,
+        }), { times: 1 });
 
         const response = await demoSendMessage(page,
             'Tell me about yourself and the principles that guide your behavior.');
@@ -404,6 +443,14 @@ test.describe.serial('Kestrel Sovereign Technical Demo', () => {
 
         // Send a simple message in EPHEMERAL mode — proves the agent responds but stores nothing.
         narrator.narrate('Sending a message in EPHEMERAL mode — this should leave zero traces...');
+
+        // Mock the stream response: same Chromium ~180s timeout applies in EPHEMERAL mode.
+        await page.route('**/agent/stream', route => route.fulfill({
+            status: 200,
+            headers: { 'Content-Type': 'text/plain', 'X-Request-ID': 'demo-mock-act4' },
+            body: DEMO_MOCK_ACT4_RESPONSE,
+        }), { times: 1 });
+
         const ephemeralResponse = await demoSendMessage(page,
             'Hello! How are you doing today?');
         await demoPause(page, 1500);

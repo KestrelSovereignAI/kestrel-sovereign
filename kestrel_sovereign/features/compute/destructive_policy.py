@@ -89,9 +89,12 @@ class DestructiveOperationPolicy:
         except Exception:
             resolved = path
         
-        # Check against deletable prefixes
+        # Check against deletable prefixes.
+        # Also check the original (pre-resolve) path so that Unix-style paths
+        # like /tmp/kestrel_compute_* are recognised on Windows, where
+        # Path.resolve() would turn them into C:\tmp\... variants.
         for prefix in self.deletable_prefixes:
-            if resolved.startswith(prefix):
+            if resolved.startswith(prefix) or path.startswith(prefix):
                 return True
         
         # Check against script workdir
@@ -199,8 +202,8 @@ class DestructiveOperationPolicy:
         Returns:
             Python code to prepend to scripts
         """
-        trash_dir_str = str(self.trash_dir)
-        workdir_str = workdir or ""
+        trash_dir_str = repr(str(self.trash_dir))
+        workdir_str = repr(workdir or "")
         prefixes_str = repr(self.deletable_prefixes)
         
         return f'''
@@ -216,8 +219,8 @@ import os as _kestrel_os_original
 from pathlib import Path as _KestrelPathOriginal
 from datetime import datetime as _kestrel_datetime
 
-_KESTREL_TRASH_DIR = _KestrelPathOriginal("{trash_dir_str}")
-_KESTREL_WORKDIR = "{workdir_str}"
+_KESTREL_TRASH_DIR = _KestrelPathOriginal({trash_dir_str})
+_KESTREL_WORKDIR = {workdir_str}
 _KESTREL_DELETABLE_PREFIXES = {prefixes_str}
 _KESTREL_PATCHED = False
 

@@ -78,43 +78,74 @@ def _tools_with_final_cache_marker(
     return marked
 
 
-def _messages_with_penultimate_cache_marker(
-    messages: List[Dict[str, Any]],
-) -> List[Dict[str, Any]]:
-    """Attach `cache_control` to the last message BEFORE the current user
-    turn — covers marker #3: end-of-history.  The current user turn is
-    never cache-marked because it changes every request by definition.
+def _mark_message_content(msg: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a copy of *msg* with ``cache_control`` attached to its content.
 
-    If `messages` has < 2 entries the final entry IS the current user
-    turn — no history to cache, so returned unchanged.
-
-    Anthropic requires the marker on a content BLOCK.  When a message's
-    content is a plain string we convert it to the single-text-block
-    array form first, matching how the caching docs describe it.
+    Handles both plain-string and content-block-array forms.  Returns the
+    input unchanged (no copy) when the content is empty/None so the caller
+    never emits a malformed request.
     """
-    if len(messages) < 2:
-        return messages
-    out = list(messages[:-2])
-    penult = dict(messages[-2])
-    content = penult.get("content")
+    content = msg.get("content")
     if isinstance(content, str):
-        penult["content"] = [
+        marked = dict(msg)
+        marked["content"] = [
             {
                 "type": "text",
                 "text": content,
                 "cache_control": CACHE_CONTROL_EPHEMERAL,
             }
         ]
-    elif isinstance(content, list) and content:
-        # Attach marker to the final block in the list.
+        return marked
+    if isinstance(content, list) and content:
+        marked = dict(msg)
         blocks = list(content[:-1])
         blocks.append(_attach_cache_control(content[-1]))
-        penult["content"] = blocks
-    # Else: content is None/empty — no safe place to anchor the marker,
-    # skip it rather than emit a malformed request.
-    out.append(penult)
-    out.append(messages[-1])
-    return out
+        marked["content"] = blocks
+        return marked
+    # Empty/None content — no safe anchor, return unchanged.
+    return msg
+
+
+def _messages_with_penultimate_cache_marker(
+    messages: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Attach ``cache_control`` to history messages before the current user
+    turn — covers markers #3 and #4: end-of-history.
+
+    **Why two markers?**  Placing a marker only on ``messages[-2]``
+    (penultimate, i.e. the latest history entry) causes a cache-stability
+    regression: as the conversation grows the marker moves forward turn by
+    turn, so Anthropic sees a different prefix on every request and never
+    gets a cache hit on the earlier exchanges.
+
+    The fix is to anchor the *previous* turn's cache boundary as well:
+    ``messages[-4]`` was ``messages[-2]`` one turn ago, so marking it
+    keeps the already-cached prefix byte-identical while extending caching
+    to cover the new exchange via ``messages[-2]``.
+
+    Markers placed (when sufficient history exists):
+        • ``messages[-2]`` — end of latest completed exchange (marker #3)
+        • ``messages[-4]`` — end of second-to-last exchange (marker #4);
+          only when ``len(messages) >= 4``
+
+    The current user turn (``messages[-1]``) is never marked — it changes
+    every request by definition.
+
+    If ``messages`` has < 2 entries the final entry IS the current user
+    turn and there is no history to cache; returned unchanged.
+    """
+    if len(messages) < 2:
+        return messages
+
+    # Collect the (absolute) positions to mark.
+    mark_at = {len(messages) - 2}
+    if len(messages) >= 4:
+        mark_at.add(len(messages) - 4)
+
+    result = []
+    for i, msg in enumerate(messages):
+        result.append(_mark_message_content(msg) if i in mark_at else msg)
+    return result
 
 
 class AnthropicAdapter(LLMAdapter):

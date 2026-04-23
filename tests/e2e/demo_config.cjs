@@ -12,7 +12,7 @@ const { buildDemoConfig } = require('@kestrel/flight');
  * Env: DEMO_SLOWMO=200, KESTREL_URL, KESTREL_API_KEY
  */
 module.exports = buildDemoConfig(
-  [{ name: 'demo', testMatch: 'demo_technical.demo.cjs', timeout: 300000 }],
+  [{ name: 'demo', testMatch: 'demo_technical.demo.cjs', timeout: 600000 }],
   {
     baseURL: process.env.KESTREL_URL || 'http://localhost:8888',
     outputDir: path.join(__dirname, 'demo-output', 'playwright'),
