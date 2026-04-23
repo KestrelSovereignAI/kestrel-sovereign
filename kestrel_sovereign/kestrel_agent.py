@@ -571,14 +571,21 @@ class KestrelAgent(
                 agent_data_path=agent_data_dir
             )
 
-            # Initialize unified context manager (orchestrates all context sources)
-            # Model identity derived lazily from llm_service.get_active_model_id()
+            # Initialize unified context manager (orchestrates all context sources).
+            # Model identity derived lazily from llm_service.get_active_model_id().
+            # Inject the ContextBuilder we just built — it has bootstrap files
+            # (SOUL.md, AGENTS.md, …) loaded with this agent's identity.  If we
+            # let ContextManager construct its own, it would have no
+            # agent_data_path and its BootstrapLoader would stay empty, so
+            # the system prompt sent on every chat turn would contain no
+            # identity block.  (That was the original bug this fix addresses.)
             self.context_manager = ContextManager(
                 storage=self.storage,
                 agent_id=self.agent_id,
                 consolidator=self.memory_consolidator,
                 memory_retriever=self.memory_system.retriever,
                 llm_service=self.llm_service,
+                context_builder=self.context_builder,
             )
 
             # Context stats accumulator for duplicate detection / token attribution.
