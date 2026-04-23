@@ -264,13 +264,59 @@ async def test_openai_compatible_adapter_preserves_history_prefix(runner, label)
         )
 
 
+def _canonicalize_anthropic_message(msg: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize an Anthropic-format message for cross-turn comparison.
+
+    Two legitimate variations that aren't "content divergence":
+
+    1. ``cache_control`` markers are attached/not-attached depending on
+       whether this message happens to be the penultimate on THIS turn.
+       Stripping them isolates the actual content.
+
+    2. When a marker gets attached, the adapter upgrades the content
+       from a plain string to the single-block list form
+       ``[{"type": "text", "text": <s>}]``.  On a later turn the same
+       message may carry no marker and remain a plain string.  The
+       semantic content is identical.  We collapse single-text-block
+       lists back to their plain-string form for comparison.
+    """
+    import copy as _copy
+
+    out = _copy.deepcopy(msg)
+    content = out.get("content")
+    if isinstance(content, list):
+        for block in content:
+            if isinstance(block, dict):
+                block.pop("cache_control", None)
+        # Collapse `[{"type": "text", "text": s}]` back to plain string.
+        if (
+            len(content) == 1
+            and isinstance(content[0], dict)
+            and content[0].get("type") == "text"
+            and set(content[0].keys()) <= {"type", "text"}
+        ):
+            out["content"] = content[0]["text"]
+    return out
+
+
+def _strip_cache_control(msg: Dict[str, Any]) -> Dict[str, Any]:
+    """Backwards-compat alias — delegates to the richer canonicalizer."""
+    return _canonicalize_anthropic_message(msg)
+
+
 @pytest.mark.asyncio
 async def test_anthropic_preserves_history_prefix_after_role_conversion():
     """Anthropic's adapter splits system out and keeps user/assistant in
     `messages`.  After that conversion, the leading user/assistant entries
     from turn 2 must byte-match the same positions in turn 3's converted
-    messages (the Anthropic-format equivalent of the OpenAI-shaped history
-    stability claim).
+    messages — EXCLUDING `cache_control` markers, which legitimately
+    shift forward as history grows (the penultimate marker moves to the
+    newest assistant response each turn; earlier cache entries persist
+    independently on Anthropic's side).
+
+    This is the Anthropic-format equivalent of the OpenAI history
+    stability claim, adjusted for Anthropic's breakpoint-based cache
+    design (see issue #705).
     """
     history_t2, history_t3 = _prior_history_and_new_history()
     msgs_t2 = _turn_messages(history=history_t2, retrieved="", query="q2")
@@ -283,10 +329,14 @@ async def test_anthropic_preserves_history_prefix_after_role_conversion():
     anthropic_msgs_t3 = captured_t3["messages"]
 
     for i in range(len(anthropic_msgs_t2) - 1):
-        assert anthropic_msgs_t2[i] == anthropic_msgs_t3[i], (
-            f"anthropic-format payload diverged at messages[{i}] between "
-            f"turn 2 and turn 3.\nt2: {anthropic_msgs_t2[i]!r}\n"
-            f"t3: {anthropic_msgs_t3[i]!r}"
+        t2_canon = _canonicalize_anthropic_message(anthropic_msgs_t2[i])
+        t3_canon = _canonicalize_anthropic_message(anthropic_msgs_t3[i])
+        assert t2_canon == t3_canon, (
+            f"anthropic-format payload content diverged at messages[{i}] "
+            f"between turn 2 and turn 3 after canonicalization — this is "
+            f"a real content change, not a marker-shift or block-upgrade "
+            f"artifact.\n"
+            f"t2: {t2_canon!r}\nt3: {t3_canon!r}"
         )
 
 
