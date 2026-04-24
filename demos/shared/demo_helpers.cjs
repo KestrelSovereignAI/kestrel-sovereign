@@ -1,6 +1,6 @@
 // @ts-check
+const fs = require('fs');
 const path = require('path');
-const { execSync } = require('child_process');
 
 // Core demo infrastructure from @kestrel/flight
 const {
@@ -22,8 +22,8 @@ const {
  * kestrel-eye integration:
  *   Screenshots are reviewed by kestrel-eye using a cheap vision model (Haiku)
  *   against expectations in eye-*.toml configs.
- *   Run: kestrel-eye review --config eye-technical.toml
- *   Loop: kestrel-eye run --config eye-technical.toml --loop
+ *   Run: kestrel-eye review --config demos/<name>/eye.toml
+ *   Loop: kestrel-eye run --config demos/<name>/eye.toml --loop
  */
 
 // ---------------------------------------------------------------------------
@@ -234,29 +234,33 @@ async function selectDemoProvider(page, opts = {}) {
 
 /**
  * Clear old conversation history so the demo starts with a clean context window.
- * Deletes directly from SQLite because there is no bulk-clear API endpoint.
+ * Walks the agent data dir with Node (cross-platform — Unix `find` and the
+ * `sqlite3` CLI aren't present on Windows) and unlinks each kestrel_prime.db
+ * it finds. The agent re-creates the DB on the next startFreshSession().
  * @param {import('@kestrel/flight').NarrationEngine} narrator
  * @param {string} agentDataDir - absolute path to agent_data/
  */
 function clearConversationHistory(narrator, agentDataDir) {
-  try {
-    const dbs = execSync(`find "${agentDataDir}" -name "kestrel_prime.db" -maxdepth 3 2>/dev/null`)
-      .toString().trim().split('\n').filter(Boolean);
-    for (const db of dbs) {
-      try {
-        execSync(`sqlite3 "${db}" "DELETE FROM conversation_history;"`);
-      } catch { /* table may not exist in some dbs */ }
-      try {
-        execSync(`sqlite3 "${db}" "DELETE FROM graph_nodes WHERE node_type IN ('backup_artifact', 'sovereignty_receipt');"`);
-      } catch { /* table may not exist */ }
-      try {
-        execSync(`sqlite3 "${db}" "DELETE FROM security_audit_log;"`);
-      } catch { /* table may not exist */ }
-      try {
-        execSync(`sqlite3 "${db}" "UPDATE security_permissions SET level = 'ask' WHERE level != 'ask';"`);
-      } catch { /* table may not exist */ }
+  const dbs = [];
+  function walk(dir, depth) {
+    if (depth > 3) return;
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch { return; }
+    for (const entry of entries) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) walk(full, depth + 1);
+      else if (entry.name === 'kestrel_prime.db') dbs.push(full);
     }
-    narrator.narrate(`Cleared conversation history, exports, and permissions from ${dbs.length} agent database(s)`);
+  }
+  try {
+    walk(agentDataDir, 0);
+    let unlinked = 0;
+    for (const db of dbs) {
+      try { fs.unlinkSync(db); unlinked++; } catch { /* locked or already gone */ }
+    }
+    narrator.narrate(`Cleared ${unlinked}/${dbs.length} agent database(s); fresh session will recreate`);
   } catch (e) {
     narrator.narrate(`Could not clear history: ${e.message}`);
   }
