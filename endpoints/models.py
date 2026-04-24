@@ -14,7 +14,7 @@ from kestrel_sovereign.llm.model_metadata import ModelCategory
 from kestrel_sovereign.sql_utils import safe_column_name
 from kestrel_sovereign.rate_limit import limiter
 from kestrel_sovereign.features.bootstrap.feature import rename_agent_core
-from endpoints.agent_helpers import get_agent
+from endpoints.agent_helpers import get_agent, get_caller
 
 logger = logging.getLogger(__name__)
 
@@ -1231,7 +1231,9 @@ async def chat_completions(request: Request):
             model_override = model_from_request
 
         assistant_text = await agent.process_input(
-            user_input, model_override=model_override
+            user_input,
+            model_override=model_override,
+            caller=get_caller(request),
         )
 
         # Report the model that was actually routed, not just what the
