@@ -153,6 +153,82 @@ async function scrollChatToBottom(page) {
 }
 
 // ---------------------------------------------------------------------------
+// Provider selection
+// ---------------------------------------------------------------------------
+
+/**
+ * Default preferred provider order for technical demos — local first so the
+ * demo runs without cloud API keys, falling back to configured cloud vendors.
+ * Matches the order that was duplicated across Acts 2/3/6 in
+ * demo_technical.demo.cjs before consolidation.
+ */
+const DEFAULT_DEMO_PROVIDER_ORDER = [
+  'ollama',
+  'llama_cpp',
+  'llama',
+  'openrouter',
+  'anthropic',
+  'openai',
+];
+
+/**
+ * Select the first available provider from `#provider-selector` that matches
+ * one of the `preferred` substrings (case-insensitive).  Logs the outcome via
+ * `narrator` when provided.
+ *
+ * Returns the matching option label, or `null` if no preference matched (the
+ * page's default stays selected).
+ *
+ * @param {import('@playwright/test').Page} page
+ * @param {object} [opts]
+ * @param {import('@kestrel/flight').NarrationEngine} [opts.narrator]
+ *        Optional narrator for progress narration.  When null, stays silent.
+ * @param {string[]} [opts.preferred]
+ *        Substrings to look for, in priority order.  Defaults to the
+ *        local-first order used by the technical demos.
+ * @param {number} [opts.pauseAfterSelect=1000]
+ *        ms to pause after a successful selection so the UI settles before
+ *        the next action.
+ * @param {boolean} [opts.narrateFallback=false]
+ *        If true, list the options available when no preference matched.
+ * @param {boolean} [opts.narrateSelection=true]
+ *        If false, stay silent on successful selection (but still narrate
+ *        errors via `narrator`).  Use for acts where the user's focus is on
+ *        something other than provider choice.
+ * @returns {Promise<string|null>} the label chosen, or null when none matched.
+ */
+async function selectDemoProvider(page, opts = {}) {
+  const {
+    narrator = null,
+    preferred = DEFAULT_DEMO_PROVIDER_ORDER,
+    pauseAfterSelect = 1000,
+    narrateFallback = false,
+    narrateSelection = true,
+  } = opts;
+
+  try {
+    const providerSelect = page.locator('#provider-selector');
+    const options = await providerSelect.locator('option').allTextContents();
+    for (const pref of preferred) {
+      const match = options.find((o) => o.toLowerCase().includes(pref));
+      if (match) {
+        await providerSelect.selectOption({ label: match });
+        if (narrator && narrateSelection) narrator.narrate(`Provider set to: ${match}`);
+        if (pauseAfterSelect > 0) await demoPause(page, pauseAfterSelect);
+        return match;
+      }
+    }
+    if (narrator && narrateFallback) {
+      narrator.narrate(`Using default provider (available: ${options.join(', ')})`);
+    }
+    return null;
+  } catch (e) {
+    if (narrator) narrator.narrate(`Could not set provider: ${e.message}`);
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Session management
 // ---------------------------------------------------------------------------
 
@@ -292,6 +368,9 @@ module.exports = {
   scrollChatToBottom,
   clearConversationHistory,
   startFreshSession,
+  // Provider selection
+  selectDemoProvider,
+  DEFAULT_DEMO_PROVIDER_ORDER,
   // Spawn helpers
   getSpawnChildren,
   waitForSpawnChildren,
