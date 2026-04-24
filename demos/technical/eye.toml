@@ -246,3 +246,76 @@ expected = [
     "Visual indication of restored state",
 ]
 layout = "Security panel showing permission restored from DENY to Allow"
+
+# Act 7: Memory Hygiene
+[[eye.screenshots]]
+name = "21-memory-trail.png"
+act = "Act 7: Memory Hygiene"
+severity = "warning"
+expected = [
+    "Chat panel with at least 2 exchanges",
+    "User and agent messages visible",
+]
+layout = "Chat interface with a short recent message trail"
+
+[[eye.screenshots]]
+name = "22-memory-rename-typing.png"
+act = "Act 7: Memory Hygiene"
+severity = "warning"
+expected = [
+    "Identity panel with conversations list visible",
+    "Inline input field active inside a conversation item",
+    "Typed text 'Demo — renamed conversation' visible in the input",
+]
+layout = "Conversations list with one item's preview replaced by an editable input"
+
+[[eye.screenshots]]
+name = "23-memory-rename-applied.png"
+act = "Act 7: Memory Hygiene"
+severity = "critical"
+expected = [
+    "Conversation preview updated to the new name",
+    "New name 'Demo — renamed conversation' (or similar) visible in the list",
+    "Rename toast confirmation (optional)",
+]
+layout = "Conversations list showing the renamed conversation"
+
+[[eye.screenshots]]
+name = "24-memory-message-delete-hover.png"
+act = "Act 7: Memory Hygiene"
+severity = "warning"
+expected = [
+    "Chat panel with messages visible",
+    "Hover-revealed ✕ delete button on a specific message",
+]
+layout = "Chat interface with the msg-delete-btn visible on a hovered message"
+
+[[eye.screenshots]]
+name = "25-memory-message-deleted.png"
+act = "Act 7: Memory Hygiene"
+severity = "critical"
+expected = [
+    "Chat panel with one fewer message than before",
+    "Toast or visual indication of deletion (optional)",
+]
+layout = "Chat interface after a single message was removed"
+
+[[eye.screenshots]]
+name = "26-memory-conv-delete-hover.png"
+act = "Act 7: Memory Hygiene"
+severity = "warning"
+expected = [
+    "Conversations list visible",
+    "Hover-revealed ✕ delete button on a conversation row",
+]
+layout = "Conversations list with the conv-delete-btn visible on a hovered conversation"
+
+[[eye.screenshots]]
+name = "27-memory-conv-deleted.png"
+act = "Act 7: Memory Hygiene"
+severity = "critical"
+expected = [
+    "Conversations list with one fewer conversation than before",
+    "Remaining conversations still listed",
+]
+layout = "Conversations list after a full-session delete"

@@ -1,0 +1,112 @@
+# kestrel-eye config for Kestrel Metrics Dashboard Demo
+# Reviews screenshots from the 5-act observability demo.
+
+[eye]
+name = "Kestrel Metrics Dashboard Demo"
+screenshot_dir = "demos/metrics/demo-output"
+test_cmd = "demos/run.sh metrics"
+
+[eye.model]
+provider = "anthropic"
+model = "claude-haiku-4-5-20251001"
+
+[eye.github]
+repo = "KestrelSovereignAI/kestrel-sovereign"
+labels = ["kestrel-eye", "metrics-review", "automated"]
+
+# Act 1: Empty dashboard
+[[eye.screenshots]]
+name = "01-metrics-empty.png"
+act = "Act 1: Empty metrics dashboard"
+severity = "warning"
+expected = [
+    "Metrics panel active",
+    "KPI cards present but with zero values or empty states",
+    "Charts visible but flat / empty",
+]
+layout = "Metrics dashboard with no activity — KPI cards at zero, flat timeline"
+
+# Act 2: Chat activity generated
+[[eye.screenshots]]
+name = "02-chat-activity-1.png"
+act = "Act 2: Generating activity"
+severity = "warning"
+expected = [
+    "Chat panel with a visible agent response",
+    "At least one user message and one agent response",
+]
+layout = "Chat interface showing agent response to an introduction prompt"
+
+[[eye.screenshots]]
+name = "03-chat-activity-2.png"
+act = "Act 2: Generating activity"
+severity = "warning"
+expected = [
+    "Chat panel with a follow-up exchange",
+    "Agent response to the date/time question",
+]
+layout = "Chat interface showing a tool-involving response"
+
+# Act 3: KPI cards populated
+[[eye.screenshots]]
+name = "04-kpi-cards.png"
+act = "Act 3: KPI cards populated"
+severity = "critical"
+expected = [
+    "Metrics panel active",
+    "KPI cards showing non-zero values (event count, durations, etc.)",
+    "Highlight border around the KPI cards region",
+]
+layout = "Metrics KPI cards populated with live numbers from the audit stream"
+
+# Act 4: Charts
+[[eye.screenshots]]
+name = "05-timeline-chart.png"
+act = "Act 4: Charts"
+severity = "critical"
+expected = [
+    "Timeline chart visible with plotted events",
+    "Chart labeled or titled",
+]
+layout = "Metrics timeline chart — events plotted over time"
+
+[[eye.screenshots]]
+name = "06-duration-chart.png"
+act = "Act 4: Charts"
+severity = "warning"
+expected = [
+    "Duration distribution chart visible",
+    "p50/p95 or per-tool bars rendered",
+]
+layout = "Duration distribution chart with tool latency bars"
+
+[[eye.screenshots]]
+name = "07-distribution-chart.png"
+act = "Act 4: Charts"
+severity = "warning"
+expected = [
+    "Event type distribution chart visible",
+    "Pie or bar rendering",
+]
+layout = "Event type distribution chart"
+
+# Act 5: Errors + bookend
+[[eye.screenshots]]
+name = "08-errors-table.png"
+act = "Act 5: Errors and bookend"
+severity = "warning"
+expected = [
+    "Errors list section visible",
+    "Either 'No errors recorded' message OR a tabular list of errors",
+]
+layout = "Errors table — transparent failure surface"
+
+[[eye.screenshots]]
+name = "09-dashboard-final.png"
+act = "Act 5: Errors and bookend"
+severity = "warning"
+expected = [
+    "Full Metrics dashboard visible",
+    "Scrolled to top",
+]
+layout = "Bookend — the whole Metrics dashboard as the final shot"

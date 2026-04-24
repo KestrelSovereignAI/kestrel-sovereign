@@ -8,9 +8,13 @@ Every demo lives in its own subdirectory. One shared helpers module; no cross-tr
 demos/
 ├── shared/
 │   └── demo_helpers.cjs     # auth, panel navigation, spawn API helpers
+├── run.sh                   # canonical entry point — isolates demo runs
 ├── spawn/                   # Issue #354 — narrated spawn lifecycle
-├── technical/               # Track A — DID, Constitution, Memory, Privacy, Sovereignty, Permissions
-└── falconer/                # Falconer product demo — Claws → Talon mesh dispatch
+├── technical/               # Track A — DID, Constitution, Memory, Privacy, Sovereignty, Permissions, Memory Hygiene
+├── falconer/                # Falconer product demo — Claws → Talon mesh dispatch
+├── metrics/                 # Observability dashboard — KPI cards, timeline, duration, distribution
+├── feature-store/           # Feature Store — browse features, search, drill into skills
+└── tasks/                   # Tasks & Activity — background task queue + real-time activity log
 ```
 
 Each demo directory contains:

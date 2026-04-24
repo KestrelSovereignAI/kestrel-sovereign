@@ -1,0 +1,75 @@
+# kestrel-eye config for Kestrel Feature Store Demo
+
+[eye]
+name = "Kestrel Feature Store Demo"
+screenshot_dir = "demos/feature-store/demo-output"
+test_cmd = "demos/run.sh feature-store"
+
+[eye.model]
+provider = "anthropic"
+model = "claude-haiku-4-5-20251001"
+
+[eye.github]
+repo = "KestrelSovereignAI/kestrel-sovereign"
+labels = ["kestrel-eye", "feature-store-review", "automated"]
+
+[[eye.screenshots]]
+name = "01-feature-grid.png"
+act = "Act 1: The Feature Store"
+severity = "critical"
+expected = [
+    "Feature Store panel active",
+    "Grid of feature cards visible",
+    "Each card shows name and description",
+]
+layout = "Feature Store grid with multiple feature cards"
+
+[[eye.screenshots]]
+name = "02-search-memory.png"
+act = "Act 2: Search and filter"
+severity = "warning"
+expected = [
+    "Search input containing 'memory'",
+    "Grid narrowed to memory-related features (or an empty-state message)",
+]
+layout = "Feature grid filtered by a 'memory' search query"
+
+[[eye.screenshots]]
+name = "03-filter-installed.png"
+act = "Act 2: Search and filter"
+severity = "warning"
+expected = [
+    "Installed filter button active",
+    "Grid restricted to installed features",
+]
+layout = "Feature grid with Installed filter active"
+
+[[eye.screenshots]]
+name = "04-feature-detail.png"
+act = "Act 3: Feature detail"
+severity = "critical"
+expected = [
+    "Feature detail view open",
+    "Description, author/version, and skills section visible",
+]
+layout = "Feature detail panel with metadata and skills"
+
+[[eye.screenshots]]
+name = "05-skills-highlighted.png"
+act = "Act 4: Skills"
+severity = "warning"
+expected = [
+    "Skills section visible with heading 'Skills (N)'",
+    "Highlight border around the skills section",
+]
+layout = "Feature detail with skills section highlighted"
+
+[[eye.screenshots]]
+name = "06-grid-bookend.png"
+act = "Act 5: Bookend"
+severity = "warning"
+expected = [
+    "Feature Store grid visible",
+    "Search and filter bar at top",
+]
+layout = "Bookend — back to the Feature Store grid"

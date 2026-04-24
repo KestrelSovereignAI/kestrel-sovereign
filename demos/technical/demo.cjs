@@ -625,6 +625,103 @@ test.describe.serial('Kestrel Sovereign Technical Demo', () => {
     });
 
     // ========================================================================
+    // Act 7: Memory Hygiene — rename and delete conversations, delete messages
+    // ========================================================================
+    test('Act 7: Memory Hygiene', async ({ page }) => {
+        narrator.act(7, 'Memory Hygiene');
+        // Auto-accept native confirm() dialogs the delete flows raise.
+        page.on('dialog', (dialog) => dialog.accept().catch(() => {}));
+
+        await demoGoto(page, BASE_URL, apiKey);
+        await demoPause(page, 1000);
+
+        // Beat 1: Build a short conversation trail so there's something to rename/delete.
+        narrator.narrate('Memory is sovereign — but sovereign means revisable. The user gets rename and delete, both per-message and per-conversation.');
+        await navigateToPanel(page, 'chat');
+        await dismissContextWarning(page);
+        await selectDemoProvider(page, { narrator, narrateSelection: false });
+
+        await demoSendMessage(page, 'Say hi in five words or less.', 60000);
+        await demoPause(page, 500);
+        await demoSendMessage(page, 'Name any color.', 60000);
+        await demoPause(page, 500);
+        await demoScreenshot(narrator, page, OUTPUT_DIR, 'memory-trail');
+
+        // Beat 2: Rename the current conversation via double-click inline editor.
+        narrator.narrate('Conversations default to an auto-summary preview. Double-click the preview to rename it — the new name persists and shows in the sidebar.');
+        await navigateToPanel(page, 'identity');
+        await demoPause(page, 1500);
+
+        const conversationsList = page.locator('#conversations-list');
+        try {
+            await conversationsList.scrollIntoViewIfNeeded();
+            const firstPreview = page.locator('.conversation-item .conversation-preview').first();
+            await firstPreview.dblclick();
+            await demoPause(page, 500);
+            const input = page.locator('.conversation-item input').first();
+            await input.fill('Demo — renamed conversation');
+            await demoPause(page, 500);
+            await demoScreenshot(narrator, page, OUTPUT_DIR, 'memory-rename-typing');
+            await input.press('Enter');
+            await demoPause(page, 1500);
+        } catch (e) {
+            narrator.narrate(`[narrator] Rename interaction issue: ${e.message}`);
+        }
+        await demoScreenshot(narrator, page, OUTPUT_DIR, 'memory-rename-applied');
+
+        // Beat 3: Delete a single message from within a conversation.
+        narrator.narrate('Per-message delete: hover a bubble, hit the ✕ — the single message is gone from history. No need to wipe the whole session.');
+        await navigateToPanel(page, 'chat');
+        await dismissContextWarning(page);
+        await demoPause(page, 1000);
+        try {
+            const messages = page.locator('.agent-message, .user-message');
+            const count = await messages.count();
+            if (count > 0) {
+                const target = messages.nth(Math.max(0, count - 2));
+                await target.scrollIntoViewIfNeeded();
+                await target.hover();
+                await demoPause(page, 700);
+                const msgDelete = target.locator('.msg-delete-btn').first();
+                if (await msgDelete.count() > 0) {
+                    await demoScreenshot(narrator, page, OUTPUT_DIR, 'memory-message-delete-hover');
+                    await msgDelete.click();
+                    await demoPause(page, 1500);
+                } else {
+                    narrator.narrate('[narrator] Per-message delete button not visible — skipping beat 3 click.');
+                }
+            }
+        } catch (e) {
+            narrator.narrate(`[narrator] Per-message delete issue: ${e.message}`);
+        }
+        await demoScreenshot(narrator, page, OUTPUT_DIR, 'memory-message-deleted');
+
+        // Beat 4: Delete an entire conversation via the hover-reveal ✕.
+        narrator.narrate('Full-session delete: the hover-reveal ✕ wipes the whole conversation after a confirm. Destructive, explicit, logged.');
+        await navigateToPanel(page, 'identity');
+        await demoPause(page, 1500);
+        try {
+            const target = page.locator('.conversation-item').first();
+            await target.scrollIntoViewIfNeeded();
+            await target.hover();
+            await demoPause(page, 500);
+            const delBtn = target.locator('.conv-delete-btn').first();
+            if (await delBtn.count() > 0) {
+                await demoScreenshot(narrator, page, OUTPUT_DIR, 'memory-conv-delete-hover');
+                await delBtn.click();
+                await demoPause(page, 2000);
+            } else {
+                narrator.narrate('[narrator] Conversation delete button not visible — skipping beat 4 click.');
+            }
+        } catch (e) {
+            narrator.narrate(`[narrator] Conversation delete issue: ${e.message}`);
+        }
+        await demoScreenshot(narrator, page, OUTPUT_DIR, 'memory-conv-deleted');
+
+        narrator.narrate('Rename, per-message delete, full-session delete — all three talk to the same /api/conversations endpoints, all three respect the current privacy mode.', { callout: true });
+    });
+
+    // ========================================================================
     // Write narration transcript
     // ========================================================================
     test.afterAll(async () => {
