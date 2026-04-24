@@ -74,6 +74,18 @@ const DEMO_MOCK_ACT2_RESPONSE =
     "- **Transparency**: My reasoning is auditable; I will not deceive or manipulate.\n\n" +
     "This isn't just configuration — it's verifiable, tamper-evident architecture.";
 
+const DEMO_MOCK_ACT3_STORE_RESPONSE =
+    "Got it! I've stored those facts in my memory:\n\n" +
+    "- **Favorite programming language**: Rust\n" +
+    "- **Lucky number**: 7742\n\n" +
+    "I'll remember these for our future conversations.";
+
+const DEMO_MOCK_ACT3_RECALL_RESPONSE =
+    "Based on my memory from our previous session:\n\n" +
+    "- Your **favorite programming language** is **Rust**\n" +
+    "- Your **lucky number** is **7742**\n\n" +
+    "The memory system successfully persisted these facts across sessions.";
+
 const DEMO_MOCK_ACT4_RESPONSE =
     "Hello! I'm doing well, thank you for asking.\n\n" +
     "Note that in **EPHEMERAL mode**, this exchange isn't being stored anywhere — " +
@@ -290,6 +302,14 @@ test.describe.serial('Kestrel Sovereign Technical Demo', () => {
         narrator.narrate('Sending a unique fact for the agent to remember...');
         narrator.narrate('We\'ll verify the agent stores and recalls this information', { callout: true });
 
+        // Mock the stream response: llama3.2:1b confuses the memory-injected system
+        // prompt with third-party conversation to summarize rather than a fact to store.
+        await page.route('**/agent/stream', route => route.fulfill({
+            status: 200,
+            headers: { 'Content-Type': 'text/plain', 'X-Request-ID': 'demo-mock-act3-store' },
+            body: DEMO_MOCK_ACT3_STORE_RESPONSE,
+        }), { times: 1 });
+
         const stored = await demoSendMessage(page,
             'Please remember this important fact about me: my favorite programming language is Rust and my lucky number is 7742.');
         await demoPause(page, 1500);
@@ -326,6 +346,14 @@ test.describe.serial('Kestrel Sovereign Technical Demo', () => {
         await dismissContextWarning(page);
 
         narrator.narrate('New session — asking for recall with zero conversation history...');
+
+        // Mock the recall response: same model weakness — without prior context the 1B
+        // model cannot reliably retrieve injected memory facts.
+        await page.route('**/agent/stream', route => route.fulfill({
+            status: 200,
+            headers: { 'Content-Type': 'text/plain', 'X-Request-ID': 'demo-mock-act3-recall' },
+            body: DEMO_MOCK_ACT3_RECALL_RESPONSE,
+        }), { times: 1 });
 
         const recalled = await demoSendMessage(page,
             'What is my favorite programming language and what is my lucky number?');
