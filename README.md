@@ -297,18 +297,29 @@ uv run pytest tests/integration/test_clean_install_verification.py -v
 ## 🔧 Configuration
 
 ### LLM Configuration (`llm_config.toml`)
-```toml
-[providers.ollama]
-enabled = true
-base_url = "http://localhost:11434"
-model = "llama3.2:3b"
-priority = 1
 
-[providers.openai]
-enabled = false
-api_key = "your-api-key"
-model = "gpt-5"
-priority = 2
+Kestrel uses a **vendor/route/model** schema. A *vendor* is who makes the weights; a *route* is how to reach them (adapter + base URL + auth). API keys belong in `.env` and are referenced by `api_key_env`. See [`llm_config.toml.example`](llm_config.toml.example) and [`docs/architecture/LLM_SERVICE_ARCHITECTURE.md`](docs/architecture/LLM_SERVICE_ARCHITECTURE.md) for the canonical spec.
+
+```toml
+route_priority = ["openai:api", "ollama:local"]
+
+[vendors.openai]
+is_cloud = true
+
+[vendors.openai.routes.api]
+adapter        = "OpenAIAdapter"
+api_key_env    = "OPENAI_API_KEY"
+model          = "auto"
+selection_hints = ["gpt-5", "mini"]
+
+[vendors.ollama]
+is_cloud = false
+
+[vendors.ollama.routes.local]
+adapter        = "OllamaAdapter"
+host           = "http://localhost:11434"
+model          = "auto"
+selection_hints = ["llama3.2", "qwen"]
 ```
 
 ### Environment Variables
