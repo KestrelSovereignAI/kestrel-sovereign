@@ -104,6 +104,128 @@ test.describe('#748 security approval popup', () => {
         await expect(page.locator('#modal-overlay')).not.toBeVisible({ timeout: 5000 });
     });
 
+    test('multiple approval events are serialized — one modal at a time, no stacking', async ({ page }) => {
+        // Deliver THREE approval events on the first SSE connect. The client
+        // must queue them and show one modal at a time, not stack overlays.
+        let sseCallCount = 0;
+        await page.route('**/agent/notifications/sse**', async (route) => {
+            sseCallCount += 1;
+            const events =
+                sseCallCount === 1
+                    ? [
+                          { event: 'connected', data: { status: 'connected' } },
+                          {
+                              event: 'approval_request',
+                              data: { ...APPROVAL_PAYLOAD, id: 'queue-1', args: { script_id: 'one' } },
+                          },
+                          {
+                              event: 'approval_request',
+                              data: { ...APPROVAL_PAYLOAD, id: 'queue-2', args: { script_id: 'two' } },
+                          },
+                          {
+                              event: 'approval_request',
+                              data: { ...APPROVAL_PAYLOAD, id: 'queue-3', args: { script_id: 'three' } },
+                          },
+                      ]
+                    : [{ event: 'connected', data: { status: 'connected' } }];
+            await route.fulfill({
+                status: 200,
+                headers: {
+                    'Content-Type': 'text/event-stream',
+                    'Cache-Control': 'no-cache',
+                    Connection: 'keep-alive',
+                },
+                body: sseBody(events),
+            });
+        });
+
+        const approveCalls = [];
+        await page.route('**/api/security/approve', async (route, request) => {
+            approveCalls.push(JSON.parse(request.postData() || '{}'));
+            await route.fulfill({
+                status: 200,
+                contentType: 'application/json',
+                body: JSON.stringify({ success: true, approved: true, scope: 'session' }),
+            });
+        });
+
+        await page.goto(`${KESTREL_URL}/?key=${encodeURIComponent(API_KEY)}`);
+
+        // Wait for the first modal to appear.
+        await expect(page.locator('#modal-overlay')).toBeVisible({ timeout: 10000 });
+
+        // Only ONE overlay must be in the DOM at any given moment — stacking
+        // two overlays is exactly the bug this test guards against.
+        await expect(page.locator('#modal-overlay')).toHaveCount(1);
+        await expect(page.locator('.modal-body')).toContainText('"script_id": "one"');
+
+        // Approve the first → queue should advance to the second.
+        await page.click('.modal-btn:has-text("This Session")');
+        await expect(page.locator('.modal-body')).toContainText('"script_id": "two"', { timeout: 5000 });
+        await expect(page.locator('#modal-overlay')).toHaveCount(1);
+
+        await page.click('.modal-btn:has-text("This Session")');
+        await expect(page.locator('.modal-body')).toContainText('"script_id": "three"', { timeout: 5000 });
+        await expect(page.locator('#modal-overlay')).toHaveCount(1);
+
+        await page.click('.modal-btn:has-text("Deny")');
+        await expect(page.locator('#modal-overlay')).not.toBeVisible({ timeout: 5000 });
+
+        // All three decisions should have been posted in order.
+        await expect.poll(() => approveCalls.length, { timeout: 5000 }).toBe(3);
+        expect(approveCalls.map((c) => c.approval_id)).toEqual(['queue-1', 'queue-2', 'queue-3']);
+        expect(approveCalls.map((c) => c.approved)).toEqual([true, true, false]);
+    });
+
+    test('duplicate approval_request events with the same id do not prompt twice', async ({ page }) => {
+        let sseCallCount = 0;
+        await page.route('**/agent/notifications/sse**', async (route) => {
+            sseCallCount += 1;
+            const events =
+                sseCallCount === 1
+                    ? [
+                          { event: 'connected', data: { status: 'connected' } },
+                          { event: 'approval_request', data: { ...APPROVAL_PAYLOAD, id: 'dup-1' } },
+                          { event: 'approval_request', data: { ...APPROVAL_PAYLOAD, id: 'dup-1' } },
+                      ]
+                    : [{ event: 'connected', data: { status: 'connected' } }];
+            await route.fulfill({
+                status: 200,
+                headers: {
+                    'Content-Type': 'text/event-stream',
+                    'Cache-Control': 'no-cache',
+                    Connection: 'keep-alive',
+                },
+                body: sseBody(events),
+            });
+        });
+
+        const approveCalls = [];
+        await page.route('**/api/security/approve', async (route, request) => {
+            approveCalls.push(JSON.parse(request.postData() || '{}'));
+            await route.fulfill({
+                status: 200,
+                contentType: 'application/json',
+                body: JSON.stringify({ success: true, approved: true, scope: 'once' }),
+            });
+        });
+
+        await page.goto(`${KESTREL_URL}/?key=${encodeURIComponent(API_KEY)}`);
+
+        await expect(page.locator('#modal-overlay')).toBeVisible({ timeout: 10000 });
+        await expect(page.locator('#modal-overlay')).toHaveCount(1);
+
+        await page.click('.modal-btn:has-text("This Time")');
+        await expect(page.locator('#modal-overlay')).not.toBeVisible({ timeout: 5000 });
+
+        // Give the deduper a moment to discard any redelivered event.
+        await page.waitForTimeout(500);
+        await expect(page.locator('#modal-overlay')).not.toBeVisible();
+
+        expect(approveCalls.length).toBe(1);
+        expect(approveCalls[0].approval_id).toBe('dup-1');
+    });
+
     test('denying from the modal posts approved=false', async ({ page }) => {
         let sseCallCount = 0;
         await page.route('**/agent/notifications/sse**', async (route) => {

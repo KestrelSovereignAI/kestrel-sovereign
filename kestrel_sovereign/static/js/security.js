@@ -10,6 +10,12 @@ export const Security = {
     pendingApprovals: new Map(),
     permissionTree: [],
     _initialized: false,
+    // Modal is a singleton — if two approval_request events arrive in quick
+    // succession, showing both concurrently would stack overlays in the DOM
+    // and leave the older one stuck. Serialize them through a queue. #748.
+    _approvalQueue: [],
+    _approvalDraining: false,
+    _seenApprovalIds: new Set(),
 
     // === Initialization ===
 
@@ -45,29 +51,54 @@ export const Security = {
 
     // === Approval Request Handling ===
 
-    async handleApprovalRequest(data) {
+    handleApprovalRequest(data) {
         console.log('Approval request received:', data);
 
-        // Store in pending map
+        // Dedupe: the SSE stream can redeliver the same event on reconnect,
+        // and the UI must not prompt twice for the same approval_id.
+        if (this._seenApprovalIds.has(data.id) || this.pendingApprovals.has(data.id)) {
+            return;
+        }
+        this._seenApprovalIds.add(data.id);
+
         this.pendingApprovals.set(data.id, data);
-
-        // Update badge
         this.updatePendingBadge(this.pendingApprovals.size);
 
-        // Show approval modal
-        const decision = await this.showApprovalModal(data);
+        this._approvalQueue.push(data);
+        // Fire-and-forget drain; errors are handled inside the drain loop.
+        this._drainApprovalQueue();
+    },
 
-        // Submit decision
-        await this.submitApproval(data.id, decision.approved, decision.scope);
+    async _drainApprovalQueue() {
+        if (this._approvalDraining) return;
+        this._approvalDraining = true;
+        try {
+            while (this._approvalQueue.length > 0) {
+                const data = this._approvalQueue.shift();
+                let decision;
+                try {
+                    decision = await this.showApprovalModal(data);
+                } catch (err) {
+                    console.error('Approval modal error:', err);
+                    decision = { approved: false, scope: 'once' };
+                }
 
-        // Remove from pending
-        this.pendingApprovals.delete(data.id);
-        this.updatePendingBadge(this.pendingApprovals.size);
+                try {
+                    await this.submitApproval(data.id, decision.approved, decision.scope);
+                } catch (err) {
+                    console.error('Failed to submit approval:', err);
+                }
 
-        // Refresh pending list if panel is open
-        const pendingContainer = document.getElementById('pending-approvals');
-        if (pendingContainer) {
-            await this.loadPendingApprovals();
+                this.pendingApprovals.delete(data.id);
+                this.updatePendingBadge(this.pendingApprovals.size);
+
+                const pendingContainer = document.getElementById('pending-approvals');
+                if (pendingContainer) {
+                    await this.loadPendingApprovals();
+                }
+            }
+        } finally {
+            this._approvalDraining = false;
         }
     },
 
