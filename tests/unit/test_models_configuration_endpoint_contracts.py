@@ -362,3 +362,181 @@ def test_current_and_set_model_endpoints_share_runtime_preference_contract():
         assert missing_response.json()["detail"] == "'model' field is required."
     finally:
         _restore_app(app, original)
+
+
+# ---------------------------------------------------------------------------
+# Three-tier key panel endpoints (resources.js) — see #735
+# ---------------------------------------------------------------------------
+
+
+def _local_sqlite_agent(has_key: bool = False):
+    """Agent fixture simulating a local-sovereign SQLite deployment.
+
+    No Postgres pool is available — BYOK/platform storage is not configured.
+    ``has_key`` toggles whether ServiceKeyStorage reports the agent having
+    a provisioned key for the queried provider.
+    """
+    db = MagicMock()
+    db.backend = MagicMock()
+    db.backend_type = "sqlite"  # No asyncpg pool on this backend
+    storage = MagicMock(db=db)
+    agent = MagicMock(storage=storage, agent_id="did:agent")
+    service_key_storage = MagicMock()
+    service_key_storage.has_key = AsyncMock(return_value=has_key)
+    return agent, service_key_storage
+
+
+def test_available_sources_reports_only_agent_tier_on_sqlite_deployments():
+    """Regression for #735.  Local-sovereign Kestrel has no pool, so user/
+    platform tiers must report False — and the badge shows "Agent Key" only
+    when the local ServiceKeyStorage actually has that provider."""
+    agent, service_key_storage = _local_sqlite_agent(has_key=True)
+
+    app, original = _prepare_app(agent)
+    try:
+        with patch(
+            "kestrel_sovereign.security.service_key_storage.ServiceKeyStorage",
+            return_value=service_key_storage,
+        ):
+            with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+                with TestClient(app) as client:
+                    response = client.get(
+                        "/api/keys/available-sources?provider=openrouter",
+                        headers=_api_headers(),
+                    )
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["provider"] == "openrouter"
+        assert payload["sources"] == {"agent": True, "user": False, "platform": False}
+        assert payload["platform_margin"] is None
+        service_key_storage.has_key.assert_awaited_once_with(provider_id="openrouter")
+    finally:
+        _restore_app(app, original)
+
+
+def test_available_sources_returns_all_false_when_agent_has_no_key():
+    agent, service_key_storage = _local_sqlite_agent(has_key=False)
+
+    app, original = _prepare_app(agent)
+    try:
+        with patch(
+            "kestrel_sovereign.security.service_key_storage.ServiceKeyStorage",
+            return_value=service_key_storage,
+        ):
+            with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+                with TestClient(app) as client:
+                    response = client.get(
+                        "/api/keys/available-sources?provider=openai",
+                        headers=_api_headers(),
+                    )
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["sources"] == {"agent": False, "user": False, "platform": False}
+    finally:
+        _restore_app(app, original)
+
+
+def test_list_user_keys_returns_empty_on_local_sqlite_deployment():
+    """The Resources panel must see an empty list (not a 405) so the
+    "No personal keys added" empty state renders."""
+    agent, _ = _local_sqlite_agent()
+
+    app, original = _prepare_app(agent)
+    try:
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                response = client.get("/api/keys/user", headers=_api_headers())
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload == {"keys": [], "count": 0, "available": False}
+    finally:
+        _restore_app(app, original)
+
+
+def test_add_user_key_returns_503_on_local_deployments_with_clear_message():
+    agent, _ = _local_sqlite_agent()
+
+    app, original = _prepare_app(agent)
+    try:
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                response = client.post(
+                    "/api/keys/user",
+                    headers=_api_headers(),
+                    json={"provider": "openrouter", "api_key": "sk-x", "passphrase": "longenough"},
+                )
+        assert response.status_code == 503
+        assert "Agent Keys" in response.json()["detail"]
+    finally:
+        _restore_app(app, original)
+
+
+def test_verify_user_passphrase_returns_not_available_on_local_deployments():
+    agent, _ = _local_sqlite_agent()
+
+    app, original = _prepare_app(agent)
+    try:
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                response = client.post(
+                    "/api/keys/user/verify",
+                    headers=_api_headers(),
+                    json={"passphrase": "anything"},
+                )
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["valid"] is False
+        assert payload["available"] is False
+    finally:
+        _restore_app(app, original)
+
+
+def test_delete_user_key_returns_503_on_local_deployments():
+    agent, _ = _local_sqlite_agent()
+
+    app, original = _prepare_app(agent)
+    try:
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                response = client.delete(
+                    "/api/keys/user/openrouter",
+                    headers=_api_headers(),
+                )
+        assert response.status_code == 503
+        assert "platform" in response.json()["detail"].lower()
+    finally:
+        _restore_app(app, original)
+
+
+def test_platform_access_returns_empty_on_local_deployments():
+    """No vending-machine providers on SQLite; the panel shows the graceful
+    empty state instead of a 405."""
+    agent, _ = _local_sqlite_agent()
+
+    app, original = _prepare_app(agent)
+    try:
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                response = client.get("/api/keys/platform", headers=_api_headers())
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload == {"providers": [], "available": False}
+    finally:
+        _restore_app(app, original)
+
+
+def test_available_sources_requires_provider_query_param():
+    """Missing provider should 422, not 500."""
+    agent, _ = _local_sqlite_agent()
+
+    app, original = _prepare_app(agent)
+    try:
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                response = client.get(
+                    "/api/keys/available-sources",
+                    headers=_api_headers(),
+                )
+        assert response.status_code == 422
+    finally:
+        _restore_app(app, original)
