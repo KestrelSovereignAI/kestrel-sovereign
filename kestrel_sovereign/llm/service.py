@@ -403,6 +403,30 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         """
         return self._mandate_preference.copy()
 
+    def _remote_first_allowed(self, model_override: Optional[str]) -> bool:
+        """Return True iff the remote-GPU fast path may run for this call.
+
+        Before the vendor/route refactor the remote GPU backend was tried
+        first whenever it was active, ignoring persisted mandates and caller
+        ``model_override`` hints.  That turned routing dishonest: the UI and
+        ``get_active_model_id`` could report one route/model while the
+        actual answer came from the remote pod.  See issue #734.
+
+        The centralized decision now lives in
+        :meth:`resolve_provider_routing`.  We only take the remote-GPU
+        shortcut when nothing has narrowed routing to a specific vendor —
+        i.e. no vendor/route in the persisted mandate and no
+        vendor-prefixed ``model_override``.  A bare model string (no ``:``
+        or ``/``) is allowed through since the remote route has its own
+        configured model and the user hasn't pinned a backend.
+        """
+        if "/" in (model_override or "") or ":" in (model_override or ""):
+            return False
+        pref = self._mandate_preference
+        if pref.get("vendor") or pref.get("route"):
+            return False
+        return True
+
     def resolve_provider_routing(
         self,
         *,
@@ -1332,8 +1356,15 @@ No other text or formatting.
             "llm.force_local_only": force_local_only,
             "llm.has_tools": tools is not None,
         }) as llm_span:
-            # Try remote GPU first if active
-            if self._backend == BackendType.REMOTE_GPU and self._remote_client and not force_local_only:
+            # Try remote GPU first when active AND routing isn't pinned.
+            # A persisted mandate or vendor-prefixed model_override must
+            # beat the remote shortcut — see #734 and _remote_first_allowed.
+            if (
+                self._backend == BackendType.REMOTE_GPU
+                and self._remote_client
+                and not force_local_only
+                and self._remote_first_allowed(model_override)
+            ):
                 try:
                     self._ensure_remote_active()
                     messages = self._remote_adapter.create_messages(user_prompt=user_prompt, system_prompt=system_prompt)
@@ -1401,8 +1432,13 @@ No other text or formatting.
         Returns:
             String content or LLMResponse
         """
-        # Try remote GPU first if active
-        if self._backend == BackendType.REMOTE_GPU and self._remote_client and not force_local_only:
+        # Try remote GPU first when active AND routing isn't pinned — #734.
+        if (
+            self._backend == BackendType.REMOTE_GPU
+            and self._remote_client
+            and not force_local_only
+            and self._remote_first_allowed(model_override)
+        ):
             try:
                 self._ensure_remote_active()
                 model = model_override or self._remote_config.model
