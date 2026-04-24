@@ -72,7 +72,7 @@ test('checkForModelChange parses embedded marker with trailing text', () => {
     });
 
     selector.allModelsData = {
-        by_provider: {
+        by_vendor: {
             anthropic: [
                 { id: 'claude-sonnet-4-6', provider: 'anthropic', display_name: 'Claude Sonnet 4.6' },
             ],
