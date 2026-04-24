@@ -75,9 +75,6 @@ class StreamingMixin:
         self, user_input, model_override, session_id, _otel_span
     ):
         """Inner streaming logic wrapped in an OTEL span."""
-        # Store user message (linked to session for resumed conversations)
-        await self.privacy_agent.add_conversation("user", user_input, session_id=session_id)
-
         # Prompt injection detection (log-only, does not block)
         check_prompt_injection(user_input)
 
@@ -136,6 +133,16 @@ class StreamingMixin:
         prompt = self.user_prompt_template.format(
             context=context_result.dynamic_user_context,
             query=wrap_user_input(user_input)
+        )
+
+        # Store the user turn AFTER context build (so memory retrieval sees
+        # the pre-current-turn state) and AFTER hook mutation (so stored bytes
+        # match sent bytes). Persisting the rendered sent-form — not raw
+        # user_input — makes history-load at turn N+1 byte-match what was
+        # sent at turn N, which is the prerequisite for Anthropic's
+        # cache_control marker at messages[-2] to compound across turns.
+        await self.privacy_agent.add_conversation(
+            "user", prompt, metadata={"sent_form": True}, session_id=session_id
         )
         system_prompt = context_result.system_prompt
 
