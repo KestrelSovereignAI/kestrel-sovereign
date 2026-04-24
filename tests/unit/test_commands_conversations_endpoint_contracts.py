@@ -165,6 +165,61 @@ def test_get_conversation_filters_session_markers_and_decrypts_messages():
         _restore_app(app, original)
 
 
+def test_get_conversation_unwraps_sent_form_user_content():
+    """Rows written with metadata.sent_form=True carry the full rendered
+    sent-form (<retrieved_context>.../<user_input>... wrappers). The
+    detail endpoint MUST strip those wrappers so the chat UI shows raw
+    user text — otherwise users see XML-looking tags in the log.
+
+    Live-verified: before this, /api/conversations/{id} returned
+    '<retrieved_context>...</retrieved_context>\\n<user_input>\\nhello...\\n</user_input>'
+    as message.content. After, it returns just 'hello...'.
+    """
+    now = datetime(2026, 4, 24, 18, 25, 0)
+    sent_form = (
+        "<retrieved_context>\n<memories>\nM1\n</memories>\n"
+        "</retrieved_context>\n<user_input>\nhello, are you really here?\n</user_input>"
+    )
+    legacy_raw = "raw from before sent-form existed"
+    rows = [
+        (
+            415, "user", "ciphertext-new",
+            '{"enc": true, "sent_form": true}',
+            now,
+        ),
+        (
+            414, "user", "ciphertext-legacy",
+            '{"enc": true}',
+            now + timedelta(minutes=1),
+        ),
+    ]
+    storage = MagicMock(agent_id="did:agent", encryption_enabled=True)
+    storage.query_conversation_start = AsyncMock(return_value=(now,))
+    storage.query_conversation_messages = AsyncMock(return_value=rows)
+    agent = MagicMock(storage=storage)
+
+    def fake_decrypt(content, meta, fernet):
+        return sent_form if content == "ciphertext-new" else legacy_raw
+
+    app, original = _prepare_app(agent)
+    try:
+        with patch("endpoints.conversations.get_agent_fernet", return_value=object()):
+            with patch("endpoints.conversations.decrypt_string", side_effect=fake_decrypt):
+                with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+                    with TestClient(app) as client:
+                        response = client.get("/api/conversations/415", headers=_api_headers())
+        assert response.status_code == 200
+        messages = response.json()["messages"]
+        new_msg = next(m for m in messages if m["id"] == 415)
+        legacy_msg = next(m for m in messages if m["id"] == 414)
+        # sent-form row → stripped back to raw user text
+        assert new_msg["content"] == "hello, are you really here?"
+        # legacy row (no flag) → pass-through as-is
+        assert legacy_msg["content"] == legacy_raw
+    finally:
+        _restore_app(app, original)
+
+
 def test_rename_conversation_happy_path_returns_stored_name():
     """PATCH /conversations/{id} with {"name": "new"} → 200 with the
     stored value echoed back.  Issue #716.
