@@ -20,6 +20,37 @@ from .token_counter import TokenCounter, get_token_counter
 from .token_budget import TokenBudget, AdaptiveTokenBudget, create_budget
 from kestrel_sovereign.security.input_guardrails import wrap_user_input
 
+
+def extract_raw_user_content(content: str) -> str:
+    """Unwrap a stored user-turn sent-form back to the raw user text.
+
+    Writers (streaming.py / kestrel_agent.py) persist the rendered sent-form
+    for user turns so history-load reproduces the byte-exact prompt that was
+    sent. Consumers that need raw user text — memory retrieval, UI previews,
+    exports — call this to strip the wrappers.
+
+    Sent-form grammar (see ``prompts/user_prompt.md`` + ``wrap_user_input``):
+        [optional leading \\n from empty {context}]
+        [optional <retrieved_context>...</retrieved_context>\\n]
+        <user_input>\\n{raw}\\n</user_input>
+
+    Idempotent on legacy raw rows (no wrappers) — returns input unchanged.
+    """
+    s = content
+    if s.startswith("\n"):
+        s = s[1:]
+    if s.startswith("<retrieved_context>"):
+        end = s.find("</retrieved_context>")
+        if end != -1:
+            s = s[end + len("</retrieved_context>"):]
+            if s.startswith("\n"):
+                s = s[1:]
+    prefix = "<user_input>\n"
+    suffix = "\n</user_input>"
+    if s.startswith(prefix) and s.endswith(suffix):
+        s = s[len(prefix):-len(suffix)]
+    return s
+
 if TYPE_CHECKING:
     from storage import AsyncStorage
     from storage.memory_consolidator import MemoryConsolidator
@@ -333,6 +364,7 @@ Use `!constitution article <N>` for specific articles, or `!constitution search 
             role = msg.get('role', 'user')
             content = msg.get('content', '')
             msg_id = msg.get('id')
+            meta = msg.get('metadata') or {}
 
             # Per-message hard cap before budget accounting
             content, content_tokens = self._cap_oversized_message(content, msg_id)
@@ -354,15 +386,16 @@ Use `!constitution article <N>` for specific articles, or `!constitution search 
             if role not in ('user', 'assistant', 'system'):
                 role = 'user' if role == 'human' else 'assistant'
 
-            # Wrap user messages in <user_input> tags on load.  This pairs
-            # with the anti-injection system prompt (which instructs the
-            # model to treat <user_input> contents as untrusted data) and,
-            # critically, makes the wrapped form byte-identical to what was
-            # sent as the current-turn user message at the previous turn.
-            # That byte-identity is what lets downstream prompt caches
-            # (llama.cpp KV, OpenAI prefix, Anthropic cache_control) hit on
-            # the history portion of the prompt across turns.
-            if role == 'user':
+            # For user turns, reproduce what was sent. Rows written with
+            # ``metadata.sent_form == True`` already hold the full rendered
+            # sent-form (retrieved_context + <user_input> wrap) — emit it
+            # verbatim so the history prefix byte-matches what the LLM saw
+            # at send time. Legacy rows (no flag) store raw text; wrap here
+            # so the anti-injection system prompt's <user_input> contract
+            # still holds. Byte-identity across turns is what lets downstream
+            # prompt caches hit (llama.cpp KV, OpenAI prefix, Anthropic
+            # cache_control).
+            if role == 'user' and not meta.get('sent_form'):
                 wrapped = wrap_user_input(content)
                 # Budget was accounted pre-wrap; add the small wrap overhead
                 # so the caller sees an honest token count.
