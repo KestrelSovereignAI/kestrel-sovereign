@@ -342,25 +342,37 @@ def _ws_get_agent(websocket: WebSocket):
     return None
 
 
-def _ws_authenticate(websocket: WebSocket) -> bool:
-    """Authenticate WebSocket via query parameter api_key or cookie session."""
+def _ws_authenticate(websocket: WebSocket):
+    """Authenticate a WebSocket connection and return the caller context.
+
+    Returns a :class:`CallerContext` when auth succeeds, or ``None`` when the
+    connection should be rejected.  Mirrors the API-key/session branches that
+    the HTTP middleware in ``server.py`` applies, so that sovereign commands
+    issued over voice (e.g. ``!safe-mode exit``) gate the same way.
+    """
     import os
+    from kestrel_sovereign.auth import AuthMethod, CallerContext
+
     expected_key = os.environ.get("KESTREL_API_KEY", "")
     if not expected_key:
-        return True  # No key configured — open access
+        # No key configured — open access, matching HTTP behavior on local dev.
+        return CallerContext.sovereign(AuthMethod.API_KEY)
 
     # Check query parameter
     api_key = websocket.query_params.get("api_key", "")
     if api_key and secrets.compare_digest(api_key, expected_key):
-        return True
+        return CallerContext.sovereign(AuthMethod.API_KEY)
 
     # Check cookie-based session (OAuth flow)
     if hasattr(websocket, "session"):
         user_email = websocket.session.get("user_email")
         if user_email:
-            return True
+            return CallerContext.authenticated(
+                identity=user_email,
+                auth_method=AuthMethod.OAUTH_SESSION,
+            )
 
-    return False
+    return None
 
 
 @router.websocket("/chat")
@@ -382,7 +394,8 @@ async def voice_chat(websocket: WebSocket):
     Auth: query parameter ?api_key=... or session cookie.
     """
     # --- Auth check before accept ---
-    if not _ws_authenticate(websocket):
+    caller = _ws_authenticate(websocket)
+    if caller is None:
         await websocket.close(code=4401, reason="Authentication required")
         return
 
@@ -483,12 +496,14 @@ async def voice_chat(websocket: WebSocket):
         full_response = []
         try:
             if hasattr(agent, "process_input_streaming"):
-                async for chunk in agent.process_input_streaming(transcript_text):
+                async for chunk in agent.process_input_streaming(
+                    transcript_text, caller=caller
+                ):
                     full_response.append(chunk)
                     # Send incremental text to client
                     await send_control({"type": "response", "text": chunk})
             else:
-                result = await agent.process_input(transcript_text)
+                result = await agent.process_input(transcript_text, caller=caller)
                 full_response.append(result)
                 await send_control({"type": "response", "text": result})
         except Exception as e:

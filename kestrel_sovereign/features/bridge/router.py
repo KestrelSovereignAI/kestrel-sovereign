@@ -32,7 +32,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
 from kestrel_sovereign.rate_limit import limiter
-from endpoints.agent_helpers import get_agent
+from endpoints.agent_helpers import get_agent, get_caller
 
 from .protocol import (
     BridgeCapabilitiesResponse,
@@ -117,6 +117,7 @@ def get_router() -> APIRouter:
                 user_input,
                 model_override=body.model_override,
                 session_id=session.id,
+                caller=get_caller(request),
             )
         except Exception as e:
             logger.error(f"Bridge invoke error: {e}", exc_info=True)
@@ -192,6 +193,7 @@ def get_router() -> APIRouter:
                     user_input,
                     model_override=body.model_override,
                     session_id=session.id,
+                    caller=get_caller(request),
                 ):
                     full_response.append(chunk)
                     event_data = json.dumps({"type": "chunk", "content": chunk})
