@@ -743,6 +743,50 @@ async def list_tasks(
         raise HTTPException(status_code=500, detail="Error listing tasks.")
 
 
+@router.get("/tasks/{task_id}")
+async def get_task(request: Request, task_id: str):
+    """
+    Fetch a single background A2A task with its artifacts.
+
+    Used by the Tasks panel to render "Load artifacts" for a given task.
+    """
+    agent = get_agent(request)
+
+    if not hasattr(agent, "task_manager") or not agent.task_manager:
+        raise HTTPException(status_code=404, detail="TaskManager not available")
+
+    try:
+        task = await agent.task_manager.task_store.get(task_id)
+    except Exception as e:
+        logger.error(f"Error loading task {task_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Error loading task.")
+
+    if task is None:
+        raise HTTPException(status_code=404, detail=f"Task '{task_id}' not found")
+
+    message_text = None
+    if task.status.message and task.status.message.parts:
+        for part in task.status.message.parts:
+            if hasattr(part, "text"):
+                message_text = part.text
+                break
+
+    artifacts_payload = []
+    for artifact in (task.artifacts or []):
+        if hasattr(artifact, "model_dump"):
+            artifacts_payload.append(artifact.model_dump())
+        else:
+            artifacts_payload.append(artifact)
+
+    return {
+        "id": task.id,
+        "status": task.status.state.value,
+        "message": message_text,
+        "artifacts": artifacts_payload,
+        "metadata": task.metadata or {},
+    }
+
+
 # --- Heartbeat Endpoints ---
 
 
