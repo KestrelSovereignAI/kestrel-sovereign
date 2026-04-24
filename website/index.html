@@ -1,0 +1,951 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Kestrel — Sovereign AI Agent Framework</title>
+  <link rel="icon" type="image/png" href="logo.png" />
+  <meta name="description" content="Build AI agents with cryptographic identity, persistent memory you own, and constitutional governance enforced above the LLM. Open source. Deployed in production." />
+  <meta property="og:title" content="Kestrel — Sovereign AI Agent Framework" />
+  <meta property="og:description" content="Build AI agents nobody can take away. Cryptographic identity. Persistent memory you own. Constitutional governance above the LLM." />
+  <meta property="og:url" content="https://kestrelsovereign.com" />
+  <meta property="og:type" content="website" />
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:title" content="Kestrel — Sovereign AI Agent Framework" />
+  <meta name="twitter:description" content="Open-source framework for AI agents with cryptographic identity, owned memory, and constitutional governance." />
+
+  <!-- Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:           #060B18;
+      --surface:      #0C1525;
+      --surface-2:    #111D30;
+      --border:       #1C2C47;
+      --border-light: #243351;
+      --blue:         #38BDF8;
+      --blue-dim:     #0EA5E9;
+      --indigo:       #818CF8;
+      --amber:        #F59E0B;
+      --green:        #34D399;
+      --red:          #F87171;
+      --text:         #F0F6FF;
+      --text-2:       #94A3B8;
+      --text-3:       #64748B;
+    }
+
+    html { scroll-behavior: smooth; }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: 'Inter', system-ui, sans-serif;
+      font-size: 16px;
+      line-height: 1.6;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    /* ─── Utility ─── */
+    .mono { font-family: 'JetBrains Mono', monospace; }
+    .container { width: 100%; max-width: 1100px; margin: 0 auto; padding: 0 24px; }
+    .section { padding: 96px 0; }
+    .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0,0,0,0); }
+
+    /* ─── Nav ─── */
+    nav {
+      position: sticky;
+      top: 0;
+      z-index: 100;
+      border-bottom: 1px solid var(--border);
+      background: rgba(6, 11, 24, 0.9);
+      backdrop-filter: blur(12px);
+    }
+    .nav-inner {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      height: 64px;
+    }
+    .nav-logo {
+      font-weight: 700;
+      font-size: 1.125rem;
+      color: var(--text);
+      text-decoration: none;
+      letter-spacing: -0.01em;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .nav-logo-mark {
+      width: 34px;
+      height: 34px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .nav-logo-mark img {
+      width: 34px;
+      height: 34px;
+      object-fit: contain;
+      filter: brightness(0) invert(1);
+    }
+    .nav-links {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      list-style: none;
+    }
+    .nav-links a {
+      color: var(--text-2);
+      text-decoration: none;
+      font-size: 0.875rem;
+      font-weight: 500;
+      padding: 6px 12px;
+      border-radius: 6px;
+      transition: color 0.15s, background 0.15s;
+    }
+    .nav-links a:hover { color: var(--text); background: var(--surface-2); }
+    .btn-nav {
+      background: var(--blue);
+      color: #000 !important;
+      font-weight: 600 !important;
+      padding: 7px 16px !important;
+      border-radius: 7px !important;
+      transition: opacity 0.15s !important;
+    }
+    .btn-nav:hover { opacity: 0.85; background: none !important; }
+
+    /* ─── Badge ─── */
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      background: rgba(56, 189, 248, 0.1);
+      border: 1px solid rgba(56, 189, 248, 0.25);
+      color: var(--blue);
+      font-size: 0.8125rem;
+      font-weight: 600;
+      padding: 5px 12px;
+      border-radius: 100px;
+      text-decoration: none;
+      transition: background 0.15s, border-color 0.15s;
+    }
+    .badge:hover {
+      background: rgba(56, 189, 248, 0.18);
+      border-color: rgba(56, 189, 248, 0.4);
+    }
+    .badge .dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--green);
+      animation: pulse 2s infinite;
+    }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.3; }
+    }
+
+    /* ─── Hero ─── */
+    .hero {
+      padding: 100px 0 80px;
+      text-align: center;
+    }
+    .hero-title {
+      font-size: clamp(2.5rem, 6vw, 4.25rem);
+      font-weight: 900;
+      line-height: 1.1;
+      letter-spacing: -0.03em;
+      margin: 24px 0 20px;
+      max-width: 900px;
+      margin-left: auto;
+      margin-right: auto;
+    }
+    .hero-title .highlight {
+      background: linear-gradient(135deg, var(--blue) 0%, var(--indigo) 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+    .hero-sub {
+      font-size: clamp(1rem, 2vw, 1.25rem);
+      color: var(--text-2);
+      max-width: 640px;
+      margin: 0 auto 40px;
+      line-height: 1.65;
+    }
+    .hero-actions {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    .btn-primary {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      background: var(--blue);
+      color: #000;
+      font-weight: 700;
+      font-size: 0.9375rem;
+      padding: 13px 26px;
+      border-radius: 9px;
+      text-decoration: none;
+      transition: opacity 0.15s, transform 0.15s;
+    }
+    .btn-primary:hover { opacity: 0.88; transform: translateY(-1px); }
+    .btn-secondary {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      background: var(--surface-2);
+      border: 1px solid var(--border-light);
+      color: var(--text);
+      font-weight: 600;
+      font-size: 0.9375rem;
+      padding: 12px 24px;
+      border-radius: 9px;
+      text-decoration: none;
+      transition: background 0.15s, border-color 0.15s, transform 0.15s;
+    }
+    .btn-secondary:hover { background: var(--surface); border-color: var(--blue); transform: translateY(-1px); }
+
+    /* ─── Hero proof ticker ─── */
+    .proof-bar {
+      margin-top: 64px;
+      padding-top: 32px;
+      border-top: 1px solid var(--border);
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      gap: 48px;
+      flex-wrap: wrap;
+    }
+    .proof-item {
+      text-align: center;
+    }
+    .proof-number {
+      font-size: 1.875rem;
+      font-weight: 800;
+      color: var(--text);
+      letter-spacing: -0.03em;
+    }
+    .proof-label {
+      font-size: 0.8125rem;
+      color: var(--text-3);
+      margin-top: 2px;
+    }
+    .proof-divider {
+      width: 1px;
+      height: 36px;
+      background: var(--border);
+    }
+
+    /* ─── Section label ─── */
+    .section-label {
+      display: inline-block;
+      font-size: 0.75rem;
+      font-weight: 700;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: var(--blue);
+      margin-bottom: 16px;
+    }
+    .section-title {
+      font-size: clamp(1.75rem, 3.5vw, 2.5rem);
+      font-weight: 800;
+      letter-spacing: -0.025em;
+      line-height: 1.2;
+      margin-bottom: 16px;
+    }
+    .section-sub {
+      font-size: 1.0625rem;
+      color: var(--text-2);
+      max-width: 560px;
+      line-height: 1.65;
+    }
+
+    /* ─── Three Pillars ─── */
+    .pillars-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+      gap: 1px;
+      background: var(--border);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      overflow: hidden;
+      margin-top: 56px;
+    }
+    .pillar-card {
+      background: var(--surface);
+      padding: 36px 32px;
+      transition: background 0.2s;
+    }
+    .pillar-card:hover { background: var(--surface-2); }
+    .pillar-icon {
+      width: 44px;
+      height: 44px;
+      border-radius: 10px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      margin-bottom: 20px;
+      font-size: 20px;
+    }
+    .icon-blue  { background: rgba(56, 189, 248, 0.12); }
+    .icon-indigo { background: rgba(129, 140, 248, 0.12); }
+    .icon-green { background: rgba(52, 211, 153, 0.12); }
+    .pillar-number {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.75rem;
+      color: var(--text-3);
+      margin-bottom: 8px;
+    }
+    .pillar-title {
+      font-size: 1.125rem;
+      font-weight: 700;
+      color: var(--text);
+      margin-bottom: 10px;
+      letter-spacing: -0.01em;
+    }
+    .pillar-body {
+      font-size: 0.9375rem;
+      color: var(--text-2);
+      line-height: 1.65;
+    }
+    .pillar-detail {
+      margin-top: 16px;
+      padding-top: 16px;
+      border-top: 1px solid var(--border);
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.8125rem;
+      color: var(--text-3);
+    }
+
+    /* ─── Proof / Caprock ─── */
+    .proof-section { background: var(--surface); border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); }
+    .proof-inner {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 64px;
+      align-items: center;
+    }
+    .proof-quote {
+      font-size: 1.25rem;
+      font-style: italic;
+      color: var(--text);
+      line-height: 1.65;
+      position: relative;
+      padding-left: 24px;
+    }
+    .proof-quote::before {
+      content: '';
+      position: absolute;
+      left: 0;
+      top: 0;
+      bottom: 0;
+      width: 3px;
+      background: var(--amber);
+      border-radius: 2px;
+    }
+    .proof-tag {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      background: rgba(245, 158, 11, 0.1);
+      border: 1px solid rgba(245, 158, 11, 0.25);
+      color: var(--amber);
+      font-size: 0.8125rem;
+      font-weight: 600;
+      padding: 4px 10px;
+      border-radius: 100px;
+      margin-bottom: 24px;
+    }
+    .proof-stat-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+    }
+    .proof-stat {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 20px;
+    }
+    .proof-stat-value {
+      font-size: 1.5rem;
+      font-weight: 800;
+      letter-spacing: -0.02em;
+      color: var(--text);
+    }
+    .proof-stat-label {
+      font-size: 0.8125rem;
+      color: var(--text-3);
+      margin-top: 4px;
+    }
+
+    /* ─── Architecture diagram / code preview ─── */
+    .code-block {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      overflow: hidden;
+    }
+    .code-header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 12px 16px;
+      border-bottom: 1px solid var(--border);
+      background: var(--surface-2);
+    }
+    .code-dot { width: 10px; height: 10px; border-radius: 50%; }
+    .dot-red { background: #FF5F57; }
+    .dot-yellow { background: #FEBC2E; }
+    .dot-green { background: #28C840; }
+    .code-filename {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.75rem;
+      color: var(--text-3);
+      margin-left: 4px;
+    }
+    .code-body {
+      padding: 24px;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.8125rem;
+      line-height: 1.75;
+      overflow-x: auto;
+    }
+    .c-comment { color: #4A5568; }
+    .c-keyword { color: var(--blue); }
+    .c-string { color: var(--green); }
+    .c-func { color: var(--indigo); }
+    .c-var { color: #F8C96B; }
+    .c-punc { color: var(--text-3); }
+
+    /* ─── CTA / Email capture ─── */
+    .cta-section {
+      text-align: center;
+    }
+    .cta-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      padding: 64px 48px;
+      position: relative;
+      overflow: hidden;
+    }
+    .cta-card::before {
+      content: '';
+      position: absolute;
+      inset: 0;
+      background: radial-gradient(ellipse at 50% 0%, rgba(56, 189, 248, 0.06) 0%, transparent 70%);
+      pointer-events: none;
+    }
+    .email-form {
+      display: flex;
+      gap: 10px;
+      max-width: 460px;
+      margin: 32px auto 0;
+      flex-wrap: wrap;
+      justify-content: center;
+    }
+    .email-input {
+      flex: 1;
+      min-width: 240px;
+      background: var(--bg);
+      border: 1px solid var(--border-light);
+      border-radius: 9px;
+      color: var(--text);
+      font-size: 0.9375rem;
+      padding: 12px 16px;
+      outline: none;
+      transition: border-color 0.15s;
+      font-family: inherit;
+    }
+    .email-input::placeholder { color: var(--text-3); }
+    .email-input:focus { border-color: var(--blue); }
+    .btn-cta {
+      background: var(--blue);
+      color: #000;
+      font-weight: 700;
+      font-size: 0.9375rem;
+      padding: 12px 22px;
+      border-radius: 9px;
+      border: none;
+      cursor: pointer;
+      font-family: inherit;
+      transition: opacity 0.15s;
+      white-space: nowrap;
+    }
+    .btn-cta:hover { opacity: 0.88; }
+    .form-note {
+      font-size: 0.8125rem;
+      color: var(--text-3);
+      margin-top: 12px;
+    }
+    .form-success {
+      display: none;
+      background: rgba(52, 211, 153, 0.1);
+      border: 1px solid rgba(52, 211, 153, 0.3);
+      color: var(--green);
+      border-radius: 9px;
+      padding: 12px 20px;
+      font-size: 0.9375rem;
+      margin-top: 16px;
+    }
+
+    /* ─── Open Source section ─── */
+    .oss-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      gap: 16px;
+      margin-top: 40px;
+    }
+    .oss-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 24px;
+      transition: border-color 0.15s, background 0.15s;
+    }
+    .oss-card:hover { border-color: var(--border-light); background: var(--surface-2); }
+    .oss-card-icon {
+      font-size: 1.5rem;
+      margin-bottom: 12px;
+    }
+    .oss-card-title {
+      font-weight: 700;
+      font-size: 1rem;
+      margin-bottom: 6px;
+      color: var(--text);
+    }
+    .oss-card-body {
+      font-size: 0.875rem;
+      color: var(--text-2);
+      line-height: 1.6;
+    }
+
+    /* ─── Footer ─── */
+    footer {
+      border-top: 1px solid var(--border);
+      padding: 40px 0;
+    }
+    .footer-inner {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 16px;
+    }
+    .footer-copy {
+      font-size: 0.875rem;
+      color: var(--text-3);
+    }
+    .footer-links {
+      display: flex;
+      gap: 24px;
+      list-style: none;
+    }
+    .footer-links a {
+      font-size: 0.875rem;
+      color: var(--text-3);
+      text-decoration: none;
+      transition: color 0.15s;
+    }
+    .footer-links a:hover { color: var(--text-2); }
+
+    /* ─── Responsive ─── */
+    @media (max-width: 768px) {
+      .proof-inner { grid-template-columns: 1fr; gap: 40px; }
+      .proof-bar { gap: 24px; }
+      .proof-divider { display: none; }
+      .hero { padding: 72px 0 56px; }
+      .section { padding: 64px 0; }
+      .nav-links .hide-mobile { display: none; }
+      .cta-card { padding: 40px 24px; }
+    }
+  </style>
+</head>
+<body>
+
+<!-- ─── Navigation ─── -->
+<nav>
+  <div class="container">
+    <div class="nav-inner">
+      <a href="/" class="nav-logo">
+        <div class="nav-logo-mark"><img src="logo.png" alt="Kestrel" /></div>
+        Kestrel
+      </a>
+      <ul class="nav-links">
+        <li class="hide-mobile"><a href="#pillars">Architecture</a></li>
+        <li class="hide-mobile"><a href="#proof">In Production</a></li>
+        <li class="hide-mobile"><a href="#open-source">Open Source</a></li>
+        <li>
+          <a href="https://github.com/KestrelSovereignAI/kestrel-sovereign" class="btn-nav" target="_blank" rel="noopener">
+            GitHub →
+          </a>
+        </li>
+      </ul>
+    </div>
+  </div>
+</nav>
+
+<!-- ─── Hero ─── -->
+<section class="hero">
+  <div class="container">
+    <a href="https://github.com/KestrelSovereignAI/kestrel-sovereign" class="badge" target="_blank" rel="noopener">
+      <span class="dot"></span>
+      Open source · Launching May 7, 2026
+    </a>
+
+    <h1 class="hero-title">
+      Build AI agents<br />
+      <span class="highlight">nobody can take away.</span>
+    </h1>
+
+    <p class="hero-sub">
+      Kestrel is a production-ready framework for AI agents with cryptographic identity,
+      persistent memory you own, and constitutional governance enforced above the LLM.
+      Not another wrapper. Infrastructure.
+    </p>
+
+    <div class="hero-actions">
+      <a href="#early-access" class="btn-primary">
+        Get early access
+        <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><path d="M5 12h14M12 5l7 7-7 7"/></svg>
+      </a>
+      <a href="https://github.com/KestrelSovereignAI/kestrel-sovereign" class="btn-secondary" target="_blank" rel="noopener">
+        <svg width="18" height="18" fill="currentColor" viewBox="0 0 24 24"><path d="M12 2C6.477 2 2 6.484 2 12.017c0 4.425 2.865 8.18 6.839 9.504.5.092.682-.217.682-.483 0-.237-.008-.868-.013-1.703-2.782.605-3.369-1.343-3.369-1.343-.454-1.158-1.11-1.466-1.11-1.466-.908-.62.069-.608.069-.608 1.003.07 1.531 1.032 1.531 1.032.892 1.53 2.341 1.088 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.113-4.555-4.951 0-1.093.39-1.988 1.029-2.688-.103-.253-.446-1.272.098-2.65 0 0 .84-.27 2.75 1.026A9.564 9.564 0 0112 6.844c.85.004 1.705.115 2.504.337 1.909-1.296 2.747-1.027 2.747-1.027.546 1.379.202 2.398.1 2.651.64.7 1.028 1.595 1.028 2.688 0 3.848-2.339 4.695-4.566 4.943.359.309.678.92.678 1.855 0 1.338-.012 2.419-.012 2.747 0 .268.18.58.688.482A10.019 10.019 0 0022 12.017C22 6.484 17.522 2 12 2z"/></svg>
+        View on GitHub
+      </a>
+    </div>
+
+    <!-- Proof bar -->
+    <div class="proof-bar">
+      <div class="proof-item">
+        <div class="proof-number">700+</div>
+        <div class="proof-label">issues shipped</div>
+      </div>
+      <div class="proof-divider"></div>
+      <div class="proof-item">
+        <div class="proof-number">3</div>
+        <div class="proof-label">sovereignty pillars</div>
+      </div>
+      <div class="proof-divider"></div>
+      <div class="proof-item">
+        <div class="proof-number">4,000+</div>
+        <div class="proof-label">unit tests</div>
+      </div>
+      <div class="proof-divider"></div>
+      <div class="proof-item">
+        <div class="proof-number">Clinical</div>
+        <div class="proof-label">production deployment</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ─── Three Pillars ─── -->
+<section class="section" id="pillars">
+  <div class="container">
+    <div style="text-align:center; max-width:640px; margin:0 auto;">
+      <span class="section-label">Architecture</span>
+      <h2 class="section-title">Three pillars of sovereignty</h2>
+      <p class="section-sub">
+        Sovereignty isn't a feature you add on top. It's a property that has to be
+        designed in from the start — across identity, memory, and governance.
+      </p>
+    </div>
+
+    <div class="pillars-grid">
+      <!-- Pillar 1 -->
+      <div class="pillar-card">
+        <div class="pillar-icon icon-blue">
+          <svg width="22" height="22" fill="none" stroke="#38BDF8" stroke-width="2" viewBox="0 0 24 24">
+            <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/>
+          </svg>
+        </div>
+        <div class="pillar-number">01 / Identity</div>
+        <div class="pillar-title">Portable DID identity</div>
+        <div class="pillar-body">
+          Every agent is born with a <code style="font-family:monospace; font-size:0.875em; color:#F8C96B;">did:pkh</code> decentralized identifier — a
+          cryptographic keypair using the same <code style="font-family:monospace; font-size:0.875em; color:#F8C96B;">secp256k1</code> curve as Ethereum.
+          The agent's identity is not issued by any platform. It's generated locally,
+          owned by the user, and portable to any environment.
+        </div>
+        <div class="pillar-detail">
+          did:pkh:eip155:1:0x8955b8cB...
+        </div>
+      </div>
+
+      <!-- Pillar 2 -->
+      <div class="pillar-card">
+        <div class="pillar-icon icon-indigo">
+          <svg width="22" height="22" fill="none" stroke="#818CF8" stroke-width="2" viewBox="0 0 24 24">
+            <ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/>
+          </svg>
+        </div>
+        <div class="pillar-number">02 / Memory</div>
+        <div class="pillar-title">Persistent memory you own</div>
+        <div class="pillar-body">
+          Conversations, documents, and relationships are stored in a local SQLite knowledge
+          graph with full-text search and RAG. The memory is yours — encrypted at rest,
+          portable, and deletable on demand. The agent's memory doesn't live in our cloud.
+        </div>
+        <div class="pillar-detail">
+          SQLite · FTS5 · Encrypted at rest
+        </div>
+      </div>
+
+      <!-- Pillar 3 -->
+      <div class="pillar-card">
+        <div class="pillar-icon icon-green">
+          <svg width="22" height="22" fill="none" stroke="#34D399" stroke-width="2" viewBox="0 0 24 24">
+            <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+          </svg>
+        </div>
+        <div class="pillar-number">03 / Governance</div>
+        <div class="pillar-title">Constitutional governance</div>
+        <div class="pillar-body">
+          Every agent runs under an audited constitution enforced <em>above</em> the LLM —
+          not inside the model, not in a prompt. Genesis audit on creation.
+          Amendment requires cryptographic signature. The model can't override it.
+          Neither can a bad prompt.
+        </div>
+        <div class="pillar-detail">
+          Genesis hash · Amendment log · Audit trail
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ─── Code sample ─── -->
+<section style="padding: 0 0 96px;">
+  <div class="container">
+    <div style="display:grid; grid-template-columns:1fr 1fr; gap:48px; align-items:center;">
+      <div>
+        <span class="section-label">Developer Experience</span>
+        <h2 class="section-title">Running in minutes,<br/>not weeks</h2>
+        <p style="font-size:1rem; color:var(--text-2); line-height:1.7; margin-top:12px; margin-bottom:28px;">
+          One command to create an agent. Another to start it. Your agent is up with a
+          full web UI, DID identity, memory store, and constitutional protections baked in.
+        </p>
+        <a href="https://github.com/KestrelSovereignAI/kestrel-sovereign#readme" class="btn-secondary" target="_blank" rel="noopener">
+          Read the quickstart →
+        </a>
+      </div>
+      <div class="code-block">
+        <div class="code-header">
+          <div class="code-dot dot-red"></div>
+          <div class="code-dot dot-yellow"></div>
+          <div class="code-dot dot-green"></div>
+          <div class="code-filename">terminal</div>
+        </div>
+        <div class="code-body">
+<span class="c-comment"># Install and set up</span>
+<span class="c-keyword">git</span> clone github.com/KestrelSovereignAI/kestrel-sovereign
+<span class="c-keyword">cd</span> kestrel-sovereign
+<span class="c-keyword">uv</span> sync
+
+<span class="c-comment"># Create your agent — gets a DID, memory store,</span>
+<span class="c-comment"># constitution, and web UI automatically</span>
+<span class="c-keyword">uv</span> run kestrel create MyAgent
+
+<span class="c-comment"># Start it</span>
+<span class="c-keyword">uv</span> run kestrel start MyAgent
+
+<span class="c-comment"># → Agent running at http://localhost:8888</span>
+<span class="c-comment"># → DID: did:pkh:eip155:1:0x...</span>
+<span class="c-comment"># → Constitution hash: 0xf3a2...</span>
+<span class="c-comment"># → Memory store: encrypted, local, yours</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ─── Proof / Caprock ─── -->
+<section class="section proof-section" id="proof">
+  <div class="container">
+    <div class="proof-inner">
+      <div>
+        <div class="proof-tag">
+          <svg width="12" height="12" fill="currentColor" viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+          Deployed in production
+        </div>
+        <h2 class="section-title">Not a demo. Not a pilot.<br/>Live in a clinical study.</h2>
+        <p style="font-size:1rem; color:var(--text-2); line-height:1.7; margin-top:12px;">
+          Kestrel powers the AI companion layer at <strong style="color:var(--text);">Caprock Health</strong>,
+          replacing static remote patient monitoring bots with constitutional AI agents
+          in an active clinical study. Agents that remember patients across sessions,
+          follow governance rules that can't be overridden, and run without phoning
+          home to a cloud platform.
+        </p>
+        <p style="font-size:1rem; color:var(--text-2); line-height:1.7; margin-top:14px;">
+          This isn't theoretical. Kestrel has been running in a real clinical environment
+          for months. That's the standard we hold ourselves to — and the bar we set
+          for the framework we're open-sourcing.
+        </p>
+      </div>
+      <div>
+        <div class="proof-stat-grid">
+          <div class="proof-stat">
+            <div class="proof-stat-value" style="color:var(--amber)">Clinical</div>
+            <div class="proof-stat-label">deployment environment</div>
+          </div>
+          <div class="proof-stat">
+            <div class="proof-stat-value" style="color:var(--blue)">RPM</div>
+            <div class="proof-stat-label">remote patient monitoring</div>
+          </div>
+          <div class="proof-stat">
+            <div class="proof-stat-value" style="color:var(--green)">Active</div>
+            <div class="proof-stat-label">running in production today</div>
+          </div>
+          <div class="proof-stat">
+            <div class="proof-stat-value" style="color:var(--indigo)">Months</div>
+            <div class="proof-stat-label">of production runtime</div>
+          </div>
+        </div>
+        <div style="margin-top:16px; padding:20px; background:var(--bg); border:1px solid var(--border); border-left:3px solid var(--amber); border-radius:10px;">
+          <p style="font-size:0.875rem; color:var(--text-2); line-height:1.6; font-style:italic;">
+            "The same three-pillar architecture powering our clinical agents is what
+            we're open-sourcing. What worked in a high-stakes environment should work
+            for any serious deployment."
+          </p>
+          <p style="font-size:0.8125rem; color:var(--text-3); margin-top:10px;">— Gabriela Aquino, Founder & CEO</p>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ─── Open Source ─── -->
+<section class="section" id="open-source">
+  <div class="container">
+    <div style="max-width:640px; margin:0 auto 0 0;">
+      <span class="section-label">Open Source</span>
+      <h2 class="section-title">The foundation is open.<br/>The ownership stays with you.</h2>
+      <p class="section-sub">
+        Kestrel is Apache 2.0 licensed. The sovereign core — identity, memory, and
+        constitutional governance — is fully open. No lock-in by design.
+      </p>
+    </div>
+
+    <div class="oss-grid">
+      <div class="oss-card">
+        <div class="oss-card-icon">⚖️</div>
+        <div class="oss-card-title">Apache 2.0 Licensed</div>
+        <div class="oss-card-body">Use it, fork it, build on it. No hidden restrictions on commercial use or modification.</div>
+      </div>
+      <div class="oss-card">
+        <div class="oss-card-icon">🔒</div>
+        <div class="oss-card-title">No Platform Lock-In</div>
+        <div class="oss-card-body">Your agent's identity and memory are not hosted by us. Self-host anywhere — your laptop, your server, your cloud.</div>
+      </div>
+      <div class="oss-card">
+        <div class="oss-card-icon">🔌</div>
+        <div class="oss-card-title">Multi-LLM Support</div>
+        <div class="oss-card-body">Anthropic, OpenAI, Gemini, Ollama — run fully local. The framework is provider-agnostic by design.</div>
+      </div>
+      <div class="oss-card">
+        <div class="oss-card-icon">🐍</div>
+        <div class="oss-card-title">Python · FastAPI · uv</div>
+        <div class="oss-card-body">Modern Python stack with a clean install story. One command to set up, runs on Mac, Linux, and Windows.</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ─── CTA / Email ─── -->
+<section class="section cta-section" id="early-access">
+  <div class="container" style="max-width:720px;">
+    <div class="cta-card">
+      <span class="section-label">Public Launch · May 7, 2026</span>
+      <h2 class="section-title" style="margin-top:12px;">Be first to build on Kestrel</h2>
+      <p style="font-size:1.0625rem; color:var(--text-2); line-height:1.65; max-width:520px; margin:0 auto;">
+        We're opening the repo publicly on May 7. Get early access before the public launch —
+        and if you want a demo, just ask.
+      </p>
+
+      <!-- Email form -->
+      <!-- To wire up a real backend, sign up at formspree.io and replace the action URL below.
+           Free tier handles up to 50 submissions/month. -->
+      <form class="email-form" id="earlyAccessForm" onsubmit="handleSubmit(event)">
+        <input
+          type="email"
+          class="email-input"
+          placeholder="you@company.com"
+          required
+          autocomplete="email"
+          aria-label="Your email address"
+          id="emailInput"
+        />
+        <button type="submit" class="btn-cta">Get early access</button>
+      </form>
+      <div class="form-success" id="formSuccess">
+        ✓ Got it — we'll reach out with access details before May 7.
+      </div>
+      <p class="form-note">Or email us directly: <a href="mailto:hello@kestrelsovereign.com" style="color:var(--text-2); text-decoration:underline;">hello@kestrelsovereign.com</a></p>
+    </div>
+  </div>
+</section>
+
+<!-- ─── Footer ─── -->
+<footer>
+  <div class="container">
+    <div class="footer-inner">
+      <div>
+        <div class="nav-logo" style="display:flex; align-items:center; gap:10px; text-decoration:none; color:var(--text); font-weight:700;">
+          <div class="nav-logo-mark"><img src="logo.png" alt="Kestrel" /></div>
+          Kestrel
+        </div>
+        <p class="footer-copy" style="margin-top:8px;">© 2026 KestrelSovereignAI. Apache 2.0.</p>
+      </div>
+      <ul class="footer-links">
+        <li><a href="https://github.com/KestrelSovereignAI/kestrel-sovereign" target="_blank" rel="noopener">GitHub</a></li>
+        <li><a href="https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/main/docs/SOVEREIGNTY.md" target="_blank" rel="noopener">Architecture</a></li>
+        <li><a href="https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/main/CONTRIBUTING.md" target="_blank" rel="noopener">Contributing</a></li>
+        <li><a href="mailto:hello@kestrelsovereign.com">Contact</a></li>
+        <li><a href="mailto:security@kestrelsovereign.com">Security</a></li>
+      </ul>
+    </div>
+  </div>
+</footer>
+
+<script>
+  async function handleSubmit(e) {
+    e.preventDefault();
+    const email = document.getElementById('emailInput').value;
+    const form = document.getElementById('earlyAccessForm');
+    const success = document.getElementById('formSuccess');
+
+    try {
+      const FORMSPREE_ENDPOINT = ''; // paste your Formspree URL here when ready
+      if (FORMSPREE_ENDPOINT) {
+        const res = await fetch(FORMSPREE_ENDPOINT, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+          body: JSON.stringify({ email }),
+        });
+        if (!res.ok) throw new Error('form error');
+      } else {
+        window.location.href = `mailto:hello@kestrelsovereign.com?subject=Early access request&body=I'd like early access to Kestrel. My email: ${encodeURIComponent(email)}`;
+      }
+    } catch (err) {
+      window.location.href = `mailto:hello@kestrelsovereign.com?subject=Early access request&body=I'd like early access to Kestrel. My email: ${encodeURIComponent(email)}`;
+    }
+
+    form.style.display = 'none';
+    success.style.display = 'block';
+  }
+</script>
+</body>
+</html>
