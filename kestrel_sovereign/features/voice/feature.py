@@ -14,17 +14,20 @@ from typing import Any, AsyncIterator, Dict, Optional
 
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.identity.identity_package import PersonalityFingerprint
-from kestrel_sovereign.privacy import PrivacyConfig
+from kestrel_sovereign.privacy import PrivacyConfig, get_privacy_preset
 from kestrel_sovereign.tools.base import ToolCategory
 from kestrel_sovereign.voice.base import VoiceConfig, VoiceInfo, TTSProvider, STTProvider, match_voice, split_sentences
 from kestrel_sovereign.voice.provider_registry import VoiceProviderRegistry
+from kestrel_sovereign.voice.routing import (
+    InstalledProviders,
+    UserVoicePreferences,
+    VoiceRoute,
+    VoiceRoutingContext,
+    resolve as resolve_voice_route,
+)
 from kestrel_sovereign.voice.stream_tap import AgentStreamTap
 
 logger = logging.getLogger(__name__)
-
-# Cloud provider names used in error messages
-_CLOUD_TTS_NAMES = {"openai", "elevenlabs"}
-_CLOUD_STT_NAMES = {"openai", "deepgram"}
 
 
 class VoicePrivacyError(Exception):
@@ -109,70 +112,174 @@ class VoiceFeature(Feature):
             return "full"
         return pa.get_storage_policy()
 
-    async def _get_tts_provider(self) -> TTSProvider:
-        """Get TTS provider respecting privacy mode."""
+    # ------------------------------------------------------------------
+    # Route resolution — single source of truth (kestrel_sovereign.voice.routing)
+    # ------------------------------------------------------------------
+
+    def _get_privacy_config(self) -> PrivacyConfig:
+        """Derive the current PrivacyConfig for the resolver.
+
+        Tries, in order:
+        1. ``pa.privacy_config`` or ``pa._privacy_config`` if it's a PrivacyConfig
+           (the real PrivacyAgent exposes the latter; tests tend to attach the
+           former directly).
+        2. Synthesize from the public API (``can_use_cloud()`` + ``get_storage_policy()``)
+           so the resolver works against any mock that implements the documented
+           contract.
+        3. Fall back to the ``normal`` preset for bare agents with no privacy
+           state wired up.
+        """
+        pa = self._get_privacy_agent()
+        if pa is None:
+            return get_privacy_preset("normal")
+
+        direct = getattr(pa, "privacy_config", None) or getattr(pa, "_privacy_config", None)
+        if isinstance(direct, PrivacyConfig):
+            return direct
+
+        storage_getter = getattr(pa, "get_storage_policy", None)
+        cloud_getter = getattr(pa, "can_use_cloud", None)
+        if storage_getter is None or cloud_getter is None:
+            return get_privacy_preset("normal")
+
+        storage = storage_getter() or "full"
+        # `shareable` is not part of the PrivacyAgent public API; default to
+        # False since the resolver does not branch on it today.
+        return PrivacyConfig(
+            storage=storage,
+            llm_location="cloud" if cloud_getter() else "local",
+            shareable=False,
+        )
+
+    def _get_llm_vendor(self) -> str:
+        """Return the current LLM vendor name (e.g. 'openai', 'anthropic').
+
+        The resolver uses this to decide whether the Realtime path is an option.
+        Returns an empty string when no vendor is identifiable — the resolver
+        treats this as 'not OpenAI' and falls back to Pipeline.
+        """
+        llm_service = getattr(self.agent, "llm_service", None)
+        if llm_service is None:
+            return ""
+        getter = getattr(llm_service, "get_current_provider_and_model", None)
+        if getter is None:
+            return ""
+        try:
+            provider, _model = getter()
+        except Exception:
+            return ""
+        return (provider or "").lower()
+
+    async def _resolve_route(self) -> VoiceRoute:
+        """Build a routing context from agent state and ask the resolver.
+
+        This is the single place where voice-path rules are applied. Callers
+        within this feature (and future endpoints) ask here, never hand-roll
+        the privacy gate.
+        """
         registry = await self._ensure_registry()
-        if not self._cloud_allowed():
-            mode_name = self._get_privacy_mode_name()
-            # If the configured provider is a cloud provider, block it with a clear message
-            configured = self._voice_config.tts_provider
-            if configured:
-                tts = registry.get_tts(configured)
-                if tts and not tts.is_local:
-                    raise VoicePrivacyError(
-                        f"Cannot use {configured.title()} TTS in {mode_name} privacy mode. "
-                        f"Install piper-tts for local TTS, or switch to 'anonymous' or higher privacy mode."
-                    )
-            providers = registry.get_local_tts()
-            if not providers:
+        prefs = self._voice_config
+        tts_names = registry.list_tts_providers()
+        stt_names = registry.list_stt_providers()
+        installed = InstalledProviders(
+            tts=set(tts_names),
+            stt=set(stt_names),
+            # Conversation providers (Realtime) are registered by a separate
+            # ticket (#725); fall back to empty set if the registry doesn't
+            # yet expose them.
+            conversation=set(
+                getattr(registry, "list_conversation_providers", lambda: [])()
+            ),
+            tts_local={n for n in tts_names if (p := registry.get_tts(n)) and p.is_local},
+            stt_local={n for n in stt_names if (p := registry.get_stt(n)) and p.is_local},
+        )
+        ctx = VoiceRoutingContext(
+            llm_vendor=self._get_llm_vendor(),
+            privacy_config=self._get_privacy_config(),
+            installed=installed,
+            preferences=UserVoicePreferences(
+                preferred_tts=prefs.tts_provider or None,
+                preferred_stt=prefs.stt_provider or None,
+            ),
+        )
+        return resolve_voice_route(ctx)
+
+    async def _get_tts_provider(self) -> TTSProvider:
+        """Get TTS provider for the current route.
+
+        Delegates provider selection to the voice path resolver so privacy
+        gating and fallback order live in exactly one place
+        (:mod:`kestrel_sovereign.voice.routing`). Only checks the TTS channel
+        — a missing STT provider does not block TTS-only callers like
+        :meth:`speak`. Translates the resolver's structured output back into
+        the legacy ``VoicePrivacyError`` messages callers (and existing tests)
+        rely on.
+        """
+        registry = await self._ensure_registry()
+        route = await self._resolve_route()
+        mode_name = self._get_privacy_mode_name()
+
+        # Preserve the "Cannot use X TTS in Y privacy mode" shape when the
+        # resolver rejected a configured cloud provider under local-only mode.
+        if route.blocked_tts:
+            raise VoicePrivacyError(
+                f"Cannot use {route.blocked_tts.title()} TTS in {mode_name} "
+                f"privacy mode. Install piper-tts for local TTS, or switch to "
+                f"'anonymous' or higher privacy mode."
+            )
+
+        if route.tts_provider is None:
+            if mode_name in ("ephemeral", "isolated"):
                 raise VoicePrivacyError(
-                    f"No local TTS provider available in {mode_name} privacy mode. "
-                    f"Install piper-tts for local TTS, or switch to 'anonymous' or higher privacy mode."
+                    f"No local TTS provider available in {mode_name} privacy "
+                    f"mode. Install piper-tts for local TTS, or switch to "
+                    f"'anonymous' or higher privacy mode."
                 )
-            return providers[0]
-        # Use configured provider, fall back to first available
-        if self._voice_config.tts_provider:
-            provider = registry.get_tts(self._voice_config.tts_provider)
-            if provider:
-                return provider
-        # Fall back to first registered TTS provider
-        for name in registry.list_tts_providers():
-            provider = registry.get_tts(name)
-            if provider:
-                return provider
-        raise VoicePrivacyError("No TTS provider available. Configure a voice provider.")
+            raise VoicePrivacyError(
+                f"No TTS provider available in {mode_name} privacy mode. "
+                f"{route.reason}"
+            )
+
+        provider = registry.get_tts(route.tts_provider)
+        if provider is None:
+            raise VoicePrivacyError(
+                f"Resolver selected TTS provider '{route.tts_provider}' but it "
+                f"is not registered. {route.reason}"
+            )
+        return provider
 
     async def _get_stt_provider(self) -> STTProvider:
-        """Get STT provider respecting privacy mode."""
+        """Get STT provider for the current route. See :meth:`_get_tts_provider`."""
         registry = await self._ensure_registry()
-        if not self._cloud_allowed():
-            mode_name = self._get_privacy_mode_name()
-            # If the configured provider is a cloud provider, block it with a clear message
-            configured = self._voice_config.stt_provider
-            if configured:
-                stt = registry.get_stt(configured)
-                if stt and not stt.is_local:
-                    raise VoicePrivacyError(
-                        f"Cannot use {configured.title()} STT in {mode_name} privacy mode. "
-                        f"Install faster-whisper for local STT, or switch to 'anonymous' or higher privacy mode."
-                    )
-            providers = registry.get_local_stt()
-            if not providers:
+        route = await self._resolve_route()
+        mode_name = self._get_privacy_mode_name()
+
+        if route.blocked_stt:
+            raise VoicePrivacyError(
+                f"Cannot use {route.blocked_stt.title()} STT in {mode_name} "
+                f"privacy mode. Install faster-whisper for local STT, or switch "
+                f"to 'anonymous' or higher privacy mode."
+            )
+
+        if route.stt_provider is None:
+            if mode_name in ("ephemeral", "isolated"):
                 raise VoicePrivacyError(
-                    f"No local STT provider available in {mode_name} privacy mode. "
-                    f"Install faster-whisper for local STT, or switch to 'anonymous' or higher privacy mode."
+                    f"No local STT provider available in {mode_name} privacy "
+                    f"mode. Install faster-whisper for local STT, or switch to "
+                    f"'anonymous' or higher privacy mode."
                 )
-            return providers[0]
-        # Use configured provider, fall back to first available
-        if self._voice_config.stt_provider:
-            provider = registry.get_stt(self._voice_config.stt_provider)
-            if provider:
-                return provider
-        for name in registry.list_stt_providers():
-            provider = registry.get_stt(name)
-            if provider:
-                return provider
-        raise VoicePrivacyError("No STT provider available. Configure a voice provider.")
+            raise VoicePrivacyError(
+                f"No STT provider available in {mode_name} privacy mode. "
+                f"{route.reason}"
+            )
+
+        provider = registry.get_stt(route.stt_provider)
+        if provider is None:
+            raise VoicePrivacyError(
+                f"Resolver selected STT provider '{route.stt_provider}' but it "
+                f"is not registered. {route.reason}"
+            )
+        return provider
 
     def _get_personality(self) -> PersonalityFingerprint | None:
         """Get the agent's personality fingerprint if available."""
