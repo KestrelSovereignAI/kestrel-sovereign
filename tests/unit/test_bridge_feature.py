@@ -148,7 +148,7 @@ class TestProtocolModels:
     def test_capabilities_response(self):
         resp = BridgeCapabilitiesResponse(
             agent_id="agent-1",
-            features=["BridgeFeature", "HeartbeatFeature"],
+            features=["BridgeFeature", "HealthFeature"],
             capabilities=[
                 BridgeCapability(
                     name="bridge_status",

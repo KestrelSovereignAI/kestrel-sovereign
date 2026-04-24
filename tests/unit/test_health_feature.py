@@ -3,10 +3,10 @@ Unit Tests for the Heartbeat Feature (#151).
 
 Tests:
 - Individual health check functions (database, LLM, memory, disk, context)
-- HeartbeatFeature lifecycle (initialize, shutdown)
-- heartbeat_check tool runs all checks and persists results
-- heartbeat_status tool returns history and uptime
-- heartbeat_interval tool changes the interval
+- HealthFeature lifecycle (initialize, shutdown)
+- health_check tool runs all checks and persists results
+- health_history tool returns history and uptime
+- health_interval tool changes the interval
 - Overall status derivation (healthy, degraded, unhealthy)
 - Background loop start/stop
 - Graceful handling of missing DB and components
@@ -19,16 +19,16 @@ import pytest
 import pytest_asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from kestrel_sovereign.features.heartbeat.checks import (
+from kestrel_sovereign.features.health.checks import (
     check_context_budget,
     check_database,
     check_disk_space,
     check_llm_service,
     check_memory_system,
 )
-from kestrel_sovereign.features.heartbeat.feature import (
+from kestrel_sovereign.features.health.feature import (
     DEFAULT_INTERVAL_SECONDS,
-    HeartbeatFeature,
+    HealthFeature,
     _derive_overall_status,
 )
 
@@ -231,7 +231,7 @@ class TestCheckDiskSpace:
     @pytest.mark.asyncio
     async def test_warn_on_low_space(self):
         # Mock shutil.disk_usage to simulate low space
-        with patch("kestrel_sovereign.features.heartbeat.checks.shutil") as mock_shutil:
+        with patch("kestrel_sovereign.features.health.checks.shutil") as mock_shutil:
             # 50MB free on 1TB disk
             mock_shutil.disk_usage.return_value = MagicMock(
                 total=1_000_000_000_000,
@@ -342,17 +342,17 @@ class TestDeriveOverallStatus:
 
 
 # ============================================================================
-# HeartbeatFeature Tests
+# HealthFeature Tests
 # ============================================================================
 
 
-class TestHeartbeatFeatureInitialize:
+class TestHealthFeatureInitialize:
     @pytest_asyncio.fixture
     async def feature(self):
-        """Create and initialize a HeartbeatFeature with mock agent."""
-        db = _make_db(table_exists_map={"heartbeat_log": True})
+        """Create and initialize a HealthFeature with mock agent."""
+        db = _make_db(table_exists_map={"health_log": True})
         agent = _make_agent(db=db)
-        feat = HeartbeatFeature(agent)
+        feat = HealthFeature(agent)
 
         # Patch asyncio.create_task to avoid actually starting the loop
         with patch("asyncio.create_task") as mock_create_task:
@@ -363,19 +363,19 @@ class TestHeartbeatFeatureInitialize:
 
     @pytest.mark.asyncio
     async def test_creates_table(self, feature):
-        """Initialize creates the heartbeat_log table."""
+        """Initialize creates the health_log table."""
         create_calls = [
             c for c in feature._db.execute.call_args_list
-            if "CREATE TABLE" in str(c) and "heartbeat_log" in str(c)
+            if "CREATE TABLE" in str(c) and "health_log" in str(c)
         ]
         assert len(create_calls) == 1
 
     @pytest.mark.asyncio
     async def test_creates_index(self, feature):
-        """Initialize creates the index on heartbeat_log."""
+        """Initialize creates the index on health_log."""
         index_calls = [
             c for c in feature._db.execute.call_args_list
-            if "CREATE INDEX" in str(c) and "heartbeat_log" in str(c)
+            if "CREATE INDEX" in str(c) and "health_log" in str(c)
         ]
         assert len(index_calls) == 1
 
@@ -391,10 +391,10 @@ class TestHeartbeatFeatureInitialize:
 class TestHeartbeatCheck:
     @pytest_asyncio.fixture
     async def feature(self):
-        """Create an initialized HeartbeatFeature."""
-        db = _make_db(table_exists_map={"heartbeat_log": True})
+        """Create an initialized HealthFeature."""
+        db = _make_db(table_exists_map={"health_log": True})
         agent = _make_agent(db=db)
-        feat = HeartbeatFeature(agent)
+        feat = HealthFeature(agent)
 
         with patch("asyncio.create_task") as mock_create_task:
             mock_create_task.return_value = _make_awaitable_task()
@@ -404,9 +404,9 @@ class TestHeartbeatCheck:
 
     @pytest.mark.asyncio
     async def test_returns_all_checks(self, feature):
-        """heartbeat_check returns results for all 5 checks."""
-        result = await feature.heartbeat_check()
-        assert "heartbeat_id" in result
+        """health_check returns results for all 5 checks."""
+        result = await feature.health_check()
+        assert "id" in result
         assert "status" in result
         assert "checks" in result
         assert "created_at" in result
@@ -420,26 +420,26 @@ class TestHeartbeatCheck:
 
     @pytest.mark.asyncio
     async def test_persists_to_db(self, feature):
-        """heartbeat_check writes a row to heartbeat_log."""
-        await feature.heartbeat_check()
+        """health_check writes a row to health_log."""
+        await feature.health_check()
 
         insert_calls = [
             c for c in feature._db.execute.call_args_list
-            if "INSERT INTO heartbeat_log" in str(c)
+            if "INSERT INTO health_log" in str(c)
         ]
         assert len(insert_calls) == 1
 
     @pytest.mark.asyncio
     async def test_stores_in_memory_history(self, feature):
-        """heartbeat_check appends to in-memory history."""
+        """health_check appends to in-memory history."""
         assert len(feature._in_memory_history) == 0
-        await feature.heartbeat_check()
+        await feature.health_check()
         assert len(feature._in_memory_history) == 1
 
     @pytest.mark.asyncio
     async def test_healthy_when_all_pass(self, feature):
         """Status is 'healthy' when all checks pass."""
-        result = await feature.heartbeat_check()
+        result = await feature.health_check()
         # With our mock agent that has db, llm, storage, the checks should mostly pass
         assert result["status"] in ("healthy", "degraded")
         # overall_healthy should match
@@ -449,9 +449,9 @@ class TestHeartbeatCheck:
 class TestHeartbeatStatus:
     @pytest_asyncio.fixture
     async def feature(self):
-        db = _make_db(table_exists_map={"heartbeat_log": True})
+        db = _make_db(table_exists_map={"health_log": True})
         agent = _make_agent(db=db)
-        feat = HeartbeatFeature(agent)
+        feat = HealthFeature(agent)
 
         with patch("asyncio.create_task") as mock_create_task:
             mock_create_task.return_value = _make_awaitable_task()
@@ -461,24 +461,24 @@ class TestHeartbeatStatus:
 
     @pytest.mark.asyncio
     async def test_returns_uptime(self, feature):
-        result = await feature.heartbeat_status()
+        result = await feature.health_history()
         assert "uptime_seconds" in result
         assert result["uptime_seconds"] >= 0
 
     @pytest.mark.asyncio
     async def test_returns_interval(self, feature):
-        result = await feature.heartbeat_status()
+        result = await feature.health_history()
         assert result["interval_seconds"] == DEFAULT_INTERVAL_SECONDS
 
     @pytest.mark.asyncio
     async def test_returns_history_from_db(self, feature):
-        """heartbeat_status queries the database for history."""
+        """health_history queries the database for history."""
         feature._db.fetchall = AsyncMock(return_value=[
             ("id-1", "healthy", '[{"name":"database","status":"pass"}]', 1, "2026-03-05T12:00:00"),
             ("id-2", "degraded", '[{"name":"database","status":"warn"}]', 0, "2026-03-05T11:00:00"),
         ])
 
-        result = await feature.heartbeat_status(limit=10)
+        result = await feature.health_history(limit=10)
         assert result["history_count"] == 2
         assert result["history"][0]["id"] == "id-1"
         assert result["history"][1]["id"] == "id-2"
@@ -490,7 +490,7 @@ class TestHeartbeatStatus:
             ("id-1", "healthy", '[]', 1, "2026-03-05T12:00:00"),
             ("id-2", "healthy", '[]', 1, "2026-03-05T11:00:00"),
         ])
-        result = await feature.heartbeat_status()
+        result = await feature.health_history()
         assert result["trend"] == "stable"
 
     @pytest.mark.asyncio
@@ -500,7 +500,7 @@ class TestHeartbeatStatus:
             ("id-1", "unhealthy", '[]', 0, "2026-03-05T12:00:00"),
             ("id-2", "healthy", '[]', 1, "2026-03-05T11:00:00"),
         ])
-        result = await feature.heartbeat_status()
+        result = await feature.health_history()
         assert result["trend"] == "declining"
 
     @pytest.mark.asyncio
@@ -510,7 +510,7 @@ class TestHeartbeatStatus:
             ("id-1", "healthy", '[]', 1, "2026-03-05T12:00:00"),
             ("id-2", "unhealthy", '[]', 0, "2026-03-05T11:00:00"),
         ])
-        result = await feature.heartbeat_status()
+        result = await feature.health_history()
         assert result["trend"] == "recovering"
 
     @pytest.mark.asyncio
@@ -520,7 +520,7 @@ class TestHeartbeatStatus:
         feature._in_memory_history = [
             {"id": "mem-1", "status": "healthy", "overall_healthy": True},
         ]
-        result = await feature.heartbeat_status()
+        result = await feature.health_history()
         assert result["history_count"] == 1
         assert result["history"][0]["id"] == "mem-1"
 
@@ -560,9 +560,9 @@ def _make_awaitable_task():
 class TestHeartbeatInterval:
     @pytest_asyncio.fixture
     async def feature(self):
-        db = _make_db(table_exists_map={"heartbeat_log": True})
+        db = _make_db(table_exists_map={"health_log": True})
         agent = _make_agent(db=db)
-        feat = HeartbeatFeature(agent)
+        feat = HealthFeature(agent)
 
         with patch("asyncio.create_task", return_value=_make_awaitable_task()):
             await feat.initialize()
@@ -572,7 +572,7 @@ class TestHeartbeatInterval:
     @pytest.mark.asyncio
     async def test_changes_interval(self, feature):
         with patch("asyncio.create_task", return_value=_make_awaitable_task()):
-            result = await feature.heartbeat_interval(seconds=120)
+            result = await feature.health_interval(seconds=120)
 
         assert result["old_interval_seconds"] == DEFAULT_INTERVAL_SECONDS
         assert result["new_interval_seconds"] == 120
@@ -581,14 +581,14 @@ class TestHeartbeatInterval:
     @pytest.mark.asyncio
     async def test_clamps_minimum(self, feature):
         with patch("asyncio.create_task", return_value=_make_awaitable_task()):
-            result = await feature.heartbeat_interval(seconds=1)
+            result = await feature.health_interval(seconds=1)
 
         assert result["new_interval_seconds"] == 10
 
     @pytest.mark.asyncio
     async def test_clamps_maximum(self, feature):
         with patch("asyncio.create_task", return_value=_make_awaitable_task()):
-            result = await feature.heartbeat_interval(seconds=9999)
+            result = await feature.health_interval(seconds=9999)
 
         assert result["new_interval_seconds"] == 3600
 
@@ -602,7 +602,7 @@ class TestLifecycle:
     @pytest.mark.asyncio
     async def test_initialize_prefers_raw_storage_without_touching_wrapper_db(self):
         """Privacy-wrapped storage.db must not be touched during initialization."""
-        db = _make_db(table_exists_map={"heartbeat_log": True})
+        db = _make_db(table_exists_map={"health_log": True})
 
         class PrivacyWrappedStorage:
             @property
@@ -612,7 +612,7 @@ class TestLifecycle:
         agent = _make_agent(db=None)
         agent.storage = PrivacyWrappedStorage()
         agent._raw_storage = MagicMock(db=db)
-        feat = HeartbeatFeature(agent)
+        feat = HealthFeature(agent)
 
         def fake_create_task(coro):
             coro.close()
@@ -626,9 +626,9 @@ class TestLifecycle:
     @pytest.mark.asyncio
     async def test_shutdown_stops_background_task(self):
         """shutdown() cancels the background task."""
-        db = _make_db(table_exists_map={"heartbeat_log": True})
+        db = _make_db(table_exists_map={"health_log": True})
         agent = _make_agent(db=db)
-        feat = HeartbeatFeature(agent)
+        feat = HealthFeature(agent)
 
         mock_task = _make_awaitable_task()
 
@@ -645,7 +645,7 @@ class TestLifecycle:
         """Initialize works gracefully without a database."""
         agent = _make_agent(db=None)
         agent.storage.db = None
-        feat = HeartbeatFeature(agent)
+        feat = HealthFeature(agent)
 
         with patch("asyncio.create_task") as mock_create_task:
             mock_create_task.return_value = _make_awaitable_task()
@@ -665,18 +665,18 @@ class TestLifecycle:
 
 class TestGracefulDegradation:
     @pytest.mark.asyncio
-    async def test_heartbeat_check_without_db(self):
-        """heartbeat_check works even without a database."""
+    async def test_health_check_without_db(self):
+        """health_check works even without a database."""
         agent = _make_agent(db=None)
         agent.storage.db = None
-        feat = HeartbeatFeature(agent)
+        feat = HealthFeature(agent)
 
         with patch("asyncio.create_task") as mock_create_task:
             mock_create_task.return_value = _make_awaitable_task()
             await feat.initialize()
 
-        result = await feat.heartbeat_check()
-        assert "heartbeat_id" in result
+        result = await feat.health_check()
+        assert "id" in result
         assert "checks" in result
         # Database check should fail but others should still run
         db_check = next(c for c in result["checks"] if c["name"] == "database")
@@ -688,20 +688,20 @@ class TestGracefulDegradation:
         feat._running = False
 
     @pytest.mark.asyncio
-    async def test_heartbeat_status_without_db(self):
-        """heartbeat_status works with in-memory history when DB unavailable."""
+    async def test_health_history_without_db(self):
+        """health_history works with in-memory history when DB unavailable."""
         agent = _make_agent(db=None)
         agent.storage.db = None
-        feat = HeartbeatFeature(agent)
+        feat = HealthFeature(agent)
 
         with patch("asyncio.create_task") as mock_create_task:
             mock_create_task.return_value = _make_awaitable_task()
             await feat.initialize()
 
         # Run a heartbeat to populate in-memory history
-        await feat.heartbeat_check()
+        await feat.health_check()
 
-        result = await feat.heartbeat_status()
+        result = await feat.health_history()
         assert result["history_count"] == 1
 
         feat._running = False
@@ -709,9 +709,9 @@ class TestGracefulDegradation:
     @pytest.mark.asyncio
     async def test_persist_failure_does_not_crash(self):
         """If DB persist fails, the heartbeat still returns results."""
-        db = _make_db(table_exists_map={"heartbeat_log": True})
+        db = _make_db(table_exists_map={"health_log": True})
         agent = _make_agent(db=db)
-        feat = HeartbeatFeature(agent)
+        feat = HealthFeature(agent)
 
         with patch("asyncio.create_task") as mock_create_task:
             mock_create_task.return_value = _make_awaitable_task()
@@ -721,15 +721,15 @@ class TestGracefulDegradation:
         original_execute = db.execute
 
         async def failing_execute(sql, *args, **kwargs):
-            if "INSERT INTO heartbeat_log" in sql:
+            if "INSERT INTO health_log" in sql:
                 raise Exception("DB write failed")
             return await original_execute(sql, *args, **kwargs)
 
         db.execute = AsyncMock(side_effect=failing_execute)
 
         # Should not raise
-        result = await feat.heartbeat_check()
-        assert "heartbeat_id" in result
+        result = await feat.health_check()
+        assert "id" in result
         assert len(feat._in_memory_history) == 1
 
         feat._running = False
@@ -743,10 +743,10 @@ class TestGracefulDegradation:
 class TestToolDiscovery:
     @pytest.mark.asyncio
     async def test_tools_registered(self):
-        """HeartbeatFeature exposes expected tools via get_tools()."""
+        """HealthFeature exposes expected tools via get_tools()."""
         db = _make_db()
         agent = _make_agent(db=db)
-        feat = HeartbeatFeature(agent)
+        feat = HealthFeature(agent)
 
         with patch("asyncio.create_task") as mock_create_task:
             mock_create_task.return_value = _make_awaitable_task()
@@ -755,27 +755,34 @@ class TestToolDiscovery:
         tools = feat.get_tools()
         tool_names = {t.name for t in tools}
 
+        # Canonical tools
+        assert "health_check" in tool_names
+        assert "health_history" in tool_names
+        assert "health_interval" in tool_names
+        # Deprecated !heartbeat* aliases retained for one release (see #753).
         assert "heartbeat_check" in tool_names
         assert "heartbeat_status" in tool_names
         assert "heartbeat_interval" in tool_names
-        assert len(tool_names) == 3
+        assert len(tool_names) == 6
 
         feat._running = False
 
     @pytest.mark.asyncio
     async def test_tool_description(self):
-        """HeartbeatFeature has a meaningful tool_description."""
+        """HealthFeature has a meaningful tool_description."""
         agent = _make_agent()
-        feat = HeartbeatFeature(agent)
-        assert "heartbeat" in feat.tool_description.lower()
-        assert "health" in feat.tool_description.lower()
+        feat = HealthFeature(agent)
+        desc = feat.tool_description.lower()
+        assert "liveness" in desc or "health" in desc
+        # Must name the subsystems it probes so the tool catalog is useful.
+        assert "database" in desc
 
     @pytest.mark.asyncio
     async def test_command_prefixes(self):
         """Tools have correct command prefixes."""
         db = _make_db()
         agent = _make_agent(db=db)
-        feat = HeartbeatFeature(agent)
+        feat = HealthFeature(agent)
 
         with patch("asyncio.create_task") as mock_create_task:
             mock_create_task.return_value = _make_awaitable_task()
@@ -783,6 +790,11 @@ class TestToolDiscovery:
 
         tools = feat.get_tools()
         prefixes = {t.schema.command_prefix for t in tools}
+        # Canonical commands
+        assert "!health" in prefixes
+        assert "!health-history" in prefixes
+        assert "!health-interval" in prefixes
+        # Deprecated aliases (warn on use)
         assert "!heartbeat" in prefixes
         assert "!heartbeat-status" in prefixes
         assert "!heartbeat-interval" in prefixes
@@ -791,45 +803,45 @@ class TestToolDiscovery:
 
 
 # ============================================================================
-# get_latest_heartbeat Tests
+# get_latest Tests
 # ============================================================================
 
 
 class TestGetLatestHeartbeat:
     @pytest.mark.asyncio
     async def test_returns_last_from_memory(self):
-        """get_latest_heartbeat returns the most recent in-memory result."""
-        db = _make_db(table_exists_map={"heartbeat_log": True})
+        """get_latest returns the most recent in-memory result."""
+        db = _make_db(table_exists_map={"health_log": True})
         agent = _make_agent(db=db)
-        feat = HeartbeatFeature(agent)
+        feat = HealthFeature(agent)
 
         with patch("asyncio.create_task") as mock_create_task:
             mock_create_task.return_value = _make_awaitable_task()
             await feat.initialize()
 
         # Run two heartbeats
-        await feat._run_heartbeat()
-        await feat._run_heartbeat()
+        await feat._run_health()
+        await feat._run_health()
 
-        latest = await feat.get_latest_heartbeat()
+        latest = await feat.get_latest()
         assert latest == feat._in_memory_history[-1]
 
         feat._running = False
 
     @pytest.mark.asyncio
     async def test_runs_fresh_when_no_history(self):
-        """get_latest_heartbeat runs a fresh heartbeat when no history exists."""
-        db = _make_db(table_exists_map={"heartbeat_log": True})
+        """get_latest runs a fresh heartbeat when no history exists."""
+        db = _make_db(table_exists_map={"health_log": True})
         agent = _make_agent(db=db)
-        feat = HeartbeatFeature(agent)
+        feat = HealthFeature(agent)
 
         with patch("asyncio.create_task") as mock_create_task:
             mock_create_task.return_value = _make_awaitable_task()
             await feat.initialize()
 
         assert len(feat._in_memory_history) == 0
-        latest = await feat.get_latest_heartbeat()
-        assert "heartbeat_id" in latest
+        latest = await feat.get_latest()
+        assert "id" in latest
         assert len(feat._in_memory_history) == 1
 
         feat._running = False
@@ -844,9 +856,9 @@ class TestInMemoryHistoryCap:
     @pytest.mark.asyncio
     async def test_caps_at_max(self):
         """In-memory history is capped at MAX_IN_MEMORY_HISTORY."""
-        db = _make_db(table_exists_map={"heartbeat_log": True})
+        db = _make_db(table_exists_map={"health_log": True})
         agent = _make_agent(db=db)
-        feat = HeartbeatFeature(agent)
+        feat = HealthFeature(agent)
 
         with patch("asyncio.create_task") as mock_create_task:
             mock_create_task.return_value = _make_awaitable_task()
@@ -857,7 +869,7 @@ class TestInMemoryHistoryCap:
             feat._in_memory_history.append({"id": f"test-{i}"})
 
         # Run one more heartbeat which triggers the cap
-        await feat._run_heartbeat()
+        await feat._run_health()
 
         # Should be capped at 100
         assert len(feat._in_memory_history) <= 100
