@@ -227,6 +227,49 @@ class AsyncStorage:
         if not self._initialized:
             await self.initialize()
         return await self.conversation.search_history(query, limit)
+
+    # --- Conversation-session management (issues #715 / #716) ---
+
+    async def delete_conversation_session(self, session_id: str) -> int:
+        """Delete every message belonging to a conversation session.
+
+        Delegator onto ``AsyncConversationStore.delete_conversation_session``.
+        Exists on the facade because ``PrivacyEnforcingStorage`` calls
+        through ``storage.<method>`` rather than
+        ``storage.conversation.<method>`` — without this wrapper the
+        privacy-aware path gets ``AttributeError`` and the endpoint
+        returns 500 (observed on live Meridian DELETE /api/conversations/
+        {id} calls before this fix).
+        """
+        if not self._initialized:
+            await self.initialize()
+        return await self.conversation.delete_conversation_session(session_id)
+
+    async def set_conversation_name(
+        self, session_id: str, name: Optional[str]
+    ) -> Optional[str]:
+        """Upsert / clear a user-assigned display name for a session.
+
+        Delegator onto ``AsyncConversationStore.set_conversation_name``.
+        Same rationale as ``delete_conversation_session`` above — the
+        privacy wrapper calls ``self._storage.set_conversation_name`` and
+        needs the method to exist at the facade layer.
+        """
+        if not self._initialized:
+            await self.initialize()
+        return await self.conversation.set_conversation_name(session_id, name)
+
+    async def get_conversation_name(self, session_id: str) -> Optional[str]:
+        """Read the user-assigned display name for a session."""
+        if not self._initialized:
+            await self.initialize()
+        return await self.conversation.get_conversation_name(session_id)
+
+    async def get_conversation_names(self) -> Dict[str, str]:
+        """Bulk read of user-assigned conversation names for this agent."""
+        if not self._initialized:
+            await self.initialize()
+        return await self.conversation.get_conversation_names()
     
     # --- Graph Operations ---
     
