@@ -1,28 +1,37 @@
 """
 Voice Provider Registry.
 
-Manages TTS and STT provider registration, discovery, and routing.
-Mirrors the pattern in kestrel_sovereign/llm/provider_registry.py.
+Manages TTS, STT, and (new in #725) ConversationProvider registration,
+discovery, and routing. Mirrors the pattern in
+``kestrel_sovereign/llm/provider_registry.py``.
 
-External packages can register voice providers via entry_points::
+External packages register providers via entry_points. TTS/STT share one
+group for backward compat; conversation (speech-to-speech) providers live
+in a separate group because they're factories for live sessions, not
+bytes-to-text transforms::
 
     [project.entry-points."kestrel_sovereign.voice_providers"]
     ElevenLabsTTS = "kestrel_voice_elevenlabs:ElevenLabsTTSProvider"
     ElevenLabsSTT = "kestrel_voice_elevenlabs:ElevenLabsSTTProvider"
+
+    [project.entry-points."kestrel_sovereign.conversation_providers"]
+    OpenAIRealtime = "kestrel_voice_openai:OpenAIRealtimeConversationProvider"
 """
 import logging
 from typing import Optional
 
+from kestrel_sdk.voice import ConversationProvider
 from kestrel_sovereign.entrypoints import discover_entry_point_classes
 from .base import TTSProvider, STTProvider
 
 logger = logging.getLogger(__name__)
 
 VOICE_PROVIDER_ENTRY_POINT_GROUP = "kestrel_sovereign.voice_providers"
+CONVERSATION_PROVIDER_ENTRY_POINT_GROUP = "kestrel_sovereign.conversation_providers"
 
 
 class VoiceProviderRegistry:
-    """Registry for TTS and STT providers."""
+    """Registry for TTS, STT, and ConversationProvider instances."""
 
     def __init__(self, config: dict):
         """Initialize the voice provider registry.
@@ -32,6 +41,7 @@ class VoiceProviderRegistry:
         """
         self._tts_providers: dict[str, TTSProvider] = {}
         self._stt_providers: dict[str, STTProvider] = {}
+        self._conversation_providers: dict[str, ConversationProvider] = {}
         self._config = config
         self._initialized = False
 
@@ -76,6 +86,9 @@ class VoiceProviderRegistry:
         # Phase 2: Discover external providers via entry_points
         await self._discover_entrypoint_providers()
 
+        # Phase 3: Discover conversation (speech-to-speech) providers.
+        await self._discover_conversation_providers()
+
         self._initialized = True
 
     async def _discover_entrypoint_providers(self) -> None:
@@ -119,6 +132,40 @@ class VoiceProviderRegistry:
                     logger.debug(f"Entry_point STT provider '{ep_name}' not available, skipping")
             except Exception as e:
                 logger.warning(f"Failed to load entry_point STT provider '{ep_name}': {e}")
+
+    async def _discover_conversation_providers(self) -> None:
+        """Scan entry_points for ConversationProvider implementations.
+
+        Conversation providers (speech-to-speech) live in a separate group
+        from TTS/STT because they own the full turn and have a different
+        contract. Discovered providers that are subclasses of
+        ``ConversationProvider`` are instantiated with their config section
+        and registered if available.
+        """
+        classes = discover_entry_point_classes(
+            CONVERSATION_PROVIDER_ENTRY_POINT_GROUP, ConversationProvider
+        )
+        for ep_name, cls in classes.items():
+            try:
+                provider_config = self._config.get(ep_name, {})
+                provider = cls(config=provider_config)
+                if provider.name in self._conversation_providers:
+                    logger.debug(
+                        f"Skipping entry_point conversation provider '{ep_name}': "
+                        f"'{provider.name}' already registered"
+                    )
+                    continue
+                if await provider.is_available():
+                    self.register_conversation(provider)
+                    logger.info(f"Registered entry_point conversation provider: {ep_name}")
+                else:
+                    logger.debug(
+                        f"Entry_point conversation provider '{ep_name}' not available, skipping"
+                    )
+            except Exception as e:
+                logger.warning(
+                    f"Failed to load entry_point conversation provider '{ep_name}': {e}"
+                )
 
     # Cloud voice providers (openai, elevenlabs, deepgram) are discovered
     # via entry_points from their respective packages:
@@ -215,3 +262,28 @@ class VoiceProviderRegistry:
     def list_stt_providers(self) -> list[str]:
         """List registered STT provider names."""
         return list(self._stt_providers.keys())
+
+    # ------------------------------------------------------------------
+    # Conversation (speech-to-speech) providers — see #725
+    # ------------------------------------------------------------------
+
+    def register_conversation(self, provider: ConversationProvider) -> None:
+        """Register a ConversationProvider."""
+        self._conversation_providers[provider.name] = provider
+
+    def get_conversation(self, name: str) -> Optional[ConversationProvider]:
+        """Get a ConversationProvider by name."""
+        return self._conversation_providers.get(name)
+
+    def list_conversation_providers(self) -> list[str]:
+        """List registered ConversationProvider names."""
+        return list(self._conversation_providers.keys())
+
+    def get_local_conversation(self) -> list[ConversationProvider]:
+        """Return only local (privacy-safe) conversation providers.
+
+        Currently always empty in practice — realtime speech-to-speech models
+        are cloud-only. Kept symmetric with ``get_local_tts``/``get_local_stt``
+        for future local realtime support.
+        """
+        return [p for p in self._conversation_providers.values() if p.is_local]
