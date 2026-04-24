@@ -47,6 +47,35 @@ class EmbeddingService:
         self.base_url = base_url or get_ollama_url()
         self._client = None
         self._async_client = None
+        # Tracks whether we've already logged the "model not installed"
+        # hint for this service instance. Embedding gets called dozens
+        # of times during agent startup (RAG indexing, memory seeding);
+        # a missing model would otherwise flood the log with identical
+        # red errors. #657.
+        self._model_missing_warned = False
+
+    def _handle_embed_error(self, exc: Exception, context: str) -> None:
+        """Log an embedding failure at the right severity.
+
+        "Model not found" is a setup issue (``ollama pull <name>``
+        fixes it) — log it as a one-time WARNING with the actionable
+        command, not as a per-call ERROR. Anything else stays ERROR
+        because it suggests something's actually broken.
+        """
+        status = getattr(exc, "status_code", None)
+        msg = str(exc).lower()
+        is_missing_model = status == 404 or "not found, try pulling it first" in msg
+        if is_missing_model:
+            if not self._model_missing_warned:
+                logger.warning(
+                    "Embedding model %r is not installed in Ollama — "
+                    "semantic memory / RAG search will be disabled. "
+                    "Run: ollama pull %s",
+                    self.model, self.model,
+                )
+                self._model_missing_warned = True
+            return
+        logger.error(f"{context}: {exc}")
 
     @property
     def client(self):
@@ -84,7 +113,7 @@ class EmbeddingService:
                 return embeddings[0]
             return None
         except Exception as e:
-            logger.error(f"Embedding failed: {e}")
+            self._handle_embed_error(e, "Embedding failed")
             return None
 
     def embed_batch(self, texts: List[str]) -> List[Optional[List[float]]]:
@@ -105,7 +134,7 @@ class EmbeddingService:
             response = self.client.embed(model=self.model, input=texts)
             return response.get('embeddings', [None] * len(texts))
         except Exception as e:
-            logger.error(f"Batch embedding failed: {e}")
+            self._handle_embed_error(e, "Batch embedding failed")
             return [None] * len(texts)
 
     async def aembed(self, text: str) -> Optional[List[float]]:
@@ -129,7 +158,7 @@ class EmbeddingService:
                 return embeddings[0]
             return None
         except Exception as e:
-            logger.error(f"Async embedding failed: {e}")
+            self._handle_embed_error(e, "Async embedding failed")
             return None
 
     async def aembed_batch(self, texts: List[str]) -> List[Optional[List[float]]]:
@@ -150,7 +179,7 @@ class EmbeddingService:
             response = await self.async_client.embed(model=self.model, input=texts)
             return response.get('embeddings', [None] * len(texts))
         except Exception as e:
-            logger.error(f"Async batch embedding failed: {e}")
+            self._handle_embed_error(e, "Async batch embedding failed")
             return [None] * len(texts)
 
 
