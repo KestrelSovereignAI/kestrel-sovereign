@@ -1176,12 +1176,6 @@ Expected Duration: {expected_duration}
             reflection_guidance=reflection_guidance,
         )
 
-        # NOW store user input — after context is built so memory retrieval
-        # doesn't find the current message as a "past memory"
-        try:
-            await self.privacy_agent.add_conversation("user", user_input, session_id=session_id)
-        except DecryptionError:
-            logging.warning("DecryptionError storing user input - continuing in degraded mode")
         self._session_briefed = True
 
         # Log budget usage for monitoring and store for API access
@@ -1209,6 +1203,18 @@ Expected Duration: {expected_duration}
             context=context_result.dynamic_user_context,
             query=wrap_user_input(user_input)
         )
+
+        # Store the user turn AFTER context build (so memory retrieval sees
+        # the pre-current-turn state) and AFTER rendering, persisting the
+        # full sent-form. History-load at turn N+1 then reproduces the bytes
+        # sent at turn N, which is what lets Anthropic's cache_control marker
+        # at messages[-2] compound across turns.
+        try:
+            await self.privacy_agent.add_conversation(
+                "user", prompt, metadata={"sent_form": True}, session_id=session_id
+            )
+        except DecryptionError:
+            logging.warning("DecryptionError storing user input - continuing in degraded mode")
 
         # Build system prompt with features and anti-injection defense
         force_local_only = not self.privacy_agent.privacy_config.allows_cloud_llm()
