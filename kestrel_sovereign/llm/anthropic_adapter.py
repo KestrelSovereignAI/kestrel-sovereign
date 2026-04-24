@@ -141,9 +141,21 @@ class AnthropicAdapter(LLMAdapter):
                the final user turn.  The current user turn is never
                marked — it's new content every request.
 
-        The 4th breakpoint is intentionally unused; reserving it lets
-        callers (or future extensions) add a non-standard marker without
-        exceeding Anthropic's per-request cap.
+        The 4th breakpoint is unused and available.  The single marker
+        at ``messages[-2]`` compounds across turns via Anthropic's
+        longest-prefix match when the application layer stores the
+        user-turn sent-form verbatim (see the ``metadata.sent_form``
+        contract in ``agent/context_builder.py`` and the
+        ``add_conversation(... metadata={'sent_form': True})`` calls in
+        ``agent/streaming.py`` and ``kestrel_agent.py``).  A second
+        history marker at ``messages[-4]`` was previously shipped as a
+        stability fix (reverted in commit 9eb97c2); atomic storage is
+        the root-cause fix and makes the redundancy unnecessary.
+
+        A concrete future use for slot #4: mark the boundary after a
+        tool-use / tool-result pair in tool-using conversations so the
+        tool schema + result become cacheable across follow-up turns.
+        Open a ticket with cache-hit metrics before spending this slot.
 
         Anthropic silently no-ops markers whose prefix is below the
         per-model minimum (1024 tokens for Opus/Sonnet, 2048 for Haiku),
