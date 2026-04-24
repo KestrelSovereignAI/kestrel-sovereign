@@ -3,15 +3,15 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Kestrel — Sovereign AI Agent Framework</title>
+  <title>Kestrel &mdash; Sovereign AI Agent Framework</title>
   <link rel="icon" type="image/png" href="logo.png" />
   <meta name="description" content="Build AI agents with cryptographic identity, persistent memory you own, and constitutional governance enforced above the LLM. Open source. Deployed in production." />
-  <meta property="og:title" content="Kestrel — Sovereign AI Agent Framework" />
+  <meta property="og:title" content="Kestrel &mdash; Sovereign AI Agent Framework" />
   <meta property="og:description" content="Build AI agents nobody can take away. Cryptographic identity. Persistent memory you own. Constitutional governance above the LLM." />
   <meta property="og:url" content="https://kestrelsovereign.com" />
   <meta property="og:type" content="website" />
   <meta name="twitter:card" content="summary_large_image" />
-  <meta name="twitter:title" content="Kestrel — Sovereign AI Agent Framework" />
+  <meta name="twitter:title" content="Kestrel &mdash; Sovereign AI Agent Framework" />
   <meta name="twitter:description" content="Open-source framework for AI agents with cryptographic identity, owned memory, and constitutional governance." />
 
   <!-- Fonts -->
@@ -589,7 +589,7 @@
         <li class="hide-mobile"><a href="#open-source">Open Source</a></li>
         <li>
           <a href="https://github.com/KestrelSovereignAI/kestrel-sovereign" class="btn-nav" target="_blank" rel="noopener">
-            GitHub →
+            GitHub &rarr;
           </a>
         </li>
       </ul>
@@ -602,7 +602,7 @@
   <div class="container">
     <a href="https://github.com/KestrelSovereignAI/kestrel-sovereign" class="badge" target="_blank" rel="noopener">
       <span class="dot"></span>
-      Open source · Launching May 7, 2026
+      Open source &middot; Launching May 7, 2026
     </a>
 
     <h1 class="hero-title">
@@ -660,7 +660,7 @@
       <h2 class="section-title">Three pillars of sovereignty</h2>
       <p class="section-sub">
         Sovereignty isn't a feature you add on top. It's a property that has to be
-        designed in from the start — across identity, memory, and governance.
+        designed in from the start &mdash; across identity, memory, and governance.
       </p>
     </div>
 
@@ -675,7 +675,7 @@
         <div class="pillar-number">01 / Identity</div>
         <div class="pillar-title">Portable DID identity</div>
         <div class="pillar-body">
-          Every agent is born with a <code style="font-family:monospace; font-size:0.875em; color:#F8C96B;">did:pkh</code> decentralized identifier — a
+          Every agent is born with a <code style="font-family:monospace; font-size:0.875em; color:#F8C96B;">did:pkh</code> decentralized identifier &mdash; a
           cryptographic keypair using the same <code style="font-family:monospace; font-size:0.875em; color:#F8C96B;">secp256k1</code> curve as Ethereum.
           The agent's identity is not issued by any platform. It's generated locally,
           owned by the user, and portable to any environment.
@@ -696,11 +696,11 @@
         <div class="pillar-title">Persistent memory you own</div>
         <div class="pillar-body">
           Conversations, documents, and relationships are stored in a local SQLite knowledge
-          graph with full-text search and RAG. The memory is yours — encrypted at rest,
+          graph with full-text search and RAG. The memory is yours &mdash; encrypted at rest,
           portable, and deletable on demand. The agent's memory doesn't live in our cloud.
         </div>
         <div class="pillar-detail">
-          SQLite · FTS5 · Encrypted at rest
+          SQLite &middot; FTS5 &middot; Encrypted at rest
         </div>
       </div>
 
@@ -714,13 +714,13 @@
         <div class="pillar-number">03 / Governance</div>
         <div class="pillar-title">Constitutional governance</div>
         <div class="pillar-body">
-          Every agent runs under an audited constitution enforced <em>above</em> the LLM —
+          Every agent runs under an audited constitution enforced <em>above</em> the LLM &mdash;
           not inside the model, not in a prompt. Genesis audit on creation.
           Amendment requires cryptographic signature. The model can't override it.
           Neither can a bad prompt.
         </div>
         <div class="pillar-detail">
-          Genesis hash · Amendment log · Audit trail
+          Genesis hash &middot; Amendment log &middot; Audit trail
         </div>
       </div>
     </div>
@@ -739,7 +739,7 @@
           full web UI, DID identity, memory store, and constitutional protections baked in.
         </p>
         <a href="https://github.com/KestrelSovereignAI/kestrel-sovereign#readme" class="btn-secondary" target="_blank" rel="noopener">
-          Read the quickstart →
+          Read the quickstart &rarr;
         </a>
       </div>
       <div class="code-block">
@@ -755,17 +755,17 @@
 <span class="c-keyword">cd</span> kestrel-sovereign
 <span class="c-keyword">uv</span> sync
 
-<span class="c-comment"># Create your agent — gets a DID, memory store,</span>
+<span class="c-comment"># Create your agent &mdash; gets a DID, memory store,</span>
 <span class="c-comment"># constitution, and web UI automatically</span>
 <span class="c-keyword">uv</span> run kestrel create MyAgent
 
 <span class="c-comment"># Start it</span>
 <span class="c-keyword">uv</span> run kestrel start MyAgent
 
-<span class="c-comment"># → Agent running at http://localhost:8888</span>
-<span class="c-comment"># → DID: did:pkh:eip155:1:0x...</span>
-<span class="c-comment"># → Constitution hash: 0xf3a2...</span>
-<span class="c-comment"># → Memory store: encrypted, local, yours</span>
+<span class="c-comment"># &rarr; Agent running at http://localhost:8888</span>
+<span class="c-comment"># &rarr; DID: did:pkh:eip155:1:0x...</span>
+<span class="c-comment"># &rarr; Constitution hash: 0xf3a2...</span>
+<span class="c-comment"># &rarr; Memory store: encrypted, local, yours</span>
         </div>
       </div>
     </div>
@@ -791,7 +791,7 @@
         </p>
         <p style="font-size:1rem; color:var(--text-2); line-height:1.7; margin-top:14px;">
           This isn't theoretical. Kestrel has been running in a real clinical environment
-          for months. That's the standard we hold ourselves to — and the bar we set
+          for months. That's the standard we hold ourselves to &mdash; and the bar we set
           for the framework we're open-sourcing.
         </p>
       </div>
@@ -820,7 +820,7 @@
             we're open-sourcing. What worked in a high-stakes environment should work
             for any serious deployment."
           </p>
-          <p style="font-size:0.8125rem; color:var(--text-3); margin-top:10px;">— Gabriela Aquino, Founder & CEO</p>
+          <p style="font-size:0.8125rem; color:var(--text-3); margin-top:10px;">&mdash; Gabriela Aquino, Founder & CEO</p>
         </div>
       </div>
     </div>
@@ -834,8 +834,8 @@
       <span class="section-label">Open Source</span>
       <h2 class="section-title">The foundation is open.<br/>The ownership stays with you.</h2>
       <p class="section-sub">
-        Kestrel is Apache 2.0 licensed. The sovereign core — identity, memory, and
-        constitutional governance — is fully open. No lock-in by design.
+        Kestrel is Apache 2.0 licensed. The sovereign core &mdash; identity, memory, and
+        constitutional governance &mdash; is fully open. No lock-in by design.
       </p>
     </div>
 
@@ -848,16 +848,16 @@
       <div class="oss-card">
         <div class="oss-card-icon">🔒</div>
         <div class="oss-card-title">No Platform Lock-In</div>
-        <div class="oss-card-body">Your agent's identity and memory are not hosted by us. Self-host anywhere — your laptop, your server, your cloud.</div>
+        <div class="oss-card-body">Your agent's identity and memory are not hosted by us. Self-host anywhere &mdash; your laptop, your server, your cloud.</div>
       </div>
       <div class="oss-card">
         <div class="oss-card-icon">🔌</div>
         <div class="oss-card-title">Multi-LLM Support</div>
-        <div class="oss-card-body">Anthropic, OpenAI, Gemini, Ollama — run fully local. The framework is provider-agnostic by design.</div>
+        <div class="oss-card-body">Anthropic, OpenAI, Gemini, Ollama &mdash; run fully local. The framework is provider-agnostic by design.</div>
       </div>
       <div class="oss-card">
         <div class="oss-card-icon">🐍</div>
-        <div class="oss-card-title">Python · FastAPI · uv</div>
+        <div class="oss-card-title">Python &middot; FastAPI &middot; uv</div>
         <div class="oss-card-body">Modern Python stack with a clean install story. One command to set up, runs on Mac, Linux, and Windows.</div>
       </div>
     </div>
@@ -868,10 +868,10 @@
 <section class="section cta-section" id="early-access">
   <div class="container" style="max-width:720px;">
     <div class="cta-card">
-      <span class="section-label">Public Launch · May 7, 2026</span>
+      <span class="section-label">Public Launch &middot; May 7, 2026</span>
       <h2 class="section-title" style="margin-top:12px;">Be first to build on Kestrel</h2>
       <p style="font-size:1.0625rem; color:var(--text-2); line-height:1.65; max-width:520px; margin:0 auto;">
-        We're opening the repo publicly on May 7. Get early access before the public launch —
+        We're opening the repo publicly on May 7. Get early access before the public launch &mdash;
         and if you want a demo, just ask.
       </p>
 
@@ -891,7 +891,7 @@
         <button type="submit" class="btn-cta">Get early access</button>
       </form>
       <div class="form-success" id="formSuccess">
-        ✓ Got it — we'll reach out with access details before May 7.
+        ✓ Got it &mdash; we'll reach out with access details before May 7.
       </div>
       <p class="form-note">Or email us directly: <a href="mailto:hello@kestrelsovereign.com" style="color:var(--text-2); text-decoration:underline;">hello@kestrelsovereign.com</a></p>
     </div>
@@ -907,7 +907,7 @@
           <div class="nav-logo-mark"><img src="logo.png" alt="Kestrel" /></div>
           Kestrel
         </div>
-        <p class="footer-copy" style="margin-top:8px;">© 2026 KestrelSovereignAI. Apache 2.0.</p>
+        <p class="footer-copy" style="margin-top:8px;">&copy; 2026 KestrelSovereignAI. Apache 2.0.</p>
       </div>
       <ul class="footer-links">
         <li><a href="https://github.com/KestrelSovereignAI/kestrel-sovereign" target="_blank" rel="noopener">GitHub</a></li>
