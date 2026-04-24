@@ -82,22 +82,22 @@ test.describe('Model API', () => {
         apiKey = await getApiKey(request);
     });
 
-    test('should return models grouped by provider', async ({ request }) => {
+    test('should return models grouped by vendor', async ({ request }) => {
         const response = await request.get(`${BASE_URL}/api/models`, {
             headers: authHeaders(apiKey)
         });
         expect(response.ok()).toBeTruthy();
 
         const data = await response.json();
-        expect(data.by_provider).toBeDefined();
+        expect(data.by_vendor).toBeDefined();
 
         // Should have at least OpenAI
-        const providers = Object.keys(data.by_provider);
+        const providers = Object.keys(data.by_vendor);
         expect(providers.length).toBeGreaterThan(0);
         expect(providers).toContain('openai');
 
         // OpenAI should have models
-        expect(data.by_provider.openai.length).toBeGreaterThan(0);
+        expect(data.by_vendor.openai.length).toBeGreaterThan(0);
     });
 
     test('should return featured models only when requested', async ({ request }) => {
@@ -109,8 +109,8 @@ test.describe('Model API', () => {
         const data = await response.json();
 
         // All returned models should be featured
-        for (const provider in data.by_provider) {
-            for (const model of data.by_provider[provider]) {
+        for (const provider in data.by_vendor) {
+            for (const model of data.by_vendor[provider]) {
                 expect(model.is_featured).toBeTruthy();
             }
         }
@@ -123,11 +123,11 @@ test.describe('Model API', () => {
         expect(response.ok()).toBeTruthy();
 
         const data = await response.json();
-        const providers = Object.keys(data.by_provider);
+        const providers = Object.keys(data.by_vendor);
 
         // Ollama should be present if models are pulled locally
         if (providers.includes('ollama')) {
-            const ollamaModels = data.by_provider.ollama;
+            const ollamaModels = data.by_vendor.ollama;
             expect(ollamaModels.length).toBeGreaterThan(0);
 
             // Each Ollama model should have required fields
@@ -146,7 +146,7 @@ test.describe('Model API', () => {
         expect(response.ok()).toBeTruthy();
 
         const data = await response.json();
-        const providers = Object.keys(data.by_provider);
+        const providers = Object.keys(data.by_vendor);
 
         // Should only have openai
         expect(providers).toContain('openai');
