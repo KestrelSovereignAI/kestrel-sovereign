@@ -611,6 +611,44 @@ class PrivacyEnforcingStorage:
 
         return count
 
+    async def set_conversation_name(
+        self, session_id: str, name: Optional[str]
+    ) -> Optional[str]:
+        """Upsert a user-chosen display name for a session (issue #716).
+
+        EPHEMERAL raises (no durable data); ISOLATED has no persistent
+        store so the wrapper echoes the normalized value without writing;
+        NORMAL delegates to the conversation store.
+        """
+        if self._privacy_config.is_ephemeral():
+            raise PrivacyViolationError(
+                "Cannot rename conversations in ephemeral mode (no persistent data)."
+            )
+        if self._policy.use_session_storage:
+            if name is None:
+                return None
+            trimmed = name.strip()
+            return trimmed or None
+
+        await self._check_write_permission("set_conversation_name")
+        return await self._storage.set_conversation_name(session_id, name)
+
+    async def get_conversation_name(self, session_id: str) -> Optional[str]:
+        """Read the user-assigned display name for a session."""
+        if self._privacy_config.is_ephemeral():
+            return None
+        if self._policy.use_session_storage:
+            return None
+        return await self._storage.get_conversation_name(session_id)
+
+    async def get_conversation_names(self) -> Dict[str, str]:
+        """Bulk read of user-assigned conversation names for this agent."""
+        if self._privacy_config.is_ephemeral():
+            return {}
+        if self._policy.use_session_storage:
+            return {}
+        return await self._storage.get_conversation_names()
+
     # === Pass-through properties (with deprecation warnings) ===
     #
     # These properties expose the underlying storage objects directly,
