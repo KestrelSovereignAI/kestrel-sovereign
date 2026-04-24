@@ -274,6 +274,73 @@ def test_tasks_endpoint_filters_by_status_and_rejects_invalid_values():
         _restore_app(app, original)
 
 
+def test_task_detail_endpoint_returns_task_with_artifacts():
+    task = Task(
+        id="task-42",
+        status=TaskStatus(
+            state=TaskState.COMPLETED,
+            message=Message(role="agent", parts=[TextPart(text="all done")]),
+        ),
+        artifacts=[
+            Artifact(name="summary", parts=[TextPart(text="summary body")]),
+            Artifact(name="notes", parts=[TextPart(text="notes body")]),
+        ],
+        metadata={"agent_id": "did:test:agent", "skill": "deliver"},
+    )
+    task_store = MagicMock()
+    task_store.get = AsyncMock(return_value=task)
+    task_manager = MagicMock(task_store=task_store)
+    agent = MagicMock(task_manager=task_manager)
+
+    app, original = _prepare_app(agent)
+    try:
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                response = client.get("/agent/tasks/task-42", headers=_api_headers())
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["id"] == "task-42"
+        assert payload["status"] == "completed"
+        assert payload["message"] == "all done"
+        assert len(payload["artifacts"]) == 2
+        assert payload["artifacts"][0]["name"] == "summary"
+        assert payload["metadata"]["skill"] == "deliver"
+        task_store.get.assert_awaited_once_with("task-42")
+    finally:
+        _restore_app(app, original)
+
+
+def test_task_detail_endpoint_returns_404_when_task_missing():
+    task_store = MagicMock()
+    task_store.get = AsyncMock(return_value=None)
+    task_manager = MagicMock(task_store=task_store)
+    agent = MagicMock(task_manager=task_manager)
+
+    app, original = _prepare_app(agent)
+    try:
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                response = client.get("/agent/tasks/missing", headers=_api_headers())
+        assert response.status_code == 404
+        assert "not found" in response.json()["detail"].lower()
+    finally:
+        _restore_app(app, original)
+
+
+def test_task_detail_endpoint_returns_404_when_task_manager_absent():
+    agent = MagicMock(spec=[])  # no task_manager attribute
+
+    app, original = _prepare_app(agent)
+    try:
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                response = client.get("/agent/tasks/anything", headers=_api_headers())
+        assert response.status_code == 404
+        assert "TaskManager not available" in response.json()["detail"]
+    finally:
+        _restore_app(app, original)
+
+
 def test_heartbeat_endpoints_cover_disabled_status_success_and_error_paths():
     disabled_agent = MagicMock(heartbeat_runner=None)
     result = SimpleNamespace(to_dict=lambda: {"ok": True, "checks": 1})
