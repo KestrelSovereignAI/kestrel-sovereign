@@ -108,11 +108,11 @@ tags = ["core", "setup", "onboarding"]
 icon = "rocket"
 core = true
 
-[heartbeat]
+[health]
 package = "kestrel-sovereign"
 git = "https://github.com/KestrelSovereignAI/kestrel-sovereign.git"
-features = ["HeartbeatFeature"]
-description = "Agent liveness monitoring and health checks"
+features = ["HealthFeature"]
+description = "Agent liveness monitoring and subsystem health checks"
 tags = ["core", "monitoring", "health"]
 icon = "heart-pulse"
 core = true
