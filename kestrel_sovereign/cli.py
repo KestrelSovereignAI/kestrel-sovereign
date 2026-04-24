@@ -21,6 +21,7 @@ Commands:
 """
 
 import argparse
+import asyncio
 import os
 import subprocess
 import sys
@@ -569,10 +570,127 @@ def _get_agent_did(agent_dir: Path) -> Optional[str]:
         return None
 
 
-def cmd_shell(args) -> int:
-    """Interactive CLI chat (absorbs main.py)."""
-    import asyncio
+def _detect_running_agent_server(
+    agent_name: str,
+    agent_cfg: LocalAgentConfig,
+    rookery: RookeryConfig,
+) -> Optional[tuple[str, str]]:
+    """Probe for a running server that hosts this agent.
 
+    Returns ``(base_url, api_key)`` if found — where ``base_url`` is what
+    the shell should POST ``/agent/invoke`` against — or ``None`` if no
+    server is up for this agent. Caller uses ``None`` to fall back to
+    the local in-process shell.
+
+    Tries two candidates in order, matching the two modes ``kestrel start``
+    supports:
+
+    1. **Standalone / subprocess mode** — agent runs on its own port
+       (``agent_cfg.port``). Base URL is that port's root; no path prefix.
+    2. **In-process multi-agent mode** — all agents share the host port
+       (``rookery.host.port``) under ``/api/agents/{name}/``. Base URL is
+       host:port + that prefix.
+
+    Health probe uses ``GET /health`` (public, no auth). Key fetch uses
+    ``GET /api/auth/key`` (public). Network errors fall through silently
+    — no server is a normal case, not an error.
+    """
+    import httpx
+
+    candidates = [
+        (f"http://localhost:{agent_cfg.port}", ""),
+        (
+            f"http://localhost:{rookery.host.port}",
+            f"/api/agents/{agent_name}",
+        ),
+    ]
+    for origin, prefix in candidates:
+        try:
+            health = httpx.get(f"{origin}/health", timeout=1.0)
+        except httpx.RequestError:
+            continue
+        if health.status_code != 200:
+            continue
+        try:
+            key_resp = httpx.get(f"{origin}/api/auth/key", timeout=2.0)
+        except httpx.RequestError:
+            continue
+        api_key = ""
+        if key_resp.status_code == 200:
+            try:
+                api_key = key_resp.json().get("key", "") or ""
+            except ValueError:
+                api_key = ""
+        # In multi-agent mode, confirm the named agent is actually routed
+        # by this server. The routing middleware returns 404 for unknown
+        # names; hit the prefix's /health proxy to verify before declaring
+        # success. (Standalone mode has no prefix, and /health above
+        # already confirmed the single-agent server is alive.)
+        if prefix:
+            try:
+                scoped = httpx.get(
+                    f"{origin}{prefix}/health", timeout=1.0,
+                    headers={"X-API-Key": api_key} if api_key else {},
+                )
+            except httpx.RequestError:
+                continue
+            if scoped.status_code != 200:
+                continue
+        return (f"{origin}{prefix}", api_key)
+    return None
+
+
+def _run_http_shell(
+    agent_name: str,
+    base_url: str,
+    api_key: str,
+) -> int:
+    """Interactive chat loop that POSTs to a running agent's HTTP API.
+
+    Used when ``_detect_running_agent_server`` finds a live server for
+    the named agent. The in-process shell (``_run_shell``) is only used
+    as a fallback when no server is running — see #654.
+    """
+    import httpx
+
+    print(f"✅ Connected to running agent at {base_url}")
+    print(f"   Agent: {agent_name}")
+    print("   Type your messages; !quit or /exit to exit.")
+
+    headers = {"X-API-Key": api_key} if api_key else {}
+    with httpx.Client(base_url=base_url, headers=headers, timeout=600.0) as client:
+        while True:
+            try:
+                user_input = input("\n> ")
+            except (EOFError, KeyboardInterrupt):
+                print()
+                break
+            stripped = user_input.strip()
+            if not stripped:
+                continue
+            if stripped in ("!quit", "/exit"):
+                break
+            try:
+                resp = client.post("/agent/invoke", json={"input": user_input})
+            except httpx.RequestError as e:
+                print(f"\nConnection error: {e}")
+                continue
+            if resp.status_code != 200:
+                print(f"\nHTTP {resp.status_code}: {resp.text[:200]}")
+                continue
+            try:
+                body = resp.json()
+            except ValueError:
+                print(f"\nKestrel returned non-JSON response: {resp.text[:200]}")
+                continue
+            print(f"\nKestrel: {body.get('response', '')}")
+    return 0
+
+
+def cmd_shell(args) -> int:
+    """Interactive CLI chat. Routes to a running server when one is up
+    for this agent; falls back to an in-process agent instance if not.
+    """
     project_dir = _get_project_dir()
     rookery = RookeryConfig.load(project_dir / ROOKERY_CONFIG_FILENAME)
     local_agents = rookery.get_local_agents()
@@ -590,7 +708,18 @@ def cmd_shell(args) -> int:
         print(f"Create the agent first: kestrel create {args.name}")
         return 1
 
-    # Run the interactive shell using the main module logic
+    # Extension loading (e.g., ElderlyExtension) is only supported in the
+    # local-process shell because it mutates the live agent object. Skip
+    # HTTP routing when the user passed --app so extensions still work.
+    use_extension = bool(getattr(args, "app", None))
+    if not use_extension:
+        server = _detect_running_agent_server(args.name, agent_cfg, rookery)
+        if server is not None:
+            base_url, api_key = server
+            return _run_http_shell(args.name, base_url, api_key)
+
+    # Fall back to in-process agent when no server is running (or when
+    # an extension is requested — see comment above).
     return asyncio.run(_run_shell(agent_dir, args))
 
 
@@ -669,7 +798,6 @@ async def _run_shell(agent_dir: Path, args) -> int:
         print("\nDeactivating agent...")
     finally:
         try:
-            import asyncio
             await asyncio.wait_for(agent.shutdown(), timeout=SHUTDOWN_TIMEOUT)
             print("Agent deactivated.")
         except asyncio.TimeoutError:
