@@ -4,6 +4,7 @@
 
 import { Modal, Toast } from './ui.js';
 import API from './api.js';
+import { subscribeSSE } from './chat.js';
 
 export const Security = {
     pendingApprovals: new Map(),
@@ -29,13 +30,17 @@ export const Security = {
     },
 
     _setupSSEHandler() {
-        // Listen for approval_request events on the global event source
-        if (window.eventSource) {
-            window.eventSource.addEventListener('approval_request', (event) => {
+        // Route approval_request events from the notification SSE stream into
+        // the approval modal. subscribeSSE handles reconnects so the handler
+        // survives network drops. See #748.
+        subscribeSSE('approval_request', (event) => {
+            try {
                 const data = JSON.parse(event.data);
                 this.handleApprovalRequest(data);
-            });
-        }
+            } catch (err) {
+                console.error('Failed to parse approval_request event:', err);
+            }
+        });
     },
 
     // === Approval Request Handling ===

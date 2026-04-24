@@ -70,6 +70,29 @@ export function initChat() {
 let notificationEventSource = null;
 let notificationReconnectTimeout = null;
 
+// Subscribers registered via subscribeSSE. Kept in module state (not attached
+// directly to notificationEventSource) so subscriptions survive reconnects —
+// each new EventSource re-attaches every handler in this list. See #748.
+const sseSubscribers = [];
+
+/**
+ * Subscribe to a named SSE event on the notification stream.
+ *
+ * Other modules (e.g. Security) call this to receive server-pushed events
+ * without reaching into `notificationEventSource` directly. The handler is
+ * stored in a module-scoped list and re-attached on every (re)connect, so
+ * subscribers keep working across network drops.
+ *
+ * @param {string} eventType  Name matching the server-side `event:` field
+ * @param {(evt: MessageEvent) => void} handler
+ */
+export function subscribeSSE(eventType, handler) {
+    sseSubscribers.push({ eventType, handler });
+    if (notificationEventSource) {
+        notificationEventSource.addEventListener(eventType, handler);
+    }
+}
+
 /**
  * Connect to the SSE notifications endpoint for real-time task updates.
  * Automatically reconnects on disconnect with exponential backoff.
@@ -112,6 +135,12 @@ export function connectNotifications() {
         notificationEventSource.addEventListener('ping', () => {
             // Keepalive - no action needed
         });
+
+        // Re-attach every subscriber to this fresh EventSource so subscriptions
+        // survive reconnects (the old EventSource is discarded).
+        for (const { eventType, handler } of sseSubscribers) {
+            notificationEventSource.addEventListener(eventType, handler);
+        }
 
         notificationEventSource.addEventListener('error', (e) => {
             console.warn('SSE notification error, will reconnect...');
