@@ -224,6 +224,7 @@ The currently exported `Feature` subclasses discovered from those modules includ
   - `GET /agent/context-status`
   - `GET /agent/reflection/status`
   - `GET /agent/tasks`
+  - `GET /agent/tasks/{task_id}`
   - `GET /agent/heartbeat/status`
   - `POST /agent/heartbeat/trigger`
   - `POST /agent/mesh`
