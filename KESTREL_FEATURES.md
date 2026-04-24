@@ -118,7 +118,7 @@ The inventory below lists **core features only**. Installed feature packages app
 - `deploy`
 - `gcp_compute`
 - `github`
-- `heartbeat`
+- `health`
 - `identity`
 - `keys`
 - `memory`
@@ -163,7 +163,7 @@ The currently exported `Feature` subclasses discovered from those modules includ
 - `DeployFeature`
 - `GCPComputeFeature`
 - `GitHubFeature`
-- `HeartbeatFeature`
+- `HealthFeature`
 - `IdentityFeature`
 - `KeyManagementFeature`
 - `MemoryAgencyFeature`
@@ -227,6 +227,8 @@ The currently exported `Feature` subclasses discovered from those modules includ
   - `GET /agent/tasks/{task_id}`
   - `GET /agent/heartbeat/status`
   - `POST /agent/heartbeat/trigger`
+  - `GET /agent/health/status`
+  - `POST /agent/health/trigger`
   - `POST /agent/mesh`
   - `GET /agent/mesh/inbox`
 - [`endpoints/conversations.py`](endpoints/conversations.py)

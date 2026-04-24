@@ -37,8 +37,8 @@ def test_health_returns_503_when_agent_missing():
     assert response.json()["status"] == "unhealthy"
 
 
-def test_health_detailed_uses_heartbeat_feature_from_feature_dict():
-    """HeartbeatFeature lookup should iterate feature values, not dict keys."""
+def test_health_detailed_uses_health_feature_from_feature_dict():
+    """HealthFeature lookup should iterate feature values, not dict keys."""
     from server import app
 
     @asynccontextmanager
@@ -52,14 +52,14 @@ def test_health_detailed_uses_heartbeat_feature_from_feature_dict():
 
     app.router.lifespan_context = noop_lifespan
 
-    heartbeat_feature = MagicMock()
-    heartbeat_feature.get_latest_heartbeat = AsyncMock(
+    health_feature = MagicMock()
+    health_feature.get_latest = AsyncMock(
         return_value={"status": "healthy", "checks": [{"status": "ok"}]}
     )
-    heartbeat_feature.__class__.__name__ = "HeartbeatFeature"
+    health_feature.__class__.__name__ = "HealthFeature"
 
     agent = MagicMock()
-    agent.features = {"HeartbeatFeature": heartbeat_feature}
+    agent.features = {"HealthFeature": health_feature}
 
     app.state.agent = agent
     app.state.agent_manager = None
@@ -76,4 +76,4 @@ def test_health_detailed_uses_heartbeat_feature_from_feature_dict():
 
     assert response.status_code == 200
     assert response.json()["status"] == "healthy"
-    heartbeat_feature.get_latest_heartbeat.assert_awaited_once()
+    health_feature.get_latest.assert_awaited_once()

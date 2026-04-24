@@ -123,7 +123,7 @@ Audited snapshot: **42** discoverable modules · **42** exported `Feature` subcl
 | `gcp_compute` | `GCPComputeFeature` |
 | `github` | `GitHubFeature` |
 | `github_app` | `GitHubAppFeature` |
-| `heartbeat` | `HeartbeatFeature` |
+| `health` | `HealthFeature` |
 | `identity` | `IdentityFeature` |
 | `keys` | `KeyManagementFeature` |
 | `memory` | `MemoryFeature` |
