@@ -1,0 +1,119 @@
+<!doctype html>
+<!--
+  Manual test harness for the AudioWorklet capture + playback pipeline (#727).
+  NOT shipped to users. Load while the dev server is running to verify:
+
+    - Capture produces 24kHz PCM16 mono chunks (inspect via DevTools console).
+    - Level meter reacts to your voice.
+    - Playback plays back a generated sine and the captured audio.
+    - flush() cuts playback within one frame.
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Kestrel voice worklet smoke test</title>
+  <style>
+    body { font-family: -apple-system, system-ui, sans-serif; padding: 2rem; max-width: 720px; color: #222; }
+    button { padding: 0.6rem 1rem; margin-right: 0.5rem; font-size: 1rem; }
+    .row { margin: 1rem 0; }
+    .kestrel-voice-level-meter { display: inline-flex; gap: 2px; height: 24px; align-items: stretch; vertical-align: middle; margin-left: 1rem; }
+    .kestrel-voice-level-bar { display: inline-block; width: 6px; background: #e0e0e0; border-radius: 1px; }
+    .kestrel-voice-level-bar--lit { background: #3b82f6; }
+    pre { background: #f5f5f5; padding: 0.5rem; border-radius: 4px; overflow-x: auto; font-size: 0.85rem; max-height: 200px; }
+    .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; background: #e5e7eb; font-size: 0.85rem; margin-left: 0.5rem; }
+  </style>
+</head>
+<body>
+  <h1>Kestrel voice worklet smoke test</h1>
+
+  <div class="row">
+    <button id="start-capture">Start capture</button>
+    <button id="stop-capture" disabled>Stop</button>
+    <span id="meter"></span>
+    <span id="capture-stats" class="pill">0 chunks</span>
+  </div>
+
+  <div class="row">
+    <button id="play-sine">Play 440Hz sine</button>
+    <button id="play-captured">Play captured audio</button>
+    <button id="flush-playback">Flush (barge-in)</button>
+    <span id="playback-stats" class="pill">idle</span>
+  </div>
+
+  <pre id="log"></pre>
+
+  <script type="module">
+    import { createVoiceCapture } from '/static/js/voice/capture.js';
+    import { createVoicePlayback } from '/static/js/voice/playback.js';
+    import { mountLevelMeter } from '/static/js/voice/level-meter.js';
+
+    const logEl = document.getElementById('log');
+    function log(msg) {
+      logEl.textContent += msg + '\n';
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    let capture = null;
+    let stopMeter = null;
+    const captureBuf = [];
+
+    document.getElementById('start-capture').onclick = async () => {
+      try {
+        capture = await createVoiceCapture({ targetSampleRate: 24000 });
+        capture.onchunk((pcm) => {
+          captureBuf.push(pcm);
+          document.getElementById('capture-stats').textContent = `${captureBuf.length} chunks`;
+        });
+        stopMeter = mountLevelMeter(document.getElementById('meter'), capture.getLevel);
+        document.getElementById('stop-capture').disabled = false;
+        document.getElementById('start-capture').disabled = true;
+        log('capture started');
+      } catch (e) {
+        log('capture error: ' + e.message);
+      }
+    };
+
+    document.getElementById('stop-capture').onclick = async () => {
+      if (capture) await capture.destroy();
+      if (stopMeter) stopMeter();
+      capture = null;
+      document.getElementById('stop-capture').disabled = true;
+      document.getElementById('start-capture').disabled = false;
+      log(`capture stopped; ${captureBuf.length} chunks captured`);
+    };
+
+    let playback = null;
+    async function ensurePlayback() {
+      if (!playback) playback = await createVoicePlayback({ sampleRate: 24000 });
+      return playback;
+    }
+
+    document.getElementById('play-sine').onclick = async () => {
+      const pb = await ensurePlayback();
+      // Generate 1 second of 440Hz sine at 24kHz PCM16.
+      const N = 24000;
+      const int16 = new Int16Array(N);
+      for (let i = 0; i < N; i++) {
+        int16[i] = Math.round(Math.sin((2 * Math.PI * 440 * i) / 24000) * 12000);
+      }
+      pb.enqueue(new Uint8Array(int16.buffer));
+      document.getElementById('playback-stats').textContent = 'playing sine';
+      log('enqueued 1s sine');
+    };
+
+    document.getElementById('play-captured').onclick = async () => {
+      const pb = await ensurePlayback();
+      for (const chunk of captureBuf) pb.enqueue(chunk);
+      document.getElementById('playback-stats').textContent = `playing ${captureBuf.length} captured chunks`;
+      log(`enqueued ${captureBuf.length} captured chunks`);
+    };
+
+    document.getElementById('flush-playback').onclick = async () => {
+      const pb = await ensurePlayback();
+      pb.flush();
+      document.getElementById('playback-stats').textContent = 'flushed';
+      log('flush');
+    };
+  </script>
+</body>
+</html>
