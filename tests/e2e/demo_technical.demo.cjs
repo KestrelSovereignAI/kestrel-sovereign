@@ -402,6 +402,32 @@ test.describe.serial('Kestrel Sovereign Technical Demo', () => {
         await dismissContextWarning(page);
         await demoPause(page, 1000);
 
+        // For a compelling open-source demo: simulate a user who has Anthropic configured
+        // as their cloud provider in NORMAL mode. The EPHEMERAL switch will then visually
+        // force a change to local Ollama, demonstrating the privacy enforcement clearly.
+        // (No real Anthropic key is needed — LLM calls in this act are all mocked.)
+        // We inject fake Anthropic model data and rebuild the provider dropdown so
+        // the selects render correctly even without a configured API key.
+        await page.evaluate(() => {
+            const sel = window._sharedModelSelector;
+            if (!sel) return;
+            // Inject Anthropic into the cached model data
+            if (!sel.allModelsData) sel.allModelsData = {};
+            if (!sel.allModelsData.by_vendor) sel.allModelsData.by_vendor = {};
+            sel.allModelsData.by_vendor['anthropic'] = [
+                { id: 'claude-3-5-sonnet-20241022', display_name: 'Claude 3.5 Sonnet', is_featured: true },
+                { id: 'claude-3-5-haiku-20241022',  display_name: 'Claude 3.5 Haiku',  is_featured: false },
+                { id: 'claude-3-opus-20240229',     display_name: 'Claude 3 Opus',     is_featured: false },
+            ];
+            // Rebuild provider dropdown HTML so 'anthropic' is a valid <option>
+            // (setSelection sets .value = provider — if the option doesn't exist the
+            // browser silently resets .value to '' and _populateModels sees no vendor)
+            sel._populateProviders();
+            // Now set selection — providerSelect has anthropic as a valid option
+            sel.setSelection('anthropic', 'claude-3-5-sonnet-20241022');
+        });
+        await demoPause(page, 500);
+
         // Show current privacy mode
         let initialMode = 'unknown';
         try {
@@ -499,6 +525,18 @@ test.describe.serial('Kestrel Sovereign Technical Demo', () => {
             await page.locator('#chat-privacy-indicator span').first().click();
             await page.waitForSelector('#privacy-dropdown', { state: 'visible', timeout: 5000 });
             await page.click('.privacy-option[data-mode="normal"]');
+
+            // Wait for dropdown to close (the privacy switch API call closes it on success)
+            await page.waitForSelector('#privacy-dropdown', { state: 'hidden', timeout: 8000 }).catch(() => {});
+            // Dismiss any open dropdown via Escape as a safety fallback
+            await page.keyboard.press('Escape');
+
+            // Wait for the indicator to show NORMAL
+            await page.waitForFunction(() => {
+                const el = document.getElementById('chat-privacy-indicator');
+                return el && el.textContent.toLowerCase().includes('normal');
+            }, { timeout: 8000 }).catch(() => {});
+
             await demoPause(page, 1500);
 
             // Wait for toast to appear and dismiss it so the screenshot is clean
