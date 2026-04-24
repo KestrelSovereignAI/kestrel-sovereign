@@ -539,6 +539,62 @@ class TestPrivacyAwareQueries:
         assert len(wrapper._session_conversations) == 1
         assert wrapper._session_conversations[0]["content"] == "Hi"
 
+    # --- delete_conversation_session ---
+
+    @pytest.mark.asyncio
+    async def test_delete_conversation_session_normal_mode_returns_count(self, mock_storage):
+        """NORMAL mode delegates to underlying storage and returns the
+        count of messages actually removed.  Also triggers orphan-pin
+        cleanup under the sovereign-override policy used for
+        message-level delete (#715).
+        """
+        # Storage's delete_conversation_session is not on mock_storage by
+        # default; wire it up.
+        mock_storage.delete_conversation_session = AsyncMock(return_value=5)
+        wrapper = PrivacyEnforcingStorage(mock_storage, PrivacyMode.NORMAL)
+
+        count = await wrapper.delete_conversation_session("sess-123", "agent-1")
+        assert count == 5
+        mock_storage.delete_conversation_session.assert_awaited_once_with("sess-123")
+        # Orphan pin cleanup should fire once a session was actually removed.
+        mock_storage.db.execute_commit.assert_awaited()
+        cleanup_args = mock_storage.db.execute_commit.call_args[0]
+        assert "memory_pins" in cleanup_args[0]
+
+    @pytest.mark.asyncio
+    async def test_delete_conversation_session_normal_mode_zero_count_no_cleanup(self, mock_storage):
+        """When storage reports 0 removed, no pin cleanup is issued — no
+        messages vanished, so no pins could have been orphaned.
+        """
+        mock_storage.delete_conversation_session = AsyncMock(return_value=0)
+        wrapper = PrivacyEnforcingStorage(mock_storage, PrivacyMode.NORMAL)
+
+        count = await wrapper.delete_conversation_session("sess-none", "agent-1")
+        assert count == 0
+        mock_storage.db.execute_commit.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_delete_conversation_session_ephemeral_raises(self, mock_storage):
+        """EPHEMERAL mode has no persistent data to delete — raise."""
+        wrapper = PrivacyEnforcingStorage(mock_storage, PrivacyMode.EPHEMERAL)
+        with pytest.raises(PrivacyViolationError):
+            await wrapper.delete_conversation_session("sess-123", "agent-1")
+
+    @pytest.mark.asyncio
+    async def test_delete_conversation_session_isolated_clears_session_list(self, mock_storage):
+        """ISOLATED mode keeps conversations in memory only; session-level
+        delete clears that in-memory backlog (closest analog to
+        "delete this session" when there's no durable session grouping).
+        """
+        wrapper = PrivacyEnforcingStorage(mock_storage, PrivacyMode.ISOLATED)
+        await wrapper.add_conversation("user", "hi")
+        await wrapper.add_conversation("assistant", "hello")
+        assert len(wrapper._session_conversations) == 2
+
+        count = await wrapper.delete_conversation_session("ignored", "agent-1")
+        assert count == 2
+        assert wrapper._session_conversations == []
+
     # --- encryption_enabled ---
 
     def test_encryption_enabled_returns_true(self, mock_storage):

@@ -313,10 +313,39 @@
             background: var(--bg-secondary);
             border: 1px solid var(--border-color);
             transition: background-color 0.15s;
+            position: relative;
         }
 
         .conversation-item:hover {
             background: var(--bg-tertiary);
+        }
+
+        /* Hover-reveal delete affordance on conversation rows (#715). */
+        .conversation-item .conv-delete-btn {
+            display: none;
+            position: absolute;
+            top: 0.5rem;
+            right: 0.5rem;
+            background: rgba(239, 68, 68, 0.85);
+            color: white;
+            border: none;
+            border-radius: 50%;
+            width: 1.4rem;
+            height: 1.4rem;
+            font-size: 0.7rem;
+            cursor: pointer;
+            line-height: 1;
+            padding: 0;
+        }
+
+        .conversation-item:hover .conv-delete-btn {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .conversation-item .conv-delete-btn:hover {
+            background: #dc2626;
         }
 
         .conversation-item.active {

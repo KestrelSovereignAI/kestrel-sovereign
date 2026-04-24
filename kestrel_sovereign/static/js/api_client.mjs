@@ -236,6 +236,7 @@ export function createApiClient({
         getConversation: (sessionId, decrypt = true) => client.request(`/api/conversations/${encodeURIComponent(sessionId)}?decrypt=${decrypt}`),
         newConversation: () => client.request('/api/conversations/new', { method: 'POST' }),
         deleteMessage: (messageId) => client.request(`/api/conversations/messages/${encodeURIComponent(messageId)}`, { method: 'DELETE' }),
+        deleteConversation: (sessionId) => client.request(`/api/conversations/${encodeURIComponent(sessionId)}`, { method: 'DELETE' }),
         getDbTables: () => client.request('/api/db/tables'),
         queryDbTable: (table, limit = 50, offset = 0, search = null) => {
             let url = `/api/db/tables/${encodeURIComponent(table)}?limit=${limit}&offset=${offset}`;

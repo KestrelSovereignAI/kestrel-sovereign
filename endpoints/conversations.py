@@ -334,6 +334,55 @@ async def delete_message(request: Request, message_id: int):
         raise HTTPException(status_code=500, detail="Error deleting message.")
 
 
+@router.delete("/conversations/{session_id}")
+@limiter.limit("30/minute")
+async def delete_conversation(request: Request, session_id: str):
+    """Delete an entire conversation session and all its messages.
+
+    Resolution supports both explicit UUID-based sessions (session_id in
+    message metadata) and legacy time-gap-based sessions (session_id is
+    the first message's row id — see
+    AsyncConversationStore._get_session_messages).  Agent-scoped; cannot
+    touch another agent's data.  Rejects ephemeral mode up front — there
+    is nothing persistent to delete in that mode.
+
+    Returns:
+        200 with {"success": true, "session_id": ..., "deleted_count": N}
+             when one or more messages were removed.
+        404 when the session doesn't exist or is empty.
+
+    See issue #715.
+    """
+    try:
+        agent = get_agent(request)
+        storage = agent.storage
+        agent_id = getattr(storage, 'agent_id', '')
+
+        deleted_count = await storage.delete_conversation_session(
+            session_id, agent_id
+        )
+        if deleted_count == 0:
+            raise HTTPException(
+                status_code=404,
+                detail="Conversation not found or already empty.",
+            )
+
+        return {
+            "success": True,
+            "session_id": session_id,
+            "deleted_count": deleted_count,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(
+            f"Error deleting conversation {session_id}: {e}", exc_info=True
+        )
+        raise HTTPException(
+            status_code=500, detail="Error deleting conversation."
+        )
+
+
 @router.get("/conversations/{session_id}/transcript")
 async def get_conversation_transcript(request: Request, session_id: str, decrypt: bool = True):
     """Get a human-readable markdown transcript for a conversation session."""
