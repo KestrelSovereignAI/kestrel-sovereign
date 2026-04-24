@@ -1,6 +1,5 @@
 // @ts-check
 const path = require('path');
-const { execSync } = require('child_process');
 
 // Core demo infrastructure from @kestrel/flight
 const {
@@ -185,17 +184,8 @@ function clearConversationHistory(narrator, agentDataDir) {
     const dbs = findDbs(agentDataDir);
     for (const db of dbs) {
       try {
-        execSync(`sqlite3 "${db}" "DELETE FROM conversation_history;"`);
-      } catch { /* table may not exist in some dbs */ }
-      try {
-        execSync(`sqlite3 "${db}" "DELETE FROM graph_nodes WHERE node_type IN ('backup_artifact', 'sovereignty_receipt');"`);
-      } catch { /* table may not exist */ }
-      try {
-        execSync(`sqlite3 "${db}" "DELETE FROM security_audit_log;"`);
-      } catch { /* table may not exist */ }
-      try {
-        execSync(`sqlite3 "${db}" "UPDATE security_permissions SET level = 'ask' WHERE level != 'ask';"`);
-      } catch { /* table may not exist */ }
+        fs.unlinkSync(db);
+      } catch { /* already gone or locked */ }
     }
     narrator.narrate(`Cleared conversation history, exports, and permissions from ${dbs.length} agent database(s)`);
   } catch (e) {
