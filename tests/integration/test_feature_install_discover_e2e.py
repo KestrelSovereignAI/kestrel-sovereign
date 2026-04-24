@@ -202,12 +202,12 @@ class TestCoreOnlyAgent:
 
     @pytest.mark.asyncio
     async def test_core_features_loaded(self, core_only_agent):
-        """Core features like ModelAgent, HeartbeatFeature are present."""
+        """Core features like ModelAgent, HealthFeature are present."""
         feature_names = set(core_only_agent.features.keys())
         assert len(feature_names) > 0, "Expected at least some core features"
 
         # Known core features should be present
-        expected_core = {"HeartbeatFeature", "ModelAgent", "BootstrapFeature"}
+        expected_core = {"HealthFeature", "ModelAgent", "BootstrapFeature"}
         found_core = expected_core & feature_names
         assert len(found_core) > 0, (
             f"Expected some core features from {expected_core}, "
@@ -319,7 +319,7 @@ class TestFeaturesAppearInAgent:
     async def test_core_features_still_present(self, agent_with_ext_features):
         """Core features remain present alongside the new external features."""
         feature_names = set(agent_with_ext_features.features.keys())
-        expected_core = {"HeartbeatFeature", "ModelAgent", "BootstrapFeature"}
+        expected_core = {"HealthFeature", "ModelAgent", "BootstrapFeature"}
         found_core = expected_core & feature_names
         assert len(found_core) > 0, (
             f"Expected core features from {expected_core} still present, "
@@ -705,7 +705,7 @@ class TestRegistryStatusResolution:
         from kestrel_sovereign.feature_registry import get_registry, FeatureStatus
 
         # Use a real core feature name that exists in the registry
-        enabled = {"HeartbeatFeature", "ModelAgent"}
+        enabled = {"HealthFeature", "ModelAgent"}
         registry = get_registry(enabled_class_names=enabled)
 
         heartbeat_pkg = registry.get("heartbeat")

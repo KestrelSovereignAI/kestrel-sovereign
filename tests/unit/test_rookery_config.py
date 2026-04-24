@@ -328,7 +328,7 @@ class TestRookeryConfigLoading:
                     "features": [
                         "BootstrapFeature",
                         "MemoryFeature",
-                        "HeartbeatFeature",
+                        "HealthFeature",
                     ],
                 },
             },
@@ -340,7 +340,7 @@ class TestRookeryConfigLoading:
         minimal = config.agents["minimal_agent"]
 
         assert full.features is None
-        assert minimal.features == ["BootstrapFeature", "MemoryFeature", "HeartbeatFeature"]
+        assert minimal.features == ["BootstrapFeature", "MemoryFeature", "HealthFeature"]
 
     def test_load_missing_file(self, tmp_path):
         """Test loading from a non-existent file raises error."""
