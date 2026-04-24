@@ -552,10 +552,20 @@ class VoiceFeature(Feature):
     def get_router(self):
         """Return the Voice HTTP/WebSocket router for dynamic mounting.
 
-        The router is defined in endpoints/voice.py and mounted by the
-        server only when VoiceFeature is discovered and enabled.
+        The core router is defined in ``endpoints/voice.py``. The Realtime
+        ephemeral-token endpoint (``/voice/realtime/session``, issue #726)
+        lives in a sibling module; include it here so both mount atomically
+        with the feature.
         """
         from endpoints.voice import router
+        from endpoints.voice_realtime import router as realtime_router
+
+        # include_router is idempotent only if we're careful — guard against
+        # double-mount when get_router is called twice for the same feature
+        # instance (the include machinery doesn't dedupe path entries).
+        if not getattr(self, "_realtime_mounted", False):
+            router.include_router(realtime_router)
+            self._realtime_mounted = True
         return router
 
     # ------------------------------------------------------------------
