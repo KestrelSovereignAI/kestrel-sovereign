@@ -199,28 +199,23 @@ test.describe.serial('Kestrel Sovereign Technical Demo', () => {
         await navigateToPanel(page, 'chat');
         await dismissContextWarning(page);
 
-        // Select a working provider from the dropdown (prefer local Ollama — cloud keys not configured)
-        try {
-            const providerSelect = page.locator('#provider-selector');
-            const options = await providerSelect.locator('option').allTextContents();
-            const preferred = ['ollama', 'llama_cpp', 'llama', 'openrouter', 'anthropic', 'openai'];
-            let selected = false;
-            for (const pref of preferred) {
-                const match = options.find(o => o.toLowerCase().includes(pref));
-                if (match) {
-                    await providerSelect.selectOption({ label: match });
-                    narrator.narrate(`Provider set to: ${match}`);
-                    await demoPause(page, 1000);
-                    selected = true;
-                    break;
-                }
-            }
-            if (!selected) {
-                narrator.narrate(`Using default provider (available: ${options.join(', ')})`);
-            }
-        } catch (e) {
-            narrator.narrate(`Could not set provider: ${e.message}`);
-        }
+        // For a compelling open-source demo, show Anthropic as the cloud provider.
+        // The LLM call is mocked so no real API key is needed.
+        await page.evaluate(() => {
+            const sel = window._sharedModelSelector;
+            if (!sel) return;
+            if (!sel.allModelsData) sel.allModelsData = {};
+            if (!sel.allModelsData.by_vendor) sel.allModelsData.by_vendor = {};
+            sel.allModelsData.by_vendor['anthropic'] = [
+                { id: 'claude-3-5-sonnet-20241022', display_name: 'Claude 3.5 Sonnet', is_featured: true },
+                { id: 'claude-3-5-haiku-20241022',  display_name: 'Claude 3.5 Haiku',  is_featured: false },
+                { id: 'claude-3-opus-20240229',     display_name: 'Claude 3 Opus',     is_featured: false },
+            ];
+            sel._populateProviders();
+            sel.setSelection('anthropic', 'claude-3-5-sonnet-20241022');
+        });
+        await demoPause(page, 500);
+        narrator.narrate('Provider set to: Anthropic / Claude 3.5 Sonnet');
 
         // Send a message that elicits constitutional awareness
         narrator.narrate('Sending a message — every response is processed through the Constitution');
@@ -280,23 +275,22 @@ test.describe.serial('Kestrel Sovereign Technical Demo', () => {
         await navigateToPanel(page, 'chat');
         await dismissContextWarning(page);
 
-        // Select a working provider (prefer local Ollama — cloud keys not configured)
-        try {
-            const providerSelect = page.locator('#provider-selector');
-            const options = await providerSelect.locator('option').allTextContents();
-            const preferred = ['ollama', 'llama_cpp', 'llama', 'openrouter', 'anthropic', 'openai'];
-            for (const pref of preferred) {
-                const match = options.find(o => o.toLowerCase().includes(pref));
-                if (match) {
-                    await providerSelect.selectOption({ label: match });
-                    narrator.narrate(`Provider set to: ${match}`);
-                    await demoPause(page, 1000);
-                    break;
-                }
-            }
-        } catch (e) {
-            narrator.narrate(`Could not set provider: ${e.message}`);
-        }
+        // Show Anthropic as the cloud provider for visual consistency with Act 2.
+        // All LLM calls in this act are mocked.
+        await page.evaluate(() => {
+            const sel = window._sharedModelSelector;
+            if (!sel) return;
+            if (!sel.allModelsData) sel.allModelsData = {};
+            if (!sel.allModelsData.by_vendor) sel.allModelsData.by_vendor = {};
+            sel.allModelsData.by_vendor['anthropic'] = [
+                { id: 'claude-3-5-sonnet-20241022', display_name: 'Claude 3.5 Sonnet', is_featured: true },
+                { id: 'claude-3-5-haiku-20241022',  display_name: 'Claude 3.5 Haiku',  is_featured: false },
+                { id: 'claude-3-opus-20240229',     display_name: 'Claude 3 Opus',     is_featured: false },
+            ];
+            sel._populateProviders();
+            sel.setSelection('anthropic', 'claude-3-5-sonnet-20241022');
+        });
+        await demoPause(page, 500);
 
         // Beat 1: Send a memorable fact
         narrator.narrate('Sending a unique fact for the agent to remember...');
