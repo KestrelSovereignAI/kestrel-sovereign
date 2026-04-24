@@ -528,8 +528,6 @@ test.describe.serial('Kestrel Sovereign Technical Demo', () => {
 
             // Wait for dropdown to close (the privacy switch API call closes it on success)
             await page.waitForSelector('#privacy-dropdown', { state: 'hidden', timeout: 8000 }).catch(() => {});
-            // Dismiss any open dropdown via Escape as a safety fallback
-            await page.keyboard.press('Escape');
 
             // Wait for the indicator to show NORMAL
             await page.waitForFunction(() => {
@@ -537,18 +535,18 @@ test.describe.serial('Kestrel Sovereign Technical Demo', () => {
                 return el && el.textContent.toLowerCase().includes('normal');
             }, { timeout: 8000 }).catch(() => {});
 
-            await demoPause(page, 1500);
-
-            // Wait for toast to appear and dismiss it so the screenshot is clean
-            try {
-                await page.waitForSelector('.toast-item', { timeout: 3000 });
-                await demoPause(page, 2000);
-                await page.evaluate(() => {
-                    document.querySelectorAll('.toast-item').forEach(t => t.remove());
-                });
-            } catch { /* no toast, fine */ }
+            await demoPause(page, 1000);
 
             narrator.narrate('NORMAL mode restored — full persistence re-enabled');
+            narrator.narrate('Reload to prove the point: the EPHEMERAL conversation left zero trace.', { callout: true });
+
+            // Reload the page — this proves the EPHEMERAL conversation was truly not stored:
+            // after reload the chat is empty, confirming zero persistence.
+            await demoGoto(page, BASE_URL, apiKey);
+            await navigateToPanel(page, 'chat');
+            await dismissContextWarning(page);
+            await demoPause(page, 1500);
+
             await dismissContextWarning(page);
             await demoScreenshot(narrator, page, OUTPUT_DIR, 'privacy-restored');
         } catch (e) {
