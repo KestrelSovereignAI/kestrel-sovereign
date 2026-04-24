@@ -159,6 +159,95 @@ async def test_anthropic_cache_read_on_turn_two_real_api():
 
 
 @pytest.mark.asyncio
+async def test_anthropic_cache_compounds_across_three_turns_with_single_marker():
+    """Three-turn conversation proves the single ``messages[-2]`` marker
+    **compounds** across turns via Anthropic's longest-prefix match,
+    provided history at turn N byte-matches what was sent at turn N-1.
+
+    This is the invariant that makes slot #4 unnecessary: once the
+    application layer stores the sent-form verbatim (see
+    ``streaming.py`` / ``kestrel_agent.py`` ``add_conversation`` calls
+    with ``metadata.sent_form``), the T2 cache entry at ``messages[-2]``
+    is still a prefix of the T3 request, so T3 reads it without needing
+    an additional marker at ``messages[-4]``.
+
+    If this assertion fails, revisit whether the upstream prefix stayed
+    byte-stable — not whether we need more markers.
+    """
+    key = _api_key()
+    if not key:
+        pytest.skip("ANTHROPIC_API_KEY not set — skipping real-network test")
+
+    client = anthropic.AsyncAnthropic(api_key=key)
+    adapter = AnthropicAdapter()
+    model = _default_model()
+
+    base = [
+        {"role": "system", "content": LARGE_SYSTEM_PROMPT},
+        {"role": "user", "content": "What is 2+2? Numeric answer only."},
+    ]
+    resp_t1 = await adapter.get_response(
+        client=client, model=model, messages=base, max_tokens=16,
+    )
+
+    messages_t2 = base + [
+        {"role": "assistant", "content": resp_t1.content or ""},
+        {"role": "user", "content": "What is 3+3? Numeric answer only."},
+    ]
+    resp_t2 = await adapter.get_response(
+        client=client, model=model, messages=messages_t2, max_tokens=16,
+    )
+    usage_t2 = getattr(resp_t2.raw, "usage", None)
+    cache_read_t2 = getattr(usage_t2, "cache_read_input_tokens", 0) or 0
+
+    messages_t3 = messages_t2 + [
+        {"role": "assistant", "content": resp_t2.content or ""},
+        {"role": "user", "content": "What is 4+4? Numeric answer only."},
+    ]
+    resp_t3 = await adapter.get_response(
+        client=client, model=model, messages=messages_t3, max_tokens=16,
+    )
+    usage_t3 = getattr(resp_t3.raw, "usage", None)
+    cache_read_t3 = getattr(usage_t3, "cache_read_input_tokens", 0) or 0
+    cache_creation_t3 = getattr(usage_t3, "cache_creation_input_tokens", 0) or 0
+    input_tokens_t3 = getattr(usage_t3, "input_tokens", 0) or 0
+
+    try:
+        close = getattr(client, "close", None)
+        if close is not None:
+            await close()
+    except Exception:
+        pass
+
+    print(
+        f"\n[{model}] T2 read={cache_read_t2} | "
+        f"T3 input={input_tokens_t3} write={cache_creation_t3} read={cache_read_t3}",
+        file=sys.stderr,
+    )
+
+    # T3 must hit cache at all — the single marker is producing usable
+    # entries across turns.
+    assert cache_read_t3 > 0, (
+        "Turn 3 should have read from cache. If zero, the marker at "
+        "messages[-2] is not producing a stable prefix. Check that the "
+        "history prefix at T3 is byte-identical to what was sent at T2 "
+        "— the atomic-storage contract (metadata.sent_form) is the "
+        "prerequisite for this invariant."
+    )
+
+    # Compounding: T3 should read MORE than T2 because the cache has
+    # grown to include T1's exchange. If T3 only reads what T2 read,
+    # caching stopped extending — the tail never became cacheable.
+    assert cache_read_t3 > cache_read_t2, (
+        "Turn 3 cache read did not exceed turn 2 cache read — the cache "
+        "is not compounding across turns. Either Anthropic stopped doing "
+        "longest-prefix match or the T2 marker didn't create a reusable "
+        "entry.\n"
+        f"T2 read={cache_read_t2} T3 read={cache_read_t3}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_anthropic_tiny_prompt_silent_no_op_under_threshold():
     """A sub-threshold prompt (< 1024 tokens total) should still succeed —
     Anthropic silently no-ops the cache_control markers rather than
