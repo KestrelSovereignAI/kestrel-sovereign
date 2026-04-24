@@ -1,4 +1,11 @@
-"""Contracts for example model config files and catalog source-of-truth shape."""
+"""Contracts for example model config files and catalog source-of-truth shape.
+
+These tests pin the schema of the shipped example configs (`llm_config.toml.example`
+and `kestrel.toml.example`) to the current vendor/route/model architecture. When
+`load_config()` auto-copies an example into place on a clean install, the result
+must produce a registry that actually initializes routes — not a dead flat-shape
+config that silently yields zero providers.
+"""
 
 from pathlib import Path
 
@@ -8,22 +15,77 @@ import tomllib
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
-def test_llm_config_example_uses_auto_models_and_selection_hints():
+def _first_route(vendors: dict) -> tuple[str, str, dict]:
+    """Return (vendor, route, route_config) for the first concrete route found.
+
+    Raises if no vendor has a routes.<name> subsection — the whole point of the
+    new schema is that at least one route must be wired.
+    """
+    for vendor_name, vendor_block in vendors.items():
+        routes = vendor_block.get("routes", {})
+        for route_name, route_cfg in routes.items():
+            return vendor_name, route_name, route_cfg
+    raise AssertionError("No vendors.*.routes.* entries found")
+
+
+def test_llm_config_example_uses_vendor_route_schema():
+    """Regression for #732.  Prior to the vendor/route refactor the example
+    used flat `[openai]` / `[ollama]` sections, so clean installs copied in a
+    file that the new provider_registry couldn't initialize.  Pin the new
+    shape so this cannot silently drift back.
+    """
     config = tomllib.loads((PROJECT_ROOT / "llm_config.toml.example").read_text(encoding="utf-8"))
 
-    assert config["openai"]["model"] == "auto"
-    assert config["openai"]["selection_hints"]
-    assert config["ollama"]["model"] == "auto"
-    assert config["ollama"]["selection_hints"]
+    assert "route_priority" in config, "route_priority must live at the root"
+    assert config["route_priority"], "route_priority cannot be empty"
+    assert all(":" in entry for entry in config["route_priority"]), \
+        "route_priority entries must be in 'vendor:route' form"
+
+    assert "vendors" in config, "Example must define a [vendors.*] namespace"
+    vendor, route, route_cfg = _first_route(config["vendors"])
+    assert "adapter" in route_cfg, f"{vendor}:{route} must declare an adapter"
+    assert route_cfg.get("model") == "auto", \
+        f"{vendor}:{route} should use auto model selection in the shipped example"
+    assert route_cfg.get("selection_hints") or "api_key_env" in route_cfg or "host" in route_cfg, \
+        f"{vendor}:{route} needs either selection_hints or a concrete endpoint/auth hint"
+
+    # The flat `[openai]` / `[ollama]` top-level sections from the old schema
+    # must not reappear — those wouldn't be recognized by provider_registry.
+    assert "openai" not in config or "routes" in config.get("openai", {}), \
+        "Top-level [openai] without routes would silently skip all routing"
 
 
-def test_unified_example_uses_auto_models_for_primary_llm_providers():
+def test_llm_config_example_priorities_match_declared_vendors():
+    """Every entry in route_priority must resolve to a real
+    `[vendors.<vendor>.routes.<route>]` block — otherwise the priority list
+    references routes that cannot initialize and the example misleads."""
+    config = tomllib.loads((PROJECT_ROOT / "llm_config.toml.example").read_text(encoding="utf-8"))
+
+    for entry in config["route_priority"]:
+        vendor, _, route = entry.partition(":")
+        vendor_block = config.get("vendors", {}).get(vendor)
+        assert vendor_block is not None, \
+            f"route_priority entry '{entry}' references undefined vendor '{vendor}'"
+        assert route in vendor_block.get("routes", {}), \
+            f"route_priority entry '{entry}' references undefined route '{route}' under vendor '{vendor}'"
+
+
+def test_unified_example_llm_block_uses_vendor_route_schema():
+    """Same contract, but for the unified `kestrel.toml.example`.  `load_config`
+    reads its `[llm]` subtree the same way as `llm_config.toml`, so the same
+    shape is required.
+    """
     config = tomllib.loads((PROJECT_ROOT / "kestrel.toml.example").read_text(encoding="utf-8"))
+    llm = config["llm"]
 
-    assert config["llm"]["openai"]["model"] == "auto"
-    assert config["llm"]["openai"]["selection_hints"]
-    assert config["llm"]["ollama"]["model"] == "auto"
-    assert config["llm"]["ollama"]["selection_hints"]
+    assert "route_priority" in llm, "[llm] must define route_priority"
+    assert llm["route_priority"], "route_priority cannot be empty"
+    assert all(":" in entry for entry in llm["route_priority"])
+
+    assert "vendors" in llm, "[llm] must define a [llm.vendors.*] namespace"
+    vendor, route, route_cfg = _first_route(llm["vendors"])
+    assert "adapter" in route_cfg
+    assert route_cfg.get("model") == "auto"
 
 
 def test_root_model_catalog_is_manual_overrides_only():
