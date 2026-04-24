@@ -43,8 +43,9 @@ uv sync   # creates .venv and installs all dependencies
 Download and install from [ollama.ai](https://ollama.ai), then:
 
 ```bash
-ollama serve              # start Ollama (keep this terminal open)
-ollama pull llama3.2      # installs llama3.2:latest used by the default config
+ollama serve                    # start Ollama (keep this terminal open)
+ollama pull llama3.2            # installs llama3.2:latest used by the default config
+ollama pull nomic-embed-text    # embedding model for RAG / semantic memory (#657)
 ```
 
 > **Want to use OpenAI instead?** Skip to Step 4b. You can always switch later.
