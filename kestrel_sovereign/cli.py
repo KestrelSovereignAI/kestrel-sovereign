@@ -39,6 +39,17 @@ from kestrel_sovereign.rookery.config import (
 from kestrel_sovereign.rookery.process_manager import ProcessManager
 
 
+# Tokens that terminate an interactive `kestrel shell` session. Matched
+# case-insensitively against the *trimmed* input — typing "  EXIT  " is
+# the same as typing "/exit". Both ``_run_shell`` (local in-process) and
+# ``_run_http_shell`` (HTTP-routed) honor this same list so users don't
+# have to remember which mode they're in. #658.
+_SHELL_EXIT_TOKENS = frozenset({"!quit", "/exit", "exit", "quit", "q", ":q"})
+_SHELL_EXIT_HINT = (
+    "Type !quit, /exit, exit, quit, or q to leave the shell."
+)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -655,7 +666,7 @@ def _run_http_shell(
 
     print(f"✅ Connected to running agent at {base_url}")
     print(f"   Agent: {agent_name}")
-    print("   Type your messages; !quit or /exit to exit.")
+    print(f"   {_SHELL_EXIT_HINT}")
 
     headers = {"X-API-Key": api_key} if api_key else {}
     with httpx.Client(base_url=base_url, headers=headers, timeout=600.0) as client:
@@ -668,7 +679,7 @@ def _run_http_shell(
             stripped = user_input.strip()
             if not stripped:
                 continue
-            if stripped in ("!quit", "/exit"):
+            if stripped.lower() in _SHELL_EXIT_TOKENS:
                 break
             try:
                 resp = client.post("/agent/invoke", json={"input": user_input})
@@ -767,6 +778,7 @@ async def _run_shell(agent_dir: Path, args) -> int:
     print("\u2705 Kestrel Agent Initialized.")
     print(f"   DID: {agent.agent_id}")
     print(f"   Memory: {agent_dir}")
+    print(f"   {_SHELL_EXIT_HINT}")
 
     decryption_error_count = 0
     MAX_DECRYPTION_ERRORS = 3
@@ -774,7 +786,7 @@ async def _run_shell(agent_dir: Path, args) -> int:
     try:
         while True:
             user_input = input("\n> ")
-            if user_input.lower() == '!quit':
+            if user_input.strip().lower() in _SHELL_EXIT_TOKENS:
                 break
             try:
                 response = await agent.process_input(user_input)
