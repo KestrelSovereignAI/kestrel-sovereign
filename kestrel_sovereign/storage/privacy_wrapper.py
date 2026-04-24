@@ -567,6 +567,50 @@ class PrivacyEnforcingStorage:
 
         return deleted
 
+    async def delete_conversation_session(
+        self, session_id: str, agent_id: str
+    ) -> int:
+        """
+        Delete an entire conversation session by ID, respecting privacy mode.
+
+        In EPHEMERAL mode, raises PrivacyViolationError (no persistent data).
+        In ISOLATED mode, filters the in-memory session conversations.
+        Otherwise delegates to the underlying storage which removes every
+        message belonging to the session (metadata-based OR time-gap-based
+        resolution — see AsyncConversationStore.delete_conversation_session).
+
+        Returns the number of messages removed (0 when the session didn't
+        exist or was already empty).
+        """
+        if self._privacy_config.is_ephemeral():
+            raise PrivacyViolationError(
+                "Cannot delete conversations in ephemeral mode (no persistent data)."
+            )
+
+        if self._policy.use_session_storage:
+            # In ISOLATED mode conversations live in an in-memory list
+            # without durable session grouping.  The practical match for
+            # "delete this session" is "clear the in-memory backlog."
+            removed = len(self._session_conversations)
+            self._session_conversations.clear()
+            return removed
+
+        await self._check_write_permission("delete_conversation_session")
+        count = await self._storage.delete_conversation_session(session_id)
+
+        # Sovereign override: clean up any memory pins that referenced
+        # messages that just ceased to exist.  Same policy as message-
+        # level delete — pins cannot block erasure.
+        if count > 0:
+            await self._storage.db.execute_commit(
+                "DELETE FROM memory_pins "
+                "WHERE agent_id = ? AND message_id NOT IN "
+                "(SELECT id FROM conversation_history WHERE agent_id = ?)",
+                (agent_id, agent_id),
+            )
+
+        return count
+
     # === Pass-through properties (with deprecation warnings) ===
     #
     # These properties expose the underlying storage objects directly,

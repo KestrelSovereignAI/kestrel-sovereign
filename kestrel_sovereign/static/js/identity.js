@@ -699,8 +699,23 @@ export async function loadConversations(_agentName) {
             time.className = 'conversation-time';
             time.textContent = timeStr;
 
+            // Hover-reveal delete control for the whole session.  Shares the
+            // conv-delete-btn CSS class so the visual treatment stays
+            // consistent with message-level delete buttons.  Issue #715.
+            const deleteBtn = document.createElement('button');
+            deleteBtn.className = 'conv-delete-btn';
+            deleteBtn.title = 'Delete conversation';
+            deleteBtn.textContent = '✕';
+            deleteBtn.addEventListener('click', (e) => {
+                // Prevent the click from bubbling to the row (which would
+                // load the conversation we're trying to delete).
+                e.stopPropagation();
+                window.deleteConversation(conv.session_id, item);
+            });
+
             item.appendChild(preview);
             item.appendChild(time);
+            item.appendChild(deleteBtn);
             container.appendChild(item);
         }
 
@@ -750,6 +765,28 @@ window.loadConversation = async function(sessionId) {
             const messageDiv = document.createElement('div');
             messageDiv.className = `message ${msg.role === 'user' ? 'user-message' : 'agent-message'}`;
 
+            // Hover-reveal delete control.  Shares CSS (.msg-delete-btn)
+            // and the window.deleteMessage handler with history.js — the
+            // intent is that every rendered historical message is
+            // deletable, regardless of WHICH loader painted it.  Before
+            // issue #715 this was only on the history-panel path, so
+            // users loading a conversation from the sidebar saw no way
+            // to delete anything.
+            if (msg.id) {
+                messageDiv.dataset.messageId = msg.id;
+                const deleteBtn = document.createElement('button');
+                deleteBtn.className = 'msg-delete-btn';
+                deleteBtn.title = 'Delete message';
+                deleteBtn.textContent = '✕';
+                deleteBtn.onclick = (e) => {
+                    e.stopPropagation();
+                    if (typeof window.deleteMessage === 'function') {
+                        window.deleteMessage(msg.id, messageDiv);
+                    }
+                };
+                messageDiv.appendChild(deleteBtn);
+            }
+
             const contentDiv = document.createElement('div');
             contentDiv.className = 'message-content';
 
@@ -769,6 +806,56 @@ window.loadConversation = async function(sessionId) {
         document.querySelector('[data-panel="chat"]')?.click();
     } catch (e) {
         console.error('Failed to load conversation:', e);
+    }
+};
+
+window.deleteConversation = async function(sessionId, rowEl) {
+    // Conversation-level delete.  Destructive and full-thread — always
+    // confirm.  Companion to per-message delete (#715); the two share
+    // the same /api/conversations endpoints and go through the privacy
+    // wrapper which rejects ephemeral mode.
+    if (!confirm(
+        'Delete this entire conversation?  Every message in the session '
+        + 'will be removed.  This cannot be undone.'
+    )) {
+        return;
+    }
+
+    try {
+        const result = await API.deleteConversation(sessionId);
+        const count = result?.deleted_count;
+
+        // Animate the sidebar row out, then remove it so the list
+        // doesn't jump underneath the cursor.
+        if (rowEl) {
+            rowEl.style.transition = 'opacity 0.2s, transform 0.2s';
+            rowEl.style.opacity = '0';
+            rowEl.style.transform = 'scale(0.97)';
+            setTimeout(() => rowEl.remove(), 200);
+        }
+
+        // If the user was viewing the conversation they just deleted,
+        // clear the chat pane and currentSessionId so downstream state
+        // (context-status footer, auto-load logic) doesn't point at a
+        // vanished session.  The auto-load behavior in #714 kicks in on
+        // the next agent-select; for now the pane stays empty.
+        if (state.currentSessionId === sessionId) {
+            state.currentSessionId = null;
+            activeConversationId = null;
+            const chatContainer = document.getElementById('chat-container');
+            if (chatContainer) chatContainer.innerHTML = '';
+            if (typeof updateContextStatus === 'function') {
+                updateContextStatus();
+            }
+        }
+
+        Toast.info(
+            typeof count === 'number'
+                ? `Conversation deleted (${count} messages)`
+                : 'Conversation deleted'
+        );
+    } catch (e) {
+        Toast.error(`Failed to delete conversation: ${e.message}`);
     }
 };
 
