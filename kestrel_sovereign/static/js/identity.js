@@ -643,6 +643,32 @@ window.selectAgent = async function(agentName) {
 
 let activeConversationId = null;
 
+// Exported for unit test — kept as a pure function so it's trivial to
+// verify without standing up DOM + fetch mocks.  Callers should treat
+// it as internal (prefix stays ``_``).
+export function _pickMostRecentConversation(conversations) {
+    // Choose the conversation with the latest `last_message_at` (fallback
+    // to `started_at` if the server doesn't surface the former).  Sorted
+    // strictly descending; ties broken by later array index.  Ephemeral
+    // sessions never appear here because the privacy wrapper doesn't
+    // persist them — so we don't need to filter.
+    if (!Array.isArray(conversations) || conversations.length === 0) {
+        return null;
+    }
+    let best = null;
+    let bestTs = -Infinity;
+    for (const conv of conversations) {
+        const raw = conv.last_message_at || conv.started_at || 0;
+        const ts = new Date(raw).getTime();
+        if (!Number.isFinite(ts)) continue;
+        if (ts >= bestTs) {
+            bestTs = ts;
+            best = conv;
+        }
+    }
+    return best;
+}
+
 export async function loadConversations(_agentName) {
     // Agent routing is handled by API.setHostAgent() — all calls auto-prefix
     try {
@@ -676,6 +702,25 @@ export async function loadConversations(_agentName) {
             item.appendChild(preview);
             item.appendChild(time);
             container.appendChild(item);
+        }
+
+        // Auto-load the most recent conversation on agent select (issue #714).
+        // Only when the chat pane is truly empty — i.e. no currentSessionId
+        // has been set since selectAgent wiped it.  This resumes where the
+        // user left off instead of dropping them into a cold, empty pane
+        // that still felt like "something is broken" in earlier iterations.
+        //
+        // If the user just hit "New Chat", state.currentSessionId will be
+        // populated by the time this code path runs from that flow — guard
+        // against clobbering it.
+        if (!state.currentSessionId && typeof window.loadConversation === 'function') {
+            const mostRecent = _pickMostRecentConversation(conversations);
+            if (mostRecent && mostRecent.session_id) {
+                // Fire-and-forget; loadConversation is async and handles its
+                // own errors via Toast. No await so a slow load doesn't stall
+                // the rest of selectAgent's parallel initialization.
+                window.loadConversation(mostRecent.session_id);
+            }
         }
     } catch (e) {
         const container = document.getElementById('conversations-list');
