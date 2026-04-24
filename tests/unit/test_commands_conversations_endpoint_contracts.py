@@ -207,3 +207,82 @@ def test_new_conversation_delete_message_and_transcript_contracts():
         assert "Original messages: 1-2" in transcript
     finally:
         _restore_app(app, original)
+
+
+def test_delete_conversation_session_returns_200_with_count_when_messages_removed():
+    """DELETE /conversations/{session_id} delegates to storage's
+    delete_conversation_session and surfaces the row count for the UI
+    (used by the "Conversation deleted (N messages)" toast).  Issue #715.
+    """
+    storage = MagicMock(agent_id="did:agent", encryption_enabled=False)
+    storage.delete_conversation_session = AsyncMock(return_value=7)
+    agent = MagicMock(storage=storage)
+
+    app, original = _prepare_app(agent)
+    try:
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                response = client.delete(
+                    "/api/conversations/session-xyz",
+                    headers=_api_headers(),
+                )
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["success"] is True
+        assert payload["session_id"] == "session-xyz"
+        assert payload["deleted_count"] == 7
+        storage.delete_conversation_session.assert_awaited_once_with(
+            "session-xyz", "did:agent",
+        )
+    finally:
+        _restore_app(app, original)
+
+
+def test_delete_conversation_session_returns_404_when_no_messages_deleted():
+    """Storage returning 0 means the session didn't exist or was already
+    empty; the endpoint surfaces that as 404 so the UI can roll back the
+    optimistic row-fade-out.
+    """
+    storage = MagicMock(agent_id="did:agent", encryption_enabled=False)
+    storage.delete_conversation_session = AsyncMock(return_value=0)
+    agent = MagicMock(storage=storage)
+
+    app, original = _prepare_app(agent)
+    try:
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                response = client.delete(
+                    "/api/conversations/nonexistent",
+                    headers=_api_headers(),
+                )
+        assert response.status_code == 404
+    finally:
+        _restore_app(app, original)
+
+
+def test_delete_conversation_session_uuid_session_id_roundtrips_cleanly():
+    """Session IDs in Kestrel are UUID4 strings
+    (``async_conversation_store._new_session_id``), all safe for URLs
+    without encoding.  Pin that a well-formed UUID round-trips through
+    the route exactly to the storage layer — no truncation, no
+    re-encoding, agent_id still attached.
+    """
+    storage = MagicMock(agent_id="did:agent", encryption_enabled=False)
+    storage.delete_conversation_session = AsyncMock(return_value=2)
+    agent = MagicMock(storage=storage)
+
+    app, original = _prepare_app(agent)
+    try:
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                response = client.delete(
+                    "/api/conversations/b5f0e218-12a4-4d6b-9e05-41b5adca7f6f",
+                    headers=_api_headers(),
+                )
+        assert response.status_code == 200
+        storage.delete_conversation_session.assert_awaited_once_with(
+            "b5f0e218-12a4-4d6b-9e05-41b5adca7f6f",
+            "did:agent",
+        )
+    finally:
+        _restore_app(app, original)

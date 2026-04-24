@@ -553,6 +553,52 @@ class AsyncConversationStore:
         )
         return result.rowcount > 0 if hasattr(result, 'rowcount') else True
 
+    async def delete_conversation_session(self, session_id: str) -> int:
+        """Delete every message belonging to the given conversation session.
+
+        Resolves which messages belong to `session_id` using the same
+        logic `_get_session_messages` uses for loading — which covers
+        both explicit UUID-based sessions (session_id stored in message
+        metadata JSON) and legacy time-gap-based sessions (session_id
+        is the row id of the first message in the cluster, and cluster
+        members are discovered by time-gap walking).
+
+        Args:
+            session_id: The session to delete.  Accepts either a UUID
+                string (for metadata-based sessions) or a numeric message
+                ID (for legacy time-gap sessions).
+
+        Returns:
+            Number of messages actually removed.  Returns 0 if the session
+            doesn't exist, isn't owned by this agent, or is already empty.
+
+        Notes:
+            Per-agent scoped via the `agent_id = ?` filter in the final
+            DELETE.  No side effects on other agents' sessions even if
+            session_ids somehow collide.  Ephemeral-mode callers must be
+            rejected at the privacy wrapper layer above — this method
+            does not read the privacy config.
+        """
+        # Fetch every message in the session (high limit — conversations
+        # can run long, but we still cap to avoid loading unbounded
+        # amounts of metadata text here).
+        rows = await self._get_session_messages(session_id, limit=10_000)
+        if not rows:
+            return 0
+
+        ids = [row[0] for row in rows]
+        if not ids:
+            return 0
+
+        placeholders = ",".join("?" for _ in ids)
+        params = [*ids, self.agent_id]
+        result = await self.db.execute_commit(
+            f"DELETE FROM conversation_history "
+            f"WHERE id IN ({placeholders}) AND agent_id = ?",
+            tuple(params),
+        )
+        return result.rowcount if hasattr(result, "rowcount") else len(ids)
+
     async def delete_messages_matching(self, content_pattern: str) -> int:
         """Delete messages containing a specific pattern (case-insensitive).
 
