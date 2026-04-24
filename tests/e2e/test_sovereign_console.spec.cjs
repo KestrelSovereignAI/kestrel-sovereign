@@ -195,13 +195,16 @@ test.describe('API Layer - Backend Health', () => {
         expect(data.currency).toBeDefined();
     });
 
-    test('GET /api/models returns providers and models list', async ({ request }) => {
+    test('GET /api/models returns vendors, routes, and models list', async ({ request }) => {
         const response = await request.get(`${BASE_URL}/api/models`);
         expect(response.status()).toBe(200);
         const data = await response.json();
-        // API returns by_provider structure (grouped models), featured list, all list, and default
-        expect(data.by_provider).toBeDefined();
-        expect(typeof data.by_provider).toBe('object');
+        // After the vendor/route refactor (#702), /api/models returns by_vendor
+        // (models grouped by the vendor that owns their weights) and a routes
+        // list (available "vendor:route" entries), not the legacy by_provider map.
+        expect(data.by_vendor).toBeDefined();
+        expect(typeof data.by_vendor).toBe('object');
+        expect(Array.isArray(data.routes)).toBe(true);
         expect(data.featured).toBeDefined();
         expect(Array.isArray(data.featured)).toBe(true);
         expect(data.default).toBeDefined();
