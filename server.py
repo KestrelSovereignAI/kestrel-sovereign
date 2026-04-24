@@ -685,7 +685,7 @@ def health_check(request: Request):
 
 @app.get("/health/detailed")
 async def health_detailed(request: Request):
-    """Detailed health check using the HeartbeatFeature.
+    """Detailed liveness check using the HealthFeature.
 
     Returns individual check results for database, LLM service,
     memory system, disk space, and context budget.
@@ -694,17 +694,16 @@ async def health_detailed(request: Request):
     if not agent:
         return {"status": "unhealthy", "error": "No agent available", "checks": []}
 
-    # Find the HeartbeatFeature among the agent's features
     features = getattr(agent, 'features', {})
-    heartbeat_feature = None
+    health_feature = None
     for feat in features.values() if isinstance(features, dict) else features:
-        if feat.__class__.__name__ == "HeartbeatFeature":
-            heartbeat_feature = feat
+        if feat.__class__.__name__ == "HealthFeature":
+            health_feature = feat
             break
 
-    if not heartbeat_feature:
+    if not health_feature:
         # Fallback: run checks directly without the feature
-        from kestrel_sovereign.features.heartbeat.checks import (
+        from kestrel_sovereign.features.health.checks import (
             check_database, check_llm_service, check_memory_system,
             check_disk_space, check_context_budget,
         )
@@ -728,8 +727,7 @@ async def health_detailed(request: Request):
             overall = "healthy"
         return {"status": overall, "checks": checks}
 
-    result = await heartbeat_feature.get_latest_heartbeat()
-    return result
+    return await health_feature.get_latest()
 
 
 # Stripe Crypto On-Ramp webhook endpoint
