@@ -1,0 +1,86 @@
+# kestrel-eye config for Kestrel Tasks & Activity Demo
+
+[eye]
+name = "Kestrel Tasks & Activity Demo"
+screenshot_dir = "demos/tasks/demo-output"
+test_cmd = "demos/run.sh tasks"
+
+[eye.model]
+provider = "anthropic"
+model = "claude-haiku-4-5-20251001"
+
+[eye.github]
+repo = "KestrelSovereignAI/kestrel-sovereign"
+labels = ["kestrel-eye", "tasks-review", "automated"]
+
+[[eye.screenshots]]
+name = "01-tasks-empty.png"
+act = "Act 1: Empty Tasks"
+severity = "warning"
+expected = [
+    "Tasks & Activity panel active",
+    "Background Tasks view selected (tab active)",
+    "Empty-state message or empty task list",
+]
+layout = "Tasks panel in default state — empty queue"
+
+[[eye.screenshots]]
+name = "02-chat-triggered.png"
+act = "Act 2: Trigger activity"
+severity = "warning"
+expected = [
+    "Chat panel visible",
+    "Agent response to the date/time question",
+]
+layout = "Chat interface after a tool-triggering message"
+
+[[eye.screenshots]]
+name = "03-task-list.png"
+act = "Act 3: Task list populated"
+severity = "warning"
+expected = [
+    "Tasks panel active",
+    "Task list container visible (may have entries or remain empty depending on features invoked)",
+    "Highlight border around the task list",
+]
+layout = "Tasks panel with task list highlighted"
+
+[[eye.screenshots]]
+name = "04-filter-completed.png"
+act = "Act 4: Filter by state"
+severity = "warning"
+expected = [
+    "Task state filter set to 'Completed'",
+    "Task list filtered accordingly (may be empty)",
+]
+layout = "Tasks view filtered to Completed state"
+
+[[eye.screenshots]]
+name = "05-filter-failed.png"
+act = "Act 4: Filter by state"
+severity = "warning"
+expected = [
+    "Task state filter set to 'Failed'",
+    "Task list filtered accordingly (may be empty)",
+]
+layout = "Tasks view filtered to Failed state"
+
+[[eye.screenshots]]
+name = "06-activity-log.png"
+act = "Act 5: Activity Log"
+severity = "critical"
+expected = [
+    "Activity Log view active (tab toggled)",
+    "List of tool/LLM/feature events with timestamps",
+]
+layout = "Activity Log view with event stream"
+
+[[eye.screenshots]]
+name = "07-bookend.png"
+act = "Act 5: Activity Log"
+severity = "warning"
+expected = [
+    "Background Tasks view active again",
+    "Panel showing default task list",
+]
+layout = "Bookend — Tasks view restored"
