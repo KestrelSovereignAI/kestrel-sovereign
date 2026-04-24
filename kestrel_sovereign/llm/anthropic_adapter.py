@@ -78,43 +78,82 @@ def _tools_with_final_cache_marker(
     return marked
 
 
-def _messages_with_penultimate_cache_marker(
-    messages: List[Dict[str, Any]],
-) -> List[Dict[str, Any]]:
-    """Attach `cache_control` to the last message BEFORE the current user
-    turn — covers marker #3: end-of-history.  The current user turn is
-    never cache-marked because it changes every request by definition.
-
-    If `messages` has < 2 entries the final entry IS the current user
-    turn — no history to cache, so returned unchanged.
-
-    Anthropic requires the marker on a content BLOCK.  When a message's
-    content is a plain string we convert it to the single-text-block
-    array form first, matching how the caching docs describe it.
+def _mark_message_content(msg: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a copy of *msg* with ``cache_control`` attached to its content.
+    Handles plain-string and content-block-array forms. Returns the input
+    unchanged when content is empty/None so the caller never emits a
+    malformed request.
     """
-    if len(messages) < 2:
-        return messages
-    out = list(messages[:-2])
-    penult = dict(messages[-2])
-    content = penult.get("content")
+    content = msg.get("content")
     if isinstance(content, str):
-        penult["content"] = [
+        marked = dict(msg)
+        marked["content"] = [
             {
                 "type": "text",
                 "text": content,
                 "cache_control": CACHE_CONTROL_EPHEMERAL,
             }
         ]
-    elif isinstance(content, list) and content:
-        # Attach marker to the final block in the list.
+        return marked
+    if isinstance(content, list) and content:
+        marked = dict(msg)
         blocks = list(content[:-1])
         blocks.append(_attach_cache_control(content[-1]))
-        penult["content"] = blocks
-    # Else: content is None/empty — no safe place to anchor the marker,
-    # skip it rather than emit a malformed request.
-    out.append(penult)
-    out.append(messages[-1])
-    return out
+        marked["content"] = blocks
+        return marked
+    return msg
+
+
+def _messages_with_penultimate_cache_marker(
+    messages: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Attach ``cache_control`` to the history messages before the current
+    user turn — covers end-of-history caching.
+
+    **Why two markers, not one.** Anthropic's prompt cache is indexed by
+    marker position, not by arbitrary longest-prefix match. A marker at
+    ``messages[-2]`` alone creates a cache entry at THIS turn's [-2]
+    position, but NEXT turn's cache lookup only queries entries that
+    correspond to NEXT turn's markers. Next turn's [-2] is a new position
+    (the just-generated assistant response), so the previous turn's
+    cached entry is never queried.
+
+    To hit the previous turn's cache entry, mark ``messages[-4]`` — which
+    at turn N+1 is the same position that was ``messages[-2]`` at turn N,
+    i.e. the end-of-history boundary from the prior request. That lookup
+    hits the cached entry and produces a compound cache read.
+
+    Markers placed (when sufficient history exists):
+        • ``messages[-2]`` — end of latest completed exchange
+        • ``messages[-4]`` — end of second-to-last exchange (matches the
+          prior turn's [-2] position so cache entries compound)
+
+    Verified empirically against ``api.anthropic.com`` in a 3-turn
+    benchmark: dropping the [-4] marker collapses T3 cache_read to the
+    system-only size (Anthropic stops compounding). See
+    ``tests/integration/test_anthropic_cache_real.py``.
+
+    The current user turn (``messages[-1]``) is never marked because it
+    changes every request by definition. If ``messages`` has < 2 entries
+    the final entry IS the current user turn — returned unchanged.
+
+    Compound caching only works when the bytes at ``messages[-4]`` of
+    turn N+1 are byte-identical to ``messages[-2]`` of turn N. That is
+    the atomic-storage contract in ``agent/context_builder.py`` —
+    user-turn sent-form is persisted verbatim with
+    ``metadata.sent_form=True`` and replayed byte-exactly on load.
+    """
+    if len(messages) < 2:
+        return messages
+
+    mark_at = {len(messages) - 2}
+    if len(messages) >= 4:
+        mark_at.add(len(messages) - 4)
+
+    return [
+        _mark_message_content(msg) if i in mark_at else msg
+        for i, msg in enumerate(messages)
+    ]
 
 
 class AnthropicAdapter(LLMAdapter):
@@ -134,28 +173,28 @@ class AnthropicAdapter(LLMAdapter):
         limit.  Takes and returns a new ``api_params`` dict so callers
         keep their input intact for logging/retry.
 
-        Markers placed:
+        Markers placed (all 4 slots consumed):
             1. End of ``system`` (converts string → content-block array).
             2. End of ``tools`` (final tool gets the marker).
-            3. End of conversation history, i.e. the message just before
-               the final user turn.  The current user turn is never
-               marked — it's new content every request.
+            3. ``messages[-2]`` — end of latest completed exchange.
+            4. ``messages[-4]`` — end of second-to-last exchange. Needed
+               so turn N+1's lookup hits the cache entry turn N wrote
+               at its own [-2] position (which is N+1's [-4] position).
 
-        The 4th breakpoint is unused and available.  The single marker
-        at ``messages[-2]`` compounds across turns via Anthropic's
-        longest-prefix match when the application layer stores the
-        user-turn sent-form verbatim (see the ``metadata.sent_form``
-        contract in ``agent/context_builder.py`` and the
-        ``add_conversation(... metadata={'sent_form': True})`` calls in
-        ``agent/streaming.py`` and ``kestrel_agent.py``).  A second
-        history marker at ``messages[-4]`` was previously shipped as a
-        stability fix (reverted in commit 9eb97c2); atomic storage is
-        the root-cause fix and makes the redundancy unnecessary.
+        Why both history markers. Anthropic's cache is indexed by marker
+        position, not longest-prefix match. A single marker at [-2]
+        alone creates entries at THIS turn's [-2] but never queries the
+        PREVIOUS turn's [-2] entry — so cache_read stays flat at the
+        system-prefix size across turns. The [-4] marker is what asks
+        Anthropic to look up the entry the prior turn wrote.
+        See ``tests/integration/test_anthropic_cache_real.py``'s 3-turn
+        compound-caching test for the empirical check.
 
-        A concrete future use for slot #4: mark the boundary after a
-        tool-use / tool-result pair in tool-using conversations so the
-        tool schema + result become cacheable across follow-up turns.
-        Open a ticket with cache-hit metrics before spending this slot.
+        Compound caching additionally requires ``messages[-4]`` of turn
+        N+1 to be byte-identical to ``messages[-2]`` of turn N. The
+        atomic-storage contract (``metadata.sent_form=True`` on user
+        rows, honored by ``context_builder.format_conversation_history``)
+        is what keeps the bytes stable so the marker actually hits.
 
         Anthropic silently no-ops markers whose prefix is below the
         per-model minimum (1024 tokens for Opus/Sonnet, 2048 for Haiku),
