@@ -103,6 +103,95 @@ def test_context_status_reports_token_budget_and_warning_band():
         _restore_app(app, original)
 
 
+def test_context_status_returns_idle_shape_when_no_session_id():
+    """Regression for #713.  Without a session_id the endpoint used to fall
+    through to ``storage.get_conversation_history(session_id=None)``, which
+    returns the agent's aggregate history across ALL sessions.  That made
+    the chat-footer indicator show the cross-session total (e.g. "472 msgs
+    · 100% Compress") on a fresh empty chat pane where no conversation was
+    active.  The fixed endpoint returns an idle/zeroed shape and never
+    reads storage in this case.
+    """
+    agent = MagicMock()
+    agent.get_current_model = MagicMock(return_value="gpt-5")
+    # Make this very loud if the code path ever tries to load history:
+    # the assertion below pins that storage was NOT consulted.
+    agent.storage.get_conversation_history = AsyncMock(
+        side_effect=AssertionError(
+            "storage must not be queried when session_id is absent"
+        )
+    )
+    agent.context_builder = MagicMock()
+
+    app, original = _prepare_app(agent)
+    try:
+        with patch(
+            "kestrel_sovereign.agent.token_counter.get_token_counter",
+            return_value=_CounterStub(context_limit=4000),
+        ):
+            with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+                with TestClient(app) as client:
+                    response = client.get(
+                        "/agent/context-status",
+                        headers=_api_headers(),
+                    )
+        assert response.status_code == 200
+        payload = response.json()
+        # Idle contract: zero counters, no warnings, status=idle.
+        assert payload["message_count"] == 0
+        assert payload["total_tokens"] == 0
+        assert payload["utilization_percent"] == 0.0
+        assert payload["compression_recommended"] is False
+        assert payload["status"] == "idle"
+        assert payload["warnings"] == []
+        # Model / limits should still reflect the agent's configuration so
+        # the UI can decide what budget to show when a session eventually
+        # IS selected.
+        assert payload["model"] == "gpt-5"
+        assert payload["context_limit"] == 4000
+        assert payload["response_reserve"] == 1024
+        assert payload["total_budget"] == 4000 - 1024
+        # Double-check: storage wasn't touched.
+        agent.storage.get_conversation_history.assert_not_awaited()
+    finally:
+        _restore_app(app, original)
+
+
+def test_context_status_returns_idle_shape_for_empty_session_id():
+    """Same guard as above, but for an explicitly-empty session_id string
+    (some clients send ``?session_id=`` rather than omit the param).  That
+    should also take the idle path, not leak aggregate counts.
+    """
+    agent = MagicMock()
+    agent.get_current_model = MagicMock(return_value="gpt-5")
+    agent.storage.get_conversation_history = AsyncMock(
+        side_effect=AssertionError(
+            "storage must not be queried for empty session_id"
+        )
+    )
+    agent.context_builder = MagicMock()
+
+    app, original = _prepare_app(agent)
+    try:
+        with patch(
+            "kestrel_sovereign.agent.token_counter.get_token_counter",
+            return_value=_CounterStub(context_limit=4000),
+        ):
+            with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+                with TestClient(app) as client:
+                    response = client.get(
+                        "/agent/context-status?session_id=",
+                        headers=_api_headers(),
+                    )
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["status"] == "idle"
+        assert payload["message_count"] == 0
+        agent.storage.get_conversation_history.assert_not_awaited()
+    finally:
+        _restore_app(app, original)
+
+
 def test_reflection_status_filters_scheduler_tasks_and_serializes_execution_history():
     scheduler = MagicMock()
     scheduler.schedule_list = AsyncMock(

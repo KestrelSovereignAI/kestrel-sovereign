@@ -330,18 +330,32 @@ let contextStatusElement = null;
 /**
  * Update the context status indicator.
  * Shows messages count and utilization percentage with color coding.
+ *
+ * When no conversation is active (`state.currentSessionId` is null, e.g. a
+ * fresh chat pane before the user starts or selects a conversation) the
+ * indicator is hidden rather than showing stale/aggregate data.  See #713 —
+ * previously this case leaked the agent's global cross-session message
+ * count into the footer and offered a Compress button based on that
+ * aggregate, which made no sense.
  */
 export async function updateContextStatus() {
     try {
-        const sessionId = state.currentSessionId || null;
-        const status = await API.getContextStatus(sessionId);
-
         if (!contextStatusElement) {
             createContextStatusElement();
         }
-
         if (!contextStatusElement) return;
 
+        const sessionId = state.currentSessionId || null;
+
+        // No active conversation → hide the footer outright. The server
+        // also returns idle/zeroed values for this case, but hiding
+        // client-side avoids any flash of "0 msgs · 0%" during the RTT.
+        if (!sessionId) {
+            contextStatusElement.innerHTML = '';
+            return;
+        }
+
+        const status = await API.getContextStatus(sessionId);
         const { message_count, utilization_percent, status: contextState, warnings } = status;
 
         // Color based on utilization

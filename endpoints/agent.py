@@ -525,6 +525,27 @@ async def get_context_status(
         counter = get_token_counter(current_model)
         context_limit = counter.get_context_limit()
 
+        # 2b. No active session → return an idle shape.  Previously passing
+        # session_id=None into get_conversation_history leaked the agent's
+        # cross-session aggregate count and falsely rolled utilization to
+        # 100%, which surfaced in the chat footer as "472 msgs · 100%
+        # Compress" on an empty pane.  See #713.  "Context window status"
+        # is only meaningful for an active conversation; with none, there's
+        # nothing to report.
+        if not session_id:
+            return {
+                "model": current_model,
+                "message_count": 0,
+                "total_tokens": 0,
+                "context_limit": context_limit,
+                "response_reserve": RESPONSE_RESERVE,
+                "total_budget": context_limit - RESPONSE_RESERVE,
+                "utilization_percent": 0.0,
+                "compression_recommended": False,
+                "status": "idle",
+                "warnings": [],
+            }
+
         # 3. Get conversation history for the specified session
         history = await agent.storage.get_conversation_history(limit=MAX_CONVERSATION_HISTORY_LIMIT, session_id=session_id)
         message_count = len(history)
