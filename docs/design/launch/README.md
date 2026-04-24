@@ -6,12 +6,16 @@ This folder holds the current landing-page copy drafts for the Kestrel open-sour
 
 - `LANDING_PAGE_WIREFRAME.md` — full landing-page wireframe with section-by-section copy, proof points, CTA guidance, and implementation notes.
 - `SIMPLE_LAUNCH_PAGE_ONE_SCREEN.md` — a tighter one-screen version for a minimal launch page.
+- `PUBLISH_READY_LANDING_PAGE_COPY.md` — tightened publish-ready copy for a fuller public page.
+- `LANDING_PAGE_HTML_STRUCTURE.md` — implementation-ready semantic HTML section structure for engineering.
 
 ## Intended Use
 
-- Start with `LANDING_PAGE_WIREFRAME.md` if the team wants a proper public page with clear sections.
-- Start with `SIMPLE_LAUNCH_PAGE_ONE_SCREEN.md` if the team wants a fast, minimal page that can ship with low implementation overhead.
-- Treat these as copy drafts, not final design or engineering specs.
+- Start with `PUBLISH_READY_LANDING_PAGE_COPY.md` if the team wants final prose that can go straight into a launch page.
+- Start with `LANDING_PAGE_HTML_STRUCTURE.md` if engineering needs a fast implementation map.
+- Use `LANDING_PAGE_WIREFRAME.md` when revisiting section order, message flow, or page logic.
+- Use `SIMPLE_LAUNCH_PAGE_ONE_SCREEN.md` if the team wants a fast, minimal page that can ship with low implementation overhead.
+- Treat these as launch-copy assets, not long-term product docs.
 
 ## Source Constraints
 
