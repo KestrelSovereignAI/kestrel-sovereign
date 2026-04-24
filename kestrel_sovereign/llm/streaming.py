@@ -216,6 +216,7 @@ class StreamingMixin:
 
             except Exception as e:
                 logger.error(f"Provider {provider['name']} failed: {e}")
+                self._maybe_disable_route(provider, e)
                 last_error = e
                 if mandate_restricted:
                     # No silent fallthrough when the user has explicitly narrowed
@@ -383,6 +384,7 @@ class StreamingMixin:
                     return
             except Exception as e:
                 logger.error(f"Provider {provider['name']} failed: {e}")
+                self._maybe_disable_route(provider, e)
                 last_error = e
                 if mandate_restricted:
                     raise LLMStreamingError(
@@ -542,6 +544,7 @@ class StreamingMixin:
 
             except Exception as e:
                 logger.error(f"Provider {provider['name']} failed: {e}")
+                self._maybe_disable_route(provider, e)
                 last_error = e
                 last_provider_name = provider["name"]
                 if mandate_restricted:

@@ -201,6 +201,15 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         self._preference_persistence_callback = None
         self._preference_persistence_tasks: set[asyncio.Task[None]] = set()
 
+        # Routes that have failed with a permanent auth error (401/403 or
+        # the equivalent "User not found" / "invalid api key" message). Once
+        # a route lands here, subsequent fallback iterations skip it for the
+        # lifetime of this service — retrying a dead API key every user turn
+        # wastes a round-trip and logs a red error on every request (#655).
+        # Cleared by restarting the service (picks up rotated keys). Keys
+        # are provider route names (matches provider["name"]).
+        self._disabled_routes: dict[str, str] = {}
+
     def set_preference_persistence_callback(self, callback) -> None:
         """Set the persistence callback for model preference.
 
@@ -212,6 +221,65 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         """
         self._preference_persistence_callback = callback
         logger.info("Model preference persistence enabled")
+
+    @staticmethod
+    def _is_permanent_auth_error(exc: Exception) -> bool:
+        """Return True for 401/403-class failures that will never recover
+        without rotating the key or restarting the service.
+
+        Matches the auth-specific subset of ``retry.NON_RETRYABLE_PATTERNS``
+        plus explicit 401/403 status codes. Intentionally narrower than
+        ``is_retryable_error`` negated — we don't want to disable a route
+        because it rejected a single malformed request (400) or a missing
+        model (404); those aren't problems with the route itself.
+        """
+        status = getattr(exc, "status_code", None) or getattr(exc, "status", None)
+        if status in (401, 403):
+            return True
+        msg = str(exc).lower()
+        auth_patterns = (
+            "user not found",
+            "invalid api key",
+            "invalid_api_key",
+            "unauthorized",
+            "permission_denied",
+            "permission denied",
+            "authentication",
+        )
+        return any(p in msg for p in auth_patterns)
+
+    def _maybe_disable_route(self, provider: Dict[str, Any], exc: Exception) -> None:
+        """Record a route as permanently disabled if *exc* looks like a
+        401/403. No-op for transient or caller-side errors. Logs once per
+        route so repeated failures don't flood the log.
+        """
+        name = provider.get("name") if isinstance(provider, dict) else None
+        if not name or name in self._disabled_routes:
+            return
+        if not self._is_permanent_auth_error(exc):
+            return
+        reason = str(exc)[:200]
+        self._disabled_routes[name] = reason
+        logger.warning(
+            "Route %s disabled for the rest of this session after permanent "
+            "auth failure: %s. Rotate the key and restart to re-enable.",
+            name, reason,
+        )
+
+    def _available_providers(
+        self, providers: Optional[List[Dict[str, Any]]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Filter out routes known to fail with a permanent auth error.
+
+        Callers that iterate the fallback chain should use this instead of
+        ``self.providers`` so each user turn skips dead routes immediately.
+        If every route has been disabled (pathological), return an empty
+        list — the caller raises a clear error rather than pretending.
+        """
+        src = providers if providers is not None else self.providers
+        if not self._disabled_routes:
+            return list(src)
+        return [p for p in src if p.get("name") not in self._disabled_routes]
 
     def set_model_preference(
         self,
@@ -450,8 +518,12 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         ``force_local_only=True`` additionally filters to local routes. If the
         resolved ``target_model`` isn't the configured default for any local
         route, it's cleared so each local route uses its own model.
+
+        Routes that have already failed in this session with a permanent auth
+        error (``self._disabled_routes``) are filtered out here so the
+        fallback chain skips them immediately on the next user turn (#655).
         """
-        providers_to_use = list(self.providers)
+        providers_to_use = self._available_providers()
         target_model: Optional[str] = None
 
         # --- 1. Explicit model_override ---
@@ -463,6 +535,28 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
                 if matching:
                     providers_to_use = matching
                 else:
+                    # If the requested route exists but was disabled earlier
+                    # in this session (#655), say so specifically — "not
+                    # available" misleads the caller into thinking it was
+                    # never configured.
+                    raw_matching = self._filter_providers_by_selector(
+                        self.providers, left,
+                    )
+                    disabled_match = [
+                        p["name"] for p in raw_matching
+                        if p.get("name") in self._disabled_routes
+                    ]
+                    if disabled_match:
+                        reasons = "; ".join(
+                            f"{n}: {self._disabled_routes[n]}"
+                            for n in disabled_match
+                        )
+                        raise LLMServiceError(
+                            f"Route '{left}' was disabled earlier this "
+                            f"session after a permanent auth failure "
+                            f"({reasons}). Rotate the key and restart "
+                            f"the service to re-enable."
+                        )
                     raise LLMProviderUnavailableError(
                         left,
                         [p["name"] for p in self.providers],
@@ -1016,7 +1110,7 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
                 else:
                     target_selector = pref_model
 
-        available_providers = self.providers
+        available_providers = self._available_providers()
         target_model = None
         if target_selector:
             resolved = self._resolve_model_selector(target_selector, providers=available_providers)
@@ -1471,8 +1565,8 @@ No other text or formatting.
                 logger.warning(f"Remote GPU failed: {exc}, falling back", exc_info=True)
                 self._deactivate_remote_backend(reason=str(exc))
 
-        # Fall back to standard providers
-        providers = self.providers
+        # Fall back to standard providers (skip any disabled by auth failure).
+        providers = self._available_providers()
         if force_local_only:
             providers = [p for p in providers if p.get("is_local")]
             # Clear any cloud model override — use the local provider's own model
@@ -1508,6 +1602,28 @@ No other text or formatting.
                     providers = matched
                     logger.info(f"Model mandate: using {target_provider} with {target_model}")
                 elif model_override:
+                    # Same disabled-route helpful error as in
+                    # resolve_provider_routing — if the requested target
+                    # matches a route that was disabled this session,
+                    # tell the caller to rotate the key and restart.
+                    raw_matching = self._filter_providers_by_selector(
+                        self.providers, target_provider,
+                    )
+                    disabled_match = [
+                        p["name"] for p in raw_matching
+                        if p.get("name") in self._disabled_routes
+                    ]
+                    if disabled_match:
+                        reasons = "; ".join(
+                            f"{n}: {self._disabled_routes[n]}"
+                            for n in disabled_match
+                        )
+                        raise LLMServiceError(
+                            f"Route '{target_provider}' was disabled "
+                            f"earlier this session after a permanent "
+                            f"auth failure ({reasons}). Rotate the key "
+                            f"and restart the service to re-enable."
+                        )
                     raise LLMServiceError(
                         f"Route/vendor '{target_provider}' not available. "
                         f"Available: {[p['name'] for p in providers]}"
@@ -1546,6 +1662,7 @@ No other text or formatting.
                 raise LLMServiceError(f"Request rejected by {provider['name']}: {e}") from e
             except Exception as e:
                 logger.error(f"Provider {provider['name']} failed: {e}")
+                self._maybe_disable_route(provider, e)
                 last_error = e
                 if mandate_restricted:
                     raise LLMServiceError(
