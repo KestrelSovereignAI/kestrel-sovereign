@@ -1,5 +1,6 @@
 """Focused contract tests for commands and conversations endpoints."""
 
+import json
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -160,6 +161,178 @@ def test_get_conversation_filters_session_markers_and_decrypts_messages():
         assert payload["messages"][0]["encrypted"] is False
         assert payload["messages"][1]["content"] == "plain reply"
         assert payload["encrypted_at_rest"] is True
+    finally:
+        _restore_app(app, original)
+
+
+def test_rename_conversation_happy_path_returns_stored_name():
+    """PATCH /conversations/{id} with {"name": "new"} → 200 with the
+    stored value echoed back.  Issue #716.
+    """
+    storage = MagicMock(agent_id="did:agent", encryption_enabled=False)
+    storage.set_conversation_name = AsyncMock(return_value="My Debugging Thread")
+    agent = MagicMock(storage=storage)
+
+    app, original = _prepare_app(agent)
+    try:
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                response = client.patch(
+                    "/api/conversations/sess-abc",
+                    json={"name": "  My Debugging Thread  "},
+                    headers=_api_headers(),
+                )
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["success"] is True
+        assert payload["session_id"] == "sess-abc"
+        assert payload["name"] == "My Debugging Thread"
+        storage.set_conversation_name.assert_awaited_once_with(
+            "sess-abc", "  My Debugging Thread  ",
+        )
+    finally:
+        _restore_app(app, original)
+
+
+def test_rename_conversation_empty_string_clears_name():
+    """An empty / whitespace-only name clears the override — storage
+    returns None and the endpoint surfaces name=null.
+    """
+    storage = MagicMock(agent_id="did:agent", encryption_enabled=False)
+    storage.set_conversation_name = AsyncMock(return_value=None)
+    agent = MagicMock(storage=storage)
+
+    app, original = _prepare_app(agent)
+    try:
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                response = client.patch(
+                    "/api/conversations/sess-abc",
+                    json={"name": "   "},
+                    headers=_api_headers(),
+                )
+        assert response.status_code == 200
+        assert response.json()["name"] is None
+        storage.set_conversation_name.assert_awaited_once_with("sess-abc", "   ")
+    finally:
+        _restore_app(app, original)
+
+
+def test_rename_conversation_null_name_also_clears():
+    """``{"name": null}`` is equivalent to clearing."""
+    storage = MagicMock(agent_id="did:agent", encryption_enabled=False)
+    storage.set_conversation_name = AsyncMock(return_value=None)
+    agent = MagicMock(storage=storage)
+
+    app, original = _prepare_app(agent)
+    try:
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                response = client.patch(
+                    "/api/conversations/sess-abc",
+                    json={"name": None},
+                    headers=_api_headers(),
+                )
+        assert response.status_code == 200
+        assert response.json()["name"] is None
+        storage.set_conversation_name.assert_awaited_once_with("sess-abc", None)
+    finally:
+        _restore_app(app, original)
+
+
+def test_rename_conversation_missing_field_400():
+    """Body without a 'name' field → 400; storage never touched."""
+    storage = MagicMock(agent_id="did:agent", encryption_enabled=False)
+    storage.set_conversation_name = AsyncMock()
+    agent = MagicMock(storage=storage)
+
+    app, original = _prepare_app(agent)
+    try:
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                response = client.patch(
+                    "/api/conversations/sess-abc",
+                    json={"not_name": "x"},
+                    headers=_api_headers(),
+                )
+        assert response.status_code == 400
+        storage.set_conversation_name.assert_not_awaited()
+    finally:
+        _restore_app(app, original)
+
+
+def test_rename_conversation_non_string_name_400():
+    """Non-string / non-null 'name' → 400."""
+    storage = MagicMock(agent_id="did:agent", encryption_enabled=False)
+    storage.set_conversation_name = AsyncMock()
+    agent = MagicMock(storage=storage)
+
+    app, original = _prepare_app(agent)
+    try:
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                response = client.patch(
+                    "/api/conversations/sess-abc",
+                    json={"name": 42},
+                    headers=_api_headers(),
+                )
+        assert response.status_code == 400
+        storage.set_conversation_name.assert_not_awaited()
+    finally:
+        _restore_app(app, original)
+
+
+def test_list_conversations_includes_user_assigned_names():
+    """List endpoint decorates sessions with their user-assigned ``name``
+    when one is set; sessions without a rename don't get the key so the
+    UI's ``conv.name || conv.preview`` fallback resolves to preview.
+
+    Fixture matches the row-order contract the endpoint expects:
+    ``query_conversations`` returns newest-first, and the endpoint reverses
+    internally (see ``test_conversations_endpoint_groups_rows_and_marks_
+    encrypted_preview`` for the canonical fixture shape).
+    """
+    now = datetime(2026, 3, 17, 9, 0, 0)
+    rows = [
+        # Newest-first.  Explicit new_session marker splits the two
+        # clusters; session_ids emitted by the endpoint are the first
+        # message id in each cluster (str-coerced).
+        (4, "user", "second thread", "{}", now + timedelta(hours=2, minutes=1)),
+        (3, "system", "[New conversation started]",
+         '{"new_session": true, "type": "session_marker"}',
+         now + timedelta(hours=2)),
+        (2, "assistant", "hi there", "{}", now + timedelta(minutes=1)),
+        (1, "user", "first thread", "{}", now),
+    ]
+    storage = MagicMock(agent_id="did:agent", encryption_enabled=False)
+    storage.query_conversations = AsyncMock(return_value=rows)
+    # Only the older session (first row id = "1") has a custom name.
+    storage.get_conversation_names = AsyncMock(
+        return_value={"1": "Custom Title"}
+    )
+    agent = MagicMock(storage=storage)
+
+    app, original = _prepare_app(agent)
+    try:
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                response = client.get(
+                    "/api/conversations",
+                    headers=_api_headers(),
+                )
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["total"] == 2
+        conversations = payload["conversations"]
+        named = [c for c in conversations if c.get("name") == "Custom Title"]
+        assert len(named) == 1, (
+            f"expected exactly one renamed session; got {conversations}"
+        )
+        # Un-renamed sessions must not have the key so the client's
+        # ``conv.name || conv.preview`` fallback resolves to preview.
+        un_renamed = [c for c in conversations if "name" not in c]
+        assert un_renamed, "at least one un-named session expected"
+        storage.get_conversation_names.assert_awaited_once()
     finally:
         _restore_app(app, original)
 

@@ -155,6 +155,20 @@ async def list_conversations(request: Request, limit: int = Query(50, ge=1, le=5
 
         sessions = list(reversed(sessions))[:limit]
 
+        # Decorate with user-assigned display names (#716).  Single bulk
+        # read rather than per-row so long conversation lists stay fast.
+        names = {}
+        get_names = getattr(storage, "get_conversation_names", None)
+        if get_names is not None:
+            try:
+                names = await get_names() or {}
+            except Exception as e:
+                logger.warning(f"Failed to load conversation names: {e}")
+        for session in sessions:
+            sid = session.get("session_id")
+            if sid and sid in names:
+                session["name"] = names[sid]
+
         return {
             "conversations": sessions,
             "total": len(sessions),
@@ -310,6 +324,66 @@ async def start_new_conversation(request: Request):
     except Exception as e:
         logger.error(f"Error starting new conversation: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Error starting new conversation.")
+
+
+@router.patch("/conversations/{session_id}")
+@limiter.limit("30/minute")
+async def rename_conversation(request: Request, session_id: str):
+    """Set (or clear) a user-assigned display name for a conversation.
+
+    Request body: ``{"name": "..."}``.  Empty string / null / whitespace-
+    only clears the override and reverts the UI to the computed preview.
+    Non-empty values are trimmed and capped at 120 chars server-side to
+    prevent unbounded growth.
+
+    Returns:
+        200 with ``{"success": true, "session_id": ..., "name": final}``
+             where ``final`` is the stored value (trimmed) or ``null``
+             when cleared.
+        400 when the request body is missing / malformed.
+
+    Agent-scoped.  Rejects in ephemeral privacy mode.
+
+    See issue #716.
+    """
+    try:
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(
+                status_code=400,
+                detail="Request body must be JSON with a 'name' field.",
+            )
+        if not isinstance(body, dict) or "name" not in body:
+            raise HTTPException(
+                status_code=400,
+                detail="Request body must include a 'name' field.",
+            )
+        raw = body["name"]
+        if raw is not None and not isinstance(raw, str):
+            raise HTTPException(
+                status_code=400,
+                detail="'name' must be a string or null.",
+            )
+
+        agent = get_agent(request)
+        storage = agent.storage
+        final_name = await storage.set_conversation_name(session_id, raw)
+
+        return {
+            "success": True,
+            "session_id": session_id,
+            "name": final_name,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(
+            f"Error renaming conversation {session_id}: {e}", exc_info=True
+        )
+        raise HTTPException(
+            status_code=500, detail="Error renaming conversation."
+        )
 
 
 @router.delete("/conversations/messages/{message_id}")

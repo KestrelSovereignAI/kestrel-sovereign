@@ -362,6 +362,21 @@
             text-overflow: ellipsis;
         }
 
+        /* Inline rename input (#716).  Sits inside .conversation-preview
+           and matches its size/weight so the row doesn't shift on edit. */
+        .conversation-rename-input {
+            width: 100%;
+            font-size: 0.875rem;
+            padding: 0.125rem 0.25rem;
+            margin: 0;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            border: 1px solid var(--accent-color);
+            border-radius: 4px;
+            font-family: inherit;
+            box-sizing: border-box;
+        }
+
         .conversation-time {
             font-size: 0.75rem;
             color: var(--text-secondary);
