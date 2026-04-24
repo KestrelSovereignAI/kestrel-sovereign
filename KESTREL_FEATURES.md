@@ -270,6 +270,12 @@ The currently exported `Feature` subclasses discovered from those modules includ
   - `PATCH /api/keys/{provider}`
   - `DELETE /api/keys/{provider}`
   - `GET /api/keys/{provider}/usage`
+  - `GET /api/keys/available-sources`
+  - `GET /api/keys/user`
+  - `POST /api/keys/user`
+  - `POST /api/keys/user/verify`
+  - `DELETE /api/keys/user/{provider}`
+  - `GET /api/keys/platform`
   - `GET /api/models`
   - `GET /api/model/current`
   - `POST /api/model/set`
