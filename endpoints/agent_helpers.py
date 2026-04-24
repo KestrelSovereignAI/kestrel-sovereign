@@ -1,6 +1,25 @@
 """Shared helpers for endpoint modules."""
 
+from typing import Optional
+
 from fastapi import HTTPException, Request
+
+
+def get_caller(request: Request):
+    """Return the CallerContext attached by the auth middleware, or None.
+
+    Used by endpoints that hand off to ``agent.process_input`` /
+    ``agent.process_input_streaming`` so that governance-command
+    authorization (e.g. ``!safe-mode exit``, ``!reanchor-constitution``)
+    is evaluated consistently regardless of which endpoint the caller
+    reached.  The middleware that populates ``request.state.caller``
+    lives in :mod:`server`.
+
+    Returns ``None`` only when the middleware was bypassed — e.g. for
+    webhooks or internal calls — which the command handler itself
+    rejects as non-sovereign.
+    """
+    return getattr(request.state, "caller", None)
 
 
 def get_agent(request: Request):
