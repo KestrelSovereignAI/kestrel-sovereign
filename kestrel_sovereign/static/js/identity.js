@@ -691,9 +691,22 @@ export async function loadConversations(_agentName) {
             item.dataset.sessionId = conv.session_id;
             item.addEventListener('click', () => window.loadConversation(conv.session_id));
 
+            // Display name: user-assigned name wins over the computed
+            // preview (issue #716).  Fallback chain keeps the sidebar
+            // readable for conversations that were never renamed and for
+            // ones renamed then cleared.
             const preview = document.createElement('div');
             preview.className = 'conversation-preview';
-            preview.textContent = conv.preview || 'New conversation';
+            const displayName = conv.name || conv.preview || 'New conversation';
+            preview.textContent = displayName;
+            preview.title = 'Double-click to rename';
+            // Double-click begins an inline rename (issue #716).  Click
+            // alone still loads the conversation; dblclick is a clear
+            // discoverability affordance matching tooltip text.
+            preview.addEventListener('dblclick', (e) => {
+                e.stopPropagation();
+                beginRenameConversation(preview, conv);
+            });
 
             const time = document.createElement('div');
             time.className = 'conversation-time';
@@ -742,6 +755,82 @@ export async function loadConversations(_agentName) {
         container.innerHTML = '<p style="color: var(--error); padding: 1rem;">Failed to load conversations</p>';
     }
 }
+
+
+function beginRenameConversation(previewEl, conv) {
+    // Swap the preview text for an inline input seeded with the current
+    // display name.  Commit on Enter / blur; cancel on Escape.  All
+    // state is captured in this closure — no module-level globals.
+    // Issue #716.
+    const originalText = previewEl.textContent;
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.className = 'conversation-rename-input';
+    input.value = conv.name || '';
+    input.placeholder = originalText || 'Conversation name';
+    input.maxLength = 120;
+    // The input lives inside a row that has a click → loadConversation
+    // listener.  Don't let keystrokes / clicks bubble and fire it while
+    // the user is typing.
+    input.addEventListener('click', (e) => e.stopPropagation());
+
+    let finalized = false;
+
+    async function commit() {
+        if (finalized) return;
+        finalized = true;
+        const newName = input.value;
+        const storedName = conv.name || '';
+        // No-op commit: typed exactly what's already stored.  Skip the
+        // network round-trip and just restore the preview.
+        if (newName.trim() === storedName.trim()) {
+            previewEl.textContent = originalText;
+            return;
+        }
+        try {
+            const result = await API.renameConversation(conv.session_id, newName);
+            const applied = result?.name;
+            conv.name = applied || null;
+            previewEl.textContent = applied || conv.preview || 'New conversation';
+            Toast.info(
+                applied
+                    ? 'Conversation renamed'
+                    : 'Conversation name cleared',
+            );
+        } catch (e) {
+            previewEl.textContent = originalText;
+            Toast.error(`Rename failed: ${e.message}`);
+        }
+    }
+
+    function cancel() {
+        if (finalized) return;
+        finalized = true;
+        previewEl.textContent = originalText;
+    }
+
+    input.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+            e.preventDefault();
+            input.blur();  // blur handler commits
+        } else if (e.key === 'Escape') {
+            e.preventDefault();
+            cancel();
+            // Rebuild preview text; removing the input is implicit
+            // because cancel already overwrote previewEl.textContent.
+            previewEl.textContent = originalText;
+        }
+    });
+    input.addEventListener('blur', () => {
+        if (!finalized) commit();
+    });
+
+    previewEl.textContent = '';
+    previewEl.appendChild(input);
+    input.focus();
+    input.select();
+}
+
 
 window.loadConversation = async function(sessionId) {
     activeConversationId = sessionId;

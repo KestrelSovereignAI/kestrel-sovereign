@@ -237,6 +237,14 @@ export function createApiClient({
         newConversation: () => client.request('/api/conversations/new', { method: 'POST' }),
         deleteMessage: (messageId) => client.request(`/api/conversations/messages/${encodeURIComponent(messageId)}`, { method: 'DELETE' }),
         deleteConversation: (sessionId) => client.request(`/api/conversations/${encodeURIComponent(sessionId)}`, { method: 'DELETE' }),
+        renameConversation: (sessionId, name) => client.request(
+            `/api/conversations/${encodeURIComponent(sessionId)}`,
+            {
+                method: 'PATCH',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name }),
+            },
+        ),
         getDbTables: () => client.request('/api/db/tables'),
         queryDbTable: (table, limit = 50, offset = 0, search = null) => {
             let url = `/api/db/tables/${encodeURIComponent(table)}?limit=${limit}&offset=${offset}`;
