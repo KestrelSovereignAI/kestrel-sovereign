@@ -6,37 +6,44 @@
 # and council configuration into a single location.
 
 # =============================================================================
-# LLM Configuration
+# LLM Configuration — vendor/route/model architecture
 # =============================================================================
-# Define the order in which the agent should try to use providers.
-# Ollama first for privacy and cost, OpenAI as fallback for complex reasoning
+# A vendor is who makes the weights; a route is how to reach them.
+# Fallback order below; the first available route is used unless a mandate says
+# otherwise. API keys belong in .env, not here — reference them by api_key_env.
+# See docs/architecture/LLM_SERVICE_ARCHITECTURE.md.
 [llm]
-provider_priority = ["ollama", "openai"]
+route_priority = ["ollama:local", "openai:api"]
 
-[llm.ollama]
-# Local Ollama instance - install from https://ollama.ai
-host = "http://localhost:11434"
-model = "auto"
+# --- Ollama (local inference) — install from https://ollama.ai ---------------
+[llm.vendors.ollama]
+is_cloud = false
+
+[llm.vendors.ollama.routes.local]
+adapter        = "OllamaAdapter"
+host           = "http://localhost:11434"
+model          = "auto"
 selection_hints = ["llama3.2", "qwen", "gpt-oss"]
 
-[llm.openai]
-# Get your API key from https://platform.openai.com/api-keys
-# Set environment variable: export OPENAI_API_KEY="your-key-here"
-api_key = "sk-YOUR_API_KEY_HERE"
-model = "auto"
+# --- OpenAI (cloud) — set OPENAI_API_KEY in .env -----------------------------
+[llm.vendors.openai]
+is_cloud = true
+
+[llm.vendors.openai.routes.api]
+adapter        = "OpenAIAdapter"
+api_key_env    = "OPENAI_API_KEY"
+model          = "auto"
 selection_hints = ["gpt-5", "mini"]
 
-# Optional: Anthropic Claude support
-#[llm.anthropic]
-#api_key = "sk-ant-YOUR_API_KEY_HERE"
-#model = "auto"
+# --- Anthropic Claude (optional) — set ANTHROPIC_API_KEY in .env -------------
+#[llm.vendors.anthropic]
+#is_cloud = true
+#
+#[llm.vendors.anthropic.routes.api]
+#adapter        = "AnthropicAdapter"
+#api_key_env    = "ANTHROPIC_API_KEY"
+#model          = "auto"
 #selection_hints = ["sonnet", "opus", "haiku"]
-
-# Optional: Additional Ollama models for specific tasks
-#[llm.ollama_large]
-#host = "http://localhost:11434"
-#model = "auto"
-#selection_hints = ["llama3.1", "70b"]  # For complex reasoning tasks
 
 [llm.ensemble]
 # The number of agent instances to run in the ensemble.
