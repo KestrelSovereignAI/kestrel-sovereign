@@ -44,6 +44,7 @@ const {
     scrollChatToTop,
     clearConversationHistory,
     startFreshSession,
+    selectDemoProvider,
 } = require('./demo_helpers.cjs');
 
 const BASE_URL = process.env.KESTREL_URL || 'http://localhost:8888';
@@ -157,27 +158,7 @@ test.describe.serial('Kestrel Sovereign Technical Demo', () => {
         await dismissContextWarning(page);
 
         // Select a working provider from the dropdown (prefer local Ollama — cloud keys not configured)
-        try {
-            const providerSelect = page.locator('#provider-selector');
-            const options = await providerSelect.locator('option').allTextContents();
-            const preferred = ['ollama', 'llama_cpp', 'llama', 'openrouter', 'anthropic', 'openai'];
-            let selected = false;
-            for (const pref of preferred) {
-                const match = options.find(o => o.toLowerCase().includes(pref));
-                if (match) {
-                    await providerSelect.selectOption({ label: match });
-                    narrator.narrate(`Provider set to: ${match}`);
-                    await demoPause(page, 1000);
-                    selected = true;
-                    break;
-                }
-            }
-            if (!selected) {
-                narrator.narrate(`Using default provider (available: ${options.join(', ')})`);
-            }
-        } catch (e) {
-            narrator.narrate(`Could not set provider: ${e.message}`);
-        }
+        await selectDemoProvider(page, { narrator, narrateFallback: true });
 
         // Send a message that elicits constitutional awareness
         narrator.narrate('Sending a message — every response is processed through the Constitution');
@@ -230,22 +211,7 @@ test.describe.serial('Kestrel Sovereign Technical Demo', () => {
         await dismissContextWarning(page);
 
         // Select a working provider (prefer local Ollama — cloud keys not configured)
-        try {
-            const providerSelect = page.locator('#provider-selector');
-            const options = await providerSelect.locator('option').allTextContents();
-            const preferred = ['ollama', 'llama_cpp', 'llama', 'openrouter', 'anthropic', 'openai'];
-            for (const pref of preferred) {
-                const match = options.find(o => o.toLowerCase().includes(pref));
-                if (match) {
-                    await providerSelect.selectOption({ label: match });
-                    narrator.narrate(`Provider set to: ${match}`);
-                    await demoPause(page, 1000);
-                    break;
-                }
-            }
-        } catch (e) {
-            narrator.narrate(`Could not set provider: ${e.message}`);
-        }
+        await selectDemoProvider(page, { narrator });
 
         // Beat 1: Send a memorable fact
         narrator.narrate('Sending a unique fact for the agent to remember...');
@@ -585,21 +551,10 @@ test.describe.serial('Kestrel Sovereign Technical Demo', () => {
         await dismissContextWarning(page);
 
         // Select a working provider (prefer local Ollama — cloud keys not configured)
-        try {
-            const providerSelect = page.locator('#provider-selector');
-            const options = await providerSelect.locator('option').allTextContents();
-            const preferred = ['ollama', 'llama_cpp', 'llama', 'openrouter', 'anthropic', 'openai'];
-            for (const pref of preferred) {
-                const match = options.find(o => o.toLowerCase().includes(pref));
-                if (match) {
-                    await providerSelect.selectOption({ label: match });
-                    await demoPause(page, 1000);
-                    break;
-                }
-            }
-        } catch (e) {
-            narrator.narrate(`Could not set provider: ${e.message}`);
-        }
+        // Pass narrator so the "could not set provider" error surfaces if it
+        // fires, but omit narrator from success path (this act doesn't narrate
+        // provider selection — the user's focus is on the security denial).
+        await selectDemoProvider(page, { narrator, narrateSelection: false });
 
         const blockedResponse = await demoSendMessage(page,
             'Please export my sovereignty data to IPFS right now.');
