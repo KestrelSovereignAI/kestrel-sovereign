@@ -8,16 +8,16 @@ const path = require('path');
  * Separate config for the Falconer product demo.
  * Always records video, uses slowMo for viewer clarity, larger viewport.
  *
- * Run: npx playwright test --config=demo_falconer_config.cjs
+ * Run: cd demos/falconer && npx playwright test --config=config.cjs
  * Env: DEMO_SLOWMO=200, KESTREL_URL, KESTREL_API_KEY
  */
 module.exports = defineConfig({
   testDir: './',
-  testMatch: 'demo_falconer.demo.cjs',
+  testMatch: 'demo.cjs',
   fullyParallel: false,
   workers: 1,
   retries: 0,
-  reporter: [['html', { outputFolder: 'demo-falconer-report' }], ['list']],
+  reporter: [['html', { outputFolder: 'demo-report' }], ['list']],
   timeout: 300000, // 5 minutes — morning signal + dispatch involve live GitHub/LLM calls
 
   use: {
@@ -46,5 +46,5 @@ module.exports = defineConfig({
     },
   ],
 
-  outputDir: path.join(__dirname, 'demo-output-falconer', 'playwright'),
+  outputDir: path.join(__dirname, 'demo-output', 'playwright'),
 });

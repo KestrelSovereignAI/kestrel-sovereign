@@ -3,8 +3,8 @@
 
 [eye]
 name = "Kestrel Sovereign Demo"
-screenshot_dir = "tests/e2e/demo-output"
-test_cmd = "npx playwright test -c tests/e2e/demo_config.cjs"
+screenshot_dir = "demos/technical/demo-output"
+test_cmd = "npx playwright test -c demos/technical/config.cjs"
 
 [eye.model]
 provider = "anthropic"

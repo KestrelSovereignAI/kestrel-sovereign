@@ -4,7 +4,7 @@
 [eye]
 name = "Kestrel Spawn Agent Demo"
 screenshot_dir = "demos/spawn/demo-output"
-test_cmd = "cd demos/spawn && npx playwright test --config=demo_config.cjs"
+test_cmd = "cd demos/spawn && npx playwright test --config=config.cjs"
 
 [eye.model]
 provider = "anthropic"

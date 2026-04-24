@@ -8,11 +8,11 @@ const { buildDemoConfig } = require('@kestrel/flight');
  * Separate config for the scripted demo (issue #133, Track A).
  * Always records video, uses slowMo for viewer clarity, larger viewport.
  *
- * Run: npx playwright test --config=demo_config.cjs
+ * Run: cd demos/technical && npx playwright test --config=config.cjs
  * Env: DEMO_SLOWMO=200, KESTREL_URL, KESTREL_API_KEY
  */
 module.exports = buildDemoConfig(
-  [{ name: 'demo', testMatch: 'demo_technical.demo.cjs', timeout: 300000 }],
+  [{ name: 'demo', testMatch: 'demo.cjs', timeout: 300000 }],
   {
     baseURL: process.env.KESTREL_URL || 'http://localhost:8888',
     outputDir: path.join(__dirname, 'demo-output', 'playwright'),

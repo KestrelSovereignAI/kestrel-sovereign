@@ -9,7 +9,7 @@
  *   Act 5: Sovereignty Export
  *   Act 6: Permission Enforcement
  *
- * Run: cd tests/e2e && npx playwright test --config=demo_config.cjs
+ * Run: cd demos/technical && npx playwright test --config=config.cjs
  *
  * Output (in demo-output/):
  *   - narration.md   — timestamped transcript with screenshot references
@@ -20,10 +20,10 @@
  *
  * kestrel-eye integration:
  *   Screenshots are reviewed by kestrel-eye (https://github.com/KestrelSovereignAI/kestrel-eye)
- *   using a cheap vision model (Haiku) against expectations in eye-technical.toml.
- *   Run: kestrel-eye review --config eye-technical.toml
- *   Loop: kestrel-eye run --config eye-technical.toml --loop
- *   In kestrel-talon: add "kestrel-eye run --config eye-technical.toml" to .kestreltalon/quality.yaml
+ *   using a cheap vision model (Haiku) against expectations in eye.toml.
+ *   Run: kestrel-eye review --config demos/technical/eye.toml
+ *   Loop: kestrel-eye run --config demos/technical/eye.toml --loop
+ *   In kestrel-talon: add "kestrel-eye run --config demos/technical/eye.toml" to .kestreltalon/quality.yaml
  */
 const { test, expect } = require('@playwright/test');
 const fs = require('fs');
@@ -45,7 +45,7 @@ const {
     clearConversationHistory,
     startFreshSession,
     selectDemoProvider,
-} = require('./demo_helpers.cjs');
+} = require('../shared/demo_helpers.cjs');
 
 const BASE_URL = process.env.KESTREL_URL || 'http://localhost:8888';
 const OUTPUT_DIR = path.join(__dirname, 'demo-output');

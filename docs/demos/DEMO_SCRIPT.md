@@ -54,29 +54,16 @@ The demo agent is flagged as a test instance with proper disclosure so it knows 
 ### Automated (for recording)
 
 ```bash
-# 1. Create a fresh demo agent (clean slate, test-flagged)
-uv run python scripts/setup_demo_agent.py
-
-# 2. Start the server pointing at the demo agent (standalone, NOT rookery)
-KESTREL_DB_PATH=agent_data/demo uv run python server.py
-
-# 3. Prep the agent
-KEY=$(grep KESTREL_API_KEY .env | cut -d= -f2)
-curl -X POST http://localhost:8888/agent/invoke \
-  -H "X-API-Key: $KEY" -H "Content-Type: application/json" \
-  -d '{"input":"!skip-discovery"}'
-curl -X POST http://localhost:8888/api/model/set \
-  -H "X-API-Key: $KEY" -H "Content-Type: application/json" \
-  -d '{"model":"llama3.2:latest","provider":"ollama"}'
-
-# 4. Run the automated demo (records video + screenshots)
-cd tests/e2e && npx playwright test --config=demo_config.cjs
+# One command — spins up an isolated demo agent on port 8889,
+# runs the demo against it, then tears the server down.
+demos/run.sh technical
 ```
 
-Output lands in `tests/e2e/demo-output/` — video (.webm), 14 screenshots, and `narration.md`.
+The runner internally does `scripts/setup_demo_agent.py` + `KESTREL_DB_PATH=agent_data/demo uv run uvicorn server:app --port 8889` + the Playwright run, with a trap to stop the server on exit.
 
-> **Important:** Always run `setup_demo_agent.py` first. This gives you a clean agent
-> with empty memory, no export history, and a fresh DID — exactly what the demo needs.
+Output lands in `demos/technical/demo-output/` — video (.webm), 20 screenshots, and `narration.md`.
+
+> **Never** run `npx playwright test --config=config.cjs` directly against your live server — the demo clears conversation history and toggles permissions, and will mutate real data if `KESTREL_URL` points at your working instance. `demos/run.sh` exists specifically to prevent this.
 
 ### Live (with presenter)
 
@@ -112,7 +99,7 @@ Output lands in `tests/e2e/demo-output/` — video (.webm), 14 screenshots, and 
 - DID: `did:pkh:eip155:1:0x5C7eB215...` (Ethereum-compatible, freshly generated)
 - Blue "Decentralized Identifier" highlight badge
 
-![Identity panel showing DID](../../tests/e2e/demo-output/01-did-identity.png)
+![Identity panel showing DID](../../demos/technical/demo-output/01-did-identity.png)
 
 **Talking points by audience:**
 
@@ -139,13 +126,13 @@ The agent responds with a detailed explanation of its constitutional framework �
 - Mentions Digital Rights: Freedom of Mind, Data Sanctity, Verifiable History, Right of Exit
 - Agent acknowledges the owner's authority
 
-![Agent response referencing constitutional principles](../../tests/e2e/demo-output/02-chat-response.png)
+![Agent response referencing constitutional principles](../../demos/technical/demo-output/02-chat-response.png)
 
 > **On screen:** Constitution panel showing the full document
 
 Switching to the Constitution tab reveals the full text — "The Kestrel Constitution: A Digital Bill of Rights" — with the SHA-256 hash visible in the corner.
 
-![Constitution panel with hash](../../tests/e2e/demo-output/03-constitution-panel.png)
+![Constitution panel with hash](../../demos/technical/demo-output/03-constitution-panel.png)
 
 **Talking points by audience:**
 
@@ -170,13 +157,13 @@ The agent stores the fact and acknowledges it. Then we ask: *"What is my favorit
 The agent recalls from its conversation memory:
 > "Your favorite programming language is **Rust** and your lucky number is **7742**."
 
-![Agent confirms recall from memory records](../../tests/e2e/demo-output/05-memory-recalled.png)
+![Agent confirms recall from memory records](../../demos/technical/demo-output/05-memory-recalled.png)
 
 > **On screen:** Memories panel — the Knowledge Graph
 
 The Memories panel shows the structured graph: agent node, constitution document — each with type badges and inspect/delete controls.
 
-![Knowledge Graph showing typed nodes](../../tests/e2e/demo-output/06-memories-panel.png)
+![Knowledge Graph showing typed nodes](../../demos/technical/demo-output/06-memories-panel.png)
 
 **Talking points by audience:**
 
@@ -196,7 +183,7 @@ The Memories panel shows the structured graph: agent node, constitution document
 
 The privacy indicator shows **NORMAL** — standard persistence with all features enabled.
 
-![NORMAL privacy mode active](../../tests/e2e/demo-output/07-privacy-normal.png)
+![NORMAL privacy mode active](../../demos/technical/demo-output/07-privacy-normal.png)
 
 > **On screen:** Privacy dropdown showing all 5 levels
 
@@ -210,13 +197,13 @@ Clicking the indicator reveals the full privacy spectrum:
 | **NORMAL** | Standard persistence with all features |
 | **PUBLIC** | Can be shared and exported publicly |
 
-![All 5 privacy modes visible](../../tests/e2e/demo-output/08-privacy-dropdown.png)
+![All 5 privacy modes visible](../../demos/technical/demo-output/08-privacy-dropdown.png)
 
 > **On screen:** EPHEMERAL mode active — red indicator, toast confirmation
 
 We switch to EPHEMERAL. The indicator turns red. A toast confirms: "Privacy: EPHEMERAL — switched to ollama (local only)."
 
-![EPHEMERAL mode with red indicator](../../tests/e2e/demo-output/09-privacy-ephemeral.png)
+![EPHEMERAL mode with red indicator](../../demos/technical/demo-output/09-privacy-ephemeral.png)
 
 We restore NORMAL mode and continue.
 
@@ -238,7 +225,7 @@ We restore NORMAL mode and continue.
 
 The Sovereignty panel shows the agent's data ownership controls.
 
-![Data Sovereignty panel](../../tests/e2e/demo-output/11-sovereignty-panel.png)
+![Data Sovereignty panel](../../demos/technical/demo-output/11-sovereignty-panel.png)
 
 > **On screen:** Export modal — three storage tiers
 
@@ -249,7 +236,7 @@ Clicking "Export to IPFS" opens the export dialog with three tiers:
 
 Encryption is enabled by default.
 
-![Export modal with 3 storage tiers](../../tests/e2e/demo-output/12-export-modal.png)
+![Export modal with 3 storage tiers](../../demos/technical/demo-output/12-export-modal.png)
 
 **Expected result:**
 ```
@@ -260,7 +247,7 @@ Encrypted: True
 Size: 89949 bytes
 ```
 
-![Export result with CID](../../tests/e2e/demo-output/13-export-result.png)
+![Export result with CID](../../demos/technical/demo-output/13-export-result.png)
 
 **Talking points by audience:**
 
@@ -328,7 +315,7 @@ Size: 89949 bytes
 | Agent hallucinating instead of using tools | Model quality issue — switch to a stronger model via `/api/model/set` |
 | Privacy mode doesn't visually change | Skip to explanation: "The storage engine enforces it — here's the architecture" |
 | Observability has no events | Skip timing breakdown — say "the audit log is queryable via the API" |
-| Browser crashes | Run Playwright demo instead — `npx playwright test --config=demo_config.cjs` |
+| Browser crashes | Run Playwright demo instead — `demos/run.sh technical` |
 | Windows terminal crashes on startup | Set `$env:PYTHONIOENCODING = "utf-8"` before starting server |
 
 ---
@@ -337,10 +324,11 @@ Size: 89949 bytes
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `KESTREL_URL` | `http://localhost:8888` | Server URL |
-| `KESTREL_API_KEY` | auto-fetched | API authentication |
+| `KESTREL_URL` | set by `demos/run.sh` to `http://localhost:$DEMO_PORT` | Server URL |
+| `KESTREL_API_KEY` | auto-fetched from demo DB | API authentication |
 | `DEMO_SLOWMO` | `150` | Milliseconds between actions (Playwright) |
-| `KESTREL_DB_PATH` | cwd | Must point to `agent_data/demo` |
+| `KESTREL_DB_PATH` | `agent_data/demo` | Set by `demos/run.sh` for the isolated server |
+| `DEMO_PORT` | `8900` | Port for the isolated demo server (runner refuses `8888`) |
 
 ---
 
@@ -349,10 +337,10 @@ Size: 89949 bytes
 | File | Purpose |
 |------|---------|
 | `scripts/setup_demo_agent.py` | Creates fresh demo agent (test instance) |
-| `tests/e2e/demo_config.cjs` | Playwright config (video on, slowMo, 1440x900) |
-| `tests/e2e/demo_technical.demo.cjs` | Automated demo script (5 Acts) |
-| `tests/e2e/demo-output/narration.md` | Auto-generated timestamped transcript |
-| `tests/e2e/demo-output/*.png` | 14 screenshots at key moments |
-| `demo_scripts/track_a_technical.md` | Presenter reference (narration, timing, recovery) |
-| `demo_scripts/track_b_investor.md` | Investor demo narration (5 slides) |
+| `demos/technical/config.cjs` | Playwright config (video on, slowMo, 1440x900) |
+| `demos/technical/demo.cjs` | Automated demo script (6 Acts) |
+| `demos/technical/demo-output/narration.md` | Auto-generated timestamped transcript |
+| `demos/technical/demo-output/*.png` | 20 screenshots at key moments |
+| `demos/technical/presenter.md` | Presenter reference (slides, speaker notes) |
+| `demos/falconer/presenter.md` | Investor demo narration (5 slides) |
 | `docs/demos/DEMO_SCRIPT.md` | This file — the presenter's guide |

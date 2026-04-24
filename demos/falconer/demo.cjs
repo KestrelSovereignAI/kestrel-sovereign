@@ -9,9 +9,9 @@
  *   Act 5: Talon Autonomous Execution (the strike)
  *   Act 6: Constitutional Governance (trust architecture)
  *
- * Run: cd tests/e2e && npx playwright test --config=demo_falconer_config.cjs
+ * Run: cd demos/falconer && npx playwright test --config=config.cjs
  *
- * Output (in demo-output-falconer/):
+ * Output (in demo-output/):
  *   - narration.md   — timestamped transcript with screenshot references
  *   - NN-name.png    — screenshots at key moments (~20 total)
  *   - video (.webm)  — full browser recording
@@ -31,7 +31,7 @@ const fs = require('fs');
 const path = require('path');
 
 const BASE_URL = process.env.KESTREL_URL || 'http://localhost:8888';
-const OUTPUT_DIR = path.join(__dirname, 'demo-output-falconer');
+const OUTPUT_DIR = path.join(__dirname, 'demo-output');
 
 /** Build a console URL with ?key= param if API key is available. */
 function consoleUrl(pathSuffix = '') {
@@ -263,7 +263,7 @@ test.afterAll(async () => {
     fs.writeFileSync(path.join(OUTPUT_DIR, 'narration.md'), md, 'utf-8');
     console.log(`\n[DEMO] Narration written to ${path.join(OUTPUT_DIR, 'narration.md')}`);
     console.log(`[DEMO] Screenshots in ${OUTPUT_DIR}`);
-    console.log(`[DEMO] Video captured by Playwright in demo-output-falconer/`);
+    console.log(`[DEMO] Video captured by Playwright in demo-output/`);
 });
 
 // ============================================================================
