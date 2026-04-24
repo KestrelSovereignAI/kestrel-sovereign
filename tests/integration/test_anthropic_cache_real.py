@@ -159,20 +159,30 @@ async def test_anthropic_cache_read_on_turn_two_real_api():
 
 
 @pytest.mark.asyncio
-async def test_anthropic_cache_compounds_across_three_turns_with_single_marker():
-    """Three-turn conversation proves the single ``messages[-2]`` marker
-    **compounds** across turns via Anthropic's longest-prefix match,
-    provided history at turn N byte-matches what was sent at turn N-1.
+async def test_anthropic_cache_compounds_across_three_turns_with_two_history_markers():
+    """Three-turn conversation proves compound cache reads: turn 3's
+    cache_read must exceed turn 2's, indicating the prior turn's
+    history-end entry is being re-read on top of the system prefix.
 
-    This is the invariant that makes slot #4 unnecessary: once the
-    application layer stores the sent-form verbatim (see
-    ``streaming.py`` / ``kestrel_agent.py`` ``add_conversation`` calls
-    with ``metadata.sent_form``), the T2 cache entry at ``messages[-2]``
-    is still a prefix of the T3 request, so T3 reads it without needing
-    an additional marker at ``messages[-4]``.
+    **Requires TWO history markers, not one.** Empirically verified:
+    with only ``messages[-2]`` marked, T3 cache_read stays flat at the
+    system-prefix size — Anthropic's cache is indexed by marker
+    position, not arbitrary longest-prefix match, so T3's marker at its
+    own [-2] never queries T2's cached entry. Marking ``messages[-4]``
+    on T3 (which is the same position that was T2's [-2]) is what asks
+    Anthropic to hit that entry.
 
-    If this assertion fails, revisit whether the upstream prefix stayed
-    byte-stable — not whether we need more markers.
+    Also requires byte-stability between ``messages[-4]`` at T3 and
+    ``messages[-2]`` at T2. This test controls for that by constructing
+    T3's messages as ``messages_t2 + [assistant_t2, user_t3]`` so the
+    shared prefix is literally identical bytes. In the live application,
+    that invariant is upheld by the atomic-storage contract
+    (``metadata.sent_form=True`` on user rows —
+    see ``agent/context_builder.py`` and ``agent/streaming.py``).
+
+    If T3 read == T2 read: either the [-4] marker is missing or the
+    bytes at [-4] of T3 don't match [-2] of T2. Investigate prefix
+    stability before adding more markers.
     """
     key = _api_key()
     if not key:
@@ -225,24 +235,26 @@ async def test_anthropic_cache_compounds_across_three_turns_with_single_marker()
         file=sys.stderr,
     )
 
-    # T3 must hit cache at all — the single marker is producing usable
-    # entries across turns.
+    # T3 must hit cache at all — the system prefix alone should always
+    # hit, even without the [-4] marker.
     assert cache_read_t3 > 0, (
-        "Turn 3 should have read from cache. If zero, the marker at "
-        "messages[-2] is not producing a stable prefix. Check that the "
-        "history prefix at T3 is byte-identical to what was sent at T2 "
-        "— the atomic-storage contract (metadata.sent_form) is the "
-        "prerequisite for this invariant."
+        "Turn 3 should have read from cache. If zero, even the system "
+        "prefix isn't being cached — something is badly wrong with the "
+        "adapter's cache_control wiring."
     )
 
-    # Compounding: T3 should read MORE than T2 because the cache has
-    # grown to include T1's exchange. If T3 only reads what T2 read,
-    # caching stopped extending — the tail never became cacheable.
+    # Compounding: T3 must read STRICTLY MORE than T2 because T3's [-4]
+    # marker queries the entry T2 wrote at its [-2] position. If equal,
+    # the [-4] marker isn't present or isn't hitting — don't add more
+    # markers without first checking prefix byte-stability and that
+    # _messages_with_penultimate_cache_marker is placing both markers.
     assert cache_read_t3 > cache_read_t2, (
-        "Turn 3 cache read did not exceed turn 2 cache read — the cache "
-        "is not compounding across turns. Either Anthropic stopped doing "
-        "longest-prefix match or the T2 marker didn't create a reusable "
-        "entry.\n"
+        "Turn 3 cache read did not exceed turn 2 cache read — the "
+        "[-4] history marker is not compounding. Verify that:\n"
+        "  1. _messages_with_penultimate_cache_marker places markers at "
+        "BOTH messages[-2] and messages[-4] when history is long enough.\n"
+        "  2. messages[-4] of T3 is byte-identical to messages[-2] of T2 "
+        "(atomic-storage contract in agent/context_builder.py).\n"
         f"T2 read={cache_read_t2} T3 read={cache_read_t3}"
     )
 
