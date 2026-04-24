@@ -538,6 +538,90 @@ class AsyncConversationStore:
             (self.agent_id,)
         )
 
+    # ------------------------------------------------------------------
+    # Conversation titles (user-assigned rename support — issue #716).
+    # ------------------------------------------------------------------
+    #
+    # Stored out-of-band in ``conversation_titles`` rather than on
+    # conversation_history rows because:
+    #   * message rows are frequently encrypted and their metadata JSON
+    #     carries unrelated bookkeeping
+    #   * rename is a single-row upsert here, vs. having to find-and-edit
+    #     the first message of a session
+    #   * deleting a session is a separate concern (#715) that wipes
+    #     messages; the title row is stale-but-harmless until the user
+    #     does something explicit to address it
+
+    MAX_CONVERSATION_NAME_LENGTH = 120
+
+    async def set_conversation_name(
+        self, session_id: str, name: Optional[str]
+    ) -> Optional[str]:
+        """Upsert the user-chosen display name for a conversation.
+
+        Args:
+            session_id: The session whose name we're setting.
+            name: New name.  ``None`` or empty-after-strip clears the
+                  override (the UI will fall back to the computed
+                  preview).  Non-empty values are trimmed and capped to
+                  ``MAX_CONVERSATION_NAME_LENGTH``.
+
+        Returns:
+            The final stored value (trimmed), or ``None`` when cleared.
+        """
+        # Normalize inputs.  Empty strings and whitespace-only strings
+        # collapse to "clear the override" so UI callers can just blur
+        # an empty text input and get the expected behavior.
+        if name is None:
+            stored: Optional[str] = None
+        else:
+            trimmed = name.strip()
+            if not trimmed:
+                stored = None
+            else:
+                stored = trimmed[: self.MAX_CONVERSATION_NAME_LENGTH]
+
+        if stored is None:
+            await self.db.execute_commit(
+                "DELETE FROM conversation_titles "
+                "WHERE agent_id = ? AND session_id = ?",
+                (self.agent_id, session_id),
+            )
+            return None
+
+        # Upsert.  SQLite and Postgres both accept the ON CONFLICT syntax.
+        await self.db.execute_commit(
+            "INSERT INTO conversation_titles (agent_id, session_id, name, updated_at) "
+            f"VALUES (?, ?, ?, {self._now_sql()}) "
+            "ON CONFLICT (agent_id, session_id) DO UPDATE SET "
+            f"  name = excluded.name, updated_at = {self._now_sql()}",
+            (self.agent_id, session_id, stored),
+        )
+        return stored
+
+    async def get_conversation_name(self, session_id: str) -> Optional[str]:
+        """Return the user-assigned name for a conversation, or None."""
+        row = await self.db.fetchone(
+            "SELECT name FROM conversation_titles "
+            "WHERE agent_id = ? AND session_id = ?",
+            (self.agent_id, session_id),
+        )
+        if not row:
+            return None
+        return row[0]
+
+    async def get_conversation_names(self) -> Dict[str, str]:
+        """Return {session_id: name} for every titled session owned by
+        this agent.  Used by the list endpoint to decorate the response
+        in a single round-trip instead of querying per row.
+        """
+        rows = await self.db.fetchall(
+            "SELECT session_id, name FROM conversation_titles "
+            "WHERE agent_id = ? AND name IS NOT NULL",
+            (self.agent_id,),
+        )
+        return {row[0]: row[1] for row in rows if row[1]}
+
     async def delete_message(self, message_id: int) -> bool:
         """Delete a specific message by ID.
 

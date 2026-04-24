@@ -61,6 +61,21 @@ CREATE TABLE IF NOT EXISTS conversation_history (
 
 CREATE INDEX IF NOT EXISTS idx_conversation_agent_id ON conversation_history(agent_id);
 
+-- User-assigned conversation titles (issue #716).  Decoupled from
+-- conversation_history so renames are a single-row upsert instead of a
+-- metadata-JSON edit on an encrypted message.  Nullable name means
+-- "cleared — use the computed display title instead."
+CREATE TABLE IF NOT EXISTS conversation_titles (
+    agent_id   TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    name       TEXT,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (agent_id, session_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_conversation_titles_agent
+    ON conversation_titles(agent_id);
+
 CREATE TABLE IF NOT EXISTS model_usage (
     model_id TEXT PRIMARY KEY,
     provider TEXT NOT NULL,
