@@ -193,8 +193,18 @@ export const Security = {
 
             return response;
         } catch (error) {
-            console.error('Failed to submit approval:', error);
-            Toast.error('Failed to submit decision');
+            // 404 here almost always means the server-side request_approval
+            // call already returned (timed out at 5min default, or was
+            // cancelled). The user sees a raw stack otherwise — replace it
+            // with a clear message and skip the redundant error toast.
+            const msg = (error && error.message) || '';
+            if (msg.includes('not found') || msg.includes('expired')) {
+                Toast.warning('This approval already expired on the server — the caller moved on.');
+                console.warn('Approval expired before user submitted decision:', approvalId);
+            } else {
+                console.error('Failed to submit approval:', error);
+                Toast.error('Failed to submit decision');
+            }
             return { success: false };
         }
     },

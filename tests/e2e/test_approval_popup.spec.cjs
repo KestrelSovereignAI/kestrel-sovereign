@@ -226,6 +226,53 @@ test.describe('#748 security approval popup', () => {
         expect(approveCalls[0].approval_id).toBe('dup-1');
     });
 
+    test('expired approval (server returns 404) shows a friendly toast, not a raw error', async ({ page }) => {
+        let sseCallCount = 0;
+        await page.route('**/agent/notifications/sse**', async (route) => {
+            sseCallCount += 1;
+            const events =
+                sseCallCount === 1
+                    ? [
+                          { event: 'connected', data: { status: 'connected' } },
+                          {
+                              event: 'approval_request',
+                              data: { ...APPROVAL_PAYLOAD, id: 'expired-1' },
+                          },
+                      ]
+                    : [{ event: 'connected', data: { status: 'connected' } }];
+            await route.fulfill({
+                status: 200,
+                headers: {
+                    'Content-Type': 'text/event-stream',
+                    'Cache-Control': 'no-cache',
+                    Connection: 'keep-alive',
+                },
+                body: sseBody(events),
+            });
+        });
+
+        // Simulate the server-side request_approval having already timed out.
+        await page.route('**/api/security/approve', async (route) => {
+            await route.fulfill({
+                status: 404,
+                contentType: 'application/json',
+                body: JSON.stringify({ detail: "Request 'expired-1' not found or expired" }),
+            });
+        });
+
+        await page.goto(`${KESTREL_URL}/?key=${encodeURIComponent(API_KEY)}`);
+
+        await expect(page.locator('#modal-overlay')).toBeVisible({ timeout: 10000 });
+        await page.click('.modal-btn:has-text("This Session")');
+
+        // User should see a clear warning toast — not a raw error stack.
+        const warning = page.locator('.toast-item').filter({ hasText: 'expired' });
+        await expect(warning).toBeVisible({ timeout: 5000 });
+
+        // Modal should still close.
+        await expect(page.locator('#modal-overlay')).not.toBeVisible({ timeout: 5000 });
+    });
+
     test('denying from the modal posts approved=false', async ({ page }) => {
         let sseCallCount = 0;
         await page.route('**/agent/notifications/sse**', async (route) => {
