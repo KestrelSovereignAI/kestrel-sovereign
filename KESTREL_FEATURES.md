@@ -327,6 +327,8 @@ The currently exported `Feature` subclasses discovered from those modules includ
   - `POST /voice/tts/stream`
   - `POST /voice/stt`
   - `WebSocket /voice/chat`
+- [`endpoints/voice_realtime.py`](endpoints/voice_realtime.py)
+  - `POST /voice/realtime/session` — mint an OpenAI Realtime ephemeral-token bundle for browser WebRTC sessions. Privacy-gated via the voice path resolver; returns 409 with fallback provider names when the active route is not realtime.
 - [`endpoints/features.py`](endpoints/features.py)
   - `GET /api/features`
   - `GET /api/features/installed`
