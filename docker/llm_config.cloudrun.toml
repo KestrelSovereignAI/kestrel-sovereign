@@ -1,20 +1,51 @@
-# LLM provider configuration for Cloud Run deployment.
-# Cloud-only providers — no local llama_cpp or ollama.
+# LLM configuration for Cloud Run deployment.
+# Vendor/route/model architecture — see docs/architecture/LLM_SERVICE_ARCHITECTURE.md
+# Cloud-only: no Claude Max OAuth, no local llama_cpp, no local ollama.
 
-provider_priority = ["anthropic", "openai", "vertex_ai"]
+route_priority = [
+    "anthropic:api",
+    "openai:api",
+    "vertex_ai:api",
+]
 
-# Anthropic (Claude) — Primary provider for Meridian and all cloud agents
-[anthropic]
-model = "auto"
-selection_hints = ["sonnet", "opus"]
-api_key_env = "ANTHROPIC_API_KEY"
 
-# OpenAI — Fallback
-[openai]
-model = "auto"
-selection_hints = ["gpt-4", "gpt-5"]
+# =============================================================================
+# Anthropic
+# =============================================================================
 
-# Vertex AI / Google AI Studio (Gemini)
-[vertex_ai]
-model = "auto"
+[vendors.anthropic]
+is_cloud = true
+
+[vendors.anthropic.routes.api]
+adapter         = "AnthropicAdapter"
+api_key_env     = "ANTHROPIC_API_KEY"
+model           = "auto"
+selection_hints = ["sonnet", "haiku", "opus"]
+
+
+# =============================================================================
+# OpenAI
+# =============================================================================
+
+[vendors.openai]
+is_cloud = true
+
+[vendors.openai.routes.api]
+adapter         = "OpenAIAdapter"
+api_key_env     = "OPENAI_API_KEY"
+model           = "auto"
+selection_hints = ["gpt-5", "gpt-4"]
+
+
+# =============================================================================
+# Google Vertex AI / AI Studio (Gemini)
+# =============================================================================
+
+[vendors.vertex_ai]
+is_cloud = true
+
+[vendors.vertex_ai.routes.api]
+adapter         = "VertexAIAdapter"
+api_key_env     = "GOOGLE_API_KEY"
+model           = "auto"
 selection_hints = ["gemini", "pro", "flash"]

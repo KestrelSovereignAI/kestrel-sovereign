@@ -6,6 +6,21 @@
 import API from './api.js';
 import { Modal, Toast, escapeHtml } from './ui.js';
 
+// Render a feature icon. `name` is typically a kicon key (e.g. "fingerprint",
+// "shield"). Falls back to the raw value when it's a literal emoji, and to a
+// generic package glyph when the name is unknown to the icon library.
+function renderFeatureIcon(name, size) {
+    const fontSize = size || '1.5rem';
+    const isKiconName = typeof name === 'string' && /^[a-z][a-z0-9-]*$/.test(name);
+    if (isKiconName && typeof window.kicon === 'function' && window.KI_PATHS && window.KI_PATHS[name]) {
+        return `<span style="font-size: ${fontSize}; line-height: 1; display: inline-flex;">${window.kicon(name, fontSize)}</span>`;
+    }
+    if (isKiconName && typeof window.kicon === 'function' && window.KI_PATHS && window.KI_PATHS['cabinet']) {
+        return `<span style="font-size: ${fontSize}; line-height: 1; display: inline-flex;">${window.kicon('cabinet', fontSize)}</span>`;
+    }
+    return `<span style="font-size: ${fontSize};">${escapeHtml(name || '')}</span>`;
+}
+
 // ============================================================================
 // State
 // ============================================================================
@@ -122,7 +137,7 @@ function renderFeatureGrid() {
 function renderFeatureCard(feature) {
     const status = feature.status || 'available';
     const badge = getStatusBadge(status);
-    const icon = feature.icon || '📦';
+    const iconHtml = renderFeatureIcon(feature.icon);
     const name = escapeHtml(feature.name || 'Unknown');
     const description = escapeHtml(feature.description || 'No description');
     const tags = feature.tags || [];
@@ -171,7 +186,7 @@ function renderFeatureCard(feature) {
            onmouseout="this.style.boxShadow='var(--card-shadow)';this.style.borderColor='var(--border-color)'">
             <div style="display: flex; justify-content: space-between; align-items: flex-start;">
                 <div style="display: flex; align-items: center; gap: 0.5rem;">
-                    <span style="font-size: 1.5rem;">${icon}</span>
+                    ${iconHtml}
                     <div>
                         <div style="font-weight: 600; font-size: 0.95rem;">${name}</div>
                         ${isCore ? '<span style="font-size: 0.65rem; color: var(--accent-color); font-weight: 600;">CORE</span>' : ''}
@@ -359,7 +374,7 @@ async function showDetail(name) {
 
 function renderDetailModal(detail) {
     const name = detail.name || 'Unknown';
-    const icon = detail.icon || '📦';
+    const iconHtml = renderFeatureIcon(detail.icon, '1.25rem');
     const description = detail.description || detail.tool_description || 'No description';
     const status = detail.status || 'available';
     const badge = getStatusBadge(status);
@@ -518,7 +533,7 @@ function renderDetailModal(detail) {
     });
 
     Modal.show({
-        title: `${icon} ${escapeHtml(name)}`,
+        title: `${iconHtml} ${escapeHtml(name)}`,
         content: `
             <div style="max-height: 60vh; overflow-y: auto;">
                 <div style="display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.75rem;">
