@@ -29,6 +29,7 @@ from kestrel_sovereign.cli import (
     _host_pid_file,
 )
 from kestrel_sovereign.rookery.process_manager import ProcessManager
+from kestrel_sovereign.rookery.config import RookeryConfig
 
 
 # -----------------------------------------------------------------------
@@ -709,6 +710,191 @@ class TestCmdShell:
         assert rc == 1
         output = capsys.readouterr().out
         assert "not found" in output
+
+    def test_shell_routes_to_running_server_when_detected(self, rookery_env, capsys):
+        """If a server is up for the named agent, cmd_shell MUST route the
+        chat session through HTTP — not spawn a second in-process agent.
+        That's the #654 fix: `kestrel start X` + `kestrel shell X` should
+        share state, not run two copies.
+        """
+        parser = build_parser()
+        args = parser.parse_args(["shell", "claw"])
+
+        with patch(
+            "kestrel_sovereign.cli._get_project_dir", return_value=rookery_env
+        ), patch(
+            "kestrel_sovereign.cli._detect_running_agent_server",
+            return_value=("http://localhost:18801", "test-key"),
+        ) as detect, patch(
+            "kestrel_sovereign.cli._run_http_shell", return_value=0
+        ) as http_shell, patch(
+            "kestrel_sovereign.cli.asyncio.run"
+        ) as local_shell:
+            rc = cmd_shell(args)
+
+        assert rc == 0
+        detect.assert_called_once()
+        http_shell.assert_called_once_with(
+            "claw", "http://localhost:18801", "test-key"
+        )
+        local_shell.assert_not_called()  # MUST NOT fall back when server is up
+
+    def test_shell_falls_back_to_local_when_no_server(self, rookery_env):
+        """No running server for this agent → spawn local in-process agent.
+        Backward-compatible with pre-#654 behavior.
+        """
+        parser = build_parser()
+        args = parser.parse_args(["shell", "claw"])
+
+        with patch(
+            "kestrel_sovereign.cli._get_project_dir", return_value=rookery_env
+        ), patch(
+            "kestrel_sovereign.cli._detect_running_agent_server",
+            return_value=None,
+        ), patch(
+            "kestrel_sovereign.cli._run_http_shell"
+        ) as http_shell, patch(
+            "kestrel_sovereign.cli.asyncio.run", return_value=0
+        ) as local_shell:
+            rc = cmd_shell(args)
+
+        assert rc == 0
+        http_shell.assert_not_called()
+        local_shell.assert_called_once()
+
+    def test_shell_with_app_extension_bypasses_http_route(self, rookery_env):
+        """Extensions (e.g. --app elderly) mutate the live agent object and
+        are only wired into the in-process shell. When --app is passed,
+        skip the HTTP-routing probe entirely so the extension loads.
+        """
+        parser = build_parser()
+        args = parser.parse_args(["shell", "claw", "--app", "elderly"])
+
+        with patch(
+            "kestrel_sovereign.cli._get_project_dir", return_value=rookery_env
+        ), patch(
+            "kestrel_sovereign.cli._detect_running_agent_server"
+        ) as detect, patch(
+            "kestrel_sovereign.cli._run_http_shell"
+        ) as http_shell, patch(
+            "kestrel_sovereign.cli.asyncio.run", return_value=0
+        ) as local_shell:
+            rc = cmd_shell(args)
+
+        assert rc == 0
+        detect.assert_not_called()  # Don't probe when --app forces local path
+        http_shell.assert_not_called()
+        local_shell.assert_called_once()
+
+
+# -----------------------------------------------------------------------
+# _detect_running_agent_server tests (#654)
+# -----------------------------------------------------------------------
+
+class TestDetectRunningAgentServer:
+    """Verify the detection helper that decides between HTTP-routed shell
+    and local in-process fallback."""
+
+    def _make_cfg(self, rookery_env):
+        from kestrel_sovereign.cli import _detect_running_agent_server
+        rookery = RookeryConfig.load(rookery_env / "rookery.toml")
+        agent_cfg = rookery.get_local_agents()["claw"]
+        return _detect_running_agent_server, agent_cfg, rookery
+
+    def test_returns_none_when_no_server_reachable(self, rookery_env):
+        """Both probe candidates raise ConnectionError → detection returns
+        None so cmd_shell falls back to local."""
+        import httpx
+        detect, agent_cfg, rookery = self._make_cfg(rookery_env)
+
+        with patch(
+            "httpx.get", side_effect=httpx.ConnectError("refused")
+        ):
+            result = detect("claw", agent_cfg, rookery)
+
+        assert result is None
+
+    def test_detects_standalone_agent_on_agent_port(self, rookery_env):
+        """Standalone / subprocess mode: the agent hosts itself on
+        agent_cfg.port. /health returns 200 → detection returns the
+        agent-port URL with no path prefix."""
+        detect, agent_cfg, rookery = self._make_cfg(rookery_env)
+
+        def fake_get(url, timeout=None, **kwargs):
+            resp = MagicMock()
+            if url.endswith(f":{agent_cfg.port}/health"):
+                resp.status_code = 200
+                return resp
+            if url.endswith(f":{agent_cfg.port}/api/auth/key"):
+                resp.status_code = 200
+                resp.json.return_value = {"key": "agent-port-key"}
+                return resp
+            raise AssertionError(f"unexpected probe: {url}")
+
+        with patch("httpx.get", side_effect=fake_get):
+            result = detect("claw", agent_cfg, rookery)
+
+        assert result == (f"http://localhost:{agent_cfg.port}", "agent-port-key")
+
+    def test_detects_multi_agent_under_host_port(self, rookery_env):
+        """In-process multi-agent mode: the agent's own port is dead, but
+        the host port responds and routes /api/agents/{name}/ to our
+        agent. Detection returns host URL with the agent prefix."""
+        import httpx
+        detect, agent_cfg, rookery = self._make_cfg(rookery_env)
+
+        def fake_get(url, timeout=None, **kwargs):
+            if url.endswith(f":{agent_cfg.port}/health"):
+                raise httpx.ConnectError("no standalone")
+            resp = MagicMock()
+            if url.endswith(f":{rookery.host.port}/health"):
+                resp.status_code = 200
+                return resp
+            if url.endswith(f":{rookery.host.port}/api/auth/key"):
+                resp.status_code = 200
+                resp.json.return_value = {"key": "host-key"}
+                return resp
+            if url.endswith(f"/api/agents/claw/health"):
+                resp.status_code = 200
+                return resp
+            raise AssertionError(f"unexpected probe: {url}")
+
+        with patch("httpx.get", side_effect=fake_get):
+            result = detect("claw", agent_cfg, rookery)
+
+        assert result == (
+            f"http://localhost:{rookery.host.port}/api/agents/claw",
+            "host-key",
+        )
+
+    def test_host_running_but_agent_not_routed_returns_none(self, rookery_env):
+        """Host port responds to /health, but scoped
+        /api/agents/{name}/health returns 404 (agent not registered by
+        this host). Detection must return None — don't misroute the
+        session to a different agent."""
+        import httpx
+        detect, agent_cfg, rookery = self._make_cfg(rookery_env)
+
+        def fake_get(url, timeout=None, **kwargs):
+            if url.endswith(f":{agent_cfg.port}/health"):
+                raise httpx.ConnectError("no standalone")
+            resp = MagicMock()
+            if url.endswith(f":{rookery.host.port}/health"):
+                resp.status_code = 200
+                return resp
+            if url.endswith(f":{rookery.host.port}/api/auth/key"):
+                resp.status_code = 200
+                resp.json.return_value = {"key": "host-key"}
+                return resp
+            if url.endswith(f"/api/agents/claw/health"):
+                resp.status_code = 404
+                return resp
+            raise AssertionError(f"unexpected probe: {url}")
+
+        with patch("httpx.get", side_effect=fake_get):
+            result = detect("claw", agent_cfg, rookery)
+
+        assert result is None
 
 
 # -----------------------------------------------------------------------
