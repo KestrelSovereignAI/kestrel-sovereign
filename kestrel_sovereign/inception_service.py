@@ -554,7 +554,7 @@ def build_cli_parser() -> argparse.ArgumentParser:
         "--output-dir",
         "--output",
         dest="output_dir",
-        type=Path,
+        type=str,
         default=None,
         help="Directory to save agent files.",
     )
