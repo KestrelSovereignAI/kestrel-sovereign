@@ -1,6 +1,6 @@
 # Launch Copy Drafts
 
-This folder holds the current landing-page copy drafts for the Kestrel open-source launch.
+This folder holds the current launch-copy assets for the Kestrel open-source launch.
 
 ## Files
 
@@ -8,6 +8,7 @@ This folder holds the current landing-page copy drafts for the Kestrel open-sour
 - `SIMPLE_LAUNCH_PAGE_ONE_SCREEN.md` — a tighter one-screen version for a minimal launch page.
 - `PUBLISH_READY_LANDING_PAGE_COPY.md` — tightened publish-ready copy for a fuller public page.
 - `LANDING_PAGE_HTML_STRUCTURE.md` — implementation-ready semantic HTML section structure for engineering.
+- `PREVIEW_PACKET_LANGUAGE.md` — canonical preview-packet send language for the builder cohort and the lighter outside-the-bubble variant.
 
 ## Intended Use
 
@@ -15,6 +16,7 @@ This folder holds the current landing-page copy drafts for the Kestrel open-sour
 - Start with `LANDING_PAGE_HTML_STRUCTURE.md` if engineering needs a fast implementation map.
 - Use `LANDING_PAGE_WIREFRAME.md` when revisiting section order, message flow, or page logic.
 - Use `SIMPLE_LAUNCH_PAGE_ONE_SCREEN.md` if the team wants a fast, minimal page that can ship with low implementation overhead.
+- Use `PREVIEW_PACKET_LANGUAGE.md` when the team needs the actual preview/send language rather than public landing-page copy.
 - Treat these as launch-copy assets, not long-term product docs.
 
 ## Source Constraints
