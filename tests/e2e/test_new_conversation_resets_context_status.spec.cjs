@@ -39,21 +39,22 @@ test('context-status footer resets to 0 messages after startNewConversation', as
     await page.evaluate((a) => window.selectAgent(a), AGENT);
 
     // The footer lives inside panel-chat; the element is in the DOM but
-    // not visible until the chat panel is active. Find it via JS (not
-    // visibility-aware locator) and wait for the async status round-trip
-    // to populate its text.
+    // not visible until the chat panel is active.  After issue #713 we
+    // no longer populate the footer before a conversation is active —
+    // selectAgent leaves ``state.currentSessionId = null`` and
+    // ``updateContextStatus`` hides the indicator in that case, rather
+    // than showing the agent's cross-session aggregate ("472 msgs ·
+    // 100% Compress" on an empty pane).  So we wait for the element to
+    // be ATTACHED but NOT for it to contain a count.
     await page.waitForSelector('#context-status', { state: 'attached', timeout: 15000 });
-    await page.waitForFunction(
-        () => {
-            const el = document.getElementById('context-status');
-            return el && /\d+\s*msgs/.test(el.textContent || '');
-        },
-        { timeout: 20000 },
-    );
 
-    // Trigger the canonical new-conversation flow. If the agent has prior
-    // history, this is where the regression used to surface — the footer
-    // kept showing the previous session's count.
+    // Trigger the canonical new-conversation flow.  Two regressions this
+    // pins: (a) the original — after ``startNewConversation`` the footer
+    // used to keep showing the PREVIOUS session's count; (b) #713 —
+    // before the new conversation, the footer used to show the agent's
+    // cross-session aggregate.  After both fixes: the footer starts
+    // empty, then settles to "0 msgs · 0%" once the fresh session is
+    // created.
     await page.evaluate(() => window.startNewConversation());
 
     // After the fix, the footer must re-poll /agent/context-status with the
