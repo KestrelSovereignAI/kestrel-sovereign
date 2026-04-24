@@ -708,9 +708,9 @@ class TestRegistryStatusResolution:
         enabled = {"HealthFeature", "ModelAgent"}
         registry = get_registry(enabled_class_names=enabled)
 
-        heartbeat_pkg = registry.get("heartbeat")
-        assert heartbeat_pkg is not None
-        assert heartbeat_pkg.status == FeatureStatus.ENABLED
+        health_pkg = registry.get("health")
+        assert health_pkg is not None
+        assert health_pkg.status == FeatureStatus.ENABLED
 
         model_pkg = registry.get("model")
         assert model_pkg is not None
