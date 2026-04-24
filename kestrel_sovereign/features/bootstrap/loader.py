@@ -347,13 +347,22 @@ class BootstrapLoader:
             return
 
         total_chars = 0
+        missing: List[str] = []
 
         for filename in self._file_order:
             filepath = self._find_file(filename)
             if filepath is None:
-                logger.warning(
-                    f"Bootstrap file '{filename}' not found in any search path — "
-                    "agent will start without this context"
+                # All entries in DEFAULT_BOOTSTRAP_FILES are explicitly
+                # optional (see the module docstring). A fresh agent has
+                # none of them, so logging a WARNING per missing file
+                # produces a wall of red on first-run — #659. Emit at
+                # DEBUG here; the per-load summary below reports the
+                # aggregate count at INFO so ops still sees what was
+                # found vs. missing without the noise.
+                missing.append(filename)
+                logger.debug(
+                    f"Bootstrap file '{filename}' not found in any search path "
+                    "(optional — agent will start without this context)"
                 )
                 continue
 
@@ -385,10 +394,19 @@ class BootstrapLoader:
             except Exception as e:
                 logger.warning(f"Failed to load bootstrap file {filename}: {e}")
 
-        if self._cache:
-            names = ", ".join(self._cache.keys())
+        # Single summary line so a fresh agent produces one INFO instead
+        # of 10 WARNINGs. Missing-count is informational; callers who
+        # want the per-file breakdown can use ``list_files()``.
+        if self._cache or missing:
+            loaded_names = ", ".join(self._cache.keys()) or "(none)"
+            missing_count = len(missing)
+            suffix = (
+                f" · {missing_count} optional file{'s' if missing_count != 1 else ''} not present"
+                if missing_count else ""
+            )
             logger.info(
-                f"Bootstrap files loaded: {names} ({total_chars} total chars)"
+                f"Bootstrap: {self.file_count} loaded [{loaded_names}] · "
+                f"{total_chars} chars{suffix}"
             )
 
         self._loaded = True
