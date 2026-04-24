@@ -726,6 +726,275 @@ async def get_key_usage(request: Request, provider: str, days: int = Query(30, g
         raise HTTPException(status_code=500, detail="Error retrieving key usage.")
 
 
+# ---------------------------------------------------------------------------
+# Three-tier key panel endpoints (resources.js)
+#
+# Kestrel's key resolution is layered: (1) Agent key, (2) User BYOK,
+# (3) Platform pool.  The console's Resources panel queries the backend to
+# render each tier and to show which source is active.  Tiers 2 and 3 live
+# in Postgres-backed platform deployments only; in a local-sovereign SQLite
+# agent these routes return empty/"not available" responses so the panel
+# renders cleanly instead of the browser spamming 405 Method Not Allowed.
+# ---------------------------------------------------------------------------
+
+
+def _get_postgres_pool(agent):
+    """Return the asyncpg Pool if the agent runs on a Postgres backend, else None.
+
+    Local-sovereign SQLite agents have no pool; the BYOK/platform storages
+    require one.  Callers use this to decide between "real" three-tier
+    behavior and the empty/disabled shape.
+    """
+    storage = getattr(agent, "storage", None)
+    if not storage or not hasattr(storage, "db"):
+        return None
+    db = storage.db
+    backend = getattr(db, "backend", None)
+    if backend is None or getattr(db, "backend_type", None) != "postgres":
+        return None
+    return getattr(backend, "_pool", None)
+
+
+@router.get("/api/keys/available-sources")
+async def get_available_key_sources(
+    request: Request,
+    provider: str = Query(..., description="Service provider id (openrouter, openai, etc.)"),
+):
+    """Report which tiers (agent/user/platform) can serve a given provider.
+
+    Always checks tier 1 (agent's own keys) via local ServiceKeyStorage.
+    Tiers 2-3 are checked only when a Postgres pool is available; in local
+    SQLite mode they're reported as False, which is accurate for that
+    deployment.
+    """
+    agent = get_agent(request)
+    provider_id = provider.lower().strip()
+
+    sources = {"agent": False, "user": False, "platform": False}
+    platform_margin = None
+
+    storage = getattr(agent, "storage", None)
+    if storage and hasattr(storage, "db"):
+        try:
+            from kestrel_sovereign.security.service_key_storage import ServiceKeyStorage
+            key_storage = ServiceKeyStorage(storage.db, agent.agent_id)
+            sources["agent"] = await key_storage.has_key(provider_id=provider_id)
+        except Exception as e:
+            logger.debug(f"Agent key source check failed for {provider_id}: {e}")
+
+    pool = _get_postgres_pool(agent)
+    if pool is not None:
+        try:
+            from kestrel_sovereign.services.layered_key_resolver import LayeredKeyResolver
+            resolver = LayeredKeyResolver(pool)
+            user_id = getattr(request.state, "user_id", None)
+            agent_did = getattr(agent, "agent_id", None)
+            platform_result = await resolver.get_available_sources(
+                provider=provider_id,
+                user_id=user_id,
+                agent_did=agent_did,
+            )
+            sources["user"] = bool(platform_result.get("user"))
+            sources["platform"] = bool(platform_result.get("platform"))
+            margin = platform_result.get("platform_margin")
+            if margin is not None:
+                platform_margin = f"{margin}"
+        except Exception as e:
+            logger.debug(f"Platform/user source check failed for {provider_id}: {e}")
+
+    return {
+        "provider": provider_id,
+        "sources": sources,
+        "platform_margin": platform_margin,
+    }
+
+
+@router.get("/api/keys/user")
+async def list_user_keys(request: Request):
+    """List user BYOK keys (empty shape on local-sovereign SQLite deployments).
+
+    In Postgres-backed platform deployments this returns the user's
+    passphrase-encrypted keys.  In local mode (no pool, no multi-user
+    concept) returns an empty list so the Resources panel renders the
+    "no personal keys added" state cleanly.
+    """
+    agent = get_agent(request)
+    pool = _get_postgres_pool(agent)
+    user_id = getattr(request.state, "user_id", None)
+
+    if pool is None or not user_id:
+        return {"keys": [], "count": 0, "available": False}
+
+    try:
+        from kestrel_sovereign.security.user_key_storage import UserKeyStorage
+        user_storage = UserKeyStorage(pool, user_id)
+        keys = await user_storage.list_keys()
+        return {
+            "keys": [
+                {
+                    "id": k.id,
+                    "provider": k.provider_id,
+                    "display_name": k.display_name,
+                    "is_active": k.is_active,
+                    "quota_limit": k.quota_limit,
+                    "quota_used": k.quota_used,
+                    "created_at": k.created_at.isoformat() if k.created_at else None,
+                }
+                for k in keys
+            ],
+            "count": len(keys),
+            "available": True,
+        }
+    except Exception as e:
+        logger.error(f"Error listing user BYOK keys: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Error retrieving user keys.")
+
+
+@router.post("/api/keys/user")
+async def add_user_key(request: Request):
+    """Add a user BYOK key.  Only available in platform (Postgres) deployments."""
+    agent = get_agent(request)
+    pool = _get_postgres_pool(agent)
+    user_id = getattr(request.state, "user_id", None)
+
+    if pool is None or not user_id:
+        raise HTTPException(
+            status_code=503,
+            detail="User BYOK is only available on platform deployments. "
+                   "Use Agent Keys (Add Agent Key) on this local sovereign instance.",
+        )
+
+    body = await request.json()
+    provider_id = (body.get("provider") or "").lower().strip()
+    api_key = (body.get("api_key") or "").strip()
+    passphrase = body.get("passphrase") or ""
+    display_name = body.get("display_name")
+
+    if not provider_id:
+        raise HTTPException(status_code=400, detail="provider is required")
+    if not api_key:
+        raise HTTPException(status_code=400, detail="api_key is required")
+    if len(passphrase) < 8:
+        raise HTTPException(status_code=400, detail="passphrase must be at least 8 characters")
+
+    try:
+        from kestrel_sovereign.security.user_key_storage import UserKeyStorage
+        user_storage = UserKeyStorage(pool, user_id)
+        key_id = await user_storage.store_key(
+            provider_id=provider_id,
+            api_key=api_key,
+            passphrase=passphrase,
+            display_name=display_name,
+        )
+        return {
+            "success": True,
+            "key_id": key_id,
+            "provider": provider_id,
+            "message": f"Personal {provider_id} key stored successfully.",
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error adding user BYOK key: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Error adding user key.")
+
+
+@router.post("/api/keys/user/verify")
+async def verify_user_passphrase(request: Request):
+    """Verify the user's BYOK passphrase against ANY stored key (platform only)."""
+    agent = get_agent(request)
+    pool = _get_postgres_pool(agent)
+    user_id = getattr(request.state, "user_id", None)
+
+    if pool is None or not user_id:
+        return {"valid": False, "available": False}
+
+    body = await request.json()
+    passphrase = body.get("passphrase") or ""
+    if not passphrase:
+        raise HTTPException(status_code=400, detail="passphrase is required")
+
+    try:
+        from kestrel_sovereign.security.user_key_storage import UserKeyStorage
+        user_storage = UserKeyStorage(pool, user_id)
+        keys = await user_storage.list_keys()
+        if not keys:
+            return {"valid": False, "available": True, "reason": "no_keys"}
+        # Verify against the first active key — if the passphrase works for
+        # any key it's correct (same passphrase is used for all of them).
+        for k in keys:
+            if await user_storage.verify_passphrase(k.provider_id, passphrase):
+                return {"valid": True, "available": True}
+        return {"valid": False, "available": True}
+    except Exception as e:
+        logger.error(f"Error verifying user passphrase: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Error verifying passphrase.")
+
+
+@router.delete("/api/keys/user/{provider}")
+async def delete_user_key(request: Request, provider: str):
+    """Delete a user BYOK key (platform deployments only)."""
+    agent = get_agent(request)
+    pool = _get_postgres_pool(agent)
+    user_id = getattr(request.state, "user_id", None)
+
+    if pool is None or not user_id:
+        raise HTTPException(
+            status_code=503,
+            detail="User BYOK is only available on platform deployments.",
+        )
+
+    try:
+        from kestrel_sovereign.security.user_key_storage import UserKeyStorage
+        user_storage = UserKeyStorage(pool, user_id)
+        deleted = await user_storage.delete_key(provider.lower())
+        if not deleted:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No personal key configured for provider '{provider}'.",
+            )
+        return {
+            "success": True,
+            "provider": provider.lower(),
+            "message": f"Personal {provider} key removed.",
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error deleting user BYOK key: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Error deleting user key.")
+
+
+@router.get("/api/keys/platform")
+async def get_platform_access(request: Request):
+    """List platform vending-machine providers (empty on local deployments)."""
+    agent = get_agent(request)
+    pool = _get_postgres_pool(agent)
+
+    if pool is None:
+        return {"providers": [], "available": False}
+
+    try:
+        from kestrel_sovereign.security.platform_key_storage import PlatformKeyStorage
+        platform_storage = PlatformKeyStorage(pool)
+        keys = await platform_storage.list_keys()
+        providers = []
+        for info in keys:
+            providers.append({
+                "provider_id": info.provider_id,
+                "provider_name": getattr(info, "provider_name", info.provider_id),
+                "is_available": info.is_active,
+                "margin_pct": (f"{int(info.margin_pct * 100)}%"
+                               if info.margin_pct is not None else None),
+                "rate_limit_per_companion": getattr(info, "rate_limit_per_companion", None),
+                "pricing_hint": getattr(info, "pricing_hint", None),
+            })
+        return {"providers": providers, "available": True}
+    except Exception as e:
+        logger.error(f"Error listing platform access: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Error retrieving platform access.")
+
+
 @router.get("/api/models")
 async def list_agent_models(
     request: Request,
