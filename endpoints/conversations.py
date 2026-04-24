@@ -276,6 +276,18 @@ async def get_conversation(request: Request, session_id: str, limit: int = Query
                 is_first_message = False
                 continue
 
+            # Unwrap user-turn sent-form so the chat UI shows raw user text,
+            # not the <retrieved_context>.../<user_input>... wrappers that
+            # history replay requires. Only applies to rows stored with the
+            # sent_form contract; legacy raw rows pass through unchanged.
+            if (
+                role == "user"
+                and meta
+                and meta.get("sent_form")
+                and not decryption_failed
+            ):
+                display_content = extract_raw_user_content(display_content)
+
             messages.append({
                 "id": msg_id,
                 "role": role,
