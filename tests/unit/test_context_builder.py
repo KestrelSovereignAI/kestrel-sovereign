@@ -226,6 +226,56 @@ class TestContextBuilder:
         result = context_builder.format_conversation_history(history)
         assert result[0]["content"] == wrap_user_input("q")
 
+    def test_format_conversation_history_sent_form_emitted_verbatim(
+        self, context_builder
+    ):
+        """Rows with metadata ``sent_form=True`` already hold the full
+        rendered sent-form (retrieved_context + <user_input> wrap). They
+        must be emitted verbatim so the history prefix byte-matches what
+        the LLM saw at send time at the prior turn.
+        """
+        sent_form = (
+            "<retrieved_context>\n<memories>\nM\n</memories>\n"
+            "</retrieved_context>\n<user_input>\nhello\n</user_input>"
+        )
+        history = [
+            {
+                "role": "user",
+                "content": sent_form,
+                "metadata": {"sent_form": True},
+            },
+            {"role": "assistant", "content": "hi"},
+        ]
+        result = context_builder.format_conversation_history(history)
+
+        assert result[0]["content"] == sent_form
+        assert result[1]["content"] == "hi"
+
+    def test_format_conversation_history_legacy_rows_still_wrapped(
+        self, context_builder
+    ):
+        """Rows WITHOUT the sent_form flag are legacy — still wrap them in
+        <user_input> tags on load so pre-sent-form conversations continue
+        to benefit from the anti-injection boundary and byte-stable replay
+        against their (limited) cache coverage.
+        """
+        from kestrel_sovereign.security.input_guardrails import wrap_user_input
+
+        history = [
+            {"role": "user", "content": "legacy raw"},  # no metadata
+            {
+                "role": "user",
+                "content": "also legacy",
+                "metadata": {"sent_form": False},
+            },
+            {"role": "user", "content": "other meta", "metadata": {"enc": False}},
+        ]
+        result = context_builder.format_conversation_history(history)
+
+        assert result[0]["content"] == wrap_user_input("legacy raw")
+        assert result[1]["content"] == wrap_user_input("also legacy")
+        assert result[2]["content"] == wrap_user_input("other meta")
+
     def test_build_system_prompt_basic(self, context_builder):
         """Test build_system_prompt with basic constitution."""
         constitution = "Article 1: Be nice."
