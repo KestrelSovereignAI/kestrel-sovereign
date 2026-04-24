@@ -9,6 +9,7 @@ from kestrel_sovereign.rate_limit import limiter
 
 from kestrel_sovereign.kestrel_config.constants import SESSION_GAP_MINUTES
 from kestrel_sovereign.security.encryption import get_fernet, get_agent_fernet, decrypt_string_fernet as decrypt_string
+from kestrel_sovereign.agent.context_builder import extract_raw_user_content
 from endpoints.agent_helpers import get_agent
 
 logger = logging.getLogger(__name__)
@@ -131,6 +132,7 @@ async def list_conversations(request: Request, limit: int = Query(50, ge=1, le=5
                     preview_content = content
                     is_encrypted = False
                     decryption_failed = False
+                    preview_is_sent_form = False
                     if metadata_json:
                         try:
                             meta = json.loads(metadata_json)
@@ -145,8 +147,14 @@ async def list_conversations(request: Request, limit: int = Query(50, ge=1, le=5
                                         except Exception as decrypt_err:
                                             logger.warning(f"Failed to decrypt preview: {decrypt_err}")
                                             decryption_failed = True
+                            preview_is_sent_form = bool(meta.get('sent_form'))
                         except json.JSONDecodeError as e:
                             logger.warning(f"Failed to parse metadata for preview in message {msg_id}: {e}")
+                    # Unwrap sent-form so the UI shows raw user text, not the
+                    # <retrieved_context>.../<user_input>... wrappers that
+                    # were stored for byte-stable history replay.
+                    if preview_is_sent_form and not decryption_failed:
+                        preview_content = extract_raw_user_content(preview_content)
                     current_session["preview"] = preview_content[:100] + ("..." if len(preview_content) > 100 else "")
                     current_session["preview_encrypted"] = is_encrypted and (not decrypt or decryption_failed)
 
