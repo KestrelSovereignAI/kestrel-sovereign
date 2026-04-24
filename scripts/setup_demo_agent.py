@@ -14,7 +14,7 @@ Output:
 
 To run the demo:
     KESTREL_DB_PATH=agent_data/demo uv run python server.py &
-    cd tests/e2e && npx playwright test --config=demo_config.cjs
+    cd demos/technical && npx playwright test --config=config.cjs
 """
 import asyncio
 import os
@@ -81,7 +81,7 @@ async def main():
     print(f"    KESTREL_DB_PATH={DEMO_DIR} uv run python server.py")
     print()
     print("  Then run the demo:")
-    print("    cd tests/e2e && npx playwright test --config=demo_config.cjs")
+    print("    cd demos/technical && npx playwright test --config=config.cjs")
     print("=" * 60)
 
 

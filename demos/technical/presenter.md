@@ -3,7 +3,7 @@
 **Audience:** Investor / Emotional (Noel)
 **Core emotion to leave with:** TRUST — with a touch of love
 **Total time:** ~12 minutes
-**Screenshots:** `tests/e2e/demo-output/`
+**Screenshots:** `demos/technical/demo-output/`
 
 ---
 
@@ -280,4 +280,4 @@
 ---
 
 *Generated from `docs/demos/DEMO_SCRIPT.md` + latest Playwright run output*
-*Screenshots: `tests/e2e/demo-output/01-did-identity.png` → `20-security-restored.png`*
+*Screenshots: `demos/technical/demo-output/01-did-identity.png` → `20-security-restored.png`*

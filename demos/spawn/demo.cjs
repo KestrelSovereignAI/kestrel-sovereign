@@ -13,7 +13,7 @@
  *   Beat 9:  Claw synthesizes results
  *   Beat 10: Spawn history shows the full story
  *
- * Run: cd demos/spawn && npx playwright test --config=demo_config.cjs
+ * Run: cd demos/spawn && npx playwright test --config=config.cjs
  *
  * Output (in demo-output/):
  *   - narration.md   — timestamped transcript with screenshot references
@@ -44,7 +44,7 @@ const {
     getSpawnChildren,
     waitForSpawnChildren,
     waitForSpawnCompletion,
-} = require('../../tests/e2e/demo_helpers.cjs');
+} = require('../shared/demo_helpers.cjs');
 
 const BASE_URL = process.env.KESTREL_URL || 'http://localhost:8888';
 const OUTPUT_DIR = path.join(__dirname, 'demo-output');
