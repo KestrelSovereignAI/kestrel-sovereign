@@ -332,32 +332,19 @@ _STATE_SPEAKING = "speaking"
 
 
 def _ws_get_agent(websocket: WebSocket):
-    """Get agent from WebSocket app state (mirrors get_agent for HTTP)."""
+    """Get agent from WebSocket app state (mirrors get_agent for HTTP).
+
+    In rookery mode the agent is set on `scope["state"]["agent"]` by the
+    `RookeryAgentRoutingMiddleware` (server.py); in single-agent mode it
+    falls through to `app.state.agent`. None means neither — the WS handler
+    surfaces this as a 4503 close.
+    """
     agent = getattr(websocket.state, "agent", None) if hasattr(websocket, "state") else None
     if agent is not None:
-        logger.info("voice_chat _ws_get_agent: from websocket.state, agent_id=%s", getattr(agent, "agent_id", "?"))
         return agent
     agent = getattr(websocket.app.state, "agent", None)
     if agent is not None:
-        logger.info("voice_chat _ws_get_agent: from app.state, agent_id=%s", getattr(agent, "agent_id", "?"))
         return agent
-    # Diagnostic for the 4503 path: dump what we DID see in scope state so
-    # we can tell whether the rookery middleware ran but stored the agent
-    # under a different key, vs didn't run at all.
-    state_keys = []
-    try:
-        scope_state = websocket.scope.get("state", {})
-        if isinstance(scope_state, dict):
-            state_keys = sorted(scope_state.keys())
-        else:
-            state_keys = sorted(getattr(scope_state, "_state", {}).keys())
-    except Exception:
-        pass
-    logger.info(
-        "voice_chat _ws_get_agent: NO AGENT — scope_state_keys=%s app_state_has_agent=%s",
-        state_keys,
-        hasattr(websocket.app.state, "agent"),
-    )
     return None
 
 
@@ -412,17 +399,15 @@ async def voice_chat(websocket: WebSocket):
 
     Auth: query parameter ?api_key=... or session cookie.
     """
-    # Diagnostic: close-before-accept manifests as HTTP 403 in the browser
-    # which hides which gate fired. Log the chosen close code at INFO so the
-    # uvicorn log identifies the failure path.
+    # close-before-accept manifests as a generic HTTP 403 in the browser, so
+    # log the chosen WS close code + reason at WARNING — without this, the
+    # only signal a user has is "WebSocket connection failed" with no
+    # actionable info.
     def _ws_reject(code: int, reason: str):
-        logger.info(
-            "voice_chat WS REJECT code=%d reason=%r path=%s qs=%s headers_origin=%r",
+        logger.warning(
+            "voice_chat WS reject code=%d reason=%s",
             code,
             reason,
-            websocket.url.path,
-            str(websocket.url.query),
-            websocket.headers.get("origin", ""),
         )
         return websocket.close(code=code, reason=reason)
 
@@ -446,8 +431,18 @@ async def voice_chat(websocket: WebSocket):
         return
 
     # --- Privacy gate: check at connection time ---
+    # /voice/chat IS the Pipeline transport by definition — Realtime opens
+    # its own WebRTC peer connection to OpenAI directly, never through this
+    # endpoint. Force prefer_realtime=False so the resolver returns the
+    # Pipeline route (with TTS+STT providers); without this override the
+    # resolver picks Realtime when the user's chat LLM is OpenAI and
+    # _get_stt_provider raises "No STT provider available" because the
+    # Realtime route legitimately has no STT (it owns audio I/O end-to-end).
+    from kestrel_sovereign.voice.routing import UserVoicePreferences as _UVP
+    _pipeline_override = _UVP(prefer_realtime=False)
+
     try:
-        stt = await vf._get_stt_provider()
+        stt = await vf._get_stt_provider(overrides=_pipeline_override)
     except VoicePrivacyError as e:
         await _ws_reject(4403, str(e))
         return
@@ -456,7 +451,7 @@ async def voice_chat(websocket: WebSocket):
         return
 
     try:
-        tts = await vf._get_tts_provider()
+        tts = await vf._get_tts_provider(overrides=_pipeline_override)
     except VoicePrivacyError as e:
         await _ws_reject(4403, str(e))
         return
