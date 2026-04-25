@@ -20,6 +20,7 @@ import {
     loadIpfsStatus,
 } from './panels.js';
 import { initChat, loadModels, connectNotifications, updateContextStatus } from './chat.js';
+import { initVoiceUI } from './voice/ui.js';
 import { Security } from './security.js';
 import { initTasks, loadTasks } from './tasks.js';
 import { loadResources } from './resources.js';
@@ -60,6 +61,11 @@ async function init() {
 
     // Initialize chat component
     initChat();
+
+    // Initialize voice UI shell — adds the 🎙️ button, transcript drawer,
+    // voice picker. Auto-fallback Realtime → Pipeline based on the
+    // server-side voice path resolver.
+    initVoiceUI();
 
     // Initialize tasks component
     initTasks();
