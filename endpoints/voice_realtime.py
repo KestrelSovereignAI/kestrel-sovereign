@@ -263,11 +263,11 @@ def _compose_instructions(agent: Any, user_override: str) -> str:
 def _collect_tools(agent: Any) -> list[ToolDef]:
     """Gather ToolDef entries for all currently-enabled agent tools.
 
-    Translates the agent's Feature-level tools into the ``ToolDef`` shape
-    the Realtime API expects. Tools without a declared parameter schema get
-    a permissive ``{"type": "object"}`` placeholder — OpenAI will still
-    accept zero-arg calls. Future work: extract richer schemas from tool
-    signatures (left as a follow-up; not required to ship the endpoint).
+    Translates the agent's Feature-level tools into the ``ToolDef`` shape the
+    Realtime API expects. ``schema.parameters`` in the live agent is a
+    ``list[ToolParameter]`` (Kestrel SDK shape), not a JSON Schema dict — we
+    translate it here. Tools without parseable schemas get a permissive
+    ``{"type": "object"}`` placeholder so OpenAI still accepts zero-arg calls.
     """
     tools: list[ToolDef] = []
     features = getattr(agent, "features", {}) or {}
@@ -284,12 +284,63 @@ def _collect_tools(agent: Any) -> list[ToolDef]:
             if schema is None:
                 continue
             name = getattr(schema, "name", "") or getattr(t, "name", "")
-            description = getattr(schema, "description", "") or ""
-            parameters = getattr(schema, "parameters", None) or {"type": "object"}
             if not name:
                 continue
-            tools.append(ToolDef(name=name, description=description, parameters_schema=parameters))
+            description = getattr(schema, "description", "") or ""
+            parameters_schema = _build_parameters_schema(getattr(schema, "parameters", None))
+            tools.append(ToolDef(name=name, description=description, parameters_schema=parameters_schema))
     return tools
+
+
+def _build_parameters_schema(parameters: Any) -> dict:
+    """Convert a tool's parameters spec into a JSON Schema dict.
+
+    Accepts:
+
+    * ``list[ToolParameter]`` (the canonical Kestrel SDK shape) — converts
+      each ``ToolParameter`` into a JSON Schema property entry, collecting
+      ``required: True`` entries into the top-level ``required`` array.
+    * Plain ``dict`` already shaped as JSON Schema — passed through.
+    * Anything else (None, malformed) — falls back to the permissive
+      ``{"type": "object"}`` so OpenAI still accepts the tool definition
+      and zero-arg invocations work.
+
+    The output is guaranteed JSON-serializable; the openai SDK's session
+    create call ``json.dumps``s the whole tool list and would fail on raw
+    ``ToolParameter`` instances (the original bug, surfaced as
+    ``Object of type ToolParameter is not JSON serializable``).
+    """
+    if isinstance(parameters, dict):
+        return parameters
+    if not isinstance(parameters, (list, tuple)):
+        return {"type": "object"}
+
+    properties: dict[str, dict] = {}
+    required: list[str] = []
+    for param in parameters:
+        param_name = getattr(param, "name", None)
+        if not param_name:
+            continue
+        prop: dict[str, Any] = {
+            "type": getattr(param, "type", None) or "string",
+        }
+        desc = getattr(param, "description", None)
+        if desc:
+            prop["description"] = desc
+        enum = getattr(param, "enum", None)
+        if enum:
+            prop["enum"] = list(enum)
+        items = getattr(param, "items", None)
+        if items:
+            prop["items"] = items
+        properties[param_name] = prop
+        if getattr(param, "required", False):
+            required.append(param_name)
+
+    schema: dict[str, Any] = {"type": "object", "properties": properties}
+    if required:
+        schema["required"] = required
+    return schema
 
 
 def _clamp_turn_mode(mode: str) -> str:

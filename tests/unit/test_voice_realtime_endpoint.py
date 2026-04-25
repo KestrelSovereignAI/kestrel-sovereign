@@ -396,6 +396,138 @@ class TestCollectTools:
         agent = SimpleNamespace()
         assert _collect_tools(agent) == []
 
+    def test_real_tool_parameters_serialize_to_json(self) -> None:
+        """Regression: live agents expose ``schema.parameters`` as a list of
+        ``ToolParameter`` dataclasses (Kestrel SDK shape), not a JSON Schema
+        dict. The previous _collect_tools shoved the raw list through to
+        ``ToolDef.parameters_schema`` and the OpenAI SDK exploded with::
+
+            Object of type ToolParameter is not JSON serializable
+
+        when it tried to ``json.dumps`` the session config. This test would
+        have caught it: build a tool whose schema has real ToolParameter
+        instances, run _collect_tools, and assert the result is JSON-encodable.
+        """
+        import json
+
+        from kestrel_sdk.tools.base import ToolParameter
+
+        param_required = ToolParameter(
+            name="city",
+            type="string",
+            description="City name to look up",
+            required=True,
+        )
+        param_optional = ToolParameter(
+            name="units",
+            type="string",
+            description="Temperature units",
+            required=False,
+            enum=["celsius", "fahrenheit"],
+        )
+        feature = SimpleNamespace(
+            get_tools=lambda: [
+                SimpleNamespace(
+                    name="weather",
+                    schema=SimpleNamespace(
+                        name="weather",
+                        description="Look up the weather.",
+                        parameters=[param_required, param_optional],
+                    ),
+                )
+            ]
+        )
+        agent = SimpleNamespace(features={"f": feature})
+
+        tools = _collect_tools(agent)
+        assert len(tools) == 1
+        # The critical assertion: parameters_schema round-trips through
+        # json.dumps without raising. If anything in there is still a
+        # ToolParameter (or other non-JSON type), this fails — same way
+        # the OpenAI SDK fails when minting a session.
+        encoded = json.dumps(tools[0].parameters_schema)
+        decoded = json.loads(encoded)
+        assert decoded["type"] == "object"
+        assert decoded["properties"]["city"]["type"] == "string"
+        assert decoded["properties"]["city"]["description"] == "City name to look up"
+        assert decoded["properties"]["units"]["enum"] == ["celsius", "fahrenheit"]
+        assert decoded["required"] == ["city"]
+        # Optional params should NOT appear in `required`.
+        assert "units" not in decoded["required"]
+
+    def test_dict_parameters_pass_through_unchanged(self) -> None:
+        """Tools that already declare parameters as a JSON Schema dict (rare,
+        but possible) should not be re-wrapped — pass through identity."""
+        explicit = {
+            "type": "object",
+            "properties": {"q": {"type": "string"}},
+            "required": ["q"],
+        }
+        feature = SimpleNamespace(
+            get_tools=lambda: [
+                SimpleNamespace(
+                    name="search",
+                    schema=SimpleNamespace(
+                        name="search", description="d", parameters=explicit
+                    ),
+                )
+            ]
+        )
+        agent = SimpleNamespace(features={"f": feature})
+        tools = _collect_tools(agent)
+        assert tools[0].parameters_schema == explicit
+
+    def test_collect_tools_output_is_fully_json_serializable(self) -> None:
+        """The strongest invariant: whatever _collect_tools returns can be
+        passed straight to ``json.dumps``, which is what the OpenAI SDK does
+        internally on the session-create call. Use a mix of all parameter
+        shapes the live runtime can produce.
+        """
+        import json
+
+        from kestrel_sdk.tools.base import ToolParameter
+
+        feature = SimpleNamespace(
+            get_tools=lambda: [
+                # Tool with ToolParameter list (canonical shape)
+                SimpleNamespace(
+                    name="t1",
+                    schema=SimpleNamespace(
+                        name="t1",
+                        description="d1",
+                        parameters=[
+                            ToolParameter(name="x", type="integer", description="x", required=True),
+                            ToolParameter(
+                                name="tags", type="array", description="tags",
+                                items={"type": "string"},
+                            ),
+                        ],
+                    ),
+                ),
+                # Tool with empty parameter list
+                SimpleNamespace(
+                    name="t2",
+                    schema=SimpleNamespace(name="t2", description="d2", parameters=[]),
+                ),
+                # Tool with no parameters attribute
+                SimpleNamespace(
+                    name="t3",
+                    schema=SimpleNamespace(name="t3", description="d3", parameters=None),
+                ),
+            ]
+        )
+        agent = SimpleNamespace(features={"f": feature})
+        tools = _collect_tools(agent)
+        # Build the kwargs the OpenAI SDK gets — with `tools` as a list of
+        # the same tool dicts ephemeral_session._tool_to_openai produces.
+        payload = [
+            {"type": "function", "name": t.name, "description": t.description,
+             "parameters": t.parameters_schema}
+            for t in tools
+        ]
+        # If any element is non-serializable, this raises.
+        json.dumps(payload)
+
 
 class TestClampTurnMode:
     def test_allows_known_modes(self) -> None:
