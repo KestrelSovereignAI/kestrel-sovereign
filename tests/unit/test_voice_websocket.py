@@ -592,3 +592,51 @@ class TestVoiceChatDisconnect:
             else:
                 sys.modules.pop(vad_key, None)
             _restore_app(app, orig)
+
+
+# ---------------------------------------------------------------------------
+# WS-must-force-Pipeline regression
+# ---------------------------------------------------------------------------
+
+
+class TestWsForcesPipelineRoute:
+    """The /voice/chat endpoint IS the Pipeline transport. The handler must
+    pass `prefer_realtime=False` when asking for STT/TTS providers, otherwise
+    the resolver picks Realtime (which legitimately has no STT) and the
+    handler closes 4403 'No STT provider available' — the bug the user hit
+    after merging the rookery WS routing fix.
+    """
+
+    def test_handler_passes_prefer_realtime_false_to_provider_getters(self):
+        from kestrel_sovereign.voice.routing import UserVoicePreferences
+
+        vf = _make_voice_feature()
+        agent = _make_agent(vf)
+        app, orig = _prepare_app(agent)
+        try:
+            with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+                with TestClient(app) as client:
+                    with client.websocket_connect("/voice/chat?api_key=test-key") as ws:
+                        ws.receive_bytes()  # initial status
+                        ws.close()
+
+            # Inspect what the handler called _get_stt_provider with.
+            stt_calls = vf._get_stt_provider.await_args_list
+            tts_calls = vf._get_tts_provider.await_args_list
+            assert stt_calls, "WS handler never called _get_stt_provider"
+            assert tts_calls, "WS handler never called _get_tts_provider"
+
+            stt_overrides = stt_calls[0].kwargs.get("overrides")
+            tts_overrides = tts_calls[0].kwargs.get("overrides")
+            assert isinstance(stt_overrides, UserVoicePreferences), (
+                "_get_stt_provider must be called with an overrides kwarg "
+                "(got args=%r kwargs=%r)" % (stt_calls[0].args, stt_calls[0].kwargs)
+            )
+            assert stt_overrides.prefer_realtime is False, (
+                "WS handler must force prefer_realtime=False; otherwise "
+                "the resolver picks Realtime and there's no STT to return"
+            )
+            assert isinstance(tts_overrides, UserVoicePreferences)
+            assert tts_overrides.prefer_realtime is False
+        finally:
+            _restore_app(app, orig)
