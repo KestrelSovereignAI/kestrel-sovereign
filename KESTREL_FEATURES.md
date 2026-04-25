@@ -236,6 +236,11 @@ The currently exported `Feature` subclasses discovered from those modules includ
   - `POST /api/conversations/new`
   - `DELETE /api/conversations/messages/{message_id}`
   - `DELETE /api/conversations/{session_id}`
+  - `POST /api/conversations/{session_id}/restore`
+  - `POST /api/conversations/{session_id}/purge`
+  - `POST /api/conversations/messages/{message_id}/restore`
+  - `POST /api/conversations/messages/{message_id}/purge`
+  - `GET /api/trash`
   - `PATCH /api/conversations/{session_id}`
   - `GET /api/conversations/{session_id}/transcript`
 - [`endpoints/memories.py`](endpoints/memories.py)
