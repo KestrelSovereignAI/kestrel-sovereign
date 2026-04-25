@@ -23,6 +23,7 @@
  * `initChat()`. Everything else is internal.
  */
 
+import API from '../api.js';
 import { Events } from './events.js';
 import { createRealtimeClient } from './realtime.js';
 import { createPipelineClient } from './pipeline.js';
@@ -30,6 +31,22 @@ import { State, nextStateForEvent } from './state-machine.js';
 
 // State.* + nextStateForEvent are imported from state-machine.js so the
 // pure transition logic stays Node-testable.
+
+/**
+ * Build the auth header bag for voice fetch calls.
+ *
+ * Voice endpoints sit behind the same auth middleware as every other
+ * Kestrel HTTP route, so the mint/voices fetches need the same `X-API-Key`
+ * (or `Authorization: Bearer …`) the app's regular API client sends.
+ * Without this any server with auth enabled returns 401, surfacing as a
+ * fatal voice error in the UI.
+ */
+function voiceAuthHeaders() {
+  const headers = {};
+  const apiKey = typeof API.getApiKey === 'function' ? API.getApiKey() : '';
+  if (apiKey) headers['X-API-Key'] = apiKey;
+  return headers;
+}
 
 const STATE_LABELS = {
   [State.IDLE]: 'Start voice session',
@@ -257,6 +274,10 @@ async function startSession() {
   try {
     client = await createRealtimeClient({
       onEvent,
+      // Rewrite to /api/agents/<host>/voice/realtime/session in rookery
+      // mode; identity in standalone mode.
+      endpoint: API.buildAgentUrl('/voice/realtime/session'),
+      getAuthHeaders: voiceAuthHeaders,
       sessionRequestBody: {
         voice: settings.voice || '',
         user_instructions: settings.instructions || '',
@@ -279,7 +300,9 @@ async function startSession() {
   try {
     client = await createPipelineClient({
       onEvent,
-      apiKey: getApiKey(),
+      apiKey: API.getApiKey() || '',
+      // Same rookery URL rewrite for the WebSocket route.
+      wsPath: API.buildAgentUrl('/voice/chat'),
     });
     await client.start();
     setPathBadge('Pipeline', 'Cascaded STT → your LLM → TTS. Slower than Realtime, preserves your model choice.');
@@ -487,8 +510,12 @@ function savePicker() {
 
 async function fetchVoices() {
   // /voice/voices is the existing endpoint that returns the active
-  // provider's discovered voice list filtered by privacy mode.
-  const resp = await fetch('/voice/voices');
+  // provider's discovered voice list filtered by privacy mode. Auth + URL
+  // rewriting via the global API client so the request behaves the same
+  // as every other Kestrel HTTP call.
+  const resp = await fetch(API.buildAgentUrl('/voice/voices'), {
+    headers: voiceAuthHeaders(),
+  });
   if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
   const body = await resp.json();
   return Array.isArray(body.voices) ? body.voices : [];
@@ -564,14 +591,6 @@ function saveSettings() {
     // Quota or disabled storage — ignore; settings stay in-memory for the
     // current session.
   }
-}
-
-
-function getApiKey() {
-  // The chat already authenticates via cookie/header — this helper only
-  // exists for the Pipeline WebSocket which expects ?api_key=. When no
-  // key is configured (open-access servers), pass empty.
-  return localStorage.getItem('kestrel.apiKey') || '';
 }
 
 
