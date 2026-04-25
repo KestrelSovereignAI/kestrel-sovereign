@@ -477,6 +477,99 @@ class TestCollectTools:
         tools = _collect_tools(agent)
         assert tools[0].parameters_schema == explicit
 
+    def test_array_param_without_items_gets_default_items(self) -> None:
+        """Regression: live `run_workflow` tool declares `steps: array` with
+        no `items`. OpenAI's strict validator rejects with::
+
+            Invalid schema for function 'run_workflow':
+            In context=('properties', 'steps'), array schema missing items.
+
+        The converter must default `items: {}` (any-type) when the
+        ToolParameter doesn't declare item shape.
+        """
+        from kestrel_sdk.tools.base import ToolParameter
+
+        param = ToolParameter(
+            name="steps",
+            type="array",
+            description="Workflow steps to run",
+            required=True,
+            # Critically: no `items` set — exactly the bug shape.
+        )
+        feature = SimpleNamespace(
+            get_tools=lambda: [
+                SimpleNamespace(
+                    name="run_workflow",
+                    schema=SimpleNamespace(
+                        name="run_workflow",
+                        description="Run a workflow.",
+                        parameters=[param],
+                    ),
+                )
+            ]
+        )
+        agent = SimpleNamespace(features={"f": feature})
+        tools = _collect_tools(agent)
+        steps_schema = tools[0].parameters_schema["properties"]["steps"]
+        assert steps_schema["type"] == "array"
+        assert "items" in steps_schema, (
+            "OpenAI rejects array schemas without `items`; converter must "
+            "default to `items: {}` when the ToolParameter doesn't declare it"
+        )
+
+    def test_dict_passthrough_runs_sanitizer_on_nested_arrays(self) -> None:
+        """Tools that pass an explicit dict schema with a nested broken
+        array also need patching — the dict-passthrough path must run the
+        same sanitizer."""
+        explicit_with_bug = {
+            "type": "object",
+            "properties": {
+                "tags": {"type": "array"},  # missing items
+                "config": {
+                    "type": "object",
+                    "properties": {
+                        "modes": {"type": "array"},  # missing items, nested
+                    },
+                },
+            },
+            "required": ["tags", "missing_prop"],  # references nonexistent prop
+        }
+        feature = SimpleNamespace(
+            get_tools=lambda: [
+                SimpleNamespace(
+                    name="x",
+                    schema=SimpleNamespace(
+                        name="x", description="d", parameters=explicit_with_bug
+                    ),
+                )
+            ]
+        )
+        agent = SimpleNamespace(features={"f": feature})
+        tools = _collect_tools(agent)
+        s = tools[0].parameters_schema
+        assert "items" in s["properties"]["tags"]
+        assert "items" in s["properties"]["config"]["properties"]["modes"]
+        # `missing_prop` should be filtered from `required` since it has no
+        # corresponding property entry — OpenAI rejects mismatched required.
+        assert s["required"] == ["tags"]
+
+    def test_object_without_properties_gets_empty_properties(self) -> None:
+        """Object nodes with no `properties` are also rejected by OpenAI."""
+        explicit = {"type": "object"}  # no properties at all
+        feature = SimpleNamespace(
+            get_tools=lambda: [
+                SimpleNamespace(
+                    name="empty",
+                    schema=SimpleNamespace(
+                        name="empty", description="d", parameters=explicit
+                    ),
+                )
+            ]
+        )
+        agent = SimpleNamespace(features={"f": feature})
+        tools = _collect_tools(agent)
+        assert tools[0].parameters_schema["properties"] == {}
+
     def test_collect_tools_output_is_fully_json_serializable(self) -> None:
         """The strongest invariant: whatever _collect_tools returns can be
         passed straight to ``json.dumps``, which is what the OpenAI SDK does
