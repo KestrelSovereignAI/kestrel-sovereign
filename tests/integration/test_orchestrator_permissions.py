@@ -50,9 +50,11 @@ async def permission_store(temp_db):
 
 
 @pytest.fixture
-def approval_queue():
-    """Create a real ApprovalQueue."""
-    return ApprovalQueue()
+def approval_queue(permission_store):
+    """Create a real ApprovalQueue wired to the permission store, matching
+    production wiring (see #785 — the queue persists scope choices and
+    audit rows centrally)."""
+    return ApprovalQueue(permission_store=permission_store)
 
 
 @pytest.fixture

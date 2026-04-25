@@ -99,7 +99,13 @@ class SecurityHook(Hook):
             return HookOutput.deny(f"Blocked by policy: {feature_name}.{tool_name}")
 
         if level in (PermissionLevel.ASK, PermissionLevel.SESSION):
-            # Queue for approval and wait
+            # Queue for approval and wait.  As of #785 the queue itself
+            # owns scope persistence and audit-row writes — we just need
+            # to translate the (approved, scope) result into a HookOutput.
+            # This used to live here, but every direct ``request_approval``
+            # caller (code_edit, compute, keys, reflection.*) was missing
+            # it, so the responsibility moved into the queue where every
+            # caller benefits.
             logger.info(f"Requesting approval: {feature_name}.{tool_name}")
 
             approved, scope = await self.approval_queue.request_approval(
@@ -109,44 +115,8 @@ class SecurityHook(Hook):
             )
 
             if not approved:
-                await self.permission_store.log_decision(
-                    feature_name=feature_name,
-                    tool_name=tool_name,
-                    action="tool_execution",
-                    decision="user_denied" if scope != "timeout" else "timeout",
-                    user_choice=scope,
-                    args_summary=args_summary,
-                )
                 logger.info(f"User denied or timeout: {feature_name}.{tool_name}")
                 return HookOutput.deny(f"User denied: {feature_name}.{tool_name}")
-
-            # Save permission based on user's scope choice
-            if scope == "always":
-                await self.permission_store.set_permission(
-                    feature_name,
-                    tool_name,
-                    PermissionLevel.ALLOW,
-                    scope="always",
-                    reason="User approved with 'always' scope",
-                )
-            elif scope == "session":
-                await self.permission_store.set_permission(
-                    feature_name,
-                    tool_name,
-                    PermissionLevel.ALLOW,
-                    scope="session",
-                    reason="User approved for this session",
-                )
-            # "once" = no persistence, just allow this execution
-
-            await self.permission_store.log_decision(
-                feature_name=feature_name,
-                tool_name=tool_name,
-                action="tool_execution",
-                decision="user_approved",
-                user_choice=scope,
-                args_summary=args_summary,
-            )
 
             logger.info(f"User approved ({scope}): {feature_name}.{tool_name}")
             return HookOutput.allow(f"User approved: {scope}")
