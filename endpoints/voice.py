@@ -335,10 +335,29 @@ def _ws_get_agent(websocket: WebSocket):
     """Get agent from WebSocket app state (mirrors get_agent for HTTP)."""
     agent = getattr(websocket.state, "agent", None) if hasattr(websocket, "state") else None
     if agent is not None:
+        logger.info("voice_chat _ws_get_agent: from websocket.state, agent_id=%s", getattr(agent, "agent_id", "?"))
         return agent
     agent = getattr(websocket.app.state, "agent", None)
     if agent is not None:
+        logger.info("voice_chat _ws_get_agent: from app.state, agent_id=%s", getattr(agent, "agent_id", "?"))
         return agent
+    # Diagnostic for the 4503 path: dump what we DID see in scope state so
+    # we can tell whether the rookery middleware ran but stored the agent
+    # under a different key, vs didn't run at all.
+    state_keys = []
+    try:
+        scope_state = websocket.scope.get("state", {})
+        if isinstance(scope_state, dict):
+            state_keys = sorted(scope_state.keys())
+        else:
+            state_keys = sorted(getattr(scope_state, "_state", {}).keys())
+    except Exception:
+        pass
+    logger.info(
+        "voice_chat _ws_get_agent: NO AGENT — scope_state_keys=%s app_state_has_agent=%s",
+        state_keys,
+        hasattr(websocket.app.state, "agent"),
+    )
     return None
 
 
@@ -393,42 +412,56 @@ async def voice_chat(websocket: WebSocket):
 
     Auth: query parameter ?api_key=... or session cookie.
     """
+    # Diagnostic: close-before-accept manifests as HTTP 403 in the browser
+    # which hides which gate fired. Log the chosen close code at INFO so the
+    # uvicorn log identifies the failure path.
+    def _ws_reject(code: int, reason: str):
+        logger.info(
+            "voice_chat WS REJECT code=%d reason=%r path=%s qs=%s headers_origin=%r",
+            code,
+            reason,
+            websocket.url.path,
+            str(websocket.url.query),
+            websocket.headers.get("origin", ""),
+        )
+        return websocket.close(code=code, reason=reason)
+
     # --- Auth check before accept ---
     caller = _ws_authenticate(websocket)
     if caller is None:
-        await websocket.close(code=4401, reason="Authentication required")
+        await _ws_reject(4401, "Authentication required")
         return
 
     # --- Resolve agent ---
     agent = _ws_get_agent(websocket)
     if agent is None:
-        await websocket.close(code=4503, reason="Agent not initialized")
+        await _ws_reject(4503, "Agent not initialized")
         return
 
     # --- Resolve VoiceFeature ---
     features = getattr(agent, "features", {})
     vf = features.get("VoiceFeature")
     if vf is None:
-        await websocket.close(code=4503, reason="VoiceFeature not available")
+        await _ws_reject(4503, "VoiceFeature not available")
         return
 
     # --- Privacy gate: check at connection time ---
     try:
         stt = await vf._get_stt_provider()
     except VoicePrivacyError as e:
-        await websocket.close(code=4403, reason=str(e))
+        await _ws_reject(4403, str(e))
         return
     except Exception as e:
-        await websocket.close(code=4503, reason=f"STT provider unavailable: {e}")
+        await _ws_reject(4503, f"STT provider unavailable: {e}")
         return
 
     try:
         tts = await vf._get_tts_provider()
     except VoicePrivacyError as e:
-        await websocket.close(code=4403, reason=str(e))
+        await _ws_reject(4403, str(e))
         return
     except Exception as e:
-        await websocket.close(code=4503, reason=f"TTS provider unavailable: {e}")
+        await _ws_reject(4503, f"TTS provider unavailable: {e}")
         return
 
     # Resolve voice_id for TTS
