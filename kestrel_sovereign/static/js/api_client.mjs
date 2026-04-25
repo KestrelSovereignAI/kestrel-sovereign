@@ -237,6 +237,34 @@ export function createApiClient({
         newConversation: () => client.request('/api/conversations/new', { method: 'POST' }),
         deleteMessage: (messageId) => client.request(`/api/conversations/messages/${encodeURIComponent(messageId)}`, { method: 'DELETE' }),
         deleteConversation: (sessionId) => client.request(`/api/conversations/${encodeURIComponent(sessionId)}`, { method: 'DELETE' }),
+        // Soft-delete recovery surface (#763 / #765). Restore brings a row
+        // out of Trash; purge hard-deletes with an audit reason. listTrash
+        // is the read side that backs the Trash sub-view.
+        listTrash: (limit = 200) => client.request(`/api/trash?limit=${encodeURIComponent(limit)}`),
+        restoreConversation: (sessionId) => client.request(
+            `/api/conversations/${encodeURIComponent(sessionId)}/restore`,
+            { method: 'POST' },
+        ),
+        purgeConversation: (sessionId, reason = 'user-initiated') => client.request(
+            `/api/conversations/${encodeURIComponent(sessionId)}/purge`,
+            {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ reason }),
+            },
+        ),
+        restoreMessage: (messageId) => client.request(
+            `/api/conversations/messages/${encodeURIComponent(messageId)}/restore`,
+            { method: 'POST' },
+        ),
+        purgeMessage: (messageId, reason = 'user-initiated') => client.request(
+            `/api/conversations/messages/${encodeURIComponent(messageId)}/purge`,
+            {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ reason }),
+            },
+        ),
         renameConversation: (sessionId, name) => client.request(
             `/api/conversations/${encodeURIComponent(sessionId)}`,
             {
