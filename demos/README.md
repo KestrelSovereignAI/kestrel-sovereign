@@ -2,6 +2,17 @@
 
 Every demo lives in its own subdirectory. One shared helpers module; no cross-tree imports.
 
+## Stories vs. vignettes
+
+* **Stories** (`spawn`, `technical`, `falconer`) — multi-act narratives, often
+  tens of screenshots. Built for keynote walkthroughs.
+* **Vignettes** — short, single-feature demos (~30s, 5–8 screenshots, one
+  happy path). Built to ride along with the feature PR that adds them and
+  double as e2e regression evidence.
+
+The convention going forward: **a feature PR ships its vignette under
+`demos/<feature-name>/`**. Copy `demos/TEMPLATE/` to start a new one.
+
 ## Layout
 
 ```
@@ -9,9 +20,10 @@ demos/
 ├── shared/
 │   └── demo_helpers.cjs     # auth, panel navigation, spawn API helpers
 ├── run.sh                   # canonical entry point — isolates demo runs
-├── spawn/                   # Issue #354 — narrated spawn lifecycle
-├── technical/               # Track A — DID, Constitution, Memory, Privacy, Sovereignty, Permissions, Memory Hygiene
-├── falconer/                # Falconer product demo — Claws → Talon mesh dispatch
+├── TEMPLATE/                # copy this to start a new vignette
+├── spawn/                   # Issue #354 — narrated spawn lifecycle (story)
+├── technical/               # Track A — DID, Constitution, Memory, Privacy, Sovereignty, Permissions (story)
+├── falconer/                # Falconer product demo — Claws → Talon mesh dispatch (story)
 ├── metrics/                 # Observability dashboard — KPI cards, timeline, duration, distribution
 ├── feature-store/           # Feature Store — browse features, search, drill into skills
 └── tasks/                   # Tasks & Activity — background task queue + real-time activity log
@@ -60,12 +72,16 @@ kestrel-eye review --config demos/<name>/eye.toml
 kestrel-eye run    --config demos/<name>/eye.toml --loop
 ```
 
-## Writing a new demo
+## Writing a new vignette
 
-1. `mkdir demos/<name>` — one directory per demo.
-2. Copy one of the existing `config.cjs` as a starting template; set `testMatch: 'demo.cjs'` and `outputDir` to `./demo-output/playwright`.
-3. Write `demo.cjs`. Import helpers from `../shared/demo_helpers.cjs`.
-4. Write `narration.md` (the story) and (optionally) `eye.toml` (the expectations).
-5. Add `presenter.md` if the demo has a live-delivery script.
+```bash
+cp -R demos/TEMPLATE demos/<feature-name>
+cd demos/<feature-name>
+# Edit demo.cjs (beats), narration.md (the story), eye.toml (expectations)
+demos/run.sh <feature-name>
+```
 
-Do **not** write demo files into `tests/e2e/`. That directory is for `test_*.spec.cjs` only.
+See `demos/TEMPLATE/README.md` for the full convention.
+
+Do **not** write demo files into `tests/e2e/`. That directory is for
+`test_*.spec.cjs` only.
