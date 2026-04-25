@@ -667,6 +667,20 @@ class KestrelAgent(
             except Exception as e:
                 logging.debug(f"Consent request failed (non-blocking): {e}")
 
+        # EPHEMERAL hard-purge defense-in-depth (#767). When leaving
+        # EPHEMERAL we close the session — and an EPHEMERAL session is
+        # contractually "no trace." If a write somehow reached storage
+        # during the session anyway, scrub it now via the hard-purge
+        # primitives and write an audit entry so the operator finds out.
+        leaving_ephemeral = (
+            self._privacy_mode == PrivacyMode.EPHEMERAL
+            and mode != PrivacyMode.EPHEMERAL
+        )
+        if leaving_ephemeral:
+            await self._purge_ephemeral_leaks(
+                reason=f"ephemeral-mode-exit-to-{mode.value}",
+            )
+
         self._privacy_mode = mode
         self.storage.set_privacy_mode(mode)
         status_message = self.privacy_agent.set_mode(mode)
@@ -756,6 +770,78 @@ class KestrelAgent(
                 biometric_warning = vf.biometric_warning()
 
         return voice_switched, biometric_warning
+
+    async def _purge_ephemeral_leaks(self, *, reason: str) -> Dict[str, int]:
+        """Drive the EPHEMERAL hard-purge defense-in-depth (#767).
+
+        Calls into the storage wrapper's ``purge_ephemeral_session``
+        primitive, then if any rows were destroyed (which means the
+        privacy layer leaked), writes a security_audit_log entry via
+        the SecurityFeature so the operator finds out. Never raises
+        — losing the audit row is preferable to leaving the leak in
+        place.
+        """
+        breakdown: Dict[str, int] = {"conversation_history": 0, "graph_nodes": 0}
+        try:
+            breakdown = await self.storage.purge_ephemeral_session(reason=reason)
+        except Exception as e:
+            logging.warning(
+                "ephemeral hard-purge failed (best-effort, continuing): %s", e
+            )
+            return breakdown
+
+        leaked = sum(breakdown.values())
+        if leaked > 0:
+            await self._record_ephemeral_leak_audit(
+                reason=reason, breakdown=breakdown,
+            )
+        return breakdown
+
+    async def _record_ephemeral_leak_audit(
+        self, *, reason: str, breakdown: Dict[str, int]
+    ) -> None:
+        """Write the audit entry for an ephemeral-leak hard-purge (#767).
+
+        Routes through the SecurityFeature's PermissionStore (the same
+        table used by the demo-isolation rail in #766). If the feature
+        isn't loaded — early startup, slim test setup — log a warning
+        and continue. The audit must NEVER block the purge.
+        """
+        try:
+            features = getattr(self, "features", {}) or {}
+            feature = features.get("Security")
+            permission_store = (
+                getattr(feature, "permission_store", None) if feature else None
+            )
+        except Exception:
+            permission_store = None
+
+        if permission_store is None:
+            logging.warning(
+                "[ephemeral-purge] audit store unavailable; "
+                "leak breakdown=%s reason=%s", breakdown, reason,
+            )
+            return
+
+        try:
+            import json as _json
+            await permission_store.log_decision(
+                feature_name="ephemeral_purge",
+                tool_name="hard_purge_guard",
+                action="ephemeral_session_close",
+                decision="leak_purged",
+                args_summary=_json.dumps({
+                    "agent_did": getattr(self, "did", None),
+                    "reason": reason,
+                    "breakdown": breakdown,
+                }),
+            )
+        except Exception as e:
+            logging.warning(
+                "[ephemeral-purge] audit write failed: %s "
+                "(breakdown=%s, reason=%s)",
+                e, breakdown, reason,
+            )
 
 
     async def _register_feature(self, feature: Feature):
@@ -1628,6 +1714,20 @@ Expected Duration: {expected_duration}
 
     async def shutdown(self):
         """Properly clean up all agent resources including async MCP connections."""
+        # EPHEMERAL hard-purge defense-in-depth (#767). If the agent
+        # process is exiting while still in EPHEMERAL, the session is
+        # closing — fire the hard-purge so any leak doesn't survive
+        # the restart. Best-effort; never block shutdown on failure.
+        try:
+            if getattr(self, "_privacy_mode", None) == PrivacyMode.EPHEMERAL:
+                await self._purge_ephemeral_leaks(
+                    reason="ephemeral-agent-shutdown",
+                )
+        except Exception as e:
+            logging.warning(
+                "ephemeral hard-purge during shutdown failed: %s", e
+            )
+
         # Stop heartbeat runner
         if hasattr(self, 'heartbeat_runner') and self.heartbeat_runner:
             try:
