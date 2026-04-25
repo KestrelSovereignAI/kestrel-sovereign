@@ -331,6 +331,7 @@ The currently exported `Feature` subclasses discovered from those modules includ
   - `WebSocket /voice/chat`
 - [`endpoints/voice_realtime.py`](endpoints/voice_realtime.py)
   - `POST /realtime/session` — declared on the realtime router; **served at `POST /voice/realtime/session`** because `VoiceFeature.get_router()` includes this router into the parent `/voice` router (FastAPI concatenates prefixes on `include_router`). Mints an OpenAI Realtime ephemeral-token bundle for browser WebRTC sessions. Privacy-gated via the voice path resolver; returns 409 with fallback provider names when the active route is not realtime.
+  - `POST /realtime/tools/{session_id}` — **served at `POST /voice/realtime/tools/{session_id}`**. Browser POSTs here when the Realtime model invokes a tool; runs it against the agent's enabled features and returns the result. Always 200 with a result payload (errors as `{result: {error: ...}}`) so the frontend always commits *something* back to the data channel — silence wedges the model.
 - [`endpoints/features.py`](endpoints/features.py)
   - `GET /api/features`
   - `GET /api/features/installed`

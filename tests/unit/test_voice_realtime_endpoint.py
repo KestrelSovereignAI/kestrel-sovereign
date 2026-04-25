@@ -705,6 +705,121 @@ class TestFeatureKeyLookup:
         assert resp.status_code == 503
 
 
+# ---------------------------------------------------------------------------
+# Tool dispatch endpoint
+# ---------------------------------------------------------------------------
+
+
+class TestToolDispatch:
+    """POST /voice/realtime/tools/{session_id} runs the requested tool against
+    the agent's enabled features and returns the result. Critical
+    invariants:
+
+    1. Always returns a 200 with a result payload — even on error — so
+       the frontend can commit *something* back to the Realtime data
+       channel. Silence wedges the model.
+    2. Unknown tool names → returns ``{result: {error: ...}}``, not 404.
+    3. Tool execution failures → caught, returned as ``{result: {error: ...}}``.
+    """
+
+    def _agent_with_tool(self, tool_obj: Any) -> Any:
+        feature = SimpleNamespace(get_tools=lambda: [tool_obj])
+        from kestrel_sovereign.features.voice.feature import VoiceFeature
+
+        voice_marker = MagicMock()
+        voice_marker.__class__ = VoiceFeature
+        return SimpleNamespace(
+            agent_id="test",
+            features={"VoiceFeature": voice_marker, "tool_owner": feature},
+            identity=SimpleNamespace(system_prompt=""),
+        )
+
+    def test_dispatches_known_tool_and_returns_result(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def _execute(**kwargs):
+            return {"echoed": kwargs}
+
+        tool = SimpleNamespace(name="echo", execute=_execute)
+        agent = self._agent_with_tool(tool)
+        _inject_agent(monkeypatch, agent)
+
+        resp = client.post(
+            "/voice/realtime/tools/sess_abc",
+            json={"call_id": "call_1", "name": "echo", "arguments": {"text": "hi"}},
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["call_id"] == "call_1"
+        assert body["result"] == {"echoed": {"text": "hi"}}
+
+    def test_unknown_tool_returns_error_result_not_404(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        agent = self._agent_with_tool(SimpleNamespace(name="other", execute=AsyncMock()))
+        _inject_agent(monkeypatch, agent)
+        resp = client.post(
+            "/voice/realtime/tools/sess",
+            json={"call_id": "c", "name": "ghost", "arguments": {}},
+        )
+        # 200 + error payload — silence would wedge the model.
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["call_id"] == "c"
+        assert "error" in body["result"]
+        assert "ghost" in body["result"]["error"]
+
+    def test_tool_exception_returns_error_result(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def _explode(**_):
+            raise RuntimeError("kaboom")
+
+        agent = self._agent_with_tool(SimpleNamespace(name="boom", execute=_explode))
+        _inject_agent(monkeypatch, agent)
+        resp = client.post(
+            "/voice/realtime/tools/sess",
+            json={"call_id": "c", "name": "boom", "arguments": {}},
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert "kaboom" in body["result"]["error"]
+
+    def test_bad_arguments_returns_error_not_500(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def _strict(*, required_arg):
+            return {"ok": required_arg}
+
+        agent = self._agent_with_tool(SimpleNamespace(name="strict", execute=_strict))
+        _inject_agent(monkeypatch, agent)
+        resp = client.post(
+            "/voice/realtime/tools/sess",
+            json={"call_id": "c", "name": "strict", "arguments": {"wrong_kwarg": 1}},
+        )
+        # Still 200 so the frontend commits the error result.
+        assert resp.status_code == 200
+        body = resp.json()
+        assert "Bad arguments" in body["result"]["error"]
+
+    def test_503_when_voice_feature_missing(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        agent = SimpleNamespace(features={}, identity=None)
+        _inject_agent(monkeypatch, agent)
+        resp = client.post(
+            "/voice/realtime/tools/sess",
+            json={"call_id": "c", "name": "anything", "arguments": {}},
+        )
+        assert resp.status_code == 503
+
+    def test_router_registers_tools_path(self) -> None:
+        voice_parent = APIRouter(prefix="/voice", tags=["voice"])
+        voice_parent.include_router(realtime_router)
+        paths = {route.path for route in voice_parent.routes}
+        assert "/voice/realtime/tools/{session_id}" in paths
+
+
 def test_router_registers_session_at_voice_realtime_session() -> None:
     """The realtime router's prefix must be `/realtime` so that nesting it
     inside the parent `/voice` router yields exactly `/voice/realtime/session`.
