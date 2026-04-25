@@ -420,11 +420,16 @@ function resetTurnState() {
 
 
 async function handleToolCall(ev) {
-  if (!client || !client.session?.session_id) {
+  // Capture the client at function entry. The module-level `client` can be
+  // nulled by stopSession()/surfaceFatalError() during the await on the
+  // tool-dispatch fetch — without this snapshot, commitToolResult below
+  // crashes with `Cannot read properties of null (reading 'commitToolResult')`.
+  const sessionClient = client;
+  if (!sessionClient || !sessionClient.session?.session_id) {
     console.warn('[voice/ui] tool call before session ready:', ev);
     return;
   }
-  const sessionId = client.session.session_id;
+  const sessionId = sessionClient.session.session_id;
   const url = API.buildAgentUrl(`/voice/realtime/tools/${encodeURIComponent(sessionId)}`);
   let body;
   try {
@@ -444,9 +449,18 @@ async function handleToolCall(ev) {
   } catch (err) {
     body = { error: `tool dispatch threw: ${err.message}` };
   }
-  // Always commit SOMETHING — silence on a tool call wedges the model.
+
+  // If the session ended while we were awaiting the dispatch, the model is
+  // gone and there's nowhere to commit. Drop silently — the model already
+  // closed.
+  if (sessionClient !== client) {
+    console.info('[voice/ui] session ended before tool result; dropping commit');
+    return;
+  }
+
+  // Always commit SOMETHING when the session is alive — silence wedges the model.
   try {
-    client.commitToolResult(ev.call_id, body.result ?? body);
+    sessionClient.commitToolResult(ev.call_id, body.result ?? body);
   } catch (err) {
     console.error('[voice/ui] commitToolResult failed:', err);
   }
