@@ -25,7 +25,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from fastapi import FastAPI
+from fastapi import APIRouter, FastAPI
 from fastapi.testclient import TestClient
 
 from endpoints.voice_realtime import (
@@ -119,8 +119,15 @@ def _make_agent(
 
 @pytest.fixture
 def client() -> TestClient:
+    # Mirror the production nesting: VoiceFeature.get_router() includes the
+    # realtime router into the parent /voice router, so the final path is
+    # /voice/realtime/session. Without this wrapper the test would call
+    # /realtime/session and miss any future regression where the parent's
+    # prefix changes.
     app = FastAPI()
-    app.include_router(realtime_router)
+    voice_parent = APIRouter(prefix="/voice", tags=["voice"])
+    voice_parent.include_router(realtime_router)
+    app.include_router(voice_parent)
     return TestClient(app)
 
 
@@ -406,3 +413,24 @@ class TestDefaultVoice:
     def test_falls_back_to_cedar(self) -> None:
         feature = SimpleNamespace(_voice_config=SimpleNamespace(tts_voice_id=""))
         assert _default_voice(feature) == "cedar"
+
+
+# ---------------------------------------------------------------------------
+# Router-prefix regression — guards against the doubled `/voice/voice/` bug
+# ---------------------------------------------------------------------------
+
+
+def test_router_registers_session_at_voice_realtime_session() -> None:
+    """The realtime router's prefix must be `/realtime` so that nesting it
+    inside the parent `/voice` router yields exactly `/voice/realtime/session`.
+
+    Setting the realtime router's prefix to `/voice/realtime` would land the
+    final route at `/voice/voice/realtime/session` and 404 against every
+    Kestrel deployment that mounts via VoiceFeature.get_router (which is all
+    of them in production).
+    """
+    voice_parent = APIRouter(prefix="/voice", tags=["voice"])
+    voice_parent.include_router(realtime_router)
+    paths = {route.path for route in voice_parent.routes}
+    assert "/voice/realtime/session" in paths
+    assert "/voice/voice/realtime/session" not in paths
