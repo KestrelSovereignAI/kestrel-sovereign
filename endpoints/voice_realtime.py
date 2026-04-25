@@ -62,6 +62,13 @@ class RealtimeSessionRequest(BaseModel):
     # Turn-detection knobs with sensible defaults — frontend may override.
     turn_detection_mode: str = "server_vad"  # "server_vad" | "semantic_vad" | "none"
     silence_ms: int = 500
+    # Per-call routing overrides — the voice picker sends these so the user
+    # can force Pipeline (e.g. to keep their selected chat LLM as the brain)
+    # or pin a specific TTS provider for this session without persisting the
+    # change. Empty string / true = use persisted defaults.
+    prefer_realtime: bool = True
+    preferred_tts: str = ""
+    preferred_stt: str = ""
 
 
 class RealtimeSessionResponse(BaseModel):
@@ -114,7 +121,12 @@ async def create_realtime_session(body: RealtimeSessionRequest, request: Request
             detail="Voice feature not enabled on this agent.",
         )
 
-    route = await feature._resolve_route()
+    overrides = UserVoicePreferences(
+        preferred_tts=body.preferred_tts or None,
+        preferred_stt=body.preferred_stt or None,
+        prefer_realtime=body.prefer_realtime,
+    )
+    route = await feature._resolve_route(overrides=overrides)
     if route.path != "realtime" or not route.conversation_provider:
         return _unavailable_response(route)
 
@@ -400,6 +412,110 @@ def _clamp_turn_mode(mode: str) -> str:
     """Guard against arbitrary strings in the request body."""
     allowed = {"server_vad", "semantic_vad", "none"}
     return mode if mode in allowed else "server_vad"
+
+
+# ---------------------------------------------------------------------------
+# Route introspection — lets the UI show which voice path + which model is
+# actually answering, so users aren't surprised that "voice" can mean
+# gpt-realtime-1.5 (Realtime path) instead of their selected chat model.
+# ---------------------------------------------------------------------------
+
+
+class RouteIntrospectionResponse(BaseModel):
+    """What the UI needs to display the active voice setup at a glance."""
+
+    path: Optional[str]                     # "realtime" | "pipeline" | "local" | None
+    reason: str
+    llm_vendor: str                         # the agent's current chat-LLM vendor
+    conversation_provider: Optional[str]    # set on Realtime path
+    tts_provider: Optional[str]             # set on Pipeline / local path
+    stt_provider: Optional[str]
+    # Voice-side model + voice IDs the resolver would actually mint with
+    # right now. None if the provider isn't installed or model discovery
+    # hasn't completed (the UI should show "discovering..." then).
+    voice_model: Optional[str]
+    voice_id: Optional[str]
+    available_conversation_providers: list[str]
+    available_tts_providers: list[str]
+    available_stt_providers: list[str]
+
+
+@router.get("/route")
+async def introspect_voice_route(
+    request: Request,
+    prefer_realtime: bool = True,
+    preferred_tts: str = "",
+    preferred_stt: str = "",
+) -> RouteIntrospectionResponse:
+    """Return the current resolved voice route + the model that would answer.
+
+    Pure-introspection: never mints a session, never opens a connection.
+    The UI calls this on load and whenever the user changes the chat-LLM
+    selection or voice-picker overrides so the model display can preview
+    "if I started voice now, what would actually answer?".
+
+    Query params let the picker preview the result of forcing a path
+    ("would Pipeline pick ElevenLabs?") without committing to a session.
+    """
+    agent = get_agent(request)
+    feature = _get_voice_feature(agent)
+    if feature is None:
+        raise HTTPException(status_code=503, detail="Voice feature not enabled on this agent.")
+
+    overrides = UserVoicePreferences(
+        preferred_tts=preferred_tts or None,
+        preferred_stt=preferred_stt or None,
+        prefer_realtime=prefer_realtime,
+    )
+    route = await feature._resolve_route(overrides=overrides)
+    registry = await feature._ensure_registry()
+    voice_model = None
+    voice_id = None
+
+    # Conversation provider: ask it which model + voice it would use.
+    if route.conversation_provider:
+        provider = registry.get_conversation(route.conversation_provider)
+        if provider is not None:
+            try:
+                models = await provider.discover_models()
+                if models:
+                    voice_model = models[0]
+            except Exception:  # noqa: BLE001 — discovery best-effort
+                pass
+        voice_id = getattr(feature._voice_config, "tts_voice_id", "") or _default_voice(feature)
+
+    # Pipeline path: model name comes from the TTS provider's discovery.
+    elif route.tts_provider:
+        tts = registry.get_tts(route.tts_provider)
+        if tts is not None:
+            try:
+                # Providers expose `discover_models()` per the upgraded
+                # contract (#1 in each cross-repo). Fall back to whatever
+                # `_resolve_model` would pick.
+                discover = getattr(tts, "discover_models", None)
+                if discover:
+                    models = await discover()
+                    if models:
+                        voice_model = models[0]
+            except Exception:  # noqa: BLE001
+                pass
+        voice_id = getattr(feature._voice_config, "tts_voice_id", "")
+
+    return RouteIntrospectionResponse(
+        path=route.path,
+        reason=route.reason,
+        llm_vendor=feature._get_llm_vendor(),
+        conversation_provider=route.conversation_provider,
+        tts_provider=route.tts_provider,
+        stt_provider=route.stt_provider,
+        voice_model=voice_model,
+        voice_id=voice_id or None,
+        available_conversation_providers=sorted(
+            getattr(registry, "list_conversation_providers", lambda: [])()
+        ),
+        available_tts_providers=sorted(registry.list_tts_providers()),
+        available_stt_providers=sorted(registry.list_stt_providers()),
+    )
 
 
 # ---------------------------------------------------------------------------
