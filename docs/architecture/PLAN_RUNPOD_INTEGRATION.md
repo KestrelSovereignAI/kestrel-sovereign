@@ -1,5 +1,13 @@
 # Plan: Sovereign GPU Integration (RunPod)
 
+> **Implementation status (last verified 2026-04-25):** RunPod is **experimental**, not production-stable. The `RunPodManager` and `BrainRouter` exist in `features/runpod/` and the happy-path lifecycle (start / stop / status / direct-mode logs) works. Known gaps:
+> - Managed-mode log retrieval is `NotImplementedError` in `features/runpod/core.py`
+> - The `!dream` image-generation command was removed; `generate_image_on_runpod()` remains in the file but nothing calls it
+> - Integration tests under `tests/integration/test_runpod_*.py` skip in CI without `RUNPOD_API_KEY`
+> - No active development since early April 2026; last substantive commits were maintenance (CI fixes, dependency strip)
+>
+> Treat the rest of this document as design intent, not a description of a polished feature.
+
 ## 1. Overview
 This document outlines the architecture for integrating ephemeral GPU compute (RunPod) into the Kestrel Sovereign Agent. The goal is to allow the agent to "upgrade its brain" on demand, moving from local/cloud inference to a high-performance private GPU pod for complex tasks or image generation, while maintaining full sovereignty and control.
 
