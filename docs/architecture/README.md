@@ -1,55 +1,107 @@
 # Kestrel Architecture Documentation
 
-This directory contains detailed Product Requirements Documents (PRDs) and technical specifications for the Kestrel agent architecture.
+Detailed Product Requirements Documents (PRDs) and technical specifications for the Kestrel agent architecture.
+
+> **Status conventions used below:**
+> - **Active** — describes the current shipped system
+> - **Experimental** — code exists and works on the happy path, but has known gaps; integration tests may skip in CI without external credentials
+> - **Aspirational** — design-of-record document; partially implemented (specifics in the doc's own banner)
+
+---
 
 ## 📂 Directory Structure
 
-### [Core Framework](core/)
-Foundational documents defining the agent's existence and infrastructure.
-- **[AGENT_ECOSYSTEM.md](core/AGENT_ECOSYSTEM.md)**: System for creating and hosting agents.
-- **[FEATURE_AGENT_FRAMEWORK.md](core/FEATURE_AGENT_FRAMEWORK.md)**: The "Society of Agents" architecture.
-- **[MULTI_MODEL_SUPPORT.md](core/MULTI_MODEL_SUPPORT.md)**: LLM Router and model abstraction.
-- **[INFRASTRUCTURE.md](core/INFRASTRUCTURE.md)**: Development infrastructure and tooling.
+### Core framework
 
-### [Storage & Sovereignty](storage/)
-Storage protocols, decentralization, and data ownership.
-- **[STORAGE_ARCHITECTURE.md](storage/STORAGE_ARCHITECTURE.md)**: High-level multi-tier storage design.
-- **[HUMAN_MEMORY_SYSTEM.md](storage/HUMAN_MEMORY_SYSTEM.md)**: Human-like memory with emotional tagging, temporal patterns, and forgetting curves.
-- **[DECENTRALIZED_STORAGE.md](storage/DECENTRALIZED_STORAGE.md)**: Vision for IPFS/Filecoin integration.
-- **[SOVEREIGNTY_V2_TECHNICAL.md](storage/SOVEREIGNTY_V2_TECHNICAL.md)**: Merkle Forest and convergent encryption.
+Foundational documents defining the agent's existence and runtime.
 
-### [Economics](economics/)
+- **[AGENT_IDENTITY_CONTRACT.md](AGENT_IDENTITY_CONTRACT.md)** — DID as the single source of truth; `agent_id` as a property derived from the DID. *Active.*
+- **[LLM_SERVICE_ARCHITECTURE.md](LLM_SERVICE_ARCHITECTURE.md)** — Vendor / route / model architecture; retry, structured output, vision, streaming. *Active (canonical).*
+- **[DYNAMIC_TOOL_LOADING.md](DYNAMIC_TOOL_LOADING.md)** — Direct tool registration after subagent dispatch. *Active.*
+- **[USER_LIFECYCLE_MANAGEMENT.md](USER_LIFECYCLE_MANAGEMENT.md)** — Soft / hard delete strategies and cryo storage. *Active.*
+- **[core/AGENT_ECOSYSTEM.md](core/AGENT_ECOSYSTEM.md)** — Agent creation and the Genesis factory. *Active.*
+- **[core/FEATURE_AGENT_FRAMEWORK.md](core/FEATURE_AGENT_FRAMEWORK.md)** — The "Society of Agents" architecture; Feature base class and `@tool` decorators. *Active.*
+- **[core/MULTI_MODEL_SUPPORT.md](core/MULTI_MODEL_SUPPORT.md)** — LLMAdapter abstraction and provider fallback. *Active.*
+- **[core/INFRASTRUCTURE.md](core/INFRASTRUCTURE.md)** — Parallel-development workflow and tooling. *Active.*
+
+### Memory & storage
+
+Storage protocols, memory systems, and data ownership.
+
+- **[MEMORY_SYSTEM.md](MEMORY_SYSTEM.md)** — Emotional tagging, Ebbinghaus decay, consolidation, memory pinning. *Active.*
+- **[MEMORY_OWNERSHIP.md](MEMORY_OWNERSHIP.md)** — Memory layer assignments and the facade pattern. *Active.*
+- **[storage/STORAGE_ARCHITECTURE.md](storage/STORAGE_ARCHITECTURE.md)** — Multi-tier storage (PostgreSQL / SQLite / IndexedDB / ephemeral). *Active.*
+- **[storage/HUMAN_MEMORY_SYSTEM.md](storage/HUMAN_MEMORY_SYSTEM.md)** — Human-like memory with temporal patterns. *Active.*
+- **[storage/DECENTRALIZED_STORAGE.md](storage/DECENTRALIZED_STORAGE.md)** — IPFS / Filecoin integration design. *Active.*
+- **[storage/SOVEREIGNTY_IMPLEMENTATION.md](storage/SOVEREIGNTY_IMPLEMENTATION.md)** — Sovereignty implementation details. *Active.*
+- **[storage/SOVEREIGNTY_V2_TECHNICAL.md](storage/SOVEREIGNTY_V2_TECHNICAL.md)** — Merkle Forest and convergent encryption. *Active.*
+
+### Security & privacy
+
+Privacy modes, key management, constitution, and cryptographic integrity.
+
+- **[security/PRIVACY_MODES.md](security/PRIVACY_MODES.md)** — The 5-tier privacy system (EPHEMERAL / ISOLATED / ANONYMOUS / NORMAL / PUBLIC). *Active.*
+- **[security/PRIVACY_AGENT.md](security/PRIVACY_AGENT.md)** — Privacy enforcement agent. *Active.*
+- **[security/KEY_MANAGEMENT.md](security/KEY_MANAGEMENT.md)** — Two-layer key architecture (KESTREL_DATA_KEY + agent private key). *Active.*
+- **[security/KEY_ROTATION.md](security/KEY_ROTATION.md)** — Key rotation procedures. *Active.*
+- **[security/CONSTITUTION_EMBEDDING.md](security/CONSTITUTION_EMBEDDING.md)** — Cryptographic binding of the constitution. *Active.*
+- **[security/CRYPTOGRAPHIC_ANCHORING.md](security/CRYPTOGRAPHIC_ANCHORING.md)** — Immutable event logging. *Active.*
+- **[security/INTEGRITY_AUDIT_SYSTEM.md](security/INTEGRITY_AUDIT_SYSTEM.md)** — Economic enforcement of ethics. *Active.*
+- **[security/ANTI_CORRUPTION_ANALYSIS.md](security/ANTI_CORRUPTION_ANALYSIS.md)** — Safeguards against economic corruption. *Active.*
+- **[security/POST_QUANTUM_CRYPTOGRAPHY_MIGRATION.md](security/POST_QUANTUM_CRYPTOGRAPHY_MIGRATION.md)** — Migration plan for NIST PQC. *Aspirational (planning doc).*
+- **[subagent_isolation_audit.md](subagent_isolation_audit.md)** — Cross-feature subagent isolation audit (Feb 2026). *Active.*
+
+### Features
+
+Specific feature designs and implementations.
+
+- **[COMPUTE_FEATURE_DESIGN.md](COMPUTE_FEATURE_DESIGN.md)** — Write / sign / review / execute pattern for sandboxed code execution. *Active.*
+- **[GITHUB_FEATURE_DESIGN.md](GITHUB_FEATURE_DESIGN.md)** — GitHub code introspection. *Aspirational* — see banner; ~half of the design ships.
+
+### Cloud & GPU compute
+
+Documents covering cloud-provider integrations. **All flagged experimental** — see each doc's banner for ground truth on what's shipped vs. designed.
+
+- **[PLAN_RUNPOD_INTEGRATION.md](PLAN_RUNPOD_INTEGRATION.md)** — RunPod GPU pods (direct + managed modes). *Experimental.*
+- **[RUNPOD_LORA_TRAINING.md](RUNPOD_LORA_TRAINING.md)** — RunPod LoRA training operational guide (Q1 2026). *Experimental, predates training/provider library split.*
+- **[VASTAI_TRAINING.md](VASTAI_TRAINING.md)** — VastAI as a training backend. *Deprioritized (Dec 2025).* Note: VastAI as a general compute provider is separate and active.
+- **[TRAINING_PROVIDER_ARCHITECTURE.md](TRAINING_PROVIDER_ARCHITECTURE.md)** — Protocol + factory for training providers. *Active (library).*
+- **[PROVIDER_ECONOMICS.md](PROVIDER_ECONOMICS.md)** — Middleman / referral revenue model. *Strategy doc.*
+
+### Wallets & economics
+
 Wallet, solvency, and economic incentives.
-- **[AGENT_ECONOMICS.md](economics/AGENT_ECONOMICS.md)**: Vision for sovereign economic entities.
-- **[WALLET_AGENT.md](economics/WALLET_AGENT.md)**: Wallet implementation details.
-- **[WALLET_SYSTEM.md](WALLET_SYSTEM.md)**: Multi-chain transaction signing (Filecoin, Ethereum, Polygon), ERC-20 tokens, fiat on-ramp.
-- **[FILECOIN_WALLET.md](FILECOIN_WALLET.md)**: Legacy Filecoin-specific wallet integration.
-- **[SOVEREIGN_SOLVENCY.md](economics/SOVEREIGN_SOLVENCY.md)**: Economic survival and dormancy protocols.
-- **[ECONOMIC_INCENTIVES_DEEP_DIVE.md](economics/ECONOMIC_INCENTIVES_DEEP_DIVE.md)**: Payment flows and mechanisms.
-- **[ECONOMIC_SYSTEM_PRACTICAL_DETAILS.md](economics/ECONOMIC_SYSTEM_PRACTICAL_DETAILS.md)**: Licensing and buy-out mechanics.
 
-### [Security & Privacy](security/)
-Privacy modes, constitution, and cryptographic integrity.
-- **[PRIVACY_MODES.md](security/PRIVACY_MODES.md)**: The 5-tier privacy system.
-- **[PRIVACY_AGENT.md](security/PRIVACY_AGENT.md)**: Privacy enforcement agent.
-- **[CONSTITUTION_EMBEDDING.md](security/CONSTITUTION_EMBEDDING.md)**: Cryptographic binding of the constitution.
-- **[CRYPTOGRAPHIC_ANCHORING.md](security/CRYPTOGRAPHIC_ANCHORING.md)**: Immutable event logging.
-- **[INTEGRITY_AUDIT_SYSTEM.md](security/INTEGRITY_AUDIT_SYSTEM.md)**: Economic enforcement of ethics.
-- **[ANTI_CORRUPTION_ANALYSIS.md](security/ANTI_CORRUPTION_ANALYSIS.md)**: Safeguards against economic corruption.
-- **[POST_QUANTUM_CRYPTOGRAPHY_MIGRATION.md](security/POST_QUANTUM_CRYPTOGRAPHY_MIGRATION.md)**: Migration to NIST PQC standards.
+- **[WALLET_SYSTEM.md](WALLET_SYSTEM.md)** — Multi-chain transaction signing (Filecoin, Ethereum, Polygon), ERC-20 tokens, fiat on-ramp. *Active.*
+- **[FILECOIN_WALLET.md](FILECOIN_WALLET.md)** — Filecoin-specific wallet integration. *Active.*
+- **[economics/AGENT_ECONOMICS.md](economics/AGENT_ECONOMICS.md)** — Vision for sovereign economic entities. *Aspirational.*
+- **[economics/WALLET_AGENT.md](economics/WALLET_AGENT.md)** — Wallet agent implementation. *Active.*
+- **[economics/SOVEREIGN_SOLVENCY.md](economics/SOVEREIGN_SOLVENCY.md)** — Economic survival and dormancy protocols. *Aspirational.*
+- **[economics/ECONOMIC_INCENTIVES_DEEP_DIVE.md](economics/ECONOMIC_INCENTIVES_DEEP_DIVE.md)** — Payment flows and mechanisms. *Active.*
+- **[economics/ECONOMIC_SYSTEM_PRACTICAL_DETAILS.md](economics/ECONOMIC_SYSTEM_PRACTICAL_DETAILS.md)** — Licensing and buy-out mechanics. *Active.*
+- **[economics/ECONOMICS_WORK_SESSION.md](economics/ECONOMICS_WORK_SESSION.md)** — Working notes from economics design sessions. *Internal.*
 
-### [Agent Tools](tools/)
-Capabilities and tool definitions.
-- **[AGENT_TOOLS_ARCHITECTURE.md](tools/AGENT_TOOLS_ARCHITECTURE.md)**: Design for the tool system.
-- **[AGENT_TOOLS_IMPLEMENTATION.md](tools/AGENT_TOOLS_IMPLEMENTATION.md)**: Implementation details of current tools.
+### Tools
 
-### [Testing](testing/)
-Test plans and quality assurance.
-- **[LLM_ROUTER_TESTING_PLAN.md](testing/LLM_ROUTER_TESTING_PLAN.md)**: Comprehensive testing strategy.
+- **[tools/AGENT_TOOLS_ARCHITECTURE.md](tools/AGENT_TOOLS_ARCHITECTURE.md)** — Design for the tool system. *Active.*
+- **[tools/AGENT_TOOLS_IMPLEMENTATION.md](tools/AGENT_TOOLS_IMPLEMENTATION.md)** — Current tool implementations. *Active.*
+- **[tools/AGENT_TOOLS.md](tools/AGENT_TOOLS.md)** — Tool catalog. *Active.*
 
-### Archived Content
-Historical documentation has been moved to `/archive/docs/`:
-- Fix summaries → `/archive/docs/fix-summaries/`
-- Session notes → `/archive/session-logs/`
-- Security audits → `/archive/docs/`
-- Outreach materials → `/archive/docs/outreach/`
+### Testing
+
+- **[testing/TESTING_GUIDE.md](testing/TESTING_GUIDE.md)** — Test runner, pyramid strategy, SQLite WAL notes. *Active (canonical).*
+- **[testing/LLM_ROUTER_TESTING_PLAN.md](testing/LLM_ROUTER_TESTING_PLAN.md)** — LLM-router testing strategy. *Active.*
+
+---
+
+## Related references
+
+- **Engineering quality program:** [`/docs/audit/`](../audit/) — feature proof matrices, seam campaigns, sync/async audit. Actively maintained.
+- **Live feature inventory:** [`/KESTREL_FEATURES.md`](../../KESTREL_FEATURES.md) (canonical, consumed by `scripts/generate_feature_docs.py`)
+- **Constitution:** [`/docs/principles/KESTREL_CONSTITUTION.md`](../principles/KESTREL_CONSTITUTION.md)
+
+---
+
+## Archive
+
+Historical / superseded architecture documents, when present, live under [`/docs/archive/`](../archive/) (gitignored). The legacy feature inventory is preserved at [`/docs/archive/KESTREL_FEATURES_legacy.md`](../archive/KESTREL_FEATURES_legacy.md).
