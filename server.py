@@ -262,6 +262,29 @@ async def lifespan(app: FastAPI):
     # Dynamic router mounting: features contribute routers via get_router()
     _mount_feature_routers(app)
 
+    # Server-side demo-mode classification (#766). Done after agents are
+    # loaded so the rail knows whether to treat destructive ops as safe.
+    from kestrel_sovereign.security.demo_isolation import classify_server_mode
+    if getattr(app.state, "agent_manager", None):
+        loaded = app.state.agent_manager.list_agents()
+        app.state.demo_mode = classify_server_mode(loaded)
+    elif getattr(app.state, "agent", None):
+        app.state.demo_mode = classify_server_mode(
+            {"_default": app.state.agent}
+        )
+    else:
+        app.state.demo_mode = False
+    if app.state.demo_mode:
+        logger.info(
+            "[demo-mode] this server is restricted to demo-scoped agents — "
+            "destructive ops on live agents will be refused"
+        )
+    else:
+        logger.info(
+            "[demo-mode] live server — destructive ops on live agents "
+            "require the X-Kestrel-Allow-Destructive header"
+        )
+
     # Initialize OpenTelemetry tracing (no-op if packages not installed)
     setup_tracing(app)
 
