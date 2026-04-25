@@ -287,6 +287,76 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
+
+# ---------------------------------------------------------------------------
+# ASGI-level rookery routing for /api/agents/{name}/...
+#
+# Why this AND `agent_routing_middleware` below: FastAPI's
+# @app.middleware("http") only fires on HTTP scope. WebSocket upgrades
+# (e.g. /api/agents/Nellie/voice/chat) bypass it entirely, so the
+# downstream WS handler can't resolve the agent and 4503's. This
+# class-based ASGI middleware sees both http and websocket scopes and
+# does the same prefix-strip + agent-resolve for either. The HTTP-only
+# version downstream is kept as a safety net in case middleware order
+# matters for some flow we haven't enumerated.
+# ---------------------------------------------------------------------------
+
+
+_AGENT_PATH_RE_ASGI = re.compile(r"^/api/agents/([^/]+)/(.+)$")
+
+
+class RookeryAgentRoutingMiddleware:
+    """Strip /api/agents/{name}/ prefix + attach the resolved agent to scope.
+
+    Works for both HTTP and WebSocket. For 404 (unknown agent) HTTP
+    requests we synthesize a JSON 404; for WebSocket we close with
+    code=4404 — close codes 4xxx are the application-defined range.
+    """
+
+    def __init__(self, asgi_app):
+        self.app = asgi_app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] not in ("http", "websocket"):
+            return await self.app(scope, receive, send)
+
+        agent_manager = getattr(app.state, "agent_manager", None)
+        if agent_manager is None:
+            return await self.app(scope, receive, send)
+
+        path = scope.get("path", "")
+        match = _AGENT_PATH_RE_ASGI.match(path)
+        if not match:
+            return await self.app(scope, receive, send)
+
+        agent_name = match.group(1)
+        agent = agent_manager.get_agent(agent_name)
+        if agent is None:
+            if scope["type"] == "http":
+                from starlette.responses import JSONResponse as _JR
+                response = _JR(
+                    status_code=404,
+                    content={"detail": f"Agent '{agent_name}' not found"},
+                )
+                return await response(scope, receive, send)
+            # WebSocket: accept then close with a clear reason — browsers see
+            # the close code in the onclose event.
+            await send({"type": "websocket.close", "code": 4404, "reason": "agent not found"})
+            return
+
+        # Mutate scope so downstream routes match the prefix-stripped path
+        # and the handler can find the agent on `request.state` /
+        # `websocket.state`. Starlette wires scope["state"] → both.
+        scope["path"] = "/" + match.group(2)
+        scope["raw_path"] = scope["path"].encode("utf-8")
+        scope.setdefault("state", {})["agent"] = agent
+
+        await self.app(scope, receive, send)
+
+
+app.add_middleware(RookeryAgentRoutingMiddleware)
+
+
 # Rate limiting
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
