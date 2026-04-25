@@ -300,20 +300,22 @@ def _build_parameters_schema(parameters: Any) -> dict:
     * ``list[ToolParameter]`` (the canonical Kestrel SDK shape) — converts
       each ``ToolParameter`` into a JSON Schema property entry, collecting
       ``required: True`` entries into the top-level ``required`` array.
-    * Plain ``dict`` already shaped as JSON Schema — passed through.
+    * Plain ``dict`` already shaped as JSON Schema — passed through (then
+      sanitized; see :func:`_sanitize_schema_for_openai`).
     * Anything else (None, malformed) — falls back to the permissive
-      ``{"type": "object"}`` so OpenAI still accepts the tool definition
-      and zero-arg invocations work.
+      ``{"type": "object"}``.
 
-    The output is guaranteed JSON-serializable; the openai SDK's session
-    create call ``json.dumps``s the whole tool list and would fail on raw
-    ``ToolParameter`` instances (the original bug, surfaced as
-    ``Object of type ToolParameter is not JSON serializable``).
+    The output is guaranteed JSON-serializable AND structurally valid for
+    the OpenAI Realtime API's strict tool-schema validator (every array has
+    ``items``; every object has ``properties``; ``required`` only references
+    declared properties). A single misshapen tool used to fail the entire
+    mint with ``Invalid schema for function 'foo': In context=('properties',
+    'steps'), array schema missing items.``
     """
     if isinstance(parameters, dict):
-        return parameters
+        return _sanitize_schema_for_openai(parameters)
     if not isinstance(parameters, (list, tuple)):
-        return {"type": "object"}
+        return {"type": "object", "properties": {}}
 
     properties: dict[str, dict] = {}
     required: list[str] = []
@@ -340,7 +342,58 @@ def _build_parameters_schema(parameters: Any) -> dict:
     schema: dict[str, Any] = {"type": "object", "properties": properties}
     if required:
         schema["required"] = required
-    return schema
+    return _sanitize_schema_for_openai(schema)
+
+
+def _sanitize_schema_for_openai(schema: Any) -> Any:
+    """Recursively patch a JSON Schema fragment to satisfy OpenAI's validator.
+
+    OpenAI's tool-schema validator is stricter than vanilla JSON Schema:
+
+    * Every node with ``type: "array"`` must have an ``items`` value.
+    * Every node with ``type: "object"`` must have a ``properties`` value.
+    * Every entry in ``required`` must exist in ``properties``.
+
+    A single tool failing any of these blows up the entire ``sessions.create``
+    call (it rejects the whole batch). This walk patches the most common
+    shortcomings in place rather than dropping the offending tool, so
+    Realtime stays usable even when an upstream feature ships a sloppy
+    schema. Returns a new dict; doesn't mutate the input.
+    """
+    if not isinstance(schema, dict):
+        return schema
+
+    out: dict[str, Any] = dict(schema)
+    type_ = out.get("type")
+
+    if type_ == "array":
+        # Default array element schema = anything; OpenAI accepts {} ↔ "any".
+        items = out.get("items")
+        if not isinstance(items, dict):
+            out["items"] = {}
+        else:
+            out["items"] = _sanitize_schema_for_openai(items)
+
+    if type_ == "object":
+        props = out.get("properties")
+        if not isinstance(props, dict):
+            props = {}
+        sanitized_props = {
+            name: _sanitize_schema_for_openai(value)
+            for name, value in props.items()
+        }
+        out["properties"] = sanitized_props
+        # Drop required entries that don't have a matching property —
+        # OpenAI rejects mismatched required arrays.
+        required = out.get("required")
+        if isinstance(required, list):
+            cleaned = [r for r in required if r in sanitized_props]
+            if cleaned:
+                out["required"] = cleaned
+            else:
+                out.pop("required", None)
+
+    return out
 
 
 def _clamp_turn_mode(mode: str) -> str:
