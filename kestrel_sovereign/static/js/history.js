@@ -463,11 +463,19 @@ function addMessageToChat(role, content, isEncrypted = false, messageId = null, 
                 : 'background: var(--bg-tertiary); margin-right: auto;'}
         `;
 
+        // Wrap rendered content in a child div — assigning to messageDiv's
+        // innerHTML/textContent directly would wipe the .msg-delete-btn /
+        // .msg-purge-btn that were just appended above (they're children of
+        // messageDiv).  See #765 — without this wrapper the soft-delete and
+        // hard-purge affordances render briefly then get blown away.
+        const contentDiv = document.createElement('div');
+        contentDiv.className = 'message-content';
         if (role === 'assistant' && window.marked) {
-            messageDiv.innerHTML = marked.parse(content);
+            contentDiv.innerHTML = marked.parse(content);
         } else {
-            messageDiv.textContent = content;
+            contentDiv.textContent = content;
         }
+        messageDiv.appendChild(contentDiv);
     }
 
     chatContainer.appendChild(messageDiv);

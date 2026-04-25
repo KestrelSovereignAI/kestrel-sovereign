@@ -573,6 +573,18 @@ export async function loadAgents() {
                 window.selectAgent(firstOnline.name);
             }
         }
+
+        // Standalone mode: reveal the conversations pane (and its Trash sub-view
+        // from #765) without going through selectAgent.  selectAgent installs a
+        // host-agent URL prefix that only exists in rookery routing — applying
+        // it in standalone produces 404s for /api/conversations and /agent/invoke.
+        // Standalone has exactly one agent, so just show the pane and let
+        // loadConversations() populate the list against the un-prefixed routes.
+        if (isStandalone && agents.length > 0) {
+            const conversationsPane = document.getElementById('conversations-pane');
+            if (conversationsPane) conversationsPane.style.display = 'flex';
+            try { await loadConversations(agents[0].name); } catch (_) { /* best-effort */ }
+        }
     } catch (e) {
         const container = document.getElementById('agents-list');
         container.innerHTML = '<p style="color: var(--error); padding: 1rem;">Failed to load agents</p>';
