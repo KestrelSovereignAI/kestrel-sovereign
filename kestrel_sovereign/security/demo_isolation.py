@@ -142,7 +142,12 @@ async def _record_audit(
     """
     permission_store = None
     try:
-        feature = agent.features.get("Security") if agent else None
+        # Feature registers under its class name "SecurityFeature".
+        # Earlier draft used "Security" and silently dropped audit
+        # writes in production — caught during smoke testing.
+        # Tolerate both keys for forward-compat.
+        features = getattr(agent, "features", {}) if agent else {}
+        feature = features.get("SecurityFeature") or features.get("Security")
         permission_store = getattr(feature, "permission_store", None) if feature else None
     except Exception:  # pragma: no cover — defensive
         permission_store = None
