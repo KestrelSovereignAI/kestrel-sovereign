@@ -187,3 +187,60 @@ async def test_max_rows_zero_or_negative_is_a_safe_noop(tmp_path):
         # Trash row still there
         in_trash = await storage.conversation.get_full_history_with_ids(only_deleted=True)
         assert len(in_trash) == 1
+
+
+@pytest.mark.asyncio
+async def test_privacy_wrapper_exposes_purge_trash_older_than(tmp_path):
+    """Regression — the cron handler reads
+    ``agent.storage.purge_trash_older_than`` where ``agent.storage``
+    is the ``PrivacyEnforcingStorage`` wrapper. Smoke testing caught
+    the missing delegator on the wrapper (the task skipped silently
+    on every tick). This test pins the wrapper's surface so the
+    delegator can't be deleted without breaking a test.
+    """
+    from kestrel_sovereign.privacy import PrivacyMode
+    from kestrel_sovereign.storage.privacy_wrapper import PrivacyEnforcingStorage
+
+    db = tmp_path / "kestrel.db"
+    async with AsyncStorage(str(db), agent_id=AGENT_ID) as underlying:
+        wrapper = PrivacyEnforcingStorage(underlying, PrivacyMode.NORMAL)
+
+        assert hasattr(wrapper, "purge_trash_older_than"), (
+            "privacy wrapper must expose purge_trash_older_than so the "
+            "trash_retention cron handler can find it"
+        )
+
+        # Seed an aged soft-deleted row
+        await underlying.conversation.add_conversation("user", "aged")
+        rows = await underlying.conversation.get_full_history_with_ids()
+        await underlying.conversation.delete_message(rows[0]["id"])
+        long_ago = datetime.now(timezone.utc) - timedelta(days=60)
+        await _stamp(underlying.conversation, rows[0]["id"], long_ago)
+
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).replace(tzinfo=None).isoformat(sep=" ")
+        purged = await wrapper.purge_trash_older_than(cutoff)
+        assert purged == 1
+
+
+@pytest.mark.asyncio
+async def test_privacy_wrapper_purge_trash_works_in_ephemeral_mode(tmp_path):
+    """Aging out already-soft-deleted rows from a prior NORMAL stint
+    must work even when the agent is currently in EPHEMERAL mode —
+    EPHEMERAL gates new persistent writes, not retention sweeps.
+    """
+    from kestrel_sovereign.privacy import PrivacyMode
+    from kestrel_sovereign.storage.privacy_wrapper import PrivacyEnforcingStorage
+
+    db = tmp_path / "kestrel.db"
+    async with AsyncStorage(str(db), agent_id=AGENT_ID) as underlying:
+        # Seed in NORMAL state, then flip the wrapper to EPHEMERAL.
+        await underlying.conversation.add_conversation("user", "soft-deleted in NORMAL")
+        rows = await underlying.conversation.get_full_history_with_ids()
+        await underlying.conversation.delete_message(rows[0]["id"])
+        long_ago = datetime.now(timezone.utc) - timedelta(days=60)
+        await _stamp(underlying.conversation, rows[0]["id"], long_ago)
+
+        wrapper = PrivacyEnforcingStorage(underlying, PrivacyMode.EPHEMERAL)
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).replace(tzinfo=None).isoformat(sep=" ")
+        purged = await wrapper.purge_trash_older_than(cutoff)
+        assert purged == 1
