@@ -400,3 +400,110 @@ def _clamp_turn_mode(mode: str) -> str:
     """Guard against arbitrary strings in the request body."""
     allowed = {"server_vad", "semantic_vad", "none"}
     return mode if mode in allowed else "server_vad"
+
+
+# ---------------------------------------------------------------------------
+# Tool dispatch — the Realtime model invokes tools server-side via OpenAI's
+# function-calling protocol. The browser receives the call (data channel),
+# POSTs here so we can run the tool against the agent's enabled features,
+# and forwards the result back to OpenAI to unblock the model.
+# ---------------------------------------------------------------------------
+
+
+class ToolCallRequest(BaseModel):
+    call_id: str
+    name: str
+    arguments: dict = {}
+
+
+class ToolCallResponse(BaseModel):
+    call_id: str
+    result: Any
+
+
+@router.post("/tools/{session_id}")
+async def dispatch_tool_call(
+    session_id: str,
+    body: ToolCallRequest,
+    request: Request,
+):
+    """Run a tool the Realtime model requested, return the result.
+
+    The frontend is responsible for committing the result back to the
+    Realtime data channel via ``client.commitToolResult``. This endpoint
+    just executes the tool against the agent's enabled features and
+    returns the raw result (or an error payload — the frontend commits
+    SOMETHING either way; silence wedges the model).
+
+    ``session_id`` is part of the path for audit logging and future
+    per-session ACLs (e.g. only allow tools registered with the session
+    that minted that ID). Today it's logged but not enforced.
+    """
+    agent = get_agent(request)
+    feature = _get_voice_feature(agent)
+    if feature is None:
+        raise HTTPException(status_code=503, detail="Voice feature not enabled on this agent.")
+
+    tool = _resolve_tool(agent, body.name)
+    if tool is None:
+        logger.warning(
+            "voice_realtime.tool unknown agent=%s session=%s name=%s",
+            getattr(agent, "agent_id", "?"), session_id, body.name,
+        )
+        return ToolCallResponse(
+            call_id=body.call_id,
+            result={"error": f"Tool not found: {body.name!r}"},
+        )
+
+    args = body.arguments or {}
+    try:
+        result = await tool.execute(**args)
+    except TypeError as exc:
+        # Bad arguments shape — return as a normal error result so the
+        # model can self-correct rather than wedging the session.
+        logger.warning(
+            "voice_realtime.tool bad args agent=%s session=%s name=%s args=%s exc=%s",
+            getattr(agent, "agent_id", "?"), session_id, body.name, args, exc,
+        )
+        return ToolCallResponse(
+            call_id=body.call_id,
+            result={"error": f"Bad arguments for {body.name}: {exc}"},
+        )
+    except Exception as exc:  # noqa: BLE001 — surface to the model as a string
+        logger.exception("voice_realtime.tool execution failed name=%s", body.name)
+        return ToolCallResponse(
+            call_id=body.call_id,
+            result={"error": f"Tool {body.name} raised: {exc}"},
+        )
+
+    logger.info(
+        "voice_realtime.tool agent=%s session=%s name=%s args_keys=%s",
+        getattr(agent, "agent_id", "?"),
+        session_id,
+        body.name,
+        sorted(args.keys()),
+    )
+    return ToolCallResponse(call_id=body.call_id, result=result)
+
+
+def _resolve_tool(agent: Any, name: str):
+    """Find an AgentTool by name across all enabled features.
+
+    Mirrors how the existing chat path looks up tools — features are
+    keyed by class name in ``agent.features``; each feature exposes
+    ``get_tools()`` returning ``AgentTool`` instances with a ``.name``
+    attribute. First match wins (names should be globally unique within
+    an agent's enabled-feature set).
+    """
+    features = getattr(agent, "features", {}) or {}
+    for feature in features.values():
+        get_tools = getattr(feature, "get_tools", None)
+        if get_tools is None:
+            continue
+        try:
+            for tool in get_tools() or []:
+                if getattr(tool, "name", None) == name:
+                    return tool
+        except Exception:  # noqa: BLE001 — one broken feature mustn't block tool lookup
+            continue
+    return None

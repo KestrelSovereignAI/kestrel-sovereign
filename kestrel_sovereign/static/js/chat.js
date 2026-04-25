@@ -466,7 +466,7 @@ window.compressContext = async function() {
 // Message Rendering
 // ============================================================================
 
-function addMessageStreaming(role) {
+export function addMessageStreaming(role) {
     const div = document.createElement('div');
     div.className = `message ${role === 'user' ? 'user-message' : 'agent-message'}`;
 
@@ -481,7 +481,7 @@ function addMessageStreaming(role) {
     return div;
 }
 
-function updateStreamingMessage(msgDiv, content) {
+export function updateStreamingMessage(msgDiv, content) {
     const contentDiv = msgDiv.querySelector('.message-content');
     if (contentDiv) {
         // Split content into tool activity and response at the --- separator
@@ -521,7 +521,7 @@ function updateStreamingMessage(msgDiv, content) {
     }
 }
 
-async function finalizeStreamingMessage(msgDiv, content) {
+export async function finalizeStreamingMessage(msgDiv, content) {
     const contentDiv = msgDiv.querySelector('.message-content');
     if (contentDiv) {
         contentDiv.classList.remove('streaming');
