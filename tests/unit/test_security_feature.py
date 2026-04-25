@@ -356,9 +356,14 @@ class TestSecurityHook:
         return store
 
     @pytest.fixture
-    def approval_queue(self):
-        """Create an approval queue."""
-        return ApprovalQueue()
+    async def approval_queue(self, permission_store):
+        """Create an approval queue wired to the permission store.
+
+        Mirrors production wiring (SecurityFeature passes the store in)
+        so the queue can persist scope choices and write audit rows
+        centrally — see #785.
+        """
+        return ApprovalQueue(permission_store=permission_store)
 
     @pytest.fixture
     async def hook(self, permission_store, approval_queue):
@@ -510,12 +515,14 @@ class TestSecurityIntegration:
 
     @pytest.fixture
     async def setup(self, tmp_path):
-        """Set up the full security stack."""
+        """Set up the full security stack with the queue wired to the store
+        (matches production wiring per #785 — the queue owns scope
+        persistence and audit-row writes)."""
         db_path = str(tmp_path / "test.db")
         store = track_store(PermissionStore(db_path))
         await store.initialize()
 
-        queue = ApprovalQueue()
+        queue = ApprovalQueue(permission_store=store)
         hook = SecurityHook(store, queue)
 
         return store, queue, hook
@@ -552,6 +559,186 @@ class TestSecurityIntegration:
         logs = await store.get_audit_log(limit=1)
         assert logs[0]["decision"] == "user_approved"
         assert logs[0]["user_choice"] == "session"
+
+
+class TestApprovalQueueScopePersistence:
+    """Regression suite for #785.
+
+    Six features (code_edit, compute, keys, reflection.*) call
+    ``ApprovalQueue.request_approval`` directly without going through
+    ``SecurityHook``.  Before #785 they all discarded the user's scope,
+    so "This Session" / "Always" never stuck.  These tests pin that the
+    queue itself now persists scope and writes audit rows whenever a
+    ``permission_store`` is wired in.
+    """
+
+    @pytest.fixture
+    async def store(self, tmp_path):
+        from kestrel_sovereign.features.security.permissions import PermissionStore
+        s = PermissionStore(str(tmp_path / "scope.db"))
+        await s.initialize()
+        return s
+
+    @pytest.fixture
+    def queue_with_store(self, store):
+        return ApprovalQueue(permission_store=store)
+
+    @pytest.fixture
+    def queue_without_store(self):
+        return ApprovalQueue()
+
+    @pytest.mark.asyncio
+    async def test_session_scope_persists_via_direct_caller(self, queue_with_store, store):
+        """A direct ``request_approval`` call (the path used by code_edit,
+        compute, keys, reflection.*) with scope='session' must produce a
+        SESSION-level permission so the next call doesn't re-prompt."""
+        async def approve_session():
+            await asyncio.sleep(0.05)
+            pending = queue_with_store.pending_requests
+            assert len(pending) == 1
+            queue_with_store.submit_decision(pending[0].id, True, "session")
+
+        asyncio.create_task(approve_session())
+        approved, scope = await queue_with_store.request_approval(
+            feature_name="code_edit",
+            tool_name="code_edit",
+            tool_args={"path": "foo.py"},
+        )
+
+        assert approved is True
+        assert scope == "session"
+        # Permission persisted as ALLOW so the second call short-circuits.
+        level = await store.get_permission("code_edit", "code_edit")
+        from kestrel_sovereign.features.security.permissions import PermissionLevel
+        assert level == PermissionLevel.ALLOW
+
+    @pytest.mark.asyncio
+    async def test_always_scope_persists_via_direct_caller(self, queue_with_store, store):
+        async def approve_always():
+            await asyncio.sleep(0.05)
+            pending = queue_with_store.pending_requests
+            queue_with_store.submit_decision(pending[0].id, True, "always")
+
+        asyncio.create_task(approve_always())
+        approved, scope = await queue_with_store.request_approval(
+            feature_name="compute",
+            tool_name="execute_script",
+            tool_args={"script": "x.py"},
+        )
+
+        assert approved is True
+        assert scope == "always"
+        from kestrel_sovereign.features.security.permissions import PermissionLevel
+        # ALWAYS goes to the SQLite row (not just the in-memory session dict).
+        # We can verify via raw SQL — bypassing the in-memory session cache.
+        import aiosqlite
+        async with aiosqlite.connect(store.db_path) as db:
+            cursor = await db.execute(
+                "SELECT level FROM security_permissions WHERE feature_name=? AND tool_name=?",
+                ("compute", "execute_script"),
+            )
+            row = await cursor.fetchone()
+        assert row is not None
+        assert row[0] == "allow"
+
+    @pytest.mark.asyncio
+    async def test_once_scope_does_not_persist(self, queue_with_store, store):
+        """``scope='once'`` should grant the current call but NOT persist —
+        the user explicitly asked for one-time approval."""
+        async def approve_once():
+            await asyncio.sleep(0.05)
+            pending = queue_with_store.pending_requests
+            queue_with_store.submit_decision(pending[0].id, True, "once")
+
+        asyncio.create_task(approve_once())
+        approved, _ = await queue_with_store.request_approval(
+            feature_name="keys",
+            tool_name="set_key",
+            tool_args={"provider": "openai"},
+        )
+
+        assert approved is True
+        from kestrel_sovereign.features.security.permissions import PermissionLevel
+        level = await store.get_permission("keys", "set_key")
+        assert level == PermissionLevel.ASK  # Default — nothing persisted.
+
+    @pytest.mark.asyncio
+    async def test_every_decision_writes_audit_row(self, queue_with_store, store):
+        """Audit log MUST capture every popup decision regardless of scope
+        or which caller fired the request — the empty audit log on real
+        agents was the most visible symptom of #785."""
+        async def approve_session():
+            await asyncio.sleep(0.05)
+            pending = queue_with_store.pending_requests
+            queue_with_store.submit_decision(pending[0].id, True, "session")
+
+        asyncio.create_task(approve_session())
+        await queue_with_store.request_approval(
+            feature_name="reflection",
+            tool_name="self_model",
+            tool_args={},
+        )
+
+        logs = await store.get_audit_log(limit=5)
+        assert any(
+            log["decision"] == "user_approved"
+            and log["user_choice"] == "session"
+            and log["feature"] == "reflection"
+            and log["tool"] == "self_model"
+            for log in logs
+        )
+
+    @pytest.mark.asyncio
+    async def test_user_denied_writes_audit_row(self, queue_with_store, store):
+        async def deny():
+            await asyncio.sleep(0.05)
+            pending = queue_with_store.pending_requests
+            queue_with_store.submit_decision(pending[0].id, False, "denied")
+
+        asyncio.create_task(deny())
+        approved, _ = await queue_with_store.request_approval(
+            feature_name="code_edit",
+            tool_name="code_commit",
+            tool_args={},
+        )
+
+        assert approved is False
+        logs = await store.get_audit_log(limit=5)
+        assert any(
+            log["decision"] == "user_denied" and log["feature"] == "code_edit"
+            for log in logs
+        )
+
+    @pytest.mark.asyncio
+    async def test_timeout_writes_audit_row(self, queue_with_store, store):
+        approved, scope = await queue_with_store.request_approval(
+            feature_name="code_edit",
+            tool_name="code_test",
+            tool_args={},
+            timeout=0.05,
+        )
+
+        assert approved is False
+        assert scope == "timeout"
+        logs = await store.get_audit_log(limit=5)
+        assert any(log["decision"] == "timeout" for log in logs)
+
+    @pytest.mark.asyncio
+    async def test_queue_without_store_remains_compatible(self, queue_without_store):
+        """ApprovalQueue must remain usable without a permission_store
+        (legacy callers / standalone tests).  The queue silently skips
+        persistence when no store is configured."""
+        async def approve():
+            await asyncio.sleep(0.05)
+            pending = queue_without_store.pending_requests
+            queue_without_store.submit_decision(pending[0].id, True, "session")
+
+        asyncio.create_task(approve())
+        approved, scope = await queue_without_store.request_approval(
+            feature_name="x", tool_name="y", tool_args={},
+        )
+        assert approved is True
+        assert scope == "session"  # Returned to caller; just nothing persisted.
 
 
 class TestSecurityFeature:
