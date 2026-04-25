@@ -87,8 +87,8 @@ curl http://localhost:7777/health
 # Check PostgreSQL
 psql $DATABASE_URL -c "SELECT version();"
 
-# Check Redis
-redis-cli -h redis -a redis_password_2024 ping
+# Check Redis (uses the dev-only password from .devcontainer/docker-compose.devcontainer.yml)
+redis-cli -h redis -a "$REDIS_PASSWORD" ping
 # Should return: PONG
 
 # Run tests
@@ -117,8 +117,8 @@ pytest --cov                     # With coverage
 # PostgreSQL
 psql $DATABASE_URL
 
-# Redis
-redis-cli -h redis -a redis_password_2024
+# Redis (password comes from .devcontainer/docker-compose.devcontainer.yml)
+redis-cli -h redis -a "$REDIS_PASSWORD"
 ```
 
 ### Python Development
@@ -136,11 +136,16 @@ python your_script.py
 ## 🔧 Environment Variables
 
 ### Already Configured
+
+The dev container injects `DATABASE_URL`, `REDIS_URL`, and `PYTHONPATH` for you. Connection strings look like:
+
 ```bash
-DATABASE_URL=postgresql://kestrel_user:kestrel_password_2024@postgres:5432/kestrel
-REDIS_URL=redis://:redis_password_2024@redis:6379
+DATABASE_URL=postgresql://kestrel_user:<password>@postgres:5432/kestrel
+REDIS_URL=redis://:<password>@redis:6379
 PYTHONPATH=/workspace:/workspace/kestrel
 ```
+
+The actual passwords live in `.devcontainer/docker-compose.devcontainer.yml` and are intentionally local-only — they exist solely so the containerized Postgres and Redis services can reach each other. **Don't reuse these for any real environment.**
 
 ### Add Your API Keys
 Create `/workspace/kestrel/.env`:

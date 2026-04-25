@@ -1,5 +1,7 @@
 # VastAI LoRA Training Architecture
 
+> **Scope clarification (2026-04-25):** this doc is specifically about *VastAI as a training backend* and that effort is deprioritized — see status banner below. VastAI **as a general compute provider** is a separate, active feature: `features/vastai/` ships with 29 tests and is exercised by the `manage_vastai` tool. If you're looking for the general-purpose VastAI integration, that's not this document.
+
 ## Overview
 
 VastAI is a peer-to-peer GPU marketplace where individual providers rent out their GPUs. This document covers using VastAI for FLUX.2 LoRA training with the SimpleTuner HTTP API.
