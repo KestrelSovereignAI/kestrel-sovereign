@@ -215,7 +215,7 @@ class VoiceFeature(Feature):
         )
         return resolve_voice_route(ctx)
 
-    async def _get_tts_provider(self) -> TTSProvider:
+    async def _get_tts_provider(self, overrides: Optional[UserVoicePreferences] = None) -> TTSProvider:
         """Get TTS provider for the current route.
 
         Delegates provider selection to the voice path resolver so privacy
@@ -225,9 +225,15 @@ class VoiceFeature(Feature):
         :meth:`speak`. Translates the resolver's structured output back into
         the legacy ``VoicePrivacyError`` messages callers (and existing tests)
         rely on.
+
+        ``overrides`` flows through to ``_resolve_route`` so transport-aware
+        callers (e.g. the /voice/chat WebSocket handler — which IS the
+        Pipeline path by definition) can force ``prefer_realtime=False`` and
+        get a Pipeline TTS provider instead of None (which the Realtime path
+        legitimately returns since Realtime owns the audio I/O end-to-end).
         """
         registry = await self._ensure_registry()
-        route = await self._resolve_route()
+        route = await self._resolve_route(overrides=overrides)
         mode_name = self._get_privacy_mode_name()
 
         # Preserve the "Cannot use X TTS in Y privacy mode" shape when the
@@ -259,10 +265,17 @@ class VoiceFeature(Feature):
             )
         return provider
 
-    async def _get_stt_provider(self) -> STTProvider:
-        """Get STT provider for the current route. See :meth:`_get_tts_provider`."""
+    async def _get_stt_provider(self, overrides: Optional[UserVoicePreferences] = None) -> STTProvider:
+        """Get STT provider for the current route. See :meth:`_get_tts_provider`.
+
+        ``overrides`` flows through to ``_resolve_route`` so the /voice/chat
+        WebSocket handler can force ``prefer_realtime=False`` — without it
+        the resolver returns the Realtime route (no STT) and this raises
+        "No STT provider available", which historically manifested as a
+        4403 close + browser-side HTTP 403 on the WS upgrade.
+        """
         registry = await self._ensure_registry()
-        route = await self._resolve_route()
+        route = await self._resolve_route(overrides=overrides)
         mode_name = self._get_privacy_mode_name()
 
         if route.blocked_stt:
