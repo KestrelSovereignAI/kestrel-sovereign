@@ -9,6 +9,8 @@ Built-in task names (registered by other features):
     memory_consolidation  -- consolidate short-term memory into episodes
     wellness_checkpoint   -- run a wellness check
     audit_anchor          -- anchor the audit trail
+    trash_retention       -- hard-purge soft-deleted conversation rows
+                             past their per-agent retention window (#764)
 
 Arbitrary feature tool invocations can also be scheduled by name.
 
@@ -93,10 +95,17 @@ class SchedulerFeature(Feature):
         # Reflection-dependent schedules only if ReflectionFeature is loaded
         has_reflection = "ReflectionFeature" in agent.features
 
+        from kestrel_sovereign.storage.retention import DEFAULT_RETENTION_CRON
+
         defaults = [
             ("backup_snapshot", "0 */4 * * *", "{}"),
             ("morning_signal", "0 8 * * *", "{}"),
             ("signal_dispatch", "5 8 * * *", "{}"),
+            # Trash retention sweep (#764). Hard-purges soft-deleted
+            # conversation rows past the per-agent retention window.
+            # Operators tune frequency via `!schedule` and the window
+            # via [trash] in kestrel.toml.
+            ("trash_retention", DEFAULT_RETENTION_CRON, "{}"),
         ]
 
         # Memory consolidation only if MemoryFeature is loaded (it owns the tool)
@@ -157,6 +166,9 @@ class SchedulerFeature(Feature):
                 )
             return json.dumps({"error": "no sync service configured"})
 
+        if task_name == "trash_retention":
+            return await self._run_trash_retention(args)
+
         # Search all features for a matching tool
         features = getattr(self.agent, "features", {})
         for feature in features.values():
@@ -174,6 +186,84 @@ class SchedulerFeature(Feature):
                 return json.dumps(result, default=str)
 
         raise ValueError(f"Unknown task: {task_name}")
+
+    async def _run_trash_retention(self, args: dict) -> str:
+        """Built-in handler for the ``trash_retention`` scheduled task (#764).
+
+        Reads the ``[trash]`` section from ``kestrel.toml``, resolves the
+        retention window for the agent's current privacy mode, computes
+        the cutoff, and asks the storage facade to hard-purge soft-
+        deleted rows past that cutoff. Returns a JSON summary so the
+        task-execution log carries the per-run breakdown.
+
+        Skips with a warning when the resolved retention is zero or
+        negative — purging on a same-day cutoff would scrub rows the
+        user might still be reaching for. Operators can disable the
+        rail entirely with ``!schedule pause <task_id>``.
+
+        Args:
+            args: Optional overrides — supports ``max_rows`` (int) for
+                the per-sweep cap. Empty dict is the common case.
+        """
+        from datetime import datetime, timedelta, timezone
+        from kestrel_sovereign.storage.retention import (
+            DEFAULT_MAX_ROWS_PER_SWEEP,
+            agent_privacy_mode,
+            load_trash_config,
+            resolve_retention_days,
+        )
+
+        storage = getattr(self.agent, "storage", None)
+        if storage is None or not hasattr(storage, "purge_trash_older_than"):
+            return json.dumps({
+                "skipped": True,
+                "reason": "storage facade missing purge_trash_older_than",
+            })
+
+        config = load_trash_config()
+        privacy_mode = agent_privacy_mode(self.agent)
+        retention_days = resolve_retention_days(
+            config=config, privacy_mode=privacy_mode,
+        )
+        if retention_days is None:
+            logger.warning(
+                "[retention] skipping agent=%s — config sets retention to "
+                "a non-positive value (would purge instantly)",
+                self._agent_id,
+            )
+            return json.dumps({
+                "skipped": True,
+                "reason": "non-positive retention window",
+                "privacy_mode": privacy_mode,
+            })
+
+        max_rows = int(args.get("max_rows") or DEFAULT_MAX_ROWS_PER_SWEEP)
+        cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
+        cutoff_iso = cutoff.replace(tzinfo=None).isoformat(sep=" ")
+
+        try:
+            purged = await storage.purge_trash_older_than(
+                cutoff_iso, max_rows=max_rows, reason="retention-janitor",
+            )
+        except Exception as e:
+            logger.warning(
+                "[retention] agent=%s sweep failed: %s", self._agent_id, e,
+            )
+            return json.dumps({"error": str(e)})
+
+        if purged:
+            logger.info(
+                "[retention.sweep] agent=%s privacy=%s window=%dd "
+                "rows_purged=%d cap=%d",
+                self._agent_id, privacy_mode, retention_days, purged, max_rows,
+            )
+        return json.dumps({
+            "rows_purged": purged,
+            "privacy_mode": privacy_mode,
+            "retention_days": retention_days,
+            "cutoff": cutoff_iso,
+            "max_rows": max_rows,
+        })
 
     # ------------------------------------------------------------------
     # Tools
