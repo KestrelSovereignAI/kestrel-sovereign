@@ -190,8 +190,12 @@ async def create_realtime_session(body: RealtimeSessionRequest, request: Request
 
 
 def _get_voice_feature(agent: Any) -> Optional[VoiceFeature]:
+    # The agent's features dict is keyed by class name (e.g. "VoiceFeature"),
+    # not by tool name — see endpoints/voice.py which uses the same lookup.
+    # Keep "voice" as a secondary key for any future agent that uses
+    # tool-name keying so the endpoint stays robust either way.
     features = getattr(agent, "features", {}) or {}
-    feature = features.get("voice")
+    feature = features.get("VoiceFeature") or features.get("voice")
     if isinstance(feature, VoiceFeature):
         return feature
     return None

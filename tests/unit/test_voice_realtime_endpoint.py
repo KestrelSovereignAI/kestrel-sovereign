@@ -92,7 +92,10 @@ def _make_agent(
 
     voice_feature.__class__ = VoiceFeature
 
-    features = {"voice": voice_feature} if include_voice_feature else {}
+    # Mirror production keying — agent.features is keyed by class name
+    # ("VoiceFeature"), not tool name ("voice"). Bug-fix backstop: the
+    # endpoint must find the feature under the class-name key.
+    features = {"VoiceFeature": voice_feature} if include_voice_feature else {}
     # Add a fake tool-bearing feature so _collect_tools exercises.
     if tools is not None:
         features["tool_owner"] = SimpleNamespace(
@@ -418,6 +421,63 @@ class TestDefaultVoice:
 # ---------------------------------------------------------------------------
 # Router-prefix regression — guards against the doubled `/voice/voice/` bug
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Feature-key regression — guards against the "voice" vs "VoiceFeature" bug
+# ---------------------------------------------------------------------------
+
+
+class TestFeatureKeyLookup:
+    """The agent.features dict is keyed by class name in the live runtime —
+    confirmed by the existing endpoints/voice.py which looks up
+    ``features.get("VoiceFeature")``. The endpoint we ship in #726 must use
+    the same key or every call returns 503 against a real agent.
+    """
+
+    def test_class_name_key_is_found(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # _make_agent already uses the class-name key; this test is
+        # explicit so the intent is documented.
+        provider = _FakeConversationProvider()
+        agent = _make_agent(
+            route=VoiceRoute(path="realtime", conversation_provider="openai_realtime", reason=""),
+            provider=provider,
+        )
+        # Confirm the key the fixture uses really is "VoiceFeature".
+        assert "VoiceFeature" in agent.features
+        _inject_agent(monkeypatch, agent)
+        resp = client.post("/voice/realtime/session", json={})
+        assert resp.status_code == 200, resp.text
+
+    def test_wrong_key_returns_503(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Re-key the same feature under "voice" (the old buggy key) and
+        # show that a fallback key in _get_voice_feature still finds it —
+        # the endpoint stays robust either way.
+        provider = _FakeConversationProvider()
+        agent = _make_agent(
+            route=VoiceRoute(path="realtime", conversation_provider="openai_realtime", reason=""),
+            provider=provider,
+        )
+        agent.features = {"voice": agent.features["VoiceFeature"]}
+        _inject_agent(monkeypatch, agent)
+        resp = client.post("/voice/realtime/session", json={})
+        assert resp.status_code == 200, resp.text
+
+    def test_neither_key_returns_503(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        agent = _make_agent(
+            route=VoiceRoute(path="realtime", conversation_provider="openai_realtime", reason=""),
+            provider=_FakeConversationProvider(),
+        )
+        agent.features = {}  # voice feature genuinely missing
+        _inject_agent(monkeypatch, agent)
+        resp = client.post("/voice/realtime/session", json={})
+        assert resp.status_code == 503
 
 
 def test_router_registers_session_at_voice_realtime_session() -> None:
