@@ -504,6 +504,38 @@ function setPathBadge(label, tooltip) {
   pathBadgeEl.textContent = label || '';
   pathBadgeEl.title = tooltip || '';
   pathBadgeEl.dataset.path = (label || '').toLowerCase();
+  // Mirror the active voice model into the chat-header model selector area
+  // so the user can see at a glance that voice is using a different model
+  // than text chat. The chat model selector itself is unchanged (text chat
+  // still uses the user's selection); we just ANNOTATE it.
+  setModelSelectorVoiceAnnotation(label, tooltip);
+}
+
+
+let _voiceAnnotationEl = null;
+
+function setModelSelectorVoiceAnnotation(label, tooltip) {
+  // Find or create the annotation element. Anchored to the chat header, to
+  // the right of the model selector group. Hidden when no label is set.
+  const modelSelector = document.getElementById('model-selector');
+  if (!modelSelector) return;
+  if (!_voiceAnnotationEl) {
+    _voiceAnnotationEl = document.createElement('span');
+    _voiceAnnotationEl.id = 'voice-active-model-annotation';
+    _voiceAnnotationEl.className = 'kestrel-voice-active-annotation';
+    _voiceAnnotationEl.hidden = true;
+    // Insert immediately after the model selector so it sits in the same
+    // visual cluster as the chat-LLM controls.
+    modelSelector.insertAdjacentElement('afterend', _voiceAnnotationEl);
+  }
+  if (label) {
+    _voiceAnnotationEl.textContent = `🎙 ${label}`;
+    _voiceAnnotationEl.title = tooltip || '';
+    _voiceAnnotationEl.hidden = false;
+  } else {
+    _voiceAnnotationEl.textContent = '';
+    _voiceAnnotationEl.hidden = true;
+  }
 }
 
 
@@ -562,6 +594,7 @@ async function refreshRoutePreview() {
   const previewEl = document.getElementById('voice-picker-route-preview');
   const ttsSel = document.getElementById('voice-picker-tts');
   const modeSel = document.getElementById('voice-picker-mode');
+  const voiceSel = document.getElementById('voice-picker-select');
   const previousTts = ttsSel.value || settings.preferred_tts || '';
   previewEl.textContent = 'Resolving...';
 
@@ -597,6 +630,44 @@ async function refreshRoutePreview() {
     opt.textContent = name;
     if (name === previousTts) opt.selected = true;
     ttsSel.appendChild(opt);
+  }
+
+  // Refresh the voice list scoped to the actually-active TTS provider.
+  // Different providers ship different voices (Cedar/Marin are OpenAI; Rachel/
+  // Domi are ElevenLabs; en_US-lessac-medium is Piper). When you flip the
+  // provider, the voice list should narrow to that provider's catalog rather
+  // than continuing to show OpenAI's 13.
+  const effectiveTts = previousTts || route.tts_provider || '';
+  await refreshVoiceList(voiceSel, effectiveTts);
+}
+
+
+async function refreshVoiceList(selectEl, providerName) {
+  selectEl.innerHTML = '<option value="">Loading voices...</option>';
+  try {
+    const voices = await fetchVoices(providerName);
+    selectEl.innerHTML = '';
+    if (voices.length === 0) {
+      const opt = document.createElement('option');
+      opt.value = '';
+      opt.textContent = providerName
+        ? `No voices reported by ${providerName}`
+        : 'No voices available — install a voice provider';
+      selectEl.appendChild(opt);
+      return;
+    }
+    for (const v of voices) {
+      const opt = document.createElement('option');
+      opt.value = v.voice_id;
+      // Suffix with provider name when "auto" so the user can see the
+      // multi-provider mix; redundant when scoped to one.
+      const providerLabel = providerName ? '' : ` · ${v.provider}`;
+      opt.textContent = `${v.name} (${v.gender}, ${v.accent})${providerLabel}`;
+      if (v.voice_id === settings.voice) opt.selected = true;
+      selectEl.appendChild(opt);
+    }
+  } catch (err) {
+    selectEl.innerHTML = `<option value="">Failed to load voices: ${err.message}</option>`;
   }
 }
 
@@ -647,14 +718,13 @@ function savePicker() {
 }
 
 
-async function fetchVoices() {
-  // /voice/voices is the existing endpoint that returns the active
-  // provider's discovered voice list filtered by privacy mode. Auth + URL
-  // rewriting via the global API client so the request behaves the same
-  // as every other Kestrel HTTP call.
-  const resp = await fetch(API.buildAgentUrl('/voice/voices'), {
-    headers: voiceAuthHeaders(),
-  });
+async function fetchVoices(providerName = '') {
+  // /voice/voices already supports `?provider=<name>` to scope the list.
+  // When providerName is empty, returns voices from all installed providers.
+  const url = API.buildAgentUrl(
+    `/voice/voices${providerName ? `?provider=${encodeURIComponent(providerName)}` : ''}`,
+  );
+  const resp = await fetch(url, { headers: voiceAuthHeaders() });
   if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
   const body = await resp.json();
   return Array.isArray(body.voices) ? body.voices : [];
@@ -801,6 +871,22 @@ function injectStyles() {
       color: var(--text-tertiary, #9ca3af);
       font-size: 0.7rem;
     }
+
+    /* Annotation in the chat header next to the model selector — surfaces
+       which model is actually answering when voice is on (which can be
+       gpt-realtime instead of the user's selected text-chat model). */
+    .kestrel-voice-active-annotation {
+      background: #16a34a;
+      color: #fff;
+      padding: 0.15rem 0.55rem;
+      margin-left: 0.5rem;
+      border-radius: 999px;
+      font-size: 0.72rem;
+      font-weight: 600;
+      cursor: help;
+      white-space: nowrap;
+    }
+    .kestrel-voice-active-annotation[hidden] { display: none; }
 
     /* Path/privacy chips live in the input footer next to context-status. */
     .kestrel-voice-path-badge {
