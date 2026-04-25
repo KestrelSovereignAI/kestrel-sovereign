@@ -14,6 +14,12 @@ Kestrel is a production-ready framework for creating autonomous AI agents with c
 
 > **In production:** Kestrel powers the AI Companion layer at Caprock Health, replacing static RPM bots with constitutional AI agents for remote patient monitoring.
 
+### What's in core, what's an add-on
+
+`pip install kestrel-sovereign` gives you a complete, working sovereign agent: identity, memory, constitution, privacy modes, multi-LLM support, voice (Piper TTS + FasterWhisper STT), local sandboxed compute, and a Cloud Run deployment path. Everything you need to run an agent locally with zero cloud commitment.
+
+Cloud providers (RunPod, Vast.ai), specialized integrations (MCP, GitHub App, wallet), and proprietary training adapters are **installable add-ons** — separate Python packages that register themselves via entry points. This split is being completed across [#462](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/462) and [#560](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/560); current state is documented in [`KESTREL_FEATURES.md`](KESTREL_FEATURES.md).
+
 ## 🚀 Quick Start
 
 ### Prerequisites
@@ -83,6 +89,21 @@ uv run kestrel list                         # List available agents
 uv run kestrel shell MyAgent                # CLI chat interface
 uv run kestrel config ./agent_data/MyAgent  # Show agent config
 ```
+
+### Feature management (`kestrel feature`)
+
+Kestrel ships a lean core; everything else is a feature. Cloud providers, training adapters, voice cloud backends, and specialized integrations are installable packages that register themselves via Python entry points.
+
+```bash
+uv run kestrel feature list                   # Show installed + available features
+uv run kestrel feature info <name>            # Detailed info about a feature
+uv run kestrel feature install <name>         # Install a feature package
+uv run kestrel feature enable <name>          # Enable an installed feature
+uv run kestrel feature disable <name>         # Disable without uninstalling
+uv run kestrel feature scaffold <name>        # Generate a new feature package skeleton
+```
+
+The canonical inventory of features lives in [`KESTREL_FEATURES.md`](KESTREL_FEATURES.md); the runtime registry is in [`kestrel_sovereign/data/feature_registry.toml`](kestrel_sovereign/data/feature_registry.toml).
 
 ### Per-Agent Configuration
 
@@ -166,18 +187,19 @@ Kestrel agents are built on several key components:
 
 ```
 kestrel-sovereign/
-├── kestrel_cli.py             # `kestrel` CLI entry point
-├── server.py                  # FastAPI agent server
-├── main.py                    # Direct interactive chat
 ├── kestrel_sovereign/         # Core sovereign package
-│   ├── kestrel_agent.py      # Core agent class
-│   ├── inception_service.py  # Agent creation (DID + genesis audit)
-│   ├── agent_config.py       # Per-agent config loader
+│   ├── cli.py                 # `kestrel` CLI entry point (canonical)
+│   ├── kestrel_agent.py       # Core agent class
+│   ├── inception_service.py   # Agent creation (DID + genesis audit)
+│   ├── agent_config.py        # Per-agent config loader
+│   ├── data/feature_registry.toml  # Runtime feature registry
 │   └── ...
+├── server.py                  # FastAPI agent server
+├── host.py                    # Multi-agent rookery host
+├── main.py                    # Direct interactive REPL
 ├── kestrel_sdk/               # Public SDK for feature authors
 ├── packages/                  # Extracted feature packages
-├── features/                  # Built-in feature documentation
-├── llm/                       # LLM adapters and services
+├── features/                  # Built-in features
 ├── docs/                      # Architecture & guides
 └── tests/                     # Test suite
 ```
@@ -211,29 +233,47 @@ kestrel-sovereign/
 - **Decentralized Storage**: Filecoin/IPFS integration for vendor independence
 - **Agent Economics**: Autonomous economic contracts using cryptographic payments
 
-## ⚠️ Known Limitations (v0.1.8 Beta)
+## ⚠️ Feature Stability (v0.1.8 Beta)
 
-### ✅ Working & Production-Ready:
-- **Constitutional AI** - Genesis audits, hierarchical permissions, approval queues
-- **DID-based Identity** - `did:pkh` format, portable agent identity
-- **5-Level Privacy Modes** - EPHEMERAL → ISOLATED → ANONYMOUS → NORMAL → PUBLIC
-- **Multi-LLM Support** - Anthropic, OpenAI, Gemini, Ollama, OpenRouter, xAI, Groq
-- **Agent Economics** - Multi-currency wallets (FIL, USDC, USDT, ETH)
-- **A2A Protocol** - JSON-RPC 2.0 for agent-to-agent communication
-- **Enhanced Storage** - SQLite/PostgreSQL with FTS, knowledge graphs, RAG pipeline
+Kestrel covers a wide surface; not all of it ships at the same maturity. **Verified 2026-04-25** by reading code, tests, skip markers, and recent git activity:
 
-### ⚠️ Work-in-Progress:
-- **DID Verification Layer** - Identity generation works, verification incomplete
-- **E2E Test Stability** - Some integration tests are occasionally flaky
-- **API Stability** - APIs may change before v1.0 (we'll document breaking changes)
+### ✅ Stable — production-ready
 
-### ❌ Not Implemented (Use OpenClaw Instead):
-- **Multi-Channel Messaging** - WhatsApp, Telegram, Discord, Slack integration
-- **Voice Interaction** - Wake word detection, TTS
-- **Browser Automation** - Chrome/Chromium control
-- **Visual Workspaces** - A2UI canvas, live reload
+- **Constitutional AI** — Genesis audits, hierarchical permissions, approval queues
+- **DID-based Identity** — `did:pkh` format, portable agent identity, export/import
+- **5-Level Privacy Modes** — EPHEMERAL → ISOLATED → ANONYMOUS → NORMAL → PUBLIC
+- **Memory & Storage** — SQLite/PostgreSQL with FTS, knowledge graph, RAG pipeline; storage parity contracts in CI
+- **LLM service** — Vendor/route/model architecture with Anthropic, OpenAI, Vertex AI, Ollama, OpenRouter, xAI, Groq; retry, structured output, streaming, vision
+- **Voice (local)** — Piper TTS + FasterWhisper STT
+- **Agent Economics** — Multi-currency wallets (FIL, USDC, USDT, ETH)
+- **A2A Protocol** — JSON-RPC 2.0 for agent-to-agent communication
+- **Cloud Run deploy** — 90 tests, active maintenance; the most-tested cloud feature
 
-**Bottom Line**: Kestrel is ready for developers building privacy-first, economically-independent AI agents. Not ready for production apps or general consumer use.
+### 🧪 Experimental — works on the happy path; gaps to know about
+
+- **RunPod GPU orchestration** — start/stop/status work; managed-mode log retrieval is `NotImplementedError`; image generation (`!dream`) is dead code; integration tests skip in CI without `RUNPOD_API_KEY`. No active development since early April 2026.
+- **Vast.ai GPU marketplace** — broader test coverage than RunPod, but recent extraction/revert churn; integration tests skip without `VASTAI_API_KEY`.
+- **GCP Compute GPU VMs** — similar maturity to Vast.ai; integration tests skip without `GCP_PROJECT_ID`.
+- **Azure Container Apps deploy** — provider stub; not the recommended deploy target.
+- **GitHub code introspection** — file reading, code search, definition lookup, issue tools all work (48 unit tests). The deeper static-analysis surface promised in [`docs/architecture/GITHUB_FEATURE_DESIGN.md`](docs/architecture/GITHUB_FEATURE_DESIGN.md) (call graphs, inheritance trees, dependency analysis) is not implemented.
+- **Training (LoRA pipeline)** — core ships the protocol + factory; the local-MPS adapter is actively maintained. Cloud-training adapters (RunPod/Vertex/Replicate) work but skip CI without API keys; production-grade adapters are being moved to private packages.
+
+### ⚠️ Work-in-progress
+
+- **DID Verification Layer** — generation works; verification is incomplete
+- **E2E Test Stability** — some integration tests are occasionally flaky
+- **API Stability** — APIs may change before v1.0; breaking changes will be documented
+
+### ❌ Not implemented in this framework
+
+These are not on the kestrel-sovereign roadmap; if you need them, OpenClaw or a different tool is the better fit.
+
+- **Multi-Channel Messaging** — WhatsApp, Telegram, Discord, Slack integration
+- **Voice cloud backends** — beyond local Piper / FasterWhisper (e.g. ElevenLabs, Deepgram)
+- **Browser Automation** — Chrome/Chromium control
+- **Visual Workspaces** — A2UI canvas, live reload
+
+**Bottom line:** Kestrel is ready for developers building privacy-first, economically-independent AI agents and for the soft-launch preview cohort. Not yet ready for unmanaged production apps or general consumer use. If you find a stability classification above doesn't match your experience, please open an issue — that's the kind of signal we need.
 
 ## 📚 Documentation
 
@@ -241,13 +281,14 @@ Detailed documentation is available in the `docs/` directory:
 
 - [Documentation Index](docs/README.md)
 
-- [Agent Ecosystem](docs/architecture/AGENT_ECOSYSTEM.md)
-- [Agent Economics](docs/architecture/AGENT_ECONOMICS.md)
+- [Agent Ecosystem](docs/architecture/core/AGENT_ECOSYSTEM.md)
+- [Agent Economics](docs/architecture/economics/AGENT_ECONOMICS.md)
 - [Kestrel Constitution](docs/principles/KESTREL_CONSTITUTION.md)
-- [Cryptographic Anchoring](docs/architecture/CRYPTOGRAPHIC_ANCHORING.md)
-- [Decentralized Storage](docs/architecture/DECENTRALIZED_STORAGE.md)
-- [Multi-Model Support](docs/architecture/MULTI_MODEL_SUPPORT.md)
-- [Privacy Modes](docs/architecture/PRIVACY_MODES.md)
+- [Cryptographic Anchoring](docs/architecture/security/CRYPTOGRAPHIC_ANCHORING.md)
+- [Decentralized Storage](docs/architecture/storage/DECENTRALIZED_STORAGE.md)
+- [Multi-Model Support](docs/architecture/core/MULTI_MODEL_SUPPORT.md)
+- [Privacy Modes](docs/architecture/security/PRIVACY_MODES.md)
+- [LLM Service Architecture](docs/architecture/LLM_SERVICE_ARCHITECTURE.md)
 
 ## 💡 Example Applications
 
@@ -463,13 +504,16 @@ Apache 2.0 — see [LICENSE](LICENSE) for details.
 
 | File | Purpose |
 |------|---------|
-| `kestrel_cli.py` | Main CLI entry point |
-| `main.py` | Interactive chat interface |
-| `server.py` | FastAPI server |
+| `kestrel_sovereign/cli.py` | Canonical `kestrel` CLI entry point |
+| `server.py` | FastAPI agent server |
+| `host.py` | Multi-agent rookery host (Cloud Run) |
+| `main.py` | Direct interactive REPL |
 | `llm_config.toml` | LLM provider configuration |
+| `KESTREL_FEATURES.md` | Canonical feature inventory |
 | `kestrel_sovereign/kestrel_agent.py` | Core agent logic |
 | `kestrel_sovereign/agent_config.py` | Per-agent config loader |
-| `kestrel_sovereign/inception_service.py` | New agent creation |
+| `kestrel_sovereign/inception_service.py` | New agent creation (DID + genesis audit) |
+| `kestrel_sovereign/data/feature_registry.toml` | Runtime feature registry |
 | `agent_data/<name>/kestrel.toml` | Per-agent configuration |
 | `agent_data/<name>/kestrel_prime.db` | Agent database |
 | `docs/**/*.md` | Detailed documentation |
