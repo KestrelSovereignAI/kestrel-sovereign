@@ -24,6 +24,7 @@
  */
 
 import API from '../api.js';
+import { addMessage, addMessageStreaming, finalizeStreamingMessage } from '../chat.js';
 import { Events } from './events.js';
 import { createRealtimeClient } from './realtime.js';
 import { createPipelineClient } from './pipeline.js';
@@ -72,8 +73,10 @@ const STATE_GLYPH = {
 // ---------------------------------------------------------------------------
 
 let buttonEl = null;
-let drawerEl = null;
-let transcriptEl = null;
+// `agentMsgDiv` holds the in-flight agent chat message during a voice turn so
+// AGENT_TEXT_DELTA events can stream into it. Reset to null when finalized.
+let agentMsgDiv = null;
+let agentTextBuffer = '';
 let pathBadgeEl = null;
 let pickerModalEl = null;
 let privacyBannerEl = null;
@@ -105,7 +108,7 @@ export function initVoiceUI() {
 
   injectStyles();
   mountButton(header);
-  mountDrawer();
+  mountStatusIndicator();
   mountPickerModal();
   setState(State.IDLE);
 
@@ -119,19 +122,22 @@ export function initVoiceUI() {
 // ---------------------------------------------------------------------------
 
 
-function mountButton(header) {
-  // Place the button in the header's left-hand button group so it sits next
-  // to History + New Chat. If we can't find that group, fall back to header
-  // append so the button is at least reachable.
-  const leftGroup = header.querySelector('div[style*="display: flex"]') || header;
+function mountButton() {
+  // Mic lives in the chat input row, immediately to the LEFT of #send-button
+  // — same affordance as ChatGPT's voice button. Voice is treated as an
+  // input modality on the existing chat, NOT a parallel session.
+  const sendBtn = document.getElementById('send-button');
+  if (!sendBtn || !sendBtn.parentElement) {
+    console.warn('[voice/ui] #send-button not found; voice button not mounted');
+    return;
+  }
   buttonEl = document.createElement('button');
   buttonEl.id = 'voice-toggle-btn';
-  buttonEl.className = 'btn btn-secondary kestrel-voice-btn';
+  buttonEl.type = 'button';
+  buttonEl.className = 'kestrel-voice-btn';
   buttonEl.title = STATE_LABELS[State.IDLE];
   buttonEl.setAttribute('aria-label', STATE_LABELS[State.IDLE]);
   buttonEl.setAttribute('aria-live', 'polite');
-  buttonEl.style.padding = '0.4rem 0.6rem';
-  buttonEl.style.fontSize = '0.85rem';
   buttonEl.textContent = STATE_GLYPH[State.IDLE];
   buttonEl.addEventListener('click', toggleSession);
   // Right-click opens the voice picker so power users can reach voice
@@ -140,50 +146,30 @@ function mountButton(header) {
     ev.preventDefault();
     openPicker();
   });
-  leftGroup.appendChild(buttonEl);
+  // Insert before the send button so the row reads: textarea | mic | send.
+  sendBtn.parentElement.insertBefore(buttonEl, sendBtn);
 }
 
 
-function mountDrawer() {
-  // Drawer holds: path badge, privacy banner, transcript. Slides in below
-  // the chat header during a session.
-  drawerEl = document.createElement('div');
-  drawerEl.id = 'voice-drawer';
-  drawerEl.className = 'kestrel-voice-drawer';
-  drawerEl.hidden = true;
+function mountStatusIndicator() {
+  // Tiny path/state indicator floats in the input footer next to the
+  // context-status. Replaces the old separate-drawer header. Hidden when
+  // idle so the existing chat UI is visually unchanged outside a session.
+  const footer = document.querySelector('.input-footer');
+  if (!footer) return;
 
   pathBadgeEl = document.createElement('span');
   pathBadgeEl.className = 'kestrel-voice-path-badge';
-  pathBadgeEl.textContent = '';
+  pathBadgeEl.hidden = true;
 
   privacyBannerEl = document.createElement('span');
   privacyBannerEl.className = 'kestrel-voice-privacy-banner';
   privacyBannerEl.hidden = true;
 
-  const headerRow = document.createElement('div');
-  headerRow.className = 'kestrel-voice-drawer-header';
-  headerRow.appendChild(pathBadgeEl);
-  headerRow.appendChild(privacyBannerEl);
-
-  const settingsBtn = document.createElement('button');
-  settingsBtn.type = 'button';
-  settingsBtn.className = 'kestrel-voice-icon-btn';
-  settingsBtn.title = 'Voice settings';
-  settingsBtn.setAttribute('aria-label', 'Open voice settings');
-  settingsBtn.textContent = '⚙';
-  settingsBtn.addEventListener('click', openPicker);
-  headerRow.appendChild(settingsBtn);
-
-  transcriptEl = document.createElement('div');
-  transcriptEl.className = 'kestrel-voice-transcript';
-  transcriptEl.setAttribute('aria-live', 'polite');
-
-  drawerEl.appendChild(headerRow);
-  drawerEl.appendChild(transcriptEl);
-
-  // Insert under the chat header.
-  const chatHeader = document.querySelector('.chat-header');
-  chatHeader?.insertAdjacentElement('afterend', drawerEl);
+  // Insert at the left of the footer so it doesn't fight the existing
+  // right-aligned context-status text.
+  footer.insertBefore(privacyBannerEl, footer.firstChild);
+  footer.insertBefore(pathBadgeEl, footer.firstChild);
 }
 
 
@@ -241,9 +227,8 @@ function setState(next) {
   buttonEl.title = STATE_LABELS[next];
   buttonEl.setAttribute('aria-label', STATE_LABELS[next]);
   buttonEl.dataset.state = next;
-  // Toggle drawer visibility based on session lifecycle: visible whenever
-  // a session is in progress, hidden in idle.
-  drawerEl.hidden = next === State.IDLE;
+  // Path/privacy badge visible whenever a session is in progress.
+  if (pathBadgeEl) pathBadgeEl.hidden = next === State.IDLE;
 }
 
 
@@ -263,7 +248,7 @@ async function toggleSession() {
 
 async function startSession() {
   setState(State.CONNECTING);
-  clearTranscript();
+  resetTurnState();
   setPathBadge('', '');
 
   const onEvent = handleClientEvent;
@@ -325,115 +310,146 @@ async function stopSession() {
 function surfaceFatalError(err) {
   console.error('[voice/ui] fatal voice error:', err);
   setState(State.ERROR);
-  appendTranscriptLine('error', err?.message || 'Voice session failed.');
+  // Surface as an agent message so the user sees it inline with the chat.
+  addMessage('agent', `⚠ Voice error: ${err?.message || 'session failed'}`);
   client = null;
 }
 
 
 // ---------------------------------------------------------------------------
-// Event handling — the same handler drives both Realtime + Pipeline clients
-// because they emit identical events (events.js).
+// Event handling — voice turns render directly into the existing chat
+// container so a voice session is a continuation of the same conversation,
+// not a parallel one. The same handler drives both Realtime + Pipeline
+// clients (they emit identical events from events.js).
 // ---------------------------------------------------------------------------
 
 
 function handleClientEvent(ev) {
   // Apply the pure state transition first so the mic-button visual updates
-  // before any DOM mutation below. ERROR.fatal escalates to ERROR state via
-  // the surfaceFatalError path so we get the right transcript line + reset.
+  // before any DOM mutation below.
   const nextState = nextStateForEvent(currentState, ev.kind, ev);
   if (nextState !== null) setState(nextState);
 
-  // Side-effects: transcript rendering + error surfacing.
   switch (ev.kind) {
-    case Events.USER_TRANSCRIPT_DELTA:
-      appendTranscriptDelta('user', ev.text);
-      break;
+    // User-side transcript: only the FINAL adds a chat message. Live
+    // partials would create N nested user bubbles; chat history wants one.
     case Events.USER_TRANSCRIPT_FINAL:
-      finalizeTranscriptLine('user', ev.text);
+      if (ev.text && ev.text.trim()) {
+        addMessage('user', ev.text);
+      }
       break;
+
+    // Agent reply streams into a single message bubble. AGENT_TEXT_DELTA
+    // appends; AGENT_TEXT_FINAL / RESPONSE_DONE finalize and reset for
+    // the next turn.
     case Events.AGENT_TEXT_DELTA:
-      appendTranscriptDelta('agent', ev.text);
+      if (ev.text) {
+        if (!agentMsgDiv) {
+          agentMsgDiv = addMessageStreaming('agent');
+          agentTextBuffer = '';
+        }
+        agentTextBuffer += ev.text;
+        const contentDiv = agentMsgDiv.querySelector('.message-content');
+        if (contentDiv) contentDiv.textContent = agentTextBuffer;
+      }
       break;
     case Events.AGENT_TEXT_FINAL:
-      finalizeTranscriptLine('agent', ev.text);
+      finalizeAgentTurn(ev.text || agentTextBuffer);
+      break;
+    case Events.RESPONSE_DONE:
+      finalizeAgentTurn(agentTextBuffer);
       break;
 
     case Events.TOOL_CALL_REQUESTED:
-      // Surface for visibility; tool dispatch into the agent registry is a
-      // follow-up wiring ticket.
-      appendTranscriptLine('tool', `Tool call: ${ev.name}(${JSON.stringify(ev.arguments)})`);
+      handleToolCall(ev).catch((err) => {
+        console.error('[voice/ui] tool dispatch failed:', err);
+      });
+      break;
+
+    case Events.SESSION_CLOSED:
+      // Drop any in-flight agent message back into the chat so the user
+      // sees what they got even if the session ended mid-response.
+      if (agentMsgDiv) finalizeAgentTurn(agentTextBuffer);
       break;
 
     case Events.ERROR:
       if (ev.fatal) {
         surfaceFatalError(new Error(ev.message));
       } else {
-        appendTranscriptLine('error', ev.message);
+        // Non-fatal: log to console; don't pollute chat history.
+        console.warn('[voice/ui]', ev.message);
       }
       break;
 
-    // SESSION_READY / SESSION_CLOSED / LISTENING_* / SPEAKING_* /
-    // THINKING_STARTED / RESPONSE_DONE are handled entirely by the state
-    // transition above — no transcript side-effect.
+    // SESSION_READY / LISTENING_* / SPEAKING_* / THINKING_STARTED handled
+    // entirely by the state-machine transition above — no chat side-effect.
     default:
       break;
   }
 }
 
 
-// ---------------------------------------------------------------------------
-// Transcript rendering — line per turn, deltas append to the current line
-// ---------------------------------------------------------------------------
-
-
-function clearTranscript() {
-  transcriptEl.innerHTML = '';
-}
-
-
-function ensureCurrentLine(role) {
-  let last = transcriptEl.lastElementChild;
-  if (!last || last.dataset.role !== role || last.dataset.final === 'true') {
-    last = document.createElement('div');
-    last.className = `kestrel-voice-line kestrel-voice-line--${role}`;
-    last.dataset.role = role;
-    last.dataset.final = 'false';
-    last.textContent = '';
-    transcriptEl.appendChild(last);
+function finalizeAgentTurn(text) {
+  const div = agentMsgDiv;
+  const buf = text || '';
+  agentMsgDiv = null;
+  agentTextBuffer = '';
+  if (!div) {
+    if (buf.trim()) addMessage('agent', buf);
+    return;
   }
-  return last;
+  // Use the chat module's finalizer so markdown / code blocks / mermaid
+  // get the same treatment as text-chat agent messages.
+  finalizeStreamingMessage(div, buf).catch((err) =>
+    console.error('[voice/ui] finalize failed:', err),
+  );
 }
 
 
-function appendTranscriptDelta(role, text) {
-  if (!text) return;
-  const line = ensureCurrentLine(role);
-  line.textContent += text;
-  scrollTranscriptToBottom();
+function resetTurnState() {
+  agentMsgDiv = null;
+  agentTextBuffer = '';
 }
 
 
-function finalizeTranscriptLine(role, text) {
-  const line = ensureCurrentLine(role);
-  if (text) line.textContent = text;  // overwrite with the canonical final text
-  line.dataset.final = 'true';
-  scrollTranscriptToBottom();
-}
+// ---------------------------------------------------------------------------
+// Tool dispatch — when the Realtime model invokes a tool, POST to the
+// backend tool-runner endpoint, then commit the result back over the data
+// channel so the model can continue.
+// ---------------------------------------------------------------------------
 
 
-function appendTranscriptLine(role, text) {
-  const line = document.createElement('div');
-  line.className = `kestrel-voice-line kestrel-voice-line--${role}`;
-  line.dataset.role = role;
-  line.dataset.final = 'true';
-  line.textContent = text;
-  transcriptEl.appendChild(line);
-  scrollTranscriptToBottom();
-}
-
-
-function scrollTranscriptToBottom() {
-  transcriptEl.scrollTop = transcriptEl.scrollHeight;
+async function handleToolCall(ev) {
+  if (!client || !client.session?.session_id) {
+    console.warn('[voice/ui] tool call before session ready:', ev);
+    return;
+  }
+  const sessionId = client.session.session_id;
+  const url = API.buildAgentUrl(`/voice/realtime/tools/${encodeURIComponent(sessionId)}`);
+  let body;
+  try {
+    const resp = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...voiceAuthHeaders() },
+      body: JSON.stringify({
+        call_id: ev.call_id,
+        name: ev.name,
+        arguments: ev.arguments,
+      }),
+    });
+    body = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      body = { error: body.detail || `tool dispatch HTTP ${resp.status}` };
+    }
+  } catch (err) {
+    body = { error: `tool dispatch threw: ${err.message}` };
+  }
+  // Always commit SOMETHING — silence on a tool call wedges the model.
+  try {
+    client.commitToolResult(ev.call_id, body.result ?? body);
+  } catch (err) {
+    console.error('[voice/ui] commitToolResult failed:', err);
+  }
 }
 
 
@@ -443,9 +459,10 @@ function scrollTranscriptToBottom() {
 
 
 function setPathBadge(label, tooltip) {
+  if (!pathBadgeEl) return;  // status indicator wasn't mountable
   pathBadgeEl.textContent = label || '';
   pathBadgeEl.title = tooltip || '';
-  pathBadgeEl.dataset.path = label.toLowerCase();
+  pathBadgeEl.dataset.path = (label || '').toLowerCase();
 }
 
 
@@ -604,19 +621,37 @@ function injectStyles() {
   const style = document.createElement('style');
   style.id = 'kestrel-voice-ui-styles';
   style.textContent = `
-    .kestrel-voice-btn { font-size: 1rem; line-height: 1; }
+    /* Mic button in the chat input row — sits between the textarea and Send. */
+    .kestrel-voice-btn {
+      background: transparent;
+      border: 1px solid var(--border-color, #2d3748);
+      color: var(--text-primary, #e5e7eb);
+      cursor: pointer;
+      font-size: 1.05rem;
+      line-height: 1;
+      padding: 0.45rem 0.6rem;
+      border-radius: 6px;
+      align-self: stretch;
+      display: inline-flex;
+      align-items: center;
+    }
+    .kestrel-voice-btn:hover { background: var(--bg-tertiary, #1f2937); }
     .kestrel-voice-btn[data-state="listening"] {
-      box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.6);
+      background: var(--error-color, #ef4444);
+      color: #fff;
+      border-color: var(--error-color, #ef4444);
       animation: kestrel-voice-pulse 1.4s infinite;
     }
     .kestrel-voice-btn[data-state="speaking"] {
       background: var(--accent-color, #3b82f6);
       color: #fff;
+      border-color: var(--accent-color, #3b82f6);
     }
     .kestrel-voice-btn[data-state="thinking"] { opacity: 0.85; }
     .kestrel-voice-btn[data-state="error"] {
       background: var(--error-color, #ef4444);
       color: #fff;
+      border-color: var(--error-color, #ef4444);
     }
     @keyframes kestrel-voice-pulse {
       0%   { box-shadow: 0 0 0 0   rgba(239, 68, 68, 0.55); }
@@ -624,29 +659,14 @@ function injectStyles() {
       100% { box-shadow: 0 0 0 0   rgba(239, 68, 68, 0);    }
     }
 
-    .kestrel-voice-drawer {
-      border-bottom: 1px solid var(--border-color);
-      background: var(--bg-secondary);
-      padding: 0.5rem 1rem;
-      max-height: 220px;
-      overflow: hidden;
-      display: flex;
-      flex-direction: column;
-      gap: 0.4rem;
-    }
-    .kestrel-voice-drawer[hidden] { display: none; }
-    .kestrel-voice-drawer-header {
-      display: flex;
-      align-items: center;
-      gap: 0.6rem;
-      font-size: 0.8rem;
-    }
+    /* Path/privacy chips live in the input footer next to context-status. */
     .kestrel-voice-path-badge {
       background: var(--bg-tertiary, #1f2937);
       color: var(--text-secondary, #d1d5db);
-      padding: 0.15rem 0.55rem;
+      padding: 0.1rem 0.5rem;
+      margin-right: 0.5rem;
       border-radius: 999px;
-      font-size: 0.75rem;
+      font-size: 0.7rem;
       font-weight: 600;
       cursor: help;
     }
@@ -655,36 +675,11 @@ function injectStyles() {
     .kestrel-voice-privacy-banner {
       background: #6b21a8;
       color: #fff;
-      padding: 0.15rem 0.55rem;
+      padding: 0.1rem 0.5rem;
+      margin-right: 0.5rem;
       border-radius: 999px;
       font-size: 0.7rem;
     }
-    .kestrel-voice-icon-btn {
-      margin-left: auto;
-      background: none;
-      border: none;
-      color: var(--text-secondary);
-      cursor: pointer;
-      font-size: 1rem;
-    }
-    .kestrel-voice-transcript {
-      flex: 1;
-      overflow-y: auto;
-      font-size: 0.85rem;
-      line-height: 1.4;
-      padding-right: 0.4rem;
-    }
-    .kestrel-voice-line {
-      padding: 0.15rem 0;
-      white-space: pre-wrap;
-      word-break: break-word;
-    }
-    .kestrel-voice-line--user::before { content: 'you · '; opacity: 0.6; font-weight: 600; }
-    .kestrel-voice-line--agent::before { content: 'agent · '; opacity: 0.6; font-weight: 600; }
-    .kestrel-voice-line--tool { color: var(--text-tertiary); font-style: italic; }
-    .kestrel-voice-line--tool::before { content: '⚙ '; }
-    .kestrel-voice-line--error { color: var(--error-color, #ef4444); }
-    .kestrel-voice-line--error::before { content: '⚠ '; }
 
     .kestrel-voice-modal {
       position: fixed; inset: 0;
