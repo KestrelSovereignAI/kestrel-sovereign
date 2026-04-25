@@ -185,6 +185,23 @@ function mountPickerModal() {
 
   card.innerHTML = `
     <h3 class="kestrel-voice-modal-title">Voice settings</h3>
+    <div id="voice-picker-route-preview" class="kestrel-voice-route-preview">
+      Loading current route...
+    </div>
+    <label class="kestrel-voice-field">
+      <span>Voice path</span>
+      <select id="voice-picker-mode" class="model-selector">
+        <option value="auto">Auto (Realtime when on OpenAI; Pipeline otherwise)</option>
+        <option value="realtime">Force Realtime (uses gpt-realtime, your chat LLM is bypassed)</option>
+        <option value="pipeline">Force Pipeline (STT → your chat LLM → TTS)</option>
+      </select>
+    </label>
+    <label class="kestrel-voice-field">
+      <span>TTS provider (Pipeline only)</span>
+      <select id="voice-picker-tts" class="model-selector">
+        <option value="">Auto (resolver picks)</option>
+      </select>
+    </label>
     <label class="kestrel-voice-field">
       <span>Voice</span>
       <select id="voice-picker-select" class="model-selector"></select>
@@ -253,9 +270,13 @@ async function startSession() {
 
   const onEvent = handleClientEvent;
 
-  // Try Realtime first. The server-side resolver returns 409 with a
-  // `fallback` payload when Realtime isn't legal under the current privacy
-  // mode + LLM vendor — we use that to pick Pipeline cleanly.
+  // Apply user picker overrides (mode + TTS) to the mint request so the
+  // server-side resolver returns the route the user actually wants. If the
+  // user forced Pipeline, the mint endpoint will return 409 immediately
+  // and we drop to the Pipeline client below — same fallback flow as the
+  // unforced case.
+  const overrides = pickerOverridesFromUI(settings.mode || 'auto', settings.preferred_tts || '');
+
   try {
     client = await createRealtimeClient({
       onEvent,
@@ -266,10 +287,16 @@ async function startSession() {
       sessionRequestBody: {
         voice: settings.voice || '',
         user_instructions: settings.instructions || '',
+        prefer_realtime: overrides.prefer_realtime,
+        preferred_tts: overrides.preferred_tts || '',
       },
     });
     await client.start();
-    setPathBadge('Realtime', 'OpenAI Realtime: low-latency speech-to-speech.');
+    const realtimeModel = client.session?.model || 'gpt-realtime';
+    setPathBadge(
+      `Realtime · ${realtimeModel}`,
+      `OpenAI Realtime: voice + reasoning answered by ${realtimeModel}, NOT your selected chat LLM. Switch to Pipeline in voice settings (right-click 🎙) to keep your chat LLM as the brain.`,
+    );
     return;
   } catch (err) {
     if (err && err.code === 'REALTIME_UNAVAILABLE') {
@@ -472,36 +499,115 @@ function setPathBadge(label, tooltip) {
 
 
 async function openPicker() {
-  // Populate the voice select lazily — first time we need it, fetch from
-  // the active provider's discovered list. If no session is open yet we
-  // use the default backend voice list.
-  const sel = document.getElementById('voice-picker-select');
-  sel.innerHTML = '<option value="">Loading...</option>';
+  // Populate from /voice/voices + show a live preview of the resolved
+  // route given the current overrides. Both fetches happen on every open
+  // so a chat-LLM swap (or restart) is reflected immediately.
+  const voiceSel = document.getElementById('voice-picker-select');
+  const ttsSel = document.getElementById('voice-picker-tts');
+  const modeSel = document.getElementById('voice-picker-mode');
+  const instructionsEl = document.getElementById('voice-picker-instructions');
 
+  voiceSel.innerHTML = '<option value="">Loading...</option>';
+  modeSel.value = settings.mode || 'auto';
+  instructionsEl.value = settings.instructions || '';
+
+  // Voices
   try {
     const voices = await fetchVoices();
-    sel.innerHTML = '';
+    voiceSel.innerHTML = '';
     if (voices.length === 0) {
       const opt = document.createElement('option');
       opt.value = '';
       opt.textContent = 'No voices available — install a voice provider';
-      sel.appendChild(opt);
+      voiceSel.appendChild(opt);
     } else {
       for (const v of voices) {
         const opt = document.createElement('option');
         opt.value = v.voice_id;
         opt.textContent = `${v.name} (${v.gender}, ${v.accent})`;
         if (v.voice_id === settings.voice) opt.selected = true;
-        sel.appendChild(opt);
+        voiceSel.appendChild(opt);
       }
     }
   } catch (err) {
-    sel.innerHTML = `<option value="">Failed to load voices: ${err.message}</option>`;
+    voiceSel.innerHTML = `<option value="">Failed to load voices: ${err.message}</option>`;
   }
 
-  document.getElementById('voice-picker-instructions').value = settings.instructions || '';
+  // Route preview + TTS provider list (both come from /voice/realtime/route).
+  await refreshRoutePreview();
+  // Re-preview when the user toggles mode or TTS — gives instant feedback.
+  modeSel.onchange = refreshRoutePreview;
+  ttsSel.onchange = refreshRoutePreview;
+
   pickerModalEl.hidden = false;
-  document.getElementById('voice-picker-instructions').focus();
+  instructionsEl.focus();
+}
+
+
+async function refreshRoutePreview() {
+  const previewEl = document.getElementById('voice-picker-route-preview');
+  const ttsSel = document.getElementById('voice-picker-tts');
+  const modeSel = document.getElementById('voice-picker-mode');
+  const previousTts = ttsSel.value || settings.preferred_tts || '';
+  previewEl.textContent = 'Resolving...';
+
+  const overrides = pickerOverridesFromUI(modeSel.value, previousTts);
+  let route;
+  try {
+    route = await fetchRoute(overrides);
+  } catch (err) {
+    previewEl.textContent = `Route preview failed: ${err.message}`;
+    return;
+  }
+
+  // Render the human summary.
+  const parts = [];
+  if (route.path === 'realtime') {
+    parts.push(`🟢 Realtime — model: ${route.voice_model || '(discovering)'}`);
+  } else if (route.path === 'pipeline') {
+    parts.push(`🟠 Pipeline — your chat LLM (${route.llm_vendor || 'unknown'}) → TTS: ${route.tts_provider || 'auto'} / STT: ${route.stt_provider || 'auto'}`);
+  } else if (route.path === 'local') {
+    parts.push(`🔒 Local — TTS: ${route.tts_provider} / STT: ${route.stt_provider}`);
+  } else {
+    parts.push(`⚠ Voice unavailable`);
+  }
+  if (route.reason) parts.push(`<small>${route.reason}</small>`);
+  previewEl.innerHTML = parts.join('<br>');
+
+  // Refresh the TTS dropdown from the discovered providers (preserve selection).
+  const installed = route.available_tts_providers || [];
+  ttsSel.innerHTML = '<option value="">Auto (resolver picks)</option>';
+  for (const name of installed) {
+    const opt = document.createElement('option');
+    opt.value = name;
+    opt.textContent = name;
+    if (name === previousTts) opt.selected = true;
+    ttsSel.appendChild(opt);
+  }
+}
+
+
+function pickerOverridesFromUI(mode, preferredTts) {
+  // Translate the mode dropdown into the resolver's prefer_realtime knob.
+  // "auto" leaves prefer_realtime at the default (true) — the resolver
+  // still falls back to Pipeline based on privacy + LLM vendor.
+  const overrides = { preferred_tts: preferredTts || '' };
+  if (mode === 'pipeline') overrides.prefer_realtime = false;
+  else overrides.prefer_realtime = true;
+  return overrides;
+}
+
+
+async function fetchRoute(overrides = {}) {
+  const params = new URLSearchParams();
+  if (overrides.prefer_realtime === false) params.set('prefer_realtime', 'false');
+  if (overrides.preferred_tts) params.set('preferred_tts', overrides.preferred_tts);
+  if (overrides.preferred_stt) params.set('preferred_stt', overrides.preferred_stt);
+  const qs = params.toString();
+  const url = API.buildAgentUrl(`/voice/realtime/route${qs ? `?${qs}` : ''}`);
+  const resp = await fetch(url, { headers: voiceAuthHeaders() });
+  if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+  return resp.json();
 }
 
 
@@ -513,11 +619,13 @@ function closePicker() {
 function savePicker() {
   const voice = document.getElementById('voice-picker-select').value;
   const instructions = document.getElementById('voice-picker-instructions').value;
-  settings = { voice, instructions };
+  const mode = document.getElementById('voice-picker-mode').value || 'auto';
+  const preferredTts = document.getElementById('voice-picker-tts').value || '';
+  settings = { voice, instructions, mode, preferred_tts: preferredTts };
   saveSettings();
   // If a session is active, push the new instructions immediately —
-  // Realtime accepts session.update mid-call. Voice change requires a new
-  // session (OpenAI Realtime can't hot-swap voices).
+  // Realtime accepts session.update mid-call. Voice/path change requires a
+  // new session (OpenAI Realtime can't hot-swap voice or model).
   if (client && instructions) {
     try { client.updateInstructions(instructions); } catch (_) {}
   }
@@ -587,16 +695,21 @@ function isTypingTarget(el) {
 
 
 function loadSettings() {
+  const defaults = { voice: '', instructions: '', mode: 'auto', preferred_tts: '' };
   try {
     const raw = localStorage.getItem(SETTINGS_KEY);
-    if (!raw) return { voice: '', instructions: '' };
+    if (!raw) return defaults;
     const parsed = JSON.parse(raw);
     return {
       voice: typeof parsed.voice === 'string' ? parsed.voice : '',
       instructions: typeof parsed.instructions === 'string' ? parsed.instructions : '',
+      // Legacy stored objects won't have `mode` / `preferred_tts` — fall
+      // back to "auto" + "" so existing users don't get a broken picker.
+      mode: typeof parsed.mode === 'string' ? parsed.mode : 'auto',
+      preferred_tts: typeof parsed.preferred_tts === 'string' ? parsed.preferred_tts : '',
     };
   } catch (_) {
-    return { voice: '', instructions: '' };
+    return defaults;
   }
 }
 
@@ -657,6 +770,22 @@ function injectStyles() {
       0%   { box-shadow: 0 0 0 0   rgba(239, 68, 68, 0.55); }
       70%  { box-shadow: 0 0 0 9px rgba(239, 68, 68, 0);    }
       100% { box-shadow: 0 0 0 0   rgba(239, 68, 68, 0);    }
+    }
+
+    /* Live route-preview block at the top of the voice picker — tells the
+       user which model would actually answer if they started a session right
+       now, given their current overrides. */
+    .kestrel-voice-route-preview {
+      background: var(--bg-tertiary, #1f2937);
+      color: var(--text-secondary, #d1d5db);
+      padding: 0.5rem 0.7rem;
+      border-radius: 6px;
+      font-size: 0.8rem;
+      line-height: 1.35;
+    }
+    .kestrel-voice-route-preview small {
+      color: var(--text-tertiary, #9ca3af);
+      font-size: 0.7rem;
     }
 
     /* Path/privacy chips live in the input footer next to context-status. */

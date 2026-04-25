@@ -170,12 +170,18 @@ class VoiceFeature(Feature):
             return ""
         return (provider or "").lower()
 
-    async def _resolve_route(self) -> VoiceRoute:
+    async def _resolve_route(self, overrides: Optional[UserVoicePreferences] = None) -> VoiceRoute:
         """Build a routing context from agent state and ask the resolver.
 
         This is the single place where voice-path rules are applied. Callers
         within this feature (and future endpoints) ask here, never hand-roll
         the privacy gate.
+
+        ``overrides`` lets a per-call preference (e.g. \"force pipeline for
+        this session\" from the voice picker) take precedence over the
+        agent-persisted ``_voice_config``. None → use only the persisted
+        prefs. Overrides only set fields are applied; unset fields fall back
+        to the persisted values.
         """
         registry = await self._ensure_registry()
         prefs = self._voice_config
@@ -193,14 +199,19 @@ class VoiceFeature(Feature):
             tts_local={n for n in tts_names if (p := registry.get_tts(n)) and p.is_local},
             stt_local={n for n in stt_names if (p := registry.get_stt(n)) and p.is_local},
         )
+        # Overrides win when provided; else fall back to persisted config.
+        ov = overrides if overrides is not None else UserVoicePreferences()
+        merged = UserVoicePreferences(
+            preferred_tts=ov.preferred_tts or (prefs.tts_provider or None),
+            preferred_stt=ov.preferred_stt or (prefs.stt_provider or None),
+            preferred_conversation=ov.preferred_conversation,
+            prefer_realtime=ov.prefer_realtime,
+        )
         ctx = VoiceRoutingContext(
             llm_vendor=self._get_llm_vendor(),
             privacy_config=self._get_privacy_config(),
             installed=installed,
-            preferences=UserVoicePreferences(
-                preferred_tts=prefs.tts_provider or None,
-                preferred_stt=prefs.stt_provider or None,
-            ),
+            preferences=merged,
         )
         return resolve_voice_route(ctx)
 

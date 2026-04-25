@@ -834,3 +834,178 @@ def test_router_registers_session_at_voice_realtime_session() -> None:
     paths = {route.path for route in voice_parent.routes}
     assert "/voice/realtime/session" in paths
     assert "/voice/voice/realtime/session" not in paths
+
+
+# ---------------------------------------------------------------------------
+# GET /voice/realtime/route — introspection endpoint
+# ---------------------------------------------------------------------------
+
+
+class TestRouteIntrospection:
+    """The UI calls GET /voice/realtime/route to display the active voice
+    route + which model would actually answer. Critical: query params let
+    the picker preview alternative routes without minting a session.
+    """
+
+    def _agent_with_route(
+        self, route: VoiceRoute, *, conversation_provider=None,
+    ) -> Any:
+        from kestrel_sovereign.features.voice.feature import VoiceFeature
+
+        registry = MagicMock()
+        registry.list_tts_providers = MagicMock(return_value=["piper", "openai"])
+        registry.list_stt_providers = MagicMock(return_value=["faster_whisper", "openai"])
+        registry.list_conversation_providers = MagicMock(return_value=["openai_realtime"])
+        registry.get_conversation = MagicMock(return_value=conversation_provider)
+        registry.get_tts = MagicMock(return_value=None)
+
+        vf = MagicMock()
+        vf.__class__ = VoiceFeature
+        vf._resolve_route = AsyncMock(return_value=route)
+        vf._ensure_registry = AsyncMock(return_value=registry)
+        vf._get_privacy_mode_name = MagicMock(return_value="normal")
+        vf._get_llm_vendor = MagicMock(return_value="openai")
+        vf._voice_config = SimpleNamespace(tts_voice_id="cedar")
+        return SimpleNamespace(
+            agent_id="test", features={"VoiceFeature": vf}, identity=None,
+        )
+
+    def test_returns_realtime_route_and_discovered_model(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        provider = MagicMock()
+        provider.discover_models = AsyncMock(return_value=["gpt-realtime-1.5"])
+        agent = self._agent_with_route(
+            VoiceRoute(
+                path="realtime", conversation_provider="openai_realtime",
+                reason="OpenAI LLM + Realtime provider installed",
+            ),
+            conversation_provider=provider,
+        )
+        _inject_agent(monkeypatch, agent)
+
+        resp = client.get("/voice/realtime/route")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["path"] == "realtime"
+        assert body["conversation_provider"] == "openai_realtime"
+        assert body["voice_model"] == "gpt-realtime-1.5"
+        assert body["voice_id"] == "cedar"
+        assert body["llm_vendor"] == "openai"
+        assert "openai_realtime" in body["available_conversation_providers"]
+
+    def test_returns_pipeline_route_when_resolver_picks_pipeline(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        agent = self._agent_with_route(
+            VoiceRoute(
+                path="pipeline", tts_provider="elevenlabs", stt_provider="openai",
+                reason="prefer_realtime=False",
+            ),
+        )
+        _inject_agent(monkeypatch, agent)
+
+        resp = client.get("/voice/realtime/route")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["path"] == "pipeline"
+        assert body["tts_provider"] == "elevenlabs"
+        assert body["stt_provider"] == "openai"
+        assert body["conversation_provider"] is None
+
+    def test_overrides_via_query_params_change_resolved_route(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Resolver mock receives the overrides — assert it gets called with
+        # the prefer_realtime=False override applied.
+        from kestrel_sovereign.features.voice.feature import VoiceFeature
+
+        registry = MagicMock()
+        registry.list_tts_providers = MagicMock(return_value=["openai"])
+        registry.list_stt_providers = MagicMock(return_value=["openai"])
+        registry.list_conversation_providers = MagicMock(return_value=[])
+        registry.get_conversation = MagicMock(return_value=None)
+        registry.get_tts = MagicMock(return_value=None)
+
+        captured = {}
+
+        async def _resolve(overrides=None):
+            captured["overrides"] = overrides
+            return VoiceRoute(
+                path="pipeline", tts_provider="openai", stt_provider="openai",
+                reason="forced",
+            )
+
+        vf = MagicMock()
+        vf.__class__ = VoiceFeature
+        vf._resolve_route = _resolve
+        vf._ensure_registry = AsyncMock(return_value=registry)
+        vf._get_privacy_mode_name = MagicMock(return_value="normal")
+        vf._get_llm_vendor = MagicMock(return_value="openai")
+        vf._voice_config = SimpleNamespace(tts_voice_id="")
+        agent = SimpleNamespace(agent_id="t", features={"VoiceFeature": vf}, identity=None)
+        _inject_agent(monkeypatch, agent)
+
+        resp = client.get(
+            "/voice/realtime/route",
+            params={"prefer_realtime": "false", "preferred_tts": "elevenlabs"},
+        )
+        assert resp.status_code == 200
+        assert captured["overrides"].prefer_realtime is False
+        assert captured["overrides"].preferred_tts == "elevenlabs"
+
+    def test_503_when_voice_feature_missing(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        agent = SimpleNamespace(features={}, identity=None)
+        _inject_agent(monkeypatch, agent)
+        resp = client.get("/voice/realtime/route")
+        assert resp.status_code == 503
+
+    def test_router_registers_route_path(self) -> None:
+        voice_parent = APIRouter(prefix="/voice", tags=["voice"])
+        voice_parent.include_router(realtime_router)
+        paths = {route.path for route in voice_parent.routes}
+        assert "/voice/realtime/route" in paths
+
+
+class TestRealtimeSessionOverrides:
+    """The mint endpoint accepts per-session overrides so the picker can
+    force Pipeline mode (or pin a TTS) without persisting agent config.
+    """
+
+    def test_prefer_realtime_false_routes_to_pipeline_409(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from kestrel_sovereign.features.voice.feature import VoiceFeature
+
+        captured = {}
+
+        async def _resolve(overrides=None):
+            captured["overrides"] = overrides
+            # Resolver picks Pipeline because prefer_realtime=False is overridden.
+            return VoiceRoute(
+                path="pipeline", tts_provider="elevenlabs", stt_provider="openai",
+                reason="user forced Pipeline",
+            )
+
+        vf = MagicMock()
+        vf.__class__ = VoiceFeature
+        vf._resolve_route = _resolve
+        vf._ensure_registry = AsyncMock(return_value=MagicMock())
+        vf._get_privacy_mode_name = MagicMock(return_value="normal")
+        vf._voice_config = SimpleNamespace(tts_voice_id="cedar")
+        agent = SimpleNamespace(
+            agent_id="t", features={"VoiceFeature": vf},
+            identity=SimpleNamespace(system_prompt=""),
+        )
+        _inject_agent(monkeypatch, agent)
+
+        resp = client.post(
+            "/voice/realtime/session",
+            json={"voice": "cedar", "prefer_realtime": False},
+        )
+        # Forced Pipeline → resolver returns pipeline → mint endpoint returns
+        # 409 with the fallback so the frontend opens the WebSocket path.
+        assert resp.status_code == 409
+        assert captured["overrides"].prefer_realtime is False
