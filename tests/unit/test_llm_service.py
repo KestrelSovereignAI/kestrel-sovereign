@@ -362,6 +362,40 @@ class TestCoreGeneration:
         assert response.has_tool_calls
 
     @pytest.mark.asyncio
+    async def test_usage_log_line_includes_cache_tokens(self, llm_service, mock_adapter, caplog):
+        """Issue #819 — every successful call emits one ``llm.usage:`` JSON
+        line so callers that downcast to a string don't lose token / cache
+        telemetry. Verifies cache_creation_input_tokens and
+        cache_read_input_tokens are surfaced when the adapter reports them."""
+        import json as _json
+        mock_adapter.get_response = AsyncMock(return_value=LLMResponse(
+            content="hi",
+            input_tokens=2103,
+            output_tokens=42,
+            total_tokens=2145,
+            cache_creation_input_tokens=0,
+            cache_read_input_tokens=66482,
+        ))
+
+        with caplog.at_level("INFO", logger="kestrel_sovereign.llm.service"):
+            await llm_service.get_response(
+                system_prompt="big stable system block",
+                user_prompt="trigger a warm cache hit",
+            )
+
+        usage_lines = [r for r in caplog.records if r.message.startswith("llm.usage: ")]
+        assert usage_lines, "expected at least one llm.usage: log line"
+        payload = _json.loads(usage_lines[-1].message.removeprefix("llm.usage: "))
+        assert payload["input_tokens"] == 2103
+        assert payload["output_tokens"] == 42
+        assert payload["cache_creation_input_tokens"] == 0
+        assert payload["cache_read_input_tokens"] == 66482
+        assert "duration_ms" in payload
+        assert "model" in payload
+        assert payload["tools"] is False
+        assert payload["structured_output"] is False
+
+    @pytest.mark.asyncio
     async def test_get_response_provider_fallback(self, llm_service, mock_adapter):
         """Test provider fallback when first provider fails."""
         # First call fails, second succeeds
