@@ -274,10 +274,43 @@ def _make_feature(fake_db, agent_id=AGENT_ID):
 
 
 def _make_privacy_wrapper(fake_db, agent_id=AGENT_ID):
-    """Create a PrivacyEnforcingStorage in NORMAL mode backed by a FakeDB."""
+    """Create a PrivacyEnforcingStorage in NORMAL mode backed by a FakeDB.
+
+    Soft-delete (#763) moved the SQL UPDATE off the wrapper and onto the
+    storage facade, so the underlying mock has to expose async
+    ``delete_message`` (and friends) that mutate the FakeDB the way the
+    real conversation store would.
+    """
     underlying = MagicMock()
     underlying.db = fake_db
     underlying.agent_id = agent_id
+
+    async def _soft_delete(row_id):
+        msg = fake_db.messages.get(row_id)
+        if not msg or msg["agent_id"] != agent_id:
+            return False
+        if msg.get("deleted_at"):
+            return False
+        msg["deleted_at"] = "2026-04-25T00:00:00"
+        return True
+
+    async def _restore(row_id):
+        msg = fake_db.messages.get(row_id)
+        if not msg or not msg.get("deleted_at"):
+            return False
+        msg["deleted_at"] = None
+        return True
+
+    async def _purge(row_id, reason="user-initiated"):
+        msg = fake_db.messages.get(row_id)
+        if not msg or msg["agent_id"] != agent_id:
+            return False
+        del fake_db.messages[row_id]
+        return True
+
+    underlying.delete_message = _soft_delete
+    underlying.restore_message = _restore
+    underlying.purge_message = _purge
     wrapper = PrivacyEnforcingStorage(underlying, PrivacyMode.NORMAL)
     return wrapper
 
@@ -288,7 +321,14 @@ def _make_privacy_wrapper(fake_db, agent_id=AGENT_ID):
 
 @pytest.mark.asyncio
 async def test_sovereign_delete_cleans_up_pins():
-    """Deleting a pinned message via privacy_wrapper should also remove its pin record."""
+    """Soft-deleting a pinned message via privacy_wrapper still removes
+    its pin record (#763 / sovereign override invariant).
+
+    Pre-#763 this test asserted the row vanished from the conversation
+    table; now it asserts the row is *soft-deleted* (``deleted_at`` is
+    stamped) but the pin is **still hard-deleted** because pins must
+    never point into Trash. The user can re-pin if they restore.
+    """
     db = FakeDB()
     msg_id = db.add_message("An important memory", {"importance": 0.9})
 
@@ -303,10 +343,11 @@ async def test_sovereign_delete_cleans_up_pins():
     deleted = await wrapper.delete_conversation_message(msg_id, AGENT_ID)
     assert deleted is True
 
-    # Message should be gone
-    assert msg_id not in db.messages
+    # Message survives in trash (soft-delete)
+    assert msg_id in db.messages
+    assert db.messages[msg_id].get("deleted_at") is not None
 
-    # Pin record should ALSO be gone -- sovereign override
+    # Pin record is gone -- sovereign override / pins can't point into trash
     assert len(db.pins) == 0
 
 
@@ -428,10 +469,12 @@ async def test_pins_cannot_resist_sovereign_deletion():
     deleted = await wrapper.delete_conversation_message(msg_id, AGENT_ID)
     assert deleted is True
 
-    # Message MUST be gone
-    assert msg_id not in db.messages
+    # Message survives in Trash (soft-delete by default — #763) but its
+    # deleted_at is stamped, so it's hidden from normal reads.
+    assert msg_id in db.messages
+    assert db.messages[msg_id].get("deleted_at") is not None
 
-    # Pin MUST also be gone -- cannot resurrect
+    # Pin MUST be gone -- cannot resurrect, cannot point into Trash.
     assert len(db.pins) == 0
 
 
