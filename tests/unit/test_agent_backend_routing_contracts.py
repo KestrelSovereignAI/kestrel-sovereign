@@ -290,6 +290,69 @@ class TestUnavailableProviderFails:
         assert target == "gpt-5-mini"
 
 
+class TestEmptyProviderListRaisesClearly:
+    """Regression: resolve_provider_routing must never return an empty list.
+
+    The streaming code paths iterate the returned providers as their fallback
+    chain. Zero providers means the loop runs zero times; the only error
+    available to surface is ``last_error=None``, which the wrapper renders as
+    "All providers failed: None" with no clue *why* nothing was tried — the
+    exact symptom downstream users (frinz integration tests) reported after
+    this refactor. resolve_provider_routing now raises a specific
+    ``LLMServiceError`` for the two real reasons:
+
+      1. Every initialized route was disabled this session by a permanent
+         auth failure (401/403).
+      2. No routes were configured at all.
+    """
+
+    def test_all_routes_disabled_raises_with_reasons(self, service_with_providers):
+        from kestrel_sovereign.llm.service import LLMServiceError
+
+        svc = service_with_providers
+        # Simulate: every initialized route hit a 401/403 earlier this session.
+        for p in svc.providers:
+            svc._disabled_routes[p["name"]] = "401 invalid_api_key"
+
+        with pytest.raises(LLMServiceError) as exc_info:
+            svc.resolve_provider_routing()
+
+        msg = str(exc_info.value)
+        # Each disabled route is named in the error so the operator knows
+        # *which* keys to rotate.
+        for p in svc.providers:
+            assert p["name"] in msg
+        assert "Rotate keys" in msg
+
+    def test_no_routes_configured_raises_with_config_hint(self, service_with_providers):
+        from kestrel_sovereign.llm.service import LLMServiceError
+
+        svc = service_with_providers
+        # Pathological: provider initialization produced zero usable routes
+        # (e.g. every vendor missing its env var).
+        svc.providers = []
+
+        with pytest.raises(LLMServiceError) as exc_info:
+            svc.resolve_provider_routing()
+
+        msg = str(exc_info.value)
+        assert "No LLM routes" in msg
+        assert "llm_config.toml" in msg
+
+    def test_streaming_does_not_see_empty_provider_list(self, service_with_providers):
+        """End-to-end shape: zero usable routes raises *before* the streaming
+        loop, so callers never get the misleading "All providers failed: None"
+        with ``last_error`` unset."""
+        from kestrel_sovereign.llm.service import LLMServiceError
+
+        svc = service_with_providers
+        svc.providers = []
+
+        # Whatever the caller asks for, resolution raises before returning.
+        with pytest.raises(LLMServiceError):
+            svc.resolve_provider_routing(model_override=None)
+
+
 class TestAnthropicPlanVsApi:
     """Contract: anthropic:plan and anthropic:api are distinct routes."""
 
