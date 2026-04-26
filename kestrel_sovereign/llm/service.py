@@ -1535,6 +1535,7 @@ No other text or formatting.
         response_format: Optional[Type[BaseModel]] = None,
         force_local_only: bool = False,
         model_override: Optional[str] = None,
+        conversation_id: Optional[str] = None,
     ) -> Union[str, LLMResponse]:
         """Generate using existing message list (for multi-turn tool calling).
 
@@ -1544,6 +1545,11 @@ No other text or formatting.
             response_format: Optional Pydantic model for structured output
             force_local_only: Only use local providers
             model_override: Override model selection
+            conversation_id: Stable id of the multi-turn conversation. When set,
+                stateful providers (e.g. CodexAdapter) anchor on the prior
+                response via ``previous_response_id`` and send only delta input,
+                preserving encrypted reasoning across turns. Stateless adapters
+                ignore it. See #808.
 
         Returns:
             String content or LLMResponse
@@ -1671,6 +1677,7 @@ No other text or formatting.
                     tools=tools,
                     response_format=response_format,
                     extra_body=provider_cache_body(provider),
+                    conversation_id=conversation_id,
                 )
                 if tools is not None or response_format is not None:
                     return response
