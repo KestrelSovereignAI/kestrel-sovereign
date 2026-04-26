@@ -6,12 +6,12 @@ name: Refresh Repo Map
 on:
   schedule:
     - cron: "17 6 * * *"  # 06:17 UTC daily — off-hours, off-the-hour to avoid cron pile-up
-  pull_request:
-    branches: [main]
-    paths:
-      - "scripts/generate_repo_map.py"
-      - ".github/workflows/repo-map.yml"
   workflow_dispatch:
+
+# Note: this workflow does NOT run on PRs. Keeping REPO_MAP.md in sync on every
+# PR would require platform-deterministic generation (we saw ~7-token drift
+# between macOS and Linux runners), which adds friction without much value.
+# The nightly auto-commit catches up after each batch of merges instead.
 
 permissions:
   contents: write
@@ -45,8 +45,8 @@ jobs:
             git diff --stat docs/audit/REPO_MAP.md
           fi
 
-      - name: Commit & push (scheduled / manual runs only)
-        if: steps.diff.outputs.changed == 'true' && github.event_name != 'pull_request'
+      - name: Commit & push if changed
+        if: steps.diff.outputs.changed == 'true'
         run: |
           git config user.name "kestrel-agent[bot]"
           git config user.email "kestrel-agent[bot]@users.noreply.github.com"
@@ -56,9 +56,3 @@ jobs:
           Auto-refresh of docs/audit/REPO_MAP.md so the kestrel-agent GitHub App's
           always-on context reflects the current tree."
           git push
-
-      - name: Fail PR if REPO_MAP.md is stale
-        if: steps.diff.outputs.changed == 'true' && github.event_name == 'pull_request'
-        run: |
-          echo "::error file=docs/audit/REPO_MAP.md::REPO_MAP.md is stale. Run: python scripts/generate_repo_map.py"
-          exit 1
