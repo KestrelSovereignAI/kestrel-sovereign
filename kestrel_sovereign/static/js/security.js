@@ -301,8 +301,14 @@ export const Security = {
 
     async setToolPermission(featureName, toolName, level) {
         try {
+            // #766: DENY toggles run through the demo-isolation rail.
+            // The header carries the operator's intent into the audit log.
+            const headers = level === 'deny'
+                ? { 'X-Kestrel-Allow-Destructive': 'user-initiated-ui-deny' }
+                : {};
             await API.request('/api/security/permissions', {
                 method: 'POST',
+                headers,
                 body: JSON.stringify({
                     feature: featureName,
                     tool: toolName,
@@ -329,8 +335,13 @@ export const Security = {
         }[currentState] || 'ask';
 
         try {
+            // #766: bulk DENY runs through the demo-isolation rail.
+            const headers = nextLevel === 'deny'
+                ? { 'X-Kestrel-Allow-Destructive': 'user-initiated-ui-deny' }
+                : {};
             await API.request('/api/security/permissions/feature', {
                 method: 'POST',
+                headers,
                 body: JSON.stringify({
                     feature: featureName,
                     level: nextLevel
