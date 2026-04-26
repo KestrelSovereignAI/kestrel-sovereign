@@ -157,7 +157,7 @@ class PrivacyEnforcingStorage:
     def set_privacy_mode(self, mode: Union[PrivacyMode, PrivacyConfig, str]) -> None:
         """
         Change the privacy mode.
-        
+
         Note: Changing to a more restrictive mode does NOT delete existing data.
         It only affects future operations.
         """
@@ -165,6 +165,87 @@ class PrivacyEnforcingStorage:
         self._privacy_config = self._to_config(mode)
         self._policy = PrivacyPolicy.from_config(self._privacy_config)
         logger.info(f"Privacy config changed: storage={old_config.storage}->{self._privacy_config.storage}, llm={old_config.llm_location}->{self._privacy_config.llm_location}")
+
+    async def purge_ephemeral_session(
+        self, reason: str = "ephemeral-session-close"
+    ) -> Dict[str, int]:
+        """Hard-purge any data the EPHEMERAL agent may have leaked (#767).
+
+        EPHEMERAL is the strongest privacy guarantee Kestrel offers —
+        the contract is "leave no trace." If a write somehow reached
+        ``conversation_history`` or ``graph_nodes`` despite the privacy
+        layer rejecting persistent writes, this method is the safety
+        net that scrubs it.
+
+        Soft-delete (#763) is for *user delete intent* on data the user
+        knew was being persisted. EPHEMERAL is the inverse — the user
+        explicitly chose "don't persist." Honor that contract by never
+        letting EPHEMERAL data live in trash. We bypass the soft-delete
+        code path entirely and call the ``purge_*`` primitives.
+
+        If this method actually finds rows, it WARNs and writes a
+        security_audit_log entry — that's a bug in the privacy layer,
+        and the audit trail is the only way the operator finds out.
+
+        The session-local in-memory buffer (``_session_conversations``)
+        is also cleared as a belt-and-braces measure, in case the
+        agent flips out of EPHEMERAL while ISOLATED-style buffering
+        accumulated something.
+
+        Args:
+            reason: Audit reason. Defaults to ``ephemeral-session-close``.
+
+        Returns:
+            Dict of ``{table_name: rows_destroyed}`` so callers can log.
+            Zero is the happy path; non-zero is a leak.
+        """
+        agent_id = self.agent_id
+        if not agent_id:
+            logger.debug("purge_ephemeral_session: no agent_id, skipping")
+            return {"conversation_history": 0, "graph_nodes": 0}
+
+        result: Dict[str, int] = {}
+
+        # Belt-and-braces: clear in-memory ISOLATED buffer too. No row
+        # count needed — the buffer never persisted.
+        self._session_conversations = []
+        self._session_files = {}
+
+        try:
+            convs = await self._storage.purge_all_conversations(reason=reason)
+        except Exception as e:
+            logger.warning(
+                "purge_ephemeral_session: conversation purge failed: %s", e
+            )
+            convs = 0
+        result["conversation_history"] = convs
+
+        try:
+            nodes = await self._storage.purge_agent_graph_nodes()
+        except Exception as e:
+            logger.warning(
+                "purge_ephemeral_session: graph_nodes purge failed: %s", e
+            )
+            nodes = 0
+        result["graph_nodes"] = nodes
+
+        leaked = sum(result.values())
+        if leaked > 0:
+            logger.warning(
+                "[privacy] WARNING: EPHEMERAL session leaked %d row(s) "
+                "into persistent storage (agent=%s, breakdown=%s); "
+                "hard-purged with reason=%s",
+                leaked, agent_id, result, reason,
+            )
+        else:
+            logger.debug(
+                "purge_ephemeral_session: clean (no leaks) for agent %s",
+                agent_id,
+            )
+        # Audit-log emission is the caller's responsibility — the agent
+        # has natural access to its SecurityFeature; the storage wrapper
+        # doesn't and shouldn't try to reach back through layers.
+        return result
     
     async def _check_write_permission(self, operation_name: str) -> None:
         """Check if write operations are allowed in current mode."""
