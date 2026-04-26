@@ -18,6 +18,7 @@ bytes-to-text transforms::
     OpenAIRealtime = "kestrel_voice_openai:OpenAIRealtimeConversationProvider"
 """
 import logging
+from dataclasses import dataclass
 from typing import Optional
 
 from kestrel_sdk.voice import ConversationProvider
@@ -28,6 +29,55 @@ logger = logging.getLogger(__name__)
 
 VOICE_PROVIDER_ENTRY_POINT_GROUP = "kestrel_sovereign.voice_providers"
 CONVERSATION_PROVIDER_ENTRY_POINT_GROUP = "kestrel_sovereign.conversation_providers"
+
+
+@dataclass
+class ProviderDiagnostic:
+    """One row in the provider-status surface.
+
+    Captures every attempted provider — registered, unavailable, or
+    import-broken — so the UI can show a real reason ("API key lacks
+    voices_read") instead of "no voices reported." Filled by the registry at
+    boot. /voice/providers/status enriches each TTS row with a live
+    ``list_voices`` probe.
+    """
+
+    name: str                          # entry-point name, e.g. "ElevenLabsTTSProvider"
+    provider_name: Optional[str]       # provider.name; None if instantiation failed
+    kind: str                          # "tts" | "stt" | "conversation"
+    registered: bool
+    is_local: bool = False
+    init_error: Optional[str] = None
+    available_error: Optional[str] = None
+    voice_count: Optional[int] = None
+    voice_list_error: Optional[str] = None
+    install_hint: Optional[str] = None
+
+
+def _install_hint_for(ep_name: str, init_error: Optional[str], avail_error: Optional[str]) -> Optional[str]:
+    """Map common failure shapes to a one-liner the user can act on.
+
+    Returns ``None`` when no specific hint applies — the UI falls back to
+    showing the raw error from ``init_error`` / ``available_error``.
+    """
+    name = (ep_name or "").lower()
+    blob = " ".join(filter(None, [init_error or "", avail_error or ""])).lower()
+    if "elevenlabs" in name:
+        if "voices_read" in blob or "missing_permission" in blob:
+            return ("Your ElevenLabs API key is missing the `voices_read` scope. "
+                    "Edit at elevenlabs.io/app/settings/api-keys and grant "
+                    "voices_read + text_to_speech.")
+        if "is_available() returned false" in blob:
+            return "Set ELEVENLABS_API_KEY in your environment, then restart the host."
+    if "deepgram" in name:
+        if "import failed" in blob or "cannot import name" in blob or "no module named 'deepgram." in blob:
+            return ("kestrel-voice-deepgram needs an update for the installed "
+                    "deepgram-sdk version. Upgrade the package or pin the SDK.")
+        if "is_available() returned false" in blob:
+            return "Set DEEPGRAM_API_KEY in your environment, then restart the host."
+    if "openai" in name and "is_available() returned false" in blob:
+        return "Set OPENAI_API_KEY in your environment, then restart the host."
+    return None
 
 
 class VoiceProviderRegistry:
@@ -44,6 +94,14 @@ class VoiceProviderRegistry:
         self._conversation_providers: dict[str, ConversationProvider] = {}
         self._config = config
         self._initialized = False
+        # Every entry-point we attempted, registered or not. Keyed implicitly
+        # by entry-point name so a single package contributing both TTS+STT
+        # appears twice (one diagnostic per role).
+        self._diagnostics: list[ProviderDiagnostic] = []
+
+    def diagnostics(self) -> list[ProviderDiagnostic]:
+        """Snapshot of every provider attempted at boot, registered or not."""
+        return list(self._diagnostics)
 
     async def initialize(self) -> None:
         """Discover and initialize available providers based on config and installed packages.
@@ -104,34 +162,101 @@ class VoiceProviderRegistry:
         stt_classes = discover_entry_point_classes(VOICE_PROVIDER_ENTRY_POINT_GROUP, STTProvider)
 
         for ep_name, cls in tts_classes.items():
-            try:
-                provider_config = self._config.get(ep_name, {})
-                provider = cls(config=provider_config)
-                if provider.name in self._tts_providers:
-                    logger.debug(f"Skipping entry_point TTS '{ep_name}': built-in '{provider.name}' already registered")
-                    continue
-                if await provider.is_available():
-                    self.register_tts(provider)
-                    logger.info(f"Registered entry_point TTS provider: {ep_name}")
-                else:
-                    logger.debug(f"Entry_point TTS provider '{ep_name}' not available, skipping")
-            except Exception as e:
-                logger.warning(f"Failed to load entry_point TTS provider '{ep_name}': {e}")
-
+            await self._try_register("tts", ep_name, cls)
         for ep_name, cls in stt_classes.items():
-            try:
-                provider_config = self._config.get(ep_name, {})
-                provider = cls(config=provider_config)
-                if provider.name in self._stt_providers:
-                    logger.debug(f"Skipping entry_point STT '{ep_name}': built-in '{provider.name}' already registered")
-                    continue
-                if await provider.is_available():
-                    self.register_stt(provider)
-                    logger.info(f"Registered entry_point STT provider: {ep_name}")
+            await self._try_register("stt", ep_name, cls)
+
+        # Capture entry points that failed to even import so the user can
+        # see a real reason in /providers/status (e.g. deepgram-sdk SDK
+        # version mismatch). discover_entry_point_classes drops these
+        # silently — we re-scan with raw importlib to record the failure.
+        await self._record_import_failures()
+
+    async def _try_register(self, kind: str, ep_name: str, cls) -> None:
+        """Instantiate, register if available, ALWAYS record a diagnostic.
+
+        Single seam where availability decisions are recorded — no silent
+        ``except: pass``. Every outcome (registered, init-failed, unavailable,
+        name-collision) becomes a ProviderDiagnostic that
+        /voice/providers/status can show.
+        """
+        provider = None
+        provider_name = None
+        init_error: Optional[str] = None
+        available_error: Optional[str] = None
+        registered = False
+        is_local = False
+        try:
+            provider_config = self._config.get(ep_name, {})
+            provider = cls(config=provider_config)
+            provider_name = provider.name
+            is_local = bool(getattr(provider, "is_local", False))
+            existing = self._tts_providers if kind == "tts" else self._stt_providers
+            if provider_name in existing:
+                available_error = f"shadowed by already-registered '{provider_name}'"
+            else:
+                try:
+                    available = await provider.is_available()
+                except Exception as e:
+                    available_error = f"is_available() raised: {e}"
                 else:
-                    logger.debug(f"Entry_point STT provider '{ep_name}' not available, skipping")
-            except Exception as e:
-                logger.warning(f"Failed to load entry_point STT provider '{ep_name}': {e}")
+                    if available:
+                        if kind == "tts":
+                            self.register_tts(provider)
+                        else:
+                            self.register_stt(provider)
+                        registered = True
+                        logger.info(f"Registered entry_point {kind.upper()} provider: {ep_name}")
+                    else:
+                        available_error = "is_available() returned False"
+        except Exception as e:
+            init_error = f"{type(e).__name__}: {e}"
+            logger.warning(f"Failed to load entry_point {kind.upper()} provider '{ep_name}': {e}")
+
+        self._diagnostics.append(
+            ProviderDiagnostic(
+                name=ep_name,
+                provider_name=provider_name,
+                kind=kind,
+                registered=registered,
+                is_local=is_local,
+                init_error=init_error,
+                available_error=available_error,
+                install_hint=_install_hint_for(ep_name, init_error, available_error),
+            )
+        )
+
+    async def _record_import_failures(self) -> None:
+        """Find entry points whose underlying module failed to import."""
+        try:
+            from importlib.metadata import entry_points
+        except Exception:
+            return
+        already = {d.name for d in self._diagnostics}
+        for group in (VOICE_PROVIDER_ENTRY_POINT_GROUP, CONVERSATION_PROVIDER_ENTRY_POINT_GROUP):
+            try:
+                eps = entry_points(group=group)
+            except Exception:
+                continue
+            for ep in eps:
+                if ep.name in already:
+                    continue
+                try:
+                    ep.load()
+                except Exception as e:
+                    kind = "conversation" if group == CONVERSATION_PROVIDER_ENTRY_POINT_GROUP else "tts"
+                    msg = f"import failed: {type(e).__name__}: {e}"
+                    self._diagnostics.append(
+                        ProviderDiagnostic(
+                            name=ep.name,
+                            provider_name=None,
+                            kind=kind,
+                            registered=False,
+                            init_error=msg,
+                            install_hint=_install_hint_for(ep.name, msg, None),
+                        )
+                    )
+                    logger.warning(f"Entry point '{ep.name}' from '{group}' failed to import: {e}")
 
     async def _discover_conversation_providers(self) -> None:
         """Scan entry_points for ConversationProvider implementations.
@@ -146,26 +271,44 @@ class VoiceProviderRegistry:
             CONVERSATION_PROVIDER_ENTRY_POINT_GROUP, ConversationProvider
         )
         for ep_name, cls in classes.items():
+            provider = None
+            provider_name = None
+            init_error: Optional[str] = None
+            available_error: Optional[str] = None
+            registered = False
             try:
                 provider_config = self._config.get(ep_name, {})
                 provider = cls(config=provider_config)
-                if provider.name in self._conversation_providers:
-                    logger.debug(
-                        f"Skipping entry_point conversation provider '{ep_name}': "
-                        f"'{provider.name}' already registered"
-                    )
-                    continue
-                if await provider.is_available():
-                    self.register_conversation(provider)
-                    logger.info(f"Registered entry_point conversation provider: {ep_name}")
+                provider_name = provider.name
+                if provider_name in self._conversation_providers:
+                    available_error = f"shadowed by already-registered '{provider_name}'"
                 else:
-                    logger.debug(
-                        f"Entry_point conversation provider '{ep_name}' not available, skipping"
-                    )
+                    try:
+                        available = await provider.is_available()
+                    except Exception as e:
+                        available_error = f"is_available() raised: {e}"
+                    else:
+                        if available:
+                            self.register_conversation(provider)
+                            registered = True
+                            logger.info(f"Registered entry_point conversation provider: {ep_name}")
+                        else:
+                            available_error = "is_available() returned False"
             except Exception as e:
-                logger.warning(
-                    f"Failed to load entry_point conversation provider '{ep_name}': {e}"
+                init_error = f"{type(e).__name__}: {e}"
+                logger.warning(f"Failed to load entry_point conversation provider '{ep_name}': {e}")
+
+            self._diagnostics.append(
+                ProviderDiagnostic(
+                    name=ep_name,
+                    provider_name=provider_name,
+                    kind="conversation",
+                    registered=registered,
+                    init_error=init_error,
+                    available_error=available_error,
+                    install_hint=_install_hint_for(ep_name, init_error, available_error),
                 )
+            )
 
     # Cloud voice providers (openai, elevenlabs, deepgram) are discovered
     # via entry_points from their respective packages:

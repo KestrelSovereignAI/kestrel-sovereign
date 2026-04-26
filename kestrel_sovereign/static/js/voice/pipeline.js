@@ -46,12 +46,25 @@ const FRAME_AUDIO = 0x01;
  * @param {string} [opts.apiKey]  API key for WebSocket auth via query param.
  * @param {string} [opts.wsPath='/voice/chat']
  * @param {number} [opts.sampleRate=24000]  PCM16 sample rate both directions.
+ * @param {string} [opts.voiceId]  TTS voice_id the user picked. Forwarded to
+ *   the server via query param so it overrides ``vf._voice_config`` and the
+ *   "first available voice" fallback.
+ * @param {string} [opts.preferredTts]  TTS provider key (e.g. "openai",
+ *   "elevenlabs"). Routes the resolver to that provider in Pipeline mode.
+ * @param {string} [opts.preferredStt]  STT provider key.
+ * @param {string} [opts.language]  ISO-639 language hint for STT (e.g. "en").
+ *   Pins Whisper to one language so it doesn't drift to other locales on
+ *   silence or short utterances.
  */
 export async function createPipelineClient({
   onEvent,
   apiKey = '',
   wsPath = '/voice/chat',
   sampleRate = 24000,
+  voiceId = '',
+  preferredTts = '',
+  preferredStt = '',
+  language = '',
 } = {}) {
   if (typeof onEvent !== 'function') {
     throw new Error('createPipelineClient requires an onEvent callback');
@@ -159,6 +172,10 @@ export async function createPipelineClient({
     const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const url = new URL(`${proto}//${window.location.host}${wsPath}`);
     if (apiKey) url.searchParams.set('api_key', apiKey);
+    if (voiceId) url.searchParams.set('voice_id', voiceId);
+    if (preferredTts) url.searchParams.set('preferred_tts', preferredTts);
+    if (preferredStt) url.searchParams.set('preferred_stt', preferredStt);
+    if (language) url.searchParams.set('language', language);
     ws = new WebSocket(url);
     ws.binaryType = 'arraybuffer';
 

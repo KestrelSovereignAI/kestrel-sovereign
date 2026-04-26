@@ -31,6 +31,11 @@ class VoiceConfig:
     tts_model: str = ""
     stt_provider: str = ""
     stt_model: str = ""
+    # Default to English for STT. Auto-detect ("") causes Whisper to
+    # hallucinate language switches in quiet/short segments and the agent
+    # then earnestly responds in Russian or German. An explicit language
+    # pins the decoder. Set to "" only if your agent really is multilingual.
+    stt_language: str = "en"
     sample_rate: int = 24000
     output_format: str = "opus"  # opus, mp3, pcm, wav
 
