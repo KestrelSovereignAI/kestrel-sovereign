@@ -36,7 +36,28 @@ logger = logging.getLogger(__name__)
 # (1024 tokens for Opus/Sonnet, 2048 for Haiku), so the marker placement
 # code doesn't need its own threshold check — Anthropic handles it.
 
-CACHE_CONTROL_EPHEMERAL = {"type": "ephemeral"}
+_DEFAULT_CACHE_TTL = "1h"  # default; bumped from "5m" to widen the warm window
+# Activates the longer TTLs (5m, 1h) — without it, Anthropic ignores the `ttl`
+# field and falls back to its 5-minute default cache.
+_EXTENDED_CACHE_TTL_BETA = "extended-cache-ttl-2025-04-11"
+
+CACHE_CONTROL_EPHEMERAL = {"type": "ephemeral", "ttl": _DEFAULT_CACHE_TTL}
+
+
+def _ensure_anthropic_beta_header(api_params: Dict[str, Any], beta: str) -> None:
+    """Merge ``beta`` into ``api_params['extra_headers']['anthropic-beta']``.
+
+    Anthropic accepts the header as comma-separated for multiple beta opt-ins;
+    callers may have already added one (e.g. `prompt-caching-2024-07-31`), so
+    we append rather than overwrite when present.
+    """
+    headers = dict(api_params.get("extra_headers") or {})
+    existing = headers.get("anthropic-beta", "")
+    parts = [p.strip() for p in existing.split(",") if p.strip()]
+    if beta not in parts:
+        parts.append(beta)
+    headers["anthropic-beta"] = ",".join(parts)
+    api_params["extra_headers"] = headers
 
 
 def _attach_cache_control(block: Dict[str, Any]) -> Dict[str, Any]:
@@ -457,6 +478,11 @@ class AnthropicAdapter(LLMAdapter):
             # below the per-model minimum cache size, so we don't gate.
             api_params = self._apply_cache_control(api_params)
 
+            # CACHE_CONTROL_EPHEMERAL carries `ttl: "1h"` (issue #797), which
+            # Anthropic only honors when this beta header is present. Without
+            # it the cache silently falls back to the 5-minute default.
+            _ensure_anthropic_beta_header(api_params, _EXTENDED_CACHE_TTL_BETA)
+
             response = await with_retry(client.messages.create, **api_params)
 
             # Parse response
@@ -484,9 +510,19 @@ class AnthropicAdapter(LLMAdapter):
             input_tokens = None
             output_tokens = None
             total_tokens = None
+            cache_creation_input_tokens = None
+            cache_read_input_tokens = None
             if hasattr(response, 'usage') and response.usage:
                 input_tokens = getattr(response.usage, 'input_tokens', None)
                 output_tokens = getattr(response.usage, 'output_tokens', None)
+                # Anthropic reports cache usage separately; either may be 0
+                # (no write/read on this call) or absent on older API versions.
+                cache_creation_input_tokens = getattr(
+                    response.usage, 'cache_creation_input_tokens', None
+                )
+                cache_read_input_tokens = getattr(
+                    response.usage, 'cache_read_input_tokens', None
+                )
                 if input_tokens is not None and output_tokens is not None:
                     total_tokens = input_tokens + output_tokens
 
@@ -497,6 +533,8 @@ class AnthropicAdapter(LLMAdapter):
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
                 total_tokens=total_tokens,
+                cache_creation_input_tokens=cache_creation_input_tokens,
+                cache_read_input_tokens=cache_read_input_tokens,
             )
 
         except Exception as e:
@@ -616,6 +654,7 @@ class AnthropicAdapter(LLMAdapter):
 
             # Attach cache_control markers — see issue #705 and _apply_cache_control.
             api_params = self._apply_cache_control(api_params)
+            _ensure_anthropic_beta_header(api_params, _EXTENDED_CACHE_TTL_BETA)
 
             async with client.messages.stream(**api_params) as stream:
                 async for text in stream.text_stream:
@@ -760,6 +799,7 @@ class AnthropicAdapter(LLMAdapter):
 
             # Attach cache_control markers — see issue #705 and _apply_cache_control.
             api_params = self._apply_cache_control(api_params)
+            _ensure_anthropic_beta_header(api_params, _EXTENDED_CACHE_TTL_BETA)
 
             logger.info(f"Starting Anthropic stream with tools for model: {model}")
 

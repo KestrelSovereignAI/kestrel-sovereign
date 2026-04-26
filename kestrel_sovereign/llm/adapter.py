@@ -41,9 +41,11 @@ class LLMResponse:
         content: Text content of the response (may be None if tool_calls present)
         tool_calls: List of tool calls requested by the model
         raw: The raw response object from the provider (for debugging)
-        input_tokens: Number of tokens in the prompt/input
+        input_tokens: Number of tokens in the prompt/input (uncached portion)
         output_tokens: Number of tokens in the completion/output
-        total_tokens: Total tokens used (input + output)
+        total_tokens: Total tokens used (input + output, excluding cache reads)
+        cache_creation_input_tokens: Tokens written to the prompt cache this call
+        cache_read_input_tokens: Tokens read from the prompt cache this call
     """
     content: Optional[str] = None
     tool_calls: Optional[List[ToolCall]] = None
@@ -52,6 +54,10 @@ class LLMResponse:
     input_tokens: Optional[int] = None
     output_tokens: Optional[int] = None
     total_tokens: Optional[int] = None
+    # Anthropic prompt-cache breakdown. Either may be 0 (no cache write/read on
+    # this call); both will be None for providers that don't report cache usage.
+    cache_creation_input_tokens: Optional[int] = None
+    cache_read_input_tokens: Optional[int] = None
 
     @property
     def has_tool_calls(self) -> bool:
