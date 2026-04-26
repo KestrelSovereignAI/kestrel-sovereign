@@ -907,6 +907,69 @@ class AsyncConversationStore:
         )
         return purged
 
+    async def purge_trash_older_than(
+        self,
+        cutoff_iso: str,
+        *,
+        max_rows: int = 10_000,
+        reason: str = "retention-janitor",
+    ) -> int:
+        """Hard-delete soft-deleted rows older than ``cutoff_iso`` (#764).
+
+        The retention janitor calls this on a periodic tick to enforce
+        the per-agent retention window. Three safety rails layered into
+        one query:
+
+        1. ``deleted_at IS NOT NULL`` — live rows are NEVER touched, no
+           matter how old. The janitor's job is to age out trash, not
+           data the user is still using.
+        2. ``deleted_at < ?`` — the cutoff. Caller computes
+           ``now - retention_days`` once per sweep so all rows in a
+           batch use the same threshold.
+        3. ``LIMIT ?`` (via ``IN (subquery)``) — prevents a runaway
+           sweep from stalling the writer thread for minutes if the
+           agent suddenly has 500k aged rows. The janitor calls back
+           on the next tick to drain the rest.
+
+        Args:
+            cutoff_iso: ISO-8601 timestamp string. Rows whose
+                ``deleted_at`` is strictly less than this are eligible
+                for purge.
+            max_rows: Hard cap on rows destroyed in a single call.
+                Defaults to 10k. Set lower for tests.
+            reason: Audit reason; lands in the operator log.
+
+        Returns:
+            Number of rows actually destroyed.
+        """
+        if not cutoff_iso:
+            return 0
+        if max_rows <= 0:
+            return 0
+
+        # SQLite doesn't support LIMIT directly inside DELETE on every
+        # build path, and even when it does the syntax differs from
+        # PostgreSQL. The IN (SELECT ... LIMIT ...) form is portable.
+        affected = await self.db.execute_commit(
+            "DELETE FROM conversation_history "
+            "WHERE id IN ("
+            "  SELECT id FROM conversation_history "
+            "  WHERE agent_id = ? "
+            "    AND deleted_at IS NOT NULL "
+            "    AND deleted_at < ? "
+            "  ORDER BY deleted_at ASC "
+            "  LIMIT ?"
+            ")",
+            (self.agent_id, cutoff_iso, max_rows),
+        )
+        purged = _rows_affected(affected)
+        if purged:
+            logger.info(
+                "purge_trash_older_than agent=%s cutoff=%s reason=%s rows=%d",
+                self.agent_id, cutoff_iso, reason, purged,
+            )
+        return purged
+
     async def delete_messages_matching(self, content_pattern: str) -> int:
         """Delete messages containing a specific pattern (case-insensitive).
 
