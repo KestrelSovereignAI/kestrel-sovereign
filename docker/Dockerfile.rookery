@@ -7,10 +7,14 @@ FROM --platform=linux/${TARGETARCH} python:3.11-slim
 
 WORKDIR /app
 
-# Install system dependencies
+# Install system dependencies. gcc + python3-dev are needed to build webrtcvad
+# (C extension, pulled in by core deps after voice PR #799). Without them, uv
+# pip install fails silently on the chain and the venv ends up empty.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     git \
+    gcc \
+    python3-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy uv from official image (faster than pip install uv)
