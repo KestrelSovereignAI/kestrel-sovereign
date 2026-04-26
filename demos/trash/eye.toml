@@ -1,0 +1,102 @@
+# kestrel-eye config for the Trash vignette.
+# Reviews each screenshot with a vision model and pins the expected layout.
+
+[eye]
+name = "Kestrel Trash Vignette"
+screenshot_dir = "demos/trash/demo-output"
+test_cmd = "demos/run.sh trash"
+
+[eye.model]
+provider = "anthropic"
+model = "claude-haiku-4-5-20251001"
+
+[eye.github]
+repo = "KestrelSovereignAI/kestrel-sovereign"
+labels = ["kestrel-eye", "trash-review", "automated"]
+
+# Beat 1: Conversation seeded
+[[eye.screenshots]]
+name = "01-conversation-seeded.png"
+act = "Beat 1: A small conversation"
+severity = "warning"
+expected = [
+    "Chat panel active",
+    "At least one user message and one agent message visible",
+]
+layout = "Two-message exchange in the chat panel — the substrate the demo will delete from"
+
+# Beat 2: Hover reveals buttons + after soft-delete
+[[eye.screenshots]]
+name = "02-hover-reveals-buttons.png"
+act = "Beat 2: Soft-delete"
+severity = "critical"
+expected = [
+    "A message is hovered with the ✕ (soft-delete) button visible",
+    "Highlight overlay frames the soft-delete button",
+]
+layout = "Hover state on a message — soft-delete affordance revealed"
+
+[[eye.screenshots]]
+name = "03-after-soft-delete.png"
+act = "Beat 2: Soft-delete"
+severity = "critical"
+expected = [
+    "The previously last message is no longer in the chat list",
+    "The chat panel shows fewer messages than before",
+]
+layout = "Chat panel after a soft-delete — message has disappeared from the active view"
+
+# Beat 3: Trash view
+[[eye.screenshots]]
+name = "04-trash-view-open.png"
+act = "Beat 3: The Trash sub-view"
+severity = "critical"
+expected = [
+    "Identity / Memory panel active",
+    "Trash sub-view is open (#conversations-trash visible)",
+    "At least one trashed item visible with Restore and Purge affordances",
+]
+layout = "Trash sub-view of the conversations pane — trashed item with restore/purge buttons"
+
+# Beat 4: Restored
+[[eye.screenshots]]
+name = "05-restored-to-chat.png"
+act = "Beat 4: Restore"
+severity = "critical"
+expected = [
+    "Chat panel active",
+    "Message count back to its original level OR previously-deleted message visible again",
+]
+layout = "Chat panel after restore — the previously-trashed message is back in the active list"
+
+# Beat 5: Purge button revealed + after hard-purge
+[[eye.screenshots]]
+name = "06-purge-button-revealed.png"
+act = "Beat 5: Hard-purge"
+severity = "warning"
+expected = [
+    "A message is hovered with the ⊘ (hard-purge) button visible",
+    "Highlight overlay frames the hard-purge button",
+]
+layout = "Hover state on a message — purge affordance revealed"
+
+[[eye.screenshots]]
+name = "07-after-hard-purge.png"
+act = "Beat 5: Hard-purge"
+severity = "critical"
+expected = [
+    "The hovered message is gone from the chat list",
+    "Chat panel renders without the purged message",
+]
+layout = "Chat panel after hard-purge — message removed entirely"
+
+# Beat 6: Bookend
+[[eye.screenshots]]
+name = "08-trash-after-purge.png"
+act = "Beat 6: Bookend"
+severity = "warning"
+expected = [
+    "Trash sub-view open",
+    "Either empty-state OR fewer items than before — the purged message is NOT listed",
+]
+layout = "Bookend — Trash reflects the purge; nothing is recoverable"
