@@ -17,6 +17,7 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -230,24 +231,82 @@ class ProcessManager:
         env: dict,
         log_file: Path,
         pid_file: Path,
+        agent_name: Optional[str] = None,
     ) -> int:
-        """Spawn a background process. Returns PID."""
+        """Spawn a background process. Returns PID.
+
+        Subprocess stdout + stderr are tee'd to two destinations by a
+        background daemon thread:
+          1. ``log_file`` on disk (preserves the per-agent debug log inside
+             the container — same behavior as before).
+          2. The parent process's stdout, prefixed with ``[agent:<name>] ``.
+             This is what Cloud Run / Cloud Logging captures, so
+             ``logger.info`` calls inside agents become visible alongside
+             host logs. See issue #812.
+
+        The daemon thread exits naturally when the subprocess closes its
+        stdout (i.e. on exit). It uses ``daemon=True`` so a stuck pump can
+        never block the host from shutting down.
+        """
         log_file.parent.mkdir(parents=True, exist_ok=True)
-        with open(log_file, "a", encoding="utf-8") as log:
-            kwargs = dict(
-                cwd=self.project_dir,
-                env=env,
-                stdout=log,
-                stderr=subprocess.STDOUT,
-            )
-            if sys.platform == "win32":
-                kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-            else:
-                kwargs["start_new_session"] = True
-            process = subprocess.Popen(cmd, **kwargs)
+        kwargs = dict(
+            cwd=self.project_dir,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,  # line-buffered (text mode)
+        )
+        if sys.platform == "win32":
+            kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            kwargs["start_new_session"] = True
+        process = subprocess.Popen(cmd, **kwargs)
+
+        # Tee the pipe to file + parent stdout in a daemon thread.
+        prefix = f"[agent:{agent_name}] " if agent_name else "[agent] "
+        thread = threading.Thread(
+            target=self._pump_stdout,
+            args=(process, log_file, prefix),
+            daemon=True,
+            name=f"stdout-pump-{agent_name or process.pid}",
+        )
+        thread.start()
 
         self.write_pid(pid_file, process.pid)
         return process.pid
+
+    @staticmethod
+    def _pump_stdout(
+        process: "subprocess.Popen[str]",
+        log_file: Path,
+        prefix: str,
+    ) -> None:
+        """Tee ``process.stdout`` to ``log_file`` and the parent's stdout.
+
+        Runs on its own daemon thread until the subprocess closes its pipe.
+        Catches and logs any exception so a misbehaving agent's output can
+        never crash the pump (which would silently break logging on disk
+        going forward).
+        """
+        try:
+            with open(log_file, "a", encoding="utf-8") as log:
+                assert process.stdout is not None  # text=True + PIPE ⇒ TextIO
+                for line in process.stdout:
+                    try:
+                        log.write(line)
+                        log.flush()
+                    except Exception:
+                        pass
+                    try:
+                        sys.stdout.write(prefix + line)
+                        sys.stdout.flush()
+                    except Exception:
+                        pass
+        except Exception as exc:
+            logger.warning("stdout pump for %s ended unexpectedly: %s", prefix.strip(), exc)
 
     # ------------------------------------------------------------------
     # Agent start / stop
@@ -335,7 +394,7 @@ class ProcessManager:
             "--host", host_bind, "--port", str(config.port),
         ]
 
-        pid = self._spawn(cmd, env, log_file, pid_file)
+        pid = self._spawn(cmd, env, log_file, pid_file, agent_name=name)
         logger.info(f"Started agent '{name}' on :{config.port} (PID {pid})")
 
         ap = AgentProcess(
