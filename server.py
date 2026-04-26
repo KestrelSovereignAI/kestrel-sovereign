@@ -262,6 +262,29 @@ async def lifespan(app: FastAPI):
     # Dynamic router mounting: features contribute routers via get_router()
     _mount_feature_routers(app)
 
+    # Server-side demo-mode classification (#766). Done after agents are
+    # loaded so the rail knows whether to treat destructive ops as safe.
+    from kestrel_sovereign.security.demo_isolation import classify_server_mode
+    if getattr(app.state, "agent_manager", None):
+        loaded = app.state.agent_manager.list_agents()
+        app.state.demo_mode = classify_server_mode(loaded)
+    elif getattr(app.state, "agent", None):
+        app.state.demo_mode = classify_server_mode(
+            {"_default": app.state.agent}
+        )
+    else:
+        app.state.demo_mode = False
+    if app.state.demo_mode:
+        logger.info(
+            "[demo-mode] this server is restricted to demo-scoped agents — "
+            "destructive ops on live agents will be refused"
+        )
+    else:
+        logger.info(
+            "[demo-mode] live server — destructive ops on live agents "
+            "require the X-Kestrel-Allow-Destructive header"
+        )
+
     # Initialize OpenTelemetry tracing (no-op if packages not installed)
     setup_tracing(app)
 
@@ -286,6 +309,76 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+
+
+# ---------------------------------------------------------------------------
+# ASGI-level rookery routing for /api/agents/{name}/...
+#
+# Why this AND `agent_routing_middleware` below: FastAPI's
+# @app.middleware("http") only fires on HTTP scope. WebSocket upgrades
+# (e.g. /api/agents/Nellie/voice/chat) bypass it entirely, so the
+# downstream WS handler can't resolve the agent and 4503's. This
+# class-based ASGI middleware sees both http and websocket scopes and
+# does the same prefix-strip + agent-resolve for either. The HTTP-only
+# version downstream is kept as a safety net in case middleware order
+# matters for some flow we haven't enumerated.
+# ---------------------------------------------------------------------------
+
+
+_AGENT_PATH_RE_ASGI = re.compile(r"^/api/agents/([^/]+)/(.+)$")
+
+
+class RookeryAgentRoutingMiddleware:
+    """Strip /api/agents/{name}/ prefix + attach the resolved agent to scope.
+
+    Works for both HTTP and WebSocket. For 404 (unknown agent) HTTP
+    requests we synthesize a JSON 404; for WebSocket we close with
+    code=4404 — close codes 4xxx are the application-defined range.
+    """
+
+    def __init__(self, asgi_app):
+        self.app = asgi_app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] not in ("http", "websocket"):
+            return await self.app(scope, receive, send)
+
+        agent_manager = getattr(app.state, "agent_manager", None)
+        if agent_manager is None:
+            return await self.app(scope, receive, send)
+
+        path = scope.get("path", "")
+        match = _AGENT_PATH_RE_ASGI.match(path)
+        if not match:
+            return await self.app(scope, receive, send)
+
+        agent_name = match.group(1)
+        agent = agent_manager.get_agent(agent_name)
+        if agent is None:
+            if scope["type"] == "http":
+                from starlette.responses import JSONResponse as _JR
+                response = _JR(
+                    status_code=404,
+                    content={"detail": f"Agent '{agent_name}' not found"},
+                )
+                return await response(scope, receive, send)
+            # WebSocket: accept then close with a clear reason — browsers see
+            # the close code in the onclose event.
+            await send({"type": "websocket.close", "code": 4404, "reason": "agent not found"})
+            return
+
+        # Mutate scope so downstream routes match the prefix-stripped path
+        # and the handler can find the agent on `request.state` /
+        # `websocket.state`. Starlette wires scope["state"] → both.
+        scope["path"] = "/" + match.group(2)
+        scope["raw_path"] = scope["path"].encode("utf-8")
+        scope.setdefault("state", {})["agent"] = agent
+
+        await self.app(scope, receive, send)
+
+
+app.add_middleware(RookeryAgentRoutingMiddleware)
+
 
 # Rate limiting
 app.state.limiter = limiter
@@ -685,7 +778,7 @@ def health_check(request: Request):
 
 @app.get("/health/detailed")
 async def health_detailed(request: Request):
-    """Detailed health check using the HeartbeatFeature.
+    """Detailed liveness check using the HealthFeature.
 
     Returns individual check results for database, LLM service,
     memory system, disk space, and context budget.
@@ -694,17 +787,16 @@ async def health_detailed(request: Request):
     if not agent:
         return {"status": "unhealthy", "error": "No agent available", "checks": []}
 
-    # Find the HeartbeatFeature among the agent's features
     features = getattr(agent, 'features', {})
-    heartbeat_feature = None
+    health_feature = None
     for feat in features.values() if isinstance(features, dict) else features:
-        if feat.__class__.__name__ == "HeartbeatFeature":
-            heartbeat_feature = feat
+        if feat.__class__.__name__ == "HealthFeature":
+            health_feature = feat
             break
 
-    if not heartbeat_feature:
+    if not health_feature:
         # Fallback: run checks directly without the feature
-        from kestrel_sovereign.features.heartbeat.checks import (
+        from kestrel_sovereign.features.health.checks import (
             check_database, check_llm_service, check_memory_system,
             check_disk_space, check_context_budget,
         )
@@ -728,8 +820,7 @@ async def health_detailed(request: Request):
             overall = "healthy"
         return {"status": overall, "checks": checks}
 
-    result = await heartbeat_feature.get_latest_heartbeat()
-    return result
+    return await health_feature.get_latest()
 
 
 # Stripe Crypto On-Ramp webhook endpoint

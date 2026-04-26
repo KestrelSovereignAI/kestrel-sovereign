@@ -10,8 +10,11 @@ import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Awaitable, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Awaitable, Callable, Dict, List, Optional
 from uuid import uuid4
+
+if TYPE_CHECKING:
+    from .permissions import PermissionStore
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +94,7 @@ class ApprovalQueue:
     def __init__(
         self,
         on_request_added: Optional[OnRequestAddedCallback] = None,
+        permission_store: Optional["PermissionStore"] = None,
     ):
         """
         Initialize the approval queue.
@@ -98,9 +102,17 @@ class ApprovalQueue:
         Args:
             on_request_added: Optional async callback when a request is added.
                              Used to emit SSE events to the UI.
+            permission_store: Optional store for persisting the user's scope
+                             choice ("session"/"always") and writing audit
+                             rows.  When set, every approval resolved through
+                             :meth:`request_approval` is persisted/audited
+                             centrally so that callers don't have to remember
+                             to do it (#785).  When None, callers retain the
+                             old responsibility of persisting scope themselves.
         """
         self._pending: Dict[str, ApprovalRequest] = {}
         self._on_request_added = on_request_added
+        self._permission_store = permission_store
 
     @property
     def pending_count(self) -> int:
@@ -177,6 +189,14 @@ class ApprovalQueue:
                 f"{'approved' if approved else 'denied'} ({scope})"
             )
 
+            await self._persist_decision(
+                feature_name=feature_name,
+                tool_name=tool_name,
+                tool_args=tool_args,
+                approved=approved,
+                scope=scope,
+            )
+
             return (approved, scope)
 
         except asyncio.TimeoutError:
@@ -184,10 +204,110 @@ class ApprovalQueue:
             logger.warning(
                 f"Approval request {request.id[:8]} timed out after {timeout}s"
             )
+            await self._persist_decision(
+                feature_name=feature_name,
+                tool_name=tool_name,
+                tool_args=tool_args,
+                approved=False,
+                scope="timeout",
+            )
             return (False, "timeout")
 
         finally:
             self._pending.pop(request.id, None)
+
+    async def _persist_decision(
+        self,
+        *,
+        feature_name: str,
+        tool_name: str,
+        tool_args: Dict,
+        approved: bool,
+        scope: str,
+    ) -> None:
+        """Persist the user's scope choice and write an audit row.
+
+        Idempotent for the "once" case (no persistence). When ``scope`` is
+        ``"session"`` or ``"always"``, the corresponding ``set_permission``
+        call is recorded so the next invocation of this tool skips the
+        popup. When the request was denied or timed out, no permission is
+        set but the audit row still records the decision.
+
+        This is the single home for scope-aware persistence — see #785.
+        Callers (the security hook AND every direct ``approval_queue``
+        caller in features like ``code_edit``, ``compute``, ``keys``,
+        ``reflection``) all benefit without having to repeat the logic.
+        """
+        if self._permission_store is None:
+            return
+
+        # Lazy import: PermissionLevel lives next door but we keep the
+        # import out of module-load to avoid a circular reference.
+        from .permissions import PermissionLevel
+
+        try:
+            if approved and scope == "always":
+                await self._permission_store.set_permission(
+                    feature_name,
+                    tool_name,
+                    PermissionLevel.ALLOW,
+                    scope="always",
+                    reason="User approved with 'always' scope",
+                )
+            elif approved and scope == "session":
+                await self._permission_store.set_permission(
+                    feature_name,
+                    tool_name,
+                    PermissionLevel.ALLOW,
+                    scope="session",
+                    reason="User approved for this session",
+                )
+            # "once" / "denied" / "timeout" / "cancelled" → no permission row.
+
+            # Audit every decision so operators can see what fired even when
+            # nothing was persisted.
+            if approved:
+                decision = "user_approved"
+            elif scope == "timeout":
+                decision = "timeout"
+            elif scope in ("cancelled", "cancelled_all"):
+                decision = "user_cancelled"
+            else:
+                decision = "user_denied"
+
+            args_summary = self._summarize_args(tool_args)
+            await self._permission_store.log_decision(
+                feature_name=feature_name,
+                tool_name=tool_name,
+                action="tool_execution",
+                decision=decision,
+                user_choice=scope,
+                args_summary=args_summary,
+            )
+        except Exception as e:  # noqa: BLE001
+            # A persistence failure must not corrupt the user's decision.
+            # Log loudly and let the caller proceed with `approved` as-is.
+            logger.warning(
+                "ApprovalQueue: failed to persist decision for "
+                f"{feature_name}.{tool_name}: {e}",
+                exc_info=True,
+            )
+
+    @staticmethod
+    def _summarize_args(args: Optional[Dict], max_chars: int = 500) -> Optional[str]:
+        """Truncate tool args for the audit log so secrets don't get logged
+        in full.  Mirrors :meth:`SecurityHook._summarize_args` so the audit
+        rows look the same regardless of which path produced them."""
+        if not args:
+            return None
+        try:
+            import json
+            text = json.dumps(args, default=str)
+        except (TypeError, ValueError):
+            text = repr(args)
+        if len(text) > max_chars:
+            return text[:max_chars] + "..."
+        return text
 
     def submit_decision(
         self,

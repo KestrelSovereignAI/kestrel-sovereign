@@ -788,6 +788,12 @@ async def get_task(request: Request, task_id: str):
 
 
 # --- Heartbeat Endpoints ---
+#
+# In the OpenClaw / kestrel-claw tradition, a "heartbeat" is a scheduled LLM
+# turn that reads HEARTBEAT.md and replies HEARTBEAT_OK or an alert.  That
+# surface is owned by HeartbeatRunner (kestrel_sovereign/heartbeat.py) and
+# these endpoints route to it.  Liveness / readiness probes (structured
+# subsystem checks, no LLM) live under /agent/health/* below.
 
 
 @router.get("/heartbeat/status")
@@ -815,6 +821,53 @@ async def heartbeat_trigger(request: Request):
     except Exception as e:
         logger.error(f"Heartbeat trigger error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Error triggering heartbeat.")
+
+
+# --- Health (liveness probe) Endpoints ---
+
+
+def _get_health_feature(agent):
+    """Resolve the HealthFeature instance from an agent, or None."""
+    features = getattr(agent, 'features', None) or {}
+    if isinstance(features, dict):
+        candidates = features.values()
+    else:
+        candidates = features
+    for feat in candidates:
+        if feat.__class__.__name__ == "HealthFeature":
+            return feat
+    return None
+
+
+@router.get("/health/status")
+async def agent_health_status(request: Request):
+    """Return HealthFeature status (feature state, interval, last result).
+
+    Separate from :func:`heartbeat_status` — heartbeat is an LLM-driven
+    self-check while ``/agent/health/*`` is the structured liveness probe.
+    """
+    agent = get_agent(request)
+    feature = _get_health_feature(agent)
+    if not feature:
+        return {"enabled": False, "message": "HealthFeature not available on this agent"}
+    return feature.get_status()
+
+
+@router.post("/health/trigger")
+async def agent_health_trigger(request: Request):
+    """Run a single liveness check synchronously and return the result."""
+    agent = get_agent(request)
+    feature = _get_health_feature(agent)
+    if not feature:
+        raise HTTPException(
+            status_code=404,
+            detail="HealthFeature not available on this agent",
+        )
+    try:
+        return await feature.run_once()
+    except Exception as e:
+        logger.error(f"Health trigger error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Error running liveness check.")
 
 
 # =========================================================================

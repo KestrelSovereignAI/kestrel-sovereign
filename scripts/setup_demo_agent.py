@@ -60,6 +60,7 @@ async def main():
         is_test_instance=True,
         test_cycle_id="demo-live",
         expected_duration="demo session",
+        is_demo=True,  # #766: server-side guardrails permit destructive ops on this agent
     )
 
     # Write demo-specific LLM config with policy-based defaults

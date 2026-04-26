@@ -1,12 +1,13 @@
 # Provider Economics: Middleman Architecture & Revenue Strategy
 
 **Version:** 1.0
-**Date:** December 2025
+**Drafted:** December 2025
+**Last verified:** 2026-04-25 (referral-program details still accurate; revenue projections are illustrative, not date-stamped financials)
 **Status:** Strategy Document
 
 ## Overview
 
-Kestrel/Kestrel operates as a **provider middleman**, enabling users to either bring their own cloud credentials (sovereignty) or use platform-managed infrastructure (convenience). This architecture creates two distinct revenue streams:
+Kestrel operates as a **provider middleman**, enabling users to either bring their own cloud credentials (sovereignty) or use platform-managed infrastructure (convenience). This architecture creates two distinct revenue streams:
 
 1. **Referral Revenue**: Commission from providers when users sign up via our links (Direct Mode)
 2. **Margin Revenue**: Markup on provider costs when we manage infrastructure (Managed Mode)

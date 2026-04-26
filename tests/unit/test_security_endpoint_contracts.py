@@ -106,6 +106,10 @@ def test_security_tree_pending_and_audit_endpoints_serialize_expected_shapes():
 def test_security_permission_mutation_endpoints_validate_levels_and_scope():
     security_feature = _make_security_feature()
     agent = MagicMock(features={"SecurityFeature": security_feature})
+    # Make is_demo a real bool so the demo-isolation rail (#766) treats
+    # this as a live agent. MagicMock would return a truthy MagicMock
+    # for any unset attribute and accidentally bypass the rail.
+    agent.is_demo = False
 
     app, original = _prepare_app(agent)
     try:
@@ -118,7 +122,13 @@ def test_security_permission_mutation_endpoints_validate_levels_and_scope():
                 )
                 feature_response = client.post(
                     "/api/security/permissions/feature",
-                    headers=_api_headers(),
+                    headers={
+                        **_api_headers(),
+                        # #766: bulk DENY runs through the rail. The UI
+                        # attaches this header automatically; the test
+                        # mirrors that behavior.
+                        "X-Kestrel-Allow-Destructive": "test-bulk-deny",
+                    },
                     json={"feature": "files", "level": "deny"},
                 )
                 invalid_level = client.post(

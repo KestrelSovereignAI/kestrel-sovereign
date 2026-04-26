@@ -1,9 +1,15 @@
 # LoRA Training & Generation - Operational Guide
 
-**Status:** Active - Dual Model Architecture (FLUX.2 + FLUX.1 Uncensored)
-**Last Updated:** 2026-01-04
+**Status:** Experimental — works on the happy path; not actively developed since Q1 2026.
+**Document last updated:** 2026-01-04 (re-verified 2026-04-25; see banner below)
 **Owner:** Kestrel Team
-**Source of Truth For:** LoRA training and selfie generation
+**Source of Truth For:** LoRA training and selfie generation operational details
+
+> **Implementation status (last verified 2026-04-25):**
+> - The training-provider library moved out of this feature: training adapters now live at `features/training/adapters/runpod_adapter.py` and the protocol/factory at `features/training/`. This document predates that split.
+> - The local-MPS adapter (`features/training/adapters/local_mps_adapter.py`) is the actively-maintained training path; the RunPod adapter is functional but its integration tests skip in CI without `RUNPOD_API_KEY`.
+> - The container variants below (`kestrel-lora:v8`, `kestrel-lora-flux1:v1`) and operational notes describe a Q1 2026 deployment that still applies for the most part, but the surrounding code has moved.
+> - Not production-stable. Treat this as a runbook for reproducing what worked, not as a guarantee.
 
 ## Current Architecture: Dual Model Support ✅
 
