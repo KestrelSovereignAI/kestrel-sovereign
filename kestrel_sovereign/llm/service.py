@@ -619,6 +619,28 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
                 logger.info("LOCAL_ONLY: ignoring non-local model '%s', using each local route's configured model", target_model)
                 target_model = None
 
+        if not providers_to_use:
+            # We never want to hand back an empty provider list. Streaming
+            # paths iterate this as their fallback chain — zero providers
+            # means the loop runs zero times and the only error available
+            # at the end is ``last_error=None``, which surfaces as the
+            # misleading message "All providers failed: None" with no clue
+            # *why* nothing was tried. Decide between the two real reasons
+            # here and raise something legible.
+            if self._disabled_routes and not self._available_providers():
+                reasons = "; ".join(
+                    f"{n}: {r}" for n, r in self._disabled_routes.items()
+                )
+                raise LLMServiceError(
+                    "No usable LLM routes — every initialized route was "
+                    f"disabled this session after permanent auth failures "
+                    f"({reasons}). Rotate keys and restart the service."
+                )
+            raise LLMServiceError(
+                "No LLM routes are configured. Check llm_config.toml and "
+                "vendor auth envs (e.g. ANTHROPIC_API_KEY, OPENAI_API_KEY)."
+            )
+
         return providers_to_use, target_model
 
     def _model_available_for_route(self, provider: Dict[str, Any], model_id: str) -> bool:
