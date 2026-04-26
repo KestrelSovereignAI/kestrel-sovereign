@@ -1,5 +1,13 @@
 # GitHub Feature Design
 
+> **Implementation status (last verified 2026-04-25):** the GitHub feature ships at `features/github/` with 48 unit tests. Roughly half of the design below is implemented — enough for "read a file, search code, get a definition, query issues" — but the deeper static-analysis surface is not.
+>
+> **Shipped:** `read_github_file`, `list_github_files`, `search_github_code`, `get_code_definition`, `list_code_definitions`, `get_self_repo_info`, `list_source_components`, `get_component_source`, `invalidate_github_cache`, plus a bonus issue-access tool family (`list_github_issues`, `get_github_issue`, `get_github_issue_comments`). Caching via SQLite (`features/github/cache.py`) and basic AST extraction (`features/github/ast_analyzer.py`) work.
+>
+> **Not shipped (still aspirational):** `find_usages`, `get_call_graph`, `get_inheritance_tree`, `analyze_dependencies`, and the deeper symbol-resolution / call-graph tooling described under "Advanced Features" below. The current AST analyzer extracts function and class definitions; it does not resolve cross-file symbol usage or build dependency graphs.
+>
+> This doc is kept as the design-of-record so the deferred capabilities are discoverable. Don't archive it.
+
 ## Overview
 
 The GitHub Feature allows the Kestrel agent to access and analyze code from GitHub repositories. This enables:

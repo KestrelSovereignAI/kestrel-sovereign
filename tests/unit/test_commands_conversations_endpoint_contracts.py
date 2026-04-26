@@ -36,6 +36,18 @@ def _api_headers():
     return {"X-API-Key": "test-key"}
 
 
+def _destructive_headers():
+    """Headers that satisfy the demo-isolation rail (#766) for live agents.
+
+    The UI attaches X-Kestrel-Allow-Destructive automatically; tests
+    that exercise destructive endpoints mirror that.
+    """
+    return {
+        "X-API-Key": "test-key",
+        "X-Kestrel-Allow-Destructive": "test-fixture",
+    }
+
+
 def test_commands_endpoint_merges_builtin_and_feature_commands():
     tool_schema = MagicMock(
         command_prefix="!ping",
@@ -412,7 +424,10 @@ def test_new_conversation_delete_message_and_transcript_contracts():
         with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
             with TestClient(app) as client:
                 new_response = client.post("/api/conversations/new", headers=_api_headers())
-                delete_response = client.delete("/api/conversations/messages/21", headers=_api_headers())
+                delete_response = client.delete(
+                    "/api/conversations/messages/21",
+                    headers=_destructive_headers(),
+                )
                 transcript_response = client.get(
                     "/api/conversations/20/transcript",
                     headers=_api_headers(),
@@ -452,7 +467,7 @@ def test_delete_conversation_session_returns_200_with_count_when_messages_remove
             with TestClient(app) as client:
                 response = client.delete(
                     "/api/conversations/session-xyz",
-                    headers=_api_headers(),
+                    headers=_destructive_headers(),
                 )
         assert response.status_code == 200
         payload = response.json()
@@ -481,7 +496,7 @@ def test_delete_conversation_session_returns_404_when_no_messages_deleted():
             with TestClient(app) as client:
                 response = client.delete(
                     "/api/conversations/nonexistent",
-                    headers=_api_headers(),
+                    headers=_destructive_headers(),
                 )
         assert response.status_code == 404
     finally:
@@ -505,7 +520,7 @@ def test_delete_conversation_session_uuid_session_id_roundtrips_cleanly():
             with TestClient(app) as client:
                 response = client.delete(
                     "/api/conversations/b5f0e218-12a4-4d6b-9e05-41b5adca7f6f",
-                    headers=_api_headers(),
+                    headers=_destructive_headers(),
                 )
         assert response.status_code == 200
         storage.delete_conversation_session.assert_awaited_once_with(

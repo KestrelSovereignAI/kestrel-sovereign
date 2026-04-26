@@ -62,6 +62,7 @@ const REALTIME_SDP_URL = 'https://api.openai.com/v1/realtime';
 export async function createRealtimeClient({
   onEvent,
   endpoint = '/voice/realtime/session',
+  getAuthHeaders = () => ({}),
   sessionRequestInit = {},
   sessionRequestBody = {},
 } = {}) {
@@ -178,10 +179,17 @@ export async function createRealtimeClient({
   async function start() {
     if (session) throw new Error('Realtime client already started');
 
-    // 1. Mint session from backend.
+    // 1. Mint session from backend. Auth headers come from `getAuthHeaders`
+    // so the voice UI shell can wire in `API.getApiKey()` (or a JWT) the same
+    // way every other Kestrel endpoint authenticates. Without this the
+    // request gets a 401 against any server with auth enabled.
+    const authHeaders = getAuthHeaders() || {};
     const resp = await fetch(endpoint, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        ...authHeaders,
+      },
       body: JSON.stringify(sessionRequestBody),
       ...sessionRequestInit,
     });

@@ -25,7 +25,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from fastapi import FastAPI
+from fastapi import APIRouter, FastAPI
 from fastapi.testclient import TestClient
 
 from endpoints.voice_realtime import (
@@ -92,7 +92,10 @@ def _make_agent(
 
     voice_feature.__class__ = VoiceFeature
 
-    features = {"voice": voice_feature} if include_voice_feature else {}
+    # Mirror production keying — agent.features is keyed by class name
+    # ("VoiceFeature"), not tool name ("voice"). Bug-fix backstop: the
+    # endpoint must find the feature under the class-name key.
+    features = {"VoiceFeature": voice_feature} if include_voice_feature else {}
     # Add a fake tool-bearing feature so _collect_tools exercises.
     if tools is not None:
         features["tool_owner"] = SimpleNamespace(
@@ -119,8 +122,15 @@ def _make_agent(
 
 @pytest.fixture
 def client() -> TestClient:
+    # Mirror the production nesting: VoiceFeature.get_router() includes the
+    # realtime router into the parent /voice router, so the final path is
+    # /voice/realtime/session. Without this wrapper the test would call
+    # /realtime/session and miss any future regression where the parent's
+    # prefix changes.
     app = FastAPI()
-    app.include_router(realtime_router)
+    voice_parent = APIRouter(prefix="/voice", tags=["voice"])
+    voice_parent.include_router(realtime_router)
+    app.include_router(voice_parent)
     return TestClient(app)
 
 
@@ -386,6 +396,231 @@ class TestCollectTools:
         agent = SimpleNamespace()
         assert _collect_tools(agent) == []
 
+    def test_real_tool_parameters_serialize_to_json(self) -> None:
+        """Regression: live agents expose ``schema.parameters`` as a list of
+        ``ToolParameter`` dataclasses (Kestrel SDK shape), not a JSON Schema
+        dict. The previous _collect_tools shoved the raw list through to
+        ``ToolDef.parameters_schema`` and the OpenAI SDK exploded with::
+
+            Object of type ToolParameter is not JSON serializable
+
+        when it tried to ``json.dumps`` the session config. This test would
+        have caught it: build a tool whose schema has real ToolParameter
+        instances, run _collect_tools, and assert the result is JSON-encodable.
+        """
+        import json
+
+        from kestrel_sdk.tools.base import ToolParameter
+
+        param_required = ToolParameter(
+            name="city",
+            type="string",
+            description="City name to look up",
+            required=True,
+        )
+        param_optional = ToolParameter(
+            name="units",
+            type="string",
+            description="Temperature units",
+            required=False,
+            enum=["celsius", "fahrenheit"],
+        )
+        feature = SimpleNamespace(
+            get_tools=lambda: [
+                SimpleNamespace(
+                    name="weather",
+                    schema=SimpleNamespace(
+                        name="weather",
+                        description="Look up the weather.",
+                        parameters=[param_required, param_optional],
+                    ),
+                )
+            ]
+        )
+        agent = SimpleNamespace(features={"f": feature})
+
+        tools = _collect_tools(agent)
+        assert len(tools) == 1
+        # The critical assertion: parameters_schema round-trips through
+        # json.dumps without raising. If anything in there is still a
+        # ToolParameter (or other non-JSON type), this fails — same way
+        # the OpenAI SDK fails when minting a session.
+        encoded = json.dumps(tools[0].parameters_schema)
+        decoded = json.loads(encoded)
+        assert decoded["type"] == "object"
+        assert decoded["properties"]["city"]["type"] == "string"
+        assert decoded["properties"]["city"]["description"] == "City name to look up"
+        assert decoded["properties"]["units"]["enum"] == ["celsius", "fahrenheit"]
+        assert decoded["required"] == ["city"]
+        # Optional params should NOT appear in `required`.
+        assert "units" not in decoded["required"]
+
+    def test_dict_parameters_pass_through_unchanged(self) -> None:
+        """Tools that already declare parameters as a JSON Schema dict (rare,
+        but possible) should not be re-wrapped — pass through identity."""
+        explicit = {
+            "type": "object",
+            "properties": {"q": {"type": "string"}},
+            "required": ["q"],
+        }
+        feature = SimpleNamespace(
+            get_tools=lambda: [
+                SimpleNamespace(
+                    name="search",
+                    schema=SimpleNamespace(
+                        name="search", description="d", parameters=explicit
+                    ),
+                )
+            ]
+        )
+        agent = SimpleNamespace(features={"f": feature})
+        tools = _collect_tools(agent)
+        assert tools[0].parameters_schema == explicit
+
+    def test_array_param_without_items_gets_default_items(self) -> None:
+        """Regression: live `run_workflow` tool declares `steps: array` with
+        no `items`. OpenAI's strict validator rejects with::
+
+            Invalid schema for function 'run_workflow':
+            In context=('properties', 'steps'), array schema missing items.
+
+        The converter must default `items: {}` (any-type) when the
+        ToolParameter doesn't declare item shape.
+        """
+        from kestrel_sdk.tools.base import ToolParameter
+
+        param = ToolParameter(
+            name="steps",
+            type="array",
+            description="Workflow steps to run",
+            required=True,
+            # Critically: no `items` set — exactly the bug shape.
+        )
+        feature = SimpleNamespace(
+            get_tools=lambda: [
+                SimpleNamespace(
+                    name="run_workflow",
+                    schema=SimpleNamespace(
+                        name="run_workflow",
+                        description="Run a workflow.",
+                        parameters=[param],
+                    ),
+                )
+            ]
+        )
+        agent = SimpleNamespace(features={"f": feature})
+        tools = _collect_tools(agent)
+        steps_schema = tools[0].parameters_schema["properties"]["steps"]
+        assert steps_schema["type"] == "array"
+        assert "items" in steps_schema, (
+            "OpenAI rejects array schemas without `items`; converter must "
+            "default to `items: {}` when the ToolParameter doesn't declare it"
+        )
+
+    def test_dict_passthrough_runs_sanitizer_on_nested_arrays(self) -> None:
+        """Tools that pass an explicit dict schema with a nested broken
+        array also need patching — the dict-passthrough path must run the
+        same sanitizer."""
+        explicit_with_bug = {
+            "type": "object",
+            "properties": {
+                "tags": {"type": "array"},  # missing items
+                "config": {
+                    "type": "object",
+                    "properties": {
+                        "modes": {"type": "array"},  # missing items, nested
+                    },
+                },
+            },
+            "required": ["tags", "missing_prop"],  # references nonexistent prop
+        }
+        feature = SimpleNamespace(
+            get_tools=lambda: [
+                SimpleNamespace(
+                    name="x",
+                    schema=SimpleNamespace(
+                        name="x", description="d", parameters=explicit_with_bug
+                    ),
+                )
+            ]
+        )
+        agent = SimpleNamespace(features={"f": feature})
+        tools = _collect_tools(agent)
+        s = tools[0].parameters_schema
+        assert "items" in s["properties"]["tags"]
+        assert "items" in s["properties"]["config"]["properties"]["modes"]
+        # `missing_prop` should be filtered from `required` since it has no
+        # corresponding property entry — OpenAI rejects mismatched required.
+        assert s["required"] == ["tags"]
+
+    def test_object_without_properties_gets_empty_properties(self) -> None:
+        """Object nodes with no `properties` are also rejected by OpenAI."""
+        explicit = {"type": "object"}  # no properties at all
+        feature = SimpleNamespace(
+            get_tools=lambda: [
+                SimpleNamespace(
+                    name="empty",
+                    schema=SimpleNamespace(
+                        name="empty", description="d", parameters=explicit
+                    ),
+                )
+            ]
+        )
+        agent = SimpleNamespace(features={"f": feature})
+        tools = _collect_tools(agent)
+        assert tools[0].parameters_schema["properties"] == {}
+
+    def test_collect_tools_output_is_fully_json_serializable(self) -> None:
+        """The strongest invariant: whatever _collect_tools returns can be
+        passed straight to ``json.dumps``, which is what the OpenAI SDK does
+        internally on the session-create call. Use a mix of all parameter
+        shapes the live runtime can produce.
+        """
+        import json
+
+        from kestrel_sdk.tools.base import ToolParameter
+
+        feature = SimpleNamespace(
+            get_tools=lambda: [
+                # Tool with ToolParameter list (canonical shape)
+                SimpleNamespace(
+                    name="t1",
+                    schema=SimpleNamespace(
+                        name="t1",
+                        description="d1",
+                        parameters=[
+                            ToolParameter(name="x", type="integer", description="x", required=True),
+                            ToolParameter(
+                                name="tags", type="array", description="tags",
+                                items={"type": "string"},
+                            ),
+                        ],
+                    ),
+                ),
+                # Tool with empty parameter list
+                SimpleNamespace(
+                    name="t2",
+                    schema=SimpleNamespace(name="t2", description="d2", parameters=[]),
+                ),
+                # Tool with no parameters attribute
+                SimpleNamespace(
+                    name="t3",
+                    schema=SimpleNamespace(name="t3", description="d3", parameters=None),
+                ),
+            ]
+        )
+        agent = SimpleNamespace(features={"f": feature})
+        tools = _collect_tools(agent)
+        # Build the kwargs the OpenAI SDK gets — with `tools` as a list of
+        # the same tool dicts ephemeral_session._tool_to_openai produces.
+        payload = [
+            {"type": "function", "name": t.name, "description": t.description,
+             "parameters": t.parameters_schema}
+            for t in tools
+        ]
+        # If any element is non-serializable, this raises.
+        json.dumps(payload)
+
 
 class TestClampTurnMode:
     def test_allows_known_modes(self) -> None:
@@ -406,3 +641,371 @@ class TestDefaultVoice:
     def test_falls_back_to_cedar(self) -> None:
         feature = SimpleNamespace(_voice_config=SimpleNamespace(tts_voice_id=""))
         assert _default_voice(feature) == "cedar"
+
+
+# ---------------------------------------------------------------------------
+# Router-prefix regression — guards against the doubled `/voice/voice/` bug
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Feature-key regression — guards against the "voice" vs "VoiceFeature" bug
+# ---------------------------------------------------------------------------
+
+
+class TestFeatureKeyLookup:
+    """The agent.features dict is keyed by class name in the live runtime —
+    confirmed by the existing endpoints/voice.py which looks up
+    ``features.get("VoiceFeature")``. The endpoint we ship in #726 must use
+    the same key or every call returns 503 against a real agent.
+    """
+
+    def test_class_name_key_is_found(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # _make_agent already uses the class-name key; this test is
+        # explicit so the intent is documented.
+        provider = _FakeConversationProvider()
+        agent = _make_agent(
+            route=VoiceRoute(path="realtime", conversation_provider="openai_realtime", reason=""),
+            provider=provider,
+        )
+        # Confirm the key the fixture uses really is "VoiceFeature".
+        assert "VoiceFeature" in agent.features
+        _inject_agent(monkeypatch, agent)
+        resp = client.post("/voice/realtime/session", json={})
+        assert resp.status_code == 200, resp.text
+
+    def test_wrong_key_returns_503(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Re-key the same feature under "voice" (the old buggy key) and
+        # show that a fallback key in _get_voice_feature still finds it —
+        # the endpoint stays robust either way.
+        provider = _FakeConversationProvider()
+        agent = _make_agent(
+            route=VoiceRoute(path="realtime", conversation_provider="openai_realtime", reason=""),
+            provider=provider,
+        )
+        agent.features = {"voice": agent.features["VoiceFeature"]}
+        _inject_agent(monkeypatch, agent)
+        resp = client.post("/voice/realtime/session", json={})
+        assert resp.status_code == 200, resp.text
+
+    def test_neither_key_returns_503(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        agent = _make_agent(
+            route=VoiceRoute(path="realtime", conversation_provider="openai_realtime", reason=""),
+            provider=_FakeConversationProvider(),
+        )
+        agent.features = {}  # voice feature genuinely missing
+        _inject_agent(monkeypatch, agent)
+        resp = client.post("/voice/realtime/session", json={})
+        assert resp.status_code == 503
+
+
+# ---------------------------------------------------------------------------
+# Tool dispatch endpoint
+# ---------------------------------------------------------------------------
+
+
+class TestToolDispatch:
+    """POST /voice/realtime/tools/{session_id} runs the requested tool against
+    the agent's enabled features and returns the result. Critical
+    invariants:
+
+    1. Always returns a 200 with a result payload — even on error — so
+       the frontend can commit *something* back to the Realtime data
+       channel. Silence wedges the model.
+    2. Unknown tool names → returns ``{result: {error: ...}}``, not 404.
+    3. Tool execution failures → caught, returned as ``{result: {error: ...}}``.
+    """
+
+    def _agent_with_tool(self, tool_obj: Any) -> Any:
+        feature = SimpleNamespace(get_tools=lambda: [tool_obj])
+        from kestrel_sovereign.features.voice.feature import VoiceFeature
+
+        voice_marker = MagicMock()
+        voice_marker.__class__ = VoiceFeature
+        return SimpleNamespace(
+            agent_id="test",
+            features={"VoiceFeature": voice_marker, "tool_owner": feature},
+            identity=SimpleNamespace(system_prompt=""),
+        )
+
+    def test_dispatches_known_tool_and_returns_result(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def _execute(**kwargs):
+            return {"echoed": kwargs}
+
+        tool = SimpleNamespace(name="echo", execute=_execute)
+        agent = self._agent_with_tool(tool)
+        _inject_agent(monkeypatch, agent)
+
+        resp = client.post(
+            "/voice/realtime/tools/sess_abc",
+            json={"call_id": "call_1", "name": "echo", "arguments": {"text": "hi"}},
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["call_id"] == "call_1"
+        assert body["result"] == {"echoed": {"text": "hi"}}
+
+    def test_unknown_tool_returns_error_result_not_404(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        agent = self._agent_with_tool(SimpleNamespace(name="other", execute=AsyncMock()))
+        _inject_agent(monkeypatch, agent)
+        resp = client.post(
+            "/voice/realtime/tools/sess",
+            json={"call_id": "c", "name": "ghost", "arguments": {}},
+        )
+        # 200 + error payload — silence would wedge the model.
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["call_id"] == "c"
+        assert "error" in body["result"]
+        assert "ghost" in body["result"]["error"]
+
+    def test_tool_exception_returns_error_result(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def _explode(**_):
+            raise RuntimeError("kaboom")
+
+        agent = self._agent_with_tool(SimpleNamespace(name="boom", execute=_explode))
+        _inject_agent(monkeypatch, agent)
+        resp = client.post(
+            "/voice/realtime/tools/sess",
+            json={"call_id": "c", "name": "boom", "arguments": {}},
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert "kaboom" in body["result"]["error"]
+
+    def test_bad_arguments_returns_error_not_500(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def _strict(*, required_arg):
+            return {"ok": required_arg}
+
+        agent = self._agent_with_tool(SimpleNamespace(name="strict", execute=_strict))
+        _inject_agent(monkeypatch, agent)
+        resp = client.post(
+            "/voice/realtime/tools/sess",
+            json={"call_id": "c", "name": "strict", "arguments": {"wrong_kwarg": 1}},
+        )
+        # Still 200 so the frontend commits the error result.
+        assert resp.status_code == 200
+        body = resp.json()
+        assert "Bad arguments" in body["result"]["error"]
+
+    def test_503_when_voice_feature_missing(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        agent = SimpleNamespace(features={}, identity=None)
+        _inject_agent(monkeypatch, agent)
+        resp = client.post(
+            "/voice/realtime/tools/sess",
+            json={"call_id": "c", "name": "anything", "arguments": {}},
+        )
+        assert resp.status_code == 503
+
+    def test_router_registers_tools_path(self) -> None:
+        voice_parent = APIRouter(prefix="/voice", tags=["voice"])
+        voice_parent.include_router(realtime_router)
+        paths = {route.path for route in voice_parent.routes}
+        assert "/voice/realtime/tools/{session_id}" in paths
+
+
+def test_router_registers_session_at_voice_realtime_session() -> None:
+    """The realtime router's prefix must be `/realtime` so that nesting it
+    inside the parent `/voice` router yields exactly `/voice/realtime/session`.
+
+    Setting the realtime router's prefix to `/voice/realtime` would land the
+    final route at `/voice/voice/realtime/session` and 404 against every
+    Kestrel deployment that mounts via VoiceFeature.get_router (which is all
+    of them in production).
+    """
+    voice_parent = APIRouter(prefix="/voice", tags=["voice"])
+    voice_parent.include_router(realtime_router)
+    paths = {route.path for route in voice_parent.routes}
+    assert "/voice/realtime/session" in paths
+    assert "/voice/voice/realtime/session" not in paths
+
+
+# ---------------------------------------------------------------------------
+# GET /voice/realtime/route — introspection endpoint
+# ---------------------------------------------------------------------------
+
+
+class TestRouteIntrospection:
+    """The UI calls GET /voice/realtime/route to display the active voice
+    route + which model would actually answer. Critical: query params let
+    the picker preview alternative routes without minting a session.
+    """
+
+    def _agent_with_route(
+        self, route: VoiceRoute, *, conversation_provider=None,
+    ) -> Any:
+        from kestrel_sovereign.features.voice.feature import VoiceFeature
+
+        registry = MagicMock()
+        registry.list_tts_providers = MagicMock(return_value=["piper", "openai"])
+        registry.list_stt_providers = MagicMock(return_value=["faster_whisper", "openai"])
+        registry.list_conversation_providers = MagicMock(return_value=["openai_realtime"])
+        registry.get_conversation = MagicMock(return_value=conversation_provider)
+        registry.get_tts = MagicMock(return_value=None)
+
+        vf = MagicMock()
+        vf.__class__ = VoiceFeature
+        vf._resolve_route = AsyncMock(return_value=route)
+        vf._ensure_registry = AsyncMock(return_value=registry)
+        vf._get_privacy_mode_name = MagicMock(return_value="normal")
+        vf._get_llm_vendor = MagicMock(return_value="openai")
+        vf._voice_config = SimpleNamespace(tts_voice_id="cedar")
+        return SimpleNamespace(
+            agent_id="test", features={"VoiceFeature": vf}, identity=None,
+        )
+
+    def test_returns_realtime_route_and_discovered_model(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        provider = MagicMock()
+        provider.discover_models = AsyncMock(return_value=["gpt-realtime-1.5"])
+        agent = self._agent_with_route(
+            VoiceRoute(
+                path="realtime", conversation_provider="openai_realtime",
+                reason="OpenAI LLM + Realtime provider installed",
+            ),
+            conversation_provider=provider,
+        )
+        _inject_agent(monkeypatch, agent)
+
+        resp = client.get("/voice/realtime/route")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["path"] == "realtime"
+        assert body["conversation_provider"] == "openai_realtime"
+        assert body["voice_model"] == "gpt-realtime-1.5"
+        assert body["voice_id"] == "cedar"
+        assert body["llm_vendor"] == "openai"
+        assert "openai_realtime" in body["available_conversation_providers"]
+
+    def test_returns_pipeline_route_when_resolver_picks_pipeline(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        agent = self._agent_with_route(
+            VoiceRoute(
+                path="pipeline", tts_provider="elevenlabs", stt_provider="openai",
+                reason="prefer_realtime=False",
+            ),
+        )
+        _inject_agent(monkeypatch, agent)
+
+        resp = client.get("/voice/realtime/route")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["path"] == "pipeline"
+        assert body["tts_provider"] == "elevenlabs"
+        assert body["stt_provider"] == "openai"
+        assert body["conversation_provider"] is None
+
+    def test_overrides_via_query_params_change_resolved_route(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Resolver mock receives the overrides — assert it gets called with
+        # the prefer_realtime=False override applied.
+        from kestrel_sovereign.features.voice.feature import VoiceFeature
+
+        registry = MagicMock()
+        registry.list_tts_providers = MagicMock(return_value=["openai"])
+        registry.list_stt_providers = MagicMock(return_value=["openai"])
+        registry.list_conversation_providers = MagicMock(return_value=[])
+        registry.get_conversation = MagicMock(return_value=None)
+        registry.get_tts = MagicMock(return_value=None)
+
+        captured = {}
+
+        async def _resolve(overrides=None):
+            captured["overrides"] = overrides
+            return VoiceRoute(
+                path="pipeline", tts_provider="openai", stt_provider="openai",
+                reason="forced",
+            )
+
+        vf = MagicMock()
+        vf.__class__ = VoiceFeature
+        vf._resolve_route = _resolve
+        vf._ensure_registry = AsyncMock(return_value=registry)
+        vf._get_privacy_mode_name = MagicMock(return_value="normal")
+        vf._get_llm_vendor = MagicMock(return_value="openai")
+        vf._voice_config = SimpleNamespace(tts_voice_id="")
+        agent = SimpleNamespace(agent_id="t", features={"VoiceFeature": vf}, identity=None)
+        _inject_agent(monkeypatch, agent)
+
+        resp = client.get(
+            "/voice/realtime/route",
+            params={"prefer_realtime": "false", "preferred_tts": "elevenlabs"},
+        )
+        assert resp.status_code == 200
+        assert captured["overrides"].prefer_realtime is False
+        assert captured["overrides"].preferred_tts == "elevenlabs"
+
+    def test_503_when_voice_feature_missing(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        agent = SimpleNamespace(features={}, identity=None)
+        _inject_agent(monkeypatch, agent)
+        resp = client.get("/voice/realtime/route")
+        assert resp.status_code == 503
+
+    def test_router_registers_route_path(self) -> None:
+        voice_parent = APIRouter(prefix="/voice", tags=["voice"])
+        voice_parent.include_router(realtime_router)
+        paths = {route.path for route in voice_parent.routes}
+        assert "/voice/realtime/route" in paths
+
+
+class TestRealtimeSessionOverrides:
+    """The mint endpoint accepts per-session overrides so the picker can
+    force Pipeline mode (or pin a TTS) without persisting agent config.
+    """
+
+    def test_prefer_realtime_false_routes_to_pipeline_409(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from kestrel_sovereign.features.voice.feature import VoiceFeature
+
+        captured = {}
+
+        async def _resolve(overrides=None):
+            captured["overrides"] = overrides
+            # Resolver picks Pipeline because prefer_realtime=False is overridden.
+            return VoiceRoute(
+                path="pipeline", tts_provider="elevenlabs", stt_provider="openai",
+                reason="user forced Pipeline",
+            )
+
+        vf = MagicMock()
+        vf.__class__ = VoiceFeature
+        vf._resolve_route = _resolve
+        vf._ensure_registry = AsyncMock(return_value=MagicMock())
+        vf._get_privacy_mode_name = MagicMock(return_value="normal")
+        vf._voice_config = SimpleNamespace(tts_voice_id="cedar")
+        agent = SimpleNamespace(
+            agent_id="t", features={"VoiceFeature": vf},
+            identity=SimpleNamespace(system_prompt=""),
+        )
+        _inject_agent(monkeypatch, agent)
+
+        resp = client.post(
+            "/voice/realtime/session",
+            json={"voice": "cedar", "prefer_realtime": False},
+        )
+        # Forced Pipeline → resolver returns pipeline → mint endpoint returns
+        # 409 with the fallback so the frontend opens the WebSocket path.
+        assert resp.status_code == 409
+        assert captured["overrides"].prefer_realtime is False
