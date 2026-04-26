@@ -550,3 +550,59 @@ class TestAgentProcess:
         assert ap.name == "claw"
         assert ap.port == 8801
         assert ap.pid == 12345
+
+
+# -----------------------------------------------------------------------
+# Stdout pump (issue #812 — agent subprocess output → host stdout)
+# -----------------------------------------------------------------------
+
+
+class TestPumpStdout:
+    """Verify the tee daemon thread mirrors subprocess output to file + stdout."""
+
+    def test_pump_writes_to_log_and_stdout(self, tmp_path, capfd):
+        """A real ``echo`` subprocess: every output line lands in the log file
+        AND in the parent's stdout (prefixed)."""
+        import subprocess
+        import sys
+        log_file = tmp_path / "agent.log"
+        marker = "PUMP_TEST_MARKER_42"
+        process = subprocess.Popen(
+            [sys.executable, "-c", f"print('{marker}'); print('second-line')"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            bufsize=1,
+        )
+        # Run pump synchronously (not the daemon thread) so we can assert deterministically
+        ProcessManager._pump_stdout(process, log_file, "[agent:test] ")
+        process.wait(timeout=5)
+
+        # File contains both lines verbatim
+        log_text = log_file.read_text(encoding="utf-8")
+        assert marker in log_text
+        assert "second-line" in log_text
+
+        # Parent stdout (captured by capfd) shows both lines, prefixed
+        captured = capfd.readouterr()
+        assert f"[agent:test] {marker}" in captured.out
+        assert "[agent:test] second-line" in captured.out
+
+    def test_pump_survives_log_write_failure(self, tmp_path, capfd):
+        """If the log file path can't be opened, the pump warns and exits;
+        it doesn't propagate the exception (which would silently kill the
+        background thread for all future output)."""
+        import subprocess
+        import sys
+        log_file = tmp_path / "does" / "not" / "exist" / "agent.log"  # parent dirs missing
+        process = subprocess.Popen(
+            [sys.executable, "-c", "print('payload')"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+        )
+        # Should not raise — pump catches the open() failure and logs a warning
+        ProcessManager._pump_stdout(process, log_file, "[agent:bad] ")
+        process.wait(timeout=5)
