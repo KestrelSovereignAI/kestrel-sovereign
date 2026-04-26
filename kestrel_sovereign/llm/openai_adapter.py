@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional, AsyncIterator, Type, Union
 from pydantic import BaseModel
 
 from .adapter import LLMAdapter, LLMResponse, ToolCall
+from .gpt5_overlay import prepend_gpt5_overlay
 from .model_metadata import ModelInfo, ModelCategory
 from .retry import with_retry
 
@@ -35,6 +36,17 @@ class OpenAIAdapter(LLMAdapter):
 
     def __init__(self):
         self.name = "openai"
+
+    def contribute_system_prompt(
+        self, model_id: str, base: Optional[str]
+    ) -> Optional[str]:
+        """Inject the GPT-5 behavior contract for gpt-5 family models.
+
+        See #807 / #806. Same overlay as ``CodexAdapter`` because GPT-5 needs
+        the discipline contracts regardless of which OAuth/API path the model
+        is reached through.
+        """
+        return prepend_gpt5_overlay(base, model_id)
 
     async def get_response(
         self,
@@ -62,6 +74,9 @@ class OpenAIAdapter(LLMAdapter):
             LLMResponse with content and/or tool calls
         """
         try:
+            # Apply provider/model-specific system-prompt contributions (e.g. the
+            # GPT-5 behavior contract). #807 / #806.
+            messages = self._apply_system_prompt_contribution(messages, model)
             # Normalize messages - OpenAI requires tool_calls arguments to be JSON strings
             normalized_messages = self._normalize_messages(messages)
 
@@ -229,6 +244,9 @@ class OpenAIAdapter(LLMAdapter):
             Text chunks as they arrive
         """
         try:
+            # Apply provider/model-specific system-prompt contributions (e.g. the
+            # GPT-5 behavior contract). #807 / #806.
+            messages = self._apply_system_prompt_contribution(messages, model)
             # Normalize messages for OpenAI compatibility
             normalized_messages = self._normalize_messages(messages)
 
@@ -332,6 +350,9 @@ class OpenAIAdapter(LLMAdapter):
                             # Continue conversation with tool results
         """
         try:
+            # Apply provider/model-specific system-prompt contributions (e.g. the
+            # GPT-5 behavior contract). #807 / #806.
+            messages = self._apply_system_prompt_contribution(messages, model)
             # Normalize messages for OpenAI compatibility
             normalized_messages = self._normalize_messages(messages)
 
