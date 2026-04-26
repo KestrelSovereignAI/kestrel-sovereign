@@ -207,7 +207,7 @@ class TestFeatureProfiles:
         all_names = {f.__class__.__name__ for f in all_features}
 
         # Pick a small subset to allow
-        allowed = {"BootstrapFeature", "MemoryFeature", "HeartbeatFeature"}
+        allowed = {"BootstrapFeature", "MemoryFeature", "HealthFeature"}
         filtered = discover_features(mock_agent, allowed_features=allowed)
         filtered_names = {f.__class__.__name__ for f in filtered}
 
@@ -324,9 +324,9 @@ class TestEntryPointDiscovery:
             async def initialize(self):
                 pass
 
-        ep = self._make_entry_point("HeartbeatFeature", DuplicateFeature)
+        ep = self._make_entry_point("HealthFeature", DuplicateFeature)
         # Rename the class to match a real local feature
-        DuplicateFeature.__name__ = "HeartbeatFeature"
+        DuplicateFeature.__name__ = "HealthFeature"
         mock_eps = MagicMock()
         mock_eps.select.return_value = [ep]
 
@@ -337,10 +337,10 @@ class TestEntryPointDiscovery:
         with patch("kestrel_sovereign.features.importlib.metadata.entry_points", return_value=mock_eps):
             features = discover_features(agent)
 
-        # HeartbeatFeature should be the LOCAL version, not the entry_point one
-        heartbeats = [f for f in features if f.__class__.__name__ == "HeartbeatFeature"]
+        # HealthFeature should be the LOCAL version, not the entry_point one
+        heartbeats = [f for f in features if f.__class__.__name__ == "HealthFeature"]
         assert len(heartbeats) == 1
-        # The local HeartbeatFeature won't be our DuplicateFeature class
+        # The local HealthFeature won't be our DuplicateFeature class
         assert heartbeats[0].__class__ is not DuplicateFeature
 
     def test_entrypoint_features_loaded_when_no_local_duplicate(self):

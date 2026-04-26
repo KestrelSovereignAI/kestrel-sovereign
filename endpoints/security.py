@@ -144,6 +144,11 @@ async def set_tool_permission(request: Request, data: SetPermissionRequest):
     Set permission for a specific tool.
 
     If tool is not specified, sets permission for all tools in the feature.
+
+    DENY toggles run through the demo-isolation rail (#766) — flipping
+    a tool to deny on a live agent without the X-Kestrel-Allow-Destructive
+    header is refused. Allow / Ask / Session are unrestricted because
+    they don't disable agent capability.
     """
     security = get_security_feature(request)
 
@@ -155,6 +160,10 @@ async def set_tool_permission(request: Request, data: SetPermissionRequest):
             status_code=400,
             detail=f"Invalid level '{data.level}'. Use: allow, deny, ask, session"
         )
+
+    if level == PermissionLevel.DENY:
+        from kestrel_sovereign.security.demo_isolation import enforce_destructive_op
+        await enforce_destructive_op(request)
 
     if data.tool:
         await security.permission_store.set_permission(
@@ -175,6 +184,7 @@ async def set_feature_permission(request: Request, data: SetFeaturePermissionReq
     Set permission for all tools in a feature (bulk update).
 
     This is the same as calling POST /permissions without a tool name.
+    Bulk DENY runs through the demo-isolation rail (#766).
     """
     security = get_security_feature(request)
 
@@ -186,6 +196,10 @@ async def set_feature_permission(request: Request, data: SetFeaturePermissionReq
             status_code=400,
             detail=f"Invalid level '{data.level}'. Use: allow, deny, ask, session"
         )
+
+    if level == PermissionLevel.DENY:
+        from kestrel_sovereign.security.demo_isolation import enforce_destructive_op
+        await enforce_destructive_op(request)
 
     await security.permission_store.set_feature_permission(data.feature, level)
     return {"success": True, "message": f"Set all tools in {data.feature} to {data.level}"}

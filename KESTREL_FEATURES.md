@@ -118,7 +118,7 @@ The inventory below lists **core features only**. Installed feature packages app
 - `deploy`
 - `gcp_compute`
 - `github`
-- `heartbeat`
+- `health`
 - `identity`
 - `keys`
 - `memory`
@@ -163,7 +163,7 @@ The currently exported `Feature` subclasses discovered from those modules includ
 - `DeployFeature`
 - `GCPComputeFeature`
 - `GitHubFeature`
-- `HeartbeatFeature`
+- `HealthFeature`
 - `IdentityFeature`
 - `KeyManagementFeature`
 - `MemoryAgencyFeature`
@@ -227,6 +227,8 @@ The currently exported `Feature` subclasses discovered from those modules includ
   - `GET /agent/tasks/{task_id}`
   - `GET /agent/heartbeat/status`
   - `POST /agent/heartbeat/trigger`
+  - `GET /agent/health/status`
+  - `POST /agent/health/trigger`
   - `POST /agent/mesh`
   - `GET /agent/mesh/inbox`
 - [`endpoints/conversations.py`](endpoints/conversations.py)
@@ -333,7 +335,9 @@ The currently exported `Feature` subclasses discovered from those modules includ
   - `POST /voice/stt`
   - `WebSocket /voice/chat`
 - [`endpoints/voice_realtime.py`](endpoints/voice_realtime.py)
-  - `POST /voice/realtime/session` — mint an OpenAI Realtime ephemeral-token bundle for browser WebRTC sessions. Privacy-gated via the voice path resolver; returns 409 with fallback provider names when the active route is not realtime.
+  - `POST /realtime/session` — declared on the realtime router; **served at `POST /voice/realtime/session`**. Body accepts per-call routing overrides (`prefer_realtime`, `preferred_tts`, `preferred_stt`) so the voice picker can force Pipeline mode or pin a TTS without persisting agent config. Privacy-gated via the voice path resolver; returns 409 with fallback provider names when the active route is not realtime.
+  - `POST /realtime/tools/{session_id}` — **served at `POST /voice/realtime/tools/{session_id}`**. Browser POSTs here when the Realtime model invokes a tool; runs it against the agent's enabled features and returns the result. Always 200 with a result payload (errors as `{result: {error: ...}}`) so the frontend always commits *something* back to the data channel — silence wedges the model.
+  - `GET /realtime/route` — **served at `GET /voice/realtime/route`**. Pure introspection: returns the resolved voice route + the model that would actually answer (`gpt-realtime-1.5` for Realtime, your chat LLM for Pipeline) plus the available conversation/TTS/STT providers. Query params (`prefer_realtime`, `preferred_tts`, `preferred_stt`) preview alternative routes without minting. Drives the voice picker's live route-preview block.
 - [`endpoints/features.py`](endpoints/features.py)
   - `GET /api/features`
   - `GET /api/features/installed`

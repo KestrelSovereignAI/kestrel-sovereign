@@ -65,9 +65,16 @@ class SecurityFeature(Feature):
         # Initialize permission store
         self.permission_store = PermissionStore(db_path)
 
-        # Initialize approval queue with SSE callback
+        # Initialize approval queue with SSE callback AND a reference to the
+        # permission store so the queue can persist the user's scope choice
+        # ("session"/"always") and write audit rows centrally.  Without this,
+        # the six features that call ``approval_queue.request_approval``
+        # directly (code_edit, compute, keys, reflection.*) would each have
+        # to remember to persist scope themselves — and all six historically
+        # forgot, which is the bug behind #785.
         self.approval_queue = ApprovalQueue(
-            on_request_added=self._emit_approval_request
+            on_request_added=self._emit_approval_request,
+            permission_store=self.permission_store,
         )
 
         # Create security hook

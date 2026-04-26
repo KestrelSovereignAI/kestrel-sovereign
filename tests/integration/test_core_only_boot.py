@@ -27,7 +27,7 @@ from kestrel_sovereign import storage
 # Non-core features to disable. Core features that should remain:
 # IdentityFeature, SecurityFeature, PeersFeature, ConstitutionFeature (mandatory),
 # plus BootstrapFeature, ContextFeature, MemoryFeature, PrivacyFeature,
-# ModelAgent, SovereigntyFeature, TaskFeature, SaveFeature, HeartbeatFeature.
+# ModelAgent, SovereigntyFeature, TaskFeature, SaveFeature, HealthFeature.
 NON_CORE_FEATURES = ",".join([
     "AuditAnchorFeature",
     "BridgeFeature",

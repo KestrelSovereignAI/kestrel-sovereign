@@ -7,6 +7,7 @@ import API from './api.js';
 import { state, PRIVACY_MODES, Toast, loadCommands } from './ui.js';
 import { disconnectNotifications, connectNotifications, loadModels, updateContextStatus } from './chat.js';
 import { generateIdenticon } from './identicon.js';
+import { trashGroupKey, groupTrashBySession } from './trash_grouping.js';
 
 // ============================================================================
 // Agent Selection (Multi-Agent Support)
@@ -572,6 +573,18 @@ export async function loadAgents() {
                 window.selectAgent(firstOnline.name);
             }
         }
+
+        // Standalone mode: reveal the conversations pane (and its Trash sub-view
+        // from #765) without going through selectAgent.  selectAgent installs a
+        // host-agent URL prefix that only exists in rookery routing — applying
+        // it in standalone produces 404s for /api/conversations and /agent/invoke.
+        // Standalone has exactly one agent, so just show the pane and let
+        // loadConversations() populate the list against the un-prefixed routes.
+        if (isStandalone && agents.length > 0) {
+            const conversationsPane = document.getElementById('conversations-pane');
+            if (conversationsPane) conversationsPane.style.display = 'flex';
+            try { await loadConversations(agents[0].name); } catch (_) { /* best-effort */ }
+        }
     } catch (e) {
         const container = document.getElementById('agents-list');
         container.innerHTML = '<p style="color: var(--error); padding: 1rem;">Failed to load agents</p>';
@@ -712,12 +725,11 @@ export async function loadConversations(_agentName) {
             time.className = 'conversation-time';
             time.textContent = timeStr;
 
-            // Hover-reveal delete control for the whole session.  Shares the
-            // conv-delete-btn CSS class so the visual treatment stays
-            // consistent with message-level delete buttons.  Issue #715.
+            // Hover-reveal soft-delete control for the whole session
+            // (issue #715, now soft per #763 — moves to Trash, recoverable).
             const deleteBtn = document.createElement('button');
             deleteBtn.className = 'conv-delete-btn';
-            deleteBtn.title = 'Delete conversation';
+            deleteBtn.title = 'Move to trash';
             deleteBtn.textContent = '✕';
             deleteBtn.addEventListener('click', (e) => {
                 // Prevent the click from bubbling to the row (which would
@@ -726,9 +738,22 @@ export async function loadConversations(_agentName) {
                 window.deleteConversation(conv.session_id, item);
             });
 
+            // Second hover-reveal button: permanent delete (#765). Sits to
+            // the left of the soft-delete ✕ so the user has to slow down to
+            // hit it intentionally. Same hover-reveal lifecycle.
+            const purgeBtn = document.createElement('button');
+            purgeBtn.className = 'conv-purge-btn';
+            purgeBtn.title = 'Delete permanently (cannot be restored)';
+            purgeBtn.textContent = '⊘';
+            purgeBtn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                window.purgeConversation(conv.session_id, item);
+            });
+
             item.appendChild(preview);
             item.appendChild(time);
             item.appendChild(deleteBtn);
+            item.appendChild(purgeBtn);
             container.appendChild(item);
         }
 
@@ -899,13 +924,13 @@ window.loadConversation = async function(sessionId) {
 };
 
 window.deleteConversation = async function(sessionId, rowEl) {
-    // Conversation-level delete.  Destructive and full-thread — always
-    // confirm.  Companion to per-message delete (#715); the two share
-    // the same /api/conversations endpoints and go through the privacy
-    // wrapper which rejects ephemeral mode.
+    // Soft-delete (#763) — moves the conversation to Trash, recoverable
+    // via the trash sub-view (#765). Companion to per-message delete
+    // (#715). Goes through the privacy wrapper which rejects ephemeral
+    // mode.
     if (!confirm(
-        'Delete this entire conversation?  Every message in the session '
-        + 'will be removed.  This cannot be undone.'
+        'Move this conversation to Trash? You can restore it from the '
+        + 'trash view, or delete it permanently from there.'
     )) {
         return;
     }
@@ -940,13 +965,278 @@ window.deleteConversation = async function(sessionId, rowEl) {
 
         Toast.info(
             typeof count === 'number'
-                ? `Conversation deleted (${count} messages)`
-                : 'Conversation deleted'
+                ? `Conversation moved to trash (${count} messages)`
+                : 'Conversation moved to trash'
         );
     } catch (e) {
         Toast.error(`Failed to delete conversation: ${e.message}`);
     }
 };
+
+window.purgeConversation = async function(sessionId, rowEl) {
+    // Permanent delete (#765). Stronger confirm: the word "permanent"
+    // appears in bold in the dialog so the user can't muscle-memory
+    // through it. Hard SQL DELETE — no recovery possible.
+    if (!confirm(
+        `Delete this conversation PERMANENTLY?\n\n`
+        + `This is a hard delete — every message in the session will be `
+        + `removed and CANNOT be restored. Soft-delete first (the regular `
+        + `delete button) is the recoverable path.\n\n`
+        + `Type the word "permanent" in your head and click OK if you mean it.`
+    )) {
+        return;
+    }
+
+    try {
+        const result = await API.purgeConversation(sessionId, 'user-initiated-ui');
+        const count = result?.purged_count;
+
+        if (rowEl) {
+            rowEl.style.transition = 'opacity 0.2s, transform 0.2s';
+            rowEl.style.opacity = '0';
+            rowEl.style.transform = 'scale(0.97)';
+            setTimeout(() => rowEl.remove(), 200);
+        }
+
+        if (state.currentSessionId === sessionId) {
+            state.currentSessionId = null;
+            activeConversationId = null;
+            const chatContainer = document.getElementById('chat-container');
+            if (chatContainer) chatContainer.innerHTML = '';
+            if (typeof updateContextStatus === 'function') {
+                updateContextStatus();
+            }
+        }
+
+        Toast.info(
+            typeof count === 'number'
+                ? `Conversation permanently deleted (${count} messages)`
+                : 'Conversation permanently deleted'
+        );
+    } catch (e) {
+        Toast.error(`Failed to permanently delete: ${e.message}`);
+    }
+};
+
+window.restoreConversation = async function(sessionId, rowEl) {
+    // Pull a soft-deleted session back out of Trash (#765). No confirm
+    // needed — restore is a non-destructive action.
+    try {
+        const result = await API.restoreConversation(sessionId);
+        const count = result?.restored_count;
+
+        if (rowEl) {
+            rowEl.style.transition = 'opacity 0.2s';
+            rowEl.style.opacity = '0';
+            setTimeout(() => rowEl.remove(), 200);
+        }
+
+        Toast.success(
+            typeof count === 'number'
+                ? `Conversation restored (${count} messages)`
+                : 'Conversation restored'
+        );
+
+        // Refresh the regular conversations list so the restored row
+        // reappears in the right place (without forcing a full reload).
+        if (typeof loadConversations === 'function') {
+            try { await loadConversations(); } catch (_) { /* noop */ }
+        }
+    } catch (e) {
+        Toast.error(`Failed to restore: ${e.message}`);
+    }
+};
+
+// ============================================================================
+// Trash sub-view (#765)
+// ============================================================================
+//
+// The Trash button in the conversations pane header swaps the pane's
+// content between the live conversations list and a trash list. Both
+// share the pane shell so the user sees the toggle as a *view*, not a
+// modal — which keeps the rookery-and-conversation switcher behavior
+// undisturbed.
+
+export async function loadTrash() {
+    const container = document.getElementById('conversations-trash');
+    if (!container) return;
+    container.innerHTML = '<p style="color: var(--text-secondary); padding: 1rem; text-align: center;">Loading trash…</p>';
+
+    try {
+        const data = await API.listTrash(500);
+        const messages = data.messages || [];
+        if (messages.length === 0) {
+            container.innerHTML = '<p style="color: var(--text-secondary); padding: 1rem; text-align: center;">Nothing in trash.</p>';
+            return;
+        }
+
+        const { sessions, orphans } = groupTrashBySession(messages);
+
+        // Combine sessions and orphans into one list, sort by deleted_at desc.
+        const items = [
+            ...sessions.map((s) => ({ kind: 'session', ...s })),
+            ...orphans.map((m) => ({
+                kind: 'message',
+                message_id: m.id,
+                deleted_at: m.deleted_at,
+                preview: m.content?.slice(0, 80) || '(empty)',
+                role: m.role,
+            })),
+        ];
+        items.sort((a, b) => (b.deleted_at || '').localeCompare(a.deleted_at || ''));
+
+        // Bucket
+        const buckets = new Map();
+        for (const item of items) {
+            const key = trashGroupKey(item.deleted_at);
+            if (!buckets.has(key)) buckets.set(key, []);
+            buckets.get(key).push(item);
+        }
+
+        // Render in the canonical bucket order
+        const order = ['Today', 'Yesterday', 'Last 7 days', 'Older'];
+        container.innerHTML = '';
+        for (const key of order) {
+            const list = buckets.get(key);
+            if (!list || !list.length) continue;
+            const title = document.createElement('div');
+            title.className = 'trash-section-title';
+            title.textContent = key;
+            container.appendChild(title);
+            for (const item of list) {
+                container.appendChild(_renderTrashItem(item));
+            }
+        }
+
+        // Retention notice — v1 hardcodes the value the retention janitor
+        // (#764) defaults to. When that ticket lands the value comes
+        // from the agent's config.
+        const notice = document.createElement('div');
+        notice.className = 'trash-retention-notice';
+        notice.textContent = 'Trash items are automatically deleted after 30 days.';
+        container.appendChild(notice);
+    } catch (e) {
+        container.innerHTML = `<p style="color: var(--error); padding: 1rem;">Failed to load trash: ${e.message}</p>`;
+    }
+}
+
+function _renderTrashItem(item) {
+    const row = document.createElement('div');
+    row.className = 'trash-item';
+
+    const preview = document.createElement('div');
+    preview.className = 'trash-preview';
+    preview.textContent = item.kind === 'session'
+        ? (item.preview || '(empty conversation)')
+        : `${item.role || 'msg'}: ${item.preview || '(empty)'}`;
+    row.appendChild(preview);
+
+    const meta = document.createElement('div');
+    meta.className = 'trash-meta';
+    const when = item.deleted_at ? new Date(item.deleted_at).toLocaleString() : 'unknown time';
+    const sub = item.kind === 'session'
+        ? `${item.count} message${item.count === 1 ? '' : 's'}`
+        : 'single message';
+    meta.innerHTML = `<span>${when}</span><span>${sub}</span>`;
+    row.appendChild(meta);
+
+    const actions = document.createElement('div');
+    actions.className = 'trash-actions';
+
+    const restore = document.createElement('button');
+    restore.className = 'btn-restore';
+    restore.textContent = 'Restore';
+    restore.addEventListener('click', async () => {
+        if (item.kind === 'session') {
+            await window.restoreConversation(item.session_id, row);
+        } else {
+            await _restoreMessageFromTrash(item.message_id, row);
+        }
+        // Refresh the trash list so counts/buckets stay accurate.
+        await loadTrash();
+    });
+
+    const purge = document.createElement('button');
+    purge.className = 'btn-purge';
+    purge.textContent = 'Delete permanently';
+    purge.addEventListener('click', async () => {
+        if (item.kind === 'session') {
+            await window.purgeConversation(item.session_id, row);
+        } else {
+            await _purgeMessageFromTrash(item.message_id, row);
+        }
+        await loadTrash();
+    });
+
+    actions.appendChild(restore);
+    actions.appendChild(purge);
+    row.appendChild(actions);
+    return row;
+}
+
+async function _restoreMessageFromTrash(messageId, rowEl) {
+    try {
+        await API.restoreMessage(messageId);
+        if (rowEl) {
+            rowEl.style.transition = 'opacity 0.2s';
+            rowEl.style.opacity = '0';
+            setTimeout(() => rowEl.remove(), 200);
+        }
+        Toast.success('Message restored');
+    } catch (e) {
+        Toast.error(`Failed to restore message: ${e.message}`);
+    }
+}
+
+async function _purgeMessageFromTrash(messageId, rowEl) {
+    if (!confirm(
+        `Delete this message PERMANENTLY?\n\n`
+        + `This is a hard delete — the message will be removed and CANNOT `
+        + `be restored.`
+    )) {
+        return;
+    }
+    try {
+        await API.purgeMessage(messageId, 'user-initiated-ui');
+        if (rowEl) {
+            rowEl.style.transition = 'opacity 0.2s';
+            rowEl.style.opacity = '0';
+            setTimeout(() => rowEl.remove(), 200);
+        }
+        Toast.info('Message permanently deleted');
+    } catch (e) {
+        Toast.error(`Failed to permanently delete: ${e.message}`);
+    }
+}
+
+export function initTrashToggle() {
+    const btn = document.getElementById('trash-toggle-btn');
+    const title = document.getElementById('conversations-pane-title');
+    const list = document.getElementById('conversations-list');
+    const trash = document.getElementById('conversations-trash');
+    if (!btn || !list || !trash) return;
+
+    btn.addEventListener('click', async () => {
+        const showingTrash = btn.dataset.mode === 'trash';
+        if (showingTrash) {
+            // Switch back to conversations
+            btn.dataset.mode = 'conversations';
+            btn.title = 'Show Trash';
+            btn.classList.remove('active');
+            list.style.display = '';
+            trash.style.display = 'none';
+            if (title) title.textContent = 'Conversations';
+        } else {
+            btn.dataset.mode = 'trash';
+            btn.title = 'Show Conversations';
+            btn.classList.add('active');
+            list.style.display = 'none';
+            trash.style.display = '';
+            if (title) title.textContent = 'Trash';
+            await loadTrash();
+        }
+    });
+}
 
 // ============================================================================
 // Pane Collapse/Expand + Resize
@@ -1028,4 +1318,6 @@ document.addEventListener('DOMContentLoaded', () => {
     // Initialize resize handles
     initPaneResize('resize-agents', 'agents-pane');
     initPaneResize('resize-conversations', 'conversations-pane');
+    // Wire the Trash toggle in the conversations pane header (#765).
+    initTrashToggle();
 });

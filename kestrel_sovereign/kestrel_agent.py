@@ -256,6 +256,22 @@ class KestrelAgent(
         """Lazy lookup for ModelAgent feature."""
         return self.features.get("ModelAgent")
 
+    @property
+    def is_demo(self) -> bool:
+        """True when this agent was inceptioned with ``is_demo=True`` (#766).
+
+        Demo-scoped agents bypass the destructive-op guardrails the server
+        applies to live agents — the rookery operator opted in to letting
+        demos clear history, toggle permissions, and switch privacy modes
+        without an explicit authorization header.
+        """
+        return getattr(self, "_is_demo", False)
+
+    @property
+    def is_test_instance(self) -> bool:
+        """True when this agent was inceptioned with ``is_test_instance=True``."""
+        return getattr(self, "_is_test_instance", False)
+
     async def initialize(self) -> None:
         """Async initialization of storage and features."""
         if self._raw_storage is None:
@@ -527,10 +543,15 @@ class KestrelAgent(
             self._is_test_instance = agent_node.properties.get("is_test_instance", False)
             self._test_cycle_id = agent_node.properties.get("test_cycle_id")
             self._agent_name = agent_node.properties.get("name", "Unnamed Agent")
+            # #766: server-side demo-isolation rail — agents flagged here
+            # bypass the destructive-op refusal that protects live agents.
+            self._is_demo = bool(agent_node.properties.get("is_demo", False))
 
             if self._is_test_instance:
                 logging.info(f"TEST INSTANCE detected: {self._agent_name} (cycle: {self._test_cycle_id})")
                 self._load_test_disclosure(agent_node.properties)
+            if self._is_demo:
+                logging.info(f"DEMO AGENT detected: {self._agent_name} — destructive ops permitted")
 
             # Activate agent's own OpenRouter key for isolated billing
             openrouter_key_hash = agent_node.properties.get("openrouter_key_hash")

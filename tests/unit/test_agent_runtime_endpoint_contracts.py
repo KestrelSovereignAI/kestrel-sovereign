@@ -341,6 +341,53 @@ def test_task_detail_endpoint_returns_404_when_task_manager_absent():
         _restore_app(app, original)
 
 
+def test_health_endpoints_return_feature_status_and_run_once():
+    """Regression for #753 — /agent/health/* is the liveness-probe surface
+    (not to be confused with /agent/heartbeat/* which is the LLM self-check).
+    Routes to the HealthFeature instance on the agent."""
+    health_feature = MagicMock()
+    health_feature.__class__.__name__ = "HealthFeature"
+    health_feature.get_status = MagicMock(return_value={"enabled": True, "interval_seconds": 60})
+    health_feature.run_once = AsyncMock(return_value={"status": "healthy", "checks": []})
+
+    agent = MagicMock()
+    agent.features = {"HealthFeature": health_feature}
+
+    app, original = _prepare_app(agent)
+    try:
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                status_resp = client.get("/agent/health/status", headers=_api_headers())
+                trigger_resp = client.post("/agent/health/trigger", headers=_api_headers())
+        assert status_resp.status_code == 200
+        assert status_resp.json()["enabled"] is True
+        assert status_resp.json()["interval_seconds"] == 60
+        assert trigger_resp.status_code == 200
+        assert trigger_resp.json()["status"] == "healthy"
+        health_feature.run_once.assert_awaited_once()
+    finally:
+        _restore_app(app, original)
+
+
+def test_health_endpoints_return_404_when_feature_missing():
+    """Agents without HealthFeature loaded should return a 404 from
+    /agent/health/trigger and a shaped-disabled payload from /status."""
+    agent = MagicMock()
+    agent.features = {}  # No HealthFeature
+
+    app, original = _prepare_app(agent)
+    try:
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                status_resp = client.get("/agent/health/status", headers=_api_headers())
+                trigger_resp = client.post("/agent/health/trigger", headers=_api_headers())
+        assert status_resp.status_code == 200
+        assert status_resp.json()["enabled"] is False
+        assert trigger_resp.status_code == 404
+    finally:
+        _restore_app(app, original)
+
+
 def test_heartbeat_endpoints_cover_disabled_status_success_and_error_paths():
     disabled_agent = MagicMock(heartbeat_runner=None)
     result = SimpleNamespace(to_dict=lambda: {"ok": True, "checks": 1})

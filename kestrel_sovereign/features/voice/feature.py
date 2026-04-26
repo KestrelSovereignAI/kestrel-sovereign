@@ -170,12 +170,18 @@ class VoiceFeature(Feature):
             return ""
         return (provider or "").lower()
 
-    async def _resolve_route(self) -> VoiceRoute:
+    async def _resolve_route(self, overrides: Optional[UserVoicePreferences] = None) -> VoiceRoute:
         """Build a routing context from agent state and ask the resolver.
 
         This is the single place where voice-path rules are applied. Callers
         within this feature (and future endpoints) ask here, never hand-roll
         the privacy gate.
+
+        ``overrides`` lets a per-call preference (e.g. \"force pipeline for
+        this session\" from the voice picker) take precedence over the
+        agent-persisted ``_voice_config``. None → use only the persisted
+        prefs. Overrides only set fields are applied; unset fields fall back
+        to the persisted values.
         """
         registry = await self._ensure_registry()
         prefs = self._voice_config
@@ -193,18 +199,23 @@ class VoiceFeature(Feature):
             tts_local={n for n in tts_names if (p := registry.get_tts(n)) and p.is_local},
             stt_local={n for n in stt_names if (p := registry.get_stt(n)) and p.is_local},
         )
+        # Overrides win when provided; else fall back to persisted config.
+        ov = overrides if overrides is not None else UserVoicePreferences()
+        merged = UserVoicePreferences(
+            preferred_tts=ov.preferred_tts or (prefs.tts_provider or None),
+            preferred_stt=ov.preferred_stt or (prefs.stt_provider or None),
+            preferred_conversation=ov.preferred_conversation,
+            prefer_realtime=ov.prefer_realtime,
+        )
         ctx = VoiceRoutingContext(
             llm_vendor=self._get_llm_vendor(),
             privacy_config=self._get_privacy_config(),
             installed=installed,
-            preferences=UserVoicePreferences(
-                preferred_tts=prefs.tts_provider or None,
-                preferred_stt=prefs.stt_provider or None,
-            ),
+            preferences=merged,
         )
         return resolve_voice_route(ctx)
 
-    async def _get_tts_provider(self) -> TTSProvider:
+    async def _get_tts_provider(self, overrides: Optional[UserVoicePreferences] = None) -> TTSProvider:
         """Get TTS provider for the current route.
 
         Delegates provider selection to the voice path resolver so privacy
@@ -214,9 +225,15 @@ class VoiceFeature(Feature):
         :meth:`speak`. Translates the resolver's structured output back into
         the legacy ``VoicePrivacyError`` messages callers (and existing tests)
         rely on.
+
+        ``overrides`` flows through to ``_resolve_route`` so transport-aware
+        callers (e.g. the /voice/chat WebSocket handler — which IS the
+        Pipeline path by definition) can force ``prefer_realtime=False`` and
+        get a Pipeline TTS provider instead of None (which the Realtime path
+        legitimately returns since Realtime owns the audio I/O end-to-end).
         """
         registry = await self._ensure_registry()
-        route = await self._resolve_route()
+        route = await self._resolve_route(overrides=overrides)
         mode_name = self._get_privacy_mode_name()
 
         # Preserve the "Cannot use X TTS in Y privacy mode" shape when the
@@ -248,10 +265,17 @@ class VoiceFeature(Feature):
             )
         return provider
 
-    async def _get_stt_provider(self) -> STTProvider:
-        """Get STT provider for the current route. See :meth:`_get_tts_provider`."""
+    async def _get_stt_provider(self, overrides: Optional[UserVoicePreferences] = None) -> STTProvider:
+        """Get STT provider for the current route. See :meth:`_get_tts_provider`.
+
+        ``overrides`` flows through to ``_resolve_route`` so the /voice/chat
+        WebSocket handler can force ``prefer_realtime=False`` — without it
+        the resolver returns the Realtime route (no STT) and this raises
+        "No STT provider available", which historically manifested as a
+        4403 close + browser-side HTTP 403 on the WS upgrade.
+        """
         registry = await self._ensure_registry()
-        route = await self._resolve_route()
+        route = await self._resolve_route(overrides=overrides)
         mode_name = self._get_privacy_mode_name()
 
         if route.blocked_stt:
