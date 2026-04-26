@@ -308,7 +308,7 @@ class StreamingMixin:
         messages: List[Dict[str, Any]],
         force_local_only: bool = False,
         model_override: Optional[str] = None,
-        conversation_id: Optional[str] = None,
+        session_id: Optional[str] = None,
     ) -> AsyncIterator[str]:
         """Stream response using a pre-built messages array.
 
@@ -320,7 +320,7 @@ class StreamingMixin:
             messages: Pre-built message list including tool results
             force_local_only: Only use local providers
             model_override: Override model selection
-            conversation_id: See ``generate_with_messages``. #808.
+            session_id: See ``generate_with_messages``. #808.
 
         Yields:
             Text chunks as they arrive from the LLM
@@ -371,7 +371,7 @@ class StreamingMixin:
                         model=model,
                         messages=messages,
                         extra_body=provider_cache_body(provider),
-                        conversation_id=conversation_id,
+                        session_id=session_id,
                     ):
                         yield chunk
                     return
@@ -382,7 +382,7 @@ class StreamingMixin:
                         model=model,
                         messages=messages,
                         extra_body=provider_cache_body(provider),
-                        conversation_id=conversation_id,
+                        session_id=session_id,
                     )
                     yield response.content if hasattr(response, 'content') else str(response)
                     return
@@ -416,7 +416,7 @@ class StreamingMixin:
         force_local_only: bool = False,
         model_override: Optional[str] = None,
         system_prompt: Optional[str] = None,
-        conversation_id: Optional[str] = None,
+        session_id: Optional[str] = None,
     ) -> AsyncIterator[Union[str, LLMResponse]]:
         """
         Stream response with tool call detection.
@@ -507,8 +507,8 @@ class StreamingMixin:
                     cache_body = provider_cache_body(provider)
                     if cache_body:
                         kwargs["extra_body"] = cache_body
-                    if conversation_id:
-                        kwargs["conversation_id"] = conversation_id
+                    if session_id:
+                        kwargs["session_id"] = session_id
 
                     async for item in adapter.get_streaming_response_with_tools(
                         client=provider["client"],
@@ -530,7 +530,7 @@ class StreamingMixin:
                             messages=messages,
                             tools=tools,
                             extra_body=provider_cache_body(provider),
-                            conversation_id=conversation_id,
+                            session_id=session_id,
                         )
                         if response.has_tool_calls:
                             yield response
@@ -546,7 +546,7 @@ class StreamingMixin:
                             model=model,
                             messages=messages,
                             extra_body=provider_cache_body(provider),
-                            conversation_id=conversation_id,
+                            session_id=session_id,
                         ):
                             yield chunk
                         return

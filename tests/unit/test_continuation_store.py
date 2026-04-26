@@ -37,7 +37,7 @@ class TestInMemoryContinuationStore:
         assert store.get("openai_plan", "conv-1") == cursor
 
     def test_namespacing_by_adapter_name(self):
-        # Same conversation_id across adapters does not collide.
+        # Same session_id across adapters does not collide.
         store = InMemoryContinuationStore()
         a = ContinuationCursor("resp_a", 1, "sig_a")
         b = ContinuationCursor("resp_b", 5, "sig_b")
@@ -46,7 +46,7 @@ class TestInMemoryContinuationStore:
         assert store.get("openai_plan", "conv-1") == a
         assert store.get("anthropic_plan", "conv-1") == b
 
-    def test_namespacing_by_conversation_id(self):
+    def test_namespacing_by_session_id(self):
         store = InMemoryContinuationStore()
         a = ContinuationCursor("resp_a", 1)
         b = ContinuationCursor("resp_b", 5)

@@ -233,7 +233,7 @@ class CodexAdapter(LLMAdapter):
 
     def _plan_request_continuation(
         self,
-        conversation_id: Optional[str],
+        session_id: Optional[str],
         instructions: Optional[str],
         responses_tools: Optional[List[Dict[str, Any]]],
         input_messages: List[Dict[str, Any]],
@@ -241,13 +241,13 @@ class CodexAdapter(LLMAdapter):
         """Decide ``previous_response_id`` and the input slice for this turn.
 
         Returns ``(previous_response_id, input_to_send, signature)``. When no
-        ``conversation_id`` is given, behavior reduces to ``(None, input_messages,
+        ``session_id`` is given, behavior reduces to ``(None, input_messages,
         signature)`` — i.e. a fresh, stateless call (the existing behavior).
         """
         signature = _compute_request_signature(instructions, responses_tools)
-        if not conversation_id:
+        if not session_id:
             return None, input_messages, signature
-        cursor = self._continuation_store.get(self.name, conversation_id)
+        cursor = self._continuation_store.get(self.name, session_id)
         prev_id, slice_start = _plan_continuation(
             cursor=cursor,
             messages_count=len(input_messages),
@@ -260,17 +260,17 @@ class CodexAdapter(LLMAdapter):
 
     def _record_continuation(
         self,
-        conversation_id: Optional[str],
+        session_id: Optional[str],
         response_id: Optional[str],
         full_messages_count: int,
         signature: str,
     ) -> None:
         """Persist the cursor for the next turn after a successful response."""
-        if not conversation_id or not response_id:
+        if not session_id or not response_id:
             return
         self._continuation_store.put(
             self.name,
-            conversation_id,
+            session_id,
             ContinuationCursor(
                 last_response_id=response_id,
                 last_message_count=full_messages_count,
@@ -300,12 +300,12 @@ class CodexAdapter(LLMAdapter):
                 "Run `codex login` or set CODEX_AUTH_TOKEN."
             )
 
-        # Conversation continuation (#808): when a conversation_id is provided
+        # Conversation continuation (#808): when a session_id is provided
         # and a cursor exists for it, send only the new input items plus
         # ``previous_response_id`` so the server can preserve encrypted
         # reasoning across turns. Pop from kwargs so it does not leak into the
         # request body builder.
-        conversation_id = kwargs.pop("conversation_id", None)
+        session_id = kwargs.pop("session_id", None)
 
         account_id = _extract_account_id(token)
         headers = _build_headers(token, account_id)
@@ -314,7 +314,7 @@ class CodexAdapter(LLMAdapter):
         responses_tools = _convert_tools_to_responses_format(tools)
 
         prev_response_id, input_to_send, signature = self._plan_request_continuation(
-            conversation_id, instructions, responses_tools, input_messages,
+            session_id, instructions, responses_tools, input_messages,
         )
 
         body = _build_request_body(
@@ -382,7 +382,7 @@ class CodexAdapter(LLMAdapter):
         # message count, not the slice — the server owns history; we just
         # track the watermark from which to send deltas next time.
         self._record_continuation(
-            conversation_id, last_response_id, len(input_messages), signature,
+            session_id, last_response_id, len(input_messages), signature,
         )
 
         content = "".join(content_parts) if content_parts else None
@@ -425,7 +425,7 @@ class CodexAdapter(LLMAdapter):
             raise RuntimeError("Codex adapter requires an OAuth token.")
 
         # Conversation continuation (#808). See ``get_response`` for rationale.
-        conversation_id = kwargs.pop("conversation_id", None)
+        session_id = kwargs.pop("session_id", None)
 
         account_id = _extract_account_id(token)
         headers = _build_headers(token, account_id)
@@ -433,9 +433,9 @@ class CodexAdapter(LLMAdapter):
         instructions = self.contribute_system_prompt(model, instructions)
         # Tools aren't passed on the text-only stream path, but signature still
         # includes them as ``[]`` so a downstream switch to the tool path with
-        # the same conversation_id correctly invalidates continuation.
+        # the same session_id correctly invalidates continuation.
         prev_response_id, input_to_send, signature = self._plan_request_continuation(
-            conversation_id, instructions, None, input_messages,
+            session_id, instructions, None, input_messages,
         )
 
         body = _build_request_body(
@@ -471,7 +471,7 @@ class CodexAdapter(LLMAdapter):
                         last_response_id = resp_data.get("id") or last_response_id
 
         self._record_continuation(
-            conversation_id, last_response_id, len(input_messages), signature,
+            session_id, last_response_id, len(input_messages), signature,
         )
         logger.info(f"Codex stream completed. Total chunks: {chunk_count}")
 
@@ -490,7 +490,7 @@ class CodexAdapter(LLMAdapter):
             raise RuntimeError("Codex adapter requires an OAuth token.")
 
         # Conversation continuation (#808). See ``get_response`` for rationale.
-        conversation_id = kwargs.pop("conversation_id", None)
+        session_id = kwargs.pop("session_id", None)
 
         account_id = _extract_account_id(token)
         headers = _build_headers(token, account_id)
@@ -499,7 +499,7 @@ class CodexAdapter(LLMAdapter):
         responses_tools = _convert_tools_to_responses_format(tools)
 
         prev_response_id, input_to_send, signature = self._plan_request_continuation(
-            conversation_id, instructions, responses_tools, input_messages,
+            session_id, instructions, responses_tools, input_messages,
         )
 
         body = _build_request_body(
@@ -566,7 +566,7 @@ class CodexAdapter(LLMAdapter):
                         last_response_id = resp_data.get("id") or last_response_id
 
         self._record_continuation(
-            conversation_id, last_response_id, len(input_messages), signature,
+            session_id, last_response_id, len(input_messages), signature,
         )
 
         # Yield final tool call response if any
