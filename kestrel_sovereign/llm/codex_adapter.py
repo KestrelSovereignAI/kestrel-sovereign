@@ -26,6 +26,7 @@ import httpx
 from pydantic import BaseModel
 
 from .adapter import LLMAdapter, LLMResponse, ToolCall
+from .gpt5_overlay import prepend_gpt5_overlay
 from .model_metadata import ModelInfo
 logger = logging.getLogger(__name__)
 
@@ -156,6 +157,17 @@ class CodexAdapter(LLMAdapter):
     def __init__(self):
         self.name = "openai_plan"
 
+    def contribute_system_prompt(
+        self, model_id: str, base: Optional[str]
+    ) -> Optional[str]:
+        """Inject the GPT-5 behavior contract for gpt-5 family models.
+
+        See #807 / #806. The contract gives GPT-5 the act/ask, tool-discipline,
+        and completion semantics that prose-style guidance does not enforce on
+        Responses-API models. No-op for non-gpt-5 ids.
+        """
+        return prepend_gpt5_overlay(base, model_id)
+
     async def get_response(
         self,
         client: Any,  # OAuth token string stored as client
@@ -181,6 +193,7 @@ class CodexAdapter(LLMAdapter):
         account_id = _extract_account_id(token)
         headers = _build_headers(token, account_id)
         instructions, input_messages = _extract_instructions_and_input(messages)
+        instructions = self.contribute_system_prompt(model, instructions)
         responses_tools = _convert_tools_to_responses_format(tools)
 
         body = _build_request_body(
@@ -282,6 +295,7 @@ class CodexAdapter(LLMAdapter):
         account_id = _extract_account_id(token)
         headers = _build_headers(token, account_id)
         instructions, input_messages = _extract_instructions_and_input(messages)
+        instructions = self.contribute_system_prompt(model, instructions)
 
         body = _build_request_body(
             model=model,
@@ -329,6 +343,7 @@ class CodexAdapter(LLMAdapter):
         account_id = _extract_account_id(token)
         headers = _build_headers(token, account_id)
         instructions, input_messages = _extract_instructions_and_input(messages)
+        instructions = self.contribute_system_prompt(model, instructions)
         responses_tools = _convert_tools_to_responses_format(tools)
 
         body = _build_request_body(
