@@ -4,7 +4,7 @@ Auto-generated file-tree + per-file purpose index. Always-loaded context for the
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
 **Generated:** 2026-04-26
-**Scope:** 1464 tracked files (885 `.py`, 227 `.md`, 352 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Scope:** 1467 tracked files (886 `.py`, 228 `.md`, 353 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -1059,6 +1059,8 @@ Repo entry points and standard project files.
   - `def get_client_and_model(model_override, refresh_discovery)`; `def generate(audience, model_override, dry_run, refresh_discovery)`; `def main()`
 - **scripts/generate_logos.py** — Generate Kestrel Sovereign logo concepts using Nano Banana 2 (Gemini 3.1 Flash Image Preview).
 - **scripts/generate_logos_v2.py** — Iterate on minimalist and heraldic logo concepts — round 2.
+- **scripts/generate_repo_map.py** — Generate docs/audit/REPO_MAP.md — a file-tree + per-file purpose index.
+  - `class FileEntry`; `def tracked_files()`; `def is_excluded(path)`; `def first_sentence(text, max_chars)`; `def summarize_python(path)`; `def summarize_markdown(path)`; `def summarize_other(path)`; `def summarize_path(rel_path)`; `…`
 - **scripts/init_agent_identity.py** — —
 - **scripts/ipfs/build.sh** — Build and push Kestrel IPFS (Kubo + GCS datastore) image to GCR
 - **scripts/ipfs/deploy.sh** — Deploy Kestrel IPFS node to GCE
@@ -1250,6 +1252,7 @@ Repo entry points and standard project files.
 - **docs/audit/FEATURE_MODULE_MATRIX.md** — Feature Module Matrix — Discovery rule: [`kestrel_sovereign/features/__init__.py`](../../kestrel_sovereign/features/__init__.py) scans single-file modules, package `__init__.py`, and package `feature.py`.
 - **docs/audit/FEATURE_PROOF_MATRIX.md** — Feature Proof Matrix — This is the first pass at mapping each discoverable feature module to direct proof.
 - **docs/audit/README.md** — Kestrel Whole-of-Vision Audit — This directory is the canonical source for the GitHub issue bodies used to track the feature-by-feature audit, inspection, and red-team program derived from `KESTREL_FEATURES.md`.
+- **docs/audit/REPO_MAP.md** — Kestrel Sovereign — Repo Map — Auto-generated file-tree + per-file purpose index.
 - **docs/audit/SEAM_CAMPAIGNS.md** — Cross-Feature Seam Campaigns — This matrix tracks adversarial campaigns that cross feature boundaries.
 - **docs/audit/SYNC_ASYNC_AUDIT.md** — Sync/Async Audit — Control document for the original issue `#300` and the refreshed current-runtime audit in issue `#624`, focused on maintained runtime surfaces.
 - **docs/audit/issues/00-umbrella-whole-of-vision-audit.md** — ## Problem
@@ -2254,6 +2257,7 @@ Repo entry points and standard project files.
 - **.github/workflows/ci.yml** — (configuration)
 - **.github/workflows/clean-install.yml** — (configuration)
 - **.github/workflows/deploy.yml** — (configuration)
+- **.github/workflows/repo-map.yml** — (configuration)
 - **.github/workflows/weekly-analysis.yml** — (configuration)
 
 ## `.devcontainer/`
