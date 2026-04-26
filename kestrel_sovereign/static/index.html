@@ -386,6 +386,123 @@
             color: rgba(255, 255, 255, 0.8);
         }
 
+        /* Trash sub-view (#765). Same shell as conversations but uses
+           a softer affordance set: permanent-delete sits next to a
+           Restore button, both visible by default (the user is
+           already in a destructive context, no need to hover-reveal). */
+        .trash-section-title {
+            font-size: 0.7rem;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+            color: var(--text-secondary);
+            padding: 0.75rem 0.5rem 0.25rem;
+        }
+
+        .trash-item {
+            padding: 0.6rem 0.75rem;
+            border-radius: 8px;
+            margin-bottom: 0.4rem;
+            background: var(--bg-secondary);
+            border: 1px dashed var(--border-color);
+            display: flex;
+            flex-direction: column;
+            gap: 0.4rem;
+        }
+
+        .trash-item .trash-preview {
+            font-size: 0.85rem;
+            color: var(--text-primary);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .trash-item .trash-meta {
+            font-size: 0.7rem;
+            color: var(--text-secondary);
+            display: flex;
+            justify-content: space-between;
+        }
+
+        .trash-actions {
+            display: flex;
+            gap: 0.4rem;
+        }
+
+        .trash-actions button {
+            flex: 1;
+            font-size: 0.75rem;
+            padding: 0.3rem 0.5rem;
+            border-radius: 6px;
+            border: 1px solid var(--border-color);
+            cursor: pointer;
+            background: var(--bg-tertiary);
+            color: var(--text-primary);
+        }
+
+        .trash-actions .btn-restore {
+            border-color: var(--accent-color);
+            color: var(--accent-color);
+            background: transparent;
+        }
+
+        .trash-actions .btn-restore:hover {
+            background: var(--accent-color);
+            color: white;
+        }
+
+        .trash-actions .btn-purge {
+            border-color: #dc2626;
+            color: #ef4444;
+            background: transparent;
+        }
+
+        .trash-actions .btn-purge:hover {
+            background: #dc2626;
+            color: white;
+        }
+
+        /* Conversation row gets a second hover button: permanent delete.
+           Sits to the left of the soft ✕ so the user has to slow down to
+           hit it intentionally (#765). */
+        .conversation-item .conv-purge-btn {
+            display: none;
+            position: absolute;
+            top: 0.5rem;
+            right: 2.1rem;
+            background: rgba(220, 38, 38, 0.85);
+            color: white;
+            border: none;
+            border-radius: 50%;
+            width: 1.4rem;
+            height: 1.4rem;
+            font-size: 0.65rem;
+            cursor: pointer;
+            line-height: 1;
+            padding: 0;
+        }
+
+        .conversation-item:hover .conv-purge-btn {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .conversation-item .conv-purge-btn:hover {
+            background: #b91c1c;
+        }
+
+        /* Trash retention notice rendered at the bottom of the trash
+           sub-view. Soft, informational; not a CTA. */
+        .trash-retention-notice {
+            padding: 0.75rem 0.5rem;
+            font-size: 0.7rem;
+            color: var(--text-secondary);
+            text-align: center;
+            border-top: 1px solid var(--border-color);
+            margin-top: 0.5rem;
+        }
+
         /* Pane Resize Handles */
         .resize-handle {
             width: 4px;
@@ -673,6 +790,37 @@
 
         .message .msg-delete-btn:hover {
             background: #dc2626;
+        }
+
+        /* Permanent-delete affordance on chat bubbles (#765). Sits to
+           the left of the soft ✕ so the user has to slow down to hit
+           it. Same hover-reveal lifecycle. */
+        .message .msg-purge-btn {
+            display: none;
+            position: absolute;
+            top: 0.25rem;
+            right: 1.65rem;
+            background: rgba(220, 38, 38, 0.85);
+            color: white;
+            border: none;
+            border-radius: 50%;
+            width: 1.25rem;
+            height: 1.25rem;
+            font-size: 0.6rem;
+            cursor: pointer;
+            line-height: 1;
+            padding: 0;
+            z-index: 1;
+        }
+
+        .message:hover .msg-purge-btn {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .message .msg-purge-btn:hover {
+            background: #b91c1c;
         }
 
         .user-message {
@@ -1032,12 +1180,16 @@
         <!-- Conversations Pane -->
         <aside id="conversations-pane" class="pane-sidebar" style="display: none;">
             <div class="pane-header">
-                <h3>Conversations</h3>
+                <h3 id="conversations-pane-title">Conversations</h3>
                 <button id="new-conversation-sidebar-btn" class="btn-icon" title="New Conversation">+</button>
+                <button id="trash-toggle-btn" class="btn-icon" title="Show Trash" data-mode="conversations">🗑</button>
                 <button id="collapse-conversations-btn" class="collapse-btn" title="Collapse">‹</button>
             </div>
             <div id="conversations-list" class="pane-content">
                 <p style="color: var(--text-secondary); padding: 1rem; text-align: center;">Select an agent to view conversations</p>
+            </div>
+            <div id="conversations-trash" class="pane-content" style="display: none;">
+                <p style="color: var(--text-secondary); padding: 1rem; text-align: center;">Loading trash…</p>
             </div>
             <div id="resize-conversations" class="resize-handle"></div>
         </aside>
