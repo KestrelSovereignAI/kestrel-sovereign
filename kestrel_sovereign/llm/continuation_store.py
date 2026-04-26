@@ -10,7 +10,7 @@ which preserves encrypted reasoning across turns. Without continuation the
 has nowhere to land on turn N+1.
 
 This module provides the minimum primitive: a small KV indexed by
-``(adapter_name, conversation_id)`` that stores a cursor naming the last
+``(adapter_name, session_id)`` that stores a cursor naming the last
 response id, the message-list length at that point, and a request signature
 used to detect tool/instruction drift mid-conversation. Anthropic and others
 do not use it (their continuation is positional in messages); the store is a
@@ -50,20 +50,20 @@ class ContinuationCursor:
 
 
 class ContinuationStore(Protocol):
-    """KV interface for continuation cursors. Keyed by (adapter_name, conversation_id)."""
+    """KV interface for continuation cursors. Keyed by (adapter_name, session_id)."""
 
     def get(
-        self, adapter_name: str, conversation_id: str
+        self, adapter_name: str, session_id: str
     ) -> Optional[ContinuationCursor]: ...
 
     def put(
         self,
         adapter_name: str,
-        conversation_id: str,
+        session_id: str,
         cursor: ContinuationCursor,
     ) -> None: ...
 
-    def clear(self, adapter_name: str, conversation_id: str) -> None: ...
+    def clear(self, adapter_name: str, session_id: str) -> None: ...
 
 
 class InMemoryContinuationStore:
@@ -78,23 +78,23 @@ class InMemoryContinuationStore:
         self._lock = threading.Lock()
 
     def get(
-        self, adapter_name: str, conversation_id: str
+        self, adapter_name: str, session_id: str
     ) -> Optional[ContinuationCursor]:
         with self._lock:
-            return self._cursors.get((adapter_name, conversation_id))
+            return self._cursors.get((adapter_name, session_id))
 
     def put(
         self,
         adapter_name: str,
-        conversation_id: str,
+        session_id: str,
         cursor: ContinuationCursor,
     ) -> None:
         with self._lock:
-            self._cursors[(adapter_name, conversation_id)] = cursor
+            self._cursors[(adapter_name, session_id)] = cursor
 
-    def clear(self, adapter_name: str, conversation_id: str) -> None:
+    def clear(self, adapter_name: str, session_id: str) -> None:
         with self._lock:
-            self._cursors.pop((adapter_name, conversation_id), None)
+            self._cursors.pop((adapter_name, session_id), None)
 
     def __len__(self) -> int:
         with self._lock:

@@ -5,10 +5,10 @@ Two layers:
 - End-to-end tests with a fake ``httpx.AsyncClient`` that drive two synthetic
   turns through ``CodexAdapter.get_response`` and assert:
     * Turn 1 sends full input, no ``previous_response_id``, writes a cursor.
-    * Turn 2 (same conversation_id, same tools/instructions) sends only the
+    * Turn 2 (same session_id, same tools/instructions) sends only the
       delta input + ``previous_response_id``, then refreshes the cursor.
     * Tool/instruction drift between turns drops continuation.
-    * No conversation_id ⇒ behavior identical to pre-#808 (no body keys added).
+    * No session_id ⇒ behavior identical to pre-#808 (no body keys added).
 """
 
 import base64
@@ -198,7 +198,7 @@ def _patch_httpx_with(captured: List[Dict[str, Any]], sse_lines: List[str]):
 
 @pytest.mark.asyncio
 class TestCodexContinuationE2E:
-    async def test_no_conversation_id_means_no_continuation_keys(self):
+    async def test_no_session_id_means_no_continuation_keys(self):
         captured: List[Dict[str, Any]] = []
         sse = _sse(
             [
@@ -219,7 +219,7 @@ class TestCodexContinuationE2E:
             )
 
         assert "previous_response_id" not in captured[0]
-        # Store stays empty — without conversation_id we don't track anything.
+        # Store stays empty — without session_id we don't track anything.
         assert len(adapter._continuation_store) == 0
 
     async def test_first_turn_writes_cursor(self):
@@ -241,7 +241,7 @@ class TestCodexContinuationE2E:
                 client=_fake_token(),
                 model="gpt-5.4",
                 messages=messages,
-                conversation_id="conv-A",
+                session_id="conv-A",
             )
 
         # First turn: full input, no previous_response_id.
@@ -274,10 +274,10 @@ class TestCodexContinuationE2E:
                     {"role": "system", "content": "sys"},
                     {"role": "user", "content": "hi"},
                 ],
-                conversation_id="conv-B",
+                session_id="conv-B",
             )
 
-        # Turn 2: append a tool result; same conversation_id, same tools (None).
+        # Turn 2: append a tool result; same session_id, same tools (None).
         captured.clear()
         sse2 = _sse(
             [
@@ -295,7 +295,7 @@ class TestCodexContinuationE2E:
                     {"role": "tool", "content": "tool result"},
                     {"role": "user", "content": "follow-up"},
                 ],
-                conversation_id="conv-B",
+                session_id="conv-B",
             )
 
         body = captured[0]
@@ -337,7 +337,7 @@ class TestCodexContinuationE2E:
                         "name": "tool_a", "description": "", "parameters": {},
                     },
                 }],
-                conversation_id="conv-C",
+                session_id="conv-C",
             )
 
         # Turn 2 with a *different* toolset — signature must mismatch and the
@@ -364,7 +364,7 @@ class TestCodexContinuationE2E:
                         "name": "tool_b", "description": "", "parameters": {},
                     },
                 }],
-                conversation_id="conv-C",
+                session_id="conv-C",
             )
 
         body = captured[0]

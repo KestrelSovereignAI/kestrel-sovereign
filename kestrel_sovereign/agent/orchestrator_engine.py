@@ -855,7 +855,8 @@ class OrchestratorEngineMixin:
         force_local_only: bool,
         effective_model: str,
         max_iterations: int = None,
-        user_message: str = None
+        user_message: str = None,
+        session_id: Optional[str] = None,
     ) -> str:
         """
         Handle the orchestrator's response, executing any tool calls.
@@ -929,7 +930,8 @@ class OrchestratorEngineMixin:
                 messages=messages,
                 tools=all_tools or None,
                 force_local_only=force_local_only,
-                model_override=effective_model
+                model_override=effective_model,
+                session_id=session_id,
             )
 
             if isinstance(response, str):
@@ -1038,6 +1040,7 @@ class OrchestratorEngineMixin:
         max_iterations: int = None,
         user_message: str = None,
         tool_events: list = None,
+        session_id: Optional[str] = None,
     ):
         """
         Streaming version of _handle_orchestrator_response.
@@ -1116,7 +1119,8 @@ class OrchestratorEngineMixin:
                 messages=messages,
                 tools=all_tools or None,
                 force_local_only=force_local_only,
-                model_override=effective_model
+                model_override=effective_model,
+                session_id=session_id,
             )
 
             if isinstance(response, str):
@@ -1129,7 +1133,8 @@ class OrchestratorEngineMixin:
                 async for chunk in self.llm_service.stream_with_messages(
                     messages=messages,
                     force_local_only=force_local_only,
-                    model_override=effective_model
+                    model_override=effective_model,
+                    session_id=session_id,
                 ):
                     yield chunk
                 return

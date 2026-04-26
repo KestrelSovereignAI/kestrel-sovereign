@@ -213,6 +213,7 @@ class StreamingMixin:
             force_local_only=force_local_only,
             model_override=effective_model,
             system_prompt=system_prompt,
+            session_id=session_id,
         ):
             if isinstance(item, str):
                 # Text chunk - yield immediately for real-time streaming
@@ -255,6 +256,7 @@ class StreamingMixin:
                 effective_model=effective_model,
                 user_message=user_input,
                 tool_events=tool_events,
+                session_id=session_id,
             ):
                 tool_response_chunks.append(chunk)
                 yield chunk
