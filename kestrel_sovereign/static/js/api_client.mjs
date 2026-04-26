@@ -235,8 +235,14 @@ export function createApiClient({
         getConversations: (decrypt = true) => client.request(`/api/conversations?decrypt=${decrypt}`),
         getConversation: (sessionId, decrypt = true) => client.request(`/api/conversations/${encodeURIComponent(sessionId)}?decrypt=${decrypt}`),
         newConversation: () => client.request('/api/conversations/new', { method: 'POST' }),
-        deleteMessage: (messageId) => client.request(`/api/conversations/messages/${encodeURIComponent(messageId)}`, { method: 'DELETE' }),
-        deleteConversation: (sessionId) => client.request(`/api/conversations/${encodeURIComponent(sessionId)}`, { method: 'DELETE' }),
+        deleteMessage: (messageId) => client.request(`/api/conversations/messages/${encodeURIComponent(messageId)}`, {
+            method: 'DELETE',
+            headers: { 'X-Kestrel-Allow-Destructive': 'user-initiated-ui' },
+        }),
+        deleteConversation: (sessionId) => client.request(`/api/conversations/${encodeURIComponent(sessionId)}`, {
+            method: 'DELETE',
+            headers: { 'X-Kestrel-Allow-Destructive': 'user-initiated-ui' },
+        }),
         renameConversation: (sessionId, name) => client.request(
             `/api/conversations/${encodeURIComponent(sessionId)}`,
             {

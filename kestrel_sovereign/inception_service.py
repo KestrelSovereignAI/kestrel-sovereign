@@ -42,6 +42,7 @@ class AgentCredentials:
     is_test_instance: bool = False
     test_cycle_id: Optional[str] = None
     openrouter_key_hash: Optional[str] = None  # For LLM billing/usage tracking
+    is_demo: bool = False  # #766: agent is demo-scoped — destructive ops on it are safe
 
     # Allow this object to be awaited in async tests while remaining usable in sync code
     def __await__(self):
@@ -292,6 +293,7 @@ async def create_kestrel_identity_async(
     database: Optional["AsyncDatabase"] = None,
     parent_did: Optional[str] = None,
     spawn_mandate: Optional["SpawnMandate"] = None,
+    is_demo: bool = False,
 ) -> AgentCredentials:
     """
     Generates a new Kestrel identity, including cryptographic keys, a W3C DID,
@@ -431,6 +433,12 @@ async def create_kestrel_identity_async(
         agent_properties["expected_duration"] = expected_duration or "unspecified"
         logging.info(f"Creating TEST INSTANCE: {agent_name} (cycle: {test_cycle_id})")
 
+    # #766: mark agent as demo-scoped so server-side guardrails treat
+    # destructive ops on it as safe and refuse them on live agents.
+    if is_demo:
+        agent_properties["is_demo"] = True
+        logging.info(f"Creating DEMO AGENT: {agent_name} (destructive ops permitted)")
+
     agent_node = GraphNode(
         node_id=agent_did,
         node_type="agent",
@@ -511,6 +519,7 @@ async def create_kestrel_identity_async(
         is_test_instance=is_test_instance,
         test_cycle_id=test_cycle_id,
         openrouter_key_hash=None,  # Provisioned on-demand, not at inception
+        is_demo=is_demo,
     )
 
 
@@ -520,7 +529,8 @@ def create_kestrel_identity(
     is_test_instance: bool = False,
     test_cycle_id: Optional[str] = None,
     agent_name: Optional[str] = None,
-    expected_duration: Optional[str] = None
+    expected_duration: Optional[str] = None,
+    is_demo: bool = False,
 ) -> AgentCredentials:
     """
     Sync wrapper for create_kestrel_identity_async.
@@ -539,7 +549,8 @@ def create_kestrel_identity(
         is_test_instance=is_test_instance,
         test_cycle_id=test_cycle_id,
         agent_name=agent_name,
-        expected_duration=expected_duration
+        expected_duration=expected_duration,
+        is_demo=is_demo,
     ))
 
 
@@ -559,6 +570,7 @@ def build_cli_parser() -> argparse.ArgumentParser:
         help="Directory to save agent files.",
     )
     parser.add_argument("--test", action="store_true", help="Create a test instance (temporary agent)")
+    parser.add_argument("--demo", action="store_true", help="Mark agent as demo-scoped (#766: server-side guardrails permit destructive ops)")
     parser.add_argument("--name", type=str, default=None, help="Custom agent name")
     parser.add_argument("--duration", type=str, default=None, help="Expected test duration (e.g., '1 hour')")
     return parser
@@ -584,7 +596,8 @@ def main():
         output_dir=str(args.output_dir) if args.output_dir else None,
         is_test_instance=args.test,
         agent_name=args.name,
-        expected_duration=args.duration
+        expected_duration=args.duration,
+        is_demo=args.demo,
     )
 
     if args.test:
