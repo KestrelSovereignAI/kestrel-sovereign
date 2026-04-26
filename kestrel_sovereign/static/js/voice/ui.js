@@ -270,51 +270,62 @@ async function startSession() {
 
   const onEvent = handleClientEvent;
 
-  // Apply user picker overrides (mode + TTS) to the mint request so the
-  // server-side resolver returns the route the user actually wants. If the
-  // user forced Pipeline, the mint endpoint will return 409 immediately
-  // and we drop to the Pipeline client below — same fallback flow as the
-  // unforced case.
+  // Apply user picker overrides (mode + TTS) to drive routing.
   const overrides = pickerOverridesFromUI(settings.mode || 'auto', settings.preferred_tts || '');
 
-  try {
-    client = await createRealtimeClient({
-      onEvent,
-      // Rewrite to /api/agents/<host>/voice/realtime/session in rookery
-      // mode; identity in standalone mode.
-      endpoint: API.buildAgentUrl('/voice/realtime/session'),
-      getAuthHeaders: voiceAuthHeaders,
-      sessionRequestBody: {
-        voice: settings.voice || '',
-        user_instructions: settings.instructions || '',
-        prefer_realtime: overrides.prefer_realtime,
-        preferred_tts: overrides.preferred_tts || '',
-      },
-    });
-    await client.start();
-    const realtimeModel = client.session?.model || 'gpt-realtime';
-    setPathBadge(
-      `Realtime · ${realtimeModel}`,
-      `OpenAI Realtime: voice + reasoning answered by ${realtimeModel}, NOT your selected chat LLM. Switch to Pipeline in voice settings (right-click 🎙) to keep your chat LLM as the brain.`,
-    );
-    return;
-  } catch (err) {
-    if (err && err.code === 'REALTIME_UNAVAILABLE') {
-      console.info('[voice/ui] Realtime declined, falling back to Pipeline:', err.fallback?.reason);
-      client = null;
-    } else {
-      surfaceFatalError(err);
+  // If the user explicitly picked Pipeline, skip Realtime entirely. The
+  // previous flow round-tripped to /voice/realtime/session, ate a 409,
+  // logged a scary console error, then fell back. That round-trip is wasted
+  // work and the 409 looks like a bug to anyone reading the network tab.
+  // Mode selection is the user's contract — honor it.
+  if (overrides.prefer_realtime !== false) {
+    try {
+      client = await createRealtimeClient({
+        onEvent,
+        // Rewrite to /api/agents/<host>/voice/realtime/session in rookery
+        // mode; identity in standalone mode.
+        endpoint: API.buildAgentUrl('/voice/realtime/session'),
+        getAuthHeaders: voiceAuthHeaders,
+        sessionRequestBody: {
+          voice: settings.voice || '',
+          user_instructions: settings.instructions || '',
+          prefer_realtime: overrides.prefer_realtime,
+          preferred_tts: overrides.preferred_tts || '',
+        },
+      });
+      await client.start();
+      const realtimeModel = client.session?.model || 'gpt-realtime';
+      setPathBadge(
+        `Realtime · ${realtimeModel}`,
+        `OpenAI Realtime: voice + reasoning answered by ${realtimeModel}, NOT your selected chat LLM. Switch to Pipeline in voice settings (right-click 🎙) to keep your chat LLM as the brain.`,
+      );
       return;
+    } catch (err) {
+      if (err && err.code === 'REALTIME_UNAVAILABLE') {
+        console.info('[voice/ui] Realtime declined, falling back to Pipeline:', err.fallback?.reason);
+        client = null;
+      } else {
+        surfaceFatalError(err);
+        return;
+      }
     }
+  } else {
+    console.info('[voice/ui] Pipeline mode forced by user picker; skipping Realtime.');
   }
 
-  // Fallback path.
+  // Pipeline path.
   try {
     client = await createPipelineClient({
       onEvent,
       apiKey: API.getApiKey() || '',
-      // Same rookery URL rewrite for the WebSocket route.
       wsPath: API.buildAgentUrl('/voice/chat'),
+      // Honor the picker's voice + provider choice. Without these the server
+      // falls back to its config-file voice and the picker is decorative.
+      voiceId: settings.voice || '',
+      preferredTts: (overrides && overrides.preferred_tts) || settings.preferred_tts || '',
+      // Pin STT to the browser's primary language tag (e.g. "en-US" → "en")
+      // so Whisper doesn't hallucinate language switches mid-utterance.
+      language: (navigator.language || 'en').split('-')[0],
     });
     await client.start();
     setPathBadge('Pipeline', 'Cascaded STT → your LLM → TTS. Slower than Realtime, preserves your model choice.');
@@ -648,11 +659,17 @@ async function refreshVoiceList(selectEl, providerName) {
     const voices = await fetchVoices(providerName);
     selectEl.innerHTML = '';
     if (voices.length === 0) {
+      // Empty list: ask /voice/providers/status for the actual reason and
+      // surface it inline. Without this, the user sees "No voices reported
+      // by elevenlabs" with no way to tell it's an API-key permission
+      // issue, package version mismatch, etc.
+      const reason = await fetchProviderReason(providerName);
       const opt = document.createElement('option');
       opt.value = '';
-      opt.textContent = providerName
+      opt.textContent = reason || (providerName
         ? `No voices reported by ${providerName}`
-        : 'No voices available — install a voice provider';
+        : 'No voices available — install a voice provider');
+      opt.disabled = true;
       selectEl.appendChild(opt);
       return;
     }
@@ -728,6 +745,37 @@ async function fetchVoices(providerName = '') {
   if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
   const body = await resp.json();
   return Array.isArray(body.voices) ? body.voices : [];
+}
+
+
+/**
+ * Look up the diagnostic reason a TTS provider has no voices. Calls
+ * /voice/providers/status and returns the install hint or raw error message
+ * for the named provider, or null when no specific diagnostic is available.
+ */
+async function fetchProviderReason(providerName) {
+  if (!providerName) return null;
+  try {
+    const url = API.buildAgentUrl('/voice/providers/status');
+    const res = await fetch(url, { headers: voiceAuthHeaders() });
+    if (!res.ok) return null;
+    const body = await res.json();
+    const rows = (body && body.providers) || [];
+    const target = providerName.toLowerCase();
+    const match = rows.find(
+      r => r.kind === 'tts'
+        && (r.provider_name === providerName
+            || (r.name || '').toLowerCase().includes(target))
+    );
+    if (!match) return null;
+    return match.install_hint
+      || match.voice_list_error
+      || match.available_error
+      || match.init_error
+      || null;
+  } catch (_) {
+    return null;
+  }
 }
 
 

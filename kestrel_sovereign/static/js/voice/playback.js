@@ -15,7 +15,12 @@
 
 const WORKLET_URL = '/static/js/voice/playback-worklet.js';
 
-export async function createVoicePlayback({ sampleRate = 24000, preRollMs = 30 } = {}) {
+// Default preroll = 400ms. The server's TTS coalescer paces audio at ~120ms
+// cadence, but the FIRST chunk waits on upstream OpenAI/ElevenLabs round-trip
+// (~360ms observed). 400ms preroll absorbs that initial latency once and the
+// jitter buffer stays full thereafter; smaller preroll causes audible stutter
+// at the start of every reply.
+export async function createVoicePlayback({ sampleRate = 24000, preRollMs = 400 } = {}) {
   if (typeof AudioWorkletNode === 'undefined') {
     throw new Error('AudioWorklet is not supported in this browser.');
   }
