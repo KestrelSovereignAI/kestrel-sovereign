@@ -292,6 +292,24 @@ class AsyncStorage:
             await self.initialize()
         return await self.conversation.purge_all(reason=reason)
 
+    async def purge_trash_older_than(
+        self,
+        cutoff_iso: str,
+        *,
+        max_rows: int = 10_000,
+        reason: str = "retention-janitor",
+    ) -> int:
+        """Retention-janitor primitive — facade delegator (#764).
+
+        Hard-deletes soft-deleted conversation rows whose ``deleted_at``
+        is older than the cutoff. Live rows are never touched.
+        """
+        if not self._initialized:
+            await self.initialize()
+        return await self.conversation.purge_trash_older_than(
+            cutoff_iso, max_rows=max_rows, reason=reason,
+        )
+
     async def purge_agent_graph_nodes(self) -> int:
         """Hard-delete every graph node owned by this agent (#767).
 

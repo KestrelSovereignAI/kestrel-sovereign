@@ -767,6 +767,31 @@ class PrivacyEnforcingStorage:
 
         return purged
 
+    async def purge_trash_older_than(
+        self,
+        cutoff_iso: str,
+        *,
+        max_rows: int = 10_000,
+        reason: str = "retention-janitor",
+    ) -> int:
+        """Retention-janitor primitive — wrapper delegator (#764).
+
+        The privacy wrapper has to expose this method because the cron
+        handler reads ``agent.storage.purge_trash_older_than`` and
+        ``agent.storage`` is the wrapper, not the raw facade. Smoke
+        testing caught the omission — the task skipped silently with
+        "storage facade missing purge_trash_older_than" on every tick.
+
+        No privacy gating needed: the rail only purges rows that were
+        already soft-deleted (``deleted_at IS NOT NULL``). Live data is
+        never touched. Even in EPHEMERAL mode, where the wrapper
+        rejects new persistent writes, aging out already-trashed rows
+        from a prior NORMAL stint is the right thing to do.
+        """
+        return await self._storage.purge_trash_older_than(
+            cutoff_iso, max_rows=max_rows, reason=reason,
+        )
+
     async def delete_conversation_session(
         self, session_id: str, agent_id: str
     ) -> int:
