@@ -1,0 +1,63 @@
+# kestrel-eye config — vignette template
+#
+# Reviews each screenshot with a vision model and checks it matches `expected`.
+# Run: kestrel-eye review --config demos/<feature-name>/eye.toml
+#
+# Severity guide:
+#   critical  → demo is broken if this fails (regression)
+#   warning   → drift to investigate, but the feature still works
+#   info      → cosmetic; track but don't gate
+
+[eye]
+name = "<Feature Name> Vignette"
+screenshot_dir = "demos/<feature-name>/demo-output"
+test_cmd = "demos/run.sh <feature-name>"
+
+[eye.model]
+provider = "anthropic"
+model = "claude-haiku-4-5-20251001"
+
+[eye.github]
+repo = "KestrelSovereignAI/kestrel-sovereign"
+labels = ["kestrel-eye", "automated"]
+
+# One block per screenshot. NarrationEngine prefixes filenames with a
+# zero-padded counter; list them in the order the demo writes them.
+
+[[eye.screenshots]]
+name = "01-starting-view.png"
+act = "Beat 1: Starting view"
+severity = "warning"
+expected = [
+    "The panel where the feature lives is active",
+    "No error banners or loading spinners",
+]
+layout = "Clean entry shot of the relevant panel"
+
+[[eye.screenshots]]
+name = "02-after-trigger.png"
+act = "Beat 2: Trigger"
+severity = "critical"
+expected = [
+    "Evidence the trigger fired (e.g. a new row, modal open, status change)",
+]
+layout = "The UI immediately after the user takes the headline action"
+
+[[eye.screenshots]]
+name = "03-result.png"
+act = "Beat 3: Result"
+severity = "critical"
+expected = [
+    "The post-action state is clearly visible",
+    "Highlight overlay (if used) frames the changed region",
+]
+layout = "Result shot — what the feature accomplishes"
+
+[[eye.screenshots]]
+name = "04-bookend.png"
+act = "Beat 4: Bookend"
+severity = "warning"
+expected = [
+    "Surface returned to a clean state OR the user has moved on",
+]
+layout = "Closing frame — completes the loop"
