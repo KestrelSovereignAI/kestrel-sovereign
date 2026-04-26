@@ -199,6 +199,49 @@ class AsyncGraphStore:
                 "DELETE FROM graph_nodes WHERE node_id = ?",
                 (node_id,)
             )
+
+    async def purge_agent_nodes(self, agent_id: str) -> int:
+        """Hard-delete every graph_node tagged with this ``agent_id`` (#767).
+
+        EPHEMERAL agents are not supposed to write to ``graph_nodes`` —
+        the privacy wrapper rejects persistent writes in that mode. This
+        method exists as the safety net for the case where a write
+        slipped through anyway: when the agent leaves EPHEMERAL or its
+        session closes, the ephemeral hard-purge calls in here to clean
+        up any leak.
+
+        Scoping uses the same JSON-path predicate as the
+        ``idx_graph_nodes_agent`` partial index so the DELETE matches a
+        live index. Edges are scrubbed too — any edge touching a node
+        owned by this agent goes with it.
+
+        Returns:
+            Number of node rows destroyed. Zero is the happy path; any
+            non-zero value means the privacy layer leaked.
+        """
+        if not agent_id:
+            return 0
+
+        if self.db.backend_type == "postgres":
+            agent_path = "(properties::jsonb->>'agent_id')"
+        else:
+            agent_path = "json_extract(properties, '$.agent_id')"
+
+        async with self.db.transaction():
+            # Wipe edges that touch any node owned by this agent first
+            # (foreign-key-like consistency, even though we don't have
+            # FK constraints on these tables).
+            await self.db.execute(
+                f"DELETE FROM graph_edges "
+                f"WHERE source_id IN (SELECT node_id FROM graph_nodes WHERE {agent_path} = ?) "
+                f"   OR target_id IN (SELECT node_id FROM graph_nodes WHERE {agent_path} = ?)",
+                (agent_id, agent_id),
+            )
+            affected = await self.db.execute(
+                f"DELETE FROM graph_nodes WHERE {agent_path} = ?",
+                (agent_id,),
+            )
+        return affected if isinstance(affected, int) else 0
     
     async def add_edge(self, source_id: str, target_id: str, label: str,
                        properties: Optional[Dict] = None) -> None:
