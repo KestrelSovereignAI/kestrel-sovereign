@@ -344,7 +344,9 @@ window.toggleHistorySidebar = function() {
 };
 
 window.deleteMessage = async function(messageId, messageDiv) {
-    if (!confirm('Delete this message? This cannot be undone.')) return;
+    // Soft-delete (#763) — moves the message to Trash, recoverable from
+    // the trash sub-view (#765).
+    if (!confirm('Move this message to Trash? You can restore it from the trash view.')) return;
 
     try {
         await API.deleteMessage(messageId);
@@ -354,9 +356,31 @@ window.deleteMessage = async function(messageId, messageDiv) {
             messageDiv.style.transform = 'scale(0.95)';
             setTimeout(() => messageDiv.remove(), 200);
         }
-        Toast.info('Message deleted');
+        Toast.info('Message moved to trash');
     } catch (e) {
         Toast.error(`Failed to delete message: ${e.message}`);
+    }
+};
+
+window.purgeMessage = async function(messageId, messageDiv) {
+    // Permanent delete (#765) — hard SQL DELETE, no recovery.
+    if (!confirm(
+        `Delete this message PERMANENTLY?\n\n`
+        + `This is a hard delete and CANNOT be restored. Soft-delete first `
+        + `(the regular ✕) is the recoverable path.`
+    )) return;
+
+    try {
+        await API.purgeMessage(messageId, 'user-initiated-ui');
+        if (messageDiv) {
+            messageDiv.style.transition = 'opacity 0.2s, transform 0.2s';
+            messageDiv.style.opacity = '0';
+            messageDiv.style.transform = 'scale(0.95)';
+            setTimeout(() => messageDiv.remove(), 200);
+        }
+        Toast.info('Message permanently deleted');
+    } catch (e) {
+        Toast.error(`Failed to permanently delete: ${e.message}`);
     }
 };
 
@@ -368,17 +392,29 @@ function addMessageToChat(role, content, isEncrypted = false, messageId = null, 
     messageDiv.className = `message ${role}`;
     if (messageId) messageDiv.dataset.messageId = messageId;
 
-    // Add hover-reveal delete button
+    // Add hover-reveal delete buttons (#763 / #765).
+    // Soft delete -> moves to Trash, recoverable.
+    // Permanent delete -> hard SQL DELETE.
     if (messageId) {
         const deleteBtn = document.createElement('button');
         deleteBtn.className = 'msg-delete-btn';
-        deleteBtn.title = 'Delete message';
+        deleteBtn.title = 'Move to trash';
         deleteBtn.textContent = '\u2715';
         deleteBtn.onclick = (e) => {
             e.stopPropagation();
             window.deleteMessage(messageId, messageDiv);
         };
         messageDiv.appendChild(deleteBtn);
+
+        const purgeBtn = document.createElement('button');
+        purgeBtn.className = 'msg-purge-btn';
+        purgeBtn.title = 'Delete permanently (cannot be restored)';
+        purgeBtn.textContent = '⊘';
+        purgeBtn.onclick = (e) => {
+            e.stopPropagation();
+            window.purgeMessage(messageId, messageDiv);
+        };
+        messageDiv.appendChild(purgeBtn);
     }
 
     // Render tool activity above the message content
@@ -427,11 +463,19 @@ function addMessageToChat(role, content, isEncrypted = false, messageId = null, 
                 : 'background: var(--bg-tertiary); margin-right: auto;'}
         `;
 
+        // Wrap rendered content in a child div — assigning to messageDiv's
+        // innerHTML/textContent directly would wipe the .msg-delete-btn /
+        // .msg-purge-btn that were just appended above (they're children of
+        // messageDiv).  See #765 — without this wrapper the soft-delete and
+        // hard-purge affordances render briefly then get blown away.
+        const contentDiv = document.createElement('div');
+        contentDiv.className = 'message-content';
         if (role === 'assistant' && window.marked) {
-            messageDiv.innerHTML = marked.parse(content);
+            contentDiv.innerHTML = marked.parse(content);
         } else {
-            messageDiv.textContent = content;
+            contentDiv.textContent = content;
         }
+        messageDiv.appendChild(contentDiv);
     }
 
     chatContainer.appendChild(messageDiv);

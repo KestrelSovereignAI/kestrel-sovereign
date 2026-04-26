@@ -235,6 +235,10 @@ export function createApiClient({
         getConversations: (decrypt = true) => client.request(`/api/conversations?decrypt=${decrypt}`),
         getConversation: (sessionId, decrypt = true) => client.request(`/api/conversations/${encodeURIComponent(sessionId)}?decrypt=${decrypt}`),
         newConversation: () => client.request('/api/conversations/new', { method: 'POST' }),
+        // Soft-delete moves to Trash, recoverable (#763 / #765).  The
+        // X-Kestrel-Allow-Destructive header satisfies the demo-isolation
+        // rail (#766) which gates every destructive endpoint behind an
+        // explicit opt-in so a stray script can't wipe a live agent.
         deleteMessage: (messageId) => client.request(`/api/conversations/messages/${encodeURIComponent(messageId)}`, {
             method: 'DELETE',
             headers: { 'X-Kestrel-Allow-Destructive': 'user-initiated-ui' },
@@ -243,6 +247,40 @@ export function createApiClient({
             method: 'DELETE',
             headers: { 'X-Kestrel-Allow-Destructive': 'user-initiated-ui' },
         }),
+        // Trash sub-view surface — list trashed items, restore one out of
+        // Trash, or hard-purge with an audit reason.  Purge is irreversible
+        // and always carries the destructive header.
+        listTrash: (limit = 200) => client.request(`/api/trash?limit=${encodeURIComponent(limit)}`),
+        restoreConversation: (sessionId) => client.request(
+            `/api/conversations/${encodeURIComponent(sessionId)}/restore`,
+            { method: 'POST' },
+        ),
+        purgeConversation: (sessionId, reason = 'user-initiated') => client.request(
+            `/api/conversations/${encodeURIComponent(sessionId)}/purge`,
+            {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-Kestrel-Allow-Destructive': 'user-initiated-purge',
+                },
+                body: JSON.stringify({ reason }),
+            },
+        ),
+        restoreMessage: (messageId) => client.request(
+            `/api/conversations/messages/${encodeURIComponent(messageId)}/restore`,
+            { method: 'POST' },
+        ),
+        purgeMessage: (messageId, reason = 'user-initiated') => client.request(
+            `/api/conversations/messages/${encodeURIComponent(messageId)}/purge`,
+            {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-Kestrel-Allow-Destructive': 'user-initiated-purge',
+                },
+                body: JSON.stringify({ reason }),
+            },
+        ),
         renameConversation: (sessionId, name) => client.request(
             `/api/conversations/${encodeURIComponent(sessionId)}`,
             {
