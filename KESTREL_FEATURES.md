@@ -328,6 +328,7 @@ The currently exported `Feature` subclasses discovered from those modules includ
   - `POST /api/saved-items/{item_id}/pin`
 - [`endpoints/voice.py`](endpoints/voice.py)
   - `GET /voice/voices`
+  - `GET /voice/providers/status` — diagnostic surface for every TTS/STT/conversation provider attempted at boot. Returns `init_error`, `available_error`, live `voice_count` for TTS, and an actionable `install_hint`. Drives the voice picker's "why is this empty?" inline reason.
   - `GET /voice/config`
   - `POST /voice/config`
   - `POST /voice/tts`
