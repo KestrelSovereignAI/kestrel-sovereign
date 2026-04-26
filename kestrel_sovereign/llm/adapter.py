@@ -175,6 +175,52 @@ class LLMAdapter(ABC):
         """
         raise NotImplementedError(f"{self.__class__.__name__} does not support model listing")
 
+    def contribute_system_prompt(
+        self, model_id: str, base: Optional[str]
+    ) -> Optional[str]:
+        """Augment a system prompt with provider/model-specific contributions.
+
+        Default returns ``base`` unchanged. Subclasses override to inject
+        behavior contracts, format hints, or other model-family discipline
+        that does not belong in the universal system prompt. The contribution
+        must be byte-stable across turns for any given ``model_id`` so that
+        the prefix-cache invariant from #703 / #706 is preserved.
+
+        See ``gpt5_overlay.prepend_gpt5_overlay`` for the canonical example.
+        """
+        return base
+
+    def _apply_system_prompt_contribution(
+        self,
+        messages: List[Dict[str, Any]],
+        model_id: str,
+    ) -> List[Dict[str, Any]]:
+        """Apply ``contribute_system_prompt`` to a chat-completions message list.
+
+        Returns a new list — does not mutate the input. The first ``system``-role
+        message has its content replaced by ``contribute_system_prompt(model_id,
+        original)``. If no system message is present and the contribution is
+        non-empty, a new system message is prepended.
+        """
+        new_messages: List[Dict[str, Any]] = []
+        augmented = False
+        for msg in messages:
+            if not augmented and msg.get("role") == "system":
+                content = msg.get("content")
+                if isinstance(content, str):
+                    contributed = self.contribute_system_prompt(model_id, content)
+                    if contributed != content:
+                        new_messages.append({**msg, "content": contributed})
+                        augmented = True
+                        continue
+            new_messages.append(msg)
+
+        if not augmented:
+            contributed = self.contribute_system_prompt(model_id, None)
+            if contributed:
+                return [{"role": "system", "content": contributed}, *new_messages]
+        return new_messages
+
     def _handle_images(
         self,
         images: Optional[List[Union[str, bytes]]],
