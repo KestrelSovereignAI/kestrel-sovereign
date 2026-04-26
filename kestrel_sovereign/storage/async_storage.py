@@ -292,6 +292,18 @@ class AsyncStorage:
             await self.initialize()
         return await self.conversation.purge_all(reason=reason)
 
+    async def purge_agent_graph_nodes(self) -> int:
+        """Hard-delete every graph node owned by this agent (#767).
+
+        Used by the EPHEMERAL hard-purge defense-in-depth — agents in
+        EPHEMERAL mode aren't supposed to write to ``graph_nodes`` at
+        all, so any rows present are a privacy-layer leak. Scopes by
+        the agent_id stored in the node's ``properties`` JSON.
+        """
+        if not self._initialized:
+            await self.initialize()
+        return await self.graph.purge_agent_nodes(self.agent_id)
+
     async def set_conversation_name(
         self, session_id: str, name: Optional[str]
     ) -> Optional[str]:
