@@ -37,6 +37,29 @@ def _decode_frame(data: bytes) -> tuple:
     return frame_type, payload
 
 
+@pytest.fixture
+def disable_vad():
+    """Suppress webrtcvad import in the WS handler.
+
+    The WS handler initializes VAD when ``kestrel_sovereign.voice.vad`` is
+    importable. Since #793 moved webrtcvad to core deps it's always present
+    in CI — and tests that send synthetic bytes (not real PCM frames) hang
+    because VAD never detects ``speech_end``. This fixture forces the
+    handler down its no-VAD passthrough path so synthetic-audio tests
+    finish in milliseconds.
+    """
+    vad_key = "kestrel_sovereign.voice.vad"
+    saved = sys.modules.pop(vad_key, None)
+    sys.modules[vad_key] = None  # type: ignore[assignment]
+    try:
+        yield
+    finally:
+        if saved is not None:
+            sys.modules[vad_key] = saved
+        else:
+            sys.modules.pop(vad_key, None)
+
+
 def _make_voice_feature(cloud_allowed=True, has_stt=True, has_tts=True,
                         stt_streaming=True, privacy_error=None):
     """Build a mock VoiceFeature for WebSocket tests."""
@@ -87,7 +110,10 @@ def _make_voice_feature(cloud_allowed=True, has_stt=True, has_tts=True,
     stt.name = "deepgram"
 
     if stt_streaming:
-        async def _stt_stream(audio_iter, language=""):
+        # Match the STTProvider ABC: transcribe_stream takes audio_format
+        # and sample_rate kwargs added so the WS handler can pin Whisper to
+        # raw PCM16 + a known rate.
+        async def _stt_stream(audio_iter, language="", audio_format="pcm16", sample_rate=24000):
             async for chunk in audio_iter:
                 yield "hello agent"
 
@@ -366,19 +392,12 @@ class TestVoiceChatPrivacy:
 class TestVoiceChatStateMachine:
     """Test state machine transitions: listening → thinking → speaking → listening."""
 
-    def test_full_voice_loop_state_transitions(self):
+    def test_full_voice_loop_state_transitions(self, disable_vad):
         """Send audio, verify: listening → transcript → thinking → response → speaking → audio → listening."""
         vf = _make_voice_feature()
         agent = _make_agent(vf)
         app, orig = _prepare_app(agent)
         try:
-            # Disable VAD so the endpoint uses direct STT passthrough.
-            # VAD requires real 16-bit PCM audio frames; fake bytes cause it
-            # to never detect speech_end, hanging the test indefinitely.
-            import sys
-            vad_key = "kestrel_sovereign.voice.vad"
-            saved_vad = sys.modules.pop(vad_key, None)
-            sys.modules[vad_key] = None  # type: ignore[assignment]
             with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
                 with TestClient(app) as client:
                     with client.websocket_connect(
@@ -432,11 +451,6 @@ class TestVoiceChatStateMachine:
                         # Should return to listening
                         assert status_states[-1] == "listening"
         finally:
-            # Restore VAD module
-            if saved_vad is not None:
-                sys.modules[vad_key] = saved_vad
-            else:
-                sys.modules.pop(vad_key, None)
             _restore_app(app, orig)
 
     def test_client_text_end_message_closes_connection(self):
@@ -481,7 +495,7 @@ class TestVoiceChatStateMachine:
         finally:
             _restore_app(app, orig)
 
-    def test_agent_fallback_to_process_input(self):
+    def test_agent_fallback_to_process_input(self, disable_vad):
         """When agent lacks process_input_streaming, fall back to process_input."""
         vf = _make_voice_feature()
         agent = _make_agent(vf, has_streaming=False)

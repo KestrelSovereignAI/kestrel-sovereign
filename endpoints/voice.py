@@ -90,6 +90,61 @@ async def list_voices(request: Request, provider: str = "") -> dict:
         raise HTTPException(status_code=500, detail="Error listing voices.")
 
 
+@router.get("/providers/status")
+async def providers_status(request: Request) -> dict:
+    """Diagnostic surface for every voice provider attempted at boot.
+
+    Returns one entry per (entry-point, role) combination, including those
+    that failed to import or whose ``is_available()`` returned False. For
+    each registered TTS provider we also live-probe ``list_voices()`` so the
+    UI can show a real reason ("ElevenLabs: 401 voices_read missing")
+    instead of an empty list. The ``install_hint`` field, when present, is a
+    one-line actionable next step.
+    """
+    agent = get_agent(request)
+    vf = _get_voice_feature(agent)
+    registry = await vf._ensure_registry()
+    diagnostics = registry.diagnostics()
+
+    out = []
+    for d in diagnostics:
+        row = {
+            "name": d.name,
+            "provider_name": d.provider_name,
+            "kind": d.kind,
+            "registered": d.registered,
+            "is_local": d.is_local,
+            "init_error": d.init_error,
+            "available_error": d.available_error,
+            "install_hint": d.install_hint,
+            "voice_count": None,
+            "voice_list_error": None,
+        }
+        # Live-probe TTS voice listing so the user sees the actual reason
+        # the provider has no voices (e.g. ElevenLabs 401 missing
+        # voices_read) — not just an empty array.
+        if d.registered and d.kind == "tts" and d.provider_name:
+            tts = registry.get_tts(d.provider_name)
+            if tts is not None:
+                try:
+                    voices = await tts.list_voices()
+                    row["voice_count"] = len(voices)
+                    if not voices and not row["install_hint"]:
+                        row["voice_list_error"] = (
+                            f"{d.provider_name} returned an empty voice list"
+                        )
+                except Exception as e:
+                    row["voice_list_error"] = f"{type(e).__name__}: {e}"
+                    if not row["install_hint"]:
+                        from kestrel_sovereign.voice.provider_registry import (
+                            _install_hint_for as _hint,
+                        )
+                        row["install_hint"] = _hint(d.name, None, row["voice_list_error"])
+        out.append(row)
+
+    return {"providers": out}
+
+
 @router.get("/config")
 async def get_voice_config(request: Request) -> dict:
     """Get the agent's current voice configuration."""
@@ -438,8 +493,28 @@ async def voice_chat(websocket: WebSocket):
     # resolver picks Realtime when the user's chat LLM is OpenAI and
     # _get_stt_provider raises "No STT provider available" because the
     # Realtime route legitimately has no STT (it owns audio I/O end-to-end).
+    #
+    # Read user preferences from the WS query string. The voice picker UI
+    # writes these when the user selects a provider/voice; without honoring
+    # them here, the picker is decorative.
     from kestrel_sovereign.voice.routing import UserVoicePreferences as _UVP
-    _pipeline_override = _UVP(prefer_realtime=False)
+    _qp = websocket.query_params
+    _preferred_tts = (_qp.get("preferred_tts") or "").strip() or None
+    _preferred_stt = (_qp.get("preferred_stt") or "").strip() or None
+    _requested_voice_id = (_qp.get("voice_id") or "").strip() or None
+    # STT language: query > VoiceConfig (default "en") > "" (auto-detect).
+    # Pinning Whisper to one language stops it from hallucinating Russian
+    # on silence or short utterances.
+    _stt_language = (
+        (_qp.get("language") or "").strip()
+        or (vf._voice_config.stt_language or "").strip()
+        or ""
+    )
+    _pipeline_override = _UVP(
+        prefer_realtime=False,
+        preferred_tts=_preferred_tts,
+        preferred_stt=_preferred_stt,
+    )
 
     try:
         stt = await vf._get_stt_provider(overrides=_pipeline_override)
@@ -459,16 +534,35 @@ async def voice_chat(websocket: WebSocket):
         await _ws_reject(4503, f"TTS provider unavailable: {e}")
         return
 
-    # Resolve voice_id for TTS
-    voice_id = vf._voice_config.tts_voice_id
+    # Resolve voice_id with explicit precedence: user request > config >
+    # provider's first voice. NO blind fallback to a different provider — if
+    # the chosen provider can't list voices (e.g. ElevenLabs key missing
+    # voices_read), close the WS visibly so the user knows their pick is
+    # broken and can fix the underlying issue via /voice/providers/status.
+    voice_id = _requested_voice_id or vf._voice_config.tts_voice_id
     if not voice_id:
         try:
             voices = await tts.list_voices()
-            if voices:
-                voice_id = voices[0].voice_id
-        except Exception:
-            pass
-    output_format = vf._voice_config.output_format or "opus"
+        except Exception as e:
+            await _ws_reject(
+                4503,
+                f"TTS provider {tts.name!r} could not list voices: {e}. "
+                f"See /voice/providers/status for the install hint.",
+            )
+            return
+        if not voices:
+            await _ws_reject(
+                4503,
+                f"TTS provider {tts.name!r} reported no voices. "
+                f"See /voice/providers/status for the install hint.",
+            )
+            return
+        voice_id = voices[0].voice_id
+    # The browser AudioWorklet expects raw PCM16 @ 24 kHz mono LE. Sending
+    # opus/mp3 makes the worklet play encoded bytes as Int16 (static). The
+    # voice config's output_format applies to file-download endpoints, NOT
+    # this WS — pin the WS to PCM regardless of config.
+    output_format = "pcm"
 
     # --- Initialize VAD (optional — degrades gracefully if webrtcvad missing) ---
     vad = None
@@ -496,7 +590,10 @@ async def voice_chat(websocket: WebSocket):
                      vad_cfg["aggressiveness"], vad_cfg["silence_threshold_ms"],
                      vad_cfg["pre_speech_padding_ms"])
     except ImportError:
-        logger.info("webrtcvad not installed — VAD disabled, using direct STT passthrough")
+        logger.warning(
+            "webrtcvad NOT installed — voice WS will not produce transcripts. "
+            "Install with: uv pip install webrtcvad"
+        )
     except Exception as e:
         logger.warning("VAD initialization failed — falling back to direct STT: %s", e)
 
@@ -515,10 +612,14 @@ async def voice_chat(websocket: WebSocket):
     await send_status(_STATE_LISTENING)
 
     async def _process_utterance(transcript_text: str):
-        """Run agent processing and TTS for a final transcript."""
+        """Run agent processing and TTS for a final transcript.
+
+        The transcript was already broadcast by _transcribe_and_process before
+        this function was invoked — re-broadcasting it here would render two
+        identical user bubbles in the chat UI.
+        """
         # --- Thinking ---
         await send_status(_STATE_THINKING)
-        await send_control({"type": "transcript", "text": transcript_text, "final": True})
 
         # Collect the full agent response via streaming
         full_response = []
@@ -550,18 +651,59 @@ async def voice_chat(websocket: WebSocket):
 
         try:
             if voice_id:
-                async for audio_chunk in tts.synthesize_stream(
-                    text=response_text,
-                    voice_id=voice_id,
-                    model=vf._voice_config.tts_model,
-                    output_format=output_format,
-                ):
-                    await websocket.send_bytes(encode_audio(audio_chunk))
+                # Pace TTS chunks to ~real-time playback cadence. Upstream
+                # providers (OpenAI especially) emit HTTP-streaming bursts
+                # followed by multi-hundred-ms gaps; forwarding the bursts
+                # as-is drains the browser's jitter buffer during the gap
+                # and playback stutters. We coalesce into ~120 ms PCM frames
+                # and emit at the audio's playback rate so the worklet
+                # always has ~one frame in hand.
+                if output_format == "pcm":
+                    BYTES_PER_SEC = 48000  # PCM16 @ 24 kHz mono
+                    target_chunk_bytes = (BYTES_PER_SEC * 120) // 1000  # ~120 ms
+
+                    buffer = bytearray()
+                    next_send_at = None
+
+                    async def _flush_audio(b: bytes):
+                        nonlocal next_send_at
+                        await websocket.send_bytes(encode_audio(b))
+                        chunk_secs = len(b) / BYTES_PER_SEC
+                        now = asyncio.get_event_loop().time()
+                        if next_send_at is None or next_send_at < now:
+                            next_send_at = now + chunk_secs
+                        else:
+                            next_send_at += chunk_secs
+                        # Stay ~80 ms ahead of playback (one chunk lookahead).
+                        sleep_for = next_send_at - now - 0.08
+                        if sleep_for > 0:
+                            await asyncio.sleep(sleep_for)
+
+                    async for audio_chunk in tts.synthesize_stream(
+                        text=response_text,
+                        voice_id=voice_id,
+                        model=vf._voice_config.tts_model,
+                        output_format=output_format,
+                    ):
+                        buffer.extend(audio_chunk)
+                        while len(buffer) >= target_chunk_bytes:
+                            await _flush_audio(bytes(buffer[:target_chunk_bytes]))
+                            del buffer[:target_chunk_bytes]
+                    if buffer:
+                        await _flush_audio(bytes(buffer))
+                else:
+                    async for audio_chunk in tts.synthesize_stream(
+                        text=response_text,
+                        voice_id=voice_id,
+                        model=vf._voice_config.tts_model,
+                        output_format=output_format,
+                    ):
+                        await websocket.send_bytes(encode_audio(audio_chunk))
             else:
                 logger.warning("No TTS voice_id configured; skipping speech synthesis.")
         except Exception as e:
             logger.error("TTS streaming error in voice chat: %s", e, exc_info=True)
-            await send_control({"type": "error", "message": "TTS synthesis failed."})
+            await send_control({"type": "error", "message": f"TTS synthesis failed: {e}"})
 
         # Back to listening
         await send_status(_STATE_LISTENING)
@@ -574,7 +716,10 @@ async def voice_chat(websocket: WebSocket):
                     yield data
 
                 async for text_segment in stt.transcribe_stream(
-                    _single_chunk_stream(), language=""
+                    _single_chunk_stream(),
+                    language=_stt_language,
+                    audio_format="pcm16",
+                    sample_rate=24000,
                 ):
                     if not text_segment.strip():
                         continue
@@ -588,7 +733,7 @@ async def voice_chat(websocket: WebSocket):
                         await _process_utterance(text_segment)
             else:
                 transcript = await stt.transcribe(
-                    audio=audio_data, language="", audio_format="opus"
+                    audio=audio_data, language=_stt_language, audio_format="pcm16"
                 )
                 if transcript and transcript.strip():
                     await send_control({
@@ -638,7 +783,15 @@ async def voice_chat(websocket: WebSocket):
                     break
 
                 if "bytes" in message and message["bytes"]:
-                    await audio_queue.put(message["bytes"])
+                    raw = message["bytes"]
+                    # Frontend prepends a 1-byte frame tag (FRAME_AUDIO=0x01)
+                    # to every WS audio frame. Strip it before feeding PCM to
+                    # the VAD / STT pipeline; otherwise the stray byte
+                    # misaligns every chunk and Whisper rejects the WAV.
+                    if raw and raw[0] == FRAME_AUDIO:
+                        await audio_queue.put(raw[1:])
+                    else:
+                        await audio_queue.put(raw)
 
                 elif "text" in message and message["text"]:
                     try:
@@ -680,7 +833,9 @@ async def voice_chat(websocket: WebSocket):
                     break
 
                 if "bytes" in message and message["bytes"]:
-                    await _transcribe_and_process(message["bytes"])
+                    raw = message["bytes"]
+                    payload = raw[1:] if raw and raw[0] == FRAME_AUDIO else raw
+                    await _transcribe_and_process(payload)
 
                 elif "text" in message and message["text"]:
                     try:
