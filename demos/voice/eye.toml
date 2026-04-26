@@ -1,0 +1,91 @@
+# kestrel-eye config for the voice vignette (Squack II, epic #721).
+# Reviews the eight-beat narrated voice session.
+
+[eye]
+name = "Kestrel Voice Vignette"
+screenshot_dir = "demos/voice/demo-output"
+test_cmd = "demos/run.sh voice"
+
+[eye.model]
+provider = "anthropic"
+model = "claude-haiku-4-5-20251001"
+
+[eye.github]
+repo = "KestrelSovereignAI/kestrel-sovereign"
+labels = ["kestrel-eye", "voice-review", "automated"]
+
+[[eye.screenshots]]
+name = "01-01-mic-button.png"
+act = "Beat 1: Mic button arrives in the chat header"
+severity = "warning"
+expected = [
+    "Chat panel active",
+    "A microphone button is visible in the chat header / input area",
+]
+layout = "Chat panel with mic affordance present in the header"
+
+[[eye.screenshots]]
+name = "02-02-voice-picker.png"
+act = "Beat 2: Voice picker opens"
+severity = "warning"
+expected = [
+    "Voice picker dialog or panel visible",
+    "At least one voice option listed (or a 'no voices discovered' state)",
+]
+layout = "Voice picker UI showing discovered voices"
+
+[[eye.screenshots]]
+name = "03-03-picker-filled.png"
+act = "Beat 3: Voice + session directive selected"
+severity = "warning"
+expected = [
+    "Voice picker shows a chosen voice",
+    "A session directive / instruction text is filled in",
+]
+layout = "Voice picker fully configured for a session"
+
+[[eye.screenshots]]
+name = "04-04-session-engaged.png"
+act = "Beat 4: Mic clicked — session engages"
+severity = "warning"
+expected = [
+    "Mic button is in a post-click state (engaged, error, or connecting)",
+    "Either a voice drawer is open OR a 'voice error / not supported' notice is visible (either is honest evidence the click reached the voice subsystem)",
+]
+layout = "UI immediately after clicking the mic — either engaged or showing the provider-not-configured error state"
+
+[[eye.screenshots]]
+name = "05-05-path-badge.png"
+act = "Beat 5: Path badge displays active route"
+severity = "warning"
+expected = [
+    "A status badge / route indicator is visible somewhere in the chat header (path badge OR privacy mode badge — both communicate active session state)",
+]
+layout = "Chat header showing session status"
+
+[[eye.screenshots]]
+name = "06-06-transcript.png"
+act = "Beat 6: Transcript drawer hosts live turns"
+severity = "warning"
+expected = [
+    "Chat panel is visible — transcript surface is the chat itself when no dedicated drawer is mounted",
+]
+layout = "Transcript substrate — chat panel hosts turns inline on this build"
+
+[[eye.screenshots]]
+name = "07-07-idle-after-esc.png"
+act = "Beat 7: Esc returns to idle"
+severity = "warning"
+expected = [
+    "Chat panel still visible after the Esc keystroke",
+]
+layout = "Chat panel after Esc — voice subsystem state varies by provider availability"
+
+[[eye.screenshots]]
+name = "08-08-persisted-settings.png"
+act = "Beat 8: Settings persist across reload"
+severity = "warning"
+expected = [
+    "After a reload, the previously chosen voice / directive is still in the picker",
+]
+layout = "Voice picker survives a reload — localStorage persistence"

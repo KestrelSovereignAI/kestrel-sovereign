@@ -1,0 +1,75 @@
+# kestrel-eye config for the EPHEMERAL purge vignette (#767).
+
+[eye]
+name = "Kestrel EPHEMERAL Purge Vignette"
+screenshot_dir = "demos/ephemeral-purge/demo-output"
+test_cmd = "demos/run.sh ephemeral-purge"
+
+[eye.model]
+provider = "anthropic"
+model = "claude-haiku-4-5-20251001"
+
+[eye.github]
+repo = "KestrelSovereignAI/kestrel-sovereign"
+labels = ["kestrel-eye", "ephemeral-purge-review", "automated"]
+
+[[eye.screenshots]]
+name = "01-normal-baseline.png"
+act = "Beat 1: NORMAL baseline"
+severity = "warning"
+expected = [
+    "Chat panel active",
+    "Privacy badge visible in the chat header showing NORMAL (or similar)",
+    "Highlight overlay frames the privacy badge",
+]
+layout = "Chat panel with the privacy badge highlighted"
+
+[[eye.screenshots]]
+name = "02-privacy-dropdown-open.png"
+act = "Beat 2: Flip to EPHEMERAL — picker open"
+severity = "warning"
+expected = [
+    "Privacy selector dropdown is visible (#privacy-dropdown OR a list of privacy modes)",
+    "Multiple mode options shown (EPHEMERAL, NORMAL, etc)",
+]
+layout = "Privacy selector dropdown overlaid on the chat panel"
+
+[[eye.screenshots]]
+name = "03-now-in-ephemeral.png"
+act = "Beat 2: Now in EPHEMERAL"
+severity = "critical"
+expected = [
+    "Privacy badge in the chat header shows EPHEMERAL",
+    "Highlight overlay frames the badge with the new state",
+]
+layout = "Chat header showing EPHEMERAL mode is active"
+
+[[eye.screenshots]]
+name = "04-ephemeral-conversation.png"
+act = "Beat 3: Ephemeral conversation"
+severity = "warning"
+expected = [
+    "Chat panel with at least one user/agent exchange",
+    "Privacy badge still shows EPHEMERAL",
+]
+layout = "Conversation in EPHEMERAL — visible in chat, not persisted to DB"
+
+[[eye.screenshots]]
+name = "05-back-to-normal.png"
+act = "Beat 4: Defense-in-depth fires"
+severity = "critical"
+expected = [
+    "Privacy badge shows NORMAL again",
+    "Highlight overlay frames the badge",
+]
+layout = "Chat header showing NORMAL mode after the transition"
+
+[[eye.screenshots]]
+name = "06-audit-log-purge.png"
+act = "Beat 5: Bookend"
+severity = "warning"
+expected = [
+    "Security panel active",
+    "An audit log surface is visible",
+]
+layout = "Security panel showing the audit log"
