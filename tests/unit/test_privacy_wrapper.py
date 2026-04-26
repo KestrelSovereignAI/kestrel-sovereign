@@ -369,6 +369,14 @@ class TestPrivacyAwareQueries:
         storage.db.execute_commit = AsyncMock(return_value=Mock(rowcount=1))
         storage.add_conversation = AsyncMock()
         storage.get_conversation_history = AsyncMock(return_value=[])
+        # Soft-delete (#763) routes through async storage methods on the
+        # facade, not raw SQL on .db, so they must be awaitable here.
+        storage.delete_message = AsyncMock(return_value=True)
+        storage.restore_message = AsyncMock(return_value=True)
+        storage.purge_message = AsyncMock(return_value=True)
+        storage.delete_conversation_session = AsyncMock(return_value=0)
+        storage.restore_conversation_session = AsyncMock(return_value=0)
+        storage.purge_conversation_session = AsyncMock(return_value=0)
         storage.conversation = Mock()
         storage.conversation.encryption_enabled = True
         return storage
@@ -502,20 +510,21 @@ class TestPrivacyAwareQueries:
 
     @pytest.mark.asyncio
     async def test_delete_message_normal_mode(self, mock_storage):
-        """NORMAL mode should delete from persistent database and clean up pins."""
+        """NORMAL mode soft-deletes via the storage facade and still
+        hard-deletes the orphaned pin row (#763 / sovereign override)."""
         wrapper = PrivacyEnforcingStorage(mock_storage, PrivacyMode.NORMAL)
 
         result = await wrapper.delete_conversation_message(42, "agent-1")
         assert result is True
-        # Two execute_commit calls: one for the message deletion,
-        # one for the sovereign pin cleanup.
-        assert mock_storage.db.execute_commit.call_count == 2
-        # First call deletes from conversation_history
-        first_call = mock_storage.db.execute_commit.call_args_list[0]
-        assert "conversation_history" in first_call[0][0]
-        # Second call cleans up memory_pins
-        second_call = mock_storage.db.execute_commit.call_args_list[1]
-        assert "memory_pins" in second_call[0][0]
+
+        # Soft-delete now lives on the storage facade, not on raw db.
+        mock_storage.delete_message.assert_awaited_once_with(42)
+
+        # Pin cleanup is still a direct hard DELETE — pins must not
+        # outlive the row they point at, even when the row is in Trash.
+        mock_storage.db.execute_commit.assert_awaited_once()
+        cleanup_args = mock_storage.db.execute_commit.call_args[0]
+        assert "memory_pins" in cleanup_args[0]
 
     @pytest.mark.asyncio
     async def test_delete_message_ephemeral_raises(self, mock_storage):

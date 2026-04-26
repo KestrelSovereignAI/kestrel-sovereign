@@ -231,7 +231,7 @@ class AsyncStorage:
     # --- Conversation-session management (issues #715 / #716) ---
 
     async def delete_conversation_session(self, session_id: str) -> int:
-        """Delete every message belonging to a conversation session.
+        """Soft-delete every message belonging to a conversation session.
 
         Delegator onto ``AsyncConversationStore.delete_conversation_session``.
         Exists on the facade because ``PrivacyEnforcingStorage`` calls
@@ -240,10 +240,57 @@ class AsyncStorage:
         privacy-aware path gets ``AttributeError`` and the endpoint
         returns 500 (observed on live Meridian DELETE /api/conversations/
         {id} calls before this fix).
+
+        Stamps ``deleted_at`` (#763); use ``purge_conversation_session``
+        for permanent removal.
         """
         if not self._initialized:
             await self.initialize()
         return await self.conversation.delete_conversation_session(session_id)
+
+    async def delete_message(self, message_id: int) -> bool:
+        """Soft-delete a single message — facade delegator (#763)."""
+        if not self._initialized:
+            await self.initialize()
+        return await self.conversation.delete_message(message_id)
+
+    async def restore_message(self, message_id: int) -> bool:
+        """Restore a soft-deleted message — facade delegator (#763)."""
+        if not self._initialized:
+            await self.initialize()
+        return await self.conversation.restore_message(message_id)
+
+    async def restore_conversation_session(self, session_id: str) -> int:
+        """Restore a soft-deleted session — facade delegator (#763)."""
+        if not self._initialized:
+            await self.initialize()
+        return await self.conversation.restore_conversation_session(session_id)
+
+    async def purge_message(
+        self, message_id: int, reason: str = "user-initiated"
+    ) -> bool:
+        """Hard-delete a single message — facade delegator (#763)."""
+        if not self._initialized:
+            await self.initialize()
+        return await self.conversation.purge_message(message_id, reason=reason)
+
+    async def purge_conversation_session(
+        self, session_id: str, reason: str = "user-initiated"
+    ) -> int:
+        """Hard-delete an entire session — facade delegator (#763)."""
+        if not self._initialized:
+            await self.initialize()
+        return await self.conversation.purge_conversation_session(
+            session_id, reason=reason
+        )
+
+    async def purge_all_conversations(
+        self, reason: str = "administrative"
+    ) -> int:
+        """Hard-delete every row for this agent — facade delegator (#763)."""
+        if not self._initialized:
+            await self.initialize()
+        return await self.conversation.purge_all(reason=reason)
 
     async def set_conversation_name(
         self, session_id: str, name: Optional[str]

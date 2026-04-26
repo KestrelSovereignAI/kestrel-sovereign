@@ -431,7 +431,11 @@ async def delete_message(request: Request, message_id: int):
 @router.delete("/conversations/{session_id}")
 @limiter.limit("30/minute")
 async def delete_conversation(request: Request, session_id: str):
-    """Delete an entire conversation session and all its messages.
+    """Soft-delete a conversation session (#763).
+
+    The session moves to Trash — every message is stamped with
+    ``deleted_at`` so the user can restore it from the Trash UI (#765).
+    Use ``POST /conversations/{session_id}/purge`` for permanent removal.
 
     Resolution supports both explicit UUID-based sessions (session_id in
     message metadata) and legacy time-gap-based sessions (session_id is
@@ -442,10 +446,11 @@ async def delete_conversation(request: Request, session_id: str):
 
     Returns:
         200 with {"success": true, "session_id": ..., "deleted_count": N}
-             when one or more messages were removed.
-        404 when the session doesn't exist or is empty.
+             when one or more messages were soft-deleted.
+        404 when the session doesn't exist or every row is already in
+            trash.
 
-    See issue #715.
+    See issues #715 (original delete behavior), #763 (soft-delete migration).
     """
     try:
         agent = get_agent(request)
@@ -465,6 +470,7 @@ async def delete_conversation(request: Request, session_id: str):
             "success": True,
             "session_id": session_id,
             "deleted_count": deleted_count,
+            "soft_deleted": True,
         }
     except HTTPException:
         raise
@@ -474,6 +480,202 @@ async def delete_conversation(request: Request, session_id: str):
         )
         raise HTTPException(
             status_code=500, detail="Error deleting conversation."
+        )
+
+
+@router.post("/conversations/{session_id}/restore")
+@limiter.limit("30/minute")
+async def restore_conversation(request: Request, session_id: str):
+    """Restore a soft-deleted conversation from Trash (#763 / #765).
+
+    Clears ``deleted_at`` on every soft-deleted message that belongs to
+    the session, making the session visible to normal reads again.
+
+    Returns:
+        200 with {"success": true, "session_id": ..., "restored_count": N}
+        404 when the session has no soft-deleted rows to restore.
+    """
+    try:
+        agent = get_agent(request)
+        storage = agent.storage
+        agent_id = getattr(storage, 'agent_id', '')
+
+        restored = await storage.restore_conversation_session(
+            session_id, agent_id
+        )
+        if restored == 0:
+            raise HTTPException(
+                status_code=404,
+                detail="No soft-deleted messages found for this session.",
+            )
+
+        return {
+            "success": True,
+            "session_id": session_id,
+            "restored_count": restored,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(
+            f"Error restoring conversation {session_id}: {e}", exc_info=True
+        )
+        raise HTTPException(
+            status_code=500, detail="Error restoring conversation."
+        )
+
+
+@router.post("/conversations/{session_id}/purge")
+@limiter.limit("10/minute")
+async def purge_conversation(request: Request, session_id: str):
+    """Permanently delete a conversation (#763).
+
+    Hard SQL DELETE — bypasses Trash. Wipes both currently-live rows and
+    rows already in trash. Body: ``{"reason": "..."}`` (optional, default
+    ``"user-initiated"``); the reason lands in the audit log (#750).
+
+    Returns:
+        200 with {"success": true, "session_id": ..., "purged_count": N}
+        404 when nothing matched.
+    """
+    try:
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        reason = (
+            body.get("reason") if isinstance(body, dict) else None
+        ) or "user-initiated"
+
+        agent = get_agent(request)
+        storage = agent.storage
+        agent_id = getattr(storage, 'agent_id', '')
+
+        purged = await storage.purge_conversation_session(
+            session_id, agent_id, reason=str(reason)
+        )
+        if purged == 0:
+            raise HTTPException(
+                status_code=404, detail="Conversation not found."
+            )
+
+        return {
+            "success": True,
+            "session_id": session_id,
+            "purged_count": purged,
+            "reason": reason,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(
+            f"Error purging conversation {session_id}: {e}", exc_info=True
+        )
+        raise HTTPException(
+            status_code=500, detail="Error purging conversation."
+        )
+
+
+@router.post("/conversations/messages/{message_id}/restore")
+@limiter.limit("30/minute")
+async def restore_message(request: Request, message_id: int):
+    """Restore a single soft-deleted message (#763 / #765)."""
+    try:
+        agent = get_agent(request)
+        storage = agent.storage
+        agent_id = getattr(storage, 'agent_id', '')
+
+        restored = await storage.restore_conversation_message(
+            message_id, agent_id
+        )
+        if not restored:
+            raise HTTPException(
+                status_code=404,
+                detail="Message not found or not in trash.",
+            )
+
+        return {"success": True, "message_id": message_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(
+            f"Error restoring message {message_id}: {e}", exc_info=True
+        )
+        raise HTTPException(
+            status_code=500, detail="Error restoring message."
+        )
+
+
+@router.post("/conversations/messages/{message_id}/purge")
+@limiter.limit("10/minute")
+async def purge_message(request: Request, message_id: int):
+    """Permanently delete a single message (#763).
+
+    Body: ``{"reason": "..."}`` (optional). The reason is recorded in
+    the audit log.
+    """
+    try:
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        reason = (
+            body.get("reason") if isinstance(body, dict) else None
+        ) or "user-initiated"
+
+        agent = get_agent(request)
+        storage = agent.storage
+        agent_id = getattr(storage, 'agent_id', '')
+
+        purged = await storage.purge_conversation_message(
+            message_id, agent_id, reason=str(reason)
+        )
+        if not purged:
+            raise HTTPException(
+                status_code=404, detail="Message not found."
+            )
+
+        return {
+            "success": True,
+            "message_id": message_id,
+            "reason": reason,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(
+            f"Error purging message {message_id}: {e}", exc_info=True
+        )
+        raise HTTPException(
+            status_code=500, detail="Error purging message."
+        )
+
+
+@router.get("/trash")
+async def list_trash(request: Request, limit: int = Query(200, ge=1, le=1000)):
+    """List soft-deleted messages for the Trash UI (#763 / #765).
+
+    Returns rows where ``deleted_at IS NOT NULL``, sorted by
+    ``deleted_at`` descending (most recently trashed first). Each row
+    includes ``deleted_at`` so the UI can group by Today / Yesterday /
+    Last 7 days / Older.
+
+    The response is at the message level — the UI groups by session_id
+    in metadata to present "deleted conversation X (N messages)".
+    """
+    try:
+        agent = get_agent(request)
+        storage = agent.storage
+
+        history = await storage.list_trashed_conversations(limit=limit)
+        return {
+            "messages": history,
+            "total": len(history),
+        }
+    except Exception as e:
+        logger.error(f"Error listing trash: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500, detail="Error retrieving trash."
         )
 
 

@@ -428,7 +428,7 @@ class PrivacyEnforcingStorage:
         return await self._storage.db.fetchall("""
             SELECT id, role, content, metadata, created_at
             FROM conversation_history
-            WHERE agent_id = ?
+            WHERE agent_id = ? AND deleted_at IS NULL
             ORDER BY created_at DESC
         """, (agent_id,))
 
@@ -460,8 +460,12 @@ class PrivacyEnforcingStorage:
         if row_id is None:
             return None
 
+        # Filter out soft-deleted anchors so detail-view requests for
+        # trashed sessions return 404 from the higher layer instead of
+        # silently loading their content.
         return await self._storage.db.fetchone(
-            "SELECT created_at FROM conversation_history WHERE id = ? AND agent_id = ?",
+            "SELECT created_at FROM conversation_history "
+            "WHERE id = ? AND agent_id = ? AND deleted_at IS NULL",
             (row_id, agent_id)
         )
 
@@ -491,7 +495,7 @@ class PrivacyEnforcingStorage:
         return await self._storage.db.fetchall("""
             SELECT id, role, content, metadata, created_at
             FROM conversation_history
-            WHERE agent_id = ? AND created_at >= ?
+            WHERE agent_id = ? AND created_at >= ? AND deleted_at IS NULL
             ORDER BY created_at ASC
             LIMIT ?
         """, (agent_id, start_time, limit))
@@ -515,7 +519,7 @@ class PrivacyEnforcingStorage:
 
         return await self._storage.db.fetchone("""
             SELECT id, created_at FROM conversation_history
-            WHERE agent_id = ?
+            WHERE agent_id = ? AND deleted_at IS NULL
             ORDER BY id DESC LIMIT 1
         """, (agent_id,))
 
@@ -523,13 +527,18 @@ class PrivacyEnforcingStorage:
         self, message_id: int, agent_id: str
     ) -> bool:
         """
-        Delete a conversation message by ID, respecting privacy mode.
+        Soft-delete a conversation message by ID, respecting privacy mode (#763).
 
         In EPHEMERAL mode, raises PrivacyViolationError (nothing to delete).
-        In ISOLATED mode, removes from session storage.
-        Otherwise deletes from persistent database.
+        In ISOLATED mode, removes from in-memory session storage (which has
+        no soft/hard distinction — the row never persisted).
+        Otherwise stamps ``deleted_at`` on the persistent row so it can be
+        restored from Trash. The matching memory_pin is hard-deleted to
+        preserve the sovereign invariant that pins cannot block, delay, or
+        resurrect erased content (#750).
 
-        Returns True if a message was deleted, False if not found.
+        Returns True if a row was soft-deleted, False if not found or
+        already in trash.
         """
         if self._privacy_config.is_ephemeral():
             raise PrivacyViolationError(
@@ -551,21 +560,131 @@ class PrivacyEnforcingStorage:
             return False
 
         await self._check_write_permission("delete_conversation_message")
-        result = await self._storage.db.execute_commit(
-            "DELETE FROM conversation_history WHERE id = ? AND agent_id = ?",
-            (row_id, agent_id)
-        )
-        deleted = result.rowcount > 0 if hasattr(result, 'rowcount') else True
+        deleted = await self._storage.delete_message(row_id)
 
-        # Sovereign override: clean up any pins on this message.
-        # Pins CANNOT block, delay, or resurrect erased content.
+        # Sovereign override: pins cannot point into Trash. Hard-delete
+        # the matching pin so the user can't navigate from a pin into a
+        # soft-deleted message. If the user later restores the message,
+        # they can re-pin it explicitly.
         if deleted:
+            await self._delete_pin_for_message(row_id, agent_id)
+
+        return deleted
+
+    async def _delete_pin_for_message(
+        self, row_id: int, agent_id: str
+    ) -> None:
+        """Best-effort drop of any pin pointing at this message id.
+
+        Tolerates a missing ``memory_pins`` table (see
+        ``_delete_orphaned_pins`` for rationale).
+        """
+        try:
             await self._storage.db.execute_commit(
                 "DELETE FROM memory_pins WHERE message_id = ? AND agent_id = ?",
                 (row_id, agent_id)
             )
+        except Exception as e:
+            logger.debug(
+                "Pin cleanup skipped (memory_pins likely absent): %s", e
+            )
 
-        return deleted
+    async def restore_conversation_message(
+        self, message_id: int, agent_id: str
+    ) -> bool:
+        """Clear deleted_at on a soft-deleted message (#763 / #765).
+
+        EPHEMERAL has nothing to restore (raises). ISOLATED has no
+        persistent state, so restore is a no-op (returns False).
+        Otherwise delegates to the conversation store.
+        """
+        if self._privacy_config.is_ephemeral():
+            raise PrivacyViolationError(
+                "Cannot restore conversations in ephemeral mode (no persistent data)."
+            )
+        if self._policy.use_session_storage:
+            return False
+
+        row_id = coerce_persistent_message_id(message_id)
+        if row_id is None:
+            return False
+
+        await self._check_write_permission("restore_conversation_message")
+        return await self._storage.restore_message(row_id)
+
+    async def restore_conversation_session(
+        self, session_id: str, agent_id: str
+    ) -> int:
+        """Clear deleted_at on every soft-deleted message in a session.
+
+        EPHEMERAL raises (no persistent data). ISOLATED returns 0 (the
+        in-memory list has no Trash distinction). Otherwise delegates to
+        the conversation store.
+        """
+        if self._privacy_config.is_ephemeral():
+            raise PrivacyViolationError(
+                "Cannot restore conversations in ephemeral mode (no persistent data)."
+            )
+        if self._policy.use_session_storage:
+            return 0
+
+        await self._check_write_permission("restore_conversation_session")
+        return await self._storage.restore_conversation_session(session_id)
+
+    async def purge_conversation_message(
+        self, message_id: int, agent_id: str, reason: str = "user-initiated"
+    ) -> bool:
+        """Hard-delete a single message (#763).
+
+        Permanent — bypasses Trash. EPHEMERAL raises (nothing to purge).
+        ISOLATED falls through to the soft-delete path because the row
+        never persisted in the first place.
+        """
+        if self._privacy_config.is_ephemeral():
+            raise PrivacyViolationError(
+                "Cannot purge conversations in ephemeral mode (no persistent data)."
+            )
+
+        if self._policy.use_session_storage:
+            return await self.delete_conversation_message(message_id, agent_id)
+
+        row_id = coerce_persistent_message_id(message_id)
+        if row_id is None:
+            return False
+
+        await self._check_write_permission("purge_conversation_message")
+        purged = await self._storage.purge_message(row_id, reason=reason)
+
+        if purged:
+            await self._delete_pin_for_message(row_id, agent_id)
+
+        return purged
+
+    async def purge_conversation_session(
+        self, session_id: str, agent_id: str, reason: str = "user-initiated"
+    ) -> int:
+        """Hard-delete every message in a session (#763).
+
+        Wipes both live and soft-deleted rows. EPHEMERAL raises.
+        ISOLATED falls through to the soft-delete equivalent.
+        """
+        if self._privacy_config.is_ephemeral():
+            raise PrivacyViolationError(
+                "Cannot purge conversations in ephemeral mode (no persistent data)."
+            )
+
+        if self._policy.use_session_storage:
+            return await self.delete_conversation_session(session_id, agent_id)
+
+        await self._check_write_permission("purge_conversation_session")
+        purged = await self._storage.purge_conversation_session(
+            session_id, reason=reason
+        )
+
+        if purged:
+            await self._delete_orphaned_pins(agent_id)
+
+        return purged
 
     async def delete_conversation_session(
         self, session_id: str, agent_id: str
@@ -598,18 +717,60 @@ class PrivacyEnforcingStorage:
         await self._check_write_permission("delete_conversation_session")
         count = await self._storage.delete_conversation_session(session_id)
 
-        # Sovereign override: clean up any memory pins that referenced
-        # messages that just ceased to exist.  Same policy as message-
-        # level delete — pins cannot block erasure.
+        # Sovereign override: clean up any memory pins that pointed at
+        # messages we just soft-deleted. Subquery filters on
+        # ``deleted_at IS NULL`` so pins on rows that just moved into
+        # Trash are caught here — without that filter the subquery
+        # would still find the trashed rows and the NOT IN would skip
+        # them, leaving dangling pins (#763 regression).
         if count > 0:
+            await self._delete_orphaned_pins(agent_id)
+
+        return count
+
+    async def _delete_orphaned_pins(self, agent_id: str) -> None:
+        """Drop pins whose message is no longer live (deleted or purged).
+
+        Tolerates a missing ``memory_pins`` table — the table is created
+        by the memory_agency feature, which may not be loaded in slim
+        startup paths or constrained tests. Production runs always have
+        it; the guard exists so pin cleanup never blocks a legitimate
+        delete in those edge cases.
+        """
+        try:
             await self._storage.db.execute_commit(
                 "DELETE FROM memory_pins "
                 "WHERE agent_id = ? AND message_id NOT IN "
-                "(SELECT id FROM conversation_history WHERE agent_id = ?)",
+                "(SELECT id FROM conversation_history "
+                " WHERE agent_id = ? AND deleted_at IS NULL)",
                 (agent_id, agent_id),
             )
+        except Exception as e:
+            logger.debug(
+                "Pin cleanup skipped (memory_pins likely absent): %s", e
+            )
 
-        return count
+    async def list_trashed_conversations(
+        self, limit: int = 200
+    ) -> List[Dict[str, Any]]:
+        """List soft-deleted messages for the Trash UI (#763 / #765).
+
+        Returns rows where ``deleted_at IS NOT NULL`` for this agent,
+        sorted most-recently-trashed first. EPHEMERAL and ISOLATED modes
+        return an empty list — neither has a persistent Trash store.
+        """
+        if self._privacy_config.is_ephemeral():
+            return []
+        if self._policy.use_session_storage:
+            return []
+
+        history = await self._storage.conversation.get_full_history_with_ids(
+            include_excluded=True,
+            include_stashed=True,
+            only_deleted=True,
+        )
+        history.sort(key=lambda m: m.get("deleted_at") or "", reverse=True)
+        return history[:limit]
 
     async def set_conversation_name(
         self, session_id: str, name: Optional[str]
