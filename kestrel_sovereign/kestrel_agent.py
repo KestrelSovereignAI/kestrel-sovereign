@@ -1390,12 +1390,16 @@ Expected Duration: {expected_duration}
 
         logging.debug(f"[CONTEXT] Sending {len(messages)} messages to LLM (1 system + {len(context_result.messages)} history + 1 user)")
 
-        # Generate response with full conversation context
+        # Generate response with full conversation context. ``session_id``
+        # threads through to stateful adapters (e.g. CodexAdapter), letting
+        # them anchor on ``previous_response_id`` and preserve encrypted
+        # reasoning across turns. #806 / #821.
         response = await self.llm_service.generate_with_messages(
             messages=messages,
             force_local_only=force_local_only,
             model_override=effective_model,
-            tools=feature_tools if feature_tools else None
+            tools=feature_tools if feature_tools else None,
+            session_id=session_id,
         )
 
         # Log LLM response timing
@@ -1442,7 +1446,8 @@ Expected Duration: {expected_duration}
             system_prompt=system_prompt,
             force_local_only=force_local_only,
             effective_model=effective_model,
-            user_message=prompt  # Pass original user message for subagent context
+            user_message=prompt,  # Pass original user message for subagent context
+            session_id=session_id,
         )
 
         # Fire POST_RESPONSE hooks (e.g., response audit)
