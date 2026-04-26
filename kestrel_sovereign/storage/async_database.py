@@ -56,10 +56,12 @@ CREATE TABLE IF NOT EXISTS conversation_history (
     role TEXT NOT NULL,
     content TEXT NOT NULL,
     metadata TEXT,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    deleted_at TIMESTAMP DEFAULT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_conversation_agent_id ON conversation_history(agent_id);
+CREATE INDEX IF NOT EXISTS idx_conversation_deleted_at ON conversation_history(agent_id, deleted_at);
 
 -- User-assigned conversation titles (issue #716).  Decoupled from
 -- conversation_history so renames are a single-row upsert instead of a
@@ -454,7 +456,48 @@ class AsyncDatabase:
             if statement:
                 await self._backend.execute(statement)
 
+        # Soft-delete migration (#763): add deleted_at to conversation_history
+        # for databases created before soft-delete shipped. Idempotent — does
+        # nothing on fresh databases (column already in CREATE TABLE).
+        await self._migrate_add_column(
+            "conversation_history", "deleted_at", "TIMESTAMP DEFAULT NULL"
+        )
+        await self._backend.execute(
+            "CREATE INDEX IF NOT EXISTS idx_conversation_deleted_at "
+            "ON conversation_history(agent_id, deleted_at)"
+        )
+
         logger.debug(f"Database schema initialized ({self.backend_type})")
+
+    async def _migrate_add_column(
+        self, table: str, column: str, col_def: str
+    ) -> None:
+        """Add a column to an existing table if it isn't already present.
+
+        Idempotent across both backends. Logs the first-time migration
+        so deployments leave a breadcrumb.
+        """
+        try:
+            if self.backend_type == "postgres":
+                await self._backend.execute(
+                    f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {col_def}"
+                )
+            else:
+                row = await self._backend.fetch_one(
+                    f"SELECT COUNT(*) FROM pragma_table_info('{table}') "
+                    f"WHERE name='{column}'"
+                )
+                if row and row[0] == 0:
+                    await self._backend.execute(
+                        f"ALTER TABLE {table} ADD COLUMN {column} {col_def}"
+                    )
+                    logger.info(
+                        f"Migrated {table}: added {column} column"
+                    )
+        except Exception as e:
+            logger.debug(
+                f"Migration check for {table}.{column}: {e}"
+            )
     
     # ─────────────────────────────────────────────────────────────────
     # Query methods - delegate to backend

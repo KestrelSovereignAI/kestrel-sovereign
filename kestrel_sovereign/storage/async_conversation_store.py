@@ -28,6 +28,25 @@ logger = logging.getLogger(__name__)
 CURRENT_KEY_VERSION = 1
 
 
+def _rows_affected(result) -> int:
+    """Normalise the return value of AsyncDatabase.execute_commit (#763).
+
+    Different backends return slightly different shapes:
+      * SQLite/Postgres backends return ``cursor.rowcount`` (int).
+      * Some legacy paths returned a Result-like object with ``.rowcount``.
+
+    Soft-delete needs an honest count so callers can distinguish "row
+    was already in trash" from "row was just trashed." The pre-existing
+    ``hasattr(result, 'rowcount') else True`` fallback lied (always
+    True), which broke the no-op semantics. Use this helper instead.
+    """
+    if isinstance(result, int):
+        return result
+    if hasattr(result, "rowcount") and result.rowcount is not None:
+        return result.rowcount
+    return 0
+
+
 class AsyncConversationStore:
     """Async conversation history storage with per-agent encryption."""
 
@@ -79,7 +98,8 @@ class AsyncConversationStore:
         try:
             row = await self.db.fetchone(
                 "SELECT metadata, created_at FROM conversation_history "
-                "WHERE agent_id = ? ORDER BY id DESC LIMIT 1",
+                "WHERE agent_id = ? AND deleted_at IS NULL "
+                "ORDER BY id DESC LIMIT 1",
                 (self.agent_id,),
             )
             if not row:
@@ -238,10 +258,11 @@ class AsyncConversationStore:
             # Session-aware retrieval: get messages from the specified session
             rows = await self._get_session_messages(session_id, limit)
         else:
-            # Default behavior: get most recent messages
+            # Default behavior: get most recent live messages
             rows = await self.db.fetchall(
                 "SELECT id, role, content, metadata, created_at FROM conversation_history "
-                "WHERE agent_id = ? ORDER BY id DESC LIMIT ?",
+                "WHERE agent_id = ? AND deleted_at IS NULL "
+                "ORDER BY id DESC LIMIT ?",
                 (self.agent_id, limit)
             )
         history = []
@@ -277,7 +298,35 @@ class AsyncConversationStore:
             history.append(entry)
         return history
 
-    async def _get_session_messages(self, session_id: str, limit: int) -> List[tuple]:
+    @staticmethod
+    def _deleted_filter_clause(deleted_filter: str) -> str:
+        """Return the SQL fragment that filters by deleted_at state.
+
+        ``live``    → only ``deleted_at IS NULL`` (default for reads).
+        ``deleted`` → only ``deleted_at IS NOT NULL`` (Trash view, restore).
+        ``all``     → no filter (purge needs every row, regardless of state).
+
+        Returns the leading ``AND`` so it can be appended to a WHERE
+        clause that already has at least one condition. ``all`` returns
+        an empty string.
+        """
+        if deleted_filter == "live":
+            return " AND deleted_at IS NULL"
+        if deleted_filter == "deleted":
+            return " AND deleted_at IS NOT NULL"
+        if deleted_filter == "all":
+            return ""
+        raise ValueError(
+            f"Invalid deleted_filter={deleted_filter!r}; "
+            "expected 'live', 'deleted', or 'all'"
+        )
+
+    async def _get_session_messages(
+        self,
+        session_id: str,
+        limit: int,
+        deleted_filter: str = "live",
+    ) -> List[tuple]:
         """Get messages belonging to a specific session.
 
         Sessions are determined by:
@@ -289,10 +338,14 @@ class AsyncConversationStore:
         Args:
             session_id: The message ID that marks the session start
             limit: Maximum messages to return
+            deleted_filter: ``live`` (default — for reads),
+                ``deleted`` (for restore / Trash view), or
+                ``all`` (for purge — finds rows in any state).
 
         Returns:
             List of raw rows (id, role, content, metadata, created_at)
         """
+        del_clause = self._deleted_filter_clause(deleted_filter)
         from datetime import datetime
         from kestrel_sdk.config.constants import SESSION_GAP_MINUTES
 
@@ -302,6 +355,9 @@ class AsyncConversationStore:
         all_rows = []
         row_id = coerce_persistent_message_id(session_id)
         if row_id is not None:
+            # The anchor row itself is looked up regardless of state — we
+            # need its timestamp even if it's been soft-deleted, otherwise
+            # we can't restore the session that owned it.
             start_row = await self.db.fetchone(
                 "SELECT created_at FROM conversation_history WHERE id = ? AND agent_id = ?",
                 (row_id, self.agent_id)
@@ -311,9 +367,9 @@ class AsyncConversationStore:
             if start_row:
                 start_time = start_row[0]
                 all_rows = await self.db.fetchall(
-                    """SELECT id, role, content, metadata, created_at
+                    f"""SELECT id, role, content, metadata, created_at
                        FROM conversation_history
-                       WHERE agent_id = ? AND created_at >= ?
+                       WHERE agent_id = ? AND created_at >= ?{del_clause}
                        ORDER BY created_at ASC
                        LIMIT ?""",
                     (self.agent_id, start_time, limit * 2)  # Fetch extra in case of filtering
@@ -322,9 +378,9 @@ class AsyncConversationStore:
         # Also get messages that explicitly belong to this session (resumed conversations)
         # These are messages with session_id in metadata that may come after a time gap
         resumed_rows = await self.db.fetchall(
-            """SELECT id, role, content, metadata, created_at
+            f"""SELECT id, role, content, metadata, created_at
                FROM conversation_history
-               WHERE agent_id = ? AND metadata LIKE ?
+               WHERE agent_id = ? AND metadata LIKE ?{del_clause}
                ORDER BY created_at ASC
                LIMIT ?""",
             (self.agent_id, f'%"session_id": "{session_id}"%', limit)
@@ -332,9 +388,9 @@ class AsyncConversationStore:
 
         # Also try without space after colon (JSON formatting varies)
         resumed_rows_alt = await self.db.fetchall(
-            """SELECT id, role, content, metadata, created_at
+            f"""SELECT id, role, content, metadata, created_at
                FROM conversation_history
-               WHERE agent_id = ? AND metadata LIKE ?
+               WHERE agent_id = ? AND metadata LIKE ?{del_clause}
                ORDER BY created_at ASC
                LIMIT ?""",
             (self.agent_id, f'%"session_id":"{session_id}"%', limit)
@@ -426,10 +482,16 @@ class AsyncConversationStore:
         return list(reversed(session_rows))
 
     async def get_full_history(self) -> List[Dict[str, Any]]:
-        """Get complete conversation history with automatic decryption."""
+        """Get complete live conversation history with automatic decryption.
+
+        Soft-deleted rows (#763) are filtered out — use
+        ``get_full_history_with_ids(include_deleted=True)`` if you need
+        to see Trash too.
+        """
         rows = await self.db.fetchall(
             "SELECT id, role, content, metadata FROM conversation_history "
-            "WHERE agent_id = ? ORDER BY id ASC",
+            "WHERE agent_id = ? AND deleted_at IS NULL "
+            "ORDER BY id ASC",
             (self.agent_id,)
         )
         history = []
@@ -482,7 +544,8 @@ class AsyncConversationStore:
             # Match both `"session_id": "X"` and `"session_id":"X"` formats
             rows = await self.db.fetchall(
                 "SELECT id, role, content, metadata FROM conversation_history "
-                "WHERE agent_id = ? AND (metadata LIKE ? OR metadata LIKE ?) "
+                "WHERE agent_id = ? AND deleted_at IS NULL "
+                "AND (metadata LIKE ? OR metadata LIKE ?) "
                 "ORDER BY id DESC LIMIT 5000",
                 (
                     self.agent_id,
@@ -491,11 +554,12 @@ class AsyncConversationStore:
                 ),
             )
         else:
-            # Fetch all messages (up to 5000) and search client-side after decryption
+            # Fetch all live messages (up to 5000) and search client-side after decryption
             # SQL LIKE doesn't work on encrypted content, so we must decrypt first
             rows = await self.db.fetchall(
                 "SELECT id, role, content, metadata FROM conversation_history "
-                "WHERE agent_id = ? ORDER BY id DESC LIMIT 5000",
+                "WHERE agent_id = ? AND deleted_at IS NULL "
+                "ORDER BY id DESC LIMIT 5000",
                 (self.agent_id,)
             )
 
@@ -532,9 +596,19 @@ class AsyncConversationStore:
         return results
 
     async def clear_history(self) -> None:
-        """Clear conversation history for this agent."""
+        """Soft-delete every live message for this agent (#763).
+
+        Stamps ``deleted_at`` instead of issuing a SQL DELETE so the rows
+        remain recoverable from Trash until the retention janitor (#764)
+        sweeps them. Already-deleted rows are left alone — re-stamping
+        would extend their retention window.
+
+        Use ``purge_all`` when you genuinely need to destroy the rows
+        (administrative wipe, EPHEMERAL session close, restore-from-CAR).
+        """
         await self.db.execute_commit(
-            "DELETE FROM conversation_history WHERE agent_id = ?",
+            f"UPDATE conversation_history SET deleted_at = {self._now_sql()} "
+            "WHERE agent_id = ? AND deleted_at IS NULL",
             (self.agent_id,)
         )
 
@@ -623,22 +697,26 @@ class AsyncConversationStore:
         return {row[0]: row[1] for row in rows if row[1]}
 
     async def delete_message(self, message_id: int) -> bool:
-        """Delete a specific message by ID.
+        """Soft-delete a specific message by ID (#763).
 
-        Args:
-            message_id: The database ID of the message to delete
+        Stamps ``deleted_at`` so the row survives in Trash until purged
+        explicitly or aged out by the retention janitor (#764). A row
+        that's already soft-deleted reports ``False`` (no-op) rather than
+        re-stamping its deleted_at.
 
         Returns:
-            True if deleted, False if not found
+            True if a live row was soft-deleted, False if not found or
+            already in trash.
         """
-        result = await self.db.execute_commit(
-            "DELETE FROM conversation_history WHERE id = ? AND agent_id = ?",
+        affected = await self.db.execute_commit(
+            f"UPDATE conversation_history SET deleted_at = {self._now_sql()} "
+            "WHERE id = ? AND agent_id = ? AND deleted_at IS NULL",
             (message_id, self.agent_id)
         )
-        return result.rowcount > 0 if hasattr(result, 'rowcount') else True
+        return _rows_affected(affected) > 0
 
     async def delete_conversation_session(self, session_id: str) -> int:
-        """Delete every message belonging to the given conversation session.
+        """Soft-delete every live message in the given session (#763).
 
         Resolves which messages belong to `session_id` using the same
         logic `_get_session_messages` uses for loading — which covers
@@ -647,25 +725,27 @@ class AsyncConversationStore:
         is the row id of the first message in the cluster, and cluster
         members are discovered by time-gap walking).
 
+        Stamps ``deleted_at`` rather than issuing a hard DELETE so the
+        session is recoverable from Trash. Use ``purge_session`` for
+        permanent removal.
+
         Args:
-            session_id: The session to delete.  Accepts either a UUID
-                string (for metadata-based sessions) or a numeric message
-                ID (for legacy time-gap sessions).
+            session_id: The session to soft-delete.  Accepts either a
+                UUID string (for metadata-based sessions) or a numeric
+                message ID (for legacy time-gap sessions).
 
         Returns:
-            Number of messages actually removed.  Returns 0 if the session
-            doesn't exist, isn't owned by this agent, or is already empty.
+            Number of live messages stamped.  Returns 0 if the session
+            doesn't exist, isn't owned by this agent, or is empty / all
+            already soft-deleted.
 
         Notes:
             Per-agent scoped via the `agent_id = ?` filter in the final
-            DELETE.  No side effects on other agents' sessions even if
-            session_ids somehow collide.  Ephemeral-mode callers must be
-            rejected at the privacy wrapper layer above — this method
-            does not read the privacy config.
+            UPDATE.  Already-soft-deleted rows are not re-stamped (their
+            existing deleted_at controls retention).  Ephemeral-mode
+            callers must be rejected at the privacy wrapper above —
+            this method does not read the privacy config.
         """
-        # Fetch every message in the session (high limit — conversations
-        # can run long, but we still cap to avoid loading unbounded
-        # amounts of metadata text here).
         rows = await self._get_session_messages(session_id, limit=10_000)
         if not rows:
             return 0
@@ -676,12 +756,156 @@ class AsyncConversationStore:
 
         placeholders = ",".join("?" for _ in ids)
         params = [*ids, self.agent_id]
-        result = await self.db.execute_commit(
+        affected = await self.db.execute_commit(
+            f"UPDATE conversation_history "
+            f"SET deleted_at = {self._now_sql()} "
+            f"WHERE id IN ({placeholders}) AND agent_id = ? "
+            f"AND deleted_at IS NULL",
+            tuple(params),
+        )
+        return _rows_affected(affected)
+
+    # ------------------------------------------------------------------
+    # Restore primitives (#763 / #765)
+    # ------------------------------------------------------------------
+    #
+    # Mirror image of the soft-delete methods. Clear ``deleted_at`` so
+    # the row reappears in normal reads. A row that was never soft-
+    # deleted is a no-op (rowcount=0).
+
+    async def restore_message(self, message_id: int) -> bool:
+        """Clear deleted_at on a soft-deleted message (#763).
+
+        Returns:
+            True if a soft-deleted row was restored, False if the row
+            doesn't exist, isn't owned by this agent, or wasn't actually
+            in trash.
+        """
+        affected = await self.db.execute_commit(
+            "UPDATE conversation_history SET deleted_at = NULL "
+            "WHERE id = ? AND agent_id = ? AND deleted_at IS NOT NULL",
+            (message_id, self.agent_id),
+        )
+        return _rows_affected(affected) > 0
+
+    async def restore_conversation_session(self, session_id: str) -> int:
+        """Clear deleted_at on every soft-deleted message in a session.
+
+        Uses the same session-resolution logic as soft-delete but with
+        ``deleted_filter='deleted'`` so we find messages that are in
+        trash, not the live ones.
+
+        Returns:
+            Number of rows restored. Zero if the session has no soft-
+            deleted rows or doesn't exist.
+        """
+        rows = await self._get_session_messages(
+            session_id, limit=10_000, deleted_filter="deleted"
+        )
+        if not rows:
+            return 0
+
+        ids = [row[0] for row in rows]
+        if not ids:
+            return 0
+
+        placeholders = ",".join("?" for _ in ids)
+        params = [*ids, self.agent_id]
+        affected = await self.db.execute_commit(
+            f"UPDATE conversation_history SET deleted_at = NULL "
+            f"WHERE id IN ({placeholders}) AND agent_id = ? "
+            f"AND deleted_at IS NOT NULL",
+            tuple(params),
+        )
+        return _rows_affected(affected)
+
+    # ------------------------------------------------------------------
+    # Purge primitives (#763)
+    # ------------------------------------------------------------------
+    #
+    # Hard SQL DELETE — the row is gone, no recovery. Callers must
+    # supply a reason string for the audit trail (#750). Privacy mode
+    # enforcement happens at the wrapper layer above.
+
+    async def purge_message(
+        self, message_id: int, reason: str = "user-initiated"
+    ) -> bool:
+        """Hard-delete a single message (#763).
+
+        Removes the row regardless of whether it's currently live or
+        already soft-deleted. The ``reason`` argument is recorded by
+        the caller in the audit log; this method just performs the
+        DELETE.
+
+        Returns:
+            True if a row was destroyed, False if not found.
+        """
+        affected = await self.db.execute_commit(
+            "DELETE FROM conversation_history WHERE id = ? AND agent_id = ?",
+            (message_id, self.agent_id),
+        )
+        deleted = _rows_affected(affected) > 0
+        if deleted:
+            logger.info(
+                "purge_message id=%s agent=%s reason=%s",
+                message_id, self.agent_id, reason,
+            )
+        return deleted
+
+    async def purge_conversation_session(
+        self, session_id: str, reason: str = "user-initiated"
+    ) -> int:
+        """Hard-delete every message in a session, live or soft-deleted (#763).
+
+        Uses ``deleted_filter='all'`` so we find both live messages and
+        ones that previously soft-deleted into trash. The whole session
+        is destroyed in one transaction.
+
+        Returns:
+            Number of rows destroyed.
+        """
+        rows = await self._get_session_messages(
+            session_id, limit=10_000, deleted_filter="all"
+        )
+        if not rows:
+            return 0
+
+        ids = [row[0] for row in rows]
+        if not ids:
+            return 0
+
+        placeholders = ",".join("?" for _ in ids)
+        params = [*ids, self.agent_id]
+        affected = await self.db.execute_commit(
             f"DELETE FROM conversation_history "
             f"WHERE id IN ({placeholders}) AND agent_id = ?",
             tuple(params),
         )
-        return result.rowcount if hasattr(result, "rowcount") else len(ids)
+        purged = _rows_affected(affected)
+        if purged:
+            logger.info(
+                "purge_conversation_session sid=%s agent=%s reason=%s rows=%d",
+                session_id, self.agent_id, reason, purged,
+            )
+        return purged
+
+    async def purge_all(self, reason: str = "administrative") -> int:
+        """Hard-delete every conversation row for this agent (#763).
+
+        Reserved for restore-from-CAR, EPHEMERAL session close (#767),
+        and explicit administrative wipe. NOT the user-facing 'clear
+        history' button — that goes through ``clear_history``.
+        """
+        affected = await self.db.execute_commit(
+            "DELETE FROM conversation_history WHERE agent_id = ?",
+            (self.agent_id,),
+        )
+        purged = _rows_affected(affected)
+        logger.info(
+            "purge_all agent=%s reason=%s rows=%d",
+            self.agent_id, reason, purged,
+        )
+        return purged
 
     async def delete_messages_matching(self, content_pattern: str) -> int:
         """Delete messages containing a specific pattern (case-insensitive).
@@ -714,20 +938,35 @@ class AsyncConversationStore:
     async def get_full_history_with_ids(
         self,
         include_excluded: bool = False,
-        include_stashed: bool = False
+        include_stashed: bool = False,
+        include_deleted: bool = False,
+        only_deleted: bool = False,
     ) -> List[Dict[str, Any]]:
         """Get complete conversation history with message IDs.
 
         Args:
-            include_excluded: If True, include messages marked as excluded from context
-            include_stashed: If True, include messages that are stashed
+            include_excluded: If True, include messages marked as excluded from context.
+            include_stashed: If True, include messages that are stashed.
+            include_deleted: If True, include soft-deleted rows alongside
+                live rows. Default False — Trash stays hidden.
+            only_deleted: If True, return ONLY soft-deleted rows. Used by
+                the Trash UI (#765). Implies ``include_deleted``.
 
         Returns:
-            List of message dicts with 'id', 'role', 'content', 'metadata', 'created_at'
+            List of message dicts with 'id', 'role', 'content', 'metadata',
+            'created_at', and 'deleted_at' (None for live rows).
         """
+        if only_deleted:
+            del_clause = " AND deleted_at IS NOT NULL"
+        elif include_deleted:
+            del_clause = ""
+        else:
+            del_clause = " AND deleted_at IS NULL"
+
         rows = await self.db.fetchall(
-            "SELECT id, role, content, metadata, created_at FROM conversation_history "
-            "WHERE agent_id = ? ORDER BY id ASC",
+            f"SELECT id, role, content, metadata, created_at, deleted_at "
+            f"FROM conversation_history "
+            f"WHERE agent_id = ?{del_clause} ORDER BY id ASC",
             (self.agent_id,)
         )
         history = []
@@ -760,7 +999,8 @@ class AsyncConversationStore:
                 'role': row[1],
                 'content': content,
                 'metadata': cleaned_meta if cleaned_meta else {},
-                'created_at': row[4]
+                'created_at': row[4],
+                'deleted_at': row[5],
             }
             history.append(entry)
         return history
@@ -855,7 +1095,8 @@ class AsyncConversationStore:
         placeholders = ",".join("?" * len(message_ids))
         rows = await self.db.fetchall(
             f"SELECT id, role, content, metadata, created_at FROM conversation_history "
-            f"WHERE id IN ({placeholders}) AND agent_id = ? ORDER BY id ASC",
+            f"WHERE id IN ({placeholders}) AND agent_id = ? "
+            f"AND deleted_at IS NULL ORDER BY id ASC",
             (*message_ids, self.agent_id)
         )
 
@@ -921,7 +1162,8 @@ class AsyncConversationStore:
         """
         rows = await self.db.fetchall(
             "SELECT id, role, content, metadata, created_at FROM conversation_history "
-            "WHERE agent_id = ? AND metadata LIKE '%\"excluded_from_context\": true%' "
+            "WHERE agent_id = ? AND deleted_at IS NULL "
+            "AND metadata LIKE '%\"excluded_from_context\": true%' "
             "ORDER BY id DESC LIMIT ?",
             (self.agent_id, limit)
         )
@@ -963,7 +1205,7 @@ class AsyncConversationStore:
             # Get specific stash
             rows = await self.db.fetchall(
                 "SELECT id, role, content, metadata, created_at FROM conversation_history "
-                "WHERE agent_id = ? AND metadata LIKE ? "
+                "WHERE agent_id = ? AND deleted_at IS NULL AND metadata LIKE ? "
                 "ORDER BY id ASC LIMIT ?",
                 (self.agent_id, f'%"stash_id": "{stash_id}"%', limit)
             )
@@ -971,7 +1213,8 @@ class AsyncConversationStore:
             # Get all stashed messages
             rows = await self.db.fetchall(
                 "SELECT id, role, content, metadata, created_at FROM conversation_history "
-                "WHERE agent_id = ? AND metadata LIKE '%\"stashed\": true%' "
+                "WHERE agent_id = ? AND deleted_at IS NULL "
+                "AND metadata LIKE '%\"stashed\": true%' "
                 "ORDER BY id DESC LIMIT ?",
                 (self.agent_id, limit)
             )
@@ -1004,7 +1247,8 @@ class AsyncConversationStore:
         # Get all stashed messages
         rows = await self.db.fetchall(
             "SELECT metadata FROM conversation_history "
-            "WHERE agent_id = ? AND metadata LIKE '%\"stashed\": true%'",
+            "WHERE agent_id = ? AND deleted_at IS NULL "
+            "AND metadata LIKE '%\"stashed\": true%'",
             (self.agent_id,)
         )
 
@@ -1039,7 +1283,8 @@ class AsyncConversationStore:
         """
         rows = await self.db.fetchall(
             "SELECT id, role, content, metadata FROM conversation_history "
-            "WHERE agent_id = ? AND metadata LIKE '%\"audit_failure\": true%'",
+            "WHERE agent_id = ? AND deleted_at IS NULL "
+            "AND metadata LIKE '%\"audit_failure\": true%'",
             (self.agent_id,)
         )
         results = []
