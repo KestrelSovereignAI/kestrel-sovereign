@@ -32,6 +32,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Literal, Optional, Union
 
+from .base import VoiceInfo
+
 
 # ---------------------------------------------------------------------------
 # Supporting types
@@ -301,13 +303,15 @@ class ConversationProvider(ABC):
         """
 
     @abstractmethod
-    async def list_voices(self) -> list[str]:
-        """Runtime-discovered voice IDs this provider exposes.
+    async def list_voices(self) -> list[VoiceInfo]:
+        """Runtime-discovered voices this provider exposes, with metadata.
 
-        Same rule as :meth:`discover_models`: no hardcoded names. Returns
-        bare voice IDs rather than :class:`VoiceInfo` to keep the SDK free
-        of the metadata taxonomy — providers surface richer metadata via
-        their TTS provider instance if they have one.
+        Returns full :class:`VoiceInfo` so the picker can render gender,
+        accent, and energy without scanning sibling TTS providers. Each
+        provider owns its catalog: if metadata isn't queryable from the
+        upstream API, surface what's available (``name`` + ``voice_id`` at
+        minimum) and leave other fields at the dataclass defaults. No
+        hardcoded names — same rule as :meth:`discover_models`.
         """
 
     @abstractmethod
