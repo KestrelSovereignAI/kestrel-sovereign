@@ -1,52 +1,62 @@
 """Per-conversation continuation cursor store for stateful provider protocols.
 
-Some providers anchor multi-turn behavior on a server-side response id rather
-than re-deriving state from the message history. The OpenAI Responses API
-(used by ``CodexAdapter``) is the immediate motivator: each completed response
-carries an id, and the next request can pass ``previous_response_id`` plus
-only the *new* input items (typically the tool results from the prior turn),
-which preserves encrypted reasoning across turns. Without continuation the
-``include=[reasoning.encrypted_content]`` flag is dead — the encrypted blob
-has nowhere to land on turn N+1.
+Some providers anchor multi-turn behavior on prior-response state. The
+ChatGPT-backend Responses API used by ``CodexAdapter`` is the immediate
+motivator: it does NOT support ``previous_response_id`` (caught live in #841)
+but it DOES accept reasoning items as input items on subsequent turns. Per
+the spec, encrypted reasoning items must appear before their corresponding
+``function_call`` items in the input list to give the model continuity of
+chain-of-thought across tool-result round trips. Without that, the
+``include=[reasoning.encrypted_content]`` flag is dead and multi-turn
+agent loops on GPT-5 reason from scratch each turn.
 
 This module provides the minimum primitive: a small KV indexed by
-``(adapter_name, session_id)`` that stores a cursor naming the last
-response id, the message-list length at that point, and a request signature
-used to detect tool/instruction drift mid-conversation. Anthropic and others
-do not use it (their continuation is positional in messages); the store is a
-no-op for them.
+``(adapter_name, session_id)`` that stores a cursor with the last response
+id, a request signature for drift detection, and a per-turn record of
+output items (reasoning + function_call) that the adapter replays as input
+on subsequent turns. Anthropic and other adapters that don't need this
+ignore the parameter and the cursor stays empty. See #806 / #808 / #842.
 
-Default implementation is process-local and dict-backed. The ``ContinuationStore``
-Protocol can be re-implemented against Redis/SQL when the runtime moves to
-multi-worker uvicorn — adapters never see the difference. See epic #806 / #808.
+Default implementation is process-local and dict-backed. The
+``ContinuationStore`` Protocol is the swap point for Redis/SQL backends in
+multi-worker deployments — adapters never see the difference.
 """
 from __future__ import annotations
 
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, Optional, Protocol, Tuple
 
 
 @dataclass(frozen=True)
 class ContinuationCursor:
-    """Snapshot of conversation state needed to send a delta turn.
+    """Snapshot of conversation state for cross-turn reasoning continuity.
 
     Attributes:
         last_response_id: The provider's id for the most recently completed
-            response on this conversation. Used as ``previous_response_id`` on
-            the next call.
-        last_message_count: ``len(messages)`` at the moment the cursor was
-            written. The next turn sends only ``messages[last_message_count:]``
-            as input.
-        last_request_signature: A stable hash of the prior request's
+            response on this session. Recorded for diagnostics; not used as
+            a continuation token on the ChatGPT backend (rejected — #841).
+        last_message_count: ``len(messages)`` after extracting the system
+            prompt at the moment the cursor was written. Used in tests to
+            reason about turn boundaries; not used to slice input on the
+            wire (slicing was removed when continuation was disabled in #841).
+        last_request_signature: Stable hash of the prior request's
             ``(instructions, tools)``. If the next call's signature differs,
-            the adapter must drop continuation and resubmit full context — the
-            server's prior reasoning was conditioned on a different prompt.
+            the cached reasoning was conditioned on a different prompt and
+            must not be replayed — drop and resubmit full context.
+        turn_outputs: Tuple of JSON-encoded lists, one per prior turn. Each
+            inner list holds the output items emitted by the model on that
+            turn (reasoning items + function_call items, in order). The
+            adapter splices these back into the input list on subsequent
+            turns so encrypted chain-of-thought persists across tool round
+            trips. JSON-encoded so the cursor stays a frozen dataclass with
+            hashable contents. See #842.
     """
 
     last_response_id: str
     last_message_count: int
     last_request_signature: Optional[str] = None
+    turn_outputs: Tuple[str, ...] = field(default_factory=tuple)
 
 
 class ContinuationStore(Protocol):
