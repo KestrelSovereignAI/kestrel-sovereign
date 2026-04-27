@@ -899,11 +899,20 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         metadata: Optional[Dict[str, Any]] = None,
         input_tokens: Optional[int] = None,
         output_tokens: Optional[int] = None,
+        cache_creation_input_tokens: Optional[int] = None,
+        cache_read_input_tokens: Optional[int] = None,
+        tools_used: Optional[bool] = None,
+        structured_output: Optional[bool] = None,
     ) -> None:
         """Log an LLM call to the observability store (if configured).
 
         This is called automatically by get_response() and generate().
         Also triggers metering callback for billing (Vending Machine).
+
+        Also emits a single structured ``llm.usage:`` INFO line so callers
+        that downcast the response to a plain string don't lose token /
+        cache telemetry. Picked up by Cloud Run / Cloud Logging via the
+        rookery stdout tee (issue #812). See issue #819.
         """
         # Log to observability store
         if self._observability_store:
@@ -958,6 +967,25 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
                     prompt_tokens=input_tokens or 0,
                     completion_tokens=output_tokens or 0,
                 )
+
+        # Wrap in try/except so a serialization edge case can never break
+        # the call path. See issue #819.
+        try:
+            usage_log = {
+                "provider": provider,
+                "model": model,
+                "duration_ms": duration_ms,
+                "success": success,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "cache_creation_input_tokens": cache_creation_input_tokens,
+                "cache_read_input_tokens": cache_read_input_tokens,
+                "tools": tools_used,
+                "structured_output": structured_output,
+            }
+            logger.info("llm.usage: %s", json.dumps(usage_log, default=str))
+        except Exception as log_err:
+            logger.warning("llm.usage log failed: %s", log_err)
 
     def get_cheap_model(self) -> Optional[str]:
         """
@@ -1108,28 +1136,11 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
             metadata={"force_local_only": force_local_only},
             input_tokens=input_tokens,
             output_tokens=output_tokens,
+            cache_creation_input_tokens=cache_creation_input_tokens,
+            cache_read_input_tokens=cache_read_input_tokens,
+            tools_used=tools is not None,
+            structured_output=response_format is not None,
         )
-
-        # Emit a single structured INFO line so callers that downcast the
-        # response to a plain string don't lose token / cache telemetry.
-        # Picked up by Cloud Run / Cloud Logging via the rookery stdout tee
-        # (issue #812). Wrap in try/except so a serialization edge case can
-        # never break the call path. See issue #819.
-        try:
-            usage_log = {
-                "provider": provider["name"],
-                "model": model_to_use,
-                "duration_ms": duration_ms,
-                "input_tokens": input_tokens,
-                "output_tokens": output_tokens,
-                "cache_creation_input_tokens": cache_creation_input_tokens,
-                "cache_read_input_tokens": cache_read_input_tokens,
-                "tools": tools is not None,
-                "structured_output": response_format is not None,
-            }
-            logger.info("llm.usage: %s", json.dumps(usage_log, default=str))
-        except Exception as log_err:
-            logger.warning("llm.usage log failed: %s", log_err)
 
         # Return full LLMResponse if tools or structured output requested
         if tools is not None or response_format is not None:
