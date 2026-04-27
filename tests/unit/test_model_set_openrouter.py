@@ -4,88 +4,108 @@ Unit tests for model-set command with OpenRouter models.
 OpenRouter models have format "provider/model" (e.g., "google/gemini-3-pro-preview")
 but the actual provider should be "openrouter", not "google".
 """
+import json
+from types import SimpleNamespace
+
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock
+
+from kestrel_sovereign.features.model.feature import ModelAgent
+from kestrel_sovereign.llm.model_cache import get_shared_model_cache
+from kestrel_sovereign.llm.model_metadata import ModelInfo
 
 
 class TestModelSetOpenRouter:
     """Test that model-set correctly identifies OpenRouter models."""
 
-    def test_openrouter_model_format_detected(self):
-        """OpenRouter models like google/gemini-3-pro should use openrouter provider."""
-        # Models in format "vendor/model" from OpenRouter should:
-        # 1. Keep the full model ID (e.g., "google/gemini-3-pro-preview")
-        # 2. Set provider to "openrouter" (not "google")
+    @pytest.fixture(autouse=True)
+    def clear_shared_model_cache(self):
+        cache = get_shared_model_cache()
+        cache.clear()
+        yield
+        cache.clear()
 
-        test_cases = [
-            ("google/gemini-3-pro-preview", "openrouter", "google/gemini-3-pro-preview"),
-            ("anthropic/claude-sonnet-4", "openrouter", "anthropic/claude-sonnet-4"),
-            ("openai/gpt-4o", "openrouter", "openai/gpt-4o"),
-            ("meta-llama/llama-3.3-70b-instruct", "openrouter", "meta-llama/llama-3.3-70b-instruct"),
-            ("deepseek/deepseek-chat-v3.1", "openrouter", "deepseek/deepseek-chat-v3.1"),
-        ]
+    async def _feature(self) -> tuple[ModelAgent, MagicMock]:
+        llm_service = MagicMock()
+        llm_service.get_model_preference.return_value = {"model": "auto"}
+        agent = SimpleNamespace(llm_service=llm_service, features={})
+        feature = ModelAgent(agent)
+        await feature.initialize()
+        return feature, llm_service
 
-        for model_input, expected_provider, expected_model in test_cases:
-            # This is what the logic SHOULD produce
-            # Currently it incorrectly splits on "/" and uses first part as provider
-            assert "/" in model_input, f"Test case {model_input} should have /"
-
-    def test_direct_provider_model_format(self):
-        """Direct provider models like openai/gpt-5 should use that provider."""
-        # Models where the prefix IS the actual provider:
-        # - openai/gpt-5 -> provider=openai, model=gpt-5
-        # - anthropic/claude-opus-4-5 -> provider=anthropic, model=claude-opus-4-5
-        # - ollama/llama3.2 -> provider=ollama, model=llama3.2
-
-        direct_cases = [
-            ("openai/gpt-5", "openai", "gpt-5"),
-            ("anthropic/claude-opus-4-5-20251101", "anthropic", "claude-opus-4-5-20251101"),
-            ("ollama/llama3.2", "ollama", "llama3.2"),
-        ]
-
-        for model_input, expected_provider, expected_model in direct_cases:
-            parts = model_input.split("/", 1)
-            assert parts[0] == expected_provider
-            assert parts[1] == expected_model
-
-    def test_model_without_provider(self):
-        """Models without / should have provider=None."""
-        simple_models = ["gpt-5", "claude-opus-4-5-20251101", "llama3.2"]
-
-        for model in simple_models:
-            assert "/" not in model
-
-
-class TestModelSetIntegration:
-    """Integration tests for model-set with actual LLM service."""
+    def _model_changed_payload(self, message: str) -> dict:
+        marker = "MODEL_CHANGED:"
+        assert marker in message
+        return json.loads(message.split(marker, 1)[1])
 
     @pytest.mark.asyncio
-    async def test_set_openrouter_model_uses_openrouter_provider(self):
-        """Setting an OpenRouter model should route through OpenRouter, not the underlying provider."""
-        # This test would verify that:
-        # 1. !model-set google/gemini-3-pro-preview
-        # 2. Results in OpenRouter API being called (not Google's API)
-        # 3. The full model ID "google/gemini-3-pro-preview" is passed to OpenRouter
-        pass  # TODO: Implement with actual LLM service mock
+    async def test_cached_openrouter_model_keeps_full_id_and_uses_openrouter(self):
+        """OpenRouter-hosted vendor/model IDs must not be split as direct vendors."""
+        get_shared_model_cache().set([
+            ModelInfo(
+                id="google/gemini-3-pro-preview",
+                provider="openrouter",
+                display_name="Gemini 3 Pro Preview",
+            ),
+        ])
+        feature, llm_service = await self._feature()
+
+        result = await feature.set_model("google/gemini-3-pro-preview")
+
+        assert result["success"] is True
+        assert result["vendor"] == "openrouter"
+        assert result["model_name"] == "google/gemini-3-pro-preview"
+        assert result["model"] == "openrouter/google/gemini-3-pro-preview"
+        llm_service.set_model_preference.assert_called_once_with(
+            "google/gemini-3-pro-preview",
+            "openrouter",
+            None,
+        )
+        assert self._model_changed_payload(result["message"]) == {
+            "model": "openrouter/google/gemini-3-pro-preview",
+            "vendor": "openrouter",
+            "route": None,
+            "model_name": "google/gemini-3-pro-preview",
+        }
 
     @pytest.mark.asyncio
-    async def test_model_discovery_identifies_openrouter_models(self):
-        """Model discovery should mark OpenRouter models correctly."""
-        # This test would verify that models from OpenRouter's /api/v1/models
-        # are tagged with provider="openrouter"
-        pass  # TODO: Implement with model discovery
+    async def test_openrouter_only_vendor_fallback_uses_openrouter_without_cache(self):
+        """Known OpenRouter-only prefixes still route through OpenRouter before discovery."""
+        feature, llm_service = await self._feature()
 
+        result = await feature.set_model("meta-llama/llama-3.3-70b-instruct")
 
-# Helper to determine if a model belongs to OpenRouter
-def is_openrouter_model(model_id: str, known_openrouter_models: set) -> bool:
-    """
-    Determine if a model ID belongs to OpenRouter.
+        assert result["success"] is True
+        assert result["vendor"] == "openrouter"
+        assert result["model_name"] == "meta-llama/llama-3.3-70b-instruct"
+        llm_service.set_model_preference.assert_called_once_with(
+            "meta-llama/llama-3.3-70b-instruct",
+            "openrouter",
+            None,
+        )
 
-    Args:
-        model_id: The model identifier (e.g., "google/gemini-3-pro-preview")
-        known_openrouter_models: Set of model IDs from OpenRouter's /models endpoint
+    @pytest.mark.asyncio
+    async def test_direct_provider_model_is_split_into_provider_and_model(self):
+        """Direct provider models keep the provider prefix as routing metadata."""
+        feature, llm_service = await self._feature()
 
-    Returns:
-        True if this model should be routed through OpenRouter
-    """
-    return model_id in known_openrouter_models
+        result = await feature.set_model("openai/gpt-5")
+
+        assert result["success"] is True
+        assert result["vendor"] == "openai"
+        assert result["model_name"] == "gpt-5"
+        assert result["model"] == "openai/gpt-5"
+        llm_service.set_model_preference.assert_called_once_with("gpt-5", "openai", None)
+
+    @pytest.mark.asyncio
+    async def test_bare_model_has_no_vendor(self):
+        """Bare model IDs should not invent routing metadata."""
+        feature, llm_service = await self._feature()
+
+        result = await feature.set_model("gpt-5")
+
+        assert result["success"] is True
+        assert result["vendor"] is None
+        assert result["model_name"] == "gpt-5"
+        assert result["model"] == "gpt-5"
+        llm_service.set_model_preference.assert_called_once_with("gpt-5", None, None)

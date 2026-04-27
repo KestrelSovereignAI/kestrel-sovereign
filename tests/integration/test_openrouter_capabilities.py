@@ -525,24 +525,39 @@ class TestOpenRouterViaLLMService:
         from kestrel_sovereign.llm.adapter import LLMResponse
 
         service = LLMService()
+        service.set_model_preference("deepseek/deepseek-chat-v3.1", "openrouter")
 
-        results = []
-        async for item in service.stream_with_tool_detection(
-            messages=[
-                {"role": "system", "content": "Use tools when needed."},
-                {"role": "user", "content": "What's the weather in Tokyo?"}
-            ],
-            tools=SAMPLE_TOOLS,
-        ):
-            results.append(item)
+        try:
+            results = []
+            async for item in service.stream_with_tool_detection(
+                messages=[
+                    {"role": "system", "content": "Use the available weather tool when asked for weather."},
+                    {"role": "user", "content": "What's the weather in Tokyo? Use the weather tool."}
+                ],
+                tools=SAMPLE_TOOLS,
+            ):
+                results.append(item)
+        finally:
+            await service.close()
 
         text_chunks = [r for r in results if isinstance(r, str)]
         llm_responses = [r for r in results if isinstance(r, LLMResponse)]
 
         print(f"✅ Stream with tools: {len(text_chunks)} text chunks, {len(llm_responses)} LLMResponse objects")
 
-        if llm_responses and llm_responses[-1].has_tool_calls:
-            print(f"✅ Tool calls detected: {llm_responses[-1].tool_calls}")
+        assert results, "stream_with_tool_detection should yield at least one item"
+        assert llm_responses, "stream should finish with an LLMResponse summary"
+
+        final_response = llm_responses[-1]
+        assert final_response.has_tool_calls, (
+            "Expected OpenRouter model to request the weather tool; "
+            f"text chunks={text_chunks!r}, final={final_response!r}"
+        )
+        tool_names = [
+            call.get("function", {}).get("name") or call.get("name")
+            for call in final_response.tool_calls
+        ]
+        assert "get_weather" in tool_names
 
 
 # =============================================================================

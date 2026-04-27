@@ -137,16 +137,18 @@ class TestVastAIConnectivity:
 
     @pytest.mark.asyncio
     async def test_list_existing_instances(self, manager):
-        """List any existing instances on the account."""
+        """List instances and verify the API response shape used by callers."""
         instances = await manager.show_instances()
 
+        assert isinstance(instances, list)
         print(f"\n[VASTAI] Found {len(instances)} existing instances:")
         for inst in instances:
+            assert isinstance(inst, dict)
+            assert "id" in inst
+            assert "actual_status" in inst or "status" in inst
             print(f"  - ID {inst.get('id')}: "
                   f"{inst.get('actual_status', 'unknown')} - "
                   f"{inst.get('gpu_name', 'Unknown GPU')}")
-
-        # This test passes regardless of instance count - just checking API works
 
 
 # =============================================================================

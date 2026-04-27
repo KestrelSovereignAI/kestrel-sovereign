@@ -9,59 +9,40 @@ test.describe('Avatar Display in Kestrel UI', () => {
         await page.goto(KESTREL_URL);
         // Wait for DOM to be ready (not networkidle - that can hang on polling pages)
         await page.waitForLoadState('domcontentloaded');
+        await page.waitForSelector('.identity-header', { timeout: 15000 });
     });
 
-    test('identity panel exists', async ({ page }) => {
-        // Identity section should exist
-        const identitySection = page.locator('.identity-card, #identity-card, [data-section="identity"]');
-        // May or may not be visible depending on UI state
-        const count = await identitySection.count();
-        expect(count).toBeGreaterThanOrEqual(0);
+    test('identity panel renders loaded identity content', async ({ page }) => {
+        const identityCard = page.locator('#identity-card');
+        await expect(identityCard).toBeVisible();
+        await expect(identityCard.locator('.identity-header')).toBeVisible();
+        await expect(identityCard.locator('#profile-name')).toBeVisible();
+        await expect(identityCard.locator('.identity-did-text')).not.toHaveText('');
     });
 
     test('avatar container has correct dimensions', async ({ page }) => {
-        // Look for avatar element
         const avatar = page.locator('.identity-avatar');
+        await expect(avatar).toBeVisible();
+        const box = await avatar.boundingBox();
 
-        if (await avatar.count() > 0) {
-            const box = await avatar.boundingBox();
-
-            if (box) {
-                // Should be roughly square (allow some tolerance)
-                expect(box.width).toBeGreaterThan(50);
-                expect(box.height).toBeGreaterThan(50);
-                // Width and height should be similar (square or near-square)
-                const ratio = box.width / box.height;
-                expect(ratio).toBeGreaterThan(0.8);
-                expect(ratio).toBeLessThan(1.2);
-            }
-        }
+        expect(box).not.toBeNull();
+        expect(box.width).toBeGreaterThan(50);
+        expect(box.height).toBeGreaterThan(50);
+        const ratio = box.width / box.height;
+        expect(ratio).toBeGreaterThan(0.8);
+        expect(ratio).toBeLessThan(1.2);
     });
 
-    test('avatar shows emoji fallback when no image', async ({ page }) => {
-        // Look for emoji fallback
-        const emojiAvatar = page.locator('.identity-avatar-emoji');
-
-        if (await emojiAvatar.count() > 0) {
-            // Should contain emoji (falcon/eagle)
-            const text = await emojiAvatar.textContent();
-            // Could be eagle emoji or other fallback
-            expect(text).toBeTruthy();
-        }
-    });
-
-    test('avatar image loads when present', async ({ page }) => {
-        // Look for avatar image
+    test('avatar image has a concrete custom or fallback source', async ({ page }) => {
         const avatarImg = page.locator('.identity-avatar-img');
+        await expect(avatarImg).toBeVisible();
 
-        if (await avatarImg.count() > 0) {
-            // Verify image src points to files endpoint
-            const src = await avatarImg.getAttribute('src');
-            expect(src).toContain('/api/files/');
+        const src = await avatarImg.getAttribute('src');
+        expect(src).toBeTruthy();
+        expect(src).toMatch(/\/api\/files\/.+|\/api\/kestrel\/companions\/.+\/avatar|data:image\/svg\+xml|\/static\/favicon\.svg/);
 
-            // Wait for image to load
-            await expect(avatarImg).toHaveAttribute('src', /\/api\/files\/.+/);
-        }
+        const loaded = await avatarImg.evaluate((img) => img.complete && img.naturalWidth > 0);
+        expect(loaded).toBe(true);
     });
 
     test('identity API returns avatar fields', async ({ page, request }) => {
@@ -115,54 +96,31 @@ test.describe('Avatar Display in Kestrel UI', () => {
 
     test('avatar styling applied correctly', async ({ page }) => {
         const avatar = page.locator('.identity-avatar');
+        await expect(avatar).toBeVisible();
+        const borderRadius = await avatar.evaluate(el =>
+            window.getComputedStyle(el).borderRadius
+        );
 
-        if (await avatar.count() > 0) {
-            // Check for rounded corners (border-radius)
-            const borderRadius = await avatar.evaluate(el =>
-                window.getComputedStyle(el).borderRadius
-            );
-
-            // Should have some border radius for rounded appearance
-            expect(borderRadius).not.toBe('0px');
-        }
+        expect(borderRadius).not.toBe('0px');
     });
 
     test('avatar container has overflow hidden', async ({ page }) => {
         const avatar = page.locator('.identity-avatar');
+        await expect(avatar).toBeVisible();
+        const overflow = await avatar.evaluate(el =>
+            window.getComputedStyle(el).overflow
+        );
 
-        if (await avatar.count() > 0) {
-            const overflow = await avatar.evaluate(el =>
-                window.getComputedStyle(el).overflow
-            );
-
-            expect(overflow).toBe('hidden');
-        }
+        expect(overflow).toBe('hidden');
     });
 
     test('avatar image uses object-fit cover', async ({ page }) => {
         const avatarImg = page.locator('.identity-avatar-img');
+        await expect(avatarImg).toBeVisible();
+        const objectFit = await avatarImg.evaluate(el =>
+            window.getComputedStyle(el).objectFit
+        );
 
-        if (await avatarImg.count() > 0) {
-            const objectFit = await avatarImg.evaluate(el =>
-                window.getComputedStyle(el).objectFit
-            );
-
-            expect(objectFit).toBe('cover');
-        }
-    });
-});
-
-test.describe('Avatar in Chat Messages', () => {
-
-    test('chat messages may include avatar', async ({ page }) => {
-        await page.goto(KESTREL_URL);
-        await page.waitForLoadState('domcontentloaded');
-
-        // Look for assistant message avatars (if implemented)
-        const messageAvatar = page.locator('.message-avatar, .assistant-avatar');
-
-        // This is optional - not all UIs show avatars in messages
-        const count = await messageAvatar.count();
-        expect(count).toBeGreaterThanOrEqual(0);
+        expect(objectFit).toBe('cover');
     });
 });
