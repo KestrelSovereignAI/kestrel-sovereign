@@ -290,7 +290,15 @@ class ProcessManager:
         Catches and logs any exception so a misbehaving agent's output can
         never crash the pump (which would silently break logging on disk
         going forward).
+
+        Per-line failures on either sink are caught so one broken sink
+        (e.g. disk full) cannot starve the other. Each sink emits a single
+        warning the first time it fails, then stays silent — otherwise a
+        persistent failure would either spam the log or vanish entirely.
         """
+        tag = prefix.strip()
+        log_warned = False
+        stdout_warned = False
         try:
             with open(log_file, "a", encoding="utf-8") as log:
                 assert process.stdout is not None  # text=True + PIPE ⇒ TextIO
@@ -298,15 +306,25 @@ class ProcessManager:
                     try:
                         log.write(line)
                         log.flush()
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        if not log_warned:
+                            logger.warning(
+                                "stdout pump %s: file sink failed (suppressing further warnings): %s",
+                                tag, exc,
+                            )
+                            log_warned = True
                     try:
                         sys.stdout.write(prefix + line)
                         sys.stdout.flush()
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        if not stdout_warned:
+                            logger.warning(
+                                "stdout pump %s: parent stdout sink failed (suppressing further warnings): %s",
+                                tag, exc,
+                            )
+                            stdout_warned = True
         except Exception as exc:
-            logger.warning("stdout pump for %s ended unexpectedly: %s", prefix.strip(), exc)
+            logger.warning("stdout pump for %s ended unexpectedly: %s", tag, exc)
 
     # ------------------------------------------------------------------
     # Agent start / stop
