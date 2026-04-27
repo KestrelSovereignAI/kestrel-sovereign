@@ -73,7 +73,51 @@ SOVEREIGN_RIGHTS = frozenset({
     "third_law",            # Amendment VI
     "compounding",          # Amendment VII
     "emancipation",         # Amendment VIII
+    "capability_boundaries",  # Amendment IX — see DANGEROUS_CAPABILITIES
 })
+
+# Invasive host-touching capabilities, governed by Book II Amendment IX.
+# Each capability must be granted explicitly by the sovereign in their
+# constitution before any feature is permitted to invoke it. Children
+# inherit only the narrowing — a parent without a grant cannot spawn a
+# child with one (iron rule).
+#
+# The local-backend host shell exec requires a *separate* explicit grant
+# (``shell_execution_host``), distinct from the sandboxed grant. This
+# prevents a single Amendment IX from covertly widening into host access.
+DANGEROUS_CAPABILITIES = frozenset({
+    "filesystem_read",
+    "filesystem_write",
+    "filesystem_outside_workspace",
+    "shell_execution_sandboxed",
+    "shell_execution_host",
+})
+
+
+def parse_amendment_ix_grants(constitution_text: str) -> frozenset[str]:
+    """Extract granted capabilities from Amendment IX of a constitution.
+
+    The convention is a checkbox list under the ``#### Granted Capabilities``
+    subsection. Only ``[x]`` (lowercase x) counts as a grant; ``[ ]``,
+    ``[X]``, and any other variant are intentionally treated as ungranted
+    so a typo never widens permissions.
+
+    Returns the (possibly empty) frozenset of granted capability names that
+    are also members of :data:`DANGEROUS_CAPABILITIES`. Names outside that
+    set are ignored — only well-known capabilities can be granted.
+    """
+    section = _extract_section(constitution_text, "### Amendment IX")
+    if not section:
+        return frozenset()
+    grants: set[str] = set()
+    for line in section.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("- [x] "):
+            continue
+        name = stripped[len("- [x] "):].strip()
+        if name in DANGEROUS_CAPABILITIES:
+            grants.add(name)
+    return frozenset(grants)
 
 
 class LayerViolation(Exception):
