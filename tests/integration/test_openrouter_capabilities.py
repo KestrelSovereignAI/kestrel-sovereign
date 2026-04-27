@@ -553,11 +553,11 @@ class TestOpenRouterViaLLMService:
             "Expected OpenRouter model to request the weather tool; "
             f"text chunks={text_chunks!r}, final={final_response!r}"
         )
-        tool_names = [
-            call.get("function", {}).get("name") or call.get("name")
-            for call in final_response.tool_calls
-        ]
-        assert "get_weather" in tool_names
+        # final_response.tool_calls is List[ToolCall] (dataclass with .name).
+        tool_names = [getattr(call, "name", None) for call in final_response.tool_calls]
+        assert "get_weather" in tool_names, (
+            f"Expected get_weather in tool_calls, got {tool_names!r}"
+        )
 
 
 # =============================================================================
@@ -575,44 +575,50 @@ class TestOpenRouterModelComparison:
     ])
     @pytest.mark.asyncio
     async def test_tool_calling_by_model(self, model: str):
-        """Test tool calling works across different models."""
+        """Each compared model MUST emit a get_weather tool call.
+
+        Quota / rate-limit responses (402, 429) skip via
+        ``check_openrouter_response``; any other non-2xx is a real failure.
+        """
         import httpx
 
         async with httpx.AsyncClient() as client:
-            try:
-                response = await client.post(
-                    "https://openrouter.ai/api/v1/chat/completions",
-                    headers={
-                        "Authorization": f"Bearer {os.getenv('OPENROUTER_API_KEY')}",
-                        "Content-Type": "application/json",
-                    },
-                    json={
-                        "model": model,
-                        "messages": [
-                            {"role": "system", "content": "Use the get_weather tool for weather questions."},
-                            {"role": "user", "content": "What's the weather in Seattle?"}
-                        ],
-                        "tools": SAMPLE_TOOLS,
-                        "tool_choice": "auto",
-                        "max_tokens": 200,
-                    },
-                    timeout=60.0,
-                )
+            response = await client.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {os.getenv('OPENROUTER_API_KEY')}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": model,
+                    "messages": [
+                        {"role": "system", "content": "Use the get_weather tool for weather questions."},
+                        {"role": "user", "content": "What's the weather in Seattle? Use the weather tool."}
+                    ],
+                    "tools": SAMPLE_TOOLS,
+                    "tool_choice": "auto",
+                    "max_tokens": 200,
+                },
+                timeout=60.0,
+            )
 
-                if response.status_code != 200:
-                    print(f"⚠️ {model}: HTTP {response.status_code}")
-                    return
+        check_openrouter_response(response)
 
-                data = response.json()
-                message = data["choices"][0]["message"]
+        data = response.json()
+        message = data["choices"][0]["message"]
+        tool_calls = message.get("tool_calls") or []
 
-                if message.get("tool_calls"):
-                    print(f"✅ {model}: Used tool calling")
-                else:
-                    print(f"⚠️ {model}: No tool calls, responded with text")
+        assert tool_calls, (
+            f"{model} did not emit any tool_calls; message={message!r}"
+        )
 
-            except Exception as e:
-                print(f"⚠️ {model}: Error - {e}")
+        names = [
+            (call.get("function", {}) or {}).get("name") or call.get("name")
+            for call in tool_calls
+        ]
+        assert "get_weather" in names, (
+            f"{model} called tools {names!r} but not get_weather"
+        )
 
 
 if __name__ == "__main__":
