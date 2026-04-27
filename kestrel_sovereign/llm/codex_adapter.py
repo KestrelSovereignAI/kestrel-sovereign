@@ -107,6 +107,86 @@ def _convert_tools_to_responses_format(tools):
     return responses_tools or None
 
 
+def _content_to_text(content: Any) -> str:
+    """Coerce Chat-Completions content (str | list of parts | None) to plain text.
+
+    Image and other non-text parts are dropped. Vision support on the Responses
+    API uses different part-type names (``input_text`` / ``input_image``); a
+    follow-up will add proper conversion when a vision-capable Codex test case
+    exists. See #828 non-goals.
+    """
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for p in content:
+            if isinstance(p, dict) and p.get("type") == "text":
+                parts.append(p.get("text", ""))
+        return "".join(parts)
+    return str(content)
+
+
+def _convert_messages_to_responses_format(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Convert Chat-Completions-style messages into Responses API input items.
+
+    The Responses API accepts a flat list of typed items rather than role-tagged
+    messages. The orchestrator (``OrchestratorEngineMixin._handle_orchestrator_response``)
+    builds messages in Chat Completions format, which is the right normalized
+    shape for a provider-agnostic agent loop. Adapter-side translation keeps
+    the orchestrator clean.
+
+    Rewriting rules:
+    - ``role=user`` and ``role=assistant`` text turns pass through with content
+      coerced to a plain string.
+    - ``role=assistant`` with ``tool_calls`` is replaced by one
+      ``{"type": "function_call", "call_id", "name", "arguments"}`` item per
+      tool call. If the assistant message also carried text content, a
+      sibling ``{"role": "assistant", "content": ...}`` is emitted first.
+    - ``role=tool`` becomes ``{"type": "function_call_output", "call_id", "output"}``.
+    - Unknown roles pass through unchanged so we don't silently swallow
+      future shapes.
+
+    Fixes #828: the Responses API rejects ``input[*].tool_calls`` and
+    ``role=tool`` with ``Unknown parameter`` errors.
+    """
+    items: List[Dict[str, Any]] = []
+    for msg in messages:
+        role = msg.get("role")
+        if role == "user":
+            items.append({"role": "user", "content": _content_to_text(msg.get("content"))})
+        elif role == "assistant":
+            tool_calls = msg.get("tool_calls") or []
+            text = _content_to_text(msg.get("content"))
+            if text:
+                items.append({"role": "assistant", "content": text})
+            for tc in tool_calls:
+                fn = tc.get("function") or {}
+                args = fn.get("arguments", "")
+                if not isinstance(args, str):
+                    args = json.dumps(args)
+                items.append({
+                    "type": "function_call",
+                    "call_id": tc.get("id", ""),
+                    "name": fn.get("name", ""),
+                    "arguments": args,
+                })
+            if not tool_calls and not text:
+                # Empty assistant message — drop. The Responses API rejects
+                # bare assistant items with no content and no function_call.
+                continue
+        elif role == "tool":
+            items.append({
+                "type": "function_call_output",
+                "call_id": msg.get("tool_call_id", ""),
+                "output": _content_to_text(msg.get("content")),
+            })
+        else:
+            items.append(msg)
+    return items
+
+
 def _build_request_body(
     model: str,
     input_messages: list,
@@ -316,6 +396,12 @@ class CodexAdapter(LLMAdapter):
         prev_response_id, input_to_send, signature = self._plan_request_continuation(
             session_id, instructions, responses_tools, input_messages,
         )
+        # Translate Chat-Completions tool_calls / role=tool messages into
+        # Responses-API ``function_call`` / ``function_call_output`` items.
+        # Done *after* the continuation slice so the watermark
+        # (``last_message_count``) continues to track the original
+        # Chat-Completions count we slice on. #828.
+        input_to_send = _convert_messages_to_responses_format(input_to_send)
 
         body = _build_request_body(
             model=model,
@@ -437,6 +523,7 @@ class CodexAdapter(LLMAdapter):
         prev_response_id, input_to_send, signature = self._plan_request_continuation(
             session_id, instructions, None, input_messages,
         )
+        input_to_send = _convert_messages_to_responses_format(input_to_send)  # #828
 
         body = _build_request_body(
             model=model,
@@ -501,6 +588,7 @@ class CodexAdapter(LLMAdapter):
         prev_response_id, input_to_send, signature = self._plan_request_continuation(
             session_id, instructions, responses_tools, input_messages,
         )
+        input_to_send = _convert_messages_to_responses_format(input_to_send)  # #828
 
         body = _build_request_body(
             model=model,
