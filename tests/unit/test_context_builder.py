@@ -382,9 +382,20 @@ class TestContextBuilderIntegration:
             # Critical: Close storage to terminate aiosqlite background thread
             await storage.close()
 
-    def test_build_rag_context_needs_async_migration(self):
-        """Test build_rag_context needs async migration."""
-        # Note: build_rag_context is still sync but will fail with async storage
-        # This test verifies the behavior when called incorrectly
-        # For now, skip as build_rag_context needs async migration
-        pytest.skip("build_rag_context needs async migration")
+    @pytest.mark.asyncio
+    async def test_build_rag_context_is_async(self, tmp_path):
+        """Async migration of build_rag_context is complete: it must accept
+        an AsyncStorage and be awaitable end-to-end."""
+        from kestrel_sovereign.storage import AsyncStorage
+
+        db_path = tmp_path / "rag.db"
+        storage = AsyncStorage(str(db_path))
+        await storage.initialize()
+
+        try:
+            builder = ContextBuilder(storage)
+            result = await builder.build_rag_context("anything")
+            # Empty storage → no chunks → None (per build_rag_context contract).
+            assert result is None
+        finally:
+            await storage.close()
