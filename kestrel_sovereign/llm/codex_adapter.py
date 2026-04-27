@@ -475,8 +475,19 @@ class CodexAdapter(LLMAdapter):
                         item = event.get("item", {})
                         if item.get("type") == "function_call":
                             idx = event.get("output_index", 0)
+                            # Capture ``call_id`` (the tool-call id used by
+                            # function_call_output to match against), NOT the
+                            # output-item ``id``. Live capture (#857) shows
+                            # both fields are present on this event. The
+                            # Responses API matches function_call ↔
+                            # function_call_output by ``call_id``; using
+                            # ``id`` produces 400 ""No tool output found""
+                            # on the replay path because the cached
+                            # function_call carries the real ``call_id`` and
+                            # the orchestrator's tool_call_id (set from this
+                            # ToolCall.id) carried the wrong field.
                             func_calls[idx] = {
-                                "id": item.get("id", ""),
+                                "id": item.get("call_id") or item.get("id", ""),
                                 "name": item.get("name", ""),
                                 "arguments": "",
                             }
@@ -685,8 +696,19 @@ class CodexAdapter(LLMAdapter):
                         item = event.get("item", {})
                         if item.get("type") == "function_call":
                             idx = event.get("output_index", 0)
+                            # Capture ``call_id`` (the tool-call id used by
+                            # function_call_output to match against), NOT the
+                            # output-item ``id``. Live capture (#857) shows
+                            # both fields are present on this event. The
+                            # Responses API matches function_call ↔
+                            # function_call_output by ``call_id``; using
+                            # ``id`` produces 400 ""No tool output found""
+                            # on the replay path because the cached
+                            # function_call carries the real ``call_id`` and
+                            # the orchestrator's tool_call_id (set from this
+                            # ToolCall.id) carried the wrong field.
                             func_calls[idx] = {
-                                "id": item.get("id", ""),
+                                "id": item.get("call_id") or item.get("id", ""),
                                 "name": item.get("name", ""),
                                 "arguments": "",
                             }

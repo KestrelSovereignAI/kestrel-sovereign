@@ -227,16 +227,70 @@ class TestCodexCursorRecordingE2E:
         # while the adapter wrote to its own store.
         assert external_store.get("openai_plan", "conv-X") is not None
 
+    async def test_adapter_extracts_call_id_not_item_id(self):
+        # #857 regression: the Responses API ships function_call items with
+        # both ``id`` (output-item id, ``fc_...``) and ``call_id`` (tool-call
+        # id, ``call_...``). The latter is what function_call_output uses to
+        # match. The adapter must expose ``call_id`` as ``ToolCall.id`` so
+        # the orchestrator's downstream tool_call_id round-trips correctly.
+        captured: List[Dict[str, Any]] = []
+        sse = _sse([
+            {
+                "type": "response.output_item.added",
+                "item": {
+                    "type": "function_call",
+                    "id": "fc_OUTPUTITEM",
+                    "call_id": "call_TOOLID",
+                    "name": "some_tool",
+                },
+                "output_index": 0,
+            },
+            {
+                "type": "response.function_call_arguments.done",
+                "output_index": 0,
+                "arguments": "{}",
+            },
+            _completed_event("resp_T1"),
+        ])
+        adapter = CodexAdapter(continuation_store=InMemoryContinuationStore())
+        with _patch_httpx_with(captured, sse):
+            resp = await adapter.get_response(
+                client=_fake_token(),
+                model="gpt-5.5",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+        assert resp.tool_calls is not None and len(resp.tool_calls) == 1
+        # Pre-#857: ``fc_OUTPUTITEM``. Post-fix: ``call_TOOLID``.
+        assert resp.tool_calls[0].id == "call_TOOLID"
+
     async def test_reasoning_items_captured_and_replayed_on_next_turn(self):
-        # #842: turn 1 emits reasoning + function_call output items. Adapter
-        # records them on the cursor. Turn 2 must replay them as input items
-        # in their original order so the model sees the encrypted chain-of-
-        # thought from turn 1 alongside the new tool result.
+        # #842 + #857: full realistic round trip. T1 emits a function_call
+        # with distinct ``id`` and ``call_id`` fields; T2 builds the
+        # orchestrator-style follow-up using the EXACT id the adapter
+        # exposed (no synthesis). The body sent on T2 must have matching
+        # call_ids on the replayed function_call and the synthesized
+        # function_call_output — that's the invariant the live wire enforces
+        # (mismatch ⇒ 400 ""No tool output found"").
         captured: List[Dict[str, Any]] = []
         adapter = CodexAdapter(continuation_store=InMemoryContinuationStore())
 
-        # Turn 1 SSE: reasoning + function_call
+        # T1: backend emits a function_call output item.
         sse1 = _sse([
+            {
+                "type": "response.output_item.added",
+                "item": {
+                    "type": "function_call",
+                    "id": "fc_OUTPUT",
+                    "call_id": "call_TOOL",
+                    "name": "model_agent",
+                },
+                "output_index": 0,
+            },
+            {
+                "type": "response.function_call_arguments.done",
+                "output_index": 0,
+                "arguments": "{}",
+            },
             {
                 "type": "response.output_item.done",
                 "item": {
@@ -250,8 +304,8 @@ class TestCodexCursorRecordingE2E:
                 "type": "response.output_item.done",
                 "item": {
                     "type": "function_call",
-                    "id": "fc_T1",
-                    "call_id": "call_xyz",
+                    "id": "fc_OUTPUT",
+                    "call_id": "call_TOOL",
                     "name": "model_agent",
                     "arguments": "{}",
                 },
@@ -259,7 +313,7 @@ class TestCodexCursorRecordingE2E:
             _completed_event("resp_T1"),
         ])
         with _patch_httpx_with(captured, sse1):
-            await adapter.get_response(
+            resp_t1 = await adapter.get_response(
                 client=_fake_token(),
                 model="gpt-5.5",
                 messages=[
@@ -269,16 +323,17 @@ class TestCodexCursorRecordingE2E:
                 session_id="conv-replay",
             )
 
+        # The id we expose to the orchestrator is the one used to build the
+        # NEXT turn's tool_call_id. It must be the API's ``call_id``.
+        assert resp_t1.tool_calls[0].id == "call_TOOL"
+
         cursor = adapter._continuation_store.get("openai_plan", "conv-replay")
-        assert cursor.turn_outputs and len(cursor.turn_outputs) == 1
         cached = json.loads(cursor.turn_outputs[0])
         assert [item["type"] for item in cached] == ["reasoning", "function_call"]
-        assert cached[0]["encrypted_content"] == "ENC_T1"
-        assert cached[1]["call_id"] == "call_xyz"
+        assert cached[1]["call_id"] == "call_TOOL"
 
-        # Turn 2: orchestrator-style follow-up. The converter must replay the
-        # cached reasoning + function_call instead of re-emitting a fresh
-        # function_call from the assistant.tool_calls message.
+        # T2: orchestrator-style follow-up using the EXACT id from resp_t1
+        # (no hardcoded synthesis — this is the production round trip).
         captured.clear()
         sse2 = _sse([
             {"type": "response.output_text.delta", "delta": "ack"},
@@ -288,6 +343,7 @@ class TestCodexCursorRecordingE2E:
             },
             _completed_event("resp_T2"),
         ])
+        tc_id = resp_t1.tool_calls[0].id  # what the orchestrator would use
         with _patch_httpx_with(captured, sse2):
             await adapter.get_response(
                 client=_fake_token(),
@@ -299,26 +355,31 @@ class TestCodexCursorRecordingE2E:
                         "role": "assistant",
                         "content": "",
                         "tool_calls": [{
-                            "id": "call_xyz",
+                            "id": tc_id,
                             "type": "function",
                             "function": {"name": "model_agent", "arguments": "{}"},
                         }],
                     },
-                    {"role": "tool", "tool_call_id": "call_xyz", "content": "gpt-5.5"},
+                    {"role": "tool", "tool_call_id": tc_id, "content": "gpt-5.5"},
                 ],
                 session_id="conv-replay",
             )
 
         body = captured[0]
-        # Replayed reasoning + function_call appear in the input list.
         types = [item.get("type") or item.get("role") for item in body["input"]]
         assert types == ["user", "reasoning", "function_call", "function_call_output"]
+        # Replayed reasoning rides along verbatim.
         assert body["input"][1]["encrypted_content"] == "ENC_T1"
-        assert body["input"][1]["id"] == "rs_T1"
-        # Replayed function_call carries the ORIGINAL id (fc_T1), not a
-        # synthesized one from the orchestrator's tool_calls field.
-        assert body["input"][2]["id"] == "fc_T1"
-        assert body["input"][2]["call_id"] == "call_xyz"
+        # The strict invariant: function_call.call_id MUST match
+        # function_call_output.call_id. This is what the wire enforces.
+        # Pre-#857 this assertion failed because the orchestrator's
+        # tool_call_id was the wrong field.
+        fc_call_id = body["input"][2]["call_id"]
+        fco_call_id = body["input"][3]["call_id"]
+        assert fc_call_id == fco_call_id == "call_TOOL", (
+            f"function_call.call_id={fc_call_id!r} must match "
+            f"function_call_output.call_id={fco_call_id!r}"
+        )
 
     async def test_signature_drift_drops_cached_reasoning(self):
         # If instructions or tools change mid-conversation, cached reasoning
