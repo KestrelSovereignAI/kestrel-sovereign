@@ -152,6 +152,40 @@ class ModelSelector {
     }
 
     /**
+     * Resolve the server's seed selection (vendor / route / model) from the
+     * /api/models response. Prefers the canonical ``default`` model id; falls
+     * back to the first priority-ordered route entry. Returns null when the
+     * payload lacks the data needed to seed.
+     */
+    _serverDefaultSelection() {
+        const data = this.allModelsData;
+        if (!data) return null;
+        const buckets = data.by_vendor || {};
+        const routes = data.routes || [];
+
+        const defaultId = data.default;
+        if (defaultId) {
+            for (const [vendor, models] of Object.entries(buckets)) {
+                if (models.some(m => m.id === defaultId)) {
+                    const r = routes.find(x => x.vendor === vendor && x.model === defaultId)
+                        || routes.find(x => x.vendor === vendor);
+                    return { vendor, model: defaultId, route: r?.route || null };
+                }
+            }
+        }
+        // Priority-ordered routes are how the server signals fallback intent.
+        for (const r of routes) {
+            if (r.vendor && buckets[r.vendor]) {
+                const model = (r.model && buckets[r.vendor].some(m => m.id === r.model))
+                    ? r.model
+                    : null;
+                return { vendor: r.vendor, model, route: r.route || null };
+            }
+        }
+        return null;
+    }
+
+    /**
      * Populate vendor dropdown
      */
     _populateProviders() {
@@ -170,12 +204,22 @@ class ModelSelector {
             return `<option value="${v}">${displayName} (${count})</option>`;
         }).join('');
 
-        // Restore saved vendor or use first.
+        // Seed order: localStorage > server default > alphabetical.
+        // Alphabetical alone is wrong — it favors "anthropic" or "gpt-3.5-turbo"
+        // simply because they sort first, ignoring the server's actual routing.
         if (this.selectedProvider && vendors.includes(this.selectedProvider)) {
             this.providerSelect.value = this.selectedProvider;
-        } else if (vendors.length > 0) {
-            this.providerSelect.value = vendors[0];
-            this.selectedProvider = vendors[0];
+        } else {
+            const seed = this._serverDefaultSelection();
+            if (seed && vendors.includes(seed.vendor)) {
+                this.providerSelect.value = seed.vendor;
+                this.selectedProvider = seed.vendor;
+                if (!this.selectedRoute && seed.route) this.selectedRoute = seed.route;
+                if (!this.selectedModel && seed.model) this.selectedModel = seed.model;
+            } else if (vendors.length > 0) {
+                this.providerSelect.value = vendors[0];
+                this.selectedProvider = vendors[0];
+            }
         }
 
         this._populateRoutes();
@@ -248,13 +292,18 @@ class ModelSelector {
             return `<option value="${m.id}">${star}${displayName}</option>`;
         }).join('');
 
-        // Restore saved model if it belongs to this provider
+        // Seed order: saved model > server default > alphabetical first.
         if (this.selectedModel && models.some(m => m.id === this.selectedModel)) {
             this.modelSelect.value = this.selectedModel;
         } else if (models.length > 0) {
-            // Select first model if no saved model for this provider
-            this.modelSelect.value = models[0].id;
-            this.selectedModel = models[0].id;
+            const defaultId = this.allModelsData?.default;
+            if (defaultId && models.some(m => m.id === defaultId)) {
+                this.modelSelect.value = defaultId;
+                this.selectedModel = defaultId;
+            } else {
+                this.modelSelect.value = models[0].id;
+                this.selectedModel = models[0].id;
+            }
         }
     }
 

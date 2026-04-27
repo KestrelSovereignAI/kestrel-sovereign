@@ -11,8 +11,15 @@ from kestrel_sovereign.llm.model_metadata import ModelCategory, ModelInfo
 
 
 def _numeric_rank(text: str, max_parts: int = 4) -> tuple[int, ...]:
-    """Return descending-sort numeric rank while ignoring date suffixes."""
-    without_dates = re.sub(r"20\d{6}", "", text)
+    """Return descending-sort numeric rank while ignoring date suffixes.
+
+    Strips contiguous (``20251215``), dashed (``2025-12-15``), underscored,
+    and space-separated (``2025 12 15``) ISO dates. The space form shows up
+    when display names normalize an id like ``gpt-audio-mini-2025-12-15``
+    into ``"Gpt Audio Mini 2025 12 15"`` — without stripping it, the ``2025``
+    leaks in as a huge number and outranks the actual model version.
+    """
+    without_dates = re.sub(r"20\d{2}[-_\s]?\d{2}[-_\s]?\d{2}", "", text)
     numbers = [int(part) for part in re.findall(r"\d+", without_dates)]
     padded = (numbers + [0] * max_parts)[:max_parts]
     return tuple(-number for number in padded)
@@ -34,10 +41,13 @@ def _rank_cached_candidates(models: list[ModelInfo]) -> list[ModelInfo]:
             token in model_lower or token in display_lower
             for token in ("preview", "beta", "experimental", "exp")
         )
+        # Rank on the canonical id, not the formatted display_name. display_name
+        # rewrites separators (e.g. ``"Gpt 5.4 Mini 2026 03 17"``) which made
+        # the legacy date-stripping regex miss embedded dates.
         return (
             not model.supports_tools,
             previewish,
-            _numeric_rank(model.display_name or model.id),
+            _numeric_rank(model.id),
             _created_rank(model.created_at),
             not model.is_featured,
             model.id.lower(),

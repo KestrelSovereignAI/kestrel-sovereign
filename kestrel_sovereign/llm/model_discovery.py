@@ -196,34 +196,16 @@ class ModelDiscoveryMixin:
     def _rank_auto_candidates(self, models: list[ModelInfo]) -> list[ModelInfo]:
         """Rank candidate models for auto-selection.
 
-        Prefers:
-        - tool-capable chat models
-        - non-preview / non-experimental IDs
-        - newer creation timestamps when available
-        - stable lexical order as final tie-break
+        Delegates to the canonical ranker in ``model_selection`` so startup
+        auto-resolution and per-agent default resolution agree on order.
+        Previously this used ``datetime.fromisoformat(created_at)`` — but
+        ``created_at`` is stored as a Unix-timestamp integer, the parse
+        fails, and the function fell through to alphabetical (``gpt-4.1-mini``
+        beating ``gpt-5.4-mini`` by ASCII order). Sharing the ranker keeps
+        any future fixes in one place.
         """
-        def created_sort_key(model: ModelInfo) -> float:
-            created_at = model.created_at
-            if not created_at:
-                return 0.0
-            try:
-                return datetime.fromisoformat(created_at.replace("Z", "+00:00")).timestamp()
-            except Exception:
-                return 0.0
-
-        def sort_key(model: ModelInfo):
-            model_lower = model.id.lower()
-            display_lower = (model.display_name or "").lower()
-            is_preview = any(token in model_lower or token in display_lower for token in ("preview", "beta", "experimental", "exp"))
-            return (
-                0 if model.supports_tools else 1,
-                0 if not is_preview else 1,
-                -created_sort_key(model),
-                display_lower or model_lower,
-                model_lower,
-            )
-
-        return sorted(models, key=sort_key)
+        from .model_selection import _rank_cached_candidates
+        return _rank_cached_candidates(models)
 
     def _load_from_disk_cache(self) -> bool:
         """Load models from disk cache into the shared process-wide cache.
