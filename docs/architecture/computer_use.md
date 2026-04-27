@@ -2,9 +2,9 @@
 
 Optional capability that lets a sovereign agent read, list, write, and edit files on the user's machine and run shell commands. Disabled by default. Enabling it requires three independent actions — and even then, every tool call is gated.
 
-## The five-stage gate sequence
+## The gate sequence
 
-Every tool call runs through the same sequence. The audit log records every stage that passed and the stage that refused (if any) as a chain like `["privacy", "constitution", "path_safety", "policy", "approval:once:human"]`.
+Every tool call runs through the same sequence. The audit log records every stage that passed and the stage that refused (if any) as a chain like `["privacy", "constitution", "path_safety", "policy", "input_validation", "approval:once:human"]`.
 
 | # | Stage | Where it lives | What enables it |
 |---|---|---|---|
@@ -13,11 +13,15 @@ Every tool call runs through the same sequence. The audit log records every stag
 | 3 | **Constitution** | Book II Amendment IX | The agent's constitution markdown contains a `### Amendment IX` section with `[x]` checked next to the capability name. Parser is strict: only lowercase `[x]` counts. |
 | 4 | **Path safety** | `path_safety.resolve_realpath` | Reject `..` traversal and embedded NUL bytes. Symlinks are *resolved*, not rejected — the realpath is what the human approver later sees. |
 | 5 | **Policy** | `PathPolicy.evaluate` / `BinaryPolicy.evaluate` | Allow-list / deny-list. Deny-list always wins. Allow-list match → `ALLOW` (read with `auto_approve_read`) or `REQUIRE_APPROVAL` (write). No match → `REQUIRE_APPROVAL` so the human can vouch. |
-| 6 | **Approval** | `SecurityFeature.approval_queue` | A human approves the per-call request inside the approval timeout (default 5 min). |
+| 6 | **Input validation** *(optional)* | A tool's `pre_approval` hook on `_run_gates` | Tools that need to touch the file before approval (diff previews for `fs-write`, occurrence-finding for `fs-edit`) do that work here. **All file I/O for `fs-write` and `fs-edit` happens inside this stage** so an unauthorized caller never triggers a read. Refusals raise `_PreApprovalRefusal` and are audited. |
+| 7 | **Approval** | `SecurityFeature.approval_queue` | A human approves the per-call request inside the approval timeout (default 5 min). |
 
-Privacy and constitution come first because they're call-level and input-independent — they decide whether the call is *eligible* at all, without leaking anything about path layout or policy contents. Path-safety and policy are input validation; they only matter once the call is eligible.
+Privacy and constitution come first because they're call-level and input-independent — they decide whether the call is *eligible* at all, without leaking anything about path layout or policy contents. Path-safety and policy are input validation on the path itself; input-validation is content-dependent validation on the file (diff, encoding, substring presence) and only runs after path is authorized.
 
-A side effect of this order: a missing constitutional grant always surfaces as `constitution:Amendment IX missing grant 'X'`, never as `path_safety:...` or `policy:...`. A probing agent can't map your allow-list before it has a grant.
+Two side effects of this order:
+
+- A missing constitutional grant always surfaces as `constitution:Amendment IX missing grant 'X'`, never as `path_safety:...`, `policy:...`, or `input_validation:...`. A probing agent can't map your allow-list, your symlink targets, or whether a substring exists in a file before it has a grant.
+- The `fs-edit` substring oracle (which would let an unauthorized agent confirm "is `password=hunter2` in this file?" via the difference between "old_text not found" and other errors) is closed: every gate failure before stage 6 returns the same constitution/privacy/policy error regardless of file contents.
 
 ## Backends
 
@@ -84,7 +88,9 @@ Denials append `denied:<stage>` to `allowed_by` and set `outcome="denied"`:
 {"allowed_by": ["privacy", "denied:constitution"], "outcome": "denied"}
 {"allowed_by": ["privacy", "constitution", "denied:path_safety"], "outcome": "denied", "error": "..."}
 {"allowed_by": ["privacy", "constitution", "path_safety", "denied:policy"], "outcome": "denied"}
-{"allowed_by": ["privacy", "constitution", "path_safety", "policy", "denied:approval:denied"], "outcome": "denied"}
+{"allowed_by": ["privacy", "constitution", "path_safety", "policy", "denied:input_validation:encoding"], "outcome": "denied"}
+{"allowed_by": ["privacy", "constitution", "path_safety", "policy", "denied:input_validation:missing_text"], "outcome": "denied"}
+{"allowed_by": ["privacy", "constitution", "path_safety", "policy", "input_validation", "denied:approval:denied"], "outcome": "denied"}
 ```
 
 Reading those rows back is the canonical way to reconstruct what happened.
@@ -99,6 +105,7 @@ Reading those rows back is the canonical way to reconstruct what happened.
 - **Accidental host shell exec** — the `docker` backend is the default and reuses the compute feature's vetted container flags. Choosing `local` requires a *separate* constitutional grant.
 - **Silent capability widening** — adding a capability requires editing the constitution, which changes its hash, which changes the agent's identity record. There is no way to enable this feature without that change being visible in the inception/continuity audit.
 - **Information disclosure via gate ordering** — privacy and constitution stages run before any input is examined. An agent without a constitutional grant cannot probe path layout or policy contents through error messages.
+- **Pre-gate file I/O leak** — `fs-write` and `fs-edit` defer all file reads (existence checks, size, encoding, substring search, diff preview) into a `pre_approval` hook that runs only after privacy/constitution/path-safety/policy authorize the call. An unauthorized caller cannot use these tools as an oracle to probe file existence, readability, encoding, or substring presence.
 
 **What this does *not* mitigate:**
 
