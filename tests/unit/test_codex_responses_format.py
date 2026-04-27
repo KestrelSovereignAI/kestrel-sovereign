@@ -112,13 +112,27 @@ class TestContentToText:
         parts = [{"type": "text", "text": "hello "}, {"type": "text", "text": "world"}]
         assert _content_to_text(parts) == "hello world"
 
-    def test_non_text_parts_dropped(self):
-        # Image parts are dropped — vision support deferred (#828 non-goal).
+    def test_non_text_parts_dropped_with_warning(self, caplog):
+        # Image parts are dropped — vision support deferred (#845). The drop
+        # logs a warning so the gap is visible in production logs rather than
+        # silently producing text-only output.
         parts = [
             {"type": "text", "text": "describe this:"},
             {"type": "image_url", "image_url": {"url": "data:..."}},
         ]
-        assert _content_to_text(parts) == "describe this:"
+        with caplog.at_level("WARNING"):
+            assert _content_to_text(parts) == "describe this:"
+        assert any(
+            "image_url" in rec.getMessage() for rec in caplog.records
+        ), f"expected a warning naming the dropped part type; got {caplog.records}"
+
+    def test_unsupported_content_type_raises(self):
+        # Anything other than str/list/None is a programmer error — fail at
+        # the adapter boundary, don't try to coerce.
+        with pytest.raises(TypeError, match="unsupported content type"):
+            _content_to_text({"weird": "shape"})
+        with pytest.raises(TypeError, match="unsupported content type"):
+            _content_to_text(42)
 
     def test_empty_list_becomes_empty(self):
         assert _content_to_text([]) == ""
@@ -266,12 +280,14 @@ class TestConvertMessagesToResponsesFormat:
         ])
         assert out == [{"role": "user", "content": "hi"}]
 
-    def test_unknown_role_passes_through(self):
-        # Forward-compat: don't silently swallow shapes we haven't accounted for.
-        out = _convert_messages_to_responses_format([
-            {"role": "developer", "content": "stay terse"},
-        ])
-        assert out == [{"role": "developer", "content": "stay terse"}]
+    def test_unknown_role_raises_at_adapter_boundary(self):
+        # Don't forward unknown roles — the server returns an opaque 400
+        # post-network. Fail fast with a clear local error naming the role
+        # so the offending caller is obvious in the traceback.
+        with pytest.raises(ValueError, match="unsupported message role 'developer'"):
+            _convert_messages_to_responses_format([
+                {"role": "developer", "content": "stay terse"},
+            ])
 
     def test_does_not_mutate_input(self):
         msgs = [
