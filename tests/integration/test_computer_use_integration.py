@@ -238,7 +238,7 @@ async def test_local_backend_refuses_without_host_grant(workspace: Path, securit
     assert feature._backend is None
     result = await feature.fs_read(path=str(workspace / "ok.txt"))
     assert result["success"] is False
-    assert "backend failed" in result["error"]
+    assert result["error"].startswith("readiness:")
 
 
 # =============================================================================
@@ -397,11 +397,21 @@ async def test_shell_denied_binary_hard_rejects(
 
 
 @pytest.mark.asyncio
-async def test_symlink_escape_is_rejected(workspace: Path, security_feature: SecurityFeature):
-    """A symlink inside the workspace pointing outside must be refused."""
+async def test_symlink_resolves_to_realpath_for_human_approver(
+    workspace: Path, security_feature: SecurityFeature
+):
+    """A symlink resolves to the realpath BEFORE the human sees it.
+
+    The real defense against symlink-escape attacks is that the human
+    approver is shown the resolved realpath, not the symlink path. If
+    the realpath is outside the allow-list (and not on the deny-list),
+    policy returns REQUIRE_APPROVAL and the human can refuse — and the
+    approval payload contains the *real* target.
+    """
     target_outside = workspace.parent / "outside_target_for_symlink_test"
     target_outside.mkdir(exist_ok=True)
-    (target_outside / "secret_in_outside.txt").write_text("escaped")
+    secret = target_outside / "secret_in_outside.txt"
+    secret.write_text("escaped")
     link = workspace / "trap_link"
     if not link.exists():
         os.symlink(target_outside, link)
@@ -416,10 +426,45 @@ async def test_symlink_escape_is_rejected(workspace: Path, security_feature: Sec
         },
         security_feature=security_feature,
     )
-    result = await feature.fs_read(path=str(workspace / "trap_link" / "secret_in_outside.txt"))
+
+    # Capture what the approval queue sees, then deny.
+    captured_args: dict[str, object] = {}
+
+    class _CapturingResponder(_ApprovalResponder):
+        async def _run(self) -> None:
+            while not self._stop.is_set():
+                for req in list(self._security.approval_queue.pending_requests):
+                    captured_args.update(req.tool_args)
+                    self._security.approval_queue.submit_decision(
+                        req.id, self._decision, self._scope
+                    )
+                    self.responded_count += 1
+                try:
+                    await asyncio.wait_for(self._stop.wait(), timeout=0.05)
+                except asyncio.TimeoutError:
+                    continue
+
+    async with _CapturingResponder(security_feature, decision=False):
+        result = await feature.fs_read(
+            path=str(workspace / "trap_link" / "secret_in_outside.txt")
+        )
+
     assert result["success"] is False
-    # path_safety raises before the policy layer is consulted
-    assert result["error"].startswith("path_safety")
+    assert result["error"].startswith("approval")
+    # The human approver was shown the resolved realpath, not the symlink path.
+    real_target = os.path.realpath(secret)
+    assert captured_args.get("path") == real_target
+
+    # Audit row reflects the same: privacy/constitution/path_safety/policy passed,
+    # approval denied. Both the resolved path and the original raw path are recorded.
+    audit = _read_audit(workspace / "audit.jsonl")
+    last = audit[-1]
+    assert last["outcome"] == "denied"
+    assert any(s.startswith("denied:approval") for s in last["allowed_by"])
+    assert "privacy" in last["allowed_by"]
+    assert "constitution" in last["allowed_by"]
+    assert "path_safety" in last["allowed_by"]
+    assert last["args"]["path"] == real_target
 
 
 # =============================================================================
@@ -448,8 +493,8 @@ async def test_audit_log_records_full_chain(workspace: Path, security_feature: S
     audit = _read_audit(workspace / "audit.jsonl")
     assert len(audit) == 3
     assert [r["tool"] for r in audit] == ["fs-read", "fs-write", "shell"]
-    # Read auto-approves -> only privacy + constitution in chain
-    assert audit[0]["allowed_by"] == ["privacy", "constitution"]
+    # Read auto-approves -> chain has privacy/constitution/path_safety/policy
+    assert audit[0]["allowed_by"] == ["privacy", "constitution", "path_safety", "policy"]
     # Writes/shell go all the way through the queue
     assert any(s.startswith("approval:") for s in audit[1]["allowed_by"])
     assert any(s.startswith("approval:") for s in audit[2]["allowed_by"])
@@ -503,3 +548,372 @@ async def test_constitution_parser_picks_up_grants_from_disk(
     assert result_write["success"] is False
     assert result_write["error"].startswith("constitution")
     assert not (workspace / "blocked.txt").exists()
+
+
+# =============================================================================
+# Reads outside the allow-list go through human approval (the case that was
+# impossible under the v0 contract because path_safety rejected first)
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_read_outside_allow_list_goes_through_approval_and_succeeds(
+    workspace: Path, security_feature: SecurityFeature
+):
+    """Path outside the allow-list reaches the approval queue, not path_safety."""
+    elsewhere = tempfile.mkdtemp(prefix="kestrel_outside_allowlist_")
+    target = Path(elsewhere) / "interesting.txt"
+    target.write_text("worth a look")
+
+    feature, _ = await _make_feature(
+        workspace=workspace,
+        privacy=PrivacyConfig(computer_access=True),
+        grants={
+            "filesystem_read",
+            "shell_execution_sandboxed",
+            "shell_execution_host",
+        },
+        security_feature=security_feature,
+    )
+
+    async with _ApprovalResponder(security_feature, decision=True) as responder:
+        result = await feature.fs_read(path=str(target))
+
+    assert result["success"] is True, result
+    assert result["content"] == "worth a look"
+    assert responder.responded_count == 1, "must reach the approval queue"
+
+    audit = _read_audit(workspace / "audit.jsonl")
+    last = audit[-1]
+    assert last["outcome"] == "ok"
+    assert "policy" in last["allowed_by"]
+    assert any(s.startswith("approval:") for s in last["allowed_by"])
+
+
+@pytest.mark.asyncio
+async def test_read_outside_allow_list_denied_when_user_refuses(
+    workspace: Path, security_feature: SecurityFeature
+):
+    elsewhere = tempfile.mkdtemp(prefix="kestrel_outside_allowlist_deny_")
+    target = Path(elsewhere) / "x.txt"
+    target.write_text("nope")
+
+    feature, _ = await _make_feature(
+        workspace=workspace,
+        privacy=PrivacyConfig(computer_access=True),
+        grants={
+            "filesystem_read",
+            "shell_execution_sandboxed",
+            "shell_execution_host",
+        },
+        security_feature=security_feature,
+    )
+
+    async with _ApprovalResponder(security_feature, decision=False):
+        result = await feature.fs_read(path=str(target))
+
+    assert result["success"] is False
+    assert result["error"].startswith("approval")
+
+
+# =============================================================================
+# Gate ordering: constitution refuses BEFORE path-safety/policy can leak info
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_constitution_denial_does_not_leak_path_or_policy_info(
+    workspace: Path, security_feature: SecurityFeature
+):
+    """A path that would have failed path_safety should still surface as a
+    constitution refusal — the agent must not learn anything about path
+    structure or policy contents until the call is constitutionally eligible.
+    """
+    feature, _ = await _make_feature(
+        workspace=workspace,
+        privacy=PrivacyConfig(computer_access=True),
+        # NO filesystem_read grant; shell grants present so backend constructs.
+        grants={"shell_execution_sandboxed", "shell_execution_host"},
+        security_feature=security_feature,
+    )
+    # Pass a path with `..` traversal — under the wrong gate order, this would
+    # surface as path_safety:traversal. Under the correct order, the agent
+    # only learns it has no constitutional grant.
+    result = await feature.fs_read(path="../../../etc/passwd")
+    assert result["success"] is False
+    assert result["error"].startswith("constitution"), result["error"]
+
+    audit = _read_audit(workspace / "audit.jsonl")
+    last = audit[-1]
+    assert last["allowed_by"] == ["privacy", "denied:constitution"]
+
+
+# =============================================================================
+# Audit on every refusal path (the v0 implementation skipped these)
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_audit_records_path_safety_traversal_refusal(
+    workspace: Path, security_feature: SecurityFeature
+):
+    feature, _ = await _make_feature(
+        workspace=workspace,
+        privacy=PrivacyConfig(computer_access=True),
+        grants={
+            "filesystem_read",
+            "shell_execution_sandboxed",
+            "shell_execution_host",
+        },
+        security_feature=security_feature,
+    )
+    result = await feature.fs_read(path="../../etc/passwd")
+    assert result["success"] is False
+    assert result["error"].startswith("path_safety")
+
+    audit = _read_audit(workspace / "audit.jsonl")
+    last = audit[-1]
+    assert last["outcome"] == "denied"
+    assert last["allowed_by"] == ["privacy", "constitution", "denied:path_safety"]
+    assert last["error"] is not None
+    assert "traversal" in last["error"]
+
+
+@pytest.mark.asyncio
+async def test_audit_records_policy_deny_refusal(
+    workspace: Path, security_feature: SecurityFeature
+):
+    """Deny-list match must produce an audit row with denied:policy."""
+    feature, _ = await _make_feature(
+        workspace=workspace,
+        privacy=PrivacyConfig(computer_access=True),
+        grants={
+            "filesystem_read",
+            "shell_execution_sandboxed",
+            "shell_execution_host",
+        },
+        security_feature=security_feature,
+    )
+    # Even with a permissive responder, the deny-list must short-circuit.
+    async with _ApprovalResponder(security_feature, decision=True) as responder:
+        result = await feature.fs_read(path=str(workspace / "secret" / "leak.txt"))
+
+    assert result["success"] is False
+    assert result["error"].startswith("policy:deny")
+    assert responder.responded_count == 0
+
+    audit = _read_audit(workspace / "audit.jsonl")
+    last = audit[-1]
+    assert last["outcome"] == "denied"
+    assert last["allowed_by"] == [
+        "privacy",
+        "constitution",
+        "path_safety",
+        "denied:policy",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_audit_records_disabled_feature_call(
+    workspace: Path, security_feature: SecurityFeature
+):
+    """Calling a tool while disabled in toml still produces an audit row."""
+    agent = _IntegrationAgent(
+        storage_path=security_feature.permission_store.db_path
+        if hasattr(security_feature.permission_store, "db_path")
+        else "",
+        privacy_config=PrivacyConfig(computer_access=True),
+        grants={"filesystem_read"},
+    )
+    agent.features["SecurityFeature"] = security_feature
+    security_feature.agent = agent
+
+    feature = ComputerUseFeature(agent)
+    cfg = _config_for(workspace)
+    cfg["enabled"] = False
+    feature._cfg = cfg
+    await feature.initialize()
+
+    result = await feature.fs_read(path=str(workspace / "ok.txt"))
+    assert result["success"] is False
+    assert result["error"].startswith("readiness:")
+
+    audit = _read_audit(workspace / "audit.jsonl")
+    assert audit
+    last = audit[-1]
+    assert last["outcome"] == "denied"
+    assert any("readiness" in s for s in last["allowed_by"])
+
+
+# =============================================================================
+# fs-edit
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_fs_edit_replaces_single_occurrence(
+    workspace: Path, security_feature: SecurityFeature
+):
+    target = workspace / "edit.txt"
+    target.write_text("alpha beta gamma beta")
+
+    feature, _ = await _make_feature(
+        workspace=workspace,
+        privacy=PrivacyConfig(computer_access=True),
+        grants={
+            "filesystem_read",
+            "filesystem_write",
+            "shell_execution_sandboxed",
+            "shell_execution_host",
+        },
+        security_feature=security_feature,
+    )
+
+    async with _ApprovalResponder(security_feature, decision=True):
+        result = await feature.fs_edit(
+            path=str(target), old_text="beta", new_text="BETA", occurrence=1
+        )
+
+    assert result["success"] is True, result
+    # Only the FIRST occurrence is replaced.
+    assert target.read_text() == "alpha BETA gamma beta"
+
+
+@pytest.mark.asyncio
+async def test_fs_edit_can_target_nth_occurrence(
+    workspace: Path, security_feature: SecurityFeature
+):
+    target = workspace / "edit2.txt"
+    target.write_text("x x x")
+
+    feature, _ = await _make_feature(
+        workspace=workspace,
+        privacy=PrivacyConfig(computer_access=True),
+        grants={
+            "filesystem_read",
+            "filesystem_write",
+            "shell_execution_sandboxed",
+            "shell_execution_host",
+        },
+        security_feature=security_feature,
+    )
+
+    async with _ApprovalResponder(security_feature, decision=True):
+        result = await feature.fs_edit(
+            path=str(target), old_text="x", new_text="Y", occurrence=2
+        )
+
+    assert result["success"] is True
+    assert target.read_text() == "x Y x"
+
+
+@pytest.mark.asyncio
+async def test_fs_edit_rejects_when_old_text_missing(
+    workspace: Path, security_feature: SecurityFeature
+):
+    target = workspace / "edit3.txt"
+    target.write_text("hello world")
+
+    feature, _ = await _make_feature(
+        workspace=workspace,
+        privacy=PrivacyConfig(computer_access=True),
+        grants={
+            "filesystem_read",
+            "filesystem_write",
+            "shell_execution_sandboxed",
+            "shell_execution_host",
+        },
+        security_feature=security_feature,
+    )
+
+    result = await feature.fs_edit(
+        path=str(target), old_text="not present", new_text="X"
+    )
+    assert result["success"] is False
+    assert "not found" in result["error"]
+    assert target.read_text() == "hello world"  # unchanged
+
+
+@pytest.mark.asyncio
+async def test_fs_edit_denied_when_user_refuses(
+    workspace: Path, security_feature: SecurityFeature
+):
+    target = workspace / "edit4.txt"
+    target.write_text("original")
+
+    feature, _ = await _make_feature(
+        workspace=workspace,
+        privacy=PrivacyConfig(computer_access=True),
+        grants={
+            "filesystem_read",
+            "filesystem_write",
+            "shell_execution_sandboxed",
+            "shell_execution_host",
+        },
+        security_feature=security_feature,
+    )
+
+    async with _ApprovalResponder(security_feature, decision=False):
+        result = await feature.fs_edit(
+            path=str(target), old_text="original", new_text="HIJACKED"
+        )
+
+    assert result["success"] is False
+    assert result["error"].startswith("approval")
+    assert target.read_text() == "original"
+
+
+# =============================================================================
+# kestrel.toml is actually loaded from disk
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_kestrel_toml_loader_is_consulted(
+    workspace: Path, security_feature: SecurityFeature, tmp_path: Path
+):
+    """Drop a kestrel.toml in the agent's storage_path and verify the
+    feature reads its [features.computer_use] section."""
+    storage_dir = tmp_path / "agent_data" / "test-agent"
+    storage_dir.mkdir(parents=True)
+    audit_path = storage_dir / "audit.jsonl"
+    toml_path = storage_dir / "kestrel.toml"
+    toml_path.write_text(
+        f"""
+[features.computer_use]
+enabled = true
+backend = "local"
+allowed_paths = ["{workspace}"]
+deny_paths = ["{workspace}/secret"]
+allowed_binaries = ["echo"]
+denied_binaries = ["rm"]
+auto_approve_read = true
+audit_log_path = "{audit_path}"
+"""
+    )
+
+    agent = _IntegrationAgent(
+        storage_path=str(storage_dir),
+        privacy_config=PrivacyConfig(computer_access=True),
+        grants={
+            "filesystem_read",
+            "shell_execution_sandboxed",
+            "shell_execution_host",
+        },
+    )
+    agent.features["SecurityFeature"] = security_feature
+    security_feature.agent = agent
+
+    feature = ComputerUseFeature(agent)
+    # Don't pre-populate _cfg — force the loader to find the toml.
+    await feature.initialize()
+
+    assert feature._backend is not None, "loader must have found enabled toml"
+    result = await feature.fs_read(path=str(workspace / "ok.txt"))
+    assert result["success"] is True
+    assert result["content"] == "hello world"
+
+    # Audit landed at the configured path
+    assert audit_path.exists()
+    rows = [json.loads(line) for line in audit_path.read_text().splitlines()]
+    assert rows and rows[-1]["tool"] == "fs-read"
