@@ -36,6 +36,7 @@ from kestrel_sdk.voice import (
     TranscriptDeltaEvent,
     TranscriptFinalEvent,
     TurnDetectionConfig,
+    VoiceInfo,
 )
 from kestrel_sovereign.voice.provider_registry import VoiceProviderRegistry
 
@@ -170,8 +171,11 @@ class FakeConversationProvider(ConversationProvider):
         # the registry — no hardcoded-model policing applies to a fake.
         return ["fake-realtime-flagship", "fake-realtime-mini"]
 
-    async def list_voices(self) -> list[str]:
-        return ["fake-voice-a", "fake-voice-b"]
+    async def list_voices(self) -> list[VoiceInfo]:
+        return [
+            VoiceInfo(voice_id="fake-voice-a", name="Fake A", provider="fake_realtime"),
+            VoiceInfo(voice_id="fake-voice-b", name="Fake B", provider="fake_realtime"),
+        ]
 
     async def is_available(self) -> bool:
         return True
@@ -222,7 +226,8 @@ async def test_provider_discovers_models_at_runtime(provider: FakeConversationPr
 async def test_provider_lists_voices_at_runtime(provider: FakeConversationProvider) -> None:
     voices = await provider.list_voices()
     assert voices
-    assert all(isinstance(v, str) for v in voices)
+    assert all(isinstance(v, VoiceInfo) for v in voices)
+    assert all(v.provider == provider.name for v in voices)
 
 
 @pytest.mark.asyncio
