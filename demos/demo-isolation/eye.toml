@@ -1,0 +1,56 @@
+# kestrel-eye config for the demo-isolation vignette (#766).
+
+[eye]
+name = "Kestrel Demo-Isolation Rail Vignette"
+screenshot_dir = "demos/demo-isolation/demo-output"
+test_cmd = "demos/run.sh demo-isolation"
+
+[eye.model]
+provider = "anthropic"
+model = "claude-haiku-4-5-20251001"
+
+[eye.github]
+repo = "KestrelSovereignAI/kestrel-sovereign"
+labels = ["kestrel-eye", "demo-isolation-review", "automated"]
+
+[[eye.screenshots]]
+name = "01-live-agent-with-data.png"
+act = "Beat 1: A live conversation"
+severity = "warning"
+expected = [
+    "Chat panel active",
+    "User and agent messages visible — at least one of each",
+]
+layout = "Healthy chat panel — the live agent the rail will protect"
+
+[[eye.screenshots]]
+name = "02-refused-without-header.png"
+act = "Beat 2: Refusal"
+severity = "critical"
+expected = [
+    "A red banner overlay is visible",
+    "Banner mentions a 403 status OR 'Destructive op refused'",
+    "Banner indicates the X-Kestrel-Allow-Destructive header was missing",
+]
+layout = "Red 403 refusal banner overlaid on the chat panel"
+
+[[eye.screenshots]]
+name = "03-allowed-with-header.png"
+act = "Beat 3: Allowed with intent"
+severity = "critical"
+expected = [
+    "A green banner overlay is visible",
+    "Banner indicates the destructive op was allowed",
+    "Banner shows the X-Kestrel-Allow-Destructive header value as the reason",
+]
+layout = "Green allowed banner overlaid on the chat panel — header carries the reason"
+
+[[eye.screenshots]]
+name = "04-audit-log-trail.png"
+act = "Beat 4: Bookend"
+severity = "warning"
+expected = [
+    "Security panel active",
+    "An audit log section is visible (#security-audit-log)",
+]
+layout = "Security panel showing the audit log surface"

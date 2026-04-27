@@ -76,7 +76,14 @@ echo "[demo-runner] Creating fresh demo agent DB at $DEMO_DB ..."
 uv run python scripts/setup_demo_agent.py
 
 echo "[demo-runner] Starting isolated server on $DEMO_URL (DB=$DEMO_DB) ..."
-KESTREL_DB_PATH="$DEMO_DB" uv run uvicorn server:app --host 127.0.0.1 --port "$DEMO_PORT" \
+# Force standalone mode — point KESTREL_ROOKERY_CONFIG at a path that doesn't
+# exist so the server skips rookery loading.  Without this, server.py:201
+# auto-loads rookery.toml from the project root, which mounts every sibling
+# agent (Meridian, Claw, Nellie) alongside the demo agent and breaks
+# isolation.  See post-merge demo runs that surfaced this.
+KESTREL_DB_PATH="$DEMO_DB" \
+KESTREL_ROOKERY_CONFIG="$DEMO_DB/rookery-disabled.toml" \
+    uv run uvicorn server:app --host 127.0.0.1 --port "$DEMO_PORT" \
     > "$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
 
