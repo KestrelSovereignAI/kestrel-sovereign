@@ -601,7 +601,12 @@ class VoiceFeature(Feature):
         """List available voices.
 
         Args:
-            provider: Filter to a specific provider (e.g., "openai", "piper"). Empty = all.
+            provider: Filter to a specific provider (e.g., "openai", "piper",
+                "openai_realtime"). Empty = all TTS providers. When the name
+                matches a conversation provider (Realtime), its voice IDs are
+                hydrated with metadata from the matching TTS catalog where
+                possible — Realtime voices are a subset of OpenAI TTS voices,
+                so we synthesize VoiceInfo entries by intersecting catalogs.
         """
         registry = await self._ensure_registry()
         cloud_ok = self._cloud_allowed()
@@ -624,6 +629,62 @@ class VoiceFeature(Feature):
                     voices.append(asdict(v) if isinstance(v, VoiceInfo) else v)
             except Exception as exc:
                 logger.warning("Failed to list voices from %s: %s", name, exc)
+
+        # Conversation providers (Realtime) — picker hits this with
+        # provider=openai_realtime when the user picks Force Realtime; we'd
+        # otherwise return [] and the picker would show "no voices".
+        # ConversationProvider.list_voices returns bare IDs (the ABC keeps the
+        # SDK free of metadata taxonomy); we hydrate by joining against
+        # already-loaded TTS provider voices on the same vendor.
+        if provider:
+            conv_names = [
+                n for n in registry.list_conversation_providers() if n == provider
+            ]
+        else:
+            conv_names = []  # no conversation voices in unfiltered "all" view
+        for name in conv_names:
+            conv = registry.get_conversation(name)
+            if conv is None:
+                continue
+            if not cloud_ok and not getattr(conv, "is_local", False):
+                continue
+            try:
+                ids = await conv.list_voices()
+            except Exception as exc:
+                logger.warning("Failed to list voices from conversation provider %s: %s", name, exc)
+                continue
+            # Try to hydrate with VoiceInfo metadata from a sibling TTS
+            # provider (Realtime voices are OpenAI voices). Walk every
+            # registered TTS provider and use the first hit per id.
+            id_to_info: dict[str, dict] = {}
+            for tts_name in registry.list_tts_providers():
+                tts = registry.get_tts(tts_name)
+                if tts is None:
+                    continue
+                try:
+                    for v in await tts.list_voices():
+                        info = asdict(v) if isinstance(v, VoiceInfo) else v
+                        id_to_info.setdefault(info.get("voice_id"), info)
+                except Exception:
+                    continue
+            for vid in ids:
+                hydrated = id_to_info.get(vid)
+                if hydrated:
+                    # Tag the provider so the picker shows it scoped correctly.
+                    voices.append({**hydrated, "provider": name})
+                else:
+                    # Bare-ID fallback so the picker is at least populated.
+                    voices.append({
+                        "voice_id": vid,
+                        "name": vid,
+                        "provider": name,
+                        "language": "en",
+                        "gender": "neutral",
+                        "preview_url": "",
+                        "age": "middle",
+                        "energy": "neutral",
+                        "accent": "neutral",
+                    })
 
         return {"voices": voices, "count": len(voices)}
 
