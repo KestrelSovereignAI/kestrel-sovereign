@@ -13,6 +13,12 @@
  *   - KESTREL_API_KEY (or /api/auth/key reachable)
  *   - OPENAI_API_KEY on the SERVER for the realtime-mint case
  *
+ * Agent selection:
+ *   - KESTREL_E2E_AGENT picks a specific agent name.
+ *   - Otherwise the first voice-capable agent on the rookery is used; this
+ *     keeps the spec portable across CI vs local dev where agent names
+ *     differ.
+ *
  * What this spec catches that the mocked one doesn't:
  *   1. /voice/realtime/route returning the wrong shape after a resolver change
  *   2. /voice/realtime/session 502 (the regression that prompted this spec)
@@ -22,15 +28,51 @@
  *   6. EPHEMERAL privacy mode making zero cloud HTTP calls (constitutional)
  */
 
-const { test, expect, request: pwRequest } = require('@playwright/test');
+const { test: base, expect, request: pwRequest } = require('@playwright/test');
 const {
   BASE_URL,
-  AGENT,
   getApiKey,
   authHeaders,
-  agentUrl,
+  agentUrlFor,
+  discoverVoiceCapableAgent,
   ensureMicFixture,
+  fetchProviderVoiceIds,
 } = require('./voice_helpers.cjs');
+
+/**
+ * Test fixture that resolves a voice-capable agent name once per test.
+ * Tests read it as ``async ({ page, request, agentName }) => ...``. Skips
+ * the test cleanly when no agent has voice support, with the failure list
+ * in the skip message so reviewers know what was tried.
+ */
+const test = base.extend({
+  agentName: async ({ request }, use) => {
+    const apiKey = await getApiKey(request);
+    if (!apiKey) {
+      base.skip(true, 'No API key (set KESTREL_API_KEY)');
+      return;
+    }
+    let name;
+    try {
+      name = await discoverVoiceCapableAgent(request, apiKey);
+    } catch (e) {
+      base.skip(true, `Cannot pick a voice-capable agent: ${e.message}`);
+      return;
+    }
+    await use(name);
+  },
+});
+
+/**
+ * Read the picker's currently-listed voice IDs (the option `value`s — the
+ * visible text is the voice's display name, but the value is the canonical
+ * voice_id we cross-check against /voice/voices).
+ */
+async function pickerVoiceIds(page) {
+  return page.locator('#voice-picker-select option').evaluateAll(
+    (opts) => opts.map((o) => o.value).filter((v) => v),
+  );
+}
 
 // Skip the entire file when the server isn't reachable — same convention as
 // the other "real" specs (test_chat_and_models, test_sovereign_console).
@@ -51,11 +93,11 @@ test.beforeAll(async () => {
 // ---------------------------------------------------------------------------
 
 test.describe('voice realtime: API contract', () => {
-  test('GET /voice/realtime/route returns realtime path when prefer_realtime=true', async ({ request }) => {
+  test('GET /voice/realtime/route returns realtime path when prefer_realtime=true', async ({ request, agentName }) => {
     const apiKey = await getApiKey(request);
     test.skip(!apiKey, 'No API key (set KESTREL_API_KEY)');
     const res = await request.get(
-      agentUrl('/voice/realtime/route?prefer_realtime=true'),
+      agentUrlFor(agentName, '/voice/realtime/route?prefer_realtime=true'),
       { headers: authHeaders(apiKey) },
     );
     expect(res.status(), 'route lookup returns 200').toBe(200);
@@ -77,21 +119,21 @@ test.describe('voice realtime: API contract', () => {
     }
   });
 
-  test('POST /voice/realtime/session returns 200 + ephemeral token (no 502)', async ({ request }) => {
+  test('POST /voice/realtime/session returns 200 + ephemeral token (no 502)', async ({ request, agentName }) => {
     const apiKey = await getApiKey(request);
     test.skip(!apiKey, 'No API key (set KESTREL_API_KEY)');
     // Pre-flight: only run this case when the server has OpenAI configured
     // AND the resolver picks realtime — otherwise the mint correctly 409s
     // and the test would assert against the wrong code path.
     const route = await request.get(
-      agentUrl('/voice/realtime/route?prefer_realtime=true'),
+      agentUrlFor(agentName, '/voice/realtime/route?prefer_realtime=true'),
       { headers: authHeaders(apiKey) },
     );
     const routeBody = await route.json();
     test.skip(routeBody.path !== 'realtime',
       `Resolver picked '${routeBody.path}' (need 'realtime' for this case): ${routeBody.reason}`);
 
-    const res = await request.post(agentUrl('/voice/realtime/session'), {
+    const res = await request.post(agentUrlFor(agentName, '/voice/realtime/session'), {
       headers: { ...authHeaders(apiKey), 'Content-Type': 'application/json' },
       data: {
         // Defaults — same shape the picker sends with no overrides.
@@ -113,14 +155,14 @@ test.describe('voice realtime: API contract', () => {
     expect(body.voice, 'mint must echo the voice').toBeTruthy();
   });
 
-  test('GET /voice/voices?provider=openai_realtime returns realtime voices (not empty)', async ({ request }) => {
+  test('GET /voice/voices?provider=openai_realtime returns realtime voices (not empty)', async ({ request, agentName }) => {
     const apiKey = await getApiKey(request);
     test.skip(!apiKey, 'No API key (set KESTREL_API_KEY)');
     // Bug 3 in #PR: the picker asked for provider=openai_realtime and got
-    // back []. Fix made VoiceFeature.list_voices fall through to conversation
-    // providers and hydrate IDs with VoiceInfo from a sibling TTS catalog.
+    // back []. After #848 the conversation provider returns VoiceInfo
+    // directly via the ABC, no sibling-catalog scan needed.
     const res = await request.get(
-      agentUrl('/voice/voices?provider=openai_realtime'),
+      agentUrlFor(agentName, '/voice/voices?provider=openai_realtime'),
       { headers: authHeaders(apiKey) },
     );
     expect(res.status()).toBe(200);
@@ -137,10 +179,10 @@ test.describe('voice realtime: API contract', () => {
     }
   });
 
-  test('GET /voice/providers/status surfaces every attempted provider with diagnostics', async ({ request }) => {
+  test('GET /voice/providers/status surfaces every attempted provider with diagnostics', async ({ request, agentName }) => {
     const apiKey = await getApiKey(request);
     test.skip(!apiKey, 'No API key (set KESTREL_API_KEY)');
-    const res = await request.get(agentUrl('/voice/providers/status'), {
+    const res = await request.get(agentUrlFor(agentName, '/voice/providers/status'), {
       headers: authHeaders(apiKey),
     });
     expect(res.status()).toBe(200);
@@ -208,18 +250,18 @@ async function loadChatForAgent(page, apiKey, agentName) {
 // ---------------------------------------------------------------------------
 
 test.describe('voice picker: live UI wiring', () => {
-  test('flipping mode → Force Realtime updates header voice annotation', async ({ page, request }) => {
+  test('flipping mode → Force Realtime updates header voice annotation', async ({ page, request, agentName }) => {
     const apiKey = await getApiKey(request);
     test.skip(!apiKey, 'No API key');
     const route = await request.get(
-      agentUrl('/voice/realtime/route?prefer_realtime=true'),
+      agentUrlFor(agentName, '/voice/realtime/route?prefer_realtime=true'),
       { headers: authHeaders(apiKey) },
     );
     const routeBody = await route.json();
     test.skip(routeBody.path !== 'realtime',
       `Realtime not available on this server (path=${routeBody.path}): ${routeBody.reason}`);
 
-    await loadChatForAgent(page, apiKey, AGENT);
+    await loadChatForAgent(page, apiKey, agentName);
     // Open picker via right-click on the mic button (matches ui.js wiring).
     await page.click('#voice-toggle-btn', { button: 'right' });
     await page.waitForSelector('#voice-picker-mode', { state: 'visible' });
@@ -236,11 +278,11 @@ test.describe('voice picker: live UI wiring', () => {
     }, { timeout: 5_000 }).toMatch(/gpt-realtime|🎙/);
   });
 
-  test('flipping mode → Force Realtime narrows voice list to realtime catalog', async ({ page, request }) => {
+  test('flipping mode → Force Realtime narrows voice list to realtime catalog', async ({ page, request, agentName }) => {
     const apiKey = await getApiKey(request);
     test.skip(!apiKey, 'No API key');
     const route = await request.get(
-      agentUrl('/voice/realtime/route?prefer_realtime=true'),
+      agentUrlFor(agentName, '/voice/realtime/route?prefer_realtime=true'),
       { headers: authHeaders(apiKey) },
     );
     const routeBody = await route.json();
@@ -256,28 +298,44 @@ test.describe('voice picker: live UI wiring', () => {
         voice: '', instructions: '', mode: 'pipeline', preferred_tts: 'elevenlabs',
       }));
     });
-    await loadChatForAgent(page, apiKey, AGENT);
+    await loadChatForAgent(page, apiKey, agentName);
+
+    // Pull the canonical catalogs once so assertions stay catalog-rename-safe:
+    // adding a voice to OpenAI realtime later doesn't break this spec.
+    const elevenIds = await fetchProviderVoiceIds(request, apiKey, agentName, 'elevenlabs');
+    const realtimeIds = await fetchProviderVoiceIds(request, apiKey, agentName, 'openai_realtime');
+    test.skip(elevenIds.size === 0,
+      'ElevenLabs not configured on this server — pre-state for the flip cannot be set up.');
+    expect(realtimeIds.size, 'realtime catalog must not be empty').toBeGreaterThan(0);
 
     await page.click('#voice-toggle-btn', { button: 'right' });
     await page.waitForSelector('#voice-picker-mode', { state: 'visible' });
 
-    // Confirm the Pipeline-mode pre-state lists ElevenLabs voices.
+    // Confirm the Pipeline-mode pre-state lists ElevenLabs voices: every
+    // visible picker option's voice_id must be in the live ElevenLabs catalog.
     await page.selectOption('#voice-picker-mode', 'pipeline');
     await expect.poll(async () => {
-      const opts = await page.locator('#voice-picker-select option').allTextContents();
-      return opts.join(' | ');
-    }, { timeout: 5_000 }).toMatch(/Sarah|Roger|Charlie/i);  // any well-known ElevenLabs voice
+      const ids = await pickerVoiceIds(page);
+      return ids.length > 0 && ids.every((id) => elevenIds.has(id));
+    }, {
+      timeout: 5_000,
+      message: 'Pipeline mode must show only ElevenLabs voice IDs',
+    }).toBe(true);
 
-    // Bug 3 catch: flip to Force Realtime, assert the dropdown now lists
-    // OpenAI realtime voices (Marin/Cedar/Alloy/...) and NO ElevenLabs voices.
+    // Bug 3 catch: flip to Force Realtime; the picker must now list voices
+    // from the realtime catalog and NONE from ElevenLabs.
     await page.selectOption('#voice-picker-mode', 'realtime');
     await expect.poll(async () => {
-      const opts = await page.locator('#voice-picker-select option').allTextContents();
-      return opts.join(' | ');
-    }, { timeout: 5_000 }).toMatch(/Marin|Cedar|Alloy|Ash|Coral/i);
+      const ids = await pickerVoiceIds(page);
+      return ids.length > 0 && ids.every((id) => realtimeIds.has(id));
+    }, {
+      timeout: 5_000,
+      message: 'Realtime mode must show only OpenAI realtime voice IDs',
+    }).toBe(true);
 
-    const optsText = (await page.locator('#voice-picker-select option').allTextContents()).join(' | ');
-    expect(optsText, 'Realtime mode must NOT list ElevenLabs voices').not.toMatch(/Sarah|Roger|Charlie/i);
+    const pickerIds = await pickerVoiceIds(page);
+    const leaked = pickerIds.filter((id) => elevenIds.has(id));
+    expect(leaked, 'Realtime mode must not list any ElevenLabs voice IDs').toEqual([]);
 
     // The TTS dropdown must be disabled in Realtime mode (Realtime owns
     // I/O end-to-end; the user's TTS pick has no effect). Without this the
