@@ -73,11 +73,22 @@ class TestVastAIConnectivity:
 
     @pytest.mark.asyncio
     async def test_search_rtx_3090_offers(self, manager):
-        """Verify can search for RTX 3090 specifically."""
+        """RTX 3090 search must return well-formed offers honoring the query.
+
+        Marketplace inventory fluctuates, so an empty result is treated as a
+        soft skip with an explicit reason — but if any offers come back they
+        must actually be RTX 3090s with reliability > 0.8 and the documented
+        offer shape.
+        """
         offers = await manager.search_offers(
             query="gpu_name = RTX_3090 reliability > 0.8 rentable = true",
             limit=5
         )
+
+        assert isinstance(offers, list), f"Expected list, got {type(offers)}"
+
+        if not offers:
+            pytest.skip("No RTX 3090 offers available on Vast.ai right now")
 
         print(f"\n[VASTAI] Found {len(offers)} RTX 3090 offers:")
         for offer in offers[:3]:
@@ -85,9 +96,18 @@ class TestVastAIConnectivity:
                   f"${offer.get('dph_total', 0):.2f}/hr, "
                   f"reliability: {offer.get('reliability', 0):.2f}")
 
-        # RTX 3090s should be available most of the time
-        if len(offers) == 0:
-            print("[VASTAI] No RTX 3090 available right now - this is normal sometimes")
+        for offer in offers:
+            assert isinstance(offer, dict)
+            assert "id" in offer, f"Offer missing id: {offer}"
+            assert "dph_total" in offer, f"Offer missing dph_total: {offer}"
+
+            gpu_name = (offer.get("gpu_name") or "").upper().replace(" ", "_")
+            assert "RTX_3090" in gpu_name, (
+                f"Search returned non-RTX_3090 offer: {offer.get('gpu_name')!r}"
+            )
+            assert offer.get("reliability", 0) > 0.8, (
+                f"Reliability filter not honored: {offer.get('reliability')}"
+            )
 
     @pytest.mark.asyncio
     async def test_search_training_profile(self, manager):
