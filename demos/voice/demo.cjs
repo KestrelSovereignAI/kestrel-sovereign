@@ -39,6 +39,8 @@ const {
   getApiKey,
   authHeaders,
   demoGoto,
+  navigateToPanel,
+  dismissContextWarning,
 } = require('../shared/demo_helpers.cjs');
 
 const BASE_URL = process.env.KESTREL_URL || 'http://localhost:8888';
@@ -63,7 +65,7 @@ test.describe.serial('Kestrel Voice Demo', () => {
   });
 
   test.afterAll(async () => {
-    const transcript = narrator.render();
+    const transcript = narrator.toMarkdown();
     fs.writeFileSync(path.join(OUTPUT_DIR, 'narration.md'), transcript);
   });
 
@@ -72,78 +74,128 @@ test.describe.serial('Kestrel Voice Demo', () => {
 
     // Beat 1: Console loads, mic button mounts.
     narrator.act(1, 'Mic button arrives in the chat header');
-    await demoGoto(page, BASE_URL, narrator);
+    await demoGoto(page, BASE_URL, apiKey);
     await page.waitForLoadState('domcontentloaded');
-    await page.waitForSelector('#voice-toggle-btn', { timeout: 15000 });
+    // Mic mounts inside the chat panel's input row.  Wait for it to attach
+    // (initVoiceUI runs after module imports settle), then navigate to chat
+    // so the button is actually visible for the screenshot — Identity is
+    // the default panel and the chat panel sits at display:none until clicked.
+    await page.waitForSelector('#voice-toggle-btn', { state: 'attached', timeout: 15000 });
+    await navigateToPanel(page, 'chat');
+    await dismissContextWarning(page);
+    await page.waitForSelector('#voice-toggle-btn', { state: 'visible', timeout: 5000 });
     await highlightElement(page, '#voice-toggle-btn');
-    await demoScreenshot(page, OUTPUT_DIR, '01-mic-button', narrator);
+    await demoScreenshot(narrator, page, OUTPUT_DIR, '01-mic-button');
     await clearHighlights(page);
 
     // Beat 2: Open voice picker (right-click).
     narrator.act(2, 'Voice picker opens, discovered voices listed');
     await page.locator('#voice-toggle-btn').click({ button: 'right' });
     await page.waitForSelector('#voice-picker-modal:not([hidden])', { timeout: 5000 });
-    await demoPause(800, narrator);
+    await demoPause(page, 800);
     await highlightElement(page, '#voice-picker-select');
-    await demoScreenshot(page, OUTPUT_DIR, '02-voice-picker', narrator);
+    await demoScreenshot(narrator, page, OUTPUT_DIR, '02-voice-picker');
     await clearHighlights(page);
 
     // Beat 3: Pick a voice + directive.
+    // The demo-agent setup may not include voice provider keys; the picker
+    // still renders, but option lists / save round-trip can be quiet.  Wrap
+    // each step so a missing piece doesn't abort the rest of the demo.
     narrator.act(3, 'User picks a voice and writes a session directive');
-    const select = page.locator('#voice-picker-select');
-    const optionCount = await select.locator('option').count();
-    if (optionCount > 0) {
-      await select.selectOption({ index: 0 });
+    try {
+      const select = page.locator('#voice-picker-select');
+      const optionCount = await select.locator('option').count();
+      if (optionCount > 0) {
+        await select.selectOption({ index: 0 });
+      } else {
+        narrator.narrate('No voices discovered (provider keys may be absent).');
+      }
+      await page.locator('#voice-picker-instructions').fill(
+        "Speak warmly, like reading a children's story by lamplight.",
+      );
+    } catch (e) {
+      narrator.narrate(`Could not configure picker: ${e.message}`);
     }
-    await page.locator('#voice-picker-instructions').fill(
-      "Speak warmly, like reading a children's story by lamplight.",
-    );
-    await demoScreenshot(page, OUTPUT_DIR, '03-picker-filled', narrator);
-    await page.locator('#voice-picker-save').click();
-    await page.waitForSelector('#voice-picker-modal[hidden]', { timeout: 3000 });
+    await demoScreenshot(narrator, page, OUTPUT_DIR, '03-picker-filled');
+    try {
+      await page.locator('#voice-picker-save').click();
+      await page.waitForSelector('#voice-picker-modal[hidden]', { timeout: 5000 });
+    } catch (e) {
+      narrator.narrate(`Picker save did not close modal cleanly: ${e.message}`);
+      // Force-close so subsequent beats can proceed.
+      await page.evaluate(() => {
+        document.getElementById('voice-picker-modal')?.setAttribute('hidden', '');
+      });
+    }
 
-    // Beat 4: Click mic — session engages.
+    // Beat 4: Click mic — session engages.  Without provider keys the
+    // session may never reach 'connected'; we still capture what the UI
+    // shows after the click.
     narrator.act(4, 'Mic clicked, session engages');
-    await page.locator('#voice-toggle-btn').click();
-    await page.waitForSelector('#voice-drawer:not([hidden])', { timeout: 10000 });
-    await demoPause(800, narrator);
-    await demoScreenshot(page, OUTPUT_DIR, '04-session-engaged', narrator);
+    try {
+      await page.locator('#voice-toggle-btn').click();
+      await page.waitForSelector('#voice-drawer:not([hidden])', { timeout: 10000 });
+    } catch (e) {
+      narrator.narrate(`Voice session did not fully engage: ${e.message}`);
+    }
+    await demoPause(page, 800);
+    await demoScreenshot(narrator, page, OUTPUT_DIR, '04-session-engaged');
 
     // Beat 5: Path badge shows the active route.
     narrator.act(5, 'Path badge displays the active route (Realtime or Pipeline)');
-    const badgeText = await page.locator('.kestrel-voice-path-badge').textContent();
-    narrator.narrate(`Path badge: ${badgeText || '(empty)'} — depends on the resolver's decision given the active LLM + privacy mode.`);
-    await highlightElement(page, '.kestrel-voice-path-badge');
-    await demoScreenshot(page, OUTPUT_DIR, '05-path-badge', narrator);
+    try {
+      const badgeText = await page.locator('.kestrel-voice-path-badge').textContent({ timeout: 3000 });
+      narrator.narrate(`Path badge: ${badgeText || '(empty)'} — resolver picks Realtime/Pipeline based on the active LLM + privacy mode.`);
+      await highlightElement(page, '.kestrel-voice-path-badge');
+    } catch (e) {
+      narrator.narrate(`Path badge not found: ${e.message}`);
+    }
+    await demoScreenshot(narrator, page, OUTPUT_DIR, '05-path-badge');
     await clearHighlights(page);
 
-    // Beat 6: Transcript drawer (rendering depends on real STT/agent activity).
+    // Beat 6: Transcript drawer.
     narrator.act(6, 'Transcript drawer hosts live user + agent turns');
-    await highlightElement(page, '.kestrel-voice-transcript');
-    await demoPause(1500, narrator);
-    await demoScreenshot(page, OUTPUT_DIR, '06-transcript', narrator);
+    try {
+      await highlightElement(page, '.kestrel-voice-transcript');
+      await demoPause(page, 1500);
+    } catch (e) {
+      narrator.narrate(`Transcript drawer not present: ${e.message}`);
+    }
+    await demoScreenshot(narrator, page, OUTPUT_DIR, '06-transcript');
     await clearHighlights(page);
 
     // Beat 7: Esc returns to idle.
     narrator.act(7, 'Esc returns to idle');
-    await page.locator('body').click({ position: { x: 0, y: 0 } });
-    await page.keyboard.press('Escape');
-    await page.waitForFunction(() => {
-      const btn = document.getElementById('voice-toggle-btn');
-      return btn && btn.dataset.state === 'idle';
-    }, { timeout: 5000 });
-    await demoScreenshot(page, OUTPUT_DIR, '07-idle-after-esc', narrator);
+    try {
+      await page.locator('body').click({ position: { x: 0, y: 0 } });
+      await page.keyboard.press('Escape');
+      await page.waitForFunction(() => {
+        const btn = document.getElementById('voice-toggle-btn');
+        return btn && btn.dataset.state === 'idle';
+      }, { timeout: 5000 });
+    } catch (e) {
+      narrator.narrate(`Idle transition not observed: ${e.message}`);
+    }
+    await demoScreenshot(narrator, page, OUTPUT_DIR, '07-idle-after-esc');
 
     // Beat 8: Settings persist across reload (localStorage).
     narrator.act(8, 'Settings persist across reload');
-    await page.reload();
-    await page.waitForSelector('#voice-toggle-btn', { timeout: 15000 });
-    await page.locator('#voice-toggle-btn').click({ button: 'right' });
-    await page.waitForSelector('#voice-picker-modal:not([hidden])', { timeout: 5000 });
-    const persistedDirective = await page.locator('#voice-picker-instructions').inputValue();
-    narrator.narrate(`Persisted directive after reload: "${persistedDirective}"`);
-    await demoScreenshot(page, OUTPUT_DIR, '08-persisted-settings', narrator);
-    await page.locator('#voice-picker-cancel').click();
+    try {
+      await page.reload();
+      await navigateToPanel(page, 'chat');
+      await dismissContextWarning(page);
+      await page.waitForSelector('#voice-toggle-btn', { state: 'visible', timeout: 10000 });
+      await page.locator('#voice-toggle-btn').click({ button: 'right' });
+      await page.waitForSelector('#voice-picker-modal:not([hidden])', { timeout: 5000 });
+      const persistedDirective = await page.locator('#voice-picker-instructions').inputValue();
+      narrator.narrate(`Persisted directive after reload: "${persistedDirective}"`);
+    } catch (e) {
+      narrator.narrate(`Persistence check could not complete: ${e.message}`);
+    }
+    await demoScreenshot(narrator, page, OUTPUT_DIR, '08-persisted-settings');
+    try {
+      await page.locator('#voice-picker-cancel').click();
+    } catch { /* picker may be closed already */ }
 
     narrator.narrate('End of voice demo.');
   });
