@@ -146,43 +146,44 @@ async def test_orchestrator_mcp_management(kestrel_agent):
 @pytest.mark.skipif(no_llm_credentials(), reason="Requires LLM credentials for natural language tool use")
 async def test_orchestrator_natural_language_tool_use(kestrel_agent):
     """
-    Test if the agent can use tools via natural language.
-    This depends on the LLM's ability to call tools.
-    
-    NOTE: This test might be flaky depending on the local model (gpt-oss:20b).
-    We will mark it as such or make it soft.
+    The agent must respond to a natural-language tool-use prompt without
+    crashing or entering safe mode, and ideally invoke ModelManagerTool.
+
+    Hard failures (these always fail the test):
+      - The call raises.
+      - Response is missing / empty / not a string.
+      - Agent enters safe mode (constitution audit failure or similar).
+
+    Soft failure (xfail, never green-lit silently):
+      - The local LLM does not produce any of the keywords we expect from
+        the tool's formatted output. This is recorded as ``xfail`` so it
+        stays visible in test reports rather than disappearing into a log
+        line, but does not break CI on flaky local models.
     """
     logger.info("Testing Natural Language Tool Use...")
-    
-    # We need to ensure the tool is loaded first so the LLM knows about it.
-    await kestrel_agent.process_input(f"!mcp-load {TEST_MCP_IMAGE}")
-    
-    # Now we ask the agent to do something that requires the tool.
-    # The agent needs to have the tools registered in its context.
-    # KestrelAgent registers tools in `_initialize_tools`.
-    # But MCP tools are dynamic. Does KestrelAgent update its tool registry when MCP tools are loaded?
-    # Let's check KestrelAgent code.
-    
-    # If KestrelAgent doesn't automatically register MCP tools with the LLM, 
-    # then natural language won't work for them yet.
-    # This is a good discovery test.
-    
-    # For now, let's just try asking it to list models, which uses the static ModelManagerTool.
-    
+
     query = "Please list all available AI models."
     response = await kestrel_agent.process_input(query)
     logger.info(f"NL Response: {response}")
-    
-    # If the LLM successfully called the tool, the response should contain model info.
-    # If it just hallucinated, it might look different.
-    # The ModelManagerTool returns a formatted string.
-    
-    # We check for keywords that would appear in the tool output but unlikely in a pure hallucination
-    # of "I don't have access".
-    if "Available Models" in response or "Ollama" in response or "OpenAI" in response:
-        logger.info("✅ Agent successfully used ModelManagerTool via NL")
-    else:
-        logger.warning("⚠️ Agent might not have used the tool. Response: " + response)
-        # We don't fail the test here because local LLMs can be unpredictable,
-        # but we log it.
+
+    assert isinstance(response, str), f"Expected str response, got {type(response)}"
+    assert response.strip(), "Agent returned an empty response"
+    assert "SAFE MODE" not in response, (
+        f"Agent entered safe mode unexpectedly: {response[:300]}"
+    )
+
+    tool_output_indicators = (
+        "Available Models",
+        "Ollama",
+        "OpenAI",
+        "Anthropic",
+        "Gemini",
+        "Claude",
+    )
+    matched = [ind for ind in tool_output_indicators if ind.lower() in response.lower()]
+    if not matched:
+        pytest.xfail(
+            "Local LLM did not invoke ModelManagerTool via NL. "
+            f"Response head: {response[:300]!r}"
+        )
 
