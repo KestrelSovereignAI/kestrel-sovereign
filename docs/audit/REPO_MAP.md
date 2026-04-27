@@ -3,8 +3,8 @@
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-04-26
-**Scope:** 1467 tracked files (886 `.py`, 228 `.md`, 353 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-04-27
+**Scope:** 1473 tracked files (892 `.py`, 228 `.md`, 353 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -483,7 +483,8 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/features/training/adapters/__init__.py** — Training Provider Adapters
 - **kestrel_sovereign/features/training/adapters/gcp_compute_adapter.py** — GCP Compute Engine Training Adapter.
   - `class GCPComputeTrainingAdapter`
-- **kestrel_sovereign/features/training/adapters/local_mps_adapter.py** — (unparseable Python source)
+- **kestrel_sovereign/features/training/adapters/local_mps_adapter.py** — Local MPS Training Adapter.
+  - `class LocalMPSTrainingAdapter`
 - **kestrel_sovereign/features/training/adapters/replicate_adapter.py** — Replicate adapter for TrainingProvider protocol.
   - `class ReplicateTrainingAdapter`
 - **kestrel_sovereign/features/training/adapters/runpod_adapter.py** — RunPod Training Adapter.
@@ -649,12 +650,16 @@ Repo entry points and standard project files.
   - `class ConstitutionalAwarenessMixin`
 - **kestrel_sovereign/llm/constitutional_profile.py** — Constitutional Profile Service
   - `class PromptAdaptation`; `class ConstitutionalProfile`; `class StateOfMind`; `class ConstitutionalProfileService`; `def get_profile_service()`
+- **kestrel_sovereign/llm/continuation_store.py** — Per-conversation continuation cursor store for stateful provider protocols.
+  - `class ContinuationCursor`; `class ContinuationStore`; `class InMemoryContinuationStore`
 - **kestrel_sovereign/llm/embedding_service.py** — Embedding Service for Kestrel.
   - `class EmbeddingService`; `def cosine_similarity(a, b)`; `async def semantic_search(query, documents, embedding_service, top_k)`; `def get_embedding_service(model, base_url)`; `def reset_embedding_service()`
 - **kestrel_sovereign/llm/error_handling.py** — Error handling decorators and utilities for LLM operations.
   - `class LLMError`; `class LLMProviderError`; `class LLMProviderTimeoutError`; `class LLMProviderAuthError`; `class LLMProviderQuotaError`; `class LLMProviderUnavailableError`; `class LLMAllProvidersFailedError`; `def handle_llm_errors(provider_name, log_errors, reraise_as)`; `…`
 - **kestrel_sovereign/llm/google_adapter.py** — Google Gemini Adapter
   - `class GoogleAdapter`
+- **kestrel_sovereign/llm/gpt5_overlay.py** — GPT-5 system-prompt overlay.
+  - `def is_gpt5_model_id(model_id)`; `def prepend_gpt5_overlay(base, model_id)`
 - **kestrel_sovereign/llm/image_utils.py** — Centralized image handling utilities for LLM adapters.
   - `class ProcessedImage`; `def detect_mime_type_from_bytes(data)`; `def detect_mime_type_from_base64(data)`; `def detect_mime_type_from_extension(path)`; `def resize_image_if_needed(image_bytes, max_dimensions, output_format)`; `def process_image(image, max_dimensions, provider)`; `def process_images(images, max_dimensions, provider)`; `def get_base64_only(images, max_dimensions, provider)`; `…`
 - **kestrel_sovereign/llm/mandate.py** — Model mandate management for LLM Service.
@@ -914,7 +919,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/voice/piper_tts.py** — Piper TTS Provider — local, CPU-based, privacy-safe text-to-speech.
   - `class PiperTTSProvider`; `def wave_file(wav_buf, config)`
 - **kestrel_sovereign/voice/provider_registry.py** — Voice Provider Registry.
-  - `class VoiceProviderRegistry`
+  - `class ProviderDiagnostic`; `class VoiceProviderRegistry`
 - **kestrel_sovereign/voice/routing.py** — Voice path resolver — single source of truth for picking the voice path.
   - `class UserVoicePreferences`; `class InstalledProviders`; `class VoiceRoutingContext`; `class VoiceRoute`; `def resolve(ctx)`
 - **kestrel_sovereign/voice/stream_tap.py** — Agent stream tap — shared infrastructure for tapping into active agent streams.
@@ -1008,7 +1013,7 @@ Repo entry points and standard project files.
   - `async def get_storage_stats(request)`; `async def list_sovereignty_exports(request)`; `async def trigger_sovereignty_export(request)`; `async def trigger_sovereignty_import(request)`; `async def list_sovereignty_files(request)`; `async def download_sovereignty_file(request, filename)`; `async def preview_sovereignty_file(request, filename, max_size)`
 - **endpoints/spawn.py** — Spawn panel API endpoints — re-exported from kestrel-feature-spawn.
 - **endpoints/voice.py** — Voice HTTP endpoints and WebSocket real-time voice chat.
-  - `class VoiceConfigRequest`; `class TTSRequest`; `class TTSStreamRequest`; `async def list_voices(request, provider)`; `async def get_voice_config(request)`; `async def set_voice_config(request, body)`; `async def synthesize_speech(request, body)`; `async def synthesize_speech_stream(request, body)`; `…`
+  - `class VoiceConfigRequest`; `class TTSRequest`; `class TTSStreamRequest`; `async def list_voices(request, provider)`; `async def providers_status(request)`; `async def get_voice_config(request)`; `async def set_voice_config(request, body)`; `async def synthesize_speech(request, body)`; `…`
 - **endpoints/voice_realtime.py** — Voice Realtime ephemeral-session mint endpoint.
   - `class RealtimeSessionRequest`; `class RealtimeSessionResponse`; `class RealtimeUnavailableResponse`; `async def create_realtime_session(body, request)`; `class RouteIntrospectionResponse`; `async def introspect_voice_route(request, prefer_realtime, preferred_tts, preferred_stt)`; `class ToolCallRequest`; `class ToolCallResponse`; `…`
 
@@ -1718,6 +1723,8 @@ Repo entry points and standard project files.
   - `async def test_adapter_preserves_system_stability_across_turns(runner, label)`; `async def test_openai_compatible_adapter_preserves_history_prefix(runner, label)`; `async def test_anthropic_preserves_history_prefix_after_role_conversion()`; `async def test_openai_adapter_is_deterministic_on_identical_input()`; `async def test_anthropic_adapter_is_deterministic_on_identical_input()`
 - **tests/unit/test_adapter_list_models.py** — Unit tests for adapter list_models() methods.
   - `class TestOpenAIAdapterListModels`; `class TestAnthropicAdapterListModels`; `class TestOllamaAdapterListModels`; `class TestGoogleAdapterListModels`; `class TestVertexAIAdapterListModels`; `class TestModelInfoSerialization`
+- **tests/unit/test_adapter_system_prompt_contribution.py** — Adapter-level tests for the ``contribute_system_prompt`` hook (#807 / #806).
+  - `class TestBaseHookIdentity`; `class TestCodexAdapterOverlay`; `class TestOpenAIAdapterOverlay`; `class TestApplySystemPromptContributionToMessages`; `class TestCodexInstructionsAugmentation`
 - **tests/unit/test_agent_backend_routing_contracts.py** — Contract tests for agent-specific backend routing (issue #425).
   - `def service_with_providers()`; `def service_with_openai_plan()`; `class TestPreferenceRoundTrip`; `class TestResolveProviderRouting`; `class TestUnavailableProviderFails`; `class TestEmptyProviderListRaisesClearly`; `class TestAnthropicPlanVsApi`; `class TestOpenAIPlanRouting`; `…`
 - **tests/unit/test_agent_cancellation.py** — Unit tests for agent request cancellation (stop button).
@@ -1787,6 +1794,8 @@ Repo entry points and standard project files.
   - `def feature(tmp_path)`; `def test_resolve_path_rejects_escape(feature)`; `async def test_code_read_returns_file_contents(feature)`; `async def test_code_read_file_io_is_offloaded(feature)`; `async def test_code_search_limits_and_reports_matches(feature)`; `async def test_code_search_file_io_is_offloaded(feature)`; `async def test_code_edit_requires_unique_match_before_approval(feature)`; `async def test_code_edit_applies_change_after_approval(feature)`; `…`
 - **tests/unit/test_codex_adapter.py** — Tests for the OpenAI plan adapter and registry integration.
   - `class TestOpenAIPlanAdapterClass`; `class TestOpenAIPlanListModels`; `class TestMessageHelpers`; `class TestAccountIdExtraction`; `class TestBuildHeaders`; `class TestOpenAIPlanProviderRegistry`; `class TestReadCodexAuthFile`
+- **tests/unit/test_codex_continuation.py** — Codex adapter continuation protocol tests (#808 / #806).
+  - `class TestComputeRequestSignature`; `class TestPlanContinuation`; `class TestCodexContinuationE2E`
 - **tests/unit/test_command_handler_async_boundary_contracts.py** — Contracts for explicit sync/async boundaries in CommandHandler.
   - `def test_privacy_save_handler_is_explicitly_async()`; `async def test_handle_awaits_privacy_save_without_leaking_coroutine()`; `async def test_handle_accepts_custom_awaitable_results_via_isawaitable()`; `def test_create_agent_handler_is_explicitly_async()`; `async def test_handle_awaits_create_agent_command()`; `def test_anchor_handler_is_explicitly_async()`; `async def test_handle_awaits_anchor_command()`
 - **tests/unit/test_command_handler_constitution_contracts.py** — Command-handler contracts for constitution verification commands.
@@ -1821,6 +1830,8 @@ Repo entry points and standard project files.
   - `class TestTokenCounter`; `class TestTokenBudget`; `class TestAdaptiveTokenBudget`; `class TestBM25Index`; `class TestTokenAllocation`; `class TestContextManagerIntegration`; `class TestSessionCompression`; `class TestAgentContextControl`; `…`
 - **tests/unit/test_context_manager_bootstrap_injection.py** — Regression test: system prompts sent via ContextManager actually contain the agent's bootstrap identity (SOUL.md).
   - `def test_context_manager_uses_injected_context_builder()`; `def test_context_manager_falls_back_when_no_injection()`; `async def test_system_prompt_contains_soul_content_when_injected()`; `def test_kestrel_agent_injects_its_own_context_builder()`
+- **tests/unit/test_continuation_store.py** — Unit tests for the continuation cursor store (#808 / #806).
+  - `class TestContinuationCursor`; `class TestInMemoryContinuationStore`
 - **tests/unit/test_continuity_verifier.py** — Unit tests for the Continuity Verifier module.
   - `class TestIdentityChallenge`; `class TestChallengeResult`; `class TestContinuityScore`; `class TestMigrationCertificate`; `class TestChallengeGenerator`; `class TestContinuityVerifier`; `class TestAuditTrail`; `class TestVerifyMigration`
 - **tests/unit/test_conversation_manager.py** — Unit tests for ConversationManager.
@@ -1909,6 +1920,8 @@ Repo entry points and standard project files.
   - `class TestModels`; `class TestASTAnalyzer`; `class TestGitHubCache`; `class TestGitHubClient`; `class TestGitHubFeature`
 - **tests/unit/test_github_processor.py** — Tests for Kestrel Talon (GitHub/ADO issue processor).
   - `class TestTalonConfig`; `class TestIssueContext`; `class TestProcessingResult`; `class TestCIStatus`; `class TestGitHubClientExtraction`; `class TestTalonE2E`
+- **tests/unit/test_gpt5_overlay.py** — Unit tests for the GPT-5 system-prompt overlay (#807 / #806).
+  - `class TestIsGpt5ModelId`; `class TestPrependGpt5Overlay`
 - **tests/unit/test_graceful_degradation.py** — Unit tests for the Graceful Degradation module.
   - `class TestSeverityLevel`; `class TestCapabilityLoss`; `class TestDegradationReport`; `class TestGracefulDegradationHandler`; `class TestConvenienceFunctions`; `class TestCapabilityImpacts`
 - **tests/unit/test_graduated_hooks.py** — Tests for graduated hook decisions (warning fields on HookOutput).
@@ -2158,7 +2171,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_voice_tags.py** — Unit tests for the voice tag normalizer.
   - `class TestParseTags`; `class TestElevenLabsV3Adapter`; `class TestOpenAITTSAdapter`; `class TestOpenAIRealtimeAdapter`; `class TestPiperAdapter`; `class TestGetAdapter`; `class TestPromptSnippet`; `def test_same_input_through_all_adapters()`
 - **tests/unit/test_voice_websocket.py** — Unit tests for the WebSocket /voice/chat endpoint (endpoints/voice.py).
-  - `class TestBinaryFraming`; `class TestVoiceChatConnection`; `class TestVoiceChatPrivacy`; `class TestVoiceChatStateMachine`; `class TestVoiceChatDisconnect`; `class TestWsForcesPipelineRoute`
+  - `def disable_vad()`; `class TestBinaryFraming`; `class TestVoiceChatConnection`; `class TestVoiceChatPrivacy`; `class TestVoiceChatStateMachine`; `class TestVoiceChatDisconnect`; `class TestWsForcesPipelineRoute`
 - **tests/unit/test_wallet_agent.py** — —
   - `async def test_wallet_agent_demonstration()`; `class TestWalletPersistence`
 - **tests/unit/test_wallet_limits.py** — Unit tests for wallet security features: daily limits and mainnet blocking.
