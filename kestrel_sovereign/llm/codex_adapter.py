@@ -110,22 +110,37 @@ def _convert_tools_to_responses_format(tools):
 def _content_to_text(content: Any) -> str:
     """Coerce Chat-Completions content (str | list of parts | None) to plain text.
 
-    Image and other non-text parts are dropped. Vision support on the Responses
-    API uses different part-type names (``input_text`` / ``input_image``); a
-    follow-up will add proper conversion when a vision-capable Codex test case
-    exists. See #828 non-goals.
+    Non-text parts (e.g. ``image_url``) are dropped with a warning so the gap
+    is visible in logs rather than silently producing text-only output.
+    Multimodal Codex is tracked separately as a follow-up; this function is
+    deliberately the single chokepoint where the drop happens, so when the
+    follow-up lands the change is local.
     """
     if content is None:
         return ""
     if isinstance(content, str):
         return content
     if isinstance(content, list):
-        parts = []
+        parts: List[str] = []
+        dropped: List[str] = []
         for p in content:
             if isinstance(p, dict) and p.get("type") == "text":
                 parts.append(p.get("text", ""))
+            elif isinstance(p, dict):
+                dropped.append(p.get("type") or "<no-type>")
+            else:
+                dropped.append(type(p).__name__)
+        if dropped:
+            logger.warning(
+                "CodexAdapter: dropping non-text content parts %s — "
+                "multimodal Codex not yet supported (#847).",
+                dropped,
+            )
         return "".join(parts)
-    return str(content)
+    raise TypeError(
+        f"CodexAdapter: unsupported content type {type(content).__name__}; "
+        "expected str, list of typed parts, or None."
+    )
 
 
 def _convert_messages_to_responses_format(
@@ -148,8 +163,10 @@ def _convert_messages_to_responses_format(
       tool call. If the assistant message also carried text content, a
       sibling ``{"role": "assistant", "content": ...}`` is emitted first.
     - ``role=tool`` becomes ``{"type": "function_call_output", "call_id", "output"}``.
-    - Unknown roles pass through unchanged so we don't silently swallow
-      future shapes.
+    - Unknown roles raise ``ValueError`` at the adapter boundary rather than
+      forwarding to the wire. A server 400 there is opaque ("Unknown
+      parameter") and discovered post-network; the adapter is the right place
+      to fail fast with a clear message naming the offending role.
 
     Reasoning replay (#842): when ``cached_turn_outputs`` is supplied (one
     inner list per prior assistant turn, in order), each ``role=assistant``
@@ -204,7 +221,13 @@ def _convert_messages_to_responses_format(
                 "output": _content_to_text(msg.get("content")),
             })
         else:
-            items.append(msg)
+            raise ValueError(
+                f"CodexAdapter received unsupported message role {role!r}; "
+                "the orchestrator should produce only system/user/assistant/tool. "
+                "Failing at the adapter boundary so the upstream caller is "
+                "obvious — a server 400 from forwarding the message would be "
+                "opaque and post-network."
+            )
     return items
 
 
