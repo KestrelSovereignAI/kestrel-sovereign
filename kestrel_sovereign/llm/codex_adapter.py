@@ -21,7 +21,7 @@ import hashlib
 import json
 import logging
 import platform
-from typing import Any, Dict, List, Optional, AsyncIterator, Type, Union
+from typing import Any, Dict, List, Optional, AsyncIterator, Tuple, Type, Union
 
 import httpx
 from pydantic import BaseModel
@@ -128,7 +128,10 @@ def _content_to_text(content: Any) -> str:
     return str(content)
 
 
-def _convert_messages_to_responses_format(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _convert_messages_to_responses_format(
+    messages: List[Dict[str, Any]],
+    cached_turn_outputs: Optional[List[List[Dict[str, Any]]]] = None,
+) -> List[Dict[str, Any]]:
     """Convert Chat-Completions-style messages into Responses API input items.
 
     The Responses API accepts a flat list of typed items rather than role-tagged
@@ -148,10 +151,18 @@ def _convert_messages_to_responses_format(messages: List[Dict[str, Any]]) -> Lis
     - Unknown roles pass through unchanged so we don't silently swallow
       future shapes.
 
-    Fixes #828: the Responses API rejects ``input[*].tool_calls`` and
-    ``role=tool`` with ``Unknown parameter`` errors.
+    Reasoning replay (#842): when ``cached_turn_outputs`` is supplied (one
+    inner list per prior assistant turn, in order), each ``role=assistant``
+    message is replaced by the cached output items for that turn — typically
+    a ``reasoning`` item followed by ``function_call`` items. This preserves
+    GPT-5's encrypted chain-of-thought across tool round trips. Falls back
+    to the simple conversion above when no cache exists for a turn.
+
+    Fixes #828 (the unknown-parameter errors) and #842 (reasoning continuity).
     """
+    cached_turn_outputs = cached_turn_outputs or []
     items: List[Dict[str, Any]] = []
+    assistant_turn_idx = 0
     for msg in messages:
         role = msg.get("role")
         if role == "user":
@@ -159,23 +170,33 @@ def _convert_messages_to_responses_format(messages: List[Dict[str, Any]]) -> Lis
         elif role == "assistant":
             tool_calls = msg.get("tool_calls") or []
             text = _content_to_text(msg.get("content"))
-            if text:
-                items.append({"role": "assistant", "content": text})
-            for tc in tool_calls:
-                fn = tc.get("function") or {}
-                args = fn.get("arguments", "")
-                if not isinstance(args, str):
-                    args = json.dumps(args)
-                items.append({
-                    "type": "function_call",
-                    "call_id": tc.get("id", ""),
-                    "name": fn.get("name", ""),
-                    "arguments": args,
-                })
-            if not tool_calls and not text:
+            empty = not tool_calls and not text
+            if empty:
                 # Empty assistant message — drop. The Responses API rejects
                 # bare assistant items with no content and no function_call.
+                # Don't increment turn index — this isn't a real prior turn.
                 continue
+            if assistant_turn_idx < len(cached_turn_outputs):
+                # Replay this turn's cached output items (reasoning +
+                # function_calls) verbatim. The encrypted_content and
+                # original ids must round-trip exactly to be valid.
+                items.extend(cached_turn_outputs[assistant_turn_idx])
+            else:
+                # No cache — convert from the Chat-Completions message.
+                if text:
+                    items.append({"role": "assistant", "content": text})
+                for tc in tool_calls:
+                    fn = tc.get("function") or {}
+                    args = fn.get("arguments", "")
+                    if not isinstance(args, str):
+                        args = json.dumps(args)
+                    items.append({
+                        "type": "function_call",
+                        "call_id": tc.get("id", ""),
+                        "name": fn.get("name", ""),
+                        "arguments": args,
+                    })
+            assistant_turn_idx += 1
         elif role == "tool":
             items.append({
                 "type": "function_call_output",
@@ -288,16 +309,59 @@ class CodexAdapter(LLMAdapter):
         """
         return prepend_gpt5_overlay(base, model_id)
 
+    def _load_replay_outputs(
+        self,
+        session_id: Optional[str],
+        signature: str,
+    ) -> List[List[Dict[str, Any]]]:
+        """Load cached output items per turn for replay (#842).
+
+        Returns a list of per-turn output-item lists. Empty list when no
+        ``session_id``, no cursor, or signature drift (cached reasoning was
+        conditioned on a different ``(instructions, tools)`` and would
+        confuse the model — drop and resubmit full context).
+        """
+        if not session_id:
+            return []
+        cursor = self._continuation_store.get(self.name, session_id)
+        if cursor is None:
+            return []
+        if cursor.last_request_signature != signature:
+            # Drift: do not replay reasoning bound to a different prompt.
+            return []
+        try:
+            return [json.loads(s) for s in cursor.turn_outputs]
+        except json.JSONDecodeError:
+            logger.warning(
+                "Failed to parse cached turn_outputs for session %s; dropping",
+                session_id,
+            )
+            return []
+
     def _record_continuation(
         self,
         session_id: Optional[str],
         response_id: Optional[str],
         full_messages_count: int,
         signature: str,
+        new_turn_outputs: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
-        """Persist the cursor for the next turn after a successful response."""
+        """Persist the cursor for the next turn after a successful response.
+
+        ``new_turn_outputs`` is the list of output items emitted by the model
+        on THIS turn (typically reasoning + function_call items). Appended to
+        any prior cached turns so subsequent calls can replay them as input.
+        See #842.
+        """
         if not session_id or not response_id:
             return
+        prior_outputs: Tuple[str, ...] = ()
+        existing = self._continuation_store.get(self.name, session_id)
+        if existing is not None and existing.last_request_signature == signature:
+            prior_outputs = existing.turn_outputs
+        new_outputs = prior_outputs
+        if new_turn_outputs:
+            new_outputs = (*prior_outputs, json.dumps(new_turn_outputs))
         self._continuation_store.put(
             self.name,
             session_id,
@@ -305,6 +369,7 @@ class CodexAdapter(LLMAdapter):
                 last_response_id=response_id,
                 last_message_count=full_messages_count,
                 last_request_signature=signature,
+                turn_outputs=new_outputs,
             ),
         )
 
@@ -330,11 +395,6 @@ class CodexAdapter(LLMAdapter):
                 "Run `codex login` or set CODEX_AUTH_TOKEN."
             )
 
-        # Conversation continuation (#808): when a session_id is provided
-        # and a cursor exists for it, send only the new input items plus
-        # ``previous_response_id`` so the server can preserve encrypted
-        # reasoning across turns. Pop from kwargs so it does not leak into the
-        # request body builder.
         session_id = kwargs.pop("session_id", None)
 
         account_id = _extract_account_id(token)
@@ -343,13 +403,15 @@ class CodexAdapter(LLMAdapter):
         instructions = self.contribute_system_prompt(model, instructions)
         responses_tools = _convert_tools_to_responses_format(tools)
 
-        # ChatGPT-backend Responses API rejects ``previous_response_id`` with
-        # 400 ""Unsupported parameter"" — caught live in #841. The continuation
-        # design from #808 doesn't apply here; always send the full converted
-        # input. Cursor is still recorded after the response for session →
-        # response_id mapping (no-op for now, but cheap and future-useful).
+        # The ChatGPT backend rejects ``previous_response_id`` (#841). Reasoning
+        # continuity is preserved instead by capturing the model's per-turn
+        # output items (reasoning + function_call) and replaying them as input
+        # items on subsequent turns — see #842.
         signature = _compute_request_signature(instructions, responses_tools)
-        input_to_send = _convert_messages_to_responses_format(input_messages)
+        cached_outputs = self._load_replay_outputs(session_id, signature)
+        input_to_send = _convert_messages_to_responses_format(
+            input_messages, cached_turn_outputs=cached_outputs,
+        )
 
         body = _build_request_body(
             model=model,
@@ -366,6 +428,9 @@ class CodexAdapter(LLMAdapter):
         func_calls: Dict[int, Dict[str, str]] = {}
         final_usage: Dict[str, Any] = {}
         last_response_id: Optional[str] = None
+        # Capture the model's output items for this turn so the next call can
+        # replay encrypted reasoning + function_calls as input items (#842).
+        new_turn_outputs: List[Dict[str, Any]] = []
 
         async with httpx.AsyncClient(timeout=120) as http:
             async with http.stream("POST", CODEX_BASE_URL, headers=headers, json=body) as resp:
@@ -405,17 +470,22 @@ class CodexAdapter(LLMAdapter):
                             func_calls[idx] = {"id": "", "name": "", "arguments": ""}
                         func_calls[idx]["arguments"] = event.get("arguments", "")
 
+                    elif event_type == "response.output_item.done":
+                        item = event.get("item", {})
+                        if item.get("type") in ("reasoning", "function_call", "message"):
+                            new_turn_outputs.append(item)
+
                     elif event_type == "response.completed":
                         resp_data = event.get("response", {})
                         final_usage = resp_data.get("usage", {})
                         last_response_id = resp_data.get("id") or last_response_id
 
-        # Persist cursor on success so the next turn for this conversation
-        # picks up from this response. ``len(input_messages)`` is the *full*
-        # message count, not the slice — the server owns history; we just
-        # track the watermark from which to send deltas next time.
+        # Persist cursor + this turn's output items so the next call replays
+        # them as input. ``len(input_messages)`` is the Chat-Completions count
+        # after system extraction.
         self._record_continuation(
             session_id, last_response_id, len(input_messages), signature,
+            new_turn_outputs=new_turn_outputs,
         )
 
         content = "".join(content_parts) if content_parts else None
@@ -457,17 +527,18 @@ class CodexAdapter(LLMAdapter):
         if not isinstance(token, str):
             raise RuntimeError("Codex adapter requires an OAuth token.")
 
-        # Conversation continuation (#808). See ``get_response`` for rationale.
         session_id = kwargs.pop("session_id", None)
 
         account_id = _extract_account_id(token)
         headers = _build_headers(token, account_id)
         instructions, input_messages = _extract_instructions_and_input(messages)
         instructions = self.contribute_system_prompt(model, instructions)
-        # Continuation disabled at the Codex wire — backend rejects
-        # ``previous_response_id``. See get_response above for full rationale (#841).
+        # See ``get_response`` for the full rationale on #841 and #842.
         signature = _compute_request_signature(instructions, None)
-        input_to_send = _convert_messages_to_responses_format(input_messages)
+        cached_outputs = self._load_replay_outputs(session_id, signature)
+        input_to_send = _convert_messages_to_responses_format(
+            input_messages, cached_turn_outputs=cached_outputs,
+        )
 
         body = _build_request_body(
             model=model,
@@ -480,6 +551,7 @@ class CodexAdapter(LLMAdapter):
         logger.info(f"Starting Codex stream for model: {model}")
         chunk_count = 0
         last_response_id: Optional[str] = None
+        new_turn_outputs: List[Dict[str, Any]] = []
 
         async with httpx.AsyncClient(timeout=120) as http:
             async with http.stream("POST", CODEX_BASE_URL, headers=headers, json=body) as resp:
@@ -496,12 +568,17 @@ class CodexAdapter(LLMAdapter):
                     if event_type == "response.output_text.delta":
                         chunk_count += 1
                         yield event.get("delta", "")
+                    elif event_type == "response.output_item.done":
+                        item = event.get("item", {})
+                        if item.get("type") in ("reasoning", "function_call", "message"):
+                            new_turn_outputs.append(item)
                     elif event_type == "response.completed":
                         resp_data = event.get("response", {})
                         last_response_id = resp_data.get("id") or last_response_id
 
         self._record_continuation(
             session_id, last_response_id, len(input_messages), signature,
+            new_turn_outputs=new_turn_outputs,
         )
         logger.info(f"Codex stream completed. Total chunks: {chunk_count}")
 
@@ -519,7 +596,6 @@ class CodexAdapter(LLMAdapter):
         if not isinstance(token, str):
             raise RuntimeError("Codex adapter requires an OAuth token.")
 
-        # Conversation continuation (#808). See ``get_response`` for rationale.
         session_id = kwargs.pop("session_id", None)
 
         account_id = _extract_account_id(token)
@@ -528,9 +604,12 @@ class CodexAdapter(LLMAdapter):
         instructions = self.contribute_system_prompt(model, instructions)
         responses_tools = _convert_tools_to_responses_format(tools)
 
-        # Continuation disabled at the Codex wire — see get_response (#841).
+        # See ``get_response`` for the full rationale on #841 and #842.
         signature = _compute_request_signature(instructions, responses_tools)
-        input_to_send = _convert_messages_to_responses_format(input_messages)
+        cached_outputs = self._load_replay_outputs(session_id, signature)
+        input_to_send = _convert_messages_to_responses_format(
+            input_messages, cached_turn_outputs=cached_outputs,
+        )
 
         body = _build_request_body(
             model=model,
@@ -547,6 +626,7 @@ class CodexAdapter(LLMAdapter):
         func_calls: Dict[int, Dict[str, str]] = {}
         final_usage: Dict[str, Any] = {}
         last_response_id: Optional[str] = None
+        new_turn_outputs: List[Dict[str, Any]] = []
 
         async with httpx.AsyncClient(timeout=120) as http:
             async with http.stream("POST", CODEX_BASE_URL, headers=headers, json=body) as resp:
@@ -588,6 +668,11 @@ class CodexAdapter(LLMAdapter):
                                 "arguments": "",
                             }
 
+                    elif event_type == "response.output_item.done":
+                        item = event.get("item", {})
+                        if item.get("type") in ("reasoning", "function_call", "message"):
+                            new_turn_outputs.append(item)
+
                     elif event_type == "response.completed":
                         resp_data = event.get("response", {})
                         usage = resp_data.get("usage", {})
@@ -596,6 +681,7 @@ class CodexAdapter(LLMAdapter):
 
         self._record_continuation(
             session_id, last_response_id, len(input_messages), signature,
+            new_turn_outputs=new_turn_outputs,
         )
 
         # Yield final tool call response if any
