@@ -1,18 +1,23 @@
 # Computer Use & File System
 
-Optional capability that lets a sovereign agent read, list, write, and edit files on the user's machine and run shell commands. Disabled by default. Enabling it requires three independent actions — any single one missing, every tool call is refused.
+Optional capability that lets a sovereign agent read, list, write, and edit files on the user's machine and run shell commands. Disabled by default. Enabling it requires three independent actions — and even then, every tool call is gated.
 
-## The three gates
+## The five-stage gate sequence
 
-Every tool call in `ComputerUseFeature` runs through these gates in order. The audit log records which gate was the last to allow (or refuse) the call.
+Every tool call runs through the same sequence. The audit log records every stage that passed and the stage that refused (if any) as a chain like `["privacy", "constitution", "path_safety", "policy", "approval:once:human"]`.
 
-| Gate | Where it lives | What enables it |
-|---|---|---|
-| **Privacy** | `PrivacyConfig.computer_access` | `agent.privacy_config.computer_access = True`. Defaults `False` on every preset (ephemeral … public); never inherited from a preset name. |
-| **Constitution** | Book II Amendment IX | The agent's constitution markdown contains a `### Amendment IX` section with `[x]` checked next to the capability name. Parser is strict: only lowercase `[x]` counts. |
-| **Approval** | `SecurityFeature.approval_queue` | A human approves the per-call request inside the approval timeout (default 5 min). Reads inside the allow-list auto-approve; writes, edits, and shell always require human approval. |
+| # | Stage | Where it lives | What enables it |
+|---|---|---|---|
+| 1 | **Readiness** | `[features.computer_use].enabled` in `kestrel.toml`, plus a successfully-constructed backend | Toml file present and feature `enabled = true`; backend constructed without `CapabilityBlocked` |
+| 2 | **Privacy** | `PrivacyConfig.computer_access` | `agent.privacy_config.computer_access = True`. Defaults `False` on every preset; never inherited from a preset name. |
+| 3 | **Constitution** | Book II Amendment IX | The agent's constitution markdown contains a `### Amendment IX` section with `[x]` checked next to the capability name. Parser is strict: only lowercase `[x]` counts. |
+| 4 | **Path safety** | `path_safety.resolve_realpath` | Reject `..` traversal and embedded NUL bytes. Symlinks are *resolved*, not rejected — the realpath is what the human approver later sees. |
+| 5 | **Policy** | `PathPolicy.evaluate` / `BinaryPolicy.evaluate` | Allow-list / deny-list. Deny-list always wins. Allow-list match → `ALLOW` (read with `auto_approve_read`) or `REQUIRE_APPROVAL` (write). No match → `REQUIRE_APPROVAL` so the human can vouch. |
+| 6 | **Approval** | `SecurityFeature.approval_queue` | A human approves the per-call request inside the approval timeout (default 5 min). |
 
-All three are mandatory. The friction is the feature: if you don't want to flip a checkbox in your constitution, you don't want this capability turned on.
+Privacy and constitution come first because they're call-level and input-independent — they decide whether the call is *eligible* at all, without leaking anything about path layout or policy contents. Path-safety and policy are input validation; they only matter once the call is eligible.
+
+A side effect of this order: a missing constitutional grant always surfaces as `constitution:Amendment IX missing grant 'X'`, never as `path_safety:...` or `policy:...`. A probing agent can't map your allow-list before it has a grant.
 
 ## Backends
 
@@ -27,12 +32,13 @@ The backend is selected once at feature init and cannot be swapped at runtime.
 
 | Tool | Capability checked | Approval policy |
 |---|---|---|
-| `!fs-read <path>` | `filesystem_read` | Auto-approve inside allow-list; human approval outside |
+| `!fs-read <path>` | `filesystem_read` | Auto-approve inside allow-list; human approval outside (the human sees the resolved realpath, including symlink targets) |
 | `!fs-list <path>` | `filesystem_read` | Auto-approve inside allow-list; human approval outside |
-| `!fs-write <path>` | `filesystem_write` | Always human approval; payload includes diff preview |
+| `!fs-write <path>` | `filesystem_write` | Always human approval; payload includes a unified-diff preview |
+| `!fs-edit <path> <old> <new>` | `filesystem_write` | Always human approval; replaces the Nth occurrence of `old_text` with `new_text`; payload includes a unified-diff preview |
 | `!shell <cmd>` | `shell_execution_sandboxed` (docker) or `shell_execution_host` (local) | Always human approval; binary deny-list hard-rejects before approval |
 
-A path that matches the deny-list is rejected before the approval queue ever sees it; the approver cannot accidentally widen the deny-list.
+A path or binary that matches the deny-list is rejected before the approval queue ever sees it; the approver cannot accidentally widen the deny-list.
 
 ## Configuration
 
@@ -49,11 +55,13 @@ auto_approve_read = true              # only inside allowed_paths
 audit_log_path = ".kestrel/computer_use_audit.jsonl"
 ```
 
+The toml is looked up in this order: (1) the agent's `storage_path` directory, (2) `<storage_path>/..`, (3) walking up from the source file to the repo root. Per-agent kestrel.toml under `agent_data/<name>/` is the typical home.
+
 The feature can also be disabled via `KESTREL_DISABLED_FEATURES=ComputerUseFeature`.
 
 ## Audit log
 
-Append-only JSONL at `audit_log_path`. One record per tool call (allowed, denied, or errored), `fsync` per write, also forwarded to the existing `record_tool_usage` feedback hook so the knowledge graph stays in sync.
+Append-only JSONL at `audit_log_path`. **One record per tool call**, regardless of whether it succeeded, was denied at any stage, or errored during execution. `fsync` per write. Also forwarded to the existing `record_tool_usage` feedback hook so the knowledge graph stays in sync.
 
 ```json
 {
@@ -61,23 +69,36 @@ Append-only JSONL at `audit_log_path`. One record per tool call (allowed, denied
   "agent_did": "did:kestrel:0x07D6…",
   "tool": "fs-write",
   "backend": "docker",
-  "args": {"path": "/Users/me/projects/foo/bar.py", "bytes": 1234},
-  "allowed_by": ["privacy", "constitution", "approval:once:human"],
+  "args": {"path": "/Users/me/projects/foo/bar.py", "bytes": 1234, "diff_preview": "..."},
+  "allowed_by": ["privacy", "constitution", "path_safety", "policy", "approval:once:human"],
   "outcome": "ok",
   "duration_ms": 42,
   "error": null
 }
 ```
 
+Denials append `denied:<stage>` to `allowed_by` and set `outcome="denied"`:
+
+```json
+{"allowed_by": ["denied:privacy"], "outcome": "denied"}
+{"allowed_by": ["privacy", "denied:constitution"], "outcome": "denied"}
+{"allowed_by": ["privacy", "constitution", "denied:path_safety"], "outcome": "denied", "error": "..."}
+{"allowed_by": ["privacy", "constitution", "path_safety", "denied:policy"], "outcome": "denied"}
+{"allowed_by": ["privacy", "constitution", "path_safety", "policy", "denied:approval:denied"], "outcome": "denied"}
+```
+
+Reading those rows back is the canonical way to reconstruct what happened.
+
 ## Threat model
 
 **What this mitigates:**
 
-- **Path traversal** — `..` segments rejected before any I/O.
-- **Symlink escape** — realpath of any candidate must live under an allow-list root; symlinks pointing outside are rejected.
-- **Deny-list bypass** — deny matches short-circuit the approval flow; the approver never sees a deny-listed path or binary.
+- **Path traversal** — `..` segments and embedded NUL bytes rejected before any I/O.
+- **Symlink escape** — realpath resolution happens *before* the human approver sees the request. A symlink inside an allow-listed directory pointing to `/etc/passwd` is shown to the approver as `/etc/passwd`, not as the symlink path.
+- **Deny-list bypass** — deny-list matches short-circuit the approval flow; the approver never sees a deny-listed path or binary.
 - **Accidental host shell exec** — the `docker` backend is the default and reuses the compute feature's vetted container flags. Choosing `local` requires a *separate* constitutional grant.
 - **Silent capability widening** — adding a capability requires editing the constitution, which changes its hash, which changes the agent's identity record. There is no way to enable this feature without that change being visible in the inception/continuity audit.
+- **Information disclosure via gate ordering** — privacy and constitution stages run before any input is examined. An agent without a constitutional grant cannot probe path layout or policy contents through error messages.
 
 **What this does *not* mitigate:**
 
@@ -87,7 +108,7 @@ Append-only JSONL at `audit_log_path`. One record per tool call (allowed, denied
 
 ## Enabling, end-to-end
 
-1. Open `kestrel.toml`, set `[features.computer_use] enabled = true`, configure `allowed_paths` and `denied_binaries`.
+1. Open the agent's `kestrel.toml` (typically `agent_data/<name>/kestrel.toml`), set `[features.computer_use] enabled = true`, configure `allowed_paths` and `denied_binaries`.
 2. Open `kestrel_sovereign/data/KESTREL_CONSTITUTION.md`, find Amendment IX, change `[ ]` to `[x]` for the capabilities you want to grant.
 3. If the agent has been inception-anchored to a previous constitution hash, run `!reanchor-constitution <new_hash_prefix>` so identity records reflect the change.
 4. Set `agent.privacy_config.computer_access = True` for the session(s) where you want the feature available.

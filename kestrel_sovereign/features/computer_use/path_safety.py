@@ -1,17 +1,19 @@
 """Path-safety guards for the computer-use feature.
 
-Pure ``pathlib`` + ``os.path.realpath``. No I/O beyond resolution. The job
-is to make every path the agent supplies safe to hand to a backend by:
+Pure ``pathlib`` + ``os.path.realpath``. No I/O beyond resolution.
 
-- forbidding ``..`` traversal segments,
-- resolving symlinks and asserting the realpath stays under a configured
-  root,
-- matching the resolved path against an allow/deny list with deny-wins
-  glob semantics.
+This module's only job is to canonicalize a candidate path:
 
-Callers should always go through :func:`resolve_within` (or
-:func:`resolve_against_roots`) before any open/stat/exec, and then through
-:func:`match_allow_list` to decide whether the operation is permitted.
+- reject ``..`` traversal segments and embedded NULs (always unsafe),
+- expand ``~`` and resolve symlinks,
+- return the absolute realpath.
+
+Whether the resulting realpath is **allowed** is a policy decision, not a
+safety decision — see :mod:`policy`. Conflating the two (the v0 design)
+made it impossible for a path "outside the allow-list" to ever reach the
+approval queue, because the path-safety guard rejected it first. That
+is a real threat-model bug — the realpath is exactly what the human
+approver needs to see in the prompt, even (especially) for unusual paths.
 """
 
 from __future__ import annotations
@@ -24,96 +26,58 @@ from typing import Iterable
 
 
 class PathSafetyError(Exception):
-    """Raised when a candidate path violates a safety guard."""
+    """Raised when a candidate path is *intrinsically* unsafe.
+
+    Reserved for unsafe-by-construction inputs: traversal segments and
+    embedded NUL bytes. Allow-list / deny-list decisions belong to
+    policy, not here.
+    """
 
 
 def assert_no_traversal(candidate: str | os.PathLike) -> None:
     """Reject any path containing ``..`` segments after normalization."""
-    parts = PurePosixPath(str(candidate).replace(os.sep, "/")).parts
+    text = str(candidate)
+    if "\x00" in text:
+        raise PathSafetyError(f"path contains NUL byte: {candidate!r}")
+    parts = PurePosixPath(text.replace(os.sep, "/")).parts
     if any(p == ".." for p in parts):
         raise PathSafetyError(f"path contains traversal segment: {candidate!r}")
 
 
-def assert_no_symlink_escape(root: Path, candidate: Path) -> None:
-    """Reject if the realpath of ``candidate`` is not under ``root``.
+def resolve_realpath(candidate: str | os.PathLike) -> Path:
+    """Canonicalize ``candidate`` to an absolute realpath.
 
-    ``candidate`` does not need to exist; we resolve as much as we can and
-    walk up to the nearest existing ancestor for the symlink check.
+    Steps:
+
+    1. :func:`assert_no_traversal` — reject ``..`` segments and NUL bytes.
+    2. Expand ``~`` to the user's home directory.
+    3. If relative, treat as relative to the current working directory
+       (the feature does not assume a workspace root here — that is a
+       policy concern).
+    4. Walk symlinks with ``os.path.realpath`` so the returned path is
+       what would actually be opened.
+
+    The returned path is what the policy layer should match against the
+    allow/deny lists, and what the approval payload should display to the
+    human. Symlink targets are resolved before the human sees them, so
+    a "safe-looking" path inside an allowed root that points to
+    ``/etc/passwd`` will appear as ``/etc/passwd`` in the approval prompt.
     """
-    real_root = Path(os.path.realpath(root))
-    cur = candidate
-    while True:
-        if cur.exists() or cur.is_symlink():
-            real = Path(os.path.realpath(cur))
-            try:
-                real.relative_to(real_root)
-            except ValueError:
-                raise PathSafetyError(
-                    f"symlink escape: {candidate} resolves to {real} "
-                    f"outside root {real_root}"
-                )
-            return
-        if cur.parent == cur:
-            return
-        cur = cur.parent
-
-
-def resolve_within(root: Path | str, candidate: str | os.PathLike) -> Path:
-    """Resolve ``candidate`` and assert it lives under ``root``.
-
-    Returns the absolute, symlink-resolved path. Raises
-    :class:`PathSafetyError` on any violation.
-    """
-    root_path = Path(root).expanduser()
-    if not root_path.is_absolute():
-        root_path = root_path.resolve()
     assert_no_traversal(candidate)
-
     cand = Path(candidate).expanduser()
     if not cand.is_absolute():
-        cand = (root_path / cand)
-    cand = cand.resolve(strict=False) if cand.exists() else _best_effort_resolve(cand)
-
-    real_root = Path(os.path.realpath(root_path))
-    try:
-        cand.relative_to(real_root)
-    except ValueError:
-        raise PathSafetyError(
-            f"path escapes root: {cand} not under {real_root}"
-        )
-    assert_no_symlink_escape(root_path, cand)
-    return cand
+        cand = Path.cwd() / cand
+    return Path(_best_effort_realpath(cand))
 
 
-def resolve_against_roots(roots: Iterable[Path | str], candidate: str | os.PathLike) -> Path:
-    """Resolve ``candidate`` and assert it lives under at least one root.
+def _best_effort_realpath(path: Path) -> str:
+    """Return the realpath even when the leaf doesn't exist yet.
 
-    Returns the resolved absolute path. The first root that contains the
-    resolved candidate wins. Raises :class:`PathSafetyError` if the
-    candidate escapes every root.
+    ``os.path.realpath`` handles non-existent leaves correctly on modern
+    Python by walking up to the deepest existing ancestor. We rely on
+    that and return the result as a plain string.
     """
-    last_err: PathSafetyError | None = None
-    for root in roots:
-        try:
-            return resolve_within(root, candidate)
-        except PathSafetyError as e:
-            last_err = e
-    if last_err is None:
-        raise PathSafetyError("no roots configured")
-    raise last_err
-
-
-def _best_effort_resolve(path: Path) -> Path:
-    """Resolve a non-existent path by walking up to the deepest existing parent."""
-    parts: list[str] = []
-    cur = path
-    while not cur.exists() and cur.parent != cur:
-        parts.append(cur.name)
-        cur = cur.parent
-    base = Path(os.path.realpath(cur)) if cur.exists() else cur
-    for name in reversed(parts):
-        base = base / name
-    return base
+    return os.path.realpath(str(path))
 
 
 @dataclass(frozen=True)
