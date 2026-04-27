@@ -296,19 +296,36 @@ test.describe('Chat Functionality', () => {
     });
 
     test('should show thinking indicator while waiting', async ({ page }) => {
+        let releaseStream;
+        const streamGate = new Promise(resolve => {
+            releaseStream = resolve;
+        });
+        await page.route('**/agent/stream', async route => {
+            await streamGate;
+            await route.fulfill({
+                status: 200,
+                headers: { 'Content-Type': 'text/plain' },
+                body: 'Paris is the capital of France.'
+            });
+        });
+
         const input = page.locator('#message-input');
         await input.fill('What is the capital of France?');
 
         const thinkingIndicator = page.locator('#thinking-indicator');
+        const sendButton = page.locator('#send-button');
 
-        // Click send
-        await page.locator('#send-button').click();
+        await sendButton.click();
 
-        // Thinking indicator should appear briefly
-        // Note: May be too fast to catch in some cases
-        const visible = await thinkingIndicator.isVisible().catch(() => false);
-        // Just verify the test runs - indicator may or may not be visible depending on response speed
-        expect(true).toBeTruthy();
+        await expect(thinkingIndicator).toBeVisible();
+        await expect(input).toBeDisabled();
+        await expect(sendButton).toBeDisabled();
+
+        releaseStream();
+
+        await expect(thinkingIndicator).toBeHidden();
+        await expect(input).toBeEnabled();
+        await expect(sendButton).toBeEnabled();
     });
 
     test('should execute !help command', async ({ page }) => {
