@@ -21,7 +21,7 @@ import hashlib
 import json
 import logging
 import platform
-from typing import Any, Dict, List, Optional, AsyncIterator, Tuple, Type, Union
+from typing import Any, Dict, List, Optional, AsyncIterator, Type, Union
 
 import httpx
 from pydantic import BaseModel
@@ -193,7 +193,6 @@ def _build_request_body(
     instructions: Optional[str] = None,
     tools: Optional[list] = None,
     stream: bool = True,
-    previous_response_id: Optional[str] = None,
     **kwargs,
 ) -> dict:
     """Build Responses API request body matching the ChatGPT backend protocol."""
@@ -210,8 +209,6 @@ def _build_request_body(
         body["instructions"] = instructions
     if tools:
         body["tools"] = tools
-    if previous_response_id:
-        body["previous_response_id"] = previous_response_id
     if "max_tokens" in kwargs:
         body["max_output_tokens"] = kwargs["max_tokens"]
     if "temperature" in kwargs:
@@ -225,13 +222,13 @@ def _compute_request_signature(
     instructions: Optional[str],
     tools: Optional[list],
 ) -> str:
-    """Stable hash of (instructions, tools) for continuation drift detection.
+    """Stable hash of (instructions, tools) recorded with the cursor.
 
-    If the next turn's signature does not match the cursor's recorded signature,
-    the server's prior reasoning was conditioned on a different prompt and
-    sending ``previous_response_id`` would either error or produce confused
-    output. The adapter drops continuation in that case and resubmits full
-    context. See #808.
+    Originally designed for #808's drift detection on ``previous_response_id``
+    continuation. The ChatGPT-backend Responses API rejects that parameter
+    (#841), so the signature is no longer used to *gate* continuation — it's
+    kept as a per-session record for diagnostics and for any future backend
+    that supports reasoning-item resubmission.
     """
     canonical = json.dumps(
         {"instructions": instructions or "", "tools": tools or []},
@@ -239,34 +236,6 @@ def _compute_request_signature(
         ensure_ascii=False,
     )
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
-
-
-def _plan_continuation(
-    *,
-    cursor: Optional[ContinuationCursor],
-    messages_count: int,
-    signature: str,
-) -> Tuple[Optional[str], Optional[int]]:
-    """Decide whether to send a delta turn given the current cursor.
-
-    Returns ``(previous_response_id, slice_start)``:
-    - ``previous_response_id`` for the request body, or ``None`` for full input.
-    - ``slice_start`` index into the input message list, or ``None`` for full input.
-
-    Branches:
-    - No cursor → fresh turn, full input.
-    - Signature mismatch → drift (tools or instructions changed mid-conversation),
-      drop continuation, full input.
-    - Signature match + new messages → delta turn from ``last_message_count``.
-    - Signature match + no new messages → defensive full input (avoid empty input).
-    """
-    if cursor is None:
-        return None, None
-    if cursor.last_request_signature != signature:
-        return None, None
-    if messages_count <= cursor.last_message_count:
-        return None, None
-    return cursor.last_response_id, cursor.last_message_count
 
 
 async def _parse_sse_events(response: httpx.Response):
@@ -296,8 +265,16 @@ class CodexAdapter(LLMAdapter):
         # One adapter instance per route (see provider_registry); per-instance
         # continuation state therefore aligns with per-conversation lifetime.
         # Multi-worker uvicorn deployments swap a shared backend in here. #808.
+        # Explicit ``is not None`` check, NOT ``or``: ``InMemoryContinuationStore``
+        # defines ``__len__``, so an empty caller-supplied store evaluates falsy
+        # under ``or`` and gets silently discarded. The bug shipped in PR #811
+        # and was caught only by the live test added in #841 — unit tests
+        # passed because they read ``adapter._continuation_store`` (the
+        # internal one), not the external store passed in.
         self._continuation_store: ContinuationStore = (
-            continuation_store or InMemoryContinuationStore()
+            continuation_store
+            if continuation_store is not None
+            else InMemoryContinuationStore()
         )
 
     def contribute_system_prompt(
@@ -310,33 +287,6 @@ class CodexAdapter(LLMAdapter):
         Responses-API models. No-op for non-gpt-5 ids.
         """
         return prepend_gpt5_overlay(base, model_id)
-
-    def _plan_request_continuation(
-        self,
-        session_id: Optional[str],
-        instructions: Optional[str],
-        responses_tools: Optional[List[Dict[str, Any]]],
-        input_messages: List[Dict[str, Any]],
-    ) -> Tuple[Optional[str], List[Dict[str, Any]], str]:
-        """Decide ``previous_response_id`` and the input slice for this turn.
-
-        Returns ``(previous_response_id, input_to_send, signature)``. When no
-        ``session_id`` is given, behavior reduces to ``(None, input_messages,
-        signature)`` — i.e. a fresh, stateless call (the existing behavior).
-        """
-        signature = _compute_request_signature(instructions, responses_tools)
-        if not session_id:
-            return None, input_messages, signature
-        cursor = self._continuation_store.get(self.name, session_id)
-        prev_id, slice_start = _plan_continuation(
-            cursor=cursor,
-            messages_count=len(input_messages),
-            signature=signature,
-        )
-        input_to_send = (
-            input_messages if slice_start is None else input_messages[slice_start:]
-        )
-        return prev_id, input_to_send, signature
 
     def _record_continuation(
         self,
@@ -393,15 +343,13 @@ class CodexAdapter(LLMAdapter):
         instructions = self.contribute_system_prompt(model, instructions)
         responses_tools = _convert_tools_to_responses_format(tools)
 
-        prev_response_id, input_to_send, signature = self._plan_request_continuation(
-            session_id, instructions, responses_tools, input_messages,
-        )
-        # Translate Chat-Completions tool_calls / role=tool messages into
-        # Responses-API ``function_call`` / ``function_call_output`` items.
-        # Done *after* the continuation slice so the watermark
-        # (``last_message_count``) continues to track the original
-        # Chat-Completions count we slice on. #828.
-        input_to_send = _convert_messages_to_responses_format(input_to_send)
+        # ChatGPT-backend Responses API rejects ``previous_response_id`` with
+        # 400 ""Unsupported parameter"" — caught live in #841. The continuation
+        # design from #808 doesn't apply here; always send the full converted
+        # input. Cursor is still recorded after the response for session →
+        # response_id mapping (no-op for now, but cheap and future-useful).
+        signature = _compute_request_signature(instructions, responses_tools)
+        input_to_send = _convert_messages_to_responses_format(input_messages)
 
         body = _build_request_body(
             model=model,
@@ -409,7 +357,6 @@ class CodexAdapter(LLMAdapter):
             instructions=instructions,
             tools=responses_tools,
             stream=True,  # ChatGPT backend requires streaming
-            previous_response_id=prev_response_id,
             **kwargs,
         )
 
@@ -517,20 +464,16 @@ class CodexAdapter(LLMAdapter):
         headers = _build_headers(token, account_id)
         instructions, input_messages = _extract_instructions_and_input(messages)
         instructions = self.contribute_system_prompt(model, instructions)
-        # Tools aren't passed on the text-only stream path, but signature still
-        # includes them as ``[]`` so a downstream switch to the tool path with
-        # the same session_id correctly invalidates continuation.
-        prev_response_id, input_to_send, signature = self._plan_request_continuation(
-            session_id, instructions, None, input_messages,
-        )
-        input_to_send = _convert_messages_to_responses_format(input_to_send)  # #828
+        # Continuation disabled at the Codex wire — backend rejects
+        # ``previous_response_id``. See get_response above for full rationale (#841).
+        signature = _compute_request_signature(instructions, None)
+        input_to_send = _convert_messages_to_responses_format(input_messages)
 
         body = _build_request_body(
             model=model,
             input_messages=input_to_send,
             instructions=instructions,
             stream=True,
-            previous_response_id=prev_response_id,
             **kwargs,
         )
 
@@ -585,10 +528,9 @@ class CodexAdapter(LLMAdapter):
         instructions = self.contribute_system_prompt(model, instructions)
         responses_tools = _convert_tools_to_responses_format(tools)
 
-        prev_response_id, input_to_send, signature = self._plan_request_continuation(
-            session_id, instructions, responses_tools, input_messages,
-        )
-        input_to_send = _convert_messages_to_responses_format(input_to_send)  # #828
+        # Continuation disabled at the Codex wire — see get_response (#841).
+        signature = _compute_request_signature(instructions, responses_tools)
+        input_to_send = _convert_messages_to_responses_format(input_messages)
 
         body = _build_request_body(
             model=model,
@@ -596,7 +538,6 @@ class CodexAdapter(LLMAdapter):
             instructions=instructions,
             tools=responses_tools,
             stream=True,
-            previous_response_id=prev_response_id,
             **kwargs,
         )
 
