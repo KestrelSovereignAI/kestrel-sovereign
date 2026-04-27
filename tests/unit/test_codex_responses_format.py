@@ -366,15 +366,14 @@ class TestCodexAdapterAppliesConverter:
         assert function_output["call_id"] == "call_xyz"
         assert function_output["output"] == "gpt-5.5"
 
-    async def test_continuation_watermark_unaffected_by_conversion(self):
-        # The cursor's ``last_message_count`` tracks the *Chat Completions*
-        # message count we sliced on, not the post-conversion item count.
-        # Verify on a two-turn run.
+    async def test_two_turn_full_input_no_previous_response_id(self):
+        # Continuation is disabled at the wire (#841): every turn sends the
+        # full converted input list and no previous_response_id, even when a
+        # session_id is provided and a cursor exists. The cursor IS still
+        # written for diagnostics.
         captured: List[Dict[str, Any]] = []
         adapter = CodexAdapter(continuation_store=InMemoryContinuationStore())
 
-        # Turn 1: full input goes through, cursor records count=2 (user only,
-        # since system extracted to instructions).
         sse1 = _sse([_completed("r1")])
         with _patch_httpx(captured, sse1):
             await adapter.get_response(
@@ -393,14 +392,11 @@ class TestCodexAdapterAppliesConverter:
             )
 
         cursor = adapter._continuation_store.get("openai_plan", "sess-1")
-        # Watermark = original Chat Completions count after system extraction:
-        # (user + assistant_with_tool_calls) = 2 — even though the converter
-        # rewrote those into 2 Responses-API items (user + function_call).
-        assert cursor.last_message_count == 2
+        assert cursor is not None
+        assert cursor.last_response_id == "r1"
 
-        # Turn 2: append a tool result. Cursor matches → delta path. The
-        # delta input must be the converted form of just the new message
-        # (function_call_output for the tool result).
+        # Turn 2: append a tool result. Even with a matching cursor, the body
+        # carries the full converted input and no previous_response_id.
         captured.clear()
         sse2 = _sse([_completed("r2")])
         with _patch_httpx(captured, sse2):
@@ -420,7 +416,14 @@ class TestCodexAdapterAppliesConverter:
                 session_id="sess-1",
             )
         body = captured[0]
-        assert body["previous_response_id"] == "r1"
+        assert "previous_response_id" not in body
+        # Full converted input — user + function_call + function_call_output.
         assert body["input"] == [
+            {"role": "user", "content": "hi"},
+            {"type": "function_call", "call_id": "c1", "name": "f", "arguments": "{}"},
             {"type": "function_call_output", "call_id": "c1", "output": "result"},
         ]
+
+        # Cursor refreshed.
+        cursor2 = adapter._continuation_store.get("openai_plan", "sess-1")
+        assert cursor2.last_response_id == "r2"
