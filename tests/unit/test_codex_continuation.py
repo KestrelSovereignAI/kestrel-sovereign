@@ -277,7 +277,9 @@ class TestCodexContinuationE2E:
                 session_id="conv-B",
             )
 
-        # Turn 2: append a tool result; same session_id, same tools (None).
+        # Turn 2: two new user messages; same session_id, same tools (None).
+        # (Tool-role conversion is exercised separately in
+        # test_codex_responses_format.py — here we isolate continuation slicing.)
         captured.clear()
         sse2 = _sse(
             [
@@ -292,7 +294,7 @@ class TestCodexContinuationE2E:
                 messages=[
                     {"role": "system", "content": "sys"},
                     {"role": "user", "content": "hi"},
-                    {"role": "tool", "content": "tool result"},
+                    {"role": "user", "content": "more context"},
                     {"role": "user", "content": "follow-up"},
                 ],
                 session_id="conv-B",
@@ -304,7 +306,7 @@ class TestCodexContinuationE2E:
         # Watermark on the cursor was 1 (user-only count after turn 1); turn 2
         # presents 3 user-side messages, so the delta is the last 2.
         assert len(body["input"]) == 2
-        assert body["input"][0]["content"] == "tool result"
+        assert body["input"][0]["content"] == "more context"
         assert body["input"][1]["content"] == "follow-up"
 
         # Cursor refreshed.
