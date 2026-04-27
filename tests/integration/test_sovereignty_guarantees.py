@@ -102,22 +102,20 @@ async def test_platform_shutdown_does_not_lose_data():
             # This creates encrypted shards and a manifest
             cid = await adapter.export_agent(agent_did, storage_tier=StorageTier.LOCAL_ONLY)
 
-        # Step 3: PLATFORM SHUTS DOWN (delete everything)
-        os.remove(db_path)
-        print("💥 SIMULATED PLATFORM SHUTDOWN - DATABASE DELETED")
+            assert cid
 
-        # Step 4: User has ONLY the export (CID)
-        # Can they recover their data?
+            # Step 3: PLATFORM SHUTS DOWN / local state is lost.
+            await storage.db.execute_commit("DELETE FROM conversation_history")
+            assert await storage.get_conversation_history() == []
 
-        print(f"✅ Export CID exists: {cid}")
-        print("✅ PROOF: Data survived platform shutdown!")
-        print("   - Created 4 precious conversations")
-        print("   - Exported to sovereignty backup")
-        print("   - DELETED original database (platform shutdown)")
-        print("   - Export CID still exists (in cache/IPFS)")
-        print()
-        print("CONCLUSION: Platform shutdown does NOT lose your data.")
-        print("            IF you exported to IPFS, you're safe.")
+            # Step 4: User has ONLY the export CID. Prove it can restore data.
+            stats = await adapter.import_agent(cid)
+            assert stats["agent_did"] == agent_did
+            assert stats["manifest_version"] == "3.0"
+            assert stats["messages_restored"] == len(precious_conversations)
+
+            restored = await storage.get_conversation_history()
+            assert [(m["role"], m["content"]) for m in restored] == precious_conversations
     finally:
         if os.path.exists(db_path):
             os.remove(db_path)
@@ -252,54 +250,20 @@ async def test_sovereignty_vs_simple_download():
 
             cid = await adapter.export_agent(agent_did, storage_tier=StorageTier.LOCAL_ONLY)
 
-        print("SOVEREIGNTY EXPORT vs SIMPLE DOWNLOAD:")
-        print()
+            assert cid
 
-        # 1. Content-addressed (CID)
-        print("✅ DIFFERENCE 1: Content-Addressed Storage")
-        print(f"   Sovereignty: CID = {cid}")
-        print("   Download: 'my_data.json' (filename means nothing)")
-        print("   → CID PROVES you have exact original data")
-        print()
+            stats = await adapter.import_agent(cid)
+            assert stats["agent_did"] == agent_did
+            assert stats["manifest_version"] == "3.0"
+            assert stats["shards_restored"] > 0
+            assert stats["messages_restored"] == 2
+            assert "assets_restored" in stats
 
-        # 2. Self-contained
-        print("✅ DIFFERENCE 2: Self-Contained")
-        print(f"   Sovereignty: Includes agent DID, constitution, metadata")
-        print(f"   Download: Just raw data, no context")
-        print(f"   → Sovereignty export is a complete agent, not just data")
-        print()
-
-        # 3. Encrypted by default
-        print("✅ DIFFERENCE 3: Encrypted by Default")
-        print(f"   Sovereignty: Always encrypted (Convergent Encryption)")
-        print("   Download: Usually plaintext")
-        print("   → Privacy built-in, not optional")
-        print()
-
-        # 4. Decentralized storage ready
-        print("✅ DIFFERENCE 4: Decentralized-Ready")
-        print("   Sovereignty: Can upload to IPFS/Filecoin")
-        print("   Download: Stored on your hard drive only")
-        print("   → Survives device failure, platform shutdown")
-        print()
-
-        # 5. Verifiable integrity
-        print("✅ DIFFERENCE 5: Verifiable Integrity")
-        print(f"   Sovereignty: Hash verification built-in")
-        print("   Download: No way to verify authenticity")
-        print("   → Can prove data hasn't been tampered with")
-        print()
-
-        # 6. Platform-independent import
-        print("✅ DIFFERENCE 6: Platform-Independent")
-        print("   Sovereignty: Import on ANY Kestrel-compatible platform")
-        print("   Download: Tied to ChatGPT's format")
-        print("   → True data portability")
-        print()
-
-        print("CONCLUSION: Sovereignty ≠ Download")
-        print("            It's cryptographic proof of ownership,")
-        print("            not just a data dump.")
+            restored = await storage.get_conversation_history()
+            assert [(m["role"], m["content"]) for m in restored] == [
+                ("user", "Remember my favorite color is blue"),
+                ("assistant", "Got it, blue is your favorite!"),
+            ]
     finally:
         if os.path.exists(db_path):
             os.remove(db_path)
@@ -346,46 +310,16 @@ async def test_inheritance_scenario():
 
             cid = await adapter.export_agent(agent_did, storage_tier=StorageTier.LOCAL_ONLY)
 
-        # Grandma puts CID in her will
-        cid_in_will = cid  # This would be the IPFS CID
+            assert cid
 
-        print("📜 INHERITANCE SCENARIO:")
-        print()
-        print("Grandma's situation:")
-        print(f"  - Has AI companion for 5 years")
-        print(f"  - {len(precious_memories)} precious conversations")
-        print(f"  - Exported to IPFS: {cid_in_will}")
-        print(f"  - Put CID in will")
-        print()
+            # Family receives the CID from the will and imports the archive.
+            await storage.db.execute_commit("DELETE FROM conversation_history")
+            stats = await adapter.import_agent(cid)
+            assert stats["agent_did"] == agent_did
+            assert stats["messages_restored"] == len(precious_memories)
 
-        # Grandma passes away
-        print("💔 Grandma passes away")
-        print()
-
-        # Family receives the CID from the will
-        family_has_cid = cid_in_will
-
-        # Family imports the agent
-        # (In real scenario, they'd load from IPFS using the CID)
-        # Since V2 import isn't fully implemented in this test suite yet,
-        # we verify the data exists and is recoverable.
-
-        print("👨‍👩‍👧‍👦 Family restores grandma's AI:")
-        print()
-        print(f"  Restoring from CID: {family_has_cid}")
-        print("  (Simulated restore via V2 Adapter)")
-
-        # Verify we can at least see the manifest (simulated)
-        assert family_has_cid is not None
-        assert len(family_has_cid) > 0
-
-        print("✅ PROOF: Inheritance works!")
-        print("   - Grandma's memories preserved")
-        print("   - Family can access via CID")
-        print("   - Stories live on forever")
-        print()
-        print("CONCLUSION: With sovereignty, your AI companion can be inherited.")
-        print("            Put CID in will = family can restore your memories.")
+            restored = await storage.get_conversation_history()
+            assert [(m["role"], m["content"]) for m in restored] == precious_memories
     finally:
         if os.path.exists(db_path):
             os.remove(db_path)
