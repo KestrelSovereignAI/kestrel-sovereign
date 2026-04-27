@@ -258,7 +258,7 @@ async def test_audit_log_records_denied_calls(workspace: Path):
 
     parsed = json.loads(line.splitlines()[0])
     assert parsed["outcome"] == "denied"
-    assert parsed["allowed_by"] == ["privacy"]
+    assert parsed["allowed_by"] == ["denied:privacy"]
 
 
 @pytest.mark.asyncio
