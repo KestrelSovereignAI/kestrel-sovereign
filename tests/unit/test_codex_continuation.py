@@ -227,6 +227,147 @@ class TestCodexCursorRecordingE2E:
         # while the adapter wrote to its own store.
         assert external_store.get("openai_plan", "conv-X") is not None
 
+    async def test_reasoning_items_captured_and_replayed_on_next_turn(self):
+        # #842: turn 1 emits reasoning + function_call output items. Adapter
+        # records them on the cursor. Turn 2 must replay them as input items
+        # in their original order so the model sees the encrypted chain-of-
+        # thought from turn 1 alongside the new tool result.
+        captured: List[Dict[str, Any]] = []
+        adapter = CodexAdapter(continuation_store=InMemoryContinuationStore())
+
+        # Turn 1 SSE: reasoning + function_call
+        sse1 = _sse([
+            {
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "reasoning",
+                    "id": "rs_T1",
+                    "encrypted_content": "ENC_T1",
+                    "summary": [],
+                },
+            },
+            {
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "function_call",
+                    "id": "fc_T1",
+                    "call_id": "call_xyz",
+                    "name": "model_agent",
+                    "arguments": "{}",
+                },
+            },
+            _completed_event("resp_T1"),
+        ])
+        with _patch_httpx_with(captured, sse1):
+            await adapter.get_response(
+                client=_fake_token(),
+                model="gpt-5.5",
+                messages=[
+                    {"role": "system", "content": "sys"},
+                    {"role": "user", "content": "hi"},
+                ],
+                session_id="conv-replay",
+            )
+
+        cursor = adapter._continuation_store.get("openai_plan", "conv-replay")
+        assert cursor.turn_outputs and len(cursor.turn_outputs) == 1
+        cached = json.loads(cursor.turn_outputs[0])
+        assert [item["type"] for item in cached] == ["reasoning", "function_call"]
+        assert cached[0]["encrypted_content"] == "ENC_T1"
+        assert cached[1]["call_id"] == "call_xyz"
+
+        # Turn 2: orchestrator-style follow-up. The converter must replay the
+        # cached reasoning + function_call instead of re-emitting a fresh
+        # function_call from the assistant.tool_calls message.
+        captured.clear()
+        sse2 = _sse([
+            {"type": "response.output_text.delta", "delta": "ack"},
+            {
+                "type": "response.output_item.done",
+                "item": {"type": "message", "id": "msg_T2", "role": "assistant"},
+            },
+            _completed_event("resp_T2"),
+        ])
+        with _patch_httpx_with(captured, sse2):
+            await adapter.get_response(
+                client=_fake_token(),
+                model="gpt-5.5",
+                messages=[
+                    {"role": "system", "content": "sys"},
+                    {"role": "user", "content": "hi"},
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [{
+                            "id": "call_xyz",
+                            "type": "function",
+                            "function": {"name": "model_agent", "arguments": "{}"},
+                        }],
+                    },
+                    {"role": "tool", "tool_call_id": "call_xyz", "content": "gpt-5.5"},
+                ],
+                session_id="conv-replay",
+            )
+
+        body = captured[0]
+        # Replayed reasoning + function_call appear in the input list.
+        types = [item.get("type") or item.get("role") for item in body["input"]]
+        assert types == ["user", "reasoning", "function_call", "function_call_output"]
+        assert body["input"][1]["encrypted_content"] == "ENC_T1"
+        assert body["input"][1]["id"] == "rs_T1"
+        # Replayed function_call carries the ORIGINAL id (fc_T1), not a
+        # synthesized one from the orchestrator's tool_calls field.
+        assert body["input"][2]["id"] == "fc_T1"
+        assert body["input"][2]["call_id"] == "call_xyz"
+
+    async def test_signature_drift_drops_cached_reasoning(self):
+        # If instructions or tools change mid-conversation, cached reasoning
+        # was conditioned on a different prompt and must NOT be replayed —
+        # would either confuse the model or be rejected by the server.
+        captured: List[Dict[str, Any]] = []
+        adapter = CodexAdapter(continuation_store=InMemoryContinuationStore())
+
+        # Turn 1 with one toolset.
+        sse1 = _sse([
+            {
+                "type": "response.output_item.done",
+                "item": {"type": "reasoning", "id": "rs_T1", "encrypted_content": "ENC", "summary": []},
+            },
+            _completed_event("resp_T1"),
+        ])
+        with _patch_httpx_with(captured, sse1):
+            await adapter.get_response(
+                client=_fake_token(),
+                model="gpt-5.5",
+                messages=[
+                    {"role": "system", "content": "sys-A"},
+                    {"role": "user", "content": "hi"},
+                ],
+                tools=[{"type": "function", "function": {"name": "tool_a", "description": "", "parameters": {}}}],
+                session_id="conv-drift",
+            )
+
+        # Turn 2 with DIFFERENT instructions → signature mismatch → no replay.
+        captured.clear()
+        sse2 = _sse([_completed_event("resp_T2")])
+        with _patch_httpx_with(captured, sse2):
+            await adapter.get_response(
+                client=_fake_token(),
+                model="gpt-5.5",
+                messages=[
+                    {"role": "system", "content": "sys-B"},  # changed
+                    {"role": "user", "content": "hi"},
+                    {"role": "user", "content": "follow-up"},
+                ],
+                tools=[{"type": "function", "function": {"name": "tool_a", "description": "", "parameters": {}}}],
+                session_id="conv-drift",
+            )
+
+        body = captured[0]
+        types = [item.get("type") or item.get("role") for item in body["input"]]
+        # No reasoning item — drift dropped the replay.
+        assert "reasoning" not in types
+
     async def test_second_turn_sends_full_input_no_previous_response_id(self):
         # Continuation is disabled at the wire — even with a matching cursor,
         # turn 2 sends the full input list and no previous_response_id.

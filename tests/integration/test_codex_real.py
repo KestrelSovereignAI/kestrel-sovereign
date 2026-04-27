@@ -243,11 +243,83 @@ async def test_codex_tool_call_round_trip_real_api():
 
 
 @pytest.mark.asyncio
+async def test_codex_reasoning_replay_real_api():
+    """Reasoning items captured from T1 must round-trip cleanly when replayed
+    as input on T2 — the alternative to ``previous_response_id`` for
+    preserving GPT-5's encrypted chain-of-thought (#842).
+
+    Uses a multi-step problem (without tools) that reliably triggers
+    ``reasoning`` items on GPT-5 with ``include=[reasoning.encrypted_content]``.
+    The strict test: if the server rejects our reasoning-item shape on T2,
+    the adapter raises 400. A clean 200 proves the replay round-trips.
+    """
+    token = _skip_if_no_creds()
+    store = InMemoryContinuationStore()
+    adapter = CodexAdapter(continuation_store=store)
+    model = _default_model()
+    session_id = "test-codex-real-reasoning-replay-no-tools"
+
+    resp_t1 = await adapter.get_response(
+        client=token,
+        model=model,
+        messages=[
+            {"role": "system", "content": "Reason step by step. Then answer concisely."},
+            {"role": "user", "content": "What is 17 multiplied by 23? Show the calculation."},
+        ],
+        session_id=session_id,
+    )
+
+    cursor = store.get("openai_plan", session_id)
+    assert cursor is not None
+    assert cursor.turn_outputs, "T1 must record output items for replay"
+    cached = json.loads(cursor.turn_outputs[0])
+    types = [item.get("type") for item in cached]
+    print(
+        f"\n[{model}] T1 captured output types: {types}",
+        file=sys.stderr,
+    )
+
+    if "reasoning" not in types:
+        pytest.skip(
+            f"GPT-5 didn't emit a reasoning item this run (types={types}); "
+            "the replay invariant cannot be exercised. This is a model "
+            "behavior fluctuation, not an adapter bug."
+        )
+
+    # T2 references the prior conversation. With reasoning replay enabled,
+    # the cached reasoning item from T1 is spliced into the input list
+    # before the model sees the new user turn. A 200 response is the
+    # strict pass condition: the live API accepted the replayed reasoning
+    # item (encrypted_content + id) as input. Pre-#842, no reasoning was
+    # replayed; post-#842, the cached chain-of-thought rides along.
+    resp_t2 = await adapter.get_response(
+        client=token,
+        model=model,
+        messages=[
+            {"role": "system", "content": "Reason step by step. Then answer concisely."},
+            {"role": "user", "content": "What is 17 multiplied by 23? Show the calculation."},
+            {"role": "assistant", "content": resp_t1.content or ""},
+            {"role": "user", "content": "Now multiply that by 2."},
+        ],
+        session_id=session_id,
+    )
+
+    print(
+        f"\n[{model}] T2 (replay enabled): content={resp_t2.content!r}",
+        file=sys.stderr,
+    )
+    assert resp_t2.content, "T2 should produce text content; a 400 from the server would have raised"
+
+    # T2's output should also have been captured.
+    cursor2 = store.get("openai_plan", session_id)
+    assert len(cursor2.turn_outputs) == 2
+
+
+@pytest.mark.asyncio
 async def test_codex_continuation_cursor_written_real_api():
     """Two-turn run with the same ``session_id``. Cursor must be written on
     turn 1 with ``last_response_id`` from the live ``response.completed`` event,
-    and turn 2 must complete without error (proving ``previous_response_id``
-    is accepted by the live endpoint).
+    and turn 2 must complete without error.
     """
     token = _skip_if_no_creds()
     store = InMemoryContinuationStore()
