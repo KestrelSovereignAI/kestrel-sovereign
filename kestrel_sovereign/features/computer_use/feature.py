@@ -252,30 +252,39 @@ class ComputerUseFeature(Feature):
         payload: Dict[str, Any],
         require_approval: bool,
     ) -> tuple[bool, List[str], str]:
-        """Run the three gates. Returns (allowed, allowed_by, denied_reason)."""
+        """Run the three gates. Returns (allowed, allowed_by, denied_reason).
+
+        ``allowed_by`` accumulates the gates that **passed**. On a denial,
+        the offending gate is appended as ``denied:<gate>`` so the audit
+        row records the whole chain — passed gates first, then the one
+        that stopped the call.
+        """
         allowed_by: List[str] = []
 
         if not self._privacy_allows():
-            await self._audit_denied(tool_name, payload, "privacy")
+            chain = allowed_by + ["denied:privacy"]
+            await self._audit_denied(tool_name, payload, chain)
             return False, allowed_by, "privacy:computer_access flag is False"
         allowed_by.append("privacy")
 
         if not self._constitution_allows(capability):
-            await self._audit_denied(tool_name, payload, "constitution")
+            chain = allowed_by + ["denied:constitution"]
+            await self._audit_denied(tool_name, payload, chain)
             return False, allowed_by, f"constitution:Amendment IX missing grant '{capability}'"
         allowed_by.append("constitution")
 
         if require_approval:
             approved, scope = await self._request_approval(tool_name, payload)
             if not approved:
-                await self._audit_denied(tool_name, payload, f"approval:{scope}")
+                chain = allowed_by + [f"denied:approval:{scope}"]
+                await self._audit_denied(tool_name, payload, chain)
                 return False, allowed_by, f"approval:{scope}"
             allowed_by.append(f"approval:{scope}")
 
         return True, allowed_by, ""
 
     async def _audit_denied(
-        self, tool_name: str, payload: Dict[str, Any], gate: str
+        self, tool_name: str, payload: Dict[str, Any], chain: List[str]
     ) -> None:
         if self._audit is None or self._backend is None:
             return
@@ -284,7 +293,7 @@ class ComputerUseFeature(Feature):
                 tool=tool_name,
                 backend=self._backend.name,
                 args=payload,
-                allowed_by=[gate],
+                allowed_by=list(chain),
                 outcome="denied",
                 agent_did=getattr(self.agent, "did", "anonymous"),
             )
