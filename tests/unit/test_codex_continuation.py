@@ -1,19 +1,26 @@
-"""Codex adapter continuation protocol tests (#808 / #806).
+"""Codex adapter cursor-tracking tests.
 
-Two layers:
-- Pure-function tests for ``_compute_request_signature`` and ``_plan_continuation``.
-- End-to-end tests with a fake ``httpx.AsyncClient`` that drive two synthetic
-  turns through ``CodexAdapter.get_response`` and assert:
-    * Turn 1 sends full input, no ``previous_response_id``, writes a cursor.
-    * Turn 2 (same session_id, same tools/instructions) sends only the
-      delta input + ``previous_response_id``, then refreshes the cursor.
-    * Tool/instruction drift between turns drops continuation.
-    * No session_id ⇒ behavior identical to pre-#808 (no body keys added).
+#841 reduced this file's scope. The original #808 design sent
+``previous_response_id`` plus delta input to preserve encrypted reasoning
+across turns — but the live ChatGPT-backend Responses API rejects
+``previous_response_id`` (caught by the integration tests in
+``tests/integration/test_codex_real.py``). The wire-side continuation
+mechanism was removed; the cursor is still written after each successful
+response so that any future per-session diagnostics or alternative
+continuation mechanism (e.g. reasoning-item resubmission) has the data.
+
+What's tested here:
+- ``_compute_request_signature`` is stable and discriminating.
+- End-to-end: cursor is recorded with ``last_response_id`` from the live
+  ``response.completed`` event when ``session_id`` is provided; nothing is
+  recorded when ``session_id`` is omitted.
+- The request body never carries ``previous_response_id`` regardless of
+  whether ``session_id`` is provided.
 """
 
 import base64
 import json
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 from unittest.mock import patch
 
 import pytest
@@ -21,12 +28,8 @@ import pytest
 from kestrel_sovereign.llm.codex_adapter import (
     CodexAdapter,
     _compute_request_signature,
-    _plan_continuation,
 )
-from kestrel_sovereign.llm.continuation_store import (
-    ContinuationCursor,
-    InMemoryContinuationStore,
-)
+from kestrel_sovereign.llm.continuation_store import InMemoryContinuationStore
 
 
 def _fake_token() -> str:
@@ -37,13 +40,8 @@ def _fake_token() -> str:
             {"https://api.openai.com/auth": {"chatgpt_account_id": "acct-test"}}
         ).encode()
     ).rstrip(b"=").decode()
-    sig = base64.urlsafe_b64encode(b"sig").rstrip(b"=").decode()
+    sig = base64.urlsafe_b64encode(b"fake-sig").rstrip(b"=").decode()
     return f"{header}.{payload}.{sig}"
-
-
-# ---------------------------------------------------------------------------
-# Pure helpers
-# ---------------------------------------------------------------------------
 
 
 class TestComputeRequestSignature:
@@ -68,45 +66,8 @@ class TestComputeRequestSignature:
         assert a == b
 
     def test_short_hash_length(self):
-        # Truncated to 16 hex chars — long enough to collision-resist within a
-        # single conversation, short enough not to bloat logs.
         sig = _compute_request_signature("x", None)
         assert len(sig) == 16
-
-
-class TestPlanContinuation:
-    def test_no_cursor_means_full_input(self):
-        prev, slice_start = _plan_continuation(
-            cursor=None, messages_count=5, signature="sig",
-        )
-        assert prev is None
-        assert slice_start is None
-
-    def test_signature_match_emits_delta(self):
-        cursor = ContinuationCursor("resp_1", last_message_count=3, last_request_signature="sig")
-        prev, slice_start = _plan_continuation(
-            cursor=cursor, messages_count=5, signature="sig",
-        )
-        assert prev == "resp_1"
-        assert slice_start == 3
-
-    def test_signature_mismatch_drops_continuation(self):
-        cursor = ContinuationCursor("resp_1", last_message_count=3, last_request_signature="old")
-        prev, slice_start = _plan_continuation(
-            cursor=cursor, messages_count=5, signature="new",
-        )
-        assert prev is None
-        assert slice_start is None
-
-    def test_no_new_messages_falls_back_to_full(self):
-        # Defensive: empty input slice would mean either a duplicate turn or a
-        # bug; resubmit the full context rather than send an empty input array.
-        cursor = ContinuationCursor("resp_1", last_message_count=5, last_request_signature="sig")
-        prev, slice_start = _plan_continuation(
-            cursor=cursor, messages_count=5, signature="sig",
-        )
-        assert prev is None
-        assert slice_start is None
 
 
 # ---------------------------------------------------------------------------
@@ -115,8 +76,6 @@ class TestPlanContinuation:
 
 
 class _FakeStreamResponse:
-    """Minimal stand-in for httpx.Response on a streaming POST."""
-
     def __init__(self, status_code: int, sse_lines: List[str]):
         self.status_code = status_code
         self._sse_lines = sse_lines
@@ -131,9 +90,8 @@ class _FakeStreamResponse:
 
 
 class _FakeStreamContext:
-    def __init__(self, response: _FakeStreamResponse, captured_body: List[Dict[str, Any]]):
+    def __init__(self, response: _FakeStreamResponse):
         self._response = response
-        self._captured = captured_body
 
     async def __aenter__(self) -> _FakeStreamResponse:
         return self._response
@@ -143,11 +101,9 @@ class _FakeStreamContext:
 
 
 class _FakeAsyncClient:
-    """Captures the JSON body of the POST and returns canned SSE events."""
-
     def __init__(self, sse_lines: List[str], captured_bodies: List[Dict[str, Any]]):
         self._sse_lines = sse_lines
-        self._captured_bodies = captured_bodies
+        self._captured = captured_bodies
 
     async def __aenter__(self) -> "_FakeAsyncClient":
         return self
@@ -156,15 +112,11 @@ class _FakeAsyncClient:
         return None
 
     def stream(self, method: str, url: str, *, headers, json):
-        # Capture the request body for later assertions.
-        self._captured_bodies.append(json)
-        return _FakeStreamContext(
-            _FakeStreamResponse(200, self._sse_lines), self._captured_bodies,
-        )
+        self._captured.append(json)
+        return _FakeStreamContext(_FakeStreamResponse(200, self._sse_lines))
 
 
 def _sse(events: List[Dict[str, Any]]) -> List[str]:
-    """Format a list of events as SSE ``data:`` lines."""
     return [f"data: {json.dumps(e)}" for e in events]
 
 
@@ -197,16 +149,15 @@ def _patch_httpx_with(captured: List[Dict[str, Any]], sse_lines: List[str]):
 
 
 @pytest.mark.asyncio
-class TestCodexContinuationE2E:
-    async def test_no_session_id_means_no_continuation_keys(self):
+class TestCodexCursorRecordingE2E:
+    async def test_no_session_id_no_cursor_no_previous_response_id(self):
         captured: List[Dict[str, Any]] = []
-        sse = _sse(
-            [
-                {"type": "response.output_text.delta", "delta": "ok"},
-                _completed_event("resp_1"),
-            ]
-        )
-        adapter = CodexAdapter(continuation_store=InMemoryContinuationStore())
+        sse = _sse([
+            {"type": "response.output_text.delta", "delta": "ok"},
+            _completed_event("resp_1"),
+        ])
+        store = InMemoryContinuationStore()
+        adapter = CodexAdapter(continuation_store=store)
 
         with _patch_httpx_with(captured, sse):
             await adapter.get_response(
@@ -219,54 +170,72 @@ class TestCodexContinuationE2E:
             )
 
         assert "previous_response_id" not in captured[0]
-        # Store stays empty — without session_id we don't track anything.
-        assert len(adapter._continuation_store) == 0
+        # Without session_id, no cursor is written.
+        assert len(store) == 0
 
-    async def test_first_turn_writes_cursor(self):
+    async def test_session_id_writes_cursor_but_no_previous_response_id(self):
         captured: List[Dict[str, Any]] = []
-        sse = _sse(
-            [
-                {"type": "response.output_text.delta", "delta": "ok"},
-                _completed_event("resp_1"),
-            ]
-        )
-        adapter = CodexAdapter(continuation_store=InMemoryContinuationStore())
-        messages = [
-            {"role": "system", "content": "sys"},
-            {"role": "user", "content": "hi"},
-        ]
+        sse = _sse([
+            {"type": "response.output_text.delta", "delta": "ok"},
+            _completed_event("resp_1"),
+        ])
+        store = InMemoryContinuationStore()
+        adapter = CodexAdapter(continuation_store=store)
 
         with _patch_httpx_with(captured, sse):
             await adapter.get_response(
                 client=_fake_token(),
                 model="gpt-5.4",
-                messages=messages,
+                messages=[
+                    {"role": "system", "content": "sys"},
+                    {"role": "user", "content": "hi"},
+                ],
                 session_id="conv-A",
             )
 
-        # First turn: full input, no previous_response_id.
-        assert "previous_response_id" not in captured[0]
-        assert len(captured[0]["input"]) == 1  # the user message
-
-        cursor = adapter._continuation_store.get("openai_plan", "conv-A")
+        # Cursor is written so future tooling has access to the response_id.
+        cursor = store.get("openai_plan", "conv-A")
         assert cursor is not None
         assert cursor.last_response_id == "resp_1"
-        # Watermark is the *full input message count* (system was extracted to
-        # instructions, so the user-only count is 1).
         assert cursor.last_message_count == 1
 
-    async def test_second_turn_sends_delta_with_previous_response_id(self):
+        # But the wire never carried previous_response_id — the ChatGPT
+        # backend rejects it (#841).
+        assert "previous_response_id" not in captured[0]
+
+    async def test_constructor_uses_supplied_store_not_internal_one(self):
+        # Regression for the #841 truthiness bug: an *empty* caller-supplied
+        # store was silently replaced with a fresh internal one because
+        # ``InMemoryContinuationStore.__len__`` returned 0 → falsy under the
+        # old ``or`` default.
         captured: List[Dict[str, Any]] = []
-        sse = _sse(
-            [
-                {"type": "response.output_text.delta", "delta": "ack"},
-                _completed_event("resp_1"),
-            ]
-        )
+        sse = _sse([_completed_event("resp_1")])
+        external_store = InMemoryContinuationStore()
+        adapter = CodexAdapter(continuation_store=external_store)
+        assert adapter._continuation_store is external_store
+
+        with _patch_httpx_with(captured, sse):
+            await adapter.get_response(
+                client=_fake_token(),
+                model="gpt-5.4",
+                messages=[{"role": "user", "content": "hi"}],
+                session_id="conv-X",
+            )
+
+        # The cursor must land in the *external* store, not a hidden internal
+        # one. Pre-fix, this assertion failed: external_store stayed empty
+        # while the adapter wrote to its own store.
+        assert external_store.get("openai_plan", "conv-X") is not None
+
+    async def test_second_turn_sends_full_input_no_previous_response_id(self):
+        # Continuation is disabled at the wire — even with a matching cursor,
+        # turn 2 sends the full input list and no previous_response_id.
+        captured: List[Dict[str, Any]] = []
+        sse1 = _sse([_completed_event("resp_1")])
+        sse2 = _sse([_completed_event("resp_2")])
         adapter = CodexAdapter(continuation_store=InMemoryContinuationStore())
 
-        # Turn 1
-        with _patch_httpx_with(captured, sse):
+        with _patch_httpx_with(captured, sse1):
             await adapter.get_response(
                 client=_fake_token(),
                 model="gpt-5.4",
@@ -277,16 +246,7 @@ class TestCodexContinuationE2E:
                 session_id="conv-B",
             )
 
-        # Turn 2: two new user messages; same session_id, same tools (None).
-        # (Tool-role conversion is exercised separately in
-        # test_codex_responses_format.py — here we isolate continuation slicing.)
         captured.clear()
-        sse2 = _sse(
-            [
-                {"type": "response.output_text.delta", "delta": "done"},
-                _completed_event("resp_2"),
-            ]
-        )
         with _patch_httpx_with(captured, sse2):
             await adapter.get_response(
                 client=_fake_token(),
@@ -294,81 +254,17 @@ class TestCodexContinuationE2E:
                 messages=[
                     {"role": "system", "content": "sys"},
                     {"role": "user", "content": "hi"},
-                    {"role": "user", "content": "more context"},
                     {"role": "user", "content": "follow-up"},
                 ],
                 session_id="conv-B",
             )
 
         body = captured[0]
-        assert body["previous_response_id"] == "resp_1"
-        # Delta = messages[1:] from the user-input slice (system was stripped).
-        # Watermark on the cursor was 1 (user-only count after turn 1); turn 2
-        # presents 3 user-side messages, so the delta is the last 2.
+        assert "previous_response_id" not in body
+        # Full input is sent, not a slice.
         assert len(body["input"]) == 2
-        assert body["input"][0]["content"] == "more context"
-        assert body["input"][1]["content"] == "follow-up"
 
-        # Cursor refreshed.
+        # Cursor refreshed with the new response_id.
         cursor = adapter._continuation_store.get("openai_plan", "conv-B")
         assert cursor.last_response_id == "resp_2"
-        assert cursor.last_message_count == 3
-
-    async def test_signature_drift_drops_continuation(self):
-        captured: List[Dict[str, Any]] = []
-        sse = _sse(
-            [
-                {"type": "response.output_text.delta", "delta": "x"},
-                _completed_event("resp_1"),
-            ]
-        )
-        adapter = CodexAdapter(continuation_store=InMemoryContinuationStore())
-
-        # Turn 1 with one toolset.
-        with _patch_httpx_with(captured, sse):
-            await adapter.get_response(
-                client=_fake_token(),
-                model="gpt-5.4",
-                messages=[
-                    {"role": "system", "content": "sys"},
-                    {"role": "user", "content": "hi"},
-                ],
-                tools=[{
-                    "type": "function",
-                    "function": {
-                        "name": "tool_a", "description": "", "parameters": {},
-                    },
-                }],
-                session_id="conv-C",
-            )
-
-        # Turn 2 with a *different* toolset — signature must mismatch and the
-        # adapter must drop continuation, sending full input + no previous_response_id.
-        captured.clear()
-        sse2 = _sse(
-            [
-                {"type": "response.output_text.delta", "delta": "y"},
-                _completed_event("resp_2"),
-            ]
-        )
-        with _patch_httpx_with(captured, sse2):
-            await adapter.get_response(
-                client=_fake_token(),
-                model="gpt-5.4",
-                messages=[
-                    {"role": "system", "content": "sys"},
-                    {"role": "user", "content": "hi"},
-                    {"role": "user", "content": "again"},
-                ],
-                tools=[{
-                    "type": "function",
-                    "function": {
-                        "name": "tool_b", "description": "", "parameters": {},
-                    },
-                }],
-                session_id="conv-C",
-            )
-
-        body = captured[0]
-        assert "previous_response_id" not in body
-        assert len(body["input"]) == 2  # full input restored
+        assert cursor.last_message_count == 2
