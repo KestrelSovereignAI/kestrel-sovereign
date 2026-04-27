@@ -633,6 +633,8 @@ async function refreshRoutePreview() {
   previewEl.innerHTML = parts.join('<br>');
 
   // Refresh the TTS dropdown from the discovered providers (preserve selection).
+  // Disable the dropdown in Realtime mode — Realtime owns audio I/O end-to-end
+  // (no separate TTS provider), so the user's TTS pick has no effect there.
   const installed = route.available_tts_providers || [];
   ttsSel.innerHTML = '<option value="">Auto (resolver picks)</option>';
   for (const name of installed) {
@@ -642,14 +644,46 @@ async function refreshRoutePreview() {
     if (name === previousTts) opt.selected = true;
     ttsSel.appendChild(opt);
   }
+  ttsSel.disabled = (route.path === 'realtime');
 
-  // Refresh the voice list scoped to the actually-active TTS provider.
-  // Different providers ship different voices (Cedar/Marin are OpenAI; Rachel/
-  // Domi are ElevenLabs; en_US-lessac-medium is Piper). When you flip the
-  // provider, the voice list should narrow to that provider's catalog rather
-  // than continuing to show OpenAI's 13.
-  const effectiveTts = previousTts || route.tts_provider || '';
-  await refreshVoiceList(voiceSel, effectiveTts);
+  // Refresh the voice list scoped to the path's actual voice catalog.
+  //   Realtime → conversation provider (e.g. openai_realtime; voices like
+  //              Marin/Cedar/Alloy on the Realtime model).
+  //   Pipeline → user-picked TTS, falling back to the resolver's choice.
+  //   Local    → resolver-picked local TTS (Piper).
+  // Without the path branch, `previousTts` ("elevenlabs") sticks across mode
+  // flips and the user sees Sarah/Roger in the picker even after switching
+  // to Realtime where those voices don't exist.
+  let voiceListProvider;
+  if (route.path === 'realtime') {
+    voiceListProvider = route.conversation_provider || 'openai_realtime';
+  } else {
+    voiceListProvider = previousTts || route.tts_provider || '';
+  }
+  await refreshVoiceList(voiceSel, voiceListProvider);
+
+  // Bug #2: live-update the chat-header annotation when the picker mode
+  // changes, not only after a session successfully starts. Otherwise the
+  // user toggles to "Force Realtime", sees the route preview update, but
+  // the header still reads the prior (Pipeline) annotation.
+  if (route.path === 'realtime') {
+    setModelSelectorVoiceAnnotation(
+      route.voice_model || 'gpt-realtime',
+      `Voice will use ${route.voice_model || 'gpt-realtime'} (Realtime). Click 🎙 to start.`,
+    );
+  } else if (route.path === 'pipeline') {
+    setModelSelectorVoiceAnnotation(
+      `Pipeline · ${route.tts_provider || 'auto'}`,
+      `Voice will use ${route.llm_vendor || 'your chat LLM'} for reasoning, ${route.tts_provider || 'auto-picked TTS'} for speech.`,
+    );
+  } else if (route.path === 'local') {
+    setModelSelectorVoiceAnnotation(
+      `Local · ${route.tts_provider || 'piper'}`,
+      `Voice will run fully local (no cloud calls).`,
+    );
+  } else {
+    setModelSelectorVoiceAnnotation('', '');
+  }
 }
 
 
