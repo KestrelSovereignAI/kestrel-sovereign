@@ -35,7 +35,7 @@ import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from kestrel_sovereign.constitution.hierarchy import (
     DANGEROUS_CAPABILITIES,
@@ -73,6 +73,26 @@ class _GateOutcome:
 
     def __bool__(self) -> bool:  # convenience for ``if outcome:``
         return self.allowed
+
+
+class _PreApprovalRefusal(Exception):
+    """Raised inside a pre-approval hook to refuse a call cleanly.
+
+    The ``reason`` is appended to the audit chain as
+    ``denied:input_validation:<reason>`` and surfaced to the caller as
+    ``input_validation:<reason>``. Use this for input-dependent checks
+    that must run *after* path-safety + policy have authorized the path
+    but before the human approver sees the request — e.g. file-decode
+    failures, missing match text, parameter validation that depends on
+    file contents.
+    """
+
+    def __init__(self, reason: str, message: str):
+        self.reason = reason
+        super().__init__(message)
+
+
+_PreApprovalHook = Callable[[Path, Dict[str, Any]], Awaitable[Dict[str, Any]]]
 
 
 class ComputerUseFeature(Feature):
@@ -277,6 +297,7 @@ class ComputerUseFeature(Feature):
         path_arg: Optional[str] = None,
         write: bool = False,
         argv: Optional[list[str]] = None,
+        pre_approval: Optional[_PreApprovalHook] = None,
     ) -> _GateOutcome:
         """Run the full gate sequence and audit on every refusal.
 
@@ -284,6 +305,17 @@ class ComputerUseFeature(Feature):
         any successful step augments it. The outcome's ``allowed_by`` is
         the chain of gates that passed; on denial the chain ends with
         ``denied:<gate>`` and the audit row is written before returning.
+
+        ``pre_approval`` runs after path-safety + policy have authorized
+        the path but **before** the approval queue is asked. It receives
+        the resolved realpath and the audit payload so far, and returns
+        an augmented payload (e.g. with a diff preview computed from the
+        file's current contents). Tools that need to touch the file
+        before approval — diff previews, occurrence-finding for fs_edit
+        — must do that work here, never in the tool body, so that
+        constitutionally-unauthorized callers never trigger any I/O.
+        Refusals inside the hook are signalled by raising
+        :class:`_PreApprovalRefusal`; the audit row records the reason.
         """
         allowed_by: List[str] = []
         payload = dict(base_payload)
@@ -346,6 +378,20 @@ class ComputerUseFeature(Feature):
             require_approval = True
         else:
             require_approval = False
+
+        # 4.5. Pre-approval hook (input-dependent work that must run
+        # AFTER privacy/constitution/path-safety/policy authorize the
+        # path but BEFORE the human approver sees the request).
+        if pre_approval is not None and "path" in payload:
+            try:
+                payload = await pre_approval(Path(payload["path"]), payload)
+            except _PreApprovalRefusal as exc:
+                chain = allowed_by + [f"denied:input_validation:{exc.reason}"]
+                await self._audit_denied(tool_name, payload, chain, error=str(exc))
+                return _GateOutcome(
+                    False, allowed_by, f"input_validation:{exc.reason}:{exc}"
+                )
+            allowed_by.append("input_validation")
 
         # 5. Approval
         if require_approval:
@@ -528,25 +574,29 @@ class ComputerUseFeature(Feature):
     async def fs_write(self, path: str, content: str) -> Dict[str, Any]:
         """Write to a file (always approval-gated).
 
+        The diff preview shown to the human approver is computed inside
+        the pre-approval hook so the existing file is **only read after**
+        privacy/constitution/path-safety/policy have authorized the path.
+
         Args:
             path: Absolute path or path relative to the current directory.
             content: UTF-8 content that will replace the file's body.
         """
         new_bytes = content.encode("utf-8")
-        # Pre-compute diff against the current file (if any) so the approval
-        # prompt can show what would change. Cheap; never raises.
-        diff_preview_text = _diff_preview(Path(path).expanduser(), new_bytes)
+
+        async def _prepare(resolved: Path, payload: Dict[str, Any]) -> Dict[str, Any]:
+            return {
+                **payload,
+                "diff_preview": _diff_preview(resolved, new_bytes),
+            }
 
         outcome = await self._run_gates(
             tool_name="fs-write",
             capability="filesystem_write",
-            base_payload={
-                "raw_path": path,
-                "bytes": len(new_bytes),
-                "diff_preview": diff_preview_text,
-            },
+            base_payload={"raw_path": path, "bytes": len(new_bytes)},
             path_arg=path,
             write=True,
+            pre_approval=_prepare,
         )
         if not outcome:
             return {"success": False, "error": outcome.denied_reason}
@@ -588,10 +638,12 @@ class ComputerUseFeature(Feature):
     ) -> Dict[str, Any]:
         """Targeted in-place edit of a file.
 
-        The tool reads the current contents, replaces the ``occurrence``-th
-        instance of ``old_text`` with ``new_text``, and writes the result.
-        It refuses if ``old_text`` does not appear at all, or if the
-        requested occurrence does not exist.
+        The tool replaces the ``occurrence``-th instance of ``old_text``
+        with ``new_text``. **All file I/O happens inside a pre-approval
+        hook that runs only after privacy/constitution/path-safety/policy
+        have authorized the path.** Constitutionally-unauthorized callers
+        cannot use this tool to probe file existence, readability, UTF-8
+        validity, or substring presence.
 
         Args:
             path: File to edit.
@@ -599,61 +651,64 @@ class ComputerUseFeature(Feature):
             new_text: Replacement text.
             occurrence: Which occurrence to replace, 1-indexed (default 1).
         """
-        if occurrence < 1:
-            return {"success": False, "error": "occurrence must be >= 1"}
+        # We carry the computed write payload across the gate boundary
+        # via this dict — it's populated inside ``_prepare`` once gates
+        # have authorized the file read.
+        prepared: Dict[str, Any] = {}
 
-        # We need the file's current contents to compute the diff — read
-        # without going through the gates because the user is the one who
-        # supplied the path; the gates run on the *write* of the result.
-        try:
-            target = Path(path).expanduser()
-        except Exception as exc:  # noqa: BLE001
-            return {"success": False, "error": f"path:{exc}"}
+        async def _prepare(resolved: Path, payload: Dict[str, Any]) -> Dict[str, Any]:
+            # Parameter validation runs here too: an unauthorized caller
+            # mustn't be able to learn that occurrence=0 is rejected.
+            if occurrence < 1:
+                raise _PreApprovalRefusal(
+                    "occurrence", "occurrence must be >= 1"
+                )
+            try:
+                old_bytes = resolved.read_bytes() if resolved.exists() else b""
+            except OSError as exc:
+                raise _PreApprovalRefusal("read", f"read failed: {exc}")
+            try:
+                old_str = old_bytes.decode("utf-8")
+            except UnicodeDecodeError:
+                raise _PreApprovalRefusal(
+                    "encoding", "fs_edit only supports UTF-8 files"
+                )
 
-        try:
-            old_bytes = target.read_bytes() if target.exists() else b""
-        except OSError as exc:
-            return {"success": False, "error": f"read:{exc}"}
+            idx = -1
+            cursor = 0
+            for _ in range(occurrence):
+                idx = old_str.find(old_text, cursor)
+                if idx < 0:
+                    raise _PreApprovalRefusal(
+                        "missing_text",
+                        f"old_text not found (occurrence {occurrence})",
+                    )
+                cursor = idx + len(old_text)
+            new_str = old_str[:idx] + new_text + old_str[idx + len(old_text):]
+            new_bytes = new_str.encode("utf-8")
 
-        try:
-            old_str = old_bytes.decode("utf-8")
-        except UnicodeDecodeError:
-            return {"success": False, "error": "fs_edit only supports UTF-8 files"}
-
-        # Find the requested occurrence.
-        idx = -1
-        cursor = 0
-        for _ in range(occurrence):
-            idx = old_str.find(old_text, cursor)
-            if idx < 0:
-                return {
-                    "success": False,
-                    "error": f"old_text not found (occurrence {occurrence})",
-                }
-            cursor = idx + len(old_text)
-        new_str = old_str[:idx] + new_text + old_str[idx + len(old_text):]
-        new_bytes = new_str.encode("utf-8")
-
-        diff_preview_text = _diff_preview(target, new_bytes)
+            prepared["new_bytes"] = new_bytes
+            return {
+                **payload,
+                "old_bytes": len(old_bytes),
+                "new_bytes": len(new_bytes),
+                "diff_preview": _diff_preview_from_strings(old_str, new_str, str(resolved)),
+            }
 
         outcome = await self._run_gates(
             tool_name="fs-edit",
             capability="filesystem_write",
-            base_payload={
-                "raw_path": path,
-                "occurrence": occurrence,
-                "old_bytes": len(old_bytes),
-                "new_bytes": len(new_bytes),
-                "diff_preview": diff_preview_text,
-            },
+            base_payload={"raw_path": path, "occurrence": occurrence},
             path_arg=path,
             write=True,
+            pre_approval=_prepare,
         )
         if not outcome:
             return {"success": False, "error": outcome.denied_reason}
 
         payload = outcome.payload  # type: ignore[attr-defined]
         resolved = Path(payload["path"])
+        new_bytes = prepared["new_bytes"]
         started = time.monotonic()
         try:
             written = await self._backend.write(resolved, new_bytes)
@@ -762,7 +817,16 @@ class ComputerUseFeature(Feature):
 
 
 def _diff_preview(path: Path, new_bytes: bytes, *, max_chars: int = 4000) -> str:
-    """Best-effort textual preview of what a write will change."""
+    """Best-effort textual preview of what a write will change.
+
+    NOTE: this reads ``path`` from disk to compute the diff. Callers that
+    are pre-gate (e.g. ``fs_write``'s base_payload construction) MUST be
+    okay with that read happening before privacy/constitution refuse the
+    call — for ``fs_write`` we accept the trade because the agent already
+    supplied the path. ``fs_edit`` uses :func:`_diff_preview_from_strings`
+    instead so its read happens inside the pre-approval hook (after the
+    gates have authorized the path).
+    """
     try:
         old = path.read_bytes() if path.exists() else b""
     except OSError:
@@ -774,13 +838,20 @@ def _diff_preview(path: Path, new_bytes: bytes, *, max_chars: int = 4000) -> str
     except UnicodeDecodeError:
         return f"binary write: {len(old)} -> {len(new_bytes)} bytes"
 
+    return _diff_preview_from_strings(old_text, new_text, str(path), max_chars=max_chars)
+
+
+def _diff_preview_from_strings(
+    old_text: str, new_text: str, path: str, *, max_chars: int = 4000
+) -> str:
+    """Render a unified diff from two already-read strings. No I/O."""
     import difflib
 
     diff = difflib.unified_diff(
         old_text.splitlines(keepends=True),
         new_text.splitlines(keepends=True),
-        fromfile=str(path) + "@old",
-        tofile=str(path) + "@new",
+        fromfile=path + "@old",
+        tofile=path + "@new",
         n=2,
     )
     rendered = "".join(diff)

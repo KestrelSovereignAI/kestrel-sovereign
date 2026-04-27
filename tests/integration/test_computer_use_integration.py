@@ -917,3 +917,349 @@ audit_log_path = "{audit_path}"
     assert audit_path.exists()
     rows = [json.loads(line) for line in audit_path.read_text().splitlines()]
     assert rows and rows[-1]["tool"] == "fs-read"
+    assert audit_path.exists()
+    rows = [json.loads(line) for line in audit_path.read_text().splitlines()]
+    assert rows and rows[-1]["tool"] == "fs-read"
+
+
+# =============================================================================
+# Pre-input-validation leak class: fs_edit / fs_write must NOT touch the file
+# until privacy/constitution/path_safety/policy have authorized the path.
+# =============================================================================
+
+
+class _ReadCountingPath(type(Path())):  # type: ignore[misc]
+    """Path subclass that counts reads — only used to fail loud if a tool
+    reads the file before the gates authorize it."""
+
+    _read_count: int = 0
+
+    def read_bytes(self):  # type: ignore[override]
+        type(self)._read_count += 1
+        return super().read_bytes()
+
+
+class _SentinelTracker:
+    """Module-level tracker for sentinel reads via monkeypatched I/O."""
+
+    reads: int = 0
+
+
+@pytest.mark.asyncio
+async def test_fs_edit_does_not_read_file_when_privacy_blocks(
+    workspace: Path, security_feature: SecurityFeature, monkeypatch: pytest.MonkeyPatch
+):
+    """An unauthorized fs_edit caller must not trigger ANY file I/O on the
+    target. This guards against the file-existence / readability / encoding
+    / substring-match oracles that would otherwise leak information before
+    the gates refuse the call.
+    """
+    target = workspace / "must_not_be_read.txt"
+    target.write_text("alpha beta gamma")
+
+    feature, _ = await _make_feature(
+        workspace=workspace,
+        privacy=PrivacyConfig(computer_access=False),  # privacy gate closed
+        grants={
+            "filesystem_read",
+            "filesystem_write",
+            "shell_execution_sandboxed",
+            "shell_execution_host",
+        },
+        security_feature=security_feature,
+    )
+
+    # Track every read against the target's realpath. If ANY read happens,
+    # the test fails — that is the whole point of this case.
+    real_target = os.path.realpath(target)
+    _SentinelTracker.reads = 0
+    real_read_bytes = Path.read_bytes
+
+    def _tracking_read_bytes(self, *a, **kw):
+        if os.path.realpath(self) == real_target:
+            _SentinelTracker.reads += 1
+        return real_read_bytes(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "read_bytes", _tracking_read_bytes)
+
+    result = await feature.fs_edit(
+        path=str(target), old_text="beta", new_text="BETA"
+    )
+
+    assert result["success"] is False
+    assert result["error"].startswith("privacy")
+    assert _SentinelTracker.reads == 0, (
+        "fs_edit must not read the target file when privacy refuses; "
+        f"saw {_SentinelTracker.reads} reads"
+    )
+
+    # File contents unchanged
+    assert target.read_text() == "alpha beta gamma"
+
+    # Audit row records privacy refusal — chain has only the failing gate
+    audit = _read_audit(workspace / "audit.jsonl")
+    assert audit[-1]["allowed_by"] == ["denied:privacy"]
+
+
+@pytest.mark.asyncio
+async def test_fs_edit_does_not_read_file_when_constitution_blocks(
+    workspace: Path, security_feature: SecurityFeature, monkeypatch: pytest.MonkeyPatch
+):
+    """Same guarantee against the constitution gate: no file I/O before
+    Amendment IX has granted ``filesystem_write``."""
+    target = workspace / "must_not_be_read_2.txt"
+    target.write_text("password=hunter2")
+
+    feature, _ = await _make_feature(
+        workspace=workspace,
+        privacy=PrivacyConfig(computer_access=True),
+        # No filesystem_write grant; shell grants present so backend builds.
+        grants={"shell_execution_sandboxed", "shell_execution_host"},
+        security_feature=security_feature,
+    )
+
+    real_target = os.path.realpath(target)
+    _SentinelTracker.reads = 0
+    real_read_bytes = Path.read_bytes
+
+    def _tracking_read_bytes(self, *a, **kw):
+        if os.path.realpath(self) == real_target:
+            _SentinelTracker.reads += 1
+        return real_read_bytes(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "read_bytes", _tracking_read_bytes)
+
+    # Try a substring-search probe: under the leaky implementation, the
+    # error would tell us whether old_text exists in the file. Under the
+    # fixed implementation, we get a constitution error and learn nothing.
+    result = await feature.fs_edit(
+        path=str(target), old_text="hunter2", new_text="REDACTED"
+    )
+
+    assert result["success"] is False
+    assert result["error"].startswith("constitution")
+    assert _SentinelTracker.reads == 0
+
+
+@pytest.mark.asyncio
+async def test_fs_edit_substring_oracle_is_closed(
+    workspace: Path, security_feature: SecurityFeature
+):
+    """Cannot distinguish "old_text present" from "old_text missing" without
+    a constitutional grant: both surface the same constitution error."""
+    target = workspace / "secret.txt"
+    target.write_text("the answer is 42")
+
+    feature, _ = await _make_feature(
+        workspace=workspace,
+        privacy=PrivacyConfig(computer_access=True),
+        grants={"shell_execution_sandboxed", "shell_execution_host"},
+        security_feature=security_feature,
+    )
+
+    res_present = await feature.fs_edit(
+        path=str(target), old_text="answer", new_text="X"
+    )
+    res_missing = await feature.fs_edit(
+        path=str(target), old_text="this-string-is-not-in-the-file", new_text="X"
+    )
+
+    # Both refusals must look identical to the caller — no oracle.
+    assert res_present["success"] is False
+    assert res_missing["success"] is False
+    assert res_present["error"].startswith("constitution")
+    assert res_missing["error"].startswith("constitution")
+    assert res_present["error"] == res_missing["error"]
+
+
+@pytest.mark.asyncio
+async def test_fs_edit_audits_input_validation_failures(
+    workspace: Path, security_feature: SecurityFeature
+):
+    """When gates pass, input-validation refusals (UTF-8 decode, missing
+    text, bad occurrence) DO produce audit rows."""
+    target = workspace / "unicode.txt"
+    target.write_bytes(b"\xff\xfe not utf-8")
+
+    feature, _ = await _make_feature(
+        workspace=workspace,
+        privacy=PrivacyConfig(computer_access=True),
+        grants={
+            "filesystem_read",
+            "filesystem_write",
+            "shell_execution_sandboxed",
+            "shell_execution_host",
+        },
+        security_feature=security_feature,
+    )
+
+    result = await feature.fs_edit(
+        path=str(target), old_text="x", new_text="y"
+    )
+    assert result["success"] is False
+    assert "encoding" in result["error"]
+
+    audit = _read_audit(workspace / "audit.jsonl")
+    last = audit[-1]
+    assert last["outcome"] == "denied"
+    # Chain shows all gates passed up to input_validation
+    assert last["allowed_by"] == [
+        "privacy",
+        "constitution",
+        "path_safety",
+        "policy",
+        "denied:input_validation:encoding",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_fs_edit_invalid_occurrence_audited(
+    workspace: Path, security_feature: SecurityFeature
+):
+    target = workspace / "occ.txt"
+    target.write_text("hello")
+
+    feature, _ = await _make_feature(
+        workspace=workspace,
+        privacy=PrivacyConfig(computer_access=True),
+        grants={
+            "filesystem_read",
+            "filesystem_write",
+            "shell_execution_sandboxed",
+            "shell_execution_host",
+        },
+        security_feature=security_feature,
+    )
+
+    result = await feature.fs_edit(
+        path=str(target), old_text="hello", new_text="hi", occurrence=0
+    )
+    assert result["success"] is False
+    assert "occurrence" in result["error"]
+
+    audit = _read_audit(workspace / "audit.jsonl")
+    last = audit[-1]
+    assert last["outcome"] == "denied"
+    assert last["allowed_by"][-1] == "denied:input_validation:occurrence"
+
+
+@pytest.mark.asyncio
+async def test_fs_edit_missing_text_audited(
+    workspace: Path, security_feature: SecurityFeature
+):
+    """The 'old_text not found' path also produces an audit row, now that
+    it lives inside the pre-approval hook."""
+    target = workspace / "miss.txt"
+    target.write_text("hello world")
+
+    feature, _ = await _make_feature(
+        workspace=workspace,
+        privacy=PrivacyConfig(computer_access=True),
+        grants={
+            "filesystem_read",
+            "filesystem_write",
+            "shell_execution_sandboxed",
+            "shell_execution_host",
+        },
+        security_feature=security_feature,
+    )
+
+    result = await feature.fs_edit(
+        path=str(target), old_text="not present", new_text="x"
+    )
+    assert result["success"] is False
+    assert "not found" in result["error"]
+
+    audit = _read_audit(workspace / "audit.jsonl")
+    last = audit[-1]
+    assert last["outcome"] == "denied"
+    assert last["allowed_by"][-1] == "denied:input_validation:missing_text"
+
+
+@pytest.mark.asyncio
+async def test_fs_write_does_not_read_file_when_privacy_blocks(
+    workspace: Path, security_feature: SecurityFeature, monkeypatch: pytest.MonkeyPatch
+):
+    """fs_write must also not touch the target file before gates pass —
+    the diff preview is computed inside the pre-approval hook."""
+    target = workspace / "write_target.txt"
+    target.write_text("existing")
+
+    feature, _ = await _make_feature(
+        workspace=workspace,
+        privacy=PrivacyConfig(computer_access=False),
+        grants={
+            "filesystem_read",
+            "filesystem_write",
+            "shell_execution_sandboxed",
+            "shell_execution_host",
+        },
+        security_feature=security_feature,
+    )
+
+    real_target = os.path.realpath(target)
+    _SentinelTracker.reads = 0
+    real_read_bytes = Path.read_bytes
+
+    def _tracking_read_bytes(self, *a, **kw):
+        if os.path.realpath(self) == real_target:
+            _SentinelTracker.reads += 1
+        return real_read_bytes(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "read_bytes", _tracking_read_bytes)
+
+    result = await feature.fs_write(path=str(target), content="new content")
+
+    assert result["success"] is False
+    assert result["error"].startswith("privacy")
+    assert _SentinelTracker.reads == 0
+
+
+@pytest.mark.asyncio
+async def test_fs_edit_diff_preview_present_in_approval_payload(
+    workspace: Path, security_feature: SecurityFeature
+):
+    """When gates pass, the pre-approval hook still computes a diff that
+    reaches the human approver — moving the read inside the gates didn't
+    break the UX."""
+    target = workspace / "diff.txt"
+    target.write_text("line1\nORIGINAL\nline3\n")
+
+    feature, _ = await _make_feature(
+        workspace=workspace,
+        privacy=PrivacyConfig(computer_access=True),
+        grants={
+            "filesystem_read",
+            "filesystem_write",
+            "shell_execution_sandboxed",
+            "shell_execution_host",
+        },
+        security_feature=security_feature,
+    )
+
+    captured: dict[str, object] = {}
+
+    class _CapturingResponder(_ApprovalResponder):
+        async def _run(self) -> None:
+            while not self._stop.is_set():
+                for req in list(self._security.approval_queue.pending_requests):
+                    captured.update(req.tool_args)
+                    self._security.approval_queue.submit_decision(
+                        req.id, self._decision, self._scope
+                    )
+                    self.responded_count += 1
+                try:
+                    await asyncio.wait_for(self._stop.wait(), timeout=0.05)
+                except asyncio.TimeoutError:
+                    continue
+
+    async with _CapturingResponder(security_feature, decision=True):
+        result = await feature.fs_edit(
+            path=str(target), old_text="ORIGINAL", new_text="REPLACED"
+        )
+
+    assert result["success"] is True
+    diff = captured.get("diff_preview", "")
+    assert "ORIGINAL" in diff
+    assert "REPLACED" in diff
+    assert target.read_text() == "line1\nREPLACED\nline3\n"
