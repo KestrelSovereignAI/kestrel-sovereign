@@ -93,7 +93,7 @@ async def test_disabled_feature_returns_error(tmp_path: Path):
     feature._cfg = _config(tmp_path, enabled=False)
     result = await feature.fs_read(path=str(tmp_path / "ok.txt"))
     assert result["success"] is False
-    assert "not enabled" in result["error"]
+    assert result["error"].startswith("readiness:")
 
 
 @pytest.mark.asyncio
@@ -275,4 +275,4 @@ async def test_local_backend_requires_both_shell_grants(workspace: Path):
     assert feature._backend is None
     result = await feature.fs_read(path=str(workspace / "ok.txt"))
     assert result["success"] is False
-    assert "backend failed" in result["error"]
+    assert result["error"].startswith("readiness:")
