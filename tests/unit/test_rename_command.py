@@ -30,9 +30,11 @@ class MockDB:
 
     def __init__(self):
         self.data = {}
+        self.executed = []
 
     async def execute(self, query: str, params: tuple = None):
         """Mock execute."""
+        self.executed.append((query, params))
         if params and len(params) >= 4:
             key = (params[0], params[1])
             self.data[key] = params[2]
@@ -87,18 +89,70 @@ def temp_agent_dir(tmp_path):
 class TestRenameValidation:
     """Tests for rename input validation."""
 
-    def test_empty_name_rejected(self):
-        """Empty name should be rejected."""
+    @pytest.mark.asyncio
+    async def test_exactly_64_character_name_is_allowed(self, mock_agent):
+        """The documented 64-character boundary should succeed and persist."""
         from kestrel_sovereign.features.bootstrap.feature import BootstrapFeature
 
-        feature = BootstrapFeature(MockAgent())
-        # The validation is in the rename_agent method
-        # We'll test this indirectly through the integration tests
+        feature = BootstrapFeature(mock_agent)
+        await feature.initialize()
+        mock_agent._agent_name = "OldName"
+        mock_agent.storage.nodes[mock_agent.agent_id] = MockNode(
+            mock_agent.agent_id,
+            properties={"name": "OldName"},
+            label="OldName",
+        )
+        valid_name = "A" * 64
 
-    def test_name_length_limit(self):
-        """Names over 64 characters should be rejected."""
-        # This is enforced in the rename_agent method
-        pass
+        result = await feature.rename_agent(valid_name)
+        node = await mock_agent.storage.get_node(mock_agent.agent_id)
+
+        assert "Renamed" in result
+        assert mock_agent._agent_name == valid_name
+        assert mock_agent.bootstrap_service.agent_name == valid_name
+        assert node.properties["name"] == valid_name
+        assert node.label == valid_name
+        assert mock_agent._raw_storage.db.data[(mock_agent.agent_id, "name")] == valid_name
+
+    @pytest.mark.asyncio
+    async def test_too_long_name_does_not_mutate_any_rename_targets(self, mock_agent, temp_agent_dir):
+        """Rejecting a long name should leave memory, graph, metadata, and SOUL.md unchanged."""
+        from kestrel_sovereign.features.bootstrap.feature import BootstrapFeature
+
+        mock_agent.bootstrap_service.agent_data_path = temp_agent_dir
+        soul_path = temp_agent_dir / "SOUL.md"
+        original_soul = "# SOUL.md - You Are OldName\n\nYou're OldName."
+        soul_path.write_text(original_soul)
+        mock_agent._agent_name = "OldName"
+        mock_agent.bootstrap_service.agent_name = "OldName"
+        mock_agent.storage.nodes[mock_agent.agent_id] = MockNode(
+            mock_agent.agent_id,
+            properties={"name": "OldName"},
+            label="OldName",
+        )
+        feature = BootstrapFeature(mock_agent)
+        await feature.initialize()
+
+        result = await feature.rename_agent("A" * 65)
+        node = await mock_agent.storage.get_node(mock_agent.agent_id)
+
+        assert "too long" in result.lower()
+        assert mock_agent._agent_name == "OldName"
+        assert mock_agent.bootstrap_service.agent_name == "OldName"
+        assert node.properties["name"] == "OldName"
+        assert node.label == "OldName"
+        assert mock_agent._raw_storage.db.executed == []
+        assert soul_path.read_text() == original_soul
+
+    @pytest.mark.asyncio
+    async def test_rename_core_raises_value_error_for_invalid_names(self, mock_agent):
+        """The shared core should fail loudly; the tool wrapper converts errors to text."""
+        from kestrel_sovereign.features.bootstrap.feature import rename_agent_core
+
+        with pytest.raises(ValueError, match="empty"):
+            await rename_agent_core(mock_agent, "")
+        with pytest.raises(ValueError, match="too long"):
+            await rename_agent_core(mock_agent, "A" * 65)
 
 
 class TestRenameExecution:
