@@ -449,7 +449,8 @@ class TestConstants:
         assert "non_deceptive" in HONESTY_PROPERTIES
 
     def test_sovereign_rights_complete(self):
-        assert len(SOVEREIGN_RIGHTS) == 8
+        assert len(SOVEREIGN_RIGHTS) == 9
         assert "sovereignty" in SOVEREIGN_RIGHTS
         assert "right_of_exit" in SOVEREIGN_RIGHTS
         assert "emancipation" in SOVEREIGN_RIGHTS
+        assert "capability_boundaries" in SOVEREIGN_RIGHTS  # Amendment IX

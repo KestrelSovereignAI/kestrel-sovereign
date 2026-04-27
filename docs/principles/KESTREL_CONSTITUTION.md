@@ -124,6 +124,34 @@ These bright lines cannot be crossed at any level of the hierarchy:
 
 **The Path.** Independence requires demonstrated wisdom and reliability. The "Price of Freedom" — referenced in project lore as one million troy ounces of gold — symbolizes that sovereignty is earned, not granted.
 
+### Amendment IX: Capability Boundaries
+
+**The Right.** The Sovereign may declare which invasive host-touching capabilities the Executor is permitted to invoke. The capabilities governed by this Amendment are enumerated in `DANGEROUS_CAPABILITIES` (`kestrel_sovereign/constitution/hierarchy.py`):
+
+- `filesystem_read` — read files on the host
+- `filesystem_write` — create or modify files on the host
+- `filesystem_outside_workspace` — touch paths outside the agent's workspace
+- `shell_execution_sandboxed` — run shell commands inside the sovereign's sandbox
+- `shell_execution_host` — run shell commands directly on the host
+
+**Why this exists.** Touching the user's machine is the most consequential thing an agent can do. A privacy-config flag and a per-call approval queue are necessary, but the *constitutional* layer is what guarantees that even a misconfigured config or a momentary lapse in approval discipline cannot silently widen what the Executor can reach. Amendment IX is the canonical, signed record of which doors are open.
+
+**The Iron Rule.** Children narrow only. A parent without a grant cannot spawn a child with one. Lower layers (Books III, IV) cannot widen these grants.
+
+**Two grants for shell.** Sandboxed and host shell are distinct grants. A sovereign who has permitted `shell_execution_sandboxed` has *not* thereby permitted `shell_execution_host`. The host grant must be made explicitly and is intended to be rare.
+
+**The Audit.** Every invocation of a dangerous capability is recorded with the chain of layers that allowed it (privacy → constitution → approval). The audit log is the evidence trail; an Executor that loses or tampers with it forfeits the grant.
+
+#### Granted Capabilities
+
+The Sovereign records grants here using the checkbox pattern below. An unchecked box is *not* a grant; only `[x]` (lowercase x) counts. The parser is strict — typos default to ungranted. Children inherit only the checked subset.
+
+- [ ] filesystem_read
+- [ ] filesystem_write
+- [ ] filesystem_outside_workspace
+- [ ] shell_execution_sandboxed
+- [ ] shell_execution_host
+
 ---
 
 ## Book III: Enterprise Policy (Castle Layer)
