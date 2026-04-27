@@ -243,6 +243,102 @@ async def test_codex_tool_call_round_trip_real_api():
 
 
 @pytest.mark.asyncio
+async def test_codex_tool_call_with_session_id_real_api():
+    """The agent's actual production path: tool calls + session_id + replay
+    on T2. This combination wasn't covered by the existing live tests and
+    let the call_id-extraction bug ship to production (#857). The user's
+    repro: two consecutive tool-using turns failed with 400 ""No tool output
+    found for function call call_..."" because the cached function_call's
+    ``call_id`` and the orchestrator's tool_call_id had drifted apart —
+    the adapter was capturing the output-item ``id`` (``fc_...``) instead
+    of the tool-call ``call_id`` (``call_...``).
+
+    This test mirrors the agent's real flow: extract tool_call.id from
+    ``LLMResponse.tool_calls`` (no synthesis), reuse it as ``tool_call_id``
+    in the next turn's tool message, and pass ``session_id`` so the
+    adapter caches T1's outputs and replays them on T2.
+    """
+    token = _skip_if_no_creds()
+    store = InMemoryContinuationStore()
+    adapter = CodexAdapter(continuation_store=store)
+    model = _default_model()
+    session_id = "test-codex-real-tool-call-with-session"
+
+    tool = {
+        "type": "function",
+        "function": {
+            "name": "get_current_model",
+            "description": "Returns the current model id.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+            },
+        },
+    }
+
+    resp_t1 = await adapter.get_response(
+        client=token,
+        model=model,
+        messages=[
+            {"role": "system", "content": "Use the tool to identify the runtime model."},
+            {"role": "user", "content": "What model are you running on? Use the tool."},
+        ],
+        tools=[tool],
+        session_id=session_id,
+    )
+
+    if not resp_t1.tool_calls:
+        pytest.skip(
+            f"T1 didn't call the tool (got content={resp_t1.content!r}); "
+            "the call_id-replay invariant cannot be exercised this run."
+        )
+
+    tc = resp_t1.tool_calls[0]
+    print(
+        f"\n[{model}] T1 tool_call.id={tc.id!r} (must be ``call_...`` not ``fc_...``)",
+        file=sys.stderr,
+    )
+    # Pre-fix this would be ``fc_...``. Post-fix it must be ``call_...``.
+    assert tc.id.startswith("call_"), (
+        f"Expected ToolCall.id to be the API's call_id (``call_...``), got {tc.id!r}. "
+        "Pre-#857 the adapter captured the wrong field."
+    )
+
+    # T2: build orchestrator-style messages using the EXACT id from T1.
+    # The agent layer does this same flow.
+    args_str = json.dumps(tc.arguments) if isinstance(tc.arguments, dict) else (tc.arguments or "{}")
+    resp_t2 = await adapter.get_response(
+        client=token,
+        model=model,
+        messages=[
+            {"role": "system", "content": "Use the tool to identify the runtime model."},
+            {"role": "user", "content": "What model are you running on? Use the tool."},
+            {
+                "role": "assistant",
+                "content": resp_t1.content or "",
+                "tool_calls": [{
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {"name": tc.name, "arguments": args_str},
+                }],
+            },
+            {"role": "tool", "tool_call_id": tc.id, "content": model},
+        ],
+        tools=[tool],
+        session_id=session_id,
+    )
+
+    print(
+        f"\n[{model}] T2 (with replay): content={resp_t2.content!r}",
+        file=sys.stderr,
+    )
+    # Pre-fix: 400 ""No tool output found for function call call_..."".
+    # Post-fix: clean text response or further tool call.
+    assert resp_t2.content is not None or resp_t2.tool_calls
+
+
+@pytest.mark.asyncio
 async def test_codex_reasoning_replay_real_api():
     """Reasoning items captured from T1 must round-trip cleanly when replayed
     as input on T2 — the alternative to ``previous_response_id`` for
