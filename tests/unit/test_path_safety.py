@@ -1,4 +1,10 @@
-"""Tests for path-safety guards (#834)."""
+"""Tests for path-safety primitives (#834).
+
+Path safety is now narrowly scoped: traversal segments and NUL bytes
+are intrinsic violations; symlinks are *resolved*, not rejected.
+Allow-list / deny-list membership is a policy decision, not a safety
+decision — see test_computer_use_policy.
+"""
 
 import os
 from pathlib import Path
@@ -9,71 +15,60 @@ from kestrel_sovereign.features.computer_use.path_safety import (
     PathSafetyError,
     assert_no_traversal,
     match_allow_list,
-    resolve_against_roots,
-    resolve_within,
+    resolve_realpath,
 )
 
 
-def test_no_traversal_rejects():
+def test_no_traversal_rejects_dotdot():
     with pytest.raises(PathSafetyError):
         assert_no_traversal("../etc/passwd")
     with pytest.raises(PathSafetyError):
         assert_no_traversal("foo/../bar")
 
 
-def test_no_traversal_allows_clean():
+def test_no_traversal_rejects_nul():
+    with pytest.raises(PathSafetyError):
+        assert_no_traversal("foo\x00.txt")
+
+
+def test_no_traversal_allows_clean_paths():
     assert_no_traversal("foo/bar/baz")
     assert_no_traversal("/abs/path/file.txt")
+    assert_no_traversal("./relative/path")  # leading "./" normalizes away
 
 
-def test_resolve_within_relative(tmp_path: Path):
-    sub = tmp_path / "sub"
-    sub.mkdir()
-    (sub / "file.txt").write_text("hi")
-    resolved = resolve_within(tmp_path, "sub/file.txt")
-    assert resolved == (tmp_path / "sub" / "file.txt").resolve()
+def test_resolve_realpath_canonicalizes(tmp_path: Path):
+    target = tmp_path / "target.txt"
+    target.write_text("hi")
+    resolved = resolve_realpath(str(target))
+    assert resolved == Path(os.path.realpath(target))
 
 
-def test_resolve_within_rejects_traversal(tmp_path: Path):
-    with pytest.raises(PathSafetyError):
-        resolve_within(tmp_path, "../escape")
-
-
-def test_resolve_within_rejects_absolute_outside_root(tmp_path: Path):
-    other = Path("/tmp/definitely-not-under-tmp_path")
-    with pytest.raises(PathSafetyError):
-        resolve_within(tmp_path, other)
-
-
-def test_resolve_within_rejects_symlink_escape(tmp_path: Path):
-    outside = tmp_path.parent / "outside_target"
-    outside.mkdir(exist_ok=True)
+def test_resolve_realpath_follows_symlink(tmp_path: Path):
+    """A symlink resolves to its target — the policy layer decides what to do with it."""
+    real = tmp_path / "real.txt"
+    real.write_text("payload")
     link = tmp_path / "link"
-    os.symlink(outside, link)
+    os.symlink(real, link)
+    resolved = resolve_realpath(str(link))
+    assert resolved == Path(os.path.realpath(real))
+
+
+def test_resolve_realpath_rejects_traversal(tmp_path: Path):
     with pytest.raises(PathSafetyError):
-        resolve_within(tmp_path, "link/anything")
+        resolve_realpath(f"{tmp_path}/../escape.txt")
 
 
-def test_resolve_within_handles_nonexistent_child(tmp_path: Path):
-    resolved = resolve_within(tmp_path, "does/not/exist/yet.txt")
-    assert str(resolved).startswith(str(tmp_path.resolve()))
+def test_resolve_realpath_handles_nonexistent_leaf(tmp_path: Path):
+    """Non-existent leaves still get a sensible realpath (parent realpath + leaf)."""
+    resolved = resolve_realpath(str(tmp_path / "does_not_exist_yet.txt"))
+    assert str(resolved).startswith(os.path.realpath(tmp_path))
 
 
-def test_resolve_against_roots_first_match_wins(tmp_path: Path):
-    a = tmp_path / "a"
-    b = tmp_path / "b"
-    a.mkdir()
-    b.mkdir()
-    (b / "file.txt").write_text("x")
-    resolved = resolve_against_roots([a, b], "file.txt")
-    # Tries a/file.txt — does not exist but path resolution allows non-existent;
-    # we only require the resolved path to live under one of the roots.
-    assert str(resolved).startswith(str(a.resolve())) or str(resolved).startswith(str(b.resolve()))
-
-
-def test_resolve_against_roots_all_fail():
-    with pytest.raises(PathSafetyError):
-        resolve_against_roots([Path("/no/such/root")], "../etc/passwd")
+def test_resolve_realpath_expands_user():
+    home = Path.home()
+    resolved = resolve_realpath("~/some-nonexistent-marker-file")
+    assert str(resolved).startswith(str(home.resolve()))
 
 
 def test_match_allow_list_deny_wins():

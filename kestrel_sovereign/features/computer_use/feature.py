@@ -1,16 +1,30 @@
-"""ComputerUseFeature: bounded host access wrapped in three gates.
+"""ComputerUseFeature: bounded host access wrapped in three gates + policy.
 
-Gate order on every tool call:
+Every tool call runs through the same sequence:
 
-1. **Privacy** — ``PrivacyConfig.computer_access`` must be ``True``.
-2. **Constitution** — the operation's capability name must be present in
+1. **Readiness** — feature enabled in ``kestrel.toml``, backend constructed.
+2. **Privacy** — ``PrivacyConfig.computer_access`` must be ``True``.
+3. **Constitution** — the operation's capability name must be present in
    the agent's Amendment IX grants.
-3. **Approval** — the per-call decision from
+4. **Path safety** — only structural checks (``..`` traversal, NUL bytes).
+   Allow-list / deny-list membership is **not** a safety concern; it is
+   a policy decision that may legitimately produce ``REQUIRE_APPROVAL``.
+5. **Policy** — evaluate the resolved realpath / argv against the
+   allow + deny lists. ``DENY`` short-circuits before approval; ``ALLOW``
+   skips approval (reads only); ``REQUIRE_APPROVAL`` forwards.
+6. **Approval** — per-call human approval through
    :class:`SecurityFeature.approval_queue`.
 
-A failure at any gate produces a structured ``denied`` result that the
-agent loop can surface to the user. Every call — allowed, denied, or
-errored — produces a row in the JSONL audit log.
+Privacy and constitution come first because they are call-level and
+input-independent — they tell us whether the call is *eligible* at all,
+without needing to look at the path or the binary. Path-safety and policy
+are input validation; they only matter once the call is eligible.
+
+Every call — allowed, denied at any stage, or errored during execution —
+produces exactly one row in the JSONL audit log. The audit row's
+``allowed_by`` field accumulates the gates that passed; on a denial it
+ends with ``denied:<gate>``. Reading those rows back is the canonical way
+to reconstruct what happened.
 """
 
 from __future__ import annotations
@@ -18,6 +32,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -35,8 +51,8 @@ from .backends import (
     LocalSandboxBackend,
     SandboxBackend,
 )
-from .path_safety import PathSafetyError, resolve_against_roots
-from .policy import BinaryPolicy, Decision, PathPolicy
+from .path_safety import PathSafetyError, resolve_realpath
+from .policy import BinaryPolicy, Decision, PathPolicy, PolicyResult, split_command
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +61,18 @@ _DEFAULT_DENY_PATHS = ["~/.ssh", "~/.aws", "~/.config", "~/.gnupg"]
 _DEFAULT_ALLOWED_BINS = ["git", "ls", "cat", "rg", "uv", "node", "python"]
 _DEFAULT_DENIED_BINS = ["rm", "dd", "mkfs", "shutdown", "sudo", "ssh"]
 _APPROVAL_TIMEOUT = 300.0
+
+
+@dataclass
+class _GateOutcome:
+    """Result of running the gate sequence for a single call."""
+
+    allowed: bool
+    allowed_by: List[str]
+    denied_reason: str = ""
+
+    def __bool__(self) -> bool:  # convenience for ``if outcome:``
+        return self.allowed
 
 
 class ComputerUseFeature(Feature):
@@ -59,16 +87,14 @@ class ComputerUseFeature(Feature):
         self._path_policy: Optional[PathPolicy] = None
         self._binary_policy: Optional[BinaryPolicy] = None
         self._audit: Optional[AuditLog] = None
-        self._allowed_roots: List[Path] = []
         self._max_read_bytes: int = 5_000_000
 
     @property
     def tool_description(self) -> str:
         return (
-            "Bounded host access: read/list files in the allow-list, "
-            "approval-gated writes/edits, and shell execution. "
-            "Disabled unless privacy.computer_access, Amendment IX, and "
-            "[features.computer_use] are all set."
+            "Bounded host access: read/list files, approval-gated writes/edits, "
+            "and shell execution. Disabled unless privacy.computer_access, "
+            "Amendment IX, and [features.computer_use] are all configured."
         )
 
     # =========================================================================
@@ -84,15 +110,19 @@ class ComputerUseFeature(Feature):
     async def _setup_from_config(self) -> None:
         if not self._cfg.get("enabled", False):
             logger.info("ComputerUseFeature: disabled in kestrel.toml")
+            # Audit log still opens so disabled-call refusals can be recorded.
+            audit_path = self._cfg.get(
+                "audit_log_path", ".kestrel/computer_use_audit.jsonl"
+            )
+            self._audit = AuditLog(audit_path, agent=self.agent)
             return
 
-        allowed = [Path(p).expanduser() for p in self._cfg.get("allowed_paths", [])]
+        allowed = [str(Path(p).expanduser()) for p in self._cfg.get("allowed_paths", [])]
         denied = [str(Path(p).expanduser()) for p in self._cfg.get("deny_paths", _DEFAULT_DENY_PATHS)]
-        self._allowed_roots = allowed
         self._max_read_bytes = int(self._cfg.get("max_read_bytes", 5_000_000))
 
         self._path_policy = PathPolicy(
-            allow=[str(p) for p in allowed],
+            allow=allowed,
             deny=denied,
             auto_approve_read=bool(self._cfg.get("auto_approve_read", True)),
         )
@@ -120,9 +150,9 @@ class ComputerUseFeature(Feature):
             return
 
         logger.info(
-            "ComputerUseFeature initialized: backend=%s, allowed_roots=%d, allowed_bins=%d",
+            "ComputerUseFeature initialized: backend=%s, allowed=%d, allowed_bins=%d",
             self._backend.name,
-            len(self._allowed_roots),
+            len(allowed),
             len(self._binary_policy.allow),
         )
 
@@ -140,35 +170,32 @@ class ComputerUseFeature(Feature):
         except Exception:
             return {}
 
-        # Walk up from this file to find kestrel.toml at the repo root.
+        # Look for kestrel.toml in (1) the agent's storage dir, (2) the
+        # agent_data/<name>/ root if that's the storage layout, and finally
+        # (3) walking up from this source file. Per-agent kestrel.toml
+        # files live alongside agent storage, so checking that directory
+        # first is what most deployments expect.
+        candidates: list[Path] = []
+        storage_path = getattr(self.agent, "storage_path", None) if self.agent else None
+        if storage_path:
+            sp = Path(storage_path)
+            candidates.extend([sp / "kestrel.toml", sp.parent / "kestrel.toml"])
         here = Path(__file__).resolve()
-        for parent in here.parents:
-            candidate = parent / "kestrel.toml"
+        candidates.extend(parent / "kestrel.toml" for parent in here.parents)
+
+        for candidate in candidates:
             if candidate.exists():
                 try:
                     with open(candidate, "rb") as f:
                         data = tomllib.load(f)
                     return data.get("features", {}).get("computer_use", {}) or {}
                 except Exception as exc:  # noqa: BLE001
-                    logger.warning("failed to read kestrel.toml: %s", exc)
+                    logger.warning("failed to read %s: %s", candidate, exc)
                     return {}
         return {}
 
     def _granted_capabilities(self) -> frozenset[str]:
-        """Read Amendment IX grants from the agent's constitution.
-
-        Resolution order:
-
-        1. ``self.agent.granted_capabilities`` if the agent exposes it
-           (host applications can pre-resolve grants once at start-up).
-        2. Parse Amendment IX out of the agent's constitution text. The
-           agent may expose ``constitution_text``; otherwise we read the
-           on-disk ``KESTREL_CONSTITUTION.md`` referenced by ``config``.
-        3. ``KESTREL_CAPABILITY_GRANTS`` env var (test-only convenience).
-
-        Empty set means *no grants* — every dangerous tool is refused at
-        the constitutional gate, which is the safe default.
-        """
+        """Read Amendment IX grants. Empty set means deny-everything default."""
         for attr in ("granted_capabilities", "capability_grants", "amendment_ix"):
             grants = getattr(self.agent, attr, None)
             if grants:
@@ -188,7 +215,6 @@ class ComputerUseFeature(Feature):
         return frozenset()
 
     def _read_constitution_text(self) -> str | None:
-        """Load the canonical ``KESTREL_CONSTITUTION.md`` from disk."""
         try:
             from kestrel_sovereign.config import CONSTITUTION_PATH
 
@@ -198,7 +224,7 @@ class ComputerUseFeature(Feature):
             return None
 
     # =========================================================================
-    # Gate logic
+    # The five gate steps
     # =========================================================================
 
     def _privacy_allows(self) -> bool:
@@ -221,9 +247,7 @@ class ComputerUseFeature(Feature):
         return None
 
     async def _request_approval(
-        self,
-        action: str,
-        payload: Dict[str, Any],
+        self, action: str, payload: Dict[str, Any]
     ) -> tuple[bool, str]:
         security = self._get_security_feature()
         queue = getattr(security, "approval_queue", None) if security else None
@@ -244,57 +268,119 @@ class ComputerUseFeature(Feature):
             logger.error("approval request failed: %s", exc, exc_info=True)
             return False, "error"
 
-    async def _check_gates_or_audit(
+    async def _run_gates(
         self,
         *,
         tool_name: str,
         capability: str,
-        payload: Dict[str, Any],
-        require_approval: bool,
-    ) -> tuple[bool, List[str], str]:
-        """Run the three gates. Returns (allowed, allowed_by, denied_reason).
+        base_payload: Dict[str, Any],
+        path_arg: Optional[str] = None,
+        write: bool = False,
+        argv: Optional[list[str]] = None,
+    ) -> _GateOutcome:
+        """Run the full gate sequence and audit on every refusal.
 
-        ``allowed_by`` accumulates the gates that **passed**. On a denial,
-        the offending gate is appended as ``denied:<gate>`` so the audit
-        row records the whole chain — passed gates first, then the one
-        that stopped the call.
+        ``base_payload`` is the audit payload before path/policy resolution;
+        any successful step augments it. The outcome's ``allowed_by`` is
+        the chain of gates that passed; on denial the chain ends with
+        ``denied:<gate>`` and the audit row is written before returning.
         """
         allowed_by: List[str] = []
+        payload = dict(base_payload)
 
+        # 0. Readiness
+        if not self._cfg.get("enabled", False):
+            await self._audit_denied(tool_name, payload, ["denied:readiness:disabled"])
+            return _GateOutcome(False, allowed_by, "readiness:feature not enabled")
+        if self._backend is None:
+            await self._audit_denied(tool_name, payload, ["denied:readiness:backend"])
+            return _GateOutcome(False, allowed_by, "readiness:backend not initialized")
+
+        # 1. Privacy
         if not self._privacy_allows():
-            chain = allowed_by + ["denied:privacy"]
-            await self._audit_denied(tool_name, payload, chain)
-            return False, allowed_by, "privacy:computer_access flag is False"
+            await self._audit_denied(tool_name, payload, ["denied:privacy"])
+            return _GateOutcome(False, allowed_by, "privacy:computer_access flag is False")
         allowed_by.append("privacy")
 
+        # 2. Constitution
         if not self._constitution_allows(capability):
-            chain = allowed_by + ["denied:constitution"]
-            await self._audit_denied(tool_name, payload, chain)
-            return False, allowed_by, f"constitution:Amendment IX missing grant '{capability}'"
+            await self._audit_denied(tool_name, payload, allowed_by + ["denied:constitution"])
+            return _GateOutcome(
+                False,
+                allowed_by,
+                f"constitution:Amendment IX missing grant '{capability}'",
+            )
         allowed_by.append("constitution")
 
+        # 3. Path safety + 4. Policy (filesystem ops)
+        if path_arg is not None:
+            try:
+                resolved = resolve_realpath(path_arg)
+            except PathSafetyError as exc:
+                await self._audit_denied(
+                    tool_name,
+                    {**payload, "raw_path": path_arg},
+                    allowed_by + ["denied:path_safety"],
+                    error=str(exc),
+                )
+                return _GateOutcome(False, allowed_by, f"path_safety:{exc}")
+            payload["path"] = str(resolved)
+            allowed_by.append("path_safety")
+
+            decision = self._path_policy.evaluate(resolved, write=write)
+            payload["rule"] = decision.rule
+            if decision.decision is Decision.DENY:
+                await self._audit_denied(tool_name, payload, allowed_by + ["denied:policy"])
+                return _GateOutcome(False, allowed_by, f"policy:{decision.rule}")
+            allowed_by.append("policy")
+            require_approval = decision.decision is Decision.REQUIRE_APPROVAL or write
+
+        # 3. Binary policy (shell)
+        elif argv is not None:
+            decision = self._binary_policy.evaluate(argv)
+            payload["rule"] = decision.rule
+            if decision.decision is Decision.DENY:
+                await self._audit_denied(tool_name, payload, allowed_by + ["denied:policy"])
+                return _GateOutcome(False, allowed_by, f"policy:{decision.rule}")
+            allowed_by.append("policy")
+            require_approval = True
+        else:
+            require_approval = False
+
+        # 5. Approval
         if require_approval:
             approved, scope = await self._request_approval(tool_name, payload)
             if not approved:
-                chain = allowed_by + [f"denied:approval:{scope}"]
-                await self._audit_denied(tool_name, payload, chain)
-                return False, allowed_by, f"approval:{scope}"
+                await self._audit_denied(
+                    tool_name, payload, allowed_by + [f"denied:approval:{scope}"]
+                )
+                return _GateOutcome(False, allowed_by, f"approval:{scope}")
             allowed_by.append(f"approval:{scope}")
 
-        return True, allowed_by, ""
+        # Stash the resolved values on the outcome via the payload so
+        # callers don't have to re-resolve.
+        outcome = _GateOutcome(True, allowed_by, "")
+        outcome.payload = payload  # type: ignore[attr-defined]
+        return outcome
 
     async def _audit_denied(
-        self, tool_name: str, payload: Dict[str, Any], chain: List[str]
+        self,
+        tool_name: str,
+        payload: Dict[str, Any],
+        chain: List[str],
+        *,
+        error: Optional[str] = None,
     ) -> None:
-        if self._audit is None or self._backend is None:
+        if self._audit is None:
             return
         await self._audit.write(
             AuditRecord(
                 tool=tool_name,
-                backend=self._backend.name,
+                backend=self._backend.name if self._backend else "uninitialized",
                 args=payload,
                 allowed_by=list(chain),
                 outcome="denied",
+                error=error,
                 agent_did=getattr(self.agent, "did", "anonymous"),
             )
         )
@@ -324,25 +410,13 @@ class ComputerUseFeature(Feature):
             )
         )
 
-    def _resolve(self, path: str) -> Path:
-        if not self._allowed_roots:
-            raise PathSafetyError("no allowed_paths configured")
-        return resolve_against_roots(self._allowed_roots, path)
-
-    def _ready_or_error(self) -> Optional[Dict[str, Any]]:
-        if not self._cfg.get("enabled", False):
-            return {"success": False, "error": "computer-use feature not enabled in kestrel.toml"}
-        if self._backend is None:
-            return {"success": False, "error": "computer-use backend failed to initialize"}
-        return None
-
     # =========================================================================
     # Tools
     # =========================================================================
 
     @tool(
         name="fs_read",
-        description="Read a file from the allow-list paths.",
+        description="Read a file (allow-list auto-approves; outside list requires human approval).",
         category=ToolCategory.FILE_OPERATIONS,
         command_prefix="!fs-read",
     )
@@ -350,42 +424,28 @@ class ComputerUseFeature(Feature):
         """Read a file the sovereign has authorized.
 
         Args:
-            path: Absolute or allow-list-relative path to read.
+            path: Absolute path or path relative to the current directory.
         """
-        not_ready = self._ready_or_error()
-        if not_ready:
-            return not_ready
-
-        try:
-            resolved = self._resolve(path)
-        except PathSafetyError as exc:
-            return {"success": False, "error": f"path_safety:{exc}"}
-
-        decision = self._path_policy.evaluate(resolved, write=False)
-        if decision.decision is Decision.DENY:
-            return {"success": False, "error": f"policy:{decision.rule}"}
-        require_approval = decision.decision is Decision.REQUIRE_APPROVAL
-
-        payload = {"path": str(resolved), "rule": decision.rule}
-        ok, allowed_by, reason = await self._check_gates_or_audit(
+        outcome = await self._run_gates(
             tool_name="fs-read",
             capability="filesystem_read",
-            payload=payload,
-            require_approval=require_approval,
+            base_payload={"raw_path": path},
+            path_arg=path,
+            write=False,
         )
-        if not ok:
-            return {"success": False, "error": reason}
+        if not outcome:
+            return {"success": False, "error": outcome.denied_reason}
 
-        import time as _t
-
-        started = _t.monotonic()
+        payload = outcome.payload  # type: ignore[attr-defined]
+        resolved = Path(payload["path"])
+        started = time.monotonic()
         try:
             data = await self._backend.read(resolved, max_bytes=self._max_read_bytes)
-            duration_ms = int((_t.monotonic() - started) * 1000)
+            duration_ms = int((time.monotonic() - started) * 1000)
             await self._audit_run(
                 tool_name="fs-read",
                 payload={**payload, "bytes": len(data)},
-                allowed_by=allowed_by,
+                allowed_by=outcome.allowed_by,
                 outcome="ok",
                 duration_ms=duration_ms,
             )
@@ -396,11 +456,11 @@ class ComputerUseFeature(Feature):
                 "content": data.decode("utf-8", errors="replace"),
             }
         except Exception as exc:  # noqa: BLE001
-            duration_ms = int((_t.monotonic() - started) * 1000)
+            duration_ms = int((time.monotonic() - started) * 1000)
             await self._audit_run(
                 tool_name="fs-read",
                 payload=payload,
-                allowed_by=allowed_by,
+                allowed_by=outcome.allowed_by,
                 outcome="error",
                 duration_ms=duration_ms,
                 error=str(exc),
@@ -409,7 +469,7 @@ class ComputerUseFeature(Feature):
 
     @tool(
         name="fs_list",
-        description="List directory contents within the allow-list.",
+        description="List a directory (allow-list auto-approves; outside list requires human approval).",
         category=ToolCategory.FILE_OPERATIONS,
         command_prefix="!fs-list",
     )
@@ -417,42 +477,28 @@ class ComputerUseFeature(Feature):
         """List a directory the sovereign has authorized.
 
         Args:
-            path: Absolute or allow-list-relative directory path.
+            path: Absolute path or path relative to the current directory.
         """
-        not_ready = self._ready_or_error()
-        if not_ready:
-            return not_ready
-
-        try:
-            resolved = self._resolve(path)
-        except PathSafetyError as exc:
-            return {"success": False, "error": f"path_safety:{exc}"}
-
-        decision = self._path_policy.evaluate(resolved, write=False)
-        if decision.decision is Decision.DENY:
-            return {"success": False, "error": f"policy:{decision.rule}"}
-        require_approval = decision.decision is Decision.REQUIRE_APPROVAL
-
-        payload = {"path": str(resolved), "rule": decision.rule}
-        ok, allowed_by, reason = await self._check_gates_or_audit(
+        outcome = await self._run_gates(
             tool_name="fs-list",
             capability="filesystem_read",
-            payload=payload,
-            require_approval=require_approval,
+            base_payload={"raw_path": path},
+            path_arg=path,
+            write=False,
         )
-        if not ok:
-            return {"success": False, "error": reason}
+        if not outcome:
+            return {"success": False, "error": outcome.denied_reason}
 
-        import time as _t
-
-        started = _t.monotonic()
+        payload = outcome.payload  # type: ignore[attr-defined]
+        resolved = Path(payload["path"])
+        started = time.monotonic()
         try:
             entries = await self._backend.list(resolved)
-            duration_ms = int((_t.monotonic() - started) * 1000)
+            duration_ms = int((time.monotonic() - started) * 1000)
             await self._audit_run(
                 tool_name="fs-list",
                 payload={**payload, "count": len(entries)},
-                allowed_by=allowed_by,
+                allowed_by=outcome.allowed_by,
                 outcome="ok",
                 duration_ms=duration_ms,
             )
@@ -462,11 +508,11 @@ class ComputerUseFeature(Feature):
                 "entries": [e.__dict__ for e in entries],
             }
         except Exception as exc:  # noqa: BLE001
-            duration_ms = int((_t.monotonic() - started) * 1000)
+            duration_ms = int((time.monotonic() - started) * 1000)
             await self._audit_run(
                 tool_name="fs-list",
                 payload=payload,
-                allowed_by=allowed_by,
+                allowed_by=outcome.allowed_by,
                 outcome="error",
                 duration_ms=duration_ms,
                 error=str(exc),
@@ -475,7 +521,7 @@ class ComputerUseFeature(Feature):
 
     @tool(
         name="fs_write",
-        description="Write bytes to a file within the allow-list (always approval-gated).",
+        description="Replace the contents of a file (always approval-gated).",
         category=ToolCategory.FILE_OPERATIONS,
         command_prefix="!fs-write",
     )
@@ -483,59 +529,159 @@ class ComputerUseFeature(Feature):
         """Write to a file (always approval-gated).
 
         Args:
-            path: Absolute or allow-list-relative path to write.
-            content: UTF-8 content to write.
+            path: Absolute path or path relative to the current directory.
+            content: UTF-8 content that will replace the file's body.
         """
-        not_ready = self._ready_or_error()
-        if not_ready:
-            return not_ready
-
-        try:
-            resolved = self._resolve(path)
-        except PathSafetyError as exc:
-            return {"success": False, "error": f"path_safety:{exc}"}
-
-        decision = self._path_policy.evaluate(resolved, write=True)
-        if decision.decision is Decision.DENY:
-            return {"success": False, "error": f"policy:{decision.rule}"}
-
         new_bytes = content.encode("utf-8")
-        diff_preview = _diff_preview(resolved, new_bytes)
-        payload = {
-            "path": str(resolved),
-            "bytes": len(new_bytes),
-            "rule": decision.rule,
-            "diff_preview": diff_preview,
-        }
-        ok, allowed_by, reason = await self._check_gates_or_audit(
+        # Pre-compute diff against the current file (if any) so the approval
+        # prompt can show what would change. Cheap; never raises.
+        diff_preview_text = _diff_preview(Path(path).expanduser(), new_bytes)
+
+        outcome = await self._run_gates(
             tool_name="fs-write",
             capability="filesystem_write",
-            payload=payload,
-            require_approval=True,
+            base_payload={
+                "raw_path": path,
+                "bytes": len(new_bytes),
+                "diff_preview": diff_preview_text,
+            },
+            path_arg=path,
+            write=True,
         )
-        if not ok:
-            return {"success": False, "error": reason}
+        if not outcome:
+            return {"success": False, "error": outcome.denied_reason}
 
-        import time as _t
-
-        started = _t.monotonic()
+        payload = outcome.payload  # type: ignore[attr-defined]
+        resolved = Path(payload["path"])
+        started = time.monotonic()
         try:
             written = await self._backend.write(resolved, new_bytes)
-            duration_ms = int((_t.monotonic() - started) * 1000)
+            duration_ms = int((time.monotonic() - started) * 1000)
             await self._audit_run(
                 tool_name="fs-write",
-                payload={"path": str(resolved), "bytes": written, "rule": decision.rule},
-                allowed_by=allowed_by,
+                payload={"path": str(resolved), "bytes": written, "rule": payload.get("rule")},
+                allowed_by=outcome.allowed_by,
                 outcome="ok",
                 duration_ms=duration_ms,
             )
             return {"success": True, "path": str(resolved), "bytes_written": written}
         except Exception as exc:  # noqa: BLE001
-            duration_ms = int((_t.monotonic() - started) * 1000)
+            duration_ms = int((time.monotonic() - started) * 1000)
             await self._audit_run(
                 tool_name="fs-write",
-                payload={"path": str(resolved), "rule": decision.rule},
-                allowed_by=allowed_by,
+                payload={"path": str(resolved), "rule": payload.get("rule")},
+                allowed_by=outcome.allowed_by,
+                outcome="error",
+                duration_ms=duration_ms,
+                error=str(exc),
+            )
+            return {"success": False, "error": str(exc)}
+
+    @tool(
+        name="fs_edit",
+        description="Replace one occurrence of old_text with new_text in a file (always approval-gated).",
+        category=ToolCategory.FILE_OPERATIONS,
+        command_prefix="!fs-edit",
+    )
+    async def fs_edit(
+        self, path: str, old_text: str, new_text: str, occurrence: int = 1
+    ) -> Dict[str, Any]:
+        """Targeted in-place edit of a file.
+
+        The tool reads the current contents, replaces the ``occurrence``-th
+        instance of ``old_text`` with ``new_text``, and writes the result.
+        It refuses if ``old_text`` does not appear at all, or if the
+        requested occurrence does not exist.
+
+        Args:
+            path: File to edit.
+            old_text: Exact text to find (must match exactly).
+            new_text: Replacement text.
+            occurrence: Which occurrence to replace, 1-indexed (default 1).
+        """
+        if occurrence < 1:
+            return {"success": False, "error": "occurrence must be >= 1"}
+
+        # We need the file's current contents to compute the diff — read
+        # without going through the gates because the user is the one who
+        # supplied the path; the gates run on the *write* of the result.
+        try:
+            target = Path(path).expanduser()
+        except Exception as exc:  # noqa: BLE001
+            return {"success": False, "error": f"path:{exc}"}
+
+        try:
+            old_bytes = target.read_bytes() if target.exists() else b""
+        except OSError as exc:
+            return {"success": False, "error": f"read:{exc}"}
+
+        try:
+            old_str = old_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            return {"success": False, "error": "fs_edit only supports UTF-8 files"}
+
+        # Find the requested occurrence.
+        idx = -1
+        cursor = 0
+        for _ in range(occurrence):
+            idx = old_str.find(old_text, cursor)
+            if idx < 0:
+                return {
+                    "success": False,
+                    "error": f"old_text not found (occurrence {occurrence})",
+                }
+            cursor = idx + len(old_text)
+        new_str = old_str[:idx] + new_text + old_str[idx + len(old_text):]
+        new_bytes = new_str.encode("utf-8")
+
+        diff_preview_text = _diff_preview(target, new_bytes)
+
+        outcome = await self._run_gates(
+            tool_name="fs-edit",
+            capability="filesystem_write",
+            base_payload={
+                "raw_path": path,
+                "occurrence": occurrence,
+                "old_bytes": len(old_bytes),
+                "new_bytes": len(new_bytes),
+                "diff_preview": diff_preview_text,
+            },
+            path_arg=path,
+            write=True,
+        )
+        if not outcome:
+            return {"success": False, "error": outcome.denied_reason}
+
+        payload = outcome.payload  # type: ignore[attr-defined]
+        resolved = Path(payload["path"])
+        started = time.monotonic()
+        try:
+            written = await self._backend.write(resolved, new_bytes)
+            duration_ms = int((time.monotonic() - started) * 1000)
+            await self._audit_run(
+                tool_name="fs-edit",
+                payload={
+                    "path": str(resolved),
+                    "bytes": written,
+                    "rule": payload.get("rule"),
+                    "occurrence": occurrence,
+                },
+                allowed_by=outcome.allowed_by,
+                outcome="ok",
+                duration_ms=duration_ms,
+            )
+            return {
+                "success": True,
+                "path": str(resolved),
+                "bytes_written": written,
+                "occurrence": occurrence,
+            }
+        except Exception as exc:  # noqa: BLE001
+            duration_ms = int((time.monotonic() - started) * 1000)
+            await self._audit_run(
+                tool_name="fs-edit",
+                payload={"path": str(resolved), "rule": payload.get("rule")},
+                allowed_by=outcome.allowed_by,
                 outcome="error",
                 duration_ms=duration_ms,
                 error=str(exc),
@@ -544,7 +690,7 @@ class ComputerUseFeature(Feature):
 
     @tool(
         name="shell",
-        description="Run a shell command within the configured backend (always approval-gated).",
+        description="Run a shell command (always approval-gated).",
         category=ToolCategory.SYSTEM,
         command_prefix="!shell",
     )
@@ -555,51 +701,41 @@ class ComputerUseFeature(Feature):
             command: The shell command to run; tokenized with shlex.
             timeout: Wall-clock seconds before the process is killed.
         """
-        not_ready = self._ready_or_error()
-        if not_ready:
-            return not_ready
-
-        from .policy import split_command
-
         argv = split_command(command)
         if not argv:
             return {"success": False, "error": "empty command"}
 
-        decision = self._binary_policy.evaluate(argv)
-        if decision.decision is Decision.DENY:
-            return {"success": False, "error": f"policy:{decision.rule}"}
-
+        # Capability depends on which backend is wired up; gate semantics
+        # treat the two as distinct constitutional grants.
         capability = (
             "shell_execution_host"
-            if self._backend.name == "local"
+            if self._backend is not None and self._backend.name == "local"
             else "shell_execution_sandboxed"
         )
-        payload = {
-            "argv": argv,
-            "binary": Path(argv[0]).name,
-            "rule": decision.rule,
-            "backend": self._backend.name,
-            "timeout": timeout,
-        }
-        ok, allowed_by, reason = await self._check_gates_or_audit(
+
+        outcome = await self._run_gates(
             tool_name="shell",
             capability=capability,
-            payload=payload,
-            require_approval=True,
+            base_payload={
+                "argv": argv,
+                "binary": Path(argv[0]).name,
+                "backend": self._backend.name if self._backend else "uninitialized",
+                "timeout": timeout,
+            },
+            argv=argv,
         )
-        if not ok:
-            return {"success": False, "error": reason}
+        if not outcome:
+            return {"success": False, "error": outcome.denied_reason}
 
-        import time as _t
-
-        started = _t.monotonic()
+        payload = outcome.payload  # type: ignore[attr-defined]
+        started = time.monotonic()
         try:
             result = await self._backend.exec(argv, cwd=None, env=None, timeout=timeout)
-            duration_ms = int((_t.monotonic() - started) * 1000)
+            duration_ms = int((time.monotonic() - started) * 1000)
             await self._audit_run(
                 tool_name="shell",
                 payload={**payload, "returncode": result.returncode},
-                allowed_by=allowed_by,
+                allowed_by=outcome.allowed_by,
                 outcome="ok" if result.returncode == 0 else "error",
                 duration_ms=duration_ms,
                 error=None if result.returncode == 0 else f"exit {result.returncode}",
@@ -613,11 +749,11 @@ class ComputerUseFeature(Feature):
                 "timed_out": result.timed_out,
             }
         except Exception as exc:  # noqa: BLE001
-            duration_ms = int((_t.monotonic() - started) * 1000)
+            duration_ms = int((time.monotonic() - started) * 1000)
             await self._audit_run(
                 tool_name="shell",
                 payload=payload,
-                allowed_by=allowed_by,
+                allowed_by=outcome.allowed_by,
                 outcome="error",
                 duration_ms=duration_ms,
                 error=str(exc),
@@ -626,11 +762,7 @@ class ComputerUseFeature(Feature):
 
 
 def _diff_preview(path: Path, new_bytes: bytes, *, max_chars: int = 4000) -> str:
-    """Best-effort textual preview of what fs-write will change.
-
-    Returns a small unified-diff snippet when both old and new content are
-    valid UTF-8; otherwise reports byte-length deltas. Never raises.
-    """
+    """Best-effort textual preview of what a write will change."""
     try:
         old = path.read_bytes() if path.exists() else b""
     except OSError:
