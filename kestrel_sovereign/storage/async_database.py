@@ -459,29 +459,64 @@ class AsyncDatabase:
         # Soft-delete migration (#763): add deleted_at to conversation_history
         # for databases created before soft-delete shipped. Idempotent — does
         # nothing on fresh databases (column already in CREATE TABLE).
-        await self._migrate_add_column(
+        #
+        # Gate the dependent index on confirmed column presence (#795). Prior
+        # to this fix, _migrate_add_column swallowed failures at DEBUG and the
+        # CREATE INDEX below ran unconditionally, taking the whole agent down
+        # with `column "deleted_at" does not exist` on production Postgres.
+        column_added = await self._migrate_add_column(
             "conversation_history", "deleted_at", "TIMESTAMP DEFAULT NULL"
         )
-        await self._backend.execute(
-            "CREATE INDEX IF NOT EXISTS idx_conversation_deleted_at "
-            "ON conversation_history(agent_id, deleted_at)"
-        )
+        if column_added:
+            await self._backend.execute(
+                "CREATE INDEX IF NOT EXISTS idx_conversation_deleted_at "
+                "ON conversation_history(agent_id, deleted_at)"
+            )
+        else:
+            logger.error(
+                "Skipping idx_conversation_deleted_at: deleted_at column "
+                "missing on conversation_history (#795). Server will boot but "
+                "soft-delete queries will be unindexed. Run manually: "
+                "ALTER TABLE conversation_history "
+                "ADD COLUMN deleted_at TIMESTAMP DEFAULT NULL; "
+                "CREATE INDEX idx_conversation_deleted_at "
+                "ON conversation_history(agent_id, deleted_at);"
+            )
 
         logger.debug(f"Database schema initialized ({self.backend_type})")
 
     async def _migrate_add_column(
         self, table: str, column: str, col_def: str
-    ) -> None:
+    ) -> bool:
         """Add a column to an existing table if it isn't already present.
 
-        Idempotent across both backends. Logs the first-time migration
-        so deployments leave a breadcrumb.
+        Idempotent across both backends. Logs the first-time migration so
+        deployments leave a breadcrumb.
+
+        Returns:
+            True if the column is confirmed present after this call (whether
+            it was pre-existing or successfully added). False if the migration
+            could not be confirmed — callers MUST treat False as a hard signal
+            and skip any DDL that depends on the column existing (e.g. an
+            index over that column). See #795.
+
+        Failures are logged at WARNING (not DEBUG) so silent regressions are
+        visible in production.
         """
         try:
             if self.backend_type == "postgres":
                 await self._backend.execute(
                     f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {col_def}"
                 )
+                # Confirm the column is actually present. ALTER ... IF NOT
+                # EXISTS can no-op silently if the connection is in an aborted
+                # transaction state or the runtime user lacks ALTER privilege,
+                # so we verify against information_schema before returning.
+                row = await self._backend.fetch_one(
+                    "SELECT 1 FROM information_schema.columns "
+                    f"WHERE table_name = '{table}' AND column_name = '{column}'"
+                )
+                return row is not None
             else:
                 row = await self._backend.fetch_one(
                     f"SELECT COUNT(*) FROM pragma_table_info('{table}') "
@@ -494,10 +529,19 @@ class AsyncDatabase:
                     logger.info(
                         f"Migrated {table}: added {column} column"
                     )
+                # Re-check after the (possible) ALTER to confirm the column
+                # is present; this is the source of truth callers rely on.
+                row = await self._backend.fetch_one(
+                    f"SELECT COUNT(*) FROM pragma_table_info('{table}') "
+                    f"WHERE name='{column}'"
+                )
+                return bool(row and row[0] > 0)
         except Exception as e:
-            logger.debug(
-                f"Migration check for {table}.{column}: {e}"
+            logger.warning(
+                f"Migration of {table}.{column} failed: {e}. "
+                f"Dependent DDL will be skipped. Run migration manually."
             )
+            return False
     
     # ─────────────────────────────────────────────────────────────────
     # Query methods - delegate to backend
