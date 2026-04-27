@@ -1,0 +1,83 @@
+# kestrel-eye config for the privacy modes vignette.
+
+[eye]
+name = "Kestrel Privacy Modes Vignette"
+screenshot_dir = "demos/privacy-modes/demo-output"
+test_cmd = "demos/run.sh privacy-modes"
+
+[eye.model]
+provider = "anthropic"
+model = "claude-haiku-4-5-20251001"
+
+[eye.github]
+repo = "KestrelSovereignAI/kestrel-sovereign"
+labels = ["kestrel-eye", "privacy-modes-review", "automated"]
+
+[[eye.screenshots]]
+name = "01-selector-all-modes.png"
+act = "Beat 1: The five-mode selector"
+severity = "critical"
+expected = [
+    "Privacy selector dropdown visible",
+    "Multiple privacy mode entries listed (at least 4 of: EPHEMERAL, ISOLATED, ANONYMOUS, NORMAL, PUBLIC)",
+]
+layout = "Privacy selector dropdown showing the five-mode spectrum"
+
+[[eye.screenshots]]
+name = "02-02-ephemeral.png"
+act = "Beat 2: EPHEMERAL"
+severity = "warning"
+expected = [
+    "Privacy badge in the chat header reads EPHEMERAL (or shows the ephemeral icon/color)",
+    "Highlight overlay frames the badge",
+]
+layout = "Chat header showing EPHEMERAL mode active"
+
+[[eye.screenshots]]
+name = "03-03-isolated.png"
+act = "Beat 3: ISOLATED"
+severity = "warning"
+expected = [
+    "Privacy badge reflects ISOLATED mode",
+    "Highlight overlay frames the badge",
+]
+layout = "Chat header showing ISOLATED mode active"
+
+[[eye.screenshots]]
+name = "04-04-anonymous.png"
+act = "Beat 4: ANONYMOUS"
+severity = "warning"
+expected = [
+    "Privacy badge reflects ANONYMOUS mode",
+    "Highlight overlay frames the badge",
+]
+layout = "Chat header showing ANONYMOUS mode active"
+
+[[eye.screenshots]]
+name = "05-05-normal.png"
+act = "Beat 5: NORMAL"
+severity = "warning"
+expected = [
+    "Privacy badge reflects NORMAL mode",
+    "Highlight overlay frames the badge",
+]
+layout = "Chat header showing NORMAL mode active"
+
+[[eye.screenshots]]
+name = "06-06-public.png"
+act = "Beat 6: PUBLIC"
+severity = "warning"
+expected = [
+    "Privacy badge reflects PUBLIC mode",
+    "Highlight overlay frames the badge",
+]
+layout = "Chat header showing PUBLIC mode active"
+
+[[eye.screenshots]]
+name = "07-bookend-normal.png"
+act = "Beat 7: Bookend"
+severity = "warning"
+expected = [
+    "Privacy badge shows NORMAL again — agent restored to a safe state",
+]
+layout = "Chat header back in NORMAL after the tour"
