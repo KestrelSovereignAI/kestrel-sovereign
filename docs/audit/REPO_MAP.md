@@ -2333,24 +2333,6 @@ Repo entry points and standard project files.
 - **.devcontainer/README.md** — Kestrel Dev Container — This directory contains the Docker-based development container configuration for Kestrel + Kestrel development.
 - **.devcontainer/docker-compose.devcontainer.yml** — (configuration)
 
-## `caprock-study/`
-
-- **caprock-study/README.md** — Caprock Clinical Validation Study — Metrics Pipeline — Automated daily data collection for the Caprock RPM pilot.
-- **caprock-study/build_cumulative.py** — Caprock Clinical Validation Study — Cumulative Tracker ======================================================= Reads all daily snapshots and builds a rolling cumulative.json plus a simple ASCII trend…
-  - `def load_snapshots(since)`; `def build_cumulative(snaps)`; `def ascii_trend_chart(cumulative, width)`
-- **caprock-study/build_dashboard.py** — Caprock Clinical Validation Study — Dashboard Generator ========================================================= Reads baseline.json, cumulative.json, and snapshots to produce a self-contained dashb…
-  - `def load_json(path)`; `def load_snapshots()`; `def build_html(baseline, cumulative, snapshots)`
-- **caprock-study/caprock-daily-metrics.yml.staged** — —
-- **caprock-study/collect_baseline.py** — Caprock Clinical Validation Study — Pre-Kestrel Baseline Collector =================================================================== Queries the PRODUCTION RemoteCares SQL Server database for the 3…
-  - `def get_connection()`; `def rows_to_dicts(cursor)`; `def row_to_dict(cursor)`; `def fetch_caprock_patients(cur)`; `def fetch_sms_baseline(cur, patient_ids, start_date, end_date)`; `def fetch_per_patient_sms_baseline(cur, patient_ids, start_date, end_date, …)`; `def fetch_vitals_baseline(cur, patient_ids, start_date, end_date, …)`; `def collect_baseline(golive_date, baseline_days)`
-- **caprock-study/collect_metrics.py** — Caprock Clinical Validation Study — Daily Metrics Collector ============================================================ Queries the RemoteCares SQL Server database and emits a structured JSON snapsh…
-  - `def get_study_phase(study_start, target_date)`; `def get_connection()`; `def rows_to_dicts(cursor)`; `def row_to_dict(cursor)`; `def fetch_active_patients(cur)`; `def fetch_sms_stats(cur, target_date)`; `def fetch_after_hours_compliance(cur, target_date)`; `def fetch_vitals_compliance(cur, target_date, patient_ids)`; `…`
-- **caprock-study/generate_mock_data.py** — Generate realistic mock data for Caprock dashboard testing.
-  - `def generate_baseline()`; `def generate_daily_snapshot(target_date, day_number)`
-- **caprock-study/requirements.txt** — —
-- **caprock-study/snapshots/.gitkeep** — —
-- **caprock-study/weekly_report.py** — Caprock Clinical Validation Study — Weekly Report Generator ============================================================ Generates a formatted weekly summary from cumulative.json and posts it as a co…
-  - `def load_cumulative()`; `def build_weekly_markdown(cumulative, week_end)`; `def post_github_comment(repo, issue_num, body)`
 
 ## `examples/`
 
