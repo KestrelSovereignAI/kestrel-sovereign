@@ -3,8 +3,8 @@
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-04-27
-**Scope:** 1473 tracked files (892 `.py`, 228 `.md`, 353 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-04-28
+**Scope:** 1509 tracked files (911 `.py`, 233 `.md`, 365 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -159,7 +159,7 @@ Repo entry points and standard project files.
   - `def load_config(file_name, section)`; `def parse_duration(value)`; `def load_section(section)`
 - **kestrel_sovereign/constitution/__init__.py** — Kestrel Constitutional Framework.
 - **kestrel_sovereign/constitution/hierarchy.py** — Constitutional Hierarchy: 4-layer constitutional framework for Kestrel agents.
-  - `class ConstitutionalLayer`; `class LayerViolation`; `class ConstitutionalLayerData`; `class LayeredConstitution`; `def validate_layer_narrowing(parent_layer, child_layer, child_policy)`
+  - `class ConstitutionalLayer`; `def parse_amendment_ix_grants(constitution_text)`; `class LayerViolation`; `class ConstitutionalLayerData`; `class LayeredConstitution`; `def validate_layer_narrowing(parent_layer, child_layer, child_policy)`
 - **kestrel_sovereign/constitutional_profiles.toml** — (configuration)
 - **kestrel_sovereign/data/KESTREL_CONSTITUTION.md** — The Kestrel Constitution — ## Preamble
 - **kestrel_sovereign/data/feature_registry.toml** — (configuration)
@@ -241,6 +241,22 @@ Repo entry points and standard project files.
   - `class ComputeSecurityHook`; `class ComputeDebugHook`
 - **kestrel_sovereign/features/compute/trash_manager.py** — Kestrel Compute Feature - Trash Manager.
   - `class TrashItem`; `class TrashManager`; `def get_trash_manager()`
+- **kestrel_sovereign/features/computer_use/__init__.py** — Computer-use feature: bounded host access for sovereign agents.
+- **kestrel_sovereign/features/computer_use/audit.py** — Append-only JSONL audit log for the computer-use feature.
+  - `class AuditRecord`; `class AuditLog`
+- **kestrel_sovereign/features/computer_use/backends/__init__.py** — Sandbox backends for the computer-use feature.
+- **kestrel_sovereign/features/computer_use/backends/base.py** — Abstract sandbox backend.
+  - `class CapabilityBlocked`; `class DirEntry`; `class CompletedRun`; `class SandboxBackend`; `async def host_read(path, max_bytes)`; `async def host_write(path, data)`; `async def host_list(path)`; `def os_scandir(path)`
+- **kestrel_sovereign/features/computer_use/backends/docker.py** — Docker sandbox backend.
+  - `class DockerSandboxBackend`
+- **kestrel_sovereign/features/computer_use/backends/local.py** — Local sandbox backend — direct host execution.
+  - `class LocalSandboxBackend`
+- **kestrel_sovereign/features/computer_use/feature.py** — ComputerUseFeature: bounded host access wrapped in three gates + policy.
+  - `class ComputerUseFeature`
+- **kestrel_sovereign/features/computer_use/path_safety.py** — Path-safety guards for the computer-use feature.
+  - `class PathSafetyError`; `def assert_no_traversal(candidate)`; `def resolve_realpath(candidate)`; `class MatchResult`; `def match_allow_list(candidate, allow, deny)`
+- **kestrel_sovereign/features/computer_use/policy.py** — Allow/deny policy resolution for paths and binaries.
+  - `class Decision`; `class PolicyResult`; `class PathPolicy`; `class BinaryPolicy`; `def split_command(cmd)`
 - **kestrel_sovereign/features/consent/__init__.py** — Agent Consent Protocol - recorded voice before significant changes.
 - **kestrel_sovereign/features/consent/feature.py** — Agent Consent Protocol Feature.
   - `class ConsentFeature`
@@ -1218,6 +1234,7 @@ Repo entry points and standard project files.
 - **docs/architecture/USER_LIFECYCLE_MANAGEMENT.md** — User Lifecycle Management Architecture — ## Overview
 - **docs/architecture/VASTAI_TRAINING.md** — VastAI LoRA Training Architecture — > **Scope clarification (2026-04-25):** this doc is specifically about *VastAI as a training backend* and that effort is deprioritized — see status banner below.
 - **docs/architecture/WALLET_SYSTEM.md** — Kestrel Multi-Chain Wallet System — This document describes the wallet system that enables Kestrel agents to manage cryptocurrency across multiple blockchain networks.
+- **docs/architecture/computer_use.md** — Computer Use & File System — Optional capability that lets a sovereign agent read, list, write, and edit files on the user's machine and run shell commands.
 - **docs/architecture/core/AGENT_ECOSYSTEM.md** — PRD: The Kestrel Agent Ecosystem — ## 1.
 - **docs/architecture/core/FEATURE_AGENT_FRAMEWORK.md** — PRD: Feature Agent Framework — ## 1.
 - **docs/architecture/core/INFRASTRUCTURE.md** — Kestrel Development Infrastructure — Complete toolkit for accelerated parallel development with Claude Code.
@@ -1510,7 +1527,9 @@ Repo entry points and standard project files.
 - **tests/e2e/test_session_context_loading.spec.cjs** — —
 - **tests/e2e/test_sovereign_console.spec.cjs** — —
 - **tests/e2e/test_sovereignty_modals.spec.cjs** — —
+- **tests/e2e/test_voice_real.spec.cjs** — —
 - **tests/e2e/test_voice_ui.spec.cjs** — —
+- **tests/e2e/voice_helpers.cjs** — —
 - **tests/fixtures/tone_440hz.wav** — —
 - **tests/frontend/api_client.test.mjs** — (mjs asset)
 - **tests/frontend/auto_load_most_recent.test.mjs** — (mjs asset)
@@ -1555,10 +1574,14 @@ Repo entry points and standard project files.
   - `class MockLLMResponse`; `class MockLLMService`; `def temp_dir()`; `def mock_db()`; `class TestBootstrapIntegrationFlow`; `class TestBootstrapWithExistingAgents`; `class TestBootstrapErrorHandling`
 - **tests/integration/test_cache_prompt_wire.py** — Integration test: `cache_prompt` reaches the wire (issue #704).
   - `async def test_cache_prompt_reaches_wire_for_llama_cpp()`; `async def test_cache_prompt_absent_from_wire_for_other_vendors(vendor)`; `async def test_real_llama_server_accepts_cache_prompt()`
+- **tests/integration/test_codex_real.py** — Integration tests: CodexAdapter against the live ChatGPT-backend Responses API.
+  - `async def test_codex_single_turn_text_real_api()`; `async def test_codex_tool_call_round_trip_real_api()`; `async def test_codex_reasoning_replay_real_api()`; `async def test_codex_continuation_cursor_written_real_api()`
 - **tests/integration/test_compress_e2e.py** — E2E Tests for Session Compression Functionality.
   - `async def agent_with_messages(temp_dir)`; `async def agent_with_few_messages(temp_dir)`; `class TestCompressCommand`; `class TestCompressionCheckNeeded`; `class TestCompressionSession`; `class TestContextManagerNoLLM`
 - **tests/integration/test_compute_security_integration.py** — Integration tests for Compute + Security feature interaction.
   - `class MockAgent`; `def temp_db()`; `def mock_agent(temp_db)`; `async def compute_feature(mock_agent)`; `async def security_feature(mock_agent)`; `class TestHookRegistration`; `class TestScriptLifecycle`; `class TestSecurityAnalysis`; `…`
+- **tests/integration/test_computer_use_integration.py** — Real integration tests for ComputerUseFeature.
+  - `async def workspace(tmp_path)`; `async def security_feature()`; `async def test_privacy_gate_refuses_when_flag_off(workspace, security_feature)`; `async def test_constitution_gate_refuses_without_grant(workspace, security_feature)`; `async def test_local_backend_refuses_without_host_grant(workspace, security_feature)`; `async def test_fs_write_requires_real_approval(workspace, security_feature)`; `async def test_fs_write_denied_when_user_refuses(workspace, security_feature)`; `async def test_fs_read_inside_allow_list_auto_approves(workspace, security_feature)`; `…`
 - **tests/integration/test_concurrent_access.py** — Concurrent Access Tests for Kestrel Agent
   - `class TestAsyncStorageConcurrency`; `class TestConcurrentAPIRequests`; `class TestAsyncStorageTransactions`; `class TestAsyncStorageReconnection`; `class TestHighConcurrencyStress`
 - **tests/integration/test_console_api_e2e.py** — End-to-End Integration Tests for Kestrel Sovereign Console API
@@ -1583,8 +1606,8 @@ Repo entry points and standard project files.
   - `async def kestrel_agent(temp_db)`; `async def test_feature_registration(kestrel_agent)`; `async def test_sovereignty_feature_execution(kestrel_agent)`; `async def test_mcp_feature_execution(kestrel_agent)`; `async def test_model_feature_execution(kestrel_agent)`
 - **tests/integration/test_dynamic_tool_loading_e2e.py** — Integration tests for dynamic tool loading.
   - `def capture_logs(level)`; `async def agent(temp_db)`; `class TestExploreThenDirectFlow`; `class TestMultiFeatureExploration`
-- **tests/integration/test_ensemble_removal_e2e.py** — Integration tests to verify ensemble mode has been properly removed (CW-005).
-  - `def temp_db()`; `async def llm_service()`; `async def kestrel_agent(temp_db, llm_service)`; `async def test_no_ensemble_config_in_agent(kestrel_agent)`; `async def test_no_child_agent_spawning(kestrel_agent)`; `async def test_process_input_single_llm_call(temp_db, llm_service, monkeypatch)`; `async def test_no_ensemble_query_method(kestrel_agent)`; `async def test_no_ensemble_metadata_in_conversation(kestrel_agent)`; `…`
+- **tests/integration/test_ensemble_removal_e2e.py** — Regression tests proving ensemble mode (CW-005) stays gone.
+  - `def test_no_ensemble_symbols_in_package_source()`; `def temp_db()`; `async def real_llm_agent(temp_db)`; `async def test_kestrel_agent_has_no_ensemble_attributes(real_llm_agent)`; `async def test_no_ensemble_metadata_in_conversation(real_llm_agent)`
 - **tests/integration/test_ephemeral_hard_purge.py** — Integration tests for the EPHEMERAL hard-purge defense-in-depth (#767).
   - `async def test_purge_clean_ephemeral_session_destroys_nothing(tmp_path)`; `async def test_purge_destroys_conversation_history_leak(tmp_path)`; `async def test_purge_destroys_soft_deleted_leak_too(tmp_path)`; `async def test_purge_destroys_leaked_graph_nodes(tmp_path)`; `async def test_purge_does_not_touch_other_agents_data(tmp_path)`; `async def test_purge_warns_and_returns_breakdown_on_leak(tmp_path, caplog)`; `async def test_purge_clears_isolated_session_buffer(tmp_path)`; `async def test_purge_with_empty_agent_id_is_a_safe_noop(tmp_path)`
 - **tests/integration/test_evm_transactions_e2e.py** — —
@@ -1794,8 +1817,10 @@ Repo entry points and standard project files.
   - `def feature(tmp_path)`; `def test_resolve_path_rejects_escape(feature)`; `async def test_code_read_returns_file_contents(feature)`; `async def test_code_read_file_io_is_offloaded(feature)`; `async def test_code_search_limits_and_reports_matches(feature)`; `async def test_code_search_file_io_is_offloaded(feature)`; `async def test_code_edit_requires_unique_match_before_approval(feature)`; `async def test_code_edit_applies_change_after_approval(feature)`; `…`
 - **tests/unit/test_codex_adapter.py** — Tests for the OpenAI plan adapter and registry integration.
   - `class TestOpenAIPlanAdapterClass`; `class TestOpenAIPlanListModels`; `class TestMessageHelpers`; `class TestAccountIdExtraction`; `class TestBuildHeaders`; `class TestOpenAIPlanProviderRegistry`; `class TestReadCodexAuthFile`
-- **tests/unit/test_codex_continuation.py** — Codex adapter continuation protocol tests (#808 / #806).
-  - `class TestComputeRequestSignature`; `class TestPlanContinuation`; `class TestCodexContinuationE2E`
+- **tests/unit/test_codex_continuation.py** — Codex adapter cursor-tracking tests.
+  - `class TestComputeRequestSignature`; `class TestCodexCursorRecordingE2E`
+- **tests/unit/test_codex_responses_format.py** — Tests for Chat-Completions → Responses-API message conversion (#828).
+  - `class TestContentToText`; `class TestConvertMessagesToResponsesFormat`; `class TestCodexAdapterAppliesConverter`
 - **tests/unit/test_command_handler_async_boundary_contracts.py** — Contracts for explicit sync/async boundaries in CommandHandler.
   - `def test_privacy_save_handler_is_explicitly_async()`; `async def test_handle_awaits_privacy_save_without_leaking_coroutine()`; `async def test_handle_accepts_custom_awaitable_results_via_isawaitable()`; `def test_create_agent_handler_is_explicitly_async()`; `async def test_handle_awaits_create_agent_command()`; `def test_anchor_handler_is_explicitly_async()`; `async def test_handle_awaits_anchor_command()`
 - **tests/unit/test_command_handler_constitution_contracts.py** — Command-handler contracts for constitution verification commands.
@@ -1808,6 +1833,12 @@ Repo entry points and standard project files.
   - `def test_commands_endpoint_merges_builtin_and_feature_commands()`; `def test_commands_endpoint_builtin_inventory_matches_command_handler_specs()`; `def test_sessions_endpoint_returns_message_totals_from_history()`; `def test_conversations_endpoint_groups_rows_and_marks_encrypted_preview()`; `def test_get_conversation_filters_session_markers_and_decrypts_messages()`; `def test_get_conversation_unwraps_sent_form_user_content()`; `def test_rename_conversation_happy_path_returns_stored_name()`; `def test_rename_conversation_empty_string_clears_name()`; `…`
 - **tests/unit/test_compute_feature.py** — Unit tests for Kestrel Compute Feature.
   - `def temp_db()`; `def temp_trash_dir(temp_dir)`; `def sample_script()`; `def sample_bash_script()`; `class TestModels`; `class TestScriptStore`; `class TestScriptSigner`; `class TestScriptAnalyzer`; `…`
+- **tests/unit/test_computer_use_audit.py** — Tests for the JSONL audit log (#836).
+  - `async def test_writes_one_record(tmp_path)`; `async def test_records_in_order(tmp_path)`; `async def test_concurrent_writes_serialized(tmp_path)`; `async def test_creates_parent_dir(tmp_path)`; `async def test_forwards_to_feedback_hook(tmp_path)`; `async def test_record_includes_outcome_and_error(tmp_path)`
+- **tests/unit/test_computer_use_feature.py** — Tests for ComputerUseFeature gate ordering and lifecycle (#838).
+  - `class FakeApprovalQueue`; `class FakeSecurityFeature`; `class FakeAgent`; `def workspace(tmp_path)`; `async def test_disabled_feature_returns_error(tmp_path)`; `async def test_privacy_gate_blocks_when_flag_off(workspace)`; `async def test_constitution_gate_blocks_without_grant(workspace)`; `async def test_deny_path_hard_rejects_before_approval(workspace)`; `…`
+- **tests/unit/test_computer_use_policy.py** — Tests for the path & binary policy resolvers (#835).
+  - `def test_path_policy_deny_wins()`; `def test_path_policy_allow_read_auto_approve()`; `def test_path_policy_allow_write_requires_approval()`; `def test_path_policy_no_match_requires_approval()`; `def test_path_policy_auto_approve_off()`; `def test_binary_policy_denied()`; `def test_binary_policy_allowed_requires_approval()`; `def test_binary_policy_unknown_denied()`; `…`
 - **tests/unit/test_consent_caller_contracts.py** — Contract tests for consent integration at feature call sites.
   - `class TestPrivacyConsentCaller`; `class TestModelConsentCaller`; `class TestSafeModeConsentCaller`
 - **tests/unit/test_consent_feature.py** — Unit Tests for Agent Consent Protocol Feature.
@@ -1816,6 +1847,8 @@ Repo entry points and standard project files.
   - `async def consent_feature()`; `class TestConsentTimeoutProceeds`; `class TestConsentTimeoutRecorded`; `class TestConsentDurationTracked`; `class TestConsentFailOpenOnError`; `class TestConsentStatsIncludesMetrics`; `class TestIntegrationPointsFailOpen`; `class TestConsentTimeoutConstant`
 - **tests/unit/test_constitution_audit.py** — Unit tests for periodic constitution audit enforcement.
   - `async def mock_agent()`; `async def test_audit_triggers_after_exactly_audit_interval()`; `async def test_audit_triggers_after_24_hours()`; `async def test_counter_resets_after_audit()`; `async def test_safe_mode_activates_on_integrity_failure()`; `async def test_audit_respects_custom_interval()`; `async def test_audit_does_not_trigger_before_interval()`; `async def test_multiple_audits_over_time()`; `…`
+- **tests/unit/test_constitution_dangerous_capabilities.py** — Tests for DANGEROUS_CAPABILITIES + Amendment IX parser (#833).
+  - `def test_dangerous_capabilities_membership()`; `def test_parser_no_section_returns_empty()`; `def test_parser_unchecked_returns_empty()`; `def test_parser_uppercase_X_does_not_count()`; `def test_parser_unknown_capability_ignored()`; `def test_parser_full_grant()`; `def test_parser_handles_indentation()`; `def test_parser_section_terminates_at_next_heading()`
 - **tests/unit/test_constitutional_hierarchy.py** — Tests for the constitutional hierarchy system (Books I-IV).
   - `class TestConstitutionalLayer`; `class TestLayeredConstitutionParsing`; `class TestEnterprisePolicyValidation`; `class TestAgentIdentityValidation`; `class TestLayerNarrowingValidation`; `class TestEffectiveConstitution`; `class TestLayerIntegrity`; `class TestExtractSection`; `…`
 - **tests/unit/test_constitutional_profile.py** — Unit tests for Constitutional Profile Service.
@@ -1995,9 +2028,9 @@ Repo entry points and standard project files.
 - **tests/unit/test_model_script_defaults.py** — Contracts for model-selecting operational scripts.
   - `def test_character_verification_script_uses_resolved_anthropic_default()`; `def test_character_verification_script_allows_explicit_override()`
 - **tests/unit/test_model_selection_contracts.py** — Contracts for shared config-driven model selection helpers.
-  - `def test_resolve_provider_default_prefers_explicit_model()`; `def test_resolve_provider_default_uses_selection_hints_against_cached_models()`; `def test_resolve_provider_default_prefers_newest_matching_model_from_discovery()`; `def test_resolve_provider_default_uses_vendor_catalog_for_subscription_route()`
+  - `def test_resolve_provider_default_prefers_explicit_model()`; `def test_resolve_provider_default_uses_selection_hints_against_cached_models()`; `def test_resolve_provider_default_prefers_newest_matching_model_from_discovery()`; `def test_resolve_provider_default_uses_vendor_catalog_for_subscription_route()`; `def test_rank_cached_candidates_handles_unix_epoch_created_at()`; `def test_rank_cached_candidates_also_handles_iso_created_at()`; `def test_rank_auto_candidates_delegates_to_cached_candidates()`; `def test_numeric_rank_strips_iso_dates_in_all_separators()`; `…`
 - **tests/unit/test_model_set_openrouter.py** — Unit tests for model-set command with OpenRouter models.
-  - `class TestModelSetOpenRouter`; `class TestModelSetIntegration`; `def is_openrouter_model(model_id, known_openrouter_models)`
+  - `class TestModelSetOpenRouter`
 - **tests/unit/test_models_configuration_endpoint_contracts.py** — Focused contract tests for model/configuration endpoints.
   - `def test_ipfs_status_reports_local_node_gateways_and_filecoin_adapter()`; `def test_wallet_endpoint_prefers_wallet_agent_and_falls_back_to_identity_balance()`; `def test_keys_endpoints_use_storage_contract_without_exposing_secrets()`; `def test_key_update_delete_and_usage_endpoints_preserve_provider_contracts()`; `def test_models_endpoint_groups_results_and_rejects_invalid_category()`; `def test_current_and_set_model_endpoints_share_runtime_preference_contract()`; `def test_available_sources_reports_only_agent_tier_on_sqlite_deployments()`; `def test_available_sources_returns_all_false_when_agent_has_no_key()`; `…`
 - **tests/unit/test_multi_agent_routing.py** — Tests for multi-agent routing middleware and /api/agents endpoint.
@@ -2006,6 +2039,8 @@ Repo entry points and standard project files.
   - `class TestNellieAnthropicPlan`; `class TestNellieOpenAIPlan`; `class TestNellieFailureModes`; `class TestNellieBackendSwitch`
 - **tests/unit/test_observability_hook.py** — Tests for the ObservabilityHook and ObservabilityFeature.
   - `class TestHookRegistration`; `class TestHookAlwaysAllows`; `class TestHookLogsEvents`; `class TestHookMissingStore`; `class TestHookExceptionHandling`; `class TestFeatureInitialization`; `class TestPrivacy`; `class TestErrorTruncation`
+- **tests/unit/test_path_safety.py** — Tests for path-safety primitives (#834).
+  - `def test_no_traversal_rejects_dotdot()`; `def test_no_traversal_rejects_nul()`; `def test_no_traversal_allows_clean_paths()`; `def test_resolve_realpath_canonicalizes(tmp_path)`; `def test_resolve_realpath_follows_symlink(tmp_path)`; `def test_resolve_realpath_rejects_traversal(tmp_path)`; `def test_resolve_realpath_handles_nonexistent_leaf(tmp_path)`; `def test_resolve_realpath_expands_user()`; `…`
 - **tests/unit/test_peers_feature.py** — Direct contracts for the Peers feature.
   - `def test_discover_host_url_from_env(monkeypatch)`; `async def test_list_peers_filters_out_self()`; `async def test_ask_agent_rejects_self_target()`; `async def test_ask_agent_reports_offline_peer()`; `async def test_ask_agent_returns_peer_response()`
 - **tests/unit/test_permission_seam_contracts.py** — Permission seam contracts across command, A2A, and tool execution paths.
@@ -2024,6 +2059,8 @@ Repo entry points and standard project files.
   - `async def test_privacy_transition_waits_for_active_stream_before_switching_modes()`
 - **tests/unit/test_privacy_agent.py** — —
   - `def test_initial_mode_sync()`; `def test_set_mode_sync()`; `async def test_isolated_mode_flow(tmp_path)`; `async def test_ephemeral_mode(tmp_path)`; `async def test_anonymous_mode(tmp_path)`
+- **tests/unit/test_privacy_computer_access.py** — Tests for the ``computer_access`` flag on ``PrivacyConfig`` (#832).
+  - `def test_default_is_false()`; `def test_allows_helper()`; `def test_all_presets_default_false(name)`; `def test_get_privacy_preset_returns_copy_with_flag_false(name)`; `def test_privacy_mode_to_config_defaults_false()`; `def test_from_config_ignores_computer_access()`; `def test_get_privacy_preset_unknown_raises()`
 - **tests/unit/test_privacy_mode_model_restore_contracts.py** — Contracts for model preservation across privacy-mode transitions.
   - `def test_privacy_mode_restores_default_cloud_model_after_local_only_transition()`; `def test_privacy_mode_restores_explicit_cloud_preference_after_local_only_transition()`; `def test_agent_level_privacy_transition_switches_to_local_model()`; `def test_privacy_command_path_uses_agent_level_model_transition()`
 - **tests/unit/test_privacy_preset_consistency.py** — Consistency tests for canonical privacy presets.
@@ -2084,6 +2121,8 @@ Repo entry points and standard project files.
   - `def track_store(store)`; `class TestPermissionStore`; `class TestApprovalQueue`; `class TestSecurityHook`; `class TestSecurityIntegration`; `class TestApprovalQueueScopePersistence`; `class TestSecurityFeature`
 - **tests/unit/test_server_health.py** — Focused tests for server health endpoint behavior.
   - `def test_health_returns_503_when_agent_missing()`; `def test_health_detailed_uses_health_feature_from_feature_dict()`
+- **tests/unit/test_session_id_threading.py** — Verify ``session_id`` threads from agent loop to LLMService callers (#821).
+  - `class TestSignatures`; `class TestOrchestratorThreadsSessionId`
 - **tests/unit/test_session_log_talon.py** — Tests for Talon PR detection in Session Log collector.
   - `class TestIsTalonPR`; `class TestReviewLatency`
 - **tests/unit/test_shared_model_cache.py** — Tests for SharedModelCache — process-wide model discovery cache.
@@ -2204,6 +2243,14 @@ Repo entry points and standard project files.
 - **demos/TEMPLATE/demo.cjs** — —
 - **demos/TEMPLATE/eye.toml** — (configuration)
 - **demos/TEMPLATE/narration.md** — <Feature Name> Vignette — Narration — > Replace this whole file.
+- **demos/demo-isolation/config.cjs** — —
+- **demos/demo-isolation/demo.cjs** — —
+- **demos/demo-isolation/eye.toml** — (configuration)
+- **demos/demo-isolation/narration.md** — Demo-Isolation Rail Vignette — Narration — ## Why this feature exists
+- **demos/ephemeral-purge/config.cjs** — —
+- **demos/ephemeral-purge/demo.cjs** — —
+- **demos/ephemeral-purge/eye.toml** — (configuration)
+- **demos/ephemeral-purge/narration.md** — EPHEMERAL Purge Vignette — Narration — ## Why this feature exists
 - **demos/falconer/config.cjs** — —
 - **demos/falconer/dashboard_screenshot.cjs** — —
 - **demos/falconer/demo.cjs** — —
@@ -2216,6 +2263,10 @@ Repo entry points and standard project files.
 - **demos/metrics/demo.cjs** — —
 - **demos/metrics/eye.toml** — (configuration)
 - **demos/metrics/narration.md** — Metrics Dashboard Demo — Narration — Observability for sovereign agents.
+- **demos/privacy-modes/config.cjs** — —
+- **demos/privacy-modes/demo.cjs** — —
+- **demos/privacy-modes/eye.toml** — (configuration)
+- **demos/privacy-modes/narration.md** — Privacy Modes Vignette — Narration — ## Why this feature exists
 - **demos/run.sh** — demos/run.sh <demo-name>
 - **demos/shared/demo_helpers.cjs** — —
 - **demos/spawn/config.cjs** — —
@@ -2236,6 +2287,8 @@ Repo entry points and standard project files.
 - **demos/trash/narration.md** — Trash Vignette — Narration — ## Why this feature exists
 - **demos/voice/config.cjs** — —
 - **demos/voice/demo.cjs** — —
+- **demos/voice/eye.toml** — (configuration)
+- **demos/voice/narration.md** — Voice Vignette — Narration — ## Why this feature exists
 
 ## `prompts/`
 
