@@ -35,7 +35,16 @@ async def get_agents(request: Request):
 
     In multi-agent mode, returns all agents with mode: "rookery".
     In single-agent mode, returns one agent with mode: "standalone".
+
+    Each agent surfaces ``is_demo`` (from the inception service) and the
+    response carries a top-level ``server_demo_mode`` flag so the page
+    can render a DEMO MODE banner — the browser-side defence in #868.
     """
+    server_demo_mode = bool(getattr(request.app.state, "demo_mode", False))
+
+    def _is_demo(a) -> bool:
+        return getattr(a, "is_demo", False) is True
+
     # Multi-agent mode: return all agents from AgentManager
     agent_manager = getattr(request.app.state, 'agent_manager', None)
     if agent_manager:
@@ -47,6 +56,7 @@ async def get_agents(request: Request):
                 card_dict["id"] = agent.agent_id
                 card_dict["name"] = name
                 card_dict["status"] = "online"
+                card_dict["is_demo"] = _is_demo(agent)
                 agents_list.append(card_dict)
             except Exception as e:
                 logger.warning(f"Error getting agent card for '{name}': {e}")
@@ -54,8 +64,13 @@ async def get_agents(request: Request):
                     "id": agent.agent_id,
                     "name": name,
                     "status": "error",
+                    "is_demo": _is_demo(agent),
                 })
-        return {"agents": agents_list, "mode": "rookery"}
+        return {
+            "agents": agents_list,
+            "mode": "rookery",
+            "server_demo_mode": server_demo_mode,
+        }
 
     # Single-agent mode
     try:
@@ -64,7 +79,12 @@ async def get_agents(request: Request):
         card_dict = agent_card.model_dump()
         card_dict["id"] = agent.agent_id
         card_dict["status"] = "online"
-        return {"agents": [card_dict], "mode": "standalone"}
+        card_dict["is_demo"] = _is_demo(agent)
+        return {
+            "agents": [card_dict],
+            "mode": "standalone",
+            "server_demo_mode": server_demo_mode,
+        }
     except Exception as e:
         logger.error(f"Error getting agents: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Error retrieving agents.")

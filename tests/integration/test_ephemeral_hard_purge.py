@@ -4,10 +4,19 @@ Exercises the storage-layer purge against a real SQLite database so the
 JSON-path predicate, transactional edge cleanup, and per-agent scoping
 are all proven end-to-end. The kestrel_agent transition wiring is
 covered separately in unit tests with mocks.
+
+Updated for #867: leaks are seeded AFTER the wrapper transitions into
+EPHEMERAL so the entered_ephemeral_at watermark is older than the leak's
+``created_at``.  That mirrors real production timing — a leak happens
+while the agent is in EPHEMERAL, not before.  Pre-EPHEMERAL data is now
+explicitly out of scope for the leak-purge (see
+``test_ephemeral_purge_scoped.py`` for the regression suite).
 """
 from __future__ import annotations
 
+import asyncio
 import json
+
 import pytest
 
 from kestrel_sovereign.privacy import PrivacyMode
@@ -17,6 +26,12 @@ from kestrel_sovereign.storage.privacy_wrapper import PrivacyEnforcingStorage
 
 AGENT_ID = "did:test:ephemeral-purge"
 OTHER_AGENT_ID = "did:test:other-agent"
+
+
+def _now_iso_utc() -> str:
+    """Match SQLite's datetime('now') format used by add_node properties."""
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
 @pytest.mark.asyncio
@@ -36,15 +51,24 @@ async def test_purge_clean_ephemeral_session_destroys_nothing(tmp_path):
 async def test_purge_destroys_conversation_history_leak(tmp_path):
     """If a row somehow reached conversation_history while EPHEMERAL was
     in effect, the hard-purge scrubs it AND reports the count so the
-    caller can audit the leak."""
+    caller can audit the leak.
+
+    Updated for #867: the wrapper enters EPHEMERAL FIRST so the watermark
+    is captured, then the leak is seeded so its ``created_at`` is past
+    the watermark.  This is the real production timing — a leak happens
+    *during* the EPHEMERAL stint, not before.
+    """
     db_path = tmp_path / "kestrel.db"
     async with AsyncStorage(str(db_path), agent_id=AGENT_ID) as storage:
+        wrapper = PrivacyEnforcingStorage(storage, PrivacyMode.EPHEMERAL)
+        # Per-second watermark — sleep past the boundary so leaks land
+        # strictly after the watermark.
+        await asyncio.sleep(1.05)
         # Simulate a leak — write directly through the underlying store,
         # bypassing the privacy wrapper that would otherwise reject this.
         await storage.conversation.add_conversation("user", "leaked turn 1")
         await storage.conversation.add_conversation("assistant", "leaked turn 2")
 
-        wrapper = PrivacyEnforcingStorage(storage, PrivacyMode.EPHEMERAL)
         result = await wrapper.purge_ephemeral_session(reason="test")
 
         assert result["conversation_history"] == 2
@@ -62,6 +86,8 @@ async def test_purge_destroys_soft_deleted_leak_too(tmp_path):
     both deleted_at IS NULL and deleted_at IS NOT NULL rows."""
     db_path = tmp_path / "kestrel.db"
     async with AsyncStorage(str(db_path), agent_id=AGENT_ID) as storage:
+        wrapper = PrivacyEnforcingStorage(storage, PrivacyMode.EPHEMERAL)
+        await asyncio.sleep(1.05)
         await storage.conversation.add_conversation("user", "leaked")
         rows = await storage.conversation.get_full_history_with_ids()
         # Soft-delete the leaked row to simulate the "leaked then user
@@ -70,7 +96,6 @@ async def test_purge_destroys_soft_deleted_leak_too(tmp_path):
         in_trash = await storage.conversation.get_full_history_with_ids(only_deleted=True)
         assert len(in_trash) == 1
 
-        wrapper = PrivacyEnforcingStorage(storage, PrivacyMode.EPHEMERAL)
         result = await wrapper.purge_ephemeral_session(reason="test")
 
         assert result["conversation_history"] == 1
@@ -84,27 +109,35 @@ async def test_purge_destroys_soft_deleted_leak_too(tmp_path):
 async def test_purge_destroys_leaked_graph_nodes(tmp_path):
     """Graph nodes the EPHEMERAL agent shouldn't have written get the
     same hard-delete treatment, with edges scrubbed in the same
-    transaction."""
+    transaction.
+
+    Updated for #867: leak nodes carry an in-window ``created_at``
+    matching real production node properties (``add_node`` callers
+    stamp it).  Pre-stint nodes are now correctly preserved by the
+    scoped purge — that's the safety improvement on the table.
+    """
     from kestrel_sovereign.storage.async_graph_store import GraphNode
     db_path = tmp_path / "kestrel.db"
     async with AsyncStorage(str(db_path), agent_id=AGENT_ID) as storage:
+        wrapper = PrivacyEnforcingStorage(storage, PrivacyMode.EPHEMERAL)
+        await asyncio.sleep(1.05)
+        leak_ts = _now_iso_utc()
         # Two nodes for this agent (the leak), one node for another agent
         # (must NOT be touched), and an edge between two of the leaked nodes.
         await storage.graph.add_node(GraphNode(
             node_id="leak-1", node_type="memory", label="memory-leak-1",
-            properties={"agent_id": AGENT_ID},
+            properties={"agent_id": AGENT_ID, "created_at": leak_ts},
         ))
         await storage.graph.add_node(GraphNode(
             node_id="leak-2", node_type="memory", label="memory-leak-2",
-            properties={"agent_id": AGENT_ID},
+            properties={"agent_id": AGENT_ID, "created_at": leak_ts},
         ))
         await storage.graph.add_node(GraphNode(
             node_id="other-1", node_type="memory", label="other",
-            properties={"agent_id": OTHER_AGENT_ID},
+            properties={"agent_id": OTHER_AGENT_ID, "created_at": leak_ts},
         ))
         await storage.graph.add_edge("leak-1", "leak-2", "follows")
 
-        wrapper = PrivacyEnforcingStorage(storage, PrivacyMode.EPHEMERAL)
         result = await wrapper.purge_ephemeral_session(reason="test")
 
         assert result["graph_nodes"] == 2
@@ -138,10 +171,11 @@ async def test_purge_does_not_touch_other_agents_data(tmp_path):
         await other_storage.conversation.add_conversation("assistant", "preserved 2")
 
     async with AsyncStorage(str(db_path), agent_id=AGENT_ID) as storage:
+        wrapper = PrivacyEnforcingStorage(storage, PrivacyMode.EPHEMERAL)
+        await asyncio.sleep(1.05)
         # Leak some conversation data on the ephemeral agent only
         await storage.conversation.add_conversation("user", "leaked")
 
-        wrapper = PrivacyEnforcingStorage(storage, PrivacyMode.EPHEMERAL)
         result = await wrapper.purge_ephemeral_session(reason="test")
         assert result["conversation_history"] == 1
 
@@ -162,9 +196,9 @@ async def test_purge_warns_and_returns_breakdown_on_leak(tmp_path, caplog):
     import logging as _logging
     db_path = tmp_path / "kestrel.db"
     async with AsyncStorage(str(db_path), agent_id=AGENT_ID) as storage:
-        await storage.conversation.add_conversation("user", "leaked")
-
         wrapper = PrivacyEnforcingStorage(storage, PrivacyMode.EPHEMERAL)
+        await asyncio.sleep(1.05)
+        await storage.conversation.add_conversation("user", "leaked")
 
         with caplog.at_level(_logging.WARNING, logger="kestrel_sovereign.storage.privacy_wrapper"):
             result = await wrapper.purge_ephemeral_session(reason="test")

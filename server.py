@@ -53,6 +53,58 @@ security = HTTPBearer(auto_error=False)
 SSE_PATHS = {"/agent/notifications/sse", "/agent/stream"}
 
 
+def resolve_rookery_path(env: dict | os._Environ) -> Path:
+    """Compute the rookery.toml path the lifespan should load (#868).
+
+    Centralised so unit tests can exercise the real decision logic
+    instead of reimplementing it locally — the bug class this guards
+    against (a demo run silently mounting live agents) is exactly the
+    kind of thing where test-and-prod-drift is dangerous.
+
+    Decision matrix:
+
+    ============================  =====================================
+     Inputs                        Result
+    ============================  =====================================
+     KESTREL_ROOKERY_CONFIG set    Honour it verbatim (operator opted in
+                                   to a specific path)
+     KESTREL_DEMO_SERVER=1 + no    Refuse to auto-mount the project-root
+       explicit config + the       ``rookery.toml``.  Returns a path that
+       default ``rookery.toml``    does not exist so the lifespan skips
+       exists at the project       multi-agent setup.  This is the
+       root                        guard that would have stopped the
+                                   #867 wipe.
+     anything else                 Use the default path (the lifespan's
+                                   ``.exists()`` check handles missing
+                                   files; production behaviour preserved).
+    ============================  =====================================
+
+    Args:
+        env: Mapping of environment variables.  Pass ``os.environ`` in
+            production; tests pass a plain ``dict``.
+
+    Returns:
+        :class:`pathlib.Path` the lifespan should attempt to load.  The
+        caller still uses ``.exists()`` to decide whether to enter
+        multi-agent mode.
+    """
+    rookery_path = Path(env.get("KESTREL_ROOKERY_CONFIG", "rookery.toml"))
+    demo_server_env = env.get("KESTREL_DEMO_SERVER", "").lower() in (
+        "1", "true", "yes",
+    )
+    rookery_explicit = "KESTREL_ROOKERY_CONFIG" in env
+    if demo_server_env and not rookery_explicit and rookery_path.exists():
+        logger.warning(
+            "[demo-server] KESTREL_DEMO_SERVER=1 with no explicit "
+            "KESTREL_ROOKERY_CONFIG — refusing to auto-mount %s.  "
+            "A demo server must not silently load live agents.  Pass "
+            "KESTREL_ROOKERY_CONFIG=<path> explicitly to opt in.",
+            rookery_path,
+        )
+        return Path("/dev/null/rookery-disabled")
+    return rookery_path
+
+
 def _set_startup_error(app: FastAPI, error: Optional[Exception]) -> None:
     """Persist startup failure state for diagnostics and health endpoints."""
     app.state.startup_error = str(error) if error else None
@@ -198,7 +250,7 @@ async def lifespan(app: FastAPI):
 
     # Detect multi-agent mode
     multi_agent_env = os.environ.get("KESTREL_MULTI_AGENT", "").lower() in ("1", "true", "yes")
-    rookery_path = Path(os.environ.get("KESTREL_ROOKERY_CONFIG", "rookery.toml"))
+    rookery_path = resolve_rookery_path(os.environ)
 
     if multi_agent_env or rookery_path.exists():
         # --- Multi-agent mode ---

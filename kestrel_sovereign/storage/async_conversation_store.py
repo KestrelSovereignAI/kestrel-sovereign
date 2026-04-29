@@ -892,9 +892,14 @@ class AsyncConversationStore:
     async def purge_all(self, reason: str = "administrative") -> int:
         """Hard-delete every conversation row for this agent (#763).
 
-        Reserved for restore-from-CAR, EPHEMERAL session close (#767),
-        and explicit administrative wipe. NOT the user-facing 'clear
-        history' button — that goes through ``clear_history``.
+        Reserved for restore-from-CAR and explicit administrative wipe.
+        NOT the user-facing 'clear history' button — that goes through
+        ``clear_history``.  NOT the EPHEMERAL leak-purge — that path
+        calls :meth:`purge_all_since` with the timestamp the agent
+        entered EPHEMERAL so it can only destroy rows written *during*
+        the EPHEMERAL stint.  Calling this method on a long-lived agent
+        wipes the entire history regardless of when rows were authored
+        (#867).
         """
         affected = await self.db.execute_commit(
             "DELETE FROM conversation_history WHERE agent_id = ?",
@@ -904,6 +909,47 @@ class AsyncConversationStore:
         logger.info(
             "purge_all agent=%s reason=%s rows=%d",
             self.agent_id, reason, purged,
+        )
+        return purged
+
+    async def purge_all_since(
+        self,
+        since_iso: str,
+        *,
+        reason: str = "ephemeral-leak",
+    ) -> int:
+        """Hard-delete conversation rows authored on/after ``since_iso``.
+
+        Scoped variant of :meth:`purge_all` for the EPHEMERAL leak-purge
+        (#867).  EPHEMERAL is "leave no trace," so anything written
+        *during* the stint is a privacy-layer leak — but rows authored
+        before the agent entered EPHEMERAL are preexisting NORMAL data
+        the user explicitly wanted persisted.  Only rows whose
+        ``created_at >= since_iso`` are destroyed.  ``since_iso`` is
+        captured at the moment the wrapper sees the transition INTO
+        EPHEMERAL.
+
+        If ``since_iso`` is empty/None, returns 0 without running the
+        DELETE — the absence of a timestamp means we can't safely scope,
+        and the original wipe-on-shutdown bug is precisely what this
+        method exists to prevent.
+        """
+        if not since_iso:
+            logger.warning(
+                "purge_all_since called without since_iso — refusing to purge "
+                "(agent=%s, reason=%s)",
+                self.agent_id, reason,
+            )
+            return 0
+        affected = await self.db.execute_commit(
+            "DELETE FROM conversation_history "
+            "WHERE agent_id = ? AND created_at >= ?",
+            (self.agent_id, since_iso),
+        )
+        purged = _rows_affected(affected)
+        logger.info(
+            "purge_all_since agent=%s since=%s reason=%s rows=%d",
+            self.agent_id, since_iso, reason, purged,
         )
         return purged
 
