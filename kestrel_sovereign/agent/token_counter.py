@@ -195,23 +195,20 @@ class TokenCounter:
         4. DEFAULT_CONTEXT_LIMIT fallback
 
         Each source is consulted with the full model string first, then
-        with the model-name-only portion (post-slash) so callers can pass
-        ``"anthropic:plan/claude-opus-4-7"`` and still hit a cache keyed
-        by ``"claude-opus-4-7"``. Without this, vendor-prefixed model
-        strings fall through to the 32K default and chats wrongly read
-        as "context 100% full" on a 1M-context Opus.
+        with the model-name-only portion (post-slash). The LLM service
+        routes by ``"vendor:route/model"`` while the cache stores bare
+        model IDs (``"claude-opus-4-7"``) — same model reachable via
+        multiple routes, so the cache shouldn't carry route prefixes.
+        This is normalization, not a workaround: the actual model ID is
+        what discovery records and what catalog lookups expect.
 
         Returns:
             Maximum tokens allowed in context
         """
-        # The cache is populated by model discovery using whatever ID the
-        # provider returned (e.g. OpenRouter "anthropic/claude-opus-4.7"),
-        # but the LLM service routes by "vendor:route/model" — these can
-        # diverge in punctuation (4-7 vs 4.7) and prefix (anthropic/ vs
-        # anthropic:plan/). Try each shape until one hits.
+        # Normalize "anthropic:plan/claude-opus-4-7" -> "claude-opus-4-7"
+        # so route-spec callers hit a cache keyed by bare model id.
         candidates = [self.model]
         if "/" in self.model:
-            # "anthropic:plan/claude-opus-4-7" -> "claude-opus-4-7"
             candidates.append(self.model.rsplit("/", 1)[1])
 
         # 1. Discovered limits (populated by API discovery this session)

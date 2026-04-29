@@ -990,6 +990,14 @@ class AnthropicAdapter(LLMAdapter):
                 model_id = model_data.get("id", "")
                 display_name = model_data.get("display_name", model_id)
 
+                # Anthropic's /v1/models returns the input window as
+                # ``max_input_tokens``. Without reading it, every model
+                # gets ``context_limit=None`` and ``register_discovered_limits``
+                # skips it — lookups then fall to DEFAULT_CONTEXT_LIMIT=32768,
+                # which surfaced as bogus "Context 100% full" warnings on
+                # Opus 4.7's 1M-token window.
+                context_limit = model_data.get("max_input_tokens")
+
                 # All Anthropic models are chat models
                 models.append(ModelInfo(
                     id=model_id,
@@ -997,6 +1005,7 @@ class AnthropicAdapter(LLMAdapter):
                     display_name=display_name,
                     category=ModelCategory.CHAT,
                     created_at=model_data.get("created_at"),
+                    context_limit=context_limit,
                     supports_vision=True,  # Claude 3+ supports vision
                     supports_tools=True,   # Claude supports tools
                     supports_streaming=True,
