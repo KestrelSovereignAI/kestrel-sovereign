@@ -83,7 +83,7 @@ def test_invoke_agent_e2e(client: TestClient, api_key: str):
 
     # 2. Invoke the agent with API key
     payload = {"input": "Hello, who are you?"}
-    response = client.post("/agent/invoke", json=payload, headers=headers)
+    response = client.post("/api/agent/invoke", json=payload, headers=headers)
 
     # 3. Check the response
     assert response.status_code == 200, f"Failed with {response.status_code}: {response.text}"

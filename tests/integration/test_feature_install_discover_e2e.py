@@ -621,7 +621,7 @@ class TestFeatureStoreAPI:
     def test_agent_info_lists_ext_features(self, client_with_ext_features):
         """GET /agent/info includes external features in the features list."""
         client, api_key = client_with_ext_features
-        response = client.get("/agent/info", headers=self._headers(api_key))
+        response = client.get("/api/agent/info", headers=self._headers(api_key))
         assert response.status_code == 200
         data = response.json()
 
@@ -667,7 +667,7 @@ class TestFeatureStoreAPI:
     def test_agent_info_excludes_disabled(self, client_with_disabled_gpu):
         """GET /agent/info does NOT list a disabled feature."""
         client, api_key = client_with_disabled_gpu
-        response = client.get("/agent/info", headers=self._headers(api_key))
+        response = client.get("/api/agent/info", headers=self._headers(api_key))
         assert response.status_code == 200
         data = response.json()
 

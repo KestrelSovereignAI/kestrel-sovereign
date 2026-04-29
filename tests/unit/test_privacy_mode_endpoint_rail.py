@@ -30,7 +30,7 @@ def _request(*, headers=None, agent=None, server_demo_mode=False):
     req.app = app
     req.state = MagicMock()
     req.state.agent = None
-    req.url.path = "/agent/privacy-mode"
+    req.url.path = "/api/agent/privacy-mode"
     req.method = "POST"
     req.headers = headers or {}
     req.client.host = "127.0.0.1"
@@ -79,17 +79,18 @@ async def test_rail_allows_privacy_mode_flip_on_demo_agent_without_header():
 
 def test_endpoint_module_declares_rail_dependency():
     """Belt-and-braces — even if a refactor renames the dependency, this
-    test catches a regression where ``POST /privacy-mode`` ships without
-    the rail attached.  The route definition lives in ``endpoints.agent``;
-    we just confirm the dependency is present in its kwargs."""
+    test catches a regression where ``POST /api/agent/privacy-mode`` ships
+    without the rail attached.  The route definition lives in
+    ``endpoints.agent``; we just confirm the dependency is present in its
+    kwargs."""
     from endpoints import agent as agent_endpoints
 
     routes = [
         r for r in agent_endpoints.router.routes
-        if getattr(r, "path", None) == "/agent/privacy-mode"
+        if getattr(r, "path", None) == "/api/agent/privacy-mode"
         and "POST" in getattr(r, "methods", set())
     ]
-    assert routes, "POST /privacy-mode route not found"
+    assert routes, "POST /api/agent/privacy-mode route not found"
     deps = list(routes[0].dependencies or [])
     dep_callables = [getattr(d, "dependency", None) for d in deps]
     assert enforce_destructive_op in dep_callables, (

@@ -90,7 +90,7 @@ def _create_multi_agent_app(agents: dict[str, MagicMock]) -> FastAPI:
     from fastapi import Request
     from endpoints.agent_helpers import get_agent
 
-    @app.get("/agent/info")
+    @app.get("/api/agent/info")
     async def agent_info(request: Request):
         agent = get_agent(request)
         return {"agent_id": agent.agent_id}
@@ -124,12 +124,12 @@ class TestAgentRoutingMiddleware:
         client = TestClient(app, raise_server_exceptions=False)
 
         # Request for Claw
-        resp = client.get("/api/agents/Claw/agent/info")
+        resp = client.get("/api/agents/Claw/api/agent/info")
         assert resp.status_code == 200
         assert resp.json()["agent_id"] == "did:claw"
 
         # Request for Emma
-        resp = client.get("/api/agents/Emma/agent/info")
+        resp = client.get("/api/agents/Emma/api/agent/info")
         assert resp.status_code == 200
         assert resp.json()["agent_id"] == "did:emma"
 
@@ -139,7 +139,7 @@ class TestAgentRoutingMiddleware:
         app = _create_multi_agent_app({"Claw": claw})
 
         client = TestClient(app, raise_server_exceptions=False)
-        resp = client.get("/api/agents/Ghost/agent/info")
+        resp = client.get("/api/agents/Ghost/api/agent/info")
         assert resp.status_code == 404
         assert "Ghost" in resp.json()["detail"]
 
@@ -149,7 +149,7 @@ class TestAgentRoutingMiddleware:
         app = _create_multi_agent_app({"Claw": claw})
 
         client = TestClient(app, raise_server_exceptions=False)
-        resp = client.get("/api/agents/claw/agent/info")
+        resp = client.get("/api/agents/claw/api/agent/info")
         assert resp.status_code == 200
         assert resp.json()["agent_id"] == "did:claw"
 
@@ -175,8 +175,8 @@ class TestAgentRoutingMiddleware:
 
         client = TestClient(app, raise_server_exceptions=False)
         # The /agent/info endpoint is mounted at /agent/info
-        # After rewriting /api/agents/Claw/agent/info -> /agent/info
-        resp = client.get("/api/agents/Claw/agent/info")
+        # After rewriting /api/agents/Claw/api/agent/info -> /agent/info
+        resp = client.get("/api/agents/Claw/api/agent/info")
         assert resp.status_code == 200
 
 
@@ -206,11 +206,11 @@ class TestAgentCRUDEndpoints:
         assert resp.json()["success"] is True
 
         # Verify Claw is gone
-        resp = client.get("/api/agents/Claw/agent/info")
+        resp = client.get("/api/agents/Claw/api/agent/info")
         assert resp.status_code == 404
 
         # Emma still works
-        resp = client.get("/api/agents/Emma/agent/info")
+        resp = client.get("/api/agents/Emma/api/agent/info")
         assert resp.status_code == 200
 
     def test_delete_nonexistent_agent(self):
@@ -314,7 +314,7 @@ class TestSingleAgentMode:
         from fastapi import Request
         from endpoints.agent_helpers import get_agent
 
-        @app.get("/agent/info")
+        @app.get("/api/agent/info")
         async def agent_info(request: Request):
             agent = get_agent(request)
             return {"agent_id": agent.agent_id}
@@ -328,6 +328,6 @@ class TestSingleAgentMode:
             return await call_next(request)
 
         client = TestClient(app, raise_server_exceptions=False)
-        resp = client.get("/agent/info")
+        resp = client.get("/api/agent/info")
         assert resp.status_code == 200
         assert resp.json()["agent_id"] == "did:single"

@@ -73,11 +73,11 @@ def app():
         )
 
         # Register test endpoints that mirror the real route paths
-        @test_app.get("/agent/notifications/sse")
+        @test_app.get("/api/agent/notifications/sse")
         def notifications_sse():
             return {"type": "sse"}
 
-        @test_app.post("/agent/stream")
+        @test_app.post("/api/agent/stream")
         def agent_stream():
             return {"type": "stream"}
 
@@ -85,7 +85,7 @@ def app():
         def conversations():
             return {"conversations": []}
 
-        @test_app.post("/agent/invoke")
+        @test_app.post("/api/agent/invoke")
         def agent_invoke():
             return {"response": "ok"}
 
@@ -110,13 +110,13 @@ class TestQueryParamAuthOnSSEPaths:
 
     def test_query_param_auth_on_notifications_sse(self, client):
         """api_key query param should authenticate on /agent/notifications/sse."""
-        resp = client.get(f"/agent/notifications/sse?api_key={API_KEY}")
+        resp = client.get(f"/api/agent/notifications/sse?api_key={API_KEY}")
         assert resp.status_code == 200
         assert resp.json() == {"type": "sse"}
 
     def test_query_param_auth_on_agent_stream(self, client):
         """api_key query param should authenticate on /agent/stream."""
-        resp = client.post(f"/agent/stream?api_key={API_KEY}")
+        resp = client.post(f"/api/agent/stream?api_key={API_KEY}")
         assert resp.status_code == 200
         assert resp.json() == {"type": "stream"}
 
@@ -131,7 +131,7 @@ class TestQueryParamAuthRejectedOnOtherPaths:
 
     def test_query_param_rejected_on_agent_invoke(self, client):
         """api_key query param should NOT authenticate on /agent/invoke."""
-        resp = client.post(f"/agent/invoke?api_key={API_KEY}")
+        resp = client.post(f"/api/agent/invoke?api_key={API_KEY}")
         assert resp.status_code == 401
 
     def test_query_param_rejected_on_memories(self, client):
@@ -162,7 +162,7 @@ class TestHeaderAuthStillWorks:
     def test_header_auth_on_sse(self, client):
         """X-API-Key header should also work on SSE endpoints."""
         resp = client.get(
-            "/agent/notifications/sse",
+            "/api/agent/notifications/sse",
             headers={"X-API-Key": API_KEY},
         )
         assert resp.status_code == 200
@@ -178,7 +178,7 @@ class TestWrongKeyRejected:
 
     def test_wrong_query_param_on_sse(self, client):
         """Wrong api_key query param should be rejected even on SSE paths."""
-        resp = client.get("/agent/notifications/sse?api_key=wrong-key")
+        resp = client.get("/api/agent/notifications/sse?api_key=wrong-key")
         assert resp.status_code == 401
 
     def test_wrong_header_key(self, client):
@@ -197,8 +197,8 @@ class TestSSEPathsConstant:
         """SSE_PATHS should contain the notification SSE and stream endpoints."""
         from server import SSE_PATHS
 
-        assert "/agent/notifications/sse" in SSE_PATHS
-        assert "/agent/stream" in SSE_PATHS
+        assert "/api/agent/notifications/sse" in SSE_PATHS
+        assert "/api/agent/stream" in SSE_PATHS
 
     def test_sse_paths_is_a_set(self):
         """SSE_PATHS should be a set for O(1) lookup."""

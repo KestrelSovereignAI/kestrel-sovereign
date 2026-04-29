@@ -78,7 +78,7 @@ def test_context_status_reports_token_budget_and_warning_band():
             with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
                 with TestClient(app) as client:
                     response = client.get(
-                        "/agent/context-status?session_id=session-1",
+                        "/api/agent/context-status?session_id=session-1",
                         headers=_api_headers(),
                     )
         assert response.status_code == 200
@@ -132,7 +132,7 @@ def test_context_status_returns_idle_shape_when_no_session_id():
             with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
                 with TestClient(app) as client:
                     response = client.get(
-                        "/agent/context-status",
+                        "/api/agent/context-status",
                         headers=_api_headers(),
                     )
         assert response.status_code == 200
@@ -180,7 +180,7 @@ def test_context_status_returns_idle_shape_for_empty_session_id():
             with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
                 with TestClient(app) as client:
                     response = client.get(
-                        "/agent/context-status?session_id=",
+                        "/api/agent/context-status?session_id=",
                         headers=_api_headers(),
                     )
         assert response.status_code == 200
@@ -220,7 +220,7 @@ def test_reflection_status_filters_scheduler_tasks_and_serializes_execution_hist
     try:
         with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
             with TestClient(app) as client:
-                response = client.get("/agent/reflection/status", headers=_api_headers())
+                response = client.get("/api/agent/reflection/status", headers=_api_headers())
         assert response.status_code == 200
         payload = response.json()
         assert payload["reflection_hook_active"] is True
@@ -256,8 +256,8 @@ def test_tasks_endpoint_filters_by_status_and_rejects_invalid_values():
     try:
         with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
             with TestClient(app) as client:
-                filtered_response = client.get("/agent/tasks?status=working&limit=25", headers=_api_headers())
-                invalid_response = client.get("/agent/tasks?status=bogus", headers=_api_headers())
+                filtered_response = client.get("/api/agent/tasks?status=working&limit=25", headers=_api_headers())
+                invalid_response = client.get("/api/agent/tasks?status=bogus", headers=_api_headers())
         assert filtered_response.status_code == 200
         filtered = filtered_response.json()
         assert filtered["total"] == 1
@@ -296,7 +296,7 @@ def test_task_detail_endpoint_returns_task_with_artifacts():
     try:
         with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
             with TestClient(app) as client:
-                response = client.get("/agent/tasks/task-42", headers=_api_headers())
+                response = client.get("/api/agent/tasks/task-42", headers=_api_headers())
         assert response.status_code == 200
         payload = response.json()
         assert payload["id"] == "task-42"
@@ -320,7 +320,7 @@ def test_task_detail_endpoint_returns_404_when_task_missing():
     try:
         with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
             with TestClient(app) as client:
-                response = client.get("/agent/tasks/missing", headers=_api_headers())
+                response = client.get("/api/agent/tasks/missing", headers=_api_headers())
         assert response.status_code == 404
         assert "not found" in response.json()["detail"].lower()
     finally:
@@ -334,7 +334,7 @@ def test_task_detail_endpoint_returns_404_when_task_manager_absent():
     try:
         with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
             with TestClient(app) as client:
-                response = client.get("/agent/tasks/anything", headers=_api_headers())
+                response = client.get("/api/agent/tasks/anything", headers=_api_headers())
         assert response.status_code == 404
         assert "TaskManager not available" in response.json()["detail"]
     finally:
@@ -357,8 +357,8 @@ def test_health_endpoints_return_feature_status_and_run_once():
     try:
         with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
             with TestClient(app) as client:
-                status_resp = client.get("/agent/health/status", headers=_api_headers())
-                trigger_resp = client.post("/agent/health/trigger", headers=_api_headers())
+                status_resp = client.get("/api/agent/health/status", headers=_api_headers())
+                trigger_resp = client.post("/api/agent/health/trigger", headers=_api_headers())
         assert status_resp.status_code == 200
         assert status_resp.json()["enabled"] is True
         assert status_resp.json()["interval_seconds"] == 60
@@ -379,8 +379,8 @@ def test_health_endpoints_return_404_when_feature_missing():
     try:
         with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
             with TestClient(app) as client:
-                status_resp = client.get("/agent/health/status", headers=_api_headers())
-                trigger_resp = client.post("/agent/health/trigger", headers=_api_headers())
+                status_resp = client.get("/api/agent/health/status", headers=_api_headers())
+                trigger_resp = client.post("/api/agent/health/trigger", headers=_api_headers())
         assert status_resp.status_code == 200
         assert status_resp.json()["enabled"] is False
         assert trigger_resp.status_code == 404
@@ -401,8 +401,8 @@ def test_heartbeat_endpoints_cover_disabled_status_success_and_error_paths():
     try:
         with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
             with TestClient(app) as client:
-                disabled_status = client.get("/agent/heartbeat/status", headers=_api_headers())
-                disabled_trigger = client.post("/agent/heartbeat/trigger", headers=_api_headers())
+                disabled_status = client.get("/api/agent/heartbeat/status", headers=_api_headers())
+                disabled_trigger = client.post("/api/agent/heartbeat/trigger", headers=_api_headers())
         assert disabled_status.status_code == 200
         assert disabled_status.json() == {"enabled": False, "message": "Heartbeat not configured"}
         assert disabled_trigger.status_code == 404
@@ -413,8 +413,8 @@ def test_heartbeat_endpoints_cover_disabled_status_success_and_error_paths():
     try:
         with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
             with TestClient(app) as client:
-                status_response = client.get("/agent/heartbeat/status", headers=_api_headers())
-                trigger_response = client.post("/agent/heartbeat/trigger", headers=_api_headers())
+                status_response = client.get("/api/agent/heartbeat/status", headers=_api_headers())
+                trigger_response = client.post("/api/agent/heartbeat/trigger", headers=_api_headers())
         assert status_response.status_code == 200
         assert status_response.json()["enabled"] is True
         assert trigger_response.status_code == 200
@@ -426,7 +426,7 @@ def test_heartbeat_endpoints_cover_disabled_status_success_and_error_paths():
     try:
         with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
             with TestClient(app) as client:
-                error_response = client.post("/agent/heartbeat/trigger", headers=_api_headers())
+                error_response = client.post("/api/agent/heartbeat/trigger", headers=_api_headers())
         assert error_response.status_code == 500
         assert error_response.json()["detail"] == "Error triggering heartbeat."
     finally:
