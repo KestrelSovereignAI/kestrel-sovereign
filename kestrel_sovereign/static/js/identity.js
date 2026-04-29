@@ -21,8 +21,6 @@ export function initAgentFromUrl() {
     const agentParam = params.get('agent');
     if (agentParam) {
         currentAgentId = agentParam;
-        // Set the agent ID in the API module for endpoint rewriting
-        API.setAgentId(agentParam);
         console.log('Kestrel Sovereign Console: Agent mode enabled for', currentAgentId);
         document.title = `Sovereign Console - Agent ${currentAgentId.slice(0, 8)}...`;
     } else {
@@ -94,15 +92,15 @@ export async function loadIdentity() {
             document.title = `${identity.name} - Sovereign Console`;
         }
 
-        // Build avatar URL - prefer serving from identity chain via avatar endpoint
+        // Build avatar URL from canonical identity payload. Hosts that embed
+        // Kestrel UI under a different URL shape are responsible for routing
+        // /api/identity/avatar (and the upload/generate variants) to the
+        // right backend — see #863.
         let avatarUrl = null;
-        if (identity.avatar_hash || identity.avatar_url) {
-            // In multi-agent mode, serve from Kestrel identity chain via platform endpoint
-            if (currentAgentId) {
-                avatarUrl = `/api/kestrel/companions/${encodeURIComponent(currentAgentId)}/avatar`;
-            } else if (identity.avatar_url) {
-                avatarUrl = identity.avatar_url;
-            }
+        if (identity.avatar_url) {
+            avatarUrl = identity.avatar_url;
+        } else if (identity.avatar_hash) {
+            avatarUrl = '/api/identity/avatar';
         }
 
         // Update nav header avatar and name
