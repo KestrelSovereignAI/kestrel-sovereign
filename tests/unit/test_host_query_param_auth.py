@@ -20,7 +20,7 @@ from fastapi.testclient import TestClient
 API_KEY = "test-host-api-key-for-sse-restriction"
 
 # Must match host.py definition
-SSE_PATH_SUFFIXES = ("/agent/notifications/sse", "/agent/stream")
+SSE_PATH_SUFFIXES = ("/api/agent/notifications/sse", "/api/agent/stream")
 
 
 @pytest.fixture
@@ -67,11 +67,11 @@ def app():
         )
 
     # Proxied SSE endpoints (through the host proxy)
-    @test_app.get("/api/agents/{agent_id}/agent/notifications/sse")
+    @test_app.get("/api/agents/{agent_id}/api/agent/notifications/sse")
     def proxied_notifications_sse(agent_id: str):
         return {"type": "sse", "agent": agent_id}
 
-    @test_app.post("/api/agents/{agent_id}/agent/stream")
+    @test_app.post("/api/agents/{agent_id}/api/agent/stream")
     def proxied_agent_stream(agent_id: str):
         return {"type": "stream", "agent": agent_id}
 
@@ -118,20 +118,20 @@ class TestQueryParamAuthOnSSEProxyPaths:
 
     def test_query_param_auth_on_proxied_notifications_sse(self, client):
         """api_key query param should authenticate on proxied /agent/notifications/sse."""
-        resp = client.get(f"/api/agents/claw/agent/notifications/sse?api_key={API_KEY}")
+        resp = client.get(f"/api/agents/claw/api/agent/notifications/sse?api_key={API_KEY}")
         assert resp.status_code == 200
         assert resp.json()["type"] == "sse"
 
     def test_query_param_auth_on_proxied_agent_stream(self, client):
         """api_key query param should authenticate on proxied /agent/stream."""
-        resp = client.post(f"/api/agents/claw/agent/stream?api_key={API_KEY}")
+        resp = client.post(f"/api/agents/claw/api/agent/stream?api_key={API_KEY}")
         assert resp.status_code == 200
         assert resp.json()["type"] == "stream"
 
     def test_query_param_auth_works_for_different_agent_ids(self, client):
         """api_key query param should work for any agent_id on SSE paths."""
         resp = client.get(
-            f"/api/agents/other-agent/agent/notifications/sse?api_key={API_KEY}"
+            f"/api/agents/other-agent/api/agent/notifications/sse?api_key={API_KEY}"
         )
         assert resp.status_code == 200
         assert resp.json()["agent"] == "other-agent"
@@ -190,7 +190,7 @@ class TestHeaderAuthStillWorks:
     def test_header_auth_on_proxied_sse(self, client):
         """X-API-Key header should also work on proxied SSE endpoints."""
         resp = client.get(
-            "/api/agents/claw/agent/notifications/sse",
+            "/api/agents/claw/api/agent/notifications/sse",
             headers={"X-API-Key": API_KEY},
         )
         assert resp.status_code == 200
@@ -215,7 +215,7 @@ class TestWrongKeyRejected:
     def test_wrong_query_param_on_proxied_sse(self, client):
         """Wrong api_key query param should be rejected even on SSE paths."""
         resp = client.get(
-            "/api/agents/claw/agent/notifications/sse?api_key=wrong-key"
+            "/api/agents/claw/api/agent/notifications/sse?api_key=wrong-key"
         )
         assert resp.status_code == 401
 
@@ -232,8 +232,8 @@ class TestSSEPathSuffixesConstant:
         """host.py should define SSE_PATH_SUFFIXES."""
         from host import SSE_PATH_SUFFIXES
 
-        assert "/agent/notifications/sse" in SSE_PATH_SUFFIXES
-        assert "/agent/stream" in SSE_PATH_SUFFIXES
+        assert "/api/agent/notifications/sse" in SSE_PATH_SUFFIXES
+        assert "/api/agent/stream" in SSE_PATH_SUFFIXES
 
     def test_host_sse_path_suffixes_is_tuple(self):
         """SSE_PATH_SUFFIXES should be a tuple."""

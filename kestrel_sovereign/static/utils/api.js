@@ -38,7 +38,7 @@ export const KestrelAPI = {
     },
 
     async getAgentInfo() {
-        return request('/agent/info');
+        return request('/api/agent/info');
     },
 
     // Identity
@@ -53,11 +53,11 @@ export const KestrelAPI = {
 
     // Privacy
     async getPrivacyMode() {
-        return request('/agent/privacy-mode');
+        return request('/api/agent/privacy-mode');
     },
 
     async setPrivacyMode(mode) {
-        return request('/agent/privacy-mode', {
+        return request('/api/agent/privacy-mode', {
             method: 'POST',
             body: JSON.stringify({ mode }),
         });
@@ -117,7 +117,7 @@ export const KestrelAPI = {
 
     // Chat
     async invoke(input) {
-        return request('/agent/invoke', {
+        return request('/api/agent/invoke', {
             method: 'POST',
             body: JSON.stringify({ input }),
         });

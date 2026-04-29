@@ -368,7 +368,7 @@ class TestAgentInvokeWithConsole:
     def test_invoke_returns_response(self, client: TestClient):
         """Agent invoke returns a response."""
         response = client.post(
-            "/agent/invoke",
+            "/api/agent/invoke",
             json={"input": "What is your DID?"}
         )
 
@@ -380,7 +380,7 @@ class TestAgentInvokeWithConsole:
     def test_invoke_with_privacy_command(self, client: TestClient):
         """Agent handles !commands for privacy."""
         response = client.post(
-            "/agent/invoke",
+            "/api/agent/invoke",
             json={"input": "!get-privacy-mode"}
         )
 
@@ -394,7 +394,7 @@ class TestPrivacyModeAPI:
 
     def test_get_privacy_mode(self, client: TestClient):
         """Get current privacy mode."""
-        response = client.get("/agent/privacy-mode")
+        response = client.get("/api/agent/privacy-mode")
         assert response.status_code == 200
         data = response.json()
 
@@ -406,20 +406,20 @@ class TestPrivacyModeAPI:
         """Set privacy mode and verify change."""
         # Set to ISOLATED
         response = client.post(
-            "/agent/privacy-mode",
+            "/api/agent/privacy-mode",
             headers={"X-Kestrel-Allow-Destructive": "test-rail-bypass"},
 json={"mode": "ISOLATED"}
         )
         assert response.status_code == 200
 
         # Verify it changed
-        get_response = client.get("/agent/privacy-mode")
+        get_response = client.get("/api/agent/privacy-mode")
         assert get_response.json()["privacy_mode"].upper() == "ISOLATED"
 
     def test_set_invalid_privacy_mode_fails(self, client: TestClient):
         """Setting invalid privacy mode returns error."""
         response = client.post(
-            "/agent/privacy-mode",
+            "/api/agent/privacy-mode",
             headers={"X-Kestrel-Allow-Destructive": "test-rail-bypass"},
 json={"mode": "INVALID_MODE"}
         )

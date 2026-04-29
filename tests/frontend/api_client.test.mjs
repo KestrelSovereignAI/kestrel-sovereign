@@ -192,7 +192,7 @@ test('streamInvoke posts canonical /agent/stream (#863)', async () => {
     }
 
     assert.deepEqual(chunks, ['hi']);
-    assert.deepEqual(fetchFn.calls.map((call) => call.url), ['/agent/stream']);
+    assert.deepEqual(fetchFn.calls.map((call) => call.url), ['/api/agent/stream']);
 });
 
 test('streamInvoke with API key refreshes bootstrap key once and retries the stream', async () => {
@@ -216,9 +216,9 @@ test('streamInvoke with API key refreshes bootstrap key once and retries the str
     assert.deepEqual(chunks, ['hel', 'lo']);
     assert.equal(sessionStorage.getItem('kestrel_api_key'), 'fresh-key');
     assert.deepEqual(fetchFn.calls.map((call) => call.url), [
-        '/agent/stream',
+        '/api/agent/stream',
         '/api/auth/key',
-        '/agent/stream',
+        '/api/agent/stream',
     ]);
     assert.equal(fetchFn.calls[0].options.headers['X-API-Key'], 'stale-key');
     assert.equal(fetchFn.calls[2].options.headers['X-API-Key'], 'fresh-key');
@@ -230,7 +230,7 @@ test('applyHostAgentPrefix preserves host-level routes and prefixes per-agent ro
         applyHostAgentPrefix('/api/models?featured_only=true', 'host-a'),
         '/api/agents/host-a/api/models?featured_only=true',
     );
-    assert.equal(applyHostAgentPrefix('/agent/invoke', null), '/agent/invoke');
+    assert.equal(applyHostAgentPrefix('/api/agent/invoke', null), '/api/agent/invoke');
 });
 
 test('isHostLevelEndpoint identifies fleet-wide routes that must not be wrapped', () => {
@@ -240,7 +240,7 @@ test('isHostLevelEndpoint identifies fleet-wide routes that must not be wrapped'
     assert.equal(isHostLevelEndpoint('/api/auth/key'), true);
     assert.equal(isHostLevelEndpoint('/health'), true);
     assert.equal(isHostLevelEndpoint('/api/identity'), false);
-    assert.equal(isHostLevelEndpoint('/agent/invoke'), false);
+    assert.equal(isHostLevelEndpoint('/api/agent/invoke'), false);
 });
 
 test('buildAgentUrl maps notification SSE paths through selected host agents', () => {
@@ -249,8 +249,8 @@ test('buildAgentUrl maps notification SSE paths through selected host agents', (
     client.setHostAgent('claw');
 
     assert.equal(
-        client.buildAgentUrl('/agent/notifications/sse'),
-        '/api/agents/claw/agent/notifications/sse',
+        client.buildAgentUrl('/api/agent/notifications/sse'),
+        '/api/agents/claw/api/agent/notifications/sse',
     );
 });
 

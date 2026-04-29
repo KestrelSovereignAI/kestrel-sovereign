@@ -654,11 +654,11 @@ async function refreshAll() {
     const details = await Promise.allSettled(
       agentsData.map(async (agent) => {
         const [info, context, tasks, mesh, heartbeat] = await Promise.allSettled([
-          agentApi(agent.name, '/agent/info'),
-          agentApi(agent.name, '/agent/context-status'),
-          agentApi(agent.name, '/agent/tasks'),
-          agentApi(agent.name, '/agent/mesh/inbox?limit=20'),
-          agentApi(agent.name, '/agent/heartbeat/status'),
+          agentApi(agent.name, '/api/agent/info'),
+          agentApi(agent.name, '/api/agent/context-status'),
+          agentApi(agent.name, '/api/agent/tasks'),
+          agentApi(agent.name, '/api/agent/mesh/inbox?limit=20'),
+          agentApi(agent.name, '/api/agent/heartbeat/status'),
         ]);
         return {
           ...agent,
@@ -846,7 +846,7 @@ function renderScheduledTasks(agents) {
     try {
       // Try to fetch reflection from proxy — we already have it if loaded
       // For now, we'll call at render time
-      agentApi(a.name, '/agent/reflection/status').then(data => {
+      agentApi(a.name, '/api/agent/reflection/status').then(data => {
         if (data.scheduled_tasks?.length) {
           const body = document.getElementById('scheduleBody');
           body.innerHTML = data.scheduled_tasks.map(t => `

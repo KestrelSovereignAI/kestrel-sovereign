@@ -60,7 +60,13 @@ API_KEY_NAME = "X-API-Key"
 # need query param auth. Restricted to avoid leaking keys in URL logs.
 # The host proxies SSE requests under /api/agents/{id}/..., so we match
 # path suffixes rather than exact paths.
-SSE_PATH_SUFFIXES = ("/agent/notifications/sse", "/agent/stream")
+SSE_PATH_SUFFIXES = (
+    "/api/agent/notifications/sse",
+    "/api/agent/stream",
+    # Back-compat (#871) — drop alongside the deprecated /agent/* mount
+    "/agent/notifications/sse",
+    "/agent/stream",
+)
 
 # Project directory (where host.py lives)
 PROJECT_DIR = Path(__file__).parent.resolve()

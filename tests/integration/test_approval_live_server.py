@@ -5,7 +5,7 @@ Boots real uvicorn on a random port, real FastAPI app, real SecurityFeature
 with a real ApprovalQueue, then:
 
     1. Connects a real HTTP client (httpx over a real TCP socket) to the
-       `/agent/notifications/sse` endpoint.
+       `/api/agent/notifications/sse` endpoint.
     2. Concurrently fires `approval_queue.request_approval()` on the agent
        (same Python process, so we have the object directly — this simulates
        what SecurityHook.execute does on any APPROVAL_REQUIRED tool call).
@@ -146,7 +146,7 @@ async def test_real_http_sse_delivers_approval_and_decision_resolves_caller(live
     async with httpx.AsyncClient(timeout=10.0) as client:
         started = asyncio.Event()
         reader_task = asyncio.create_task(
-            _read_approval_event(client, f"{base_url}/agent/notifications/sse", started)
+            _read_approval_event(client, f"{base_url}/api/agent/notifications/sse", started)
         )
 
         # Wait for the SSE stream to be live (ensures the server's listener is

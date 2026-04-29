@@ -49,8 +49,15 @@ api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
 security = HTTPBearer(auto_error=False)
 
 # Paths where API key query parameter auth is allowed
-# (EventSource/SSE can't send headers, so these endpoints need query param auth)
-SSE_PATHS = {"/agent/notifications/sse", "/agent/stream"}
+# (EventSource/SSE can't send headers, so these endpoints need query param auth).
+# Both the canonical /api/agent/* paths and the deprecated /agent/* paths are
+# allowed during the back-compat window (#871).
+SSE_PATHS = {
+    "/api/agent/notifications/sse",
+    "/api/agent/stream",
+    "/agent/notifications/sse",
+    "/agent/stream",
+}
 
 
 def resolve_rookery_path(env: dict | os._Environ) -> Path:
@@ -466,6 +473,9 @@ from endpoints.auth_oauth import router as auth_oauth_router, register_oauth, oa
 app.include_router(auth_oauth_router)
 register_oauth(app)
 
+# Canonical mount under /api/* (see #871). The deprecated /agent/* prefix
+# is rewritten to /api/agent/* by a middleware below — we don't double-mount
+# the router because that would defeat OpenAPI / route-inventory tooling.
 app.include_router(agent_router)
 app.include_router(conversations_router)
 app.include_router(memories_router)
@@ -521,6 +531,12 @@ async def github_proxy(path: str, request: Request):
 
 # Regex for multi-agent path routing: /api/agents/{name}/{remaining_path}
 _AGENT_PATH_RE = re.compile(r"^/api/agents/([^/]+)/(.+)$")
+
+# #871 — first-hit dedupe state for the deprecated /agent/* prefix shim.
+# The middleware itself is registered at the end of this file so it runs
+# OUTERMOST (Starlette runs middleware in reverse registration order); this
+# is critical so the path rewrite happens BEFORE auth sees the request.
+_DEPRECATED_AGENT_PREFIX_SEEN: set[tuple[str, str]] = set()
 
 
 @app.middleware("http")
@@ -767,6 +783,37 @@ app.add_middleware(
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["Content-Type", "Authorization", "X-API-Key"],
 )
+
+
+# #871 — Registered LAST so it wraps everything else. Starlette runs
+# middleware in reverse registration order, so this is the OUTERMOST
+# middleware: it sees /agent/* before auth, rewrites the scope to the
+# canonical /api/agent/*, dispatches the rest of the stack, and decorates
+# the response with RFC 8594 Deprecation/Sunset/Link headers. Drop this
+# shim alongside the back-compat support window.
+@app.middleware("http")
+async def deprecated_agent_prefix_compat(request: Request, call_next):
+    path = request.url.path
+    if path.startswith("/agent/") or path == "/agent":
+        rewritten = "/api" + path  # /agent/foo -> /api/agent/foo
+        client = request.headers.get("user-agent", "?")
+        key = (path, client)
+        if key not in _DEPRECATED_AGENT_PREFIX_SEEN:
+            _DEPRECATED_AGENT_PREFIX_SEEN.add(key)
+            logger.warning(
+                "deprecated /agent/* prefix used: path=%s ua=%s — migrate to %s (#871)",
+                path,
+                client,
+                rewritten,
+            )
+        request.scope["path"] = rewritten
+        request.scope["raw_path"] = rewritten.encode("utf-8")
+        response = await call_next(request)
+        response.headers["Deprecation"] = "true"
+        response.headers["Sunset"] = "next-release"
+        response.headers["Link"] = f'<{rewritten}>; rel="successor-version"'
+        return response
+    return await call_next(request)
 
 
 if SERVE_UI:

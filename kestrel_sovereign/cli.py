@@ -589,7 +589,7 @@ def _detect_running_agent_server(
     """Probe for a running server that hosts this agent.
 
     Returns ``(base_url, api_key)`` if found — where ``base_url`` is what
-    the shell should POST ``/agent/invoke`` against — or ``None`` if no
+    the shell should POST ``/api/agent/invoke`` against — or ``None`` if no
     server is up for this agent. Caller uses ``None`` to fall back to
     the local in-process shell.
 
@@ -682,7 +682,7 @@ def _run_http_shell(
             if stripped.lower() in _SHELL_EXIT_TOKENS:
                 break
             try:
-                resp = client.post("/agent/invoke", json={"input": user_input})
+                resp = client.post("/api/agent/invoke", json={"input": user_input})
             except httpx.RequestError as e:
                 print(f"\nConnection error: {e}")
                 continue

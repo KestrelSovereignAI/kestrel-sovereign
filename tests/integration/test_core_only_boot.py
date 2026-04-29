@@ -114,7 +114,7 @@ class TestCoreEndpoints:
 
     def test_agent_info_returns_only_core_features(self, client: TestClient):
         """GET /agent/info lists only core features, no disabled ones."""
-        response = client.get("/agent/info")
+        response = client.get("/api/agent/info")
         assert response.status_code == 200
         data = response.json()
 
@@ -188,7 +188,7 @@ class TestPrivacyMode:
 
     def test_get_privacy_mode(self, client: TestClient):
         """GET /agent/privacy-mode returns current mode."""
-        response = client.get("/agent/privacy-mode")
+        response = client.get("/api/agent/privacy-mode")
         assert response.status_code == 200
         data = response.json()
         assert "privacy_mode" in data
@@ -197,14 +197,14 @@ class TestPrivacyMode:
         """Privacy mode can be set to NORMAL and retrieved."""
         # Set to NORMAL
         response = client.post(
-            "/agent/privacy-mode",
+            "/api/agent/privacy-mode",
             headers={"X-Kestrel-Allow-Destructive": "test-rail-bypass"},
 json={"mode": "normal"},
         )
         assert response.status_code == 200
 
         # Retrieve and verify
-        response = client.get("/agent/privacy-mode")
+        response = client.get("/api/agent/privacy-mode")
         assert response.status_code == 200
         data = response.json()
         assert data["privacy_mode"] == "normal"
@@ -212,13 +212,13 @@ json={"mode": "normal"},
     def test_set_ephemeral_mode(self, client: TestClient):
         """Privacy mode can be set to EPHEMERAL."""
         response = client.post(
-            "/agent/privacy-mode",
+            "/api/agent/privacy-mode",
             headers={"X-Kestrel-Allow-Destructive": "test-rail-bypass"},
 json={"mode": "ephemeral"},
         )
         assert response.status_code == 200
 
-        response = client.get("/agent/privacy-mode")
+        response = client.get("/api/agent/privacy-mode")
         assert response.status_code == 200
         data = response.json()
         assert data["privacy_mode"] == "ephemeral"
@@ -226,7 +226,7 @@ json={"mode": "ephemeral"},
     def test_invalid_privacy_mode_rejected(self, client: TestClient):
         """Invalid privacy mode returns 400."""
         response = client.post(
-            "/agent/privacy-mode",
+            "/api/agent/privacy-mode",
             headers={"X-Kestrel-Allow-Destructive": "test-rail-bypass"},
 json={"mode": "invalid_mode"},
         )
@@ -287,7 +287,7 @@ class TestAgentInvoke:
     def test_invoke_returns_response(self, client: TestClient):
         """POST /agent/invoke returns a response from the agent."""
         response = client.post(
-            "/agent/invoke",
+            "/api/agent/invoke",
             json={"input": "Say hello in exactly 3 words."},
         )
         assert response.status_code == 200

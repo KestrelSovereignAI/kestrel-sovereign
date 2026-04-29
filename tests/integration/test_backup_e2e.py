@@ -70,7 +70,7 @@ async def test_backup_local_tier_via_api(async_client: AsyncClient, api_key: str
     assert resp.json()["agent_initialized"] is True
 
     # create local backup
-    resp = await async_client.post("/agent/invoke", json={"input": "!backup tier=local"}, headers=headers)
+    resp = await async_client.post("/api/agent/invoke", json={"input": "!backup tier=local"}, headers=headers)
     assert resp.status_code == 200
     data = resp.json()
     assert "response" in data
@@ -96,15 +96,15 @@ async def test_promote_backup_isolated_flow(async_client: AsyncClient, api_key: 
     headers = {"X-API-Key": api_key}
 
     # switch to isolated mode
-    resp = await async_client.post("/agent/invoke", json={"input": "!privacy isolated"}, headers=headers)
+    resp = await async_client.post("/api/agent/invoke", json={"input": "!privacy isolated"}, headers=headers)
     assert resp.status_code == 200
 
     # add activity in isolated session (use command that doesn't require LLM)
-    resp = await async_client.post("/agent/invoke", json={"input": "!status"}, headers=headers)
+    resp = await async_client.post("/api/agent/invoke", json={"input": "!status"}, headers=headers)
     assert resp.status_code == 200
 
     # promote and back up
-    resp = await async_client.post("/agent/invoke", json={"input": "!promote-backup tier=local"}, headers=headers)
+    resp = await async_client.post("/api/agent/invoke", json={"input": "!promote-backup tier=local"}, headers=headers)
     assert resp.status_code == 200
     data = resp.json()
     assert "Backup created:" in data["response"]

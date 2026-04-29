@@ -26,7 +26,10 @@ logger = logging.getLogger(__name__)
 _sse_connections: dict[tuple[str, str], int] = defaultdict(int)
 _sse_lock = asyncio.Lock()
 
-router = APIRouter(prefix="/agent", tags=["agent"])
+# #871 — every Kestrel HTTP route lives under /api/* now. The deprecated
+# /agent/* prefix is kept working by a thin path-rewrite middleware in
+# server.py for one release.
+router = APIRouter(prefix="/api/agent", tags=["agent"])
 
 # Regex strips invalid JSON escape sequences (e.g. \! from zsh shells)
 _INVALID_JSON_ESCAPE = re.compile(rb'\\([^"\\/bfnrtu])')

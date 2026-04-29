@@ -141,7 +141,7 @@ def test_sse_query_param_auth_reaches_stream_endpoint_and_preserves_400():
     try:
         with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
             with TestClient(app) as client:
-                response = client.post("/agent/stream?api_key=test-key", json={})
+                response = client.post("/api/agent/stream?api_key=test-key", json={})
         assert response.status_code == 400
         assert response.json()["detail"] == "Input not provided."
     finally:
@@ -167,9 +167,9 @@ def test_protected_agent_route_accepts_api_key_and_multi_agent_rewrite_matches()
     try:
         with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
             with TestClient(app) as client:
-                direct_response = client.get("/agent/info", headers={"X-API-Key": "test-key"})
+                direct_response = client.get("/api/agent/info", headers={"X-API-Key": "test-key"})
                 rewritten_response = client.get(
-                    "/api/agents/Claw/agent/info",
+                    "/api/agents/Claw/api/agent/info",
                     headers={"X-API-Key": "test-key"},
                 )
         assert direct_response.status_code == 200
