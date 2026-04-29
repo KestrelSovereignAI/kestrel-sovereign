@@ -198,7 +198,8 @@ class TestPrivacyMode:
         # Set to NORMAL
         response = client.post(
             "/agent/privacy-mode",
-            json={"mode": "normal"},
+            headers={"X-Kestrel-Allow-Destructive": "test-rail-bypass"},
+json={"mode": "normal"},
         )
         assert response.status_code == 200
 
@@ -212,7 +213,8 @@ class TestPrivacyMode:
         """Privacy mode can be set to EPHEMERAL."""
         response = client.post(
             "/agent/privacy-mode",
-            json={"mode": "ephemeral"},
+            headers={"X-Kestrel-Allow-Destructive": "test-rail-bypass"},
+json={"mode": "ephemeral"},
         )
         assert response.status_code == 200
 
@@ -225,7 +227,8 @@ class TestPrivacyMode:
         """Invalid privacy mode returns 400."""
         response = client.post(
             "/agent/privacy-mode",
-            json={"mode": "invalid_mode"},
+            headers={"X-Kestrel-Allow-Destructive": "test-rail-bypass"},
+json={"mode": "invalid_mode"},
         )
         assert response.status_code == 400
 

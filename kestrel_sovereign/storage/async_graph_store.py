@@ -200,46 +200,67 @@ class AsyncGraphStore:
                 (node_id,)
             )
 
-    async def purge_agent_nodes(self, agent_id: str) -> int:
-        """Hard-delete every graph_node tagged with this ``agent_id`` (#767).
+    async def purge_agent_nodes(
+        self, agent_id: str, *, since_iso: Optional[str] = None
+    ) -> int:
+        """Hard-delete graph_nodes tagged with this ``agent_id`` (#767/#867).
 
         EPHEMERAL agents are not supposed to write to ``graph_nodes`` —
         the privacy wrapper rejects persistent writes in that mode. This
         method exists as the safety net for the case where a write
-        slipped through anyway: when the agent leaves EPHEMERAL or its
-        session closes, the ephemeral hard-purge calls in here to clean
-        up any leak.
+        slipped through anyway.
 
         Scoping uses the same JSON-path predicate as the
         ``idx_graph_nodes_agent`` partial index so the DELETE matches a
         live index. Edges are scrubbed too — any edge touching a node
         owned by this agent goes with it.
 
+        Args:
+            agent_id: agent's DID.
+            since_iso: Optional ISO-8601 timestamp.  When provided, only
+                nodes whose ``properties.created_at >= since_iso`` are
+                destroyed — this scopes the EPHEMERAL leak-purge to the
+                rows authored *during* the EPHEMERAL stint and leaves
+                preexisting NORMAL data alone (#867).  When omitted,
+                every node owned by this agent is destroyed (legacy
+                behaviour preserved for restore-from-CAR and explicit
+                administrative wipes).
+
         Returns:
             Number of node rows destroyed. Zero is the happy path; any
-            non-zero value means the privacy layer leaked.
+            non-zero value during a leak-purge means the privacy layer
+            leaked.
         """
         if not agent_id:
             return 0
 
         if self.db.backend_type == "postgres":
             agent_path = "(properties::jsonb->>'agent_id')"
+            created_path = "(properties::jsonb->>'created_at')"
         else:
             agent_path = "json_extract(properties, '$.agent_id')"
+            created_path = "json_extract(properties, '$.created_at')"
+
+        if since_iso:
+            agent_clause = f"({agent_path} = ? AND {created_path} >= ?)"
+            agent_args: tuple = (agent_id, since_iso)
+        else:
+            agent_clause = f"{agent_path} = ?"
+            agent_args = (agent_id,)
 
         async with self.db.transaction():
-            # Wipe edges that touch any node owned by this agent first
+            # Wipe edges that touch any node we're about to remove first
             # (foreign-key-like consistency, even though we don't have
             # FK constraints on these tables).
             await self.db.execute(
                 f"DELETE FROM graph_edges "
-                f"WHERE source_id IN (SELECT node_id FROM graph_nodes WHERE {agent_path} = ?) "
-                f"   OR target_id IN (SELECT node_id FROM graph_nodes WHERE {agent_path} = ?)",
-                (agent_id, agent_id),
+                f"WHERE source_id IN (SELECT node_id FROM graph_nodes WHERE {agent_clause}) "
+                f"   OR target_id IN (SELECT node_id FROM graph_nodes WHERE {agent_clause})",
+                agent_args + agent_args,
             )
             affected = await self.db.execute(
-                f"DELETE FROM graph_nodes WHERE {agent_path} = ?",
-                (agent_id,),
+                f"DELETE FROM graph_nodes WHERE {agent_clause}",
+                agent_args,
             )
         return affected if isinstance(affected, int) else 0
     

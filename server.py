@@ -200,6 +200,28 @@ async def lifespan(app: FastAPI):
     multi_agent_env = os.environ.get("KESTREL_MULTI_AGENT", "").lower() in ("1", "true", "yes")
     rookery_path = Path(os.environ.get("KESTREL_ROOKERY_CONFIG", "rookery.toml"))
 
+    # Demo-server marker (#868) — set by demos/run.sh to make absolutely
+    # sure a demo run can't silently mount the live rookery.  When this
+    # env var is truthy, an existing rookery.toml at the project root is
+    # ignored unless ``KESTREL_ROOKERY_CONFIG`` points at it explicitly.
+    # Without this guard, running ``demos/run.sh`` from the main repo
+    # picked up the project-root ``rookery.toml`` and mounted Meridian /
+    # Claw / Nellie alongside the demo agent — which is the routing
+    # precondition that let the EPHEMERAL-purge wipe through (#867).
+    demo_server_env = os.environ.get("KESTREL_DEMO_SERVER", "").lower() in (
+        "1", "true", "yes"
+    )
+    rookery_explicit = "KESTREL_ROOKERY_CONFIG" in os.environ
+    if demo_server_env and not rookery_explicit and rookery_path.exists():
+        logger.warning(
+            "[demo-server] KESTREL_DEMO_SERVER=1 with no explicit "
+            "KESTREL_ROOKERY_CONFIG — refusing to auto-mount %s.  "
+            "A demo server must not silently load live agents.  Pass "
+            "KESTREL_ROOKERY_CONFIG=<path> explicitly to opt in.",
+            rookery_path,
+        )
+        rookery_path = Path("/dev/null/rookery-disabled")
+
     if multi_agent_env or rookery_path.exists():
         # --- Multi-agent mode ---
         try:

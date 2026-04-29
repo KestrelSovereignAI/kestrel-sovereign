@@ -530,11 +530,68 @@ function escapeHtml(str) {
 
 let selectedAgentName = null;
 
+/**
+ * Render the DEMO MODE banner from the /api/agents response (#868).
+ *
+ * The banner is the browser-side defence against the routing precondition
+ * that let the EPHEMERAL-purge wipe through (#867 root cause): a demo run
+ * silently mounting live agents and the page auto-targeting one of them.
+ *
+ * Three states:
+ *   - `server_demo_mode === true` AND every agent is demo-scoped → green
+ *     "DEMO MODE" pill naming the targeted agent.  Routine demo run.
+ *   - `server_demo_mode === true` AND any agent is NOT demo-scoped → red
+ *     mismatch banner.  This is the bug the rail was added to catch.
+ *   - `server_demo_mode === false` → no banner; production UI looks normal.
+ */
+function renderDemoModeBanner({ serverDemoMode, agents, isStandalone }) {
+    const id = 'demo-mode-banner';
+    document.getElementById(id)?.remove();
+    if (!serverDemoMode) return;
+
+    const target = isStandalone
+        ? agents[0]
+        : agents.find((a) => a.status !== 'offline') || agents[0];
+    const targetName = target?.name || '<no agent>';
+    const liveAgents = agents.filter((a) => a.is_demo !== true).map((a) => a.name);
+    const isMisconfig = liveAgents.length > 0;
+
+    const banner = document.createElement('div');
+    banner.id = id;
+    banner.setAttribute('role', 'status');
+    banner.style.cssText = `
+        position: sticky; top: 0; z-index: 50;
+        padding: 0.5rem 1rem; font-size: 0.8rem; font-weight: 600;
+        font-family: ui-sans-serif, system-ui, sans-serif;
+        display: flex; align-items: center; gap: 0.5rem;
+        ${isMisconfig
+            ? 'background: linear-gradient(90deg, #7f1d1d, #b91c1c); color: white;'
+            : 'background: linear-gradient(90deg, #14532d, #16a34a); color: white;'}
+    `;
+    banner.innerHTML = isMisconfig
+        ? `<span>⛔ DEMO MODE MISCONFIG</span>
+           <span style="opacity:.85; font-weight: 400;">— this server is in demo mode but mounted live agents: ${liveAgents.map(escapeHtml).join(', ')}.  Refusing to auto-select.</span>`
+        : `<span>🧪 DEMO MODE</span>
+           <span style="opacity:.85; font-weight: 400;">— targeting <code>${escapeHtml(targetName)}</code> (is_demo=true).  Production data is not at risk.</span>`;
+
+    document.body.insertBefore(banner, document.body.firstChild);
+}
+
 export async function loadAgents() {
     try {
         const data = await API.getAgents();
         const agents = data.agents || [];
         const isStandalone = data.mode === 'standalone';
+
+        // DEMO MODE banner (#868) — visible warning so an operator notices
+        // when a demo server has somehow mounted a live agent.  Demo mode
+        // is determined server-side at startup (every loaded agent is
+        // demo-scoped); the banner names the agent the page would target.
+        renderDemoModeBanner({
+            serverDemoMode: !!data.server_demo_mode,
+            agents,
+            isStandalone,
+        });
 
         const container = document.getElementById('agents-list');
         if (agents.length === 0) {
