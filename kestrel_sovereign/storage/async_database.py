@@ -61,7 +61,9 @@ CREATE TABLE IF NOT EXISTS conversation_history (
 );
 
 CREATE INDEX IF NOT EXISTS idx_conversation_agent_id ON conversation_history(agent_id);
-CREATE INDEX IF NOT EXISTS idx_conversation_deleted_at ON conversation_history(agent_id, deleted_at);
+-- idx_conversation_deleted_at is created after the deleted_at migration in
+-- _init_schema (#795). Keeping it here would crash on pre-#770 DBs whose
+-- conversation_history doesn't yet have the column.
 
 -- User-assigned conversation titles (issue #716).  Decoupled from
 -- conversation_history so renames are a single-row upsert instead of a
@@ -456,9 +458,12 @@ class AsyncDatabase:
             if statement:
                 await self._backend.execute(statement)
 
-        # Soft-delete migration (#763): add deleted_at to conversation_history
-        # for databases created before soft-delete shipped. Idempotent — does
-        # nothing on fresh databases (column already in CREATE TABLE).
+        # Soft-delete migration (#763): backfill deleted_at on
+        # conversation_history for DBs created before #770. Fresh DBs already
+        # have it from CREATE TABLE. If the ALTER raises, let it propagate:
+        # _init_schema callers should refuse to bring the agent up rather
+        # than start half-broken — every conversation read filters on
+        # `WHERE deleted_at IS NULL` and would fail at runtime (#795).
         await self._migrate_add_column(
             "conversation_history", "deleted_at", "TIMESTAMP DEFAULT NULL"
         )
@@ -472,32 +477,27 @@ class AsyncDatabase:
     async def _migrate_add_column(
         self, table: str, column: str, col_def: str
     ) -> None:
-        """Add a column to an existing table if it isn't already present.
+        """Add a column to an existing table if not already present.
 
-        Idempotent across both backends. Logs the first-time migration
-        so deployments leave a breadcrumb.
+        Idempotent across both backends. Raises on any backend error —
+        callers should let it propagate so the agent fails to boot rather
+        than continuing with a broken schema.
         """
-        try:
-            if self.backend_type == "postgres":
-                await self._backend.execute(
-                    f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {col_def}"
-                )
-            else:
-                row = await self._backend.fetch_one(
-                    f"SELECT COUNT(*) FROM pragma_table_info('{table}') "
-                    f"WHERE name='{column}'"
-                )
-                if row and row[0] == 0:
-                    await self._backend.execute(
-                        f"ALTER TABLE {table} ADD COLUMN {column} {col_def}"
-                    )
-                    logger.info(
-                        f"Migrated {table}: added {column} column"
-                    )
-        except Exception as e:
-            logger.debug(
-                f"Migration check for {table}.{column}: {e}"
+        if self.backend_type == "postgres":
+            await self._backend.execute(
+                f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {col_def}"
             )
+            return
+
+        row = await self._backend.fetch_one(
+            f"SELECT COUNT(*) FROM pragma_table_info('{table}') "
+            f"WHERE name='{column}'"
+        )
+        if row and row[0] == 0:
+            await self._backend.execute(
+                f"ALTER TABLE {table} ADD COLUMN {column} {col_def}"
+            )
+            logger.info(f"Migrated {table}: added {column} column")
     
     # ─────────────────────────────────────────────────────────────────
     # Query methods - delegate to backend
