@@ -236,17 +236,73 @@ class AsyncGraphStore:
 
         if self.db.backend_type == "postgres":
             agent_path = "(properties::jsonb->>'agent_id')"
-            created_path = "(properties::jsonb->>'created_at')"
+            # graph_nodes.properties.created_at is documented as
+            # ``YYYY-MM-DDTHH:MM:SS+00:00`` (ISO with T separator, fixed
+            # offset).  Normalise it to ``YYYY-MM-DD HH:MM:SS`` so it can
+            # be lex-compared against the SQLite-format watermark the
+            # privacy wrapper records.  Without this normalisation the
+            # ``T`` (0x54) sorts AFTER space (0x20) and every same-day
+            # graph row appears strictly greater than the watermark — so
+            # pre-stint nodes get purged.
+            created_normalized = (
+                "to_char(("
+                "  CASE WHEN (properties::jsonb->>'created_at') IS NULL THEN NULL "
+                "       ELSE ((properties::jsonb->>'created_at')::timestamptz) "
+                "  END "
+                ") AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')"
+            )
         else:
             agent_path = "json_extract(properties, '$.agent_id')"
-            created_path = "json_extract(properties, '$.created_at')"
+            # SQLite normalisation: ``T`` → space, then truncate to
+            # ``YYYY-MM-DD HH:MM:SS`` (length 19).  Handles both ISO
+            # (``2026-04-26T16:31:06+00:00``) and SQLite-format (``2026-04-26
+            # 16:31:06``) inputs uniformly.
+            created_normalized = (
+                "substr("
+                "  replace(json_extract(properties, '$.created_at'), 'T', ' '), "
+                "  1, 19"
+                ")"
+            )
 
         if since_iso:
-            agent_clause = f"({agent_path} = ? AND {created_path} >= ?)"
+            # Nodes without a ``created_at`` are excluded from the scoped
+            # purge — we can't prove they're in-window leaks, so we
+            # preserve them rather than risk destroying real preexisting
+            # data.  Operators get a WARNING below if any such nodes
+            # exist for this agent (visible-but-skipped surface).
+            agent_clause = (
+                f"({agent_path} = ? AND {created_normalized} IS NOT NULL "
+                f"AND {created_normalized} >= ?)"
+            )
             agent_args: tuple = (agent_id, since_iso)
         else:
             agent_clause = f"{agent_path} = ?"
             agent_args = (agent_id,)
+
+        # When scoping by since_iso, count nodes for this agent that have
+        # NO created_at — they're skipped by the predicate and we want
+        # operators to see them so they can investigate the missing
+        # provenance.  Cheap row count, scoped to the agent.
+        if since_iso:
+            try:
+                untimed_row = await self.db.fetchone(
+                    f"SELECT COUNT(*) FROM graph_nodes "
+                    f"WHERE {agent_path} = ? "
+                    f"  AND {created_normalized} IS NULL",
+                    (agent_id,),
+                )
+                untimed = int(untimed_row[0]) if untimed_row else 0
+                if untimed > 0:
+                    logger.warning(
+                        "purge_agent_nodes (scoped): %d node(s) for agent=%s "
+                        "have no properties.created_at and were skipped — "
+                        "leak coverage is incomplete for them.  Investigate "
+                        "the writer and stamp created_at going forward.",
+                        untimed, agent_id,
+                    )
+            except Exception:
+                # Pre-flight count is informational only.
+                pass
 
         async with self.db.transaction():
             # Wipe edges that touch any node we're about to remove first

@@ -174,6 +174,104 @@ async def test_watermark_refreshes_on_re_entry(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_graph_nodes_with_iso_timestamps_are_scoped_correctly(tmp_path):
+    """Regression for the format-mismatch bug found in PR review.
+
+    Production graph_nodes store ``properties.created_at`` as
+    ``YYYY-MM-DDTHH:MM:SS+00:00`` (ISO with T separator and offset) per
+    the ``async_graph_store`` module docstring — produced by
+    ``datetime.now(timezone.utc).isoformat()``.  The leak-purge watermark
+    is space-format ``YYYY-MM-DD HH:MM:SS``.  A naive lex compare puts
+    ISO strings strictly after space strings (T > space in ASCII), so
+    every same-day pre-EPHEMERAL graph node would be incorrectly purged
+    against a space-format watermark.
+
+    The fix normalises ``properties.created_at`` server-side before
+    comparing — this test seeds real ISO-format timestamps and proves
+    that pre-stint nodes survive while in-stint leaks are destroyed.
+    """
+    from datetime import datetime, timedelta, timezone
+    from kestrel_sovereign.storage.async_graph_store import GraphNode
+
+    db_path = tmp_path / "kestrel.db"
+    async with AsyncStorage(str(db_path), agent_id=AGENT_ID) as storage:
+        # Pre-stint: a node authored 10 minutes ago in real ISO format.
+        old_ts = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+        await storage.graph.add_node(GraphNode(
+            node_id="pre-stint", node_type="memory", label="from-NORMAL",
+            properties={"agent_id": AGENT_ID, "created_at": old_ts},
+        ))
+
+        wrapper = PrivacyEnforcingStorage(storage, PrivacyMode.NORMAL)
+        wrapper.set_privacy_mode(PrivacyMode.EPHEMERAL)
+
+        await asyncio.sleep(1.05)
+
+        # In-stint leak: ISO timestamp captured AFTER the watermark.
+        leak_ts = datetime.now(timezone.utc).isoformat()
+        await storage.graph.add_node(GraphNode(
+            node_id="in-stint-leak", node_type="memory", label="leaked",
+            properties={"agent_id": AGENT_ID, "created_at": leak_ts},
+        ))
+
+        result = await wrapper.purge_ephemeral_session(reason="test-iso")
+
+    assert result["graph_nodes"] == 1, (
+        f"Only the in-stint leak should be purged from graph_nodes; got "
+        f"{result['graph_nodes']}.  Pre-stint ISO-format nodes must "
+        f"normalise correctly against the space-format watermark."
+    )
+
+    # Confirm the pre-stint node is still in the DB.
+    async with AsyncStorage(str(db_path), agent_id=AGENT_ID) as storage:
+        survivor = await storage.graph.get_node("pre-stint")
+        assert survivor is not None, (
+            "Pre-stint NORMAL graph node was destroyed — this is the "
+            "T-vs-space lex bug the fix exists to prevent."
+        )
+        gone = await storage.graph.get_node("in-stint-leak")
+        assert gone is None
+
+
+@pytest.mark.asyncio
+async def test_graph_nodes_without_created_at_are_skipped_with_warning(tmp_path, caplog):
+    """Conservative coverage: nodes without ``created_at`` can't be proven
+    in-window, so they survive — but the operator gets a WARNING with
+    the count so the missing provenance can be investigated."""
+    import logging as _logging
+    from kestrel_sovereign.storage.async_graph_store import GraphNode
+
+    db_path = tmp_path / "kestrel.db"
+    async with AsyncStorage(str(db_path), agent_id=AGENT_ID) as storage:
+        # Node with no created_at (matches some legacy writers).
+        await storage.graph.add_node(GraphNode(
+            node_id="legacy", node_type="memory", label="no-timestamp",
+            properties={"agent_id": AGENT_ID},
+        ))
+
+        wrapper = PrivacyEnforcingStorage(storage, PrivacyMode.NORMAL)
+        wrapper.set_privacy_mode(PrivacyMode.EPHEMERAL)
+        await asyncio.sleep(1.05)
+
+        with caplog.at_level(_logging.WARNING, logger="kestrel_sovereign.storage.async_graph_store"):
+            result = await wrapper.purge_ephemeral_session(reason="test-untimed")
+
+    assert result["graph_nodes"] == 0, (
+        "Untimestamped nodes are preserved by the scoped purge — data "
+        "preservation wins over leak coverage when provenance is missing."
+    )
+    assert any(
+        "have no properties.created_at" in rec.message for rec in caplog.records
+    ), (
+        "Operators must see a WARNING listing the count of skipped nodes."
+    )
+
+    async with AsyncStorage(str(db_path), agent_id=AGENT_ID) as storage:
+        survivor = await storage.graph.get_node("legacy")
+        assert survivor is not None
+
+
+@pytest.mark.asyncio
 async def test_other_agents_data_untouched(tmp_path):
     """Per-agent scoping (a holdover from #767) still holds — the scoped
     purge must not touch rows owned by other agents that share the DB.

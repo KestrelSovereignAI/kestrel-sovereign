@@ -621,8 +621,20 @@ export async function loadAgents() {
             container.appendChild(item);
         }
 
+        // Demo-server misconfig (#868): a server in demo_mode that mounted
+        // any non-demo agent is the routing precondition that wiped
+        // Meridian.  The banner already names the bad state — but words
+        // alone aren't enough; the page MUST also refuse to install a
+        // host-agent prefix, otherwise every subsequent UI click still
+        // routes to whichever agent ``selectAgent`` would have picked.
+        const hasLiveAgent = (data.server_demo_mode === true) && agents.some(
+            (a) => a.is_demo !== true,
+        );
+
         // Auto-select first online agent only in rookery mode (not standalone)
-        if (!selectedAgentName && !isStandalone) {
+        // and never when the demo server is in misconfig — the banner
+        // explicitly tells the operator the auto-select is disabled.
+        if (!selectedAgentName && !isStandalone && !hasLiveAgent) {
             const firstOnline = agents.find(a => a.status !== 'offline');
             if (firstOnline) {
                 window.selectAgent(firstOnline.name);
@@ -635,7 +647,8 @@ export async function loadAgents() {
         // it in standalone produces 404s for /api/conversations and /agent/invoke.
         // Standalone has exactly one agent, so just show the pane and let
         // loadConversations() populate the list against the un-prefixed routes.
-        if (isStandalone && agents.length > 0) {
+        // Skip in misconfig — the agent list is not safe to auto-target.
+        if (isStandalone && agents.length > 0 && !hasLiveAgent) {
             const conversationsPane = document.getElementById('conversations-pane');
             if (conversationsPane) conversationsPane.style.display = 'flex';
             try { await loadConversations(agents[0].name); } catch (_) { /* best-effort */ }
