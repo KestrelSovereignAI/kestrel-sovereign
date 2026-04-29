@@ -5,7 +5,7 @@
 
 import API from './api.js';
 import { state, PRIVACY_MODES, Toast, loadCommands } from './ui.js';
-import { disconnectNotifications, connectNotifications, loadModels, updateContextStatus } from './chat.js';
+import { disconnectNotifications, connectNotifications, loadModels, updateContextStatus, updateThinkingIndicator, bumpUiGeneration } from './chat.js';
 import { generateIdenticon } from './identicon.js';
 import { trashGroupKey, groupTrashBySession } from './trash_grouping.js';
 
@@ -664,6 +664,20 @@ window.selectAgent = async function(agentName) {
 
     // Set host agent routing in API layer
     API.setHostAgent(agentName);
+
+    // Bump the chat UI generation BEFORE we wipe `chatContainer` below.
+    // Any in-flight stream that captured the prior generation at dispatch
+    // time will treat its UI as stale from this point on and won't paint
+    // the about-to-be-rebuilt pane (covers the A→B→A timing case where
+    // agent equality is restored but the pane was wiped twice).
+    bumpUiGeneration();
+
+    // Refresh the chat-input "Thinking…" indicator + send/input disabled
+    // state from the new agent's waiting status. If the previous agent
+    // was mid-stream, its indicator stays in `state.waitingAgents` for
+    // its own bookkeeping but only the *current* agent's status is
+    // reflected in the UI.
+    updateThinkingIndicator();
 
     // Update selection UI
     document.querySelectorAll('.agent-item').forEach(item => {

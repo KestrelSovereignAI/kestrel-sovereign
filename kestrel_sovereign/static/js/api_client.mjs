@@ -215,8 +215,12 @@ export function createApiClient({
 
     const state = {
         selectedHostAgent: null,
-        streamAbortController: null,
-        currentStreamRequestId: null,
+        // Per-agent stream bookkeeping. Keyed by host-agent name (null key
+        // for standalone mode). Was a single slot, which clobbered Agent A's
+        // controller when a second stream started on Agent B and made the
+        // Stop button target the wrong stream.
+        streamAbortControllers: new Map(),
+        currentStreamRequestIds: new Map(),
     };
 
     const client = {
@@ -381,20 +385,30 @@ export function createApiClient({
             const queryString = params.toString();
             return client.request(`/api/models${queryString ? `?${queryString}` : ''}`);
         },
-        getStreamAbortController() {
-            return state.streamAbortController;
+        getStreamAbortController(agent) {
+            // Default to the current host agent so existing single-agent
+            // call sites keep working unchanged.
+            const key = agent === undefined ? state.selectedHostAgent : agent;
+            return state.streamAbortControllers.get(key) || null;
         },
-        getCurrentStreamRequestId() {
-            return state.currentStreamRequestId;
+        getCurrentStreamRequestId(agent) {
+            const key = agent === undefined ? state.selectedHostAgent : agent;
+            return state.currentStreamRequestIds.get(key) || null;
         },
         async *streamInvoke(input, model = null, sessionId = null, provider = null, retried = false) {
+            // Capture the dispatch agent BEFORE any await so an async auth
+            // provider can't let the user switch agents between header
+            // construction and URL build — without this, headers/URL/state
+            // could end up referring to different agents.
+            const dispatchAgent = state.selectedHostAgent;
+            const controller = new AbortCtor();
+            const signal = controller.signal;
+            state.streamAbortControllers.set(dispatchAgent, controller);
+
             const headers = await buildHeaders({ 'Content-Type': 'application/json' });
 
-            state.streamAbortController = new AbortCtor();
-            const signal = state.streamAbortController.signal;
-
             try {
-                const url = applyHostAgentPrefix('/api/agent/stream', state.selectedHostAgent);
+                const url = applyHostAgentPrefix('/api/agent/stream', dispatchAgent);
                 const response = await fetchImpl(url, {
                     method: 'POST',
                     headers,
@@ -415,7 +429,7 @@ export function createApiClient({
                 }
 
                 if (!response.ok) throw new Error(`HTTP ${response.status}`);
-                state.currentStreamRequestId = response.headers.get('X-Request-ID');
+                state.currentStreamRequestIds.set(dispatchAgent, response.headers.get('X-Request-ID'));
                 const reader = response.body.getReader();
                 const decoder = new DecoderCtor();
 
@@ -435,8 +449,12 @@ export function createApiClient({
                 }
                 throw error;
             } finally {
-                state.streamAbortController = null;
-                state.currentStreamRequestId = null;
+                // Clear only this dispatch's slot — never the *current* agent's,
+                // which may belong to a different in-flight stream.
+                if (state.streamAbortControllers.get(dispatchAgent) === controller) {
+                    state.streamAbortControllers.delete(dispatchAgent);
+                }
+                state.currentStreamRequestIds.delete(dispatchAgent);
             }
         },
         getApiKey() {
