@@ -110,22 +110,22 @@ class TestOpenRouterToolCalling:
             check_openrouter_response(response)
             data = response.json()
 
-            # Check if tool calls are in response
             assert "choices" in data
             choice = data["choices"][0]
             message = choice["message"]
 
-            # DeepSeek should call the get_weather tool
-            if message.get("tool_calls"):
-                tool_calls = message["tool_calls"]
-                assert len(tool_calls) >= 1
-                assert tool_calls[0]["function"]["name"] == "get_weather"
-                args = json.loads(tool_calls[0]["function"]["arguments"])
-                assert "tokyo" in args.get("location", "").lower()
-                print(f"✅ DeepSeek tool call: {tool_calls[0]}")
-            else:
-                # Some models might not support tools - that's informative
-                print(f"⚠️ DeepSeek did not use tool calling, responded with: {message.get('content', '')[:100]}")
+            tool_calls = message.get("tool_calls") or []
+            assert tool_calls, (
+                "DeepSeek emitted no tool_calls for an explicit tool-routing prompt. "
+                f"This is the regression this test exists to catch. message={message!r}"
+            )
+            assert tool_calls[0]["function"]["name"] == "get_weather", (
+                f"Expected get_weather, got {tool_calls[0]['function']['name']!r}"
+            )
+            args = json.loads(tool_calls[0]["function"]["arguments"])
+            assert "tokyo" in (args.get("location") or "").lower(), (
+                f"get_weather called with wrong location: {args!r}"
+            )
 
     @pytest.mark.asyncio
     async def test_tool_calling_claude_via_openrouter(self):
@@ -158,13 +158,14 @@ class TestOpenRouterToolCalling:
             choice = data["choices"][0]
             message = choice["message"]
 
-            if message.get("tool_calls"):
-                tool_calls = message["tool_calls"]
-                assert len(tool_calls) >= 1
-                assert tool_calls[0]["function"]["name"] == "get_weather"
-                print(f"✅ Claude tool call: {tool_calls[0]}")
-            else:
-                print(f"⚠️ Claude did not use tool calling")
+            tool_calls = message.get("tool_calls") or []
+            assert tool_calls, (
+                "Claude (via OpenRouter) emitted no tool_calls for an explicit "
+                f"tool-routing prompt. message={message!r}"
+            )
+            assert tool_calls[0]["function"]["name"] == "get_weather", (
+                f"Expected get_weather, got {tool_calls[0]['function']['name']!r}"
+            )
 
     @pytest.mark.asyncio
     async def test_multiple_parallel_tool_calls(self):
@@ -195,15 +196,27 @@ class TestOpenRouterToolCalling:
             data = response.json()
             message = data["choices"][0]["message"]
 
-            if message.get("tool_calls"):
-                tool_calls = message["tool_calls"]
-                tool_names = [tc["function"]["name"] for tc in tool_calls]
-                print(f"✅ Parallel tool calls: {tool_names}")
-                # Check if both tools were called
-                if len(tool_calls) >= 2:
-                    assert "get_weather" in tool_names or "search_web" in tool_names
-            else:
-                print(f"⚠️ Model did not use parallel tool calls")
+            tool_calls = message.get("tool_calls") or []
+            assert tool_calls, (
+                "Model emitted no tool_calls when asked to use both weather and "
+                f"web-search tools. message={message!r}"
+            )
+
+            tool_names = [tc["function"]["name"] for tc in tool_calls]
+            assert {"get_weather", "search_web"} & set(tool_names), (
+                f"Expected at least one of get_weather/search_web, got {tool_names!r}"
+            )
+
+            if len(tool_calls) < 2:
+                pytest.xfail(
+                    "Model returned a single tool call instead of parallel calls. "
+                    "Parallel tool-calling is provider/model-dependent and tracked "
+                    f"via xfail to keep regressions visible. tool_names={tool_names!r}"
+                )
+
+            assert {"get_weather", "search_web"}.issubset(set(tool_names)), (
+                f"Parallel call returned but not the expected pair: {tool_names!r}"
+            )
 
 
 # =============================================================================
@@ -305,9 +318,20 @@ class TestOpenRouterStreaming:
 
         print(f"✅ Streaming: {len(chunks_received)} text chunks, {len(tool_calls_detected)} tool call deltas")
 
-        # Either text or tool calls should be received
-        assert len(chunks_received) > 0 or len(tool_calls_detected) > 0, \
-            "Should receive either text chunks or tool call deltas"
+        assert tool_calls_detected, (
+            "Streaming-with-tools must emit tool_call deltas when the prompt asks "
+            "for a weather lookup; text-only streaming would mean the streaming "
+            "tool-calling path silently regressed. "
+            f"text_chunks={len(chunks_received)}, tool_call_deltas=0"
+        )
+        names_seen = {
+            (delta.get("function") or {}).get("name")
+            for delta in tool_calls_detected
+            if (delta.get("function") or {}).get("name")
+        }
+        assert "get_weather" in names_seen, (
+            f"Expected get_weather among streamed tool deltas, got {names_seen!r}"
+        )
 
 
 # =============================================================================
@@ -440,13 +464,20 @@ class TestOpenRouterStructuredOutput:
             data = response.json()
             content = data["choices"][0]["message"]["content"]
 
-            # Try to parse as JSON
+            assert content, "JSON mode returned empty content"
             try:
                 parsed = json.loads(content)
-                print(f"✅ JSON mode returned valid JSON: {type(parsed)}")
-                assert isinstance(parsed, (dict, list))
-            except json.JSONDecodeError:
-                print(f"⚠️ Response not valid JSON: {content[:100]}")
+            except json.JSONDecodeError as exc:
+                raise AssertionError(
+                    "JSON mode returned non-parseable content. The only meaningful "
+                    f"contract for response_format=json_object is parseable JSON. "
+                    f"error={exc}; content={content[:300]!r}"
+                ) from exc
+
+            assert isinstance(parsed, (dict, list)), (
+                f"JSON mode returned a primitive ({type(parsed).__name__}), "
+                f"expected object or array: {parsed!r}"
+            )
 
 
 # =============================================================================
@@ -478,13 +509,17 @@ class TestOpenRouterViaLLMService:
 
         print(f"✅ LLMService response type: {type(response)}")
 
-        if hasattr(response, 'has_tool_calls') and response.has_tool_calls:
-            print(f"✅ Tool calls via LLMService: {response.tool_calls}")
-            assert any(tc.name == "get_weather" for tc in response.tool_calls)
-        elif hasattr(response, 'content'):
-            print(f"⚠️ LLMService returned content instead of tool calls: {response.content[:100]}")
-        else:
-            print(f"⚠️ Response: {response}")
+        assert hasattr(response, "has_tool_calls"), (
+            f"LLMService returned an object without has_tool_calls: {response!r}"
+        )
+        assert response.has_tool_calls, (
+            "LLMService routed an explicit tool prompt through OpenRouter but "
+            f"produced no tool_calls. content={getattr(response, 'content', None)!r}"
+        )
+        names = [getattr(tc, "name", None) for tc in response.tool_calls]
+        assert "get_weather" in names, (
+            f"Expected get_weather in LLMService tool_calls, got {names!r}"
+        )
 
     @pytest.mark.asyncio
     async def test_llm_service_streaming_via_openrouter(self):
