@@ -180,10 +180,11 @@ export async function createRealtimeClient({
     if (session) throw new Error('Realtime client already started');
 
     // 1. Mint session from backend. Auth headers come from `getAuthHeaders`
-    // so the voice UI shell can wire in `API.getApiKey()` (or a JWT) the same
-    // way every other Kestrel endpoint authenticates. Without this the
-    // request gets a 401 against any server with auth enabled.
-    const authHeaders = getAuthHeaders() || {};
+    // so the voice UI shell can wire in `API.applyAuth({})` (which honors
+    // whatever provider is active — API key, JWT, OAuth) the same way every
+    // other Kestrel endpoint authenticates. Without this the request gets a
+    // 401 against any server with auth enabled.
+    const authHeaders = (await getAuthHeaders()) || {};
     const resp = await fetch(endpoint, {
       method: 'POST',
       headers: {
