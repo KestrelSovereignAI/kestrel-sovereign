@@ -314,10 +314,17 @@ class ModelCatalogService:
         if override:
             model.display_name = override
 
-        # Context limit override
-        context_limit = self.get_context_limit(model.id)
-        if context_limit is not None:
-            model.context_limit = context_limit
+        # Context limit: catalog is a fallback for providers that don't
+        # report a context window (per the [context_limits_override] section
+        # header). When discovery DID return a value, trust it — provider
+        # APIs are the source of truth, the catalog is the offline safety
+        # net. Without this guard, stale catalog entries silently demote a
+        # real 1M-window model to whatever the TOML says when the vendor
+        # quietly expanded the window.
+        if model.context_limit is None:
+            context_limit = self.get_context_limit(model.id)
+            if context_limit is not None:
+                model.context_limit = context_limit
 
         # Tool support override
         tool_support = self.get_tool_support(model.id)
