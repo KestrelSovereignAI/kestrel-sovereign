@@ -76,13 +76,16 @@ echo "[demo-runner] Creating fresh demo agent DB at $DEMO_DB ..."
 uv run python scripts/setup_demo_agent.py
 
 echo "[demo-runner] Starting isolated server on $DEMO_URL (DB=$DEMO_DB) ..."
-# Force standalone mode — point KESTREL_ROOKERY_CONFIG at a path that doesn't
-# exist so the server skips rookery loading.  Without this, server.py:201
-# auto-loads rookery.toml from the project root, which mounts every sibling
-# agent (Meridian, Claw, Nellie) alongside the demo agent and breaks
-# isolation.  See post-merge demo runs that surfaced this.
+# Force standalone mode — both belt AND braces for #868:
+#   * KESTREL_ROOKERY_CONFIG points at a non-existent path so the server
+#     skips rookery loading.  Without this, server.py:201 auto-loads
+#     rookery.toml from the project root and mounts every sibling agent
+#     (Meridian, Claw, Nellie) alongside the demo agent.
+#   * KESTREL_DEMO_SERVER=1 makes server.py refuse the auto-load even if
+#     someone removes the explicit KESTREL_ROOKERY_CONFIG line above.
 KESTREL_DB_PATH="$DEMO_DB" \
 KESTREL_ROOKERY_CONFIG="$DEMO_DB/rookery-disabled.toml" \
+KESTREL_DEMO_SERVER=1 \
     uv run uvicorn server:app --host 127.0.0.1 --port "$DEMO_PORT" \
     > "$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
@@ -123,6 +126,40 @@ if ! curl -sS -o /dev/null -w "%{http_code}" "$DEMO_URL/health" 2>/dev/null | gr
   tail -50 "$SERVER_LOG" >&2
   exit 1
 fi
+
+# Sanity-check (#868 acceptance criterion #3) — abort startup if the demo
+# server somehow reports a non-demo agent.  The two upstream defences
+# (KESTREL_ROOKERY_CONFIG override + KESTREL_DEMO_SERVER=1) should make
+# this unreachable in practice, but the cost of a false negative is
+# wiping a live agent — so we re-check at the boundary.
+echo "[demo-runner] Verifying every loaded agent is is_demo=true ..."
+AGENTS_JSON="$(curl -sS "$DEMO_URL/api/agents" || true)"
+LIVE_AGENTS="$(printf '%s' "$AGENTS_JSON" | python3 -c "
+import json, sys
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    print('!!parse-error', end='')
+    sys.exit(0)
+live = [a.get('name') or a.get('id') or '<unnamed>' for a in (data.get('agents') or []) if a.get('is_demo') is not True]
+print(','.join(live), end='')
+")"
+case "$LIVE_AGENTS" in
+  '!!parse-error')
+    echo "[demo-runner] Could not parse /api/agents response — refusing to run." >&2
+    echo "$AGENTS_JSON" | head -c 400 >&2
+    echo "" >&2
+    exit 1
+    ;;
+  '')
+    : # all agents are demo-scoped, proceed
+    ;;
+  *)
+    echo "[demo-runner] Refusing to run: server reports non-demo agent(s) — $LIVE_AGENTS" >&2
+    echo "[demo-runner] This is the routing precondition that wiped Meridian (#867/#868)." >&2
+    exit 1
+    ;;
+esac
 
 echo "[demo-runner] Running demos/$DEMO ..."
 cd "demos/$DEMO"

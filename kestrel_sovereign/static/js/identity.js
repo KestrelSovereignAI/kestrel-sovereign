@@ -530,11 +530,68 @@ function escapeHtml(str) {
 
 let selectedAgentName = null;
 
+/**
+ * Render the DEMO MODE banner from the /api/agents response (#868).
+ *
+ * The banner is the browser-side defence against the routing precondition
+ * that let the EPHEMERAL-purge wipe through (#867 root cause): a demo run
+ * silently mounting live agents and the page auto-targeting one of them.
+ *
+ * Three states:
+ *   - `server_demo_mode === true` AND every agent is demo-scoped → green
+ *     "DEMO MODE" pill naming the targeted agent.  Routine demo run.
+ *   - `server_demo_mode === true` AND any agent is NOT demo-scoped → red
+ *     mismatch banner.  This is the bug the rail was added to catch.
+ *   - `server_demo_mode === false` → no banner; production UI looks normal.
+ */
+function renderDemoModeBanner({ serverDemoMode, agents, isStandalone }) {
+    const id = 'demo-mode-banner';
+    document.getElementById(id)?.remove();
+    if (!serverDemoMode) return;
+
+    const target = isStandalone
+        ? agents[0]
+        : agents.find((a) => a.status !== 'offline') || agents[0];
+    const targetName = target?.name || '<no agent>';
+    const liveAgents = agents.filter((a) => a.is_demo !== true).map((a) => a.name);
+    const isMisconfig = liveAgents.length > 0;
+
+    const banner = document.createElement('div');
+    banner.id = id;
+    banner.setAttribute('role', 'status');
+    banner.style.cssText = `
+        position: sticky; top: 0; z-index: 50;
+        padding: 0.5rem 1rem; font-size: 0.8rem; font-weight: 600;
+        font-family: ui-sans-serif, system-ui, sans-serif;
+        display: flex; align-items: center; gap: 0.5rem;
+        ${isMisconfig
+            ? 'background: linear-gradient(90deg, #7f1d1d, #b91c1c); color: white;'
+            : 'background: linear-gradient(90deg, #14532d, #16a34a); color: white;'}
+    `;
+    banner.innerHTML = isMisconfig
+        ? `<span>⛔ DEMO MODE MISCONFIG</span>
+           <span style="opacity:.85; font-weight: 400;">— this server is in demo mode but mounted live agents: ${liveAgents.map(escapeHtml).join(', ')}.  Refusing to auto-select.</span>`
+        : `<span>🧪 DEMO MODE</span>
+           <span style="opacity:.85; font-weight: 400;">— targeting <code>${escapeHtml(targetName)}</code> (is_demo=true).  Production data is not at risk.</span>`;
+
+    document.body.insertBefore(banner, document.body.firstChild);
+}
+
 export async function loadAgents() {
     try {
         const data = await API.getAgents();
         const agents = data.agents || [];
         const isStandalone = data.mode === 'standalone';
+
+        // DEMO MODE banner (#868) — visible warning so an operator notices
+        // when a demo server has somehow mounted a live agent.  Demo mode
+        // is determined server-side at startup (every loaded agent is
+        // demo-scoped); the banner names the agent the page would target.
+        renderDemoModeBanner({
+            serverDemoMode: !!data.server_demo_mode,
+            agents,
+            isStandalone,
+        });
 
         const container = document.getElementById('agents-list');
         if (agents.length === 0) {
@@ -564,8 +621,20 @@ export async function loadAgents() {
             container.appendChild(item);
         }
 
+        // Demo-server misconfig (#868): a server in demo_mode that mounted
+        // any non-demo agent is the routing precondition that wiped
+        // Meridian.  The banner already names the bad state — but words
+        // alone aren't enough; the page MUST also refuse to install a
+        // host-agent prefix, otherwise every subsequent UI click still
+        // routes to whichever agent ``selectAgent`` would have picked.
+        const hasLiveAgent = (data.server_demo_mode === true) && agents.some(
+            (a) => a.is_demo !== true,
+        );
+
         // Auto-select first online agent only in rookery mode (not standalone)
-        if (!selectedAgentName && !isStandalone) {
+        // and never when the demo server is in misconfig — the banner
+        // explicitly tells the operator the auto-select is disabled.
+        if (!selectedAgentName && !isStandalone && !hasLiveAgent) {
             const firstOnline = agents.find(a => a.status !== 'offline');
             if (firstOnline) {
                 window.selectAgent(firstOnline.name);
@@ -578,7 +647,8 @@ export async function loadAgents() {
         // it in standalone produces 404s for /api/conversations and /agent/invoke.
         // Standalone has exactly one agent, so just show the pane and let
         // loadConversations() populate the list against the un-prefixed routes.
-        if (isStandalone && agents.length > 0) {
+        // Skip in misconfig — the agent list is not safe to auto-target.
+        if (isStandalone && agents.length > 0 && !hasLiveAgent) {
             const conversationsPane = document.getElementById('conversations-pane');
             if (conversationsPane) conversationsPane.style.display = 'flex';
             try { await loadConversations(agents[0].name); } catch (_) { /* best-effort */ }

@@ -407,7 +407,8 @@ class TestPrivacyModeAPI:
         # Set to ISOLATED
         response = client.post(
             "/agent/privacy-mode",
-            json={"mode": "ISOLATED"}
+            headers={"X-Kestrel-Allow-Destructive": "test-rail-bypass"},
+json={"mode": "ISOLATED"}
         )
         assert response.status_code == 200
 
@@ -419,7 +420,8 @@ class TestPrivacyModeAPI:
         """Setting invalid privacy mode returns error."""
         response = client.post(
             "/agent/privacy-mode",
-            json={"mode": "INVALID_MODE"}
+            headers={"X-Kestrel-Allow-Destructive": "test-rail-bypass"},
+json={"mode": "INVALID_MODE"}
         )
 
         # Should fail

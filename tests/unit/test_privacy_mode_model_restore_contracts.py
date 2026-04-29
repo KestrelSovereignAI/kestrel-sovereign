@@ -94,12 +94,12 @@ def test_privacy_mode_restores_default_cloud_model_after_local_only_transition()
             with TestClient(app) as client:
                 isolated_response = client.post(
                     "/agent/privacy-mode",
-                    headers={"X-API-Key": "test-key"},
+                    headers={"X-API-Key": "test-key", "X-Kestrel-Allow-Destructive": "test-rail-bypass"},
                     json={"mode": "isolated"},
                 )
                 normal_response = client.post(
                     "/agent/privacy-mode",
-                    headers={"X-API-Key": "test-key"},
+                    headers={"X-API-Key": "test-key", "X-Kestrel-Allow-Destructive": "test-rail-bypass"},
                     json={"mode": "normal"},
                 )
         assert isolated_response.status_code == 200
@@ -136,12 +136,12 @@ def test_privacy_mode_restores_explicit_cloud_preference_after_local_only_transi
             with TestClient(app) as client:
                 client.post(
                     "/agent/privacy-mode",
-                    headers={"X-API-Key": "test-key"},
+                    headers={"X-API-Key": "test-key", "X-Kestrel-Allow-Destructive": "test-rail-bypass"},
                     json={"mode": "isolated"},
                 )
                 response = client.post(
                     "/agent/privacy-mode",
-                    headers={"X-API-Key": "test-key"},
+                    headers={"X-API-Key": "test-key", "X-Kestrel-Allow-Destructive": "test-rail-bypass"},
                     json={"mode": "normal"},
                 )
         assert response.status_code == 200
