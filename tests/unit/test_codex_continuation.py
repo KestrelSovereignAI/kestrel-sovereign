@@ -381,6 +381,133 @@ class TestCodexCursorRecordingE2E:
             f"function_call_output.call_id={fco_call_id!r}"
         )
 
+    async def test_stale_cache_call_ids_do_not_leak_into_new_loop(self):
+        # #875 regression. Cache holds fc(call_STALE) from a prior agent
+        # loop. The new loop's orchestrator emits assistant.tool_calls with
+        # call_id=call_NEW. The converter must emit fc(call_NEW) (synthesized
+        # from message — id-match cache miss path), NOT fc(call_STALE).
+        # Pre-fix: positional replay injected fc(call_STALE) regardless,
+        # producing fc(STALE)+fco(NEW) orphan pair → 400 on the wire.
+        from kestrel_sovereign.llm.codex_adapter import (
+            _compute_request_signature, _convert_tools_to_responses_format,
+        )
+        from kestrel_sovereign.llm.continuation_store import ContinuationCursor
+
+        captured: List[Dict[str, Any]] = []
+        adapter = CodexAdapter(continuation_store=InMemoryContinuationStore())
+
+        # Pre-populate cache as if a prior loop ended.
+        tools = [{
+            "type": "function",
+            "function": {"name": "tool_a", "description": "", "parameters": {}},
+        }]
+        sig = _compute_request_signature("sys", _convert_tools_to_responses_format(tools))
+        adapter._continuation_store.put(
+            "openai_plan", "conv-stale",
+            ContinuationCursor(
+                last_response_id="resp_prior",
+                last_message_count=1,
+                last_request_signature=sig,
+                turn_outputs=(json.dumps([{
+                    "type": "function_call",
+                    "id": "fc_STALE",
+                    "call_id": "call_STALE",
+                    "name": "tool_a",
+                    "arguments": "{}",
+                }]),),
+            ),
+        )
+
+        sse = _sse([_completed_event("resp_new")])
+        with _patch_httpx_with(captured, sse):
+            await adapter.get_response(
+                client=_fake_token(),
+                model="gpt-5.5",
+                messages=[
+                    {"role": "system", "content": "sys"},
+                    {"role": "user", "content": "hi"},
+                    {
+                        "role": "assistant", "content": "",
+                        "tool_calls": [{
+                            "id": "call_NEW",
+                            "type": "function",
+                            "function": {"name": "tool_a", "arguments": "{}"},
+                        }],
+                    },
+                    {"role": "tool", "tool_call_id": "call_NEW", "content": "result"},
+                ],
+                tools=tools,
+                session_id="conv-stale",
+            )
+
+        body = captured[0]
+        fcs = [it for it in body["input"] if it.get("type") == "function_call"]
+        assert len(fcs) == 1, f"Expected exactly one function_call, got {fcs}"
+        assert fcs[0]["call_id"] == "call_NEW"
+        # No stale call_id leaked from the cache.
+        assert all(it.get("call_id") != "call_STALE" for it in body["input"]), (
+            f"Stale cached call_STALE leaked into the new loop: {body['input']}"
+        )
+
+    async def test_fresh_agent_loop_clears_stale_cache(self):
+        # #875 secondary fix. When the input has no assistant.tool_calls
+        # (= start of a new agent loop after a prior conversation), the
+        # cache is cleared so it doesn't grow unboundedly and stale entries
+        # can't leak via id-match either.
+        from kestrel_sovereign.llm.codex_adapter import _compute_request_signature
+        from kestrel_sovereign.llm.continuation_store import ContinuationCursor
+
+        captured: List[Dict[str, Any]] = []
+        adapter = CodexAdapter(continuation_store=InMemoryContinuationStore())
+
+        sig = _compute_request_signature("sys", None)
+        adapter._continuation_store.put(
+            "openai_plan", "conv-fresh",
+            ContinuationCursor(
+                last_response_id="resp_prior",
+                last_message_count=1,
+                last_request_signature=sig,
+                turn_outputs=(json.dumps([
+                    {"type": "reasoning", "id": "rs_OLD", "encrypted_content": "OLD", "summary": []},
+                    {"type": "function_call", "id": "fc_OLD", "call_id": "call_OLD",
+                     "name": "x", "arguments": "{}"},
+                ]),),
+            ),
+        )
+
+        sse = _sse([
+            {"type": "response.output_text.delta", "delta": "ok"},
+            {
+                "type": "response.output_item.done",
+                "item": {"type": "message", "id": "msg_NEW", "role": "assistant"},
+            },
+            _completed_event("resp_new"),
+        ])
+        with _patch_httpx_with(captured, sse):
+            await adapter.get_response(
+                client=_fake_token(),
+                model="gpt-5.5",
+                messages=[
+                    {"role": "system", "content": "sys"},
+                    {"role": "user", "content": "Fresh user message."},
+                ],
+                session_id="conv-fresh",
+            )
+
+        body = captured[0]
+        # No stale reasoning/function_call leaked into the body.
+        assert all(
+            it.get("type") not in ("reasoning", "function_call") for it in body["input"]
+        ), f"Stale cache leaked: {body['input']}"
+        # Cache was cleared, then turn 1 of the new loop was recorded fresh.
+        cursor = adapter._continuation_store.get("openai_plan", "conv-fresh")
+        assert len(cursor.turn_outputs) == 1
+        new_outputs = json.loads(cursor.turn_outputs[0])
+        # OLD entries are not in the new turn's outputs.
+        assert all(it.get("id") not in {"rs_OLD", "fc_OLD"} for it in new_outputs)
+        # The fresh turn captured the new message item.
+        assert any(it.get("id") == "msg_NEW" for it in new_outputs)
+
     async def test_signature_drift_drops_cached_reasoning(self):
         # If instructions or tools change mid-conversation, cached reasoning
         # was conditioned on a different prompt and must NOT be replayed —

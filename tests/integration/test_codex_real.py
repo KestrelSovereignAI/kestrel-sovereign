@@ -339,76 +339,135 @@ async def test_codex_tool_call_with_session_id_real_api():
 
 
 @pytest.mark.asyncio
-async def test_codex_reasoning_replay_real_api():
-    """Reasoning items captured from T1 must round-trip cleanly when replayed
-    as input on T2 — the alternative to ``previous_response_id`` for
-    preserving GPT-5's encrypted chain-of-thought (#842).
+async def test_codex_two_separate_agent_loops_share_session_real_api():
+    """The user's #875 production scenario: two independent agent loops on
+    the same ``session_id``. Loop 1 ends; the orchestrator's storage keeps
+    the final assistant text only (no tool/tool_call messages). Loop 2
+    starts with a fresh user message and a fresh tool exchange.
 
-    Uses a multi-step problem (without tools) that reliably triggers
-    ``reasoning`` items on GPT-5 with ``include=[reasoning.encrypted_content]``.
-    The strict test: if the server rejects our reasoning-item shape on T2,
-    the adapter raises 400. A clean 200 proves the replay round-trips.
+    Pre-#875 the cache from loop 1 leaked into loop 2: the converter walked
+    assistant messages positionally and replayed loop 1's
+    ``function_call(call_X)`` items even though loop 2's tool messages
+    referenced ``call_Y``. Result: 400 ""No tool call found for function
+    call output with call_id call_Y"".
+
+    Post-#875 the converter looks up cached function_calls by ``call_id``
+    against the orchestrator's current ``tool_calls``, AND the adapter
+    clears the cache when the input has no tool history (start of a fresh
+    loop). Both loops must complete with 200.
     """
     token = _skip_if_no_creds()
     store = InMemoryContinuationStore()
     adapter = CodexAdapter(continuation_store=store)
     model = _default_model()
-    session_id = "test-codex-real-reasoning-replay-no-tools"
+    session_id = "test-codex-real-multi-loop-shared-session"
 
-    resp_t1 = await adapter.get_response(
-        client=token,
-        model=model,
+    tool = {
+        "type": "function",
+        "function": {
+            "name": "get_current_model",
+            "description": "Returns the current model id.",
+            "parameters": {
+                "type": "object", "properties": {}, "additionalProperties": False,
+            },
+        },
+    }
+
+    # --- Agent loop 1: tool call + tool result + final answer ---
+    resp_l1_t1 = await adapter.get_response(
+        client=token, model=model,
         messages=[
-            {"role": "system", "content": "Reason step by step. Then answer concisely."},
-            {"role": "user", "content": "What is 17 multiplied by 23? Show the calculation."},
+            {"role": "system", "content": "Use the tool to identify the runtime model."},
+            {"role": "user", "content": "What model are you? Use the tool."},
         ],
+        tools=[tool],
         session_id=session_id,
     )
+    if not resp_l1_t1.tool_calls:
+        pytest.skip("Loop 1 didn't call the tool; cannot exercise the bug.")
+    tc1 = resp_l1_t1.tool_calls[0]
+    args1 = json.dumps(tc1.arguments) if isinstance(tc1.arguments, dict) else (tc1.arguments or "{}")
 
-    cursor = store.get("openai_plan", session_id)
-    assert cursor is not None
-    assert cursor.turn_outputs, "T1 must record output items for replay"
-    cached = json.loads(cursor.turn_outputs[0])
-    types = [item.get("type") for item in cached]
+    resp_l1_t2 = await adapter.get_response(
+        client=token, model=model,
+        messages=[
+            {"role": "system", "content": "Use the tool to identify the runtime model."},
+            {"role": "user", "content": "What model are you? Use the tool."},
+            {
+                "role": "assistant", "content": "",
+                "tool_calls": [{
+                    "id": tc1.id, "type": "function",
+                    "function": {"name": tc1.name, "arguments": args1},
+                }],
+            },
+            {"role": "tool", "tool_call_id": tc1.id, "content": model},
+        ],
+        tools=[tool],
+        session_id=session_id,
+    )
     print(
-        f"\n[{model}] T1 captured output types: {types}",
+        f"\n[{model}] Loop 1 final: {resp_l1_t2.content!r}",
         file=sys.stderr,
     )
 
-    if "reasoning" not in types:
-        pytest.skip(
-            f"GPT-5 didn't emit a reasoning item this run (types={types}); "
-            "the replay invariant cannot be exercised. This is a model "
-            "behavior fluctuation, not an adapter bug."
-        )
+    # Cache now holds 2 turn_outputs from loop 1.
+    cursor_after_loop1 = store.get("openai_plan", session_id)
+    assert len(cursor_after_loop1.turn_outputs) == 2
 
-    # T2 references the prior conversation. With reasoning replay enabled,
-    # the cached reasoning item from T1 is spliced into the input list
-    # before the model sees the new user turn. A 200 response is the
-    # strict pass condition: the live API accepted the replayed reasoning
-    # item (encrypted_content + id) as input. Pre-#842, no reasoning was
-    # replayed; post-#842, the cached chain-of-thought rides along.
-    resp_t2 = await adapter.get_response(
-        client=token,
-        model=model,
+    # --- Agent loop 2: NEW user message, no tool history in input ---
+    # The orchestrator's storage keeps only the final assistant text from
+    # loop 1; tool/tool_call messages are transient. So loop 2's input has
+    # no ``assistant.tool_calls`` — pre-#875 this triggered the bug.
+    resp_l2_t1 = await adapter.get_response(
+        client=token, model=model,
         messages=[
-            {"role": "system", "content": "Reason step by step. Then answer concisely."},
-            {"role": "user", "content": "What is 17 multiplied by 23? Show the calculation."},
-            {"role": "assistant", "content": resp_t1.content or ""},
-            {"role": "user", "content": "Now multiply that by 2."},
+            {"role": "system", "content": "Use the tool to identify the runtime model."},
+            {"role": "user", "content": "What model are you? Use the tool."},
+            {"role": "assistant", "content": resp_l1_t2.content or ""},
+            {"role": "user", "content": "Confirm again — what model are you? Use the tool."},
         ],
+        tools=[tool],
         session_id=session_id,
     )
+    if not resp_l2_t1.tool_calls:
+        pytest.skip("Loop 2 didn't call the tool; cannot exercise the round trip.")
+    tc2 = resp_l2_t1.tool_calls[0]
 
+    # Cache should have been cleared at loop 2 T1 (no tool history in input).
+    # The new turn output is loop 2 T1 only.
+    cursor_after_l2_t1 = store.get("openai_plan", session_id)
+    assert len(cursor_after_l2_t1.turn_outputs) == 1, (
+        f"Cache should reset on fresh loop; got {len(cursor_after_l2_t1.turn_outputs)} turns "
+        f"(stale entries from loop 1 leaked through)"
+    )
+
+    args2 = json.dumps(tc2.arguments) if isinstance(tc2.arguments, dict) else (tc2.arguments or "{}")
+    resp_l2_t2 = await adapter.get_response(
+        client=token, model=model,
+        messages=[
+            {"role": "system", "content": "Use the tool to identify the runtime model."},
+            {"role": "user", "content": "What model are you? Use the tool."},
+            {"role": "assistant", "content": resp_l1_t2.content or ""},
+            {"role": "user", "content": "Confirm again — what model are you? Use the tool."},
+            {
+                "role": "assistant", "content": "",
+                "tool_calls": [{
+                    "id": tc2.id, "type": "function",
+                    "function": {"name": tc2.name, "arguments": args2},
+                }],
+            },
+            {"role": "tool", "tool_call_id": tc2.id, "content": model},
+        ],
+        tools=[tool],
+        session_id=session_id,
+    )
     print(
-        f"\n[{model}] T2 (replay enabled): content={resp_t2.content!r}",
+        f"\n[{model}] Loop 2 final: {resp_l2_t2.content!r}",
         file=sys.stderr,
     )
-    assert resp_t2.content, "T2 should produce text content; a 400 from the server would have raised"
-
-    # T2's output should also have been captured.
-    cursor2 = store.get("openai_plan", session_id)
-    assert len(cursor2.turn_outputs) == 2
+    # Pre-#875: loop 2 raised 400 ""No tool call found for function call output
+    # with call_id call_..."". Post-fix: clean text response.
+    assert resp_l2_t2.content is not None or resp_l2_t2.tool_calls
 
 
 @pytest.mark.asyncio
