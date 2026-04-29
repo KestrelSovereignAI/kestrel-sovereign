@@ -1,32 +1,19 @@
 /**
  * Kestrel Sovereign Console - Testable API Client
- * Extracted from api.js so auth and routing behavior can be tested directly.
+ *
+ * Issues calls to canonical Kestrel paths (e.g. /api/identity, /agent/invoke).
+ * Hosts that embed Kestrel UI under a different URL shape are responsible for
+ * routing those canonical paths back to the right backend (e.g. by mounting
+ * Kestrel UI under a path prefix and forwarding /api/* to a per-agent
+ * subprocess). See issue #863 for the rationale.
+ *
+ * Auth is delegated to an `authProvider` so a host can supply its own
+ * (e.g. a JWT it minted) without modifying Kestrel. The default provider
+ * preserves the standalone Kestrel-server behavior: try /api/auth/key,
+ * fall back to /auth/me, redirect to /auth/login if both fail.
  */
 
-const ENDPOINT_MAPPINGS = {
-    '/api/identity': '/identity',
-    '/api/constitution': '/constitution',
-    '/agent/privacy-mode': '/privacy',
-    '/api/memories': '/memory',
-    '/api/sovereignty/exports': '/sovereignty/exports',
-    '/api/sovereignty/export': '/sovereignty/export',
-    '/api/sovereignty/import': '/sovereignty/import',
-    '/agent/invoke': '/invoke',
-    '/agent/stream': '/stream',
-    '/api/models': '/models',
-    '/api/model/current': '/model/current',
-    '/api/commands': '/commands',
-    '/api/storage/stats': '/storage/stats',
-    '/api/wallet': '/wallet',
-    '/api/keys': '/keys',
-    '/api/conversations': '/conversations',
-    '/api/tasks': '/tasks',
-    '/api/security/pending': '/security/pending',
-    '/api/security/approve': '/security/approve',
-    '/api/security/permissions': '/security/permissions',
-    '/api/db/tables': '/db/tables',
-    '/api/ipfs/status': '/ipfs/status',
-};
+const HOST_LEVEL_AGENTS_RE = /^\/api\/agents\/[^/]+\/(start|stop|status|logs)/;
 
 function getRequiredDependency(name, value) {
     if (!value) {
@@ -37,124 +24,94 @@ function getRequiredDependency(name, value) {
 
 export function isHostLevelEndpoint(endpoint) {
     if (endpoint === '/api/agents' || endpoint.startsWith('/api/agents?')) return true;
-    if (/^\/api\/agents\/[^/]+\/(start|stop|status|logs)/.test(endpoint)) return true;
+    if (HOST_LEVEL_AGENTS_RE.test(endpoint)) return true;
     if (endpoint === '/api/auth/key' || endpoint.startsWith('/api/auth/')) return true;
     if (endpoint === '/health') return true;
     return false;
 }
 
-export function rewriteEndpoint(endpoint, { currentAgentId = null, selectedHostAgent = null } = {}) {
-    let rewritten = endpoint;
-
-    if (selectedHostAgent && !isHostLevelEndpoint(rewritten)) {
-        rewritten = `/api/agents/${encodeURIComponent(selectedHostAgent)}${rewritten}`;
+export function applyHostAgentPrefix(endpoint, selectedHostAgent) {
+    if (!selectedHostAgent || isHostLevelEndpoint(endpoint)) {
+        return endpoint;
     }
-
-    if (!currentAgentId) {
-        return rewritten;
-    }
-
-    const agentBase = `/api/kestrel/companions/${encodeURIComponent(currentAgentId)}`;
-    if (ENDPOINT_MAPPINGS[rewritten]) {
-        return `${agentBase}${ENDPOINT_MAPPINGS[rewritten]}`;
-    }
-
-    for (const [pattern, suffix] of Object.entries(ENDPOINT_MAPPINGS)) {
-        if (rewritten.startsWith(pattern)) {
-            return `${agentBase}${suffix}${rewritten.slice(pattern.length)}`;
-        }
-    }
-
-    return rewritten;
+    return `/api/agents/${encodeURIComponent(selectedHostAgent)}${endpoint}`;
 }
 
-export function createApiClient({
-    fetchFn = globalThis.fetch,
-    localStorage = globalThis.localStorage,
-    sessionStorage = globalThis.sessionStorage,
-    location = globalThis.location,
-    logger = globalThis.console,
-    AbortControllerCtor = globalThis.AbortController,
-    TextDecoderCtor = globalThis.TextDecoder,
+export function createKestrelStandaloneAuthProvider({
+    fetchFn,
+    sessionStorage,
+    location,
+    logger,
 } = {}) {
     const fetchImpl = getRequiredDependency('fetch', fetchFn);
-    const localStore = getRequiredDependency('localStorage', localStorage);
     const sessionStore = getRequiredDependency('sessionStorage', sessionStorage);
     const locationRef = getRequiredDependency('location', location);
     const log = getRequiredDependency('console', logger);
-    const AbortCtor = getRequiredDependency('AbortController', AbortControllerCtor);
-    const DecoderCtor = getRequiredDependency('TextDecoder', TextDecoderCtor);
 
-    const state = {
-        apiKey: null,
-        jwtToken: null,
-        oauthSession: false,
-        bootstrapDisabled: false,
-        currentAgentId: null,
-        selectedHostAgent: null,
-        streamAbortController: null,
-        currentStreamRequestId: null,
-    };
+    let apiKey = null;
+    let oauthSession = false;
+    let bootstrapDisabled = false;
 
-    const client = {
-        async init() {
-            if (state.currentAgentId) {
-                state.jwtToken = readPlatformJwt();
-                if (state.jwtToken) {
-                    log.log('Kestrel UI: Using JWT token from session');
-                    return;
-                }
-                log.warn('Kestrel UI: Multi-agent mode but no JWT token found');
+    async function bootstrapApiKey() {
+        try {
+            const resp = await fetchImpl('/api/auth/key');
+            if (resp.ok) {
+                const data = await resp.json();
+                apiKey = data.key;
+                sessionStore.setItem('kestrel_api_key', apiKey);
+                return 'ok';
             }
+            if (resp.status === 401 || resp.status === 404 || resp.status === 403) {
+                bootstrapDisabled = true;
+                return 'disabled';
+            }
+            log.error('Failed to get API key:', resp.status);
+            return 'error';
+        } catch (error) {
+            log.error('Failed to initialize authentication:', error);
+            return 'error';
+        }
+    }
 
-            // Allow ?key= query param for convenience (matches dashboard behavior)
-            const params = new URLSearchParams(locationRef.search);
+    return {
+        async ensureAuthenticated() {
+            const params = new URLSearchParams(locationRef.search || '');
             if (params.get('key')) {
-                state.apiKey = params.get('key');
-                sessionStore.setItem('kestrel_api_key', state.apiKey);
+                apiKey = params.get('key');
+                sessionStore.setItem('kestrel_api_key', apiKey);
                 log.log('API key set from URL parameter');
                 return;
             }
 
-            state.apiKey = sessionStore.getItem('kestrel_api_key');
-            if (state.apiKey) {
+            apiKey = sessionStore.getItem('kestrel_api_key');
+            if (apiKey) {
                 log.log('Using cached API key from sessionStorage');
                 return;
             }
 
-            try {
-                const resp = await fetchImpl('/api/auth/key');
-                if (resp.ok) {
-                    const data = await resp.json();
-                    state.apiKey = data.key;
-                    sessionStore.setItem('kestrel_api_key', state.apiKey);
-                    log.log('API key retrieved and cached');
-                    return;
-                }
-                if (resp.status === 401 || resp.status === 404 || resp.status === 403) {
-                    state.bootstrapDisabled = true;
-                    log.log('API key bootstrap unavailable — checking OAuth session');
-                } else {
-                    log.error('Failed to get API key:', resp.status);
-                }
-            } catch (error) {
-                log.error('Failed to initialize authentication:', error);
+            const status = await bootstrapApiKey();
+            if (status === 'ok') {
+                log.log('API key retrieved and cached');
+                return;
+            }
+            if (status === 'disabled') {
+                log.log('API key bootstrap unavailable — checking OAuth session');
             }
 
             try {
                 const meResp = await fetchImpl('/auth/me');
                 if (meResp.ok) {
                     const user = await meResp.json();
-                    state.oauthSession = true;
+                    oauthSession = true;
                     log.log(`Authenticated via OAuth: ${user.email}`);
                     return;
                 }
             } catch (error) {
-                // OAuth session check failed; init falls through to redirect/no-auth behavior.
+                // OAuth session check failed; fall through to redirect/no-auth.
             }
 
-            if (!state.apiKey && !state.jwtToken && !state.oauthSession) {
-                if (state.bootstrapDisabled) {
+            if (!apiKey && !oauthSession) {
+                if (bootstrapDisabled) {
                     log.warn('OAuth required — redirecting to login');
                     locationRef.href = '/auth/login';
                 } else {
@@ -163,19 +120,121 @@ export function createApiClient({
             }
         },
 
+        applyAuth(headers) {
+            if (apiKey) {
+                return { ...headers, 'X-API-Key': apiKey };
+            }
+            return headers;
+        },
+
+        async onUnauthorized() {
+            log.warn('Authentication failed - refreshing API key...');
+            sessionStore.removeItem('kestrel_api_key');
+            apiKey = null;
+
+            const status = await bootstrapApiKey();
+            if (status === 'ok') {
+                log.log('API key refreshed - retrying request');
+                return 'refreshed';
+            }
+
+            if (oauthSession) {
+                log.warn('OAuth session expired — redirecting to login');
+                locationRef.href = '/auth/login';
+                return 'redirected';
+            }
+
+            return 'failed';
+        },
+
+        getApiKey() {
+            return apiKey;
+        },
+    };
+}
+
+export function createBearerTokenAuthProvider({
+    getToken,
+    onUnauthenticated,
+    headerName = 'Authorization',
+    tokenPrefix = 'Bearer ',
+} = {}) {
+    if (typeof getToken !== 'function') {
+        throw new Error('BearerTokenAuthProvider requires getToken()');
+    }
+
+    return {
+        async ensureAuthenticated() {
+            const token = await getToken();
+            if (!token) {
+                if (typeof onUnauthenticated === 'function') {
+                    await onUnauthenticated();
+                }
+                throw new Error('Bearer token unavailable');
+            }
+        },
+
+        async applyAuth(headers) {
+            const token = await getToken();
+            if (!token) return headers;
+            return { ...headers, [headerName]: `${tokenPrefix}${token}` };
+        },
+
+        async onUnauthorized() {
+            if (typeof onUnauthenticated === 'function') {
+                await onUnauthenticated();
+                return 'redirected';
+            }
+            return 'failed';
+        },
+    };
+}
+
+export function createApiClient({
+    fetchFn = globalThis.fetch,
+    sessionStorage = globalThis.sessionStorage,
+    location = globalThis.location,
+    logger = globalThis.console,
+    AbortControllerCtor = globalThis.AbortController,
+    TextDecoderCtor = globalThis.TextDecoder,
+    authProvider = null,
+} = {}) {
+    const fetchImpl = getRequiredDependency('fetch', fetchFn);
+    const sessionStore = getRequiredDependency('sessionStorage', sessionStorage);
+    const locationRef = getRequiredDependency('location', location);
+    const log = getRequiredDependency('console', logger);
+    const AbortCtor = getRequiredDependency('AbortController', AbortControllerCtor);
+    const DecoderCtor = getRequiredDependency('TextDecoder', TextDecoderCtor);
+
+    const auth = authProvider || createKestrelStandaloneAuthProvider({
+        fetchFn: fetchImpl,
+        sessionStorage: sessionStore,
+        location: locationRef,
+        logger: log,
+    });
+
+    const state = {
+        selectedHostAgent: null,
+        streamAbortController: null,
+        currentStreamRequestId: null,
+    };
+
+    const client = {
+        async init() {
+            await auth.ensureAuthenticated();
+        },
+
         async request(endpoint, options = {}, retried = false) {
-            const headers = buildHeaders(options.headers);
+            const headers = await buildHeaders(options.headers);
             // Let the browser set Content-Type for FormData (multipart boundary)
             if (options.body instanceof FormData) {
                 delete headers['Content-Type'];
             }
-            const response = await fetchImpl(rewrite(endpoint), {
-                ...options,
-                headers,
-            });
+            const url = applyHostAgentPrefix(endpoint, state.selectedHostAgent);
+            const response = await fetchImpl(url, { ...options, headers });
 
             if (response.status === 401 && !retried) {
-                const recovery = await recoverFromUnauthorized();
+                const recovery = await auth.onUnauthorized();
                 if (recovery === 'redirected') return;
                 if (recovery === 'refreshed') return this.request(endpoint, options, true);
 
@@ -321,18 +380,14 @@ export function createApiClient({
             return state.currentStreamRequestId;
         },
         async *streamInvoke(input, model = null, sessionId = null, provider = null, retried = false) {
-            const headers = { 'Content-Type': 'application/json' };
-            if (state.jwtToken) {
-                headers.Authorization = `Bearer ${state.jwtToken}`;
-            } else if (state.apiKey) {
-                headers['X-API-Key'] = state.apiKey;
-            }
+            const headers = await buildHeaders({ 'Content-Type': 'application/json' });
 
             state.streamAbortController = new AbortCtor();
             const signal = state.streamAbortController.signal;
 
             try {
-                const response = await fetchImpl(rewrite('/agent/stream'), {
+                const url = applyHostAgentPrefix('/agent/stream', state.selectedHostAgent);
+                const response = await fetchImpl(url, {
                     method: 'POST',
                     headers,
                     body: JSON.stringify({ input, model, session_id: sessionId, provider }),
@@ -340,7 +395,7 @@ export function createApiClient({
                 });
 
                 if (response.status === 401 && !retried) {
-                    const recovery = await recoverFromUnauthorized();
+                    const recovery = await auth.onUnauthorized();
                     if (recovery === 'redirected') return;
                     if (recovery === 'refreshed') {
                         yield* client.streamInvoke(input, model, sessionId, provider, true);
@@ -377,16 +432,15 @@ export function createApiClient({
             }
         },
         getApiKey() {
-            return state.apiKey;
+            return typeof auth.getApiKey === 'function' ? auth.getApiKey() : null;
         },
-        setAgentId(agentId) {
-            state.currentAgentId = agentId;
-        },
-        getAgentId() {
-            return state.currentAgentId;
-        },
-        isMultiAgentMode() {
-            return state.currentAgentId !== null;
+        // Sign an arbitrary headers object with whatever the active auth
+        // provider attaches. Use this from any code that has to call fetch()
+        // directly instead of going through client.request() — most commonly
+        // anything that needs Content-Type control (FormData) or a non-JSON
+        // protocol (EventSource preflight, etc.).
+        async applyAuth(headers = {}) {
+            return await auth.applyAuth({ ...headers });
         },
         setHostAgent(agentName) {
             state.selectedHostAgent = agentName;
@@ -398,10 +452,7 @@ export function createApiClient({
             return state.selectedHostAgent !== null;
         },
         buildAgentUrl(path) {
-            if (state.selectedHostAgent && !isHostLevelEndpoint(path)) {
-                return `/api/agents/${encodeURIComponent(state.selectedHostAgent)}${path}`;
-            }
-            return path;
+            return applyHostAgentPrefix(path, state.selectedHostAgent);
         },
         getContextStatus: (sessionId = null) => {
             const params = sessionId ? `?session_id=${encodeURIComponent(sessionId)}` : '';
@@ -412,85 +463,12 @@ export function createApiClient({
         },
     };
 
-    function buildHeaders(extraHeaders = {}) {
+    async function buildHeaders(extraHeaders = {}) {
         const headers = {
             'Content-Type': 'application/json',
             ...extraHeaders,
         };
-        if (state.jwtToken) {
-            headers.Authorization = `Bearer ${state.jwtToken}`;
-        } else if (state.apiKey) {
-            headers['X-API-Key'] = state.apiKey;
-        }
-        return headers;
-    }
-
-    async function recoverFromUnauthorized() {
-        if (state.jwtToken) {
-            log.warn('Platform session expired — clearing JWT and redirecting to login');
-            clearPlatformJwt();
-            locationRef.href = '/auth/login';
-            return 'redirected';
-        }
-
-        if (await refreshApiKey()) {
-            return 'refreshed';
-        }
-
-        if (state.oauthSession) {
-            log.warn('OAuth session expired — redirecting to login');
-            locationRef.href = '/auth/login';
-            return 'redirected';
-        }
-
-        return 'failed';
-    }
-
-    async function refreshApiKey() {
-        log.warn('Authentication failed - refreshing API key...');
-        sessionStore.removeItem('kestrel_api_key');
-        state.apiKey = null;
-
-        try {
-            const keyResp = await fetchImpl('/api/auth/key');
-            if (keyResp.ok) {
-                const data = await keyResp.json();
-                state.apiKey = data.key;
-                sessionStore.setItem('kestrel_api_key', state.apiKey);
-                log.log('API key refreshed - retrying request');
-                return true;
-            }
-            if (keyResp.status === 401 || keyResp.status === 403 || keyResp.status === 404) {
-                if (keyResp.status === 401 || keyResp.status === 404) {
-                    state.bootstrapDisabled = true;
-                }
-                log.warn('API key bootstrap unavailable during refresh');
-            }
-        } catch (error) {
-            log.error('Failed to refresh API key:', error);
-        }
-
-        return false;
-    }
-
-    function rewrite(endpoint) {
-        return rewriteEndpoint(endpoint, {
-            currentAgentId: state.currentAgentId,
-            selectedHostAgent: state.selectedHostAgent,
-        });
-    }
-
-    function readPlatformJwt() {
-        return localStore.getItem('platform_auth_token')
-            || localStore.getItem('token')
-            || sessionStore.getItem('token');
-    }
-
-    function clearPlatformJwt() {
-        state.jwtToken = null;
-        localStore.removeItem('platform_auth_token');
-        localStore.removeItem('token');
-        sessionStore.removeItem('token');
+        return await auth.applyAuth(headers);
     }
 
     return client;
