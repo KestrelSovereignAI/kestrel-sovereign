@@ -436,15 +436,29 @@ async def notifications_sse(request: Request):
         _sse_connections[conn_key] += 1
 
     async def event_generator():
-        """Generate SSE events for task notifications."""
-        try:
-            agent = get_agent(request)
+        """Generate SSE events for task notifications and agent event bus."""
+        agent = get_agent(request)
 
+        # Forward events from agent.emit_event (e.g. approval_request) to this
+        # stream. Without this listener, SecurityFeature._emit_approval_request
+        # fires into an empty _event_listeners list and approval popups never
+        # reach the browser. See #748.
+        event_queue: asyncio.Queue = asyncio.Queue()
+
+        async def _forward(event_type: str, data):
+            await event_queue.put((event_type, data))
+
+        listener_registered = False
+        if hasattr(agent, "add_event_listener"):
+            agent.add_event_listener(_forward)
+            listener_registered = True
+
+        try:
             # Send initial connection event
             yield f"event: connected\ndata: {json.dumps({'status': 'connected'})}\n\n"
 
             ping_interval = SSE_PING_INTERVAL_SECONDS
-            poll_interval = 0.5  # Check for notifications every 500ms
+            poll_interval = 0.5  # Check for task notifications every 500ms
             last_ping = time.monotonic()
 
             while True:
@@ -453,7 +467,18 @@ async def notifications_sse(request: Request):
                     logger.debug("SSE client disconnected")
                     break
 
-                # Check for pending notifications
+                # Drain any events from the agent event bus without blocking.
+                # These arrive as (event_type, payload) tuples and are forwarded
+                # as native SSE events so the browser's EventSource can route
+                # them via addEventListener(event_type, ...).
+                while True:
+                    try:
+                        event_type, data = event_queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                    yield f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
+
+                # Check for pending task-completion notifications
                 notifications = agent.get_pending_notifications()
                 for notification in notifications:
                     # Determine notification type from emoji prefix
@@ -487,6 +512,8 @@ async def notifications_sse(request: Request):
             logger.error(f"SSE error: {e}", exc_info=True)
             yield f"event: error\ndata: {json.dumps({'error': 'Internal server error'})}\n\n"
         finally:
+            if listener_registered:
+                agent.remove_event_listener(_forward)
             async with _sse_lock:
                 _sse_connections[conn_key] -= 1
                 if _sse_connections[conn_key] <= 0:
