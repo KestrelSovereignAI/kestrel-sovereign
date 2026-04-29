@@ -4,11 +4,18 @@
 
 import { Modal, Toast } from './ui.js';
 import API from './api.js';
+import { subscribeSSE } from './chat.js';
 
 export const Security = {
     pendingApprovals: new Map(),
     permissionTree: [],
     _initialized: false,
+    // Modal is a singleton — if two approval_request events arrive in quick
+    // succession, showing both concurrently would stack overlays in the DOM
+    // and leave the older one stuck. Serialize them through a queue. #748.
+    _approvalQueue: [],
+    _approvalDraining: false,
+    _seenApprovalIds: new Set(),
 
     // === Initialization ===
 
@@ -29,40 +36,69 @@ export const Security = {
     },
 
     _setupSSEHandler() {
-        // Listen for approval_request events on the global event source
-        if (window.eventSource) {
-            window.eventSource.addEventListener('approval_request', (event) => {
+        // Route approval_request events from the notification SSE stream into
+        // the approval modal. subscribeSSE handles reconnects so the handler
+        // survives network drops. See #748.
+        subscribeSSE('approval_request', (event) => {
+            try {
                 const data = JSON.parse(event.data);
                 this.handleApprovalRequest(data);
-            });
-        }
+            } catch (err) {
+                console.error('Failed to parse approval_request event:', err);
+            }
+        });
     },
 
     // === Approval Request Handling ===
 
-    async handleApprovalRequest(data) {
+    handleApprovalRequest(data) {
         console.log('Approval request received:', data);
 
-        // Store in pending map
+        // Dedupe: the SSE stream can redeliver the same event on reconnect,
+        // and the UI must not prompt twice for the same approval_id.
+        if (this._seenApprovalIds.has(data.id) || this.pendingApprovals.has(data.id)) {
+            return;
+        }
+        this._seenApprovalIds.add(data.id);
+
         this.pendingApprovals.set(data.id, data);
-
-        // Update badge
         this.updatePendingBadge(this.pendingApprovals.size);
 
-        // Show approval modal
-        const decision = await this.showApprovalModal(data);
+        this._approvalQueue.push(data);
+        // Fire-and-forget drain; errors are handled inside the drain loop.
+        this._drainApprovalQueue();
+    },
 
-        // Submit decision
-        await this.submitApproval(data.id, decision.approved, decision.scope);
+    async _drainApprovalQueue() {
+        if (this._approvalDraining) return;
+        this._approvalDraining = true;
+        try {
+            while (this._approvalQueue.length > 0) {
+                const data = this._approvalQueue.shift();
+                let decision;
+                try {
+                    decision = await this.showApprovalModal(data);
+                } catch (err) {
+                    console.error('Approval modal error:', err);
+                    decision = { approved: false, scope: 'once' };
+                }
 
-        // Remove from pending
-        this.pendingApprovals.delete(data.id);
-        this.updatePendingBadge(this.pendingApprovals.size);
+                try {
+                    await this.submitApproval(data.id, decision.approved, decision.scope);
+                } catch (err) {
+                    console.error('Failed to submit approval:', err);
+                }
 
-        // Refresh pending list if panel is open
-        const pendingContainer = document.getElementById('pending-approvals');
-        if (pendingContainer) {
-            await this.loadPendingApprovals();
+                this.pendingApprovals.delete(data.id);
+                this.updatePendingBadge(this.pendingApprovals.size);
+
+                const pendingContainer = document.getElementById('pending-approvals');
+                if (pendingContainer) {
+                    await this.loadPendingApprovals();
+                }
+            }
+        } finally {
+            this._approvalDraining = false;
         }
     },
 
@@ -157,8 +193,18 @@ export const Security = {
 
             return response;
         } catch (error) {
-            console.error('Failed to submit approval:', error);
-            Toast.error('Failed to submit decision');
+            // 404 here almost always means the server-side request_approval
+            // call already returned (timed out at 5min default, or was
+            // cancelled). The user sees a raw stack otherwise — replace it
+            // with a clear message and skip the redundant error toast.
+            const msg = (error && error.message) || '';
+            if (msg.includes('not found') || msg.includes('expired')) {
+                Toast.warning('This approval already expired on the server — the caller moved on.');
+                console.warn('Approval expired before user submitted decision:', approvalId);
+            } else {
+                console.error('Failed to submit approval:', error);
+                Toast.error('Failed to submit decision');
+            }
             return { success: false };
         }
     },
