@@ -194,24 +194,44 @@ class TokenCounter:
         3. ModelCatalogService (model_catalog.toml overrides)
         4. DEFAULT_CONTEXT_LIMIT fallback
 
+        Each source is consulted with the full model string first, then
+        with the model-name-only portion (post-slash) so callers can pass
+        ``"anthropic:plan/claude-opus-4-7"`` and still hit a cache keyed
+        by ``"claude-opus-4-7"``. Without this, vendor-prefixed model
+        strings fall through to the 32K default and chats wrongly read
+        as "context 100% full" on a 1M-context Opus.
+
         Returns:
             Maximum tokens allowed in context
         """
+        # The cache is populated by model discovery using whatever ID the
+        # provider returned (e.g. OpenRouter "anthropic/claude-opus-4.7"),
+        # but the LLM service routes by "vendor:route/model" — these can
+        # diverge in punctuation (4-7 vs 4.7) and prefix (anthropic/ vs
+        # anthropic:plan/). Try each shape until one hits.
+        candidates = [self.model]
+        if "/" in self.model:
+            # "anthropic:plan/claude-opus-4-7" -> "claude-opus-4-7"
+            candidates.append(self.model.rsplit("/", 1)[1])
+
         # 1. Discovered limits (populated by API discovery this session)
-        if self.model in _discovered_context_limits:
-            return _discovered_context_limits[self.model]
+        for key in candidates:
+            if key in _discovered_context_limits:
+                return _discovered_context_limits[key]
 
         # 2. Cached limits (from previous discovery runs)
         cached = _load_cached_limits()
-        if self.model in cached:
-            return cached[self.model]
+        for key in candidates:
+            if key in cached:
+                return cached[key]
 
         # 3. Catalog TOML overrides
         catalog = _get_catalog_service()
         if catalog is not None:
-            limit = catalog.get_context_limit(self.model)
-            if limit is not None:
-                return limit
+            for key in candidates:
+                limit = catalog.get_context_limit(key)
+                if limit is not None:
+                    return limit
 
         logger.warning(f"Unknown model {self.model}, using default context limit {DEFAULT_CONTEXT_LIMIT}")
         return DEFAULT_CONTEXT_LIMIT
