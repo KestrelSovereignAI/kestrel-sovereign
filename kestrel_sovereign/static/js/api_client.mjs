@@ -275,7 +275,15 @@ export function createApiClient({
         }),
         getConstitution: () => client.request('/api/constitution'),
         getPrivacyMode: () => client.request('/agent/privacy-mode'),
-        setPrivacyMode: (mode) => client.request('/agent/privacy-mode', { method: 'POST', body: JSON.stringify({ mode }) }),
+        // setPrivacyMode is destructive on live agents (#867 gates the
+        // endpoint) — a flip into EPHEMERAL primes the leak-purge for the
+        // next exit.  The UI carries the opt-in header so the rail sees an
+        // intentional change; scripts must opt in explicitly.
+        setPrivacyMode: (mode) => client.request('/agent/privacy-mode', {
+            method: 'POST',
+            headers: { 'X-Kestrel-Allow-Destructive': 'user-initiated-mode-change' },
+            body: JSON.stringify({ mode }),
+        }),
         getSessions: (limit = 50) => client.request(`/api/sessions?limit=${limit}`),
         getMemories: (nodeType = null, limit = 100) => {
             let url = `/api/memories?limit=${limit}`;

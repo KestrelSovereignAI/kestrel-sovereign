@@ -1,6 +1,6 @@
 """Agent invoke and streaming endpoints."""
 from collections import defaultdict
-from fastapi import APIRouter, HTTPException, Request, Query
+from fastapi import APIRouter, Depends, HTTPException, Request, Query
 from fastapi.responses import StreamingResponse
 from typing import Optional
 import asyncio
@@ -16,6 +16,7 @@ from kestrel_sovereign.kestrel_config.constants import (
     SSE_PING_INTERVAL_SECONDS,
 )
 from kestrel_sovereign.rate_limit import limiter
+from kestrel_sovereign.security.demo_isolation import enforce_destructive_op
 from endpoints.agent_helpers import get_agent
 
 logger = logging.getLogger(__name__)
@@ -256,9 +257,21 @@ async def get_privacy_mode(request: Request):
         raise HTTPException(status_code=500, detail="Error retrieving privacy mode.")
 
 
-@router.post("/privacy-mode")
+@router.post(
+    "/privacy-mode",
+    dependencies=[Depends(enforce_destructive_op)],
+)
 async def set_privacy_mode(request: Request):
-    """Set privacy mode."""
+    """Set privacy mode.
+
+    Gated by the demo-isolation rail (#766 / #867).  A privacy-mode flip is
+    destructive in practice — flipping a live agent into EPHEMERAL means the
+    next exit triggers the leak-purge, which can hard-DELETE rows the agent
+    didn't author during the session if the leak-purge isn't scoped (see
+    #867 for the wipe that prompted this gate).  On a live agent the rail
+    therefore requires the ``X-Kestrel-Allow-Destructive`` header so a
+    stray script can't change a live agent's privacy contract by accident.
+    """
     try:
         from kestrel_sovereign.privacy import PrivacyMode
 

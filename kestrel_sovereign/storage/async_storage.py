@@ -292,6 +292,20 @@ class AsyncStorage:
             await self.initialize()
         return await self.conversation.purge_all(reason=reason)
 
+    async def purge_conversations_since(
+        self, since_iso: str, *, reason: str = "ephemeral-leak",
+    ) -> int:
+        """Scoped variant for the EPHEMERAL leak-purge (#867).
+
+        Only destroys rows whose ``created_at >= since_iso``.  ``since_iso``
+        is the timestamp the agent entered EPHEMERAL — anything authored
+        before that is preexisting NORMAL data the user explicitly wanted
+        persisted, and must not be touched.
+        """
+        if not self._initialized:
+            await self.initialize()
+        return await self.conversation.purge_all_since(since_iso, reason=reason)
+
     async def purge_trash_older_than(
         self,
         cutoff_iso: str,
@@ -310,17 +324,26 @@ class AsyncStorage:
             cutoff_iso, max_rows=max_rows, reason=reason,
         )
 
-    async def purge_agent_graph_nodes(self) -> int:
-        """Hard-delete every graph node owned by this agent (#767).
+    async def purge_agent_graph_nodes(
+        self, *, since_iso: Optional[str] = None
+    ) -> int:
+        """Hard-delete graph nodes owned by this agent (#767/#867).
 
         Used by the EPHEMERAL hard-purge defense-in-depth — agents in
         EPHEMERAL mode aren't supposed to write to ``graph_nodes`` at
         all, so any rows present are a privacy-layer leak. Scopes by
         the agent_id stored in the node's ``properties`` JSON.
+
+        ``since_iso`` (when provided) further scopes to only nodes whose
+        ``properties.created_at >= since_iso``, so the EPHEMERAL leak
+        purge only destroys rows authored *during* the EPHEMERAL stint
+        and leaves preexisting NORMAL nodes alone.
         """
         if not self._initialized:
             await self.initialize()
-        return await self.graph.purge_agent_nodes(self.agent_id)
+        return await self.graph.purge_agent_nodes(
+            self.agent_id, since_iso=since_iso
+        )
 
     async def set_conversation_name(
         self, session_id: str, name: Optional[str]

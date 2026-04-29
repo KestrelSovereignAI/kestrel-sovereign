@@ -121,7 +121,33 @@ class PrivacyEnforcingStorage:
         self._policy = PrivacyPolicy.from_config(self._privacy_config)
         self._session_conversations: List[Dict] = []
         self._session_files: Dict[str, bytes] = {}
+        # ISO-8601 timestamp recorded at the moment the wrapper transitions
+        # INTO EPHEMERAL.  The leak-purge (#867) uses this to scope its
+        # DELETE so that flipping a long-lived agent into EPHEMERAL for 30
+        # seconds doesn't destroy the months of NORMAL history that
+        # preceded it — only rows authored on/after this timestamp can be
+        # leaks.  None when the agent was never in EPHEMERAL during this
+        # process; refreshed each time we re-enter EPHEMERAL.
+        self._entered_ephemeral_at: Optional[str] = None
+        if self._privacy_config.is_ephemeral():
+            self._entered_ephemeral_at = self._now_iso()
         logger.info(f"PrivacyEnforcingStorage initialized with config: storage={self._privacy_config.storage}, llm={self._privacy_config.llm_location}")
+
+    @staticmethod
+    def _now_iso() -> str:
+        """Watermark format used to scope the EPHEMERAL leak-purge.
+
+        Matches SQLite's ``datetime('now')`` shape (``YYYY-MM-DD HH:MM:SS``,
+        UTC, no offset, no microseconds) so a lexicographic ``>=`` compares
+        cleanly against the values stored in ``conversation_history.created_at``.
+        ISO-8601 with a ``T`` separator and microseconds compares as
+        strictly greater than every value the DB writes — that's the bug
+        the original implementation hit, where ``2026-04-26T13:24:05.5``
+        (watermark) was lexicographically *higher* than
+        ``2026-04-26 13:24:06`` (row), so no rows ever matched.
+        """
+        from datetime import datetime, timezone
+        return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
     @property
     def agent_id(self) -> str:
@@ -160,9 +186,21 @@ class PrivacyEnforcingStorage:
 
         Note: Changing to a more restrictive mode does NOT delete existing data.
         It only affects future operations.
+
+        Records ``_entered_ephemeral_at`` on every transition INTO
+        EPHEMERAL so the leak-purge (#867) can scope its DELETE to rows
+        authored *during* the EPHEMERAL stint.  Stale watermarks from a
+        prior EPHEMERAL stint are overwritten on re-entry; the watermark
+        is preserved across the EPHEMERAL→exit transition because the
+        purge needs to read it before clearing.
         """
         old_config = self._privacy_config
-        self._privacy_config = self._to_config(mode)
+        new_config = self._to_config(mode)
+        was_ephemeral = old_config.is_ephemeral()
+        is_ephemeral = new_config.is_ephemeral()
+        if is_ephemeral and not was_ephemeral:
+            self._entered_ephemeral_at = self._now_iso()
+        self._privacy_config = new_config
         self._policy = PrivacyPolicy.from_config(self._privacy_config)
         logger.info(f"Privacy config changed: storage={old_config.storage}->{self._privacy_config.storage}, llm={old_config.llm_location}->{self._privacy_config.llm_location}")
 
@@ -211,8 +249,29 @@ class PrivacyEnforcingStorage:
         self._session_conversations = []
         self._session_files = {}
 
+        # Scoped to ``_entered_ephemeral_at`` (#867) so the DELETE only
+        # touches rows authored *during* the EPHEMERAL stint.  Without
+        # this watermark, flipping a long-lived agent into EPHEMERAL for
+        # a few seconds and back out destroyed every preexisting NORMAL
+        # row — that's the wipe that prompted the scoping fix.  When the
+        # watermark is missing (e.g. the agent was already EPHEMERAL
+        # before the wrapper was constructed and we never observed the
+        # transition), the scoped purge primitives refuse to delete
+        # anything rather than fall back to the unbounded behaviour.
+        since = self._entered_ephemeral_at
+        if not since:
+            logger.warning(
+                "purge_ephemeral_session: no entered_ephemeral_at watermark "
+                "(agent=%s, reason=%s) — refusing to purge to avoid the "
+                "wipe-on-shutdown bug fixed in #867",
+                agent_id, reason,
+            )
+            return {"conversation_history": 0, "graph_nodes": 0}
+
         try:
-            convs = await self._storage.purge_all_conversations(reason=reason)
+            convs = await self._storage.purge_conversations_since(
+                since, reason=reason,
+            )
         except Exception as e:
             logger.warning(
                 "purge_ephemeral_session: conversation purge failed: %s", e
@@ -221,7 +280,9 @@ class PrivacyEnforcingStorage:
         result["conversation_history"] = convs
 
         try:
-            nodes = await self._storage.purge_agent_graph_nodes()
+            nodes = await self._storage.purge_agent_graph_nodes(
+                since_iso=since,
+            )
         except Exception as e:
             logger.warning(
                 "purge_ephemeral_session: graph_nodes purge failed: %s", e
@@ -233,15 +294,21 @@ class PrivacyEnforcingStorage:
         if leaked > 0:
             logger.warning(
                 "[privacy] WARNING: EPHEMERAL session leaked %d row(s) "
-                "into persistent storage (agent=%s, breakdown=%s); "
+                "into persistent storage (agent=%s, since=%s, breakdown=%s); "
                 "hard-purged with reason=%s",
-                leaked, agent_id, result, reason,
+                leaked, agent_id, since, result, reason,
             )
         else:
             logger.debug(
-                "purge_ephemeral_session: clean (no leaks) for agent %s",
-                agent_id,
+                "purge_ephemeral_session: clean (no leaks) for agent %s "
+                "since %s",
+                agent_id, since,
             )
+
+        # Clear the watermark — the EPHEMERAL stint is over.  Re-entering
+        # EPHEMERAL refreshes it via :meth:`set_privacy_mode`.
+        self._entered_ephemeral_at = None
+
         # Audit-log emission is the caller's responsibility — the agent
         # has natural access to its SecurityFeature; the storage wrapper
         # doesn't and shouldn't try to reach back through layers.
