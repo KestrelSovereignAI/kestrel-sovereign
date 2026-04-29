@@ -3,8 +3,8 @@
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-04-28
-**Scope:** 1509 tracked files (911 `.py`, 233 `.md`, 365 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-04-29
+**Scope:** 1499 tracked files (905 `.py`, 232 `.md`, 362 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -2332,7 +2332,6 @@ Repo entry points and standard project files.
 - **.devcontainer/Dockerfile.devcontainer** — —
 - **.devcontainer/README.md** — Kestrel Dev Container — This directory contains the Docker-based development container configuration for Kestrel + Kestrel development.
 - **.devcontainer/docker-compose.devcontainer.yml** — (configuration)
-
 
 ## `examples/`
 
