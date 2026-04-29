@@ -254,7 +254,7 @@ async def dispatch_to_talon(
     )
 
     # POST to recipient's mesh endpoint via rookery
-    url = f"{host_url}/api/agents/{recipient}/agent/mesh"
+    url = f"{host_url}/api/agents/{recipient}/api/agent/mesh"
     payload = json.dumps(msg.to_dict()).encode("utf-8")
     req = urllib.request.Request(
         url,

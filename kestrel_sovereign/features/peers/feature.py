@@ -180,7 +180,7 @@ class PeersFeature(Feature):
                 "error": "Cannot send a message to yourself",
             }
 
-        url = f"{self._host_url}/api/agents/{agent_name}/agent/invoke"
+        url = f"{self._host_url}/api/agents/{agent_name}/api/agent/invoke"
 
         try:
             async with httpx.AsyncClient() as client:
@@ -301,8 +301,8 @@ class PeersFeature(Feature):
             correlation_id=correlation_id or None,
         )
 
-        # Deliver via rookery host → recipient's /agent/mesh endpoint
-        url = f"{self._host_url}/api/agents/{recipient}/agent/mesh"
+        # Deliver via rookery host → recipient's /api/agent/mesh endpoint
+        url = f"{self._host_url}/api/agents/{recipient}/api/agent/mesh"
 
         try:
             async with httpx.AsyncClient() as client:

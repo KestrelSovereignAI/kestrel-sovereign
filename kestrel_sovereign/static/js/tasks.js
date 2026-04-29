@@ -159,7 +159,7 @@ export async function loadTasks() {
         }
         params.append('limit', '50');
 
-        const response = await API.request(`/agent/tasks?${params.toString()}`);
+        const response = await API.request(`/api/agent/tasks?${params.toString()}`);
 
         if (response.message) {
             // TaskManager not available
@@ -432,7 +432,7 @@ window.loadTaskArtifacts = async function(taskId) {
     container.innerHTML = '<div style="color: var(--text-tertiary); font-size: 0.75rem;">Loading...</div>';
 
     try {
-        const response = await API.request(`/agent/tasks/${taskId}`);
+        const response = await API.request(`/api/agent/tasks/${taskId}`);
         const artifacts = response.artifacts || [];
 
         if (artifacts.length === 0) {

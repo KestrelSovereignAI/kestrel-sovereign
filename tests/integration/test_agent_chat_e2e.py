@@ -87,7 +87,7 @@ def test_agent_invoke_basic_chat(client: TestClient, api_key: str):
         "model": "gpt-5-mini"
     }
 
-    response = client.post("/agent/invoke", json=payload, headers=headers)
+    response = client.post("/api/agent/invoke", json=payload, headers=headers)
 
     # Assert 200 status
     assert response.status_code == 200
@@ -112,7 +112,7 @@ def test_agent_invoke_factual_question(client: TestClient, api_key: str):
         "model": "gpt-5-mini"
     }
 
-    response = client.post("/agent/invoke", json=payload, headers=headers)
+    response = client.post("/api/agent/invoke", json=payload, headers=headers)
 
     assert response.status_code == 200
     data = response.json()
@@ -130,7 +130,7 @@ def test_agent_invoke_empty_input_returns_400(client: TestClient, api_key: str):
     # Empty payload (no "input" field)
     payload = {}
 
-    response = client.post("/agent/invoke", json=payload, headers=headers)
+    response = client.post("/api/agent/invoke", json=payload, headers=headers)
 
     # Assert 400 status
     assert response.status_code == 400
@@ -144,7 +144,7 @@ def test_agent_invoke_without_auth_returns_401(client: TestClient):
         "model": "gpt-5-mini"
     }
 
-    response = client.post("/agent/invoke", json=payload)
+    response = client.post("/api/agent/invoke", json=payload)
 
     # Assert 401 status
     assert response.status_code == 401

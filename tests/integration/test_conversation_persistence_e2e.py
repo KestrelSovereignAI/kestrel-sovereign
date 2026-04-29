@@ -91,7 +91,7 @@ def test_multi_turn_context_maintained(client: TestClient, api_key: str):
         "input": "My name is Alice. Remember that.",
         "model": "gpt-5-mini"
     }
-    response1 = client.post("/agent/invoke", json=payload1, headers=headers)
+    response1 = client.post("/api/agent/invoke", json=payload1, headers=headers)
 
     assert response1.status_code == 200, f"First request failed: {response1.text}"
     response1_data = response1.json()
@@ -104,7 +104,7 @@ def test_multi_turn_context_maintained(client: TestClient, api_key: str):
         "input": "What is my name?",
         "model": "gpt-5-mini"
     }
-    response2 = client.post("/agent/invoke", json=payload2, headers=headers)
+    response2 = client.post("/api/agent/invoke", json=payload2, headers=headers)
 
     assert response2.status_code == 200, f"Second request failed: {response2.text}"
     response2_data = response2.json()
@@ -140,7 +140,7 @@ def test_session_id_isolates_conversations(client: TestClient, api_key: str):
         "model": "gpt-5-mini",
         "session_id": "session_a"
     }
-    response_a = client.post("/agent/invoke", json=payload_a, headers=headers)
+    response_a = client.post("/api/agent/invoke", json=payload_a, headers=headers)
 
     assert response_a.status_code == 200, f"Session A request failed: {response_a.text}"
     response_a_data = response_a.json()
@@ -153,7 +153,7 @@ def test_session_id_isolates_conversations(client: TestClient, api_key: str):
         "model": "gpt-5-mini",
         "session_id": "session_b"
     }
-    response_b = client.post("/agent/invoke", json=payload_b, headers=headers)
+    response_b = client.post("/api/agent/invoke", json=payload_b, headers=headers)
 
     assert response_b.status_code == 200, f"Session B request failed: {response_b.text}"
     response_b_data = response_b.json()
@@ -190,7 +190,7 @@ def test_conversation_history_endpoint(client: TestClient, api_key: str):
         "model": "gpt-5-mini",
         "session_id": test_session_id
     }
-    response = client.post("/agent/invoke", json=payload, headers=headers)
+    response = client.post("/api/agent/invoke", json=payload, headers=headers)
 
     assert response.status_code == 200, f"Invoke request failed: {response.text}"
     response_data = response.json()

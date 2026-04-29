@@ -112,7 +112,7 @@ class TestStopEndpoint:
         app.state.agent = mock_agent
         
         client = TestClient(app)
-        response = client.post("/agent/stop")
+        response = client.post("/api/agent/stop")
         
         assert response.status_code == 200
         data = response.json()
@@ -136,7 +136,7 @@ class TestStopEndpoint:
         app.state.agent = mock_agent
         
         client = TestClient(app)
-        response = client.post("/agent/stop")
+        response = client.post("/api/agent/stop")
         
         assert response.status_code == 200
         data = response.json()
@@ -158,7 +158,7 @@ class TestStopEndpoint:
         app.state.agent = mock_agent
 
         client = TestClient(app)
-        response = client.post("/agent/stop", json={"request_id": "req-123"})
+        response = client.post("/api/agent/stop", json={"request_id": "req-123"})
 
         assert response.status_code == 200
         mock_agent.cancel_current_request.assert_called_once_with(request_id="req-123")
