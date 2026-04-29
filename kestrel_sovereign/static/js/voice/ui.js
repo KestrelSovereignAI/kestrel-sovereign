@@ -375,6 +375,22 @@ function handleClientEvent(ev) {
       }
       break;
 
+    // SPEAKING_STARTED marks the start of a NEW agent response (mapped
+    // from `response.created` in realtime.js). Defensive turn boundary:
+    // if a prior agent bubble is still open here, the previous turn's
+    // RESPONSE_DONE / AGENT_TEXT_FINAL didn't fire (or fired late), so
+    // close it now. Without this, AGENT_TEXT_DELTA for the new turn
+    // appends to the old bubble forever.
+    case Events.SPEAKING_STARTED:
+      if (agentMsgDiv) finalizeAgentTurn(agentTextBuffer);
+      break;
+
+    // LISTENING_STARTED (user begins speaking) is also an unambiguous
+    // "current agent turn is over" signal. Same defensive close.
+    case Events.LISTENING_STARTED:
+      if (agentMsgDiv) finalizeAgentTurn(agentTextBuffer);
+      break;
+
     // Agent reply streams into a single message bubble. AGENT_TEXT_DELTA
     // appends; AGENT_TEXT_FINAL / RESPONSE_DONE finalize and reset for
     // the next turn.
@@ -417,8 +433,9 @@ function handleClientEvent(ev) {
       }
       break;
 
-    // SESSION_READY / LISTENING_* / SPEAKING_* / THINKING_STARTED handled
-    // entirely by the state-machine transition above — no chat side-effect.
+    // SESSION_READY / LISTENING_STOPPED / SPEAKING_STOPPED / THINKING_STARTED
+    // handled entirely by the state-machine transition above. (LISTENING_STARTED
+    // and SPEAKING_STARTED have explicit cases above to close stale bubbles.)
     default:
       break;
   }
