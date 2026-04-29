@@ -107,6 +107,20 @@ def _convert_tools_to_responses_format(tools):
     return responses_tools or None
 
 
+def _messages_have_tool_history(messages: List[Dict[str, Any]]) -> bool:
+    """True if any ``role=assistant`` message carries ``tool_calls``.
+
+    Marker for ""this input represents an agent loop already in progress""
+    versus ""this input is a fresh user message starting a new loop"". Used
+    to decide whether replaying a session's cached reasoning items is safe
+    or whether the cache is from a prior loop and should be cleared (#875).
+    """
+    for m in messages:
+        if m.get("role") == "assistant" and m.get("tool_calls"):
+            return True
+    return False
+
+
 def _content_to_text(content: Any) -> str:
     """Coerce Chat-Completions content (str | list of parts | None) to plain text.
 
@@ -168,18 +182,46 @@ def _convert_messages_to_responses_format(
       parameter") and discovered post-network; the adapter is the right place
       to fail fast with a clear message naming the offending role.
 
-    Reasoning replay (#842): when ``cached_turn_outputs`` is supplied (one
-    inner list per prior assistant turn, in order), each ``role=assistant``
-    message is replaced by the cached output items for that turn — typically
-    a ``reasoning`` item followed by ``function_call`` items. This preserves
-    GPT-5's encrypted chain-of-thought across tool round trips. Falls back
-    to the simple conversion above when no cache exists for a turn.
+    Reasoning replay (#842 + #875): when ``cached_turn_outputs`` is supplied
+    the converter looks up cached ``function_call`` items by ``call_id`` and
+    replays them — preserving the original ``encrypted_content`` of any
+    reasoning items that accompanied them. Lookup is **id-based**, not
+    positional: only cached function_calls whose ``call_id`` appears in the
+    current input's orchestrator ``tool_calls`` are emitted. Stale cache
+    entries (call_ids no longer in the message list — typical when the
+    cache accumulated across separate agent loops sharing one ``session_id``)
+    are silently ignored, so they never inject orphan function_call items
+    that would trigger ""No tool call found for function call output""
+    errors on the wire. See #875 for the position-vs-id failure mode.
 
-    Fixes #828 (the unknown-parameter errors) and #842 (reasoning continuity).
+    Reasoning items are emitted once per turn group, before the first
+    matching function_call from that turn. A turn's reasoning is only
+    replayed when at least one of that turn's function_calls also matches —
+    i.e. encrypted reasoning rides along with the tool exchange it was
+    bound to.
+
+    Fixes #828 (unknown-parameter errors), #842 (reasoning continuity),
+    and #875 (cache-scope mismatch).
     """
     cached_turn_outputs = cached_turn_outputs or []
+
+    # Build call_id → (turn_idx, fc_item). The cache may hold many turns from
+    # the session's history; we'll only emit the ones whose call_id matches
+    # an orchestrator tool_call in the current input.
+    fc_by_call_id: Dict[str, Tuple[int, Dict[str, Any]]] = {}
+    turn_reasoning: Dict[int, List[Dict[str, Any]]] = {}
+    for turn_idx, turn in enumerate(cached_turn_outputs):
+        turn_reasoning[turn_idx] = [
+            it for it in turn if it.get("type") == "reasoning"
+        ]
+        for it in turn:
+            if it.get("type") == "function_call":
+                cid = it.get("call_id")
+                if cid:
+                    fc_by_call_id[cid] = (turn_idx, it)
+
     items: List[Dict[str, Any]] = []
-    assistant_turn_idx = 0
+    emitted_turn_reasoning: set = set()  # turn indices whose reasoning is already emitted
     for msg in messages:
         role = msg.get("role")
         if role == "user":
@@ -191,29 +233,35 @@ def _convert_messages_to_responses_format(
             if empty:
                 # Empty assistant message — drop. The Responses API rejects
                 # bare assistant items with no content and no function_call.
-                # Don't increment turn index — this isn't a real prior turn.
                 continue
-            if assistant_turn_idx < len(cached_turn_outputs):
-                # Replay this turn's cached output items (reasoning +
-                # function_calls) verbatim. The encrypted_content and
-                # original ids must round-trip exactly to be valid.
-                items.extend(cached_turn_outputs[assistant_turn_idx])
-            else:
-                # No cache — convert from the Chat-Completions message.
-                if text:
-                    items.append({"role": "assistant", "content": text})
-                for tc in tool_calls:
+            if text:
+                items.append({"role": "assistant", "content": text})
+            for tc in tool_calls:
+                cid = tc.get("id") or ""
+                cache_hit = fc_by_call_id.get(cid)
+                if cache_hit is not None:
+                    turn_idx, cached_fc = cache_hit
+                    # Emit this turn's reasoning items once, just before the
+                    # first matching function_call from that turn.
+                    if turn_idx not in emitted_turn_reasoning:
+                        for r in turn_reasoning.get(turn_idx, []):
+                            items.append(r)
+                        emitted_turn_reasoning.add(turn_idx)
+                    items.append(cached_fc)
+                else:
+                    # No cache match — synthesize the function_call from the
+                    # orchestrator's tool_call. This is the post-#828 path
+                    # for fresh tool exchanges (no prior reasoning to replay).
                     fn = tc.get("function") or {}
                     args = fn.get("arguments", "")
                     if not isinstance(args, str):
                         args = json.dumps(args)
                     items.append({
                         "type": "function_call",
-                        "call_id": tc.get("id", ""),
+                        "call_id": cid,
                         "name": fn.get("name", ""),
                         "arguments": args,
                     })
-            assistant_turn_idx += 1
         elif role == "tool":
             items.append({
                 "type": "function_call_output",
@@ -336,13 +384,20 @@ class CodexAdapter(LLMAdapter):
         self,
         session_id: Optional[str],
         signature: str,
+        messages: Optional[List[Dict[str, Any]]] = None,
     ) -> List[List[Dict[str, Any]]]:
-        """Load cached output items per turn for replay (#842).
+        """Load cached output items per turn for replay (#842 + #875).
 
-        Returns a list of per-turn output-item lists. Empty list when no
-        ``session_id``, no cursor, or signature drift (cached reasoning was
-        conditioned on a different ``(instructions, tools)`` and would
-        confuse the model — drop and resubmit full context).
+        Returns a list of per-turn output-item lists. Empty list when:
+        - No ``session_id``.
+        - No cursor exists for the session.
+        - Signature drift (cached reasoning was conditioned on different
+          ``(instructions, tools)``).
+        - The input ``messages`` show no tool history — i.e. the orchestrator
+          is starting a fresh agent loop. In that case the cache from the
+          prior loop is stale and we clear it (#875). Without this guard the
+          cache grows unboundedly and stale function_call items get injected
+          into unrelated agent loops.
         """
         if not session_id:
             return []
@@ -351,6 +406,12 @@ class CodexAdapter(LLMAdapter):
             return []
         if cursor.last_request_signature != signature:
             # Drift: do not replay reasoning bound to a different prompt.
+            return []
+        # Fresh-loop guard: if the current input has no assistant.tool_calls
+        # messages, the prior cache cannot apply (no function_calls to match
+        # against). Clear it so it doesn't accumulate across user messages.
+        if messages is not None and not _messages_have_tool_history(messages):
+            self._continuation_store.clear(self.name, session_id)
             return []
         try:
             return [json.loads(s) for s in cursor.turn_outputs]
@@ -431,7 +492,7 @@ class CodexAdapter(LLMAdapter):
         # output items (reasoning + function_call) and replaying them as input
         # items on subsequent turns — see #842.
         signature = _compute_request_signature(instructions, responses_tools)
-        cached_outputs = self._load_replay_outputs(session_id, signature)
+        cached_outputs = self._load_replay_outputs(session_id, signature, messages=input_messages)
         input_to_send = _convert_messages_to_responses_format(
             input_messages, cached_turn_outputs=cached_outputs,
         )
@@ -569,7 +630,7 @@ class CodexAdapter(LLMAdapter):
         instructions = self.contribute_system_prompt(model, instructions)
         # See ``get_response`` for the full rationale on #841 and #842.
         signature = _compute_request_signature(instructions, None)
-        cached_outputs = self._load_replay_outputs(session_id, signature)
+        cached_outputs = self._load_replay_outputs(session_id, signature, messages=input_messages)
         input_to_send = _convert_messages_to_responses_format(
             input_messages, cached_turn_outputs=cached_outputs,
         )
@@ -640,7 +701,7 @@ class CodexAdapter(LLMAdapter):
 
         # See ``get_response`` for the full rationale on #841 and #842.
         signature = _compute_request_signature(instructions, responses_tools)
-        cached_outputs = self._load_replay_outputs(session_id, signature)
+        cached_outputs = self._load_replay_outputs(session_id, signature, messages=input_messages)
         input_to_send = _convert_messages_to_responses_format(
             input_messages, cached_turn_outputs=cached_outputs,
         )
