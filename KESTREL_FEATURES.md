@@ -215,24 +215,24 @@ The currently exported `Feature` subclasses discovered from those modules includ
   - `POST /auth/token`
   - `GET /auth/verify`
 - [`endpoints/agent.py`](endpoints/agent.py)
-  - `POST /agent/invoke`
-  - `POST /agent/stream`
-  - `POST /agent/stop`
-  - `GET /agent/info`
-  - `GET /agent/privacy-mode`
-  - `POST /agent/privacy-mode`
-  - `GET /agent/notifications`
-  - `GET /agent/notifications/sse`
-  - `GET /agent/context-status`
-  - `GET /agent/reflection/status`
-  - `GET /agent/tasks`
-  - `GET /agent/tasks/{task_id}`
-  - `GET /agent/heartbeat/status`
-  - `POST /agent/heartbeat/trigger`
-  - `GET /agent/health/status`
-  - `POST /agent/health/trigger`
-  - `POST /agent/mesh`
-  - `GET /agent/mesh/inbox`
+  - `POST /api/agent/invoke`
+  - `POST /api/agent/stream`
+  - `POST /api/agent/stop`
+  - `GET /api/agent/info`
+  - `GET /api/agent/privacy-mode`
+  - `POST /api/agent/privacy-mode`
+  - `GET /api/agent/notifications`
+  - `GET /api/agent/notifications/sse`
+  - `GET /api/agent/context-status`
+  - `GET /api/agent/reflection/status`
+  - `GET /api/agent/tasks`
+  - `GET /api/agent/tasks/{task_id}`
+  - `GET /api/agent/heartbeat/status`
+  - `POST /api/agent/heartbeat/trigger`
+  - `GET /api/agent/health/status`
+  - `POST /api/agent/health/trigger`
+  - `POST /api/agent/mesh`
+  - `GET /api/agent/mesh/inbox`
 - [`endpoints/conversations.py`](endpoints/conversations.py)
   - `GET /api/sessions`
   - `GET /api/conversations`

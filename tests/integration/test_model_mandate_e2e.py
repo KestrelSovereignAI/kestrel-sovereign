@@ -296,7 +296,7 @@ class TestProtectedEndpointsRequireAuth:
 
     def test_agent_invoke_requires_auth(self, client):
         """POST /agent/invoke requires API key."""
-        response = client.post("/agent/invoke", json={"input": "test"})
+        response = client.post("/api/agent/invoke", json={"input": "test"})
 
         # Should be 401 without auth
         assert response.status_code == 401

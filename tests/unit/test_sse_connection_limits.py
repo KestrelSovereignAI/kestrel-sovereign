@@ -60,7 +60,7 @@ class TestSSEConnectionLimits:
         _sse_connections[("testclient", agent_id)] = MAX_SSE_CONNECTIONS_PER_CLIENT
 
         client = TestClient(app_with_mock_agent, raise_server_exceptions=False)
-        response = client.get("/agent/notifications/sse")
+        response = client.get("/api/agent/notifications/sse")
 
         assert response.status_code == 429
         assert "Too many SSE connections" in response.json()["detail"]
@@ -72,7 +72,7 @@ class TestSSEConnectionLimits:
         _sse_connections[("testclient", agent_id)] = MAX_SSE_CONNECTIONS_PER_CLIENT + 10
 
         client = TestClient(app_with_mock_agent, raise_server_exceptions=False)
-        response = client.get("/agent/notifications/sse")
+        response = client.get("/api/agent/notifications/sse")
 
         assert response.status_code == 429
 
@@ -88,7 +88,7 @@ class TestSSEConnectionLimits:
         # Now max out testclient too — should get rejected
         _sse_connections[("testclient", agent_id)] = MAX_SSE_CONNECTIONS_PER_CLIENT
         client = TestClient(app_with_mock_agent, raise_server_exceptions=False)
-        response = client.get("/agent/notifications/sse")
+        response = client.get("/api/agent/notifications/sse")
         assert response.status_code == 429
 
         # But if testclient has room, it would not be rejected
@@ -104,7 +104,7 @@ class TestSSEConnectionLimits:
         # Deliberately do not set app.state.agent
 
         client = TestClient(app, raise_server_exceptions=False)
-        response = client.get("/agent/notifications/sse")
+        response = client.get("/api/agent/notifications/sse")
 
         assert response.status_code == 503
 
@@ -176,7 +176,7 @@ class TestSSEConnectionLimits:
         _sse_connections[("testclient", agent_id)] = MAX_SSE_CONNECTIONS_PER_CLIENT
 
         client = TestClient(app_with_mock_agent, raise_server_exceptions=False)
-        response = client.get("/agent/notifications/sse")
+        response = client.get("/api/agent/notifications/sse")
 
         detail = response.json()["detail"]
         assert f"limit: {MAX_SSE_CONNECTIONS_PER_CLIENT}" in detail

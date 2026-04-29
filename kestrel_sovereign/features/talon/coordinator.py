@@ -199,7 +199,7 @@ class TalonCoordinatorFeature(Feature):
             issue_title=title or f"#{issue_number}",
         )
 
-        url = f"{host_url}/api/agents/talon/agent/mesh"
+        url = f"{host_url}/api/agents/talon/api/agent/mesh"
         payload = json.dumps(msg.to_dict()).encode("utf-8")
         req = urllib.request.Request(
             url,

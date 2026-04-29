@@ -105,12 +105,12 @@ export function connectNotifications() {
     // EventSource can't send custom headers. Standalone server: pass the
     // bootstrap API key as a query param. OAuth: the session cookie rides
     // automatically. Embedded hosts using a non-API-key auth scheme (e.g.
-    // BearerToken) must authenticate /agent/notifications/sse via cookie or
-    // their own middleware — the host controls that path.
+    // BearerToken) must authenticate /api/agent/notifications/sse via cookie
+    // or their own middleware — the host controls that path.
     const apiKey = API.getApiKey();
 
     try {
-        const ssePath = API.buildAgentUrl('/agent/notifications/sse');
+        const ssePath = API.buildAgentUrl('/api/agent/notifications/sse');
         const sseUrl = apiKey ? `${ssePath}?api_key=${encodeURIComponent(apiKey)}` : ssePath;
         notificationEventSource = new EventSource(sseUrl);
 

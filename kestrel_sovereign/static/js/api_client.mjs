@@ -250,7 +250,7 @@ export function createApiClient({
         },
 
         health: () => client.request('/health'),
-        getAgentInfo: () => client.request('/agent/info'),
+        getAgentInfo: () => client.request('/api/agent/info'),
         getAgents: () => client.request('/api/agents'),
         getIdentity: () => client.request('/api/identity'),
         updateIdentity: (data) => client.request('/api/identity', {
@@ -274,12 +274,12 @@ export function createApiClient({
             body: JSON.stringify({ description, num_outputs: numOutputs }),
         }),
         getConstitution: () => client.request('/api/constitution'),
-        getPrivacyMode: () => client.request('/agent/privacy-mode'),
+        getPrivacyMode: () => client.request('/api/agent/privacy-mode'),
         // setPrivacyMode is destructive on live agents (#867 gates the
         // endpoint) — a flip into EPHEMERAL primes the leak-purge for the
         // next exit.  The UI carries the opt-in header so the rail sees an
         // intentional change; scripts must opt in explicitly.
-        setPrivacyMode: (mode) => client.request('/agent/privacy-mode', {
+        setPrivacyMode: (mode) => client.request('/api/agent/privacy-mode', {
             method: 'POST',
             headers: { 'X-Kestrel-Allow-Destructive': 'user-initiated-mode-change' },
             body: JSON.stringify({ mode }),
@@ -364,11 +364,11 @@ export function createApiClient({
         },
         getIpfsStatus: () => client.request('/api/ipfs/status'),
         getWallet: () => client.request('/api/wallet'),
-        invoke: (input, model = null, sessionId = null, provider = null) => client.request('/agent/invoke', {
+        invoke: (input, model = null, sessionId = null, provider = null) => client.request('/api/agent/invoke', {
             method: 'POST',
             body: JSON.stringify({ input, model, session_id: sessionId, provider }),
         }),
-        stop: (requestId = null) => client.request('/agent/stop', {
+        stop: (requestId = null) => client.request('/api/agent/stop', {
             method: 'POST',
             body: JSON.stringify(requestId ? { request_id: requestId } : {}),
         }),
@@ -394,7 +394,7 @@ export function createApiClient({
             const signal = state.streamAbortController.signal;
 
             try {
-                const url = applyHostAgentPrefix('/agent/stream', state.selectedHostAgent);
+                const url = applyHostAgentPrefix('/api/agent/stream', state.selectedHostAgent);
                 const response = await fetchImpl(url, {
                     method: 'POST',
                     headers,
@@ -464,7 +464,7 @@ export function createApiClient({
         },
         getContextStatus: (sessionId = null) => {
             const params = sessionId ? `?session_id=${encodeURIComponent(sessionId)}` : '';
-            return client.request(`/agent/context-status${params}`);
+            return client.request(`/api/agent/context-status${params}`);
         },
         _getState() {
             return { ...state };
