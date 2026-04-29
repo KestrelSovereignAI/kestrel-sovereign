@@ -42,11 +42,9 @@ import { State, nextStateForEvent } from './state-machine.js';
  * Without this any server with auth enabled returns 401, surfacing as a
  * fatal voice error in the UI.
  */
-function voiceAuthHeaders() {
-  const headers = {};
-  const apiKey = typeof API.getApiKey === 'function' ? API.getApiKey() : '';
-  if (apiKey) headers['X-API-Key'] = apiKey;
-  return headers;
+async function voiceAuthHeaders() {
+  // Honors the active auth provider (API key, JWT, OAuth) — see #863.
+  return typeof API.applyAuth === 'function' ? await API.applyAuth({}) : {};
 }
 
 const STATE_LABELS = {

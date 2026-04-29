@@ -79,12 +79,14 @@ export function connectNotifications() {
         notificationEventSource.close();
     }
 
-    // Get API key for authentication (EventSource can't send headers)
+    // EventSource can't send custom headers. Standalone server: pass the
+    // bootstrap API key as a query param. OAuth: the session cookie rides
+    // automatically. Embedded hosts using a non-API-key auth scheme (e.g.
+    // BearerToken) must authenticate /agent/notifications/sse via cookie or
+    // their own middleware — the host controls that path.
     const apiKey = API.getApiKey();
 
     try {
-        // Pass API key as query parameter since EventSource can't send headers.
-        // In OAuth mode (no API key), the session cookie is sent automatically.
         const ssePath = API.buildAgentUrl('/agent/notifications/sse');
         const sseUrl = apiKey ? `${ssePath}?api_key=${encodeURIComponent(apiKey)}` : ssePath;
         notificationEventSource = new EventSource(sseUrl);
@@ -596,10 +598,7 @@ export async function loadModels() {
         apiEndpoint: API.buildAgentUrl('/api/models'),
         currentModelEndpoint: API.buildAgentUrl('/api/model/current'),
         storagePrefix: `kestrel_${API.getHostAgent() || 'default'}`,
-        getAuthHeader: () => {
-            const key = API.getApiKey();
-            return key ? { 'X-API-Key': key } : {};
-        },
+        getAuthHeader: async () => await API.applyAuth({}),
         onModelChange: async (vendor, model, isInitialLoad, route) => {
             if (isInitialLoad) return;
 
@@ -622,9 +621,7 @@ export async function loadModels() {
 
             const body = { vendor, model };
             if (route) body.route = route;
-            const headers = { 'Content-Type': 'application/json' };
-            const key = API.getApiKey();
-            if (key) headers['X-API-Key'] = key;
+            const headers = await API.applyAuth({ 'Content-Type': 'application/json' });
 
             try {
                 const resp = await fetch(API.buildAgentUrl('/api/model/set'), {

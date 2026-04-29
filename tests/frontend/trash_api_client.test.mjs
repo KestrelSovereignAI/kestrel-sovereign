@@ -48,13 +48,11 @@ function createFetchQueue(...responses) {
 }
 
 function makeClient({ fetchFn }) {
-    const localStorage = createStorage();
     const sessionStorage = createStorage({ kestrel_api_key: 'k-test' });
     return createApiClient({
         fetchFn,
-        localStorage,
         sessionStorage,
-        location: { href: '/console' },
+        location: { href: '/console', search: '' },
         logger: console,
     });
 }

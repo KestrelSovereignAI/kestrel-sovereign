@@ -132,7 +132,7 @@ class ModelSelector {
         try {
             const headers = {
                 'Content-Type': 'application/json',
-                ...this.getAuthHeader()
+                ...(await this.getAuthHeader())
             };
 
             const response = await fetch(this.apiEndpoint, { headers });
@@ -382,7 +382,7 @@ class ModelSelector {
         try {
             const headers = {
                 'Content-Type': 'application/json',
-                ...this.getAuthHeader()
+                ...(await this.getAuthHeader())
             };
 
             const response = await fetch(this.currentModelEndpoint, { headers });
@@ -611,7 +611,7 @@ class ModelSelector {
         try {
             const headers = {
                 'Content-Type': 'application/json',
-                ...this.getAuthHeader()
+                ...(await this.getAuthHeader())
             };
             const body = { vendor, model };
             if (route) body.route = route;
