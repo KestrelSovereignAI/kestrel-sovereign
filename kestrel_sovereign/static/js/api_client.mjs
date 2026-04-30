@@ -401,11 +401,16 @@ export function createApiClient({
             // construction and URL build — without this, headers/URL/state
             // could end up referring to different agents.
             const dispatchAgent = state.selectedHostAgent;
+
+            // Build auth headers BEFORE installing the abort controller in
+            // the per-agent map. If buildHeaders() throws (auth provider
+            // failure, bearer-token unavailable, etc.) we must not leave a
+            // stale controller behind for the next Stop click to fire on.
+            const headers = await buildHeaders({ 'Content-Type': 'application/json' });
+
             const controller = new AbortCtor();
             const signal = controller.signal;
             state.streamAbortControllers.set(dispatchAgent, controller);
-
-            const headers = await buildHeaders({ 'Content-Type': 'application/json' });
 
             try {
                 const url = applyHostAgentPrefix('/api/agent/stream', dispatchAgent);

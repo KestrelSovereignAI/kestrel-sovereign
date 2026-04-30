@@ -442,6 +442,34 @@ test('streamInvoke stores abort controller + request id keyed by the dispatching
     assert.equal(client.getCurrentStreamRequestId('agent-B'), null);
 });
 
+test('streamInvoke does not leak an abort controller when auth header build rejects (PR #874 review-2)', async () => {
+    // Pre-this-fix the controller was inserted into the per-agent map
+    // BEFORE awaiting buildHeaders(). If applyAuth() rejected (expired
+    // bearer, etc.) the try/finally never ran and a stale controller was
+    // left under the dispatch agent's key. The next Stop click would
+    // resolve that stale controller and call .abort() on it — confusing
+    // at best, dangerous if the same controller object got reused.
+    const provider = {
+        async ensureAuthenticated() {},
+        async applyAuth() {
+            throw new Error('bearer token unavailable');
+        },
+        async onUnauthorized() { return 'failed'; },
+    };
+    const fetchFn = createFetchQueue();
+    const { client } = createClient({ fetchFn, authProvider: provider });
+
+    client.setHostAgent('agent-A');
+    const iter = client.streamInvoke('hello');
+    await assert.rejects(() => iter.next(), /bearer token unavailable/);
+
+    // Map must be empty for agent-A — no leaked controller.
+    assert.equal(client.getStreamAbortController('agent-A'), null);
+    assert.equal(client.getCurrentStreamRequestId('agent-A'), null);
+    // And no fetch should have been issued — auth failed before URL build.
+    assert.equal(fetchFn.calls.length, 0);
+});
+
 test('streamInvoke captures dispatch agent BEFORE awaiting auth headers (PR #874)', async () => {
     // Pre-fix, streamInvoke awaited buildHeaders() before snapshotting
     // selectedHostAgent. With an async auth provider, switching agents

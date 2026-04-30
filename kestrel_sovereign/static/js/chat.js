@@ -50,6 +50,29 @@ export function _getUiGeneration() {
     return uiGeneration;
 }
 
+/**
+ * Canonical chat-pane wipe-and-rebuild. Bumps the UI generation counter
+ * BEFORE the DOM mutation so any in-flight stream's
+ * `dispatchGeneration === uiGeneration` check fails immediately — that
+ * stops chunks from painting a now-stale msgDiv during/after the wipe.
+ *
+ * Every code path that clears or rebuilds the chat container (agent
+ * switch, conversation load, new chat, clear chat, soft/hard delete of
+ * the active conversation) must go through this helper. Bare
+ * `chatContainer.innerHTML = ...` calls leak: the generation counter
+ * doesn't move, so a stream dispatched against the old pane keeps
+ * thinking it's still current and writes into the freshly-rebuilt pane.
+ *
+ * The element is looked up fresh rather than relying on the cached
+ * `chatContainer` ref because callers may run before `initChat()` has
+ * resolved the ref or in contexts where the cache hasn't been populated.
+ */
+export function wipeChatPane(html = '') {
+    bumpUiGeneration();
+    const el = chatContainer || document.getElementById('chat-container');
+    if (el) el.innerHTML = html;
+}
+
 // ============================================================================
 // Initialization
 // ============================================================================
@@ -969,14 +992,16 @@ function selectHighlightedCommand() {
 window.clearChat = function() {
     if (!chatContainer) return;
 
-    // Clear all messages except the welcome message
-    chatContainer.innerHTML = `
+    // Clear all messages except the welcome message. wipeChatPane() bumps
+    // the UI generation so any in-flight stream against this pane gates
+    // out before its chunks can paint the welcome view.
+    wipeChatPane(`
         <div class="message agent-message">
             <div class="message-content">
                 <p>Hello! I am your Kestrel AI agent, bound by the Kestrel Constitution to be your truthful and honorable assistant. How can I help you today?</p>
             </div>
         </div>
-    `;
+    `);
 
     // Clear message input
     if (messageInput) {

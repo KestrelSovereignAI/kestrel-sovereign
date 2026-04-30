@@ -42,7 +42,7 @@ globalThis.fetch = globalThis.fetch || (async () => ({ ok: false, status: 500 })
 // `kicon` is a global helper loaded via <script> in production; stub it.
 globalThis.kicon = globalThis.kicon || (() => '');
 
-const { bumpUiGeneration, _getUiGeneration } = await import(
+const { bumpUiGeneration, _getUiGeneration, wipeChatPane } = await import(
     '../../kestrel_sovereign/static/js/chat.js'
 );
 
@@ -57,6 +57,40 @@ test('UI generation counter starts at 0 and increments on each bump (PR #874)', 
     bumpUiGeneration();
     bumpUiGeneration();
     assert.equal(_getUiGeneration(), baseline + 3);
+});
+
+test('wipeChatPane() bumps the UI generation BEFORE the DOM mutation (PR #874 review-2)', () => {
+    // Every chat-pane wipe path (selectAgent, loadConversation,
+    // startNewConversation, clearChat, delete/purgeConversation) must go
+    // through wipeChatPane() so the generation counter moves with the
+    // wipe. Bare innerHTML='' wipes leak: a stream dispatched against the
+    // pre-wipe pane keeps thinking it's current and writes into the
+    // freshly-rebuilt one.
+    const fakeContainer = { innerHTML: '<old>previous</old>' };
+    let lookups = 0;
+    globalThis.document.getElementById = (id) => {
+        if (id === 'chat-container') {
+            lookups += 1;
+            return fakeContainer;
+        }
+        return null;
+    };
+
+    const before = _getUiGeneration();
+    wipeChatPane('<div>fresh</div>');
+
+    assert.equal(_getUiGeneration(), before + 1, 'generation must bump');
+    assert.equal(fakeContainer.innerHTML, '<div>fresh</div>', 'pane must be replaced');
+    assert.ok(lookups >= 1, 'must look up #chat-container fresh, not rely on a stale ref');
+});
+
+test('wipeChatPane() called with no argument clears to empty string (PR #874 review-2)', () => {
+    const fakeContainer = { innerHTML: '<old>previous</old>' };
+    globalThis.document.getElementById = (id) =>
+        id === 'chat-container' ? fakeContainer : null;
+
+    wipeChatPane();
+    assert.equal(fakeContainer.innerHTML, '');
 });
 
 test('UI generation gate: dispatch captured at gen N becomes stale after a bump (PR #874)', () => {

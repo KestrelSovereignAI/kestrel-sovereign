@@ -5,7 +5,7 @@
 
 import API from './api.js';
 import { state, PRIVACY_MODES, Toast, loadCommands } from './ui.js';
-import { disconnectNotifications, connectNotifications, loadModels, updateContextStatus, updateThinkingIndicator, bumpUiGeneration } from './chat.js';
+import { disconnectNotifications, connectNotifications, loadModels, updateContextStatus, updateThinkingIndicator, wipeChatPane } from './chat.js';
 import { generateIdenticon } from './identicon.js';
 import { trashGroupKey, groupTrashBySession } from './trash_grouping.js';
 
@@ -665,12 +665,12 @@ window.selectAgent = async function(agentName) {
     // Set host agent routing in API layer
     API.setHostAgent(agentName);
 
-    // Bump the chat UI generation BEFORE we wipe `chatContainer` below.
-    // Any in-flight stream that captured the prior generation at dispatch
-    // time will treat its UI as stale from this point on and won't paint
-    // the about-to-be-rebuilt pane (covers the A→B→A timing case where
-    // agent equality is restored but the pane was wiped twice).
-    bumpUiGeneration();
+    // Wipe the chat pane via the shared helper. wipeChatPane() bumps the
+    // UI generation BEFORE the DOM mutation so any in-flight stream that
+    // captured the prior generation at dispatch time gates out
+    // immediately — covers the A→B→A case where agent equality is
+    // restored after two switches but the pane was wiped twice.
+    wipeChatPane();
 
     // Refresh the chat-input "Thinking…" indicator + send/input disabled
     // state from the new agent's waiting status. If the previous agent
@@ -691,12 +691,6 @@ window.selectAgent = async function(agentName) {
     // Show conversations pane
     const conversationsPane = document.getElementById('conversations-pane');
     conversationsPane.style.display = 'flex';
-
-    // Clear chat messages — previous agent's messages shouldn't persist
-    const chatContainer = document.getElementById('chat-container');
-    if (chatContainer) {
-        chatContainer.innerHTML = '';
-    }
 
     // Reset session and cached panel data so they reload from the new agent
     state.currentSessionId = null;
@@ -952,8 +946,11 @@ window.loadConversation = async function(sessionId) {
         const data = await API.getConversation(sessionId);
         const messages = data.messages || [];
 
+        // wipeChatPane() bumps the UI generation so any stream still
+        // running against the previous conversation gates out before
+        // its chunks land in the freshly-loaded view.
+        wipeChatPane();
         const chatContainer = document.getElementById('chat-container');
-        chatContainer.innerHTML = '';
 
         const renderMd = window.SharedMarkdown?.renderMarkdown;
 
@@ -1038,8 +1035,9 @@ window.deleteConversation = async function(sessionId, rowEl) {
         if (state.currentSessionId === sessionId) {
             state.currentSessionId = null;
             activeConversationId = null;
-            const chatContainer = document.getElementById('chat-container');
-            if (chatContainer) chatContainer.innerHTML = '';
+            // Bump-and-wipe in one shot — any in-flight stream against
+            // the now-deleted session gates out before painting.
+            wipeChatPane();
             if (typeof updateContextStatus === 'function') {
                 updateContextStatus();
             }
@@ -1083,8 +1081,9 @@ window.purgeConversation = async function(sessionId, rowEl) {
         if (state.currentSessionId === sessionId) {
             state.currentSessionId = null;
             activeConversationId = null;
-            const chatContainer = document.getElementById('chat-container');
-            if (chatContainer) chatContainer.innerHTML = '';
+            // Bump-and-wipe — any in-flight stream against the
+            // now-purged session gates out before painting.
+            wipeChatPane();
             if (typeof updateContextStatus === 'function') {
                 updateContextStatus();
             }
