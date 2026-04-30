@@ -247,28 +247,51 @@ class KestrelAgent(
         return self.did
 
     def get_feature(self, name: str):
-        """Look up a registered feature by class name, tool_name, or
-        a case-insensitive shorthand.
+        """Look up a registered feature by class name, tool_name, or a
+        case-insensitive shorthand.
 
         Features are stored in ``self.features`` keyed by
         ``Feature.name`` (which is ``__class__.__name__``), so
-        ``"SecurityFeature"`` is the canonical key. Several call sites
-        scattered through the codebase try the lowercase tool name
-        (``"security"``) instead and silently miss — symptom: tools
-        emit ``"Security feature not available"`` even though the
-        feature is registered. This helper accepts both forms.
+        ``"SecurityFeature"`` is the canonical key. Six call sites
+        historically passed the lowercase shorthand (``"security"``)
+        and missed.
+
+        Resolution, all case-insensitive:
+
+        1. Exact dict lookup on ``name``.
+        2. Class-name match — also accepts the ``"Feature"`` suffix
+           being absent (so ``"security"`` → ``SecurityFeature``).
+        3. ``tool_name`` match — same suffix tolerance for the
+           auto-derived ``"_feature"`` (so ``"security"`` →
+           ``security_feature``).
+
+        ``Feature.tool_name`` is a property, so accessing it on a
+        feature whose subclass overrides it as a non-property still
+        works.
         """
         if not name:
             return None
         feature = self.features.get(name)
         if feature is not None:
             return feature
+
         target = name.lower()
+        target_with_suffix = (
+            target if target.endswith("feature") else target + "feature"
+        )
+
         for feat in self.features.values():
-            if feat.name.lower() == target:
+            class_name = feat.name.lower() if getattr(feat, "name", None) else ""
+            if class_name in (target, target_with_suffix):
                 return feat
-            tool_name = getattr(feat, "tool_name", None)
-            if tool_name and tool_name.lower() == target:
+            try:
+                tool_name = (getattr(feat, "tool_name", "") or "").lower()
+            except Exception:
+                tool_name = ""
+            target_tool = (
+                target if target.endswith("_feature") else target + "_feature"
+            )
+            if tool_name and tool_name in (target, target_tool):
                 return feat
         return None
 
