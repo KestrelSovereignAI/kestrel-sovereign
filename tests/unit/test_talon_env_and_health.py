@@ -10,6 +10,7 @@ exposes the result of that without dispatching real work.
 from __future__ import annotations
 
 import asyncio
+import os
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -167,3 +168,159 @@ async def test_talon_health_reports_help_failure(monkeypatch, tmp_path):
     assert report["execute"]["ok"] is False
     assert report["execute"]["returncode"] == 7
     assert "boom" in report["execute"]["stderr_tail"]
+
+
+@pytest.mark.asyncio
+async def test_dispatch_via_cli_background_returns_immediately_and_logs(
+    tmp_path, monkeypatch,
+):
+    """Background dispatch must return BEFORE talon completes — that
+    was the whole reason ``talon_claim`` was timing out at 300s.
+    Use a script that sleeps 30s and assert dispatch returns in
+    under a second with a usable job_id and log path.
+    """
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_test")
+
+    # Real subprocess: sleep ~30s. We assert dispatch returns fast,
+    # then kill the child so the test exits cleanly.
+    fake_bin = tmp_path / "kestrel-talon"
+    fake_bin.write_text(
+        "#!/bin/sh\n"
+        "echo 'starting'\n"
+        "for i in $(seq 1 30); do echo \"tick $i\"; sleep 1; done\n"
+    )
+    fake_bin.chmod(0o755)
+
+    agent = SimpleNamespace(_scheduler=None, storage_path=str(tmp_path / "agent.db"))
+    feat = TalonCoordinatorFeature(agent)
+
+    with patch.object(
+        TalonCoordinatorFeature, "_find_talon_bin", return_value=str(fake_bin),
+    ):
+        t0 = asyncio.get_event_loop().time()
+        result = await feat._dispatch_via_cli_background(
+            ["claim", "--repo", "x/y", "--issue", "1"],
+            label="claim:x/y#1",
+            extra_meta={"repo": "x/y", "issue": 1},
+        )
+        elapsed = asyncio.get_event_loop().time() - t0
+
+    try:
+        assert elapsed < 2.0, (
+            f"Background dispatch should return in < 2s, took {elapsed:.2f}s"
+        )
+        assert result["dispatched"] is True
+        assert result["method"] == "cli_background"
+        assert result["job_id"]
+        assert result["pid"]
+        assert result["log_path"]
+
+        job = feat._jobs[result["job_id"]]
+        assert job["status"] == "dispatched"
+        assert job["repo"] == "x/y"
+        assert job["issue"] == 1
+        assert os.path.isfile(job["log_path"])
+    finally:
+        # Reap the long-running fake-talon child so pytest doesn't
+        # hang on shutdown waiting for it.
+        proc = feat._jobs[result["job_id"]]["process"]
+        proc.kill()
+        await proc.wait()
+
+
+@pytest.mark.asyncio
+async def test_status_reaps_finished_background_jobs(tmp_path, monkeypatch):
+    """``talon_status`` must reap subprocesses that have exited and
+    flip their status to ``complete`` / ``failed`` based on rc.
+    """
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_test")
+
+    fake_bin = tmp_path / "kestrel-talon-fast"
+    fake_bin.write_text("#!/bin/sh\necho done\nexit 0\n")
+    fake_bin.chmod(0o755)
+
+    agent = SimpleNamespace(_scheduler=None, storage_path=str(tmp_path / "agent.db"))
+    feat = TalonCoordinatorFeature(agent)
+
+    with patch.object(
+        TalonCoordinatorFeature, "_find_talon_bin", return_value=str(fake_bin),
+    ):
+        result = await feat._dispatch_via_cli_background(
+            ["dummy"], label="dummy", extra_meta={},
+        )
+
+    job_id = result["job_id"]
+    # Wait for the child to actually exit before polling status.
+    await feat._jobs[job_id]["process"].wait()
+
+    status = await feat.talon_status()
+    matching = [j for j in status["jobs"] if j["id"] == job_id]
+    assert matching, f"Job {job_id} missing from status"
+    assert matching[0]["status"] == "complete"
+    assert matching[0]["returncode"] == 0
+    assert "completed_at" in matching[0]
+    # Process handle must NOT leak into the response (not JSON-safe).
+    assert "process" not in matching[0]
+
+
+@pytest.mark.asyncio
+async def test_status_marks_failed_jobs(tmp_path, monkeypatch):
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_test")
+    fake_bin = tmp_path / "kestrel-talon-fail"
+    fake_bin.write_text("#!/bin/sh\nexit 3\n")
+    fake_bin.chmod(0o755)
+
+    agent = SimpleNamespace(_scheduler=None, storage_path=str(tmp_path / "agent.db"))
+    feat = TalonCoordinatorFeature(agent)
+
+    with patch.object(
+        TalonCoordinatorFeature, "_find_talon_bin", return_value=str(fake_bin),
+    ):
+        result = await feat._dispatch_via_cli_background(
+            ["dummy"], label="dummy", extra_meta={},
+        )
+
+    await feat._jobs[result["job_id"]]["process"].wait()
+    status = await feat.talon_status()
+    matching = [j for j in status["jobs"] if j["id"] == result["job_id"]]
+    assert matching[0]["status"] == "failed"
+    assert matching[0]["returncode"] == 3
+
+
+@pytest.mark.asyncio
+async def test_talon_job_log_returns_tail(tmp_path, monkeypatch):
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_test")
+    fake_bin = tmp_path / "kestrel-talon-log"
+    fake_bin.write_text(
+        "#!/bin/sh\n"
+        "for i in $(seq 1 20); do echo \"log line $i\"; done\n"
+    )
+    fake_bin.chmod(0o755)
+
+    agent = SimpleNamespace(_scheduler=None, storage_path=str(tmp_path / "agent.db"))
+    feat = TalonCoordinatorFeature(agent)
+
+    with patch.object(
+        TalonCoordinatorFeature, "_find_talon_bin", return_value=str(fake_bin),
+    ):
+        result = await feat._dispatch_via_cli_background(
+            ["dummy"], label="dummy", extra_meta={},
+        )
+
+    await feat._jobs[result["job_id"]]["process"].wait()
+
+    log_result = await feat.talon_job_log(result["job_id"], lines=5)
+    assert log_result["success"] is True
+    assert log_result["lines"] == 5
+    assert "log line 20" in log_result["content"]
+    assert "log line 16" in log_result["content"]
+    # Earlier lines should NOT be in the tail
+    assert "log line 1\n" not in log_result["content"][:200]
+
+
+@pytest.mark.asyncio
+async def test_talon_job_log_unknown_id():
+    feat = TalonCoordinatorFeature(SimpleNamespace(_scheduler=None))
+    result = await feat.talon_job_log("not-a-real-id")
+    assert result["success"] is False
+    assert "Unknown" in result["error"]

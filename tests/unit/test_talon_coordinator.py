@@ -46,39 +46,57 @@ class TestTalonClaim:
             mock_mesh.assert_awaited_once_with("org/repo", 42)
 
     @pytest.mark.asyncio
-    async def test_claim_falls_back_to_cli(self):
-        """When mesh fails, falls back to CLI."""
+    async def test_claim_falls_back_to_cli_background(self):
+        """When mesh fails, falls back to background CLI dispatch.
+
+        Background dispatch returns immediately with a job_id; the
+        previous synchronous behavior was killing Talon mid-work
+        with a 300s subprocess timeout.
+        """
         feature = TalonCoordinatorFeature(_make_agent())
         with patch.object(feature, "_dispatch_via_mesh", new_callable=AsyncMock) as mock_mesh, \
-             patch.object(feature, "_dispatch_via_cli", new_callable=AsyncMock) as mock_cli:
+             patch.object(feature, "_dispatch_via_cli_background", new_callable=AsyncMock) as mock_bg:
             mock_mesh.return_value = {"dispatched": False, "reason": "no_mesh_host"}
-            mock_cli.return_value = {"dispatched": True, "method": "cli"}
+            mock_bg.return_value = {
+                "dispatched": True,
+                "method": "cli_background",
+                "job_id": "abc",
+                "pid": 1234,
+            }
             result = await feature.talon_claim(repo="org/repo", issue=42)
             assert result["dispatched"] is True
-            assert result["method"] == "cli"
+            assert result["method"] == "cli_background"
+            assert result["job_id"] == "abc"
+            args = mock_bg.call_args[0][0]
+            # Best-practice defaults from the README: worktree on,
+            # repo-dir set, opus model, skip-clarification.
+            assert "--worktree" in args
+            assert "--repo-dir" in args
+            assert "--model" in args and "opus" in args
+            assert "--skip-clarification" in args
 
 
 class TestTalonBatch:
     @pytest.mark.asyncio
     async def test_batch_with_prd(self):
         feature = TalonCoordinatorFeature(_make_agent())
-        with patch.object(feature, "_dispatch_via_cli", new_callable=AsyncMock) as mock_cli:
-            mock_cli.return_value = {"dispatched": True, "method": "cli"}
+        with patch.object(feature, "_dispatch_via_cli_background", new_callable=AsyncMock) as mock_bg:
+            mock_bg.return_value = {"dispatched": True, "method": "cli_background"}
             result = await feature.talon_batch(repo="org/repo", prd="prd.json")
             assert result["dispatched"] is True
-            mock_cli.assert_awaited_once()
-            args = mock_cli.call_args[0][0]
+            mock_bg.assert_awaited_once()
+            args = mock_bg.call_args[0][0]
             assert "batch" in args
             assert "--prd" in args
 
     @pytest.mark.asyncio
     async def test_batch_with_label(self):
         feature = TalonCoordinatorFeature(_make_agent())
-        with patch.object(feature, "_dispatch_via_cli", new_callable=AsyncMock) as mock_cli:
-            mock_cli.return_value = {"dispatched": True, "method": "cli"}
+        with patch.object(feature, "_dispatch_via_cli_background", new_callable=AsyncMock) as mock_bg:
+            mock_bg.return_value = {"dispatched": True, "method": "cli_background"}
             result = await feature.talon_batch(repo="org/repo", label="P0")
             assert result["dispatched"] is True
-            args = mock_cli.call_args[0][0]
+            args = mock_bg.call_args[0][0]
             assert "--label" in args
             assert "P0" in args
 
