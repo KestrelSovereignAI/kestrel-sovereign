@@ -332,3 +332,189 @@ test('BearerTokenAuthProvider 401 path delegates to onUnauthenticated and stops 
     assert.equal(result, undefined);
     assert.equal(redirected, true);
 });
+
+// ----------------------------------------------------------------------------
+// Per-agent stream bookkeeping (PR #874 regression)
+//
+// Pre-#874 the abort controller and request id were single global slots.
+// Starting a stream on Agent B while Agent A was still streaming clobbered
+// A's controller, so the Stop button targeted the most recent stream
+// regardless of which pane the user was viewing.
+// ----------------------------------------------------------------------------
+
+// Streamed-response stub that exposes a "finish" hook so the test can hold
+// two streams open at once and inspect the API client's per-agent state in
+// the middle.
+function pendingStreamResponse(headers = {}) {
+    let finish;
+    const finished = new Promise((resolve) => { finish = resolve; });
+    let yielded = false;
+    return {
+        finish,
+        response: {
+            ok: true,
+            status: 200,
+            headers: {
+                get(name) {
+                    return headers[name] ?? headers[name.toLowerCase()] ?? null;
+                },
+            },
+            body: {
+                getReader() {
+                    return {
+                        async read() {
+                            if (!yielded) {
+                                yielded = true;
+                                return { done: false, value: new TextEncoder().encode('chunk') };
+                            }
+                            await finished;
+                            return { done: true };
+                        },
+                        releaseLock() {},
+                    };
+                },
+            },
+        },
+    };
+}
+
+test('streamInvoke stores abort controller + request id keyed by the dispatching host agent (PR #874)', async () => {
+    const a = pendingStreamResponse({ 'X-Request-ID': 'req-A' });
+    const b = pendingStreamResponse({ 'X-Request-ID': 'req-B' });
+    const fetchFn = createFetchQueue(a.response, b.response);
+    const { client } = createClient({
+        fetchFn,
+        sessionInitial: { kestrel_api_key: 'k' },
+    });
+    await client.init();
+
+    // Start stream on agent A and pull the first chunk so the X-Request-ID
+    // header is processed and stored. The generator suspends inside the
+    // reader awaiting more data — we hold the stream open from here on.
+    client.setHostAgent('agent-A');
+    const aIter = client.streamInvoke('hello-A');
+    await aIter.next();
+
+    // Switch to agent B and start a second stream there, also pulling its
+    // first chunk so its bookkeeping is materialized.
+    client.setHostAgent('agent-B');
+    const bIter = client.streamInvoke('hello-B');
+    await bIter.next();
+
+    // Each agent's controller is stored under its own key — neither
+    // overwrote the other. (Pre-fix, A's slot was clobbered by B.)
+    const ctlA = client.getStreamAbortController('agent-A');
+    const ctlB = client.getStreamAbortController('agent-B');
+    assert.ok(ctlA, 'agent-A abort controller present');
+    assert.ok(ctlB, 'agent-B abort controller present');
+    assert.notEqual(ctlA, ctlB);
+    assert.equal(client.getCurrentStreamRequestId('agent-A'), 'req-A');
+    assert.equal(client.getCurrentStreamRequestId('agent-B'), 'req-B');
+
+    // No-arg form defaults to the currently selected host agent — the
+    // contract chat.js relies on for its Stop button.
+    assert.equal(client.getStreamAbortController(), ctlB);
+    assert.equal(client.getCurrentStreamRequestId(), 'req-B');
+
+    // Switching back to A surfaces A's controller via the no-arg form.
+    client.setHostAgent('agent-A');
+    assert.equal(client.getStreamAbortController(), ctlA);
+    assert.equal(client.getCurrentStreamRequestId(), 'req-A');
+
+    // Aborting agent-A must NOT touch agent-B's controller.
+    assert.equal(ctlA.signal.aborted, false);
+    assert.equal(ctlB.signal.aborted, false);
+    ctlA.abort();
+    assert.equal(ctlA.signal.aborted, true);
+    assert.equal(ctlB.signal.aborted, false);
+
+    // Drain both generators so the test exits cleanly.
+    a.finish();
+    b.finish();
+    for await (const _ of aIter) { /* drain */ }
+    for await (const _ of bIter) { /* drain */ }
+
+    // Once a stream finishes, its slot is cleared but the *other* agent's
+    // slot must remain untouched if that stream is still in flight.
+    assert.equal(client.getStreamAbortController('agent-A'), null);
+    assert.equal(client.getStreamAbortController('agent-B'), null);
+    assert.equal(client.getCurrentStreamRequestId('agent-A'), null);
+    assert.equal(client.getCurrentStreamRequestId('agent-B'), null);
+});
+
+test('streamInvoke does not leak an abort controller when auth header build rejects (PR #874 review-2)', async () => {
+    // Pre-this-fix the controller was inserted into the per-agent map
+    // BEFORE awaiting buildHeaders(). If applyAuth() rejected (expired
+    // bearer, etc.) the try/finally never ran and a stale controller was
+    // left under the dispatch agent's key. The next Stop click would
+    // resolve that stale controller and call .abort() on it — confusing
+    // at best, dangerous if the same controller object got reused.
+    const provider = {
+        async ensureAuthenticated() {},
+        async applyAuth() {
+            throw new Error('bearer token unavailable');
+        },
+        async onUnauthorized() { return 'failed'; },
+    };
+    const fetchFn = createFetchQueue();
+    const { client } = createClient({ fetchFn, authProvider: provider });
+
+    client.setHostAgent('agent-A');
+    const iter = client.streamInvoke('hello');
+    await assert.rejects(() => iter.next(), /bearer token unavailable/);
+
+    // Map must be empty for agent-A — no leaked controller.
+    assert.equal(client.getStreamAbortController('agent-A'), null);
+    assert.equal(client.getCurrentStreamRequestId('agent-A'), null);
+    // And no fetch should have been issued — auth failed before URL build.
+    assert.equal(fetchFn.calls.length, 0);
+});
+
+test('streamInvoke captures dispatch agent BEFORE awaiting auth headers (PR #874)', async () => {
+    // Pre-fix, streamInvoke awaited buildHeaders() before snapshotting
+    // selectedHostAgent. With an async auth provider, switching agents
+    // during that await caused the URL + bookkeeping to refer to the new
+    // agent — silently misrouting the request the caller had dispatched
+    // to the old one.
+    let setHostAgentDuringAuth = null;
+    let providerInvocations = 0;
+    const provider = {
+        async ensureAuthenticated() {},
+        async applyAuth(headers) {
+            providerInvocations += 1;
+            // Simulate a real switch happening while we're awaiting auth.
+            // The client variable is captured by closure below.
+            if (setHostAgentDuringAuth) setHostAgentDuringAuth();
+            return { ...headers, 'X-Auth': `tok-${providerInvocations}` };
+        },
+        async onUnauthorized() { return 'failed'; },
+    };
+
+    const stream = pendingStreamResponse({ 'X-Request-ID': 'req-A' });
+    const fetchFn = createFetchQueue(stream.response);
+    const { client } = createClient({ fetchFn, authProvider: provider });
+
+    client.setHostAgent('agent-A');
+    setHostAgentDuringAuth = () => client.setHostAgent('agent-B');
+
+    const iter = client.streamInvoke('hello');
+    await iter.next();
+
+    // The URL must reflect the agent at dispatch time (A), not the agent
+    // the user switched to mid-await (B). Anything else means a stream
+    // dispatched to A would be silently rerouted to B.
+    assert.equal(fetchFn.calls.length, 1);
+    assert.equal(
+        fetchFn.calls[0].url,
+        '/api/agents/agent-A/api/agent/stream',
+        'URL must use dispatch-time agent, not post-await agent',
+    );
+
+    // Bookkeeping must be keyed by dispatch agent A, not the now-current B.
+    assert.ok(client.getStreamAbortController('agent-A'));
+    assert.equal(client.getStreamAbortController('agent-B'), null);
+    assert.equal(client.getCurrentStreamRequestId('agent-A'), 'req-A');
+
+    stream.finish();
+    for await (const _ of iter) { /* drain */ }
+});

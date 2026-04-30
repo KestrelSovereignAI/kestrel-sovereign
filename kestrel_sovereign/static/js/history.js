@@ -5,7 +5,7 @@
 
 import API from './api.js';
 import { state, Toast, escapeHtml } from './ui.js';
-import { updateContextStatus } from './chat.js';
+import { updateContextStatus, wipeChatPane } from './chat.js';
 
 // ============================================================================
 // Chat History Browser
@@ -214,10 +214,11 @@ window.loadConversation = async function(sessionId) {
             state.encryptedAtRest = data.encrypted_at_rest;
         }
 
+        // Bumps UI generation as part of the wipe so any stream still
+        // streaming against the previous conversation gates out before its
+        // chunks can land in the freshly-loaded view.
+        wipeChatPane();
         const chatContainer = document.getElementById('chat-container');
-        if (chatContainer) {
-            chatContainer.innerHTML = '';
-        }
 
         if (!state.showDecrypted && state.encryptedAtRest) {
             const banner = document.createElement('div');
@@ -300,15 +301,14 @@ window.startNewConversation = async function() {
         const result = await API.newConversation();
         state.currentSessionId = result.session_id;
 
-        const chatContainer = document.getElementById('chat-container');
-        if (chatContainer) {
-            chatContainer.innerHTML = `
-                <div style="text-align: center; padding: 2rem; color: var(--text-secondary);">
-                    <span style="font-size: 2rem;">\u{2728}</span>
-                    <p style="margin-top: 0.5rem;">New conversation started. Say hello!</p>
-                </div>
-            `;
-        }
+        // wipeChatPane() bumps the UI generation so any stream still
+        // running against the previous (now-replaced) session gates out.
+        wipeChatPane(`
+            <div style="text-align: center; padding: 2rem; color: var(--text-secondary);">
+                <span style="font-size: 2rem;">\u{2728}</span>
+                <p style="margin-top: 0.5rem;">New conversation started. Say hello!</p>
+            </div>
+        `);
 
         await loadConversationHistory();
 

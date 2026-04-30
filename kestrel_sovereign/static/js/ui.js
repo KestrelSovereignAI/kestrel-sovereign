@@ -82,7 +82,10 @@ export const state = {
     storage: null,
     wallet: null,
     privacyMode: 'normal',
-    isWaiting: false,
+    // Per-agent waiting state (Set of host-agent names — null key for
+    // standalone mode). Replaced the single `isWaiting` bool so a stream
+    // on Agent A doesn't make Agent B's input look "Thinking" too.
+    waitingAgents: new Set(),
     conversations: [],
     currentSessionId: null,
     showDecrypted: true,
