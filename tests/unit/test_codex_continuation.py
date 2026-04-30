@@ -382,59 +382,94 @@ class TestCodexCursorRecordingE2E:
         )
 
     async def test_stale_cache_call_ids_do_not_leak_into_new_loop(self):
-        # #875 regression. Cache holds fc(call_STALE) from a prior agent
-        # loop. The new loop's orchestrator emits assistant.tool_calls with
-        # call_id=call_NEW. The converter must emit fc(call_NEW) (synthesized
-        # from message — id-match cache miss path), NOT fc(call_STALE).
+        # #875 regression. Two real adapter calls: the first plays the role
+        # of ""prior agent loop"" and writes a tool turn into the cache; the
+        # second plays the role of ""new agent loop"" with a different
+        # call_id. The converter must emit the synthesized fc(call_NEW)
+        # from the new message and skip the cached fc(call_STALE).
         # Pre-fix: positional replay injected fc(call_STALE) regardless,
         # producing fc(STALE)+fco(NEW) orphan pair → 400 on the wire.
-        from kestrel_sovereign.llm.codex_adapter import (
-            _compute_request_signature, _convert_tools_to_responses_format,
-        )
-        from kestrel_sovereign.llm.continuation_store import ContinuationCursor
-
         captured: List[Dict[str, Any]] = []
         adapter = CodexAdapter(continuation_store=InMemoryContinuationStore())
-
-        # Pre-populate cache as if a prior loop ended.
         tools = [{
             "type": "function",
             "function": {"name": "tool_a", "description": "", "parameters": {}},
         }]
-        sig = _compute_request_signature("sys", _convert_tools_to_responses_format(tools))
-        adapter._continuation_store.put(
-            "openai_plan", "conv-stale",
-            ContinuationCursor(
-                last_response_id="resp_prior",
-                last_message_count=1,
-                last_request_signature=sig,
-                turn_outputs=(json.dumps([{
+
+        # --- Loop 1: tool turn populates cache via the real adapter path ---
+        sse_loop1 = _sse([
+            {
+                "type": "response.output_item.added",
+                "item": {
                     "type": "function_call",
-                    "id": "fc_STALE",
+                    "id": "fc_STALE_OUTPUT",
+                    "call_id": "call_STALE",
+                    "name": "tool_a",
+                },
+                "output_index": 0,
+            },
+            {
+                "type": "response.function_call_arguments.done",
+                "output_index": 0,
+                "arguments": "{}",
+            },
+            {
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "function_call",
+                    "id": "fc_STALE_OUTPUT",
                     "call_id": "call_STALE",
                     "name": "tool_a",
                     "arguments": "{}",
-                }]),),
-            ),
-        )
-
-        sse = _sse([_completed_event("resp_new")])
-        with _patch_httpx_with(captured, sse):
+                },
+            },
+            _completed_event("resp_loop1"),
+        ])
+        with _patch_httpx_with(captured, sse_loop1):
             await adapter.get_response(
                 client=_fake_token(),
                 model="gpt-5.5",
                 messages=[
                     {"role": "system", "content": "sys"},
-                    {"role": "user", "content": "hi"},
+                    {"role": "user", "content": "loop 1"},
+                ],
+                tools=tools,
+                session_id="conv-stale",
+            )
+
+        # Sanity: cache holds the loop-1 tool turn.
+        cursor = adapter._continuation_store.get("openai_plan", "conv-stale")
+        assert "call_STALE" in cursor.turn_outputs[0]
+
+        # --- Loop 2: a new tool exchange with a DIFFERENT call_id ---
+        captured.clear()
+        sse_loop2 = _sse([_completed_event("resp_loop2")])
+        with _patch_httpx_with(captured, sse_loop2):
+            await adapter.get_response(
+                client=_fake_token(),
+                model="gpt-5.5",
+                messages=[
+                    {"role": "system", "content": "sys"},
+                    {"role": "user", "content": "loop 1"},
                     {
                         "role": "assistant", "content": "",
                         "tool_calls": [{
-                            "id": "call_NEW",
+                            "id": "call_STALE",  # loop 1's tool call
                             "type": "function",
                             "function": {"name": "tool_a", "arguments": "{}"},
                         }],
                     },
-                    {"role": "tool", "tool_call_id": "call_NEW", "content": "result"},
+                    {"role": "tool", "tool_call_id": "call_STALE", "content": "result1"},
+                    {"role": "user", "content": "loop 2"},
+                    {
+                        "role": "assistant", "content": "",
+                        "tool_calls": [{
+                            "id": "call_NEW",  # ← different from cached call_STALE
+                            "type": "function",
+                            "function": {"name": "tool_a", "arguments": "{}"},
+                        }],
+                    },
+                    {"role": "tool", "tool_call_id": "call_NEW", "content": "result2"},
                 ],
                 tools=tools,
                 session_id="conv-stale",
@@ -442,71 +477,214 @@ class TestCodexCursorRecordingE2E:
 
         body = captured[0]
         fcs = [it for it in body["input"] if it.get("type") == "function_call"]
-        assert len(fcs) == 1, f"Expected exactly one function_call, got {fcs}"
-        assert fcs[0]["call_id"] == "call_NEW"
-        # No stale call_id leaked from the cache.
-        assert all(it.get("call_id") != "call_STALE" for it in body["input"]), (
-            f"Stale cached call_STALE leaked into the new loop: {body['input']}"
+        # Two function_calls: loop-1's (replayed from cache by id-match on
+        # call_STALE) and loop-2's (synthesized from message because no
+        # cache entry has call_NEW). Both must be present so their
+        # respective function_call_outputs match.
+        call_ids = sorted(it["call_id"] for it in fcs)
+        assert call_ids == ["call_NEW", "call_STALE"], (
+            f"Expected fc for both call_STALE (replayed) and call_NEW "
+            f"(synthesized), got {call_ids}"
         )
+        # Each function_call has a matching function_call_output.
+        fcos = [it for it in body["input"] if it.get("type") == "function_call_output"]
+        fco_call_ids = sorted(it["call_id"] for it in fcos)
+        assert fco_call_ids == ["call_NEW", "call_STALE"]
 
-    async def test_fresh_agent_loop_clears_stale_cache(self):
-        # #875 secondary fix. When the input has no assistant.tool_calls
-        # (= start of a new agent loop after a prior conversation), the
-        # cache is cleared so it doesn't grow unboundedly and stale entries
-        # can't leak via id-match either.
-        from kestrel_sovereign.llm.codex_adapter import _compute_request_signature
-        from kestrel_sovereign.llm.continuation_store import ContinuationCursor
-
+    async def test_text_only_reasoning_replays_positionally(self):
+        # #842 invariant preserved alongside #875 fix. T1 is a text-only
+        # response; the cache captures its reasoning + message. T2's input
+        # references the prior assistant text — the cached items should
+        # replay positionally so encrypted reasoning rides along.
+        # Two real adapter calls so the signature flow matches production.
         captured: List[Dict[str, Any]] = []
         adapter = CodexAdapter(continuation_store=InMemoryContinuationStore())
 
-        sig = _compute_request_signature("sys", None)
-        adapter._continuation_store.put(
-            "openai_plan", "conv-fresh",
-            ContinuationCursor(
-                last_response_id="resp_prior",
-                last_message_count=1,
-                last_request_signature=sig,
-                turn_outputs=(json.dumps([
-                    {"type": "reasoning", "id": "rs_OLD", "encrypted_content": "OLD", "summary": []},
-                    {"type": "function_call", "id": "fc_OLD", "call_id": "call_OLD",
-                     "name": "x", "arguments": "{}"},
-                ]),),
-            ),
-        )
-
-        sse = _sse([
-            {"type": "response.output_text.delta", "delta": "ok"},
+        # T1: text-only response with reasoning + message output items.
+        sse_t1 = _sse([
             {
                 "type": "response.output_item.done",
-                "item": {"type": "message", "id": "msg_NEW", "role": "assistant"},
+                "item": {
+                    "type": "reasoning",
+                    "id": "rs_T1",
+                    "encrypted_content": "ENC_T1",
+                    "summary": [],
+                },
             },
-            _completed_event("resp_new"),
+            {
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "message",
+                    "id": "msg_T1",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "prior answer"}],
+                },
+            },
+            _completed_event("resp_T1"),
         ])
-        with _patch_httpx_with(captured, sse):
+        with _patch_httpx_with(captured, sse_t1):
             await adapter.get_response(
                 client=_fake_token(),
                 model="gpt-5.5",
                 messages=[
                     {"role": "system", "content": "sys"},
-                    {"role": "user", "content": "Fresh user message."},
+                    {"role": "user", "content": "first question"},
                 ],
-                session_id="conv-fresh",
+                session_id="conv-text",
+            )
+
+        # T2: text-only follow-up that includes T1's assistant text.
+        captured.clear()
+        sse_t2 = _sse([_completed_event("resp_T2")])
+        with _patch_httpx_with(captured, sse_t2):
+            await adapter.get_response(
+                client=_fake_token(),
+                model="gpt-5.5",
+                messages=[
+                    {"role": "system", "content": "sys"},
+                    {"role": "user", "content": "first question"},
+                    {"role": "assistant", "content": "prior answer"},
+                    {"role": "user", "content": "follow up"},
+                ],
+                session_id="conv-text",
             )
 
         body = captured[0]
-        # No stale reasoning/function_call leaked into the body.
-        assert all(
-            it.get("type") not in ("reasoning", "function_call") for it in body["input"]
-        ), f"Stale cache leaked: {body['input']}"
-        # Cache was cleared, then turn 1 of the new loop was recorded fresh.
-        cursor = adapter._continuation_store.get("openai_plan", "conv-fresh")
-        assert len(cursor.turn_outputs) == 1
-        new_outputs = json.loads(cursor.turn_outputs[0])
-        # OLD entries are not in the new turn's outputs.
-        assert all(it.get("id") not in {"rs_OLD", "fc_OLD"} for it in new_outputs)
-        # The fresh turn captured the new message item.
-        assert any(it.get("id") == "msg_NEW" for it in new_outputs)
+        types = [it.get("type") or it.get("role") for it in body["input"]]
+        # The text-only assistant message at position 1 is replaced by the
+        # cached turn's reasoning + message items, in that order.
+        assert types == ["user", "reasoning", "message", "user"], types
+        assert body["input"][1]["encrypted_content"] == "ENC_T1"
+        assert body["input"][1]["id"] == "rs_T1"
+        assert body["input"][2]["id"] == "msg_T1"
+
+    async def test_stale_tool_turn_does_not_leak_into_text_replay(self):
+        # Cache holds a tool turn AND a text turn. New input has only a
+        # text-only assistant message. Tool turn must NOT leak (id-match on
+        # an absent call_id); text turn DOES replay positionally.
+        # Three adapter calls: the first two populate the cache faithfully
+        # (loop with a tool exchange + a text follow-up), the third reads.
+        captured: List[Dict[str, Any]] = []
+        adapter = CodexAdapter(continuation_store=InMemoryContinuationStore())
+        tools = [{
+            "type": "function",
+            "function": {"name": "tool_a", "description": "", "parameters": {}},
+        }]
+
+        # Call 1: tool turn (cached as turn_outputs[0])
+        sse_call1 = _sse([
+            {
+                "type": "response.output_item.added",
+                "item": {
+                    "type": "function_call",
+                    "id": "fc_TOOL_OUT",
+                    "call_id": "call_STALE",
+                    "name": "tool_a",
+                },
+                "output_index": 0,
+            },
+            {
+                "type": "response.function_call_arguments.done",
+                "output_index": 0,
+                "arguments": "{}",
+            },
+            {
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "function_call",
+                    "id": "fc_TOOL_OUT",
+                    "call_id": "call_STALE",
+                    "name": "tool_a",
+                    "arguments": "{}",
+                },
+            },
+            _completed_event("resp_C1"),
+        ])
+        with _patch_httpx_with(captured, sse_call1):
+            await adapter.get_response(
+                client=_fake_token(),
+                model="gpt-5.5",
+                messages=[
+                    {"role": "system", "content": "sys"},
+                    {"role": "user", "content": "q1"},
+                ],
+                tools=tools,
+                session_id="conv-mixed",
+            )
+
+        # Call 2: text follow-up — populates a TEXT turn (turn_outputs[1])
+        captured.clear()
+        sse_call2 = _sse([
+            {
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "reasoning",
+                    "id": "rs_TEXT",
+                    "encrypted_content": "ENC_TEXT",
+                    "summary": [],
+                },
+            },
+            {
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "message",
+                    "id": "msg_TEXT",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "answer"}],
+                },
+            },
+            _completed_event("resp_C2"),
+        ])
+        with _patch_httpx_with(captured, sse_call2):
+            await adapter.get_response(
+                client=_fake_token(),
+                model="gpt-5.5",
+                messages=[
+                    {"role": "system", "content": "sys"},
+                    {"role": "user", "content": "q1"},
+                    {
+                        "role": "assistant", "content": "",
+                        "tool_calls": [{
+                            "id": "call_STALE", "type": "function",
+                            "function": {"name": "tool_a", "arguments": "{}"},
+                        }],
+                    },
+                    {"role": "tool", "tool_call_id": "call_STALE", "content": "result"},
+                ],
+                tools=tools,
+                session_id="conv-mixed",
+            )
+
+        # Call 3: NEW user message, text-only follow-up.
+        # The orchestrator's storage keeps only final assistant text from
+        # the prior conversation; tool/tool_call messages are transient.
+        # Tools are still passed (the agent's palette is stable across user
+        # messages) so the request signature stays in sync with prior calls
+        # and the cache survives the session boundary.
+        captured.clear()
+        sse_call3 = _sse([_completed_event("resp_C3")])
+        with _patch_httpx_with(captured, sse_call3):
+            await adapter.get_response(
+                client=_fake_token(),
+                model="gpt-5.5",
+                messages=[
+                    {"role": "system", "content": "sys"},
+                    {"role": "user", "content": "q1"},
+                    {"role": "assistant", "content": "answer"},
+                    {"role": "user", "content": "follow"},
+                ],
+                tools=tools,
+                session_id="conv-mixed",
+            )
+
+        body = captured[0]
+        # No stale tool-turn items in the body.
+        assert all(it.get("call_id") != "call_STALE" for it in body["input"])
+        assert all(it.get("id") != "fc_TOOL_OUT" for it in body["input"])
+        # Text-turn reasoning + message replayed at the assistant position.
+        ids = [it.get("id") for it in body["input"]]
+        assert "rs_TEXT" in ids
+        assert "msg_TEXT" in ids
 
     async def test_signature_drift_drops_cached_reasoning(self):
         # If instructions or tools change mid-conversation, cached reasoning
