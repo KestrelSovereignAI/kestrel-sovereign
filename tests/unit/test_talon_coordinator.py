@@ -140,7 +140,9 @@ class TestCLIDispatch:
     @pytest.mark.asyncio
     async def test_no_binary(self):
         feature = TalonCoordinatorFeature(_make_agent())
-        with patch("shutil.which", return_value=None):
+        with patch.object(
+            TalonCoordinatorFeature, "_find_talon_bin", return_value=None
+        ):
             result = await feature._dispatch_via_cli(["claim", "--repo", "a/b", "--issue", "1"])
             assert result["dispatched"] is False
             assert "not found" in result["error"]
