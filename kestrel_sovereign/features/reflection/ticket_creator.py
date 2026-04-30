@@ -12,6 +12,7 @@ from datetime import datetime
 from typing import Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from .models import ImprovementProposal  # noqa: F401
     from kestrel_sovereign.features.github.client import GitHubClient
     from kestrel_sovereign.features.security.feature import SecurityFeature
     from .models import Insight
@@ -128,6 +129,117 @@ class TicketCreator:
         except Exception as e:
             logger.error(f"Failed to create GitHub issue: {e}")
             raise
+
+    async def create_ticket_from_proposal(
+        self,
+        proposal: "ImprovementProposal",
+        security_feature: "SecurityFeature",
+        timeout: float = 300.0,
+    ) -> Optional[str]:
+        """Create a GitHub issue from an approved improvement proposal.
+
+        Mirrors ``create_ticket_from_insight`` but uses proposal
+        fields directly. The two paths share an output shape so the
+        caller (``create_improvement_ticket``) can dispatch by
+        whichever object the user passed in.
+
+        Note: this approval is the *external write* gate (publishing
+        to GitHub), distinct from the proposal's earlier
+        *self-modification* approval. Passing an already-approved
+        proposal still asks the user before posting — that's
+        deliberate. See Nellie's review notes on separating proposal
+        approval from external-write approval.
+        """
+        title = f"[Agent Proposal] {proposal.title}"
+        body = self._build_ticket_body_from_proposal(proposal)
+        labels = self._suggest_labels_from_proposal(proposal)
+
+        logger.info(f"Requesting external-write approval for ticket: {title}")
+        approval_request = {
+            "feature_name": "reflection",
+            "tool_name": "create_github_issue",
+            "tool_args": {
+                "title": proposal.title,
+                "source": "proposal",
+                "proposal_id": proposal.id,
+                "change_type": proposal.change_type.value,
+                "labels": labels,
+                "previously_approved_for_self_modify": bool(proposal.approved),
+            },
+        }
+
+        try:
+            approved, _approval_type = await security_feature.approval_queue.request_approval(
+                **approval_request,
+                timeout=timeout,
+            )
+        except Exception as e:
+            logger.error(f"Approval request failed: {e}")
+            return None
+
+        if not approved:
+            logger.info(f"Ticket creation not approved: {title}")
+            return None
+
+        try:
+            result = await self.github.create_issue(
+                repo=self.repo,
+                title=title,
+                body=body,
+                labels=labels,
+            )
+            issue_url = result.get("html_url")
+            logger.info(f"Created ticket from proposal: {issue_url}")
+            return issue_url
+        except Exception as e:
+            logger.error(f"Failed to create GitHub issue from proposal: {e}")
+            raise
+
+    def _build_ticket_body_from_proposal(self, proposal: "ImprovementProposal") -> str:
+        """Markdown body derived from an ImprovementProposal."""
+        sections = []
+        sections.append(f"## {proposal.change_type.value.replace('_', ' ').title()} Proposal")
+        sections.append("")
+        sections.append(f"**Generated:** {datetime.utcnow().isoformat()}Z")
+        sections.append(f"**Proposal ID:** `{proposal.id}`")
+        if proposal.insight_id:
+            sections.append(f"**Source Insight:** `{proposal.insight_id}`")
+        sections.append(
+            f"**Status:** "
+            f"{'approved for self-modification' if proposal.approved else 'awaiting approval'}"
+        )
+        if proposal.approved_at:
+            sections.append(f"**Approved At:** {proposal.approved_at.isoformat()}Z")
+        sections.append("")
+
+        sections.append("## Description")
+        sections.append("")
+        sections.append(proposal.description)
+        sections.append("")
+
+        sections.append("## Proposed Change")
+        sections.append("")
+        sections.append("```")
+        sections.append(proposal.proposed_change)
+        sections.append("```")
+        sections.append("")
+
+        sections.append("---")
+        sections.append("*This issue was created from an approved Kestrel agent proposal.*")
+        sections.append(
+            "*External-write approval was obtained separately from the "
+            "self-modification approval — see proposal record for details.*"
+        )
+        return "\n".join(sections)
+
+    def _suggest_labels_from_proposal(self, proposal: "ImprovementProposal") -> list[str]:
+        """Labels for proposal-sourced issues."""
+        labels = ["agent-proposal", "self-improvement"]
+        ct = proposal.change_type.value
+        labels.append(f"change-type:{ct.replace('_', '-')}")
+        if proposal.approved:
+            labels.append("self-modify-approved")
+        return labels
 
     def _build_ticket_body(self, insight: "Insight") -> str:
         """Build the GitHub issue body from an insight.
