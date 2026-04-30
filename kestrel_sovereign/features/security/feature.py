@@ -74,6 +74,7 @@ class SecurityFeature(Feature):
         # forgot, which is the bug behind #785.
         self.approval_queue = ApprovalQueue(
             on_request_added=self._emit_approval_request,
+            on_request_withdrawn=self._emit_approval_withdrawn,
             permission_store=self.permission_store,
         )
 
@@ -164,6 +165,27 @@ class SecurityFeature(Feature):
             )
         else:
             logger.debug("Agent has no emit_event method, SSE not sent")
+
+    async def _emit_approval_withdrawn(self, request: ApprovalRequest, reason: str):
+        """
+        Emit SSE event for an approval that was evicted from the queue
+        without a user submit (timeout or task cancellation).
+
+        The UI subscribes to ``approval_withdrawn`` and closes any modal
+        showing this id, so the user doesn't end up clicking ""Approve"" on
+        an entry the server has already discarded — which used to surface
+        as a 404 with the misleading message ""expired"". See #877.
+        """
+        if hasattr(self.agent, "emit_event"):
+            await self.agent.emit_event(
+                "approval_withdrawn",
+                {
+                    "id": request.id,
+                    "reason": reason,  # "timeout" | "cancelled"
+                },
+            )
+        else:
+            logger.debug("Agent has no emit_event method, withdrawal SSE not sent")
 
     async def shutdown(self):
         """Clean up resources."""

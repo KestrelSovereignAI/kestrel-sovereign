@@ -61,8 +61,12 @@ class ApprovalRequest:
         }
 
 
-# Type for the SSE callback
+# Type for the SSE callbacks
 OnRequestAddedCallback = Callable[[ApprovalRequest], Awaitable[None]]
+# ``reason`` is one of "timeout" | "cancelled" — the request exited
+# ``request_approval`` without a user submit, so any UI showing the modal
+# must withdraw it. See #877.
+OnRequestWithdrawnCallback = Callable[[ApprovalRequest, str], Awaitable[None]]
 
 
 class ApprovalQueue:
@@ -94,6 +98,7 @@ class ApprovalQueue:
     def __init__(
         self,
         on_request_added: Optional[OnRequestAddedCallback] = None,
+        on_request_withdrawn: Optional[OnRequestWithdrawnCallback] = None,
         permission_store: Optional["PermissionStore"] = None,
     ):
         """
@@ -102,6 +107,11 @@ class ApprovalQueue:
         Args:
             on_request_added: Optional async callback when a request is added.
                              Used to emit SSE events to the UI.
+            on_request_withdrawn: Optional async callback when a request is
+                             evicted without a user submit (timeout or task
+                             cancellation). Used to emit SSE events so the UI
+                             can withdraw any open modal — without this, the
+                             user's modal would 404 on submit. See #877.
             permission_store: Optional store for persisting the user's scope
                              choice ("session"/"always") and writing audit
                              rows.  When set, every approval resolved through
@@ -112,6 +122,7 @@ class ApprovalQueue:
         """
         self._pending: Dict[str, ApprovalRequest] = {}
         self._on_request_added = on_request_added
+        self._on_request_withdrawn = on_request_withdrawn
         self._permission_store = permission_store
 
     @property
@@ -175,6 +186,7 @@ class ApprovalQueue:
                 logger.warning(f"Failed to notify UI of approval request: {e}", exc_info=True)
 
         # Wait for user decision or timeout
+        withdrawn_reason: Optional[str] = None
         try:
             await asyncio.wait_for(
                 request.resume_event.wait(),
@@ -201,6 +213,7 @@ class ApprovalQueue:
 
         except asyncio.TimeoutError:
             request.status = ApprovalStatus.TIMEOUT
+            withdrawn_reason = "timeout"
             logger.warning(
                 f"Approval request {request.id[:8]} timed out after {timeout}s"
             )
@@ -213,8 +226,41 @@ class ApprovalQueue:
             )
             return (False, "timeout")
 
+        except asyncio.CancelledError:
+            # Calling task cancelled (HTTP stream dropped, agent loop torn
+            # down, server shutdown). The UI's modal is now stale — withdraw
+            # it via SSE so the user doesn't see a 404 on submit (#877).
+            withdrawn_reason = "cancelled"
+            logger.info(
+                f"Approval request {request.id[:8]} cancelled "
+                "(calling task gone) — withdrawing UI modal"
+            )
+            raise
+
         finally:
-            self._pending.pop(request.id, None)
+            popped = self._pending.pop(request.id, None)
+            # Notify UI ONLY when the request is exiting without a user
+            # submit. A normal user-submit path resolves resume_event via
+            # ``submit_decision`` which sets status; the UI doesn't need a
+            # withdrawal event in that case (the modal already closed).
+            if popped is not None and withdrawn_reason and self._on_request_withdrawn:
+                try:
+                    await self._on_request_withdrawn(popped, withdrawn_reason)
+                except (ConnectionError, TimeoutError) as e:
+                    logger.warning(
+                        f"Failed to notify UI of approval withdrawal (network error): {e}",
+                        exc_info=True,
+                    )
+                except (TypeError, AttributeError) as e:
+                    logger.warning(
+                        f"Failed to notify UI of approval withdrawal (callback error): {e}",
+                        exc_info=True,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to notify UI of approval withdrawal: {e}",
+                        exc_info=True,
+                    )
 
     async def _persist_decision(
         self,
