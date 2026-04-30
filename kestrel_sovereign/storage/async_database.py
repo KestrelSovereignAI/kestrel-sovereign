@@ -61,7 +61,9 @@ CREATE TABLE IF NOT EXISTS conversation_history (
 );
 
 CREATE INDEX IF NOT EXISTS idx_conversation_agent_id ON conversation_history(agent_id);
-CREATE INDEX IF NOT EXISTS idx_conversation_deleted_at ON conversation_history(agent_id, deleted_at);
+-- idx_conversation_deleted_at lives in _init_schema (after the
+-- soft-delete migration runs). Legacy DBs predate the column and
+-- would crash here. See #795.
 
 -- User-assigned conversation titles (issue #716).  Decoupled from
 -- conversation_history so renames are a single-row upsert instead of a
@@ -458,14 +460,23 @@ class AsyncDatabase:
 
         # Soft-delete migration (#763): add deleted_at to conversation_history
         # for databases created before soft-delete shipped. Idempotent — does
-        # nothing on fresh databases (column already in CREATE TABLE).
+        # nothing on fresh databases (column already in CREATE TABLE). The
+        # dependent index is created only after we verify the column is
+        # present, otherwise legacy DBs blow up at boot (#795).
         await self._migrate_add_column(
             "conversation_history", "deleted_at", "TIMESTAMP DEFAULT NULL"
         )
-        await self._backend.execute(
-            "CREATE INDEX IF NOT EXISTS idx_conversation_deleted_at "
-            "ON conversation_history(agent_id, deleted_at)"
-        )
+        if await self._column_exists("conversation_history", "deleted_at"):
+            await self._backend.execute(
+                "CREATE INDEX IF NOT EXISTS idx_conversation_deleted_at "
+                "ON conversation_history(agent_id, deleted_at)"
+            )
+        else:
+            logger.error(
+                "Skipping idx_conversation_deleted_at: column missing after "
+                "migration. This indicates a migration failure — see "
+                "preceding logs."
+            )
 
         logger.debug(f"Database schema initialized ({self.backend_type})")
 
@@ -474,30 +485,43 @@ class AsyncDatabase:
     ) -> None:
         """Add a column to an existing table if it isn't already present.
 
-        Idempotent across both backends. Logs the first-time migration
-        so deployments leave a breadcrumb.
+        Idempotent across both backends — Postgres uses ``ADD COLUMN IF
+        NOT EXISTS``; SQLite checks ``pragma_table_info`` first. Real
+        failures (locked DB, disk full, syntactically-bad ``col_def``)
+        propagate to the caller; previously they were swallowed at debug
+        level, which let dependent index creation crash boot with a
+        misleading error (#795).
         """
-        try:
-            if self.backend_type == "postgres":
-                await self._backend.execute(
-                    f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {col_def}"
-                )
-            else:
-                row = await self._backend.fetch_one(
-                    f"SELECT COUNT(*) FROM pragma_table_info('{table}') "
-                    f"WHERE name='{column}'"
-                )
-                if row and row[0] == 0:
-                    await self._backend.execute(
-                        f"ALTER TABLE {table} ADD COLUMN {column} {col_def}"
-                    )
-                    logger.info(
-                        f"Migrated {table}: added {column} column"
-                    )
-        except Exception as e:
-            logger.debug(
-                f"Migration check for {table}.{column}: {e}"
+        if self.backend_type == "postgres":
+            await self._backend.execute(
+                f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {col_def}"
             )
+            return
+
+        row = await self._backend.fetch_one(
+            f"SELECT COUNT(*) FROM pragma_table_info('{table}') "
+            f"WHERE name='{column}'"
+        )
+        if row and row[0] == 0:
+            await self._backend.execute(
+                f"ALTER TABLE {table} ADD COLUMN {column} {col_def}"
+            )
+            logger.info(f"Migrated {table}: added {column} column")
+
+    async def _column_exists(self, table: str, column: str) -> bool:
+        """Verify a column exists on a table after a migration ran."""
+        if self.backend_type == "postgres":
+            row = await self._backend.fetch_one(
+                "SELECT COUNT(*) FROM information_schema.columns "
+                "WHERE table_name=? AND column_name=?",
+                (table, column),
+            )
+        else:
+            row = await self._backend.fetch_one(
+                f"SELECT COUNT(*) FROM pragma_table_info('{table}') "
+                f"WHERE name='{column}'"
+            )
+        return bool(row and row[0] > 0)
     
     # ─────────────────────────────────────────────────────────────────
     # Query methods - delegate to backend
