@@ -16,6 +16,15 @@ export const Security = {
     _approvalQueue: [],
     _approvalDraining: false,
     _seenApprovalIds: new Set(),
+    // Ids the server has already evicted (timeout/cancelled). When a
+    // withdrawal SSE arrives for an id that's currently in flight we mark
+    // it here so the modal-resolution path knows to skip the POST. #877.
+    _withdrawnApprovalIds: new Set(),
+    // Resolver for the active modal — set in showApprovalModal. When a
+    // withdrawal SSE lands for the modal currently on screen, we close it
+    // immediately rather than wait for the user. #877.
+    _activeApprovalId: null,
+    _activeApprovalResolver: null,
 
     // === Initialization ===
 
@@ -47,6 +56,18 @@ export const Security = {
                 console.error('Failed to parse approval_request event:', err);
             }
         });
+        // Withdrawal events: the server is telling us the queue entry is
+        // gone (timeout or task cancellation). Close any modal showing this
+        // id; clear local queue state. Without this the user clicks
+        // ""Approve"" on a stale modal and sees a 404. #877.
+        subscribeSSE('approval_withdrawn', (event) => {
+            try {
+                const data = JSON.parse(event.data);
+                this.handleApprovalWithdrawn(data);
+            } catch (err) {
+                console.error('Failed to parse approval_withdrawn event:', err);
+            }
+        });
     },
 
     // === Approval Request Handling ===
@@ -59,6 +80,11 @@ export const Security = {
         if (this._seenApprovalIds.has(data.id) || this.pendingApprovals.has(data.id)) {
             return;
         }
+        // If the server already withdrew this id (rare race: withdrawal SSE
+        // beat the request SSE on a slow network), don't prompt at all.
+        if (this._withdrawnApprovalIds.has(data.id)) {
+            return;
+        }
         this._seenApprovalIds.add(data.id);
 
         this.pendingApprovals.set(data.id, data);
@@ -69,12 +95,44 @@ export const Security = {
         this._drainApprovalQueue();
     },
 
+    handleApprovalWithdrawn(data) {
+        console.log('Approval withdrawn:', data.id, 'reason:', data.reason);
+        this._withdrawnApprovalIds.add(data.id);
+
+        // If this id is the modal currently on screen, close it now and
+        // skip the POST that would otherwise 404.
+        if (this._activeApprovalId === data.id && this._activeApprovalResolver) {
+            const resolver = this._activeApprovalResolver;
+            this._activeApprovalResolver = null;
+            this._activeApprovalId = null;
+            try {
+                Modal.hide();
+            } catch (err) {
+                // Modal may already be closing — non-fatal.
+            }
+            resolver({ approved: false, scope: 'once', _withdrawn: true });
+        }
+
+        // Drop any queued-but-not-yet-shown entry.
+        this._approvalQueue = this._approvalQueue.filter(e => e.id !== data.id);
+        if (this.pendingApprovals.delete(data.id)) {
+            this.updatePendingBadge(this.pendingApprovals.size);
+        }
+    },
+
     async _drainApprovalQueue() {
         if (this._approvalDraining) return;
         this._approvalDraining = true;
         try {
             while (this._approvalQueue.length > 0) {
                 const data = this._approvalQueue.shift();
+                // If a withdrawal SSE landed before we got around to showing
+                // this entry's modal, don't show it at all.
+                if (this._withdrawnApprovalIds.has(data.id)) {
+                    this.pendingApprovals.delete(data.id);
+                    this.updatePendingBadge(this.pendingApprovals.size);
+                    continue;
+                }
                 let decision;
                 try {
                     decision = await this.showApprovalModal(data);
@@ -83,10 +141,15 @@ export const Security = {
                     decision = { approved: false, scope: 'once' };
                 }
 
-                try {
-                    await this.submitApproval(data.id, decision.approved, decision.scope);
-                } catch (err) {
-                    console.error('Failed to submit approval:', err);
+                // Withdrawal short-circuits the POST: the server already
+                // evicted the queue entry, so submitting would 404. The
+                // resolver flagged this with ``_withdrawn: true``. #877.
+                if (!decision._withdrawn) {
+                    try {
+                        await this.submitApproval(data.id, decision.approved, decision.scope);
+                    } catch (err) {
+                        console.error('Failed to submit approval:', err);
+                    }
                 }
 
                 this.pendingApprovals.delete(data.id);
@@ -104,6 +167,19 @@ export const Security = {
 
     async showApprovalModal(data) {
         return new Promise((resolve) => {
+            // Track the active modal so a withdrawal SSE can close it
+            // proactively. The wrapper resolver clears the tracking before
+            // forwarding the decision so a late withdrawal can't double-close.
+            const wrappedResolve = (decision) => {
+                if (this._activeApprovalId === data.id) {
+                    this._activeApprovalId = null;
+                    this._activeApprovalResolver = null;
+                }
+                resolve(decision);
+            };
+            this._activeApprovalId = data.id;
+            this._activeApprovalResolver = wrappedResolve;
+
             const argsHtml = data.args && Object.keys(data.args).length > 0
                 ? `<pre class="args-preview" style="
                     background: var(--bg-tertiary);
@@ -138,7 +214,7 @@ export const Security = {
                         type: 'danger',
                         onClick: () => {
                             Modal.hide();
-                            resolve({ approved: false, scope: 'once' });
+                            wrappedResolve({ approved: false, scope: 'once' });
                         }
                     },
                     {
@@ -146,7 +222,7 @@ export const Security = {
                         type: 'secondary',
                         onClick: () => {
                             Modal.hide();
-                            resolve({ approved: true, scope: 'once' });
+                            wrappedResolve({ approved: true, scope: 'once' });
                         }
                     },
                     {
@@ -154,7 +230,7 @@ export const Security = {
                         type: 'primary',
                         onClick: () => {
                             Modal.hide();
-                            resolve({ approved: true, scope: 'session' });
+                            wrappedResolve({ approved: true, scope: 'session' });
                         }
                     },
                     {
@@ -162,11 +238,11 @@ export const Security = {
                         type: 'primary',
                         onClick: () => {
                             Modal.hide();
-                            resolve({ approved: true, scope: 'always' });
+                            wrappedResolve({ approved: true, scope: 'always' });
                         }
                     }
                 ],
-                onClose: () => resolve({ approved: false, scope: 'once' })
+                onClose: () => wrappedResolve({ approved: false, scope: 'once' })
             });
         });
     },
@@ -193,14 +269,16 @@ export const Security = {
 
             return response;
         } catch (error) {
-            // 404 here almost always means the server-side request_approval
-            // call already returned (timed out at 5min default, or was
-            // cancelled). The user sees a raw stack otherwise — replace it
-            // with a clear message and skip the redundant error toast.
+            // 404 here means the server already evicted the queue entry —
+            // either the calling task was cancelled (#877) or the request
+            // timed out (5-minute default). Either way the user's decision
+            // has nowhere to land. The withdrawal SSE handler is the
+            // primary path for closing the modal proactively; this branch
+            // only fires when the SSE didn't beat the user's click.
             const msg = (error && error.message) || '';
             if (msg.includes('not found') || msg.includes('expired')) {
-                Toast.warning('This approval already expired on the server — the caller moved on.');
-                console.warn('Approval expired before user submitted decision:', approvalId);
+                Toast.warning('Approval was withdrawn by the agent before you could decide.');
+                console.warn('Approval withdrawn by agent before decision submitted:', approvalId);
             } else {
                 console.error('Failed to submit approval:', error);
                 Toast.error('Failed to submit decision');
