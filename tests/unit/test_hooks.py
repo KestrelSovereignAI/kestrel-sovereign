@@ -105,6 +105,31 @@ class FailingHook(Hook):
         raise ValueError("Test error")
 
 
+class AwaitsUserInputHook(Hook):
+    """Test hook that blocks for longer than the watchdog would allow.
+
+    Used to verify the hook manager's ``awaits_user_input`` opt-out:
+    despite the parent class having ``timeout=0.1``, the manager
+    must NOT cancel this hook because it represents an
+    approval-style human wait.
+    """
+
+    def __init__(self, delay: float = 0.5):
+        super().__init__(
+            name="awaits_user_hook",
+            events=[HookEvent.PRE_TOOL_USE],
+            timeout=0.1,  # would normally cancel a 0.5s sleep
+            awaits_user_input=True,
+        )
+        self.delay = delay
+        self.completed = False
+
+    async def execute(self, input: HookInput) -> HookOutput:
+        await asyncio.sleep(self.delay)
+        self.completed = True
+        return HookOutput.allow("approved by human")
+
+
 # === HookInput Tests ===
 
 class TestHookInput:
@@ -365,6 +390,38 @@ class TestHooksManager:
         # Should still allow (timeout hook skipped)
         assert output.continue_execution is True
         assert allow_hook.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_awaits_user_input_hook_not_subject_to_watchdog(self):
+        """Hooks that block on a human decision (approvals, prompts)
+        opt out of the manager's ``asyncio.wait_for`` watchdog by
+        setting ``awaits_user_input=True``. The watchdog's clock is
+        designed to bound deterministic hooks (audit, telemetry,
+        validation) — applying it to a human wait is the bug that
+        made the SecurityHook's approval modals "disappear in
+        ~5 seconds." This test asserts the watchdog is genuinely
+        skipped, not just bumped.
+        """
+        manager = HooksManager()
+        # Hook sleeps 0.5s but its declared per-hook timeout is 0.1s.
+        # Without the opt-out, the manager would cancel it.
+        human_hook = AwaitsUserInputHook(delay=0.5)
+        manager.register(human_hook)
+
+        input = HookInput(
+            session_id="test",
+            hook_event_name="PreToolUse",
+            tool_name="test_tool",
+        )
+
+        output = await manager.execute_hooks(HookEvent.PRE_TOOL_USE, input)
+        # The hook ran to completion. If the watchdog had fired, the
+        # manager would log "skipping" before the sleep finished and
+        # ``human_hook.completed`` would be False.
+        assert output.continue_execution is True
+        assert human_hook.completed is True, (
+            "watchdog cancelled awaits_user_input hook — opt-out failed"
+        )
 
     @pytest.mark.asyncio
     async def test_execute_hooks_exception_skips(self):

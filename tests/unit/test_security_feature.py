@@ -372,11 +372,14 @@ class TestApprovalQueue:
         assert withdrawn[0][1] == "timeout"
 
     @pytest.mark.asyncio
-    async def test_withdrawn_callback_fires_on_cancellation(self):
-        # #877: when the calling task is cancelled (HTTP stream dropped,
-        # agent loop torn down, server shutdown), ``request_approval``'s
-        # await raises ``CancelledError`` and the queue entry is evicted.
-        # The withdrawal callback must still fire so the UI knows.
+    async def test_cancellation_keeps_request_alive_for_user(self):
+        # New contract (replaces the old #877 spackle): when the
+        # calling task is cancelled (HTTP stream dropped, browser
+        # closed, user switched to a different agent in the
+        # rookery), the request MUST survive in ``_pending`` so the
+        # user's modal stays interactive. No ``approval_withdrawn``
+        # event fires, because the user has not abandoned the
+        # decision — only the agent's read of it.
         withdrawn: list = []
 
         async def on_withdrawn(req: ApprovalRequest, reason: str):
@@ -392,8 +395,52 @@ class TestApprovalQueue:
         with pytest.raises(asyncio.CancelledError):
             await request_task
 
+        # Request stayed alive. No withdrawal event fired.
+        assert len(queue._pending) == 1
+        assert withdrawn == []
+
+        # The user can still submit a decision against the surviving
+        # request — exactly the "user comes back later" path that
+        # the old behavior denied them.
+        request_id = next(iter(queue._pending.keys()))
+        assert queue.submit_decision(
+            request_id, approved=True, scope="once",
+        ) is True
+
+    @pytest.mark.asyncio
+    async def test_sweep_stale_reaps_old_pending(self):
+        # The cancellation-leaves-request-alive contract means
+        # ``_pending`` grows when many agent tasks die before users
+        # decide. ``sweep_stale(cutoff)`` is the operator's GC: pass
+        # an explicit age cutoff, anything older gets reaped.
+        from datetime import timedelta
+
+        withdrawn: list = []
+
+        async def on_withdrawn(req: ApprovalRequest, reason: str):
+            withdrawn.append((req, reason))
+
+        queue = ApprovalQueue(on_request_withdrawn=on_withdrawn)
+
+        fresh = ApprovalRequest(
+            id="fresh", feature_name="f", tool_name="t", tool_args={},
+            created_at=datetime.now(timezone.utc),
+        )
+        ancient = ApprovalRequest(
+            id="ancient", feature_name="f", tool_name="t", tool_args={},
+            created_at=datetime.now(timezone.utc) - timedelta(hours=25),
+        )
+        queue._pending[fresh.id] = fresh
+        queue._pending[ancient.id] = ancient
+
+        # 24h cutoff: ancient is older, fresh isn't.
+        reaped = await queue.sweep_stale(older_than_seconds=24 * 3600)
+        assert reaped == 1
+        assert "fresh" in queue._pending
+        assert "ancient" not in queue._pending
         assert len(withdrawn) == 1
-        assert withdrawn[0][1] == "cancelled"
+        assert withdrawn[0][0].id == "ancient"
+        assert withdrawn[0][1] == "timeout"
 
     @pytest.mark.asyncio
     async def test_withdrawn_callback_does_not_fire_on_user_submit(self):
@@ -447,6 +494,26 @@ class TestSecurityHook:
     async def hook(self, permission_store, approval_queue):
         """Create a security hook."""
         return SecurityHook(permission_store, approval_queue)
+
+    def test_security_hook_is_marked_awaits_user_input(
+        self, permission_store, approval_queue,
+    ):
+        """SecurityHook blocks on a human decision, so the hook
+        manager must NOT wrap it in ``asyncio.wait_for``. The
+        ``awaits_user_input=True`` flag tells the manager to skip
+        the watchdog. Without it, the manager's default 5s timeout
+        cancelled the queue's await before the user could click —
+        the actual driver of the "modal disappears in ~5 seconds"
+        bug. Bumping the timeout to a bigger arbitrary number was
+        spackle; the structural answer is to take the manager's
+        clock off this hook entirely.
+        """
+        hook = SecurityHook(permission_store, approval_queue)
+        assert hook.awaits_user_input is True, (
+            "SecurityHook must declare awaits_user_input=True so the "
+            "hook manager doesn't impose a timeout on a human "
+            "response."
+        )
 
     @pytest.mark.asyncio
     async def test_auto_allow(self, hook, permission_store):

@@ -40,7 +40,16 @@ class ApprovalRequest:
     tool_name: str
     tool_args: Dict
     created_at: datetime
-    timeout_seconds: float = 300.0  # 5 minute default
+    # Optional wall-clock cap. ``None`` means "wait indefinitely for
+    # the user" — appropriate for interactive approvals where the
+    # user owns the timing. A finite value is for batch/automation
+    # callers that want a deterministic abandon point. Stale-request
+    # cleanup is the operator's responsibility via
+    # ``ApprovalQueue.sweep_stale``, not an implicit per-request
+    # timer the user never sees. Earlier defaults (300s, then 3600s)
+    # were both arbitrary and both produced the same disappear-modal
+    # shape, just with different mean-time-to-bug.
+    timeout_seconds: Optional[float] = None
     status: ApprovalStatus = ApprovalStatus.PENDING
 
     # For resumption after approval
@@ -140,19 +149,24 @@ class ApprovalQueue:
         feature_name: str,
         tool_name: str,
         tool_args: Dict,
-        timeout: float = 300.0,
+        timeout: Optional[float] = None,
     ) -> tuple[bool, str]:
         """
         Queue a request and wait for user decision.
 
         This method blocks until the user approves, denies, or the
-        request times out.
+        wall-clock ``timeout`` (if any) elapses.
 
         Args:
             feature_name: Name of the feature making the request
             tool_name: Name of the tool requesting approval
             tool_args: Arguments to the tool (shown to user)
-            timeout: Timeout in seconds (default 5 minutes)
+            timeout: Wall-clock seconds to wait. ``None`` (default) =
+                wait indefinitely; the user owns the timing.
+                Operators can call ``sweep_stale`` to clean up
+                requests that are clearly abandoned. Pass a finite
+                value only for batch/automation callers that need a
+                deterministic abandon point.
 
         Returns:
             Tuple of (approved: bool, scope: str)
@@ -185,8 +199,23 @@ class ApprovalQueue:
             except Exception as e:
                 logger.warning(f"Failed to notify UI of approval request: {e}", exc_info=True)
 
-        # Wait for user decision or timeout
-        withdrawn_reason: Optional[str] = None
+        # Wait for user decision or wall-clock timeout.
+        #
+        # Past behavior popped the request and emitted ``approval_withdrawn``
+        # on every non-success exit path, including ``CancelledError`` —
+        # which fires whenever the calling task dies (HTTP stream
+        # dropped, agent loop torn down, user switched chat tabs in
+        # the rookery). PR #877 reframed the user-facing message but
+        # kept the underlying behavior: a slow user lost the chance
+        # to decide. That was spackle.
+        #
+        # New invariant: only TIMEOUT removes the request. Cancellation
+        # leaves it alive — the modal stays open, the user can decide
+        # at their leisure, and ``submit_decision`` records the
+        # outcome whenever the click finally lands. Stale entries are
+        # reaped by ``sweep_stale`` (called from a periodic
+        # background task or directly by tests).
+        timed_out = False
         try:
             await asyncio.wait_for(
                 request.resume_event.wait(),
@@ -213,7 +242,7 @@ class ApprovalQueue:
 
         except asyncio.TimeoutError:
             request.status = ApprovalStatus.TIMEOUT
-            withdrawn_reason = "timeout"
+            timed_out = True
             logger.warning(
                 f"Approval request {request.id[:8]} timed out after {timeout}s"
             )
@@ -227,25 +256,31 @@ class ApprovalQueue:
             return (False, "timeout")
 
         except asyncio.CancelledError:
-            # Calling task cancelled (HTTP stream dropped, agent loop torn
-            # down, server shutdown). The UI's modal is now stale — withdraw
-            # it via SSE so the user doesn't see a 404 on submit (#877).
-            withdrawn_reason = "cancelled"
+            # Calling task cancelled (HTTP stream dropped, browser
+            # closed, user switched to a different agent in the
+            # rookery). The user has not yet decided. Leave the
+            # request in ``_pending`` so the modal stays interactive,
+            # and re-raise without firing withdrawal — the modal must
+            # NOT auto-close on us.
             logger.info(
-                f"Approval request {request.id[:8]} cancelled "
-                "(calling task gone) — withdrawing UI modal"
+                f"Approval request {request.id[:8]} await cancelled; "
+                "request kept alive for user decision"
             )
             raise
 
         finally:
-            popped = self._pending.pop(request.id, None)
-            # Notify UI ONLY when the request is exiting without a user
-            # submit. A normal user-submit path resolves resume_event via
-            # ``submit_decision`` which sets status; the UI doesn't need a
-            # withdrawal event in that case (the modal already closed).
-            if popped is not None and withdrawn_reason and self._on_request_withdrawn:
+            # Only remove the request on a true success (resume_event
+            # fired) or timeout. Cancellation leaves it for the user.
+            if request.resume_event.is_set() or timed_out:
+                popped = self._pending.pop(request.id, None)
+            else:
+                popped = None
+            # Notify UI ONLY when we genuinely abandon the request via
+            # timeout. Successful user-submit closes its own modal;
+            # cancellation no longer triggers withdrawal at all.
+            if popped is not None and timed_out and self._on_request_withdrawn:
                 try:
-                    await self._on_request_withdrawn(popped, withdrawn_reason)
+                    await self._on_request_withdrawn(popped, "timeout")
                 except (ConnectionError, TimeoutError) as e:
                     logger.warning(
                         f"Failed to notify UI of approval withdrawal (network error): {e}",
@@ -423,6 +458,60 @@ class ApprovalQueue:
 
         logger.info(f"Request {request_id[:8]} cancelled")
         return True
+
+    async def sweep_stale(
+        self,
+        older_than_seconds: float,
+    ) -> int:
+        """Remove pending requests older than ``older_than_seconds``.
+
+        The cancellation-leaves-request-alive contract means
+        ``_pending`` grows unboundedly when many agent tasks die
+        before users decide. ``sweep_stale`` is the operator's
+        cleanup primitive — call it on whatever cadence and cutoff
+        makes sense for the deployment (e.g. hourly with a 24h
+        cutoff). The cutoff is intentionally a required argument:
+        there's no sensible default when individual requests carry
+        no implicit deadline.
+
+        Fires ``on_request_withdrawn(req, "timeout")`` for each
+        reaped request so any still-mounted UI modal closes.
+
+        Returns the number of requests removed.
+        """
+        now = datetime.now(timezone.utc)
+        reaped: List[ApprovalRequest] = []
+        for rid in list(self._pending.keys()):
+            req = self._pending.get(rid)
+            if req is None:
+                continue
+            if req.resume_event.is_set():
+                # Decision already submitted — let the regular path
+                # clean it up (we don't want to race with an awaiting
+                # request_approval coroutine that's about to return).
+                continue
+            cutoff = older_than_seconds
+            age = (now - req.created_at).total_seconds()
+            if age >= cutoff:
+                reaped.append(req)
+                self._pending.pop(rid, None)
+                req.status = ApprovalStatus.TIMEOUT
+
+        for req in reaped:
+            logger.info(
+                f"Sweeping stale approval request {req.id[:8]} "
+                f"(age > {older_than_seconds}s)"
+            )
+            if self._on_request_withdrawn:
+                try:
+                    await self._on_request_withdrawn(req, "timeout")
+                except Exception as e:
+                    logger.warning(
+                        f"Sweep withdrawal callback failed for "
+                        f"{req.id[:8]}: {e}",
+                    )
+
+        return len(reaped)
 
     def cancel_all(self) -> int:
         """
