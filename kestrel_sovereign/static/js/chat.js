@@ -31,6 +31,48 @@ let sharedModelSelector = null;
 // Autocomplete state
 let autocompleteSelectedIndex = -1;
 
+// UI generation counter. Bumps every time `selectAgent()` calls
+// `bumpUiGeneration()` — i.e. every time the chat pane is wiped and
+// rebuilt for a (re)selected agent. A stream captures this value at
+// dispatch time and treats its UI as "stale" the moment the global
+// counter moves past it. Agent-equality alone can't catch this:
+// A→B→A re-enters with `selectedHostAgent === dispatchAgent` but
+// `chatContainer.innerHTML = ''` already orphaned the old msgDiv.
+let uiGeneration = 0;
+
+export function bumpUiGeneration() {
+    uiGeneration++;
+}
+
+// Test seam — frontend tests need to inspect/reset the counter without
+// reaching through `selectAgent`'s DOM dependencies.
+export function _getUiGeneration() {
+    return uiGeneration;
+}
+
+/**
+ * Canonical chat-pane wipe-and-rebuild. Bumps the UI generation counter
+ * BEFORE the DOM mutation so any in-flight stream's
+ * `dispatchGeneration === uiGeneration` check fails immediately — that
+ * stops chunks from painting a now-stale msgDiv during/after the wipe.
+ *
+ * Every code path that clears or rebuilds the chat container (agent
+ * switch, conversation load, new chat, clear chat, soft/hard delete of
+ * the active conversation) must go through this helper. Bare
+ * `chatContainer.innerHTML = ...` calls leak: the generation counter
+ * doesn't move, so a stream dispatched against the old pane keeps
+ * thinking it's still current and writes into the freshly-rebuilt pane.
+ *
+ * The element is looked up fresh rather than relying on the cached
+ * `chatContainer` ref because callers may run before `initChat()` has
+ * resolved the ref or in contexts where the cache hasn't been populated.
+ */
+export function wipeChatPane(html = '') {
+    bumpUiGeneration();
+    const el = chatContainer || document.getElementById('chat-container');
+    if (el) el.innerHTML = html;
+}
+
 // ============================================================================
 // Initialization
 // ============================================================================
@@ -251,12 +293,21 @@ export function disconnectNotifications() {
 // Thinking Indicator
 // ============================================================================
 
-function showThinking(show) {
+/**
+ * Refresh the thinking indicator + input/send disable state from
+ * `state.waitingAgents`. Only the *currently selected* agent's status
+ * controls the visible UI — that way switching to Agent B while Agent A
+ * is mid-stream doesn't make B's input look busy. Call this whenever
+ * the waiting set changes OR the selected agent changes.
+ */
+export function updateThinkingIndicator() {
+    const current = API.getHostAgent();
+    const busy = state.waitingAgents.has(current);
     if (thinkingIndicator) {
-        thinkingIndicator.style.display = show ? 'flex' : 'none';
+        thinkingIndicator.style.display = busy ? 'flex' : 'none';
     }
-    if (messageInput) messageInput.disabled = show;
-    if (sendButton) sendButton.disabled = show;
+    if (messageInput) messageInput.disabled = busy;
+    if (sendButton) sendButton.disabled = busy;
 }
 
 // ============================================================================
@@ -284,9 +335,11 @@ async function stopRequest() {
         console.error('Error stopping request:', e);
     }
     
-    // Reset UI state
-    state.isWaiting = false;
-    showThinking(false);
+    // Reset UI state for the currently-selected agent only. If the user
+    // switched away while a different stream was running, that stream's
+    // bookkeeping is cleared by its own sendMessage finally block.
+    state.waitingAgents.delete(API.getHostAgent());
+    updateThinkingIndicator();
 }
 
 // ============================================================================
@@ -295,12 +348,20 @@ async function stopRequest() {
 
 export async function sendMessage() {
     const text = messageInput.value.trim();
-    if (!text || state.isWaiting) return;
+    // Capture the agent AND the UI generation this dispatch is bound to.
+    // The URL inside streamInvoke() is locked to dispatchAgent at fetch
+    // time, so server-side routing is safe. We use dispatchAgent +
+    // dispatchGeneration together to gate UI updates so chunks from a
+    // dispatch issued before a pane wipe (selectAgent → A→B→A) can't
+    // paint a now-orphaned msgDiv in the freshly-rebuilt pane.
+    const dispatchAgent = API.getHostAgent();
+    const dispatchGeneration = uiGeneration;
+    if (!text || state.waitingAgents.has(dispatchAgent)) return;
 
     await addMessage('user', text);
     messageInput.value = '';
-    state.isWaiting = true;
-    showThinking(true);
+    state.waitingAgents.add(dispatchAgent);
+    updateThinkingIndicator();
 
     // Get current session ID for context-aware conversation
     const sessionId = state.currentSessionId || null;
@@ -313,6 +374,13 @@ export async function sendMessage() {
     // from the previous agent would silently reroute the new agent's
     // chat to a different model. Source of truth: server mandate.
 
+    // A stream's UI is "current" only if BOTH the active agent matches
+    // AND the chat pane hasn't been wiped/rebuilt since dispatch. Agent
+    // equality alone misses A→B→A: the pane was wiped on each switch,
+    // so the captured msgDiv is detached even though the agent matches.
+    const isCurrent = () =>
+        API.getHostAgent() === dispatchAgent && uiGeneration === dispatchGeneration;
+
     try {
         if (state.useStreaming) {
             const msgDiv = addMessageStreaming('agent');
@@ -321,34 +389,53 @@ export async function sendMessage() {
             try {
                 for await (const chunk of API.streamInvoke(text, null, sessionId, null)) {
                     fullContent += chunk;
-                    updateStreamingMessage(msgDiv, fullContent);
+                    // Skip DOM repaint when the user has switched agents —
+                    // chatContainer was wiped on switch, msgDiv is now an
+                    // orphan, and updating the shared model selector with
+                    // this stream's content would corrupt the new agent's UI.
+                    if (isCurrent()) {
+                        updateStreamingMessage(msgDiv, fullContent);
+                    }
                 }
-                await finalizeStreamingMessage(msgDiv, fullContent);
-                await checkForModelChange(fullContent);
+                if (isCurrent()) {
+                    await finalizeStreamingMessage(msgDiv, fullContent);
+                    await checkForModelChange(fullContent);
+                }
             } catch (streamError) {
                 if (streamError.message.includes('404') || streamError.message.includes('405')) {
                     console.log('Streaming not available, falling back to standard invoke');
                     state.useStreaming = false;
                     msgDiv.remove();
                     const response = await API.invoke(text, null, sessionId, null);
-                    await addMessage('agent', response.response);
-                    await checkForModelChange(response.response);
+                    if (isCurrent()) {
+                        await addMessage('agent', response.response);
+                        await checkForModelChange(response.response);
+                    }
                 } else {
                     throw streamError;
                 }
             }
         } else {
             const response = await API.invoke(text, null, sessionId, null);
-            await addMessage('agent', response.response);
-            await checkForModelChange(response.response);
+            if (isCurrent()) {
+                await addMessage('agent', response.response);
+                await checkForModelChange(response.response);
+            }
         }
     } catch (e) {
-        await addMessage('agent', `Error: ${e.message}`);
+        if (isCurrent()) {
+            await addMessage('agent', `Error: ${e.message}`);
+        } else {
+            console.warn(`stream error on ${dispatchAgent} (no longer current):`, e.message);
+        }
     } finally {
-        state.isWaiting = false;
-        showThinking(false);
-        // Update context status after each message
-        updateContextStatus();
+        state.waitingAgents.delete(dispatchAgent);
+        updateThinkingIndicator();
+        // Update context status only for the currently-visible agent.
+        // Updating from a stale dispatch would query the wrong session.
+        if (isCurrent()) {
+            updateContextStatus();
+        }
     }
 }
 
@@ -905,14 +992,16 @@ function selectHighlightedCommand() {
 window.clearChat = function() {
     if (!chatContainer) return;
 
-    // Clear all messages except the welcome message
-    chatContainer.innerHTML = `
+    // Clear all messages except the welcome message. wipeChatPane() bumps
+    // the UI generation so any in-flight stream against this pane gates
+    // out before its chunks can paint the welcome view.
+    wipeChatPane(`
         <div class="message agent-message">
             <div class="message-content">
                 <p>Hello! I am your Kestrel AI agent, bound by the Kestrel Constitution to be your truthful and honorable assistant. How can I help you today?</p>
             </div>
         </div>
-    `;
+    `);
 
     // Clear message input
     if (messageInput) {
