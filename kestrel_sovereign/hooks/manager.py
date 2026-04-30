@@ -204,10 +204,18 @@ class HooksManager:
 
         for hook in matching_hooks:
             try:
-                output = await asyncio.wait_for(
-                    hook.execute(input),
-                    timeout=hook.timeout
-                )
+                # Hooks that block on human input (approvals, prompts)
+                # are not bounded by the manager's watchdog — bounding a
+                # person's response time with a synthetic timeout was
+                # the actual cause of the "approval modal disappears
+                # after 5 seconds" bug. The hook owns its own lifecycle.
+                if getattr(hook, "awaits_user_input", False):
+                    output = await hook.execute(input)
+                else:
+                    output = await asyncio.wait_for(
+                        hook.execute(input),
+                        timeout=hook.timeout
+                    )
 
                 logger.debug(
                     f"Hook '{hook.name}' returned: "
@@ -283,6 +291,8 @@ class HooksManager:
 
         async def execute_with_timeout(hook: Hook) -> Optional[HookOutput]:
             try:
+                if getattr(hook, "awaits_user_input", False):
+                    return await hook.execute(input)
                 return await asyncio.wait_for(
                     hook.execute(input),
                     timeout=hook.timeout

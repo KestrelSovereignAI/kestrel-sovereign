@@ -51,6 +51,16 @@ class SecurityHook(Hook):
             name="security_guard",
             events=[HookEvent.PRE_TOOL_USE, HookEvent.PRE_SUBAGENT_CALL],
             priority=priority,
+            # SecurityHook blocks on human input. The hook manager
+            # MUST NOT wrap its execute() in ``asyncio.wait_for`` —
+            # that would cancel the queue's await before the user
+            # could click. Was the actual driver of the "modal
+            # disappears in ~5 seconds" bug: Hook.timeout defaulted
+            # to 5s, and the manager's wait_for ran on every hook.
+            # Setting awaits_user_input=True moves the lifecycle
+            # bound off the hook timer and onto the approval queue
+            # itself (which has its own staleness sweep).
+            awaits_user_input=True,
         )
         self.permission_store = permission_store
         self.approval_queue = approval_queue

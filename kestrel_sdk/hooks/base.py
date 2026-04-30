@@ -231,6 +231,7 @@ class Hook(ABC):
         matcher: Optional[str] = None,  # Regex for tool names
         priority: int = 100,
         timeout: float = 5.0,
+        awaits_user_input: bool = False,
     ):
         """
         Initialize a hook.
@@ -240,13 +241,25 @@ class Hook(ABC):
             events: List of HookEvent types this hook handles
             matcher: Optional regex pattern to match tool names
             priority: Execution priority (lower = earlier, default 100)
-            timeout: Maximum execution time in seconds
+            timeout: Maximum execution time in seconds. IGNORED when
+                ``awaits_user_input=True`` — see below.
+            awaits_user_input: If True, this hook blocks waiting for a
+                human decision (e.g. an approval prompt). The hook
+                manager will NOT wrap ``execute()`` in
+                ``asyncio.wait_for`` for these hooks; bounding human
+                response time with a synthetic timeout would cancel
+                the wait before the user could reply. Such hooks are
+                expected to manage their own lifecycle (e.g. by
+                writing to a queue with its own staleness sweep).
+                Default False so non-interactive hooks (audit,
+                telemetry, validation) keep their existing watchdog.
         """
         self.name = name
         self.events = events
         self.matcher = matcher
         self.priority = priority
         self.timeout = timeout
+        self.awaits_user_input = awaits_user_input
         self.enabled = True
         self._compiled_matcher: Optional[re.Pattern] = None
 
