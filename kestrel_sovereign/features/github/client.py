@@ -422,6 +422,58 @@ class GitHubClient:
         else:
             raise GitHubClientError(f"Issue creation failed: {response.text}", response.status_code)
 
+    async def create_issue_comment(
+        self,
+        repo: str,
+        issue_number: int,
+        body: str,
+    ) -> dict:
+        """Post a new comment on a GitHub issue or PR.
+
+        Args:
+            repo: Repository in 'owner/repo' format
+            issue_number: Issue or PR number
+            body: Comment body (markdown supported)
+
+        Returns:
+            Created comment dict including 'html_url', 'id'
+
+        Raises:
+            GitHubClientError: If comment creation fails
+        """
+        owner, repo_name = self._parse_repo(repo)
+        client = await self._get_client()
+
+        response = await client.post(
+            f"/repos/{owner}/{repo_name}/issues/{issue_number}/comments",
+            json={"body": body},
+        )
+
+        if response.status_code == 201:
+            result = response.json()
+            logger.info(
+                f"Posted comment on #{issue_number} in {repo}: "
+                f"{result.get('html_url', '')}"
+            )
+            return result
+        if response.status_code == 403:
+            raise GitHubClientError("Rate limited or access denied", 403)
+        if response.status_code == 404:
+            raise GitHubClientError(
+                f"Issue #{issue_number} not found in {repo}", 404
+            )
+        if response.status_code == 410:
+            raise GitHubClientError(
+                "Issues are disabled for this repository", 410
+            )
+        if response.status_code == 422:
+            raise GitHubClientError(
+                f"Validation failed: {response.text}", 422
+            )
+        raise GitHubClientError(
+            f"Comment creation failed: {response.text}", response.status_code
+        )
+
     async def list_issues(
         self,
         repo: str,

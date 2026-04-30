@@ -1,4 +1,6 @@
 """GitHub Feature - Repository access and code introspection."""
+import asyncio
+import hashlib
 import logging
 import os
 from typing import Any, Optional
@@ -732,3 +734,174 @@ Use `list_source_components` to see the feature components that make up this age
 
         lines.append(f"\n*{len(comments)} comment(s)*")
         return "\n".join(lines)
+
+    @tool(
+        name="create_github_issue_comment",
+        description=(
+            "Post a comment on a GitHub issue or PR. Approval-gated and "
+            "audit-logged. Use 'self' as repo to comment on the agent's "
+            "own codebase."
+        ),
+        category=ToolCategory.SYSTEM,
+    )
+    async def create_github_issue_comment(
+        self,
+        issue_number: int,
+        body: str,
+        repo: str = "self",
+        dry_run: bool = False,
+    ) -> dict:
+        """Post a comment on a GitHub issue. Requires user approval.
+
+        Args:
+            issue_number: Issue or PR number to comment on.
+            body: Comment body in markdown. Empty/whitespace-only bodies
+                are refused. Bodies over 60_000 chars are refused
+                (GitHub's hard limit is 65_536; we leave headroom for
+                trailing audit annotation).
+            repo: Repository in 'owner/repo' format, or 'self' for the
+                agent's own repo.
+            dry_run: If True, validate inputs and request approval but do
+                NOT actually post. Returns ``preview`` instead of
+                ``html_url``. Useful when an agent wants to surface the
+                exact body to the user before committing.
+
+        Returns:
+            On success: ``{success: True, html_url, id, repo,
+            issue_number, body_sha256}``. On approval rejection or
+            validation failure: ``{success: False, error, ...}``.
+        """
+        body_clean = (body or "").strip()
+        if not body_clean:
+            return {
+                "success": False,
+                "error": "Comment body is empty",
+            }
+        if len(body_clean) > 60_000:
+            return {
+                "success": False,
+                "error": (
+                    f"Comment body too long ({len(body_clean)} chars). "
+                    "GitHub limits comments to ~65k; cap is 60k here."
+                ),
+            }
+
+        repo_resolved = self._resolve_repo(repo)
+        body_sha = hashlib.sha256(body_clean.encode("utf-8")).hexdigest()
+
+        approved = await self._request_comment_approval(
+            repo=repo_resolved,
+            issue_number=issue_number,
+            body=body_clean,
+            body_sha=body_sha,
+            dry_run=dry_run,
+        )
+        if not approved:
+            return {
+                "success": False,
+                "error": (
+                    "Comment not approved (dry-run preview)"
+                    if dry_run
+                    else "Comment not approved"
+                ),
+                "requires_approval": True,
+                "repo": repo_resolved,
+                "issue_number": issue_number,
+                "body_sha256": body_sha,
+            }
+
+        if dry_run:
+            return {
+                "success": True,
+                "preview": True,
+                "repo": repo_resolved,
+                "issue_number": issue_number,
+                "body_sha256": body_sha,
+                "body": body_clean,
+            }
+
+        try:
+            result = await self.client.create_issue_comment(
+                repo_resolved, issue_number, body_clean,
+            )
+        except GitHubClientError as e:
+            logger.error(
+                f"create_issue_comment failed for {repo_resolved}#{issue_number}: {e}"
+            )
+            return {
+                "success": False,
+                "error": str(e),
+                "repo": repo_resolved,
+                "issue_number": issue_number,
+                "body_sha256": body_sha,
+            }
+
+        return {
+            "success": True,
+            "html_url": result.get("html_url"),
+            "id": result.get("id"),
+            "repo": repo_resolved,
+            "issue_number": issue_number,
+            "body_sha256": body_sha,
+        }
+
+    def _get_security_feature(self):
+        """Find the SecurityFeature on the parent agent.
+
+        Uses ``agent.get_feature(...)`` if available (the canonical
+        accessor that handles both class-name and tool-name keys), and
+        falls back to direct dict lookup so the tool still works in
+        unit-test stubs that wire ``features={"SecurityFeature": ...}``
+        directly.
+        """
+        agent = self.agent
+        if agent is None:
+            return None
+        if hasattr(agent, "get_feature"):
+            feat = agent.get_feature("SecurityFeature")
+            if feat is not None:
+                return feat
+        features = getattr(agent, "features", None)
+        if isinstance(features, dict):
+            return features.get("SecurityFeature") or features.get("security")
+        return None
+
+    async def _request_comment_approval(
+        self,
+        repo: str,
+        issue_number: int,
+        body: str,
+        body_sha: str,
+        dry_run: bool,
+    ) -> bool:
+        """Gate the actual GitHub write through SecurityFeature."""
+        security = self._get_security_feature()
+        if security is None or not hasattr(security, "approval_queue"):
+            logger.warning(
+                "SecurityFeature unavailable; cannot post issue comment"
+            )
+            return False
+
+        details = {
+            "repo": repo,
+            "issue_number": issue_number,
+            "body_preview": body[:500] + ("..." if len(body) > 500 else ""),
+            "body_chars": len(body),
+            "body_sha256": body_sha,
+            "dry_run": dry_run,
+        }
+        try:
+            approved, _scope = await security.approval_queue.request_approval(
+                feature_name="github",
+                tool_name="create_github_issue_comment",
+                tool_args=details,
+            )
+            return bool(approved)
+        except (TimeoutError, asyncio.TimeoutError):
+            return False
+        except Exception as e:
+            logger.error(
+                f"Approval request failed for create_github_issue_comment: {e}",
+                exc_info=True,
+            )
+            return False
