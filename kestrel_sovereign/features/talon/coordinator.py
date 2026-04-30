@@ -179,6 +179,113 @@ class TalonCoordinatorFeature(Feature):
             return {"resumed": True, "message": "Talon dispatch resumed at 08:05 daily."}
         return {"resumed": False, "error": "Scheduler not available"}
 
+    @tool(
+        name="talon_health",
+        description=(
+            "Check whether kestrel-talon is reachable and runnable: "
+            "binary discoverable, subprocess env clean, executes "
+            "``--help`` successfully. Read-only, no dispatch."
+        ),
+        category=ToolCategory.SYSTEM,
+        command_prefix="!talon health",
+    )
+    async def talon_health(self) -> Dict[str, Any]:
+        """Smoke-test the talon CLI path without dispatching real work.
+
+        Returns a structured report covering:
+
+        * ``binary``: where the executable lives (or why we couldn't
+          find it).
+        * ``env``: which Anthropic keys were stripped, and which
+          GitHub token name was found. The actual token VALUE is
+          never returned.
+        * ``execute``: result of ``kestrel-talon --help``: returncode,
+          first line of stdout, and stderr summary if it failed.
+
+        Use this BEFORE ``talon_claim`` on a real issue — most past
+        dispatch failures came from missing/wrong env, and this
+        check catches them in seconds without burning a Claude Max
+        session or touching GitHub.
+        """
+        report: Dict[str, Any] = {"healthy": False}
+
+        # 1. Binary discovery
+        talon_bin = self._find_talon_bin()
+        if not talon_bin:
+            report["binary"] = {
+                "found": False,
+                "error": (
+                    "kestrel-talon not found. Set KESTREL_TALON_BIN, "
+                    "`uv sync` it into this venv, or place a sibling "
+                    "checkout at ../kestrel-talon with its own .venv."
+                ),
+            }
+            return report
+        report["binary"] = {"found": True, "path": talon_bin}
+
+        # 2. Env cleanliness
+        stripped = [
+            k for k in self._ANTHROPIC_KEYS_TO_STRIP if k in os.environ
+        ]
+        env_report: Dict[str, Any] = {
+            "stripped_anthropic_keys": stripped,
+        }
+        try:
+            built_env = self._build_subprocess_env()
+        except RuntimeError as e:
+            env_report["error"] = str(e)
+            report["env"] = env_report
+            return report
+
+        token_source = next(
+            (
+                name
+                for name in ("GH_TOKEN", "GITHUB_TOKEN", "GITHUB_PAT")
+                if os.environ.get(name)
+            ),
+            None,
+        )
+        env_report["github_token_source"] = token_source
+        env_report["env_var_count"] = len(built_env)
+        report["env"] = env_report
+
+        # 3. Execute --help to prove the binary is runnable AND that
+        # talon's own startup (which imports Claude Agent SDK) doesn't
+        # crash with our env. Bounded: --help returns in < 5s.
+        cmd = [talon_bin, "--help"]
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=built_env,
+            )
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=15,
+            )
+        except asyncio.TimeoutError:
+            report["execute"] = {
+                "ok": False,
+                "error": "kestrel-talon --help timed out after 15s",
+            }
+            return report
+        except Exception as e:
+            report["execute"] = {"ok": False, "error": str(e)}
+            return report
+
+        out = stdout.decode(errors="replace")
+        err = stderr.decode(errors="replace")
+        first_out_line = next((ln for ln in out.splitlines() if ln.strip()), "")
+        report["execute"] = {
+            "ok": proc.returncode == 0,
+            "returncode": proc.returncode,
+            "first_line": first_out_line[:200],
+            "stderr_tail": err[-400:] if err else "",
+        }
+
+        report["healthy"] = bool(report["execute"]["ok"])
+        return report
+
     # ------------------------------------------------------------------
     # Internal: Mesh dispatch (preferred)
     # ------------------------------------------------------------------
@@ -264,6 +371,58 @@ class TalonCoordinatorFeature(Feature):
 
         return None
 
+    # Anthropic credentials kestrel-talon must NOT see — its Claude
+    # Agent SDK call chain auto-uses Claude Max OAuth from ``~/.claude``,
+    # but only if no API-key env var is set. If kestrel-sovereign was
+    # launched with ``ANTHROPIC_API_KEY`` (which it usually is — the
+    # main agent uses it for its own LLM calls), passing that env
+    # straight through silently flips talon onto API-key billing
+    # AND breaks any "I am running as user X" identity assertions.
+    #
+    # See ``feedback_kestrel_talon.md``: "API key is specifically
+    # stripped." Order matters too — Claude Agent SDK merges parent
+    # ``os.environ`` after we hand it our env dict, so the talon
+    # binary itself further mutates ``os.environ`` at runtime; we
+    # only need to make sure our subprocess starts clean.
+    _ANTHROPIC_KEYS_TO_STRIP = (
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "CLAUDE_API_KEY",
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_USE_VERTEX",
+    )
+
+    @staticmethod
+    def _build_subprocess_env() -> Dict[str, str]:
+        """Construct the env dict for a kestrel-talon subprocess.
+
+        Removes Anthropic API-key vars so talon falls back to Claude
+        Max OAuth, and verifies a GitHub token is present (talon
+        cannot do anything useful without one). Raises ``RuntimeError``
+        with an actionable message if a required var is missing —
+        callers convert that into a structured ``dispatched=False``
+        response so the agent can surface the actual cause.
+        """
+        env = {**os.environ}
+        for key in TalonCoordinatorFeature._ANTHROPIC_KEYS_TO_STRIP:
+            env.pop(key, None)
+
+        gh_token = (
+            env.get("GH_TOKEN")
+            or env.get("GITHUB_TOKEN")
+            or env.get("GITHUB_PAT")
+        )
+        if not gh_token:
+            raise RuntimeError(
+                "kestrel-talon needs GITHUB_TOKEN, GH_TOKEN, or GITHUB_PAT "
+                "in the kestrel-sovereign environment to access GitHub. "
+                "Set one in .env (use `gh auth token --user UncleSaurus`)."
+            )
+        # Mirror to both names talon's downstream tools accept.
+        env.setdefault("GITHUB_TOKEN", gh_token)
+        env.setdefault("GH_TOKEN", gh_token)
+        return env
+
     async def _dispatch_via_cli(self, args: List[str]) -> Dict[str, Any]:
         """Fall back to kestrel-talon CLI via subprocess."""
         talon_bin = self._find_talon_bin()
@@ -278,13 +437,18 @@ class TalonCoordinatorFeature(Feature):
                 ),
             }
 
+        try:
+            env = self._build_subprocess_env()
+        except RuntimeError as e:
+            return {"dispatched": False, "error": str(e)}
+
         cmd = [talon_bin] + args
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                env={**os.environ},
+                env=env,
             )
             stdout, stderr = await asyncio.wait_for(
                 proc.communicate(), timeout=300,
