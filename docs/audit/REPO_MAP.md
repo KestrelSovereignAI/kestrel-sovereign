@@ -3,8 +3,8 @@
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-04-29
-**Scope:** 1499 tracked files (905 `.py`, 232 `.md`, 362 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-04-30
+**Scope:** 1507 tracked files (912 `.py`, 232 `.md`, 363 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -60,7 +60,7 @@ Repo entry points and standard project files.
   - `def get_database_url()`; `def get_redis_url()`; `class ServiceChecker`; `class SmartTestRunner`; `def main()`
 - **runpod_config.toml.example** — —
 - **server.py** — A FastAPI server to expose Kestrel agent functionality as a service.
-  - `def get_api_key()`; `async def verify_api_key(request, api_key_header, token)`; `async def lifespan(app)`; `class RookeryAgentRoutingMiddleware`; `async def github_proxy(path, request)`; `async def logging_context_middleware(request, call_next)`; `async def request_metrics_middleware(request, call_next)`; `async def static_cache_control(request, call_next)`; `…`
+  - `def resolve_rookery_path(env)`; `def get_api_key()`; `async def verify_api_key(request, api_key_header, token)`; `async def lifespan(app)`; `class RookeryAgentRoutingMiddleware`; `async def github_proxy(path, request)`; `async def logging_context_middleware(request, call_next)`; `async def request_metrics_middleware(request, call_next)`; `…`
 - **start_kestrel.sh** — DEPRECATED: Use 'kestrel start' instead.
 - **stop_kestrel.sh** — DEPRECATED: Use 'kestrel stop' instead.
 - **test_llm_providers.py** — Test LLM providers: OpenAI, Anthropic, and Vertex AI (Gemini).
@@ -1514,6 +1514,7 @@ Repo entry points and standard project files.
 - **tests/e2e/playwright.config.cjs** — —
 - **tests/e2e/spawn/spawn-console.spec.cjs** — —
 - **tests/e2e/spawn/spawn-lifecycle.spec.cjs** — —
+- **tests/e2e/test_approval_popup.spec.cjs** — —
 - **tests/e2e/test_avatar_display.spec.cjs** — —
 - **tests/e2e/test_chat_and_models.spec.cjs** — —
 - **tests/e2e/test_clarification_workflow.py** — End-to-end tests for GitHub clarification workflow using Playwright.
@@ -1566,6 +1567,10 @@ Repo entry points and standard project files.
   - `async def test_anthropic_cache_read_on_turn_two_real_api()`; `async def test_anthropic_cache_compounds_across_three_turns_with_two_history_markers()`; `async def test_anthropic_tiny_prompt_silent_no_op_under_threshold()`
 - **tests/integration/test_api_e2e.py** — End-to-End API Test
   - `def api_key()`; `def client(monkeypatch)`; `def anyio_backend()`; `def test_invoke_agent_e2e(client, api_key)`
+- **tests/integration/test_approval_live_server.py** — Live-server integration test for the approval SSE path (#748).
+  - `def clean_sse_connections()`; `def live_server()`; `async def test_real_http_sse_delivers_approval_and_decision_resolves_caller(live_server)`; `async def test_real_http_denying_posts_404_after_request_times_out(live_server)`
+- **tests/integration/test_approval_sse_e2e.py** — End-to-end test for the approval-request SSE path with real infrastructure.
+  - `def clean_sse_connections()`; `async def test_approval_request_reaches_sse_and_decision_resolves_caller()`
 - **tests/integration/test_avatar_api_e2e.py** — Integration tests for avatar API endpoints
   - `def client(monkeypatch)`; `class TestFileEndpoint`; `class TestIdentityEndpoint`; `class TestAvatarStorageIntegration`; `class TestVisualIdentityFeatureIntegration`; `class TestFileServing`
 - **tests/integration/test_backup_e2e.py** — —
@@ -1575,7 +1580,7 @@ Repo entry points and standard project files.
 - **tests/integration/test_cache_prompt_wire.py** — Integration test: `cache_prompt` reaches the wire (issue #704).
   - `async def test_cache_prompt_reaches_wire_for_llama_cpp()`; `async def test_cache_prompt_absent_from_wire_for_other_vendors(vendor)`; `async def test_real_llama_server_accepts_cache_prompt()`
 - **tests/integration/test_codex_real.py** — Integration tests: CodexAdapter against the live ChatGPT-backend Responses API.
-  - `async def test_codex_single_turn_text_real_api()`; `async def test_codex_tool_call_round_trip_real_api()`; `async def test_codex_reasoning_replay_real_api()`; `async def test_codex_continuation_cursor_written_real_api()`
+  - `async def test_codex_single_turn_text_real_api()`; `async def test_codex_tool_call_round_trip_real_api()`; `async def test_codex_tool_call_with_session_id_real_api()`; `async def test_codex_reasoning_replay_real_api()`; `async def test_codex_continuation_cursor_written_real_api()`
 - **tests/integration/test_compress_e2e.py** — E2E Tests for Session Compression Functionality.
   - `async def agent_with_messages(temp_dir)`; `async def agent_with_few_messages(temp_dir)`; `class TestCompressCommand`; `class TestCompressionCheckNeeded`; `class TestCompressionSession`; `class TestContextManagerNoLLM`
 - **tests/integration/test_compute_security_integration.py** — Integration tests for Compute + Security feature interaction.
@@ -1610,6 +1615,8 @@ Repo entry points and standard project files.
   - `def test_no_ensemble_symbols_in_package_source()`; `def temp_db()`; `async def real_llm_agent(temp_db)`; `async def test_kestrel_agent_has_no_ensemble_attributes(real_llm_agent)`; `async def test_no_ensemble_metadata_in_conversation(real_llm_agent)`
 - **tests/integration/test_ephemeral_hard_purge.py** — Integration tests for the EPHEMERAL hard-purge defense-in-depth (#767).
   - `async def test_purge_clean_ephemeral_session_destroys_nothing(tmp_path)`; `async def test_purge_destroys_conversation_history_leak(tmp_path)`; `async def test_purge_destroys_soft_deleted_leak_too(tmp_path)`; `async def test_purge_destroys_leaked_graph_nodes(tmp_path)`; `async def test_purge_does_not_touch_other_agents_data(tmp_path)`; `async def test_purge_warns_and_returns_breakdown_on_leak(tmp_path, caplog)`; `async def test_purge_clears_isolated_session_buffer(tmp_path)`; `async def test_purge_with_empty_agent_id_is_a_safe_noop(tmp_path)`
+- **tests/integration/test_ephemeral_purge_scoped.py** — Integration tests for the scoped EPHEMERAL leak-purge (#867).
+  - `async def test_no_writes_during_ephemeral_destroys_nothing(tmp_path)`; `async def test_only_in_window_rows_are_purged(tmp_path)`; `async def test_purge_without_watermark_refuses(tmp_path)`; `async def test_watermark_refreshes_on_re_entry(tmp_path)`; `async def test_graph_nodes_with_iso_timestamps_are_scoped_correctly(tmp_path)`; `async def test_graph_nodes_without_created_at_are_skipped_with_warning(tmp_path, caplog)`; `async def test_other_agents_data_untouched(tmp_path)`
 - **tests/integration/test_evm_transactions_e2e.py** — —
   - `class TestChainNetwork`; `class TestNetworkConfig`; `class TestEVMAdapter`; `class TestTransactionRequest`; `class TestTransactionSecurityHook`; `class TestTokenRegistry`; `class TestERC20Adapter`; `class TestTransactionManager`; `…`
 - **tests/integration/test_feature_install_discover_e2e.py** — E2E tests for the feature install/discover lifecycle (Issue #495).
@@ -1756,6 +1763,8 @@ Repo entry points and standard project files.
   - `def set_test_key(monkeypatch)`; `class TestKeyDerivation`; `class TestEncryptDecrypt`; `class TestErrorHandling`; `class TestAllPurposes`
 - **tests/unit/test_agent_manager.py** — Unit tests for the in-process AgentManager.
   - `class TestAgentManagerBasics`; `class TestLoadFromConfig`; `class TestCreateAgent`; `class TestSpawnAgent`
+- **tests/unit/test_agent_prefix_consolidation.py** — Regression tests for the /agent → /api/agent prefix consolidation (#871).
+  - `def test_canonical_api_agent_prefix_serves_agent_routes()`; `def test_deprecated_agent_prefix_still_resolves(caplog)`; `def test_deprecation_log_dedupes_per_path_and_ua()`
 - **tests/unit/test_agent_runtime_endpoint_contracts.py** — Focused contract tests for agent runtime/status endpoints.
   - `def test_context_status_reports_token_budget_and_warning_band()`; `def test_context_status_returns_idle_shape_when_no_session_id()`; `def test_context_status_returns_idle_shape_for_empty_session_id()`; `def test_reflection_status_filters_scheduler_tasks_and_serializes_execution_history()`; `def test_tasks_endpoint_filters_by_status_and_rejects_invalid_values()`; `def test_task_detail_endpoint_returns_task_with_artifacts()`; `def test_task_detail_endpoint_returns_404_when_task_missing()`; `def test_task_detail_endpoint_returns_404_when_task_manager_absent()`; `…`
 - **tests/unit/test_anthropic_cache_control.py** — Unit tests for Anthropic cache_control markers (issue #705).
@@ -1891,6 +1900,8 @@ Repo entry points and standard project files.
   - `async def feature()`; `async def feature_no_db()`; `async def queue()`; `class TestBackoffComputation`; `class TestDeliveryStatusEnum`; `class TestQueueEntryModel`; `class TestDeliveryResult`; `class TestDeliveryToolRegistration`; `…`
 - **tests/unit/test_demo_isolation.py** — Unit tests for the server-side demo-mode isolation rail (#766).
   - `def test_empty_rookery_is_live_mode()`; `def test_all_demo_agents_classifies_as_demo()`; `def test_one_live_agent_keeps_server_live()`; `def test_truthy_non_bool_is_demo_does_not_flip_classification()`; `async def test_live_server_live_target_no_header_is_refused_with_audit()`; `async def test_live_server_live_target_with_header_is_allowed_and_audited()`; `async def test_live_server_demo_target_passes_silently()`; `async def test_demo_server_demo_target_passes_silently()`; `…`
+- **tests/unit/test_demo_server_rookery_guard.py** — Unit tests for the demo-server rookery auto-mount guard (#868-1).
+  - `def test_demo_marker_with_existing_rookery_disables_auto_mount(tmp_path, monkeypatch)`; `def test_explicit_rookery_config_honored_even_in_demo_mode(tmp_path)`; `def test_no_demo_marker_uses_rookery_normally(tmp_path, monkeypatch)`; `def test_demo_marker_without_rookery_file_no_op(tmp_path, monkeypatch)`; `def test_demo_marker_truthy_variants(tmp_path, monkeypatch)`; `def test_lifespan_actually_calls_resolve_rookery_path()`
 - **tests/unit/test_denied_tools_dispatch.py** — Tests for security DENY enforcement at orchestrator dispatch level.
   - `class TestDeniedToolsStripping`; `class TestSubagentDeniedToolsExclusion`
 - **tests/unit/test_deploy_bugs.py** — Unit tests for deploy feature bug fixes (#101).
@@ -2061,6 +2072,8 @@ Repo entry points and standard project files.
   - `def test_initial_mode_sync()`; `def test_set_mode_sync()`; `async def test_isolated_mode_flow(tmp_path)`; `async def test_ephemeral_mode(tmp_path)`; `async def test_anonymous_mode(tmp_path)`
 - **tests/unit/test_privacy_computer_access.py** — Tests for the ``computer_access`` flag on ``PrivacyConfig`` (#832).
   - `def test_default_is_false()`; `def test_allows_helper()`; `def test_all_presets_default_false(name)`; `def test_get_privacy_preset_returns_copy_with_flag_false(name)`; `def test_privacy_mode_to_config_defaults_false()`; `def test_from_config_ignores_computer_access()`; `def test_get_privacy_preset_unknown_raises()`
+- **tests/unit/test_privacy_mode_endpoint_rail.py** — Unit tests for the rail-gate on POST /agent/privacy-mode (#867-A).
+  - `async def test_rail_refuses_privacy_mode_flip_on_live_agent_without_header()`; `async def test_rail_allows_privacy_mode_flip_on_live_agent_with_header()`; `async def test_rail_allows_privacy_mode_flip_on_demo_agent_without_header()`; `def test_endpoint_module_declares_rail_dependency()`
 - **tests/unit/test_privacy_mode_model_restore_contracts.py** — Contracts for model preservation across privacy-mode transitions.
   - `def test_privacy_mode_restores_default_cloud_model_after_local_only_transition()`; `def test_privacy_mode_restores_explicit_cloud_preference_after_local_only_transition()`; `def test_agent_level_privacy_transition_switches_to_local_model()`; `def test_privacy_command_path_uses_agent_level_model_transition()`
 - **tests/unit/test_privacy_preset_consistency.py** — Consistency tests for canonical privacy presets.
@@ -2153,6 +2166,8 @@ Repo entry points and standard project files.
   - `def parent_keys()`; `def child_keys()`; `def sample_mandate()`; `class TestSpawnMandate`; `class TestMandateSigning`; `class TestChildDIDDocument`
 - **tests/unit/test_sql_utils.py** — Tests for kestrel_sovereign.sql_utils — SQL identifier validation.
   - `class TestSafeTableName`; `class TestSafeColumnName`
+- **tests/unit/test_sse_approval_events.py** — Tests that the /agent/notifications/sse endpoint forwards events from the agent's event bus (e.g.
+  - `def clean_sse_connections()`; `async def test_approval_request_event_is_forwarded_to_sse_stream()`; `async def test_listener_is_registered_and_cleaned_up()`; `async def test_agent_without_event_bus_does_not_crash()`
 - **tests/unit/test_sse_connection_limits.py** — Unit tests for SSE connection limits (issue #145).
   - `def clean_sse_connections()`; `def app_with_mock_agent()`; `class TestSSEConnectionLimits`; `class TestSSEConnectionTrackerModule`
 - **tests/unit/test_state_of_mind_feature.py** — Direct contracts for the StateOfMind feature.
