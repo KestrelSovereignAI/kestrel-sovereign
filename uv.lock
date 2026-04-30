@@ -2627,6 +2627,7 @@ dependencies = [
     { name = "toml" },
     { name = "urllib3" },
     { name = "uvicorn" },
+    { name = "webrtcvad" },
 ]
 
 [package.optional-dependencies]
@@ -2671,7 +2672,6 @@ all-features = [
     { name = "twilio" },
     { name = "vastai-sdk" },
     { name = "web3" },
-    { name = "webrtcvad" },
 ]
 cloud = [
     { name = "azure-identity" },
@@ -2732,7 +2732,6 @@ full = [
     { name = "twilio" },
     { name = "vastai-sdk" },
     { name = "web3" },
-    { name = "webrtcvad" },
 ]
 github = [
     { name = "kestrel-talon" },
@@ -2785,7 +2784,6 @@ voice = [
     { name = "faster-whisper" },
     { name = "piper-tts" },
     { name = "soundfile" },
-    { name = "webrtcvad" },
 ]
 voice-cloud = [
     { name = "deepgram-sdk" },
@@ -2795,7 +2793,6 @@ voice-local = [
     { name = "faster-whisper" },
     { name = "piper-tts" },
     { name = "soundfile" },
-    { name = "webrtcvad" },
 ]
 wallet = [
     { name = "stripe" },
@@ -2925,7 +2922,7 @@ requires-dist = [
     { name = "uvicorn", specifier = "==0.35.0" },
     { name = "vastai-sdk", marker = "extra == 'cloud'", specifier = ">=0.1.0" },
     { name = "web3", marker = "extra == 'wallet'", specifier = ">=7.0.0" },
-    { name = "webrtcvad", marker = "extra == 'voice-local'", specifier = ">=2.0.10" },
+    { name = "webrtcvad", specifier = ">=2.0.10" },
 ]
 provides-extras = ["test", "ml", "local", "voice-local", "voice-cloud", "voice", "observability", "cloud", "wallet", "mcp", "visual", "delivery", "github", "search", "all-features", "full"]
 
