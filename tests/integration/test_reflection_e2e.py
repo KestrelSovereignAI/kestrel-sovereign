@@ -780,13 +780,18 @@ def test_self_model_manager_requires_available_provider(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_create_improvement_ticket_without_ticket_creator():
-    """Test create_improvement_ticket fails gracefully without ticket creator."""
+    """Test create_improvement_ticket fails gracefully without ticket creator.
+
+    The runtime guards on ``_ticket_handler``, not ``_ticket_creator`` —
+    ``_ticket_handler`` is what gets composed from the creator at init
+    time. Null the field the runtime actually checks.
+    """
     agent = MockAgent()
     feature = ReflectionFeature(agent)
     await feature.initialize()
     feature._db = agent._db
-    # Explicitly set ticket creator to None
     feature._ticket_creator = None
+    feature._ticket_handler = None
 
     result = await feature.create_improvement_ticket(insight_id="test-insight")
 
@@ -801,8 +806,8 @@ async def test_get_self_model_without_manager():
     feature = ReflectionFeature(agent)
     await feature.initialize()
     feature._db = agent._db
-    # Explicitly set self model manager to None
     feature._self_model_manager = None
+    feature._self_model_handler = None
 
     result = await feature.get_self_model()
 
@@ -818,6 +823,7 @@ async def test_update_self_model_without_manager():
     await feature.initialize()
     feature._db = agent._db
     feature._self_model_manager = None
+    feature._self_model_handler = None
 
     result = await feature.update_self_model()
 
