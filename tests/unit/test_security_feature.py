@@ -342,6 +342,84 @@ class TestApprovalQueue:
         assert callback_calls[0].feature_name == "Feature"
         assert callback_calls[0].tool_args == {"arg": "value"}
 
+    @pytest.mark.asyncio
+    async def test_withdrawn_callback_fires_on_timeout(self):
+        # #877: when ``request_approval`` exits via timeout (no user
+        # submit), ``_on_request_withdrawn`` MUST fire so the UI can close
+        # any modal showing this request — otherwise the user clicks
+        # ""Approve"" on a stale modal and submits to a now-empty queue,
+        # getting a 404 with a misleading ""expired"" message.
+        added: list = []
+        withdrawn: list = []
+
+        async def on_added(req: ApprovalRequest):
+            added.append(req)
+
+        async def on_withdrawn(req: ApprovalRequest, reason: str):
+            withdrawn.append((req, reason))
+
+        queue = ApprovalQueue(
+            on_request_added=on_added,
+            on_request_withdrawn=on_withdrawn,
+        )
+
+        approved, scope = await queue.request_approval(
+            "Feature", "tool", {}, timeout=0.05,
+        )
+        assert (approved, scope) == (False, "timeout")
+        assert len(withdrawn) == 1
+        assert withdrawn[0][0].id == added[0].id
+        assert withdrawn[0][1] == "timeout"
+
+    @pytest.mark.asyncio
+    async def test_withdrawn_callback_fires_on_cancellation(self):
+        # #877: when the calling task is cancelled (HTTP stream dropped,
+        # agent loop torn down, server shutdown), ``request_approval``'s
+        # await raises ``CancelledError`` and the queue entry is evicted.
+        # The withdrawal callback must still fire so the UI knows.
+        withdrawn: list = []
+
+        async def on_withdrawn(req: ApprovalRequest, reason: str):
+            withdrawn.append((req, reason))
+
+        queue = ApprovalQueue(on_request_withdrawn=on_withdrawn)
+
+        request_task = asyncio.create_task(
+            queue.request_approval("Feature", "tool", {})
+        )
+        await asyncio.sleep(0.05)
+        request_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await request_task
+
+        assert len(withdrawn) == 1
+        assert withdrawn[0][1] == "cancelled"
+
+    @pytest.mark.asyncio
+    async def test_withdrawn_callback_does_not_fire_on_user_submit(self):
+        # User-submitted decisions resolve via ``submit_decision`` which
+        # sets ``resume_event``. The normal path runs, ``request_approval``
+        # returns. The withdrawal callback must NOT fire — the modal
+        # already closed when the user clicked.
+        withdrawn: list = []
+
+        async def on_withdrawn(req: ApprovalRequest, reason: str):
+            withdrawn.append((req, reason))
+
+        queue = ApprovalQueue(on_request_withdrawn=on_withdrawn)
+
+        request_task = asyncio.create_task(
+            queue.request_approval("Feature", "tool", {})
+        )
+        await asyncio.sleep(0.05)
+        # Find the queued request and resolve it as if the user clicked.
+        request_id = next(iter(queue._pending.keys()))
+        assert queue.submit_decision(request_id, approved=True, scope="once") is True
+        approved, scope = await request_task
+        assert approved is True
+        assert scope == "once"
+        assert withdrawn == []  # no spurious withdrawal event
+
 
 # === SecurityHook Tests ===
 
