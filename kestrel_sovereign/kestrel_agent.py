@@ -246,6 +246,32 @@ class KestrelAgent(
         """
         return self.did
 
+    def get_feature(self, name: str):
+        """Look up a registered feature by class name, tool_name, or
+        a case-insensitive shorthand.
+
+        Features are stored in ``self.features`` keyed by
+        ``Feature.name`` (which is ``__class__.__name__``), so
+        ``"SecurityFeature"`` is the canonical key. Several call sites
+        scattered through the codebase try the lowercase tool name
+        (``"security"``) instead and silently miss — symptom: tools
+        emit ``"Security feature not available"`` even though the
+        feature is registered. This helper accepts both forms.
+        """
+        if not name:
+            return None
+        feature = self.features.get(name)
+        if feature is not None:
+            return feature
+        target = name.lower()
+        for feat in self.features.values():
+            if feat.name.lower() == target:
+                return feat
+            tool_name = getattr(feat, "tool_name", None)
+            if tool_name and tool_name.lower() == target:
+                return feat
+        return None
+
     @property
     def mcp_agent(self):
         """Lazy lookup for MCPAgent feature."""
