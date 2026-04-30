@@ -334,6 +334,55 @@ class ReflectionDatabaseHelper:
             logger.error(f"Failed to get insight by ID {insight_id}: {e}")
             return None
 
+    async def get_proposal_by_id(self, proposal_id: str) -> Optional[ImprovementProposal]:
+        """Get a specific improvement proposal by ID.
+
+        Returns None if the proposal doesn't exist or belongs to a
+        different agent. Used by the create-ticket path to accept
+        either an insight ID or a proposal ID — the user-facing
+        ``propose_improvement`` returns proposal IDs, so without this
+        the next-step ``create_improvement_ticket(proposal_id)``
+        couldn't find anything (the symptom Nellie hit).
+        """
+        if not self.db:
+            return None
+
+        try:
+            rows = await self.db.fetchall(
+                """
+                SELECT id, insight_id, title, description, change_type,
+                       proposed_change, requires_approval, approved,
+                       rejection_reason, approved_at, approved_by,
+                       created_at, applied_at
+                FROM improvement_proposals
+                WHERE id = ? AND agent_id = ?
+                """,
+                (proposal_id, self.agent_id),
+            )
+
+            if not rows:
+                return None
+
+            row = rows[0]
+            return ImprovementProposal(
+                id=row[0],
+                insight_id=row[1],
+                title=row[2],
+                description=row[3],
+                change_type=ChangeType(row[4]),
+                proposed_change=row[5],
+                requires_approval=bool(row[6]),
+                approved=bool(row[7]),
+                rejection_reason=row[8],
+                approved_at=datetime.fromisoformat(row[9]) if row[9] else None,
+                approved_by=row[10],
+                created_at=datetime.fromisoformat(row[11]) if row[11] else datetime.utcnow(),
+                applied_at=datetime.fromisoformat(row[12]) if row[12] else None,
+            )
+        except Exception as e:
+            logger.error(f"Failed to get proposal by ID {proposal_id}: {e}")
+            return None
+
     async def get_actionable_insights(
         self,
         from_session_id: str = None,

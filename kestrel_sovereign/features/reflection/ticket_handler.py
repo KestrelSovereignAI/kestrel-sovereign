@@ -40,80 +40,159 @@ class TicketHandler:
         self.agent = agent
 
     async def create_improvement_ticket(self, insight_id: str) -> Dict[str, Any]:
+        """Create a GitHub issue from an actionable insight OR an
+        approved improvement proposal.
+
+        Accepts either an insight ID or a proposal ID — the parameter
+        is named ``insight_id`` for backwards compat, but a proposal
+        ID resolves through ``get_proposal_by_id`` and routes to the
+        proposal-shaped ticket builder. This closes the seam Nellie
+        flagged: ``propose_improvement`` returns proposal IDs, but
+        the next step expected insight IDs and silently failed.
+
+        State on success:
+            ``{success, issue_url, source ('insight' | 'proposal'),
+             insight_id | proposal_id, state}``
+        where ``state`` is one of ``"ticket_created"``.
+
+        State on failure:
+            ``{success, error, state, ...}`` where ``state`` describes
+        the gate that blocked: ``"ticket_creator_unavailable"``,
+        ``"economic_gate_blocked"``, ``"db_unavailable"``,
+        ``"not_found"``, ``"not_actionable"``,
+        ``"security_unavailable"``, ``"approval_denied_or_failed"``.
+
+        Requires: economic eligibility (paid tier or revenue share),
+        external-write approval, and ``GITHUB_PAT``/``GITHUB_TOKEN``.
         """
-        Create a GitHub issue from an actionable insight.
-
-        This requires:
-        - Economic eligibility (paid tier or revenue share)
-        - Constitutional approval before creation
-        - GITHUB_PAT environment variable configured
-
-        Args:
-            insight_id: ID of the insight to create a ticket for
-
-        Returns:
-            Result including GitHub issue URL if created
-        """
-        # Check ticket creator availability
         if not self.ticket_creator:
             return {
                 "success": False,
+                "state": "ticket_creator_unavailable",
                 "error": "Ticket creator not available - check GITHUB_PAT configuration",
             }
 
-        # Check economic eligibility
         if self.economic_gate and not self.economic_gate.can_create_tickets():
             return {
                 "success": False,
+                "state": "economic_gate_blocked",
                 "error": "Ticket creation requires paid tier or revenue share agreement",
             }
 
-        # Get the insight from database
         if not self.db_helper:
-            return {"success": False, "error": "Database not available"}
+            return {
+                "success": False,
+                "state": "db_unavailable",
+                "error": "Database not available",
+            }
 
         try:
             insight = await self.db_helper.get_insight_by_id(insight_id)
-            if not insight:
-                return {"success": False, "error": f"Insight {insight_id} not found"}
+            if insight is not None:
+                return await self._ticket_from_insight(insight)
 
-            if not insight.actionable:
-                return {
-                    "success": False,
-                    "error": "Insight is not marked as actionable",
-                }
+            # Fall back to proposal lookup — the user-facing
+            # ``propose_improvement`` returns proposal IDs and Nellie
+            # was reasonably feeding those straight into create-ticket.
+            proposal = await self.db_helper.get_proposal_by_id(insight_id)
+            if proposal is not None:
+                return await self._ticket_from_proposal(proposal)
 
-            # Get security feature for approval
-            security = self._get_security_feature()
-            if not security:
-                return {
-                    "success": False,
-                    "error": "Security feature not available for constitutional approval",
-                }
-
-            # Create the ticket with constitutional approval
-            issue_url = await self.ticket_creator.create_ticket_from_insight(
-                insight=insight,
-                security_feature=security,
-                timeout=APPROVAL_TIMEOUT_DEFAULT,
-            )
-
-            if issue_url:
-                return {
-                    "success": True,
-                    "issue_url": issue_url,
-                    "insight_id": insight_id,
-                }
-            else:
-                return {
-                    "success": False,
-                    "error": "Ticket creation not approved or failed",
-                    "insight_id": insight_id,
-                }
+            return {
+                "success": False,
+                "state": "not_found",
+                "error": (
+                    f"No insight or proposal with id {insight_id!r} "
+                    "found for this agent"
+                ),
+            }
 
         except Exception as e:
-            logger.error(f"Failed to create ticket: {e}")
-            return {"success": False, "error": str(e)}
+            logger.error(f"Failed to create ticket: {e}", exc_info=True)
+            return {
+                "success": False,
+                "state": "error",
+                "error": str(e),
+            }
+
+    async def _ticket_from_insight(self, insight) -> Dict[str, Any]:
+        if not insight.actionable:
+            return {
+                "success": False,
+                "state": "not_actionable",
+                "error": "Insight is not marked as actionable",
+                "insight_id": insight.id,
+            }
+
+        security = self._get_security_feature()
+        if not security:
+            return {
+                "success": False,
+                "state": "security_unavailable",
+                "error": "Security feature not available for constitutional approval",
+                "insight_id": insight.id,
+            }
+
+        issue_url = await self.ticket_creator.create_ticket_from_insight(
+            insight=insight,
+            security_feature=security,
+            timeout=APPROVAL_TIMEOUT_DEFAULT,
+        )
+        if issue_url:
+            return {
+                "success": True,
+                "state": "ticket_created",
+                "source": "insight",
+                "issue_url": issue_url,
+                "insight_id": insight.id,
+            }
+        return {
+            "success": False,
+            "state": "approval_denied_or_failed",
+            "error": "Ticket creation not approved or failed",
+            "insight_id": insight.id,
+        }
+
+    async def _ticket_from_proposal(self, proposal) -> Dict[str, Any]:
+        if not proposal.approved:
+            return {
+                "success": False,
+                "state": "proposal_not_approved",
+                "error": (
+                    "Proposal must be approved (via propose_improvement) "
+                    "before its ticket can be filed"
+                ),
+                "proposal_id": proposal.id,
+            }
+
+        security = self._get_security_feature()
+        if not security:
+            return {
+                "success": False,
+                "state": "security_unavailable",
+                "error": "Security feature not available for constitutional approval",
+                "proposal_id": proposal.id,
+            }
+
+        issue_url = await self.ticket_creator.create_ticket_from_proposal(
+            proposal=proposal,
+            security_feature=security,
+            timeout=APPROVAL_TIMEOUT_DEFAULT,
+        )
+        if issue_url:
+            return {
+                "success": True,
+                "state": "ticket_created",
+                "source": "proposal",
+                "issue_url": issue_url,
+                "proposal_id": proposal.id,
+            }
+        return {
+            "success": False,
+            "state": "approval_denied_or_failed",
+            "error": "Ticket creation not approved or failed",
+            "proposal_id": proposal.id,
+        }
 
     def _get_security_feature(self):
         """Get the security feature from the agent."""
