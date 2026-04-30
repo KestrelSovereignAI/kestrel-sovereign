@@ -227,11 +227,56 @@ class TalonCoordinatorFeature(Feature):
     # Internal: CLI fallback
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _find_talon_bin() -> Optional[str]:
+        """Locate the kestrel-talon executable.
+
+        Search order:
+        1. ``KESTREL_TALON_BIN`` env var (explicit override).
+        2. ``shutil.which`` against the running process's PATH (works
+           when ``uv sync`` installed kestrel-talon into this venv).
+        3. Sibling-checkout convention used in dev: a ``kestrel-talon``
+           directory next to ``kestrel-sovereign`` with its own
+           ``.venv/bin/kestrel-talon``. Required because Jason's
+           workflow keeps talon as a separate ``uv run`` source tree
+           rather than installed into the kestrel venv.
+        """
+        override = os.environ.get("KESTREL_TALON_BIN")
+        if override and os.path.isfile(override) and os.access(override, os.X_OK):
+            return override
+
+        on_path = shutil.which("kestrel-talon")
+        if on_path:
+            return on_path
+
+        # Sibling layout: parents = talon, features, kestrel_sovereign,
+        # kestrel-sovereign (project root), then projects/. The sibling
+        # checkout lives next to the project root.
+        sibling = (
+            Path(__file__).resolve().parents[4]
+            / "kestrel-talon"
+            / ".venv"
+            / "bin"
+            / "kestrel-talon"
+        )
+        if sibling.is_file() and os.access(sibling, os.X_OK):
+            return str(sibling)
+
+        return None
+
     async def _dispatch_via_cli(self, args: List[str]) -> Dict[str, Any]:
         """Fall back to kestrel-talon CLI via subprocess."""
-        talon_bin = shutil.which("kestrel-talon")
+        talon_bin = self._find_talon_bin()
         if not talon_bin:
-            return {"dispatched": False, "error": "kestrel-talon not found on PATH"}
+            return {
+                "dispatched": False,
+                "error": (
+                    "kestrel-talon not found. Set KESTREL_TALON_BIN, install "
+                    "kestrel-talon into the kestrel-sovereign venv "
+                    "(`uv sync`), or place a sibling checkout at "
+                    "../kestrel-talon with its own .venv."
+                ),
+            }
 
         cmd = [talon_bin] + args
         try:
