@@ -21,13 +21,22 @@ import pytest
 
 
 class _StubSecurity:
-    """Minimal SecurityFeature stand-in: name + approval_queue."""
+    """Minimal SecurityFeature stand-in.
 
-    name = "SecurityFeature"
-    tool_name = "security"
+    Mirrors the real Feature surface: ``name = __class__.__name__``,
+    ``tool_name`` is the auto-derived snake-case (``security_feature``).
+    Earlier versions of this stub hand-set ``tool_name = "security"``,
+    which made tests pass against a lookup that didn't actually work
+    in production. Don't reintroduce that.
+    """
 
     def __init__(self):
+        self.name = "SecurityFeature"
         self.approval_queue = MagicMock()
+
+    @property
+    def tool_name(self) -> str:
+        return "security_feature"
 
 
 def _agent_with_security():
@@ -53,8 +62,10 @@ def test_kestrel_agent_get_feature_resolves_class_name():
 
 
 def test_kestrel_agent_get_feature_resolves_lowercase_alias():
-    """The lowercase ``"security"`` shorthand the broken sites used must
-    now resolve to the registered SecurityFeature.
+    """The lowercase ``"security"`` shorthand the broken sites used
+    must resolve to the registered SecurityFeature, even though the
+    feature's ``tool_name`` is the auto-derived ``"security_feature"``
+    (not ``"security"``). This is the case the original fix missed.
     """
     from kestrel_sovereign.kestrel_agent import KestrelAgent
 
@@ -63,6 +74,24 @@ def test_kestrel_agent_get_feature_resolves_lowercase_alias():
     agent.features = {"SecurityFeature": sec}
 
     assert KestrelAgent.get_feature(agent, "security") is sec
+    assert KestrelAgent.get_feature(agent, "Security") is sec
+    assert KestrelAgent.get_feature(agent, "security_feature") is sec
+
+
+def test_kestrel_agent_get_feature_resolves_against_real_security_feature():
+    """End-to-end with the actual SecurityFeature class. If the lookup
+    can't find the real thing, no synthetic stub-based test counts.
+    """
+    from kestrel_sovereign.kestrel_agent import KestrelAgent
+    from kestrel_sovereign.features.security.feature import SecurityFeature
+
+    sec = SecurityFeature.__new__(SecurityFeature)
+    sec.name = "SecurityFeature"
+    agent = SimpleNamespace.__new__(SimpleNamespace)
+    agent.features = {"SecurityFeature": sec}
+
+    assert KestrelAgent.get_feature(agent, "security") is sec
+    assert KestrelAgent.get_feature(agent, "SecurityFeature") is sec
 
 
 def test_kestrel_agent_get_feature_resolves_tool_name():
