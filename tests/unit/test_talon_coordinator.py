@@ -46,16 +46,29 @@ class TestTalonClaim:
             mock_mesh.assert_awaited_once_with("org/repo", 42)
 
     @pytest.mark.asyncio
-    async def test_claim_falls_back_to_cli_background(self):
+    async def test_claim_falls_back_to_cli_background(self, tmp_path, monkeypatch):
         """When mesh fails, falls back to background CLI dispatch.
 
-        Background dispatch returns immediately with a job_id; the
-        previous synchronous behavior was killing Talon mid-work
-        with a 300s subprocess timeout.
+        Requires a provisioned workspace — the safeguard refuses to
+        point Talon at the running source tree. The test sets
+        KESTREL_TALON_WORKSPACE_ROOT to tmp_path and stubs a ready
+        workspace state.
         """
+        monkeypatch.setenv("KESTREL_TALON_WORKSPACE_ROOT", str(tmp_path))
         feature = TalonCoordinatorFeature(_make_agent())
+        ready_state = {
+            "repo": "org/repo",
+            "path": str(tmp_path / "org__repo"),
+            "exists": True,
+            "is_git": True,
+            "head": "main",
+            "clean": True,
+            "last_fetch_at": None,
+            "safe": True,
+        }
         with patch.object(feature, "_dispatch_via_mesh", new_callable=AsyncMock) as mock_mesh, \
-             patch.object(feature, "_dispatch_via_cli_background", new_callable=AsyncMock) as mock_bg:
+             patch.object(feature, "_dispatch_via_cli_background", new_callable=AsyncMock) as mock_bg, \
+             patch.object(TalonCoordinatorFeature, "_workspace_state", return_value=ready_state):
             mock_mesh.return_value = {"dispatched": False, "reason": "no_mesh_host"}
             mock_bg.return_value = {
                 "dispatched": True,
@@ -68,12 +81,32 @@ class TestTalonClaim:
             assert result["method"] == "cli_background"
             assert result["job_id"] == "abc"
             args = mock_bg.call_args[0][0]
-            # Best-practice defaults from the README: worktree on,
-            # repo-dir set, opus model, skip-clarification.
             assert "--worktree" in args
             assert "--repo-dir" in args
             assert "--model" in args and "opus" in args
             assert "--skip-clarification" in args
+            repo_dir_idx = args.index("--repo-dir") + 1
+            assert str(tmp_path) in args[repo_dir_idx]
+
+    @pytest.mark.asyncio
+    async def test_claim_refuses_when_workspace_not_provisioned(self):
+        """The structural safeguard: dispatch refuses when the target
+        repo has no workspace clone. No flag overrides this — the
+        agent must call ``talon_setup_workspace`` first.
+        """
+        feature = TalonCoordinatorFeature(_make_agent())
+        with patch.object(feature, "_dispatch_via_mesh", new_callable=AsyncMock) as mock_mesh, \
+             patch.object(feature, "_dispatch_via_cli_background", new_callable=AsyncMock) as mock_bg, \
+             patch.object(TalonCoordinatorFeature, "_workspace_state", return_value={
+                 "exists": False, "is_git": False, "safe": True,
+                 "path": "/tmp/no-workspace/org__repo",
+             }):
+            mock_mesh.return_value = {"dispatched": False}
+            result = await feature.talon_claim(repo="org/repo", issue=42)
+            assert result["dispatched"] is False
+            assert result["state"] == "workspace_not_provisioned"
+            assert "talon_setup_workspace" in result["next_step"]
+            mock_bg.assert_not_called()
 
 
 class TestTalonBatch:
