@@ -339,6 +339,66 @@ async def test_codex_tool_call_with_session_id_real_api():
 
 
 @pytest.mark.asyncio
+async def test_codex_text_only_reasoning_replay_real_api():
+    """Text-only reasoning continuity (#842). T1 asks GPT-5 a problem that
+    reliably triggers a ``reasoning`` item but no function_calls. T2 is a
+    text-only follow-up referencing T1. The cached T1 reasoning must be
+    replayed as input on T2 — preserving encrypted chain-of-thought across
+    plain text turns. The strict pass condition is HTTP 200; if the live
+    API rejects our reasoning-item shape on T2, the adapter raises 400.
+
+    Scoped narrowly: this test exists to prevent regression of the
+    text-only replay path that the #875 fix could otherwise have removed
+    if the cache clear had been overly broad.
+    """
+    token = _skip_if_no_creds()
+    store = InMemoryContinuationStore()
+    adapter = CodexAdapter(continuation_store=store)
+    model = _default_model()
+    session_id = "test-codex-real-text-only-replay"
+
+    resp_t1 = await adapter.get_response(
+        client=token, model=model,
+        messages=[
+            {"role": "system", "content": "Reason step by step. Then answer concisely."},
+            {"role": "user", "content": "What is 17 multiplied by 23? Show the calculation."},
+        ],
+        session_id=session_id,
+    )
+
+    cursor = store.get("openai_plan", session_id)
+    assert cursor is not None
+    cached = json.loads(cursor.turn_outputs[0])
+    types = [item.get("type") for item in cached]
+    if "reasoning" not in types:
+        pytest.skip(
+            f"GPT-5 didn't emit a reasoning item this run (types={types}); "
+            "behavior fluctuation, not an adapter bug."
+        )
+
+    resp_t2 = await adapter.get_response(
+        client=token, model=model,
+        messages=[
+            {"role": "system", "content": "Reason step by step. Then answer concisely."},
+            {"role": "user", "content": "What is 17 multiplied by 23? Show the calculation."},
+            {"role": "assistant", "content": resp_t1.content or ""},
+            {"role": "user", "content": "Now multiply that by 2."},
+        ],
+        session_id=session_id,
+    )
+
+    print(
+        f"\n[{model}] text-only T2 (replay enabled): {resp_t2.content!r}",
+        file=sys.stderr,
+    )
+    assert resp_t2.content, "T2 should produce text content"
+
+    # Both turns recorded, cache grows to 2 entries.
+    cursor2 = store.get("openai_plan", session_id)
+    assert len(cursor2.turn_outputs) == 2
+
+
+@pytest.mark.asyncio
 async def test_codex_two_separate_agent_loops_share_session_real_api():
     """The user's #875 production scenario: two independent agent loops on
     the same ``session_id``. Loop 1 ends; the orchestrator's storage keeps
@@ -433,14 +493,8 @@ async def test_codex_two_separate_agent_loops_share_session_real_api():
         pytest.skip("Loop 2 didn't call the tool; cannot exercise the round trip.")
     tc2 = resp_l2_t1.tool_calls[0]
 
-    # Cache should have been cleared at loop 2 T1 (no tool history in input).
-    # The new turn output is loop 2 T1 only.
-    cursor_after_l2_t1 = store.get("openai_plan", session_id)
-    assert len(cursor_after_l2_t1.turn_outputs) == 1, (
-        f"Cache should reset on fresh loop; got {len(cursor_after_l2_t1.turn_outputs)} turns "
-        f"(stale entries from loop 1 leaked through)"
-    )
-
+    # The cache accumulates across loops (id-match keeps it safe; no
+    # fresh-loop clear by design — preserves text-only continuity).
     args2 = json.dumps(tc2.arguments) if isinstance(tc2.arguments, dict) else (tc2.arguments or "{}")
     resp_l2_t2 = await adapter.get_response(
         client=token, model=model,
