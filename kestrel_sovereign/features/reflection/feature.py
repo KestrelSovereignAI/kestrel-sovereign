@@ -98,6 +98,14 @@ class ReflectionFeature(Feature):
         self._init_reflection_checkers()
         self._init_optional_services()
 
+        # Wire handlers that compose database + optional services. Has
+        # to run AFTER both passes — _init_database used to do this
+        # eagerly, but _ticket_creator and _self_model_manager don't
+        # exist yet at that point. Result: ``create_improvement_ticket``
+        # always returned ``"Ticket handler not available"`` even when
+        # GitHub and the database were both healthy.
+        self._wire_composite_handlers()
+
     async def post_all_features_loaded(self, agent):
         """Wire reflection into the sleep cycle after all features are loaded."""
         from kestrel_sovereign.features.reflection.hooks import create_reflection_hook
@@ -120,23 +128,9 @@ class ReflectionFeature(Feature):
         # Initialize training manager
         self._training_manager = TrainingManager(self)
 
-        # Initialize ticket handler
-        if self._ticket_creator and self._db_helper:
-            self._ticket_handler = TicketHandler(
-                self._ticket_creator,
-                self._economic_gate,
-                self._db_helper,
-                self.agent,
-            )
-
-        # Initialize self-model handler
-        if self._self_model_manager and self._db_helper:
-            self._self_model_handler = SelfModelHandler(
-                self._self_model_manager,
-                self._economic_gate,
-                self._db_helper,
-                self.agent,
-            )
+        # Composite handlers (ticket, self-model) are wired in
+        # _wire_composite_handlers() after _init_optional_services
+        # populates _ticket_creator and _self_model_manager.
 
     def _init_analyzer(self):
         """Initialize the interaction analyzer."""
@@ -213,6 +207,43 @@ class ReflectionFeature(Feature):
                 logger.info("ReflectionFeature: Self-model manager initialized")
             except SelfModelConfigError as e:
                 logger.warning(f"ReflectionFeature: Self-model manager not available: {e}")
+
+    def _wire_composite_handlers(self):
+        """Build handlers that need both the database helper AND the
+        optional services that come from other features.
+
+        Lives in its own pass because ``_init_database`` and
+        ``_init_optional_services`` populate different halves of the
+        dependency graph; whichever ran first won't see the other
+        half's outputs.
+        """
+        if self._ticket_creator and self._db_helper:
+            self._ticket_handler = TicketHandler(
+                self._ticket_creator,
+                self._economic_gate,
+                self._db_helper,
+                self.agent,
+            )
+            logger.info("ReflectionFeature: TicketHandler wired")
+        else:
+            missing = []
+            if not self._ticket_creator:
+                missing.append("ticket_creator (needs github feature + GITHUB_TOKEN)")
+            if not self._db_helper:
+                missing.append("db_helper (needs reflection database)")
+            logger.info(
+                "ReflectionFeature: TicketHandler not wired — missing %s",
+                ", ".join(missing),
+            )
+
+        if self._self_model_manager and self._db_helper:
+            self._self_model_handler = SelfModelHandler(
+                self._self_model_manager,
+                self._economic_gate,
+                self._db_helper,
+                self.agent,
+            )
+            logger.info("ReflectionFeature: SelfModelHandler wired")
 
     def _get_feature(self, name: str):
         """Get a feature from the agent."""
