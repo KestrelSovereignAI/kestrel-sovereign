@@ -324,3 +324,191 @@ async def test_talon_job_log_unknown_id():
     result = await feat.talon_job_log("not-a-real-id")
     assert result["success"] is False
     assert "Unknown" in result["error"]
+
+
+# ----- Self-modification safeguards -----------------------------------
+
+
+def test_workspace_path_is_outside_running_source_by_default():
+    """Default workspace root must NOT be inside the running agent's
+    source tree, regardless of where the user runs from.
+    """
+    from kestrel_sovereign.features.talon.coordinator import (
+        _RUNNING_AGENT_SOURCE_ROOT, _path_contains,
+    )
+    workspace = TalonCoordinatorFeature._workspace_path_for(
+        "KestrelSovereignAI/kestrel-sovereign"
+    )
+    assert not _path_contains(_RUNNING_AGENT_SOURCE_ROOT, workspace), (
+        f"Default workspace {workspace} is inside running source "
+        f"{_RUNNING_AGENT_SOURCE_ROOT} — that's the bug we're fixing."
+    )
+
+
+def test_assert_workspace_safe_refuses_running_source(monkeypatch):
+    """When KESTREL_TALON_WORKSPACE_ROOT is set to the running agent's
+    source root, the resolved workspace path lies INSIDE that source —
+    ``_assert_workspace_safe`` rejects, no flag override.
+    """
+    from kestrel_sovereign.features.talon.coordinator import (
+        _RUNNING_AGENT_SOURCE_ROOT,
+    )
+    monkeypatch.setenv(
+        "KESTREL_TALON_WORKSPACE_ROOT", str(_RUNNING_AGENT_SOURCE_ROOT),
+    )
+    workspace = TalonCoordinatorFeature._workspace_path_for("any/repo")
+    reason = TalonCoordinatorFeature._assert_workspace_safe(workspace)
+    assert reason is not None
+    assert "running agent's source tree" in reason
+    # Error message must name the env var so the user knows what to set.
+    assert "KESTREL_TALON_WORKSPACE_ROOT" in reason
+
+
+def test_assert_workspace_safe_refuses_workspace_equal_to_source(monkeypatch):
+    """When the workspace path resolves to the running source root
+    itself, the error names the constitutional alternatives.
+    """
+    from kestrel_sovereign.features.talon.coordinator import (
+        _RUNNING_AGENT_SOURCE_ROOT,
+    )
+    reason = TalonCoordinatorFeature._assert_workspace_safe(
+        _RUNNING_AGENT_SOURCE_ROOT
+    )
+    assert reason is not None
+    assert "running agent's source tree" in reason
+    assert "code_edit" in reason or "propose_improvement" in reason
+
+
+def test_assert_workspace_safe_refuses_workspace_containing_source():
+    """If the workspace path WOULD contain the running agent's source
+    (e.g. user set workspace root to the projects parent), refuse.
+    """
+    from kestrel_sovereign.features.talon.coordinator import (
+        _RUNNING_AGENT_SOURCE_ROOT,
+    )
+    parent = _RUNNING_AGENT_SOURCE_ROOT.parent
+    reason = TalonCoordinatorFeature._assert_workspace_safe(parent)
+    assert reason is not None
+
+
+@pytest.mark.asyncio
+async def test_claim_refuses_unsafe_workspace_root(monkeypatch):
+    """End-to-end: ``talon_claim`` returns ``unsafe_workspace`` when
+    the resolved workspace would touch the running source tree.
+    """
+    from kestrel_sovereign.features.talon.coordinator import (
+        _RUNNING_AGENT_SOURCE_ROOT,
+    )
+    monkeypatch.setenv(
+        "KESTREL_TALON_WORKSPACE_ROOT", str(_RUNNING_AGENT_SOURCE_ROOT),
+    )
+    feat = _make_feature()
+    with patch.object(
+        TalonCoordinatorFeature, "_dispatch_via_mesh",
+        new_callable=AsyncMock,
+        return_value={"dispatched": False},
+    ):
+        result = await feat.talon_claim(repo="self", issue=1)
+    assert result["dispatched"] is False
+    assert result["state"] == "unsafe_workspace"
+
+
+@pytest.mark.asyncio
+async def test_setup_workspace_clones_outside_running_source(
+    tmp_path, monkeypatch,
+):
+    """Provisioning a workspace creates a directory under the workspace
+    root, not under the running source. Approves auto via stubbed
+    SecurityFeature; stubs git clone so we don't hit the network.
+    """
+    from pathlib import Path as _Path
+    from kestrel_sovereign.features.talon.coordinator import (
+        _RUNNING_AGENT_SOURCE_ROOT, _path_contains,
+    )
+    monkeypatch.setenv("KESTREL_TALON_WORKSPACE_ROOT", str(tmp_path))
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_test")
+
+    sec = SimpleNamespace(
+        name="SecurityFeature",
+        approval_queue=SimpleNamespace(
+            request_approval=AsyncMock(return_value=(True, "user")),
+        ),
+    )
+    agent = SimpleNamespace(
+        _scheduler=None,
+        features={"SecurityFeature": sec},
+    )
+    agent.get_feature = lambda name: sec if name == "SecurityFeature" else None
+    feat = TalonCoordinatorFeature(agent)
+
+    async def fake_git_clone(self, url, dest):
+        _Path(dest).mkdir(parents=True, exist_ok=True)
+        (_Path(dest) / ".git").mkdir(exist_ok=True)
+        (_Path(dest) / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
+        return {"ok": True}
+
+    with patch.object(
+        TalonCoordinatorFeature, "_git_clone", new=fake_git_clone,
+    ):
+        result = await feat.talon_setup_workspace(repo="org/repo")
+
+    assert result["success"] is True
+    assert result["state"] == "created"
+    workspace_path = _Path(result["workspace"]["path"])
+    assert workspace_path.exists()
+    assert (workspace_path / ".git").is_dir()
+    assert not _path_contains(_RUNNING_AGENT_SOURCE_ROOT, workspace_path)
+
+
+@pytest.mark.asyncio
+async def test_setup_workspace_denied_without_approval(tmp_path, monkeypatch):
+    """Workspace setup is approval-gated. Without approval, fails
+    with ``approval_denied`` and creates nothing on disk.
+    """
+    monkeypatch.setenv("KESTREL_TALON_WORKSPACE_ROOT", str(tmp_path))
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_test")
+
+    sec = SimpleNamespace(
+        name="SecurityFeature",
+        approval_queue=SimpleNamespace(
+            request_approval=AsyncMock(return_value=(False, "user")),
+        ),
+    )
+    agent = SimpleNamespace(
+        _scheduler=None,
+        features={"SecurityFeature": sec},
+    )
+    agent.get_feature = lambda name: sec if name == "SecurityFeature" else None
+    feat = TalonCoordinatorFeature(agent)
+
+    result = await feat.talon_setup_workspace(repo="org/repo")
+    assert result["success"] is False
+    assert result["state"] == "approval_denied"
+    assert not (tmp_path / "org__repo" / ".git").exists()
+
+
+@pytest.mark.asyncio
+async def test_workspace_status_reports_missing_workspace(monkeypatch, tmp_path):
+    monkeypatch.setenv("KESTREL_TALON_WORKSPACE_ROOT", str(tmp_path))
+    feat = _make_feature()
+    result = await feat.talon_workspace_status(repo="org/never-cloned")
+    assert result["exists"] is False
+    assert result["is_git"] is False
+    assert result["safe"] is True
+
+
+@pytest.mark.asyncio
+async def test_workspace_status_reports_unsafe(monkeypatch):
+    """If KESTREL_TALON_WORKSPACE_ROOT is unsafe, workspace_status
+    surfaces that — agent can react instead of being silently blocked.
+    """
+    from kestrel_sovereign.features.talon.coordinator import (
+        _RUNNING_AGENT_SOURCE_ROOT,
+    )
+    monkeypatch.setenv(
+        "KESTREL_TALON_WORKSPACE_ROOT", str(_RUNNING_AGENT_SOURCE_ROOT),
+    )
+    feat = _make_feature()
+    result = await feat.talon_workspace_status(repo="org/x")
+    assert result["safe"] is False
+    assert "running agent's source tree" in result["unsafe_reason"]

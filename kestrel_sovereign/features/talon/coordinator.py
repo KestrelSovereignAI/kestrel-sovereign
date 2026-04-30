@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import shutil
+import subprocess
 import time
 import urllib.error
 import urllib.request
@@ -33,6 +34,25 @@ logger = logging.getLogger(__name__)
 # Default sibling-checkout layout assumed throughout: kestrel-sovereign
 # and target repos live as siblings under a common project parent.
 _DEFAULT_PROJECT_PARENT = Path(__file__).resolve().parents[4]
+
+# The running agent's own source root. Captured at import time so an
+# in-process attacker mutating ``Path(__file__)`` later can't move it.
+# The dispatcher refuses to point Talon at this directory; talon
+# operates against a separate workspace clone instead. See
+# ``_workspace_root_for`` and ``talon_setup_workspace``.
+_RUNNING_AGENT_SOURCE_ROOT = Path(__file__).resolve().parents[3]
+
+
+def _path_contains(parent: Path, child: Path) -> bool:
+    """True iff ``child`` is ``parent`` or under it. Resolves both."""
+    try:
+        parent_r = parent.resolve()
+        child_r = child.resolve()
+    except OSError:
+        return False
+    if parent_r == child_r:
+        return True
+    return parent_r in child_r.parents
 
 
 class TalonCoordinatorFeature(Feature):
@@ -123,10 +143,40 @@ class TalonCoordinatorFeature(Feature):
             return mesh_result
 
         repo_resolved = self._resolve_repo(repo)
-        repo_dir = self._resolve_repo_dir(repo_resolved)
+        workspace = self._workspace_path_for(repo_resolved)
+
+        unsafe_reason = self._assert_workspace_safe(workspace)
+        if unsafe_reason:
+            return {
+                "dispatched": False,
+                "state": "unsafe_workspace",
+                "error": unsafe_reason,
+            }
+
+        # If the workspace doesn't exist, refuse and tell the agent
+        # the structural next step. Don't silently fall through to
+        # the running source tree — that's the bug we're fixing.
+        state = self._workspace_state(repo_resolved)
+        if not state["exists"] or not state["is_git"]:
+            return {
+                "dispatched": False,
+                "state": "workspace_not_provisioned",
+                "error": (
+                    "No talon workspace exists for "
+                    f"{repo_resolved} at {workspace}. The dispatcher "
+                    "will not operate on the running agent's source "
+                    "tree. Call talon_setup_workspace(repo) to "
+                    "provision a sandboxed clone, then retry."
+                ),
+                "workspace": state,
+                "next_step": (
+                    f"talon_setup_workspace(repo='{repo_resolved}')"
+                ),
+            }
+
         worktree_base = (
             os.environ.get("KESTREL_TALON_WORKTREE_BASE")
-            or str(_DEFAULT_PROJECT_PARENT)
+            or str(workspace.parent)
         )
 
         args = [
@@ -135,7 +185,7 @@ class TalonCoordinatorFeature(Feature):
             "--issue", str(issue),
             "--max-iterations", str(max_iterations),
             "--model", model,
-            "--repo-dir", repo_dir,
+            "--repo-dir", str(workspace),
         ]
         if worktree:
             args += ["--worktree", "--worktree-base", worktree_base]
@@ -145,8 +195,244 @@ class TalonCoordinatorFeature(Feature):
         return await self._dispatch_via_cli_background(
             args,
             label=f"claim:{repo_resolved}#{issue}",
-            extra_meta={"repo": repo_resolved, "issue": issue, "model": model},
+            extra_meta={
+                "repo": repo_resolved,
+                "issue": issue,
+                "model": model,
+                "workspace": str(workspace),
+            },
         )
+
+    @tool(
+        name="talon_workspace_status",
+        description=(
+            "Read-only: report on the talon workspace clone for a "
+            "repo (path, exists, git HEAD, clean state, last fetch). "
+            "No side effects."
+        ),
+        category=ToolCategory.UTILITY,
+        command_prefix="!talon workspace-status",
+    )
+    async def talon_workspace_status(self, repo: str) -> Dict[str, Any]:
+        """Inspect the talon workspace for ``repo``.
+
+        Use this BEFORE ``talon_claim`` to verify the sandbox is
+        ready: workspace exists, has a ``.git``, working tree is
+        clean, last fetch was recent. If ``exists`` is False, call
+        ``talon_setup_workspace`` first.
+        """
+        repo_resolved = self._resolve_repo(repo)
+        return {
+            "success": True,
+            "repo": repo_resolved,
+            **self._workspace_state(repo_resolved),
+        }
+
+    @tool(
+        name="talon_setup_workspace",
+        description=(
+            "Provision (or refresh) a sandboxed talon workspace clone "
+            "for a repo. The clone lives outside the running agent's "
+            "source tree, so talon_claim can operate without ever "
+            "touching the agent's own checkout. Approval-gated."
+        ),
+        category=ToolCategory.SYSTEM,
+        command_prefix="!talon setup-workspace",
+    )
+    async def talon_setup_workspace(
+        self,
+        repo: str,
+        fetch: bool = True,
+    ) -> Dict[str, Any]:
+        """Clone ``repo`` into the canonical talon workspace path.
+
+        If the workspace already exists as a git checkout and
+        ``fetch`` is True, runs ``git fetch --all --prune`` to
+        refresh remote refs. Approval-gated: this is a network +
+        disk operation that creates persistent state under the
+        agent's home directory.
+
+        Args:
+            repo: GitHub repo in ``owner/name`` format, or ``"self"``.
+            fetch: If True (default), fetch remote refs after clone
+                or against an existing clone.
+
+        Returns:
+            ``{success, state: "created" | "refreshed" | "exists",
+              workspace: {...}}`` on success. Failure returns
+            ``{success: False, error, ...}``.
+        """
+        repo_resolved = self._resolve_repo(repo)
+        workspace = self._workspace_path_for(repo_resolved)
+
+        unsafe_reason = self._assert_workspace_safe(workspace)
+        if unsafe_reason:
+            return {
+                "success": False,
+                "state": "unsafe_workspace",
+                "error": unsafe_reason,
+            }
+
+        approved = await self._request_workspace_approval(
+            repo=repo_resolved, workspace=workspace, fetch=fetch,
+        )
+        if not approved:
+            return {
+                "success": False,
+                "state": "approval_denied",
+                "error": "Workspace setup not approved",
+                "workspace": str(workspace),
+            }
+
+        existing = self._workspace_state(repo_resolved)
+        if existing["exists"] and existing["is_git"]:
+            if fetch:
+                fetch_result = await self._git_fetch(workspace)
+                if not fetch_result["ok"]:
+                    return {
+                        "success": False,
+                        "state": "fetch_failed",
+                        "error": fetch_result["error"],
+                        "workspace": self._workspace_state(repo_resolved),
+                    }
+                return {
+                    "success": True,
+                    "state": "refreshed",
+                    "workspace": self._workspace_state(repo_resolved),
+                }
+            return {
+                "success": True,
+                "state": "exists",
+                "workspace": existing,
+            }
+
+        # Need to clone. Make sure the parent dir exists.
+        try:
+            workspace.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            return {
+                "success": False,
+                "state": "mkdir_failed",
+                "error": str(e),
+            }
+
+        clone_url = f"https://github.com/{repo_resolved}.git"
+        clone_result = await self._git_clone(clone_url, workspace)
+        if not clone_result["ok"]:
+            return {
+                "success": False,
+                "state": "clone_failed",
+                "error": clone_result["error"],
+            }
+
+        return {
+            "success": True,
+            "state": "created",
+            "workspace": self._workspace_state(repo_resolved),
+        }
+
+    def _get_security_feature(self):
+        agent = getattr(self, "agent", None)
+        if agent is None:
+            return None
+        if hasattr(agent, "get_feature"):
+            feat = agent.get_feature("SecurityFeature")
+            if feat is not None:
+                return feat
+        features = getattr(agent, "features", None)
+        if isinstance(features, dict):
+            return features.get("SecurityFeature") or features.get("security")
+        return None
+
+    async def _request_workspace_approval(
+        self, repo: str, workspace: Path, fetch: bool,
+    ) -> bool:
+        """Gate workspace creation/refresh through SecurityFeature.
+
+        Setting up a workspace creates persistent state and pulls
+        from the network — both worth a user-visible approval gate.
+        Without an approval queue, dispatch is denied (fail-closed).
+        """
+        security = self._get_security_feature()
+        if security is None or not hasattr(security, "approval_queue"):
+            logger.warning(
+                "SecurityFeature unavailable; talon_setup_workspace denied"
+            )
+            return False
+        try:
+            approved, _scope = await security.approval_queue.request_approval(
+                feature_name="talon",
+                tool_name="setup_workspace",
+                tool_args={
+                    "repo": repo,
+                    "workspace_path": str(workspace),
+                    "fetch": fetch,
+                    "operation": (
+                        "refresh existing clone"
+                        if workspace.exists()
+                        else "clone fresh"
+                    ),
+                },
+            )
+            return bool(approved)
+        except (TimeoutError, asyncio.TimeoutError):
+            return False
+        except Exception as e:
+            logger.error(f"Workspace approval failed: {e}", exc_info=True)
+            return False
+
+    async def _git_clone(self, url: str, dest: Path) -> Dict[str, Any]:
+        try:
+            env = self._build_subprocess_env()
+        except RuntimeError as e:
+            return {"ok": False, "error": str(e)}
+        proc = await asyncio.create_subprocess_exec(
+            "git", "clone", url, str(dest),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+        )
+        try:
+            _stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=300,
+            )
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            return {"ok": False, "error": "git clone timed out (300s)"}
+        if proc.returncode != 0:
+            return {
+                "ok": False,
+                "error": stderr.decode(errors="replace")[-500:] or "git clone failed",
+            }
+        return {"ok": True}
+
+    async def _git_fetch(self, workspace: Path) -> Dict[str, Any]:
+        try:
+            env = self._build_subprocess_env()
+        except RuntimeError as e:
+            return {"ok": False, "error": str(e)}
+        proc = await asyncio.create_subprocess_exec(
+            "git", "fetch", "--all", "--prune",
+            cwd=str(workspace),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+        )
+        try:
+            _stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=120,
+            )
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            return {"ok": False, "error": "git fetch timed out (120s)"}
+        if proc.returncode != 0:
+            return {
+                "ok": False,
+                "error": stderr.decode(errors="replace")[-500:] or "git fetch failed",
+            }
+        return {"ok": True}
 
     @staticmethod
     def _resolve_repo(repo: str) -> str:
@@ -157,26 +443,131 @@ class TalonCoordinatorFeature(Feature):
         return repo
 
     @staticmethod
-    def _resolve_repo_dir(repo: str) -> str:
-        """Find a local checkout for ``repo`` next to kestrel-sovereign.
+    def _workspace_root() -> Path:
+        """Where workspace clones live.
 
-        Talon needs the target repo on disk for git operations.
-        Convention: ``<project_parent>/<repo_name>``. If that doesn't
-        exist, fall back to the kestrel-sovereign project root —
-        Talon will fail loudly enough that the user can supply
-        ``KESTREL_TALON_REPO_DIR`` themselves rather than us
-        silently dispatching against the wrong repo.
+        Default: ``~/.kestrel/talon_workspaces/``. Override with
+        ``KESTREL_TALON_WORKSPACE_ROOT``. Always OUTSIDE the running
+        agent's source tree by construction.
         """
-        override = os.environ.get("KESTREL_TALON_REPO_DIR")
+        override = os.environ.get("KESTREL_TALON_WORKSPACE_ROOT")
         if override:
-            return override
-        repo_name = repo.split("/", 1)[-1] if "/" in repo else repo
-        candidate = _DEFAULT_PROJECT_PARENT / repo_name
-        if candidate.is_dir():
-            return str(candidate)
-        # Fallback to the kestrel-sovereign root (most common case
-        # since that's the agent's own repo and the most-claimed one).
-        return str(_DEFAULT_PROJECT_PARENT / "kestrel-sovereign")
+            return Path(override).expanduser().resolve()
+        return (Path.home() / ".kestrel" / "talon_workspaces").resolve()
+
+    @classmethod
+    def _workspace_path_for(cls, repo: str) -> Path:
+        """Canonical workspace clone path for a given repo string.
+
+        Always under ``_workspace_root()`` and never inside the
+        running agent's source tree — so even if a user sets
+        ``KESTREL_TALON_WORKSPACE_ROOT`` to a path that *would*
+        overlap, ``_assert_workspace_safe`` rejects it before any
+        dispatch.
+        """
+        owner_repo = repo.replace("/", "__")  # filesystem-safe
+        return cls._workspace_root() / owner_repo
+
+    @classmethod
+    def _assert_workspace_safe(cls, workspace: Path) -> Optional[str]:
+        """Return None if the workspace is safe to operate against, or
+        an error string explaining why it isn't.
+
+        "Safe" means the workspace path is NOT the running agent's
+        source root and NOT a directory containing it. This is
+        structural, not a flag the agent can bypass.
+        """
+        if _path_contains(workspace, _RUNNING_AGENT_SOURCE_ROOT):
+            return (
+                f"Workspace path {workspace} contains the running agent's "
+                f"source tree {_RUNNING_AGENT_SOURCE_ROOT}. The dispatcher "
+                "refuses to operate on the agent's own source — Talon "
+                "would commit/branch/quality-check against the running "
+                "process. Use code_edit / propose_improvement for "
+                "constitutional self-modification, or set "
+                "KESTREL_TALON_WORKSPACE_ROOT to a path outside the "
+                "source tree."
+            )
+        if _path_contains(_RUNNING_AGENT_SOURCE_ROOT, workspace):
+            return (
+                f"Workspace path {workspace} is inside the running agent's "
+                f"source tree {_RUNNING_AGENT_SOURCE_ROOT}. Move the "
+                "workspace root outside the source tree (set "
+                "KESTREL_TALON_WORKSPACE_ROOT)."
+            )
+        return None
+
+    @classmethod
+    def _workspace_state(cls, repo_resolved: str) -> Dict[str, Any]:
+        """Read-only snapshot of a workspace clone's state.
+
+        Returns a dict with: ``path``, ``exists``, ``is_git`` (has
+        ``.git``), ``head`` (current ref or ``None``), ``clean``
+        (no uncommitted changes; ``None`` when not a git checkout),
+        ``last_fetch_at`` (mtime of ``.git/FETCH_HEAD`` or ``None``),
+        ``safe`` (passes ``_assert_workspace_safe``).
+        """
+        path = cls._workspace_path_for(repo_resolved)
+        unsafe_reason = cls._assert_workspace_safe(path)
+
+        state: Dict[str, Any] = {
+            "repo": repo_resolved,
+            "path": str(path),
+            "exists": path.is_dir(),
+            "is_git": False,
+            "head": None,
+            "clean": None,
+            "last_fetch_at": None,
+            "safe": unsafe_reason is None,
+        }
+        if unsafe_reason:
+            state["unsafe_reason"] = unsafe_reason
+            return state
+
+        if not path.is_dir():
+            return state
+
+        git_dir = path / ".git"
+        state["is_git"] = git_dir.exists()
+        if not state["is_git"]:
+            return state
+
+        # HEAD ref
+        head_file = git_dir / "HEAD"
+        if head_file.is_file():
+            try:
+                head_text = head_file.read_text(encoding="utf-8").strip()
+                if head_text.startswith("ref: refs/heads/"):
+                    state["head"] = head_text[len("ref: refs/heads/"):]
+                else:
+                    state["head"] = head_text[:40]
+            except OSError:
+                pass
+
+        # Working-tree cleanliness — porcelain check via subprocess so
+        # we don't reimplement git status. Tolerates missing git.
+        try:
+            proc = subprocess.run(
+                ["git", "status", "--porcelain"],
+                cwd=str(path),
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            state["clean"] = (proc.returncode == 0 and not proc.stdout.strip())
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            state["clean"] = None
+
+        fetch_head = git_dir / "FETCH_HEAD"
+        if fetch_head.is_file():
+            try:
+                state["last_fetch_at"] = datetime.fromtimestamp(
+                    fetch_head.stat().st_mtime, tz=timezone.utc,
+                ).isoformat()
+            except OSError:
+                pass
+
+        return state
 
     @tool(
         name="talon_batch",
