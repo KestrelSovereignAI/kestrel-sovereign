@@ -3,8 +3,8 @@
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-04-30
-**Scope:** 1507 tracked files (912 `.py`, 232 `.md`, 363 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-05-01
+**Scope:** 1514 tracked files (918 `.py`, 232 `.md`, 364 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -1534,6 +1534,7 @@ Repo entry points and standard project files.
 - **tests/fixtures/tone_440hz.wav** — —
 - **tests/frontend/api_client.test.mjs** — (mjs asset)
 - **tests/frontend/auto_load_most_recent.test.mjs** — (mjs asset)
+- **tests/frontend/chat_ui_generation.test.mjs** — (mjs asset)
 - **tests/frontend/model_selector.test.mjs** — (mjs asset)
 - **tests/frontend/route_selector.test.mjs** — (mjs asset)
 - **tests/frontend/trash_api_client.test.mjs** — (mjs asset)
@@ -1580,7 +1581,7 @@ Repo entry points and standard project files.
 - **tests/integration/test_cache_prompt_wire.py** — Integration test: `cache_prompt` reaches the wire (issue #704).
   - `async def test_cache_prompt_reaches_wire_for_llama_cpp()`; `async def test_cache_prompt_absent_from_wire_for_other_vendors(vendor)`; `async def test_real_llama_server_accepts_cache_prompt()`
 - **tests/integration/test_codex_real.py** — Integration tests: CodexAdapter against the live ChatGPT-backend Responses API.
-  - `async def test_codex_single_turn_text_real_api()`; `async def test_codex_tool_call_round_trip_real_api()`; `async def test_codex_tool_call_with_session_id_real_api()`; `async def test_codex_reasoning_replay_real_api()`; `async def test_codex_continuation_cursor_written_real_api()`
+  - `async def test_codex_single_turn_text_real_api()`; `async def test_codex_tool_call_round_trip_real_api()`; `async def test_codex_tool_call_with_session_id_real_api()`; `async def test_codex_text_only_reasoning_replay_real_api()`; `async def test_codex_two_separate_agent_loops_share_session_real_api()`; `async def test_codex_continuation_cursor_written_real_api()`
 - **tests/integration/test_compress_e2e.py** — E2E Tests for Session Compression Functionality.
   - `async def agent_with_messages(temp_dir)`; `async def agent_with_few_messages(temp_dir)`; `class TestCompressCommand`; `class TestCompressionCheckNeeded`; `class TestCompressionSession`; `class TestContextManagerNoLLM`
 - **tests/integration/test_compute_security_integration.py** — Integration tests for Compute + Security feature interaction.
@@ -1669,6 +1670,8 @@ Repo entry points and standard project files.
   - `async def test_messages_prefix_stable_across_turns_with_different_retrieval()`; `async def test_cache_covers_system_and_older_history_on_third_turn()`
 - **tests/integration/test_reflection_e2e.py** — End-to-end tests for the Reflection feature.
   - `class MockLLMService`; `class MockConversationStore`; `class MockDatabase`; `class MockAgent`; `async def test_analyzer_generates_insights()`; `async def test_analyzer_handles_empty_conversations()`; `async def test_analyzer_handles_llm_error()`; `async def test_reflect_runs_layered_checks()`; `…`
+- **tests/integration/test_reflection_propose_to_ticket.py** — Cross-seam regression test for the propose → approve → ticket flow.
+  - `async def wired_feature(tmp_path, monkeypatch)`; `async def test_propose_then_create_ticket_with_proposal_id(wired_feature)`; `async def test_unapproved_proposal_blocks_ticket(tmp_path, monkeypatch)`; `async def test_unknown_id_returns_clear_not_found(wired_feature)`
 - **tests/integration/test_retention_purge_primitive.py** — Integration tests for the retention-purge primitive (#764).
   - `async def test_purge_trash_older_than_destroys_aged_rows(tmp_path)`; `async def test_purge_does_not_touch_rows_within_window(tmp_path)`; `async def test_purge_never_touches_live_rows(tmp_path)`; `async def test_per_agent_scoping(tmp_path)`; `async def test_max_rows_caps_a_single_sweep(tmp_path)`; `async def test_idempotent_when_nothing_to_purge(tmp_path)`; `async def test_max_rows_zero_or_negative_is_a_safe_noop(tmp_path)`; `async def test_privacy_wrapper_exposes_purge_trash_older_than(tmp_path)`; `…`
 - **tests/integration/test_runpod_feature.py** — —
@@ -1745,6 +1748,8 @@ Repo entry points and standard project files.
 - **tests/unit/storage/__init__.py** — —
 - **tests/unit/storage/test_db_backends.py** — Tests for database backend abstraction layer.
   - `class TestPlaceholderConversion`; `class TestSchemaConversion`; `class TestSQLiteBackend`; `class TestAsyncDatabase`
+- **tests/unit/storage/test_deleted_at_legacy_migration.py** — Regression test for #795: deleted_at migration silently fails on legacy DBs.
+  - `async def test_legacy_db_loads_and_migrates_deleted_at(tmp_path)`; `async def test_migration_failure_surfaces(tmp_path, monkeypatch)`
 - **tests/unit/test_a2a_stores.py** — Unit tests for A2A Protocol Stores.
   - `def db_path()`; `def track_store(store)`; `class TestTaskStore`; `class TestSessionService`; `class TestMemoryService`; `class TestObservabilityStore`; `class TestOrchestrationStore`; `class TestFeedbackStore`
 - **tests/unit/test_a2a_task_manager.py** — Unit tests for A2A TaskManager and TaskWorker.
@@ -1962,6 +1967,8 @@ Repo entry points and standard project files.
   - `def test_generator_uses_canonical_source_path()`; `def test_dry_run_returns_expected_output_paths(capsys)`; `def test_generator_uses_provider_default_resolution_for_anthropic()`; `def test_generator_uses_provider_default_resolution_for_openai()`; `def test_generator_refreshes_provider_discovery_before_default_resolution()`
 - **tests/unit/test_github_feature.py** — Unit tests for GitHub feature.
   - `class TestModels`; `class TestASTAnalyzer`; `class TestGitHubCache`; `class TestGitHubClient`; `class TestGitHubFeature`
+- **tests/unit/test_github_issue_comment.py** — Unit tests for GitHubFeature.create_github_issue_comment.
+  - `def feature_factory()`; `async def test_empty_body_refused_before_approval(feature_factory)`; `async def test_oversized_body_refused_before_approval(feature_factory)`; `async def test_approval_denied_does_not_post(feature_factory)`; `async def test_dry_run_does_not_post(feature_factory)`; `async def test_approved_call_posts_and_returns_url(feature_factory)`; `async def test_self_repo_alias_resolves(feature_factory)`; `async def test_client_error_surfaces(feature_factory)`; `…`
 - **tests/unit/test_github_processor.py** — Tests for Kestrel Talon (GitHub/ADO issue processor).
   - `class TestTalonConfig`; `class TestIssueContext`; `class TestProcessingResult`; `class TestCIStatus`; `class TestGitHubClientExtraction`; `class TestTalonE2E`
 - **tests/unit/test_gpt5_overlay.py** — Unit tests for the GPT-5 system-prompt overlay (#807 / #806).
@@ -1977,7 +1984,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_heartbeat.py** — Tests for the heartbeat system (#151).
   - `class TestParseDuration`; `class TestHeartbeatConfig`; `class TestOKPattern`; `def mock_agent(tmp_path)`; `def default_config()`; `class TestHeartbeatRunner`; `class TestActiveHours`; `class TestResponseNormalization`
 - **tests/unit/test_hooks.py** — Unit Tests for Kestrel Hooks System.
-  - `class AllowAllHook`; `class DenyAllHook`; `class RegexMatcherHook`; `class TimeoutHook`; `class SessionStartHook`; `class FailingHook`; `class TestHookInput`; `class TestHookOutput`; `…`
+  - `class AllowAllHook`; `class DenyAllHook`; `class RegexMatcherHook`; `class TimeoutHook`; `class SessionStartHook`; `class FailingHook`; `class AwaitsUserInputHook`; `class TestHookInput`; `…`
 - **tests/unit/test_host.py** — Unit tests for host.py — Kestrel Host thin FastAPI proxy.
   - `async def make_host_app(config)`; `def disable_autostart()`; `class TestHealthEndpoint`; `class TestAuthMiddleware`; `class TestListAgents`; `class TestProxyToAgent`; `class TestProcessManagementEndpoints`
 - **tests/unit/test_host_query_param_auth.py** — Unit tests for host.py API key query parameter restriction (GitHub issue #160).
@@ -2092,6 +2099,8 @@ Repo entry points and standard project files.
   - `def test_rasa_webhook_does_not_force_hardcoded_model_override()`
 - **tests/unit/test_reanchor_constitution.py** — Unit tests for !reanchor-constitution command.
   - `async def test_reanchor_rejects_missing_hash()`; `async def test_reanchor_rejects_short_hash()`; `async def test_reanchor_rejects_wrong_hash()`; `async def test_reanchor_succeeds_with_correct_hash()`; `async def test_reanchor_accepts_full_hash()`; `async def test_reanchor_does_not_exit_safe_mode()`; `async def test_reanchor_noop_when_already_current()`; `async def test_reanchor_fails_when_no_identity_node()`; `…`
+- **tests/unit/test_reflection_handler_wiring.py** — Regression tests for ReflectionFeature handler wiring.
+  - `async def agent_with_storage(tmp_path, monkeypatch)`; `async def test_ticket_handler_wired_when_dependencies_present(agent_with_storage)`; `async def test_create_improvement_ticket_reaches_handler(agent_with_storage)`; `async def test_ticket_handler_skipped_when_github_missing(tmp_path, monkeypatch)`
 - **tests/unit/test_remote_gpu_mandate_gate.py** — Regression suite for #734 — remote-GPU shortcut must honor the mandate.
   - `def test_remote_first_allowed_with_no_mandate_and_no_override()`; `def test_remote_first_allowed_with_bare_model_override()`; `def test_remote_first_allowed_rejects_vendor_prefixed_override()`; `def test_remote_first_allowed_rejects_vendor_route_prefixed_override()`; `def test_remote_first_allowed_rejects_vendor_selector_without_slash()`; `def test_remote_first_allowed_rejects_mandate_with_vendor()`; `def test_remote_first_allowed_rejects_mandate_with_route()`; `def test_remote_first_allowed_with_model_only_mandate()`; `…`
 - **tests/unit/test_rename_command.py** — Unit tests for the rename command.
@@ -2132,6 +2141,8 @@ Repo entry points and standard project files.
   - `def test_security_tree_pending_and_audit_endpoints_serialize_expected_shapes()`; `def test_security_permission_mutation_endpoints_validate_levels_and_scope()`; `def test_security_approval_and_cancellation_endpoints_preserve_queue_contracts()`; `def test_security_endpoints_return_503_when_feature_is_unavailable()`
 - **tests/unit/test_security_feature.py** — Unit Tests for Kestrel Security Feature.
   - `def track_store(store)`; `class TestPermissionStore`; `class TestApprovalQueue`; `class TestSecurityHook`; `class TestSecurityIntegration`; `class TestApprovalQueueScopePersistence`; `class TestSecurityFeature`
+- **tests/unit/test_security_feature_lookup.py** — Regression test for the security-feature-lookup bug.
+  - `def test_kestrel_agent_get_feature_resolves_class_name()`; `def test_kestrel_agent_get_feature_resolves_lowercase_alias()`; `def test_kestrel_agent_get_feature_resolves_against_real_security_feature()`; `def test_kestrel_agent_get_feature_resolves_tool_name()`; `def test_kestrel_agent_get_feature_returns_none_when_missing()`; `def test_feature_security_lookup_finds_registered_security_feature(module_path, handler_attr, handler_kwargs, tmp_path)`; `def test_reflection_ticket_handler_finds_security()`; `def test_reflection_approval_handler_finds_security()`
 - **tests/unit/test_server_health.py** — Focused tests for server health endpoint behavior.
   - `def test_health_returns_503_when_agent_missing()`; `def test_health_detailed_uses_health_feature_from_feature_dict()`
 - **tests/unit/test_session_id_threading.py** — Verify ``session_id`` threads from agent loop to LLMService callers (#821).
@@ -2188,6 +2199,8 @@ Repo entry points and standard project files.
   - `class TestCapability`; `class TestCapabilityMap`; `class TestCapabilityGap`; `class TestSubstrateAdapter`; `class TestConvenienceFunctions`; `class TestSubstrateProfiles`
 - **tests/unit/test_talon_coordinator.py** — Tests for TalonCoordinatorFeature.
   - `class TestTalonCoordinatorInit`; `class TestTalonClaim`; `class TestTalonBatch`; `class TestTalonStatus`; `class TestTalonPauseResume`; `class TestMeshDispatch`; `class TestCLIDispatch`
+- **tests/unit/test_talon_env_and_health.py** — Tests for talon coordinator env handling and the new talon_health tool.
+  - `def test_build_subprocess_env_strips_anthropic_keys(monkeypatch)`; `def test_build_subprocess_env_promotes_gh_token_to_github_token(monkeypatch)`; `def test_build_subprocess_env_raises_when_no_github_token(monkeypatch)`; `async def test_dispatch_via_cli_returns_clear_error_when_no_token(monkeypatch)`; `async def test_talon_health_returns_unhealthy_when_binary_missing(monkeypatch)`; `async def test_talon_health_runs_help_and_reports_success(monkeypatch, tmp_path)`; `async def test_talon_health_reports_help_failure(monkeypatch, tmp_path)`; `async def test_dispatch_via_cli_background_returns_immediately_and_logs(tmp_path, monkeypatch)`; `…`
 - **tests/unit/test_telemetry.py** — Tests for kestrel_sovereign.telemetry module.
   - `class TestIsTracingEnabled`; `class TestOptionalSpan`; `class TestSetupTracing`; `class TestStartEndSpan`; `class TestGetTracer`; `class TestGracefulDegradation`
 - **tests/unit/test_testing_module.py** — Tests for kestrel_sovereign.testing module (MockAgent, FeatureTestCase, fixtures).
