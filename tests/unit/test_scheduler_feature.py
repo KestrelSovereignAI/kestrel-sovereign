@@ -529,7 +529,10 @@ class TestTaskExecutor:
 
     @pytest.mark.asyncio
     async def test_execute_known_task(self, feature):
-        # Mock a feature with a matching tool
+        # Mock a feature with a matching tool. Phase 4 of #889 renamed
+        # `_execute_scheduled_task` → `_lookup_and_run_tool` (the
+        # tool-search body) when the dispatcher took over the executor
+        # role. The lookup behavior tested here is unchanged.
         mock_tool = MagicMock()
         mock_tool.name = "wellness_check"
         mock_tool.execute = AsyncMock(return_value={"success": True, "score": 0.85})
@@ -539,7 +542,7 @@ class TestTaskExecutor:
 
         feature.agent.features = {"WellnessFeature": mock_feature}
 
-        result = await feature._execute_scheduled_task("wellness_check", {})
+        result = await feature._lookup_and_run_tool("wellness_check", {})
         parsed = json.loads(result)
         assert parsed["success"] is True
 
@@ -547,7 +550,7 @@ class TestTaskExecutor:
     async def test_execute_unknown_task_raises(self, feature):
         feature.agent.features = {}
         with pytest.raises(ValueError, match="Unknown task"):
-            await feature._execute_scheduled_task("nonexistent_task", {})
+            await feature._lookup_and_run_tool("nonexistent_task", {})
 
 
 # =========================================================================
