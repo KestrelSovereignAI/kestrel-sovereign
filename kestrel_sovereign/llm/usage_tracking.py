@@ -172,7 +172,7 @@ class UsageTrackingMixin:
         """Pull (download) an Ollama model."""
         ollama_provider = None
         for provider in self.providers:
-            if provider["name"] == "ollama":
+            if provider.get("vendor") == "ollama":
                 ollama_provider = provider
                 break
 
@@ -260,7 +260,7 @@ class UsageTrackingMixin:
 
         protected_models = set()
         for provider in self.providers:
-            if provider["name"] == "ollama":
+            if provider.get("vendor") == "ollama":
                 protected_models.add(provider["model"])
 
         if self.mandate_config:
@@ -312,7 +312,7 @@ class UsageTrackingMixin:
 
         ollama_provider = None
         for provider in self.providers:
-            if provider["name"] == "ollama":
+            if provider.get("vendor") == "ollama":
                 ollama_provider = provider
                 break
 
