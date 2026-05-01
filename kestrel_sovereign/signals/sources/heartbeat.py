@@ -9,6 +9,7 @@ signal_log.
 
 from __future__ import annotations
 
+import hashlib
 from datetime import time as dtime, timedelta
 from pathlib import Path
 from typing import Optional
@@ -48,15 +49,17 @@ def _heartbeat_schema(payload: dict) -> dict:
 
 
 def _heartbeat_redact(payload: dict) -> str:
-    """The HEARTBEAT.md content is operator-authored (TRUSTED), but it can
-    contain reminders about private matters. Store length + a short prefix
-    rather than the full text — enough to debug "why did the bird ping at
-    3am" without leaking content into the signal_log."""
+    """HEARTBEAT.md content is operator-authored (TRUSTED) but routinely
+    contains private reminders. Store length + content digest only — the
+    digest proves "we saw the same content twice" for debugging without
+    persisting any of the content itself. Truncated to 12 hex chars to
+    keep the log readable; full sha256 is overkill for this purpose.
+    """
     md = payload.get("heartbeat_md", "") or ""
     if not md:
         return "<empty heartbeat_md>"
-    prefix = md[:80].replace("\n", " ").strip()
-    return f"len={len(md)} prefix={prefix!r}"
+    digest = hashlib.sha256(md.encode("utf-8")).hexdigest()[:12]
+    return f"len={len(md)} sha256_12={digest}"
 
 
 def build_heartbeat_registration(
@@ -109,9 +112,22 @@ def _build_quiet_hours(
     active_start: Optional[str], active_end: Optional[str]
 ) -> Optional[tuple[dtime, dtime]]:
     """Translate the legacy `active_hours_start/end` (when the bird IS
-    awake) into `quiet_hours` (when it is NOT). The dispatcher's attention
-    policy expresses inactive windows; heartbeat config expresses the
-    inverse. Empty config → no quiet hours."""
+    awake) into `quiet_hours` (when it is NOT).
+
+    Boundary preservation: legacy `_is_within_active_hours` used
+    `start <= now <= end` — INCLUSIVE on both ends. The dispatcher's
+    `_time_in_window` is `[start, end)` — exclusive at end. Naively
+    inverting (end, start) would flip a tick at exactly `active_end`
+    from active to quiet, which is a behavior regression at the
+    boundary.
+
+    Fix: shift the quiet window's start by one minute so the active-end
+    boundary minute stays active. Active 09:00–22:00 (inclusive both)
+    becomes quiet 22:01–09:00 — equivalent to the legacy semantics at
+    minute resolution.
+
+    Empty config → no quiet hours.
+    """
     if not active_start or not active_end:
         return None
     try:
@@ -119,10 +135,7 @@ def _build_quiet_hours(
         end = _parse_hhmm(active_end)
     except ValueError:
         return None
-    # Quiet window is the complement of the active window. If active is
-    # 09:00–22:00, quiet is 22:00–09:00 (wraps midnight; the dispatcher's
-    # _time_in_window handles the wrap).
-    return (end, start)
+    return (_add_minute(end), start)
 
 
 def _parse_hhmm(value: str) -> dtime:
@@ -132,3 +145,10 @@ def _parse_hhmm(value: str) -> dtime:
         raise ValueError(f"expected HH:MM, got {value!r}")
     hour, minute = int(parts[0]), int(parts[1])
     return dtime(hour=hour, minute=minute)
+
+
+def _add_minute(t: dtime) -> dtime:
+    """Add one minute, wrapping at midnight (23:59 → 00:00)."""
+    minutes = t.hour * 60 + t.minute + 1
+    minutes %= 24 * 60
+    return dtime(hour=minutes // 60, minute=minutes % 60)

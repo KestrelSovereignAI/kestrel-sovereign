@@ -110,8 +110,10 @@ def test_heartbeat_registration_shape():
 
 
 def test_heartbeat_registration_quiet_hours_inverts_active_window():
-    """Active 09:00-22:00 → quiet 22:00-09:00 (wraps midnight; the
-    dispatcher's _time_in_window handles the wrap)."""
+    """Active 09:00-22:00 → quiet 22:01-09:00. The +1 minute shift
+    preserves the legacy inclusive-end behavior: a tick at exactly
+    active_end (22:00) stays active. See `_build_quiet_hours` docstring
+    in heartbeat.py for the boundary rationale."""
     from datetime import time as dtime
 
     reg = build_heartbeat_registration(
@@ -119,7 +121,172 @@ def test_heartbeat_registration_quiet_hours_inverts_active_window():
         active_hours_start="09:00",
         active_hours_end="22:00",
     )
-    assert reg.attention_policy.quiet_hours == (dtime(22, 0), dtime(9, 0))
+    assert reg.attention_policy.quiet_hours == (dtime(22, 1), dtime(9, 0))
+
+
+def test_heartbeat_active_end_boundary_stays_active():
+    """Regression for #903 P1: at exactly active_end (e.g. 22:00:00) the
+    legacy `_is_within_active_hours` returned True (inclusive end).
+    A naive inversion to quiet=(22:00, 09:00) would have flipped this to
+    quiet. The +1 minute shift in `_build_quiet_hours` keeps 22:00:00
+    active; quiet starts at 22:01:00."""
+    from datetime import datetime, time as dtime, timezone
+    from unittest.mock import patch
+
+    from kestrel_sdk.signals import (
+        AttentionPolicy,
+        Signal,
+        SignalMode,
+        Status,
+        Urgency,
+    )
+    from kestrel_sovereign.signals import (
+        OrderedLockManager,
+        SignalDispatcher,
+        SignalLogStore,
+        SourceRegistry,
+    )
+
+    reg = build_heartbeat_registration(
+        interval_seconds=1800,
+        active_hours_start="09:00",
+        active_hours_end="22:00",
+    )
+    assert reg.attention_policy.quiet_hours == (dtime(22, 1), dtime(9, 0))
+
+    # Drive the dispatcher's internal clock to exactly 22:00:00 UTC and
+    # confirm the heartbeat source is NOT in its quiet window.
+    fixed_now = datetime(2026, 5, 1, 22, 0, 0, tzinfo=timezone.utc)
+    locks = OrderedLockManager()
+    registry = SourceRegistry()
+    registry.register(reg)
+
+    class _Stub:
+        did = "did:test:boundary"
+        def __init__(self):
+            self.calls = []
+        async def process_input(self, prompt):
+            self.calls.append(prompt)
+            return "HEARTBEAT_OK"
+        def _track_background_task(self, coro, *, name):
+            import asyncio
+            return asyncio.create_task(coro, name=name)
+
+    agent = _Stub()
+
+    import asyncio
+
+    async def _run():
+        # signal_log store needs a backend; use a fresh in-memory sqlite.
+        from kestrel_sovereign.storage.db import SQLiteBackend
+        backend = SQLiteBackend(":memory:")
+        await backend.connect()
+        store = SignalLogStore(backend)
+        await store.initialize()
+        dispatcher = SignalDispatcher(
+            agent=agent,
+            registry=registry,
+            lock_manager=locks,
+            store=store,
+            clock=lambda: fixed_now,
+        )
+        signal = Signal(
+            source="heartbeat",
+            kind="tick",
+            mode=SignalMode.COGNITION,
+            payload={"heartbeat_md": ""},
+            target_agent=agent.did,
+            urgency=Urgency.NORMAL,
+        )
+        result = await dispatcher.dispatch_signal(signal)
+        await backend.close()
+        return result
+
+    result = asyncio.run(_run())
+    assert result.status == Status.OK, (
+        f"22:00:00 (exact active_end) must stay active under the +1 minute "
+        f"inversion; got {result.status} ({result.error})"
+    )
+
+
+def test_heartbeat_active_end_plus_one_minute_is_quiet():
+    """Boundary on the other side: 22:01:00 falls inside quiet window."""
+    from datetime import datetime, timezone
+
+    from kestrel_sdk.signals import (
+        Signal,
+        SignalMode,
+        Status,
+        Urgency,
+    )
+    from kestrel_sovereign.signals import (
+        OrderedLockManager,
+        SignalDispatcher,
+        SignalLogStore,
+        SourceRegistry,
+    )
+
+    reg = build_heartbeat_registration(
+        interval_seconds=1800,
+        active_hours_start="09:00",
+        active_hours_end="22:00",
+    )
+    fixed_now = datetime(2026, 5, 1, 22, 1, 0, tzinfo=timezone.utc)
+
+    class _Stub:
+        did = "did:test:boundary2"
+        async def process_input(self, prompt):
+            raise AssertionError("LLM must not be called when quiet")
+        def _track_background_task(self, coro, *, name):
+            import asyncio
+            return asyncio.create_task(coro, name=name)
+
+    agent = _Stub()
+    registry = SourceRegistry()
+    registry.register(reg)
+
+    import asyncio
+
+    async def _run():
+        from kestrel_sovereign.storage.db import SQLiteBackend
+        backend = SQLiteBackend(":memory:")
+        await backend.connect()
+        store = SignalLogStore(backend)
+        await store.initialize()
+        dispatcher = SignalDispatcher(
+            agent=agent,
+            registry=registry,
+            lock_manager=OrderedLockManager(),
+            store=store,
+            clock=lambda: fixed_now,
+        )
+        signal = Signal(
+            source="heartbeat",
+            kind="tick",
+            mode=SignalMode.COGNITION,
+            payload={"heartbeat_md": ""},
+            target_agent=agent.did,
+            urgency=Urgency.NORMAL,
+        )
+        result = await dispatcher.dispatch_signal(signal)
+        await backend.close()
+        return result
+
+    result = asyncio.run(_run())
+    assert result.status == Status.DROPPED_QUIET_HOURS
+
+
+def test_heartbeat_quiet_hours_handles_midnight_active_end():
+    """active_hours_end = 23:59 → quiet starts at 00:00 (wraps).
+    Verifies the _add_minute helper handles the day boundary."""
+    from datetime import time as dtime
+
+    reg = build_heartbeat_registration(
+        interval_seconds=1800,
+        active_hours_start="06:00",
+        active_hours_end="23:59",
+    )
+    assert reg.attention_policy.quiet_hours == (dtime(0, 0), dtime(6, 0))
 
 
 def test_heartbeat_registration_no_active_hours_means_no_quiet_window():
@@ -222,9 +389,17 @@ async def test_heartbeat_dispatch_writes_signal_log_with_redaction(components):
     source, status, redacted, raw = rows[0]
     assert source == SOURCE_NAME
     assert status == Status.OK.value
-    # Redaction policy stores length + short prefix, never the full text.
+    # Redaction policy stores length + content digest only — never the
+    # text itself. Verifies the #903 P2 fix where the prior policy
+    # stored the first 80 characters of HEARTBEAT.md.
     assert "len=" in redacted
-    assert "Personal private" in redacted  # prefix, not full text
+    assert "sha256_12=" in redacted
+    assert "Personal" not in redacted, (
+        "redacted summary must not contain HEARTBEAT.md content; "
+        "see #903 review P2"
+    )
+    assert "private" not in redacted
+    assert "reminder" not in redacted
     # store_raw_trusted=False on heartbeat → payload_raw is null even for
     # TRUSTED sources, so HEARTBEAT.md content never lands in the log.
     assert raw is None
