@@ -150,19 +150,26 @@ def build_signal_for_completed_task(task: Any, target_agent: str) -> Signal:
     constructing real pydantic Task objects.
     """
     chain = _deserialize_chain(getattr(task, "metadata", None) or {})
+    task_id = str(getattr(task, "id", "<unknown>"))
+    task_state = _state_to_str(task)
 
     return Signal(
         source=SOURCE_NAME,
         kind="terminal",
         mode=SignalMode.COGNITION,
         payload={
-            "task_id": str(getattr(task, "id", "<unknown>")),
-            "task_state": _state_to_str(task),
+            "task_id": task_id,
+            "task_state": task_state,
             "result_summary": _summarize_task_result(task),
         },
         target_agent=target_agent,
         visibility=Visibility.INTERNAL,
         urgency=Urgency.NORMAL,
+        # dedupe_key is (task_id, terminal_state) so retry storms or
+        # double-fired terminal callbacks for the same task collapse
+        # within the registration's coalescing_window. Without this
+        # the dispatcher can't coalesce — see #905 review P2.
+        dedupe_key=f"{task_id}:{task_state}",
         causation_chain=list(chain),
     )
 

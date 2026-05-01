@@ -64,7 +64,14 @@ def _fake_task(
     return SimpleNamespace(id=task_id, status=status, metadata=metadata or {})
 
 
-class _FakeAgent:
+from kestrel_sovereign.agent.turn_lifecycle import TurnLifecycleMixin
+
+
+class _FakeAgent(TurnLifecycleMixin):
+    """Inherits TurnLifecycleMixin so the dispatcher's COGNITION route
+    can call `_set_current_chain` / `_clear_current_chain` (#905 review
+    P1 plumbing). Production `KestrelAgent` has the same inheritance."""
+
     def __init__(self, did: str = "did:test:agent-A"):
         self._did = did
         self.background_tasks: list[asyncio.Task] = []
@@ -409,6 +416,233 @@ async def test_event_manager_callback_keeps_sse_notification_when_dispatcher_pre
     assert rows[0][1] == Status.OK.value
 
     await backend.close()
+
+
+@pytest.mark.asyncio
+async def test_duplicate_terminal_completions_coalesced(components):
+    """#905 review P2: build_signal_for_completed_task sets
+    dedupe_key=`<task_id>:<terminal_state>` so retry storms or
+    double-fired terminal callbacks for the same task collapse within
+    the registration's coalescing_window (5s default). Without this
+    the dispatcher coalescing pipeline can't fire — dedupe_key=None
+    skips coalescing entirely."""
+    c = components
+    task = _fake_task(task_id="dup-1", state="completed", summary_text="done")
+
+    sig1 = build_signal_for_completed_task(task, target_agent=c.agent.did)
+    sig2 = build_signal_for_completed_task(task, target_agent=c.agent.did)
+
+    # Sanity: both signals carry the same dedupe_key.
+    assert sig1.dedupe_key == sig2.dedupe_key == "dup-1:completed"
+
+    r1 = await c.dispatcher.dispatch_signal(sig1)
+    r2 = await c.dispatcher.dispatch_signal(sig2)
+
+    assert r1.status == Status.OK
+    assert r2.status == Status.COALESCED, (
+        f"second completion of task dup-1 must collapse; got {r2.status}"
+    )
+    # Only one LLM call.
+    assert len(c.agent.process_input_calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# Outbound chain plumbing (#905 review P1) — full loop through real
+# TaskManager.create_task
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_taskmanager_create_task_attaches_chain_via_provider(tmp_path):
+    """`TaskManager.create_task` reads the agent's in-flight causation
+    chain via the registered provider and attaches it to outbound task
+    metadata. The receive side rehydrates from this metadata.
+
+    Verifies the wiring without a full agent — uses a stub provider
+    returning a known chain and asserts it lands in task.metadata.
+    """
+    from kestrel_sovereign.a2a.stores import (
+        SQLiteSessionService, SQLiteTaskStore, SQLiteObservabilityStore,
+    )
+    from kestrel_sovereign.a2a.task_manager import TaskManager
+    from kestrel_sovereign.a2a.types import (
+        Message, TaskSendParams, TextPart,
+    )
+
+    db_path = str(tmp_path / "tm.db")
+    task_store = SQLiteTaskStore(db_path)
+    session_service = SQLiteSessionService(db_path)
+    observability_store = SQLiteObservabilityStore(db_path)
+
+    # Provider returns an already-serialized chain — same shape
+    # KestrelAgent._provide_causation_chain emits.
+    serialized_chain = [
+        {
+            "agent_id": "did:test:A",
+            "source": SOURCE_NAME,
+            "signal_id": "sig-prior",
+            "turn_id": "turn-prior",
+            "depth": 1,
+            "emitted_at": datetime(2026, 5, 1, 9, 0, tzinfo=timezone.utc).isoformat(),
+        }
+    ]
+    tm = TaskManager(
+        task_store=task_store,
+        session_service=session_service,
+        observability_store=observability_store,
+        causation_chain_provider=lambda: serialized_chain,
+    )
+    await tm.initialize()
+
+    params = TaskSendParams(
+        id="outbound-1",
+        sessionId="session-1",
+        message=Message(role="user", parts=[TextPart(text="do thing")]),
+        metadata={"agent_id": "PeerB", "skill": "do_thing"},
+    )
+    task = await tm.create_task(params, agent_name="PeerB")
+
+    # Original metadata preserved + chain appended.
+    assert task.metadata["agent_id"] == "PeerB"
+    assert task.metadata["skill"] == "do_thing"
+    assert task.metadata["causation_chain"] == serialized_chain
+
+    await tm.close()
+
+
+@pytest.mark.asyncio
+async def test_taskmanager_create_task_omits_chain_when_provider_returns_none(
+    tmp_path,
+):
+    """No active turn → provider returns None → no causation_chain in
+    metadata. Avoids bloating the task row with empty chain entries
+    for direct HTTP user input or tests that don't drive cognition."""
+    from kestrel_sovereign.a2a.stores import (
+        SQLiteSessionService, SQLiteTaskStore, SQLiteObservabilityStore,
+    )
+    from kestrel_sovereign.a2a.task_manager import TaskManager
+    from kestrel_sovereign.a2a.types import (
+        Message, TaskSendParams, TextPart,
+    )
+
+    db_path = str(tmp_path / "tm.db")
+    tm = TaskManager(
+        task_store=SQLiteTaskStore(db_path),
+        session_service=SQLiteSessionService(db_path),
+        observability_store=SQLiteObservabilityStore(db_path),
+        causation_chain_provider=lambda: None,
+    )
+    await tm.initialize()
+
+    params = TaskSendParams(
+        id="outbound-2",
+        sessionId="session-1",
+        message=Message(role="user", parts=[TextPart(text="x")]),
+        metadata={"agent_id": "PeerB"},
+    )
+    task = await tm.create_task(params, agent_name="PeerB")
+    assert "causation_chain" not in task.metadata
+
+    await tm.close()
+
+
+@pytest.mark.asyncio
+async def test_full_AB_A_loop_via_real_taskmanager_rejected_at_depth_2(
+    components, tmp_path,
+):
+    """End-to-end: simulate the agent dispatching an A2A completion
+    cognition, the resulting turn spawning an outbound A2A task that
+    PICKS UP the chain via the agent's _current_chain (set by the
+    dispatcher), the receiving side reading the chain back from
+    metadata, and the SECOND completion signal being rejected at
+    depth 2 by cycle detection.
+
+    This is the test that Phase 5's headline test (with manual
+    metadata setup) didn't actually validate end-to-end."""
+    from kestrel_sovereign.a2a.stores import (
+        SQLiteSessionService, SQLiteTaskStore, SQLiteObservabilityStore,
+    )
+    from kestrel_sovereign.a2a.task_manager import TaskManager
+    from kestrel_sovereign.a2a.types import (
+        Message, TaskSendParams, TextPart,
+    )
+
+    c = components
+
+    # Wire the agent's chain provider — same as KestrelAgent.initialize().
+    def _provide_chain():
+        chain = c.agent._current_chain if hasattr(c.agent, "_current_chain") else None
+        if not chain:
+            return None
+        return serialize_chain_for_metadata(chain)
+
+    db_path = str(tmp_path / "loop.db")
+    tm = TaskManager(
+        task_store=SQLiteTaskStore(db_path),
+        session_service=SQLiteSessionService(db_path),
+        observability_store=SQLiteObservabilityStore(db_path),
+        causation_chain_provider=_provide_chain,
+    )
+    await tm.initialize()
+
+    # ---- First completion: dispatcher sets chain on agent, turn runs.
+    initial_task = _fake_task(task_id="t-loop-1", metadata={})
+    sig1 = build_signal_for_completed_task(initial_task, target_agent=c.agent.did)
+
+    # Stub process_input to simulate the in-turn outbound task creation
+    # — like the real agent would when a feature decides to spawn work
+    # on a peer in response to receiving the completion notification.
+    outbound_tasks_seen = []
+
+    async def turn_emits_outbound(prompt):
+        params = TaskSendParams(
+            id=f"outbound-{len(outbound_tasks_seen) + 1}",
+            sessionId="session-loop",
+            message=Message(role="user", parts=[TextPart(text="follow-up")]),
+            metadata={"agent_id": "PeerB", "skill": "do_thing"},
+        )
+        new_task = await tm.create_task(params, agent_name="PeerB")
+        outbound_tasks_seen.append(new_task)
+        return "ack"
+
+    c.agent.process_input = turn_emits_outbound  # patch for this test
+
+    r1 = await c.dispatcher.dispatch_signal(sig1)
+    assert r1.status == Status.OK
+    assert len(outbound_tasks_seen) == 1
+
+    # ---- Outbound task carries the chain (depth 1: agent A frame).
+    outbound_task = outbound_tasks_seen[0]
+    assert "causation_chain" in outbound_task.metadata
+    chain_in_metadata = outbound_task.metadata["causation_chain"]
+    assert len(chain_in_metadata) == 1
+    assert chain_in_metadata[0]["agent_id"] == c.agent.did
+    assert chain_in_metadata[0]["source"] == SOURCE_NAME
+
+    # ---- Second completion: peer finishes the outbound task and the
+    # callback fires locally. The receive-side signal builder rehydrates
+    # the chain from metadata → the new signal carries A's prior frame.
+    completed_outbound = _fake_task(
+        task_id=outbound_task.id,
+        state="completed",
+        metadata=outbound_task.metadata,
+    )
+    sig2 = build_signal_for_completed_task(
+        completed_outbound, target_agent=c.agent.did
+    )
+    assert len(sig2.causation_chain) == 1, (
+        "rehydrated chain must carry the prior A frame"
+    )
+
+    r2 = await c.dispatcher.dispatch_signal(sig2)
+    assert r2.status == Status.DROPPED_CYCLE, (
+        f"second completion must be rejected as cycle (A appears "
+        f"in chain with same source); got {r2.status}"
+    )
+    # No second outbound task was created — the cycle was caught.
+    assert len(outbound_tasks_seen) == 1
+
+    await tm.close()
 
 
 @pytest.mark.asyncio

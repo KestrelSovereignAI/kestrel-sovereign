@@ -448,10 +448,24 @@ class SignalDispatcher:
                     assert registration.prompt_template is not None
                     prompt = self._render_prompt(signal, registration)
                     # The turn lifecycle (Phase 2) acquires CONVERSATION
-                    # inside process_input. Until Phase 2 lands, this call
-                    # hits the racy process_input directly — Phase 2 is the
-                    # fix; the dispatcher's call site does not change.
-                    result = await self._agent.process_input(prompt)
+                    # inside process_input.
+                    #
+                    # Phase 5 of #889: set the agent's current causation
+                    # chain to this signal's chain (already extended
+                    # with the new frame in step 2 of the pipeline) so
+                    # outbound A2A tasks created during the turn carry
+                    # the lineage forward. Without this, A→B→A loops
+                    # would restart at depth 1 every iteration —
+                    # caught in #905 review P1.
+                    set_chain = getattr(self._agent, "_set_current_chain", None)
+                    clear_chain = getattr(self._agent, "_clear_current_chain", None)
+                    if set_chain is not None:
+                        set_chain(signal.causation_chain)
+                    try:
+                        result = await self._agent.process_input(prompt)
+                    finally:
+                        if clear_chain is not None:
+                            clear_chain()
                     return self._success(
                         signal,
                         start,

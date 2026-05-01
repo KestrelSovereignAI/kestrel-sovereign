@@ -427,6 +427,14 @@ class KestrelAgent(
                 feedback_store=feedback_store,
                 hooks_manager=self.hooks_manager,  # Pass hooks manager for security
                 on_task_complete=self._on_background_task_complete,  # For notifications
+                # Provider returns the in-flight cognition turn's
+                # causation chain (serialized) so outbound A2A tasks
+                # carry the lineage. The dispatcher sets the chain on
+                # the agent before calling process_input for COGNITION
+                # signals; create_task reads it via this provider.
+                # See #905 review P1 — without this, A→B→A loops would
+                # restart at depth 1 every iteration.
+                causation_chain_provider=self._provide_causation_chain,
             )
             await self.task_manager.initialize()
 
@@ -1717,6 +1725,24 @@ Expected Duration: {expected_duration}
             _background_memory_processing(),
             name="post_response_memory_enrichment",
         )
+
+    def _provide_causation_chain(self):
+        """Return the in-flight turn's causation chain in the
+        already-serialized form `serialize_chain_for_metadata` produces,
+        or None when no signal-driven turn is active. Wired into
+        TaskManager so outbound A2A tasks (created via create_task
+        during a turn) carry the lineage forward — see #905 review P1.
+        """
+        chain = self._get_current_chain()
+        if not chain:
+            return None
+        # Local import to avoid pulling signals.sources into the agent
+        # module's import time (circular: agent imports signals.sources
+        # for source registration; sources can import agent.types).
+        from kestrel_sovereign.signals.sources.a2a import (
+            serialize_chain_for_metadata,
+        )
+        return serialize_chain_for_metadata(chain)
 
     def _track_background_task(self, coro, *, name: str) -> asyncio.Task:
         """Start agent-owned background work and remove it when complete."""

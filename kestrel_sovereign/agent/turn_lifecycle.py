@@ -19,10 +19,10 @@ from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
-from typing import AsyncIterator
+from typing import AsyncIterator, Optional
 from uuid import uuid4
 
-from kestrel_sdk.signals import ResourceLock
+from kestrel_sdk.signals import CausationFrame, ResourceLock
 from kestrel_sovereign.signals import OrderedLockManager
 
 logger = logging.getLogger(__name__)
@@ -35,6 +35,14 @@ class TurnLifecycleMixin:
     `_get_lock_manager` accessor lazy-creates one for tests/callers that
     bypass `__init__` via `KestrelAgent.__new__` (mirrors the existing
     `_get_privacy_transition_lock` pattern in `kestrel_agent.py`).
+
+    `_current_chain` is the causation chain for the in-flight turn.
+    The dispatcher sets it via `_set_current_chain` before invoking
+    `process_input` for a COGNITION signal so that any outbound A2A
+    tasks created during the turn (via `TaskManager.create_task`) can
+    carry the chain forward in their metadata. Without this, A→B→A
+    loops would restart at depth 1 every iteration and dispatcher
+    cycle detection would never fire (caught in #905 review P1).
     """
 
     _lock_manager: OrderedLockManager
@@ -47,6 +55,27 @@ class TurnLifecycleMixin:
             mgr = OrderedLockManager()
             self._lock_manager = mgr
         return mgr
+
+    def _get_current_chain(self) -> Optional[list[CausationFrame]]:
+        """Return the in-flight turn's causation chain, or None when no
+        cognition signal triggered the current turn (e.g. direct HTTP
+        user input). Outbound TaskManager.create_task uses this via the
+        provider callback registered in agent init."""
+        return getattr(self, "_current_chain", None)
+
+    def _set_current_chain(
+        self, chain: Optional[list[CausationFrame]]
+    ) -> None:
+        """Set the in-flight turn's causation chain. The dispatcher
+        invokes this before calling process_input for COGNITION signals.
+        Stores a copy so subsequent dispatcher mutations don't bleed
+        into the agent's view."""
+        self._current_chain = list(chain) if chain else []
+
+    def _clear_current_chain(self) -> None:
+        """Clear the in-flight chain (called in the dispatcher's
+        finally block after the cognition turn completes)."""
+        self._current_chain = None
 
     @asynccontextmanager
     async def _turn_lifecycle(self) -> AsyncIterator[str]:
