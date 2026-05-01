@@ -203,6 +203,33 @@ class KestrelAgent(
                         overlay, exc,
                     )
 
+        # Per-agent ``[privacy] computer_access`` opt-in (#900). The privacy
+        # presets ship with ``computer_access=False`` by design — the design
+        # comment in ``privacy.py`` says it "must be opted into explicitly
+        # by setting the flag after preset construction." This is that
+        # explicit path: read ``[privacy] computer_access`` from the agent's
+        # ``kestrel.toml`` and apply it to the privacy_agent's PrivacyConfig
+        # when it gets constructed in ``initialize()``. Default stays False.
+        self._privacy_computer_access: bool = False
+        if storage_path:
+            agent_toml = Path(storage_path).parent / "kestrel.toml"
+            if agent_toml.exists():
+                try:
+                    try:
+                        import tomllib  # type: ignore[import-not-found]
+                    except ImportError:
+                        import tomli as tomllib  # type: ignore[import-not-found]
+                    with open(agent_toml, "rb") as f:
+                        toml_data = tomllib.load(f)
+                    self._privacy_computer_access = bool(
+                        toml_data.get("privacy", {}).get("computer_access", False)
+                    )
+                except Exception as exc:
+                    logging.warning(
+                        "Failed to read [privacy] from %s: %s",
+                        agent_toml, exc,
+                    )
+
         # Determine database backend
         self._db_backend = db_backend or os.environ.get("KESTREL_DB_BACKEND", "sqlite")
         self._database_url = database_url or os.environ.get("KESTREL_DATABASE_URL")
@@ -407,8 +434,28 @@ class KestrelAgent(
             # Wrap storage with privacy-enforcing layer
             self.storage = PrivacyEnforcingStorage(self._raw_storage, self._privacy_mode)
 
-            # Initialize privacy agent
-            self.privacy_agent = PrivacyAgent(self._raw_storage, self._privacy_mode)
+            # Initialize privacy agent. When the agent's kestrel.toml flips
+            # ``[privacy] computer_access = true`` (#900), we build a
+            # ``PrivacyConfig`` from the preset, set the flag, and pass that
+            # in instead of the raw mode string. The flag is independent of
+            # the preset by design (privacy.py comment: "must be opted into
+            # explicitly"), so the only way to enable it on a running
+            # agent is via this path.
+            if self._privacy_computer_access:
+                from kestrel_sovereign.privacy import (
+                    PrivacyConfig,
+                    privacy_mode_to_config,
+                )
+                base_cfg = privacy_mode_to_config(self._privacy_mode)
+                opted_in = PrivacyConfig(
+                    storage=base_cfg.storage,
+                    llm_location=base_cfg.llm_location,
+                    shareable=base_cfg.shareable,
+                    computer_access=True,
+                )
+                self.privacy_agent = PrivacyAgent(self._raw_storage, opted_in)
+            else:
+                self.privacy_agent = PrivacyAgent(self._raw_storage, self._privacy_mode)
 
             # Initialize TaskManager for A2A unified routing
             # All stores use the abstract data layer (SQLite for sovereign, PostgreSQL for multi-tenant)
@@ -725,6 +772,19 @@ class KestrelAgent(
     def privacy_mode(self) -> PrivacyMode:
         """Get current privacy mode."""
         return self._privacy_mode
+
+    @property
+    def privacy_config(self):
+        """Live PrivacyConfig for this agent, or ``None`` before ``initialize()``.
+
+        ComputerUseFeature._privacy_allows reads ``self.agent.privacy_config``
+        — without this delegation it would always see ``None`` and gate-1 would
+        always deny, even with ``[privacy] computer_access = true`` set (#900).
+        """
+        privacy_agent = getattr(self, "privacy_agent", None)
+        if privacy_agent is None:
+            return None
+        return privacy_agent.privacy_config
 
     def _get_privacy_transition_lock(self) -> asyncio.Lock:
         """Return the lock that serializes privacy transitions with active streams."""
