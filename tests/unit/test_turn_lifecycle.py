@@ -138,6 +138,38 @@ async def test_turn_id_is_unique_per_call():
 
 
 @pytest.mark.asyncio
+async def test_process_input_enters_lifecycle_before_bootstrap_and_commands():
+    """Regression for the v3.1 review of PR #902: bootstrap and command
+    paths in `process_input` had been outside the lifecycle wrap, so
+    first-run bootstrap turns and `!command` invocations could interleave
+    with heartbeat or another HTTP request and corrupt conversation
+    history. Verified by source inspection — every code path that touches
+    state must run inside `async with self._turn_lifecycle()`."""
+    import inspect
+    from kestrel_sovereign.kestrel_agent import KestrelAgent
+
+    src = inspect.getsource(KestrelAgent.process_input)
+
+    # The lifecycle wrap exists.
+    assert "self._turn_lifecycle()" in src, (
+        "process_input must enter the turn lifecycle"
+    )
+
+    # The bootstrap and command paths come AFTER the lifecycle entry.
+    lifecycle_pos = src.index("self._turn_lifecycle()")
+    bootstrap_pos = src.index("BOOTSTRAP CHECK")
+    command_pos = src.index("Handle explicit commands")
+    assert bootstrap_pos > lifecycle_pos, (
+        "BOOTSTRAP CHECK must run inside the turn lifecycle "
+        "(see #902 P1 review — _handle_bootstrap writes conversation history)"
+    )
+    assert command_pos > lifecycle_pos, (
+        "Command handling must run inside the turn lifecycle "
+        "(command_handler.handle can persist agent state)"
+    )
+
+
+@pytest.mark.asyncio
 async def test_lifecycle_shares_lock_manager_with_dispatcher():
     """Cross-system invariant: the agent's `_lock_manager` is the same
     instance the SignalDispatcher will hold. If a dispatched ACTION signal

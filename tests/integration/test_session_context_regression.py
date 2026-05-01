@@ -167,13 +167,12 @@ async def test_kestrel_agent_uses_generate_with_messages():
     import inspect
     from kestrel_sovereign.kestrel_agent import KestrelAgent
 
-    # process_input → _process_input_traced (wrapper) → _process_input_traced_locked
-    # The actual LLM call lives in _locked; the wrapper enters the turn
-    # lifecycle (CONVERSATION lock) before delegating.
+    # process_input itself enters the turn lifecycle (Phase 2 of #889 —
+    # bootstrap + command paths must be inside the lifecycle), then calls
+    # _process_input_traced_locked where the actual LLM call lives.
     source = inspect.getsource(KestrelAgent.process_input)
-    traced_source = inspect.getsource(KestrelAgent._process_input_traced)
     locked_source = inspect.getsource(KestrelAgent._process_input_traced_locked)
-    combined = source + traced_source + locked_source
+    combined = source + locked_source
 
     # CRITICAL: Must use generate_with_messages, not generate
     assert "generate_with_messages" in combined, \

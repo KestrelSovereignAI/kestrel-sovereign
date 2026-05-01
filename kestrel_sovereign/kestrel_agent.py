@@ -1236,56 +1236,43 @@ Expected Duration: {expected_duration}
                     "Normal operation will resume once integrity is restored."
                 )
 
-        # BOOTSTRAP CHECK: Handle first-time agent wake-up and discovery
-        if self.bootstrap_service and await self.bootstrap_service.is_bootstrap_needed():
-            # Allow bootstrap commands to pass through
-            bootstrap_commands = ["!skip-discovery", "!restart-discovery", "!bootstrap-status"]
-            if user_input.startswith("!") and user_input.split()[0] in bootstrap_commands:
-                pass  # Let command handler process these
-            else:
-                bootstrap_response = await self._handle_bootstrap(user_input, session_id)
-                if bootstrap_response:
-                    return bootstrap_response
-
-        # Handle explicit commands first (using the CommandHandler)
-        if user_input.startswith("!"):
-            # Special handling for !continue - replace with continuation prompt
-            if user_input.strip().lower() == "!continue":
-                user_input = "Please continue from where you left off."
-            else:
-                response = await self.command_handler.handle(user_input, caller=caller)
-                if response:
-                    return response
-
-        # --- OpenTelemetry span for the full request lifecycle ---
-        with optional_span("agent.process_input", {
-            "agent.did": self.did,
-            "agent.session_id": session_id or "",
-            "agent.input_length": len(user_input),
-        }) as _otel_span:
-            return await self._process_input_traced(
-                user_input, model_override, session_id, _otel_span, include_memories
-            )
-
-    async def _process_input_traced(
-        self,
-        user_input: str,
-        model_override: str,
-        session_id: str,
-        _otel_span,
-        include_memories: bool = True,
-    ) -> str:
-        """Acquire the turn lifecycle (CONVERSATION lock + turn_id), then
-        run the actual traced body. The split lets `process_input_streaming`
-        share the same lifecycle without double-acquiring the lock."""
+        # Everything below this point CAN touch conversation history
+        # (bootstrap writes, command handlers may persist state, the LLM
+        # turn appends user/assistant messages). Acquire the turn
+        # lifecycle here so bootstrap and command-handling paths cannot
+        # interleave with a heartbeat tick or another HTTP request.
         async with self._turn_lifecycle():
-            return await self._process_input_traced_locked(
-                user_input,
-                model_override,
-                session_id,
-                _otel_span,
-                include_memories,
-            )
+            # BOOTSTRAP CHECK: Handle first-time agent wake-up and discovery
+            if self.bootstrap_service and await self.bootstrap_service.is_bootstrap_needed():
+                # Allow bootstrap commands to pass through
+                bootstrap_commands = ["!skip-discovery", "!restart-discovery", "!bootstrap-status"]
+                if user_input.startswith("!") and user_input.split()[0] in bootstrap_commands:
+                    pass  # Let command handler process these
+                else:
+                    bootstrap_response = await self._handle_bootstrap(user_input, session_id)
+                    if bootstrap_response:
+                        return bootstrap_response
+
+            # Handle explicit commands first (using the CommandHandler)
+            if user_input.startswith("!"):
+                # Special handling for !continue - replace with continuation prompt
+                if user_input.strip().lower() == "!continue":
+                    user_input = "Please continue from where you left off."
+                else:
+                    response = await self.command_handler.handle(user_input, caller=caller)
+                    if response:
+                        return response
+
+            # --- OpenTelemetry span for the full request lifecycle ---
+            with optional_span("agent.process_input", {
+                "agent.did": self.did,
+                "agent.session_id": session_id or "",
+                "agent.input_length": len(user_input),
+            }) as _otel_span:
+                # Lifecycle is already entered; call the locked body directly.
+                return await self._process_input_traced_locked(
+                    user_input, model_override, session_id, _otel_span, include_memories
+                )
 
     async def _process_input_traced_locked(
         self,
