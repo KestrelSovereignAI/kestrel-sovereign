@@ -354,6 +354,61 @@ test('all keys sub-caps off + wallet off → resources panel is hidden', () => {
     assert.equal(panelIsEnabled(client, 'resources'), false);
 });
 
+// Re-implementation of the multiplexed SSE gate in chat.js
+// connectNotifications().  The real function is exported but uses the
+// singleton API instance from api.js — we can't swap that under
+// node:test without a DOM stub, so we mirror the boolean here against a
+// freshly-constructed client and assert the contract.  When the gate
+// changes in chat.js, this mirror must change too.
+function shouldOpenNotificationStream(client) {
+    return client.hasCapability('chat')
+        || client.hasCapability('permissions')
+        || client.hasCapability('audit');
+}
+
+test('SSE notification stream opens when chat is off but permissions is on (#879 P1 follow-up)', () => {
+    // Regression for: a host with chat:false but permissions:true (or
+    // audit:true) still needs the SSE stream open because Security.init()
+    // subscribes approval_request / approval_withdrawn handlers to it.
+    // Pre-fix, connectNotifications() gated solely on chat and the
+    // approval modal would never fire in that configuration.
+    const permsOnly = makeClient({
+        capabilities: { chat: false, audit: false },
+    });
+    assert.equal(
+        shouldOpenNotificationStream(permsOnly), true,
+        'permissions-only host must still open the notification stream',
+    );
+
+    const auditOnly = makeClient({
+        capabilities: { chat: false, permissions: false },
+    });
+    assert.equal(
+        shouldOpenNotificationStream(auditOnly), true,
+        'audit-only host must still open the notification stream',
+    );
+
+    const allOff = makeClient({
+        capabilities: { chat: false, permissions: false, audit: false },
+    });
+    assert.equal(
+        shouldOpenNotificationStream(allOff), false,
+        'no chat + no security ⇒ no consumer for SSE; stream stays closed',
+    );
+
+    const chatOff = makeClient({ capabilities: { chat: false } });
+    assert.equal(
+        shouldOpenNotificationStream(chatOff), true,
+        'permissions/audit default-on ⇒ stream opens even with chat off',
+    );
+
+    const standalone = makeClient();
+    assert.equal(
+        shouldOpenNotificationStream(standalone), true,
+        'default config opens the stream (everything on)',
+    );
+});
+
 test('storage:false alone does not affect Resources visibility', () => {
     // Regression for the P2 review note: a host that only sets
     // {storage: false} (and leaves keys/wallet on by default) should still

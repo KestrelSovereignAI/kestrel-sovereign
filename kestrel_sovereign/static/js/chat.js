@@ -146,11 +146,17 @@ export function subscribeSSE(eventType, handler) {
  * Automatically reconnects on disconnect with exponential backoff.
  */
 export function connectNotifications() {
-    // #879: SSE notifications drive the chat thinking-indicator and
-    // approval modals.  When the host opted out of chat there's no UI to
-    // surface the events to and the /api/agent/notifications/sse endpoint
-    // may not even be mounted, so don't open the connection.
-    if (!API.hasCapability('chat')) return;
+    // #879: the SSE notification stream is multiplexed — chat consumes
+    // task/streaming events for the thinking indicator, Security.init()
+    // consumes approval_request / approval_withdrawn for the modal queue
+    // (#748).  A host that disables chat but keeps permissions/approval
+    // prompts on still needs the stream open, otherwise the approval
+    // modal never fires.  Open the connection if EITHER consumer is
+    // active; only skip when none of them are.
+    const needed = API.hasCapability('chat')
+        || API.hasCapability('permissions')
+        || API.hasCapability('audit');
+    if (!needed) return;
     if (notificationEventSource) {
         notificationEventSource.close();
     }
