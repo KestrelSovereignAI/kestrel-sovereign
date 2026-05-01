@@ -694,9 +694,13 @@ async def auth_middleware(request: Request, call_next):
                 pass
 
         # Check query parameter for SSE endpoints only (EventSource can't send headers)
-        # Restricted to SSE_PATHS to avoid leaking keys in URL logs on other endpoints
+        # Restricted to SSE_PATHS to avoid leaking keys in URL logs on other endpoints.
+        # Use scope["path"] rather than request.url.path: the deprecated_agent_prefix_compat
+        # middleware rewrites scope["path"] before auth runs, but request.url caches the
+        # original path if it was accessed earlier in the same middleware call chain.
         api_key_query = request.query_params.get("api_key")
-        if api_key_query and any(request.url.path.endswith(p) for p in SSE_PATHS):
+        _scope_path = request.scope.get("path", request.url.path)
+        if api_key_query and any(_scope_path == p or _scope_path.endswith(p) for p in SSE_PATHS):
             if secrets.compare_digest(api_key_query, expected_key):
                 request.state.caller = CallerContext.sovereign(AuthMethod.API_KEY)
                 return await call_next(request)
