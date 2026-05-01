@@ -112,9 +112,12 @@ class ModelPreferenceMixin:
 
     def _get_local_model_fallback(self) -> str:
         """Get the configured local (ollama) model for economy/solvency fallback."""
-        # Check ollama provider in the providers list
+        # Check ollama provider in the providers list. Providers are keyed
+        # by composite "<vendor>:<route>" (e.g. "ollama:local") in the
+        # vendor/route/model architecture — match on the ``vendor`` field
+        # to find any ollama route, not the bare ``name``.
         for provider in self.llm_service.providers:
-            if provider.get("name") == "ollama":
+            if provider.get("vendor") == "ollama":
                 return provider.get("model", "auto")
         # Fall back to config
         if hasattr(self.llm_service, 'config'):

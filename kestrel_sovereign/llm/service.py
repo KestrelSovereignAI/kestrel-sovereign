@@ -1371,7 +1371,7 @@ No other text or formatting.
                 try:
                     await self.pull_model(model_id, auto_confirm=True)
                     for provider in self.providers:
-                        if provider["name"] == "ollama":
+                        if provider.get("vendor") == "ollama":
                             provider_for_model = provider
                             break
                 except (RuntimeError, ValueError, ConnectionError, TimeoutError) as e:
