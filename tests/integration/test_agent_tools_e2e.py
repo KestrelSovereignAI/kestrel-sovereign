@@ -85,6 +85,9 @@ async def kestrel_agent(llm_service, temp_db):
         from kestrel_sovereign.bootstrap import BootstrapState
         await agent.bootstrap_service.set_bootstrap_state(BootstrapState.COMPLETE)
 
+    # SecurityHook permissions are auto-granted by the
+    # _auto_grant_security_permissions autouse fixture in conftest.py.
+
     yield agent
 
     # Async cleanup for MCP and other resources

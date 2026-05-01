@@ -530,6 +530,24 @@ class TestAgentLevelLifecycle:
         )
         await agent.initialize()
 
+        # SecurityHook permissions for the registered features are
+        # auto-granted by the _auto_grant_security_permissions
+        # autouse fixture in tests/integration/conftest.py.  But
+        # this test fires HookInput(tool_name="test_tool") with no
+        # explicit feature_name, so SecurityHook resolves it as
+        # ("unknown", "test_tool") — a synthetic pair that isn't in
+        # the registered-tools tree.  Grant it ALLOW directly.
+        from kestrel_sovereign.features.security.permissions import PermissionLevel
+        security_feature = agent.get_feature("SecurityFeature")
+        if security_feature and security_feature.permission_store:
+            await security_feature.permission_store.set_permission(
+                feature_name="unknown",
+                tool_name="test_tool",
+                level=PermissionLevel.ALLOW,
+                scope="always",
+                reason="feature-lifecycle-e2e synthetic hook input",
+            )
+
         feature = LifecycleTestFeature(agent)
 
         yield agent, feature

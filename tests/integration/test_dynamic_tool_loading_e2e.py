@@ -68,10 +68,9 @@ async def agent(temp_db):
     await a.initialize()
 
     from tests.integration.conftest import complete_bootstrap
-    # complete_bootstrap also installs an auto-approve responder on
-    # SecurityFeature's approval queue (#879 follow-up) so the
-    # orchestrator-loop test doesn't hang on the SecurityHook's
-    # human-input wait.  See conftest.install_auto_approve.
+    # SecurityHook permissions are auto-granted by the
+    # _auto_grant_security_permissions autouse fixture in
+    # tests/integration/conftest.py — see #879 follow-up.
     await complete_bootstrap(a)
 
     yield a
