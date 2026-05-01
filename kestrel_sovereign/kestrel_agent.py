@@ -35,6 +35,8 @@ from kestrel_sovereign.agent.tool_registry import ToolRegistryMixin
 from kestrel_sovereign.agent.model_preference import ModelPreferenceMixin
 from kestrel_sovereign.agent.event_manager import EventManagerMixin
 from kestrel_sovereign.agent.request_lifecycle import RequestLifecycleMixin
+from kestrel_sovereign.agent.turn_lifecycle import TurnLifecycleMixin
+from kestrel_sovereign.signals import OrderedLockManager
 from kestrel_sovereign.storage.memory_system import MemorySystem
 from kestrel_sovereign.hooks import HooksManager, HookEvent, HookInput, PermissionDecision
 from kestrel_sovereign.bootstrap import BootstrapService, BootstrapState
@@ -135,6 +137,7 @@ class KestrelAgent(
     ModelPreferenceMixin,
     EventManagerMixin,
     RequestLifecycleMixin,
+    TurnLifecycleMixin,
 ):
     """
     The Kestrel Agent orchestrates memory, reasoning, and actions, bound by the Kestrel Constitution.
@@ -219,6 +222,12 @@ class KestrelAgent(
         self._active_request_ids: set[str] = set()
         self._cancelled_requests: set = set()
         self._privacy_transition_lock = asyncio.Lock()
+
+        # Shared lock manager for the dispatcher (Phase 1) AND the turn
+        # lifecycle (Phase 2). CONVERSATION is acquired by `_turn_lifecycle`
+        # in `process_input`/`process_input_streaming` — registered signal
+        # sources are forbidden from declaring it (registry enforces).
+        self._lock_manager = OrderedLockManager()
 
         # Session state
         self._session_briefed = False
@@ -1258,8 +1267,41 @@ Expected Duration: {expected_duration}
                 user_input, model_override, session_id, _otel_span, include_memories
             )
 
-    async def _process_input_traced(self, user_input: str, model_override: str, session_id: str, _otel_span, include_memories: bool = True) -> str:
-        """Inner process_input logic wrapped in an OTEL span."""
+    async def _process_input_traced(
+        self,
+        user_input: str,
+        model_override: str,
+        session_id: str,
+        _otel_span,
+        include_memories: bool = True,
+    ) -> str:
+        """Acquire the turn lifecycle (CONVERSATION lock + turn_id), then
+        run the actual traced body. The split lets `process_input_streaming`
+        share the same lifecycle without double-acquiring the lock."""
+        async with self._turn_lifecycle():
+            return await self._process_input_traced_locked(
+                user_input,
+                model_override,
+                session_id,
+                _otel_span,
+                include_memories,
+            )
+
+    async def _process_input_traced_locked(
+        self,
+        user_input: str,
+        model_override: str,
+        session_id: str,
+        _otel_span,
+        include_memories: bool = True,
+    ) -> str:
+        """Inner process_input logic wrapped in an OTEL span.
+
+        Caller MUST hold the turn lifecycle (CONVERSATION lock). Exposed
+        as a separate method so streaming's command-delegation path can
+        invoke this directly while the streaming generator already holds
+        the lifecycle, avoiding a self-deadlock against a non-reentrant
+        asyncio.Lock."""
         # Prompt injection detection (log-only, does not block)
         check_prompt_injection(user_input)
 
