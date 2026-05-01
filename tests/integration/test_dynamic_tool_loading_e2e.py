@@ -68,38 +68,11 @@ async def agent(temp_db):
     await a.initialize()
 
     from tests.integration.conftest import complete_bootstrap
+    # complete_bootstrap also installs an auto-approve responder on
+    # SecurityFeature's approval queue (#879 follow-up) so the
+    # orchestrator-loop test doesn't hang on the SecurityHook's
+    # human-input wait.  See conftest.install_auto_approve.
     await complete_bootstrap(a)
-
-    # The SecurityHook (PRE_TOOL_USE / PRE_SUBAGENT_CALL) defaults newly
-    # discovered tools to PermissionLevel.ASK and blocks indefinitely on
-    # ``approval_queue.request_approval`` until a human responds.  Since
-    # commit 61b431a4 ("take the watchdog clock off human-input hooks")
-    # that wait is no longer bounded by the hook manager's 5-second
-    # timeout — which was correct for the prod approval-modal bug, but
-    # leaves integration tests with no responder hanging until pytest-
-    # timeout fires.
-    #
-    # Install an auto-approve responder on the approval queue: every
-    # incoming request is immediately approved with ``always`` scope.
-    # This is the test-suite analogue of a human clicking Approve on
-    # every modal — production code paths are untouched, and the
-    # SecurityHook still runs through its full permission/audit logic.
-    security_feature = a.get_feature("SecurityFeature")
-    if security_feature and security_feature.approval_queue:
-        queue = security_feature.approval_queue
-        original_on_request_added = queue._on_request_added
-
-        async def _auto_approve(request):
-            if original_on_request_added:
-                # Preserve the SSE emit so the production path (and any
-                # observers) still see the request transit.
-                try:
-                    await original_on_request_added(request)
-                except Exception:
-                    pass
-            queue.submit_decision(request.id, approved=True, scope="always")
-
-        queue._on_request_added = _auto_approve
 
     yield a
 
