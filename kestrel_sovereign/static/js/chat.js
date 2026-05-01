@@ -175,6 +175,8 @@ export function connectNotifications() {
 
         notificationEventSource.addEventListener('connected', (e) => {
             console.log('SSE notifications connected');
+            // Reset backoff counter — connection is healthy
+            reconnectAttempts = 0;
             // Clear any pending reconnect
             if (notificationReconnectTimeout) {
                 clearTimeout(notificationReconnectTimeout);
@@ -222,10 +224,24 @@ export function connectNotifications() {
 
 /**
  * Schedule a reconnection attempt with exponential backoff.
+ *
+ * Stops retrying after MAX_RECONNECT_ATTEMPTS consecutive failures so a
+ * persistent auth error (e.g. wrong API key) doesn't flood the server with
+ * repeated 401 requests. reconnectAttempts is reset to 0 when a connection
+ * is established successfully (see 'connected' handler in connectNotifications).
  */
+const MAX_RECONNECT_ATTEMPTS = 10;
 let reconnectAttempts = 0;
 function scheduleReconnect() {
     if (notificationReconnectTimeout) return;
+
+    if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+        console.warn(
+            `SSE notifications: giving up after ${MAX_RECONNECT_ATTEMPTS} failed attempts. ` +
+            'Check that KESTREL_API_KEY matches the running server.'
+        );
+        return;
+    }
 
     // Exponential backoff: 1s, 2s, 4s, 8s, max 30s
     const delay = Math.min(1000 * Math.pow(2, reconnectAttempts), 30000);
