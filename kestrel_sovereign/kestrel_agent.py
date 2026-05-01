@@ -484,6 +484,20 @@ class KestrelAgent(
                 build_a2a_task_complete_registration()
             )
 
+            # Register the Stripe deposit-complete webhook source
+            # (Phase 6 of #889 — the first UNTRUSTED COGNITION source).
+            # Registration is unconditional even when the wallet
+            # feature isn't loaded; the StripeWebhookHandler is wired
+            # by the wallet feature when it initializes, and uses
+            # `agent.on_stripe_deposit_complete` (defined elsewhere on
+            # the agent) as its on_deposit_complete callback.
+            from kestrel_sovereign.signals.sources.wallet import (
+                build_stripe_deposit_registration,
+            )
+            self.signal_registry.register(
+                build_stripe_deposit_registration()
+            )
+
             # Initialize storage providers for features (reflection self-model, etc.)
             self.lighthouse_provider = None
             self.storacha_provider = None
@@ -1725,6 +1739,48 @@ Expected Duration: {expected_duration}
             _background_memory_processing(),
             name="post_response_memory_enrichment",
         )
+
+    async def on_stripe_deposit_complete(self, session) -> None:
+        """Callback for `StripeWebhookHandler.on_deposit_complete`.
+
+        Builds an UNTRUSTED COGNITION signal envelope from the Stripe
+        OnRampSession and `enqueue_signal`s it through the dispatcher.
+        The HTTP webhook handler returns 200 immediately after Stripe
+        signature verification; this callback runs in the handler's
+        async context but doesn't block — the dispatcher's tracker
+        owns the supervised cognition turn (Phase 6 of #889).
+
+        Wired by the wallet feature at init time:
+            handler.on_deposit_complete = agent.on_stripe_deposit_complete
+        """
+        dispatcher = getattr(self, "dispatcher", None)
+        if dispatcher is None:
+            logging.warning(
+                "Stripe deposit complete callback fired but agent has no "
+                "dispatcher; deposit %s acknowledged without cognition",
+                getattr(session, "session_id", "<unknown>"),
+            )
+            return
+        try:
+            from kestrel_sovereign.signals.sources.wallet import (
+                build_signal_for_deposit,
+            )
+            signal = build_signal_for_deposit(
+                session=session, target_agent=self.did,
+            )
+            await dispatcher.enqueue_signal(signal)
+        except Exception as e:
+            # Never break the webhook handler's success path on a
+            # dispatcher hiccup — Stripe's record-of-truth is the DB
+            # update that already ran before this callback. Log and
+            # move on; signal_log absence will surface in operator
+            # dashboards as a missing entry.
+            logging.error(
+                "Failed to enqueue stripe.deposit_complete signal "
+                "for session %s: %s",
+                getattr(session, "session_id", "<unknown>"), e,
+                exc_info=True,
+            )
 
     def _provide_causation_chain(self):
         """Return the in-flight turn's causation chain in the
