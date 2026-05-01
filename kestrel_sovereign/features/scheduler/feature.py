@@ -235,16 +235,20 @@ class SchedulerFeature(Feature):
     @staticmethod
     def _translate_signal_result(result, task_name: str) -> Any:
         """Map a SignalResult into the runner's expected return shape
-        (str | (str, float) tuple | None). Failures bubble up as
-        exceptions so the runner records status='failed' as today.
+        (str | (str, float) tuple | None).
 
-        - OK              → action_result if ACTION, artifact if ARTIFACT
-        - DROPPED_*       → "skipped: <status>" string (recorded as
-                            success in task_execution_log; no test
-                            currently distinguishes "skipped" from
-                            "ran cleanly" at the runner level)
-        - FAILED          → raise the dispatcher's error so the runner
-                            records status='failed' with the message
+        - OK                    → action_result if ACTION, artifact if ARTIFACT
+        - FAILED, DROPPED_VALIDATION, DROPPED_CYCLE
+                                → raise RuntimeError → runner records
+                                  status='failed'. These represent
+                                  misconfiguration (bad args, cycle in
+                                  the causation chain) — silently
+                                  recording them as 'success' would
+                                  hide real bugs.
+        - DROPPED_RATE_LIMIT, DROPPED_QUIET_HOURS, COALESCED
+                                → "skipped: <status>" string (success
+                                  row; benign skip the operator can
+                                  grep for in result_text).
         """
         from kestrel_sdk.signals import SignalMode, Status
 
@@ -269,14 +273,20 @@ class SchedulerFeature(Feature):
             # _execute_scheduled_task body).
             return json.dumps(payload, default=str)
 
-        if result.status == Status.FAILED:
+        # Failure-equivalent drops — surface as exceptions so the
+        # runner records status='failed'.
+        if result.status in (
+            Status.FAILED,
+            Status.DROPPED_VALIDATION,
+            Status.DROPPED_CYCLE,
+        ):
             raise RuntimeError(
-                f"dispatch failed for {task_name}: {result.error or 'unknown'}"
+                f"dispatch {result.status.value} for {task_name}: "
+                f"{result.error or 'unknown'}"
             )
 
-        # Coalesced / dropped — the runner sees this as success with a
-        # short text describing the drop. Operators can grep for these
-        # in task_execution_log.result_text.
+        # Benign drops (rate limit, quiet hours, coalesced) — recorded
+        # as success with a short text describing the drop.
         return f"skipped: {result.status.value} ({result.error or ''})".strip(" ()")
 
     # ------------------------------------------------------------------

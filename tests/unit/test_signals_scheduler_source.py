@@ -130,11 +130,19 @@ def test_state_mutating_tasks_declare_memory():
     """Sources that touch shared storage declare MEMORY so they
     serialize against each other (and against any future feature that
     declares MEMORY too). v1 uses a coarse `MEMORY` lock; finer
-    granularity is a follow-up."""
+    granularity is a follow-up.
+
+    `reflect` is in this set despite not being in CRON_TASKS as ACTION
+    — ReflectionFeature.reflect() persists each session via
+    _persist_reflection() (writes session + insights rows), so it
+    shares storage state with memory_consolidate. Caught in #904 review
+    P2; the prior empty-resources classification was wrong.
+    """
     by_name = {name: resources for name, _, resources in CRON_TASKS}
     assert ResourceLock.MEMORY in by_name["trash_retention"]
     assert ResourceLock.MEMORY in by_name["training_cycle"]
     assert ResourceLock.MEMORY in by_name["memory_consolidate"]
+    assert ResourceLock.MEMORY in by_name["reflect"]
 
 
 # ---------------------------------------------------------------------------

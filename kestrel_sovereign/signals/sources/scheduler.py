@@ -75,9 +75,14 @@ CRON_TASKS: list[tuple[str, SignalMode, frozenset[ResourceLock]]] = [
     ("training_cycle", SignalMode.ACTION, frozenset({ResourceLock.MEMORY})),
     # Feature workflow returning briefing text. Read-only.
     ("morning_signal", SignalMode.ARTIFACT, frozenset()),
-    # Reflection workflow returning a structured Dict. Read-only of
-    # conversation; doesn't write back.
-    ("reflect", SignalMode.ARTIFACT, frozenset()),
+    # Reflection workflow returning a structured Dict. ReflectionFeature
+    # persists each session (`_persist_reflection` writes session +
+    # insights rows), so it shares storage state with memory_consolidate
+    # and any other reflection persistence path. Coarse MEMORY lock
+    # keeps them serialized; a finer reflection-specific lock is a
+    # follow-up if the over-serialization with memory_consolidate ever
+    # bites in practice.
+    ("reflect", SignalMode.ARTIFACT, frozenset({ResourceLock.MEMORY})),
     # Consolidation writes episodes/patterns into memory storage.
     # Owner confirmed ARTIFACT (#893): no follow-up cognition triggered.
     ("memory_consolidate", SignalMode.ARTIFACT, frozenset({ResourceLock.MEMORY})),

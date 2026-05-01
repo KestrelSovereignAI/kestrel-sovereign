@@ -553,6 +553,133 @@ class TestTaskExecutor:
             await feature._lookup_and_run_tool("nonexistent_task", {})
 
 
+class TestTranslateSignalResult:
+    """Regression for #904 review P1: misconfiguration drops
+    (DROPPED_VALIDATION, DROPPED_CYCLE) must surface as failures so the
+    runner records status='failed', matching the legacy behavior where
+    bad args_json would have raised at `**args` / `.get`. Benign drops
+    (rate_limit, quiet_hours, coalesced) keep flowing as success rows
+    with descriptive text in result_text."""
+
+    @staticmethod
+    def _make_result(status, *, mode=None, action_result=None, artifact=None, error=None):
+        from kestrel_sdk.signals import SignalMode, SignalResult
+
+        return SignalResult(
+            signal_id="sig-test",
+            status=status,
+            mode=mode or SignalMode.ACTION,
+            duration_ms=1,
+            action_result=action_result,
+            artifact=artifact,
+            error=error,
+        )
+
+    def test_validation_drop_raises(self, feature):
+        """Bad args (e.g. args_json decoded to a non-dict) → schema
+        validation in the dispatcher → DROPPED_VALIDATION → must
+        bubble up so runner records 'failed'."""
+        from kestrel_sdk.signals import Status
+
+        with pytest.raises(RuntimeError, match="dropped_validation"):
+            feature._translate_signal_result(
+                self._make_result(Status.DROPPED_VALIDATION, error="payload not dict"),
+                "morning_signal",
+            )
+
+    def test_cycle_drop_raises(self, feature):
+        """Causation cycle = misconfiguration; surface as failure."""
+        from kestrel_sdk.signals import Status
+
+        with pytest.raises(RuntimeError, match="dropped_cycle"):
+            feature._translate_signal_result(
+                self._make_result(Status.DROPPED_CYCLE, error="agent in chain"),
+                "reflect",
+            )
+
+    def test_failed_status_raises(self, feature):
+        """Tool exception inside the handler → Status.FAILED → raise."""
+        from kestrel_sdk.signals import Status
+
+        with pytest.raises(RuntimeError, match="failed"):
+            feature._translate_signal_result(
+                self._make_result(Status.FAILED, error="tool blew up"),
+                "training_cycle",
+            )
+
+    def test_rate_limit_drop_returns_skipped_string(self, feature):
+        """Rate limit is a benign throttle; record as success with
+        'skipped: ...' text."""
+        from kestrel_sdk.signals import Status
+
+        result = feature._translate_signal_result(
+            self._make_result(Status.DROPPED_RATE_LIMIT, error="too many"),
+            "backup_snapshot",
+        )
+        assert isinstance(result, str)
+        assert result.startswith("skipped:")
+        assert "rate_limit" in result
+
+    def test_quiet_hours_drop_returns_skipped_string(self, feature):
+        from kestrel_sdk.signals import Status
+
+        result = feature._translate_signal_result(
+            self._make_result(Status.DROPPED_QUIET_HOURS, error="quiet"),
+            "morning_signal",
+        )
+        assert result.startswith("skipped:")
+        assert "quiet_hours" in result
+
+    def test_coalesced_returns_skipped_string(self, feature):
+        from kestrel_sdk.signals import Status
+
+        result = feature._translate_signal_result(
+            self._make_result(Status.COALESCED, error=None),
+            "morning_signal",
+        )
+        assert result.startswith("skipped:")
+
+    def test_ok_action_returns_action_result(self, feature):
+        from kestrel_sdk.signals import SignalMode, Status
+
+        result = feature._translate_signal_result(
+            self._make_result(
+                Status.OK, mode=SignalMode.ACTION, action_result="ran-it"
+            ),
+            "signal_dispatch",
+        )
+        assert result == "ran-it"
+
+    def test_ok_artifact_dict_is_json_encoded(self, feature):
+        """ARTIFACT tools commonly return Dicts. Preserve the legacy
+        result_text contract (JSON-encoded for the runner)."""
+        from kestrel_sdk.signals import SignalMode, Status
+
+        result = feature._translate_signal_result(
+            self._make_result(
+                Status.OK, mode=SignalMode.ARTIFACT, artifact={"score": 0.9}
+            ),
+            "reflect",
+        )
+        assert isinstance(result, str)
+        assert json.loads(result) == {"score": 0.9}
+
+    def test_ok_action_tuple_preserved_for_outcome_signal(self, feature):
+        """Tools may return (text, outcome_signal) — runner extracts
+        the second element. Translation must preserve the tuple shape."""
+        from kestrel_sdk.signals import SignalMode, Status
+
+        result = feature._translate_signal_result(
+            self._make_result(
+                Status.OK,
+                mode=SignalMode.ACTION,
+                action_result=("dispatched", 0.7),
+            ),
+            "signal_dispatch",
+        )
+        assert result == ("dispatched", 0.7)
+
+
 # =========================================================================
 # schedule_update
 # =========================================================================
