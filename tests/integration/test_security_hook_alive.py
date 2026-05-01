@@ -30,29 +30,20 @@ from kestrel_sovereign.privacy import PrivacyMode
 
 
 @pytest_asyncio.fixture
-async def bare_agent(temp_db, monkeypatch):
+async def bare_agent(temp_db):
     """A real KestrelAgent with NO pre-granted permissions.
 
     Deliberately doesn't call ``grant_permissions`` — every tool
     stays at the default PermissionLevel.ASK so the SecurityHook
     actually exercises its queue path.
 
-    Two cleanup steps are needed to guarantee the bare state:
-
-    1. Unset ``LIGHTHOUSE_API_KEY`` for this fixture so the agent's
-       cold-start restore (kestrel_agent.initialize) doesn't pull a
-       prior test's snapshot from Lighthouse.  Without this the
-       fresh ``temp_db`` gets overwritten with whatever permissions
-       a previous test wrote, and "ungranted" stops being true.
-
-    2. After ``initialize()`` runs ``_register_all_tools`` (which
-       inserts every tool at the default ASK level via INSERT OR
-       IGNORE), no further grants are made — but if any cross-test
-       cache leaks through we DELETE every row tagged with a known
-       test-grant reason as a belt-and-braces clear.
+    Lighthouse cold-start restore is suppressed by the autouse
+    ``_isolate_from_lighthouse_snapshots`` fixture in conftest.py
+    so the bare state is hermetic.  As a belt-and-braces measure
+    we still UPDATE every row to ``ask`` after initialize() in
+    case any other path persists a non-default level in the
+    future.
     """
-    monkeypatch.delenv("LIGHTHOUSE_API_KEY", raising=False)
-
     llm_service = LLMService()
     agent = KestrelAgent(
         did="did:test:security-hook-alive",

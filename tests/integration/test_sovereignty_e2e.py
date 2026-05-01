@@ -132,8 +132,21 @@ async def test_agent_command_integration(temp_db, llm_service, monkeypatch):
         await agent.initialize()
 
         # Skip bootstrap for test agents
-        from tests.integration.conftest import complete_bootstrap
+        from tests.integration.conftest import complete_bootstrap, grant_permissions
         await complete_bootstrap(agent)
+
+        # ``!export-sovereignty`` routes to SovereigntyFeature.
+        # export_sovereignty through the orchestrator, which fires
+        # PRE_TOOL_USE.  Grant ALLOW for that single pair so the
+        # SecurityHook short-circuits on the permission check
+        # instead of queueing for human approval that never arrives
+        # in a test.  See conftest.grant_permissions for the full
+        # background (#879).
+        await grant_permissions(
+            agent,
+            ("SovereigntyFeature", "export_sovereignty"),
+            reason="sovereignty-e2e command-integration",
+        )
 
         # Inject a secret for testing using monkeypatch
         monkeypatch.setenv("KESTREL_DATA_KEY", "test-agent-secret")

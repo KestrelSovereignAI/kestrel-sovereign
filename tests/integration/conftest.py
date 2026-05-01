@@ -23,6 +23,30 @@ def _force_single_agent_mode(monkeypatch, tmp_path):
     )
 
 
+@pytest.fixture(autouse=True)
+def _isolate_from_lighthouse_snapshots(monkeypatch):
+    """Ensure tests don't restore prior-run state from Lighthouse.
+
+    KestrelAgent.initialize does a cold-start restore from Lighthouse
+    when LIGHTHOUSE_API_KEY is set and the storage_path doesn't
+    exist yet (kestrel_agent.py around line 328).  Locally that's
+    fine for production, but in tests it pulls a previous run's
+    snapshot into a fresh tempdir DB — which can leak permission
+    rows, conversation history, and audit log across tests.
+
+    Concretely: a permission_store row written by yesterday's
+    integration run can land in today's bare_agent fixture and
+    silently grant ALLOW for a tool the test wanted at default
+    ASK.  Test passes locally; fails on CI (where the env var
+    isn't set).  Saw exactly that with #879's per-test grants.
+
+    Strip the env var globally for the integration suite.  Tests
+    that specifically want to exercise the Lighthouse restore path
+    can re-set it inside their own fixture.
+    """
+    monkeypatch.delenv("LIGHTHOUSE_API_KEY", raising=False)
+
+
 # NOTE: There is intentionally no autouse blanket-grant fixture here.
 #
 # An earlier iteration patched KestrelAgent.initialize to bulk-grant
