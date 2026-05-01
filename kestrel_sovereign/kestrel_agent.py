@@ -178,6 +178,31 @@ class KestrelAgent(
         self._allowed_features = allowed_features
         self._sync_enabled = _resolve_sync_enabled(sync_enabled)
 
+        # Per-agent constitution overlay (#898). When ``<agent_dir>/CONSTITUTION.md``
+        # exists, its text becomes ``self.constitution_text`` so feature-side
+        # grant lookups (e.g. ``ComputerUseFeature._granted_capabilities``)
+        # see this agent's Amendment IX checkboxes instead of falling
+        # through to the package constitution. Books I-II and the rest of
+        # the framework continue to come from the package — only Amendment
+        # IX grants are read from the overlay because that's what the
+        # parser scopes to. Absent file → ``constitution_text`` stays None
+        # and the package fallback is used (existing behavior).
+        self.constitution_text: Optional[str] = None
+        if storage_path:
+            overlay = Path(storage_path).parent / "CONSTITUTION.md"
+            if overlay.exists():
+                try:
+                    self.constitution_text = overlay.read_text(encoding="utf-8")
+                    logging.info(
+                        "Loaded per-agent constitution overlay from %s",
+                        overlay,
+                    )
+                except OSError as exc:
+                    logging.warning(
+                        "Failed to read per-agent constitution overlay %s: %s",
+                        overlay, exc,
+                    )
+
         # Determine database backend
         self._db_backend = db_backend or os.environ.get("KESTREL_DB_BACKEND", "sqlite")
         self._database_url = database_url or os.environ.get("KESTREL_DATABASE_URL")
