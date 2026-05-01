@@ -16,11 +16,15 @@ Requirements:
 - `codex login` completed (stores token in ~/.codex/auth.json)
   OR CODEX_AUTH_TOKEN env var set
 """
+import asyncio
 import base64
 import hashlib
 import json
 import logging
+import os
 import platform
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional, AsyncIterator, Tuple, Type, Union
 
 import httpx
@@ -38,6 +42,16 @@ logger = logging.getLogger(__name__)
 
 CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex/responses"
 JWT_CLAIM_PATH = "https://api.openai.com/auth"
+
+# OAuth refresh endpoint + the codex CLI's published OAuth client_id (the
+# ``aud`` claim of the id_token in ``~/.codex/auth.json``). Used by
+# ``_refresh_codex_oauth_token`` when our access_token has expired and the
+# auth-file copy is also stale. See #887 for why the adapter handles this
+# itself rather than letting a transient ``token_expired`` 401 disable the
+# route for the rest of the session.
+OPENAI_OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
+CODEX_CLI_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+CODEX_AUTH_FILE = Path.home() / ".codex" / "auth.json"
 
 
 def _extract_account_id(token: str) -> str:
@@ -70,6 +84,95 @@ def _build_headers(token: str, account_id: str) -> dict:
         "Accept": "text/event-stream",
         "Content-Type": "application/json",
     }
+
+
+def _read_codex_auth_file() -> Optional[Dict[str, Any]]:
+    """Return the parsed contents of ``~/.codex/auth.json`` or None.
+
+    Used both to pick up tokens refreshed externally (e.g. by the codex CLI
+    or its companion runtime) and to source the ``refresh_token`` when we
+    refresh ourselves. See #887.
+    """
+    try:
+        return json.loads(CODEX_AUTH_FILE.read_text())
+    except FileNotFoundError:
+        return None
+    except (OSError, json.JSONDecodeError) as e:
+        logger.warning(f"Failed to read {CODEX_AUTH_FILE}: {e}")
+        return None
+
+
+def _access_token_from_auth_data(data: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Extract the access_token from the auth.json shape produced by ``codex login``.
+
+    Tolerant of the two shapes seen in the wild:
+
+      {"tokens": {"access_token": ...}, "auth_mode": ""oauth"", ...}
+      {"access_token": ..., ...}
+    """
+    if not data:
+        return None
+    tokens = data.get("tokens") or {}
+    return tokens.get("access_token") or data.get("access_token")
+
+
+def _write_codex_auth_file(data: Dict[str, Any]) -> None:
+    """Write the auth.json back atomically. Preserves any unknown top-level
+    fields the codex CLI may have set so its own state isn't clobbered.
+    """
+    CODEX_AUTH_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = CODEX_AUTH_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, indent=2))
+    os.replace(tmp, CODEX_AUTH_FILE)
+
+
+async def _refresh_codex_oauth_token(refresh_token: str) -> Dict[str, Any]:
+    """Exchange ``refresh_token`` for fresh tokens via OpenAI's OAuth endpoint.
+
+    Returns the raw token response (typically ``{access_token, id_token,
+    refresh_token, expires_in, ...}``). Raises ``RuntimeError`` on any non-200
+    so callers can fall through to ""truly permanent auth failure"" handling.
+    """
+    body = {
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id": CODEX_CLI_CLIENT_ID,
+    }
+    async with httpx.AsyncClient(timeout=30) as http:
+        resp = await http.post(
+            OPENAI_OAUTH_TOKEN_URL,
+            data=body,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+    if resp.status_code != 200:
+        raise RuntimeError(
+            f"OAuth refresh failed with {resp.status_code}: {resp.text[:300]}"
+        )
+    return resp.json()
+
+
+def _persist_refreshed_tokens(token_response: Dict[str, Any]) -> None:
+    """Merge the refresh response back into auth.json under the ``tokens`` key.
+
+    Best-effort: failure to write doesn't prevent using the new token in
+    memory — the next process restart will fall back to the (still-stale)
+    file copy and refresh again, which is fine.
+    """
+    data = _read_codex_auth_file() or {}
+    tokens = dict(data.get("tokens") or {})
+    if "access_token" in token_response:
+        tokens["access_token"] = token_response["access_token"]
+    if "id_token" in token_response:
+        tokens["id_token"] = token_response["id_token"]
+    # Refresh tokens may rotate — keep the new one if present, else preserve.
+    if token_response.get("refresh_token"):
+        tokens["refresh_token"] = token_response["refresh_token"]
+    data["tokens"] = tokens
+    data["last_refresh"] = datetime.now(timezone.utc).isoformat()
+    try:
+        _write_codex_auth_file(data)
+    except OSError as e:
+        logger.warning(f"Failed to persist refreshed Codex tokens to disk: {e}")
 
 
 def _extract_instructions_and_input(messages):
@@ -375,6 +478,72 @@ class CodexAdapter(LLMAdapter):
             if continuation_store is not None
             else InMemoryContinuationStore()
         )
+        # Cached access token: when we refresh on 401, subsequent calls use
+        # the new token without re-reading auth.json or hitting OAuth again.
+        # The provider registry supplied the original token via the ``client``
+        # parameter; this overrides it once we know it's stale. See #887.
+        self._refreshed_token: Optional[str] = None
+        # Serialize concurrent refresh attempts. Multiple in-flight calls all
+        # 401-ing at once would otherwise hammer the OAuth endpoint with the
+        # same refresh request.
+        self._refresh_lock = asyncio.Lock()
+
+    def _current_token(self, fallback: str) -> str:
+        """Return the latest known access token (refresh override or fallback)."""
+        return self._refreshed_token or fallback
+
+    async def _refresh_token_if_possible(self, current_token: str) -> Optional[str]:
+        """Try to recover a working access token after a 401. Returns the new
+        token or None if recovery isn't possible (no refresh_token, or the
+        OAuth endpoint itself rejected the refresh — i.e. truly permanent).
+
+        Two-step recovery, ordered cheap → expensive:
+
+        1. Re-read ``~/.codex/auth.json``. If the file's access_token is
+           newer than the one we got the 401 with, the codex CLI (or a peer
+           process) refreshed it externally — adopt and retry.
+        2. Otherwise, perform the OAuth ``refresh_token`` grant ourselves,
+           write the new tokens back to disk, and return the new
+           access_token.
+
+        Caller serializes via ``self._refresh_lock`` so concurrent 401s
+        produce one refresh, not N.
+        """
+        async with self._refresh_lock:
+            # Another in-flight call may have already refreshed while we
+            # were waiting on the lock. Pick that up instead of redoing.
+            if self._refreshed_token and self._refreshed_token != current_token:
+                return self._refreshed_token
+
+            file_data = _read_codex_auth_file()
+            file_token = _access_token_from_auth_data(file_data)
+            if file_token and file_token != current_token:
+                logger.info(
+                    "Codex token refreshed externally; adopting from auth.json"
+                )
+                self._refreshed_token = file_token
+                return file_token
+
+            rt = (file_data or {}).get("tokens", {}).get("refresh_token")
+            if not rt:
+                logger.warning(
+                    "Codex 401 with no refresh_token in auth.json — "
+                    "cannot recover; treating as permanent."
+                )
+                return None
+            try:
+                token_response = await _refresh_codex_oauth_token(rt)
+            except Exception as e:
+                logger.warning(f"Codex OAuth refresh failed: {e}")
+                return None
+            new_token = token_response.get("access_token")
+            if not new_token:
+                logger.warning("OAuth refresh response had no access_token field")
+                return None
+            _persist_refreshed_tokens(token_response)
+            self._refreshed_token = new_token
+            logger.info("Codex access token refreshed via OAuth")
+            return new_token
 
     def contribute_system_prompt(
         self, model_id: str, base: Optional[str]
@@ -480,11 +649,11 @@ class CodexAdapter(LLMAdapter):
                 "Codex adapter requires an OAuth token. "
                 "Run `codex login` or set CODEX_AUTH_TOKEN."
             )
+        # Adopt any token a previous call refreshed in-memory.
+        token = self._current_token(token)
 
         session_id = kwargs.pop("session_id", None)
 
-        account_id = _extract_account_id(token)
-        headers = _build_headers(token, account_id)
         instructions, input_messages = _extract_instructions_and_input(messages)
         instructions = self.contribute_system_prompt(model, instructions)
         responses_tools = _convert_tools_to_responses_format(tools)
@@ -518,64 +687,82 @@ class CodexAdapter(LLMAdapter):
         # replay encrypted reasoning + function_calls as input items (#842).
         new_turn_outputs: List[Dict[str, Any]] = []
 
+        # Two attempts: the first uses our current token, the second uses a
+        # refreshed token if the first 401'd. See #887 — ``token_expired``
+        # is transient and recovers via ``_refresh_token_if_possible``;
+        # only after refresh fails do we treat the 401 as permanent.
         async with httpx.AsyncClient(timeout=120) as http:
-            async with http.stream("POST", CODEX_BASE_URL, headers=headers, json=body) as resp:
-                if resp.status_code != 200:
-                    await resp.aread()
-                    error_text = resp.text[:500]
-                    logger.error(f"Codex API error {resp.status_code}: {error_text}")
-                    raise RuntimeError(
-                        f"Codex API returned {resp.status_code}: {error_text}"
-                    )
+            for attempt in range(2):
+                account_id = _extract_account_id(token)
+                headers = _build_headers(token, account_id)
+                async with http.stream("POST", CODEX_BASE_URL, headers=headers, json=body) as resp:
+                    if resp.status_code == 401 and attempt == 0:
+                        await resp.aread()
+                        new_token = await self._refresh_token_if_possible(token)
+                        if new_token and new_token != token:
+                            token = new_token
+                            continue  # retry once with refreshed token
+                        # Refresh didn't help — propagate as before.
+                        error_text = resp.text[:500]
+                        logger.error(f"Codex API error 401: {error_text}")
+                        raise RuntimeError(f"Codex API returned 401: {error_text}")
+                    if resp.status_code != 200:
+                        await resp.aread()
+                        error_text = resp.text[:500]
+                        logger.error(f"Codex API error {resp.status_code}: {error_text}")
+                        raise RuntimeError(
+                            f"Codex API returned {resp.status_code}: {error_text}"
+                        )
 
-                async for event in _parse_sse_events(resp):
-                    event_type = event.get("type", "")
+                    async for event in _parse_sse_events(resp):
+                        event_type = event.get("type", "")
 
-                    if event_type == "response.output_text.delta":
-                        content_parts.append(event.get("delta", ""))
+                        if event_type == "response.output_text.delta":
+                            content_parts.append(event.get("delta", ""))
 
-                    elif event_type == "response.output_item.added":
-                        item = event.get("item", {})
-                        if item.get("type") == "function_call":
+                        elif event_type == "response.output_item.added":
+                            item = event.get("item", {})
+                            if item.get("type") == "function_call":
+                                idx = event.get("output_index", 0)
+                                # Capture ``call_id`` (the tool-call id used by
+                                # function_call_output to match against), NOT the
+                                # output-item ``id``. Live capture (#857) shows
+                                # both fields are present on this event. The
+                                # Responses API matches function_call ↔
+                                # function_call_output by ``call_id``; using
+                                # ``id`` produces 400 ""No tool output found""
+                                # on the replay path because the cached
+                                # function_call carries the real ``call_id`` and
+                                # the orchestrator's tool_call_id (set from this
+                                # ToolCall.id) carried the wrong field.
+                                func_calls[idx] = {
+                                    "id": item.get("call_id") or item.get("id", ""),
+                                    "name": item.get("name", ""),
+                                    "arguments": "",
+                                }
+
+                        elif event_type == "response.function_call_arguments.delta":
                             idx = event.get("output_index", 0)
-                            # Capture ``call_id`` (the tool-call id used by
-                            # function_call_output to match against), NOT the
-                            # output-item ``id``. Live capture (#857) shows
-                            # both fields are present on this event. The
-                            # Responses API matches function_call ↔
-                            # function_call_output by ``call_id``; using
-                            # ``id`` produces 400 ""No tool output found""
-                            # on the replay path because the cached
-                            # function_call carries the real ``call_id`` and
-                            # the orchestrator's tool_call_id (set from this
-                            # ToolCall.id) carried the wrong field.
-                            func_calls[idx] = {
-                                "id": item.get("call_id") or item.get("id", ""),
-                                "name": item.get("name", ""),
-                                "arguments": "",
-                            }
+                            if idx not in func_calls:
+                                func_calls[idx] = {"id": "", "name": "", "arguments": ""}
+                            func_calls[idx]["arguments"] += event.get("delta", "")
 
-                    elif event_type == "response.function_call_arguments.delta":
-                        idx = event.get("output_index", 0)
-                        if idx not in func_calls:
-                            func_calls[idx] = {"id": "", "name": "", "arguments": ""}
-                        func_calls[idx]["arguments"] += event.get("delta", "")
+                        elif event_type == "response.function_call_arguments.done":
+                            idx = event.get("output_index", 0)
+                            if idx not in func_calls:
+                                func_calls[idx] = {"id": "", "name": "", "arguments": ""}
+                            func_calls[idx]["arguments"] = event.get("arguments", "")
 
-                    elif event_type == "response.function_call_arguments.done":
-                        idx = event.get("output_index", 0)
-                        if idx not in func_calls:
-                            func_calls[idx] = {"id": "", "name": "", "arguments": ""}
-                        func_calls[idx]["arguments"] = event.get("arguments", "")
+                        elif event_type == "response.output_item.done":
+                            item = event.get("item", {})
+                            if item.get("type") in ("reasoning", "function_call", "message"):
+                                new_turn_outputs.append(item)
 
-                    elif event_type == "response.output_item.done":
-                        item = event.get("item", {})
-                        if item.get("type") in ("reasoning", "function_call", "message"):
-                            new_turn_outputs.append(item)
-
-                    elif event_type == "response.completed":
-                        resp_data = event.get("response", {})
-                        final_usage = resp_data.get("usage", {})
-                        last_response_id = resp_data.get("id") or last_response_id
+                        elif event_type == "response.completed":
+                            resp_data = event.get("response", {})
+                            final_usage = resp_data.get("usage", {})
+                            last_response_id = resp_data.get("id") or last_response_id
+                    break  # successful stream consumed; exit retry loop
 
         # Persist cursor + this turn's output items so the next call replays
         # them as input. ``len(input_messages)`` is the Chat-Completions count
@@ -623,11 +810,10 @@ class CodexAdapter(LLMAdapter):
         token = client
         if not isinstance(token, str):
             raise RuntimeError("Codex adapter requires an OAuth token.")
+        token = self._current_token(token)
 
         session_id = kwargs.pop("session_id", None)
 
-        account_id = _extract_account_id(token)
-        headers = _build_headers(token, account_id)
         instructions, input_messages = _extract_instructions_and_input(messages)
         instructions = self.contribute_system_prompt(model, instructions)
         # See ``get_response`` for the full rationale on #841 and #842.
@@ -651,27 +837,40 @@ class CodexAdapter(LLMAdapter):
         new_turn_outputs: List[Dict[str, Any]] = []
 
         async with httpx.AsyncClient(timeout=120) as http:
-            async with http.stream("POST", CODEX_BASE_URL, headers=headers, json=body) as resp:
-                if resp.status_code != 200:
-                    await resp.aread()
-                    error_text = resp.text[:500]
-                    logger.error(f"Codex stream error {resp.status_code}: {error_text}")
-                    raise RuntimeError(
-                        f"Codex API returned {resp.status_code}: {error_text}"
-                    )
+            for attempt in range(2):
+                account_id = _extract_account_id(token)
+                headers = _build_headers(token, account_id)
+                async with http.stream("POST", CODEX_BASE_URL, headers=headers, json=body) as resp:
+                    if resp.status_code == 401 and attempt == 0:
+                        await resp.aread()
+                        new_token = await self._refresh_token_if_possible(token)
+                        if new_token and new_token != token:
+                            token = new_token
+                            continue
+                        error_text = resp.text[:500]
+                        logger.error(f"Codex stream error 401: {error_text}")
+                        raise RuntimeError(f"Codex API returned 401: {error_text}")
+                    if resp.status_code != 200:
+                        await resp.aread()
+                        error_text = resp.text[:500]
+                        logger.error(f"Codex stream error {resp.status_code}: {error_text}")
+                        raise RuntimeError(
+                            f"Codex API returned {resp.status_code}: {error_text}"
+                        )
 
-                async for event in _parse_sse_events(resp):
-                    event_type = event.get("type", "")
-                    if event_type == "response.output_text.delta":
-                        chunk_count += 1
-                        yield event.get("delta", "")
-                    elif event_type == "response.output_item.done":
-                        item = event.get("item", {})
-                        if item.get("type") in ("reasoning", "function_call", "message"):
-                            new_turn_outputs.append(item)
-                    elif event_type == "response.completed":
-                        resp_data = event.get("response", {})
-                        last_response_id = resp_data.get("id") or last_response_id
+                    async for event in _parse_sse_events(resp):
+                        event_type = event.get("type", "")
+                        if event_type == "response.output_text.delta":
+                            chunk_count += 1
+                            yield event.get("delta", "")
+                        elif event_type == "response.output_item.done":
+                            item = event.get("item", {})
+                            if item.get("type") in ("reasoning", "function_call", "message"):
+                                new_turn_outputs.append(item)
+                        elif event_type == "response.completed":
+                            resp_data = event.get("response", {})
+                            last_response_id = resp_data.get("id") or last_response_id
+                    break  # successful stream consumed
 
         self._record_continuation(
             session_id, last_response_id, len(input_messages), signature,
@@ -692,11 +891,10 @@ class CodexAdapter(LLMAdapter):
         token = client
         if not isinstance(token, str):
             raise RuntimeError("Codex adapter requires an OAuth token.")
+        token = self._current_token(token)
 
         session_id = kwargs.pop("session_id", None)
 
-        account_id = _extract_account_id(token)
-        headers = _build_headers(token, account_id)
         instructions, input_messages = _extract_instructions_and_input(messages)
         instructions = self.contribute_system_prompt(model, instructions)
         responses_tools = _convert_tools_to_responses_format(tools)
@@ -726,66 +924,78 @@ class CodexAdapter(LLMAdapter):
         new_turn_outputs: List[Dict[str, Any]] = []
 
         async with httpx.AsyncClient(timeout=120) as http:
-            async with http.stream("POST", CODEX_BASE_URL, headers=headers, json=body) as resp:
-                if resp.status_code != 200:
-                    await resp.aread()
-                    error_text = resp.text[:500]
-                    raise RuntimeError(
-                        f"Codex API returned {resp.status_code}: {error_text}"
-                    )
+            for attempt in range(2):
+                account_id = _extract_account_id(token)
+                headers = _build_headers(token, account_id)
+                async with http.stream("POST", CODEX_BASE_URL, headers=headers, json=body) as resp:
+                    if resp.status_code == 401 and attempt == 0:
+                        await resp.aread()
+                        new_token = await self._refresh_token_if_possible(token)
+                        if new_token and new_token != token:
+                            token = new_token
+                            continue
+                        error_text = resp.text[:500]
+                        raise RuntimeError(f"Codex API returned 401: {error_text}")
+                    if resp.status_code != 200:
+                        await resp.aread()
+                        error_text = resp.text[:500]
+                        raise RuntimeError(
+                            f"Codex API returned {resp.status_code}: {error_text}"
+                        )
 
-                async for event in _parse_sse_events(resp):
-                    event_type = event.get("type", "")
+                    async for event in _parse_sse_events(resp):
+                        event_type = event.get("type", "")
 
-                    if event_type == "response.output_text.delta":
-                        chunk_count += 1
-                        delta = event.get("delta", "")
-                        text_content += delta
-                        yield delta
+                        if event_type == "response.output_text.delta":
+                            chunk_count += 1
+                            delta = event.get("delta", "")
+                            text_content += delta
+                            yield delta
 
-                    elif event_type == "response.function_call_arguments.delta":
-                        idx = event.get("output_index", 0)
-                        if idx not in func_calls:
-                            func_calls[idx] = {"id": "", "name": "", "arguments": ""}
-                        func_calls[idx]["arguments"] += event.get("delta", "")
-
-                    elif event_type == "response.function_call_arguments.done":
-                        idx = event.get("output_index", 0)
-                        if idx not in func_calls:
-                            func_calls[idx] = {"id": "", "name": "", "arguments": ""}
-                        func_calls[idx]["arguments"] = event.get("arguments", "")
-
-                    elif event_type == "response.output_item.added":
-                        item = event.get("item", {})
-                        if item.get("type") == "function_call":
+                        elif event_type == "response.function_call_arguments.delta":
                             idx = event.get("output_index", 0)
-                            # Capture ``call_id`` (the tool-call id used by
-                            # function_call_output to match against), NOT the
-                            # output-item ``id``. Live capture (#857) shows
-                            # both fields are present on this event. The
-                            # Responses API matches function_call ↔
-                            # function_call_output by ``call_id``; using
-                            # ``id`` produces 400 ""No tool output found""
-                            # on the replay path because the cached
-                            # function_call carries the real ``call_id`` and
-                            # the orchestrator's tool_call_id (set from this
-                            # ToolCall.id) carried the wrong field.
-                            func_calls[idx] = {
-                                "id": item.get("call_id") or item.get("id", ""),
-                                "name": item.get("name", ""),
-                                "arguments": "",
-                            }
+                            if idx not in func_calls:
+                                func_calls[idx] = {"id": "", "name": "", "arguments": ""}
+                            func_calls[idx]["arguments"] += event.get("delta", "")
 
-                    elif event_type == "response.output_item.done":
-                        item = event.get("item", {})
-                        if item.get("type") in ("reasoning", "function_call", "message"):
-                            new_turn_outputs.append(item)
+                        elif event_type == "response.function_call_arguments.done":
+                            idx = event.get("output_index", 0)
+                            if idx not in func_calls:
+                                func_calls[idx] = {"id": "", "name": "", "arguments": ""}
+                            func_calls[idx]["arguments"] = event.get("arguments", "")
 
-                    elif event_type == "response.completed":
-                        resp_data = event.get("response", {})
-                        usage = resp_data.get("usage", {})
-                        final_usage = usage
-                        last_response_id = resp_data.get("id") or last_response_id
+                        elif event_type == "response.output_item.added":
+                            item = event.get("item", {})
+                            if item.get("type") == "function_call":
+                                idx = event.get("output_index", 0)
+                                # Capture ``call_id`` (the tool-call id used by
+                                # function_call_output to match against), NOT the
+                                # output-item ``id``. Live capture (#857) shows
+                                # both fields are present on this event. The
+                                # Responses API matches function_call ↔
+                                # function_call_output by ``call_id``; using
+                                # ``id`` produces 400 ""No tool output found""
+                                # on the replay path because the cached
+                                # function_call carries the real ``call_id`` and
+                                # the orchestrator's tool_call_id (set from this
+                                # ToolCall.id) carried the wrong field.
+                                func_calls[idx] = {
+                                    "id": item.get("call_id") or item.get("id", ""),
+                                    "name": item.get("name", ""),
+                                    "arguments": "",
+                                }
+
+                        elif event_type == "response.output_item.done":
+                            item = event.get("item", {})
+                            if item.get("type") in ("reasoning", "function_call", "message"):
+                                new_turn_outputs.append(item)
+
+                        elif event_type == "response.completed":
+                            resp_data = event.get("response", {})
+                            usage = resp_data.get("usage", {})
+                            final_usage = usage
+                            last_response_id = resp_data.get("id") or last_response_id
+                    break  # successful stream consumed
 
         self._record_continuation(
             session_id, last_response_id, len(input_messages), signature,
