@@ -90,18 +90,20 @@ async function init() {
     await loadAgents();
 
     // In standalone mode (no rookery agent selected), load data directly.
-    // #879: each loader self-guards against its capability being disabled,
-    // so we can fan them all out unconditionally; the no-ops are cheap and
-    // keep this block stable as new caps land.
+    // #879: each loader self-guards against its capability being disabled
+    // (chat → connectNotifications/loadModels/updateContextStatus/
+    // loadCommands; identity, privacy → their own caps), so we fan them
+    // out unconditionally and the no-ops keep this block stable as new
+    // caps land.
     if (!API.isRookeryMode()) {
-        if (API.hasCapability('chat')) connectNotifications();
+        connectNotifications();
         await Promise.all([
             loadIdentity(),
             loadPrivacyMode(),
-            API.hasCapability('chat') ? loadModels() : Promise.resolve(),
+            loadModels(),
             loadCommands(API),
         ]);
-        if (API.hasCapability('chat')) updateContextStatus();
+        updateContextStatus();
     }
 
     console.log('Kestrel Sovereign Console ready');

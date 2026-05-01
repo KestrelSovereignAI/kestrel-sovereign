@@ -273,7 +273,10 @@ const PANEL_CAPABILITIES_FOR_TEST = {
     memories: ['memory'],
     tasks: ['tasks'],
     sovereignty: ['sovereignty'],
-    resources: ['keys', 'wallet', 'storage'],
+    // `storage` is intentionally absent here — see the comment above
+    // PANEL_CAPABILITIES in identity.js.  When a real storage-stats section
+    // lands, add it here AND in identity.js together.
+    resources: ['keys', 'wallet'],
     metrics: ['metrics'],
     spawn: ['spawn'],
     features: ['featureStore'],
@@ -337,15 +340,28 @@ test('object-shaped keys cap: agent off, user/platform on → resources panel st
     assert.equal(panelIsEnabled(client, 'resources'), true);
 });
 
-test('all keys sub-caps off + wallet/storage off → resources panel is hidden', () => {
+test('all keys sub-caps off + wallet off → resources panel is hidden', () => {
+    // `storage` is not a Resources sub-section today (no storage-stats
+    // panel ships in resources.js), so it's not part of the gate — only
+    // keys and wallet are.  This test would have wrongly required
+    // storage:false too if the gate still listed storage.
     const client = makeClient({
         capabilities: {
             keys: { agent: false, user: false, platform: false },
             wallet: false,
-            storage: false,
         },
     });
     assert.equal(panelIsEnabled(client, 'resources'), false);
+});
+
+test('storage:false alone does not affect Resources visibility', () => {
+    // Regression for the P2 review note: a host that only sets
+    // {storage: false} (and leaves keys/wallet on by default) should still
+    // see the Resources tab.  Pre-fix this passed because `storage` was
+    // only one of three OR'd caps; we keep the assertion to lock it in
+    // even after `storage` was dropped from the gate.
+    const client = makeClient({ capabilities: { storage: false } });
+    assert.equal(panelIsEnabled(client, 'resources'), true);
 });
 
 test('initNavigation prunes hidden tabs and re-promotes a surviving tab to active', () => {

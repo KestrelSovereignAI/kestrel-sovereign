@@ -63,6 +63,12 @@ export function setLazyLoaders(loaders) {
 //
 // Standalone Kestrel ships with every capability defaulting to true,
 // so this map only kicks in when an embedding host opts out.
+// `storage` is a canonical capability key but the resources panel today
+// has no storage-stats section — only keys + wallet + usage live there.
+// Listing it on this panel would make a host that enables only `storage`
+// see a Resources tab whose every visible section is hidden.  When a real
+// storage section ships, add `storage` here AND wire a sub-section guard
+// into resources.js (mirroring the keys/wallet pattern).
 const PANEL_CAPABILITIES = {
     identity: ['identity'],
     chat: ['chat'],
@@ -70,7 +76,7 @@ const PANEL_CAPABILITIES = {
     memories: ['memory'],
     tasks: ['tasks'],
     sovereignty: ['sovereignty'],
-    resources: ['keys', 'wallet', 'storage'],
+    resources: ['keys', 'wallet'],
     metrics: ['metrics'],
     spawn: ['spawn'],
     features: ['featureStore'],
@@ -777,11 +783,16 @@ window.selectAgent = async function(agentName) {
     state.storage = null;
     state.wallet = null;
 
-    // Reconnect SSE notifications to the new agent
+    // Reconnect SSE notifications to the new agent.  #879: every
+    // chat-adjacent helper here (connectNotifications, loadModels,
+    // loadCommands, updateContextStatus) self-guards on the chat
+    // capability, so when a host disables chat these become no-ops and
+    // the chat-only endpoints (/api/agent/notifications/sse, /api/models,
+    // /api/commands, context-status) are never hit on agent select.
     disconnectNotifications();
     connectNotifications();
 
-    // Reload all agent-specific data in parallel
+    // Reload all agent-specific data in parallel.
     await Promise.all([
         loadIdentity(),
         loadPrivacyMode(),

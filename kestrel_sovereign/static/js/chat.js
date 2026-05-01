@@ -146,6 +146,11 @@ export function subscribeSSE(eventType, handler) {
  * Automatically reconnects on disconnect with exponential backoff.
  */
 export function connectNotifications() {
+    // #879: SSE notifications drive the chat thinking-indicator and
+    // approval modals.  When the host opted out of chat there's no UI to
+    // surface the events to and the /api/agent/notifications/sse endpoint
+    // may not even be mounted, so don't open the connection.
+    if (!API.hasCapability('chat')) return;
     if (notificationEventSource) {
         notificationEventSource.close();
     }
@@ -463,6 +468,10 @@ let contextStatusElement = null;
  * aggregate, which made no sense.
  */
 export async function updateContextStatus() {
+    // #879: context-status footer is part of the chat surface.  No-op when
+    // the host opted out so /api/agent/context-status isn't called on every
+    // conversation change.
+    if (!API.hasCapability('chat')) return;
     try {
         if (!contextStatusElement) {
             createContextStatusElement();
@@ -691,6 +700,8 @@ export async function addMessage(role, content) {
  * Initialize the shared model selector component
  */
 export async function loadModels() {
+    // #879: model selector lives in the chat header — skip when chat is off.
+    if (!API.hasCapability('chat')) return;
     // Check if SharedModelSelector is available (loaded via script tag)
     if (!window.SharedModelSelector) {
         console.error('SharedModelSelector not loaded. Include /shared/model-selector/index.js');
