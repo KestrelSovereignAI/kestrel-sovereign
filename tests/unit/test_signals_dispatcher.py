@@ -228,6 +228,130 @@ async def test_sanitizer_runs_on_untrusted_non_action(dispatcher_components, tmp
 
 
 @pytest.mark.asyncio
+async def test_schema_failure_drops_validation(dispatcher_components):
+    """Registered schema must reject malformed payloads BEFORE they reach
+    handlers, artifact handlers, cognition templates, or signal logs.
+    Regression for an earlier draft where SourceRegistration.schema was
+    declared but never invoked by the pipeline."""
+    c = dispatcher_components
+
+    def strict_schema(payload: dict) -> dict:
+        if "user_id" not in payload:
+            raise ValueError("missing required field 'user_id'")
+        return payload
+
+    captured: list[dict] = []
+
+    async def handler(payload: dict) -> dict:
+        captured.append(payload)
+        return {"ok": True}
+
+    c.registry.register(
+        SourceRegistration(
+            name="strict",
+            schema=strict_schema,
+            default_mode=SignalMode.ACTION,
+            allowed_modes=frozenset({SignalMode.ACTION}),
+            handler=handler,
+            log_redaction=_redaction(),
+        )
+    )
+
+    bad = await c.dispatcher.dispatch_signal(
+        _signal("strict", payload={"wrong": "shape"})
+    )
+    assert bad.status == Status.DROPPED_VALIDATION
+    assert "Schema rejected" in (bad.error or "")
+    assert "user_id" in (bad.error or "")
+    assert captured == [], "handler must not run when schema rejects"
+
+    good = await c.dispatcher.dispatch_signal(
+        _signal("strict", payload={"user_id": "abc"})
+    )
+    assert good.status == Status.OK
+    assert captured == [{"user_id": "abc"}]
+
+
+@pytest.mark.asyncio
+async def test_schema_normalization_replaces_payload(dispatcher_components):
+    """Schema is allowed to normalize (defaults, type coercion). Downstream
+    handlers see the normalized form, not the original."""
+    c = dispatcher_components
+
+    def normalize(payload: dict) -> dict:
+        return {**payload, "added_by_schema": True}
+
+    captured: list[dict] = []
+
+    async def handler(payload: dict) -> dict:
+        captured.append(payload)
+        return None
+
+    c.registry.register(
+        SourceRegistration(
+            name="normalizing",
+            schema=normalize,
+            default_mode=SignalMode.ACTION,
+            allowed_modes=frozenset({SignalMode.ACTION}),
+            handler=handler,
+            log_redaction=_redaction(),
+        )
+    )
+    result = await c.dispatcher.dispatch_signal(
+        _signal("normalizing", payload={"orig": 1})
+    )
+    assert result.status == Status.OK
+    assert captured == [{"orig": 1, "added_by_schema": True}]
+
+
+@pytest.mark.asyncio
+async def test_schema_runs_after_sanitizer(dispatcher_components, tmp_path):
+    """For UNTRUSTED sources, sanitizer scrubs first, then schema validates
+    the scrubbed form. The schema sees the canonical payload that will
+    actually reach the handler."""
+    c = dispatcher_components
+    template = tmp_path / "tpl.md"
+    template.write_text("payload: {payload}")
+
+    sanitizer_seen: list[dict] = []
+    schema_seen: list[dict] = []
+
+    def sanitize(p: dict) -> dict:
+        sanitizer_seen.append(p)
+        return {"safe_field": p.get("safe_field", "")}
+
+    def schema(p: dict) -> dict:
+        schema_seen.append(p)
+        if "safe_field" not in p:
+            raise ValueError("schema requires safe_field")
+        return p
+
+    c.registry.register(
+        SourceRegistration(
+            name="ordered",
+            schema=schema,
+            default_mode=SignalMode.COGNITION,
+            allowed_modes=frozenset({SignalMode.COGNITION}),
+            prompt_template=template,
+            trust=Trust.UNTRUSTED,
+            sanitizer=sanitize,
+            log_redaction=_redaction(),
+        )
+    )
+    result = await c.dispatcher.dispatch_signal(
+        _signal(
+            "ordered",
+            mode=SignalMode.COGNITION,
+            payload={"safe_field": "hi", "evil": "<script>"},
+        )
+    )
+    assert result.status == Status.OK
+    assert sanitizer_seen == [{"safe_field": "hi", "evil": "<script>"}]
+    # Schema saw the post-sanitizer payload — no "evil" key.
+    assert schema_seen == [{"safe_field": "hi"}]
+
+
+@pytest.mark.asyncio
 async def test_sanitizer_failure_drops_validation(dispatcher_components, tmp_path):
     c = dispatcher_components
 

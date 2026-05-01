@@ -167,6 +167,12 @@ class RedactionPolicy:
 # results. ARTIFACT result is opaque (whatever the feature workflow returns).
 ActionHandler = Callable[[dict], Awaitable[Any]]
 ArtifactHandler = Callable[["Signal"], Awaitable[Any]]
+PayloadSchema = Callable[[dict], dict]
+"""Schema validator. Receives the raw (or post-sanitizer) payload, returns
+the validated/normalized form, raises on invalid. Sources that use pydantic
+should wrap: `lambda p: MyModel(**p).model_dump()`. Sources with no schema
+needs can pass `dict` (no-op copy) — but writing an explicit validator is
+preferred since it's the source's contract with downstream handlers."""
 
 
 @dataclass
@@ -177,7 +183,7 @@ class SourceRegistration:
 
     # Identity
     name: str
-    schema: type  # validator class with .validate(dict) -> dict, or a callable
+    schema: PayloadSchema
 
     # Mode
     default_mode: SignalMode

@@ -269,6 +269,21 @@ class SignalDispatcher:
                     registration=registration,
                 )
 
+        # Schema validation runs AFTER sanitization so the schema validates
+        # the canonical, scrubbed form that downstream handlers/templates
+        # will actually see. The validated value replaces the payload —
+        # schemas may normalize (defaults, type coercion) without surprise.
+        try:
+            signal.payload = registration.schema(signal.payload)
+        except Exception as e:
+            return self._fail(
+                signal,
+                start,
+                Status.DROPPED_VALIDATION,
+                error=f"Schema rejected payload: {type(e).__name__}: {e}",
+                registration=registration,
+            )
+
         # Step 2: append-and-cycle-check
         new_frame, cycle_reason = self._compute_frame_and_check_cycle(
             signal, registration

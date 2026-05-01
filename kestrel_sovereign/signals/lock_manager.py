@@ -1,9 +1,15 @@
 """Single ordered lock manager for the signal dispatcher.
 
 Per SIGNAL_DISPATCHER.md §Concern 2: any caller acquiring multiple named
-locks acquires them in lexicographic order. `CONVERSATION` is the
+locks acquires them in a single global order. `CONVERSATION` is the
 highest-order acquisition (always last) and is owned solely by the turn
 lifecycle — the dispatcher never pre-acquires it for COGNITION sources.
+
+The order is defined by `lock_sort_key` below: `CONVERSATION` is pinned to
+the end via a (rank, name) tuple; everything else lex-orders on its enum
+value within the lower rank. We do NOT sort by raw enum value because
+"conversation" sorts before "memory"/"scheduler"/"wallet" alphabetically,
+which would put CONVERSATION first — directly contradicting the design.
 """
 
 from __future__ import annotations
@@ -15,12 +21,24 @@ from typing import AsyncIterator, Iterable
 from kestrel_sdk.signals import ResourceLock
 
 
+def lock_sort_key(name: ResourceLock) -> tuple[int, str]:
+    """Global lock acquisition order.
+
+    `CONVERSATION` is pinned last (rank 1). Every other lock acquires in
+    lex order of its enum value (rank 0). Exposed at module scope so tests
+    and other components can assert against the canonical ordering.
+    """
+    if name == ResourceLock.CONVERSATION:
+        return (1, "")
+    return (0, name.value)
+
+
 class OrderedLockManager:
     """Acquires a set of named locks in a single sorted pass.
 
-    Lex order on lock name is the global invariant. There is no second
-    order, so the only deadlock surface (two callers acquiring the same
-    pair in different orders) cannot exist.
+    The single global order (see `lock_sort_key`) is the entire deadlock-
+    freedom invariant: with one order, two callers cannot acquire the same
+    pair of locks in opposite directions, so the deadlock surface is empty.
     """
 
     def __init__(self) -> None:
@@ -40,11 +58,9 @@ class OrderedLockManager:
     async def acquire(
         self, names: Iterable[ResourceLock]
     ) -> AsyncIterator[None]:
-        """Acquire all named locks in lex order; release in reverse on exit.
-
-        Empty iterable is a no-op (yields immediately).
-        """
-        ordered = sorted(set(names), key=lambda r: r.value)
+        """Acquire all named locks in canonical order; release in reverse
+        on exit. Empty iterable is a no-op (yields immediately)."""
+        ordered = sorted(set(names), key=lock_sort_key)
         acquired: list[asyncio.Lock] = []
         try:
             for name in ordered:

@@ -11,6 +11,33 @@ import pytest
 
 from kestrel_sdk.signals import ResourceLock
 from kestrel_sovereign.signals import OrderedLockManager
+from kestrel_sovereign.signals.lock_manager import lock_sort_key
+
+
+def test_conversation_sorts_last_in_canonical_order():
+    """Load-bearing invariant: CONVERSATION is acquired LAST regardless of
+    its alphabetical position. Phase 2's turn lifecycle relies on this —
+    the dispatcher acquires registered resources, then enters a code path
+    that acquires CONVERSATION; if CONVERSATION sorted first by enum value
+    (alphabetically before MEMORY/SCHEDULER/WALLET), the lock-order
+    invariant in the design would be violated."""
+    all_locks = list(ResourceLock)
+    ordered = sorted(all_locks, key=lock_sort_key)
+    assert ordered[-1] == ResourceLock.CONVERSATION, (
+        f"CONVERSATION must sort last; got order: "
+        f"{[l.name for l in ordered]}"
+    )
+    # Non-CONVERSATION locks lex-order on enum value among themselves.
+    others = [l for l in ordered if l != ResourceLock.CONVERSATION]
+    assert others == sorted(others, key=lambda l: l.value)
+
+
+def test_subset_with_conversation_still_orders_it_last():
+    """Even when CONVERSATION is the only lex-early item in the subset,
+    it goes last."""
+    subset = {ResourceLock.CONVERSATION, ResourceLock.MEMORY}
+    ordered = sorted(subset, key=lock_sort_key)
+    assert ordered == [ResourceLock.MEMORY, ResourceLock.CONVERSATION]
 
 
 @pytest.mark.asyncio
@@ -87,6 +114,20 @@ async def test_lex_order_invariant_no_deadlock_under_overlap():
         asyncio.gather(task_a(), task_b()), timeout=1.0
     )
     assert sorted(results) == ["A", "B"]
+
+
+@pytest.mark.asyncio
+async def test_manager_can_acquire_conversation_with_others():
+    """Smoke test that the manager accepts CONVERSATION as part of an
+    acquisition set without erroring. (The dispatcher rejects sources that
+    declare CONVERSATION; this test exercises the lower-level manager
+    directly, since Phase 2's turn lifecycle will use it that way.)"""
+    mgr = OrderedLockManager()
+    async with mgr.acquire({ResourceLock.CONVERSATION, ResourceLock.MEMORY}):
+        assert mgr.is_held(ResourceLock.MEMORY)
+        assert mgr.is_held(ResourceLock.CONVERSATION)
+    assert not mgr.is_held(ResourceLock.MEMORY)
+    assert not mgr.is_held(ResourceLock.CONVERSATION)
 
 
 @pytest.mark.asyncio
