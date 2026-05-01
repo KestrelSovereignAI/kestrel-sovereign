@@ -409,6 +409,7 @@ class OrchestratorEngineMixin:
         *,
         tool_events: Optional[list] = None,
         streaming: bool = False,
+        session_id: str = "orchestrator",
     ):
         """
         Dispatch a single tool call — used by both streaming and non-streaming loops.
@@ -455,11 +456,13 @@ class OrchestratorEngineMixin:
             result = await self._dispatch_feature_tool(
                 tool_call, feature, args, dispatch_start, dispatch_event_id,
                 user_message, tool_events=tool_events, streaming=streaming,
+                session_id=session_id,
             )
         elif tool_name in self._direct_tools:
             result = await self._dispatch_direct_tool(
                 tool_call, tool_name, args, dispatch_start, dispatch_event_id,
                 tool_events=tool_events, streaming=streaming,
+                session_id=session_id,
             )
         else:
             result = {"success": False, "error": f"Unknown feature tool: {tool_name}"}
@@ -505,7 +508,7 @@ class OrchestratorEngineMixin:
 
     async def _dispatch_feature_tool(
         self, tool_call, feature, args, dispatch_start, dispatch_event_id,
-        user_message, *, tool_events=None, streaming=False,
+        user_message, *, tool_events=None, streaming=False, session_id="orchestrator",
     ):
         """Dispatch to a feature subagent with hook enforcement."""
         tool_name = tool_call.name
@@ -513,7 +516,7 @@ class OrchestratorEngineMixin:
 
         # --- PRE_SUBAGENT_CALL hooks ---
         subagent_hook_input = HookInput(
-            session_id="orchestrator",
+            session_id=session_id,
             hook_event_name=HookEvent.PRE_SUBAGENT_CALL.value,
             tool_name=tool_name,
             tool_input=args,
@@ -560,7 +563,7 @@ class OrchestratorEngineMixin:
                 tool_name=tool_name,
                 feature_name=hook_feature_name,
                 args=args,
-                session_id="orchestrator",
+                session_id=session_id,
                 execute_fn=_exec_feature,
             )
 
@@ -573,7 +576,7 @@ class OrchestratorEngineMixin:
 
             # Fire POST_SUBAGENT_CALL hook (non-blocking, parallel)
             post_hook_input = HookInput(
-                session_id="orchestrator",
+                session_id=session_id,
                 hook_event_name=HookEvent.POST_SUBAGENT_CALL.value,
                 tool_name=tool_name,
                 tool_input=args,
@@ -593,12 +596,13 @@ class OrchestratorEngineMixin:
             return await self._handle_feature_error(
                 e, tool_name, hook_feature_name, args, dispatch_start,
                 dispatch_event_id, tool_events=tool_events, streaming=streaming,
+                session_id=session_id,
             )
         except Exception as e:
             return await self._handle_feature_error(
                 e, tool_name, hook_feature_name, args, dispatch_start,
                 dispatch_event_id, tool_events=tool_events, streaming=streaming,
-                log_traceback=True,
+                log_traceback=True, session_id=session_id,
             )
 
     async def _get_denied_tools(self, feature_name: str) -> set:
@@ -645,6 +649,7 @@ class OrchestratorEngineMixin:
     async def _handle_feature_error(
         self, error, tool_name, hook_feature_name, args, dispatch_start,
         dispatch_event_id, *, tool_events=None, streaming=False, log_traceback=False,
+        session_id="orchestrator",
     ):
         """Handle feature execution error with logging and hooks."""
         if log_traceback:
@@ -663,7 +668,7 @@ class OrchestratorEngineMixin:
 
         # Fire POST_SUBAGENT_CALL hook on failure
         post_hook_input = HookInput(
-            session_id="orchestrator",
+            session_id=session_id,
             hook_event_name=HookEvent.POST_SUBAGENT_CALL.value,
             tool_name=tool_name,
             tool_input=args,
@@ -681,7 +686,7 @@ class OrchestratorEngineMixin:
 
     async def _dispatch_direct_tool(
         self, tool_call, tool_name, args, dispatch_start, dispatch_event_id,
-        *, tool_events=None, streaming=False,
+        *, tool_events=None, streaming=False, session_id="orchestrator",
     ):
         """Dispatch a direct tool call (no subagent LLM hop)."""
         tool = self._direct_tools[tool_name]
@@ -695,7 +700,7 @@ class OrchestratorEngineMixin:
                 tool_name=tool_name,
                 feature_name=hook_feature_name,
                 args=args,
-                session_id="orchestrator",
+                session_id=session_id,
                 execute_fn=_exec_direct,
             )
 
@@ -781,6 +786,7 @@ class OrchestratorEngineMixin:
         *,
         tool_events: Optional[list] = None,
         streaming: bool = False,
+        session_id: str = "orchestrator",
     ):
         """
         Execute a batch of tool calls, using parallelism where safe.
@@ -802,6 +808,7 @@ class OrchestratorEngineMixin:
                     tc, features_by_tool_name, known_tools, messages,
                     iteration, user_message,
                     tool_events=tool_events, streaming=streaming,
+                    session_id=session_id,
                 )
             return
 
@@ -815,6 +822,7 @@ class OrchestratorEngineMixin:
                         tc, features_by_tool_name, known_tools, messages,
                         iteration, user_message,
                         tool_events=tool_events, streaming=streaming,
+                        session_id=session_id,
                     )
             else:
                 # Parallel execution of concurrency-safe direct tools
@@ -833,6 +841,7 @@ class OrchestratorEngineMixin:
                             tc, features_by_tool_name, known_tools, msg_list,
                             iteration, user_message,
                             tool_events=tool_events, streaming=streaming,
+                            session_id=session_id,
                         )
 
                 await asyncio.gather(
@@ -919,6 +928,7 @@ class OrchestratorEngineMixin:
             await self._execute_tool_batch(
                 response.tool_calls, features_by_tool_name, known_tools,
                 messages, iteration, user_message,
+                session_id=session_id,
             )
 
             # Continue conversation with tool results
@@ -1109,6 +1119,7 @@ class OrchestratorEngineMixin:
                 response.tool_calls, features_by_tool_name, known_tools,
                 messages, iteration, user_message,
                 tool_events=tool_events, streaming=True,
+                session_id=session_id,
             )
 
             all_tools = self._build_all_tools()
