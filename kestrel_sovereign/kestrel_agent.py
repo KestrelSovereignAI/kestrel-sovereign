@@ -464,6 +464,18 @@ class KestrelAgent(
                 store=signal_log_store,
             )
 
+            # Register the a2a.task_complete source so peer-task
+            # completions wake the bird via the dispatcher (Phase 5 of
+            # #889). The receiving callback in EventManagerMixin builds
+            # the Signal envelope and calls enqueue_signal; this
+            # registration provides the routing target.
+            from kestrel_sovereign.signals.sources.a2a import (
+                build_a2a_task_complete_registration,
+            )
+            self.signal_registry.register(
+                build_a2a_task_complete_registration()
+            )
+
             # Initialize storage providers for features (reflection self-model, etc.)
             self.lighthouse_provider = None
             self.storacha_provider = None
