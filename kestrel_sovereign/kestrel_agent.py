@@ -436,6 +436,34 @@ class KestrelAgent(
             # Expose observability store for orchestrator instrumentation
             self.observability_store = observability_store
 
+            # Initialize SignalDispatcher with the agent's existing
+            # OrderedLockManager (shared with the turn lifecycle so
+            # disjoint resource locks parallelize correctly) and a
+            # signal_log store backed by the agent's primary database
+            # connection. Source registrations land in the registry as
+            # features/runners initialize — heartbeat (Phase 3, this PR)
+            # is the first; scheduler/A2A/Stripe follow in Phases 4-6.
+            from kestrel_sovereign.signals import (
+                SignalDispatcher,
+                SignalLogStore,
+                SourceRegistry,
+            )
+
+            # AsyncStorage owns the underlying DatabaseBackend; reuse it
+            # so signal_log shares the agent's pool/connection rather than
+            # opening a separate one to the same db.
+            signal_log_store = SignalLogStore(self._raw_storage._backend)
+            await signal_log_store.initialize()
+
+            self.signal_registry = SourceRegistry()
+            self.signal_log_store = signal_log_store
+            self.dispatcher = SignalDispatcher(
+                agent=self,
+                registry=self.signal_registry,
+                lock_manager=self._lock_manager,
+                store=signal_log_store,
+            )
+
             # Initialize storage providers for features (reflection self-model, etc.)
             self.lighthouse_provider = None
             self.storacha_provider = None
@@ -696,9 +724,23 @@ class KestrelAgent(
                 if feature:
                     self._register_explored_feature_tools(feature)
 
-            # Initialize heartbeat system (periodic agent self-checks)
+            # Initialize heartbeat system (periodic agent self-checks).
+            # Registers the heartbeat source with the dispatcher so its
+            # ticks route through the signal pipeline (Phase 3 of #889).
             from kestrel_sovereign.heartbeat import HeartbeatConfig, HeartbeatRunner
+            from kestrel_sovereign.signals.sources.heartbeat import (
+                build_heartbeat_registration,
+            )
+
             self._heartbeat_config = HeartbeatConfig.from_config()
+            self.signal_registry.register(
+                build_heartbeat_registration(
+                    interval_seconds=self._heartbeat_config.interval_seconds,
+                    active_hours_start=self._heartbeat_config.active_hours_start,
+                    active_hours_end=self._heartbeat_config.active_hours_end,
+                    timezone_name=self._heartbeat_config.timezone,
+                )
+            )
             self.heartbeat_runner = HeartbeatRunner(self, self._heartbeat_config)
             if self._heartbeat_config.enabled:
                 await self.heartbeat_runner.start()
