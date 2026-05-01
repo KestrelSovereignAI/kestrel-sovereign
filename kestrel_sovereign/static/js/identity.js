@@ -53,7 +53,55 @@ export function setLazyLoaders(loaders) {
     loadFeatureStore = loaders.loadFeatureStore;
 }
 
+// Map data-panel values to the capability keys that gate them (#879).
+// A panel whose required caps are ALL explicitly false is removed from
+// the nav and its panel DOM is dropped — no hidden-but-present buttons.
+// A panel listed with multiple caps stays visible if ANY of them is on
+// (e.g. ``security`` is shown when either ``audit`` or ``permissions``
+// are enabled, with the disabled sub-section hidden by the panel's own
+// init guard).
+//
+// Standalone Kestrel ships with every capability defaulting to true,
+// so this map only kicks in when an embedding host opts out.
+// `storage` is a canonical capability key but the resources panel today
+// has no storage-stats section — only keys + wallet + usage live there.
+// Listing it on this panel would make a host that enables only `storage`
+// see a Resources tab whose every visible section is hidden.  When a real
+// storage section ships, add `storage` here AND wire a sub-section guard
+// into resources.js (mirroring the keys/wallet pattern).
+const PANEL_CAPABILITIES = {
+    identity: ['identity'],
+    chat: ['chat'],
+    constitution: ['constitution'],
+    memories: ['memory'],
+    tasks: ['tasks'],
+    sovereignty: ['sovereignty'],
+    resources: ['keys', 'wallet'],
+    metrics: ['metrics'],
+    spawn: ['spawn'],
+    features: ['featureStore'],
+    security: ['audit', 'permissions'],
+};
+
+function panelIsEnabled(panelId) {
+    const caps = PANEL_CAPABILITIES[panelId];
+    if (!caps || caps.length === 0) return true;
+    return caps.some((cap) => API.hasCapability(cap));
+}
+
 export function initNavigation() {
+    // Pass 1: prune nav tabs and panel DOM for any panel whose backing
+    // capability is explicitly disabled.  Done before wiring click
+    // handlers so we don't leave dangling listeners on removed nodes.
+    document.querySelectorAll('.nav-tab').forEach((tab) => {
+        const panelId = tab.dataset.panel;
+        if (!panelIsEnabled(panelId)) {
+            tab.remove();
+            const panel = document.getElementById(`panel-${panelId}`);
+            if (panel) panel.remove();
+        }
+    });
+
     document.querySelectorAll('.nav-tab').forEach(tab => {
         tab.addEventListener('click', () => {
             const panelId = tab.dataset.panel;
@@ -76,6 +124,21 @@ export function initNavigation() {
             if (panelId === 'features' && loadFeatureStore) loadFeatureStore();
         });
     });
+
+    // If the default-active "identity" tab was removed because the host
+    // opted out, promote the first surviving tab to active so the page
+    // doesn't open onto a vanished panel.
+    const active = document.querySelector('.nav-tab.active');
+    if (!active) {
+        const first = document.querySelector('.nav-tab');
+        if (first) {
+            first.classList.add('active');
+            const panelId = first.dataset.panel;
+            document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+            document.getElementById(`panel-${panelId}`)?.classList.add('active');
+            state.currentPanel = panelId;
+        }
+    }
 }
 
 // ============================================================================
@@ -83,6 +146,9 @@ export function initNavigation() {
 // ============================================================================
 
 export async function loadIdentity() {
+    // #879: deep-link defense — no /api/identity fetch when disabled.
+    // identity is the default panel so disabling it is unusual but legal.
+    if (!API.hasCapability('identity')) return;
     try {
         const identity = await API.getIdentity();
         state.identity = identity;
@@ -359,6 +425,10 @@ function _wireProfileEditor(identity) {
 // ============================================================================
 
 export async function loadPrivacyMode() {
+    // #879: deep-link defense — no /api/agent/privacy-mode fetch when disabled.
+    // Hosts that don't expose privacy controls (the chip in the chat header)
+    // typically opt out so the indicator doesn't render with a stale value.
+    if (!API.hasCapability('privacy')) return;
     try {
         const data = await API.getPrivacyMode();
         state.privacyMode = data.privacy_mode;
@@ -578,6 +648,14 @@ function renderDemoModeBanner({ serverDemoMode, agents, isStandalone }) {
 }
 
 export async function loadAgents() {
+    // #879: hosts that aren't a rookery (e.g. Frinz) don't have an
+    // /api/agents endpoint — skip the fetch entirely and hide the agents
+    // pane so the user doesn't see a "Failed to load agents" card.
+    if (!API.hasCapability('rookery')) {
+        const pane = document.getElementById('agents-pane');
+        if (pane) pane.style.display = 'none';
+        return;
+    }
     try {
         const data = await API.getAgents();
         const agents = data.agents || [];
@@ -648,7 +726,11 @@ export async function loadAgents() {
         // Standalone has exactly one agent, so just show the pane and let
         // loadConversations() populate the list against the un-prefixed routes.
         // Skip in misconfig — the agent list is not safe to auto-target.
-        if (isStandalone && agents.length > 0 && !hasLiveAgent) {
+        if (isStandalone && agents.length > 0 && !hasLiveAgent && API.hasCapability('conversations')) {
+            // #879: don't reveal the conversations pane (or fire its fetch)
+            // when the host opted out — its own loadConversations() guard
+            // would hide the pane after we re-show it, but the show/hide
+            // race produces a one-frame flicker we can avoid by gating here.
             const conversationsPane = document.getElementById('conversations-pane');
             if (conversationsPane) conversationsPane.style.display = 'flex';
             try { await loadConversations(agents[0].name); } catch (_) { /* best-effort */ }
@@ -701,11 +783,16 @@ window.selectAgent = async function(agentName) {
     state.storage = null;
     state.wallet = null;
 
-    // Reconnect SSE notifications to the new agent
+    // Reconnect SSE notifications to the new agent.  #879: every
+    // chat-adjacent helper here (connectNotifications, loadModels,
+    // loadCommands, updateContextStatus) self-guards on the chat
+    // capability, so when a host disables chat these become no-ops and
+    // the chat-only endpoints (/api/agent/notifications/sse, /api/models,
+    // /api/commands, context-status) are never hit on agent select.
     disconnectNotifications();
     connectNotifications();
 
-    // Reload all agent-specific data in parallel
+    // Reload all agent-specific data in parallel.
     await Promise.all([
         loadIdentity(),
         loadPrivacyMode(),
@@ -759,6 +846,14 @@ export function _pickMostRecentConversation(conversations) {
 }
 
 export async function loadConversations(_agentName) {
+    // #879: deep-link defense — hosts with their own chat surface (e.g. Frinz)
+    // typically disable the conversations sidebar entirely.  Hide the pane and
+    // skip the /api/conversations fetch.
+    if (!API.hasCapability('conversations')) {
+        const pane = document.getElementById('conversations-pane');
+        if (pane) pane.style.display = 'none';
+        return;
+    }
     // Agent routing is handled by API.setHostAgent() — all calls auto-prefix
     try {
         const data = await API.getConversations();

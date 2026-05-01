@@ -15,6 +15,35 @@
 
 const HOST_LEVEL_AGENTS_RE = /^\/api\/agents\/[^/]+\/(start|stop|status|logs)/;
 
+// Canonical list of UI capabilities a host can opt out of (#879).  Embedded
+// hosts populate ``KESTREL_UI_CONFIG.capabilities`` with a subset of these
+// keys set to ``false`` (or to a nested object for partial support); missing
+// keys default to ``true`` so standalone Kestrel renders unchanged.  This is
+// the single source of truth — when a new panel ships, add its key here and
+// have the panel guard its init() with ``API.hasCapability(key)``.
+//
+// Object-shaped values are supported via dot-paths (e.g. ``keys.agent``):
+// any sub-key absent from the host config is treated as ``true``.
+export const CAPABILITY_KEYS = Object.freeze({
+    chat: true,
+    identity: true,
+    constitution: true,
+    privacy: true,
+    memory: true,
+    tasks: true,
+    sovereignty: true,
+    storage: true,
+    wallet: true,
+    conversations: true,
+    keys: true,           // object: { agent, user, platform }
+    audit: true,
+    permissions: true,
+    rookery: true,        // host-level: "Other agents" sidebar (/api/agents)
+    spawn: true,
+    featureStore: true,
+    metrics: true,
+});
+
 function getRequiredDependency(name, value) {
     if (!value) {
         throw new Error(`API client requires ${name}`);
@@ -190,6 +219,34 @@ export function createBearerTokenAuthProvider({
     };
 }
 
+// Resolve a dot-path against the host-supplied capabilities map.  Returns
+// ``true`` when the key is absent (default-on), ``false`` when explicitly
+// disabled at any segment.  Boolean leaves win immediately; object leaves
+// recurse on the next segment.  Exported for unit tests.
+export function resolveCapability(capabilities, path) {
+    if (!path) return true;
+    const segments = String(path).split('.');
+    let cursor = capabilities;
+    for (const seg of segments) {
+        if (cursor === null || cursor === undefined) return true;
+        if (typeof cursor === 'boolean') return cursor;
+        if (typeof cursor !== 'object') return true;
+        if (!(seg in cursor)) return true;
+        cursor = cursor[seg];
+    }
+    if (cursor === null || cursor === undefined) return true;
+    if (typeof cursor === 'boolean') return cursor;
+    // Object leaf with no matching path segment — feature is enabled overall;
+    // its subkeys gate sub-sections.  Treat the parent as enabled.
+    if (typeof cursor === 'object') {
+        // If every sub-key is explicitly false, the parent is effectively off.
+        const values = Object.values(cursor);
+        if (values.length > 0 && values.every((v) => v === false)) return false;
+        return true;
+    }
+    return true;
+}
+
 export function createApiClient({
     fetchFn = globalThis.fetch,
     sessionStorage = globalThis.sessionStorage,
@@ -198,6 +255,7 @@ export function createApiClient({
     AbortControllerCtor = globalThis.AbortController,
     TextDecoderCtor = globalThis.TextDecoder,
     authProvider = null,
+    capabilities = null,
 } = {}) {
     const fetchImpl = getRequiredDependency('fetch', fetchFn);
     const sessionStore = getRequiredDependency('sessionStorage', sessionStorage);
@@ -212,6 +270,12 @@ export function createApiClient({
         location: locationRef,
         logger: log,
     });
+
+    // Capabilities map (#879).  ``null`` and ``{}`` both mean "host did not
+    // opt out of anything"; missing keys default to ``true``.  Stored as a
+    // plain object so callers can read it via ``client.getCapabilities()``
+    // for diagnostics, but the resolver is the only sanctioned read path.
+    const capsMap = capabilities && typeof capabilities === 'object' ? capabilities : {};
 
     const state = {
         selectedHostAgent: null,
@@ -491,6 +555,17 @@ export function createApiClient({
         },
         _getState() {
             return { ...state };
+        },
+        // #879: capability gating.  Hosts supply ``capabilities`` on
+        // ``KESTREL_UI_CONFIG`` to opt out of panels that don't apply in
+        // their embed.  Default is "everything on" so standalone Kestrel and
+        // pre-#879 hosts behave exactly as before.  Pass dot-paths for
+        // nested checks (e.g. ``hasCapability('keys.agent')``).
+        hasCapability(path) {
+            return resolveCapability(capsMap, path);
+        },
+        getCapabilities() {
+            return capsMap;
         },
     };
 

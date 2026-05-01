@@ -27,6 +27,8 @@ let activeView = 'tasks';
 // ============================================================================
 
 export function initTasks() {
+    // #879: skip wiring when the host disabled the tasks panel.
+    if (!API.hasCapability('tasks')) return;
     taskList = document.getElementById('task-list');
     taskFilter = document.getElementById('task-filter');
     refreshBtn = document.getElementById('btn-refresh-tasks');
@@ -148,6 +150,8 @@ function stopAutoRefresh() {
 let expandedTaskIds = new Set();
 
 export async function loadTasks() {
+    // #879: deep-link defense — no /api/agent/tasks fetches when disabled.
+    if (!API.hasCapability('tasks')) return;
     if (!taskList) return;
 
     const statusFilter = taskFilter?.value || '';

@@ -67,8 +67,25 @@ async def agent(temp_db):
     )
     await a.initialize()
 
-    from tests.integration.conftest import complete_bootstrap
+    from tests.integration.conftest import complete_bootstrap, grant_permissions
     await complete_bootstrap(a)
+
+    # The orchestrator-loop tests in TestExploreThenDirectFlow
+    # exercise the SecurityHook chain: the LLM mock dispatches
+    # ``model_agent`` as a subagent (PRE_SUBAGENT_CALL) and then
+    # ``list_models`` as a direct tool (PRE_TOOL_USE through
+    # _dispatch_direct_tool, which keys by lowercase feature
+    # tool_name).  Grant ALLOW for exactly those pairs — anything
+    # else stays at the default ASK so an unexpected dispatch hangs
+    # and surfaces the regression.  See conftest.grant_permissions
+    # for the full background (#879).
+    await grant_permissions(
+        a,
+        ("ModelAgent", "model_agent"),    # subagent dispatch
+        ("ModelAgent", "list_models"),    # direct feature tool
+        ("model_agent", "list_models"),   # direct-tool path via _tool_to_feature
+        reason="dynamic-tool-loading-e2e",
+    )
 
     yield a
 
