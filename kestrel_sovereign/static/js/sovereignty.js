@@ -33,6 +33,8 @@ function showError(elementId, message) {
 // ============================================================================
 
 export async function loadExports() {
+    // #879: deep-link defense — no /api/sovereignty fetch when disabled.
+    if (!API.hasCapability('sovereignty')) return;
     showLoading('export-list');
     try {
         const data = await API.getSovereigntyExports();

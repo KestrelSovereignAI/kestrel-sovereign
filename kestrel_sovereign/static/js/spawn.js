@@ -19,6 +19,10 @@ let budgetChart = null;
 // ============================================================================
 
 export function initSpawn() {
+    // #879: short-circuit when the host has no spawn surface.  Skipping
+    // setupAutoRefresh() also avoids attaching a MutationObserver to a
+    // panel that initNavigation() may have removed.
+    if (!API.hasCapability('spawn')) return;
     refreshBtn = document.getElementById('btn-refresh-spawn');
     refreshSelect = document.getElementById('spawn-refresh-interval');
 
@@ -88,6 +92,10 @@ function stopAutoRefresh() {
 // ============================================================================
 
 export async function loadSpawn() {
+    // #879: deep-link defense — never fetch /api/spawn/children for a host
+    // that opted out of the spawn capability, even if the panel switcher
+    // somehow points at this loader.
+    if (!API.hasCapability('spawn')) return;
     try {
         const data = await API.request('/api/spawn/children');
         renderChildren(data.children || []);

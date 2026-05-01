@@ -89,7 +89,12 @@ async function init() {
     // all agent-specific data (identity, privacy, models, SSE, context).
     await loadAgents();
 
-    // In standalone mode (no rookery agent selected), load data directly
+    // In standalone mode (no rookery agent selected), load data directly.
+    // #879: each loader self-guards against its capability being disabled
+    // (chat → connectNotifications/loadModels/updateContextStatus/
+    // loadCommands; identity, privacy → their own caps), so we fan them
+    // out unconditionally and the no-ops keep this block stable as new
+    // caps land.
     if (!API.isRookeryMode()) {
         connectNotifications();
         await Promise.all([
