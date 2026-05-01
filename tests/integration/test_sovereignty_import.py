@@ -139,6 +139,17 @@ async def test_agent_command_import(temp_db, llm_service, skip_bootstrap):
     # Skip bootstrap to test commands directly
     await skip_bootstrap(agent)
 
+    # ``!export-sovereignty local`` and ``!import-sovereignty <cid>``
+    # both route through the orchestrator's PRE_TOOL_USE chain.
+    # Grant ALLOW for both pairs.  See conftest.grant_permissions (#879).
+    from tests.integration.conftest import grant_permissions
+    await grant_permissions(
+        agent,
+        ("SovereigntyFeature", "export_sovereignty"),
+        ("SovereigntyFeature", "import_sovereignty"),
+        reason="sovereignty-import agent-command",
+    )
+
     # Use unique marker to avoid collision with any system messages
     unique_marker = f"SOVEREIGNTY_TEST_{uuid.uuid4().hex[:8]}"
 

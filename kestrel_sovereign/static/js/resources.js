@@ -15,16 +15,54 @@ let byokUnlocked = false;
 
 /**
  * Load all resources data
+ *
+ * #879: each sub-section is gated by its own capability so an embedded host
+ * can keep, say, the wallet visible while opting out of agent-scoped keys.
+ * Sections whose cap is false are also hidden from the DOM so the user
+ * doesn't see misleading empty cards. Headings live in static HTML and don't
+ * carry a capability key, so we tag them by sibling-of the *-list container.
  */
 async function loadResources() {
-    await Promise.all([
-        refreshAgentKeys(),
-        refreshUserKeys(),
-        refreshPlatformAccess(),
-        refreshWallet(),
-        loadUsage(),
-        updateActiveKeySource()
-    ]);
+    _hideDisabledResourceSections();
+
+    const tasks = [];
+    if (API.hasCapability('keys.agent')) tasks.push(refreshAgentKeys());
+    if (API.hasCapability('keys.user')) tasks.push(refreshUserKeys());
+    if (API.hasCapability('keys.platform')) tasks.push(refreshPlatformAccess());
+    if (API.hasCapability('wallet')) tasks.push(refreshWallet());
+    if (API.hasCapability('keys')) {
+        // Usage and active-key indicator only make sense when at least one
+        // key tier is enabled.
+        tasks.push(loadUsage());
+        tasks.push(updateActiveKeySource());
+    }
+    await Promise.all(tasks);
+}
+
+// Hide the static section wrappers for sub-sections the host opted out of.
+// Idempotent — reads the capability map on every call so the resources
+// panel is safe to reload.
+function _hideDisabledResourceSections() {
+    const checks = [
+        { cap: 'keys.agent', listId: 'agent-keys-list' },
+        { cap: 'keys.user', listId: 'user-keys-list' },
+        { cap: 'keys.platform', listId: 'platform-access-list' },
+        { cap: 'wallet', listId: 'wallet-details' },
+        { cap: 'keys', listId: 'usage-details' },
+        { cap: 'keys', listId: 'active-key-source' },
+    ];
+    for (const { cap, listId } of checks) {
+        const el = document.getElementById(listId);
+        if (!el) continue;
+        // Walk up to the section wrapper (the immediate child of panel-content
+        // for the keys/wallet/usage sections; active-key-source is itself the
+        // wrapper).  Falls back to the element itself when the parent isn't a
+        // distinct wrapper.
+        const wrapper = el.id === 'active-key-source'
+            ? el
+            : el.closest('div[style*="margin-bottom"]') || el.parentElement || el;
+        wrapper.style.display = API.hasCapability(cap) ? '' : 'none';
+    }
 }
 
 /**

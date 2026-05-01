@@ -78,6 +78,12 @@ export function wipeChatPane(html = '') {
 // ============================================================================
 
 export function initChat() {
+    // #879: skip wiring when the host has its own chat surface.  The chat
+    // panel's DOM was removed by initNavigation(); attaching listeners now
+    // would just no-op against missing nodes, but the explicit gate makes
+    // the intent legible and keeps SharedModelSelector / autocomplete from
+    // initializing in a host that doesn't render any of it.
+    if (!API.hasCapability('chat')) return;
     chatContainer = document.getElementById('chat-container');
     messageInput = document.getElementById('message-input');
     sendButton = document.getElementById('send-button');
@@ -140,6 +146,17 @@ export function subscribeSSE(eventType, handler) {
  * Automatically reconnects on disconnect with exponential backoff.
  */
 export function connectNotifications() {
+    // #879: the SSE notification stream is multiplexed — chat consumes
+    // task/streaming events for the thinking indicator, Security.init()
+    // consumes approval_request / approval_withdrawn for the modal queue
+    // (#748).  A host that disables chat but keeps permissions/approval
+    // prompts on still needs the stream open, otherwise the approval
+    // modal never fires.  Open the connection if EITHER consumer is
+    // active; only skip when none of them are.
+    const needed = API.hasCapability('chat')
+        || API.hasCapability('permissions')
+        || API.hasCapability('audit');
+    if (!needed) return;
     if (notificationEventSource) {
         notificationEventSource.close();
     }
@@ -457,6 +474,10 @@ let contextStatusElement = null;
  * aggregate, which made no sense.
  */
 export async function updateContextStatus() {
+    // #879: context-status footer is part of the chat surface.  No-op when
+    // the host opted out so /api/agent/context-status isn't called on every
+    // conversation change.
+    if (!API.hasCapability('chat')) return;
     try {
         if (!contextStatusElement) {
             createContextStatusElement();
@@ -685,6 +706,8 @@ export async function addMessage(role, content) {
  * Initialize the shared model selector component
  */
 export async function loadModels() {
+    // #879: model selector lives in the chat header — skip when chat is off.
+    if (!API.hasCapability('chat')) return;
     // Check if SharedModelSelector is available (loaded via script tag)
     if (!window.SharedModelSelector) {
         console.error('SharedModelSelector not loaded. Include /shared/model-selector/index.js');

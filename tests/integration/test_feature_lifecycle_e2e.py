@@ -530,6 +530,23 @@ class TestAgentLevelLifecycle:
         )
         await agent.initialize()
 
+        # test_full_agent_lifecycle fires
+        # ``HookInput(tool_name="test_tool")`` with no explicit
+        # feature_name.  SecurityHook resolves the (None, "test_tool")
+        # pair to ("unknown", "test_tool") and consults the
+        # permission store.  The test isn't *about* security — it
+        # verifies hook register/disable/re-enable lifecycle — so
+        # we declare this pair as ALLOW up-front to keep the test's
+        # hook chain non-blocking.  Anything else fired in this test
+        # stays at default ASK and would surface as a hang.  See
+        # conftest.grant_permissions for the full background (#879).
+        from tests.integration.conftest import grant_permissions
+        await grant_permissions(
+            agent,
+            ("unknown", "test_tool"),
+            reason="feature-lifecycle-e2e synthetic hook input",
+        )
+
         feature = LifecycleTestFeature(agent)
 
         yield agent, feature

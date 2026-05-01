@@ -58,6 +58,11 @@ export let AGENT_COMMANDS = [
  */
 export async function loadCommands(apiModule) {
     if (!apiModule) return;
+    // #879: slash-commands hydrate the chat input autocomplete — when the
+    // host has its own chat surface, no /api/commands fetch.
+    if (typeof apiModule.hasCapability === 'function' && !apiModule.hasCapability('chat')) {
+        return;
+    }
     try {
         const data = await apiModule.request('/api/commands');
         if (data.commands && data.commands.length > 0) {

@@ -85,6 +85,20 @@ async def kestrel_agent(llm_service, temp_db):
         from kestrel_sovereign.bootstrap import BootstrapState
         await agent.bootstrap_service.set_bootstrap_state(BootstrapState.COMPLETE)
 
+    # test_kestrel_agent_command_execution dispatches
+    # ``!model-list`` which routes to ModelAgent.list_models
+    # through the orchestrator, firing the SecurityHook
+    # PRE_TOOL_USE chain.  Grant ALLOW for that single pair — every
+    # other tool stays at default ASK so an unexpected dispatch
+    # hangs and surfaces the regression.  See
+    # conftest.grant_permissions for the full background (#879).
+    from tests.integration.conftest import grant_permissions
+    await grant_permissions(
+        agent,
+        ("ModelAgent", "list_models"),
+        reason="agent-tools-e2e",
+    )
+
     yield agent
 
     # Async cleanup for MCP and other resources

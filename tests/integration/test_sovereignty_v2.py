@@ -113,6 +113,18 @@ async def test_agent_export_command(temp_db, skip_bootstrap):
     # Skip bootstrap to test commands directly
     await skip_bootstrap(agent)
 
+    # ``!export-sovereignty`` routes through the orchestrator,
+    # firing PRE_TOOL_USE for ``("SovereigntyFeature",
+    # "export_sovereignty")``.  Grant ALLOW so the SecurityHook
+    # short-circuits on the permission check instead of queueing
+    # for human approval.  See conftest.grant_permissions (#879).
+    from tests.integration.conftest import grant_permissions
+    await grant_permissions(
+        agent,
+        ("SovereigntyFeature", "export_sovereignty"),
+        reason="sovereignty-v2 agent-export-command",
+    )
+
     try:
         # Add some test data first
         await agent.storage._storage.add_conversation("user", "Test message", metadata={"timestamp": "2025-11-21T10:00:00Z"})
