@@ -21,6 +21,8 @@ let distributionChart = null;
 // ============================================================================
 
 export function initMetrics() {
+    // #879: skip wiring entirely when the host disabled the metrics panel.
+    if (!API.hasCapability('metrics')) return;
     refreshBtn = document.getElementById('btn-refresh-metrics');
     refreshSelect = document.getElementById('metrics-refresh-interval');
 
@@ -90,6 +92,9 @@ function stopAutoRefresh() {
 // ============================================================================
 
 export async function loadMetrics() {
+    // #879: deep-link defense — no /api/observability fetches when the host
+    // opted out of the metrics surface.
+    if (!API.hasCapability('metrics')) return;
     try {
         const [summary, eventsResp] = await Promise.all([
             API.request('/api/observability/summary?minutes=60'),

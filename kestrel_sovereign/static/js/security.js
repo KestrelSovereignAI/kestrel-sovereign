@@ -31,13 +31,25 @@ export const Security = {
     async init() {
         if (this._initialized) return;
 
+        // #879: short-circuit when the host opted out of *both* security
+        // sub-surfaces.  Approval-request modals are still useful even when
+        // the audit/permissions panels are hidden (an embedded host might
+        // want approval prompts for tool calls without surfacing a full
+        // security panel), so the SSE handler is wired regardless.
+        const auditOn = API.hasCapability('audit');
+        const permsOn = API.hasCapability('permissions');
+
         // Set up SSE handler for approval requests
         this._setupSSEHandler();
 
-        // Load initial data when Security panel is opened
-        const securityTab = document.querySelector('[data-panel="security"]');
-        if (securityTab) {
-            securityTab.addEventListener('click', () => this.loadSecurityPanel());
+        // Load initial data when Security panel is opened.  Skip the click
+        // wiring entirely when both sub-caps are off — the panel itself was
+        // removed by initNavigation() so the tab doesn't exist.
+        if (auditOn || permsOn) {
+            const securityTab = document.querySelector('[data-panel="security"]');
+            if (securityTab) {
+                securityTab.addEventListener('click', () => this.loadSecurityPanel());
+            }
         }
 
         this._initialized = true;
@@ -290,14 +302,23 @@ export const Security = {
     // === Permission Tree UI ===
 
     async loadSecurityPanel() {
-        await Promise.all([
-            this.loadPermissionTree(),
-            this.loadPendingApprovals(),
-            this.loadAuditLog()
-        ]);
+        // #879: only fan out fetches for the sub-sections the host enabled.
+        // Pending approvals are tied to permissions tree (the queue is the
+        // gating UI for permission grants), so they ride along with it.
+        const tasks = [];
+        if (API.hasCapability('permissions')) {
+            tasks.push(this.loadPermissionTree());
+            tasks.push(this.loadPendingApprovals());
+        }
+        if (API.hasCapability('audit')) {
+            tasks.push(this.loadAuditLog());
+        }
+        await Promise.all(tasks);
     },
 
     async loadPermissionTree() {
+        // #879: deep-link defense — no /api/security fetch when disabled.
+        if (!API.hasCapability('permissions')) return;
         try {
             const response = await API.request('/api/security/permissions/tree');
             this.permissionTree = response.tree || [];
@@ -568,6 +589,8 @@ export const Security = {
     // === Audit Log UI ===
 
     async loadAuditLog() {
+        // #879: deep-link defense — no /api/security/audit fetch when disabled.
+        if (!API.hasCapability('audit')) return;
         const container = document.getElementById('security-audit-log');
         if (!container) return;
 

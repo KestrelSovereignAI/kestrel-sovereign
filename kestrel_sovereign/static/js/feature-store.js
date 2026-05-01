@@ -34,6 +34,10 @@ let searchQuery = '';
 // ============================================================================
 
 export function initFeatureStore() {
+    // #879: short-circuit when the host opts out of the feature store.
+    // Without this guard, the click handlers and search input would still
+    // be wired against panel DOM that initNavigation() may have removed.
+    if (!API.hasCapability('featureStore')) return;
     const filterBtns = document.querySelectorAll('#feature-store-filters .feature-filter-btn');
     filterBtns.forEach(btn => {
         btn.addEventListener('click', () => {
@@ -58,6 +62,10 @@ export function initFeatureStore() {
 // ============================================================================
 
 export async function loadFeatureStore() {
+    // #879: deep-link defense — even if app.js skipped initFeatureStore(),
+    // a direct loadFeatureStore() call from a deep-link panel switcher must
+    // not fire the /api/features fetch when the host disabled the feature.
+    if (!API.hasCapability('featureStore')) return;
     const container = document.getElementById('feature-grid');
     if (!container) return;
 

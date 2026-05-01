@@ -25,6 +25,8 @@ function showError(elementId, message) {
 // ============================================================================
 
 export async function loadConstitution() {
+    // #879: deep-link defense — no /api/constitution fetch when disabled.
+    if (!API.hasCapability('constitution')) return;
     showLoading('constitution-content');
     try {
         const data = await API.getConstitution();
@@ -49,6 +51,8 @@ export async function loadConstitution() {
 // ============================================================================
 
 export async function loadMemories(nodeType = null) {
+    // #879: deep-link defense — no /api/memories fetch when disabled.
+    if (!API.hasCapability('memory')) return;
     showLoading('memory-list');
     try {
         const data = await API.getMemories(nodeType);

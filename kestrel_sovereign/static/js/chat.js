@@ -78,6 +78,12 @@ export function wipeChatPane(html = '') {
 // ============================================================================
 
 export function initChat() {
+    // #879: skip wiring when the host has its own chat surface.  The chat
+    // panel's DOM was removed by initNavigation(); attaching listeners now
+    // would just no-op against missing nodes, but the explicit gate makes
+    // the intent legible and keeps SharedModelSelector / autocomplete from
+    // initializing in a host that doesn't render any of it.
+    if (!API.hasCapability('chat')) return;
     chatContainer = document.getElementById('chat-container');
     messageInput = document.getElementById('message-input');
     sendButton = document.getElementById('send-button');
