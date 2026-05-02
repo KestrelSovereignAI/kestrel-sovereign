@@ -5,7 +5,7 @@
 
 import API from './api.js';
 import { state, PRIVACY_MODES, Toast, loadCommands } from './ui.js';
-import { disconnectNotifications, connectNotifications, loadModels, updateContextStatus, updateThinkingIndicator, wipeChatPane } from './chat.js';
+import { disconnectNotifications, connectNotifications, loadModels, updateContextStatus, updateThinkingIndicator, mountChatPane, wipeAgentChatPane, refreshAgentThinkingDot, stopAgent } from './chat.js';
 import { generateIdenticon } from './identicon.js';
 import { trashGroupKey, groupTrashBySession } from './trash_grouping.js';
 
@@ -680,8 +680,9 @@ export async function loadAgents() {
         container.innerHTML = '';
         for (const agent of agents) {
             const isOnline = agent.status !== 'offline';
+            const isThinking = state.waitingAgents.has(agent.name);
             const item = document.createElement('div');
-            item.className = `agent-item${selectedAgentName === agent.name ? ' selected' : ''}${!isOnline ? ' offline' : ''}`;
+            item.className = `agent-item${selectedAgentName === agent.name ? ' selected' : ''}${!isOnline ? ' offline' : ''}${isThinking ? ' agent-thinking' : ''}`;
             item.dataset.agentName = agent.name;
 
             // Only enable rookery agent selection in non-standalone mode
@@ -689,13 +690,29 @@ export async function loadAgents() {
                 item.addEventListener('click', () => window.selectAgent(agent.name));
             }
 
+            // Per-agent thinking pulse + stop control. Pulse is driven
+            // by `state.waitingAgents` (the same Set sendMessage adds
+            // to on dispatch and removes from in finally). The stop
+            // button is rendered always but only visible while
+            // `.agent-thinking` is on (CSS gate); a click reaches the
+            // exact agent's /stop endpoint via stopAgent().
             item.innerHTML = `
                 <span class="agent-status-dot ${isOnline ? 'online' : 'offline'}"></span>
+                <span class="agent-thinking-dot" title="${escapeHtml(agent.name || 'Agent')} is thinking"></span>
                 <div class="agent-info">
                     <div class="agent-name">${escapeHtml(agent.name || 'Unnamed Agent')}</div>
                     <div class="agent-description">${escapeHtml(agent.description || 'No description')}</div>
                 </div>
+                <button class="agent-stop-btn" title="Stop ${escapeHtml(agent.name || 'agent')}" aria-label="Stop ${escapeHtml(agent.name || 'agent')}">&times;</button>
             `;
+
+            const stopBtn = item.querySelector('.agent-stop-btn');
+            if (stopBtn) {
+                stopBtn.addEventListener('click', (e) => {
+                    e.stopPropagation();  // don't also fire selectAgent
+                    stopAgent(agent.name);
+                });
+            }
             container.appendChild(item);
         }
 
@@ -747,12 +764,13 @@ window.selectAgent = async function(agentName) {
     // Set host agent routing in API layer
     API.setHostAgent(agentName);
 
-    // Wipe the chat pane via the shared helper. wipeChatPane() bumps the
-    // UI generation BEFORE the DOM mutation so any in-flight stream that
-    // captured the prior generation at dispatch time gates out
-    // immediately — covers the A→B→A case where agent equality is
-    // restored after two switches but the pane was wiped twice.
-    wipeChatPane();
+    // Mount the new agent's chat pane. Streams already in flight
+    // against the previous agent's pane keep painting into that
+    // (now-detached) pane — when the user switches back, their work
+    // is preserved exactly where they left it. Agent switch does NOT
+    // bump any generation; only within-agent context changes
+    // (clear/new chat, conversation switch, delete) do.
+    mountChatPane(agentName);
 
     // Refresh the chat-input "Thinking…" indicator + send/input disabled
     // state from the new agent's waiting status. If the previous agent
@@ -774,8 +792,10 @@ window.selectAgent = async function(agentName) {
     const conversationsPane = document.getElementById('conversations-pane');
     conversationsPane.style.display = 'flex';
 
-    // Reset session and cached panel data so they reload from the new agent
-    state.currentSessionId = null;
+    // Reset cached panel data so they reload for the new agent. Note
+    // that `state.currentSessionId` is per-pane now (its getter reads
+    // from the mounted agent's pane) — explicitly NOT nulling it so
+    // each agent keeps its own session across switches.
     state.identity = null;
     state.constitution = null;
     state.memories = null;
@@ -1041,11 +1061,17 @@ window.loadConversation = async function(sessionId) {
         const data = await API.getConversation(sessionId);
         const messages = data.messages || [];
 
-        // wipeChatPane() bumps the UI generation so any stream still
-        // running against the previous conversation gates out before
-        // its chunks land in the freshly-loaded view.
-        wipeChatPane();
-        const chatContainer = document.getElementById('chat-container');
+        // Wipe ONLY the visible agent's pane and bump that agent's
+        // pane-local generation. A stream still running against the
+        // previous conversation on this agent gates out before its
+        // chunks can paint the freshly-loaded view; other agents'
+        // streams are untouched.
+        const currentAgent = API.getHostAgent();
+        wipeAgentChatPane(currentAgent);
+        state.currentSessionId = sessionId;
+        // Append messages directly into this agent's pane element.
+        const pane = state.chatPanes.get(currentAgent);
+        const chatContainer = pane ? pane.element : document.getElementById('chat-container');
 
         const renderMd = window.SharedMarkdown?.renderMarkdown;
 
@@ -1088,7 +1114,16 @@ window.loadConversation = async function(sessionId) {
             chatContainer.appendChild(messageDiv);
         }
 
-        chatContainer.scrollTop = chatContainer.scrollHeight;
+        // Sync scroll on the live viewport (#chat-container is the
+        // overflow:auto element; the pane is its child). Only sync if
+        // this is the visible agent's pane — detached panes get scroll
+        // restored on remount.
+        const viewport = document.getElementById('chat-container');
+        if (viewport && pane && pane.element.parentNode === viewport) {
+            viewport.scrollTop = viewport.scrollHeight;
+        } else if (pane) {
+            pane.scrollPos = Number.MAX_SAFE_INTEGER;  // snap to bottom on mount
+        }
 
         // Switch to chat panel
         document.querySelector('[data-panel="chat"]')?.click();
@@ -1128,11 +1163,14 @@ window.deleteConversation = async function(sessionId, rowEl) {
         // vanished session.  The auto-load behavior in #714 kicks in on
         // the next agent-select; for now the pane stays empty.
         if (state.currentSessionId === sessionId) {
-            state.currentSessionId = null;
             activeConversationId = null;
-            // Bump-and-wipe in one shot — any in-flight stream against
-            // the now-deleted session gates out before painting.
-            wipeChatPane();
+            // Wipe ONLY the visible agent's pane and bump that agent's
+            // pane-local generation. Streams in flight on OTHER agents
+            // are unaffected. Setting currentSessionId via the getter
+            // resolves to the visible agent's pane, so this is the
+            // right scope.
+            wipeAgentChatPane(API.getHostAgent());
+            state.currentSessionId = null;
             if (typeof updateContextStatus === 'function') {
                 updateContextStatus();
             }
@@ -1174,11 +1212,12 @@ window.purgeConversation = async function(sessionId, rowEl) {
         }
 
         if (state.currentSessionId === sessionId) {
-            state.currentSessionId = null;
             activeConversationId = null;
-            // Bump-and-wipe — any in-flight stream against the
-            // now-purged session gates out before painting.
-            wipeChatPane();
+            // Wipe ONLY the visible agent's pane and bump that agent's
+            // pane-local generation. In-flight streams on other agents
+            // are unaffected.
+            wipeAgentChatPane(API.getHostAgent());
+            state.currentSessionId = null;
             if (typeof updateContextStatus === 'function') {
                 updateContextStatus();
             }

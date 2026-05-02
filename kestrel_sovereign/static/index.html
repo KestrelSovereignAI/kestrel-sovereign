@@ -304,6 +304,71 @@
             color: rgba(255, 255, 255, 0.8);
         }
 
+        /* Per-agent activity indicator. Hidden by default; the row's
+           `.agent-thinking` class (toggled by refreshAgentThinkingDot
+           based on state.waitingAgents) gates its visibility. Lets a
+           user know Agent A is still thinking while they're chatting
+           with Agent B. */
+        .agent-thinking-dot {
+            display: none;
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: #f59e0b;  /* amber */
+            box-shadow: 0 0 0 0 rgba(245, 158, 11, 0.6);
+            flex-shrink: 0;
+            animation: agentThinkingPulse 1.4s ease-in-out infinite;
+        }
+        .agent-item.agent-thinking .agent-thinking-dot {
+            display: inline-block;
+        }
+        @keyframes agentThinkingPulse {
+            0%, 100% { box-shadow: 0 0 0 0 rgba(245, 158, 11, 0.65); opacity: 1; }
+            50%      { box-shadow: 0 0 0 6px rgba(245, 158, 11, 0);   opacity: 0.55; }
+        }
+
+        /* Per-agent stop control: hidden until the agent is actually
+           thinking. Clicking aborts that agent's stream client-side
+           and tells THAT agent's backend to stop (api_client.stop
+           takes the agent name explicitly). */
+        .agent-stop-btn {
+            display: none;
+            background: transparent;
+            border: 1px solid var(--border-color);
+            color: var(--text-secondary);
+            border-radius: 6px;
+            font-size: 1rem;
+            line-height: 1;
+            padding: 0.125rem 0.45rem;
+            cursor: pointer;
+            transition: background-color 0.15s, color 0.15s, border-color 0.15s;
+            flex-shrink: 0;
+        }
+        .agent-stop-btn:hover {
+            background: var(--error, #dc2626);
+            color: white;
+            border-color: var(--error, #dc2626);
+        }
+        .agent-item.agent-thinking .agent-stop-btn {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .agent-item.selected .agent-stop-btn {
+            border-color: rgba(255, 255, 255, 0.4);
+            color: rgba(255, 255, 255, 0.85);
+        }
+
+        /* Per-agent chat pane element. Each agent owns one of these
+           detached fragments; mountChatPane() attaches the visible
+           agent's pane as the sole child of #chat-container (the scroll
+           viewport). The pane is just a passthrough container — actual
+           overflow is on #chat-container so scroll position is shared
+           machinery, not per-pane. */
+        .chat-container-pane {
+            display: contents;
+        }
+
         /* Conversation items in Conversations pane */
         .conversation-item {
             padding: 0.75rem;
