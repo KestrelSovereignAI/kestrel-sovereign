@@ -41,6 +41,7 @@ from kestrel_sdk.signals import (
     SourceRegistration,
     Status,
     Urgency,
+    Visibility,
 )
 from kestrel_sovereign.signals.lock_manager import OrderedLockManager
 from kestrel_sovereign.signals.registry import RegistrationError, SourceRegistry
@@ -587,6 +588,55 @@ class SignalDispatcher:
             logger.exception(
                 "Failed to write signal_log entry for %s", signal.id
             )
+
+        # Phase 7 of #889: emit a UI-side-channel SSE event for non-
+        # INTERNAL signals. Three rendering tiers in the design:
+        #   - INTERNAL              → log only, no UI emit
+        #   - USER_VISIBLE          → side channel OR inline (per session_id)
+        #   - ADMIN_VISIBLE         → side channel for admin tools
+        # Existing sources (heartbeat, cron, a2a.task_complete, stripe)
+        # default to INTERNAL — none of them surprise-emit to the UI.
+        # Sources opt in by constructing signals with an explicit
+        # visibility argument.
+        if signal.visibility == Visibility.INTERNAL:
+            return
+        emit = getattr(self._agent, "emit_event", None)
+        if emit is None:
+            return
+        try:
+            await emit("signal_completed", _build_ui_event_payload(signal, result))
+        except Exception:
+            logger.exception(
+                "Failed to emit signal_completed UI event for %s", signal.id
+            )
+
+
+def _build_ui_event_payload(signal: Signal, result: SignalResult) -> dict:
+    """Construct the JSON payload shape for the UI side-channel event.
+
+    Routing fields (`session_id`, `visibility`, `target_agent`,
+    `source`, `caller`) tell the consumer where to render the turn.
+    Result fields (`status`, `duration_ms`, `error`) summarize the
+    outcome. The actual artifact / action_result is NOT included —
+    consumers fetch it from signal_log if they need the body. This
+    keeps SSE payloads bounded (no unbounded LLM text on the wire)
+    and centralizes redaction concerns at the store.
+    """
+    return {
+        "signal_id": signal.id,
+        "source": signal.source,
+        "kind": signal.kind,
+        "mode": signal.mode.value,
+        "target_agent": signal.target_agent,
+        "session_id": signal.session_id,
+        "caller": signal.caller,
+        "visibility": signal.visibility.value,
+        "urgency": signal.urgency.value,
+        "status": result.status.value,
+        "duration_ms": result.duration_ms,
+        "error": result.error,
+        "arrived_at": signal.arrived_at.isoformat(),
+    }
 
 
 # ---------------------------------------------------------------------------
