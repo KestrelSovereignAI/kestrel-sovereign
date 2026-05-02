@@ -549,7 +549,12 @@ export async function sendMessage() {
             let fullContent = '';
 
             try {
-                for await (const chunk of API.streamInvoke(text, null, sessionId, null)) {
+                // Pass dispatchAgent EXPLICITLY to streamInvoke so the
+                // URL is pinned to this dispatch's agent, even if the
+                // user switches mid-flight or a 401 refresh forces a
+                // retry. Without this the URL would be recaptured
+                // from state.selectedHostAgent at fetch time.
+                for await (const chunk of API.streamInvoke(text, null, sessionId, null, false, dispatchAgent)) {
                     fullContent += chunk;
                     // Per-pane gate only — chunks DO paint into the
                     // dispatch agent's pane element even when that
@@ -575,7 +580,11 @@ export async function sendMessage() {
                     console.log('Streaming not available, falling back to standard invoke');
                     state.useStreaming = false;
                     msgDiv.remove();
-                    const response = await API.invoke(text, null, sessionId, null);
+                    // invokeForAgent pins the URL to dispatchAgent —
+                    // unprefixed invoke() routes via the currently
+                    // selected agent and would land on the wrong
+                    // backend if the user has switched.
+                    const response = await API.invokeForAgent(text, null, sessionId, null, dispatchAgent);
                     if (isPaneFresh()) {
                         await addMessage('agent', response.response, pane.element);
                     }
@@ -587,7 +596,7 @@ export async function sendMessage() {
                 }
             }
         } else {
-            const response = await API.invoke(text, null, sessionId, null);
+            const response = await API.invokeForAgent(text, null, sessionId, null, dispatchAgent);
             if (isPaneFresh()) {
                 await addMessage('agent', response.response, pane.element);
             }
