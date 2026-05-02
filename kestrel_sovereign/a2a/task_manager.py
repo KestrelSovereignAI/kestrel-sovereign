@@ -87,6 +87,7 @@ class TaskManager:
         feedback_store: Optional[FeedbackStore] = None,
         hooks_manager: Optional["HooksManager"] = None,
         on_task_complete: Optional[Callable[[Task], None]] = None,
+        causation_chain_provider: Optional[Callable[[], Optional[list]]] = None,
     ):
         self.task_store = task_store
         self.session_service = session_service
@@ -97,6 +98,17 @@ class TaskManager:
 
         # Callback for task completion notifications (for chat notifications)
         self._on_task_complete = on_task_complete
+
+        # Callback returning the in-flight cognition turn's causation
+        # chain (already serialized as list of dicts) or None when no
+        # signal-driven turn is active. Used by `create_task` to attach
+        # the chain to outbound A2A tasks so the receiving side
+        # reconstructs the lineage and the dispatcher's cycle detection
+        # can fire on real A→B→A loops. Without this, completion-driven
+        # cognition would restart at depth 1 every iteration and the
+        # only loop bound would be the per-source rate limit
+        # (#905 review P1).
+        self._causation_chain_provider = causation_chain_provider
 
         # Event subscribers for SSE streaming
         self._subscribers: dict[str, list[asyncio.Queue]] = {}
@@ -558,13 +570,32 @@ class TaskManager:
             }
         )
 
+        # Attach the in-flight turn's causation chain to outbound task
+        # metadata if a provider is registered (KestrelAgent wires this
+        # in initialize()). The receiving side reconstructs the chain
+        # via signals.sources.a2a._deserialize_chain when the task
+        # terminates. Empty/missing chains are not stored to avoid
+        # bloating metadata with empty lists.
+        outbound_metadata = dict(params.metadata) if params.metadata else {}
+        if self._causation_chain_provider is not None:
+            try:
+                chain = self._causation_chain_provider()
+            except Exception as e:
+                logger.warning(
+                    "causation_chain_provider raised; proceeding "
+                    "without chain metadata: %s", e,
+                )
+                chain = None
+            if chain:
+                outbound_metadata["causation_chain"] = chain
+
         # Create task
         task = Task(
             id=params.id,
             sessionId=params.sessionId,
             status=TaskStatus(state=TaskState.SUBMITTED),
             history=[params.message],
-            metadata=params.metadata,
+            metadata=outbound_metadata,
         )
 
         # Save to store

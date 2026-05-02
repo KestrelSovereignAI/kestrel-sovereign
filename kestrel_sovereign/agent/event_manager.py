@@ -41,14 +41,26 @@ class EventManagerMixin:
         """
         Callback invoked when a background task completes.
 
-        Queues a notification message to be included in the next chat response.
-        This is called by TaskManager when tasks reach terminal states
+        Two outputs (parallel, neither replaces the other):
+
+        1. SSE notification \u2014 appended to `_pending_task_notifications`
+           for the next chat response. Browser-facing surface, unchanged
+           since before #889.
+        2. Cognition signal (Phase 5 of #889) \u2014 enqueued via the
+           dispatcher so the bird wakes up and decides what to do with
+           the result. Carries the causation chain from
+           `task.metadata["causation_chain"]` so A\u2192B\u2192A ping-pong loops
+           are caught by Phase 1's cycle detection.
+
+        Called by TaskManager when tasks reach terminal states
         (COMPLETED, FAILED, CANCELED).
         """
         from kestrel_sovereign.a2a.types import TaskState
 
         state = task.status.state
         task_id = task.id
+
+        # ---- 1. SSE notification (legacy path; unchanged) ----------------
 
         # Get task description from metadata
         agent_id = task.metadata.get("agent_id", "unknown") if task.metadata else "unknown"
@@ -72,6 +84,43 @@ class EventManagerMixin:
 
         self._pending_task_notifications.append(msg)
         logging.info(f"Queued task notification: {msg}")
+
+        # ---- 2. Cognition signal via dispatcher (Phase 5 of #889) -------
+
+        dispatcher = getattr(self, "dispatcher", None)
+        if dispatcher is None:
+            # Pre-Phase-5 agents (or tests with mocked agents lacking a
+            # dispatcher) just get the SSE notification \u2014 backward compat.
+            return
+
+        try:
+            from kestrel_sovereign.signals.sources.a2a import (
+                build_signal_for_completed_task,
+            )
+
+            signal = build_signal_for_completed_task(
+                task=task, target_agent=self.did
+            )
+
+            # enqueue_signal is async (returns SignalHandle). We're in a
+            # sync callback (TaskManager._notify_status_update calls us
+            # synchronously). Wrap the await in a tracked coroutine \u2014
+            # the agent's background task tracker supervises the work
+            # so exceptions land in logs and shutdown drains it cleanly.
+            async def _enqueue():
+                await dispatcher.enqueue_signal(signal)
+
+            self._track_background_task(
+                _enqueue(), name=f"a2a_complete:{task_id[:8]}",
+            )
+        except Exception as e:
+            # Never let a dispatcher failure break the SSE notification
+            # path (browser users still get the green check). Log and
+            # continue.
+            logging.warning(
+                "Failed to enqueue a2a.task_complete signal for %s: %s",
+                task_id, e, exc_info=True,
+            )
 
     def get_pending_notifications(self) -> List[str]:
         """
