@@ -294,9 +294,28 @@ def build_stripe_deposit_registration() -> SourceRegistration:
             store_raw_trusted=False,  # honored regardless because trust=UNTRUSTED
             redact_caller_identifier=True,
         ),
+        # Phase 7 of #889: surface the bird's response to the deposit
+        # in the UI side channel so a USER_VISIBLE deposit signal
+        # renders meaningfully. The cognition turn's response is the
+        # bird deciding what to acknowledge / notify / act on.
+        result_summary=_stripe_result_summary,
         # 90 days for financial audit trail.
         retention_days=90,
     )
+
+
+def _stripe_result_summary(result_body: Any) -> str:
+    """Bounded body for the UI side channel. The cognition turn's
+    response could acknowledge the deposit, plan downstream actions,
+    or flag suspicion if the prompt-template fence detected an
+    injection attempt. Surfacing it lets the operator/user see what
+    the bird decided to do with their money."""
+    if result_body is None:
+        return ""
+    text = result_body if isinstance(result_body, str) else str(result_body)
+    if len(text) > 1000:
+        return text[:1000] + "...(truncated)"
+    return text
 
 
 # ---------------------------------------------------------------------------

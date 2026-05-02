@@ -145,17 +145,34 @@ class AttentionPolicy:
 class RedactionPolicy:
     """Required for every source registration; no defaults.
 
-    `summarize` runs against the validated payload and returns a redacted
-    string suitable for `signal_log.payload_redacted`. Raw UNTRUSTED payloads
-    are NEVER stored — only digest + summary.
+    Controls what we persist about the INCOMING payload — webhook
+    bodies, A2A task metadata, cron args, etc. This is genuine
+    redaction: the data is not ours, it may be UNTRUSTED, and we
+    don't want raw versions sitting in signal_log forever.
 
-    `store_raw_trusted` is opt-in and only honored when source.trust is
-    TRUSTED. Defaults to False for safety.
+    `summarize` runs against the validated payload and returns a
+    redacted string for `signal_log.payload_redacted`. UNTRUSTED raw
+    payloads are NEVER stored — only digest + summary. TRUSTED raw
+    payloads are stored only when `store_raw_trusted=True`.
+
+    The result body (what handlers/turns RETURN) lives elsewhere —
+    see `SourceRegistration.result_summary`. That isn't redaction
+    (the result is our own output); it's UI summarization.
     """
 
     summarize: Callable[[dict], str]
     store_raw_trusted: bool = False
     redact_caller_identifier: bool = True
+
+
+# Hard cap on `result_summary` output (and thus on the SSE payload's
+# result body field plus the signal_log.result_summary column),
+# applied AFTER the per-source callback returns. 2KB chosen as: long
+# enough for a useful preview (~30 lines of text or a multi-paragraph
+# briefing), short enough to not bloat wire/storage. The per-source
+# callback owns the summarization choice; this is just the safety cap
+# against a misconfigured callback returning megabyte text.
+MAX_RESULT_SUMMARY_BYTES = 2048
 
 
 # ---------------------------------------------------------------------------
@@ -209,9 +226,27 @@ class SourceRegistration:
     resources: frozenset[ResourceLock] = frozenset()
     allow_self_loops: bool = False
 
-    # Privacy & audit — both required (registry rejects None for log_redaction)
+    # Privacy & audit — log_redaction required (registry rejects None)
     log_redaction: Optional[RedactionPolicy] = None
     retention_days: int = 30
+
+    # UI summarization — OPTIONAL per-source callback that produces a
+    # bounded text body for the dispatch result (artifact /
+    # action_result / cognition return value). Surfaced in:
+    #   - the `signal_completed` SSE payload's `result_summary` field
+    #   - the `signal_log.result_summary` column
+    # so UI consumers of non-INTERNAL signals get something meaningful
+    # to render. Default `None` means UI consumers see metadata only;
+    # the result body is then only available at source-specific
+    # surfaces (chat history for COGNITION, task_execution_log for
+    # cron, etc.). Hard-capped at MAX_RESULT_SUMMARY_BYTES regardless.
+    #
+    # NOT redaction — the result body is the bird's own output, not
+    # third-party data. This is bounded UI summarization. Source
+    # authors that need to filter sensitive content (e.g. user-private
+    # context the bird referenced in its response) do so inside the
+    # callback.
+    result_summary: Optional[Callable[[Any], str]] = None
 
 
 # ---------------------------------------------------------------------------

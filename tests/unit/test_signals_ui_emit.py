@@ -55,6 +55,14 @@ def _redaction() -> RedactionPolicy:
     return RedactionPolicy(summarize=lambda p: "<redacted>")
 
 
+def _result_summary(body):
+    """Test helper: stringify the body. Real sources implement
+    domain-specific bounded summaries (see a2a/heartbeat/wallet
+    sources). The dispatcher's behavior is symmetric — whatever the
+    callback returns, capped at MAX_RESULT_SUMMARY_BYTES."""
+    return str(body) if body is not None else ""
+
+
 class _FakeAgent:
     did = "did:test:phase7"
 
@@ -98,6 +106,7 @@ async def components(tmp_path):
             allowed_modes=frozenset({SignalMode.ACTION}),
             handler=_action_handler,
             log_redaction=_redaction(),
+            result_summary=_result_summary,
         )
     )
     yield SimpleNamespace(
@@ -208,12 +217,11 @@ async def test_payload_carries_routing_fields(components):
 
 
 @pytest.mark.asyncio
-async def test_payload_excludes_artifact_and_action_result(components):
-    """Phase 7 design: SSE payload carries metadata only; the body
-    (artifact text, action_result dict) is fetched from signal_log
-    if needed. Keeps SSE bandwidth bounded and centralizes redaction
-    at the store. Verifies that no `artifact` or `action_result` key
-    leaks into the SSE event."""
+async def test_payload_excludes_raw_artifact_and_action_result(components):
+    """The raw artifact / action_result is NEVER on the wire — the
+    per-source `result_summary` callback decides what bounded text
+    becomes user-visible. Verifies the raw fields don't leak into
+    the SSE event regardless of the summary."""
     c = components
     sig = _make_signal(visibility=Visibility.USER_VISIBLE)
     await c.dispatcher.dispatch_signal(sig)
@@ -221,6 +229,225 @@ async def test_payload_excludes_artifact_and_action_result(components):
     payload = c.agent.emitted[0][1]
     assert "artifact" not in payload
     assert "action_result" not in payload
+
+
+@pytest.mark.asyncio
+async def test_payload_includes_result_summary_when_source_sets_callback(components):
+    """#907 review P1 fix: sources opt in via
+    `SourceRegistration.result_summary`; when set, the bounded body
+    appears in the SSE payload AND in signal_log.result_summary.
+    Without this, USER_VISIBLE/ADMIN_VISIBLE signals were a
+    metadata-only toast — the side channel had nothing to render."""
+    c = components
+    sig = _make_signal(visibility=Visibility.USER_VISIBLE)
+    await c.dispatcher.dispatch_signal(sig)
+    await _drain(c.agent)
+    payload = c.agent.emitted[0][1]
+    # The action handler returned {"ran": payload}; _result_summary
+    # stringifies it. The presence of the field is the contract;
+    # the exact text is the source's choice.
+    assert payload["result_summary"] is not None
+    assert "ran" in payload["result_summary"]
+
+
+@pytest.mark.asyncio
+async def test_payload_result_summary_is_none_when_source_omits_callback(
+    tmp_path,
+):
+    """A source registered without `result_summary` gets None in the
+    SSE payload — UI consumers see metadata-only and must fetch the
+    body from the source-specific surface (chat history, etc.).
+    This is the legitimate metadata-only case the contract supports."""
+    backend = SQLiteBackend(str(tmp_path / "no_summary.db"))
+    await backend.connect()
+    store = SignalLogStore(backend)
+    await store.initialize()
+    registry = SourceRegistry()
+    agent = _FakeAgent()
+    dispatcher = SignalDispatcher(
+        agent=agent, registry=registry,
+        lock_manager=OrderedLockManager(), store=store,
+    )
+
+    async def _h(payload):
+        return {"unused": True}
+
+    registry.register(
+        SourceRegistration(
+            name="ui_test.no_summary",
+            schema=lambda p: p,
+            default_mode=SignalMode.ACTION,
+            allowed_modes=frozenset({SignalMode.ACTION}),
+            handler=_h,
+            log_redaction=_redaction(),
+            # NO result_summary — opt-out.
+        )
+    )
+
+    sig = Signal(
+        source="ui_test.no_summary",
+        kind="run",
+        mode=SignalMode.ACTION,
+        payload={},
+        target_agent="did:test:phase7",
+        visibility=Visibility.USER_VISIBLE,
+    )
+    await dispatcher.dispatch_signal(sig)
+    pending = [t for t in agent.background_tasks if not t.done()]
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+
+    payload = agent.emitted[0][1]
+    assert payload["result_summary"] is None
+    await backend.close()
+
+
+@pytest.mark.asyncio
+async def test_result_summary_truncated_at_hard_cap(tmp_path):
+    """Defense in depth: even if a misconfigured callback returns
+    megabyte text, the store hard-caps at MAX_RESULT_SUMMARY_BYTES
+    so SSE bandwidth and signal_log row size stay bounded."""
+    from kestrel_sdk.signals import MAX_RESULT_SUMMARY_BYTES
+
+    backend = SQLiteBackend(str(tmp_path / "huge.db"))
+    await backend.connect()
+    store = SignalLogStore(backend)
+    await store.initialize()
+    registry = SourceRegistry()
+    agent = _FakeAgent()
+    dispatcher = SignalDispatcher(
+        agent=agent, registry=registry,
+        lock_manager=OrderedLockManager(), store=store,
+    )
+
+    async def _h(payload):
+        return "x" * 100_000  # huge return body
+
+    registry.register(
+        SourceRegistration(
+            name="ui_test.huge",
+            schema=lambda p: p,
+            default_mode=SignalMode.ACTION,
+            allowed_modes=frozenset({SignalMode.ACTION}),
+            handler=_h,
+            log_redaction=_redaction(),
+            # Misconfigured callback: returns the full body unbounded.
+            result_summary=lambda body: body,
+        )
+    )
+
+    sig = Signal(
+        source="ui_test.huge",
+        kind="run",
+        mode=SignalMode.ACTION,
+        payload={},
+        target_agent="did:test:phase7",
+        visibility=Visibility.USER_VISIBLE,
+    )
+    await dispatcher.dispatch_signal(sig)
+    pending = [t for t in agent.background_tasks if not t.done()]
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+
+    payload = agent.emitted[0][1]
+    summary = payload["result_summary"]
+    # Cap + truncation marker. Real text is exactly MAX bytes plus the
+    # "...(truncated)" suffix.
+    assert summary.endswith("...(truncated)")
+    assert len(summary) <= MAX_RESULT_SUMMARY_BYTES + len("...(truncated)")
+
+    rows = await backend.fetch_all(
+        "SELECT result_summary FROM signal_log WHERE source=?",
+        ("ui_test.huge",),
+    )
+    assert rows[0][0] == summary  # store has the same capped text
+
+    await backend.close()
+
+
+@pytest.mark.asyncio
+async def test_result_summary_callback_failure_records_placeholder(tmp_path):
+    """A misconfigured callback that raises shouldn't break the
+    dispatch — it gets a placeholder so the operator can debug, and
+    the SSE event still fires."""
+    backend = SQLiteBackend(str(tmp_path / "fail.db"))
+    await backend.connect()
+    store = SignalLogStore(backend)
+    await store.initialize()
+    registry = SourceRegistry()
+    agent = _FakeAgent()
+    dispatcher = SignalDispatcher(
+        agent=agent, registry=registry,
+        lock_manager=OrderedLockManager(), store=store,
+    )
+
+    async def _h(payload):
+        return {"ok": True}
+
+    def bad_summary(body):
+        raise ValueError("summary bug")
+
+    registry.register(
+        SourceRegistration(
+            name="ui_test.broken",
+            schema=lambda p: p,
+            default_mode=SignalMode.ACTION,
+            allowed_modes=frozenset({SignalMode.ACTION}),
+            handler=_h,
+            log_redaction=_redaction(),
+            result_summary=bad_summary,
+        )
+    )
+
+    sig = Signal(
+        source="ui_test.broken",
+        kind="run",
+        mode=SignalMode.ACTION,
+        payload={},
+        target_agent="did:test:phase7",
+        visibility=Visibility.USER_VISIBLE,
+    )
+    result = await dispatcher.dispatch_signal(sig)
+    # Dispatch itself succeeds; the callback failure is contained.
+    assert result.status == Status.OK
+    pending = [t for t in agent.background_tasks if not t.done()]
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+
+    payload = agent.emitted[0][1]
+    assert payload["result_summary"] is not None
+    assert "result_summary failed" in payload["result_summary"]
+    assert "ValueError" in payload["result_summary"]
+    await backend.close()
+
+
+# ---------------------------------------------------------------------------
+# P2 fix: failed log write does NOT emit
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_log_write_failure_suppresses_ui_emit(components, monkeypatch):
+    """#907 review P2: contract is "SSE event fires AFTER the log
+    write." If the write fails, the audit trail is broken — emitting
+    a signal_completed with a signal_id that can't be looked up in
+    signal_log would mislead consumers. Verify the dispatcher
+    suppresses the emit on log failure."""
+    c = components
+
+    async def fail_append(*args, **kwargs):
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr(c.dispatcher._store, "append", fail_append)
+
+    sig = _make_signal(visibility=Visibility.USER_VISIBLE)
+    result = await c.dispatcher.dispatch_signal(sig)
+    # Dispatch reports OK because the handler ran successfully;
+    # the log write happens in the background.
+    assert result.status == Status.OK
+    await _drain(c.agent)
+    # No SSE emit because the log write raised.
+    assert c.agent.emitted == []
 
 
 # ---------------------------------------------------------------------------

@@ -106,11 +106,30 @@ class SignalLogStore(UnifiedStoreBase):
                 payload_digest TEXT NOT NULL,
                 payload_redacted TEXT,
                 payload_raw {json_type},
+                result_summary TEXT,
                 causation_chain_digest TEXT NOT NULL,
                 error TEXT,
                 retention_until {ts_type} NOT NULL
             )
         """)
+
+        # Phase 7 of #889: result_summary column added so UI consumers
+        # of the signal_completed SSE event get a bounded body. Sources
+        # opt in by setting `SourceRegistration.result_summary`.
+        # Existing databases get the column via this additive ALTER
+        # (silently ignored if already applied).
+        try:
+            await self._backend.execute(
+                f"ALTER TABLE {self.TABLE} ADD COLUMN result_summary TEXT"
+            )
+        except Exception as e:
+            msg = str(e).lower()
+            if "duplicate column" in msg or "already exists" in msg:
+                pass  # additive migration already applied
+            else:
+                logger.warning(
+                    "result_summary ALTER failed (proceeding without it): %s", e,
+                )
 
         # Indexes for the queries we expect: by source, by target_agent,
         # by status (for failure dashboards), and by retention_until (sweep).
@@ -141,15 +160,26 @@ class SignalLogStore(UnifiedStoreBase):
         signal: Signal,
         registration: SourceRegistration,
         result: SignalResult,
-    ) -> None:
-        """Persist a dispatch outcome. Redaction runs HERE — the dispatcher
-        does not see (and must not see) the redacted form before this call.
+    ) -> Optional[str]:
+        """Persist a dispatch outcome. Payload redaction runs HERE
+        (the dispatcher does not see the redacted form before this
+        call); per-source result UI summarization also runs here so
+        the bounded body is stored AND returned for the SSE payload.
+
+        Returns the `result_summary` text the source produced (or None
+        when the source didn't set `result_summary` on its
+        registration). The caller (dispatcher) uses the return value
+        to populate the `signal_completed` SSE payload.
         """
+        from kestrel_sdk.signals import MAX_RESULT_SUMMARY_BYTES
+
         policy = registration.log_redaction
         assert policy is not None, "Registry should reject sources without a policy"
 
-        # Redaction first; raw stays in memory until this point and never
-        # touches the wire if the policy is honest.
+        # Payload redaction (third-party data we don't trust): the
+        # incoming signal payload — webhook bodies, A2A metadata, cron
+        # args. Raw UNTRUSTED stays in memory until this point and
+        # never touches the wire if the policy is honest.
         try:
             payload_redacted = policy.summarize(signal.payload)
         except Exception as e:
@@ -159,6 +189,34 @@ class SignalLogStore(UnifiedStoreBase):
                 signal.source,
             )
             payload_redacted = f"<redaction failed: {type(e).__name__}>"
+
+        # Phase 7 of #889: per-source UI summarization of the OUTPUT
+        # body. Different concern from payload redaction — the result
+        # is the bird's own output (artifact/action_result/cognition
+        # return), bounded for SSE bandwidth and signal_log row size.
+        # Sources opt in by setting registration.result_summary; default
+        # None means UI consumers see metadata-only signal_completed
+        # events. Hard-capped at MAX_RESULT_SUMMARY_BYTES regardless,
+        # as defense in depth against a misconfigured callback.
+        result_summary: Optional[str] = None
+        result_body = (
+            result.artifact if result.artifact is not None else result.action_result
+        )
+        if registration.result_summary is not None and result_body is not None:
+            try:
+                summary = registration.result_summary(result_body)
+            except Exception as e:
+                logger.exception(
+                    "result_summary callback raised for source '%s'; "
+                    "result_summary will be a placeholder. Fix the callback.",
+                    signal.source,
+                )
+                summary = f"<result_summary failed: {type(e).__name__}>"
+            if not isinstance(summary, str):
+                summary = str(summary) if summary is not None else ""
+            if len(summary) > MAX_RESULT_SUMMARY_BYTES:
+                summary = summary[:MAX_RESULT_SUMMARY_BYTES] + "...(truncated)"
+            result_summary = summary
 
         store_raw = (
             registration.trust == Trust.TRUSTED and policy.store_raw_trusted
@@ -194,8 +252,9 @@ class SignalLogStore(UnifiedStoreBase):
                 dispatched_at, completed_at, status, duration_ms,
                 turn_id, artifact_digest, action_result_digest,
                 payload_digest, payload_redacted, payload_raw,
+                result_summary,
                 causation_chain_digest, error, retention_until
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 signal.id,
@@ -218,11 +277,14 @@ class SignalLogStore(UnifiedStoreBase):
                 _digest(signal.payload),
                 payload_redacted,
                 payload_raw_json,
+                result_summary,
                 _digest(_serialize_chain(signal.causation_chain)),
                 result.error,
                 self.to_timestamp_param(retention_until),
             ),
         )
+
+        return result_summary
 
     # ------------------------------------------------------------------
     # Retention sweep

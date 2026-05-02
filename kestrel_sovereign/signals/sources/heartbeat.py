@@ -12,7 +12,7 @@ from __future__ import annotations
 import hashlib
 from datetime import time as dtime, timedelta
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from kestrel_sdk.signals import (
     AttentionPolicy,
@@ -104,8 +104,32 @@ def build_heartbeat_registration(
             store_raw_trusted=False,  # HEARTBEAT.md may carry operator-private notes
             redact_caller_identifier=True,
         ),
+        # Phase 7 of #889: surface the bird's heartbeat response in
+        # the UI side channel when the signal is non-INTERNAL. For
+        # quiet HEARTBEAT_OK ticks, returning empty keeps the UI
+        # clean; for alerts, the operator sees the alert text
+        # directly in the side-channel event.
+        result_summary=_heartbeat_result_summary,
         retention_days=14,
     )
+
+
+def _heartbeat_result_summary(result_body: Any) -> str:
+    """The cognition turn's result is the bird's response text. For a
+    healthy heartbeat the bird replies "HEARTBEAT_OK" and we return
+    empty (no UI noise for routine ticks). For an alert we surface
+    the alert text so the operator's side channel renders something
+    actionable."""
+    if not result_body:
+        return ""
+    text = result_body if isinstance(result_body, str) else str(result_body)
+    # Don't surface the all-clear in the UI side channel. Let routine
+    # heartbeats stay metadata-only; only alerts get a body.
+    if "HEARTBEAT_OK" in text and len(text.strip()) < 30:
+        return ""
+    if len(text) > 1000:
+        return text[:1000] + "...(truncated)"
+    return text
 
 
 def _build_quiet_hours(

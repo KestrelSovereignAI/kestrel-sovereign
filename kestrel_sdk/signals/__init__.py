@@ -9,6 +9,7 @@ Design: docs/architecture/SIGNAL_DISPATCHER.md (in the sovereign repo).
 """
 
 from kestrel_sdk.signals.models import (
+    MAX_RESULT_SUMMARY_BYTES,
     ActionHandler,
     ArtifactHandler,
     AttentionPolicy,
@@ -29,6 +30,7 @@ from kestrel_sdk.signals.models import (
 )
 
 __all__ = [
+    "MAX_RESULT_SUMMARY_BYTES",
     "ActionHandler",
     "ArtifactHandler",
     "AttentionPolicy",

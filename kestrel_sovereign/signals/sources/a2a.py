@@ -85,6 +85,25 @@ def _a2a_redact(payload: dict) -> str:
     return f"task_id={task_id} state={state} summary={summary!r}"
 
 
+def _a2a_result_summary(result_body: Any) -> str:
+    """Phase 7 of #889: bounded body for the UI side channel. The
+    cognition turn's result is whatever process_input returned — the
+    bird's response text after deciding what to do with the peer-task
+    completion. Surface it so a USER_VISIBLE/ADMIN_VISIBLE
+    a2a.task_complete signal renders meaningfully rather than a
+    metadata-only "the bird did a thing" toast.
+
+    The store hard-caps at MAX_RESULT_SUMMARY_BYTES; the per-source
+    cap here is gentler (1000 chars) so reasonably-sized bird responses
+    come through intact."""
+    if result_body is None:
+        return ""
+    text = result_body if isinstance(result_body, str) else str(result_body)
+    if len(text) > 1000:
+        return text[:1000] + "...(truncated)"
+    return text
+
+
 # ---------------------------------------------------------------------------
 # Registration
 # ---------------------------------------------------------------------------
@@ -128,6 +147,7 @@ def build_a2a_task_complete_registration() -> SourceRegistration:
             store_raw_trusted=False,
             redact_caller_identifier=True,
         ),
+        result_summary=_a2a_result_summary,
         retention_days=14,
     )
 

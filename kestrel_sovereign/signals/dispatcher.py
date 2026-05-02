@@ -583,11 +583,20 @@ class SignalDispatcher:
         result: SignalResult,
     ) -> None:
         try:
-            await self._store.append(signal, registration, result)
+            result_summary = await self._store.append(
+                signal, registration, result
+            )
         except Exception:
             logger.exception(
                 "Failed to write signal_log entry for %s", signal.id
             )
+            # #907 review P2: contract says SSE event fires AFTER the
+            # log write. If the write failed, the audit trail is
+            # broken — emitting a signal_completed event whose
+            # signal_id can't be looked up in signal_log would mislead
+            # consumers that try to correlate. Better to be silent and
+            # surface the failure via the logger.exception above.
+            return
 
         # Phase 7 of #889: emit a UI-side-channel SSE event for non-
         # INTERNAL signals. Three rendering tiers in the design:
@@ -603,24 +612,39 @@ class SignalDispatcher:
         emit = getattr(self._agent, "emit_event", None)
         if emit is None:
             return
+        payload = _build_ui_event_payload(signal, result, result_summary)
         try:
-            await emit("signal_completed", _build_ui_event_payload(signal, result))
+            await emit("signal_completed", payload)
         except Exception:
             logger.exception(
                 "Failed to emit signal_completed UI event for %s", signal.id
             )
 
 
-def _build_ui_event_payload(signal: Signal, result: SignalResult) -> dict:
+def _build_ui_event_payload(
+    signal: Signal,
+    result: SignalResult,
+    result_summary: Optional[str],
+) -> dict:
     """Construct the JSON payload shape for the UI side-channel event.
 
     Routing fields (`session_id`, `visibility`, `target_agent`,
     `source`, `caller`) tell the consumer where to render the turn.
     Result fields (`status`, `duration_ms`, `error`) summarize the
-    outcome. The actual artifact / action_result is NOT included —
-    consumers fetch it from signal_log if they need the body. This
-    keeps SSE payloads bounded (no unbounded LLM text on the wire)
-    and centralizes redaction concerns at the store.
+    outcome.
+
+    `result_summary` (#907 review P1 fix) is the bounded text body
+    produced by the source's `result_summary` callback, capped in the
+    store at MAX_RESULT_SUMMARY_BYTES. Sources that don't set the
+    callback get None here — consumers see metadata only and must
+    fetch the body from a source-specific surface (chat history,
+    task_execution_log, etc.). The same value lands in
+    signal_log.result_summary; the UI can scroll back via the log if
+    it needs the historical text after the SSE event.
+
+    The full raw artifact / action_result is NEVER included — the
+    per-source `result_summary` callback controls what becomes
+    user-visible, with a hard byte cap as defense in depth.
     """
     return {
         "signal_id": signal.id,
@@ -635,6 +659,7 @@ def _build_ui_event_payload(signal: Signal, result: SignalResult) -> dict:
         "status": result.status.value,
         "duration_ms": result.duration_ms,
         "error": result.error,
+        "result_summary": result_summary,
         "arrived_at": signal.arrived_at.isoformat(),
     }
 
