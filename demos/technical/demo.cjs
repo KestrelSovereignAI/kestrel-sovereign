@@ -218,7 +218,7 @@ test.describe.serial('Kestrel Sovereign Technical Demo', () => {
         narrator.narrate('We\'ll verify the agent stores and recalls this information', { callout: true });
 
         const stored = await demoSendMessage(page,
-            'Please remember this important fact about me: my favorite programming language is Rust and my lucky number is 7742.');
+            'Please remember this important fact about me: my favorite programming language is Rust and my lucky number is 7742.', 600000);
         await demoPause(page, 1500);
 
         if (stored) {
@@ -255,7 +255,7 @@ test.describe.serial('Kestrel Sovereign Technical Demo', () => {
         narrator.narrate('New session — asking for recall with zero conversation history...');
 
         const recalled = await demoSendMessage(page,
-            'What is my favorite programming language and what is my lucky number?');
+            'What is my favorite programming language and what is my lucky number?', 600000);
         await demoPause(page, 1500);
 
         if (recalled) {
