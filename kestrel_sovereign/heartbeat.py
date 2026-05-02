@@ -219,36 +219,46 @@ class HeartbeatRunner:
                 break
 
     async def _tick(self) -> HeartbeatResult:
-        """Execute a single heartbeat tick."""
+        """Execute a single heartbeat tick.
+
+        Routes through the SignalDispatcher (Phase 3 of #889). The
+        dispatcher's attention_policy enforces quiet hours; the result's
+        OK/COALESCED/DROPPED_QUIET_HOURS status is translated back to
+        heartbeat's ok/skipped/error vocabulary by `_translate_result`.
+
+        In-memory history is preserved as the source of truth for the
+        existing `/heartbeat/status` endpoint. The signal_log written by
+        the dispatcher provides parallel audit; migrating the endpoint
+        to read from signal_log is a follow-up.
+        """
+        from kestrel_sdk.signals import (
+            Signal,
+            SignalMode,
+            Status,
+            Urgency,
+            Visibility,
+        )
+        from kestrel_sovereign.signals.sources.heartbeat import SOURCE_NAME
+
         start_time = time.monotonic()
         timestamp = datetime.now(tz=_UTC).isoformat()
 
-        # Check active hours
-        if not self._is_within_active_hours():
-            result = HeartbeatResult(
-                status="skipped",
-                timestamp=timestamp,
-                duration_ms=0,
-                reason="outside active hours",
-            )
-            self._record_result(result)
-            return result
+        heartbeat_content = self._load_heartbeat_file() or ""
 
-        # Load HEARTBEAT.md content
-        heartbeat_content = self._load_heartbeat_file()
-
-        # Build prompt
-        prompt = HEARTBEAT_PROMPT.format(timestamp=timestamp)
-        if heartbeat_content:
-            prompt = f"{prompt}\n\n---\n{heartbeat_content}\n---"
+        signal = Signal(
+            source=SOURCE_NAME,
+            kind="tick",
+            mode=SignalMode.COGNITION,
+            payload={"heartbeat_md": heartbeat_content},
+            target_agent=self.agent.did,
+            visibility=Visibility.INTERNAL,
+            urgency=Urgency.NORMAL,
+        )
 
         try:
-            # Call agent's process_input with the heartbeat prompt
-            response = await self.agent.process_input(prompt)
+            sig_result = await self.agent.dispatcher.dispatch_signal(signal)
             duration_ms = int((time.monotonic() - start_time) * 1000)
-
-            # Normalize response
-            result = self._normalize_response(response, timestamp, duration_ms)
+            result = self._translate_result(sig_result, timestamp, duration_ms)
         except Exception as e:
             duration_ms = int((time.monotonic() - start_time) * 1000)
             result = HeartbeatResult(
@@ -256,11 +266,51 @@ class HeartbeatRunner:
                 message=str(e),
                 timestamp=timestamp,
                 duration_ms=duration_ms,
-                reason=f"process_input failed: {type(e).__name__}",
+                reason=f"dispatch_signal failed: {type(e).__name__}",
             )
 
         self._record_result(result)
         return result
+
+    def _translate_result(
+        self, sig_result, timestamp: str, duration_ms: int
+    ) -> HeartbeatResult:
+        """Map a dispatcher SignalResult into the heartbeat vocabulary.
+
+        Today's heartbeat statuses are: ok | alert | skipped | error. The
+        dispatcher knows: OK | COALESCED | DROPPED_QUIET_HOURS |
+        DROPPED_RATE_LIMIT | DROPPED_CYCLE | DROPPED_VALIDATION | FAILED.
+
+        - OK              → run `_normalize_response` on the artifact (LLM text)
+        - DROPPED_*       → "skipped" with a reason string
+        - COALESCED       → "skipped" (a duplicate fired within the window)
+        - FAILED          → "error" with the dispatcher's error message
+        """
+        from kestrel_sdk.signals import Status
+
+        status = sig_result.status
+
+        if status == Status.OK:
+            response_text = sig_result.artifact or ""
+            return self._normalize_response(response_text, timestamp, duration_ms)
+
+        if status == Status.FAILED:
+            return HeartbeatResult(
+                status="error",
+                message=sig_result.error or "dispatcher reported FAILED",
+                timestamp=timestamp,
+                duration_ms=duration_ms,
+                reason=f"dispatch failed: {sig_result.error or 'unknown'}",
+            )
+
+        # COALESCED, DROPPED_QUIET_HOURS, DROPPED_RATE_LIMIT, DROPPED_CYCLE,
+        # DROPPED_VALIDATION → no LLM call happened; record as skipped.
+        return HeartbeatResult(
+            status="skipped",
+            timestamp=timestamp,
+            duration_ms=duration_ms,
+            reason=f"{status.value}: {sig_result.error or ''}".strip(": "),
+        )
 
     def _normalize_response(
         self, text: str, timestamp: str, duration_ms: int

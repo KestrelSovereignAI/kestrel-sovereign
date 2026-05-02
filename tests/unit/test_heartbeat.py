@@ -120,10 +120,45 @@ class TestOKPattern:
 
 @pytest.fixture
 def mock_agent(tmp_path):
-    """Create a mock KestrelAgent."""
+    """Create a mock KestrelAgent.
+
+    Phase 3 of #889 routed heartbeat through the SignalDispatcher; the
+    mock now provides a `dispatcher.dispatch_signal` that wraps the
+    legacy `process_input` return-value plumbing in a SignalResult. Tests
+    keep setting `agent.process_input.return_value` as before — the
+    dispatcher wrapper reads it and packages it as `SignalResult.artifact`.
+    """
+    from kestrel_sdk.signals import SignalResult, Status, SignalMode
+
     agent = Mock()
+    agent.did = "did:test:heartbeat"
     agent.storage_path = str(tmp_path / "kestrel_prime.db")
     agent.process_input = AsyncMock(return_value="HEARTBEAT_OK")
+
+    async def fake_dispatch(signal):
+        # Re-use process_input for the test's return-value/side-effect
+        # configuration, then package the result the way the dispatcher
+        # would: artifact carries the LLM response text.
+        try:
+            response = await agent.process_input(signal.payload.get("heartbeat_md", ""))
+        except Exception as exc:
+            return SignalResult(
+                signal_id=signal.id,
+                status=Status.FAILED,
+                mode=SignalMode.COGNITION,
+                duration_ms=1,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+        return SignalResult(
+            signal_id=signal.id,
+            status=Status.OK,
+            mode=SignalMode.COGNITION,
+            duration_ms=1,
+            artifact=response,
+        )
+
+    agent.dispatcher = Mock()
+    agent.dispatcher.dispatch_signal = AsyncMock(side_effect=fake_dispatch)
     return agent
 
 
@@ -278,6 +313,8 @@ class TestActiveHours:
     @pytest.mark.asyncio
     async def test_skipped_outside_hours(self, mock_agent):
         """Heartbeat skipped when outside active hours."""
+        from kestrel_sdk.signals import SignalMode, SignalResult, Status
+
         config = HeartbeatConfig(
             enabled=True,
             active_hours_start="09:00",
@@ -286,10 +323,23 @@ class TestActiveHours:
         )
         runner = HeartbeatRunner(mock_agent, config)
 
-        with patch.object(runner, "_is_within_active_hours", return_value=False):
-            result = await runner.run_once()
-            assert result.status == "skipped"
-            assert "active hours" in result.reason
+        # Phase 3 of #889 moved active-hours enforcement out of heartbeat
+        # and into the dispatcher's per-source attention_policy. Outside
+        # active hours, the dispatcher returns DROPPED_QUIET_HOURS and
+        # heartbeat translates that into status="skipped".
+        async def quiet_hours_dispatch(signal):
+            return SignalResult(
+                signal_id=signal.id,
+                status=Status.DROPPED_QUIET_HOURS,
+                mode=SignalMode.COGNITION,
+                duration_ms=0,
+                error="outside attention window",
+            )
+
+        mock_agent.dispatcher.dispatch_signal.side_effect = quiet_hours_dispatch
+        result = await runner.run_once()
+        assert result.status == "skipped"
+        assert "dropped_quiet_hours" in result.reason
 
 
 class TestResponseNormalization:
