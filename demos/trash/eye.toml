@@ -47,16 +47,21 @@ expected = [
 layout = "Chat panel after a soft-delete — message has disappeared from the active view"
 
 # Beat 3: Trash view
+# Note: the Trash toggle and #conversations-trash sub-view live inside the
+# Chat panel's conversations sidebar (#conversations-pane), not in
+# Identity/Memory. The earlier expectation ("Identity / Memory panel active")
+# was wrong — the trash UI was reorganized in #774 to sit alongside the
+# active conversation list rather than under Identity.
 [[eye.screenshots]]
 name = "04-trash-view-open.png"
 act = "Beat 3: The Trash sub-view"
 severity = "critical"
 expected = [
-    "Identity / Memory panel active",
-    "Trash sub-view is open (#conversations-trash visible)",
+    "Chat panel active",
+    "Conversations sidebar visible with the Trash sub-view open (#conversations-trash)",
     "At least one trashed item visible with Restore and Purge affordances",
 ]
-layout = "Trash sub-view of the conversations pane — trashed item with restore/purge buttons"
+layout = "Chat panel with the conversations sidebar's Trash sub-view open"
 
 # Beat 4: Restored
 [[eye.screenshots]]

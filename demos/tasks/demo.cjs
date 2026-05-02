@@ -44,6 +44,8 @@ test.describe.serial('Kestrel Tasks Demo', () => {
   test.beforeAll(async ({ request }) => {
     if (!fs.existsSync(OUTPUT_DIR)) fs.mkdirSync(OUTPUT_DIR, { recursive: true });
     apiKey = await getApiKey(request, BASE_URL);
+    // Approval modal is suppressed server-side via KESTREL_DEMO_SERVER=1
+    // (set by demos/run.sh). See SecurityFeature._register_all_tools.
   });
 
   test.afterAll(() => {

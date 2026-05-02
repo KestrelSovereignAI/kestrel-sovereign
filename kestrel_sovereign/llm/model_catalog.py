@@ -110,6 +110,8 @@ class ModelCatalogService:
         self._context_limits: Dict[str, int] = {}
         self._display_names: Dict[str, str] = {}
         self._tool_support: Dict[str, bool] = {}
+        # vendor -> {"small": model_id, "medium": ..., "large": ...}
+        self._size_tiers: Dict[str, Dict[str, str]] = {}
 
         # Legacy support: if old-style [featured] section exists, still load it
         self._featured: Dict[str, Set[str]] = {}
@@ -151,6 +153,12 @@ class ModelCatalogService:
 
             # Parse tool support overrides
             self._tool_support = self._config.get("tool_support", {})
+
+            # Parse size tiers (vendor -> small/medium/large -> model_id).
+            # See [size_tiers] in model_catalog.toml — discovery seam for
+            # "give me the canonical small / medium / large model for this
+            # vendor" without hardcoding model IDs in Python.
+            self._size_tiers = self._config.get("size_tiers", {})
 
             # Legacy: load [featured] if it exists (for backward compat)
             featured = self._config.get("featured", {})
@@ -250,6 +258,28 @@ class ModelCatalogService:
                 return limit
 
         return None
+
+    def get_model_for_size(self, vendor: str, size: str) -> Optional[str]:
+        """Look up the canonical model ID for a vendor at a size tier.
+
+        Size tiers are vendor-relative — "large" means "the biggest
+        general-purpose chat model this vendor publishes," not a fixed
+        token threshold. They're config (model_catalog.toml
+        [size_tiers]) so a new generation requires editing one section,
+        not chasing version numbers across the codebase.
+
+        Args:
+            vendor: e.g. "anthropic", "openai", "ollama"
+            size:   "small", "medium", or "large"
+
+        Returns:
+            The configured model ID, or None when the vendor or size
+            tier isn't declared. Callers decide whether None is a skip
+            (tests) or a fallback (production selection).
+        """
+        self._ensure_loaded()
+        vendor_tiers = self._size_tiers.get(vendor, {})
+        return vendor_tiers.get(size)
 
     def get_tool_support(self, model_id: str) -> Optional[bool]:
         """Get tool support override for a model.

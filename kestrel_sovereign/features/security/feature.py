@@ -7,6 +7,7 @@ providing CLI commands and API integration.
 
 import asyncio
 import logging
+import os
 from datetime import datetime, timezone
 from typing import List, Optional
 
@@ -128,9 +129,23 @@ class SecurityFeature(Feature):
         logger.info("SecurityFeature async initialization complete")
 
     async def _register_all_tools(self):
-        """Register all agent tools with default ASK permission."""
+        """Register all agent tools with default ASK permission.
+
+        Demo servers (KESTREL_DEMO_SERVER=1, set by demos/run.sh) get
+        ALLOW as the default instead — Playwright demos can't click
+        through an interactive approval modal, and the demo agent runs
+        in an isolated DB so the broader-grants are scoped correctly.
+        Without this, every demo whose subject is something OTHER than
+        the security flow has to chase modal-dismissal helpers in JS
+        for whichever feature the LLM happens to pick (#897 review).
+        """
         if not hasattr(self.agent, "features"):
             return
+
+        is_demo_server = os.environ.get("KESTREL_DEMO_SERVER", "").lower() in (
+            "1", "true", "yes",
+        )
+        default_level = PermissionLevel.ALLOW if is_demo_server else PermissionLevel.ASK
 
         for feature_name, feature in self.agent.features.items():
             # Skip registering our own tools
@@ -141,10 +156,15 @@ class SecurityFeature(Feature):
                 await self.permission_store.register_tool(
                     feature_name=feature_name,
                     tool_name=tool_obj.name,
-                    default_level=PermissionLevel.ASK,
+                    default_level=default_level,
                 )
 
-        logger.info("Registered all tools with security permissions")
+        if is_demo_server:
+            logger.info(
+                "Registered all tools with ALLOW (KESTREL_DEMO_SERVER=1)"
+            )
+        else:
+            logger.info("Registered all tools with security permissions")
 
     async def _emit_approval_request(self, request: ApprovalRequest):
         """
