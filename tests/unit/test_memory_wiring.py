@@ -171,9 +171,12 @@ class TestMemoryConsolidateToolExists:
     """
 
     def test_memory_feature_exposes_consolidate_tool(self):
-        """The scheduler's _execute_scheduled_task searches feature tools by
+        """The scheduler's _lookup_and_run_tool searches feature tools by
         name. If MemoryFeature doesn't expose memory_consolidate, the
-        scheduled task fails with 'Unknown task'."""
+        scheduled task fails with 'Unknown task'.
+
+        (Phase 4 of #889 renamed `_execute_scheduled_task` →
+        `_lookup_and_run_tool`; the search body it tests is unchanged.)"""
         from kestrel_sovereign.features.memory.feature import MemoryFeature
 
         # Find the @tool decorator on memory_consolidate

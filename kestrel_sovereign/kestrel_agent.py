@@ -35,6 +35,8 @@ from kestrel_sovereign.agent.tool_registry import ToolRegistryMixin
 from kestrel_sovereign.agent.model_preference import ModelPreferenceMixin
 from kestrel_sovereign.agent.event_manager import EventManagerMixin
 from kestrel_sovereign.agent.request_lifecycle import RequestLifecycleMixin
+from kestrel_sovereign.agent.turn_lifecycle import TurnLifecycleMixin
+from kestrel_sovereign.signals import OrderedLockManager
 from kestrel_sovereign.storage.memory_system import MemorySystem
 from kestrel_sovereign.hooks import HooksManager, HookEvent, HookInput, PermissionDecision
 from kestrel_sovereign.bootstrap import BootstrapService, BootstrapState
@@ -135,6 +137,7 @@ class KestrelAgent(
     ModelPreferenceMixin,
     EventManagerMixin,
     RequestLifecycleMixin,
+    TurnLifecycleMixin,
 ):
     """
     The Kestrel Agent orchestrates memory, reasoning, and actions, bound by the Kestrel Constitution.
@@ -271,6 +274,12 @@ class KestrelAgent(
         self._active_request_ids: set[str] = set()
         self._cancelled_requests: set = set()
         self._privacy_transition_lock = asyncio.Lock()
+
+        # Shared lock manager for the dispatcher (Phase 1) AND the turn
+        # lifecycle (Phase 2). CONVERSATION is acquired by `_turn_lifecycle`
+        # in `process_input`/`process_input_streaming` — registered signal
+        # sources are forbidden from declaring it (registry enforces).
+        self._lock_manager = OrderedLockManager()
 
         # Session state
         self._session_briefed = False
@@ -490,6 +499,14 @@ class KestrelAgent(
                 feedback_store=feedback_store,
                 hooks_manager=self.hooks_manager,  # Pass hooks manager for security
                 on_task_complete=self._on_background_task_complete,  # For notifications
+                # Provider returns the in-flight cognition turn's
+                # causation chain (serialized) so outbound A2A tasks
+                # carry the lineage. The dispatcher sets the chain on
+                # the agent before calling process_input for COGNITION
+                # signals; create_task reads it via this provider.
+                # See #905 review P1 — without this, A→B→A loops would
+                # restart at depth 1 every iteration.
+                causation_chain_provider=self._provide_causation_chain,
             )
             await self.task_manager.initialize()
 
@@ -498,6 +515,60 @@ class KestrelAgent(
 
             # Expose observability store for orchestrator instrumentation
             self.observability_store = observability_store
+
+            # Initialize SignalDispatcher with the agent's existing
+            # OrderedLockManager (shared with the turn lifecycle so
+            # disjoint resource locks parallelize correctly) and a
+            # signal_log store backed by the agent's primary database
+            # connection. Source registrations land in the registry as
+            # features/runners initialize — heartbeat (Phase 3, this PR)
+            # is the first; scheduler/A2A/Stripe follow in Phases 4-6.
+            from kestrel_sovereign.signals import (
+                SignalDispatcher,
+                SignalLogStore,
+                SourceRegistry,
+            )
+
+            # AsyncStorage owns the underlying DatabaseBackend; reuse it
+            # so signal_log shares the agent's pool/connection rather than
+            # opening a separate one to the same db.
+            signal_log_store = SignalLogStore(self._raw_storage._backend)
+            await signal_log_store.initialize()
+
+            self.signal_registry = SourceRegistry()
+            self.signal_log_store = signal_log_store
+            self.dispatcher = SignalDispatcher(
+                agent=self,
+                registry=self.signal_registry,
+                lock_manager=self._lock_manager,
+                store=signal_log_store,
+            )
+
+            # Register the a2a.task_complete source so peer-task
+            # completions wake the bird via the dispatcher (Phase 5 of
+            # #889). The receiving callback in EventManagerMixin builds
+            # the Signal envelope and calls enqueue_signal; this
+            # registration provides the routing target.
+            from kestrel_sovereign.signals.sources.a2a import (
+                build_a2a_task_complete_registration,
+            )
+            self.signal_registry.register(
+                build_a2a_task_complete_registration()
+            )
+
+            # Register the Stripe deposit-complete webhook source
+            # (Phase 6 of #889 — the first UNTRUSTED COGNITION source).
+            # Registration is unconditional even when the wallet
+            # feature isn't loaded; the StripeWebhookHandler is wired
+            # by the wallet feature when it initializes, and uses
+            # `agent.on_stripe_deposit_complete` (defined elsewhere on
+            # the agent) as its on_deposit_complete callback.
+            from kestrel_sovereign.signals.sources.wallet import (
+                build_stripe_deposit_registration,
+            )
+            self.signal_registry.register(
+                build_stripe_deposit_registration()
+            )
 
             # Initialize storage providers for features (reflection self-model, etc.)
             self.lighthouse_provider = None
@@ -759,9 +830,23 @@ class KestrelAgent(
                 if feature:
                     self._register_explored_feature_tools(feature)
 
-            # Initialize heartbeat system (periodic agent self-checks)
+            # Initialize heartbeat system (periodic agent self-checks).
+            # Registers the heartbeat source with the dispatcher so its
+            # ticks route through the signal pipeline (Phase 3 of #889).
             from kestrel_sovereign.heartbeat import HeartbeatConfig, HeartbeatRunner
+            from kestrel_sovereign.signals.sources.heartbeat import (
+                build_heartbeat_registration,
+            )
+
             self._heartbeat_config = HeartbeatConfig.from_config()
+            self.signal_registry.register(
+                build_heartbeat_registration(
+                    interval_seconds=self._heartbeat_config.interval_seconds,
+                    active_hours_start=self._heartbeat_config.active_hours_start,
+                    active_hours_end=self._heartbeat_config.active_hours_end,
+                    timezone_name=self._heartbeat_config.timezone,
+                )
+            )
             self.heartbeat_runner = HeartbeatRunner(self, self._heartbeat_config)
             if self._heartbeat_config.enabled:
                 await self.heartbeat_runner.start()
@@ -1312,39 +1397,59 @@ Expected Duration: {expected_duration}
                     "Normal operation will resume once integrity is restored."
                 )
 
-        # BOOTSTRAP CHECK: Handle first-time agent wake-up and discovery
-        if self.bootstrap_service and await self.bootstrap_service.is_bootstrap_needed():
-            # Allow bootstrap commands to pass through
-            bootstrap_commands = ["!skip-discovery", "!restart-discovery", "!bootstrap-status"]
-            if user_input.startswith("!") and user_input.split()[0] in bootstrap_commands:
-                pass  # Let command handler process these
-            else:
-                bootstrap_response = await self._handle_bootstrap(user_input, session_id)
-                if bootstrap_response:
-                    return bootstrap_response
+        # Everything below this point CAN touch conversation history
+        # (bootstrap writes, command handlers may persist state, the LLM
+        # turn appends user/assistant messages). Acquire the turn
+        # lifecycle here so bootstrap and command-handling paths cannot
+        # interleave with a heartbeat tick or another HTTP request.
+        async with self._turn_lifecycle():
+            # BOOTSTRAP CHECK: Handle first-time agent wake-up and discovery
+            if self.bootstrap_service and await self.bootstrap_service.is_bootstrap_needed():
+                # Allow bootstrap commands to pass through
+                bootstrap_commands = ["!skip-discovery", "!restart-discovery", "!bootstrap-status"]
+                if user_input.startswith("!") and user_input.split()[0] in bootstrap_commands:
+                    pass  # Let command handler process these
+                else:
+                    bootstrap_response = await self._handle_bootstrap(user_input, session_id)
+                    if bootstrap_response:
+                        return bootstrap_response
 
-        # Handle explicit commands first (using the CommandHandler)
-        if user_input.startswith("!"):
-            # Special handling for !continue - replace with continuation prompt
-            if user_input.strip().lower() == "!continue":
-                user_input = "Please continue from where you left off."
-            else:
-                response = await self.command_handler.handle(user_input, caller=caller)
-                if response:
-                    return response
+            # Handle explicit commands first (using the CommandHandler)
+            if user_input.startswith("!"):
+                # Special handling for !continue - replace with continuation prompt
+                if user_input.strip().lower() == "!continue":
+                    user_input = "Please continue from where you left off."
+                else:
+                    response = await self.command_handler.handle(user_input, caller=caller)
+                    if response:
+                        return response
 
-        # --- OpenTelemetry span for the full request lifecycle ---
-        with optional_span("agent.process_input", {
-            "agent.did": self.did,
-            "agent.session_id": session_id or "",
-            "agent.input_length": len(user_input),
-        }) as _otel_span:
-            return await self._process_input_traced(
-                user_input, model_override, session_id, _otel_span, include_memories
-            )
+            # --- OpenTelemetry span for the full request lifecycle ---
+            with optional_span("agent.process_input", {
+                "agent.did": self.did,
+                "agent.session_id": session_id or "",
+                "agent.input_length": len(user_input),
+            }) as _otel_span:
+                # Lifecycle is already entered; call the locked body directly.
+                return await self._process_input_traced_locked(
+                    user_input, model_override, session_id, _otel_span, include_memories
+                )
 
-    async def _process_input_traced(self, user_input: str, model_override: str, session_id: str, _otel_span, include_memories: bool = True) -> str:
-        """Inner process_input logic wrapped in an OTEL span."""
+    async def _process_input_traced_locked(
+        self,
+        user_input: str,
+        model_override: str,
+        session_id: str,
+        _otel_span,
+        include_memories: bool = True,
+    ) -> str:
+        """Inner process_input logic wrapped in an OTEL span.
+
+        Caller MUST hold the turn lifecycle (CONVERSATION lock). Exposed
+        as a separate method so streaming's command-delegation path can
+        invoke this directly while the streaming generator already holds
+        the lifecycle, avoiding a self-deadlock against a non-reentrant
+        asyncio.Lock."""
         # Prompt injection detection (log-only, does not block)
         check_prompt_injection(user_input)
 
@@ -1719,6 +1824,66 @@ Expected Duration: {expected_duration}
             _background_memory_processing(),
             name="post_response_memory_enrichment",
         )
+
+    async def on_stripe_deposit_complete(self, session) -> None:
+        """Callback for `StripeWebhookHandler.on_deposit_complete`.
+
+        Builds an UNTRUSTED COGNITION signal envelope from the Stripe
+        OnRampSession and `enqueue_signal`s it through the dispatcher.
+        The HTTP webhook handler returns 200 immediately after Stripe
+        signature verification; this callback runs in the handler's
+        async context but doesn't block — the dispatcher's tracker
+        owns the supervised cognition turn (Phase 6 of #889).
+
+        Wired by the wallet feature at init time:
+            handler.on_deposit_complete = agent.on_stripe_deposit_complete
+        """
+        dispatcher = getattr(self, "dispatcher", None)
+        if dispatcher is None:
+            logging.warning(
+                "Stripe deposit complete callback fired but agent has no "
+                "dispatcher; deposit %s acknowledged without cognition",
+                getattr(session, "session_id", "<unknown>"),
+            )
+            return
+        try:
+            from kestrel_sovereign.signals.sources.wallet import (
+                build_signal_for_deposit,
+            )
+            signal = build_signal_for_deposit(
+                session=session, target_agent=self.did,
+            )
+            await dispatcher.enqueue_signal(signal)
+        except Exception as e:
+            # Never break the webhook handler's success path on a
+            # dispatcher hiccup — Stripe's record-of-truth is the DB
+            # update that already ran before this callback. Log and
+            # move on; signal_log absence will surface in operator
+            # dashboards as a missing entry.
+            logging.error(
+                "Failed to enqueue stripe.deposit_complete signal "
+                "for session %s: %s",
+                getattr(session, "session_id", "<unknown>"), e,
+                exc_info=True,
+            )
+
+    def _provide_causation_chain(self):
+        """Return the in-flight turn's causation chain in the
+        already-serialized form `serialize_chain_for_metadata` produces,
+        or None when no signal-driven turn is active. Wired into
+        TaskManager so outbound A2A tasks (created via create_task
+        during a turn) carry the lineage forward — see #905 review P1.
+        """
+        chain = self._get_current_chain()
+        if not chain:
+            return None
+        # Local import to avoid pulling signals.sources into the agent
+        # module's import time (circular: agent imports signals.sources
+        # for source registration; sources can import agent.types).
+        from kestrel_sovereign.signals.sources.a2a import (
+            serialize_chain_for_metadata,
+        )
+        return serialize_chain_for_metadata(chain)
 
     def _track_background_task(self, coro, *, name: str) -> asyncio.Task:
         """Start agent-owned background work and remove it when complete."""

@@ -60,10 +60,11 @@ class StreamingMixin:
         try:
             transition_lock = self._get_privacy_transition_lock()
             async with transition_lock:
-                async for chunk in self._process_input_streaming_traced(
-                    user_input, model_override, session_id, _otel_span
-                ):
-                    yield chunk
+                async with self._turn_lifecycle():
+                    async for chunk in self._process_input_streaming_traced_locked(
+                        user_input, model_override, session_id, _otel_span
+                    ):
+                        yield chunk
         except Exception as exc:
             end_span(_otel_span, error=exc)
             raise
@@ -71,10 +72,17 @@ class StreamingMixin:
             end_span(_otel_span)
             return
 
-    async def _process_input_streaming_traced(
+    async def _process_input_streaming_traced_locked(
         self, user_input, model_override, session_id, _otel_span
     ):
-        """Inner streaming logic wrapped in an OTEL span."""
+        """Inner streaming logic wrapped in an OTEL span.
+
+        Caller MUST hold the turn lifecycle (CONVERSATION lock). The
+        wrapper `process_input_streaming` enters the lifecycle once;
+        delegating here from a held-lifecycle context avoids the
+        non-reentrant-lock self-deadlock that the dispatcher (Phase 1)
+        would otherwise hit when COGNITION signals route through this
+        path."""
         # Prompt injection detection (log-only, does not block)
         check_prompt_injection(user_input)
 
