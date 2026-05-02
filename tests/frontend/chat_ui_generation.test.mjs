@@ -1,10 +1,23 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-// chat.js touches `window.SharedMarkdown` at module top, and pulls in
-// api.js (which expects browser globals). Stub just enough of that
-// surface so we can import the module and exercise the UI-generation
-// seam in isolation.
+// Per-pane generation gating replaced the old global uiGeneration
+// regime. The invariant flipped:
+//
+//   * Agent switch (A→B→A) does NOT bump any generation. Streams
+//     dispatched against A's pane keep painting into A's pane element
+//     even while B is mounted. Agent equality is no longer the gate;
+//     pane-attachment is.
+//
+//   * Within-agent context changes (clear chat, new chat, conversation
+//     switch on the same agent, soft/hard delete of the active
+//     conversation) bump THAT agent's pane.generation. The dispatch
+//     captured a generation token at start; the gate fails the moment
+//     the pane's generation moves past it.
+//
+// These tests exercise the per-pane gate directly via wipeAgentChatPane
+// and the chatPanes Map, without spinning up the full sendMessage path.
+
 globalThis.window = globalThis.window || {};
 globalThis.window.SharedMarkdown = {
     renderMarkdown: () => '',
@@ -13,105 +26,126 @@ globalThis.window.SharedMarkdown = {
     renderMermaidDiagrams: () => {},
     finalizeMarkdown: async () => {},
 };
-function stubElement() {
-    return {
-        classList: { add() {}, remove() {}, toggle() {} },
+
+// Minimal jsdom-ish stubs. createElement returns a node with the
+// children / appendChild semantics we need for pane attachment tests.
+function makeNode(tag = 'div') {
+    const node = {
+        tagName: tag.toUpperCase(),
+        nodeType: 1,
+        children: [],
+        childNodes: [],
+        parentNode: null,
+        classList: { _set: new Set(), add(c){this._set.add(c);}, remove(c){this._set.delete(c);}, toggle(c, on){if(on===undefined){this._set.has(c)?this._set.delete(c):this._set.add(c);}else if(on){this._set.add(c);}else{this._set.delete(c);}return this._set.has(c);}, contains(c){return this._set.has(c);} },
+        dataset: {},
         style: {},
-        addEventListener() {},
-        appendChild() {},
-        querySelector: () => null,
-        querySelectorAll: () => [],
         innerHTML: '',
         textContent: '',
+        scrollTop: 0,
+        scrollHeight: 0,
+        addEventListener() {},
+        querySelector() { return null; },
+        querySelectorAll() { return []; },
+        appendChild(child) {
+            child.parentNode = this;
+            this.children.push(child);
+            this.childNodes.push(child);
+            return child;
+        },
+        remove() {
+            if (this.parentNode) {
+                const i = this.parentNode.children.indexOf(this);
+                if (i >= 0) this.parentNode.children.splice(i, 1);
+                this.parentNode = null;
+            }
+        },
+        get firstChild() { return this.children[0] || null; },
     };
+    return node;
 }
+
+let chatContainer = makeNode('div');
+chatContainer.id = 'chat-container';
+
 globalThis.document = globalThis.document || {
-    getElementById: () => null,
-    createElement: () => stubElement(),
-    head: stubElement(),
-    body: stubElement(),
-    addEventListener: () => {},
-    querySelector: () => null,
-    querySelectorAll: () => [],
+    getElementById(id) { if (id === 'chat-container') return chatContainer; return null; },
+    createElement(tag) { return makeNode(tag); },
+    head: makeNode(), body: makeNode(),
+    addEventListener() {},
+    querySelector() { return null; },
+    querySelectorAll() { return []; },
 };
 globalThis.sessionStorage = globalThis.sessionStorage || {
     getItem: () => null, setItem: () => {}, removeItem: () => {},
 };
 globalThis.location = globalThis.location || { href: '/', search: '' };
 globalThis.fetch = globalThis.fetch || (async () => ({ ok: false, status: 500 }));
-// `kicon` is a global helper loaded via <script> in production; stub it.
 globalThis.kicon = globalThis.kicon || (() => '');
+globalThis.CSS = globalThis.CSS || { escape: (s) => String(s).replace(/"/g, '\\"') };
 
-const { bumpUiGeneration, _getUiGeneration, wipeChatPane } = await import(
+const { mountChatPane, wipeAgentChatPane } = await import(
     '../../kestrel_sovereign/static/js/chat.js'
 );
+const { state, getOrCreateChatPane } = await import(
+    '../../kestrel_sovereign/static/js/ui.js'
+);
 
-test('UI generation counter starts at 0 and increments on each bump (PR #874)', () => {
-    // The counter is module-scoped so we can't reset it between tests —
-    // capture the baseline and assert deltas.
-    const baseline = _getUiGeneration();
+test('agent switch (A→B→A) does NOT bump any pane generation', () => {
+    const paneA = getOrCreateChatPane('agent-a');
+    const paneB = getOrCreateChatPane('agent-b');
+    const genA0 = paneA.generation;
+    const genB0 = paneB.generation;
 
-    bumpUiGeneration();
-    assert.equal(_getUiGeneration(), baseline + 1);
+    mountChatPane('agent-a');
+    mountChatPane('agent-b');
+    mountChatPane('agent-a');
 
-    bumpUiGeneration();
-    bumpUiGeneration();
-    assert.equal(_getUiGeneration(), baseline + 3);
+    assert.equal(paneA.generation, genA0, "A's generation must not move on agent switches");
+    assert.equal(paneB.generation, genB0, "B's generation must not move on agent switches");
 });
 
-test('wipeChatPane() bumps the UI generation BEFORE the DOM mutation (PR #874 review-2)', () => {
-    // Every chat-pane wipe path (selectAgent, loadConversation,
-    // startNewConversation, clearChat, delete/purgeConversation) must go
-    // through wipeChatPane() so the generation counter moves with the
-    // wipe. Bare innerHTML='' wipes leak: a stream dispatched against the
-    // pre-wipe pane keeps thinking it's current and writes into the
-    // freshly-rebuilt one.
-    const fakeContainer = { innerHTML: '<old>previous</old>' };
-    let lookups = 0;
-    globalThis.document.getElementById = (id) => {
-        if (id === 'chat-container') {
-            lookups += 1;
-            return fakeContainer;
-        }
-        return null;
-    };
+test('within-agent context change bumps ONLY that agent\'s generation', () => {
+    const paneA = getOrCreateChatPane('agent-a');
+    const paneB = getOrCreateChatPane('agent-b');
+    const genA0 = paneA.generation;
+    const genB0 = paneB.generation;
 
-    const before = _getUiGeneration();
-    wipeChatPane('<div>fresh</div>');
+    wipeAgentChatPane('agent-a');
 
-    assert.equal(_getUiGeneration(), before + 1, 'generation must bump');
-    assert.equal(fakeContainer.innerHTML, '<div>fresh</div>', 'pane must be replaced');
-    assert.ok(lookups >= 1, 'must look up #chat-container fresh, not rely on a stale ref');
+    assert.equal(paneA.generation, genA0 + 1, "A's generation must bump");
+    assert.equal(paneB.generation, genB0, "B's generation must NOT move when A is wiped");
 });
 
-test('wipeChatPane() called with no argument clears to empty string (PR #874 review-2)', () => {
-    const fakeContainer = { innerHTML: '<old>previous</old>' };
-    globalThis.document.getElementById = (id) =>
-        id === 'chat-container' ? fakeContainer : null;
+test('per-pane gate: dispatch captured at gen N becomes stale only after a within-agent wipe', () => {
+    const pane = getOrCreateChatPane('agent-a');
+    const dispatchGeneration = pane.generation;
 
-    wipeChatPane();
-    assert.equal(fakeContainer.innerHTML, '');
+    // No within-agent change: gate holds.
+    assert.equal(pane.generation === dispatchGeneration, true);
+
+    // Agent switches do NOT invalidate the gate (the very point of
+    // the per-pane regime — streams keep painting through switches).
+    mountChatPane('agent-b');
+    mountChatPane('agent-a');
+    assert.equal(pane.generation === dispatchGeneration, true,
+        'agent switches must not invalidate the dispatch generation');
+
+    // A within-agent context change DOES invalidate the gate.
+    wipeAgentChatPane('agent-a');
+    assert.equal(pane.generation === dispatchGeneration, false,
+        'within-agent context change must move the pane generation');
 });
 
-test('UI generation gate: dispatch captured at gen N becomes stale after a bump (PR #874)', () => {
-    // Models the A→B→A timing case the reviewer flagged. agent-equality
-    // alone says "current!" after switching back to A — but the chat
-    // pane was wiped twice in between, orphaning the in-flight stream's
-    // msgDiv. The generation token catches that: the captured
-    // dispatchGeneration freezes; uiGeneration moves on with each
-    // selectAgent() call.
-    const dispatchGeneration = _getUiGeneration();
+test('mountChatPane attaches the target pane and detaches the previous one', () => {
+    const paneA = getOrCreateChatPane('mount-a');
+    const paneB = getOrCreateChatPane('mount-b');
 
-    // Equivalent of "current pane unchanged" — generation matches.
-    assert.equal(_getUiGeneration() === dispatchGeneration, true);
+    mountChatPane('mount-a');
+    assert.equal(paneA.element.parentNode, chatContainer, 'A must be mounted');
 
-    // selectAgent('B') would call bumpUiGeneration() before wiping the pane.
-    bumpUiGeneration();
-    assert.equal(_getUiGeneration() === dispatchGeneration, false);
+    mountChatPane('mount-b');
+    assert.equal(paneA.element.parentNode, null, 'A must be detached');
+    assert.equal(paneB.element.parentNode, chatContainer, 'B must be mounted');
 
-    // selectAgent('A') again — agent equality is restored from the
-    // dispatcher's perspective, but the generation has moved on twice.
-    bumpUiGeneration();
-    assert.equal(_getUiGeneration() === dispatchGeneration, false);
-    assert.equal(_getUiGeneration(), dispatchGeneration + 2);
+    assert.equal(state.mountedChatAgent, 'mount-b');
 });

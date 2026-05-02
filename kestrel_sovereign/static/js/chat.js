@@ -4,7 +4,7 @@
  */
 
 import API from './api.js';
-import { state, AGENT_COMMANDS, Toast } from './ui.js';
+import { state, AGENT_COMMANDS, Toast, getOrCreateChatPane } from './ui.js';
 
 // Shared markdown utilities - loaded via script tag before this module
 const {
@@ -31,46 +31,101 @@ let sharedModelSelector = null;
 // Autocomplete state
 let autocompleteSelectedIndex = -1;
 
-// UI generation counter. Bumps every time `selectAgent()` calls
-// `bumpUiGeneration()` — i.e. every time the chat pane is wiped and
-// rebuilt for a (re)selected agent. A stream captures this value at
-// dispatch time and treats its UI as "stale" the moment the global
-// counter moves past it. Agent-equality alone can't catch this:
-// A→B→A re-enters with `selectedHostAgent === dispatchAgent` but
-// `chatContainer.innerHTML = ''` already orphaned the old msgDiv.
-let uiGeneration = 0;
-
-export function bumpUiGeneration() {
-    uiGeneration++;
-}
-
-// Test seam — frontend tests need to inspect/reset the counter without
-// reaching through `selectAgent`'s DOM dependencies.
-export function _getUiGeneration() {
-    return uiGeneration;
+/**
+ * Resolve the live #chat-container scroll viewport. Looked up fresh
+ * because callers may run before initChat() has populated the cached
+ * ref (e.g. early agent-select firing in parallel with init).
+ */
+function getChatContainer() {
+    return chatContainer || document.getElementById('chat-container');
 }
 
 /**
- * Canonical chat-pane wipe-and-rebuild. Bumps the UI generation counter
- * BEFORE the DOM mutation so any in-flight stream's
- * `dispatchGeneration === uiGeneration` check fails immediately — that
- * stops chunks from painting a now-stale msgDiv during/after the wipe.
- *
- * Every code path that clears or rebuilds the chat container (agent
- * switch, conversation load, new chat, clear chat, soft/hard delete of
- * the active conversation) must go through this helper. Bare
- * `chatContainer.innerHTML = ...` calls leak: the generation counter
- * doesn't move, so a stream dispatched against the old pane keeps
- * thinking it's still current and writes into the freshly-rebuilt pane.
- *
- * The element is looked up fresh rather than relying on the cached
- * `chatContainer` ref because callers may run before `initChat()` has
- * resolved the ref or in contexts where the cache hasn't been populated.
+ * Resolve the chat pane element a write should target. When called
+ * with no arg, defaults to the currently-mounted agent's pane — this
+ * is what voice/ui.js and other no-arg consumers rely on so a single
+ * helper signature works for both "write to the visible chat" and
+ * "write to a specific agent's detached pane".
  */
-export function wipeChatPane(html = '') {
-    bumpUiGeneration();
-    const el = chatContainer || document.getElementById('chat-container');
-    if (el) el.innerHTML = html;
+function resolvePaneElement(paneElement) {
+    if (paneElement) return paneElement;
+    if (state.mountedChatAgent === undefined) return null;
+    const pane = state.chatPanes.get(state.mountedChatAgent);
+    return pane ? pane.element : null;
+}
+
+/**
+ * Mount the named agent's pane into #chat-container, swapping out
+ * whichever pane (if any) is currently mounted. Does NOT bump any
+ * generation — agent switching never invalidates a stream's pane. If
+ * the incoming pane has unrendered mermaid (deferred during streaming
+ * on a detached fragment, see updateStreamingMessage / finalize), run
+ * the mermaid pass now that it's live and clear the flag.
+ */
+export function mountChatPane(agentName) {
+    const target = getOrCreateChatPane(agentName);
+    const container = getChatContainer();
+    if (!container) {
+        // Pre-init or chat-disabled host — record the intent so the
+        // first real mount picks up the right agent. The pane stays
+        // detached in the JS heap.
+        state.mountedChatAgent = agentName;
+        return target;
+    }
+
+    // Detach the currently-mounted pane (if any), saving its scroll.
+    if (state.mountedChatAgent !== undefined) {
+        const current = state.chatPanes.get(state.mountedChatAgent);
+        if (current && current.element.parentNode === container) {
+            current.scrollPos = container.scrollTop;
+            current.element.remove();
+        }
+    }
+
+    // Empty the container of any leftover non-pane children (defensive
+    // against pre-migration HTML that mounted welcome content directly
+    // into #chat-container without going through a pane).
+    container.innerHTML = '';
+    container.appendChild(target.element);
+    state.mountedChatAgent = agentName;
+
+    // Restore scroll to where the user left this agent's conversation.
+    container.scrollTop = target.scrollPos;
+
+    // Mermaid finalization was deferred while the pane was detached —
+    // some renderers refuse to operate on disconnected nodes. Render
+    // now that the pane is live.
+    if (target.hasUnrenderedMermaid) {
+        try {
+            renderMermaidDiagrams(target.element);
+        } catch (e) {
+            console.warn('mermaid render on mount failed:', e);
+        }
+        target.hasUnrenderedMermaid = false;
+    }
+    return target;
+}
+
+/**
+ * Wipe ONE agent's pane and bump that agent's pane-local generation.
+ * Used for within-agent context changes — clear chat, new chat,
+ * conversation switch, soft/hard delete of the active conversation.
+ * Streams dispatched against the old generation drop their DOM writes
+ * (their server-side response still persists to the agent's DB).
+ *
+ * Crucially, this does NOT touch any other agent's pane: a switch of
+ * conversations on Agent A while Agent B is mid-stream must leave B's
+ * chunks painting into B's pane uninterrupted.
+ */
+export function wipeAgentChatPane(agentName, html = '') {
+    const pane = getOrCreateChatPane(agentName);
+    pane.generation += 1;
+    pane.streamingMsgDiv = null;
+    pane.fullContent = '';
+    pane.sessionId = null;
+    pane.hasUnrenderedMermaid = false;
+    pane.element.innerHTML = html;
+    pane.scrollPos = 0;
 }
 
 // ============================================================================
@@ -89,6 +144,28 @@ export function initChat() {
     sendButton = document.getElementById('send-button');
     modelSelector = document.getElementById('model-selector');
     thinkingIndicator = document.getElementById('thinking-indicator');
+
+    // Initial-pane migration: HTML ships welcome content baked into
+    // #chat-container. Move that content into a pane element so the
+    // pane-cache invariants hold from the very first frame — bare
+    // chatContainer children would survive selectAgent's swap and end
+    // up rendered alongside the new agent's pane.
+    //
+    // The host-agent is null at init (selectAgent hasn't run); the
+    // null-keyed pane is what standalone mode uses for its only
+    // conversation. In rookery mode, the first selectAgent call swaps
+    // this pane out via mountChatPane.
+    if (chatContainer) {
+        const initialAgent = API.getHostAgent();
+        const initialPane = getOrCreateChatPane(initialAgent);
+        // Move existing children (welcome card, demo banners, etc.)
+        // into the pane element and clear the container before mount.
+        while (chatContainer.firstChild) {
+            initialPane.element.appendChild(chatContainer.firstChild);
+        }
+        chatContainer.appendChild(initialPane.element);
+        state.mountedChatAgent = initialAgent;
+    }
 
     // Event listeners
     sendButton?.addEventListener('click', sendMessage);
@@ -255,13 +332,20 @@ function scheduleReconnect() {
 
 /**
  * Show a task notification in the chat interface.
+ *
+ * Notifications target the visible (mounted) agent's pane — task
+ * notifications come over a single SSE stream pinned to the selected
+ * agent, so by definition the visible pane is the right destination.
+ * Per-agent task notifications for non-visible agents would require
+ * one SSE per loaded agent and is out of scope for the parallel-chat
+ * change.
  */
 function showTaskNotification(message, type) {
     // Reset reconnect attempts on successful notification
     reconnectAttempts = 0;
 
-    // Add as a special notification message in the chat
-    if (!chatContainer) return;
+    const paneElement = resolvePaneElement();
+    if (!paneElement) return;
 
     const div = document.createElement('div');
     div.className = 'message notification-message';
@@ -301,8 +385,9 @@ function showTaskNotification(message, type) {
         </div>
     `;
 
-    chatContainer.appendChild(div);
-    chatContainer.scrollTop = chatContainer.scrollHeight;
+    paneElement.appendChild(div);
+    const c = getChatContainer();
+    if (c) c.scrollTop = c.scrollHeight;
 
     // Also show a Toast notification
     Toast.show(message, type === 'failed' ? 'error' : 'info');
@@ -343,36 +428,66 @@ export function updateThinkingIndicator() {
     if (sendButton) sendButton.disabled = busy;
 }
 
+/**
+ * Toggle the per-agent thinking pulse + per-agent stop control on a
+ * sidebar agent row. Driven by `state.waitingAgents`. Called from
+ * sendMessage start / finally / catch so the dot lights up while the
+ * agent has work in flight, even when a different agent is visible.
+ *
+ * Selector matches the row rendered in identity.js loadAgents().
+ * No-op if the row hasn't been rendered yet (early init).
+ */
+export function refreshAgentThinkingDot(agentName) {
+    if (typeof document === 'undefined') return;
+    const row = document.querySelector(`.agent-item[data-agent-name="${CSS.escape(String(agentName))}"]`);
+    if (!row) return;
+    const busy = state.waitingAgents.has(agentName);
+    row.classList.toggle('agent-thinking', busy);
+}
+
 // ============================================================================
 // Stop Request
 // ============================================================================
 
 /**
- * Stop the current streaming request.
- * Called when user clicks the Stop button.
+ * Stop the currently-visible agent's streaming request. Wired to the
+ * chat-pane Stop button. Use stopAgent(name) for the per-agent stop
+ * control rendered in the sidebar agent list.
  */
 async function stopRequest() {
-    console.log('Stop button clicked');
-    
-    // Abort client-side fetch using API's AbortController
-    const abortController = API.getStreamAbortController();
+    return stopAgent(API.getHostAgent());
+}
+
+/**
+ * Stop a specific agent's in-flight stream. Aborts client-side via
+ * the per-agent AbortController, and tells the server to halt by
+ * routing the /stop POST to that agent's endpoint (NOT the currently-
+ * selected agent's, which is what the un-overloaded API.stop would do).
+ *
+ * Exposed so the sidebar agent list can render a per-agent stop
+ * affordance — clicking "Stop A" while viewing B must reach A's
+ * backend, not B's.
+ */
+export async function stopAgent(agentName) {
+    const abortController = API.getStreamAbortController(agentName);
     if (abortController) {
-        abortController.abort();
+        try { abortController.abort(); } catch (_) { /* noop */ }
     }
-    
-    // Tell server to stop processing
+
+    const requestId = API.getCurrentStreamRequestId(agentName);
     try {
-        const result = await API.stop(API.getCurrentStreamRequestId());
-        console.log('Stop result:', result);
+        // Pass agentName explicitly so the stop POST hits this agent's
+        // endpoint regardless of which agent is currently selected.
+        await API.stop(requestId, agentName);
     } catch (e) {
-        console.error('Error stopping request:', e);
+        console.error(`Error stopping request on ${agentName}:`, e);
     }
-    
-    // Reset UI state for the currently-selected agent only. If the user
-    // switched away while a different stream was running, that stream's
-    // bookkeeping is cleared by its own sendMessage finally block.
-    state.waitingAgents.delete(API.getHostAgent());
-    updateThinkingIndicator();
+
+    state.waitingAgents.delete(agentName);
+    refreshAgentThinkingDot(agentName);
+    if (agentName === API.getHostAgent()) {
+        updateThinkingIndicator();
+    }
 }
 
 // ============================================================================
@@ -381,23 +496,34 @@ async function stopRequest() {
 
 export async function sendMessage() {
     const text = messageInput.value.trim();
-    // Capture the agent AND the UI generation this dispatch is bound to.
-    // The URL inside streamInvoke() is locked to dispatchAgent at fetch
-    // time, so server-side routing is safe. We use dispatchAgent +
-    // dispatchGeneration together to gate UI updates so chunks from a
-    // dispatch issued before a pane wipe (selectAgent → A→B→A) can't
-    // paint a now-orphaned msgDiv in the freshly-rebuilt pane.
+
+    // Capture the dispatch agent and pin the dispatch's pane up front,
+    // BEFORE any await — the user could mount a different agent's pane
+    // before the first stream chunk arrives, and the user's typed text
+    // must always land in the agent it was dispatched against.
     const dispatchAgent = API.getHostAgent();
-    const dispatchGeneration = uiGeneration;
     if (!text || state.waitingAgents.has(dispatchAgent)) return;
 
-    await addMessage('user', text);
+    const pane = getOrCreateChatPane(dispatchAgent);
+    // Capture the pane-local generation. This dispatch's DOM writes
+    // gate on `pane.generation === dispatchGeneration`. Agent switches
+    // do NOT bump generation — only within-agent context changes
+    // (clear chat, new conversation, soft/hard delete) do, so streams
+    // keep painting through agent switches but stop the moment the
+    // user changes the conversation underneath them.
+    const dispatchGeneration = pane.generation;
+
+    // Read the dispatch agent's session id from its pane (the
+    // currentSessionId getter resolves to the mounted agent — at this
+    // point the user could have already switched, so go through the
+    // pane directly).
+    const sessionId = pane.sessionId || null;
+
+    await addMessage('user', text, pane.element);
     messageInput.value = '';
     state.waitingAgents.add(dispatchAgent);
     updateThinkingIndicator();
-
-    // Get current session ID for context-aware conversation
-    const sessionId = state.currentSessionId || null;
+    refreshAgentThinkingDot(dispatchAgent);
 
     // DO NOT send model/provider overrides from the chat UI. The server
     // already knows each agent's persisted mandate (set via POST
@@ -407,41 +533,53 @@ export async function sendMessage() {
     // from the previous agent would silently reroute the new agent's
     // chat to a different model. Source of truth: server mandate.
 
-    // A stream's UI is "current" only if BOTH the active agent matches
-    // AND the chat pane hasn't been wiped/rebuilt since dispatch. Agent
-    // equality alone misses A→B→A: the pane was wiped on each switch,
-    // so the captured msgDiv is detached even though the agent matches.
-    const isCurrent = () =>
-        API.getHostAgent() === dispatchAgent && uiGeneration === dispatchGeneration;
+    // Pane-fresh = "no within-agent context change since dispatch."
+    // Visible-and-fresh = also the agent the user is actively viewing;
+    // used to gate global-singleton updates (model selector, footer).
+    const isPaneFresh = () => pane.generation === dispatchGeneration;
+    const isCurrentVisible = () =>
+        isPaneFresh() && API.getHostAgent() === dispatchAgent;
+
+    let wasAborted = false;
 
     try {
         if (state.useStreaming) {
-            const msgDiv = addMessageStreaming('agent');
+            const msgDiv = addMessageStreaming('agent', pane.element);
+            pane.streamingMsgDiv = msgDiv;
             let fullContent = '';
 
             try {
                 for await (const chunk of API.streamInvoke(text, null, sessionId, null)) {
                     fullContent += chunk;
-                    // Skip DOM repaint when the user has switched agents —
-                    // chatContainer was wiped on switch, msgDiv is now an
-                    // orphan, and updating the shared model selector with
-                    // this stream's content would corrupt the new agent's UI.
-                    if (isCurrent()) {
-                        updateStreamingMessage(msgDiv, fullContent);
+                    // Per-pane gate only — chunks DO paint into the
+                    // dispatch agent's pane element even when that
+                    // pane is detached (the user is viewing a
+                    // different agent). When they come back, the
+                    // streaming text is already there.
+                    if (isPaneFresh()) {
+                        updateStreamingMessage(msgDiv, fullContent, pane.element);
                     }
                 }
-                if (isCurrent()) {
-                    await finalizeStreamingMessage(msgDiv, fullContent);
+                if (isPaneFresh()) {
+                    await finalizeStreamingMessage(msgDiv, fullContent, pane);
+                }
+                if (isCurrentVisible()) {
                     await checkForModelChange(fullContent);
                 }
             } catch (streamError) {
+                if (streamError.name === 'AbortError') {
+                    wasAborted = true;
+                    throw streamError;
+                }
                 if (streamError.message.includes('404') || streamError.message.includes('405')) {
                     console.log('Streaming not available, falling back to standard invoke');
                     state.useStreaming = false;
                     msgDiv.remove();
                     const response = await API.invoke(text, null, sessionId, null);
-                    if (isCurrent()) {
-                        await addMessage('agent', response.response);
+                    if (isPaneFresh()) {
+                        await addMessage('agent', response.response, pane.element);
+                    }
+                    if (isCurrentVisible()) {
                         await checkForModelChange(response.response);
                     }
                 } else {
@@ -450,24 +588,38 @@ export async function sendMessage() {
             }
         } else {
             const response = await API.invoke(text, null, sessionId, null);
-            if (isCurrent()) {
-                await addMessage('agent', response.response);
+            if (isPaneFresh()) {
+                await addMessage('agent', response.response, pane.element);
+            }
+            if (isCurrentVisible()) {
                 await checkForModelChange(response.response);
             }
         }
     } catch (e) {
-        if (isCurrent()) {
-            await addMessage('agent', `Error: ${e.message}`);
+        if (e && e.name === 'AbortError') {
+            wasAborted = true;
+        } else if (isPaneFresh()) {
+            await addMessage('agent', `Error: ${e.message}`, pane.element);
         } else {
-            console.warn(`stream error on ${dispatchAgent} (no longer current):`, e.message);
+            console.warn(`stream error on ${dispatchAgent} (pane stale):`, e.message);
         }
     } finally {
+        pane.streamingMsgDiv = null;
         state.waitingAgents.delete(dispatchAgent);
+        refreshAgentThinkingDot(dispatchAgent);
+        // Drive the visible thinking indicator from whatever agent the
+        // user is currently looking at, not the dispatch agent.
         updateThinkingIndicator();
-        // Update context status only for the currently-visible agent.
-        // Updating from a stale dispatch would query the wrong session.
-        if (isCurrent()) {
+        // Context status touches a global singleton — gate on visible.
+        if (isCurrentVisible()) {
             updateContextStatus();
+        }
+        // Toast the user when a non-visible agent finishes responding,
+        // so a long-running answer on Agent A surfaces while they're
+        // chatting with Agent B. Skipped on aborts and on stale panes.
+        if (!wasAborted && isPaneFresh() && API.getHostAgent() !== dispatchAgent) {
+            const label = dispatchAgent || 'agent';
+            Toast.info(`${label} finished responding`);
         }
     }
 }
@@ -573,13 +725,16 @@ function createContextStatusElement() {
 }
 
 /**
- * Show a context warning message in the chat.
+ * Show a context warning message in the chat. Targets the visible
+ * agent's pane — context warnings are emitted from updateContextStatus
+ * which itself only runs for the visible agent.
  */
-function showContextWarning(warnings) {
-    if (!chatContainer) return;
+function showContextWarning(warnings, paneElement = null) {
+    const target = resolvePaneElement(paneElement);
+    if (!target) return;
 
     // Don't show duplicate warnings
-    if (chatContainer.querySelector('.context-warning')) return;
+    if (target.querySelector('.context-warning')) return;
 
     const div = document.createElement('div');
     div.className = 'message system-message context-warning';
@@ -595,8 +750,9 @@ function showContextWarning(warnings) {
         <strong>${kicon('warning')} Context Warning:</strong> ${warnings.join('. ')}
         <br><small>Use <code>!compress</code> to summarize older messages, or start fresh with <code>!new-session</code></small>
     `;
-    chatContainer.appendChild(div);
-    chatContainer.scrollTop = chatContainer.scrollHeight;
+    target.appendChild(div);
+    const c = getChatContainer();
+    if (c) c.scrollTop = c.scrollHeight;
 }
 
 /**
@@ -621,7 +777,15 @@ window.compressContext = async function() {
 // Message Rendering
 // ============================================================================
 
-export function addMessageStreaming(role) {
+/**
+ * Append a streaming message bubble. Optional paneElement targets a
+ * specific agent's detached pane; without it, defaults to the visible
+ * (mounted) agent's pane so single-agent and voice-pipe call sites
+ * continue to work without modification. Scroll-syncs only when the
+ * write lands on the currently-mounted pane.
+ */
+export function addMessageStreaming(role, paneElement = null) {
+    const target = resolvePaneElement(paneElement);
     const div = document.createElement('div');
     div.className = `message ${role === 'user' ? 'user-message' : 'agent-message'}`;
 
@@ -630,13 +794,18 @@ export function addMessageStreaming(role) {
     contentDiv.textContent = '';
 
     div.appendChild(contentDiv);
-    chatContainer.appendChild(div);
-    chatContainer.scrollTop = chatContainer.scrollHeight;
+    if (target) {
+        target.appendChild(div);
+        const c = getChatContainer();
+        if (c && target.parentNode === c) {
+            c.scrollTop = c.scrollHeight;
+        }
+    }
 
     return div;
 }
 
-export function updateStreamingMessage(msgDiv, content) {
+export function updateStreamingMessage(msgDiv, content, paneElement = null) {
     const contentDiv = msgDiv.querySelector('.message-content');
     if (contentDiv) {
         // Split content into tool activity and response at the --- separator
@@ -646,7 +815,7 @@ export function updateStreamingMessage(msgDiv, content) {
 
         // Check if content has tool indicators (before separator or if no separator yet)
         const hasToolIndicators = /^[🔧✓❌]/.test(content.trim());
-        
+
         if (hasToolIndicators && !content.includes('\n---\n')) {
             // Still in tool execution phase - show as activity
             const activityHtml = content.split('\n').map(line => {
@@ -672,23 +841,70 @@ export function updateStreamingMessage(msgDiv, content) {
             highlightCodeBlocks(contentDiv, true);
         }
 
-        chatContainer.scrollTop = chatContainer.scrollHeight;
+        // Scroll-sync only when this msgDiv is in the live viewport;
+        // detached panes update their `scrollPos` lazily on remount.
+        const target = paneElement || msgDiv.parentNode;
+        const c = getChatContainer();
+        if (c && target && target.parentNode === c) {
+            c.scrollTop = c.scrollHeight;
+        }
     }
 }
 
-export async function finalizeStreamingMessage(msgDiv, content) {
+/**
+ * Final-render a streaming bubble. `paneOrElement` accepts either a
+ * pane element directly or a full pane object — passing the pane lets
+ * us defer mermaid rendering when the pane is currently detached. The
+ * caller in sendMessage passes the pane; voice/ui.js passes nothing
+ * and gets the visible-pane default (mermaid runs immediately because
+ * the pane is already mounted).
+ *
+ * Note: this no longer calls checkForModelChange(). The shared model
+ * selector is a global singleton — letting helpers mutate it from a
+ * background-pane finalize would corrupt the visible agent's UI.
+ * sendMessage gates that call on isCurrentVisible() instead.
+ */
+export async function finalizeStreamingMessage(msgDiv, content, paneOrElement = null) {
     const contentDiv = msgDiv.querySelector('.message-content');
-    if (contentDiv) {
-        contentDiv.classList.remove('streaming');
-        // Use shared markdown utilities for full render with mermaid support
-        await finalizeMarkdown(contentDiv, content);
+    if (!contentDiv) return;
 
-        await checkForModelChange(content);
-        chatContainer.scrollTop = chatContainer.scrollHeight;
+    contentDiv.classList.remove('streaming');
+
+    // Detect which pane this write lands on so we can choose between
+    // running the full markdown finalization (incl. mermaid) now or
+    // deferring the mermaid pass until the pane is mounted. mermaid
+    // 10+ technically renders on detached nodes, but we've seen
+    // flakiness — be conservative and defer.
+    let pane = null;
+    let paneEl = null;
+    if (paneOrElement && typeof paneOrElement === 'object') {
+        if (paneOrElement.element) {
+            pane = paneOrElement;
+            paneEl = paneOrElement.element;
+        } else if (paneOrElement.appendChild) {
+            paneEl = paneOrElement;
+        }
     }
+    if (!paneEl) paneEl = msgDiv.parentNode;
+    const c = getChatContainer();
+    const mounted = !!(c && paneEl && paneEl.parentNode === c);
+
+    await finalizeMarkdown(contentDiv, content);
+    if (!mounted && pane && /```mermaid/.test(content)) {
+        // Mark the pane so mountChatPane re-runs the mermaid pass.
+        pane.hasUnrenderedMermaid = true;
+    }
+
+    if (mounted && c) c.scrollTop = c.scrollHeight;
 }
 
-export async function addMessage(role, content) {
+/**
+ * Append a non-streaming message bubble. See addMessageStreaming for
+ * the paneElement contract; the same default applies. checkForModelChange
+ * is intentionally NOT invoked here — see finalizeStreamingMessage.
+ */
+export async function addMessage(role, content, paneElement = null) {
+    const target = resolvePaneElement(paneElement);
     const div = document.createElement('div');
     div.className = `message ${role === 'user' ? 'user-message' : 'agent-message'}`;
 
@@ -705,13 +921,12 @@ export async function addMessage(role, content) {
     }
 
     div.appendChild(contentDiv);
-    chatContainer.appendChild(div);
+    if (target) target.appendChild(div);
 
-    if (role === 'agent') {
-        await checkForModelChange(content);
+    const c = getChatContainer();
+    if (c && target && target.parentNode === c) {
+        c.scrollTop = c.scrollHeight;
     }
-
-    chatContainer.scrollTop = chatContainer.scrollHeight;
 }
 
 // ============================================================================
@@ -1031,10 +1246,10 @@ function selectHighlightedCommand() {
 window.clearChat = function() {
     if (!chatContainer) return;
 
-    // Clear all messages except the welcome message. wipeChatPane() bumps
-    // the UI generation so any in-flight stream against this pane gates
-    // out before its chunks can paint the welcome view.
-    wipeChatPane(`
+    // Clear ONLY the visible agent's pane and bump that agent's
+    // pane-local generation. Other agents' panes (and their in-flight
+    // streams) are untouched.
+    wipeAgentChatPane(API.getHostAgent(), `
         <div class="message agent-message">
             <div class="message-content">
                 <p>Hello! I am your Kestrel AI agent, bound by the Kestrel Constitution to be your truthful and honorable assistant. How can I help you today?</p>

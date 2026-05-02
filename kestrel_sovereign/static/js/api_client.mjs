@@ -287,34 +287,54 @@ export function createApiClient({
         currentStreamRequestIds: new Map(),
     };
 
+    // Single-source the fetch + auth + 401-retry pipeline so both
+    // request() and requestForAgent() share it. Without this factor
+    // out, an explicit-agent call would either skip auth-refresh or
+    // re-implement it (drift risk). The url passed in is FINAL — the
+    // caller has already applied host-agent prefixing if needed.
+    async function performRequest(url, options = {}, retried = false, retryCb = null) {
+        const headers = await buildHeaders(options.headers);
+        if (options.body instanceof FormData) {
+            delete headers['Content-Type'];
+        }
+        const response = await fetchImpl(url, { ...options, headers });
+
+        if (response.status === 401 && !retried) {
+            const recovery = await auth.onUnauthorized();
+            if (recovery === 'redirected') return;
+            if (recovery === 'refreshed' && retryCb) return retryCb();
+
+            const error = await response.json().catch(() => ({ detail: 'Authentication failed' }));
+            throw new Error(error.detail || 'Authentication failed - please refresh the page');
+        }
+
+        if (!response.ok) {
+            const error = await response.json().catch(() => ({ detail: response.statusText }));
+            throw new Error(error.detail || `HTTP ${response.status}`);
+        }
+        return response.json();
+    }
+
     const client = {
         async init() {
             await auth.ensureAuthenticated();
         },
 
         async request(endpoint, options = {}, retried = false) {
-            const headers = await buildHeaders(options.headers);
-            // Let the browser set Content-Type for FormData (multipart boundary)
-            if (options.body instanceof FormData) {
-                delete headers['Content-Type'];
-            }
             const url = applyHostAgentPrefix(endpoint, state.selectedHostAgent);
-            const response = await fetchImpl(url, { ...options, headers });
+            return performRequest(url, options, retried, () => this.request(endpoint, options, true));
+        },
 
-            if (response.status === 401 && !retried) {
-                const recovery = await auth.onUnauthorized();
-                if (recovery === 'redirected') return;
-                if (recovery === 'refreshed') return this.request(endpoint, options, true);
-
-                const error = await response.json().catch(() => ({ detail: 'Authentication failed' }));
-                throw new Error(error.detail || 'Authentication failed - please refresh the page');
-            }
-
-            if (!response.ok) {
-                const error = await response.json().catch(() => ({ detail: response.statusText }));
-                throw new Error(error.detail || `HTTP ${response.status}`);
-            }
-            return response.json();
+        // Like request() but pins the host-agent prefix to the explicit
+        // `agent` arg instead of state.selectedHostAgent. Used when a
+        // caller must reach a specific agent's endpoint while the user
+        // is currently viewing a different one — e.g. clicking the
+        // sidebar Stop control on Agent A while the chat pane shows
+        // Agent B. The caller must pass the canonical /api/agent/...
+        // path; routing is applied here so we don't double-prefix.
+        async requestForAgent(endpoint, options = {}, agent, retried = false) {
+            const url = applyHostAgentPrefix(endpoint, agent);
+            return performRequest(url, options, retried, () => this.requestForAgent(endpoint, options, agent, true));
         },
 
         health: () => client.request('/health'),
@@ -436,10 +456,21 @@ export function createApiClient({
             method: 'POST',
             body: JSON.stringify({ input, model, session_id: sessionId, provider }),
         }),
-        stop: (requestId = null) => client.request('/api/agent/stop', {
-            method: 'POST',
-            body: JSON.stringify(requestId ? { request_id: requestId } : {}),
-        }),
+        // Two-arg overload: pass `agent` to target a specific agent's
+        // /stop endpoint regardless of which agent is currently
+        // selected. Without it, a sidebar "Stop Agent A" click while
+        // viewing Agent B would route the stop to B's backend (because
+        // request() pins to state.selectedHostAgent), aborting client-
+        // side but never telling A's server to halt.
+        stop: (requestId = null, agent) => {
+            const opts = {
+                method: 'POST',
+                body: JSON.stringify(requestId ? { request_id: requestId } : {}),
+            };
+            return agent !== undefined
+                ? client.requestForAgent('/api/agent/stop', opts, agent)
+                : client.request('/api/agent/stop', opts);
+        },
         getModels: (options = {}) => {
             const params = new URLSearchParams();
             if (options.featuredOnly !== undefined) params.append('featured_only', options.featuredOnly);
