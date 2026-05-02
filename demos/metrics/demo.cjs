@@ -44,6 +44,8 @@ test.describe.serial('Kestrel Metrics Dashboard Demo', () => {
   test.beforeAll(async ({ request }) => {
     if (!fs.existsSync(OUTPUT_DIR)) fs.mkdirSync(OUTPUT_DIR, { recursive: true });
     apiKey = await getApiKey(request, BASE_URL);
+    // Approval modal is suppressed server-side via KESTREL_DEMO_SERVER=1
+    // (set by demos/run.sh). See SecurityFeature._register_all_tools.
   });
 
   test.afterAll(() => {
@@ -107,7 +109,7 @@ test.describe.serial('Kestrel Metrics Dashboard Demo', () => {
     narrator.act(4, 'Charts — timeline, duration, distribution');
     narrator.narrate(
       'Three charts complete the picture. Timeline shows events over time, colored by type. ' +
-      'Duration shows p50/p95 per tool. Distribution breaks down event types.'
+      'Duration shows average milliseconds per tool. Distribution breaks down event types.'
     );
     await demoGoto(page, BASE_URL, apiKey);
     await dismissContextWarning(page);
@@ -116,7 +118,7 @@ test.describe.serial('Kestrel Metrics Dashboard Demo', () => {
 
     const charts = [
       { sel: '#metrics-timeline-chart',     name: 'timeline-chart',     caption: 'Timeline — events over time, colored by type' },
-      { sel: '#metrics-duration-chart',     name: 'duration-chart',     caption: 'Duration distribution — p50 / p95 per tool' },
+      { sel: '#metrics-duration-chart',     name: 'duration-chart',     caption: 'Tool duration — average milliseconds per tool' },
       { sel: '#metrics-distribution-chart', name: 'distribution-chart', caption: 'Event type distribution' },
     ];
 
@@ -153,6 +155,8 @@ test.describe.serial('Kestrel Metrics Dashboard Demo', () => {
 
     await page.evaluate(() => window.scrollTo(0, 0));
     await demoPause(page, 1000);
-    await demoScreenshot(narrator, page, OUTPUT_DIR, 'dashboard-final');
+    // fullPage so the bookend captures the whole dashboard
+    // (KPI + 3 charts + errors), not just what fits in the viewport.
+    await demoScreenshot(narrator, page, OUTPUT_DIR, 'dashboard-final', { fullPage: true });
   });
 });

@@ -367,6 +367,12 @@ test.describe.serial('Trash Vignette', () => {
     await clearHighlights(page);
 
     const purged = await page.evaluate(() => {
+      // Auto-accept confirm() since the click happens inside page.evaluate —
+      // Playwright's `page.on('dialog', ...)` only intercepts dialogs raised
+      // from outside the evaluate frame. Without this override, btn.click()
+      // blocks on the confirm prompt and the purge never fires (the message
+      // is still visible after, which fails the eye expectation).
+      window.confirm = () => true;
       const messages = document.querySelectorAll('.message[data-message-id]');
       if (!messages.length) return false;
       const btn = messages[messages.length - 1].querySelector('.msg-purge-btn');
