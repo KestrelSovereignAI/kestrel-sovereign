@@ -78,6 +78,24 @@ export async function loadCommands(apiModule) {
 // State
 // ============================================================================
 
+// Per-agent chat pane cache. Each agent owns a detached <div> that
+// stays alive across agent switches so streams keep painting into
+// their dispatch agent's pane whether visible or not. The visible
+// pane is just whichever fragment is currently mounted into
+// #chat-container. Keyed by host-agent name; null is the standalone-
+// mode key. Pane shape:
+//   {
+//     element: HTMLDivElement,         // detached pane container
+//     generation: number,               // bumped on within-agent context change
+//     streamingMsgDiv: HTMLDivElement|null,
+//     fullContent: string,
+//     sessionId: string|null,
+//     scrollPos: number,
+//     hasUnrenderedMermaid: boolean,    // mermaid render deferred until mount
+//   }
+const chatPanes = new Map();
+let mountedChatAgent;  // undefined sentinel — null is a valid key
+
 export const state = {
     currentPanel: 'identity',
     identity: null,
@@ -92,13 +110,69 @@ export const state = {
     // on Agent A doesn't make Agent B's input look "Thinking" too.
     waitingAgents: new Set(),
     conversations: [],
-    currentSessionId: null,
     showDecrypted: true,
     encryptedAtRest: false,
     useStreaming: true,
     selectedModel: null,
     selectedProvider: null,
+
+    chatPanes,
+
+    get mountedChatAgent() { return mountedChatAgent; },
+    set mountedChatAgent(v) { mountedChatAgent = v; },
 };
+
+// `state.currentSessionId` is now agent-scoped: it reads/writes the
+// sessionId of whichever agent's pane is currently mounted. Treating
+// it as a per-pane property is what lets each agent retain its
+// session across switches without nuking it on selectAgent.
+//
+// Reads when no pane is mounted return null so callers that probe
+// during early init (loadConversations auto-load, history sidebar
+// rendering, footer status) keep their previous "no session yet"
+// behavior. Writes when no pane is mounted are a no-op rather than
+// creating a phantom pane keyed on `undefined`.
+Object.defineProperty(state, 'currentSessionId', {
+    get() {
+        if (mountedChatAgent === undefined) return null;
+        const pane = chatPanes.get(mountedChatAgent);
+        return pane ? pane.sessionId : null;
+    },
+    set(value) {
+        if (mountedChatAgent === undefined) return;
+        const pane = chatPanes.get(mountedChatAgent);
+        if (pane) pane.sessionId = value;
+    },
+    enumerable: true,
+    configurable: false,
+});
+
+/**
+ * Lazily create the per-agent chat pane element. Pane elements live
+ * detached until mounted into #chat-container. Returned object is the
+ * canonical per-agent chat state — message DOM, generation, session,
+ * scroll, and the mermaid-deferral flag are all tracked here.
+ */
+export function getOrCreateChatPane(agentName) {
+    let pane = chatPanes.get(agentName);
+    if (pane) return pane;
+    const element = document.createElement('div');
+    element.className = 'chat-container-pane';
+    if (agentName !== null && agentName !== undefined) {
+        element.dataset.agent = String(agentName);
+    }
+    pane = {
+        element,
+        generation: 0,
+        streamingMsgDiv: null,
+        fullContent: '',
+        sessionId: null,
+        scrollPos: 0,
+        hasUnrenderedMermaid: false,
+    };
+    chatPanes.set(agentName, pane);
+    return pane;
+}
 
 // ============================================================================
 // Toast Notifications
