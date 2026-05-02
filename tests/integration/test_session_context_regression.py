@@ -167,10 +167,12 @@ async def test_kestrel_agent_uses_generate_with_messages():
     import inspect
     from kestrel_sovereign.kestrel_agent import KestrelAgent
 
-    # process_input delegates to _process_input_traced, so check both
+    # process_input itself enters the turn lifecycle (Phase 2 of #889 —
+    # bootstrap + command paths must be inside the lifecycle), then calls
+    # _process_input_traced_locked where the actual LLM call lives.
     source = inspect.getsource(KestrelAgent.process_input)
-    traced_source = inspect.getsource(KestrelAgent._process_input_traced)
-    combined = source + traced_source
+    locked_source = inspect.getsource(KestrelAgent._process_input_traced_locked)
+    combined = source + locked_source
 
     # CRITICAL: Must use generate_with_messages, not generate
     assert "generate_with_messages" in combined, \
@@ -193,10 +195,11 @@ async def test_streaming_uses_messages_with_history():
     import inspect
     from kestrel_sovereign.agent.streaming import StreamingMixin
 
-    # process_input_streaming delegates to _process_input_streaming_traced, so check both
+    # process_input_streaming → _process_input_streaming_traced_locked
+    # (the wrapper enters the turn lifecycle inline; the body lives in _locked).
     source = inspect.getsource(StreamingMixin.process_input_streaming)
-    traced_source = inspect.getsource(StreamingMixin._process_input_streaming_traced)
-    combined = source + traced_source
+    locked_source = inspect.getsource(StreamingMixin._process_input_streaming_traced_locked)
+    combined = source + locked_source
 
     # CRITICAL: Must pass messages to the streaming call
     # Streaming uses stream_with_tool_detection(messages=messages, ...)

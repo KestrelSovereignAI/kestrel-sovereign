@@ -56,7 +56,9 @@ class SchedulerFeature(Feature):
         )
 
     async def initialize(self):
-        """Initialize the scheduler: set up DB refs and start the background runner."""
+        """Initialize the scheduler: set up DB refs, register cron sources
+        with the SignalDispatcher (Phase 4 of #889), and start the
+        background runner."""
         self._db = None
         self._agent_id = ""
         self._runner: Optional[SchedulerRunner] = None
@@ -70,11 +72,45 @@ class SchedulerFeature(Feature):
             logger.warning("SchedulerFeature: no database available, running in no-op mode")
             return
 
-        # Start background runner
+        # Register one source per built-in cron task with the dispatcher.
+        # Done at initialize() (not post_all_features_loaded) so the
+        # registry is stable before the background runner starts polling.
+        # Tools that depend on other features (e.g. `reflect` requires
+        # ReflectionFeature) register their sources unconditionally; if
+        # the underlying tool isn't loaded the handler raises and the
+        # dispatcher captures it as FAILED. Saner than dynamic registration.
+        from kestrel_sovereign.signals.sources.scheduler import (
+            build_cron_registrations,
+        )
+
+        registry = getattr(self.agent, "signal_registry", None)
+        if registry is not None:
+            cron_registrations = build_cron_registrations(
+                tool_lookup=self._lookup_and_run_tool,
+                builtin_handlers={
+                    "backup_snapshot": self._handle_backup_snapshot,
+                    "trash_retention": self._run_trash_retention,
+                },
+            )
+            for reg in cron_registrations:
+                # Idempotent against re-init: skip if already registered
+                # (the registry rejects duplicates, but a feature reload
+                # in tests shouldn't blow up).
+                if reg.name not in registry:
+                    registry.register(reg)
+        else:
+            logger.warning(
+                "SchedulerFeature: no signal_registry on agent, "
+                "cron tasks will not be dispatched as signals"
+            )
+
+        # Start background runner. The new executor builds a Signal
+        # envelope per task and routes through the dispatcher; cron
+        # config and task_execution_log shape are unchanged.
         self._runner = SchedulerRunner(
             db=self._db,
             agent_id=self._agent_id,
-            executor=self._execute_scheduled_task,
+            executor=self._dispatch_scheduled_task,
         )
         await self._runner.start()
         logger.info("SchedulerFeature initialized")
@@ -138,38 +174,130 @@ class SchedulerFeature(Feature):
             await self._runner.stop()
 
     # ------------------------------------------------------------------
-    # Task executor callback
+    # Task executor — dispatches via SignalDispatcher (Phase 4 of #889)
     # ------------------------------------------------------------------
 
-    async def _execute_scheduled_task(self, task_name: str, args: dict) -> str:
+    async def _dispatch_scheduled_task(self, task_name: str, args: dict) -> Any:
+        """SchedulerRunner executor — builds a Signal envelope per task
+        and routes through the agent's SignalDispatcher.
+
+        Returns whatever shape the runner expects from the legacy
+        executor: a string (or a (text, outcome_signal) tuple). The
+        translation lives in `_translate_signal_result`.
+
+        The cron expression and task_execution_log shape are unchanged.
+        Per-task mode (ACTION/ARTIFACT) and resource locks come from the
+        SourceRegistration built in `signals/sources/scheduler.py`.
         """
-        Execute a scheduled task by name.
+        from kestrel_sdk.signals import Signal, SignalMode, Status, Visibility
+        from kestrel_sovereign.signals.sources.scheduler import (
+            CRON_TASKS,
+            cron_source_name,
+        )
 
-        Looks up the task_name as a feature tool across all registered features
-        on the agent, then invokes it with the supplied args.
+        dispatcher = getattr(self.agent, "dispatcher", None)
+        if dispatcher is None:
+            # Fallback for partially-initialized agents (e.g. legacy
+            # test fixtures): execute the tool directly without going
+            # through the signal pipeline. Production agents always
+            # have a dispatcher; this branch is defensive only.
+            logger.warning(
+                "SchedulerFeature: no dispatcher on agent, "
+                "executing %r directly", task_name,
+            )
+            return await self._lookup_and_run_tool(task_name, args)
 
-        Args:
-            task_name: Name of the tool to invoke (e.g. "wellness_check")
-            args: Dict of keyword arguments for the tool
+        # Look up the task's mode from the classification table. If a
+        # task fires that isn't in CRON_TASKS, it has no source
+        # registration — fall back to direct tool execution rather than
+        # rejecting (preserves backward compat for ad-hoc tools added
+        # via `!schedule add <cron> <custom_tool>`).
+        mode_by_name = {name: mode for name, mode, _ in CRON_TASKS}
+        mode = mode_by_name.get(task_name)
+        if mode is None:
+            logger.info(
+                "SchedulerFeature: %r has no source registration, "
+                "executing directly", task_name,
+            )
+            return await self._lookup_and_run_tool(task_name, args)
 
-        Returns:
-            JSON-encoded result string
+        signal = Signal(
+            source=cron_source_name(task_name),
+            kind="run",
+            mode=mode,
+            payload=args or {},
+            target_agent=self.agent.did,
+            visibility=Visibility.INTERNAL,
+        )
+        result = await dispatcher.dispatch_signal(signal)
+        return self._translate_signal_result(result, task_name)
+
+    @staticmethod
+    def _translate_signal_result(result, task_name: str) -> Any:
+        """Map a SignalResult into the runner's expected return shape
+        (str | (str, float) tuple | None).
+
+        - OK                    → action_result if ACTION, artifact if ARTIFACT
+        - FAILED, DROPPED_VALIDATION, DROPPED_CYCLE
+                                → raise RuntimeError → runner records
+                                  status='failed'. These represent
+                                  misconfiguration (bad args, cycle in
+                                  the causation chain) — silently
+                                  recording them as 'success' would
+                                  hide real bugs.
+        - DROPPED_RATE_LIMIT, DROPPED_QUIET_HOURS, COALESCED
+                                → "skipped: <status>" string (success
+                                  row; benign skip the operator can
+                                  grep for in result_text).
         """
-        # Built-in tasks (not feature tools)
-        if task_name == "backup_snapshot":
-            sync = getattr(self.agent, "_sync_service", None)
-            if sync:
-                results = await sync.force_snapshot()
-                return json.dumps(
-                    {t: {"success": r.success, "bytes": r.bytes_synced} for t, r in results.items()},
-                    default=str,
-                )
-            return json.dumps({"error": "no sync service configured"})
+        from kestrel_sdk.signals import SignalMode, Status
 
-        if task_name == "trash_retention":
-            return await self._run_trash_retention(args)
+        if result.status == Status.OK:
+            payload = (
+                result.action_result if result.mode == SignalMode.ACTION
+                else result.artifact
+            )
+            # Tools may return a string, a (text, signal) tuple, a Dict,
+            # or None. The runner JSON-stringifies non-tuple values for
+            # task_execution_log.result_text. Pass through as-is so the
+            # runner's existing handling (which keeps tuples for
+            # outcome_signal extraction) keeps working.
+            if isinstance(payload, tuple):
+                return payload
+            if isinstance(payload, str):
+                return payload
+            if payload is None:
+                return None
+            # Dict / other → JSON-encode here (matches the legacy
+            # behavior of `json.dumps(result, default=str)` in the old
+            # _execute_scheduled_task body).
+            return json.dumps(payload, default=str)
 
-        # Search all features for a matching tool
+        # Failure-equivalent drops — surface as exceptions so the
+        # runner records status='failed'.
+        if result.status in (
+            Status.FAILED,
+            Status.DROPPED_VALIDATION,
+            Status.DROPPED_CYCLE,
+        ):
+            raise RuntimeError(
+                f"dispatch {result.status.value} for {task_name}: "
+                f"{result.error or 'unknown'}"
+            )
+
+        # Benign drops (rate limit, quiet hours, coalesced) — recorded
+        # as success with a short text describing the drop.
+        return f"skipped: {result.status.value} ({result.error or ''})".strip(" ()")
+
+    # ------------------------------------------------------------------
+    # Source-registration handlers
+    # ------------------------------------------------------------------
+
+    async def _lookup_and_run_tool(self, task_name: str, args: dict) -> str:
+        """Tool-lookup body shared by every cron source handler that
+        delegates to a feature tool. This is the existing executor's
+        tool-search logic, lifted out so the source registrations can
+        invoke it without re-entering the dispatcher (which would loop)."""
         features = getattr(self.agent, "features", {})
         for feature in features.values():
             if not hasattr(feature, "get_tools"):
@@ -177,15 +305,36 @@ class SchedulerFeature(Feature):
             for agent_tool in feature.get_tools():
                 if agent_tool.name == task_name:
                     result = await agent_tool.execute(**args)
+                    # Preserve the legacy JSON-encode contract for
+                    # downstream consumers (task_execution_log.result_text,
+                    # endpoints/agent.py history view).
+                    if isinstance(result, str):
+                        return result
                     return json.dumps(result, default=str)
 
-        # Also check our own tools
+        # Also check our own tools (SchedulerFeature has !schedule
+        # commands but they're not typically scheduled themselves).
         for agent_tool in self.get_tools():
             if agent_tool.name == task_name:
                 result = await agent_tool.execute(**args)
+                if isinstance(result, str):
+                    return result
                 return json.dumps(result, default=str)
 
         raise ValueError(f"Unknown task: {task_name}")
+
+    async def _handle_backup_snapshot(self, args: dict) -> str:
+        """ACTION handler for the `backup_snapshot` cron source. Hits
+        the agent's sync service directly — there is no feature tool
+        for this, so it can't go through the generic tool lookup."""
+        sync = getattr(self.agent, "_sync_service", None)
+        if sync:
+            results = await sync.force_snapshot()
+            return json.dumps(
+                {t: {"success": r.success, "bytes": r.bytes_synced} for t, r in results.items()},
+                default=str,
+            )
+        return json.dumps({"error": "no sync service configured"})
 
     async def _run_trash_retention(self, args: dict) -> str:
         """Built-in handler for the ``trash_retention`` scheduled task (#764).
