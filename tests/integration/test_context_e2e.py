@@ -304,10 +304,31 @@ class TestDifferentModels:
 
     @pytest.mark.asyncio
     async def test_large_model_context(self, storage_with_history):
-        """Test context building with large model (Claude 1M)."""
+        """Verify ContextManager picks up the large-model context
+        window for the configured large Anthropic model.
+
+        Pair to ``test_small_model_context`` (phi3, 4K). Resolves the
+        model via ``catalog.get_model_for_size("anthropic", "large")``
+        — config-driven, no model-ID hardcoding (this exact test was
+        previously stranded on ``claude-opus-4-5-20251101`` for that
+        reason). Asserts the budget reflects whatever the
+        catalog/cache/discovery chain says about that model's context,
+        with a floor that catches a regression where the "large" tier
+        accidentally points at a small-context model.
+        """
+        from kestrel_sovereign.llm.model_catalog import get_catalog_service
+
+        catalog = get_catalog_service()
+        model = catalog.get_model_for_size("anthropic", "large")
+        if not model:
+            pytest.skip(
+                "No anthropic.large entry in model_catalog.toml "
+                "[size_tiers] — configure one to exercise this path"
+            )
+
         manager = ContextManager(
             storage=storage_with_history,
-            model="claude-opus-4-5-20251101",  # 1M context
+            model=model,
             agent_id="test-agent"
         )
 
@@ -317,9 +338,15 @@ class TestDifferentModels:
             privacy_mode="NORMAL"
         )
 
-        # With huge context, should fit everything easily
-        # Budget should be much larger
-        assert result.budget_summary["context_limit"] == 1000000
+        # The actual limit is whatever discovery/cache/catalog returns
+        # for this model — assert the budget reflects it, with a floor
+        # so a "large" tier pointing at a 32K model fails loudly here.
+        context_limit = result.budget_summary["context_limit"]
+        assert context_limit >= 100_000, (
+            f"Configured anthropic.large is '{model}' but its context "
+            f"resolved to {context_limit} tokens — that's not large. "
+            "Check catalog [context_limits_override] or [size_tiers]."
+        )
 
 
 class TestConstitutionInContext:

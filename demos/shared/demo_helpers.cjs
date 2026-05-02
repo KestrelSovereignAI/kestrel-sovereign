@@ -289,6 +289,84 @@ async function startFreshSession(request, baseUrl, apiKey, narrator) {
 }
 
 // ---------------------------------------------------------------------------
+// Security / approval helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Pre-grant a feature's tools to a permission level so the demo's chat
+ * trigger doesn't get blocked by an interactive "Permission Required"
+ * modal. Hits POST /api/security/permissions/feature, which sets every
+ * tool in the feature to the given level in one call.
+ *
+ * IMPORTANT: only `level="allow"` auto-approves silently. `"session"`
+ * and `"ask"` both still trigger the approval modal — the SecurityHook
+ * (kestrel_sovereign/features/security/hooks.py) treats SESSION as
+ * "ask, then remember the answer for this session." Demos need ALLOW.
+ *
+ * @param {import('@playwright/test').APIRequestContext} request
+ * @param {string} baseUrl
+ * @param {string|null} apiKey
+ * @param {string} feature   e.g. "ComputeFeature"
+ * @param {string} [level="allow"]   "allow" | "session" | "ask" | "deny"
+ * @returns {Promise<boolean>} true on success
+ */
+async function grantFeaturePermission(request, baseUrl, apiKey, feature, level = 'allow') {
+  try {
+    const response = await request.post(`${baseUrl}/api/security/permissions/feature`, {
+      headers: { ...authHeaders(apiKey), 'Content-Type': 'application/json' },
+      data: { feature, level },
+    });
+    if (!response.ok()) {
+      console.warn(`[DEMO] grantFeaturePermission(${feature}, ${level}) -> ${response.status()}`);
+      return false;
+    }
+    return true;
+  } catch (e) {
+    console.warn(`[DEMO] grantFeaturePermission failed: ${e.message}`);
+    return false;
+  }
+}
+
+/**
+ * Pre-grant every feature in the permission tree to ALLOW so demos
+ * that don't care about the security flow never see an approval modal,
+ * regardless of which tool the LLM happens to pick. Pulls the tree
+ * from /api/security/permissions/tree, then sets each feature to the
+ * given level. Avoids the "I granted ComputeFeature but the agent
+ * picked CodeEdit" papercut.
+ *
+ * Use this for demos whose subject is something OTHER than security
+ * (Tasks, Metrics, Trash). Demos that exercise the approval flow on
+ * purpose should use `grantFeaturePermission` for one specific feature.
+ *
+ * @param {import('@playwright/test').APIRequestContext} request
+ * @param {string} baseUrl
+ * @param {string|null} apiKey
+ * @param {string} [level="allow"]
+ * @returns {Promise<number>} count of features granted
+ */
+async function grantAllFeaturePermissions(request, baseUrl, apiKey, level = 'allow') {
+  let granted = 0;
+  try {
+    const treeResp = await request.get(`${baseUrl}/api/security/permissions/tree`, {
+      headers: authHeaders(apiKey),
+    });
+    if (!treeResp.ok()) {
+      console.warn(`[DEMO] permissions/tree -> ${treeResp.status()}, skipping bulk grant`);
+      return 0;
+    }
+    const { tree } = await treeResp.json();
+    for (const feature of (tree || [])) {
+      const ok = await grantFeaturePermission(request, baseUrl, apiKey, feature.name, level);
+      if (ok) granted++;
+    }
+  } catch (e) {
+    console.warn(`[DEMO] grantAllFeaturePermissions failed: ${e.message}`);
+  }
+  return granted;
+}
+
+// ---------------------------------------------------------------------------
 // Spawn API helpers
 // ---------------------------------------------------------------------------
 
@@ -375,6 +453,9 @@ module.exports = {
   // Provider selection
   selectDemoProvider,
   DEFAULT_DEMO_PROVIDER_ORDER,
+  // Security pre-grants
+  grantFeaturePermission,
+  grantAllFeaturePermissions,
   // Spawn helpers
   getSpawnChildren,
   waitForSpawnChildren,

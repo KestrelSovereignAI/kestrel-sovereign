@@ -75,10 +75,10 @@ name = "06-duration-chart.png"
 act = "Act 4: Charts"
 severity = "warning"
 expected = [
-    "Duration distribution chart visible",
-    "p50/p95 or per-tool bars rendered",
+    "Tool duration chart visible",
+    "Per-tool bars showing average milliseconds (chart titled 'Tool Duration (avg ms)')",
 ]
-layout = "Duration distribution chart with tool latency bars"
+layout = "Per-tool average-duration bar chart"
 
 [[eye.screenshots]]
 name = "07-distribution-chart.png"

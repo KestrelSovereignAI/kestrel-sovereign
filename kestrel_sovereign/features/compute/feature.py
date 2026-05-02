@@ -372,8 +372,17 @@ class ComputeFeature(Feature):
                     f"This pattern is not allowed for security reasons."
                 )
         
+        # Demo servers (KESTREL_DEMO_SERVER=1) skip the approval queue entirely:
+        # Playwright can't click through it, and the demo agent runs in an
+        # isolated DB so the broader-grants are scoped correctly. Without this
+        # the modal still pops here even though SecurityFeature defaults to
+        # ALLOW for demo servers — ComputeFeature reaches into the queue
+        # directly rather than going through SecurityHook.get_permission().
+        _is_demo_server = os.environ.get("KESTREL_DEMO_SERVER", "").lower() in (
+            "1", "true", "yes",
+        )
         # Request user approval unless auto-approved by policy
-        if script.risk_score >= self.policy.auto_approve_below_risk:
+        if not _is_demo_server and script.risk_score >= self.policy.auto_approve_below_risk:
             # Need user approval - check if SecurityFeature has an approval queue
             security_feature = getattr(self.agent, 'features', {}).get('SecurityFeature')
             if security_feature and hasattr(security_feature, 'approval_queue') and security_feature.approval_queue:

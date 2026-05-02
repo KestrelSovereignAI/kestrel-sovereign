@@ -201,7 +201,16 @@ class PermissionStore:
             if row:
                 return PermissionLevel(row[0])
 
-        # Default: ASK (ask first time)
+        # Default for unregistered tools.
+        # Demo servers (KESTREL_DEMO_SERVER=1) auto-allow — _register_all_tools
+        # only catches sub-tools (web_search), not feature-as-subagent
+        # invocations (web_search_feature, the snake-cased class name from
+        # Feature.tool_name). Without this, the modal still pops for
+        # subagent-level calls even though every sub-tool is ALLOW. Demo
+        # subjects that aren't security shouldn't have to chase that.
+        import os as _os
+        if _os.environ.get("KESTREL_DEMO_SERVER", "").lower() in ("1", "true", "yes"):
+            return PermissionLevel.ALLOW
         return PermissionLevel.ASK
 
     async def set_permission(
