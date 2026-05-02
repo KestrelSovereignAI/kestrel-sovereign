@@ -456,6 +456,23 @@ export function createApiClient({
             method: 'POST',
             body: JSON.stringify({ input, model, session_id: sessionId, provider }),
         }),
+        // Explicit-agent invoke — mirrors stop(id, agent). sendMessage
+        // dispatches a chat against a specific agent's pane; if the
+        // user switches agents while sendMessage awaits this call, the
+        // unprefixed `invoke()` would route to whichever agent is
+        // currently selected and the response would land in the wrong
+        // pane. invokeForAgent pins the URL to the captured dispatch
+        // agent so the request always reaches the agent the chat was
+        // sent to.
+        invokeForAgent: (input, model = null, sessionId = null, provider = null, agent) => {
+            const opts = {
+                method: 'POST',
+                body: JSON.stringify({ input, model, session_id: sessionId, provider }),
+            };
+            return agent !== undefined
+                ? client.requestForAgent('/api/agent/invoke', opts, agent)
+                : client.request('/api/agent/invoke', opts);
+        },
         // Two-arg overload: pass `agent` to target a specific agent's
         // /stop endpoint regardless of which agent is currently
         // selected. Without it, a sidebar "Stop Agent A" click while
@@ -490,12 +507,17 @@ export function createApiClient({
             const key = agent === undefined ? state.selectedHostAgent : agent;
             return state.currentStreamRequestIds.get(key) || null;
         },
-        async *streamInvoke(input, model = null, sessionId = null, provider = null, retried = false) {
-            // Capture the dispatch agent BEFORE any await so an async auth
-            // provider can't let the user switch agents between header
-            // construction and URL build — without this, headers/URL/state
-            // could end up referring to different agents.
-            const dispatchAgent = state.selectedHostAgent;
+        async *streamInvoke(input, model = null, sessionId = null, provider = null, retried = false, agent) {
+            // Pin the dispatch agent. The sixth `agent` parameter lets a
+            // caller (sendMessage) capture state.selectedHostAgent at
+            // its own dispatch boundary and pass it through, so the user
+            // switching agents between sendMessage's capture and
+            // streamInvoke's first await can't drift the URL to the
+            // wrong backend. The 401 retry path also passes this value
+            // to itself instead of recapturing state.selectedHostAgent
+            // — that recursion was the original bug: an auth refresh
+            // on Agent A's stream could yield to a switched-to Agent B.
+            const dispatchAgent = agent === undefined ? state.selectedHostAgent : agent;
 
             // Build auth headers BEFORE installing the abort controller in
             // the per-agent map. If buildHeaders() throws (auth provider
@@ -520,7 +542,9 @@ export function createApiClient({
                     const recovery = await auth.onUnauthorized();
                     if (recovery === 'redirected') return;
                     if (recovery === 'refreshed') {
-                        yield* client.streamInvoke(input, model, sessionId, provider, true);
+                        // Pass the SAME dispatchAgent to the retry — do
+                        // NOT let it recapture state.selectedHostAgent.
+                        yield* client.streamInvoke(input, model, sessionId, provider, true, dispatchAgent);
                         return;
                     }
 
@@ -543,9 +567,13 @@ export function createApiClient({
                     reader.releaseLock();
                 }
             } catch (error) {
+                // Re-throw AbortError so sendMessage can distinguish a
+                // user-initiated stop from a clean stream end. The old
+                // silent return swallowed the signal — sendMessage then
+                // toasted "agent finished responding" on a non-visible
+                // agent the user had just stopped from the sidebar.
                 if (error.name === 'AbortError') {
                     log.log('Stream aborted by user');
-                    return;
                 }
                 throw error;
             } finally {
