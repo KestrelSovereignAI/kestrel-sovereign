@@ -13,10 +13,11 @@ KestrelAgent) lives in the integration suite — too heavy for unit tier.
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 
 import pytest
 
-from kestrel_sdk.signals import ResourceLock
+from kestrel_sdk.signals import CausationFrame, ResourceLock
 from kestrel_sovereign.agent.turn_lifecycle import TurnLifecycleMixin
 from kestrel_sovereign.signals import OrderedLockManager
 
@@ -203,3 +204,96 @@ async def test_lifecycle_shares_lock_manager_with_dispatcher():
 
     can_finish_turn.set()
     await asyncio.gather(turn_task, action_task)
+
+
+# ---------------------------------------------------------------------------
+# Causation chain isolation across concurrent COGNITION dispatches
+# (#906 review P1)
+# ---------------------------------------------------------------------------
+
+
+def _frame(agent_id: str, source: str, depth: int) -> CausationFrame:
+    return CausationFrame(
+        agent_id=agent_id,
+        source=source,
+        signal_id=f"sig-{agent_id}-{depth}",
+        turn_id=None,
+        depth=depth,
+        emitted_at=datetime.now(timezone.utc),
+    )
+
+
+@pytest.mark.asyncio
+async def test_concurrent_set_current_chain_is_task_local():
+    """Two coroutines each set/get/clear their own chain concurrently.
+    Without ContextVar isolation (the #906 P1 fix), one would clobber
+    the other's view because `_current_chain` was a shared agent
+    attribute. With ContextVar, each task sees only its own chain."""
+    agent = _StubAgent()
+
+    chain_a = [_frame("agent-A", "heartbeat", 1)]
+    chain_b = [_frame("agent-B", "a2a.task_complete", 1),
+               _frame("agent-B", "a2a.task_complete", 2)]
+
+    a_started = asyncio.Event()
+    b_can_finish = asyncio.Event()
+
+    saw_a: list = []
+    saw_b: list = []
+
+    async def task_a() -> None:
+        # A enters first, captures its chain, parks.
+        token = agent._set_current_chain(chain_a)
+        try:
+            a_started.set()
+            await b_can_finish.wait()
+            # While B was running concurrently with its own chain, A's
+            # view must remain chain_a — not chain_b.
+            saw_a.extend(agent._get_current_chain() or [])
+        finally:
+            agent._clear_current_chain(token)
+
+    async def task_b() -> None:
+        # B starts after A is parked, sets its OWN chain, captures
+        # immediately, then signals A to wake.
+        await a_started.wait()
+        token = agent._set_current_chain(chain_b)
+        try:
+            saw_b.extend(agent._get_current_chain() or [])
+        finally:
+            agent._clear_current_chain(token)
+        b_can_finish.set()
+
+    await asyncio.gather(task_a(), task_b())
+
+    assert saw_a == chain_a, (
+        "task A must see its own chain after task B set a different one — "
+        "without ContextVar isolation, B's set() would have clobbered A's"
+    )
+    assert saw_b == chain_b
+
+
+@pytest.mark.asyncio
+async def test_chain_clears_to_default_on_token_reset():
+    """After clear, the next read returns None — the default empty
+    chain (translated to None for falsy semantics by _get_current_chain)."""
+    agent = _StubAgent()
+    assert agent._get_current_chain() is None
+
+    token = agent._set_current_chain([_frame("a", "x", 1)])
+    assert agent._get_current_chain() is not None
+
+    agent._clear_current_chain(token)
+    assert agent._get_current_chain() is None
+
+
+@pytest.mark.asyncio
+async def test_clear_without_token_falls_back_safely():
+    """Defensive call (clear with no token) shouldn't raise. Used by
+    the dispatcher when set_chain returned None (e.g. because the
+    agent didn't have the mixin)."""
+    agent = _StubAgent()
+    # Set then clear without the matching token — must not raise.
+    agent._set_current_chain([_frame("a", "x", 1)])
+    agent._clear_current_chain(None)
+    assert agent._get_current_chain() is None

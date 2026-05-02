@@ -334,7 +334,14 @@ def build_signal_for_deposit(session: Any, target_agent: str) -> Signal:
         payload=raw_payload,
         target_agent=target_agent,
         visibility=Visibility.INTERNAL,
-        urgency=Urgency.NORMAL,
+        # HIGH urgency so the source's `urgency_override=HIGH` in
+        # attention_policy actually fires when an operator configures
+        # quiet hours. Financial events SHOULD wake the bird at 3am.
+        # If an operator wants Stripe deposits to honor quiet hours,
+        # they can lower `urgency_override` on the registration; the
+        # default is to wake. (#906 review P2 — emitting NORMAL meant
+        # the override never kicked in.)
+        urgency=Urgency.HIGH,
         # Coalesce double-fired completions for the same Stripe session.
         dedupe_key=f"{sid}:completed",
     )

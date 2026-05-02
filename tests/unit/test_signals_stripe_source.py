@@ -368,16 +368,21 @@ async def test_high_urgency_overrides_quiet_hours(tmp_path):
 
     session = _fake_session(session_id="urgent-1")
 
-    # NORMAL urgency → blocked.
+    # The default urgency from build_signal_for_deposit is HIGH (#906
+    # review P2). Override to NORMAL to test the "blocked when normal"
+    # branch.
     sig_normal = build_signal_for_deposit(session, target_agent=agent.did)
+    assert sig_normal.urgency == Urgency.HIGH, (
+        "build_signal_for_deposit must default to HIGH urgency so the "
+        "urgency_override actually fires in production — see #906 P2"
+    )
     sig_normal.urgency = Urgency.NORMAL
     r1 = await dispatcher.dispatch_signal(sig_normal)
     assert r1.status == Status.DROPPED_QUIET_HOURS
 
-    # HIGH urgency → bypasses.
+    # Default-built signal (HIGH) → bypasses quiet hours.
     session2 = _fake_session(session_id="urgent-2")
     sig_high = build_signal_for_deposit(session2, target_agent=agent.did)
-    sig_high.urgency = Urgency.HIGH
     r2 = await dispatcher.dispatch_signal(sig_high)
     assert r2.status == Status.OK
 

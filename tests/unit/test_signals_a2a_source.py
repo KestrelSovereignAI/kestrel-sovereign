@@ -570,8 +570,12 @@ async def test_full_AB_A_loop_via_real_taskmanager_rejected_at_depth_2(
     c = components
 
     # Wire the agent's chain provider — same as KestrelAgent.initialize().
+    # The chain lives in a ContextVar (#906 review P1 fix). Reading via
+    # `_get_current_chain` ensures we see the value the dispatcher set
+    # for THIS task — earlier the test reached into a now-removed
+    # `_current_chain` attribute and silently saw None.
     def _provide_chain():
-        chain = c.agent._current_chain if hasattr(c.agent, "_current_chain") else None
+        chain = c.agent._get_current_chain()
         if not chain:
             return None
         return serialize_chain_for_metadata(chain)
