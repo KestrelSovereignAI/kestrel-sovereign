@@ -303,10 +303,14 @@ async def test_payload_result_summary_is_none_when_source_omits_callback(
 
 
 @pytest.mark.asyncio
-async def test_result_summary_truncated_at_hard_cap(tmp_path):
+async def test_result_summary_truncated_at_byte_cap(tmp_path):
     """Defense in depth: even if a misconfigured callback returns
     megabyte text, the store hard-caps at MAX_RESULT_SUMMARY_BYTES
-    so SSE bandwidth and signal_log row size stay bounded."""
+    so SSE bandwidth and signal_log row size stay bounded.
+
+    The cap is BYTES (suffix included), not Python characters — the
+    suffix is budgeted INSIDE the cap so the returned string's UTF-8
+    encoding is guaranteed <= MAX_RESULT_SUMMARY_BYTES."""
     from kestrel_sdk.signals import MAX_RESULT_SUMMARY_BYTES
 
     backend = SQLiteBackend(str(tmp_path / "huge.db"))
@@ -351,16 +355,87 @@ async def test_result_summary_truncated_at_hard_cap(tmp_path):
 
     payload = agent.emitted[0][1]
     summary = payload["result_summary"]
-    # Cap + truncation marker. Real text is exactly MAX bytes plus the
-    # "...(truncated)" suffix.
     assert summary.endswith("...(truncated)")
-    assert len(summary) <= MAX_RESULT_SUMMARY_BYTES + len("...(truncated)")
+    # Byte invariant: encoded length (suffix included) <= cap.
+    assert len(summary.encode("utf-8")) <= MAX_RESULT_SUMMARY_BYTES
 
     rows = await backend.fetch_all(
         "SELECT result_summary FROM signal_log WHERE source=?",
         ("ui_test.huge",),
     )
     assert rows[0][0] == summary  # store has the same capped text
+
+    await backend.close()
+
+
+@pytest.mark.asyncio
+async def test_result_summary_truncates_non_ascii_by_bytes(tmp_path):
+    """#907 review P2 regression: prior truncation used `len()` which
+    counts Python characters. Multi-byte codepoints (CJK, emoji)
+    could exceed the documented byte cap — a 2048-char Japanese
+    summary is ~6KB on the wire. Verify the byte invariant holds for
+    non-ASCII text and that the truncation point is UTF-8 valid (no
+    UnicodeDecodeError, no half-codepoint at the cut)."""
+    from kestrel_sdk.signals import MAX_RESULT_SUMMARY_BYTES
+
+    backend = SQLiteBackend(str(tmp_path / "cjk.db"))
+    await backend.connect()
+    store = SignalLogStore(backend)
+    await store.initialize()
+    registry = SourceRegistry()
+    agent = _FakeAgent()
+    dispatcher = SignalDispatcher(
+        agent=agent, registry=registry,
+        lock_manager=OrderedLockManager(), store=store,
+    )
+
+    # Each "あ" is 3 bytes in UTF-8. 1500 chars = 4500 bytes, well
+    # over the 2048-byte cap. Under the buggy len()-based truncation
+    # this would have passed through (1500 < 2048 chars) producing a
+    # 4500-byte result.
+    big_cjk = "あ" * 1500
+    assert len(big_cjk) < MAX_RESULT_SUMMARY_BYTES  # would have passed under old code
+    assert len(big_cjk.encode("utf-8")) > MAX_RESULT_SUMMARY_BYTES
+
+    async def _h(payload):
+        return big_cjk
+
+    registry.register(
+        SourceRegistration(
+            name="ui_test.cjk",
+            schema=lambda p: p,
+            default_mode=SignalMode.ACTION,
+            allowed_modes=frozenset({SignalMode.ACTION}),
+            handler=_h,
+            log_redaction=_redaction(),
+            result_summary=lambda body: body,
+        )
+    )
+
+    sig = Signal(
+        source="ui_test.cjk",
+        kind="run",
+        mode=SignalMode.ACTION,
+        payload={},
+        target_agent="did:test:phase7",
+        visibility=Visibility.USER_VISIBLE,
+    )
+    await dispatcher.dispatch_signal(sig)
+    pending = [t for t in agent.background_tasks if not t.done()]
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+
+    summary = agent.emitted[0][1]["result_summary"]
+    encoded = summary.encode("utf-8")
+    assert len(encoded) <= MAX_RESULT_SUMMARY_BYTES, (
+        f"byte cap violated: {len(encoded)} > {MAX_RESULT_SUMMARY_BYTES}"
+    )
+    assert summary.endswith("...(truncated)")
+    # No UnicodeDecodeError implicit in reaching this point — the
+    # truncation didn't strand a partial codepoint.
+    # Body before suffix is valid UTF-8 (encode/decode roundtrip OK).
+    body = summary[: -len("...(truncated)")]
+    assert body.encode("utf-8").decode("utf-8") == body
 
     await backend.close()
 

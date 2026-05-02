@@ -71,6 +71,40 @@ def _serialize_chain(chain: list[CausationFrame]) -> list[dict]:
     ]
 
 
+# Truncation marker appended when `_truncate_to_bytes` shortens text.
+# ASCII so its byte length equals its character length; budgeted INTO
+# the cap so the returned string (suffix included) is guaranteed
+# encode("utf-8") <= max_bytes.
+_TRUNCATION_SUFFIX = "...(truncated)"
+_TRUNCATION_SUFFIX_BYTES = len(_TRUNCATION_SUFFIX.encode("utf-8"))
+
+
+def _truncate_to_bytes(text: str, max_bytes: int) -> str:
+    """Truncate ``text`` so its UTF-8 byte length is at most
+    ``max_bytes`` (suffix included). UTF-8 boundary safe — a multi-byte
+    codepoint that would straddle the cut is dropped via
+    ``errors='ignore'`` rather than raising or producing invalid UTF-8.
+
+    The suffix is budgeted INSIDE the cap (not added on top), so
+    callers and tests can rely on the byte invariant. Caught in #907
+    review P2: the prior `len(summary)` truncation counted Python
+    characters and the suffix was added on top, both of which let
+    non-ASCII text exceed the documented byte cap.
+    """
+    encoded = text.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return text
+    body_budget = max_bytes - _TRUNCATION_SUFFIX_BYTES
+    if body_budget <= 0:
+        # Cap too small to fit even the suffix. Return the suffix
+        # truncated to fit; rare/pathological case (cap < ~14 bytes).
+        return _TRUNCATION_SUFFIX.encode("utf-8")[:max_bytes].decode(
+            "utf-8", errors="ignore"
+        )
+    truncated_body = encoded[:body_budget].decode("utf-8", errors="ignore")
+    return truncated_body + _TRUNCATION_SUFFIX
+
+
 class SignalLogStore(UnifiedStoreBase):
     """Backend-agnostic signal log persistence."""
 
@@ -214,9 +248,9 @@ class SignalLogStore(UnifiedStoreBase):
                 summary = f"<result_summary failed: {type(e).__name__}>"
             if not isinstance(summary, str):
                 summary = str(summary) if summary is not None else ""
-            if len(summary) > MAX_RESULT_SUMMARY_BYTES:
-                summary = summary[:MAX_RESULT_SUMMARY_BYTES] + "...(truncated)"
-            result_summary = summary
+            result_summary = _truncate_to_bytes(
+                summary, MAX_RESULT_SUMMARY_BYTES
+            )
 
         store_raw = (
             registration.trust == Trust.TRUSTED and policy.store_raw_trusted
