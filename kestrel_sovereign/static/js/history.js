@@ -5,7 +5,7 @@
 
 import API from './api.js';
 import { state, Toast, escapeHtml } from './ui.js';
-import { updateContextStatus, wipeChatPane } from './chat.js';
+import { updateContextStatus, wipeAgentChatPane } from './chat.js';
 
 // ============================================================================
 // Chat History Browser
@@ -208,17 +208,23 @@ window.loadConversation = async function(sessionId) {
 
     try {
         const data = await API.getConversation(sessionId, state.showDecrypted);
-        state.currentSessionId = sessionId;
 
         if (data.encrypted_at_rest !== undefined) {
             state.encryptedAtRest = data.encrypted_at_rest;
         }
 
-        // Bumps UI generation as part of the wipe so any stream still
-        // streaming against the previous conversation gates out before its
-        // chunks can land in the freshly-loaded view.
-        wipeChatPane();
-        const chatContainer = document.getElementById('chat-container');
+        // Wipe the visible agent's pane and bump that agent's pane-
+        // local generation — a conversation switch is a within-agent
+        // context change. Streams in flight on OTHER agents are NOT
+        // touched. Setting currentSessionId via the property routes
+        // into the visible agent's pane.
+        wipeAgentChatPane(API.getHostAgent());
+        state.currentSessionId = sessionId;
+        // viewport is the scroll host (#chat-container); pane is its
+        // child and where messages are appended.
+        const viewport = document.getElementById('chat-container');
+        const visiblePane = state.chatPanes.get(state.mountedChatAgent);
+        const paneEl = visiblePane ? visiblePane.element : viewport;
 
         if (!state.showDecrypted && state.encryptedAtRest) {
             const banner = document.createElement('div');
@@ -246,7 +252,7 @@ window.loadConversation = async function(sessionId) {
                     font-size: 0.75rem;
                 ">Decrypt</button>
             `;
-            chatContainer.appendChild(banner);
+            paneEl.appendChild(banner);
         }
 
         data.messages.forEach(msg => {
@@ -266,8 +272,8 @@ window.loadConversation = async function(sessionId) {
 
         renderConversationHistory({ conversations: state.conversations, encrypted_at_rest: state.encryptedAtRest });
 
-        if (chatContainer) {
-            chatContainer.scrollTop = chatContainer.scrollHeight;
+        if (viewport) {
+            viewport.scrollTop = viewport.scrollHeight;
         }
 
         const statusText = state.showDecrypted ? '' : ' (encrypted view)';
@@ -299,16 +305,19 @@ window.toggleEncryptionView = async function() {
 window.startNewConversation = async function() {
     try {
         const result = await API.newConversation();
-        state.currentSessionId = result.session_id;
 
-        // wipeChatPane() bumps the UI generation so any stream still
-        // running against the previous (now-replaced) session gates out.
-        wipeChatPane(`
+        // Wipe the visible agent's pane and bump that agent's pane-
+        // local generation so any stream still running against the
+        // previous (now-replaced) session gates out. Other agents are
+        // unaffected. Then write currentSessionId via the property,
+        // which writes into the visible agent's pane.
+        wipeAgentChatPane(API.getHostAgent(), `
             <div style="text-align: center; padding: 2rem; color: var(--text-secondary);">
                 <span style="font-size: 2rem;">\u{2728}</span>
                 <p style="margin-top: 0.5rem;">New conversation started. Say hello!</p>
             </div>
         `);
+        state.currentSessionId = result.session_id;
 
         await loadConversationHistory();
 
@@ -385,8 +394,14 @@ window.purgeMessage = async function(messageId, messageDiv) {
 };
 
 function addMessageToChat(role, content, isEncrypted = false, messageId = null, toolActivityHtml = '') {
-    const chatContainer = document.getElementById('chat-container');
-    if (!chatContainer) return;
+    // Append into the visible (mounted) agent's pane element — the
+    // viewport (#chat-container) is now the scroll host and panes are
+    // its children, so writing directly to the viewport would orphan
+    // the message outside any agent's pane.
+    const visibleAgent = state.mountedChatAgent;
+    const visiblePane = visibleAgent === undefined ? null : state.chatPanes.get(visibleAgent);
+    const target = visiblePane ? visiblePane.element : document.getElementById('chat-container');
+    if (!target) return;
 
     const messageDiv = document.createElement('div');
     messageDiv.className = `message ${role}`;
@@ -478,5 +493,5 @@ function addMessageToChat(role, content, isEncrypted = false, messageId = null, 
         messageDiv.appendChild(contentDiv);
     }
 
-    chatContainer.appendChild(messageDiv);
+    target.appendChild(messageDiv);
 }
