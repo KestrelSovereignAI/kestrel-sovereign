@@ -3,8 +3,8 @@
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-05-01
-**Scope:** 1514 tracked files (918 `.py`, 232 `.md`, 364 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-05-02
+**Scope:** 1519 tracked files (922 `.py`, 232 `.md`, 365 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -1534,6 +1534,7 @@ Repo entry points and standard project files.
 - **tests/fixtures/tone_440hz.wav** — —
 - **tests/frontend/api_client.test.mjs** — (mjs asset)
 - **tests/frontend/auto_load_most_recent.test.mjs** — (mjs asset)
+- **tests/frontend/capabilities.test.mjs** — (mjs asset)
 - **tests/frontend/chat_ui_generation.test.mjs** — (mjs asset)
 - **tests/frontend/model_selector.test.mjs** — (mjs asset)
 - **tests/frontend/route_selector.test.mjs** — (mjs asset)
@@ -1557,7 +1558,7 @@ Repo entry points and standard project files.
 - **tests/infrastructure/test_ssh_pod.py** — SSH-enabled pod test for RunPod infrastructure.
   - `def runpod_client()`; `def cleanup_pod(runpod_client)`; `def test_ssh_enabled_pod(runpod_client, cleanup_pod)`
 - **tests/integration/conftest.py** — Pytest configuration for integration tests.
-  - `async def complete_bootstrap(agent)`; `def skip_bootstrap()`
+  - `async def complete_bootstrap(agent)`; `async def grant_permissions(agent)`; `def skip_bootstrap()`
 - **tests/integration/test_agent_chat_e2e.py** — Integration tests for full agent chat flow via /agent/invoke with REAL LLM calls.
   - `def client(monkeypatch)`; `def api_key()`; `def test_health_endpoint(client)`; `def test_agent_invoke_basic_chat(client, api_key)`; `def test_agent_invoke_factual_question(client, api_key)`; `def test_agent_invoke_empty_input_returns_400(client, api_key)`; `def test_agent_invoke_without_auth_returns_401(client)`
 - **tests/integration/test_agent_own_key.py** — Integration tests for agent-owned API key activation.
@@ -1678,6 +1679,8 @@ Repo entry points and standard project files.
   - `class FakeRunPodManager`; `class DummyLLMService`; `async def runpod_feature(monkeypatch)`; `async def test_manage_gpu_start_and_stop(runpod_feature)`; `async def test_image_generation_tears_down_session(runpod_feature)`
 - **tests/integration/test_runpod_real_integration.py** — —
   - `class TestRunPodRealIntegration`
+- **tests/integration/test_security_hook_alive.py** — Sanity tests for the SecurityHook chain in integration mode.
+  - `async def bare_agent(temp_db)`; `async def test_security_guard_hook_is_registered_on_pre_tool_use(bare_agent)`; `async def test_ungranted_tool_queues_for_approval(bare_agent)`; `async def test_explicit_grant_lets_hook_short_circuit(bare_agent)`
 - **tests/integration/test_session_context.py** — Tests for session-based conversation context loading.
   - `async def storage_with_sessions(tmp_path)`; `async def test_get_history_without_session_returns_recent(storage_with_sessions)`; `async def test_get_history_with_session_id_filters_to_session(storage_with_sessions)`; `async def test_get_history_session_2(storage_with_sessions)`; `async def test_get_history_session_3(storage_with_sessions)`; `async def test_nonexistent_session_returns_empty(storage_with_sessions)`; `async def test_privacy_feature_passes_session_id(tmp_path)`; `async def test_resumed_conversation_includes_messages_with_session_id_metadata(tmp_path)`; `…`
 - **tests/integration/test_session_context_regression.py** — Regression tests for session context loading in LLM calls.
@@ -1835,6 +1838,8 @@ Repo entry points and standard project files.
   - `class TestComputeRequestSignature`; `class TestCodexCursorRecordingE2E`
 - **tests/unit/test_codex_responses_format.py** — Tests for Chat-Completions → Responses-API message conversion (#828).
   - `class TestContentToText`; `class TestConvertMessagesToResponsesFormat`; `class TestCodexAdapterAppliesConverter`
+- **tests/unit/test_codex_token_refresh.py** — CodexAdapter OAuth token-refresh recovery tests (#887).
+  - `class TestExternalRefreshAdoption`; `class TestOAuthRefreshFlow`; `class TestRefreshFailurePropagates`; `class TestRefreshCacheReuse`
 - **tests/unit/test_command_handler_async_boundary_contracts.py** — Contracts for explicit sync/async boundaries in CommandHandler.
   - `def test_privacy_save_handler_is_explicitly_async()`; `async def test_handle_awaits_privacy_save_without_leaking_coroutine()`; `async def test_handle_accepts_custom_awaitable_results_via_isawaitable()`; `def test_create_agent_handler_is_explicitly_async()`; `async def test_handle_awaits_create_agent_command()`; `def test_anchor_handler_is_explicitly_async()`; `async def test_handle_awaits_anchor_command()`
 - **tests/unit/test_command_handler_constitution_contracts.py** — Command-handler contracts for constitution verification commands.
@@ -2061,6 +2066,8 @@ Repo entry points and standard project files.
   - `def test_no_traversal_rejects_dotdot()`; `def test_no_traversal_rejects_nul()`; `def test_no_traversal_allows_clean_paths()`; `def test_resolve_realpath_canonicalizes(tmp_path)`; `def test_resolve_realpath_follows_symlink(tmp_path)`; `def test_resolve_realpath_rejects_traversal(tmp_path)`; `def test_resolve_realpath_handles_nonexistent_leaf(tmp_path)`; `def test_resolve_realpath_expands_user()`; `…`
 - **tests/unit/test_peers_feature.py** — Direct contracts for the Peers feature.
   - `def test_discover_host_url_from_env(monkeypatch)`; `async def test_list_peers_filters_out_self()`; `async def test_ask_agent_rejects_self_target()`; `async def test_ask_agent_reports_offline_peer()`; `async def test_ask_agent_returns_peer_response()`
+- **tests/unit/test_per_agent_constitution_overlay.py** — Per-agent CONSTITUTION.md overlay loading (#898).
+  - `class TestPerAgentOverlayLoading`; `class TestComputerUseFeaturePicksUpOverlay`
 - **tests/unit/test_permission_seam_contracts.py** — Permission seam contracts across command, A2A, and tool execution paths.
   - `async def test_a2a_skill_uses_feature_class_name_for_permission_hooks()`; `async def test_command_routing_uses_same_permission_identity_as_a2a_skill()`
 - **tests/unit/test_personality_analyzer.py** — Unit tests for the Personality Analyzer module.
@@ -2079,6 +2086,8 @@ Repo entry points and standard project files.
   - `def test_initial_mode_sync()`; `def test_set_mode_sync()`; `async def test_isolated_mode_flow(tmp_path)`; `async def test_ephemeral_mode(tmp_path)`; `async def test_anonymous_mode(tmp_path)`
 - **tests/unit/test_privacy_computer_access.py** — Tests for the ``computer_access`` flag on ``PrivacyConfig`` (#832).
   - `def test_default_is_false()`; `def test_allows_helper()`; `def test_all_presets_default_false(name)`; `def test_get_privacy_preset_returns_copy_with_flag_false(name)`; `def test_privacy_mode_to_config_defaults_false()`; `def test_from_config_ignores_computer_access()`; `def test_get_privacy_preset_unknown_raises()`
+- **tests/unit/test_privacy_computer_access_toml.py** — Per-agent ``[privacy] computer_access`` opt-in via kestrel.toml (#900).
+  - `class TestTomlOptInRead`; `class TestPrivacyConfigProperty`
 - **tests/unit/test_privacy_mode_endpoint_rail.py** — Unit tests for the rail-gate on POST /agent/privacy-mode (#867-A).
   - `async def test_rail_refuses_privacy_mode_flip_on_live_agent_without_header()`; `async def test_rail_allows_privacy_mode_flip_on_live_agent_with_header()`; `async def test_rail_allows_privacy_mode_flip_on_demo_agent_without_header()`; `def test_endpoint_module_declares_rail_dependency()`
 - **tests/unit/test_privacy_mode_model_restore_contracts.py** — Contracts for model preservation across privacy-mode transitions.
