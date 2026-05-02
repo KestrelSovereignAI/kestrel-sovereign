@@ -78,8 +78,13 @@ async function demoSendMessage(page, message, timeout = 90000) {
         const msgs = document.querySelectorAll('.agent-message');
         if (msgs.length <= count) return false;
         const last = msgs[msgs.length - 1];
-        return (last.textContent || '').trim().length > 5 &&
-               !last.querySelector('.streaming');
+        if ((last.textContent || '').trim().length <= 5) return false;
+        if (last.querySelector('.streaming')) return false;
+        // Wait for send button to be re-enabled — it's disabled for the full
+        // duration of the LLM call (set in sendMessage() finally block).
+        const btn = document.getElementById('send-button');
+        if (btn && btn.disabled) return false;
+        return true;
       },
       initialCount,
       { timeout }
@@ -87,6 +92,17 @@ async function demoSendMessage(page, message, timeout = 90000) {
     return page.locator('.agent-message').last();
   } catch (e) {
     console.warn(`[DEMO] Message send/wait issue: ${e.message}`);
+    // Even if the content wait timed out, wait for the send button to become
+    // re-enabled — that happens in sendMessage()'s finally block only after
+    // the LLM fully responds. This prevents screenshots showing "Thinking...".
+    await page.waitForFunction(
+      () => {
+        const btn = document.getElementById('send-button');
+        return btn && !btn.disabled;
+      },
+      null,
+      { timeout: 300000 }
+    ).catch(() => {});
     const count = await page.locator('.agent-message').count();
     return count > 0 ? page.locator('.agent-message').last() : null;
   }
