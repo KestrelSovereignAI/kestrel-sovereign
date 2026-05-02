@@ -247,6 +247,57 @@ test('within-agent conversation switch (wipeAgentChatPane) gates out chunks disp
         'post-wipe chunks must not paint into the pane');
 });
 
+test('aborted background stream does NOT toast "agent finished responding"', async () => {
+    // Regression for the P2 routing bug: the abort path in streamInvoke
+    // used to silently `return` instead of throwing AbortError, so
+    // sendMessage never set wasAborted. A sidebar Stop on a non-visible
+    // agent then fell through to the background-completion toast and
+    // told the user the agent had finished — when in fact they had
+    // just stopped it.
+    getOrCreateChatPane('abort-A');
+    getOrCreateChatPane('abort-B');
+    apiModule.default.setHostAgent('abort-A');
+    mountChatPane('abort-A');
+
+    const toasts = [];
+    const origInfo = Toast.info;
+    Toast.info = (msg) => toasts.push(msg);
+
+    // Build a stream iterator that throws AbortError on demand. This
+    // mirrors the new streamInvoke behavior: AbortError propagates,
+    // sendMessage's catch sets wasAborted=true.
+    let throwAbort = null;
+    const iter = (async function* () {
+        // Yield one chunk, then await an abort trigger.
+        yield 'partial ';
+        await new Promise((resolve) => { throwAbort = resolve; });
+        const e = new Error('aborted'); e.name = 'AbortError'; throw e;
+    })();
+    const origStream = apiModule.default.streamInvoke;
+    apiModule.default.streamInvoke = () => iter;
+
+    messageInput.value = 'hi';
+    const sendPromise = sendMessage();
+    // Let the user message land + first chunk paint.
+    await Promise.resolve(); await Promise.resolve();
+    await new Promise((r) => setTimeout(r, 5));
+
+    // User switches to B, then hits sidebar Stop on A.
+    apiModule.default.setHostAgent('abort-B');
+    mountChatPane('abort-B');
+
+    // Trigger the abort path — same path stopAgent() drives in real
+    // usage (controller.abort() in the AbortController, fetch throws).
+    throwAbort();
+    await sendPromise;
+
+    apiModule.default.streamInvoke = origStream;
+    Toast.info = origInfo;
+
+    assert.equal(toasts.length, 0,
+        'a stopped non-visible stream must NOT emit a finished-responding toast');
+});
+
 test('agent switch does NOT abort or detach an in-flight stream\'s pane writes', async () => {
     // Direct invariant: switching to B does not bump A's generation,
     // so isPaneFresh() in sendMessage stays true and chunks keep
