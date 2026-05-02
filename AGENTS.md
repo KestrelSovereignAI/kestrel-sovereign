@@ -85,6 +85,18 @@ GITHUB_HUMAN_REVIEWER=username    # Human for blocked issues (optional)
 2. Review constitutional protections in `kestrel_sovereign/constitution.py`
 3. Run constitution-verifier tests
 
+### Working with signals (anything that wakes the bird)
+
+The bird wakes via **signals** dispatched through
+`SignalDispatcher`. Heartbeat ticks, scheduled cron tasks, A2A peer
+task completions, and external webhooks (Stripe deposits, etc.)
+are all signals.
+
+- **Design spec**: [`docs/architecture/SIGNAL_DISPATCHER.md`](docs/architecture/SIGNAL_DISPATCHER.md)
+- **Adding a new source**: [`docs/architecture/SIGNAL_SOURCES_GUIDE.md`](docs/architecture/SIGNAL_SOURCES_GUIDE.md) (walkthrough + cycle-detection worked examples)
+- **All current sources**: [`kestrel_sovereign/signals/sources/`](kestrel_sovereign/signals/sources/) — grep here to see exactly what wakes the bird
+- **Hooks ≠ signals**: hooks intercept work in flight, signals originate work. The dispatcher module docstring covers the distinction loudly.
+
 ### Working with LLM providers
 1. Config in `[llm]` section of `kestrel.toml` (or `llm_config.toml` for backward compat)
 2. Provider implementations in `kestrel_sovereign/llm/`

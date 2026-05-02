@@ -1,9 +1,43 @@
 """SignalDispatcher — the runtime engine.
 
-Pipeline (per SIGNAL_DISPATCHER.md §"The dispatcher contract"):
+# Signals vs hooks — read this before adding either
+
+Signals ORIGINATE work. Hooks INTERCEPT work. They sit on opposite
+sides of the cognition lifecycle and conflating them is the original
+sin behind half the bugs in the early signal-dispatcher epic.
+
+* A **signal** wakes the bird (COGNITION) or runs a side effect
+  (ACTION/ARTIFACT). It enters the dispatcher pipeline below and
+  ends in either a turn (COGNITION) or a registered handler
+  (ACTION / ARTIFACT). Heartbeat ticks, scheduled cron firings,
+  A2A task-completion notifications, and external webhooks are all
+  signals.
+* A **hook** is invoked DURING work the bird is already doing —
+  PRE_TOOL_USE, POST_TOOL_USE, USER_PROMPT_SUBMIT, STOP. Hooks live
+  in `kestrel_sovereign/hooks/manager.py` and modify the flow of an
+  in-flight turn (e.g. asking the user to approve a tool call
+  before it runs).
+
+The arrow is one-way: a signal can produce a turn that fires hooks;
+a hook never produces a signal. If you find yourself reaching for
+the dispatcher from inside a hook, you almost certainly want to
+modify the in-flight turn instead. If you find yourself reaching
+for the hook system from inside a signal handler, you almost
+certainly want to add a downstream signal source.
+
+The textbook example of getting this wrong: approval. Approval is
+"the bird is paused mid-turn waiting for the user to click yes/no."
+That is a HOOK (it suspends an in-flight turn until a gate
+releases), not a SIGNAL (which would start a new turn — defeating
+the point and racing the original turn). Approval lives in the
+hook system; the dispatcher does not own it.
+
+# The pipeline
+
+Per SIGNAL_DISPATCHER.md §"The dispatcher contract":
 
     1. validate against registration
-    2. append-and-cycle-check
+    2. append-and-cycle-check  (worked examples in SIGNAL_SOURCES_GUIDE.md)
     3. quiet-hours check
     4. coalescing check
     5. rate-limit check
@@ -11,13 +45,32 @@ Pipeline (per SIGNAL_DISPATCHER.md §"The dispatcher contract"):
     7. route by mode
        - ACTION    → handler(payload)
        - ARTIFACT  → artifact_handler(signal)
-       - COGNITION → render prompt_template → cognition_runner(prompt)
-                     CONVERSATION lock acquired by the turn lifecycle, NOT here
+       - COGNITION → render prompt_template → process_input(prompt)
+                     CONVERSATION lock acquired by the turn lifecycle,
+                     NOT here. Sources are FORBIDDEN from declaring
+                     CONVERSATION in their `resources` (registry rejects
+                     at register time).
     8. release locks (reverse order; handled by lock manager context)
-    9. log result
+    9. log to signal_log; if visibility != INTERNAL also emit a
+       `signal_completed` SSE event AFTER the log write succeeds
+       (consumers correlate by signal_id; emitting before/without
+       the log entry would mislead them).
 
-`enqueue_signal` returns an awaitable handle backed by the agent's existing
-background task tracker — never a raw `asyncio.create_task`.
+`enqueue_signal` returns an awaitable handle backed by the agent's
+existing background task tracker — NEVER a raw `asyncio.create_task`.
+The lint test at `tests/unit/test_signals_no_raw_create_task.py`
+enforces this for the whole repo.
+
+# Where to learn more
+
+- `docs/architecture/SIGNAL_DISPATCHER.md` — the design spec
+  (architecture decisions, concerns, classification table).
+- `docs/architecture/SIGNAL_SOURCES_GUIDE.md` — the operator
+  guide for adding a new signal source (registration walkthrough,
+  cycle-detection worked examples, redaction patterns).
+- `kestrel_sovereign/signals/sources/` — every cron task, A2A
+  completion, webhook source the agent listens to. `grep` here to
+  see exactly what wakes the bird.
 """
 
 from __future__ import annotations
