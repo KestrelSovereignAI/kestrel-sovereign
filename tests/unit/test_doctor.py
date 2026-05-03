@@ -157,37 +157,29 @@ def _seed_with_anchored_constitution(
     *,
     constitution_text: bytes,
     stored_hash: str | None,
-    agent_name: str = "Test",
 ) -> None:
     """Build a project tree where the agent's anchored hash is exactly ``stored_hash``.
 
     Pass ``stored_hash=None`` to omit the constitution_hash property
     entirely (older-agent scenario).
+
+    Always writes to ``tmp_path / "agent_data" / "test"`` to match the
+    lowercase data_dir produced by ``_seed_ready``. On case-sensitive
+    filesystems (Linux) ``"test"`` and ``"Test"`` are different
+    directories, and the rookery's ``data_dir=Path("agent_data/test")``
+    is what doctor reads — anchoring elsewhere would silently
+    write into the wrong location.
     """
     _seed_ready(tmp_path)
 
-    # Override the agent_name folder if needed.
-    if agent_name != "Test":
-        rookery = RookeryConfig(
-            host=HostConfig(),
-            agents={
-                agent_name: LocalAgentConfig(
-                    data_dir=Path(f"agent_data/{agent_name}"), port=8801, autostart=True,
-                )
-            },
-        )
-        rookery.save(tmp_path / ROOKERY_CONFIG_FILENAME)
-        old_db_dir = tmp_path / "agent_data" / "test"
-        new_db_dir = tmp_path / "agent_data" / agent_name
-        if old_db_dir.exists():
-            old_db_dir.rename(new_db_dir)
-
-    db_path = tmp_path / "agent_data" / agent_name / "kestrel_prime.db"
+    # Match the path _seed_ready uses (rookery says data_dir is
+    # "agent_data/test" — lowercase, regardless of the agent's name).
+    db_path = tmp_path / "agent_data" / "test" / "kestrel_prime.db"
     db_path.parent.mkdir(parents=True, exist_ok=True)
     if db_path.exists():
         db_path.unlink()
 
-    properties: dict = {"name": agent_name}
+    properties: dict = {"name": "Test"}
     if stored_hash is not None:
         properties["constitution_hash"] = stored_hash
 
@@ -205,7 +197,7 @@ def _seed_with_anchored_constitution(
         conn.execute(
             "INSERT INTO graph_nodes(node_id, node_type, label, properties) "
             "VALUES (?, 'agent', ?, ?)",
-            (f"did:test:{agent_name}", agent_name, json.dumps(properties)),
+            ("did:test:Test", "Test", json.dumps(properties)),
         )
         conn.commit()
 
