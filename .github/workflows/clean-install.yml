@@ -139,16 +139,34 @@ jobs:
       # Step 8: Start agent and verify health endpoint (QUICKSTART Step 6)
       - name: Start agent and verify health endpoint
         run: |
-          # Start agent in background (rookery assigns port 8802 to first agent)
+          # Read the agent's actual port from rookery.toml — don't hardcode.
+          # The historical "first agent gets 8802" assumption depended on an
+          # order-of-operations quirk where inception ran before port
+          # allocation, causing auto-discovery to claim 8801 and bumping
+          # the new agent to 8802. Reading the real value is robust to
+          # that and to any future port-allocation tweaks.
+          PORT=$(uv run python -c "
+          import tomllib, sys
+          with open('rookery.toml', 'rb') as f:
+              cfg = tomllib.load(f)
+          agent = cfg.get('agents', {}).get('CITestAgent') or {}
+          port = agent.get('port')
+          if not port:
+              sys.stderr.write('rookery.toml missing port for CITestAgent\n')
+              sys.exit(1)
+          print(port)
+          ")
+          echo "Agent port from rookery.toml: $PORT"
+
           uv run kestrel start CITestAgent &
           START_PID=$!
 
           # Wait for health endpoint (up to 30 seconds)
-          echo "Waiting for agent health endpoint..."
+          echo "Waiting for agent health endpoint on port $PORT..."
           for i in $(seq 1 30); do
-            if curl -sf http://localhost:8802/health > /dev/null 2>&1; then
-              echo "PASS: Agent health endpoint responding on port 8802"
-              HEALTH=$(curl -s http://localhost:8802/health)
+            if curl -sf "http://localhost:$PORT/health" > /dev/null 2>&1; then
+              echo "PASS: Agent health endpoint responding on port $PORT"
+              HEALTH=$(curl -s "http://localhost:$PORT/health")
               echo "Health response: $HEALTH"
 
               # Stop agent
@@ -159,7 +177,7 @@ jobs:
             sleep 1
           done
 
-          echo "FAIL: Agent did not respond on health endpoint within 30 seconds"
+          echo "FAIL: Agent did not respond on port $PORT within 30 seconds"
           # Show logs for debugging
           if [ -f "agent_data/CITestAgent/agent.log" ]; then
             echo "=== Agent log ==="
