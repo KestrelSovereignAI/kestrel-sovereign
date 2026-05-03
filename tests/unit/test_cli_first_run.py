@@ -72,6 +72,36 @@ def test_first_run_tty_eof_returns_error(tmp_path, monkeypatch):
     assert rc == 1
 
 
+def test_setup_check_and_reset_combo_is_rejected(tmp_path, capsys):
+    """`kestrel setup --check --reset` must error before doing anything.
+
+    The first defense is here at the CLI: --check is read-only by
+    contract, --reset moves files; combining them is a contradiction.
+    Reject with a clear message and exit 2 (usage error).
+    """
+    from kestrel_sovereign.cli import build_parser, cmd_setup
+
+    # Stub a configured project so any wizard run that slipped through
+    # would touch real files. We assert it doesn't.
+    (tmp_path / ".env").write_text("KESTREL_DATA_KEY=stub\n")
+    (tmp_path / "kestrel.toml").write_text("[llm]\nroute_priority = ['ollama:local']\n")
+    env_text = (tmp_path / ".env").read_text()
+
+    parser = build_parser()
+    args = parser.parse_args(["setup", "--check", "--reset"])
+
+    with patch("kestrel_sovereign.cli._get_project_dir", return_value=tmp_path):
+        rc = cmd_setup(args)
+
+    assert rc == 2
+    captured = capsys.readouterr()
+    assert "mutually exclusive" in captured.err.lower()
+    # Files untouched.
+    assert (tmp_path / ".env").read_text() == env_text
+    assert list(tmp_path.glob(".env.backup-*")) == []
+    assert list(tmp_path.glob("kestrel.toml.backup-*")) == []
+
+
 def test_first_run_propagates_wizard_failure(tmp_path, monkeypatch):
     monkeypatch.delenv("CI", raising=False)
     monkeypatch.delenv("KESTREL_NONINTERACTIVE", raising=False)

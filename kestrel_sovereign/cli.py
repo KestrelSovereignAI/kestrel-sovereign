@@ -818,6 +818,18 @@ def cmd_setup(args) -> int:
     from kestrel_sovereign.setup.context import Flow
     from kestrel_sovereign.setup.wizard import build_context, run_wizard
 
+    if args.check and args.reset:
+        # --check is read-only by contract; --reset writes (moves files
+        # aside). Combining them silently moved .env / kestrel.toml to
+        # backups before the check phase ever ran. Reject the combo
+        # rather than picking a winner.
+        print(
+            "error: --check and --reset are mutually exclusive. "
+            "--check is read-only; --reset moves files to backups.",
+            file=sys.stderr,
+        )
+        return 2
+
     project_dir = _get_project_dir()
 
     if args.check:

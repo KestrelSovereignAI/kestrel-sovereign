@@ -28,8 +28,17 @@ def run_wizard(
 
     Returns a process exit code: ``0`` if every step finished without
     blockers, ``1`` otherwise. Callers (CLI) propagate that to ``sys.exit``.
+
+    ``--check`` is read-only by contract: even if ``ctx.reset`` is True,
+    we refuse to move files in CHECK mode. The CLI rejects this combo
+    upfront with a clear error; this guard catches anyone calling
+    ``run_wizard`` directly (e.g. tests, embedders).
     """
-    if ctx.reset:
+    if ctx.reset and ctx.flow is Flow.CHECK:
+        ctx.block(
+            "refused to reset in --check mode (read-only by contract)"
+        )
+    elif ctx.reset:
         _reset_config_files(ctx)
 
     if only_step is not None:

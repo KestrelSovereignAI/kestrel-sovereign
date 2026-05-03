@@ -112,6 +112,42 @@ def test_wizard_check_mode_returns_zero_when_ready(tmp_path):
     assert rc == 0
 
 
+def test_wizard_check_with_reset_does_not_move_files(tmp_path):
+    """`--check --reset` is forbidden combo. CLI rejects it; this guards
+    direct ``run_wizard`` callers (tests / embedders) from accidentally
+    moving files when --check should be read-only.
+
+    Reproducer: before this guard, the wizard moved .env and kestrel.toml
+    to .backup-<ts> *before* the check flow noticed it should not write.
+    The check then reported the originals as missing — silent corruption
+    of a "read-only" command.
+    """
+    write_env(
+        tmp_path / ".env",
+        {"KESTREL_DATA_KEY": Fernet.generate_key().decode("ascii")},
+    )
+    (tmp_path / "kestrel.toml").write_text(
+        "[llm]\nroute_priority = []\n", encoding="utf-8"
+    )
+    env_text_before = (tmp_path / ".env").read_text()
+    toml_text_before = (tmp_path / "kestrel.toml").read_text()
+
+    ctx = _make_ctx(tmp_path, Flow.CHECK, reset=True)
+    rc = run_wizard(ctx)
+
+    # Originals must still be there, content unchanged.
+    assert (tmp_path / ".env").exists()
+    assert (tmp_path / "kestrel.toml").exists()
+    assert (tmp_path / ".env").read_text() == env_text_before
+    assert (tmp_path / "kestrel.toml").read_text() == toml_text_before
+    # No backup files created.
+    assert list(tmp_path.glob(".env.backup-*")) == []
+    assert list(tmp_path.glob("kestrel.toml.backup-*")) == []
+    # And the wizard must have flagged the misuse as a blocker.
+    assert rc != 0
+    assert any("refused to reset in --check" in b for b in ctx.blockers)
+
+
 def test_wizard_reset_moves_existing_files_aside(tmp_path):
     write_env(
         tmp_path / ".env",
