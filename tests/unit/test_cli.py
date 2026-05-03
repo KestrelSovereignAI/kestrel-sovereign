@@ -339,6 +339,11 @@ def rookery_env(tmp_path):
     # Create logs directory
     (tmp_path / "logs").mkdir(exist_ok=True)
 
+    # Stub .env so the first-run setup hook in cmd_start does not fire.
+    # cmd_start tests assume a configured project; the first-run path is
+    # exercised separately in test_cli_first_run.py.
+    (tmp_path / ".env").write_text("KESTREL_DATA_KEY=stub\n")
+
     return tmp_path
 
 
@@ -592,15 +597,18 @@ class TestCmdCreate:
         assert "already exists" in output
 
     def test_create_inception_failure(self, rookery_env, capsys):
-        """Create should fail if inception fails."""
+        """Create should fail if inception raises."""
         parser = build_parser()
         args = parser.parse_args(["create", "newagent"])
 
-        mock_result = MagicMock()
-        mock_result.returncode = 1
+        async def boom(**_kwargs):
+            raise RuntimeError("inception kaboom")
 
         with patch("kestrel_sovereign.cli._get_project_dir", return_value=rookery_env), \
-             patch("subprocess.run", return_value=mock_result):
+             patch(
+                 "kestrel_sovereign.inception_service.create_kestrel_identity_async",
+                 side_effect=boom,
+             ):
             rc = cmd_create(args)
 
         assert rc == 1
@@ -610,19 +618,24 @@ class TestCmdCreate:
         parser = build_parser()
         args = parser.parse_args(["create", "newagent"])
 
-        mock_result = MagicMock()
-        mock_result.returncode = 0
-
         agent_dir = rookery_env / "agent_data" / "newagent"
 
-        def fake_inception(*a, **kw):
-            # Simulate inception creating the agent directory
-            agent_dir.mkdir(parents=True, exist_ok=True)
-            (agent_dir / "kestrel_prime.db").touch()
-            return mock_result
+        async def fake_inception(*, output_dir, agent_name, **_kwargs):
+            out = Path(output_dir)
+            out.mkdir(parents=True, exist_ok=True)
+            (out / "kestrel_prime.db").touch()
+
+            class _Creds:
+                agent_did = "did:pkh:eip155:1:0xFakeFakeFakeFakeFakeFakeFakeFakeFakeFa"
+                db_path = str(out / "kestrel_prime.db")
+
+            return _Creds()
 
         with patch("kestrel_sovereign.cli._get_project_dir", return_value=rookery_env), \
-             patch("subprocess.run", side_effect=fake_inception):
+             patch(
+                 "kestrel_sovereign.inception_service.create_kestrel_identity_async",
+                 side_effect=fake_inception,
+             ):
             rc = cmd_create(args)
 
         assert rc == 0
@@ -640,18 +653,22 @@ class TestCmdCreate:
         parser = build_parser()
         args = parser.parse_args(["create", "newagent", "--port", "9999"])
 
-        mock_result = MagicMock()
-        mock_result.returncode = 0
+        async def fake_inception(*, output_dir, agent_name, **_kwargs):
+            out = Path(output_dir)
+            out.mkdir(parents=True, exist_ok=True)
+            (out / "kestrel_prime.db").touch()
 
-        agent_dir = rookery_env / "agent_data" / "newagent"
+            class _Creds:
+                agent_did = "did:pkh:eip155:1:0xFakeFakeFakeFakeFakeFakeFakeFakeFakeFa"
+                db_path = str(out / "kestrel_prime.db")
 
-        def fake_inception(*a, **kw):
-            agent_dir.mkdir(parents=True, exist_ok=True)
-            (agent_dir / "kestrel_prime.db").touch()
-            return mock_result
+            return _Creds()
 
         with patch("kestrel_sovereign.cli._get_project_dir", return_value=rookery_env), \
-             patch("subprocess.run", side_effect=fake_inception):
+             patch(
+                 "kestrel_sovereign.inception_service.create_kestrel_identity_async",
+                 side_effect=fake_inception,
+             ):
             rc = cmd_create(args)
 
         assert rc == 0
@@ -664,17 +681,23 @@ class TestCmdCreate:
 # -----------------------------------------------------------------------
 
 class TestCmdHealth:
-    """Tests for the 'health' command."""
+    """Tests for the 'health' command (deprecated alias for doctor)."""
 
-    def test_health_calls_run_health_check(self):
-        """Health should delegate to run_health_check."""
+    def test_health_is_alias_for_doctor(self, capsys):
+        """`kestrel health` runs the doctor and prints a deprecation note."""
+        from kestrel_sovereign.doctor import DoctorReport
+
         parser = build_parser()
         args = parser.parse_args(["health"])
 
-        with patch("kestrel_sovereign.cli.cmd_health") as mock:
-            mock.return_value = 0
-            # Just verify it's callable
-            assert cmd_health(args) == 0
+        ready = DoctorReport(ok=["all good"])
+        with patch("kestrel_sovereign.doctor.diagnose", return_value=ready):
+            rc = cmd_health(args)
+
+        assert rc == 0
+        output = capsys.readouterr().out
+        assert "deprecated" in output.lower()
+        assert "all good" in output
 
 
 # -----------------------------------------------------------------------

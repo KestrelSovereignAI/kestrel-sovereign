@@ -103,6 +103,11 @@ def _host_log_file(project_dir: Optional[Path] = None) -> Path:
 def cmd_start(args) -> int:
     """Start host and/or agents."""
     project_dir = _get_project_dir()
+
+    first_run_rc = _maybe_first_run_setup(project_dir)
+    if first_run_rc is not None:
+        return first_run_rc
+
     rookery = RookeryConfig.load(project_dir / ROOKERY_CONFIG_FILENAME)
     pm = ProcessManager(project_dir)
 
@@ -500,64 +505,34 @@ def cmd_list(args) -> int:
 
 
 def cmd_create(args) -> int:
-    """Create a new agent via inception."""
+    """Create a new agent via inception (thin wrapper over the agent step)."""
+    from kestrel_sovereign.setup.steps.agent import create_agent
+
     project_dir = _get_project_dir()
     name = args.name
-
-    # Determine data directory
     agent_data_dir = project_dir / "agent_data" / name
 
-    if agent_data_dir.exists() and (agent_data_dir / "kestrel_prime.db").exists():
+    if (agent_data_dir / "kestrel_prime.db").exists():
         print(f"Agent '{name}' already exists at {agent_data_dir}")
         return 1
 
     print(f"\U0001F985 Creating new Kestrel agent: {name}")
 
-    # Run inception service
-    cmd = [
-        sys.executable, "-m", "kestrel_sovereign.inception_service",
-        "--output-dir", str(agent_data_dir),
-        "--name", name,
-    ]
-
-    result = subprocess.run(cmd, cwd=project_dir)
-    if result.returncode != 0:
-        print("Inception failed")
+    try:
+        result = create_agent(
+            name=name,
+            project_dir=project_dir,
+            agent_data_root=project_dir / "agent_data",
+            autostart=True,
+            port=args.port,
+        )
+    except Exception as exc:  # noqa: BLE001 \u2014 surface inception failure verbatim
+        print(f"Inception failed: {exc}")
         return 1
 
-    # Determine next available port
-    rookery_path = project_dir / ROOKERY_CONFIG_FILENAME
-    rookery = RookeryConfig.load(rookery_path)
-    port = args.port
-    if port is None:
-        used_ports = {rookery.host.port}
-        for cfg in rookery.get_local_agents().values():
-            used_ports.add(cfg.port)
-        # Start from the max existing agent port + 1 or default, whichever is higher
-        max_agent_port = max(
-            (cfg.port for cfg in rookery.get_local_agents().values()),
-            default=DEFAULT_AGENT_START_PORT - 1,
-        )
-        port = max(DEFAULT_AGENT_START_PORT, max_agent_port + 1)
-        while port in used_ports:
-            port += 1
-
-    # Add agent to rookery config
-    rookery.agents[name] = LocalAgentConfig(
-        data_dir=Path("agent_data") / name,
-        port=port,
-        autostart=True,
-    )
-
-    # Save rookery config
-    rookery.save(rookery_path)
-
-    # Print the DID from the agent's database
-    did_str = _get_agent_did(agent_data_dir)
-
-    print(f"   DID: {did_str or '(unknown)'}")
+    print(f"   DID: {result.did or '(unknown)'}")
     print(f"   Data dir: agent_data/{name}/")
-    print(f"   Port: {port} (next available)")
+    print(f"   Port: {result.port} (next available)")
     print(f"   Added to {ROOKERY_CONFIG_FILENAME}")
     print(f"\u2705 Agent created. Start with: kestrel start {name}")
     return 0
@@ -823,10 +798,115 @@ async def _run_shell(agent_dir: Path, args) -> int:
 
 
 def cmd_health(args) -> int:
-    """Run health check."""
-    from kestrel_sovereign.health_check import run_health_check
-    run_health_check()
-    return 0
+    """Deprecated alias for ``kestrel doctor``. Removed in a future release."""
+    print("(`kestrel health` is deprecated — use `kestrel doctor`)")
+    return cmd_doctor(args)
+
+
+def cmd_doctor(args) -> int:
+    """Diagnose readiness without making any changes."""
+    from kestrel_sovereign.doctor import diagnose, format_report
+
+    project_dir = _get_project_dir()
+    report = diagnose(project_dir)
+    print(format_report(report))
+    return 0 if report.ready else 1
+
+
+def cmd_setup(args) -> int:
+    """Run the setup wizard."""
+    from kestrel_sovereign.setup.context import Flow
+    from kestrel_sovereign.setup.wizard import build_context, run_wizard
+
+    if args.check and args.reset:
+        # --check is read-only by contract; --reset writes (moves files
+        # aside). Combining them silently moved .env / kestrel.toml to
+        # backups before the check phase ever ran. Reject the combo
+        # rather than picking a winner.
+        print(
+            "error: --check and --reset are mutually exclusive. "
+            "--check is read-only; --reset moves files to backups.",
+            file=sys.stderr,
+        )
+        return 2
+
+    project_dir = _get_project_dir()
+
+    if args.check:
+        flow = Flow.CHECK
+    elif args.quickstart:
+        flow = Flow.QUICKSTART
+    else:
+        flow = Flow.INTERACTIVE
+
+    ctx = build_context(project_dir, flow=flow, reset=args.reset)
+    return run_wizard(ctx, only_step=args.step)
+
+
+def _maybe_first_run_setup(project_dir: Path) -> Optional[int]:
+    """If this looks like a truly fresh checkout, offer to run setup.
+
+    Fires only when **both** of these are true:
+
+      1. ``.env`` is absent, AND
+      2. There are no agents registered in the rookery.
+
+    A user who has already inceptioned an agent (``kestrel create``) has
+    done deliberate setup; we must not block ``kestrel start`` for them
+    even if their ``.env`` is missing — inception falls back to plaintext
+    key storage when ``KESTREL_DATA_KEY`` is unset, and the CI clean-
+    install workflow exercises exactly that path.
+
+    Returns:
+        ``None`` to proceed with start as normal.
+        ``0`` if the user just finished setup successfully — caller should
+            re-read rookery and continue starting.
+        Non-zero if the user declined / setup failed — caller exits.
+
+    Honors ``KESTREL_SKIP_FIRST_RUN=1`` to bypass entirely.
+    """
+    if os.environ.get("KESTREL_SKIP_FIRST_RUN", "").lower() in ("1", "true", "yes"):
+        return None
+    env_path = project_dir / ".env"
+    if env_path.exists():
+        return None
+
+    # Only treat a missing .env as "fresh checkout" if no agents exist.
+    rookery_path = project_dir / ROOKERY_CONFIG_FILENAME
+    if rookery_path.exists():
+        try:
+            existing_rookery = RookeryConfig.load(
+                rookery_path, auto_discover_fallback=False
+            )
+            if existing_rookery.get_local_agents():
+                return None
+        except Exception:
+            # If rookery parsing fails, fall through to the prompt path.
+            pass
+
+    from kestrel_sovereign.setup.prompts import is_tty
+
+    if not is_tty():
+        print("No .env found. Run: kestrel setup --quickstart")
+        return 1
+
+    print("No .env found — looks like a fresh checkout.")
+    try:
+        answer = input("Run `kestrel setup` now? [Y/n] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return 1
+    if answer in ("", "y", "yes"):
+        from kestrel_sovereign.setup.context import Flow
+        from kestrel_sovereign.setup.wizard import build_context, run_wizard
+
+        ctx = build_context(project_dir, flow=Flow.INTERACTIVE, reset=False)
+        rc = run_wizard(ctx)
+        if rc != 0:
+            return rc
+        return None  # Proceed with start
+    print("Skipped. Re-run later with: kestrel setup")
+    return 1
 
 
 # ---------------------------------------------------------------------------
@@ -1396,8 +1476,34 @@ def build_parser() -> argparse.ArgumentParser:
         help="Load an application extension",
     )
 
-    # kestrel health
-    subparsers.add_parser("health", help="Run health check")
+    # kestrel health (deprecated alias for doctor)
+    subparsers.add_parser("health", help="(deprecated) alias for `kestrel doctor`")
+
+    # kestrel doctor
+    subparsers.add_parser("doctor", help="Diagnose readiness; no changes")
+
+    # kestrel setup [step]
+    setup_p = subparsers.add_parser(
+        "setup", help="Run the setup wizard (idempotent, re-runnable)"
+    )
+    setup_p.add_argument(
+        "step", nargs="?",
+        choices=["keys", "llm", "agent", "verify", "talon"],
+        help="Run only this step (default: run all in order). "
+             "Optional steps (talon) only run when named explicitly.",
+    )
+    setup_p.add_argument(
+        "--quickstart", action="store_true",
+        help="Accept defaults; only prompt for missing secrets",
+    )
+    setup_p.add_argument(
+        "--check", action="store_true",
+        help="Report readiness only, never write or prompt",
+    )
+    setup_p.add_argument(
+        "--reset", action="store_true",
+        help="Move existing .env and kestrel.toml aside before regenerating",
+    )
 
     # kestrel config <agent_dir>
     config_p = subparsers.add_parser("config", help="Show/edit agent config")
@@ -1476,6 +1582,8 @@ def main() -> int:
         "create": cmd_create,
         "shell": cmd_shell,
         "health": cmd_health,
+        "doctor": cmd_doctor,
+        "setup": cmd_setup,
         "config": cmd_config,
         "feature": cmd_feature,
         "skills": cmd_skills,
