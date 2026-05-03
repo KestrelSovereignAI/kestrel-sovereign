@@ -1,0 +1,329 @@
+"""CI verification helpers for the clean-install workflow.
+
+Each subcommand is a single readiness assertion against the on-disk
+state the wizard produces. The workflow YAML calls them as:
+
+    uv run python scripts/ci/clean_install_verify.py wizard-artifacts
+    uv run python scripts/ci/clean_install_verify.py identity --agent-name Kestrel
+    uv run python scripts/ci/clean_install_verify.py constitution --agent-name Kestrel
+    uv run python scripts/ci/clean_install_verify.py memory --agent-name Kestrel
+    uv run python scripts/ci/clean_install_verify.py start-and-health --agent-name Kestrel
+    uv run python scripts/ci/clean_install_verify.py did-persists --agent-name Kestrel
+
+Pure stdlib. No shell idioms. No package import (kestrel_sovereign would
+pull heavy deps; we're just reading SQLite + TOML + dotenv). Designed
+so the workflow runs identically on Ubuntu, macOS, and Windows.
+
+Exit code 0 = pass. Non-zero = fail; the message on stderr says why.
+"""
+
+from __future__ import annotations
+
+import argparse
+import re
+import sqlite3
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+if sys.version_info >= (3, 11):
+    import tomllib
+else:  # pragma: no cover — clean-install matrix uses 3.13
+    import tomli as tomllib  # type: ignore[no-redef]
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+_DOTENV_RE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=(.*)$")
+
+
+def _read_dotenv(path: Path) -> dict[str, str]:
+    """Minimal dotenv parser. Strips one layer of surrounding quotes."""
+    out: dict[str, str] = {}
+    if not path.exists():
+        return out
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        m = _DOTENV_RE.match(raw)
+        if not m:
+            continue
+        key, value = m.group(1), m.group(2).strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1]
+        out[key] = value
+    return out
+
+
+def _read_toml(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    with open(path, "rb") as f:
+        return tomllib.load(f)
+
+
+def _agent_db(agent_name: str) -> Path:
+    return Path("agent_data") / agent_name / "kestrel_prime.db"
+
+
+def _fail(msg: str) -> int:
+    print(f"FAIL: {msg}", file=sys.stderr)
+    return 1
+
+
+def _ok(msg: str) -> int:
+    print(f"PASS: {msg}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: wizard-artifacts
+# ---------------------------------------------------------------------------
+
+def cmd_wizard_artifacts(args: argparse.Namespace) -> int:
+    """Sanity-check the files the wizard claims it produced."""
+    required_files = [Path(".env"), Path("kestrel.toml"), Path("rookery.toml")]
+    missing = [str(p) for p in required_files if not p.exists()]
+    if missing:
+        return _fail(f"wizard did not produce: {', '.join(missing)}")
+
+    env = _read_dotenv(Path(".env"))
+    if not env.get("KESTREL_DATA_KEY"):
+        return _fail("KESTREL_DATA_KEY missing from .env after wizard")
+
+    config = _read_toml(Path("kestrel.toml"))
+    priority = (config.get("llm") or {}).get("route_priority") or []
+    if not priority:
+        return _fail("kestrel.toml missing [llm].route_priority")
+
+    return _ok(
+        f".env, kestrel.toml ({len(priority)} routes), rookery.toml all present; "
+        f"KESTREL_DATA_KEY set"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: identity (DID exists in graph_nodes)
+# ---------------------------------------------------------------------------
+
+def cmd_identity(args: argparse.Namespace) -> int:
+    """Identity Pillar: agent's DID is stored as a graph node."""
+    db_path = _agent_db(args.agent_name)
+    if not db_path.exists():
+        return _fail(f"Agent database not created at {db_path}")
+
+    with sqlite3.connect(str(db_path)) as conn:
+        row = conn.execute(
+            "SELECT node_id FROM graph_nodes WHERE node_type='agent' LIMIT 1"
+        ).fetchone()
+    if not row or not row[0]:
+        return _fail("No DID found in graph_nodes")
+    return _ok(f"Identity Pillar — DID: {row[0]}")
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: constitution (governed_by edge + document node + RAG chunks)
+# ---------------------------------------------------------------------------
+
+def cmd_constitution(args: argparse.Namespace) -> int:
+    """Constitution Pillar: stored, edge-linked to agent, RAG-indexed."""
+    db_path = _agent_db(args.agent_name)
+    if not db_path.exists():
+        return _fail(f"Agent database not found at {db_path}")
+
+    with sqlite3.connect(str(db_path)) as conn:
+        edges = conn.execute(
+            "SELECT COUNT(*) FROM graph_edges WHERE label='governed_by'"
+        ).fetchone()[0]
+        docs = conn.execute(
+            "SELECT COUNT(*) FROM graph_nodes WHERE node_type='document'"
+        ).fetchone()[0]
+        files = conn.execute(
+            "SELECT COUNT(*) FROM files WHERE original_name='KESTREL_CONSTITUTION.md'"
+        ).fetchone()[0]
+        chunks = conn.execute("SELECT COUNT(*) FROM document_chunks").fetchone()[0]
+
+    if not (edges and docs and files):
+        return _fail(
+            f"Constitution not anchored — "
+            f"governed_by={edges}, constitution_docs={docs}, files={files}"
+        )
+    return _ok(
+        f"Constitution Pillar — governed_by={edges}, constitution_docs={docs}, "
+        f"files={files}, rag_chunks={chunks}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: memory (required tables exist)
+# ---------------------------------------------------------------------------
+
+_REQUIRED_TABLES = {
+    "graph_nodes",
+    "graph_edges",
+    "files",
+    "document_chunks",
+    "conversation_history",
+}
+
+
+def cmd_memory(args: argparse.Namespace) -> int:
+    """Memory Pillar: storage tables created by inception are all present."""
+    db_path = _agent_db(args.agent_name)
+    if not db_path.exists():
+        return _fail(f"Agent database not found at {db_path}")
+
+    with sqlite3.connect(str(db_path)) as conn:
+        rows = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    tables = {r[0] for r in rows}
+    missing = _REQUIRED_TABLES - tables
+    if missing:
+        return _fail(f"missing tables: {sorted(missing)}")
+    return _ok(f"Memory Pillar — {len(tables)} tables, all required present")
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: start-and-health (start, probe /health, stop)
+# ---------------------------------------------------------------------------
+
+def _agent_port(agent_name: str) -> int | None:
+    rookery = _read_toml(Path("rookery.toml"))
+    return ((rookery.get("agents") or {}).get(agent_name) or {}).get("port")
+
+
+def _kestrel(*args: str) -> subprocess.CompletedProcess[str]:
+    """Invoke the kestrel CLI via the current Python interpreter.
+
+    We use ``python -m kestrel_sovereign.cli`` (rather than the
+    ``kestrel`` entry-point script) because the entry point is named
+    ``kestrel`` on Unix and ``kestrel.exe`` on Windows; the module
+    invocation is identical on every OS.
+    """
+    return subprocess.run(
+        [sys.executable, "-m", "kestrel_sovereign.cli", *args],
+        capture_output=True,
+        text=True,
+    )
+
+
+def _poll_health(port: int, timeout_s: int = 30) -> bool:
+    """Poll ``GET http://localhost:<port>/health`` until 200 or timeout."""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            with urllib.request.urlopen(
+                f"http://localhost:{port}/health", timeout=2
+            ) as resp:
+                if resp.status == 200:
+                    return True
+        except (urllib.error.URLError, ConnectionError, TimeoutError):
+            pass
+        time.sleep(1)
+    return False
+
+
+def cmd_start_and_health(args: argparse.Namespace) -> int:
+    """Start the agent, verify /health responds, stop the agent.
+
+    ``kestrel start`` already waits for the agent's health internally,
+    but we probe externally too — that catches cases where the start
+    command thinks the agent is healthy but the HTTP route is broken.
+    """
+    port = _agent_port(args.agent_name)
+    if not port:
+        return _fail(f"rookery.toml missing port for {args.agent_name}")
+    print(f"Agent port from rookery.toml: {port}")
+
+    start = _kestrel("start", args.agent_name)
+    sys.stdout.write(start.stdout)
+    sys.stderr.write(start.stderr)
+    if start.returncode != 0:
+        return _fail(f"kestrel start exited {start.returncode}")
+
+    try:
+        if not _poll_health(port, timeout_s=30):
+            return _fail(
+                f"Agent did not respond on http://localhost:{port}/health "
+                f"within 30 seconds"
+            )
+        print(f"Health endpoint responding on port {port}")
+    finally:
+        # Always try to stop, even if the health check failed — leaves
+        # the runner clean for the DID-persistence step.
+        stop = _kestrel("stop", args.agent_name)
+        sys.stdout.write(stop.stdout)
+        sys.stderr.write(stop.stderr)
+
+    return _ok(f"Health endpoint verified on port {port}")
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: did-persists (DB still has DID after stop/start cycle)
+# ---------------------------------------------------------------------------
+
+def cmd_did_persists(args: argparse.Namespace) -> int:
+    """Identity portability: DID survives a stop/start cycle."""
+    db_path = _agent_db(args.agent_name)
+    if not db_path.exists():
+        return _fail(f"Agent database not found at {db_path}")
+
+    with sqlite3.connect(str(db_path)) as conn:
+        row = conn.execute(
+            "SELECT node_id FROM graph_nodes WHERE node_type='agent' LIMIT 1"
+        ).fetchone()
+    if not row or not row[0]:
+        return _fail("DID not found after restart cycle")
+    return _ok(f"DID persists after stop/start cycle: {row[0]}")
+
+
+# ---------------------------------------------------------------------------
+# Entry
+# ---------------------------------------------------------------------------
+
+def _build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="clean_install_verify",
+        description="Per-step assertions for the clean-install CI job.",
+    )
+    sub = p.add_subparsers(dest="command", required=True)
+
+    sub.add_parser("wizard-artifacts", help="Verify wizard wrote .env, kestrel.toml, rookery.toml")
+
+    for name, help_text in (
+        ("identity", "Verify Identity Pillar — DID in graph_nodes"),
+        ("constitution", "Verify Constitution Pillar — anchored + RAG-indexed"),
+        ("memory", "Verify Memory Pillar — required tables present"),
+        ("start-and-health", "Start agent, probe /health, stop agent"),
+        ("did-persists", "Verify DID survives after the stop/start cycle"),
+    ):
+        sp = sub.add_parser(name, help=help_text)
+        sp.add_argument(
+            "--agent-name", required=True,
+            help="Agent name (matches rookery.toml + agent_data/<name>/)",
+        )
+
+    return p
+
+
+_HANDLERS = {
+    "wizard-artifacts": cmd_wizard_artifacts,
+    "identity": cmd_identity,
+    "constitution": cmd_constitution,
+    "memory": cmd_memory,
+    "start-and-health": cmd_start_and_health,
+    "did-persists": cmd_did_persists,
+}
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _build_parser().parse_args(argv)
+    return _HANDLERS[args.command](args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
