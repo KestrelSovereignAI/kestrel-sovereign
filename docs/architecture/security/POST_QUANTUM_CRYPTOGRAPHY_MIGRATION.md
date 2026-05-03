@@ -17,7 +17,7 @@ The original draft was a one-page sketch. Reviewers and inventory work surfaced 
 1. "Burn the boats" with no continuity story orphaned every existing agent.
 2. Pure post-quantum (no hybrid) contradicted CNSA 2.0 / IETF transition guidance.
 3. The DID method change (`did:pkh:eip155:1` is structurally welded to Ethereum and secp256k1) was not addressed.
-4. ML-KEM "for at-rest data" misframed the threat — local AES-GCM with locally-derived keys is not HNDL-vulnerable. The real KEM target is exported and shared artifacts, which don't exist as a feature yet.
+4. ML-KEM "for at-rest data" misframed the threat — local AES-GCM with locally-derived keys is not HNDL-vulnerable. The real KEM target is **recipient-wrapped** export and sharing. Note: agent CAR export already exists today (`SovereignStorageAdapter.export_agent`, [`storage/sovereign_adapter.py:252+`](../../../kestrel_sovereign/storage/sovereign_adapter.py#L252)) — encrypted shards/assets/keyring packed into a CARv1 archive, uploaded to IPFS/Filecoin. What's missing is wrapping the keyring to a **recipient's** public key; today the keyring is encrypted to the agent's own `KESTREL_DATA_KEY`-derived key, so "export" today is really "self-archive." Wave 4 introduces recipient KEM wrapping. Until then, every `export_agent` upload is HNDL-relevant if the CAR ever leaves the originating agent's custody.
 5. Spawn-mandate signing ([`spawn/mandate.py:77-89`](../../../kestrel_sovereign/spawn/mandate.py#L77-L89)) and the public-HMAC tamper-tag ([`features/compute/script_signer.py:170`](../../../kestrel_sovereign/features/compute/script_signer.py#L170)) were missed.
 6. ML-DSA + SLH-DSA required everywhere was overkill — SLH-DSA is for irrevocable, long-horizon checkpoints, not routine signing.
 7. Verifier-rejects-all-unverified-sigs was too strict for migration; legacy import and offline recovery need policy modes.
@@ -58,7 +58,7 @@ This PRD-v2 corrects all eight.
 
 `did:pkh:eip155:1` cannot host PQ keys (the DID *is* `keccak(secp256k1_pubkey)[-20:]`). Two viable alternatives evaluated:
 
-- **`did:web` with full DID document carrying multiple `verificationMethod` entries (W3C Multikey).** Self-hosted at `https://<domain>/.well-known/did/<agent>/did.json`. Standards-aligned, supports multi-key naturally, key rotation is just a DID document update.
+- **`did:web` with full DID document carrying multiple `verificationMethod` entries (W3C Multikey).** Path-based DIDs resolve per the W3C did:web method spec: `did:web:agents.kestrel.sh:<agent>` → `https://agents.kestrel.sh/<agent>/did.json` (path components after the host map directly to URL path; `/.well-known/did.json` is the resolution path only for *bare-domain* DIDs like `did:web:agents.kestrel.sh`). Standards-aligned, supports multi-key naturally, key rotation is just a DID document update.
 - **`did:key` with a composite multicodec.** Cleaner self-contained URI but requires W3C-blessed multicodec for hybrid composites; that work is in flight but not landed.
 
 **Decision: `did:web`.** Path of least resistance to ship; revisit `did:key` once W3C lands a hybrid multicodec. Configuration flag `KESTREL_IDENTITY_METHOD` to allow opt-in to legacy `did:pkh` only during Wave 2 transition (deprecation warning attached).
@@ -122,12 +122,12 @@ Tentative; finalize in PRD-v3 once Wave 2 ships and benchmarks land:
 
 ## 9. Library bake-off
 
-Decision criteria: FIPS validation status, API stability, key/sig sizes on disk, signing/verification latency on M-series and Cloud Run x86, wheels available (no compile-on-deploy).
+Decision criteria: FIPS validation status, API stability, key/sig sizes on disk, signing/verification latency on M-series and Cloud Run x86, **prebuilt wheels available (no compile-on-deploy)**, supply-chain provenance.
 
 Candidates:
 
-- **`pqcrypto`** — pure-Python ML-KEM/ML-DSA. No C dependency. Performance acceptable for low-frequency operations; verify before committing for hot paths.
-- **`oqs-python` / `liboqs-python`** — broadest coverage, C dependency. Requires liboqs C library on host or in image. liboqs is research-grade; track FIPS validation status.
+- **`pqcrypto`** — CFFI bindings to PQClean-derived C implementations of ML-KEM/ML-DSA/SLH-DSA. PyPI ships prebuilt wheels for common platforms; meets the "no compile-on-deploy" bar. Performance acceptable for low-frequency operations; verify before committing for hot paths.
+- **`oqs-python` / `liboqs-python`** — broadest algorithm coverage, depends on liboqs C library at the system level. Requires either prebuilt wheels with vendored liboqs or an image that ships liboqs; liboqs itself is research-grade and tracks NIST drafts faster than FIPS validation.
 - **Upstream `cryptography>=45.x`** — track only; PQ support is staged but not yet shipping in stable.
 
 **Approach:** Wave 1 ships `CryptoSuite` with `Secp256k1Suite` implemented and ML-DSA/ML-KEM/SLH-DSA suites stubbed. Wave 2 implements 2–3 PQ suites behind the same interface, runs NIST CAVP KAT vectors against all of them in CI, and selects the production default based on the criteria above. The abstraction means the choice is reversible.

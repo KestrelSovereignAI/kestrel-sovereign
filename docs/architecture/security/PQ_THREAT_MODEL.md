@@ -35,7 +35,7 @@ Grover does not "break" symmetric crypto — it forces a doubling of key sizes t
 |---|---|---|---|---|
 | Agent identity sig (secp256k1 ECDSA) | Forge with private key only | Forgery from public key (Shor) | No (no decryption) | **High** — historical-agent identity theft |
 | Spawn-mandate chain (ECDSA) | Forge with private key | Forgery from public key (Shor) | No | **High** — forge any descendant's lineage |
-| Constitution-anchoring sig | Forge with private key | Forgery from public key (Shor) | No | **High** — forge governance edits |
+| Constitution anchor (v1) | n/a — anchor today is `agent_node.properties.constitution_hash` (raw SHA-256), **not signed** | n/a | n/a | The forgery surface today is the *identity package that wraps the anchor* (covered in the row above), not the bare graph hash. Wave 3 introduces a v2 signed anchor — at that point this row gains a Shor-forgery risk on the anchor signature itself. |
 | Public-HMAC tamper-tag | **Already trivially forgeable** (key is public DID) | n/a | n/a | **Critical** — Wave 0B fix |
 | Local AES-256-GCM (keystore, API keys, CAR keyring) | None (with sound master key) | Grover halves to 128-bit | **No** — locally-derived keys, not wrapped to a public key | Low |
 | Fernet (AES-128) — 17 sites | None today, but small margin | Grover halves to ~64-bit | Mild | **Medium** — Wave 0C, mostly hygiene |

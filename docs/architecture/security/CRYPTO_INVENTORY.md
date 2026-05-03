@@ -61,7 +61,9 @@ None in use. ML-DSA, ML-KEM, SLH-DSA, hybrid combiners — all unimplemented.
 
 ### Fernet (AES-128-CBC + HMAC-SHA256) — legacy path (Wave 0C kill target)
 
-17 sites. Below modern bar today (AES-128 < AES-256); Grover halves to ~64-bit effective.
+**17 files** with direct `Fernet` / `cryptography.fernet` usage. Below modern bar today (AES-128 < AES-256); Grover halves to ~64-bit effective. Authoritative list from `grep -lE '(Fernet|fernet|cryptography\.fernet)' --include='*.py' --include='*.sh' -r .` (excluding `.venv`, `__pycache__`, `worktrees`, and `tests/` — see "Test files" note below).
+
+#### Production code (14 files)
 
 | Layer | File |
 |---|---|
@@ -79,8 +81,18 @@ None in use. ML-DSA, ML-KEM, SLH-DSA, hybrid combiners — all unimplemented.
 | Conversations endpoint | [`endpoints/conversations.py`](../../../endpoints/conversations.py) |
 | Reflection — memory check | [`kestrel_sovereign/features/reflection/checks/memory.py`](../../../kestrel_sovereign/features/reflection/checks/memory.py) |
 | Reflection — arms check | [`kestrel_sovereign/features/reflection/checks/arms.py`](../../../kestrel_sovereign/features/reflection/checks/arms.py) |
-| Demo script | [`examples/demo_sovereignty.py`](../../../examples/demo_sovereignty.py) |
-| Emma rotation script | [`scripts/rotate_emma_key.py`](../../../scripts/rotate_emma_key.py) |
+
+#### Tooling and examples (3 files)
+
+| Layer | File | Notes |
+|---|---|---|
+| Demo script | [`examples/demo_sovereignty.py`](../../../examples/demo_sovereignty.py) | Migrates with the rest |
+| Emma rotation script | [`scripts/rotate_emma_key.py`](../../../scripts/rotate_emma_key.py) | Will need to handle both v1 Fernet and v2 AEAD during transition |
+| Backup-restore test harness | [`scripts/test_backup_restore.sh`](../../../scripts/test_backup_restore.sh) | Generates Fernet keys for round-trip testing; update once v2 AEAD ships |
+
+#### Test files (downstream consumers, not direct migration targets)
+
+Six unit test files reference `Fernet` to exercise the production crypto: [`tests/unit/test_agent_encryption.py`](../../../tests/unit/test_agent_encryption.py), [`tests/unit/test_commands_conversations_endpoint_contracts.py`](../../../tests/unit/test_commands_conversations_endpoint_contracts.py), [`tests/unit/test_decryption_failure.py`](../../../tests/unit/test_decryption_failure.py), [`tests/unit/test_encryption.py`](../../../tests/unit/test_encryption.py), [`tests/unit/test_key_rotation.py`](../../../tests/unit/test_key_rotation.py), [`tests/unit/test_post_response_pipeline.py`](../../../tests/unit/test_post_response_pipeline.py). These get **extended** in Wave 0C to cover both v1 read and v2 write — they are not migrated away from in the same sense as production code.
 
 ### HMAC-SHA256 — JWT signing and webhook auth (legitimate uses)
 
