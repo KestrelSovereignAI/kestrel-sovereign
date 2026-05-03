@@ -179,6 +179,59 @@ class TestRotationCoversBothPrefixes:
             "ciphertext rubble after KESTREL_DATA_KEY swap)."
         )
 
+    def test_validate_key_passphrase_matches_get_fernet(self, monkeypatch):
+        """Wave 0C regression: ``_validate_key`` must derive the same AES
+        key as ``get_fernet()`` for any given KESTREL_DATA_KEY value.
+
+        The pre-fix ``_validate_key`` called ``AEADCipher(key)`` directly,
+        which accepts ANY 32-byte string as a raw AES key. So a 32-char
+        passphrase like 'a'*32 was used as-is for the rotation key, while
+        ``get_fernet()`` for the same passphrase SHA-256-derives the key.
+        Different keys → rotation re-encrypts data under a key the
+        runtime can never reproduce → permanent ciphertext rubble after
+        the user swaps KESTREL_DATA_KEY.
+        """
+        # 32-character passphrase — the pathological case
+        passphrase = "a" * 32
+        monkeypatch.setenv("KESTREL_DATA_KEY", passphrase)
+
+        runtime_cipher = encryption.get_fernet()
+        rotation_cipher = key_rotation_module._validate_key(passphrase)
+
+        plaintext = b"data the user expects to keep across rotation"
+        rotated = rotation_cipher.encrypt(plaintext)
+
+        # Pre-fix this raised DecryptionError because the keys diverged:
+        # rotation_cipher used raw `b'aaaa...'`, runtime used SHA-256(passphrase)
+        assert runtime_cipher.decrypt(rotated) == plaintext, (
+            "_validate_key must produce the same AES key as get_fernet() — "
+            "otherwise rotated rows become unreadable after a KESTREL_DATA_KEY swap"
+        )
+
+    def test_validate_key_short_passphrase_matches_get_fernet(self, monkeypatch):
+        """Same invariant for short passphrases (the common case)."""
+        passphrase = "hunter2"  # 7 chars, won't even base64-decode
+        monkeypatch.setenv("KESTREL_DATA_KEY", passphrase)
+
+        runtime = encryption.get_fernet()
+        rotation = key_rotation_module._validate_key(passphrase)
+
+        pt = b"x"
+        assert runtime.decrypt(rotation.encrypt(pt)) == pt
+        assert rotation.decrypt(runtime.encrypt(pt)) == pt
+
+    def test_validate_key_real_fernet_key_matches_get_fernet(self, monkeypatch):
+        """Same invariant when the input is a genuine Fernet-shaped key."""
+        real_fernet_key = Fernet.generate_key().decode()
+        monkeypatch.setenv("KESTREL_DATA_KEY", real_fernet_key)
+
+        runtime = encryption.get_fernet()
+        rotation = key_rotation_module._validate_key(real_fernet_key)
+
+        pt = b"real-fernet-key-path"
+        assert runtime.decrypt(rotation.encrypt(pt)) == pt
+        assert rotation.decrypt(runtime.encrypt(pt)) == pt
+
     @pytest.mark.asyncio
     async def test_count_encrypted_records_sql_matches_both_prefixes(self):
         cap = _SqlCapture(count_value=42)
