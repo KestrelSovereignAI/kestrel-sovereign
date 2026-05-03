@@ -3,6 +3,13 @@ Kestrel Compute Feature - Script Signer.
 
 Cryptographic signing of scripts using the agent's secp256k1 DID key.
 Ensures scripts cannot be tampered with after agent creates them.
+
+Sign-or-fail: if the agent's signing keys are unavailable, signing raises
+``ScriptSigningKeysUnavailable``. There is no fallback. Verification rejects
+any signature whose prefix is not ``ecdsa:``; the historical ``hmac:`` prefix
+used a public DID as the HMAC key and was forgeable by anyone who could read
+the script. See ``docs/architecture/security/CRYPTO_INVENTORY.md`` and the
+Wave 0B section of the Quantum Hardening epic.
 """
 
 import hashlib
@@ -15,6 +22,10 @@ from typing import Optional
 from .models import ComputeScript
 
 logger = logging.getLogger(__name__)
+
+
+class ScriptSigningKeysUnavailable(Exception):
+    """Raised when ScriptSigner.sign is invoked without usable signing keys."""
 
 
 class ScriptSigner:
@@ -134,100 +145,103 @@ class ScriptSigner:
     
     async def sign(self, script: ComputeScript) -> str:
         """
-        Sign a script's content.
-        
-        Creates an ECDSA signature of the script's content hash using secp256k1.
-        Falls back to HMAC-SHA256 if keys aren't available.
-        
+        Sign a script's content with secp256k1 ECDSA.
+
+        Sign-or-fail. If the agent's keys cannot be loaded, raises
+        ``ScriptSigningKeysUnavailable``. There is no fallback.
+
         Args:
             script: The script to sign
-            
+
         Returns:
-            Base64-encoded signature string
+            Base64-encoded signature string with ``ecdsa:`` prefix.
+
+        Raises:
+            ScriptSigningKeysUnavailable: when keys cannot be loaded or the
+                signing operation fails.
         """
         import base64
-        
+
         content_hash = self._content_hash(script)
         content_hash_bytes = hashlib.sha256(content_hash.encode()).digest()
-        
-        # Try ECDSA signing with secp256k1 first
-        if await self._load_keys() and self._private_key:
-            try:
-                from cryptography.hazmat.primitives.asymmetric import ec
-                from cryptography.hazmat.primitives import hashes
-                
-                signature_bytes = self._private_key.sign(
-                    content_hash_bytes,
-                    ec.ECDSA(hashes.SHA256())
-                )
-                return "ecdsa:" + base64.b64encode(signature_bytes).decode()
-            except Exception as e:
-                logger.warning(f"ECDSA signing failed: {e}, falling back to HMAC")
-        
-        # Fallback: HMAC-SHA256 with DID as key
-        # This is less secure but provides tamper detection without proper keys
-        import hmac
-        key = (self.agent_did or "kestrel-unsigned").encode()
-        signature = hmac.new(key, content_hash.encode(), hashlib.sha256).digest()
-        
-        # Prefix with "hmac:" to indicate fallback method
-        return "hmac:" + base64.b64encode(signature).decode()
+
+        if not await self._load_keys() or self._private_key is None:
+            raise ScriptSigningKeysUnavailable(
+                f"Cannot sign script {script.id[:8]}…: secp256k1 keys for "
+                f"DID {self.agent_did!r} are not available. Refusing to "
+                "produce a signature; the historical HMAC fallback was "
+                "forgeable and has been removed."
+            )
+
+        try:
+            from cryptography.hazmat.primitives.asymmetric import ec
+            from cryptography.hazmat.primitives import hashes
+
+            signature_bytes = self._private_key.sign(
+                content_hash_bytes,
+                ec.ECDSA(hashes.SHA256())
+            )
+            return "ecdsa:" + base64.b64encode(signature_bytes).decode()
+        except Exception as e:
+            raise ScriptSigningKeysUnavailable(
+                f"ECDSA signing failed for script {script.id[:8]}…: {e}"
+            ) from e
     
     async def verify(self, script: ComputeScript) -> bool:
         """
         Verify a script's signature.
-        
-        Ensures the script hasn't been modified since it was signed.
-        
+
+        Returns True only for a genuine ECDSA signature over the script's
+        canonical content hash, produced by the agent identified in the DID
+        document this signer can resolve. Rejects every other case — most
+        importantly the historical ``hmac:`` prefix, whose key was the public
+        DID and so could be forged by any reader of the script.
+
         Args:
             script: The script to verify
-            
+
         Returns:
-            True if signature is valid, False otherwise
+            True only if the ECDSA signature verifies; False otherwise.
         """
         if not script.signature:
-            logger.warning(f"Script {script.id[:8]}... has no signature")
+            logger.warning(f"Script {script.id[:8]}… has no signature")
             return False
-        
+
+        if script.signature.startswith("hmac:"):
+            logger.critical(
+                f"Script {script.id[:8]}… carries an 'hmac:' signature. "
+                "These were produced by a removed fallback that used the "
+                "public DID as the HMAC key (forgeable by any reader). "
+                "Rejecting; re-sign with current ECDSA keys to restore."
+            )
+            return False
+
+        if not script.signature.startswith("ecdsa:"):
+            logger.warning(f"Unknown signature format: {script.signature[:10]}…")
+            return False
+
         import base64
-        
         content_hash = self._content_hash(script)
         content_hash_bytes = hashlib.sha256(content_hash.encode()).digest()
-        
-        # Check if HMAC fallback signature
-        if script.signature.startswith("hmac:"):
-            import hmac
-            key = (script.signed_by or self.agent_did or "kestrel-unsigned").encode()
-            expected = hmac.new(key, content_hash.encode(), hashlib.sha256).digest()
-            expected_b64 = base64.b64encode(expected).decode()
-            
-            actual_b64 = script.signature[5:]  # Remove "hmac:" prefix
-            return hmac.compare_digest(expected_b64, actual_b64)
-        
-        # ECDSA verification
-        if script.signature.startswith("ecdsa:"):
-            if await self._load_keys() and self._public_key:
-                try:
-                    from cryptography.hazmat.primitives.asymmetric import ec
-                    from cryptography.hazmat.primitives import hashes
-                    
-                    signature_bytes = base64.b64decode(script.signature[6:])  # Remove "ecdsa:" prefix
-                    self._public_key.verify(
-                        signature_bytes,
-                        content_hash_bytes,
-                        ec.ECDSA(hashes.SHA256())
-                    )
-                    return True
-                except Exception as e:
-                    logger.warning(f"ECDSA signature verification failed: {e}")
-                    return False
-            else:
-                logger.warning("Cannot verify ECDSA signature without public key")
-                return False
-        
-        # Unknown signature format
-        logger.warning(f"Unknown signature format: {script.signature[:10]}...")
-        return False
+
+        if not await self._load_keys() or self._public_key is None:
+            logger.warning("Cannot verify ECDSA signature without public key")
+            return False
+
+        try:
+            from cryptography.hazmat.primitives.asymmetric import ec
+            from cryptography.hazmat.primitives import hashes
+
+            signature_bytes = base64.b64decode(script.signature[6:])
+            self._public_key.verify(
+                signature_bytes,
+                content_hash_bytes,
+                ec.ECDSA(hashes.SHA256())
+            )
+            return True
+        except Exception as e:
+            logger.warning(f"ECDSA signature verification failed: {e}")
+            return False
     
     async def sign_and_update(self, script: ComputeScript) -> ComputeScript:
         """
