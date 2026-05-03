@@ -58,10 +58,26 @@ def mock_agent(temp_db):
 
 @pytest.fixture
 async def compute_feature(mock_agent):
-    """Create and initialize compute feature."""
+    """Create and initialize compute feature.
+
+    Wave 0B: ScriptSigner now sign-or-fails. The MockAgent has no real key
+    custody, so we inject a freshly-generated secp256k1 keypair onto the
+    signer to exercise the genuine ECDSA path. Tests assert ``ecdsa:``
+    output and signed state.
+    """
     feature = ComputeFeature(mock_agent)
     await feature.initialize()
     mock_agent.features["ComputeFeature"] = feature
+
+    # Inject real ECDSA keys into the signer (no inception ceremony in tests)
+    if feature.signer is not None:
+        from cryptography.hazmat.primitives.asymmetric import ec
+        feature.signer._private_key = ec.generate_private_key(ec.SECP256K1())
+        feature.signer._public_key = feature.signer._private_key.public_key()
+        async def _ok():
+            return True
+        feature.signer._load_keys = _ok
+
     # Auto-register hooks (mirrors _register_feature in kestrel_agent.py)
     for hook in feature.get_hooks():
         mock_agent.hooks_manager.register(hook)
@@ -141,7 +157,49 @@ class TestScriptLifecycle:
         
         assert script.state == ScriptState.SIGNED
         assert script.signature is not None
-        assert script.signature.startswith("hmac:") or script.signature.startswith("ecdsa:")
+        assert script.signature.startswith("ecdsa:"), (
+            "Wave 0B: only ecdsa: signatures are produced; the hmac: fallback "
+            "was removed because its key was the public DID and so was forgeable."
+        )
+
+    @pytest.mark.asyncio
+    async def test_run_script_rejects_legacy_hmac_signature(self, compute_feature):
+        """Defense-in-depth: run_script must independently verify the signature
+        before executing, not trust script.state alone. A host that bypasses
+        or misregisters the security-hook chain would otherwise execute a
+        forgeable legacy 'hmac:' tag.
+        """
+        import base64, hashlib, hmac as hmac_mod
+
+        # Write a script normally — gets a real ecdsa: signature
+        await compute_feature.write_script(
+            name="legacy",
+            language="python",
+            content="print('legacy')",
+            purpose="defense-in-depth test",
+        )
+        scripts = await compute_feature.script_store.list_recent(1)
+        script = scripts[0]
+        assert script.state == ScriptState.SIGNED
+
+        # Tamper: replace the ecdsa: signature with a freshly-forged hmac: tag
+        canonical = f"{script.name}|{script.language}|{script.content}|{script.purpose}"
+        content_hash = hashlib.sha256(canonical.encode()).hexdigest()
+        forged = hmac_mod.new(
+            (script.signed_by or "").encode(), content_hash.encode(), hashlib.sha256
+        ).digest()
+        script.signature = "hmac:" + base64.b64encode(forged).decode()
+        await compute_feature.script_store.update(script)
+
+        # run_script should reject before reaching the executor
+        result = await compute_feature.run_script(script.id, executor="uv")
+        assert "invalid signature" in result.lower(), (
+            f"run_script must reject the legacy hmac: tag, got: {result!r}"
+        )
+
+        # And the script must now be marked REJECTED on disk
+        refreshed = await compute_feature.script_store.find_by_id_prefix(script.id)
+        assert refreshed.state == ScriptState.REJECTED
 
 
 class TestSecurityAnalysis:
