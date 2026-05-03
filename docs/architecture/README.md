@@ -48,7 +48,10 @@ Privacy modes, key management, constitution, and cryptographic integrity.
 - **[security/CRYPTOGRAPHIC_ANCHORING.md](security/CRYPTOGRAPHIC_ANCHORING.md)** — Immutable event logging. *Active.*
 - **[security/INTEGRITY_AUDIT_SYSTEM.md](security/INTEGRITY_AUDIT_SYSTEM.md)** — Economic enforcement of ethics. *Active.*
 - **[security/ANTI_CORRUPTION_ANALYSIS.md](security/ANTI_CORRUPTION_ANALYSIS.md)** — Safeguards against economic corruption. *Active.*
-- **[security/POST_QUANTUM_CRYPTOGRAPHY_MIGRATION.md](security/POST_QUANTUM_CRYPTOGRAPHY_MIGRATION.md)** — Migration plan for NIST PQC. *Aspirational (planning doc).*
+- **[security/POST_QUANTUM_CRYPTOGRAPHY_MIGRATION.md](security/POST_QUANTUM_CRYPTOGRAPHY_MIGRATION.md)** — Quantum hardening PRD-v2 (active). Tracking [epic #921](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/921).
+- **[security/CRYPTO_INVENTORY.md](security/CRYPTO_INVENTORY.md)** — Authoritative inventory of every cryptographic primitive in use. *Active (Wave 0A).*
+- **[security/PQ_THREAT_MODEL.md](security/PQ_THREAT_MODEL.md)** — Post-quantum threat model: what Shor breaks, what Grover degrades, what is HNDL-relevant. *Active (Wave 0A).*
+- **[security/SERIALIZATION_COMPATIBILITY.md](security/SERIALIZATION_COMPATIBILITY.md)** — Serialization compatibility matrix for signed/encrypted artifacts (v1 → v2 migration). *Active (Wave 0A).*
 - **[subagent_isolation_audit.md](subagent_isolation_audit.md)** — Cross-feature subagent isolation audit (Feb 2026). *Active.*
 
 ### Features
