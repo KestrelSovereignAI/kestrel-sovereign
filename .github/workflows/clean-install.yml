@@ -4,8 +4,11 @@ name: Clean Install Validation
 # Covers: git clone → uv sync → kestrel setup --quickstart → kestrel doctor
 #         → kestrel start → 3 pillars verified → DID persists across restart.
 #
-# This job exercises the wizard path (the documented bootstrap), so any
-# regression in `kestrel setup` is caught here before users hit it.
+# The verification logic lives in scripts/ci/clean_install_verify.py — pure
+# Python with no shell idioms — so this workflow runs identically on
+# Ubuntu, macOS, and Windows runners (where steps would otherwise default
+# to PowerShell).
+#
 # See: https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/184
 
 on:
@@ -31,7 +34,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     env:
@@ -61,198 +64,33 @@ jobs:
       - name: Run setup wizard (kestrel setup --quickstart)
         run: uv run kestrel setup --quickstart
 
-      # Sanity-check: wizard produced the artifacts it promised.
-      - name: Verify wizard wrote .env, kestrel.toml, rookery.toml
-        run: |
-          for f in .env kestrel.toml rookery.toml; do
-            if [ ! -f "$f" ]; then
-              echo "FAIL: wizard did not produce $f"
-              exit 1
-            fi
-            echo "  ✓ $f present"
-          done
-          # Wizard's contract: KESTREL_DATA_KEY is set
-          if ! grep -q '^KESTREL_DATA_KEY=' .env; then
-            echo "FAIL: KESTREL_DATA_KEY missing from .env after wizard"
-            exit 1
-          fi
-          # And [llm] route_priority has at least one entry
-          if ! grep -q '^route_priority' kestrel.toml; then
-            echo "FAIL: kestrel.toml missing route_priority"
-            exit 1
-          fi
+      # All assertions below delegate to scripts/ci/clean_install_verify.py.
+      # That script is pure Python (stdlib only, no shell idioms), so each
+      # `run:` is a single command line — identical on bash, PowerShell, cmd.
+      - name: Verify wizard artifacts (.env, kestrel.toml, rookery.toml)
+        run: uv run python scripts/ci/clean_install_verify.py wizard-artifacts
 
-      # CLI smoke test on the diagnostic surface that ships alongside setup.
-      # `kestrel doctor` exits 0 iff readiness holds; we treat its non-zero
-      # exit as a CI failure since the wizard just claimed success.
-      - name: Run kestrel doctor
+      - name: Run kestrel doctor (readiness gate)
         run: uv run kestrel doctor
 
-      # Verify Identity pillar — DID exists in the agent DB
-      - name: Verify Identity Pillar — DID exists
-        run: |
-          DB_PATH="agent_data/${{ env.AGENT_NAME }}/kestrel_prime.db"
-          if [ ! -f "$DB_PATH" ]; then
-            echo "FAIL: Agent database not created at $DB_PATH"
-            exit 1
-          fi
-          echo "Database exists: $DB_PATH"
+      - name: Verify Identity Pillar
+        run: uv run python scripts/ci/clean_install_verify.py identity --agent-name "${{ env.AGENT_NAME }}"
 
-          # DID is stored as a graph node (node_type='agent', node_id=did:kestrel:...)
-          DID=$(uv run python -c "
-          import sqlite3, json
-          conn = sqlite3.connect('$DB_PATH')
-          cursor = conn.execute(\"SELECT node_id FROM graph_nodes WHERE node_type='agent' LIMIT 1\")
-          row = cursor.fetchone()
-          conn.close()
-          print(row[0] if row else '')
-          ")
+      - name: Verify Constitution Pillar
+        run: uv run python scripts/ci/clean_install_verify.py constitution --agent-name "${{ env.AGENT_NAME }}"
 
-          if [ -z "$DID" ]; then
-            echo "FAIL: No DID found in graph_nodes"
-            exit 1
-          fi
-          echo "PASS: Identity Pillar — DID: $DID"
+      - name: Verify Memory Pillar
+        run: uv run python scripts/ci/clean_install_verify.py memory --agent-name "${{ env.AGENT_NAME }}"
 
-      # Verify Constitution pillar
-      - name: Verify Constitution Pillar — constitution anchored
-        run: |
-          DB_PATH="agent_data/${{ env.AGENT_NAME }}/kestrel_prime.db"
-
-          RESULT=$(uv run python -c "
-          import sqlite3
-          conn = sqlite3.connect('$DB_PATH')
-          # Constitution is stored as a file and linked via graph edge 'governed_by'
-          cursor = conn.execute(\"SELECT COUNT(*) FROM graph_edges WHERE label='governed_by'\")
-          edges = cursor.fetchone()[0]
-          cursor = conn.execute(\"SELECT COUNT(*) FROM graph_nodes WHERE node_type='document'\")
-          docs = cursor.fetchone()[0]
-          cursor = conn.execute(\"SELECT COUNT(*) FROM files WHERE original_name='KESTREL_CONSTITUTION.md'\")
-          files = cursor.fetchone()[0]
-          cursor = conn.execute(\"SELECT COUNT(*) FROM document_chunks\")
-          chunks = cursor.fetchone()[0]
-          conn.close()
-          if edges > 0 and docs > 0 and files > 0:
-              print(f'OK:governed_by={edges},constitution_docs={docs},files={files},rag_chunks={chunks}')
-          else:
-              print(f'FAIL:governed_by={edges},constitution_docs={docs},files={files}')
-          ")
-
-          if echo "$RESULT" | grep -q "^FAIL"; then
-            echo "FAIL: Constitution not properly anchored — $RESULT"
-            exit 1
-          fi
-          echo "PASS: Constitution Pillar — $RESULT"
-
-      # Verify Memory pillar — storage tables exist
-      - name: Verify Memory Pillar — storage tables exist
-        run: |
-          DB_PATH="agent_data/${{ env.AGENT_NAME }}/kestrel_prime.db"
-
-          TABLE_CHECK=$(uv run python -c "
-          import sqlite3
-          conn = sqlite3.connect('$DB_PATH')
-          cursor = conn.execute(\"SELECT name FROM sqlite_master WHERE type='table'\")
-          tables = [row[0] for row in cursor.fetchall()]
-          conn.close()
-          # Core sovereignty tables created by inception
-          required = {'graph_nodes', 'graph_edges', 'files', 'document_chunks', 'conversation_history'}
-          missing = required - set(tables)
-          if missing:
-              print(f'MISSING:{missing}')
-          else:
-              print(f'OK:{len(tables)} tables')
-          ")
-
-          if echo "$TABLE_CHECK" | grep -q "MISSING"; then
-            echo "FAIL: $TABLE_CHECK"
-            exit 1
-          fi
-          echo "PASS: Memory Pillar — $TABLE_CHECK"
-
-      # QUICKSTART Step 6: start the agent and verify health endpoint.
-      # Read the port from rookery.toml — port allocation is deterministic
-      # but not load-bearing on a hardcoded number.
       - name: Start agent and verify health endpoint
-        run: |
-          PORT=$(uv run python -c "
-          import tomllib, sys
-          with open('rookery.toml', 'rb') as f:
-              cfg = tomllib.load(f)
-          agent = cfg.get('agents', {}).get('${{ env.AGENT_NAME }}') or {}
-          port = agent.get('port')
-          if not port:
-              sys.stderr.write('rookery.toml missing port for ${{ env.AGENT_NAME }}\n')
-              sys.exit(1)
-          print(port)
-          ")
-          echo "Agent port from rookery.toml: $PORT"
+        run: uv run python scripts/ci/clean_install_verify.py start-and-health --agent-name "${{ env.AGENT_NAME }}"
 
-          uv run kestrel start "${{ env.AGENT_NAME }}" &
-          START_PID=$!
-
-          echo "Waiting for agent health endpoint on port $PORT..."
-          for i in $(seq 1 30); do
-            if curl -sf "http://localhost:$PORT/health" > /dev/null 2>&1; then
-              echo "PASS: Agent health endpoint responding on port $PORT"
-              HEALTH=$(curl -s "http://localhost:$PORT/health")
-              echo "Health response: $HEALTH"
-
-              uv run kestrel stop "${{ env.AGENT_NAME }}" 2>/dev/null || true
-              kill $START_PID 2>/dev/null || true
-              exit 0
-            fi
-            sleep 1
-          done
-
-          echo "FAIL: Agent did not respond on port $PORT within 30 seconds"
-          if [ -f "agent_data/${{ env.AGENT_NAME }}/agent.log" ]; then
-            echo "=== Agent log ==="
-            tail -50 "agent_data/${{ env.AGENT_NAME }}/agent.log"
-          fi
-          if [ -d "logs" ]; then
-            echo "=== Host logs ==="
-            ls -la logs/
-            for f in logs/*.log; do
-              [ -f "$f" ] && tail -20 "$f"
-            done
-          fi
-          kill $START_PID 2>/dev/null || true
-          exit 1
-
-      # Verify DID persists across restart (identity portability)
       - name: Verify DID persists across restart
-        run: |
-          DB_PATH="agent_data/${{ env.AGENT_NAME }}/kestrel_prime.db"
-
-          DID_AFTER=$(uv run python -c "
-          import sqlite3
-          conn = sqlite3.connect('$DB_PATH')
-          cursor = conn.execute(\"SELECT node_id FROM graph_nodes WHERE node_type='agent' LIMIT 1\")
-          row = cursor.fetchone()
-          conn.close()
-          print(row[0] if row else '')
-          ")
-
-          if [ -z "$DID_AFTER" ]; then
-            echo "FAIL: DID not found after restart cycle"
-            exit 1
-          fi
-          echo "PASS: DID persists after stop/start cycle: $DID_AFTER"
+        run: uv run python scripts/ci/clean_install_verify.py did-persists --agent-name "${{ env.AGENT_NAME }}"
 
       - name: Summary
         if: always()
         run: |
-          echo "============================================"
-          echo "  Clean Install Validation — ${{ matrix.os }}"
-          echo "============================================"
-          echo "  Python: ${{ env.PYTHON_VERSION }}"
-          echo "  uv sync: OK"
-          echo "  kestrel setup --quickstart: OK (wizard owns inception + DID)"
-          echo "  kestrel doctor: OK (readiness)"
-          echo "  Identity pillar: Verified"
-          echo "  Constitution pillar: Verified"
-          echo "  Memory pillar: Verified"
-          echo "  Health endpoint: Verified"
-          echo "  DID persistence: Verified"
-          echo "============================================"
+          echo "Clean Install Validation matrix: ${{ matrix.os }}"
+          echo "Python: ${{ env.PYTHON_VERSION }}"
+          echo "Agent: ${{ env.AGENT_NAME }}"
