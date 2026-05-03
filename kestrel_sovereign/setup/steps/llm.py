@@ -101,7 +101,59 @@ _ANTHROPIC = _Vendor(
     },
 )
 
-_VENDORS_BY_KEY = {v.key: v for v in (_OLLAMA, _OPENAI, _ANTHROPIC)}
+# Google Gemini via the public API (NOT Vertex — Vertex needs ADC + project,
+# which is too much to gather in a wizard prompt; users wanting Vertex can
+# add the [llm.vendors.vertex_ai] block by hand).
+_GOOGLE = _Vendor(
+    key="google",
+    label="Google Gemini (cloud — needs GOOGLE_API_KEY)",
+    route_id="google:api",
+    is_cloud=True,
+    api_key_env="GOOGLE_API_KEY",
+    toml_block={
+        "vendors": {
+            "google": {
+                "is_cloud": True,
+                "routes": {
+                    "api": {
+                        "adapter": "GoogleAdapter",
+                        "api_key_env": "GOOGLE_API_KEY",
+                        "model": "auto",
+                        "selection_hints": ["flash", "pro"],
+                    }
+                },
+            }
+        }
+    },
+)
+
+# OpenRouter — meta-provider that proxies many model families. Users get
+# Anthropic/Google/Mistral/etc. behind one key.
+_OPENROUTER = _Vendor(
+    key="openrouter",
+    label="OpenRouter (multi-vendor proxy — needs OPENROUTER_API_KEY)",
+    route_id="openrouter:api",
+    is_cloud=True,
+    api_key_env="OPENROUTER_API_KEY",
+    toml_block={
+        "vendors": {
+            "openrouter": {
+                "is_cloud": True,
+                "routes": {
+                    "api": {
+                        "adapter": "OpenRouterAdapter",
+                        "api_key_env": "OPENROUTER_API_KEY",
+                        "model": "auto",
+                        "selection_hints": ["sonnet", "gpt", "gemini"],
+                    }
+                },
+            }
+        }
+    },
+)
+
+_ALL_VENDORS = (_OLLAMA, _OPENAI, _ANTHROPIC, _GOOGLE, _OPENROUTER)
+_VENDORS_BY_KEY = {v.key: v for v in _ALL_VENDORS}
 
 
 def run(ctx: SetupContext) -> None:
@@ -190,13 +242,13 @@ def _select_vendors(
 
     choice = ctx.prompter.select(
         "Default LLM provider?",
-        choices=[_OLLAMA.label, _OPENAI.label, _ANTHROPIC.label],
+        choices=[v.label for v in _ALL_VENDORS],
         default=_OLLAMA.label,
     )
-    primary = next(v for v in (_OLLAMA, _OPENAI, _ANTHROPIC) if v.label == choice)
+    primary = next(v for v in _ALL_VENDORS if v.label == choice)
 
     fallbacks: list[_Vendor] = []
-    for vendor in (_OLLAMA, _OPENAI, _ANTHROPIC):
+    for vendor in _ALL_VENDORS:
         if vendor.key == primary.key:
             continue
         if ctx.prompter.confirm(

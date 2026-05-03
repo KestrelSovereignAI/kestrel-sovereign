@@ -46,10 +46,8 @@ def test_llm_interactive_picks_openai_with_key(tmp_path):
     answers = [
         # Pick OpenAI as primary
         "OpenAI (cloud — needs OPENAI_API_KEY)",
-        # No fallback for ollama
-        False,
-        # No fallback for anthropic
-        False,
+        # Decline every other vendor as a fallback (4 of them)
+        False, False, False, False,
         # Provide key
         "sk-test-key",
     ]
@@ -88,6 +86,8 @@ def test_llm_anthropic_path(tmp_path):
         "Anthropic Claude (cloud — needs ANTHROPIC_API_KEY)",
         False,  # No ollama fallback
         False,  # No openai fallback
+        False,  # No google fallback
+        False,  # No openrouter fallback
         "sk-ant-test",
     ]
     ctx = _make_ctx(tmp_path, Flow.INTERACTIVE, answers=answers)
@@ -96,6 +96,66 @@ def test_llm_anthropic_path(tmp_path):
     env = read_env(tmp_path / ".env")
     assert config["llm"]["route_priority"] == ["anthropic:api"]
     assert env["ANTHROPIC_API_KEY"] == "sk-ant-test"
+
+
+def test_llm_google_path(tmp_path):
+    answers = [
+        "Google Gemini (cloud — needs GOOGLE_API_KEY)",
+        False, False, False, False,  # No fallbacks
+        "AIzaTestKey",
+    ]
+    ctx = _make_ctx(tmp_path, Flow.INTERACTIVE, answers=answers)
+    llm.run(ctx)
+    config = read_toml(tmp_path / "kestrel.toml")
+    env = read_env(tmp_path / ".env")
+    assert config["llm"]["route_priority"] == ["google:api"]
+    assert env["GOOGLE_API_KEY"] == "AIzaTestKey"
+    assert config["llm"]["vendors"]["google"]["routes"]["api"]["adapter"] == "GoogleAdapter"
+
+
+def test_llm_openrouter_path(tmp_path):
+    answers = [
+        "OpenRouter (multi-vendor proxy — needs OPENROUTER_API_KEY)",
+        False, False, False, False,
+        "sk-or-v1-test",
+    ]
+    ctx = _make_ctx(tmp_path, Flow.INTERACTIVE, answers=answers)
+    llm.run(ctx)
+    config = read_toml(tmp_path / "kestrel.toml")
+    env = read_env(tmp_path / ".env")
+    assert config["llm"]["route_priority"] == ["openrouter:api"]
+    assert env["OPENROUTER_API_KEY"] == "sk-or-v1-test"
+    assert config["llm"]["vendors"]["openrouter"]["routes"]["api"]["adapter"] == "OpenRouterAdapter"
+
+
+def test_llm_multi_vendor_chain(tmp_path):
+    """Picking Google primary with Anthropic + OpenRouter as fallbacks."""
+    answers = [
+        # Primary: Google
+        "Google Gemini (cloud — needs GOOGLE_API_KEY)",
+        # Per-vendor fallback prompts in declared order: ollama, openai, anthropic, openrouter
+        False,  # ollama
+        False,  # openai
+        True,   # anthropic
+        True,   # openrouter
+        # API keys for each cloud route in declared order: openai/anthropic/google/openrouter
+        # but only google + anthropic + openrouter are selected
+        "AIzaPrim",  # google primary
+        "sk-ant-fb",  # anthropic fallback
+        "sk-or-fb",  # openrouter fallback
+    ]
+    ctx = _make_ctx(tmp_path, Flow.INTERACTIVE, answers=answers)
+    llm.run(ctx)
+    config = read_toml(tmp_path / "kestrel.toml")
+    env = read_env(tmp_path / ".env")
+
+    priority = config["llm"]["route_priority"]
+    assert priority[0] == "google:api"
+    assert "anthropic:api" in priority
+    assert "openrouter:api" in priority
+    assert env["GOOGLE_API_KEY"] == "AIzaPrim"
+    assert env["ANTHROPIC_API_KEY"] == "sk-ant-fb"
+    assert env["OPENROUTER_API_KEY"] == "sk-or-fb"
 
 
 def test_llm_check_mode_does_not_write(tmp_path):
