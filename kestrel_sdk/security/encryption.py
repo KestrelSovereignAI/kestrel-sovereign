@@ -373,6 +373,12 @@ def encrypt_string_fernet(content: str, cipher: Optional[AEADCipher]) -> Tuple[s
     """Encrypt string content if a cipher is available.
 
     Name retained for legacy callers; parameter is now an ``AEADCipher``.
+
+    Note: this helper does not expose Associated Data (AAD). Tokens written
+    elsewhere with AAD bound will fail to decrypt through ``decrypt_string_fernet``
+    (the AEADCipher will report a "wrong key, AAD, or tampering" diagnostic).
+    Callers that need AAD-bound encryption should use ``AEADCipher.encrypt`` /
+    ``AEADCipher.decrypt`` directly.
     """
     if cipher is None:
         return content, False
@@ -385,6 +391,10 @@ def decrypt_string_fernet(content: str, metadata: Optional[Dict[str, Any]], ciph
 
     Name retained for legacy callers; parameter is now an ``AEADCipher``.
     Accepts both v2 (``KSAv2:``) and legacy Fernet ciphertext.
+
+    Note: AAD is not exposed by this helper. A v2 token written with AAD
+    elsewhere will fail to decrypt through this path; use ``AEADCipher.decrypt``
+    directly if you need AAD-bound decryption.
     """
     if cipher is None:
         if metadata and metadata.get("enc"):

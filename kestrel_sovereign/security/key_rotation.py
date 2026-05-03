@@ -368,9 +368,16 @@ class KeyRotationService:
         safe_id_col = safe_column_name(id_column)
         safe_content_col = safe_column_name(content_column)
 
-        # Get all records
+        # Get all encrypted rows. Match both legacy Fernet (`gAAAAA%`) and v2
+        # AEAD (`KSAv2:%`) prefixes — Wave 0C (#915) made AEADCipher emit v2
+        # tokens for new writes, so a filter that only catches `gAAAAA%` would
+        # silently leave any post-Wave-0C row encrypted under the old key after
+        # rotation, creating permanent ciphertext rubble once KESTREL_DATA_KEY
+        # is swapped.
         async with self.storage.database.execute(
-            f"SELECT {safe_id_col}, {safe_content_col} FROM {safe_tbl} WHERE {safe_content_col} LIKE 'gAAAAA%'"
+            f"SELECT {safe_id_col}, {safe_content_col} FROM {safe_tbl} "
+            f"WHERE {safe_content_col} LIKE 'gAAAAA%' "
+            f"   OR {safe_content_col} LIKE 'KSAv2:%'"
         ) as cursor:
             rows = await cursor.fetchall()
 
@@ -418,7 +425,9 @@ class KeyRotationService:
                 safe_tbl = safe_table_name(table)
                 safe_col = safe_column_name(column)
                 async with self.storage.database.execute(
-                    f"SELECT COUNT(*) FROM {safe_tbl} WHERE {safe_col} LIKE 'gAAAAA%'"
+                    f"SELECT COUNT(*) FROM {safe_tbl} "
+                    f"WHERE {safe_col} LIKE 'gAAAAA%' "
+                    f"   OR {safe_col} LIKE 'KSAv2:%'"
                 ) as cursor:
                     row = await cursor.fetchone()
                     if row:
