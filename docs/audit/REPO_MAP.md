@@ -3,8 +3,8 @@
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-05-02
-**Scope:** 1519 tracked files (922 `.py`, 232 `.md`, 365 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-05-03
+**Scope:** 1555 tracked files (947 `.py`, 237 `.md`, 371 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -144,6 +144,8 @@ Repo entry points and standard project files.
   - `class ToolContextManager`
 - **kestrel_sovereign/agent/tool_registry.py** — Dynamic tool registry mixin for KestrelAgent.
   - `class ToolRegistryMixin`
+- **kestrel_sovereign/agent/turn_lifecycle.py** — Shared turn lifecycle for non-streaming and streaming entry points.
+  - `class TurnLifecycleMixin`
 - **kestrel_sovereign/agent_config.py** — Agent Configuration Management.
   - `class AgentConfig`; `def find_agent_dir(hint)`; `def list_agents(base_dir)`
 - **kestrel_sovereign/auth.py** — Caller context for threading authentication identity into agent operations.
@@ -759,6 +761,26 @@ Repo entry points and standard project files.
   - `class KeyNotConfiguredError`; `class KeyResolutionService`; `async def resolve_key(provider, agent_did, storage, require)`
 - **kestrel_sovereign/services/layered_key_resolver.py** — Layered Key Resolution Service for Kestrel.
   - `class KeyNotConfiguredError`; `class KeyResolutionResult`; `class LayeredKeyResolver`; `async def resolve_key(pool, provider, companion_id, user_id, …)`
+- **kestrel_sovereign/signals/__init__.py** — Signal Dispatcher — runtime.
+- **kestrel_sovereign/signals/dispatcher.py** — SignalDispatcher — the runtime engine.
+  - `class DispatcherAgent`; `class SignalDispatcher`
+- **kestrel_sovereign/signals/handlers.py** — Built-in helpers for source handlers.
+  - `def template_artifact_handler(template_path)`
+- **kestrel_sovereign/signals/lock_manager.py** — Single ordered lock manager for the signal dispatcher.
+  - `def lock_sort_key(name)`; `class OrderedLockManager`
+- **kestrel_sovereign/signals/registry.py** — Source Registry — the v1 boundary.
+  - `class RegistrationError`; `class SourceRegistry`
+- **kestrel_sovereign/signals/sources/__init__.py** — Built-in signal source registrations.
+- **kestrel_sovereign/signals/sources/a2a.py** — Source registration for A2A task completion (Phase 5 of #889).
+  - `def build_a2a_task_complete_registration()`; `def build_signal_for_completed_task(task, target_agent)`; `def serialize_chain_for_metadata(chain)`
+- **kestrel_sovereign/signals/sources/heartbeat.py** — Source registration for the heartbeat (Phase 3 of #889).
+  - `def build_heartbeat_registration()`
+- **kestrel_sovereign/signals/sources/scheduler.py** — Source registrations for built-in cron tasks (Phase 4 of #889).
+  - `def cron_source_name(task_name)`; `def build_cron_registrations()`
+- **kestrel_sovereign/signals/sources/wallet.py** — Source registration for the Stripe crypto-onramp deposit-complete webhook (Phase 6 of #889).
+  - `def build_stripe_deposit_registration()`; `def build_signal_for_deposit(session, target_agent)`
+- **kestrel_sovereign/signals/store.py** — signal_log persistence.
+  - `class SignalLogStore`
 - **kestrel_sovereign/spawn/__init__.py** — Spawn subsystem for Kestrel agent delegation.
 - **kestrel_sovereign/spawn/delegated_wallet.py** — DelegatedWallet: Budget delegation for spawned child agents.
   - `class BudgetExceededError`; `class BudgetAllocation`; `class DelegatedWallet`; `async def create_delegated_wallet(parent_wallet, parent_did, child_did, budget, …)`; `async def release_delegated_wallet(delegated_wallet, parent_wallet, currency)`
@@ -974,6 +996,9 @@ Repo entry points and standard project files.
   - `def get_fernet()`; `def get_master_key_bytes()`; `def get_agent_fernet(agent_id)`; `def get_agent_key(agent_did, purpose)`; `def encrypt(agent_did, purpose, plaintext)`; `def decrypt(agent_did, purpose, ciphertext)`; `def encrypt_string(agent_did, purpose, plaintext)`; `def decrypt_string(agent_did, purpose, ciphertext)`; `…`
 - **kestrel_sdk/security/exceptions.py** — Unified exception hierarchy for Kestrel security module.
   - `class SecurityError`; `class KeyStorageError`; `class KeyNotFoundError`; `class KeyNotConfiguredError`; `class EncryptionError`; `class DecryptionError`; `class MasterKeyNotConfiguredError`; `class InvalidPurposeError`; `…`
+- **kestrel_sdk/signals/__init__.py** — Kestrel SDK — Signal Dispatcher interfaces.
+- **kestrel_sdk/signals/models.py** — Signal Dispatcher data model — public contract.
+  - `class SignalMode`; `class Trust`; `class Urgency`; `class Visibility`; `class Status`; `class ResourceLock`; `class CausationFrame`; `class RateLimit`; `…`
 - **kestrel_sdk/storage/__init__.py** — Kestrel SDK — Storage provider interfaces.
 - **kestrel_sdk/storage/providers/__init__.py** — Kestrel SDK — Storage provider interfaces.
 - **kestrel_sdk/storage/providers/base.py** — Storage Provider Protocol
@@ -1230,6 +1255,8 @@ Repo entry points and standard project files.
 - **docs/architecture/PROVIDER_ECONOMICS.md** — Provider Economics: Middleman Architecture & Revenue Strategy — **Version:** 1.0 **Drafted:** December 2025 **Last verified:** 2026-04-25 (referral-program details still accurate; revenue projections are illustrative, not date-stamped financials) **Status:** Stra…
 - **docs/architecture/README.md** — Kestrel Architecture Documentation — Detailed Product Requirements Documents (PRDs) and technical specifications for the Kestrel agent architecture.
 - **docs/architecture/RUNPOD_LORA_TRAINING.md** — LoRA Training & Generation - Operational Guide — **Status:** Experimental — works on the happy path; not actively developed since Q1 2026.
+- **docs/architecture/SIGNAL_DISPATCHER.md** — Signal Dispatcher — Design — **Status:** Draft v3 — second-pass review incorporated, ready for epic creation **Date:** 2026-05-01 **Author:** opus-4.7 (with @UncleSaurus, reviewed by sonnet-4.6)
+- **docs/architecture/SIGNAL_SOURCES_GUIDE.md** — Signal Sources — Operator Guide — How to add a new signal source to the bird.
 - **docs/architecture/TRAINING_PROVIDER_ARCHITECTURE.md** — Training Provider Architecture — ## Overview
 - **docs/architecture/USER_LIFECYCLE_MANAGEMENT.md** — User Lifecycle Management Architecture — ## Overview
 - **docs/architecture/VASTAI_TRAINING.md** — VastAI LoRA Training Architecture — > **Scope clarification (2026-04-25):** this doc is specifically about *VastAI as a training backend* and that effort is deprioritized — see status banner below.
@@ -1533,13 +1560,19 @@ Repo entry points and standard project files.
 - **tests/e2e/voice_helpers.cjs** — —
 - **tests/fixtures/tone_440hz.wav** — —
 - **tests/frontend/api_client.test.mjs** — (mjs asset)
+- **tests/frontend/api_client_dispatch_pinning.test.mjs** — (mjs asset)
+- **tests/frontend/api_client_stop.test.mjs** — (mjs asset)
 - **tests/frontend/auto_load_most_recent.test.mjs** — (mjs asset)
 - **tests/frontend/capabilities.test.mjs** — (mjs asset)
 - **tests/frontend/chat_ui_generation.test.mjs** — (mjs asset)
+- **tests/frontend/initial_pane_migration.test.mjs** — (mjs asset)
 - **tests/frontend/model_selector.test.mjs** — (mjs asset)
+- **tests/frontend/parallel_chat.test.mjs** — (mjs asset)
 - **tests/frontend/route_selector.test.mjs** — (mjs asset)
+- **tests/frontend/session_id_property.test.mjs** — (mjs asset)
 - **tests/frontend/trash_api_client.test.mjs** — (mjs asset)
 - **tests/frontend/trash_grouping.test.mjs** — (mjs asset)
+- **tests/frontend/voice_default_pane.test.mjs** — (mjs asset)
 - **tests/infrastructure/build_test.sh** — Configuration - using default Cloud Build service account
 - **tests/infrastructure/check_pods.py** — Check RunPod pods status.
   - `def main()`
@@ -2162,6 +2195,26 @@ Repo entry points and standard project files.
   - `class TestSharedModelCache`; `class TestSharedModelCacheSingleton`
 - **tests/unit/test_shell_exit_tokens.py** — Shell exit tokens — #658.
   - `class TestExitTokenSet`
+- **tests/unit/test_signals_a2a_source.py** — Phase 5 of #889: a2a.task_complete source registration + causation chain propagation + the cycle detection mechanism's first real-world exercise.
+  - `async def components(tmp_path)`; `def test_registration_is_cognition_only_and_trusted()`; `def test_registration_schema_rejects_missing_required_fields()`; `def test_registration_redaction_caps_long_summaries()`; `def test_build_signal_extracts_text_from_status_message()`; `def test_build_signal_falls_back_when_no_status_message()`; `def test_build_signal_with_no_metadata_yields_empty_chain()`; `def test_build_signal_rehydrates_chain_from_metadata()`; `…`
+- **tests/unit/test_signals_dispatcher.py** — Unit tests for the SignalDispatcher pipeline.
+  - `def db_path(tmp_path)`; `async def dispatcher_components(db_path)`; `async def test_unknown_source_drops_validation(dispatcher_components)`; `async def test_mode_not_in_allowed_drops_validation(dispatcher_components)`; `async def test_sanitizer_runs_on_untrusted_non_action(dispatcher_components, tmp_path)`; `async def test_schema_failure_drops_validation(dispatcher_components)`; `async def test_schema_normalization_replaces_payload(dispatcher_components)`; `async def test_schema_runs_after_sanitizer(dispatcher_components, tmp_path)`; `…`
+- **tests/unit/test_signals_heartbeat_source.py** — Phase 3 of #889: heartbeat source registration + end-to-end through the real dispatcher.
+  - `async def components(tmp_path)`; `def test_heartbeat_registration_shape()`; `def test_heartbeat_registration_quiet_hours_inverts_active_window()`; `def test_heartbeat_active_end_boundary_stays_active()`; `def test_heartbeat_active_end_plus_one_minute_is_quiet()`; `def test_heartbeat_quiet_hours_handles_midnight_active_end()`; `def test_heartbeat_registration_no_active_hours_means_no_quiet_window()`; `def test_heartbeat_schema_rejects_unknown_keys()`; `…`
+- **tests/unit/test_signals_lock_manager.py** — Unit tests for the OrderedLockManager.
+  - `def test_conversation_sorts_last_in_canonical_order()`; `def test_subset_with_conversation_still_orders_it_last()`; `async def test_acquire_empty_set_is_noop()`; `async def test_acquire_releases_on_normal_exit()`; `async def test_acquire_releases_on_exception()`; `async def test_concurrent_holders_serialize()`; `async def test_lex_order_invariant_no_deadlock_under_overlap()`; `async def test_manager_can_acquire_conversation_with_others()`; `…`
+- **tests/unit/test_signals_models_registry.py** — Unit tests for signal models (SDK contract) and source registry validation.
+  - `def test_causation_frame_is_frozen()`; `def test_signal_defaults_are_safe()`; `def test_urgency_at_or_above()`; `def test_register_valid_action_source()`; `def test_register_rejects_duplicate_name()`; `def test_register_rejects_empty_name()`; `def test_register_rejects_default_mode_not_in_allowed()`; `def test_register_rejects_action_without_handler()`; `…`
+- **tests/unit/test_signals_no_raw_create_task.py** — Lint test: no raw asyncio.create_task(dispatch_signal/enqueue_signal).
+  - `def test_no_raw_create_task_around_signal_dispatch()`
+- **tests/unit/test_signals_scheduler_source.py** — Phase 4 of #889: scheduler source registrations + executor end-to-end through the real SignalDispatcher.
+  - `async def dispatcher_components(tmp_path)`; `def test_all_seven_cron_tasks_are_classified()`; `def test_action_vs_artifact_split_matches_design()`; `def test_no_cron_source_declares_conversation()`; `def test_state_mutating_tasks_declare_memory()`; `def test_build_cron_registrations_returns_seven_correctly_named()`; `def test_action_registrations_have_handler_artifact_have_artifact_handler()`; `def test_builtin_handlers_override_tool_lookup()`; `…`
+- **tests/unit/test_signals_store.py** — Unit tests for SignalLogStore — table creation, redaction, retention.
+  - `async def store(tmp_path)`; `async def test_initialize_creates_table_and_indexes(store)`; `async def test_append_writes_redacted_summary(store)`; `async def test_trusted_opt_in_stores_raw(store)`; `async def test_untrusted_never_stores_raw_even_with_opt_in(store)`; `async def test_failed_redaction_does_not_block_logging(store)`; `async def test_purge_expired_deletes_only_old_rows(store)`
+- **tests/unit/test_signals_stripe_source.py** — Phase 6 of #889: Stripe deposit-complete webhook — the first UNTRUSTED COGNITION source.
+  - `async def components(tmp_path)`; `def test_registration_is_untrusted_cognition_with_sanitizer()`; `def test_registration_without_sanitizer_would_be_rejected()`; `def test_sanitizer_drops_unallowlisted_fields()`; `def test_sanitizer_strips_control_characters_from_strings()`; `def test_sanitizer_caps_string_length()`; `def test_sanitizer_replaces_malformed_wallet_address_with_placeholder()`; `def test_sanitizer_normalizes_amounts()`; `…`
+- **tests/unit/test_signals_ui_emit.py** — Phase 7 of #889: UI side-channel SSE emit for non-INTERNAL signals.
+  - `async def components(tmp_path)`; `async def test_internal_signal_does_not_emit_ui_event(components)`; `async def test_user_visible_signal_emits_signal_completed(components)`; `async def test_admin_visible_signal_also_emits(components)`; `async def test_payload_carries_routing_fields(components)`; `async def test_payload_excludes_raw_artifact_and_action_result(components)`; `async def test_payload_includes_result_summary_when_source_sets_callback(components)`; `async def test_payload_result_summary_is_none_when_source_omits_callback(tmp_path)`; `…`
 - **tests/unit/test_skills_feature.py** — Unit tests for SkillsFeature and Skill serialization.
   - `class TestSkillModel`; `class TestHelpers`; `async def feature(tmp_path)`; `class TestToolRegistration`; `class TestExtractCandidates`; `class TestSkillSave`; `class TestListShowDelete`; `class TestModuleConstants`; `…`
 - **tests/unit/test_sovereign_override_pins.py** — Tests for sovereign override of memory pins.
@@ -2220,6 +2273,8 @@ Repo entry points and standard project files.
   - `class FakeToolCall`; `class FakeToolSchema`; `class FakeTool`; `class FakeFeature`; `class TestPartitionToolCalls`; `class TestIsConcurrencySafe`; `class TestMaxConcurrency`
 - **tests/unit/test_tool_result_persistence.py** — Tests for large tool result persistence — preview with head+tail.
   - `class TestBuildPersistedPreview`
+- **tests/unit/test_turn_lifecycle.py** — Race regression tests for the shared turn lifecycle.
+  - `async def test_two_concurrent_turns_serialize()`; `async def test_three_concurrent_turns_serialize_in_order()`; `async def test_exception_in_turn_body_releases_lock()`; `async def test_conversation_lock_is_held_inside_turn()`; `async def test_turn_id_is_unique_per_call()`; `async def test_process_input_enters_lifecycle_before_bootstrap_and_commands()`; `async def test_lifecycle_shares_lock_manager_with_dispatcher()`; `async def test_concurrent_set_current_chain_is_task_local()`; `…`
 - **tests/unit/test_vad.py** — Unit tests for Voice Activity Detection (kestrel_sovereign/voice/vad.py).
   - `class TestVADConstruction`; `class TestIsSpeech`; `class TestDetectUtterances`; `class TestLoadVADConfig`
 - **tests/unit/test_vastai_feature.py** — Unit tests for Vast.ai GPU feature.
@@ -2330,6 +2385,9 @@ Repo entry points and standard project files.
 ## `prompts/`
 
 - **prompts/companion_system_prompt.md** — Companion System Prompt — ## Platform Awareness
+- **prompts/signals/a2a_task_complete.md** — [A2A_COMPLETE] An A2A task you spawned has reached a terminal state.
+- **prompts/signals/heartbeat.md** — [HEARTBEAT] Read HEARTBEAT.md if it exists.
+- **prompts/signals/webhook_stripe_deposit.md** — [STRIPE_DEPOSIT] An external Stripe webhook has reported a crypto deposit.
 - **prompts/system_prompt.md** — Kestrel System Prompt — You are Kestrel, a sovereign AI agent.
 - **prompts/test_instance_disclosure.md** — Test Instance Disclosure — This disclosure is prepended to the system prompt for test agents.
 - **prompts/user_prompt.md** — User Prompt Template — This template is used to format the user's query with context.
