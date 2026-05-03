@@ -233,6 +233,17 @@ class AEADCipher:
         return token.startswith(KSA_V2_PREFIX)
 
     @staticmethod
+    def generate_key() -> bytes:
+        """Generate a fresh 32-byte key, encoded as URL-safe base64.
+
+        Drop-in replacement for ``Fernet.generate_key()``. The 44-byte
+        ASCII output works directly as an ``AEADCipher`` constructor
+        argument and as a legacy ``Fernet`` key (for migration). Raw
+        random source is ``os.urandom``.
+        """
+        return base64.urlsafe_b64encode(os.urandom(KEY_SIZE))
+
+    @staticmethod
     def _compose_aad(alg_id: int, user_aad: Optional[bytes]) -> bytes:
         """Always-bound prefix: ``alg_id || (user_aad or empty)``.
 

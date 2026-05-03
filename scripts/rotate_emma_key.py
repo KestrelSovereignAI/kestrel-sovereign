@@ -16,9 +16,9 @@ from pathlib import Path
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives import hashes
+from kestrel_sdk.security.aead import AEADCipher
 from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -31,8 +31,8 @@ def passphrase_to_master_key(passphrase: str) -> bytes:
     return base64.urlsafe_b64encode(digest)
 
 
-def derive_agent_fernet(master_key: bytes, agent_id: str) -> Fernet:
-    """Derive per-agent Fernet key using HKDF."""
+def derive_agent_fernet(master_key: bytes, agent_id: str) -> AEADCipher:
+    """Derive a per-agent AEADCipher using HKDF (drop-in for the legacy Fernet)."""
     hkdf = HKDF(
         algorithm=hashes.SHA256(),
         length=32,
@@ -40,7 +40,7 @@ def derive_agent_fernet(master_key: bytes, agent_id: str) -> Fernet:
         info=b"kestrel-agent-v1"
     )
     derived = hkdf.derive(master_key)
-    return Fernet(base64.urlsafe_b64encode(derived))
+    return AEADCipher(derived)
 
 
 async def rotate_conversation_keys(db_path: str, old_pass: str, new_pass: str) -> dict:

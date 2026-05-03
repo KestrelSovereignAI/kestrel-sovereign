@@ -98,10 +98,13 @@ class MemoryChecker(HealthChecker):
                 check.message = "No conversation history yet"
                 return check
 
-            # Check if content looks encrypted (gAAAAA = Fernet prefix)
+            # Check if content looks encrypted (legacy Fernet 'gAAAAA' or v2 'KSAv2:')
+            def _looks_encrypted(c: str) -> bool:
+                return c.startswith("gAAAAA") or c.startswith("KSAv2:")
+
             encrypted_count = sum(
                 1 for msg in history
-                if msg.get("content", "").startswith("gAAAAA")
+                if _looks_encrypted(msg.get("content", ""))
             )
 
             if encrypted_count > 0:

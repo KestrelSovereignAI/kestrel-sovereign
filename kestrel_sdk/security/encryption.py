@@ -1,9 +1,22 @@
 """
-Fernet encryption helpers for Kestrel SDK.
+Symmetric encryption helpers for Kestrel SDK.
 
 Requires the 'crypto' extra: pip install kestrel-sovereign-sdk[crypto]
 
-Provides Fernet-based encryption at rest with:
+Wave 0C (#915) of the Quantum Hardening epic (#921): the AEAD primitive
+moved from Fernet (AES-128-CBC + HMAC-SHA256) to AES-256-GCM via
+``AEADCipher``. AEADCipher is a drop-in replacement for ``Fernet`` —
+``.encrypt()``/``.decrypt()`` API preserved — so call-sites need not
+change. Existing Fernet ciphertext continues to decrypt because
+``AEADCipher.decrypt`` dispatches on token prefix; new writes always
+emit the v2 ``KSAv2:`` token. See ``kestrel_sdk/security/aead.py``.
+
+The legacy public names ``get_fernet``, ``get_agent_fernet``,
+``encrypt_string_fernet``, ``decrypt_string_fernet`` keep their behaviour
+contract; they now return / accept ``AEADCipher`` instances instead of
+``Fernet`` instances. Type annotations updated accordingly.
+
+Provides:
 - Per-agent key derivation (each agent gets unique keys)
 - Purpose-specific subkeys (conversations, service-keys, wallet, backup)
 - Multiple key sources (env var, Docker Secrets, file paths)
@@ -12,7 +25,7 @@ Provides Fernet-based encryption at rest with:
 Key Hierarchy:
     KESTREL_DATA_KEY (env var or secrets file)
         | (SHA-256 if passphrase)
-    Master Key (32-byte Fernet key)
+    Master Key (32-byte raw key, base64-encodable for legacy Fernet shape)
         | (HKDF with agent DID as salt)
     Agent Key
         | (HKDF with purpose as info)
@@ -27,10 +40,11 @@ import logging
 import os
 from typing import Optional, Dict, Tuple, Any
 
-from cryptography.fernet import Fernet, InvalidToken
+from cryptography.fernet import Fernet  # validation-only: Fernet still used to detect raw-Fernet-key shape
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives import hashes
 
+from .aead import AEADCipher
 from .exceptions import (
     DecryptionError,
     MasterKeyNotConfiguredError,
@@ -145,38 +159,49 @@ def _get_master_key() -> bytes:
 
 
 # =============================================================================
-# Fernet-based Encryption (Global and Per-Agent)
+# AEAD Cipher Construction (Global and Per-Agent)
 # =============================================================================
+#
+# Names preserved for caller compatibility: a returned AEADCipher acts as a
+# drop-in for a Fernet (matching .encrypt()/.decrypt() shape) and, on
+# decrypt, dispatches on the token prefix so legacy Fernet data still works.
 
-def get_fernet() -> Optional[Fernet]:
+def get_fernet() -> Optional[AEADCipher]:
     """
-    Initialize Fernet encryption from KESTREL_DATA_KEY.
+    Initialize the global symmetric AEAD cipher from KESTREL_DATA_KEY.
+
+    Despite the legacy name, returns an ``AEADCipher`` (AES-256-GCM with
+    Fernet read-compat) — drop-in for the previous ``Fernet`` instance.
 
     Returns:
-        Fernet instance if key is available, None otherwise
+        AEADCipher if key is available, None otherwise.
     """
     key = _get_data_key()
     if not key:
         return None
 
     try:
-        # Try using key directly as Fernet key
-        Fernet(key)  # Validate
-        return Fernet(key)
+        Fernet(key)  # Validate raw-Fernet-key shape
+        return AEADCipher(key)
     except Exception as e:
-        # Derive Fernet key from passphrase using SHA-256
+        # Derive a 32-byte key from passphrase using SHA-256
         logger.debug(f"Key is not a raw Fernet key, deriving from passphrase: {e}")
         digest = hashlib.sha256(key.encode('utf-8')).digest()
-        fernet_key = base64.urlsafe_b64encode(digest)
-        return Fernet(fernet_key)
+        return AEADCipher(digest)
 
 
 def get_master_key_bytes() -> Optional[bytes]:
     """
-    Get master encryption key as bytes for Fernet.
+    Get the master encryption key as bytes (URL-safe-base64 form).
+
+    Returns the 44-byte URL-safe-base64 encoding of the 32-byte master
+    key. Kept in this shape for callers (legacy and new) that pass it
+    around as a Fernet-compatible key value; ``AEADCipher`` accepts
+    either raw 32 bytes or this 44-byte form, so passing it through is
+    safe in either direction.
 
     Returns:
-        32-byte URL-safe base64 encoded key, or None if key not available
+        44 bytes, or None if key not available.
     """
     key = _get_data_key()
     if not key:
@@ -184,7 +209,7 @@ def get_master_key_bytes() -> Optional[bytes]:
 
     try:
         key_bytes = key.encode() if isinstance(key, str) else key
-        Fernet(key_bytes)  # Validate it's a valid Fernet key
+        Fernet(key_bytes)  # Validate raw-Fernet-key shape
         return key_bytes
     except Exception as e:
         logger.debug(f"Key is not a raw Fernet key, deriving bytes from passphrase: {e}")
@@ -192,15 +217,17 @@ def get_master_key_bytes() -> Optional[bytes]:
         return base64.urlsafe_b64encode(digest)
 
 
-def get_agent_fernet(agent_id: str) -> Optional[Fernet]:
+def get_agent_fernet(agent_id: str) -> Optional[AEADCipher]:
     """
-    Get Fernet instance with per-agent derived key using HKDF.
+    Get an AEAD cipher with per-agent derived key using HKDF.
+
+    Despite the legacy name, returns an ``AEADCipher``.
 
     Args:
         agent_id: Agent's DID (e.g., "did:pkh:eip155:1:0x...")
 
     Returns:
-        Fernet instance with agent-specific key, or None if no master key
+        AEADCipher with agent-specific key, or None if no master key.
     """
     master = get_master_key_bytes()
     if not master:
@@ -218,7 +245,7 @@ def get_agent_fernet(agent_id: str) -> Optional[Fernet]:
             info=b"kestrel-agent-v1"
         )
         derived = hkdf.derive(master)
-        return Fernet(base64.urlsafe_b64encode(derived))
+        return AEADCipher(derived)
     except Exception as e:
         logger.error(f"Failed to derive agent key: {e}")
         return None
@@ -275,23 +302,26 @@ def get_agent_key(agent_did: str, purpose: str) -> bytes:
 
 
 def encrypt(agent_did: str, purpose: str, plaintext: bytes) -> bytes:
-    """Encrypt bytes for an agent with purpose-specific key."""
+    """Encrypt bytes for an agent with purpose-specific key.
+
+    Always emits v2 (``KSAv2:``) tokens. Existing Fernet-encrypted data
+    keeps decrypting via the AEADCipher legacy-read path with the same
+    derived key.
+    """
     key = get_agent_key(agent_did, purpose)
-    fernet_key = base64.urlsafe_b64encode(key)
-    fernet = Fernet(fernet_key)
-    return fernet.encrypt(plaintext)
+    return AEADCipher(key).encrypt(plaintext)
 
 
 def decrypt(agent_did: str, purpose: str, ciphertext: bytes) -> bytes:
-    """Decrypt bytes for an agent with purpose-specific key."""
-    key = get_agent_key(agent_did, purpose)
-    fernet_key = base64.urlsafe_b64encode(key)
-    fernet = Fernet(fernet_key)
+    """Decrypt bytes for an agent with purpose-specific key.
 
+    Accepts both v2 and legacy Fernet ciphertext.
+    """
+    key = get_agent_key(agent_did, purpose)
     try:
-        return fernet.decrypt(ciphertext)
-    except InvalidToken as e:
-        raise DecryptionError(f"Decryption failed - wrong key or corrupted data: {e}") from e
+        return AEADCipher(key).decrypt(ciphertext)
+    except DecryptionError:
+        raise
     except Exception as e:
         raise DecryptionError(f"Decryption failed: {e}") from e
 
@@ -307,54 +337,65 @@ def decrypt_string(agent_did: str, purpose: str, ciphertext: bytes) -> str:
 
 
 # =============================================================================
-# Legacy Fernet Helpers
+# Cipher-instance-based helpers
 # =============================================================================
+#
+# Names retain the ``_fernet`` suffix for caller compatibility, but the
+# parameter is an ``AEADCipher`` (drop-in for ``Fernet``). On encrypt we
+# always emit v2; on decrypt we accept both v2 and legacy Fernet.
 
-def encrypt_bytes(content: bytes, fernet: Optional[Fernet]) -> Tuple[bytes, bool]:
-    """Encrypt bytes content if Fernet is available."""
-    if fernet is None:
+def encrypt_bytes(content: bytes, cipher: Optional[AEADCipher]) -> Tuple[bytes, bool]:
+    """Encrypt bytes content if a cipher is available."""
+    if cipher is None:
         return content, False
-    return fernet.encrypt(content), True
+    return cipher.encrypt(content), True
 
 
-def decrypt_bytes(content: bytes, fernet: Optional[Fernet], metadata: Optional[Dict[str, Any]] = None) -> bytes:
+def decrypt_bytes(content: bytes, cipher: Optional[AEADCipher], metadata: Optional[Dict[str, Any]] = None) -> bytes:
     """Decrypt bytes content if it was encrypted."""
-    if fernet is None:
+    if cipher is None:
         if metadata and metadata.get("enc"):
             raise DecryptionError("No decryption key available but content is marked as encrypted")
         return content
 
     if metadata and metadata.get("enc"):
         try:
-            return fernet.decrypt(content)
-        except InvalidToken as e:
-            raise DecryptionError(f"Decryption failed - wrong key or corrupted data: {e}") from e
+            return cipher.decrypt(content)
+        except DecryptionError:
+            raise
         except Exception as e:
             raise DecryptionError(f"Decryption failed: {e}") from e
 
     return content
 
 
-def encrypt_string_fernet(content: str, fernet: Optional[Fernet]) -> Tuple[str, bool]:
-    """Encrypt string content if Fernet is available."""
-    if fernet is None:
+def encrypt_string_fernet(content: str, cipher: Optional[AEADCipher]) -> Tuple[str, bool]:
+    """Encrypt string content if a cipher is available.
+
+    Name retained for legacy callers; parameter is now an ``AEADCipher``.
+    """
+    if cipher is None:
         return content, False
-    encrypted = fernet.encrypt(content.encode('utf-8')).decode('utf-8')
+    encrypted = cipher.encrypt(content.encode('utf-8')).decode('utf-8')
     return encrypted, True
 
 
-def decrypt_string_fernet(content: str, metadata: Optional[Dict[str, Any]], fernet: Optional[Fernet]) -> str:
-    """Decrypt string content if it was encrypted."""
-    if fernet is None:
+def decrypt_string_fernet(content: str, metadata: Optional[Dict[str, Any]], cipher: Optional[AEADCipher]) -> str:
+    """Decrypt string content if it was encrypted.
+
+    Name retained for legacy callers; parameter is now an ``AEADCipher``.
+    Accepts both v2 (``KSAv2:``) and legacy Fernet ciphertext.
+    """
+    if cipher is None:
         if metadata and metadata.get("enc"):
             raise DecryptionError("No decryption key available but content is marked as encrypted")
         return content
 
     if metadata and metadata.get("enc"):
         try:
-            return fernet.decrypt(content.encode('utf-8')).decode('utf-8')
-        except InvalidToken as e:
-            raise DecryptionError(f"Decryption failed - wrong key or corrupted data: {e}") from e
+            return cipher.decrypt(content.encode('utf-8')).decode('utf-8')
+        except DecryptionError:
+            raise
         except Exception as e:
             raise DecryptionError(f"Decryption failed: {e}") from e
 
