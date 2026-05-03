@@ -20,7 +20,7 @@ Audit the platform surfaces so provider capabilities, model mandate behavior, AP
 - `kestrel_sovereign/llm/`
 - `endpoints/`
 - `static/js/`
-- `kestrel_cli.py`
+- `kestrel_sovereign/cli.py`
 - `kestrel_sovereign/config.py`
 - `docker/`
 - `scripts/cloudrun/`
