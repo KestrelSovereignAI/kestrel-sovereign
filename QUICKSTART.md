@@ -48,60 +48,44 @@ ollama pull llama3.2            # installs llama3.2:latest used by the default c
 ollama pull nomic-embed-text    # embedding model for RAG / semantic memory (#657)
 ```
 
-> **Want to use OpenAI instead?** Skip to Step 4b. You can always switch later.
+> **Want OpenAI or Anthropic instead?** Pick it in the wizard at Step 4. You can also re-run `kestrel setup llm` later.
 
 ---
 
-## Step 4a — Configure LLM (Ollama — recommended for privacy)
+## Step 4 — Run the setup wizard
 
 ```bash
-cp llm_config.toml.example llm_config.toml
+uv run kestrel setup
 ```
 
-The default config works with Ollama out of the box. No edits needed to start.
+The wizard:
+1. Generates `.env` with a fresh `KESTREL_DATA_KEY` (Fernet) for encrypted memory
+2. Writes `[llm]` into `kestrel.toml` with the providers you choose
+3. Runs the **Inception Service**: generates a secp256k1 keypair, derives a cryptographic DID, creates the encrypted SQLite store at `./agent_data/<name>/`, anchors the Kestrel Constitution as the agent's first memory, and runs a genesis integrity audit
+4. Registers the new agent in `rookery.toml` and prints a readiness report
 
-> The config file sets provider priority: Ollama first, OpenAI as fallback. Add your OpenAI key later if you want cloud fallback for complex reasoning.
-
----
-
-## Step 4b — Configure LLM (OpenAI — if you prefer cloud)
+Skip the prompts and accept Ollama defaults:
 
 ```bash
-cp llm_config.toml.example llm_config.toml
+uv run kestrel setup --quickstart
 ```
 
-Edit `llm_config.toml` and set:
-```toml
-provider_priority = ["openai"]
-
-[openai]
-api_key = "sk-your-key-here"   # or use OPENAI_API_KEY env variable
-model = "gpt-4o-mini"
-```
-
----
-
-## Step 5 — Create your first sovereign agent
+Diagnose without making any changes:
 
 ```bash
-uv run kestrel create MyAgent
+uv run kestrel doctor
 ```
-
-This runs the **Inception Service**, which:
-1. Generates a secp256k1 keypair and derives a cryptographic DID
-2. Creates an encrypted SQLite memory store at `./agent_data/MyAgent/`
-3. Anchors the Kestrel Constitution as the agent's first memory
-4. Runs a genesis integrity audit — if it fails, the agent is not created
 
 You'll see output like:
 ```
-Agent created: did:kestrel:0x8955b8...
-Constitution anchored
-Genesis audit passed
-Database: ./agent_data/MyAgent/kestrel_prime.db
+Created agent 'Kestrel' with DID did:pkh:eip155:1:0x8955b8...
+Registered 'Kestrel' in rookery.toml on port 8801 (autostart)
+✅ Ready. Start with: kestrel start
 ```
 
 > **That DID is yours.** It's cryptographically unique, not stored on any platform, and travels with the `kestrel_prime.db` file wherever you take it.
+
+> Re-running the wizard is safe: every step is idempotent, and any file change is preceded by a timestamped backup (`.env.backup-YYYYMMDD-HHMMSS`). `KESTREL_DATA_KEY` is *never* regenerated once set — that would brick existing encrypted data.
 
 ---
 
@@ -190,7 +174,12 @@ curl http://localhost:8888/health
 ## CLI reference
 
 ```bash
-uv run kestrel health                         # check prerequisites
+uv run kestrel setup                          # run the setup wizard
+uv run kestrel setup --quickstart             # accept defaults; only prompt for missing secrets
+uv run kestrel setup --check                  # report readiness; no changes
+uv run kestrel setup llm                      # re-run only the LLM step
+uv run kestrel setup --reset                  # back up and regenerate .env + kestrel.toml
+uv run kestrel doctor                         # diagnose readiness
 uv run kestrel create MyAgent                 # create a new agent
 uv run kestrel create MyAgent --port 8899     # create with custom port
 uv run kestrel start MyAgent                  # start an agent

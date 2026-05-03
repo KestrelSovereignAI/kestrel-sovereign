@@ -34,6 +34,8 @@ dependencies = [
     "python-dotenv==1.1.1",
     "toml==0.10.2",
     "PyYAML>=6.0",
+    # Interactive setup wizard prompts
+    "questionary>=2.0.1",
     # Email validation
     "email-validator>=2.3.0",
     # Form data parsing (required by FastAPI for file uploads)
