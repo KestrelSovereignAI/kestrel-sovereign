@@ -53,6 +53,7 @@ Regenerate via `scripts/generate_feature_docs.py`.
 ## Design
 
 - **[`design/`](design/)** — brand guide, logo specs, ecosystem visual identity
+- **[`design/launch/README.md`](design/launch/README.md)** — launch-page copy drafts (wireframe, one-screen variant, preview-packet language)
 - **[`logo-prompts.md`](logo-prompts.md)** — logo prompt history
 
 ## Archive
@@ -62,3 +63,5 @@ Regenerate via `scripts/generate_feature_docs.py`.
 ## Documentation freshness
 
 Docs may lag code; treat them as guidance and prefer code/tests for current behavior. Each major architecture document carries an explicit status banner indicating whether the described feature is Active, Experimental, or Aspirational. If a doc and the code disagree, the code is authoritative — please file an issue or PR.
+
+**Pre-release cleanup required:** Some docs in `business/`, `outreach/`, and `legal/` may contain identifying information that should be reviewed before public release.
