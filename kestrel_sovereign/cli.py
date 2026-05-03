@@ -844,7 +844,18 @@ def cmd_setup(args) -> int:
 
 
 def _maybe_first_run_setup(project_dir: Path) -> Optional[int]:
-    """If no ``.env`` exists, offer to run setup before starting.
+    """If this looks like a truly fresh checkout, offer to run setup.
+
+    Fires only when **both** of these are true:
+
+      1. ``.env`` is absent, AND
+      2. There are no agents registered in the rookery.
+
+    A user who has already inceptioned an agent (``kestrel create``) has
+    done deliberate setup; we must not block ``kestrel start`` for them
+    even if their ``.env`` is missing — inception falls back to plaintext
+    key storage when ``KESTREL_DATA_KEY`` is unset, and the CI clean-
+    install workflow exercises exactly that path.
 
     Returns:
         ``None`` to proceed with start as normal.
@@ -859,6 +870,19 @@ def _maybe_first_run_setup(project_dir: Path) -> Optional[int]:
     env_path = project_dir / ".env"
     if env_path.exists():
         return None
+
+    # Only treat a missing .env as "fresh checkout" if no agents exist.
+    rookery_path = project_dir / ROOKERY_CONFIG_FILENAME
+    if rookery_path.exists():
+        try:
+            existing_rookery = RookeryConfig.load(
+                rookery_path, auto_discover_fallback=False
+            )
+            if existing_rookery.get_local_agents():
+                return None
+        except Exception:
+            # If rookery parsing fails, fall through to the prompt path.
+            pass
 
     from kestrel_sovereign.setup.prompts import is_tty
 

@@ -15,6 +15,64 @@ def test_first_run_returns_none_when_env_exists(tmp_path):
     assert _maybe_first_run_setup(tmp_path) is None
 
 
+def test_first_run_returns_none_when_agent_already_registered(tmp_path):
+    """Captures the CI clean-install scenario:
+
+    A user (or CI) ran ``kestrel create`` first, which registered an
+    agent and wrote ``rookery.toml`` but did NOT create ``.env``
+    (inception falls back to plaintext key storage with a warning).
+    Then they run ``kestrel start``. The first-run hook must NOT
+    intercept — they've clearly done setup, even if not via the wizard.
+
+    Pre-fix: the hook fired and exited 1, breaking the CI clean-install
+    job that was already passing the inception + 3-pillar checks.
+    """
+    import toml as _toml
+
+    rookery_path = tmp_path / "rookery.toml"
+    rookery_path.write_text(_toml.dumps({
+        "host": {"port": 8888, "bind": "0.0.0.0"},
+        "agents": {
+            "CITestAgent": {
+                "data_dir": "agent_data/CITestAgent",
+                "port": 8801,
+                "autostart": True,
+            }
+        },
+    }))
+    # No .env on purpose.
+    assert not (tmp_path / ".env").exists()
+    assert _maybe_first_run_setup(tmp_path) is None
+
+
+def test_first_run_fires_when_rookery_has_no_agents(tmp_path):
+    """An empty rookery is the same as no rookery — fire the prompt."""
+    import toml as _toml
+
+    (tmp_path / "rookery.toml").write_text(_toml.dumps({
+        "host": {"port": 8888, "bind": "0.0.0.0"},
+        "agents": {},
+    }))
+    # No .env, rookery exists but is empty.
+    with (
+        patch("kestrel_sovereign.setup.prompts.is_tty", return_value=False),
+    ):
+        rc = _maybe_first_run_setup(tmp_path)
+    # Non-TTY path → exit 1 with the hint.
+    assert rc == 1
+
+
+def test_first_run_tolerates_corrupt_rookery(tmp_path):
+    """If rookery.toml fails to parse, we still want to prompt setup —
+    don't silently let the user proceed with broken config."""
+    (tmp_path / "rookery.toml").write_text("[broken\nthis = is not valid")
+    with (
+        patch("kestrel_sovereign.setup.prompts.is_tty", return_value=False),
+    ):
+        rc = _maybe_first_run_setup(tmp_path)
+    assert rc == 1
+
+
 def test_first_run_returns_none_when_skip_env_set(tmp_path, monkeypatch):
     monkeypatch.setenv("KESTREL_SKIP_FIRST_RUN", "1")
     # No .env present, but skip env wins.
