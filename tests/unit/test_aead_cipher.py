@@ -17,7 +17,16 @@ import os
 import pytest
 from cryptography.fernet import Fernet
 
-from kestrel_sdk.security.aead import AEADCipher, KSA_V2_PREFIX, KEY_SIZE
+from kestrel_sdk.security.aead import (
+    AEADCipher,
+    KSA_V2_PREFIX,
+    KEY_SIZE,
+    NONCE_SIZE,
+    ALG_ID_SIZE,
+    GCM_TAG_SIZE,
+    ALG_AES_256_GCM,
+    ALG_NONE,
+)
 from kestrel_sdk.security.exceptions import DecryptionError
 
 
@@ -69,12 +78,26 @@ def test_v2_round_trip_large(cipher):
 
 
 def test_v2_token_decoded_form(cipher):
-    """Sanity-check the token shape: prefix + base64(nonce + ct+tag)."""
+    """Sanity-check the token shape: prefix + base64(alg_id + nonce + ct+tag)."""
     ct = cipher.encrypt(b"x")
     body = ct[len(KSA_V2_PREFIX):]
     raw = base64.urlsafe_b64decode(body)
-    # nonce=12, plaintext=1 byte, tag=16 → 29 bytes
-    assert len(raw) == 12 + 1 + 16
+    # alg_id=1, nonce=12, plaintext=1 byte, tag=16 → 30 bytes
+    assert len(raw) == ALG_ID_SIZE + NONCE_SIZE + 1 + GCM_TAG_SIZE
+    # First byte is the algorithm identifier
+    assert raw[0] == ALG_AES_256_GCM
+
+
+def test_v2_token_carries_explicit_alg_byte(cipher):
+    """The alg_id byte must be present in the framing so future suites
+    can be added without bumping the version prefix. Bound into AAD so
+    flipping it fails authentication."""
+    ct = cipher.encrypt(b"payload")
+    raw = base64.urlsafe_b64decode(ct[len(KSA_V2_PREFIX):])
+    assert raw[0] == ALG_AES_256_GCM, (
+        "v2 framing must start with an explicit alg_id byte "
+        "(see SERIALIZATION_COMPATIBILITY.md cross-cutting rule #1)"
+    )
 
 
 def test_each_encrypt_produces_unique_token(cipher):
@@ -146,6 +169,73 @@ def test_garbled_v2_base64_rejected(cipher):
     fake = KSA_V2_PREFIX + b"!!!not base64!!!"
     with pytest.raises(DecryptionError):
         cipher.decrypt(fake)
+
+
+# -----------------------------------------------------------------------------
+# Strict base64 (regression for review feedback on PR #926)
+# -----------------------------------------------------------------------------
+
+def test_strict_b64_rejects_appended_junk(cipher):
+    """Regression: lenient urlsafe_b64decode used to silently ignore non-base64
+    characters appended to a valid token, so cipher.decrypt(ct + b'!!!') would
+    return the original plaintext. Strict decoding rejects this."""
+    ct = cipher.encrypt(b"important")
+    with pytest.raises(DecryptionError):
+        cipher.decrypt(ct + b"!!!")
+
+
+def test_strict_b64_rejects_appended_newline(cipher):
+    """Regression: same issue with whitespace/newlines."""
+    ct = cipher.encrypt(b"important")
+    with pytest.raises(DecryptionError):
+        cipher.decrypt(ct + b"\n")
+
+
+def test_strict_b64_rejects_internal_whitespace(cipher):
+    """Whitespace inside the base64 body must also be rejected."""
+    ct = cipher.encrypt(b"important")
+    body = ct[len(KSA_V2_PREFIX):]
+    spliced = KSA_V2_PREFIX + body[:8] + b"\n" + body[8:]
+    with pytest.raises(DecryptionError):
+        cipher.decrypt(spliced)
+
+
+def test_strict_b64_rejects_outside_alphabet(cipher):
+    """Characters outside the URL-safe-base64 alphabet must be rejected."""
+    ct = cipher.encrypt(b"important")
+    body = bytearray(ct[len(KSA_V2_PREFIX):])
+    # Pick an index in the body and replace with '+' (standard base64 char,
+    # not part of urlsafe alphabet)
+    body[3] = ord("+")
+    with pytest.raises(DecryptionError):
+        cipher.decrypt(KSA_V2_PREFIX + bytes(body))
+
+
+# -----------------------------------------------------------------------------
+# Algorithm identifier (alg_id byte)
+# -----------------------------------------------------------------------------
+
+def test_alg_id_tampering_fails_authentication(cipher):
+    """Flipping the alg_id byte to coerce a different suite must fail
+    authentication, because alg_id is bound into the AEAD AAD."""
+    ct = cipher.encrypt(b"payload")
+    raw = bytearray(base64.urlsafe_b64decode(ct[len(KSA_V2_PREFIX):]))
+    # Flip alg_id from AES-256-GCM to "none" — this is the suite-swap attack
+    raw[0] = ALG_NONE
+    tampered = KSA_V2_PREFIX + base64.urlsafe_b64encode(bytes(raw))
+    with pytest.raises(DecryptionError):
+        cipher.decrypt(tampered)
+
+
+def test_unknown_alg_id_rejected_with_diagnostic(cipher):
+    """A future alg_id this build doesn't know about must fail with a clear
+    message rather than mis-decrypt."""
+    ct = cipher.encrypt(b"payload")
+    raw = bytearray(base64.urlsafe_b64decode(ct[len(KSA_V2_PREFIX):]))
+    raw[0] = 0x99  # unknown future suite
+    tampered = KSA_V2_PREFIX + base64.urlsafe_b64encode(bytes(raw))
+    with pytest.raises(DecryptionError, match="unknown alg_id"):
+        cipher.decrypt(tampered)
 
 
 # -----------------------------------------------------------------------------
