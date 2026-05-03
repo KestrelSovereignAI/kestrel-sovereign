@@ -24,7 +24,7 @@ The foundational bug this exposes: **most artifacts today have no `{v, alg}` tag
 | Container | `mandate.parent_signature: str` (hex DER) | `mandate.signatures: [{alg, kid, sig}]` + `mandate.version: 2` |
 | Version tag? | **No** | `version: 2` |
 | Algorithm tag? | **No** | Per-signature `alg` |
-| Migration | v1 mandate accepted under `LEGACY_ALLOWED` policy; new mandates always v2 hybrid. Existing parent-child relationships not re-signed (would require parent's old key) — chain validity continues until the parent is rotated via Wave 3 succession. |
+| Migration | v1 mandate accepted under `LEGACY_ALLOWED` policy; new mandates always v2 hybrid. Existing parent-child relationships are **not re-signed** at parent rotation — instead, verifiers apply temporal-validity windows (see *Temporal validity rules* below) so that pre-rotation mandates remain verifiable against the recorded legacy key, while post-rotation mandates must use the new hybrid key. |
 
 ### 3. Signed compute script
 
@@ -41,7 +41,7 @@ The foundational bug this exposes: **most artifacts today have no `{v, alg}` tag
 | Field | v1 (today) | v2 (Wave 2 co-migrates) |
 |---|---|---|
 | Producer | [`agent/constitution.py:71`](../../../kestrel_sovereign/agent/constitution.py#L71) (anchor stored on agent graph node), [`inception_service.py:262-267`](../../../kestrel_sovereign/inception_service.py#L262-L267) (initial anchor) | Same |
-| Container | `agent_node.properties.constitution_hash: str` (SHA-256 hex) — **no signature**, no algorithm tag | Versioned anchor block: `{v: 2, hash: {alg: "sha256", value}, signed_by: kid, signature: {alg, sig}}` — anchor itself becomes a signed artifact |
+| Container | `agent_node.properties.constitution_hash: str` (SHA-256 hex) — **no signature**, no algorithm tag | Versioned anchor block: `{v: 2, hash: {alg: "sha256", value}, signatures: [{alg, kid, sig}, ...]}` — anchor itself becomes a hybrid-signed artifact (matches identity-package signature-array shape so policy rules apply uniformly) |
 | Version tag? | **No** | Yes |
 | Algorithm tag? | **No** (implicit SHA-256) | Yes |
 | Migration | v1 anchor accepted as legacy on read; on next constitution rotation or audit anchor write, upgrade to v2. Wave 3 succession ceremony writes new v2 anchor signed by new hybrid key + SLH-DSA countersign. |
@@ -84,6 +84,27 @@ The foundational bug this exposes: **most artifacts today have no `{v, alg}` tag
 | Container | JSON file: `{salt, nonce, ciphertext, key_type, ...}` (already versioned-ish) | Add explicit `format_version: 2` and `key_alg` field; existing files migrate on next save |
 | Version tag? | Partial (key_type is a tag but not format-versioned) | Explicit `format_version` |
 | Algorithm tag? | Partial | Explicit `key_alg` (e.g., `"secp256k1"`, `"ed25519+ml-dsa-65"`) |
+
+## Temporal validity rules
+
+Succession statements (Wave 3) define key effectivity windows: a key is *authoritative* only for artifacts whose timestamp falls within the window between when it was issued and when it was succeeded. This is what makes the verify-policy work without forcing a re-signing pass on every historical artifact.
+
+For a mandate, identity package, or constitution anchor signed by some `kid`:
+
+1. Resolve the agent's succession chain: `[K₀ → K₁ → K₂ → ... → Kₙ]` where `K₀` is the original key, `Kₙ` is the current.
+2. Find the window for `kid`: starts at the agent's inception (for `K₀`) or the rotation `effective_from` of the succession statement that introduced this key, ends at the rotation `effective_from` of the succession statement that retired it (or `+∞` if it's the current key).
+3. The artifact's timestamp must fall within `kid`'s window. Outside the window → reject regardless of policy mode.
+4. Within the window: apply the verify-policy mode active for this *context*. `LEGACY_ALLOWED` permits a single classical sig; `HYBRID_REQUIRED` requires both classical and PQ sigs **provided the key in question carried both** (a pre-rotation `K₀` only ever signed classically, so `HYBRID_REQUIRED` against an in-window `K₀` artifact must accept the single-classical sig — i.e., temporal validity *softens* HYBRID_REQUIRED for legacy keys, and PRD-v2 §7 must be read with this in mind).
+
+**Concrete example.** Emma rotates on `2026-06-15` from `K_emma_legacy` (secp256k1) to `K_emma_hybrid` (Ed25519+ML-DSA-65). After rotation:
+
+- A spawn mandate Emma signed on `2026-04-10` against her legacy key: verify against `K_emma_legacy` per the succession chain. Pre-rotation timestamp = in `K_emma_legacy`'s window. `HYBRID_REQUIRED` accepts (legacy-key softening). ✅
+- A spawn mandate purportedly signed by `K_emma_legacy` on `2026-07-01`: timestamp out-of-window. Reject. ✅ (this is the forgery case after rotation)
+- A spawn mandate signed by `K_emma_hybrid` on `2026-07-01`: in-window for `K_emma_hybrid`. `HYBRID_REQUIRED` requires both Ed25519 and ML-DSA-65 sigs to verify. ✅
+
+This temporal-validity model resolves the apparent contradiction between PRD-v2 §7 ("verification tightens to `HYBRID_REQUIRED` once parent has rotated") and historical artifacts being immutable: the policy tightens for *new* artifacts the rotated key cannot have signed, while artifacts from before the rotation remain verifiable through their original key as recorded in the succession chain. No re-signing pass required.
+
+Cycle detection in the succession chain walker is mandatory (no `kid` may appear twice in a chain).
 
 ## Cross-cutting design rules
 

@@ -105,6 +105,8 @@ Per-context defaults, **not** a global flag:
 | Constitution audit (routine) | Inherits agent's identity policy | — |
 | Constitution checkpoint (rotation events) | `PQ_REQUIRED` once Wave 3 lands | — |
 
+The policy modes apply *within* a key's effectivity window. Temporal-validity rules in [`SERIALIZATION_COMPATIBILITY.md`](SERIALIZATION_COMPATIBILITY.md#temporal-validity-rules) govern how succession chains map an artifact's timestamp to the key authoritative at that moment. In particular: `HYBRID_REQUIRED` against a legacy-only in-window key softens to "verify the classical signature on the legacy key" — historical artifacts signed before a parent's rotation remain verifiable without a re-signing pass. This is the resolution of the otherwise contradictory pair "tighten to `HYBRID_REQUIRED` after rotation" and "do not re-sign historical mandates."
+
 ## 8. Default-tightening release schedule
 
 Tentative; finalize in PRD-v3 once Wave 2 ships and benchmarks land:

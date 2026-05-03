@@ -15,16 +15,34 @@ The single classical signature primitive in use across all sovereign-identity su
 | Agent keypair generation | [`inception_service.py:54-58`](../../../kestrel_sovereign/inception_service.py#L54-L58) | `ec.generate_private_key(SECP256K1)` | — | EllipticCurvePrivateKey |
 | Public-key → Ethereum address | [`inception_service.py:70-87`](../../../kestrel_sovereign/inception_service.py#L70-L87) | Keccak-256(uncompressed pubkey) → last 20 bytes + EIP-55 checksum | — | `0x{40-hex}` |
 | DID document creation | [`inception_service.py:110-129`](../../../kestrel_sovereign/inception_service.py#L110-L129) | — | — | `did:pkh:eip155:1:{address}` + `EcdsaSecp256k1VerificationKey2019` |
-| Identity-package signing | [`identity/signing.py:104-110`](../../../kestrel_sovereign/identity/signing.py#L104-L110) | `private_key.sign(content_hash, ec.ECDSA(SHA256))` | [`identity/signing.py:160-164`](../../../kestrel_sovereign/identity/signing.py#L160-L164), [`identity/signing.py:222-232`](../../../kestrel_sovereign/identity/signing.py#L222-L232) (DID-doc fallback) | DER signature, hex-encoded into `package.signature` |
+| Identity-package signing | [`identity/signing.py:104-110`](../../../kestrel_sovereign/identity/signing.py#L104-L110) | `private_key.sign(content_hash.encode('utf-8'), ec.ECDSA(SHA256))` (signs the **hex-encoded** SHA-256 digest as ASCII bytes, not the raw 32-byte digest) | [`identity/signing.py:160-164`](../../../kestrel_sovereign/identity/signing.py#L160-L164), [`identity/signing.py:222-232`](../../../kestrel_sovereign/identity/signing.py#L222-L232) (DID-doc fallback) | DER signature, hex-encoded into `package.signature` |
 | Spawn-mandate signing | [`spawn/mandate.py:77-89`](../../../kestrel_sovereign/spawn/mandate.py#L77-L89) | `parent_private_key.sign(payload, ec.ECDSA(SHA256))` | [`spawn/mandate.py:92+`](../../../kestrel_sovereign/spawn/mandate.py#L92) | DER signature, hex into `mandate.parent_signature` |
-| Script signing (primary path) | [`features/compute/script_signer.py:153-163`](../../../kestrel_sovereign/features/compute/script_signer.py#L153-L163) | `_private_key.sign(content_hash_bytes, ec.ECDSA(SHA256))` | [`features/compute/script_signer.py:198+`](../../../kestrel_sovereign/features/compute/script_signer.py#L198) | `ecdsa:{base64}` |
+| Script signing (primary path) | [`features/compute/script_signer.py:153-163`](../../../kestrel_sovereign/features/compute/script_signer.py#L153-L163) | `_private_key.sign(content_hash_bytes, ec.ECDSA(SHA256))` (signs `sha256(content_hash_string).digest()` — i.e., the script's hex-content-hash *re-hashed* into raw 32 bytes, see `script_signer.py:151`) | [`features/compute/script_signer.py:198+`](../../../kestrel_sovereign/features/compute/script_signer.py#L198) | `ecdsa:{base64}` |
 | Wallet — Filecoin/EVM | [`features/wallet/filecoin_keys.py`](../../../kestrel_sovereign/features/wallet/filecoin_keys.py) | secp256k1 (chain-bound) | n/a (chain-verified) | wallet address |
+
+### Ed25519 — Storacha UCAN invocation signing
+
+A separate asymmetric primitive used to authorize uploads to Storacha (web3.storage) via UCAN v1 invocations. Independent keypair, independent DID (`did:key:z<multibase ed25519>`), independent custody (`STORACHA_AGENT_KEY` env var).
+
+| Surface | File:Line | Sign | Output format |
+|---|---|---|---|
+| Ed25519 keypair load | [`storage/providers/storacha_ucan.py:432-470`](../../../kestrel_sovereign/storage/providers/storacha_ucan.py#L432-L470) | `Ed25519PrivateKey.from_private_bytes(seed)` | `Ed25519PrivateKey` |
+| `did:key` derivation from Ed25519 pub | [`storage/providers/storacha_ucan.py:485+`](../../../kestrel_sovereign/storage/providers/storacha_ucan.py#L485) | multibase + multicodec → `did:key:z6Mk…` | DID string |
+| UCAN v1 invocation signing | [`storage/providers/storacha_ucan.py:385+`](../../../kestrel_sovereign/storage/providers/storacha_ucan.py#L385) | Ed25519 over CIDv1 of DAG-CBOR-encoded invocation block | UCAN v1 invocation |
+
+Wave 1's `CryptoSuite` will absorb this via `Ed25519Suite` (same suite implemented for the new agent identity hybrid). Storacha-specific keypair custody and `did:key` derivation logic stays in this provider; only the underlying signing primitive becomes shared.
 
 ### "HMAC-as-signature" — public-keyed tamper tag (BROKEN, Wave 0B kill target)
 
 | File:Line | Issue |
 |---|---|
 | [`features/compute/script_signer.py:165-174`](../../../kestrel_sovereign/features/compute/script_signer.py#L165-L174) | HMAC-SHA256 with key = `(self.agent_did or "kestrel-unsigned").encode()`. **The HMAC key is the agent's PUBLIC DID.** Anyone reading the script can forge the `hmac:` tag. Verify path at [`script_signer.py:198+`](../../../kestrel_sovereign/features/compute/script_signer.py#L198) accepts it. |
+
+### `MigrationCertificate.signature` — present but unwired (future surface)
+
+| File:Line | Status |
+|---|---|
+| [`identity/continuity_verifier.py:137`](../../../kestrel_sovereign/identity/continuity_verifier.py#L137) | Schema field `signature: str = ""` exists; no signing call-site found. If this gets wired up, it joins the long-lived signed-artifact set and must adopt the v2 signature container from Wave 1. Tracked here so Wave 1 covers it. |
 
 ### Post-quantum primitives
 
@@ -64,12 +82,13 @@ None in use. ML-DSA, ML-KEM, SLH-DSA, hybrid combiners — all unimplemented.
 | Demo script | [`examples/demo_sovereignty.py`](../../../examples/demo_sovereignty.py) |
 | Emma rotation script | [`scripts/rotate_emma_key.py`](../../../scripts/rotate_emma_key.py) |
 
-### HMAC-SHA256 — JWT signing (legitimate use)
+### HMAC-SHA256 — JWT signing and webhook auth (legitimate uses)
 
 | Surface | File:Line | Algorithm | Notes |
 |---|---|---|---|
 | OAuth JWT issuance | [`endpoints/auth_oauth.py:182`](../../../endpoints/auth_oauth.py#L182) | `jwt.encode(payload, secret, algorithm="HS256")` | Symmetric; Grover-safe at ≥256-bit secret |
 | OAuth JWT verification | [`endpoints/auth_oauth.py:185-190`](../../../endpoints/auth_oauth.py#L185-L190) | `jwt.decode(token, secret, algorithms=["HS256"])` | Pin algorithms list (already correct) |
+| Webhook signature validation | [`features/webhooks/auth.py:124-130`](../../../kestrel_sovereign/features/webhooks/auth.py#L124-L130) | `hmac.new(secret, body, sha256).hexdigest()` then `hmac.compare_digest` | Symmetric; PQ-safe with ≥256-bit secret per provider. Wave 5 audits secret length. |
 
 ## Hash primitives
 
