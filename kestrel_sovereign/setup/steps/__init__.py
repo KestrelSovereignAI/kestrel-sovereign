@@ -12,12 +12,26 @@ There are two kinds of steps:
     integrations the user does not want set up automatically.
 """
 
-from kestrel_sovereign.setup.steps import agent, keys, llm, talon, verify
+from kestrel_sovereign.setup.steps import (
+    agent,
+    integrations,
+    keys,
+    llm,
+    talon,
+    verify,
+)
 
 #: Stable ordering used when the user runs ``kestrel setup`` with no step.
+#:
+#: ``integrations`` lives between ``llm`` and ``agent`` so the user can
+#: opt into Tavily/voice/cloud credentials immediately after picking
+#: their LLM provider, but still before the agent is incepted (which
+#: is the slow step). Declining everything in ``integrations`` is a
+#: no-op — the wizard flows straight into ``agent``.
 ORDERED = (
     ("keys", keys.run),
     ("llm", llm.run),
+    ("integrations", integrations.run),
     ("agent", agent.run),
     ("verify", verify.run),
 )
@@ -30,4 +44,7 @@ OPTIONAL = (
 #: Lookup for ``kestrel setup <step>``. Includes both default and optional.
 BY_NAME = {name: fn for name, fn in (*ORDERED, *OPTIONAL)}
 
-__all__ = ["ORDERED", "OPTIONAL", "BY_NAME", "agent", "keys", "llm", "talon", "verify"]
+__all__ = [
+    "ORDERED", "OPTIONAL", "BY_NAME",
+    "agent", "integrations", "keys", "llm", "talon", "verify",
+]
