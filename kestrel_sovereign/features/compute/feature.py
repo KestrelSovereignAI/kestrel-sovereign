@@ -340,7 +340,25 @@ class ComputeFeature(Feature):
         script = await self.script_store.find_by_id_prefix(script_id)
         if not script:
             return f"Error: Script not found with ID starting with '{script_id}'"
-        
+
+        # Defense-in-depth: re-verify the signature here, independent of the
+        # security-hook chain. Wave 0B (#914) — script.state alone is not
+        # sufficient; a host that bypasses or misregisters the hook chain
+        # would otherwise trust a forgeable legacy 'hmac:' tag.
+        if self.signer is not None and script.signature:
+            is_valid = await self.signer.verify(script)
+            if not is_valid:
+                script.state = ScriptState.REJECTED
+                script.review_notes = (
+                    "Invalid signature on execution attempt — "
+                    "possible tampering or legacy 'hmac:' tag."
+                )
+                await self.script_store.update(script)
+                return (
+                    f"Error: Script '{script.name}' has an invalid signature. "
+                    f"Re-create or re-sign with current ECDSA keys before retrying."
+                )
+
         # Check state
         if script.state == ScriptState.REJECTED:
             return (

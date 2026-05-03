@@ -165,6 +165,28 @@ async def test_verify_rejects_empty_signature(temp_db, script):
 
 
 @pytest.mark.asyncio
+async def test_verify_rejects_none_signature(temp_db, script):
+    """script.signature = None must be rejected (vs empty string)."""
+    signer = _signer_with_keys(temp_db)
+    script.signature = None
+    assert await signer.verify(script) is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prefix", ["HMAC:", "Hmac:", "hMaC:", " hmac:", "\thmac:"])
+async def test_verify_rejects_case_and_whitespace_variants(temp_db, script, prefix):
+    """Pin behaviour: any non-exact 'hmac:' prefix falls into the unknown-prefix
+    branch and is rejected. Prevents a future "case-insensitive prefix matching"
+    refactor from silently re-opening the forgery hole.
+    """
+    import base64
+    signer = _signer_with_keys(temp_db)
+    # Even with a "valid-looking" payload the prefix variant must be rejected
+    script.signature = prefix + base64.b64encode(b"\x00" * 32).decode()
+    assert await signer.verify(script) is False
+
+
+@pytest.mark.asyncio
 async def test_verify_rejects_wrong_did_signature(temp_db, script):
     """A signature produced under DID A must not verify under DID B's keys."""
     signer_a = _signer_with_keys(temp_db, did="did:ethr:0xAAAA")
