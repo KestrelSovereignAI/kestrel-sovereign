@@ -58,10 +58,26 @@ def mock_agent(temp_db):
 
 @pytest.fixture
 async def compute_feature(mock_agent):
-    """Create and initialize compute feature."""
+    """Create and initialize compute feature.
+
+    Wave 0B: ScriptSigner now sign-or-fails. The MockAgent has no real key
+    custody, so we inject a freshly-generated secp256k1 keypair onto the
+    signer to exercise the genuine ECDSA path. Tests assert ``ecdsa:``
+    output and signed state.
+    """
     feature = ComputeFeature(mock_agent)
     await feature.initialize()
     mock_agent.features["ComputeFeature"] = feature
+
+    # Inject real ECDSA keys into the signer (no inception ceremony in tests)
+    if feature.signer is not None:
+        from cryptography.hazmat.primitives.asymmetric import ec
+        feature.signer._private_key = ec.generate_private_key(ec.SECP256K1())
+        feature.signer._public_key = feature.signer._private_key.public_key()
+        async def _ok():
+            return True
+        feature.signer._load_keys = _ok
+
     # Auto-register hooks (mirrors _register_feature in kestrel_agent.py)
     for hook in feature.get_hooks():
         mock_agent.hooks_manager.register(hook)
@@ -141,7 +157,10 @@ class TestScriptLifecycle:
         
         assert script.state == ScriptState.SIGNED
         assert script.signature is not None
-        assert script.signature.startswith("hmac:") or script.signature.startswith("ecdsa:")
+        assert script.signature.startswith("ecdsa:"), (
+            "Wave 0B: only ecdsa: signatures are produced; the hmac: fallback "
+            "was removed because its key was the public DID and so was forgeable."
+        )
 
 
 class TestSecurityAnalysis:

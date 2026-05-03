@@ -33,7 +33,10 @@ from kestrel_sovereign.features.compute.models import (
     calculate_risk_score,
 )
 from kestrel_sovereign.features.compute.script_store import ScriptStore
-from kestrel_sovereign.features.compute.script_signer import ScriptSigner
+from kestrel_sovereign.features.compute.script_signer import (
+    ScriptSigner,
+    ScriptSigningKeysUnavailable,
+)
 from kestrel_sovereign.features.compute.script_analyzer import (
     ScriptAnalyzer,
     AnalysisResult,
@@ -83,6 +86,27 @@ def sample_script():
         purpose="Test script for unit tests",
         state=ScriptState.DRAFT,
     )
+
+
+@pytest.fixture
+def signer_with_ecdsa_keys(temp_db):
+    """A ScriptSigner with real secp256k1 keys injected.
+
+    Bypasses the on-disk key loader (which requires an inception ceremony)
+    by mocking ``_load_keys`` and stuffing a freshly-generated keypair onto
+    the signer instance. Use for any test that exercises the signing path
+    after Wave 0B; the HMAC fallback no longer exists.
+    """
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    signer = ScriptSigner("did:ethr:0xtest", temp_db)
+    signer._private_key = ec.generate_private_key(ec.SECP256K1())
+    signer._public_key = signer._private_key.public_key()
+
+    async def _mock_load_keys():
+        return True
+    signer._load_keys = _mock_load_keys
+    return signer
 
 
 @pytest.fixture
@@ -301,55 +325,83 @@ class TestScriptStore:
 # =============================================================================
 
 class TestScriptSigner:
-    """Tests for script signing."""
-    
+    """Tests for script signing.
+
+    Wave 0B (#914): the HMAC fallback was removed. Signing fails closed when
+    keys are unavailable; verification rejects any ``hmac:``-prefixed
+    signature. Tests below exercise the post-Wave-0B contract.
+    """
+
     @pytest.mark.asyncio
-    async def test_sign_hmac_fallback(self, temp_db, sample_script):
-        """Test signing with HMAC fallback (no Ed25519 keys)."""
+    async def test_sign_raises_when_keys_unavailable(self, temp_db, sample_script):
+        """sign() must raise ScriptSigningKeysUnavailable, not return an HMAC tag."""
         signer = ScriptSigner("did:key:test123", temp_db)
-        
-        signature = await signer.sign(sample_script)
-        
+        # No keys injected, no inception ceremony performed → _load_keys returns False
+        with pytest.raises(ScriptSigningKeysUnavailable):
+            await signer.sign(sample_script)
+
+    @pytest.mark.asyncio
+    async def test_sign_produces_ecdsa_prefix(self, signer_with_ecdsa_keys, sample_script):
+        """sign() with valid keys produces an ecdsa:-prefixed signature."""
+        signature = await signer_with_ecdsa_keys.sign(sample_script)
         assert signature is not None
-        assert signature.startswith("hmac:")
-    
+        assert signature.startswith("ecdsa:")
+
     @pytest.mark.asyncio
-    async def test_verify_hmac(self, temp_db, sample_script):
-        """Test verifying HMAC signature."""
-        signer = ScriptSigner("did:key:test123", temp_db)
-        
-        signature = await signer.sign(sample_script)
-        sample_script.signature = signature
-        sample_script.signed_by = "did:key:test123"
-        
-        is_valid = await signer.verify(sample_script)
-        assert is_valid is True
-    
+    async def test_verify_rejects_hmac_prefix(self, signer_with_ecdsa_keys, sample_script):
+        """Any signature with the legacy hmac: prefix must be rejected.
+
+        The HMAC fallback used the public DID as the HMAC key, so any reader
+        of the script could forge the tag. Even if the math 'verifies' under
+        the old algorithm, post-Wave-0B verifiers must reject it.
+        """
+        import base64, hashlib, hmac as hmac_mod
+
+        # Reconstruct what the old fallback produced
+        canonical = f"{sample_script.name}|{sample_script.language}|{sample_script.content}|{sample_script.purpose}"
+        content_hash = hashlib.sha256(canonical.encode()).hexdigest()
+        forged = hmac_mod.new(
+            b"did:ethr:0xtest", content_hash.encode(), hashlib.sha256
+        ).digest()
+        sample_script.signature = "hmac:" + base64.b64encode(forged).decode()
+        sample_script.signed_by = "did:ethr:0xtest"
+
+        is_valid = await signer_with_ecdsa_keys.verify(sample_script)
+        assert is_valid is False, (
+            "verify() must reject hmac:-prefixed signatures even when the "
+            "HMAC math would 'verify' — the key is the public DID and so "
+            "the tag is forgeable by any reader."
+        )
+
     @pytest.mark.asyncio
-    async def test_verify_tampered_content(self, temp_db, sample_script):
-        """Test that tampered content fails verification."""
-        signer = ScriptSigner("did:key:test123", temp_db)
-        
-        signature = await signer.sign(sample_script)
+    async def test_verify_tampered_content(self, signer_with_ecdsa_keys, sample_script):
+        """Test that tampered content fails ECDSA verification."""
+        signature = await signer_with_ecdsa_keys.sign(sample_script)
         sample_script.signature = signature
-        sample_script.signed_by = "did:key:test123"
-        
+        sample_script.signed_by = "did:ethr:0xtest"
+
         # Tamper with content
         sample_script.content = "print('Malicious code!')"
-        
-        is_valid = await signer.verify(sample_script)
+
+        is_valid = await signer_with_ecdsa_keys.verify(sample_script)
         assert is_valid is False
-    
+
     @pytest.mark.asyncio
-    async def test_sign_and_update(self, temp_db, sample_script):
+    async def test_sign_and_update(self, signer_with_ecdsa_keys, sample_script):
         """Test sign_and_update convenience method."""
-        signer = ScriptSigner("did:key:test123", temp_db)
-        
-        updated = await signer.sign_and_update(sample_script)
-        
+        updated = await signer_with_ecdsa_keys.sign_and_update(sample_script)
+
         assert updated.signature is not None
-        assert updated.signed_by == "did:key:test123"
+        assert updated.signature.startswith("ecdsa:")
+        assert updated.signed_by == "did:ethr:0xtest"
         assert updated.signed_at is not None
+
+    @pytest.mark.asyncio
+    async def test_sign_and_update_propagates_unavailable(self, temp_db, sample_script):
+        """sign_and_update must propagate ScriptSigningKeysUnavailable."""
+        signer = ScriptSigner("did:key:test123", temp_db)
+        with pytest.raises(ScriptSigningKeysUnavailable):
+            await signer.sign_and_update(sample_script)
 
 
 # =============================================================================
@@ -799,13 +851,13 @@ class TestIntegration:
     """Integration tests for the compute feature."""
     
     @pytest.mark.asyncio
-    async def test_full_script_lifecycle(self, temp_db):
+    async def test_full_script_lifecycle(self, temp_db, signer_with_ecdsa_keys):
         """Test complete script lifecycle: create, sign, analyze, store."""
         # Initialize components
         store = ScriptStore(temp_db)
         await store.initialize()
-        
-        signer = ScriptSigner("did:key:test", temp_db)
+
+        signer = signer_with_ecdsa_keys
         analyzer = ScriptAnalyzer()
         
         # Create script

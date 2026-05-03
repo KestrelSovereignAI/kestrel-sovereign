@@ -262,9 +262,21 @@ class ComputeFeature(Feature):
         
         # Store the script
         await self.script_store.save(script)
-        
-        # Sign with agent DID
-        await self.signer.sign_and_update(script)
+
+        # Sign with agent DID. Sign-or-fail: if keys are unavailable the
+        # script stays in DRAFT and is reported back to the caller.
+        from .script_signer import ScriptSigningKeysUnavailable
+        try:
+            await self.signer.sign_and_update(script)
+        except ScriptSigningKeysUnavailable as e:
+            logger.error(f"Cannot sign script {script.id[:8]}…: {e}")
+            return (
+                f"❌ Script '{name}' saved as DRAFT but could not be signed.\n"
+                f"   ID: {script.id[:8]}\n"
+                f"   Reason: agent secp256k1 signing keys are not available. "
+                f"Cannot produce an unforgeable signature; refusing to mark "
+                f"as SIGNED."
+            )
         script.state = ScriptState.SIGNED
         await self.script_store.update(script)
         
