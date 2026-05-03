@@ -43,8 +43,6 @@ Repo entry points and standard project files.
 - **host.py** — Kestrel Host - Thin FastAPI proxy + static file server + process manager.
   - `def get_api_key()`; `def load_rookery_config()`; `async def lifespan(app)`; `async def auth_middleware(request, call_next)`; `async def serve_index()`; `async def get_bootstrap_key(request)`; `async def github_proxy(path, request)`; `async def health_check(request)`; `…`
 - **kestrel.toml.example** — —
-- **kestrel_cli.py** — Kestrel Sovereign Agent CLI
-  - `def get_script_dir()`; `def is_port_in_use(port)`; `def is_process_running(pid)`; `def kill_process(pid, force)`; `def wait_for_health(port, timeout)`; `def cmd_start(args)`; `def cmd_stop(args)`; `def cmd_status(args)`; `…`
 - **llm_config.toml** — (configuration)
 - **llm_config.toml.example** — —
 - **main.py** — The main entry point for the Kestrel Agent.
