@@ -1,7 +1,11 @@
 name: Clean Install Validation
 
 # Validates that QUICKSTART.md works on a fresh machine.
-# Covers: git clone → uv sync → kestrel create → kestrel start → 3 pillars verified.
+# Covers: git clone → uv sync → kestrel setup --quickstart → kestrel doctor
+#         → kestrel start → 3 pillars verified → DID persists across restart.
+#
+# This job exercises the wizard path (the documented bootstrap), so any
+# regression in `kestrel setup` is caught here before users hit it.
 # See: https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/184
 
 on:
@@ -14,7 +18,14 @@ on:
 env:
   PYTHON_VERSION: "3.13"
   KESTREL_AUDIT_MODE: "skip"
+  # Force the wizard's non-TTY branch so it never blocks on a prompt.
+  # With this set, build_context() returns NonInteractivePrompter which
+  # accepts defaults silently — exactly what --quickstart needs in CI.
+  KESTREL_NONINTERACTIVE: "1"
 
+# The wizard creates an agent named "Kestrel" by default in quickstart
+# mode (kestrel_sovereign/setup/steps/agent.py::_prompt_name). Centralise
+# the name so future renames stay in lockstep with the wizard.
 jobs:
   clean-install:
     strategy:
@@ -23,6 +34,8 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
+    env:
+      AGENT_NAME: "Kestrel"
 
     steps:
       - name: Checkout
@@ -37,29 +50,50 @@ jobs:
       - name: Set up Python
         run: uv python install ${{ env.PYTHON_VERSION }}
 
-      # Step 1: uv sync (QUICKSTART Step 2)
+      # QUICKSTART Step 2: install dependencies
       - name: Install dependencies (uv sync)
         run: uv sync
 
-      # Step 2: Copy example config (QUICKSTART Step 4a)
-      - name: Configure LLM (copy example config)
-        run: cp llm_config.toml.example llm_config.toml
+      # QUICKSTART Step 4: run the setup wizard.
+      # --quickstart accepts Ollama as the LLM (no API key needed in CI),
+      # generates KESTREL_DATA_KEY + KESTREL_API_KEY, writes [llm] into
+      # kestrel.toml, and runs inception for an agent named "Kestrel".
+      - name: Run setup wizard (kestrel setup --quickstart)
+        run: uv run kestrel setup --quickstart
 
-      # Step 3: kestrel health (CLI smoke test)
-      - name: Run kestrel health
-        run: uv run kestrel health
-        continue-on-error: true  # health may warn about missing Ollama — that's OK in CI
+      # Sanity-check: wizard produced the artifacts it promised.
+      - name: Verify wizard wrote .env, kestrel.toml, rookery.toml
+        run: |
+          for f in .env kestrel.toml rookery.toml; do
+            if [ ! -f "$f" ]; then
+              echo "FAIL: wizard did not produce $f"
+              exit 1
+            fi
+            echo "  ✓ $f present"
+          done
+          # Wizard's contract: KESTREL_DATA_KEY is set
+          if ! grep -q '^KESTREL_DATA_KEY=' .env; then
+            echo "FAIL: KESTREL_DATA_KEY missing from .env after wizard"
+            exit 1
+          fi
+          # And [llm] route_priority has at least one entry
+          if ! grep -q '^route_priority' kestrel.toml; then
+            echo "FAIL: kestrel.toml missing route_priority"
+            exit 1
+          fi
 
-      # Step 4: kestrel create (QUICKSTART Step 5 — Inception)
-      - name: Create agent via inception
-        run: uv run kestrel create CITestAgent
+      # CLI smoke test on the diagnostic surface that ships alongside setup.
+      # `kestrel doctor` exits 0 iff readiness holds; we treat its non-zero
+      # exit as a CI failure since the wizard just claimed success.
+      - name: Run kestrel doctor
+        run: uv run kestrel doctor
 
-      # Step 5: Verify DID identity pillar
+      # Verify Identity pillar — DID exists in the agent DB
       - name: Verify Identity Pillar — DID exists
         run: |
-          DB_PATH="agent_data/CITestAgent/kestrel_prime.db"
+          DB_PATH="agent_data/${{ env.AGENT_NAME }}/kestrel_prime.db"
           if [ ! -f "$DB_PATH" ]; then
-            echo "FAIL: Agent database not created"
+            echo "FAIL: Agent database not created at $DB_PATH"
             exit 1
           fi
           echo "Database exists: $DB_PATH"
@@ -80,10 +114,10 @@ jobs:
           fi
           echo "PASS: Identity Pillar — DID: $DID"
 
-      # Step 6: Verify Constitution pillar
+      # Verify Constitution pillar
       - name: Verify Constitution Pillar — constitution anchored
         run: |
-          DB_PATH="agent_data/CITestAgent/kestrel_prime.db"
+          DB_PATH="agent_data/${{ env.AGENT_NAME }}/kestrel_prime.db"
 
           RESULT=$(uv run python -c "
           import sqlite3
@@ -110,10 +144,10 @@ jobs:
           fi
           echo "PASS: Constitution Pillar — $RESULT"
 
-      # Step 7: Verify Memory pillar — storage tables exist
+      # Verify Memory pillar — storage tables exist
       - name: Verify Memory Pillar — storage tables exist
         run: |
-          DB_PATH="agent_data/CITestAgent/kestrel_prime.db"
+          DB_PATH="agent_data/${{ env.AGENT_NAME }}/kestrel_prime.db"
 
           TABLE_CHECK=$(uv run python -c "
           import sqlite3
@@ -136,32 +170,27 @@ jobs:
           fi
           echo "PASS: Memory Pillar — $TABLE_CHECK"
 
-      # Step 8: Start agent and verify health endpoint (QUICKSTART Step 6)
+      # QUICKSTART Step 6: start the agent and verify health endpoint.
+      # Read the port from rookery.toml — port allocation is deterministic
+      # but not load-bearing on a hardcoded number.
       - name: Start agent and verify health endpoint
         run: |
-          # Read the agent's actual port from rookery.toml — don't hardcode.
-          # The historical "first agent gets 8802" assumption depended on an
-          # order-of-operations quirk where inception ran before port
-          # allocation, causing auto-discovery to claim 8801 and bumping
-          # the new agent to 8802. Reading the real value is robust to
-          # that and to any future port-allocation tweaks.
           PORT=$(uv run python -c "
           import tomllib, sys
           with open('rookery.toml', 'rb') as f:
               cfg = tomllib.load(f)
-          agent = cfg.get('agents', {}).get('CITestAgent') or {}
+          agent = cfg.get('agents', {}).get('${{ env.AGENT_NAME }}') or {}
           port = agent.get('port')
           if not port:
-              sys.stderr.write('rookery.toml missing port for CITestAgent\n')
+              sys.stderr.write('rookery.toml missing port for ${{ env.AGENT_NAME }}\n')
               sys.exit(1)
           print(port)
           ")
           echo "Agent port from rookery.toml: $PORT"
 
-          uv run kestrel start CITestAgent &
+          uv run kestrel start "${{ env.AGENT_NAME }}" &
           START_PID=$!
 
-          # Wait for health endpoint (up to 30 seconds)
           echo "Waiting for agent health endpoint on port $PORT..."
           for i in $(seq 1 30); do
             if curl -sf "http://localhost:$PORT/health" > /dev/null 2>&1; then
@@ -169,8 +198,7 @@ jobs:
               HEALTH=$(curl -s "http://localhost:$PORT/health")
               echo "Health response: $HEALTH"
 
-              # Stop agent
-              uv run kestrel stop CITestAgent 2>/dev/null || true
+              uv run kestrel stop "${{ env.AGENT_NAME }}" 2>/dev/null || true
               kill $START_PID 2>/dev/null || true
               exit 0
             fi
@@ -178,10 +206,9 @@ jobs:
           done
 
           echo "FAIL: Agent did not respond on port $PORT within 30 seconds"
-          # Show logs for debugging
-          if [ -f "agent_data/CITestAgent/agent.log" ]; then
+          if [ -f "agent_data/${{ env.AGENT_NAME }}/agent.log" ]; then
             echo "=== Agent log ==="
-            tail -50 agent_data/CITestAgent/agent.log
+            tail -50 "agent_data/${{ env.AGENT_NAME }}/agent.log"
           fi
           if [ -d "logs" ]; then
             echo "=== Host logs ==="
@@ -193,10 +220,10 @@ jobs:
           kill $START_PID 2>/dev/null || true
           exit 1
 
-      # Step 9: Verify DID persists across restart (identity portability)
+      # Verify DID persists across restart (identity portability)
       - name: Verify DID persists across restart
         run: |
-          DB_PATH="agent_data/CITestAgent/kestrel_prime.db"
+          DB_PATH="agent_data/${{ env.AGENT_NAME }}/kestrel_prime.db"
 
           DID_AFTER=$(uv run python -c "
           import sqlite3
@@ -221,7 +248,8 @@ jobs:
           echo "============================================"
           echo "  Python: ${{ env.PYTHON_VERSION }}"
           echo "  uv sync: OK"
-          echo "  kestrel create: OK (inception + DID)"
+          echo "  kestrel setup --quickstart: OK (wizard owns inception + DID)"
+          echo "  kestrel doctor: OK (readiness)"
           echo "  Identity pillar: Verified"
           echo "  Constitution pillar: Verified"
           echo "  Memory pillar: Verified"
