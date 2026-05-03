@@ -1452,8 +1452,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     setup_p.add_argument(
         "step", nargs="?",
-        choices=["keys", "llm", "agent", "verify"],
-        help="Run only this step (default: run all in order)",
+        choices=["keys", "llm", "agent", "verify", "talon"],
+        help="Run only this step (default: run all in order). "
+             "Optional steps (talon) only run when named explicitly.",
     )
     setup_p.add_argument(
         "--quickstart", action="store_true",
