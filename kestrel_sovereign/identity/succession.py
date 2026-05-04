@@ -394,15 +394,15 @@ def finalize(statement: SuccessionStatement) -> SuccessionStatement:
 class SuccessionVerifyResult:
     """Outcome of :func:`verify_succession`.
 
-    ``ok`` is the composite verdict — predecessor + successor (+ archival
-    if present) all satisfied their per-side policy AND the predecessor
-    DID is cryptographically bound to its embedded verification methods.
+    ``ok`` is the composite verdict — both DIDs cryptographically bound
+    to their embedded VMs, both signature sides satisfy their policy,
+    archival (if present) verifies, and the statement_id matches.
 
     Per-side ``PolicyResult`` instances are exposed so callers can log
-    or re-check finer-grained outcomes. The ``statement_id_consistent``
-    flag is the integrity check on the embedded statement_id;
-    ``predecessor_did_bound`` is the new attacker-takeover guard added
-    in response to a P1 review finding.
+    or re-check finer-grained outcomes. The DID-binding flags
+    (``predecessor_did_bound`` / ``successor_did_bound``) and the
+    ``statement_id_consistent`` flag are the integrity guards added in
+    response to codex P1/P2 review findings on #963.
     """
 
     ok: bool
@@ -411,6 +411,7 @@ class SuccessionVerifyResult:
     archival: Optional[PolicyResult]
     statement_id_consistent: bool
     predecessor_did_bound: bool
+    successor_did_bound: bool
     reason: str
 
 
@@ -684,10 +685,21 @@ def verify_succession(
     """
     payload = signable_payload(statement)
 
-    # 1) Predecessor DID binding — gate before anything else.
-    bound, bind_reason = verify_did_binding(
+    # 1) Predecessor DID binding — gate before predecessor signatures.
+    pred_bound, pred_bind_reason = verify_did_binding(
         statement.predecessor_did,
         statement.predecessor_verification_methods,
+        did_web_resolver=did_web_resolver,
+    )
+
+    # 1b) Successor DID binding — same threat. Without this, a predecessor
+    # (legitimate or compromised) could sign a "succession to did:web:
+    # victim.example" while the embedded VMs are actually attacker-owned
+    # under did:web:attacker.example. Codex P1 finding on the post-fix
+    # review of #963.
+    succ_bound, succ_bind_reason = verify_did_binding(
+        statement.successor_did,
+        statement.successor_verification_methods,
         did_web_resolver=did_web_resolver,
     )
 
@@ -744,11 +756,20 @@ def verify_succession(
                     alg_ids_seen=archival_result.alg_ids_seen,
                 )
 
-    # Statement-id integrity
+    # Statement-id integrity. Codex P2: an empty statement_id used to
+    # be silently accepted as "consistent". Now we require it to be
+    # present AND match — chain walkers and audit logs index by id, so
+    # an unaddressable statement is not safe to accept.
     expected_id = compute_statement_id(statement)
-    id_ok = (not statement.statement_id) or statement.statement_id == expected_id
+    id_ok = bool(statement.statement_id) and statement.statement_id == expected_id
 
-    composite_ok = bound and predecessor_result.ok and successor_result.ok and id_ok
+    composite_ok = (
+        pred_bound
+        and succ_bound
+        and predecessor_result.ok
+        and successor_result.ok
+        and id_ok
+    )
     if archival_result is not None:
         composite_ok = composite_ok and archival_result.ok
 
@@ -756,8 +777,10 @@ def verify_succession(
         reason = "succession statement verified"
     else:
         parts = []
-        if not bound:
-            parts.append(f"predecessor DID binding: {bind_reason}")
+        if not pred_bound:
+            parts.append(f"predecessor DID binding: {pred_bind_reason}")
+        if not succ_bound:
+            parts.append(f"successor DID binding: {succ_bind_reason}")
         if not predecessor_result.ok:
             parts.append(f"predecessor: {predecessor_result.reason}")
         if not successor_result.ok:
@@ -765,10 +788,16 @@ def verify_succession(
         if archival_result and not archival_result.ok:
             parts.append(f"archival: {archival_result.reason}")
         if not id_ok:
-            parts.append(
-                f"statement_id mismatch: stored={statement.statement_id!r} "
-                f"computed={expected_id!r}"
-            )
+            if not statement.statement_id:
+                parts.append(
+                    "statement_id is empty; finalize() the statement before "
+                    "verification (chain walkers and audit logs index by id)"
+                )
+            else:
+                parts.append(
+                    f"statement_id mismatch: stored={statement.statement_id!r} "
+                    f"computed={expected_id!r}"
+                )
         reason = "; ".join(parts) or "unknown failure"
 
     return SuccessionVerifyResult(
@@ -777,7 +806,8 @@ def verify_succession(
         successor=successor_result,
         archival=archival_result,
         statement_id_consistent=id_ok,
-        predecessor_did_bound=bound,
+        predecessor_did_bound=pred_bound,
+        successor_did_bound=succ_bound,
         reason=reason,
     )
 
