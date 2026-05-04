@@ -235,23 +235,22 @@ class KeyRotationService:
 
     async def get_status(self, rotation_id: str) -> Optional[RotationRecord]:
         """Get the status of a rotation operation."""
-        async with self.storage.database.execute(
+        row = await self.storage.database.fetchone(
             "SELECT * FROM key_rotations WHERE id = ?",
-            (rotation_id,)
-        ) as cursor:
-            row = await cursor.fetchone()
-            if row:
-                return RotationRecord(
-                    id=row[0],
-                    started_at=datetime.fromisoformat(row[1]),
-                    completed_at=datetime.fromisoformat(row[2]) if row[2] else None,
-                    old_key_hash=row[3],
-                    new_key_hash=row[4],
-                    status=RotationStatus(row[5]),
-                    records_processed=row[6],
-                    records_total=row[7],
-                    error_message=row[8],
-                )
+            (rotation_id,),
+        )
+        if row:
+            return RotationRecord(
+                id=row[0],
+                started_at=datetime.fromisoformat(row[1]),
+                completed_at=datetime.fromisoformat(row[2]) if row[2] else None,
+                old_key_hash=row[3],
+                new_key_hash=row[4],
+                status=RotationStatus(row[5]),
+                records_processed=row[6],
+                records_total=row[7],
+                error_message=row[8],
+            )
         return None
 
     async def resume_rotation(self, rotation_id: str, key_file: str) -> bool:
@@ -321,6 +320,22 @@ class KeyRotationService:
         """
         await self.drain_rotations(cancel=True)
 
+    # ------------------------------------------------------------------
+    # Encrypted-table registry
+    # ------------------------------------------------------------------
+    #
+    # Tables that store encrypted content the rotation must walk. Names
+    # match the production storage layer (``conversation_history`` —
+    # NOT the legacy ``conversations`` — and ``files``). Adding a new
+    # encrypted table elsewhere in the codebase requires a one-line
+    # entry here so the rotation actually walks it; the previous
+    # hardcoded list silently drifted from production for years.
+
+    ENCRYPTED_TABLES: List[Dict[str, str]] = [
+        {"table": "conversation_history", "content_column": "content", "id_column": "id"},
+        {"table": "files", "content_column": "content", "id_column": "content_hash"},
+    ]
+
     async def _execute_rotation(
         self,
         rotation: RotationRecord,
@@ -329,21 +344,13 @@ class KeyRotationService:
     ):
         """Execute the actual key rotation."""
         try:
-            # Rotate conversation messages
-            await self._rotate_table(
-                rotation, old_fernet, new_fernet,
-                table="conversations",
-                content_column="content",
-                id_column="rowid"
-            )
-
-            # Rotate file store
-            await self._rotate_table(
-                rotation, old_fernet, new_fernet,
-                table="files",
-                content_column="content",
-                id_column="file_id"
-            )
+            for entry in self.ENCRYPTED_TABLES:
+                await self._rotate_table(
+                    rotation, old_fernet, new_fernet,
+                    table=entry["table"],
+                    content_column=entry["content_column"],
+                    id_column=entry["id_column"],
+                )
 
             # Rotation complete
             rotation.status = RotationStatus.COMPLETED
@@ -371,33 +378,35 @@ class KeyRotationService:
         content_column: str,
         id_column: str,
     ):
-        """Rotate encryption for a single table."""
-        # Get records not yet rotated
-        already_rotated = set()
-        async with self.storage.database.execute(
+        """Rotate encryption for a single table.
+
+        Uses ``AsyncDatabase``'s ``fetchall`` / ``execute`` API directly.
+        The previous ``async with database.execute(...) as cursor`` shape
+        did not match this API and made the rotation a no-op against real
+        DBs (#932).
+        """
+        # Records already rotated in this run (resumability)
+        already_rotated_rows = await self.storage.database.fetchall(
             "SELECT record_id FROM rotation_progress WHERE rotation_id = ? AND table_name = ?",
-            (rotation.id, table)
-        ) as cursor:
-            async for row in cursor:
-                already_rotated.add(row[0])
+            (rotation.id, table),
+        )
+        already_rotated = {row[0] for row in already_rotated_rows}
 
         # Validate identifiers for safe SQL interpolation
         safe_tbl = safe_table_name(table)
         safe_id_col = safe_column_name(id_column)
         safe_content_col = safe_column_name(content_column)
 
-        # Get all encrypted rows. Match both legacy Fernet (`gAAAAA%`) and v2
-        # AEAD (`KSAv2:%`) prefixes — Wave 0C (#915) made AEADCipher emit v2
-        # tokens for new writes, so a filter that only catches `gAAAAA%` would
-        # silently leave any post-Wave-0C row encrypted under the old key after
-        # rotation, creating permanent ciphertext rubble once KESTREL_DATA_KEY
-        # is swapped.
-        async with self.storage.database.execute(
+        # Match both legacy Fernet (`gAAAAA%`) and v2 AEAD (`KSAv2:%`) prefixes.
+        # Wave 0C (#915) made AEADCipher emit v2 tokens for new writes; a filter
+        # that only catches `gAAAAA%` would silently leave post-Wave-0C rows
+        # encrypted under the old key — permanent ciphertext rubble after a
+        # KESTREL_DATA_KEY swap.
+        rows = await self.storage.database.fetchall(
             f"SELECT {safe_id_col}, {safe_content_col} FROM {safe_tbl} "
             f"WHERE {safe_content_col} LIKE 'gAAAAA%' "
             f"   OR {safe_content_col} LIKE 'KSAv2:%'"
-        ) as cursor:
-            rows = await cursor.fetchall()
+        )
 
         for record_id, encrypted_content in rows:
             record_id_str = str(record_id)
@@ -405,75 +414,111 @@ class KeyRotationService:
                 continue
 
             try:
-                # Decrypt with old key
+                # Decrypt with old key (handles both Fernet and v2)
                 decrypted = old_fernet.decrypt(encrypted_content.encode())
 
-                # Re-encrypt with new key
+                # Re-encrypt with new key (always emits v2)
                 new_encrypted = new_fernet.encrypt(decrypted).decode()
 
-                # Update record
+                # Update the row, then mark as rotated. Order matters: if
+                # the UPDATE succeeds and we crash before INSERT, a resume
+                # will see the row already encrypted under new_fernet and
+                # the LIKE filter still matches (KSAv2:%), but old_fernet
+                # cannot decrypt it — we'd skip it via the per-row except
+                # below and the records_processed count would be off by
+                # one. Acceptable: the row is correctly under new_fernet.
                 await self.storage.database.execute(
                     f"UPDATE {safe_tbl} SET {safe_content_col} = ? WHERE {safe_id_col} = ?",
-                    (new_encrypted, record_id)
+                    (new_encrypted, record_id),
                 )
-
-                # Mark as rotated
                 await self.storage.database.execute(
-                    "INSERT INTO rotation_progress (rotation_id, table_name, record_id, rotated_at) VALUES (?, ?, ?, ?)",
-                    (rotation.id, table, record_id_str, datetime.now(timezone.utc).isoformat())
+                    "INSERT INTO rotation_progress (rotation_id, table_name, record_id, rotated_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (rotation.id, table, record_id_str, datetime.now(timezone.utc).isoformat()),
                 )
 
                 rotation.records_processed += 1
 
-                # Update progress periodically
                 if rotation.records_processed % 100 == 0:
                     await self._save_rotation(rotation)
-                    logger.info(f"Rotation progress: {rotation.records_processed}/{rotation.records_total}")
+                    logger.info(
+                        f"Rotation progress: "
+                        f"{rotation.records_processed}/{rotation.records_total}"
+                    )
 
             except Exception as e:
                 logger.warning(f"Failed to rotate record {record_id} in {table}: {e}")
-                # Continue with other records
+                # Continue with other rows
 
     async def _count_encrypted_records(self) -> int:
-        """Count total encrypted records across all tables."""
+        """Count total encrypted records across all registered tables."""
         total = 0
-
-        for table, column in [("conversations", "content"), ("files", "content")]:
+        for entry in self.ENCRYPTED_TABLES:
+            table = entry["table"]
+            column = entry["content_column"]
             try:
                 safe_tbl = safe_table_name(table)
                 safe_col = safe_column_name(column)
-                async with self.storage.database.execute(
+                value = await self.storage.database.fetchval(
                     f"SELECT COUNT(*) FROM {safe_tbl} "
                     f"WHERE {safe_col} LIKE 'gAAAAA%' "
                     f"   OR {safe_col} LIKE 'KSAv2:%'"
-                ) as cursor:
-                    row = await cursor.fetchone()
-                    if row:
-                        total += row[0]
+                )
+                total += value or 0
             except Exception as e:
                 # Table may not exist in this storage backend
                 logger.warning(f"Could not count encrypted data in {table}.{column}: {e}")
                 continue
-
         return total
+
+    # ------------------------------------------------------------------
+    # AEAD upgrade — same key, lift v1 Fernet rows to v2 AES-256-GCM
+    # ------------------------------------------------------------------
+
+    async def upgrade_to_aead(
+        self,
+        new_key: Optional[str] = None,
+        new_key_file: Optional[str] = None,
+    ) -> str:
+        """Re-encrypt every Fernet row as v2 AEAD without changing the key.
+
+        Wave 0C (#915) makes new writes emit ``KSAv2:`` v2 tokens; the
+        AEADCipher legacy-decrypt path keeps existing Fernet rows readable.
+        That is sufficient for ongoing operation, but a full corpus stays
+        on the weaker AES-128 primitive until each row is touched. This
+        method drives an eager re-encryption sweep using the current
+        ``KESTREL_DATA_KEY`` for both sides — the same key, just a
+        stronger format.
+
+        Optionally the caller can pass ``new_key`` / ``new_key_file`` to
+        rotate AND upgrade in one pass; otherwise the runtime key is used.
+
+        Returns the rotation id.
+        """
+        if new_key is None and new_key_file is None:
+            from kestrel_sovereign.security.encryption import _get_data_key
+            current = _get_data_key()
+            if not current:
+                raise ValueError("KESTREL_DATA_KEY is not configured")
+            new_key = current
+        return await self.start_rotation(new_key=new_key, new_key_file=new_key_file)
 
     async def _get_in_progress_rotation(self) -> Optional[RotationRecord]:
         """Check for any in-progress rotation."""
-        async with self.storage.database.execute(
+        row = await self.storage.database.fetchone(
             "SELECT * FROM key_rotations WHERE status = ?",
-            (RotationStatus.IN_PROGRESS.value,)
-        ) as cursor:
-            row = await cursor.fetchone()
-            if row:
-                return RotationRecord(
-                    id=row[0],
-                    started_at=datetime.fromisoformat(row[1]),
-                    old_key_hash=row[3],
-                    new_key_hash=row[4],
-                    status=RotationStatus(row[5]),
-                    records_processed=row[6],
-                    records_total=row[7],
-                )
+            (RotationStatus.IN_PROGRESS.value,),
+        )
+        if row:
+            return RotationRecord(
+                id=row[0],
+                started_at=datetime.fromisoformat(row[1]),
+                old_key_hash=row[3],
+                new_key_hash=row[4],
+                status=RotationStatus(row[5]),
+                records_processed=row[6],
+                records_total=row[7],
+            )
         return None
 
     async def _save_rotation(self, rotation: RotationRecord):
