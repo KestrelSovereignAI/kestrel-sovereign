@@ -52,10 +52,20 @@ class AgentCredentials:
 
 
 def generate_secp256k1_keypair() -> tuple[ec.EllipticCurvePrivateKey, ec.EllipticCurvePublicKey]:
-    """Generate a secp256k1 key pair"""
-    private_key = ec.generate_private_key(ec.SECP256K1())
-    public_key = private_key.public_key()
-    return private_key, public_key
+    """Generate a secp256k1 key pair.
+
+    Wave 1 sub-PR 5: routed through ``KeypairFactory`` so future
+    hybrid-identity work (Wave 2) flips the default suite without
+    touching this function. Behavior is byte-identical to the
+    previous direct ``ec.generate_private_key(ec.SECP256K1())`` call —
+    pinned by the CryptoSuite behavior-preservation pair test in
+    ``tests/unit/test_crypto_suite.py``.
+    """
+    from kestrel_sovereign.security.crypto_suite import ALG_ECDSA_SECP256K1_SHA256
+    from kestrel_sovereign.security.keypair_factory import KeypairFactory
+
+    keypair = KeypairFactory.generate(ALG_ECDSA_SECP256K1_SHA256)
+    return keypair.private_key, keypair.public_key
 
 
 def public_key_to_hex(public_key: ec.EllipticCurvePublicKey) -> str:
