@@ -206,7 +206,7 @@ class KestrelAgent(
                         overlay, exc,
                     )
 
-        # Per-agent ``[privacy] computer_access`` opt-in (#900). The privacy
+        # Per-agent ``[privacy] computer_access`` opt-in (#956). The privacy
         # presets ship with ``computer_access=False`` by design — the design
         # comment in ``privacy.py`` says it "must be opted into explicitly
         # by setting the flag after preset construction." This is that
@@ -444,7 +444,7 @@ class KestrelAgent(
             self.storage = PrivacyEnforcingStorage(self._raw_storage, self._privacy_mode)
 
             # Initialize privacy agent. When the agent's kestrel.toml flips
-            # ``[privacy] computer_access = true`` (#900), we build a
+            # ``[privacy] computer_access = true`` (#956), we build a
             # ``PrivacyConfig`` from the preset, set the flag, and pass that
             # in instead of the raw mode string. The flag is independent of
             # the preset by design (privacy.py comment: "must be opted into
@@ -864,7 +864,7 @@ class KestrelAgent(
 
         ComputerUseFeature._privacy_allows reads ``self.agent.privacy_config``
         — without this delegation it would always see ``None`` and gate-1 would
-        always deny, even with ``[privacy] computer_access = true`` set (#900).
+        always deny, even with ``[privacy] computer_access = true`` set (#956).
         """
         privacy_agent = getattr(self, "privacy_agent", None)
         if privacy_agent is None:
