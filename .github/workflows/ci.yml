@@ -14,6 +14,11 @@ on:
 env:
   PYTHON_VERSION: "3.13"
   KESTREL_AUDIT_MODE: "skip"  # Skip audit in CI
+  # Stabilize parametrize ordering across xdist workers. Some test sources
+  # iterate frozensets / dicts whose ordering depends on PYTHONHASHSEED;
+  # without this pin, workers see different parametrize orderings and
+  # xdist refuses to run with "Different tests were collected between gw…".
+  PYTHONHASHSEED: "0"
 
 jobs:
   # Fast checks first
@@ -24,6 +29,8 @@ jobs:
 
       - name: Install uv
         uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with:
+          enable-cache: true
 
       - name: Configure git for private deps
         run: git config --global url."https://x-access-token:${{ secrets.GH_PAT }}@github.com/".insteadOf "https://github.com/"
@@ -47,6 +54,8 @@ jobs:
 
       - name: Install uv
         uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with:
+          enable-cache: true
 
       - name: Configure git for private deps
         run: git config --global url."https://x-access-token:${{ secrets.GH_PAT }}@github.com/".insteadOf "https://github.com/"
@@ -58,7 +67,12 @@ jobs:
         run: uv sync
 
       - name: Run unit tests
-        run: uv run pytest tests/unit/ -v --tb=short -x --timeout=60
+        # ``-n auto`` parallelizes across runner cores via pytest-xdist
+        # (already a dev dep). Local benchmark on the unit suite: ~5 min
+        # serial → ~45 sec under -n auto on a 16-core runner. The
+        # PYTHONHASHSEED env at the workflow level keeps parametrize
+        # ordering deterministic across workers.
+        run: uv run pytest tests/unit/ -n auto -v --tb=short -x --timeout=60
         timeout-minutes: 10
         env:
           KESTREL_AUDIT_MODE: skip
@@ -104,6 +118,8 @@ jobs:
 
       - name: Install uv
         uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with:
+          enable-cache: true
 
       - name: Configure git for private deps
         run: git config --global url."https://x-access-token:${{ secrets.GH_PAT }}@github.com/".insteadOf "https://github.com/"
@@ -115,6 +131,10 @@ jobs:
         run: uv sync
 
       - name: Run integration tests
+        # NOT parallelized: integration tests share a single Postgres
+        # database and Redis instance, and most don't isolate state per-test.
+        # A follow-up PR can introduce per-worker schemas / databases and
+        # add ``-n auto`` here once the isolation work is done.
         run: uv run pytest tests/integration/ -v --tb=short -x --timeout=120 -m "not docker_mcp and not cloud_resource"
         timeout-minutes: 20
         env:
@@ -138,6 +158,8 @@ jobs:
 
       - name: Install uv
         uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with:
+          enable-cache: true
 
       - name: Configure git for private deps
         run: git config --global url."https://x-access-token:${{ secrets.GH_PAT }}@github.com/".insteadOf "https://github.com/"
