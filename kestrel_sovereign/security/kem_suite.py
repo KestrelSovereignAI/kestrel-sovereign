@@ -406,12 +406,22 @@ class MLKEM768Suite(KEMSuite):
         """Raw 1184-byte ML-KEM-768 public key (FIPS 203 wire format).
 
         pqcrypto already returns the public key as raw bytes, so this
-        is an identity cast with type validation.
+        is an identity cast with type AND length validation. Length
+        validation here mirrors :meth:`deserialize_public_key` (codex
+        P2 round 2): without it a truncated or padded byte string
+        could slip into a DID ``keyAgreement`` entry under the
+        ``ml-kem-768`` multicodec and only fail downstream on
+        encapsulation, after publication.
         """
         if not isinstance(public_key, (bytes, bytearray)):
             raise KEMSuiteError(
                 f"ml-kem-768 public_key must be bytes; got "
                 f"{type(public_key).__name__}"
+            )
+        if len(public_key) != self.PUBLIC_KEY_SIZE:
+            raise KEMSuiteError(
+                f"ml-kem-768 public key must be {self.PUBLIC_KEY_SIZE} "
+                f"bytes; got {len(public_key)}"
             )
         return bytes(public_key)
 

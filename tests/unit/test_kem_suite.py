@@ -318,6 +318,15 @@ def test_mlkem768_deserialize_rejects_wrong_length():
         suite.deserialize_public_key(b"\x00" * 100)
 
 
+def test_mlkem768_serialize_rejects_wrong_length():
+    """Codex P2 round 2: serialize must reject mis-sized public keys
+    before emitting them under the ml-kem-768 multicodec. Without this
+    a truncated key could be published in a DID keyAgreement entry."""
+    suite = MLKEM768Suite()
+    with pytest.raises(KEMSuiteError, match="must be 1184"):
+        suite.serialize_public_key(b"\x00" * 100)
+
+
 # ---------------------------------------------------------------------------
 # ML-KEM-768 multikey
 # ---------------------------------------------------------------------------
