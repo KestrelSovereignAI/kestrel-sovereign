@@ -85,6 +85,7 @@ with open(f"private/successions/{AGENT_SLUG}.json", "w") as f:
 ## Verification (do this NOW, before the cutoff)
 
 ```python
+from kestrel_sovereign.identity.did_web import resolve as did_web_resolve
 from kestrel_sovereign.identity.succession_chain import verify_artifact_against_chain
 from kestrel_sovereign.security.verify_policy import VerifyPolicy
 
@@ -93,7 +94,11 @@ from kestrel_sovereign.identity.hybrid_keypair import sign_hybrid
 test_payload = b"post-rotation smoke test"
 test_signatures = sign_hybrid(test_payload, result.new_identity.keypair)
 
-# Verify under the chain at a post-cutoff timestamp
+# Verify under the chain at a post-cutoff timestamp.
+# The did:web successor's binding requires real network resolution
+# of https://<domain>/<slug>/did.json — pass identity.did_web.resolve
+# as the resolver. The chain walker will use it for the chain tip
+# (chain-internal links are satisfied by chain linkage).
 verdict = verify_artifact_against_chain(
     root_did=legacy_did,
     root_verification_methods=legacy_vms,
@@ -102,6 +107,7 @@ verdict = verify_artifact_against_chain(
     artifact_payload=test_payload,
     artifact_signatures=test_signatures,
     policy=VerifyPolicy.HYBRID_REQUIRED,
+    did_web_resolver=did_web_resolve,
 )
 assert verdict.ok, verdict.reason
 ```
