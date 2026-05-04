@@ -48,10 +48,18 @@ from kestrel_sovereign.security.verify_policy import VerifyPolicy
 
 @pytest.fixture(scope="module")
 def legacy_kestrel():
-    """Legacy ECDSA-only Kestrel #1-style identity."""
+    """Legacy ECDSA-only Kestrel #1-style identity.
+
+    DID derived from the keypair via ``public_key_to_ethereum_address``
+    so the ``verify_did_binding`` check from #963 holds.
+    """
+    from kestrel_sovereign.inception_service import (
+        public_key_to_ethereum_address,
+    )
     secp = Secp256k1Suite()
     kp = secp.generate_keypair()
-    did = "did:pkh:eip155:1:0xKESTRELONE"
+    address = public_key_to_ethereum_address(kp.public_key)
+    did = f"did:pkh:eip155:1:{address}"
     vms = build_verification_methods(did, [(secp, kp.public_key)])
     return {
         "did": did,
