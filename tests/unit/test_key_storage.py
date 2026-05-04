@@ -472,3 +472,15 @@ class TestSaveLoadSecretBytes:
         # Both files exist; both load independently
         assert storage.has_key("shared_id")
         assert storage.has_secret_bytes("shared_id")
+
+
+    def test_secret_bytes_path_traversal_sanitized(self, storage):
+        """Codex P2: key_id ``"../foo"`` must NOT escape storage_dir.
+        Sanitization mirrors ``_get_key_path``."""
+        import os
+        secret = os.urandom(32)
+        path = storage.save_secret_bytes(secret, "../escaped")
+        # The returned path's parent should be storage_dir, not escape it
+        assert path.parent == storage.storage_dir
+        # The filename should have the dots stripped
+        assert "/" not in path.name and ".." not in path.stem

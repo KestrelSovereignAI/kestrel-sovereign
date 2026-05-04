@@ -414,8 +414,15 @@ class SecureKeyStorage:
 
     def _get_secret_bytes_path(self, key_id: str) -> Path:
         """Distinct from ``_get_key_path`` so ``.bytes.enc`` files don't
-        collide with ``.key.enc`` files used for cryptography objects."""
-        return self.storage_dir / f"{key_id}.bytes.enc"
+        collide with ``.key.enc`` files used for cryptography objects.
+
+        Codex P2 review: path-traversal sanitation must mirror
+        :meth:`_get_key_path`. Without it, a caller passing an
+        unsanitized tenant/agent id like ``"../foo"`` could read or
+        write secret bundles outside ``storage_dir``.
+        """
+        safe_id = "".join(c for c in key_id if c.isalnum() or c in "-_")
+        return self.storage_dir / f"{safe_id}.bytes.enc"
     
     def migrate_plaintext_key(self, pem_path: Path, key_id: Optional[str] = None) -> Path:
         """
