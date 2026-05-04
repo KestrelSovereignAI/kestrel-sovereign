@@ -345,13 +345,21 @@ class ComputeFeature(Feature):
         # security-hook chain. Wave 0B (#914) — script.state alone is not
         # sufficient; a host that bypasses or misregisters the hook chain
         # would otherwise trust a forgeable legacy 'hmac:' tag.
-        if self.signer is not None and script.signature:
+        #
+        # Gate on state, not on a truthy signature (#925). A manually
+        # corrupted DB row with state=SIGNED and signature=None/"" would
+        # otherwise skip verify entirely and fall through to the state
+        # check that accepts SIGNED. ``signer.verify()`` already rejects
+        # null/empty signatures internally; we just have to actually call it.
+        if self.signer is not None and script.state in (
+            ScriptState.SIGNED, ScriptState.APPROVED,
+        ):
             is_valid = await self.signer.verify(script)
             if not is_valid:
                 script.state = ScriptState.REJECTED
                 script.review_notes = (
                     "Invalid signature on execution attempt — "
-                    "possible tampering or legacy 'hmac:' tag."
+                    "possible tampering, legacy 'hmac:' tag, or missing signature."
                 )
                 await self.script_store.update(script)
                 return (

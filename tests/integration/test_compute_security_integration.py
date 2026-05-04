@@ -201,6 +201,61 @@ class TestScriptLifecycle:
         refreshed = await compute_feature.script_store.find_by_id_prefix(script.id)
         assert refreshed.state == ScriptState.REJECTED
 
+    @pytest.mark.asyncio
+    async def test_run_script_rejects_state_signed_with_null_signature(self, compute_feature):
+        """Defense-in-depth (#925): a manually corrupted DB row with
+        ``state=SIGNED`` but ``signature=None`` must NOT execute. The pre-#925
+        guard short-circuited on a falsy signature, so verify never ran and
+        the state check happily accepted SIGNED. Now we gate on state, not
+        on signature truthiness.
+        """
+        await compute_feature.write_script(
+            name="null_sig",
+            language="python",
+            content="print('null sig regression')",
+            purpose="state=SIGNED + signature=None test",
+        )
+        scripts = await compute_feature.script_store.list_recent(1)
+        script = scripts[0]
+        assert script.state == ScriptState.SIGNED
+
+        # Simulate a corrupted/partial-write row.
+        script.signature = None
+        await compute_feature.script_store.update(script)
+
+        result = await compute_feature.run_script(script.id, executor="uv")
+        assert "invalid signature" in result.lower(), (
+            f"run_script must reject state=SIGNED with no signature, got: {result!r}"
+        )
+
+        refreshed = await compute_feature.script_store.find_by_id_prefix(script.id)
+        assert refreshed.state == ScriptState.REJECTED
+
+    @pytest.mark.asyncio
+    async def test_run_script_rejects_state_signed_with_empty_signature(self, compute_feature):
+        """Same #925 case as null, but ``signature=""``. Both falsy values
+        must follow the verify→REJECT path."""
+        await compute_feature.write_script(
+            name="empty_sig",
+            language="python",
+            content="print('empty sig regression')",
+            purpose="state=SIGNED + signature='' test",
+        )
+        scripts = await compute_feature.script_store.list_recent(1)
+        script = scripts[0]
+        assert script.state == ScriptState.SIGNED
+
+        script.signature = ""
+        await compute_feature.script_store.update(script)
+
+        result = await compute_feature.run_script(script.id, executor="uv")
+        assert "invalid signature" in result.lower(), (
+            f"run_script must reject state=SIGNED with empty signature, got: {result!r}"
+        )
+
+        refreshed = await compute_feature.script_store.find_by_id_prefix(script.id)
+        assert refreshed.state == ScriptState.REJECTED
+
 
 class TestSecurityAnalysis:
     """Test security analysis integration."""
