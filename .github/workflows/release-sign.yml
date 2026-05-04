@@ -63,14 +63,35 @@ jobs:
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "Release tag: $TAG"
 
-      - name: Checkout
-        # Use the validated tag (not the raw input) as the checkout
-        # ref. For tag-push runs ``steps.release_tag.outputs.tag`` is
-        # the same as the trigger ref; for dispatch it's the operator-
-        # provided + format-validated tag.
+      # Codex P1 round 6 — split signing tooling (from main, trusted)
+      # from the artifact source (from the tag, untrusted by review):
+      #
+      # - ./signing-tools/ : checked out from ``main``; provides the
+      #   ``kestrel release sign`` CLI + ``load_signing_key_from_env.py``.
+      #   Secrets only enter the env in steps that ``cd`` here.
+      # - ./release-tree/ : checked out from the validated tag; the
+      #   thing being built. ``uv build`` runs from here and may
+      #   execute build-backend hooks declared in the tag's
+      #   pyproject.toml, but the signing secrets are NOT in the env
+      #   for that step. Even a malicious tag cannot exfiltrate
+      #   release-signing keys.
+      #
+      # Without this split, a tag like ``v9.9.9`` pointing at malicious
+      # code would have its build hooks run with KESTREL_RELEASE_SECRET_B64
+      # in scope.
+
+      - name: Checkout signing tooling (main)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: main
+          path: signing-tools
+          fetch-depth: 1
+
+      - name: Checkout release source (validated tag)
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           ref: ${{ steps.release_tag.outputs.tag }}
+          path: release-tree
           fetch-depth: 0
 
       - name: Install uv
@@ -84,61 +105,60 @@ jobs:
       - name: Set up Python
         run: uv python install ${{ env.PYTHON_VERSION }}
 
-      - name: Install dependencies
+      - name: Install signing-tools dependencies (from main)
+        working-directory: signing-tools
         run: uv sync
 
-      - name: Build wheel and sdist
+      - name: Build wheel and sdist (from tag, no signing secrets in env)
+        working-directory: release-tree
+        # IMPORTANT: this step runs build-backend hooks from the
+        # release tag's pyproject.toml. No release-signing secrets
+        # are exposed here, so a malicious tag cannot steal them.
         run: |
-          uv build --wheel --sdist --out-dir dist/
-          ls -la dist/
+          uv build --wheel --sdist --out-dir ../dist/
+          ls -la ../dist/
 
-      - name: Load signing key into SecureKeyStorage
+      - name: Load signing key into SecureKeyStorage (using main's loader)
+        working-directory: signing-tools
         env:
           KESTREL_DATA_KEY: ${{ secrets.KESTREL_DATA_KEY }}
           KESTREL_RELEASE_SECRET_B64: ${{ secrets.KESTREL_RELEASE_SECRET_B64 }}
           KESTREL_RELEASE_PUBLIC_B64: ${{ secrets.KESTREL_RELEASE_PUBLIC_B64 }}
         run: |
           uv run python scripts/release/load_signing_key_from_env.py \
-            --storage-dir ./release-keys \
+            --storage-dir ../release-keys \
             --key-id release-key
 
-      - name: Sign release manifest
+      - name: Sign release manifest (using main's CLI over tag's dist/)
+        working-directory: signing-tools
         env:
           KESTREL_DATA_KEY: ${{ secrets.KESTREL_DATA_KEY }}
         # Codex P1 round 1: the trusted-signer stderr capture cannot
-        # land inside ``./dist`` — the shell creates the file at
-        # redirect time, the CLI walks dist and hashes the (then-empty)
-        # capture file into the manifest, then the CLI writes stderr
-        # to it AFTER hashing. Self-verify would then see different
-        # bytes than the manifest claims.
-        # Write the capture under workflow scratch dir; copy to dist
-        # AFTER signing so it lives alongside the manifest.
+        # land inside the artifacts dir — the shell creates the file
+        # at redirect time, the CLI walks dist and hashes the (then-
+        # empty) capture file into the manifest, then the CLI writes
+        # stderr to it AFTER hashing. Self-verify would see different
+        # bytes than the manifest claims. Write outside dist instead.
+        #
+        # CLI is from main (signing-tools/); artifacts come from tag
+        # (../dist/, relative to this working dir).
         run: |
-          mkdir -p ./signing-stderr
+          mkdir -p ../signing-stderr
           uv run kestrel release sign \
-            --artifacts-dir ./dist \
+            --artifacts-dir ../dist \
             --release-tag "${{ steps.release_tag.outputs.tag }}" \
             --key-id release-key \
             --signer-did "did:web:kestrelsovereignai.github.io" \
             --kid "release-key-1" \
-            --output ./dist/release-manifest.json \
-            --storage-dir ./release-keys 2> ./signing-stderr/trusted-signer.txt
-          grep "trusted_signer_multibase" ./signing-stderr/trusted-signer.txt || true
+            --output ../dist/release-manifest.json \
+            --storage-dir ../release-keys 2> ../signing-stderr/trusted-signer.txt
+          grep "trusted_signer_multibase" ../signing-stderr/trusted-signer.txt || true
 
-      - name: Self-verify the just-signed release
+      - name: Self-verify the just-signed release (using main's CLI)
+        working-directory: signing-tools
         env:
           KESTREL_DATA_KEY: ${{ secrets.KESTREL_DATA_KEY }}
           KESTREL_RELEASE_PUBLIC_B64: ${{ secrets.KESTREL_RELEASE_PUBLIC_B64 }}
-        # Self-verify catches keypair-mismatch / corrupted-manifest
-        # bugs BEFORE the artifacts get uploaded to the release. The
-        # multibase pubkey we trust is computed from the public-side
-        # env var, not parsed from sign's stderr (avoids a parsing
-        # dependency on the human-readable output).
-        #
-        # Codex P1 round 3: the previous ``python -c`` heredoc
-        # preserved YAML indentation; Python rejected the leading
-        # whitespace before ``import``. Use a real script file to
-        # avoid line-zero indentation rules entirely.
         run: |
           cat > /tmp/derive-pub-multibase.py <<'EOF'
           import base64, os
@@ -151,8 +171,8 @@ jobs:
           EOF
           PUB_MB=$(uv run python /tmp/derive-pub-multibase.py)
           uv run kestrel release verify \
-            --manifest ./dist/release-manifest.json \
-            --artifacts-dir ./dist \
+            --manifest ../dist/release-manifest.json \
+            --artifacts-dir ../dist \
             --trusted-signer-multibase "$PUB_MB"
 
       - name: Upload signed release as workflow artifact
