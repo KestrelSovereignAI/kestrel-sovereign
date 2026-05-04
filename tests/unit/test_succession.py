@@ -235,6 +235,26 @@ def test_archival_countersign_embeds_verification_method(
     assert signed.archival_verification_method == vm
 
 
+def test_archival_countersign_uses_preattached_vm_kid(
+    base_statement, slh_keypair_with_vm,
+):
+    """Codex P2 round 8: when the caller pre-attaches the archival VM
+    on the statement and calls ``archival_countersign`` WITHOUT passing
+    ``verification_method=``, the signature's kid must still be derived
+    from the preattached VM (not stuck at the default ``"archival"``)
+    or the verifier can't match the signature to the VM at check time.
+    """
+    from dataclasses import replace as _replace
+    kp, vm = slh_keypair_with_vm
+    # Pre-attach the VM (different code path than passing it to the
+    # function)
+    pre_attached = _replace(base_statement, archival_verification_method=vm)
+    signed = archival_countersign(pre_attached, kp)  # no explicit VM
+    assert signed.archival_signature is not None
+    expected_kid = vm["id"].rsplit("#", 1)[-1]
+    assert signed.archival_signature["kid"] == expected_kid
+
+
 # ---------------------------------------------------------------------------
 # verify_succession — happy paths
 # ---------------------------------------------------------------------------
