@@ -23,7 +23,7 @@ import json
 import logging
 import sys
 from pathlib import Path
-from typing import List, Tuple
+from typing import Iterator, List, Tuple
 
 from kestrel_sovereign.security.crypto_suite import (
     ALG_SLH_DSA_SHA2_128S,
@@ -152,8 +152,8 @@ def _walk_artifacts(
     root: Path,
     *,
     skip: List[Path] = None,
-) -> List[Tuple[str, bytes]]:
-    """Walk ``root`` recursively. Returns ``[(relative_path, bytes), ...]``.
+) -> Iterator[Tuple[str, Path]]:
+    """Walk ``root`` recursively. Yields ``(relative_path, absolute_path)``.
 
     Paths use forward slashes for cross-platform consistency; the
     manifest's path validator already rejects ``..`` / absolute /
@@ -161,17 +161,19 @@ def _walk_artifacts(
     artifact dir.
 
     ``skip`` lists absolute paths to exclude (e.g. the manifest
-    output if it lives inside the artifacts dir). Codex P2 round 1:
-    re-signing into a manifest path inside the artifact tree used to
-    produce a self-referential manifest that was unverifiable
-    immediately after the re-write.
+    output if it lives inside the artifacts dir).
+
+    Codex P2 round 3: this used to return ``List[Tuple[str, bytes]]``
+    which buffered every artifact in memory at once. For real releases
+    with multi-GB tarballs that OOMs. Now it yields paths only and
+    callers read each file one at a time so peak memory is bounded by
+    the largest single artifact.
     """
     if not root.exists():
         raise FileNotFoundError(f"artifacts directory not found: {root}")
     if not root.is_dir():
         raise NotADirectoryError(f"artifacts path is not a directory: {root}")
     skip_resolved = {p.resolve() for p in (skip or [])}
-    out: List[Tuple[str, bytes]] = []
     for path in sorted(root.rglob("*")):
         if not path.is_file():
             continue
@@ -179,8 +181,7 @@ def _walk_artifacts(
             continue
         rel = path.relative_to(root)
         rel_str = rel.as_posix()
-        out.append((rel_str, path.read_bytes()))
-    return out
+        yield (rel_str, path)
 
 
 def _load_slh_keypair(storage: SecureKeyStorage, key_id: str) -> Keypair:
@@ -254,30 +255,39 @@ def cmd_release_sign(args) -> int:
             pass  # output is outside the artifacts dir
         else:
             skip.append(out_path)
+    manifest = new_manifest(
+        release_tag=args.release_tag,
+        signer_did=args.signer_did,
+    )
+    artifact_count = 0
     try:
-        artifacts = _walk_artifacts(artifacts_dir, skip=skip)
+        for rel_path, abs_path in _walk_artifacts(artifacts_dir, skip=skip):
+            # Per-file read keeps peak memory bounded by the largest
+            # single artifact rather than the whole release tree
+            # (codex P2 round 3).
+            try:
+                content = abs_path.read_bytes()
+            except OSError as e:
+                print(f"error: artifact {rel_path!r} read failed: {e}", file=sys.stderr)
+                return 2
+            try:
+                manifest = add_artifact_entry(manifest, rel_path, content)
+            except ReleaseManifestError as e:
+                print(f"error: artifact {rel_path!r}: {e}", file=sys.stderr)
+                return 2
+            del content  # release before reading the next file
+            artifact_count += 1
     except (FileNotFoundError, NotADirectoryError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
 
-    if not artifacts:
+    if artifact_count == 0:
         print(
             f"error: no files found under {artifacts_dir}; refusing to sign "
             f"an empty manifest",
             file=sys.stderr,
         )
         return 2
-
-    manifest = new_manifest(
-        release_tag=args.release_tag,
-        signer_did=args.signer_did,
-    )
-    for rel_path, content in artifacts:
-        try:
-            manifest = add_artifact_entry(manifest, rel_path, content)
-        except ReleaseManifestError as e:
-            print(f"error: artifact {rel_path!r}: {e}", file=sys.stderr)
-            return 2
 
     manifest = sign_manifest(manifest, keypair, kid=args.kid)
     manifest = finalize(manifest)
