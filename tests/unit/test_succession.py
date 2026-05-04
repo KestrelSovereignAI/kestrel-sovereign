@@ -726,6 +726,51 @@ def test_successor_did_mismatch_rejected(legacy_predecessor):
 # statement_id strictness (P2 codex follow-up review of #963)
 # ---------------------------------------------------------------------------
 
+def test_duplicate_kid_takeover_rejected(legacy_predecessor, hybrid_successor):
+    """Codex P1 (third round): an attacker embeds the victim's REAL VM
+    (to satisfy did:pkh binding via any-match) AND an attacker-controlled
+    VM with the SAME ``#key-1`` fragment. Pre-fix: the attacker's VM
+    silently overwrote the victim's in ``methods_by_kid``, so the
+    attacker's signature verified for the victim's DID.
+
+    Post-fix: ``_check_unique_vm_kids`` runs first in
+    ``verify_did_binding`` and refuses any VM list with duplicate kid
+    fragments.
+    """
+    # Attacker: their own secp256k1 keypair
+    att_secp = Secp256k1Suite()
+    att_kp = att_secp.generate_keypair()
+    att_vm = build_verification_methods(
+        legacy_predecessor["did"], [(att_secp, att_kp.public_key)],
+    )[0]
+    # Force the attacker's VM to share the victim's kid fragment
+    att_vm["id"] = legacy_predecessor["vms"][0]["id"]  # same id → same kid
+
+    # VMs list: legitimate FIRST (passes binding any-match), attacker SECOND
+    pred_vms = list(legacy_predecessor["vms"]) + [att_vm]
+    att_kid = att_vm["id"].rsplit("#", 1)[-1]
+
+    s = SuccessionStatement(
+        predecessor_did=legacy_predecessor["did"],
+        successor_did=hybrid_successor["did"],
+        effective_from="2026-05-04T18:00:00+00:00",
+        reason="duplicate-kid takeover attempt",
+        predecessor_verification_methods=pred_vms,
+        successor_verification_methods=hybrid_successor["vms"],
+    )
+    s = sign_predecessor(s, [(att_kp, att_kid)])  # attacker signs
+    s = sign_successor(s, [
+        (hybrid_successor["hybrid"].classical, hybrid_successor["classical_kid"]),
+        (hybrid_successor["hybrid"].pq, hybrid_successor["pq_kid"]),
+    ])
+    s = finalize(s)
+
+    result = verify_succession(s, did_web_resolver=_self_attesting_resolver(s))
+    assert not result.ok, "duplicate-kid takeover must be rejected"
+    assert not result.predecessor_did_bound
+    assert "duplicate kid" in result.reason
+
+
 def test_unfinalized_statement_rejected(
     base_statement, legacy_predecessor, hybrid_successor,
 ):
