@@ -829,6 +829,61 @@ def test_extra_unbound_vm_decoy_rejected(legacy_predecessor, hybrid_successor):
     )
 
 
+def test_malformed_effective_from_rejected(legacy_predecessor, hybrid_successor):
+    """Codex P2 round 5: a cryptographically valid statement with a
+    malformed ``effective_from`` (non-ISO 8601, naive timezone, etc.)
+    used to verify ok=True because verify_succession only checked
+    signatures. Downstream chain walkers depend on this timestamp
+    being parseable to enforce the temporal cutoff, so accepting
+    bogus values produced statements whose cutoff couldn't be
+    enforced reliably.
+
+    Now ``verify_succession`` validates the timestamp and fails-closed
+    on malformed/non-UTC values.
+    """
+    s = SuccessionStatement(
+        predecessor_did=legacy_predecessor["did"],
+        successor_did=hybrid_successor["did"],
+        effective_from="not-a-date",   # malformed
+        reason="malformed timestamp",
+        predecessor_verification_methods=legacy_predecessor["vms"],
+        successor_verification_methods=hybrid_successor["vms"],
+    )
+    s = sign_predecessor(s, [(legacy_predecessor["kp"], legacy_predecessor["kid"])])
+    s = sign_successor(s, [
+        (hybrid_successor["hybrid"].classical, hybrid_successor["classical_kid"]),
+        (hybrid_successor["hybrid"].pq, hybrid_successor["pq_kid"]),
+    ])
+    s = finalize(s)
+
+    result = verify_succession(s, did_web_resolver=_self_attesting_resolver(s))
+    assert not result.ok
+    assert "effective_from invalid" in result.reason
+
+
+def test_naive_effective_from_rejected(legacy_predecessor, hybrid_successor):
+    """Same fix: a timezone-naive timestamp must be rejected because
+    cutoff comparisons must be unambiguous about timezone."""
+    s = SuccessionStatement(
+        predecessor_did=legacy_predecessor["did"],
+        successor_did=hybrid_successor["did"],
+        effective_from="2026-05-04T18:00:00",  # NO TZ
+        reason="naive timestamp",
+        predecessor_verification_methods=legacy_predecessor["vms"],
+        successor_verification_methods=hybrid_successor["vms"],
+    )
+    s = sign_predecessor(s, [(legacy_predecessor["kp"], legacy_predecessor["kid"])])
+    s = sign_successor(s, [
+        (hybrid_successor["hybrid"].classical, hybrid_successor["classical_kid"]),
+        (hybrid_successor["hybrid"].pq, hybrid_successor["pq_kid"]),
+    ])
+    s = finalize(s)
+
+    result = verify_succession(s, did_web_resolver=_self_attesting_resolver(s))
+    assert not result.ok
+    assert "timezone-naive" in result.reason
+
+
 def test_did_binding_handles_non_mapping_vm(legacy_predecessor):
     """Codex P2 round 4: a malformed VM list (e.g. archived data with a
     non-dict entry) used to crash with AttributeError on vm.get(). Now
