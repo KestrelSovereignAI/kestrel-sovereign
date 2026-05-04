@@ -1035,6 +1035,57 @@ def test_adaptive_policy_promotes_hybrid_predecessor(hybrid_successor):
     assert "HYBRID_REQUIRED" in result.predecessor.reason
 
 
+def test_adaptive_policy_uses_resolved_did_web_doc_not_embedded_subset(hybrid_successor):
+    """Codex P1 round 10: an attacker for a hybrid did:web predecessor
+    can DOWNSHIFT the adaptive policy by embedding only the predecessor's
+    classical VM (subset of the published doc). Pre-fix: adaptive policy
+    looked at the embedded subset, didn't see a PQ key, and returned
+    LEGACY_ALLOWED — letting a classical-only signature pass.
+
+    Post-fix: when the predecessor is did:web and a resolver is provided,
+    the policy is derived from the RESOLVED published DID document, which
+    is the source of truth for what keys the agent has. The PQ key
+    appears there, so HYBRID_REQUIRED applies, and classical-only fails.
+    """
+    from kestrel_sovereign.identity.hybrid_keypair import generate_hybrid_keypair
+
+    hybrid_pred = generate_hybrid_keypair()
+    pred_did = "did:web:legit.example:hybrid-agent"
+    full_pred_vms = build_verification_methods(pred_did, hybrid_pred.public_keys())
+    classical_kid = full_pred_vms[0]["id"].rsplit("#", 1)[-1]
+
+    # Statement embeds ONLY the classical VM (downshift attempt)
+    embedded_pred_vms = [full_pred_vms[0]]
+
+    s = SuccessionStatement(
+        predecessor_did=pred_did,
+        successor_did=hybrid_successor["did"],
+        effective_from="2027-01-01T00:00:00+00:00",
+        reason="downshift attempt via embedded-VM subset",
+        predecessor_verification_methods=embedded_pred_vms,
+        successor_verification_methods=hybrid_successor["vms"],
+    )
+    s = sign_predecessor(s, [(hybrid_pred.classical, classical_kid)])
+    s = sign_successor(s, [
+        (hybrid_successor["hybrid"].classical, hybrid_successor["classical_kid"]),
+        (hybrid_successor["hybrid"].pq, hybrid_successor["pq_kid"]),
+    ])
+    s = finalize(s)
+
+    # Resolver returns the FULL published doc with both classical + PQ
+    def _resolver(did):
+        if did == pred_did:
+            return {"id": pred_did, "verificationMethod": full_pred_vms}
+        if did == hybrid_successor["did"]:
+            return {"id": did, "verificationMethod": hybrid_successor["vms"]}
+        raise ValueError(did)
+
+    result = verify_succession(s, did_web_resolver=_resolver)
+    # Adaptive policy sees PQ in published doc → HYBRID_REQUIRED → fails
+    assert not result.ok
+    assert "HYBRID_REQUIRED" in result.predecessor.reason
+
+
 def test_unfinalized_statement_rejected(
     base_statement, legacy_predecessor, hybrid_successor,
 ):
