@@ -302,36 +302,50 @@ class ChainSignaturesResult:
     reason: str
 
 
-def _build_chain_internal_resolver(chain: SuccessionChain):
-    """Build a did:web resolver that satisfies binding for chain-internal
-    predecessors via chain linkage rather than network resolution.
+def _build_chain_internal_resolver(
+    chain: SuccessionChain,
+    user_resolver: Optional[Callable[[str], Mapping[str, object]]] = None,
+):
+    """Build a chain-aware did:web resolver.
 
-    For statement[i+1] (i >= 0), the predecessor is the previous link's
-    successor. ``build_chain`` already verified the VMs match. So when
-    ``verify_succession`` asks the resolver to validate a did:web
-    predecessor that is in fact a previous successor in this chain, the
-    resolver returns a synthetic DID document containing exactly the
-    same VMs the embedded statement carries — by construction the
-    binding check passes.
+    Codex P1 chain-walker review: the previous version returned the
+    embedded successor VMs for EVERY chain successor — including the
+    chain TIP (the current active identity) and any successor being
+    bound at signing time. That made successor binding tautological
+    for did:web (the binding check confirmed embedded == embedded).
 
-    For did:web URIs that are NOT in the chain (e.g. an external
-    reference), the resolver raises so verify_succession's binding
-    check fails-closed. Callers wanting external resolution must pass
-    a different resolver.
+    New behavior:
+    - **Chain-internal linkage** (predecessor_did of statement[i+1]
+      equals successor_did of statement[i] for some i): return a
+      synthetic doc containing the previous successor's VMs. Honest
+      because :func:`build_chain` already enforced VM linkage and the
+      previous statement's successor signatures attested to those VMs.
+    - **Non-linkage DIDs** (chain tip's successor, root predecessor,
+      external references): defer to ``user_resolver``. If no user
+      resolver is provided, raise so binding fails-closed.
+
+    Linkage DIDs are exactly: ``successor_did`` of statements[0:n-1]
+    (i.e. all chain successors except the last). The last successor
+    is the active identity; its publication is the source of truth.
     """
-    successors_by_did = {
-        s.successor_did: tuple(dict(vm) for vm in s.successor_verification_methods)
-        for s in chain.statements
-    }
+    if not chain.statements:
+        linkage_dids: dict = {}
+    else:
+        linkage_dids = {
+            s.successor_did: tuple(dict(vm) for vm in s.successor_verification_methods)
+            for s in chain.statements[:-1]
+        }
 
     def _resolver(did: str) -> Mapping[str, object]:
-        vms = successors_by_did.get(did)
-        if vms is None:
-            raise SuccessionChainError(
-                f"chain-internal resolver cannot resolve {did!r}: "
-                f"not a successor in this chain"
-            )
-        return {"id": did, "verificationMethod": list(vms)}
+        if did in linkage_dids:
+            return {"id": did, "verificationMethod": list(linkage_dids[did])}
+        if user_resolver is not None:
+            return user_resolver(did)
+        raise SuccessionChainError(
+            f"chain-aware resolver cannot resolve {did!r}: not an "
+            f"internal-linkage DID and no user_resolver was provided "
+            f"to handle the chain tip / external lookup"
+        )
 
     return _resolver
 
@@ -339,24 +353,34 @@ def _build_chain_internal_resolver(chain: SuccessionChain):
 def verify_chain_signatures(
     chain: SuccessionChain,
     *,
-    predecessor_policy: VerifyPolicy = VerifyPolicy.LEGACY_ALLOWED,
+    predecessor_policy: Optional[VerifyPolicy] = None,
     successor_policy: VerifyPolicy = VerifyPolicy.HYBRID_REQUIRED,
     require_archival: bool = False,
+    did_web_resolver: Optional[Callable[[str], Mapping[str, object]]] = None,
 ) -> ChainSignaturesResult:
     """Verify every statement in the chain individually.
 
     Each statement's :func:`verify_succession` runs with the supplied
     policies. For chain-internal did:web predecessors (statement[i+1]'s
     predecessor matches statement[i]'s successor), binding is satisfied
-    via :func:`_build_chain_internal_resolver` rather than network
-    resolution — chain VM linkage was already verified at
-    :func:`build_chain` time, so the resolver returning the chain's own
-    successor VMs is honest by construction.
+    via the chain-internal resolver — chain VM linkage was already
+    verified at :func:`build_chain` time. For NON-linkage DIDs (the
+    chain tip's successor, etc.) the wrapper defers to
+    ``did_web_resolver`` if provided.
+
+    Codex round-11 chain review:
+    - ``predecessor_policy`` defaults to ``None`` so
+      ``verify_succession``'s adaptive auto-promotion to HYBRID_REQUIRED
+      kicks in for hybrid-predecessor links (was hardcoded LEGACY_ALLOWED
+      which regressed quantum-hardening for post-migration rotations).
+    - The chain-internal resolver no longer self-resolves did:web
+      successors; callers must pass ``did_web_resolver`` for the chain
+      tip / any external lookup.
 
     The composite ``ok`` is True only if every statement passes.
     Per-statement results are returned for diagnostics.
     """
-    chain_resolver = _build_chain_internal_resolver(chain)
+    chain_resolver = _build_chain_internal_resolver(chain, user_resolver=did_web_resolver)
 
     per_results: List[SuccessionVerifyResult] = []
     all_ok = True
@@ -482,6 +506,7 @@ def verify_artifact_against_chain(
     artifact_signatures: Sequence[Mapping[str, str]],
     policy: VerifyPolicy = VerifyPolicy.HYBRID_REQUIRED,
     verify_chain: bool = True,
+    did_web_resolver: Optional[Callable[[str], Mapping]] = None,
 ) -> ArtifactChainVerifyResult:
     """Verify an artifact's signatures against the active identity at
     ``artifact_timestamp``, applying the post-cutoff rule.
@@ -522,11 +547,74 @@ def verify_artifact_against_chain(
         :class:`ArtifactChainVerifyResult` with active identity,
         per-statement diagnostics, and the policy verdict.
     """
+    # Step 0: anchor the chain to the supplied root (codex P1 round 11
+    # chain review). Without this, an attacker could hand the verifier
+    # a valid succession chain for AN UNRELATED identity along with an
+    # artifact, and artifacts signed by that chain's successor would
+    # verify as though they belonged to the supplied root_did.
+    #
+    # Anchor rule: when chain is non-empty, statements[0].predecessor_did
+    # MUST equal root_did, and statements[0].predecessor_verification_
+    # methods MUST equal root_verification_methods (matched by
+    # id + multibase).
+    if not chain.is_empty():
+        first = chain.statements[0]
+        if first.predecessor_did != root_did:
+            return ArtifactChainVerifyResult(
+                ok=False,
+                active_identity=ActiveIdentity(
+                    did=root_did, verification_methods=tuple(),
+                    is_root=True, succession_index=None, post_cutoff=False,
+                ),
+                chain_signatures=ChainSignaturesResult(
+                    ok=False, per_statement=tuple(),
+                    reason="chain not anchored to supplied root",
+                ),
+                policy_result=PolicyResult(
+                    ok=False, reason="not evaluated", alg_ids_seen=frozenset(),
+                ),
+                reason=(
+                    f"chain anchor mismatch: chain[0].predecessor_did="
+                    f"{first.predecessor_did!r} but root_did={root_did!r}"
+                ),
+            )
+        root_keys = sorted(
+            (vm.get("id"), vm.get("publicKeyMultibase"))
+            for vm in root_verification_methods
+            if isinstance(vm, Mapping)
+        )
+        first_pred_keys = sorted(
+            (vm.get("id"), vm.get("publicKeyMultibase"))
+            for vm in first.predecessor_verification_methods
+            if isinstance(vm, Mapping)
+        )
+        if root_keys != first_pred_keys:
+            return ArtifactChainVerifyResult(
+                ok=False,
+                active_identity=ActiveIdentity(
+                    did=root_did, verification_methods=tuple(),
+                    is_root=True, succession_index=None, post_cutoff=False,
+                ),
+                chain_signatures=ChainSignaturesResult(
+                    ok=False, per_statement=tuple(),
+                    reason="chain not anchored to supplied root VMs",
+                ),
+                policy_result=PolicyResult(
+                    ok=False, reason="not evaluated", alg_ids_seen=frozenset(),
+                ),
+                reason=(
+                    "chain anchor mismatch: chain[0].predecessor_verification"
+                    "_methods do not match supplied root_verification_methods "
+                    "(id + multibase). Refusing to treat an unrelated chain "
+                    "as belonging to this root."
+                ),
+            )
+
     # Step 1: chain structure was validated at build_chain() time. Now
     # validate chain signatures too (unless disabled for performance —
     # e.g. a hot-path verifier that already cached the chain result).
     if verify_chain:
-        chain_sigs = verify_chain_signatures(chain)
+        chain_sigs = verify_chain_signatures(chain, did_web_resolver=did_web_resolver)
     else:
         chain_sigs = ChainSignaturesResult(
             ok=True,
