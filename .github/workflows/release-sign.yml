@@ -32,10 +32,45 @@ jobs:
     timeout-minutes: 20
 
     steps:
+      # Codex P1 round 5: validate the release tag BEFORE checking out
+      # any code from the dispatch ref. The previous order let
+      # ``Load signing key into SecureKeyStorage`` run with secrets
+      # AGAINST scripts from a not-yet-validated ref. If an operator
+      # supplied a malicious ref (or pushed a malicious tag matching
+      # the glob), the secret-bearing step ran from that code before
+      # we ever checked the ref shape. Reorder so format validation
+      # is step 1.
+      - name: Determine and validate release tag
+        id: release_tag
+        env:
+          # Codex P1 round 2: pass ``inputs.ref`` via env var, never
+          # ``${{ ... }}``-expanded into shell. A crafted dispatch ref
+          # containing ``$()`` / quotes / etc would otherwise execute
+          # arbitrary commands in this step.
+          DISPATCH_REF: ${{ github.event.inputs.ref || '' }}
+        run: |
+          if [ -n "$DISPATCH_REF" ]; then
+            TAG="$DISPATCH_REF"
+          else
+            TAG="${GITHUB_REF##*/}"
+          fi
+          # Codex P1 round 3: validate the tag-push branch too, not
+          # only the dispatch input.
+          if ! printf '%s' "$TAG" | grep -Eq '^v[0-9]+(\.[0-9]+){2}([-+][A-Za-z0-9.]+)?$'; then
+            echo "error: release tag must look like vX.Y.Z (got: $TAG)" >&2
+            exit 2
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Release tag: $TAG"
+
       - name: Checkout
+        # Use the validated tag (not the raw input) as the checkout
+        # ref. For tag-push runs ``steps.release_tag.outputs.tag`` is
+        # the same as the trigger ref; for dispatch it's the operator-
+        # provided + format-validated tag.
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          ref: ${{ github.event.inputs.ref || github.ref }}
+          ref: ${{ steps.release_tag.outputs.tag }}
           fetch-depth: 0
 
       - name: Install uv
@@ -66,39 +101,6 @@ jobs:
           uv run python scripts/release/load_signing_key_from_env.py \
             --storage-dir ./release-keys \
             --key-id release-key
-
-      - name: Determine release tag
-        id: release_tag
-        env:
-          # Codex P1 round 2: pass ``inputs.ref`` via env var, never
-          # ``${{ ... }}``-expanded into shell. A crafted dispatch ref
-          # containing ``$()`` / quotes / etc would otherwise execute
-          # arbitrary commands in the signing step's privileged
-          # context.
-          DISPATCH_REF: ${{ github.event.inputs.ref || '' }}
-        # ${GITHUB_REF##*/} resolves to the workflow's run ref. For
-        # workflow_dispatch that's the *branch* the operator picked
-        # from the GitHub UI, not their typed-in inputs.ref. Use the
-        # explicit input for dispatch; fall back to GITHUB_REF for
-        # tag pushes. Validate the input is tag-shaped before using it.
-        run: |
-          if [ -n "$DISPATCH_REF" ]; then
-            TAG="$DISPATCH_REF"
-          else
-            TAG="${GITHUB_REF##*/}"
-          fi
-          # Codex P1 round 3: validate the tag-push branch too, not
-          # only the dispatch input. The tag-push glob
-          # ``v[0-9]*.[0-9]*.[0-9]*`` matches ``v1.2.3$(...)``;
-          # anyone who can push such a tag would otherwise execute
-          # arbitrary commands in the signing job's secret-bearing
-          # context once TAG is interpolated downstream.
-          if ! printf '%s' "$TAG" | grep -Eq '^v[0-9]+(\.[0-9]+){2}([-+][A-Za-z0-9.]+)?$'; then
-            echo "error: release tag must look like vX.Y.Z (got: $TAG)" >&2
-            exit 2
-          fi
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "Release tag: $TAG"
 
       - name: Sign release manifest
         env:
