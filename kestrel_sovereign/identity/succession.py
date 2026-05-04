@@ -442,6 +442,41 @@ class SuccessionVerifyResult:
 #   prevents an attacker from getting a "free pass" by claiming a
 #   did:web that nobody resolves.
 
+def _check_unique_vm_kids(vms: List[Mapping]) -> Tuple[bool, str]:
+    """Reject verification-method lists that contain duplicate kids.
+
+    W3C DID Core 5.1.1 says "the value of the id property MUST...
+    uniquely identify the verification method." But ``_verify_signatures
+    _against`` builds ``methods_by_kid`` by overwriting on duplicates,
+    and the DID-binding check accepts "any-match" — so an attacker could
+    embed the victim's real VM (to satisfy binding) AND an attacker-
+    controlled VM with the SAME kid fragment (to be the one that
+    actually verifies signatures).
+
+    Treat any duplicate kid (fragment after ``#``, or full id when no
+    fragment) as a structural error. The pattern is never legitimate,
+    and silent acceptance is the exact attack codex caught.
+    """
+    seen: dict[str, str] = {}  # kid -> first id that used it
+    for vm in vms:
+        if not isinstance(vm, Mapping):
+            continue
+        vm_id = vm.get("id") or ""
+        kid = vm_id.rsplit("#", 1)[-1] if "#" in vm_id else vm_id
+        if not kid:
+            continue
+        if kid in seen:
+            return False, (
+                f"verification methods contain duplicate kid {kid!r} "
+                f"(ids: {seen[kid]!r} and {vm_id!r}); per W3C DID Core 5.1.1 "
+                f"every verification method id MUST be unique. Refusing to "
+                f"silently overwrite — this is the duplicate-kid takeover "
+                f"path."
+            )
+        seen[kid] = vm_id
+    return True, ""
+
+
 def _verify_did_pkh_eip155_binding(did: str, vms: List[Mapping]) -> bool:
     """did:pkh:eip155:1:0x<addr> — verify a secp256k1 VM derives the address.
 
@@ -526,6 +561,14 @@ def verify_did_binding(
     if not did:
         return False, "DID is empty"
 
+    # Duplicate-kid guard runs ahead of every method-specific check.
+    # Without this, an attacker can include the victim's legitimate VM
+    # to pass binding AND a same-kid attacker VM that the signature
+    # verifier picks up (because methods_by_kid overwrites on collision).
+    unique_ok, unique_reason = _check_unique_vm_kids(verification_methods)
+    if not unique_ok:
+        return False, unique_reason
+
     if did.startswith("did:pkh:eip155:1:"):
         if _verify_did_pkh_eip155_binding(did, verification_methods):
             return True, "did:pkh:eip155 binding verified"
@@ -593,9 +636,21 @@ def _verify_signatures_against(
     Mirrors the same crypto-check logic as
     :func:`identity.hybrid_keypair.verify_hybrid` but isolated here
     for clarity and to avoid a circular import.
+
+    Defense-in-depth (codex P1 follow-up): reject duplicate kids so a
+    later-listed attacker VM cannot silently overwrite the legitimate
+    one in ``methods_by_kid``. ``verify_did_binding`` is the primary
+    guard, but anything that calls ``_verify_signatures_against`` on
+    arbitrary VMs (e.g. archival side, future callers) gets the same
+    protection here.
     """
+    vms_list = list(verification_methods)
+    unique_ok, _reason = _check_unique_vm_kids(vms_list)
+    if not unique_ok:
+        return []
+
     methods_by_kid: dict = {}
-    for vm in verification_methods:
+    for vm in vms_list:
         vm_id = vm.get("id") or ""
         kid = vm_id.rsplit("#", 1)[-1] if "#" in vm_id else vm_id
         methods_by_kid[kid] = vm
