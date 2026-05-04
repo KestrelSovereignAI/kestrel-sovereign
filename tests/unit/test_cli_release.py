@@ -327,6 +327,36 @@ def test_verify_rejects_missing_artifact_file(
 # Posix paths in manifest
 # ---------------------------------------------------------------------------
 
+def test_sign_rejects_mismatched_public_key(tmp_path, artifacts_dir, monkeypatch):
+    """Codex P2 round 2: if ``<key_id>.pub`` is stale and doesn't pair
+    with the secret, the previous CLI signed anyway and printed a
+    multibase that wouldn't verify the manifest. Now self-checks and
+    refuses."""
+    monkeypatch.setenv("KESTREL_DATA_KEY", "x" * 32)
+    storage_dir = tmp_path / "keys"
+    storage_dir.mkdir()
+    storage = SecureKeyStorage(storage_dir=storage_dir)
+    suite = SLHDSASHA2128sSuite()
+
+    # Save secret of one keypair, public of a DIFFERENT keypair → stale
+    kp_a = suite.generate_keypair()
+    kp_b = suite.generate_keypair()
+    storage.save_secret_bytes(kp_a.private_key, "release-key")
+    storage.save_secret_bytes(kp_b.public_key, "release-key.pub")  # WRONG pair
+
+    args = argparse.Namespace(
+        artifacts_dir=str(artifacts_dir),
+        release_tag="v1",
+        key_id="release-key",
+        signer_did="",
+        kid="k1",
+        output="-",
+        storage_dir=str(storage_dir),
+    )
+    rc = cmd_release_sign(args)
+    assert rc == 2
+
+
 def test_resign_skips_existing_manifest_inside_artifacts_dir(
     storage_with_keypair, artifacts_dir,
 ):

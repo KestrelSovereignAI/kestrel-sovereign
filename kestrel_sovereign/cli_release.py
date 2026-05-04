@@ -39,6 +39,7 @@ from kestrel_sovereign.security.release_manifest import (
     finalize,
     new_manifest,
     sign_manifest,
+    signable_payload,
     verify_artifact_bytes,
     verify_manifest,
 )
@@ -280,6 +281,24 @@ def cmd_release_sign(args) -> int:
 
     manifest = sign_manifest(manifest, keypair, kid=args.kid)
     manifest = finalize(manifest)
+
+    # Self-verify against the LOADED public key before publishing
+    # anything (codex P2 round 2). If <key_id>.pub is stale or
+    # doesn't pair with the secret, sign would still succeed with the
+    # secret but the operator would publish an unverifiable manifest
+    # paired with the wrong multibase. Fail loud here instead.
+    suite = SLHDSASHA2128sSuite()
+    payload_for_check = signable_payload(manifest)
+    sig_hex = manifest.signatures[-1]["sig"]
+    if not suite.verify(payload_for_check, bytes.fromhex(sig_hex), keypair.public_key):
+        print(
+            f"error: signing keypair self-check FAILED — the loaded "
+            f"public key {args.key_id}.pub does not pair with the secret "
+            f"key {args.key_id}. Refusing to publish a manifest that "
+            f"consumers cannot verify with the printed pubkey.",
+            file=sys.stderr,
+        )
+        return 2
 
     json_str = json.dumps(manifest.to_dict(), indent=2)
     if args.output == "-":
