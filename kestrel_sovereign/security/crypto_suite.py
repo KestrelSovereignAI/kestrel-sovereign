@@ -91,13 +91,24 @@ class CryptoSuite(abc.ABC):
     """Pluggable signature suite.
 
     Concrete subclasses MUST set ``alg_id`` to a unique stable identifier
-    (see the reserved list at module scope) and implement the four
-    abstract methods. KEM suites (Wave 4) extend a separate
-    ``KEMSuite`` interface — kept distinct from signing because the
-    operation semantics differ.
+    (see the reserved list at module scope) and implement the abstract
+    methods. KEM suites (Wave 4) extend a separate ``KEMSuite``
+    interface — kept distinct from signing because the operation
+    semantics differ.
+
+    Optional class attributes:
+
+    - ``public_key_multicodec`` — the multicodec varint bytes that
+      identify this suite's public-key shape in W3C Multikey
+      (``publicKeyMultibase``) strings. Required for any suite whose
+      keys appear in identity-package v2 ``verificationMethods`` or
+      ``did:web`` documents. If unset, the suite cannot produce a
+      ``z...``-prefixed multibase string and ``multikey.public_key_to_multibase``
+      raises.
     """
 
     alg_id: ClassVar[str]
+    public_key_multicodec: ClassVar[bytes] = b""
 
     @abc.abstractmethod
     def generate_keypair(self) -> Keypair:
@@ -120,15 +131,49 @@ class CryptoSuite(abc.ABC):
 
     @abc.abstractmethod
     def serialize_public_key(self, public_key: Any) -> bytes:
-        """Serialize ``public_key`` to its on-the-wire form.
+        """Legacy on-the-wire serialization for backwards-compatible
+        artifact fields (e.g. ``publicKeyHex`` in v1 DID documents).
 
-        Returned bytes must be re-acceptable by ``deserialize_public_key``;
-        the round-trip is exercised by the suite's KAT tests.
+        For ECC suites this is the uncompressed X9.62 point — same shape
+        ``inception_service.public_key_to_hex`` already emits — so v1
+        readers don't break.
+
+        For W3C Multikey / ``publicKeyMultibase`` callers, use
+        ``serialize_public_key_for_multikey`` instead — that emits the
+        format the multicodec table specifies (e.g. compressed 33-byte
+        secp256k1, raw 32-byte ed25519). Mixing the two will produce
+        valid-looking but cross-implementation-incompatible identifiers.
         """
 
     @abc.abstractmethod
     def deserialize_public_key(self, raw: bytes) -> Any:
-        """Inverse of ``serialize_public_key``."""
+        """Inverse of ``serialize_public_key`` (legacy uncompressed form)."""
+
+    def serialize_public_key_for_multikey(self, public_key: Any) -> bytes:
+        """Serialize a public key in the W3C Multikey-compatible shape
+        for this suite's ``public_key_multicodec``.
+
+        The default implementation raises — suites that participate in
+        Multikey / ``did:key`` / ``did:web`` verification methods MUST
+        override to emit the spec-mandated format. Failing loud here
+        prevents a future suite from accidentally shipping its legacy
+        uncompressed bytes under multicodec 0xe7 (which the spec defines
+        as 33-byte compressed) and producing identifiers that other
+        implementations reject or rederive to a different key shape.
+        """
+        raise CryptoSuiteError(
+            f"{type(self).__name__} (alg_id={self.alg_id!r}) does not "
+            f"implement serialize_public_key_for_multikey. Override on "
+            f"the suite class with the format mandated by its "
+            f"public_key_multicodec entry in the multicodec table."
+        )
+
+    def deserialize_public_key_from_multikey(self, raw: bytes) -> Any:
+        """Inverse of ``serialize_public_key_for_multikey``."""
+        raise CryptoSuiteError(
+            f"{type(self).__name__} (alg_id={self.alg_id!r}) does not "
+            f"implement deserialize_public_key_from_multikey."
+        )
 
 
 class CryptoSuiteError(Exception):
@@ -199,6 +244,8 @@ class Secp256k1Suite(CryptoSuite):
     """
 
     alg_id: ClassVar[str] = ALG_ECDSA_SECP256K1_SHA256
+    # Multicodec 0xe7 (secp256k1-pub), varint-encoded.
+    public_key_multicodec: ClassVar[bytes] = b"\xe7\x01"
 
     def generate_keypair(self) -> Keypair:
         from cryptography.hazmat.primitives.asymmetric import ec
@@ -244,6 +291,42 @@ class Secp256k1Suite(CryptoSuite):
         except Exception as e:
             raise CryptoSuiteError(
                 f"secp256k1 public-key deserialization failed: {e}"
+            ) from e
+
+    def serialize_public_key_for_multikey(self, public_key: Any) -> bytes:
+        """W3C Multikey form for secp256k1: 33-byte compressed X9.62.
+
+        The multicodec table (https://github.com/multiformats/multicodec)
+        defines 0xe7 ``secp256k1-pub`` as a 33-byte compressed point with
+        a leading 0x02 or 0x03 byte indicating Y parity. did:key and the
+        W3C Multikey / did-controller specs both rely on this shape;
+        emitting the legacy 65-byte uncompressed point under the same
+        codec produces strings other implementations reject or rederive
+        to a different key.
+        """
+        from cryptography.hazmat.primitives.serialization import (
+            Encoding, PublicFormat,
+        )
+        return public_key.public_bytes(
+            encoding=Encoding.X962,
+            format=PublicFormat.CompressedPoint,
+        )
+
+    def deserialize_public_key_from_multikey(self, raw: bytes) -> Any:
+        """Inverse of ``serialize_public_key_for_multikey``.
+
+        Accepts a 33-byte compressed X9.62 point. The underlying
+        ``cryptography`` library handles compressed→uncompressed
+        decompression internally.
+        """
+        from cryptography.hazmat.primitives.asymmetric import ec
+        try:
+            return ec.EllipticCurvePublicKey.from_encoded_point(
+                ec.SECP256K1(), raw,
+            )
+        except Exception as e:
+            raise CryptoSuiteError(
+                f"secp256k1 multikey public-key deserialization failed: {e}"
             ) from e
 
 
