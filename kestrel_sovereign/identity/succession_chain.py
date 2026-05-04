@@ -174,6 +174,13 @@ def build_chain(statements: Iterable[SuccessionStatement]) -> SuccessionChain:
                 f"statement[{i}] is a self-succession "
                 f"({s.predecessor_did!r}); refusing"
             )
+        # Codex P2 round 12: validate every statement's timestamp,
+        # including the first one. Otherwise build_chain([single]) lets
+        # a malformed timestamp through and resolve_active_identity
+        # raises later — turning structured verification into an
+        # exception. Parse for side-effect (raises on malformed input);
+        # re-parsed in the comparison branch below for the dt value.
+        _parse_iso8601_utc(s.effective_from)
         if i == 0:
             continue
         prev = seq[i - 1]
