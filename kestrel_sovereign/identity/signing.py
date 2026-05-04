@@ -100,11 +100,14 @@ def sign_package(
         content_hash = package.compute_content_hash()
         package.content_hash = content_hash
 
-        # Sign the hash
-        signature = private_key.sign(
-            content_hash.encode('utf-8'),
-            ec.ECDSA(hashes.SHA256())
+        # Sign the hash. Wave 1 sub-PR 5: route through Secp256k1Suite.
+        # Byte-identical to the previous direct ec.ECDSA(SHA256) call;
+        # pinned by the CryptoSuite behavior-preservation pair test.
+        from kestrel_sovereign.security.crypto_suite import (
+            ALG_ECDSA_SECP256K1_SHA256, get_suite,
         )
+        suite = get_suite(ALG_ECDSA_SECP256K1_SHA256)
+        signature = suite.sign(content_hash.encode("utf-8"), private_key)
 
         # Store signature as hex
         package.signature = signature.hex()
@@ -155,18 +158,20 @@ def verify_package_signature(
         private_key, did_document = load_kestrel_identity(key_id, storage_dir)
         public_key = private_key.public_key()
 
-        # Verify signature
-        signature_bytes = bytes.fromhex(package.signature)
-        public_key.verify(
-            signature_bytes,
-            package.content_hash.encode('utf-8'),
-            ec.ECDSA(hashes.SHA256())
+        # Verify signature via Secp256k1Suite (Wave 1 sub-PR 5).
+        from kestrel_sovereign.security.crypto_suite import (
+            ALG_ECDSA_SECP256K1_SHA256, get_suite,
         )
-
-        return True, "Signature valid"
-
-    except InvalidSignature:
+        signature_bytes = bytes.fromhex(package.signature)
+        suite = get_suite(ALG_ECDSA_SECP256K1_SHA256)
+        if suite.verify(
+            package.content_hash.encode("utf-8"),
+            signature_bytes,
+            public_key,
+        ):
+            return True, "Signature valid"
         return False, "Invalid signature"
+
     except FileNotFoundError:
         # Try to verify using public key from DID document
         return _verify_with_did_document(package, storage_dir)
@@ -217,24 +222,24 @@ def _verify_with_did_document(
         if not public_key_hex:
             return False, "DID document publicKey entry has no publicKeyHex"
 
-        # Reconstruct EC public key from the uncompressed hex
+        # Reconstruct EC public key + verify via Secp256k1Suite
+        # (Wave 1 sub-PR 5).
+        from kestrel_sovereign.security.crypto_suite import (
+            ALG_ECDSA_SECP256K1_SHA256, get_suite,
+        )
+        suite = get_suite(ALG_ECDSA_SECP256K1_SHA256)
         public_key_bytes = bytes.fromhex(public_key_hex)
-        public_key = ec.EllipticCurvePublicKey.from_encoded_point(
-            ec.SECP256K1(), public_key_bytes
-        )
+        public_key = suite.deserialize_public_key(public_key_bytes)
 
-        # Verify the signature
         signature_bytes = bytes.fromhex(package.signature)
-        public_key.verify(
+        if suite.verify(
+            package.content_hash.encode("utf-8"),
             signature_bytes,
-            package.content_hash.encode('utf-8'),
-            ec.ECDSA(hashes.SHA256())
-        )
-
-        return True, "Signature valid (verified via DID document)"
-
-    except InvalidSignature:
+            public_key,
+        ):
+            return True, "Signature valid (verified via DID document)"
         return False, "Invalid signature (DID document verification)"
+
     except (ValueError, KeyError, IndexError) as e:
         return False, f"DID document parsing failed: {e}"
     except Exception as e:
@@ -346,17 +351,22 @@ class PackageSigner:
         return False
 
     def sign(self, package: AgentIdentityPackage) -> AgentIdentityPackage:
-        """Sign a package with the loaded key."""
+        """Sign a package with the loaded key.
+
+        Wave 1 sub-PR 5: routed through Secp256k1Suite (behavior-identical).
+        """
         if self._private_key is None:
             raise SigningError("Signer not initialized - use within 'with' block")
+
+        from kestrel_sovereign.security.crypto_suite import (
+            ALG_ECDSA_SECP256K1_SHA256, get_suite,
+        )
 
         content_hash = package.compute_content_hash()
         package.content_hash = content_hash
 
-        signature = self._private_key.sign(
-            content_hash.encode('utf-8'),
-            ec.ECDSA(hashes.SHA256())
-        )
+        suite = get_suite(ALG_ECDSA_SECP256K1_SHA256)
+        signature = suite.sign(content_hash.encode("utf-8"), self._private_key)
         package.signature = signature.hex()
 
         return package
