@@ -601,18 +601,18 @@ class LighthouseProvider(StorageProvider, CryostasisCapable, MultiCurrencyPaymen
     async def _encrypt_content(self, content: bytes) -> tuple[bytes, str]:
         """Encrypt content using Fernet with a derived key."""
         try:
-            from cryptography.fernet import Fernet
+            from kestrel_sdk.security.aead import AEADCipher
         except ImportError:
             raise ImportError("cryptography package required for encryption")
 
         # Generate content-specific key
-        content_key = Fernet.generate_key()
-        f = Fernet(content_key)
+        content_key = AEADCipher.generate_key()
+        f = AEADCipher(content_key)
         encrypted = f.encrypt(content)
 
         # Get master key from environment
         master_key = self._get_master_key()
-        f_master = Fernet(master_key)
+        f_master = AEADCipher(master_key)
 
         # Encrypt the content key with master key
         encrypted_key = f_master.encrypt(content_key)
@@ -628,7 +628,7 @@ class LighthouseProvider(StorageProvider, CryostasisCapable, MultiCurrencyPaymen
     async def _decrypt_content(self, encrypted: bytes, key_hash: str) -> bytes:
         """Decrypt content using stored key."""
         try:
-            from cryptography.fernet import Fernet
+            from kestrel_sdk.security.aead import AEADCipher
         except ImportError:
             raise ImportError("cryptography package required for decryption")
 
@@ -642,11 +642,11 @@ class LighthouseProvider(StorageProvider, CryostasisCapable, MultiCurrencyPaymen
 
         # Decrypt key with master
         master_key = self._get_master_key()
-        f_master = Fernet(master_key)
+        f_master = AEADCipher(master_key)
         content_key = f_master.decrypt(encrypted_key)
 
         # Decrypt content
-        f_content = Fernet(content_key)
+        f_content = AEADCipher(content_key)
         return f_content.decrypt(encrypted)
 
     def _get_master_key(self) -> bytes:

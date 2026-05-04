@@ -37,7 +37,7 @@ class TestDecryptionFailure:
             with pytest.raises(DecryptionError) as exc_info:
                 decrypt_string(encrypted, metadata, fernet_wrong)
 
-            assert "Decryption failed" in str(exc_info.value)
+            assert "decryption failed" in str(exc_info.value).lower()
 
     def test_decrypt_bytes_wrong_key_raises_error(self):
         """Decrypting bytes with wrong key should raise DecryptionError."""
@@ -55,7 +55,7 @@ class TestDecryptionFailure:
             with pytest.raises(DecryptionError) as exc_info:
                 decrypt_bytes(encrypted, fernet_wrong, metadata)
 
-            assert "Decryption failed" in str(exc_info.value)
+            assert "decryption failed" in str(exc_info.value).lower()
 
     def test_decrypt_string_no_key_but_encrypted_raises_error(self):
         """Decrypting encrypted content without any key should raise DecryptionError."""

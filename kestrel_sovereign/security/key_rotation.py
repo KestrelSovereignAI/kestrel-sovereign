@@ -23,7 +23,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Coroutine, Dict, List, Optional
 
-from cryptography.fernet import Fernet
+from kestrel_sdk.security.aead import AEADCipher
 
 from kestrel_sovereign.sql_utils import safe_table_name, safe_column_name
 from kestrel_sovereign.security.encryption import DecryptionError, get_fernet, _read_key_from_file
@@ -76,17 +76,40 @@ def _hash_key(key: str) -> str:
     return hashlib.sha256(key.encode()).hexdigest()[:16]
 
 
-def _validate_key(key: str) -> Fernet:
-    """Validate that a key can be used for Fernet encryption."""
+def _validate_key(key: str) -> "AEADCipher":
+    """Validate that a key can be used as an AEADCipher key.
+
+    The key-derivation logic here MUST match ``get_fernet()`` exactly: any
+    divergence means rotation encrypts new rows with a different key than
+    the runtime decrypts with — the post-swap result is rotated rows that
+    can never be read again.
+
+    Logic, in order:
+
+    1. If the input is a real Fernet-shaped key (44-byte URL-safe base64
+       encoding 32 raw bytes), use it directly. ``Fernet(key)`` is the
+       authoritative shape detector — note that ``AEADCipher(key)`` would
+       happily accept *any* 32-byte input (e.g. a 32-character passphrase)
+       as a raw AES key, which is a different, incompatible key. We
+       therefore must NOT use ``AEADCipher(key)`` as the shape probe.
+
+    2. Otherwise treat the input as a passphrase and derive the key via
+       SHA-256, matching the runtime ``get_fernet()`` passphrase branch.
+
+    Returns an ``AEADCipher`` (drop-in for the legacy ``Fernet`` return
+    type; AES-256-GCM with Fernet read-compat per Wave 0C of the Quantum
+    Hardening epic).
+    """
+    from cryptography.fernet import Fernet  # shape probe only, never used to encrypt
+    import base64
+
     try:
-        # Try as raw Fernet key
-        return Fernet(key)
+        Fernet(key)  # raises if not a real Fernet-shaped key
     except Exception:
-        # Derive from passphrase
+        # Passphrase path — must match get_fernet() exactly
         digest = hashlib.sha256(key.encode('utf-8')).digest()
-        import base64
-        fernet_key = base64.urlsafe_b64encode(digest)
-        return Fernet(fernet_key)
+        return AEADCipher(base64.urlsafe_b64encode(digest))
+    return AEADCipher(key)
 
 
 class KeyRotationService:
@@ -301,8 +324,8 @@ class KeyRotationService:
     async def _execute_rotation(
         self,
         rotation: RotationRecord,
-        old_fernet: Fernet,
-        new_fernet: Fernet
+        old_fernet: "AEADCipher",
+        new_fernet: "AEADCipher"
     ):
         """Execute the actual key rotation."""
         try:
@@ -342,11 +365,11 @@ class KeyRotationService:
     async def _rotate_table(
         self,
         rotation: RotationRecord,
-        old_fernet: Fernet,
-        new_fernet: Fernet,
+        old_fernet: "AEADCipher",
+        new_fernet: "AEADCipher",
         table: str,
         content_column: str,
-        id_column: str
+        id_column: str,
     ):
         """Rotate encryption for a single table."""
         # Get records not yet rotated
@@ -363,9 +386,16 @@ class KeyRotationService:
         safe_id_col = safe_column_name(id_column)
         safe_content_col = safe_column_name(content_column)
 
-        # Get all records
+        # Get all encrypted rows. Match both legacy Fernet (`gAAAAA%`) and v2
+        # AEAD (`KSAv2:%`) prefixes — Wave 0C (#915) made AEADCipher emit v2
+        # tokens for new writes, so a filter that only catches `gAAAAA%` would
+        # silently leave any post-Wave-0C row encrypted under the old key after
+        # rotation, creating permanent ciphertext rubble once KESTREL_DATA_KEY
+        # is swapped.
         async with self.storage.database.execute(
-            f"SELECT {safe_id_col}, {safe_content_col} FROM {safe_tbl} WHERE {safe_content_col} LIKE 'gAAAAA%'"
+            f"SELECT {safe_id_col}, {safe_content_col} FROM {safe_tbl} "
+            f"WHERE {safe_content_col} LIKE 'gAAAAA%' "
+            f"   OR {safe_content_col} LIKE 'KSAv2:%'"
         ) as cursor:
             rows = await cursor.fetchall()
 
@@ -413,7 +443,9 @@ class KeyRotationService:
                 safe_tbl = safe_table_name(table)
                 safe_col = safe_column_name(column)
                 async with self.storage.database.execute(
-                    f"SELECT COUNT(*) FROM {safe_tbl} WHERE {safe_col} LIKE 'gAAAAA%'"
+                    f"SELECT COUNT(*) FROM {safe_tbl} "
+                    f"WHERE {safe_col} LIKE 'gAAAAA%' "
+                    f"   OR {safe_col} LIKE 'KSAv2:%'"
                 ) as cursor:
                     row = await cursor.fetchone()
                     if row:
