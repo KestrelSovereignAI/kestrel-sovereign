@@ -330,3 +330,23 @@ def test_create_did_web_identity_rejects_empty_slug():
     from kestrel_sovereign.identity.did_web import DidWebError
     with pytest.raises(DidWebError, match="slug must be non-empty"):
         create_did_web_identity("example.com", "")
+
+
+def test_verify_hybrid_rejects_duplicate_kids(hybrid):
+    """Codex P1 follow-up regression: a VM list with duplicate kid
+    fragments must be rejected (would otherwise let an attacker-
+    controlled VM silently overwrite a legitimate one in the
+    methods_by_kid map)."""
+    data = b"x"
+    sigs = sign_hybrid(data, hybrid)
+    did = "did:web:example.com:agent"
+    doc = build_did_document(did, hybrid.public_keys())
+    # Add a third VM whose id collides with the first VM's kid
+    legitimate_vms = doc["verificationMethod"]
+    duplicate_vm = dict(legitimate_vms[1])
+    duplicate_vm["id"] = legitimate_vms[0]["id"]  # SAME kid as #1
+    methods = legitimate_vms + [duplicate_vm]
+
+    result = verify_hybrid(data, sigs, methods)
+    assert not result.ok
+    assert "duplicate kid" in result.reason
