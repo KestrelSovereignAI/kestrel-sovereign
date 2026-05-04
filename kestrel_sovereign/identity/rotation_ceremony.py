@@ -266,7 +266,31 @@ def run_rotation_ceremony(
     # 8) Belt-and-suspenders: re-verify the statement before returning.
     # If we've made any plumbing mistake (kid mismatch, lost VMs, etc.)
     # we want to fail HERE, not when the consumer tries to use it.
-    verify_result = verify_succession(statement)
+    #
+    # The successor's did:web document hasn't been published yet at this
+    # point (the caller publishes it after the ceremony returns), so we
+    # pass a self-attesting resolver: it returns the VMs we just minted
+    # as the "published" doc. That's structurally honest because we ARE
+    # the authority for those VMs at mint time. The third-party verifier
+    # downstream will run ``did_web.resolve`` against the actual HTTPS
+    # URL and catch any divergence between what was minted and what
+    # got published.
+    def _self_attesting_resolver(did: str) -> dict:
+        if did == statement.successor_did:
+            return {
+                "id": did,
+                "verificationMethod": list(statement.successor_verification_methods),
+            }
+        if did == statement.predecessor_did:
+            return {
+                "id": did,
+                "verificationMethod": list(statement.predecessor_verification_methods),
+            }
+        raise ValueError(f"unknown DID at ceremony self-verify: {did!r}")
+
+    verify_result = verify_succession(
+        statement, did_web_resolver=_self_attesting_resolver,
+    )
     if not verify_result.ok:
         raise RuntimeError(
             f"rotation ceremony produced an unverifiable succession "
