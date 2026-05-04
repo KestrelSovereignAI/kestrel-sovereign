@@ -98,10 +98,17 @@ class MemoryChecker(HealthChecker):
                 check.message = "No conversation history yet"
                 return check
 
-            # Check if content looks encrypted (gAAAAA = Fernet prefix)
+            # Check if content looks encrypted (legacy Fernet 'gAAAAA' or v2 'KSAv2:').
+            # Min-length guard avoids tripping on a literal short string a user
+            # might paste — both real prefixes are followed by a long base64 body
+            # (Fernet token >= 73 chars, v2 token >= ~46 chars). 50 is a safe lower
+            # bound that still rejects short pasted strings.
+            def _looks_encrypted(c: str) -> bool:
+                return len(c) > 50 and (c.startswith("gAAAAA") or c.startswith("KSAv2:"))
+
             encrypted_count = sum(
                 1 for msg in history
-                if msg.get("content", "").startswith("gAAAAA")
+                if _looks_encrypted(msg.get("content", ""))
             )
 
             if encrypted_count > 0:

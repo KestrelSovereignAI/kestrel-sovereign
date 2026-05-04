@@ -227,28 +227,32 @@ class FilecoinAdapter:
             raise
     
     def _decrypt_content(self, encrypted_content: bytes, key_hash: str) -> bytes:
-        """Decrypts content using the two-tiered key system."""
-        from cryptography.fernet import Fernet
-        
+        """Decrypts content using the two-tiered key system.
+
+        AEADCipher reads both v2 and legacy Fernet ciphertext, so existing
+        Filecoin-stored content stays decryptable across the migration.
+        """
+        from kestrel_sdk.security.aead import AEADCipher
+
         # 1. Read the encrypted content key from where it was stored
         key_file = self.cache_dir / f"key_{key_hash}.key"
         if not key_file.exists():
             raise FileNotFoundError(f"Could not find key file for hash: {key_hash}")
-        
+
         with open(key_file, 'rb') as f:
             encrypted_key = f.read()
-            
+
         # 2. Decrypt the content key with the master key
         master_key = self._get_master_key()
-        f_master = Fernet(master_key)
+        f_master = AEADCipher(master_key)
         try:
             content_key = f_master.decrypt(encrypted_key)
         except Exception as e:
             logging.error(f"Failed to decrypt content key with master key: {e}")
             raise
-            
+
         # 3. Use the decrypted content key to decrypt the actual content
-        f_content = Fernet(content_key)
+        f_content = AEADCipher(content_key)
         try:
             decrypted_content = f_content.decrypt(encrypted_content)
             return decrypted_content
@@ -275,27 +279,30 @@ class FilecoinAdapter:
         )
 
     def _encrypt_content(self, content: bytes) -> Tuple[bytes, str]:
-        """Encrypt content with a derived key and secure the key."""
-        from cryptography.fernet import Fernet
-        
+        """Encrypt content with a derived key and secure the key.
+
+        Both layers (content and key wrap) now use AES-256-GCM v2.
+        """
+        from kestrel_sdk.security.aead import AEADCipher
+
         # 1. Generate a new, unique key for this specific content
-        content_key = Fernet.generate_key()
-        f_content = Fernet(content_key)
+        content_key = AEADCipher.generate_key()
+        f_content = AEADCipher(content_key)
         encrypted_content = f_content.encrypt(content)
-        
+
         # 2. Encrypt the content key with a master key
         master_key = self._get_master_key()
-        f_master = Fernet(master_key)
+        f_master = AEADCipher(master_key)
         encrypted_key = f_master.encrypt(content_key)
-        
+
         # 3. Use the hash of the encrypted key as its identifier
         key_hash = hashlib.sha256(encrypted_key).hexdigest()
-        
+
         # 4. Store the encrypted key
         key_file = self.cache_dir / f"key_{key_hash}.key"
         with open(key_file, 'wb') as f:
             f.write(encrypted_key)
-            
+
         return encrypted_content, key_hash
 
     def _find_suitable_miner(self, size_bytes: int = 0) -> Optional[str]:

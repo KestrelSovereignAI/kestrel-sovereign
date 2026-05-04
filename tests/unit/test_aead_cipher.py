@@ -201,14 +201,46 @@ def test_strict_b64_rejects_internal_whitespace(cipher):
 
 
 def test_strict_b64_rejects_outside_alphabet(cipher):
-    """Characters outside the URL-safe-base64 alphabet must be rejected."""
+    """Characters outside the URL-safe-base64 alphabet must be rejected.
+
+    Pre-fix: ``base64.b64decode(altchars=b"-_", validate=True)`` silently
+    accepted standard-base64 ``+`` / ``/`` as aliases for ``-`` / ``_``,
+    decoding them to the same byte values. Same plaintext could be carried
+    by two different token strings — canonical encoding broken even though
+    AEAD authentication still worked. The explicit alphabet pre-check in
+    ``_strict_urlsafe_b64decode`` closes that hole.
+    """
     ct = cipher.encrypt(b"important")
     body = bytearray(ct[len(KSA_V2_PREFIX):])
-    # Pick an index in the body and replace with '+' (standard base64 char,
-    # not part of urlsafe alphabet)
     body[3] = ord("+")
-    with pytest.raises(DecryptionError):
+    with pytest.raises(DecryptionError) as excinfo:
         cipher.decrypt(KSA_V2_PREFIX + bytes(body))
+    # The rejection must come from the alphabet check (canonical-encoding
+    # diagnostic), not from a downstream AEAD tag failure
+    assert "non-canonical encoding" in str(excinfo.value).lower()
+
+
+def test_strict_b64_rejects_standard_alphabet_slash(cipher):
+    """Standard-base64 ``/`` must be rejected (alias attack on canonical encoding)."""
+    ct = cipher.encrypt(b"important")
+    body = bytearray(ct[len(KSA_V2_PREFIX):])
+    body[5] = ord("/")
+    with pytest.raises(DecryptionError, match="non-canonical encoding"):
+        cipher.decrypt(KSA_V2_PREFIX + bytes(body))
+
+
+def test_token_carries_no_standard_alphabet_chars(cipher):
+    """A freshly-encrypted token must not contain ``+`` or ``/``.
+
+    AEADCipher uses ``urlsafe_b64encode`` on write, so this is a static
+    invariant — but pinning it in a test guards against a future refactor
+    accidentally switching to standard-base64 output, which would then be
+    rejected by the strict decoder above and corrupt every read.
+    """
+    for _ in range(20):
+        ct = cipher.encrypt(os.urandom(64))
+        body = ct[len(KSA_V2_PREFIX):]
+        assert b"+" not in body and b"/" not in body
 
 
 # -----------------------------------------------------------------------------
