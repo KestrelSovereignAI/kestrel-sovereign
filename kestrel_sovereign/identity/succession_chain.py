@@ -407,9 +407,29 @@ def _verify_artifact_signatures(
     """Drop entries that don't crypto-verify; return survivors. Mirrors
     :func:`succession._verify_signatures_against` but accepts the
     bytes-payload form artifacts use directly.
+
+    Defense-in-depth (codex P1 follow-up): refuse VM lists with
+    duplicate kid fragments. Same attack as in succession.py — a
+    later attacker-controlled VM silently overwrites a legitimate one
+    in ``methods_by_kid``.
     """
+    vms_list = list(verification_methods)
+    seen_kids: dict = {}
+    for vm in vms_list:
+        if not isinstance(vm, Mapping):
+            continue
+        vm_id = vm.get("id") or ""
+        kid = vm_id.rsplit("#", 1)[-1] if "#" in vm_id else vm_id
+        if not kid:
+            continue
+        if kid in seen_kids:
+            return []
+        seen_kids[kid] = vm_id
+
     methods_by_kid: dict = {}
-    for vm in verification_methods:
+    for vm in vms_list:
+        if not isinstance(vm, Mapping):
+            continue
         vm_id = vm.get("id") or ""
         kid = vm_id.rsplit("#", 1)[-1] if "#" in vm_id else vm_id
         methods_by_kid[kid] = vm
