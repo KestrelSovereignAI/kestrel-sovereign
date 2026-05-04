@@ -1,4 +1,4 @@
-"""Per-agent ``[privacy] computer_access`` opt-in via kestrel.toml (#900).
+"""Per-agent ``[privacy] computer_access`` opt-in via kestrel.toml (#956).
 
 Two real bugs this PR fixes:
 
@@ -126,7 +126,7 @@ class TestPrivacyConfigProperty:
             llm_service=_StubLLMService(),
         )
         # Just exercise the privacy-init slice, not the whole initialize().
-        # Replicating that slice keeps the test fast and focused on #900.
+        # Replicating that slice keeps the test fast and focused on #956.
         agent._raw_storage = AsyncStorage(
             str(agent_dir / "kestrel_prime.db"),
             agent_id=agent.did,
