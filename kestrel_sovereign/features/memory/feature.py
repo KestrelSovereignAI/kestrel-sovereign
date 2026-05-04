@@ -13,8 +13,9 @@ Integrates with the human-like memory system:
 """
 
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
+from kestrel_sovereign.agent.context_builder import extract_raw_user_content
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.storage_access import (
     resolve_feature_conversation_store,
@@ -23,6 +24,39 @@ from kestrel_sovereign.features.storage_access import (
 from kestrel_sovereign.tools.base import ToolCategory
 
 logger = logging.getLogger(__name__)
+
+
+def _strip_sent_form_for_recall(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Strip the sent-form template from user-role rows before returning
+    them to the LLM via a memory-recall tool result.
+
+    User-turn rows are persisted in their fully-rendered prompt form
+    (``<retrieved_context>...</retrieved_context>\\n<user_input>...</user_input>``)
+    so the conversation-history loader can replay byte-exact bytes for
+    Anthropic prompt-cache stability. That's the right shape for prompt
+    replay, but the wrong shape for memory recall: when an agent asks
+    ``search_memory("what did we discuss")``, the model receives the
+    retrieved-context block as the ``user`` content and treats the
+    previous turn's retrieved memories as if the user had spoken them.
+
+    Real-world symptom: April 28 cluster of "Based on the retrieved
+    context, I can tell you that..." memories — the model paraphrasing
+    its own prior retrieval block back at itself.
+
+    Fix is local to the recall path: strip the wrappers only for
+    ``role == "user"`` rows. Assistant rows are persisted as raw text
+    and pass through unchanged. ``extract_raw_user_content`` is
+    idempotent on legacy/raw rows.
+    """
+    out = []
+    for msg in messages:
+        if msg.get("role") == "user" and isinstance(msg.get("content"), str):
+            cleaned = dict(msg)
+            cleaned["content"] = extract_raw_user_content(msg["content"])
+            out.append(cleaned)
+        else:
+            out.append(msg)
+    return out
 
 
 class MemoryFeature(Feature):
@@ -116,7 +150,7 @@ class MemoryFeature(Feature):
 
             return {
                 "success": True,
-                "results": results,
+                "results": _strip_sent_form_for_recall(results),
                 "count": len(results),
                 "query": query,
                 "session_id": session_id,
@@ -145,7 +179,7 @@ class MemoryFeature(Feature):
             history = await self.storage.get_conversation_history(limit=limit)
             return {
                 "success": True,
-                "messages": history,
+                "messages": _strip_sent_form_for_recall(history),
                 "count": len(history)
             }
         except (AttributeError, TypeError) as e:
@@ -394,13 +428,20 @@ class MemoryFeature(Feature):
                 limit=limit
             )
 
-            # Format for readability
+            # Format for readability. Strip sent-form wrappers from
+            # user-role rows so the returned content is what the user
+            # actually said, not a rendered prompt with retrieved-context
+            # blocks (see _strip_sent_form_for_recall).
             formatted = []
             for mem in memories:
                 meta = mem.get("metadata", {})
+                role = mem.get("role", "unknown")
+                content = mem.get("content", "")
+                if role == "user" and isinstance(content, str):
+                    content = extract_raw_user_content(content)
                 formatted.append({
-                    "content": mem.get("content", ""),
-                    "role": mem.get("role", "unknown"),
+                    "content": content,
+                    "role": role,
                     "score": mem.get("score", 0),
                     "emotional_valence": meta.get("emotional_valence", 0),
                     "importance": meta.get("importance", 0.5),
