@@ -78,6 +78,7 @@ dependencies = [
     # OpenAI as too-short — no transcripts ever reach the user. Required for
     # any working voice path; kept in core (not voice-local) on purpose.
     "webrtcvad>=2.0.10",
+    "pqcrypto>=0.4.0",
 ]
 
 [project.optional-dependencies]
