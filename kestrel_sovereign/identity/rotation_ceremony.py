@@ -201,20 +201,9 @@ def run_rotation_ceremony(
                 f"archival_keypair must be {ALG_SLH_DSA_SHA2_128S}; "
                 f"got {archival_keypair.suite_id!r}"
             )
-        if archival_verification_method is None:
-            # Mint one ourselves — caller still owns the private key,
-            # but at least the public-key Multikey is consistent.
-            slh_suite = SLHDSASHA2128sSuite()
-            archival_verification_method = build_verification_methods(
-                # The archival VM controller is typically the new DID
-                # (the successor underwrites the long-horizon signature
-                # they're delegating to a hash-based key).
-                f"did:web:{new_did_domain}:{new_did_slug}",
-                [(slh_suite, archival_keypair.public_key)],
-                kid_prefix="archival",
-            )[0]
 
-    # 1) New hybrid identity
+    # 1) New hybrid identity (mint first so we know the actual DID,
+    #    including any extra_path_segments the caller passed)
     aka = list(also_known_as) if also_known_as is not None else [predecessor_did]
     new_identity = create_did_web_identity(
         new_did_domain,
@@ -223,6 +212,18 @@ def run_rotation_ceremony(
         also_known_as=aka,
         services=services,
     )
+
+    # Auto-build the archival VM AFTER the new identity is minted so it
+    # carries the correct DID (including extra_path_segments). Codex P3
+    # found this — pre-fix the auto-built VM used a DID that omitted
+    # the path segments.
+    if archival_keypair is not None and archival_verification_method is None:
+        slh_suite = SLHDSASHA2128sSuite()
+        archival_verification_method = build_verification_methods(
+            new_identity.did,
+            [(slh_suite, archival_keypair.public_key)],
+            kid_prefix="archival",
+        )[0]
 
     # 2-4) Build + sign the succession statement
     statement = SuccessionStatement(
