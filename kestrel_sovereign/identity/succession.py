@@ -342,13 +342,19 @@ def archival_countersign(
     suite = get_suite(ALG_SLH_DSA_SHA2_128S)
     payload = signable_payload(statement)
 
-    # If a verification_method is provided, derive the signature's kid
-    # from its id fragment so the entry and VM line up by default. The
-    # explicit ``kid`` parameter still wins when the caller really wants
-    # a specific kid (rare).
+    # Derive the signature's kid from the VM's id fragment so the entry
+    # and VM line up by default. The explicit ``kid`` parameter still
+    # wins when the caller really wants a specific kid (rare).
+    #
+    # Codex P2 round 8: this also applies when the VM was PRE-ATTACHED
+    # to ``statement.archival_verification_method`` and the caller
+    # didn't pass a ``verification_method=`` argument (the docstring
+    # described that flow, but the kid derivation only fired for the
+    # explicit-VM path). Fall back to the preattached VM if we have one.
+    effective_vm = verification_method or statement.archival_verification_method
     resolved_kid = kid
-    if verification_method and kid == "archival":
-        vm_id = verification_method.get("id") or ""
+    if effective_vm and kid == "archival":
+        vm_id = effective_vm.get("id") or ""
         if "#" in vm_id:
             resolved_kid = vm_id.rsplit("#", 1)[-1]
 
