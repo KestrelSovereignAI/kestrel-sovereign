@@ -383,3 +383,103 @@ def test_verify_artifact_bytes_unknown_path(signed_manifest):
 
 def test_verify_artifact_bytes_rejects_non_bytes(signed_manifest):
     assert not verify_artifact_bytes(signed_manifest, "wheel.whl", "not-bytes")  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# Codex P2 round 1 regressions
+# ---------------------------------------------------------------------------
+
+def test_verify_rejects_manifest_with_traversal_path(slh_kp, slh_pub_multibase):
+    """Codex P2: a producer who SOMEHOW produced a signed manifest
+    with ``../escape`` artifact paths used to verify ok=True; the
+    consumer's per-artifact code would then drive disk lookups outside
+    the release directory.
+
+    Construct such a manifest directly (bypassing ``add_artifact_entry``'s
+    validator) and confirm ``verify_manifest`` rejects it.
+    """
+    from kestrel_sovereign.security.release_manifest import ArtifactEntry
+    from dataclasses import replace
+
+    m = new_manifest(release_tag="v1", released_at="2026-05-04T20:00:00+00:00")
+    rogue = ArtifactEntry(
+        path="../escape/etc-passwd",  # path traversal
+        sha256="0" * 64,
+        size=0,
+    )
+    m_with_rogue = replace(m, artifacts=[rogue])
+
+    # sign_manifest now also rejects malformed manifests pre-emptively
+    with pytest.raises(ReleaseManifestError, match="must not contain '\\.\\.'"):
+        sign_manifest(m_with_rogue, slh_kp, kid="k1")
+
+    # Even if a malformed manifest somehow reached the verifier (e.g.
+    # parsed from JSON without going through add_artifact_entry), it's
+    # rejected at verify time.
+    suite = SLHDSASHA2128sSuite()
+    payload = signable_payload(m_with_rogue)
+    sig = suite.sign(payload, slh_kp.private_key)
+    forged = replace(m_with_rogue, signatures=[
+        {"alg": ALG_SLH_DSA_SHA2_128S, "kid": "k1", "sig": sig.hex()}
+    ])
+    forged = finalize(forged)
+    result = verify_manifest(forged, trusted_signer_multibase=slh_pub_multibase)
+    assert not result.ok
+    assert "manifest invariant violated" in result.reason
+
+
+def test_verify_rejects_manifest_with_absolute_path(slh_kp, slh_pub_multibase):
+    from kestrel_sovereign.security.release_manifest import ArtifactEntry
+    from dataclasses import replace
+
+    m = new_manifest(release_tag="v1", released_at="2026-05-04T20:00:00+00:00")
+    rogue = ArtifactEntry(path="/etc/passwd", sha256="0" * 64, size=0)
+    m_with_rogue = replace(m, artifacts=[rogue])
+
+    suite = SLHDSASHA2128sSuite()
+    payload = signable_payload(m_with_rogue)
+    sig = suite.sign(payload, slh_kp.private_key)
+    forged = replace(m_with_rogue, signatures=[
+        {"alg": ALG_SLH_DSA_SHA2_128S, "kid": "k1", "sig": sig.hex()}
+    ])
+    forged = finalize(forged)
+    result = verify_manifest(forged, trusted_signer_multibase=slh_pub_multibase)
+    assert not result.ok
+    assert "absolute" in result.reason
+
+
+def test_verify_rejects_manifest_with_non_hex_sha256(slh_kp, slh_pub_multibase):
+    """Invariant: each artifact's sha256 must be 64 hex chars."""
+    from kestrel_sovereign.security.release_manifest import ArtifactEntry
+    from dataclasses import replace
+
+    m = new_manifest(release_tag="v1", released_at="2026-05-04T20:00:00+00:00")
+    rogue = ArtifactEntry(path="ok.whl", sha256="not-hex-" * 8, size=0)
+    m_with_rogue = replace(m, artifacts=[rogue])
+
+    suite = SLHDSASHA2128sSuite()
+    sig = suite.sign(signable_payload(m_with_rogue), slh_kp.private_key)
+    forged = replace(m_with_rogue, signatures=[
+        {"alg": ALG_SLH_DSA_SHA2_128S, "kid": "k1", "sig": sig.hex()}
+    ])
+    forged = finalize(forged)
+    result = verify_manifest(forged, trusted_signer_multibase=slh_pub_multibase)
+    assert not result.ok
+
+
+def test_verify_handles_malformed_trusted_signer_multibase(signed_manifest):
+    """Codex P2: a malformed pinned multibase used to crash with
+    ValueError from base58 / varint decoding. Now wrapped into a
+    structured failure result."""
+    bogus_multibase = "zNOT-BASE58-AT-ALL-0OIl"  # contains 0/O/I/l (excluded chars)
+    result = verify_manifest(
+        signed_manifest, trusted_signer_multibase=bogus_multibase,
+    )
+    assert not result.ok
+    assert "decode failed" in result.reason
+
+
+def test_verify_handles_empty_trusted_signer_multibase(signed_manifest):
+    result = verify_manifest(signed_manifest, trusted_signer_multibase="")
+    assert not result.ok
+    assert "decode failed" in result.reason

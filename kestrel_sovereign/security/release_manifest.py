@@ -284,6 +284,50 @@ def new_manifest(
     )
 
 
+def _validate_manifest_invariants(manifest: ReleaseManifest) -> None:
+    """Re-run construction-time invariants on a parsed/constructed
+    manifest. Codex P2: ``from_dict`` previously trusted whatever was
+    in the JSON, so a signed manifest with ``../escape`` paths could
+    be accepted by ``verify_manifest`` and drive downstream artifact
+    lookups outside the release directory.
+
+    Run this before signing AND inside the verifier so neither path
+    can produce/consume a malformed manifest.
+    """
+    if not isinstance(manifest.release_tag, str) or not manifest.release_tag:
+        raise ReleaseManifestError(
+            f"manifest.release_tag must be a non-empty string; "
+            f"got {manifest.release_tag!r}"
+        )
+    _validate_iso8601_utc(manifest.released_at)
+    seen_paths = set()
+    for i, a in enumerate(manifest.artifacts):
+        if not isinstance(a, ArtifactEntry):
+            raise ReleaseManifestError(
+                f"artifacts[{i}] must be an ArtifactEntry; got {type(a).__name__}"
+            )
+        _validate_artifact_path(a.path)
+        if a.path in seen_paths:
+            raise ReleaseManifestError(
+                f"duplicate artifact path: {a.path!r}"
+            )
+        seen_paths.add(a.path)
+        if not isinstance(a.sha256, str) or len(a.sha256) != 64:
+            raise ReleaseManifestError(
+                f"artifacts[{i}].sha256 must be 64-char hex; got {a.sha256!r}"
+            )
+        try:
+            int(a.sha256, 16)
+        except ValueError as e:
+            raise ReleaseManifestError(
+                f"artifacts[{i}].sha256 is not valid hex: {e}"
+            ) from e
+        if not isinstance(a.size, int) or a.size < 0:
+            raise ReleaseManifestError(
+                f"artifacts[{i}].size must be a non-negative int; got {a.size!r}"
+            )
+
+
 def add_artifact_entry(
     manifest: ReleaseManifest,
     path: str,
@@ -320,9 +364,15 @@ def sign_manifest(
     kid: str,
 ) -> ReleaseManifest:
     """Apply a signature using ``keypair``. Multiple signatures are
-    supported by chaining calls (e.g. SLH-DSA + Ed25519 hybrid)."""
+    supported by chaining calls (e.g. SLH-DSA + Ed25519 hybrid).
+
+    Re-validates manifest invariants before signing so a producer
+    cannot accidentally produce a signed-but-malformed manifest
+    (codex P2 review).
+    """
     if not isinstance(kid, str) or not kid:
         raise ReleaseManifestError(f"kid must be a non-empty string; got {kid!r}")
+    _validate_manifest_invariants(manifest)
     suite = get_suite(keypair.suite_id)
     payload = signable_payload(manifest)
     sig = suite.sign(payload, keypair.private_key)
@@ -383,12 +433,33 @@ def verify_manifest(
         result, ``signer_match`` (the trusted key actually verified
         one of the signatures), and ``manifest_id_consistent``.
     """
+    # Re-run invariants on the parsed/passed manifest. Without this a
+    # signed manifest with ``../escape`` paths could verify ok=True
+    # and drive consumer code outside the release directory (codex P2).
+    try:
+        _validate_manifest_invariants(manifest)
+    except ReleaseManifestError as e:
+        return ManifestVerifyResult(
+            ok=False,
+            signature_policy=PolicyResult(
+                ok=False, reason="manifest invariant violated",
+                alg_ids_seen=frozenset(),
+            ),
+            manifest_id_consistent=False,
+            signer_match=False,
+            reason=f"manifest invariant violated: {e}",
+        )
+
     payload = signable_payload(manifest)
 
-    # Decode the trusted signer's public key
+    # Decode the trusted signer's public key. ``multibase_to_public_key``
+    # can raise both ``CryptoSuiteError`` (unknown codec / wrong suite)
+    # AND ``ValueError`` (non-base58btc input, varint truncation). Wrap
+    # both so a malformed pinned key produces a structured failure
+    # instead of crashing the verifier (codex P2).
     try:
         trusted_suite, trusted_pub = multibase_to_public_key(trusted_signer_multibase)
-    except CryptoSuiteError as e:
+    except (CryptoSuiteError, ValueError) as e:
         return ManifestVerifyResult(
             ok=False,
             signature_policy=PolicyResult(
