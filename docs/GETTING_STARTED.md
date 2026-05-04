@@ -36,18 +36,37 @@ ls -la *.db
 ```
 
 ### 3. Configure LLM Providers
-```bash
-# Copy example configuration
-cp llm_config.toml.example llm_config.toml
 
-# Edit with your settings
-nano llm_config.toml
+The simplest path is the setup wizard, which writes a unified `kestrel.toml`:
+
+```bash
+kestrel setup llm
+# Or run all wizard steps:
+kestrel setup
 ```
+
+If you prefer to hand-edit, copy the unified template and edit the `[llm]` section:
+
+```bash
+cp kestrel.toml.example kestrel.toml
+nano kestrel.toml   # edit the [llm] table
+```
+
+**Migrating from a legacy `llm_config.toml`?** Run the one-shot migration:
+
+```bash
+kestrel migrate-llm-config
+```
+
+This merges your existing `llm_config.toml` into `kestrel.toml [llm]`, renames
+the source to `llm_config.toml.bak`, and backs up any prior `kestrel.toml`. It
+is idempotent — re-running it after a successful migration is a no-op. See
+issue #938 for the full deprecation plan.
 
 **Key Configuration Points:**
 - **Ollama**: Should work out of the box if running on localhost:11434
 - **OpenAI**: Set `OPENAI_API_KEY` environment variable or edit config file
-- **Provider Priority**: Ollama first for privacy, OpenAI as fallback
+- **Route Priority**: Ollama first for privacy, OpenAI as fallback
 
 ### 4. Start Chatting with Existing Agent
 ```bash
@@ -169,8 +188,8 @@ ollama pull phi3:latest
 # Set API key (optional - Ollama is primary)
 export OPENAI_API_KEY="your-key-here"
 
-# Or disable OpenAI in llm_config.toml
-# provider_priority = ["ollama"]
+# Or disable OpenAI in kestrel.toml under [llm]
+# route_priority = ["ollama:local"]
 ```
 
 **3. "Database not found"**
@@ -227,7 +246,7 @@ Run the health check script to verify your setup:
 | `main.py` | Interactive chat interface |
 | `kestrel_agent.py` | Core agent logic |
 | `storage.py` | Memory and knowledge management |
-| `llm_config.toml` | LLM provider configuration |
+| `kestrel.toml` | Unified config (LLM, agents, features). `[llm]` section holds provider config. |
 | `inception_service.py` | New agent creation |
 | `test_*.py` | Test suites |
 | `features/*.md` | Detailed documentation |
