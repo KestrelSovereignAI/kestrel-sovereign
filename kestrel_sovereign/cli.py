@@ -813,6 +813,116 @@ def cmd_doctor(args) -> int:
     return 0 if report.ready else 1
 
 
+def cmd_constitution(args) -> int:
+    """Dispatch ``kestrel constitution`` subcommands."""
+    constitution_commands = {
+        "reanchor": cmd_constitution_reanchor,
+    }
+    handler = constitution_commands.get(args.constitution_command)
+    if handler is None:
+        print("Usage: kestrel constitution {reanchor}")
+        return 1
+    return handler(args)
+
+
+def cmd_constitution_reanchor(args) -> int:
+    """Reanchor an agent to the current canonical constitution."""
+    import asyncio
+
+    from kestrel_sovereign.config import CONSTITUTION_PATH
+    from kestrel_sovereign.rookery.config import (
+        ROOKERY_CONFIG_FILENAME, RookeryConfig,
+    )
+    from kestrel_sovereign.setup.constitution_reanchor import (
+        reanchor_constitution,
+    )
+
+    project_dir = _get_project_dir()
+    rookery = RookeryConfig.load(
+        project_dir / ROOKERY_CONFIG_FILENAME, auto_discover_fallback=False,
+    )
+    agents = rookery.get_local_agents()
+
+    if args.agent_name not in agents:
+        print(
+            f"error: '{args.agent_name}' not in rookery. "
+            f"Available: {', '.join(agents.keys()) or '(none)'}",
+            file=sys.stderr,
+        )
+        return 2
+
+    agent_dir = (project_dir / agents[args.agent_name].data_dir).resolve()
+    canonical = Path(args.constitution_path or CONSTITUTION_PATH)
+
+    # Pre-flight check: agent must not be running. SQLite WAL locking
+    # would corrupt mid-write. We check the rookery's PID file rather
+    # than probing the network — same source-of-truth as `kestrel stop`.
+    if _agent_appears_running(project_dir, args.agent_name, agents[args.agent_name]):
+        print(
+            f"error: agent '{args.agent_name}' appears to be running. "
+            f"Run `kestrel stop {args.agent_name}` first to avoid DB corruption.",
+            file=sys.stderr,
+        )
+        return 2
+
+    result = asyncio.run(
+        reanchor_constitution(
+            agent_name=args.agent_name,
+            agent_dir=agent_dir,
+            canonical_path=canonical,
+            force=args.force,
+            authorization=f"kestrel constitution reanchor (cli, {args.agent_name})",
+        )
+    )
+
+    if result.error:
+        print(f"error: {result.error}", file=sys.stderr)
+        return 1
+    if result.unchanged:
+        print(
+            f"{result.agent_name}: already anchored to current constitution "
+            f"({result.new_hash[:12]}…) — nothing to do."
+        )
+        return 0
+    if result.drift_unforced:
+        print(
+            f"{result.agent_name}: constitution drift detected.\n"
+            f"  Stored: {result.old_hash[:12]}…\n"
+            f"  File:   {result.new_hash[:12]}… ({result.canonical_path})\n"
+            f"\n"
+            f"Re-run with --force to update the agent's anchor. "
+            f"The DB will be backed up to "
+            f"{result.db_path.name}.backup-<timestamp> before any write."
+        )
+        return 1
+    # Reanchored.
+    print(
+        f"{result.agent_name}: reanchored.\n"
+        f"  Old: {result.old_hash[:12]}…\n"
+        f"  New: {result.new_hash[:12]}…\n"
+        f"  Source:  {result.canonical_path}\n"
+        f"  Backup:  {result.backup_path}"
+    )
+    return 0
+
+
+def _agent_appears_running(project_dir, agent_name, agent_cfg) -> bool:
+    """Best-effort check that the agent process isn't holding the DB."""
+    try:
+        from kestrel_sovereign.rookery.process_manager import ProcessManager
+
+        resolved_dir = (project_dir / agent_cfg.data_dir).resolve()
+        pid_file = ProcessManager.agent_pid_file(resolved_dir)
+        pid = ProcessManager.read_pid(pid_file)
+        if pid is None:
+            return False
+        return ProcessManager.is_process_running(pid)
+    except Exception:
+        # If we can't tell, err on the side of letting the user proceed
+        # — they get a clear error from the storage layer if it's locked.
+        return False
+
+
 def cmd_setup(args) -> int:
     """Run the setup wizard."""
     from kestrel_sovereign.setup.context import Flow
@@ -1505,6 +1615,30 @@ def build_parser() -> argparse.ArgumentParser:
         help="Move existing .env and kestrel.toml aside before regenerating",
     )
 
+    # kestrel constitution {reanchor}
+    constitution_p = subparsers.add_parser(
+        "constitution",
+        help="Constitution lifecycle (reanchor an agent to the current file)",
+    )
+    constitution_sub = constitution_p.add_subparsers(dest="constitution_command")
+
+    reanchor_p = constitution_sub.add_parser(
+        "reanchor",
+        help="Reanchor agent to the current canonical KESTREL_CONSTITUTION.md",
+    )
+    reanchor_p.add_argument(
+        "--agent-name", required=True,
+        help="Name of the agent (must be in rookery.toml)",
+    )
+    reanchor_p.add_argument(
+        "--force", action="store_true",
+        help="Required to actually write. Without --force, drift is reported but the DB is untouched.",
+    )
+    reanchor_p.add_argument(
+        "--constitution-path", default=None,
+        help="Override the canonical constitution path (defaults to package's KESTREL_CONSTITUTION.md)",
+    )
+
     # kestrel config <agent_dir>
     config_p = subparsers.add_parser("config", help="Show/edit agent config")
     config_p.add_argument("agent_dir", nargs="?", help="Agent directory")
@@ -1584,6 +1718,7 @@ def main() -> int:
         "health": cmd_health,
         "doctor": cmd_doctor,
         "setup": cmd_setup,
+        "constitution": cmd_constitution,
         "config": cmd_config,
         "feature": cmd_feature,
         "skills": cmd_skills,

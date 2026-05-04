@@ -214,17 +214,11 @@ def _check_constitution_drift(
                 f"{name}: constitution anchored to current file ({stored_hash[:12]}…)"
             )
         else:
-            # Don't name a remediation command that doesn't exist yet.
-            # Drift detection ships before reanchor (the writer touches
-            # five DB locations + RAG index — its own PR with proper
-            # integration tests). The message tells the user exactly
-            # what diverged so they can act; once the reanchor CLI
-            # lands, this hint should be replaced with the command.
             report.fail.append(
                 f"{name}: constitution drift — stored {stored_hash[:12]}… "
                 f"does not match {canonical} ({on_disk_hash[:12]}…). "
-                f"Agent is anchored to an older copy; reanchor support "
-                f"is planned but not yet shipped."
+                f"Run `kestrel constitution reanchor --agent-name {name} --force` "
+                f"to update (DB is backed up first)."
             )
 
 
