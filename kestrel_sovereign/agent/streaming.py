@@ -1,7 +1,8 @@
 """Streaming response handling for Kestrel Agent."""
+import asyncio
 import logging
 import time
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 from kestrel_sovereign.hooks import HookEvent, HookInput, PermissionDecision
 from kestrel_sovereign.llm.adapter import LLMResponse
@@ -282,12 +283,16 @@ class StreamingMixin:
             tool_final_text = pre_tool_text + post_tool_text
             tool_final_text = await self._fire_post_response_hook(tool_final_text, session_id)
             meta = {'tool_events': tool_events} if tool_events else None
-            await self.privacy_agent.add_conversation("assistant", tool_final_text, metadata=meta, session_id=session_id)
+            await self._persist_assistant_turn_safely(
+                tool_final_text, metadata=meta, session_id=session_id
+            )
         else:
             # No tool calls - text was already streamed above
             final_text = "".join(full_response)
             final_text = await self._fire_post_response_hook(final_text, session_id)
-            await self.privacy_agent.add_conversation("assistant", final_text, session_id=session_id)
+            await self._persist_assistant_turn_safely(
+                final_text, metadata=None, session_id=session_id
+            )
 
         # Fire STOP hook (streaming response cycle complete)
         hooks_manager = getattr(self, "hooks_manager", None)
@@ -299,6 +304,64 @@ class StreamingMixin:
             await hooks_manager.execute_hooks_parallel(
                 HookEvent.STOP, hook_input
             )
+
+    async def _persist_assistant_turn_safely(
+        self,
+        text: str,
+        metadata: Optional[Dict[str, Any]] = None,
+        session_id: Optional[str] = None,
+    ) -> None:
+        """Persist the assistant turn under cancellation-safe handling.
+
+        FastAPI's ``StreamingResponse`` cancels the wrapping async
+        generator on client disconnect — browser nav, agent switch,
+        network blip. Without protection, a disconnect after the last
+        chunk is yielded but BEFORE this insert completes would lose
+        the assistant turn entirely: the user already saw the response,
+        but the next turn's history loader can't find it. Surfaced by
+        Meridian's "I don't see my own quantum response" report.
+
+        ``asyncio.shield`` keeps the persist task alive even when the
+        outer generator is cancelled. The exception handler logs and
+        emits a metric so production can detect this happening at all.
+        We never re-raise — the request is already over from the
+        client's perspective; raising here would only mask the original
+        cancellation.
+        """
+        try:
+            await asyncio.shield(
+                self.privacy_agent.add_conversation(
+                    "assistant", text, metadata=metadata, session_id=session_id
+                )
+            )
+        except asyncio.CancelledError:
+            # Outer task cancelled mid-persist. shield() means the
+            # add_conversation coroutine keeps running to completion in
+            # the background — we just don't get to await it. Re-raise
+            # so the cancellation propagates correctly.
+            raise
+        except Exception as exc:
+            logging.error(
+                "Failed to persist assistant turn (session_id=%s): %s",
+                session_id, exc, exc_info=True,
+            )
+            try:
+                await self.observability_store.log_metric(
+                    agent_name=self.did,
+                    metric_name="assistant_turn_persist_failed",
+                    metric_value=1.0,
+                    metadata={
+                        "session_id": session_id or "",
+                        "error_type": type(exc).__name__,
+                        "error_msg": str(exc)[:500],
+                    },
+                )
+            except Exception:
+                # Telemetry failures must never propagate from a
+                # post-response persist path. If observability is also
+                # broken, the logged ERROR above is the last line of
+                # defense.
+                pass
 
     async def _fire_post_response_hook(self, response_text: str, session_id: str = None) -> str:
         """Fire POST_RESPONSE hooks on completed response text.
