@@ -65,10 +65,18 @@ from kestrel_sovereign.security.verify_policy import VerifyPolicy
 
 @pytest.fixture(scope="module")
 def legacy_root():
-    """Legacy ECDSA-only root identity (Kestrel #1 style)."""
+    """Legacy ECDSA-only root identity (Kestrel #1 style).
+
+    DID derived from the keypair via ``public_key_to_ethereum_address``
+    so the new ``verify_did_binding`` check from #963 passes.
+    """
+    from kestrel_sovereign.inception_service import (
+        public_key_to_ethereum_address,
+    )
     secp = Secp256k1Suite()
     kp = secp.generate_keypair()
-    did = "did:pkh:eip155:1:0xKESTRELONE"
+    address = public_key_to_ethereum_address(kp.public_key)
+    did = f"did:pkh:eip155:1:{address}"
     vms = build_verification_methods(did, [(secp, kp.public_key)])
     return {
         "did": did,
@@ -191,6 +199,33 @@ def test_build_chain_rejects_temporal_regression(first_succession, successor_v2,
     )
     with pytest.raises(SuccessionChainError, match="temporal monotonicity"):
         build_chain([first_succession, backward])
+
+
+def test_build_chain_rejects_vm_linkage_mismatch(
+    first_succession, successor_v1, successor_v2,
+):
+    """P1 codex regression: chain linkage must check that statement[i+1]'s
+    predecessor_verification_methods exactly equal statement[i]'s
+    successor_verification_methods. Otherwise an attacker could fork
+    the chain by claiming the right predecessor_did but embedding their
+    OWN keys; the per-statement DID-binding check on a did:web
+    predecessor can't catch that without resolution.
+    """
+    # Build a "rogue" second statement that claims the right predecessor
+    # DID (successor_v1) but smuggles in successor_v2's VMs as the
+    # predecessor — an attacker substituting their own keys.
+    rogue = SuccessionStatement(
+        predecessor_did=successor_v1["did"],  # correct DID
+        successor_did=successor_v2["did"],
+        effective_from="2027-01-01T00:00:00+00:00",
+        reason="forked vms",
+        # WRONG: should be successor_v1's vms (per chain linkage), but
+        # the attacker embeds someone else's
+        predecessor_verification_methods=successor_v2["vms"],
+        successor_verification_methods=successor_v2["vms"],
+    )
+    with pytest.raises(SuccessionChainError, match="VM linkage broken"):
+        build_chain([first_succession, rogue])
 
 
 def test_build_chain_rejects_self_succession(legacy_root):
