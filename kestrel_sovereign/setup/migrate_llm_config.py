@@ -11,11 +11,15 @@ from __future__ import annotations
 import difflib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
+
+import toml
 
 from .toml_file import read_toml, write_toml
 
-Action = Literal["migrated", "no_source", "diverged", "already_clean"]
+Action = Literal[
+    "migrated", "no_source", "diverged", "already_clean", "parse_error",
+]
 
 
 @dataclass(frozen=True)
@@ -26,6 +30,7 @@ class MigrationResult:
     bak_path: Path | None = None
     backup_path: Path | None = None
     diff: str | None = None
+    error: str | None = None
 
 
 def migrate_llm_config(
@@ -37,6 +42,9 @@ def migrate_llm_config(
 
     Outcomes:
         ``no_source`` — No standalone file present. Exit 0; nothing to do.
+        ``parse_error`` — Source file is malformed TOML. The source is
+            **preserved untouched** so the user can fix it; ``kestrel.toml``
+            is also untouched. ``error`` carries the parser message.
         ``already_clean`` — Source content already lives in ``[llm]``
             byte-for-byte. Source is renamed to ``.bak``; ``kestrel.toml``
             is left untouched (no backup taken).
@@ -58,7 +66,22 @@ def migrate_llm_config(
             source_path=source,
         )
 
-    source_data = read_toml(source)
+    # Strict parse on the source. read_toml() tolerates malformed TOML by
+    # returning {}, which is right for runtime config (degrade gracefully
+    # rather than refuse to boot) but wrong for a migration: an empty dict
+    # would make a corrupted source look identical to a missing [llm]
+    # section, the source would get renamed to .bak with a "success"
+    # message, and the user's only LLM config would silently vanish.
+    try:
+        source_data = _read_source_strict(source)
+    except _SourceParseError as exc:
+        return MigrationResult(
+            action="parse_error",
+            kestrel_toml_path=kestrel_toml,
+            source_path=source,
+            error=str(exc),
+        )
+
     existing = read_toml(kestrel_toml)
     existing_llm = existing.get("llm", {}) if isinstance(existing, dict) else {}
 
@@ -88,6 +111,27 @@ def migrate_llm_config(
         bak_path=bak_path,
         backup_path=write_result.backup_path,
     )
+
+
+class _SourceParseError(Exception):
+    """Raised when llm_config.toml exists but cannot be parsed as TOML."""
+
+
+def _read_source_strict(path: Path) -> dict[str, Any]:
+    """Parse ``path`` as TOML and raise on failure.
+
+    Distinct from :func:`read_toml`, which is deliberately tolerant for
+    runtime config loading. The migration tool needs to know the
+    difference between *empty* and *broken*.
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise _SourceParseError(f"cannot read {path}: {exc}") from exc
+    try:
+        return toml.loads(text)
+    except toml.TomlDecodeError as exc:
+        raise _SourceParseError(str(exc)) from exc
 
 
 def _rename_to_bak(source: Path) -> Path:

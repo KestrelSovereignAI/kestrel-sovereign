@@ -926,6 +926,17 @@ def cmd_migrate_llm_config(args) -> int:
         )
         return 0
 
+    if result.action == "parse_error":
+        print(
+            f"error: {result.source_path.name} is not valid TOML.\n"
+            f"  {result.error}\n"
+            f"\n"
+            f"The source file has NOT been touched. Fix the syntax error "
+            f"and re-run `kestrel migrate-llm-config`.",
+            file=sys.stderr,
+        )
+        return 1
+
     if result.action == "diverged":
         print(
             f"error: kestrel.toml [llm] differs from {result.source_path.name}.\n"

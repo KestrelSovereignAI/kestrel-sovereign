@@ -79,6 +79,24 @@ def test_already_clean_exits_zero(tmp_path, capsys):
     assert (tmp_path / "llm_config.toml.bak").exists()
 
 
+def test_parse_error_exits_one_and_preserves_source(tmp_path, capsys):
+    """Malformed source: stderr error, exit 1, source file untouched."""
+    source = tmp_path / "llm_config.toml"
+    original = "[broken\nnot = valid\n"
+    source.write_text(original)
+
+    args = _parse(["migrate-llm-config", "--project-dir", str(tmp_path)])
+    rc = cmd_migrate_llm_config(args)
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "not valid TOML" in err
+    assert "NOT been touched" in err
+    # Source preserved verbatim.
+    assert source.read_text() == original
+    assert not (tmp_path / "llm_config.toml.bak").exists()
+
+
 def test_force_overrides_divergence(tmp_path, capsys):
     (tmp_path / "kestrel.toml").write_text(toml.dumps({
         "llm": {"route_priority": ["openai:api"]},

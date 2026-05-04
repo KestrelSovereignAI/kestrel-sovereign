@@ -149,16 +149,46 @@ def test_existing_bak_does_not_get_clobbered(tmp_path):
     assert (tmp_path / "llm_config.toml.bak").read_text() == "# from a prior migration\n"
 
 
-def test_corrupted_source_treated_as_empty(tmp_path):
-    """read_toml returns {} on parse failure. A corrupted llm_config.toml
-    should produce a 'migrated' result with [llm] = {} when kestrel.toml
-    has no [llm] section yet — we don't want the migration tool to crash
-    on broken input; the source is preserved as .bak for human inspection."""
-    (tmp_path / "llm_config.toml").write_text("[broken\nnot = valid\n")
+def test_malformed_source_returns_parse_error_and_preserves_source(tmp_path):
+    """Malformed source TOML must NOT be silently treated as an empty
+    dict. ``read_toml`` is deliberately tolerant for runtime config (so a
+    bad file doesn't break boot), but the migration tool needs strict
+    parsing — otherwise a corrupted llm_config.toml + missing [llm] in
+    kestrel.toml both look like {}, and the source gets renamed to .bak
+    with a misleading 'success' message, silently destroying the user's
+    only LLM config."""
+    source = tmp_path / "llm_config.toml"
+    original = "[broken\nnot = valid\n"
+    source.write_text(original)
 
     result = migrate_llm_config(tmp_path)
-    # With existing_llm == {} == source_data == {}, this is "already_clean"
-    # rather than "migrated". Either way, the broken source is moved aside.
-    assert result.action in {"already_clean", "migrated"}
-    assert result.bak_path is not None and result.bak_path.exists()
-    assert not (tmp_path / "llm_config.toml").exists()
+
+    assert result.action == "parse_error"
+    assert result.error  # carries the parser message
+    # Source file MUST be preserved verbatim for the user to fix.
+    assert source.exists()
+    assert source.read_text() == original
+    assert not (tmp_path / "llm_config.toml.bak").exists()
+    # kestrel.toml must not be created.
+    assert not (tmp_path / "kestrel.toml").exists()
+
+
+def test_malformed_source_does_not_touch_existing_kestrel_toml(tmp_path):
+    """If the user already has a populated kestrel.toml [llm] and the
+    legacy source is broken, we must NOT touch either file."""
+    pre_kestrel = toml.dumps({
+        "llm": {"route_priority": ["openai:api"]},
+        "agent": {"name": "X"},
+    })
+    (tmp_path / "kestrel.toml").write_text(pre_kestrel)
+    source = tmp_path / "llm_config.toml"
+    original = "[broken\nnot = valid\n"
+    source.write_text(original)
+
+    result = migrate_llm_config(tmp_path, force=True)  # even with --force
+
+    assert result.action == "parse_error"
+    # Both files untouched.
+    assert source.read_text() == original
+    assert (tmp_path / "kestrel.toml").read_text() == pre_kestrel
+    assert not (tmp_path / "llm_config.toml.bak").exists()
