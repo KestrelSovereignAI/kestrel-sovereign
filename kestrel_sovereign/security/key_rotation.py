@@ -76,40 +76,65 @@ def _hash_key(key: str) -> str:
     return hashlib.sha256(key.encode()).hexdigest()[:16]
 
 
+def _master_bytes_from_key(key: str) -> bytes:
+    """Resolve a raw key string to its 44-byte URL-safe-base64 master form.
+
+    Mirrors ``get_master_key_bytes()`` exactly so per-agent HKDF derivations
+    stay identical across runtime and rotation. If the input is a
+    Fernet-shaped key (44-byte URL-safe base64), it's used directly;
+    otherwise it's treated as a passphrase and SHA-256-derived. Any
+    drift between this function and ``get_master_key_bytes`` corrupts
+    every per-agent row during rotation.
+    """
+    from cryptography.fernet import Fernet  # shape probe only
+    import base64
+    try:
+        Fernet(key)  # raises if not a real Fernet-shaped key
+    except Exception:
+        digest = hashlib.sha256(key.encode("utf-8")).digest()
+        return base64.urlsafe_b64encode(digest)
+    return key.encode("ascii") if isinstance(key, str) else key
+
+
+def _derive_agent_cipher(master: bytes, agent_id: str) -> "AEADCipher":
+    """Derive a per-agent ``AEADCipher`` from master bytes and agent_id.
+
+    Mirrors ``get_agent_fernet`` byte-for-byte (HKDF-SHA256 with
+    ``salt=agent_id`` and ``info=b"kestrel-agent-v1"``). Used by rotation
+    to derive matching ciphers for both old and new masters when walking
+    per-agent encrypted rows in ``conversation_history``.
+    """
+    import base64
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+    from cryptography.hazmat.primitives import hashes
+    hkdf = HKDF(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=agent_id.encode("utf-8"),
+        info=b"kestrel-agent-v1",
+    )
+    derived = hkdf.derive(master)
+    return AEADCipher(base64.urlsafe_b64encode(derived))
+
+
 def _validate_key(key: str) -> "AEADCipher":
     """Validate that a key can be used as an AEADCipher key.
 
     The key-derivation logic here MUST match ``get_fernet()`` exactly: any
     divergence means rotation encrypts new rows with a different key than
-    the runtime decrypts with — the post-swap result is rotated rows that
-    can never be read again.
+    the runtime decrypts with — rotated rows become unreadable after the
+    user swaps ``KESTREL_DATA_KEY``.
 
-    Logic, in order:
+    Logic mirrors ``get_fernet()``:
 
     1. If the input is a real Fernet-shaped key (44-byte URL-safe base64
        encoding 32 raw bytes), use it directly. ``Fernet(key)`` is the
-       authoritative shape detector — note that ``AEADCipher(key)`` would
-       happily accept *any* 32-byte input (e.g. a 32-character passphrase)
-       as a raw AES key, which is a different, incompatible key. We
-       therefore must NOT use ``AEADCipher(key)`` as the shape probe.
-
-    2. Otherwise treat the input as a passphrase and derive the key via
-       SHA-256, matching the runtime ``get_fernet()`` passphrase branch.
-
-    Returns an ``AEADCipher`` (drop-in for the legacy ``Fernet`` return
-    type; AES-256-GCM with Fernet read-compat per Wave 0C of the Quantum
-    Hardening epic).
+       authoritative shape detector — ``AEADCipher(key)`` would accept
+       any 32-byte input (e.g. a 32-character passphrase) as a raw AES
+       key, which would diverge from ``get_fernet()``'s passphrase path.
+    2. Otherwise treat the input as a passphrase and derive via SHA-256.
     """
-    from cryptography.fernet import Fernet  # shape probe only, never used to encrypt
-    import base64
-
-    try:
-        Fernet(key)  # raises if not a real Fernet-shaped key
-    except Exception:
-        # Passphrase path — must match get_fernet() exactly
-        digest = hashlib.sha256(key.encode('utf-8')).digest()
-        return AEADCipher(base64.urlsafe_b64encode(digest))
-    return AEADCipher(key)
+    return AEADCipher(_master_bytes_from_key(key))
 
 
 class KeyRotationService:
@@ -191,19 +216,16 @@ class KeyRotationService:
         if not new_key:
             raise ValueError("No new key provided")
 
-        # Validate new key
-        new_fernet = _validate_key(new_key)
+        # Validate the new key (raises if it can't be coerced to a usable cipher)
+        _validate_key(new_key)
+        new_master = _master_bytes_from_key(new_key)
 
         # Get current key
-        old_fernet = get_fernet()
-        if not old_fernet:
-            raise ValueError("No current key configured (KESTREL_DATA_KEY)")
-
-        # Get current key for hashing
         from kestrel_sovereign.security.encryption import _get_data_key
         old_key = _get_data_key()
         if not old_key:
-            raise ValueError("Cannot retrieve current key for hashing")
+            raise ValueError("No current key configured (KESTREL_DATA_KEY)")
+        old_master = _master_bytes_from_key(old_key)
 
         # Create rotation record
         rotation = RotationRecord(
@@ -227,7 +249,7 @@ class KeyRotationService:
         )
 
         self._track_rotation_task(
-            self._execute_rotation(rotation, old_fernet, new_fernet),
+            self._execute_rotation(rotation, old_master, new_master),
             rotation.id,
         )
 
@@ -235,23 +257,22 @@ class KeyRotationService:
 
     async def get_status(self, rotation_id: str) -> Optional[RotationRecord]:
         """Get the status of a rotation operation."""
-        async with self.storage.database.execute(
+        row = await self.storage.database.fetchone(
             "SELECT * FROM key_rotations WHERE id = ?",
-            (rotation_id,)
-        ) as cursor:
-            row = await cursor.fetchone()
-            if row:
-                return RotationRecord(
-                    id=row[0],
-                    started_at=datetime.fromisoformat(row[1]),
-                    completed_at=datetime.fromisoformat(row[2]) if row[2] else None,
-                    old_key_hash=row[3],
-                    new_key_hash=row[4],
-                    status=RotationStatus(row[5]),
-                    records_processed=row[6],
-                    records_total=row[7],
-                    error_message=row[8],
-                )
+            (rotation_id,),
+        )
+        if row:
+            return RotationRecord(
+                id=row[0],
+                started_at=datetime.fromisoformat(row[1]),
+                completed_at=datetime.fromisoformat(row[2]) if row[2] else None,
+                old_key_hash=row[3],
+                new_key_hash=row[4],
+                status=RotationStatus(row[5]),
+                records_processed=row[6],
+                records_total=row[7],
+                error_message=row[8],
+            )
         return None
 
     async def resume_rotation(self, rotation_id: str, key_file: str) -> bool:
@@ -277,12 +298,16 @@ class KeyRotationService:
             raise ValueError("Key does not match rotation's new key")
 
         # Continue from where we left off
-        old_fernet = get_fernet()
-        new_fernet = _validate_key(new_key)
+        from kestrel_sovereign.security.encryption import _get_data_key
+        old_key = _get_data_key()
+        if not old_key:
+            raise ValueError("No current key configured (KESTREL_DATA_KEY)")
+        old_master = _master_bytes_from_key(old_key)
+        new_master = _master_bytes_from_key(new_key)
 
         self._current_rotation = rotation
         self._track_rotation_task(
-            self._execute_rotation(rotation, old_fernet, new_fernet),
+            self._execute_rotation(rotation, old_master, new_master),
             rotation.id,
         )
 
@@ -321,29 +346,73 @@ class KeyRotationService:
         """
         await self.drain_rotations(cancel=True)
 
+    # ------------------------------------------------------------------
+    # Encrypted-table registry
+    # ------------------------------------------------------------------
+    #
+    # Tables that store encrypted content the rotation must walk. Names
+    # match the production storage layer (``conversation_history`` —
+    # NOT the legacy ``conversations`` — and ``files``). Adding a new
+    # encrypted table elsewhere in the codebase requires a one-line
+    # entry here so the rotation actually walks it; the previous
+    # hardcoded list silently drifted from production for years.
+
+    # Each entry declares:
+    # - ``agent_id_column``: per-agent HKDF table (set) vs global (None).
+    #   Per-agent rows are encrypted under
+    #   ``HKDF(master, salt=agent_id, info=b"kestrel-agent-v1")``; rotation
+    #   MUST derive the matching cipher per row, or the global cipher fails
+    #   to decrypt and rows are silently skipped — corruption on key swap.
+    # - ``is_text_column``: TEXT (True) vs BLOB/BYTEA (False). SQL-side
+    #   ``LIKE 'gAAAAA%'`` works on TEXT and on SQLite's typeless BLOB but
+    #   does NOT compile against PostgreSQL BYTEA. BLOB tables therefore
+    #   route through a Python-side prefix filter instead of SQL LIKE.
+    ENCRYPTED_TABLES: List[Dict[str, Any]] = [
+        {
+            "table": "conversation_history",
+            "content_column": "content",
+            "id_column": "id",
+            "agent_id_column": "agent_id",
+            "is_text_column": True,
+        },
+        {
+            "table": "files",
+            "content_column": "content",
+            "id_column": "content_hash",
+            "agent_id_column": None,
+            "is_text_column": False,  # BLOB/BYTEA — Python-side filter
+        },
+    ]
+
+    # Prefixes that mark an encrypted row, used by the BLOB Python-side filter.
+    _ENCRYPTED_PREFIXES = (b"gAAAAA", b"KSAv2:")
+
     async def _execute_rotation(
         self,
         rotation: RotationRecord,
-        old_fernet: "AEADCipher",
-        new_fernet: "AEADCipher"
+        old_master: bytes,
+        new_master: bytes,
     ):
-        """Execute the actual key rotation."""
-        try:
-            # Rotate conversation messages
-            await self._rotate_table(
-                rotation, old_fernet, new_fernet,
-                table="conversations",
-                content_column="content",
-                id_column="rowid"
-            )
+        """Execute the actual key rotation.
 
-            # Rotate file store
-            await self._rotate_table(
-                rotation, old_fernet, new_fernet,
-                table="files",
-                content_column="content",
-                id_column="file_id"
-            )
+        Takes 44-byte URL-safe-base64 master keys for both sides so each
+        per-agent row can have its HKDF-derived cipher built on demand.
+        Same-key (master-equal) runs short-circuit ``LIKE 'KSAv2:%'``
+        rows since they're already in v2 — useful for the
+        ``upgrade_to_aead`` path.
+        """
+        same_key = old_master == new_master
+        try:
+            for entry in self.ENCRYPTED_TABLES:
+                await self._rotate_table(
+                    rotation, old_master, new_master,
+                    table=entry["table"],
+                    content_column=entry["content_column"],
+                    id_column=entry["id_column"],
+                    agent_id_column=entry.get("agent_id_column"),
+                    is_text_column=entry.get("is_text_column", True),
+                    skip_v2=same_key,
+                )
 
             # Rotation complete
             rotation.status = RotationStatus.COMPLETED
@@ -365,115 +434,281 @@ class KeyRotationService:
     async def _rotate_table(
         self,
         rotation: RotationRecord,
-        old_fernet: "AEADCipher",
-        new_fernet: "AEADCipher",
+        old_master: bytes,
+        new_master: bytes,
         table: str,
         content_column: str,
         id_column: str,
+        agent_id_column: Optional[str] = None,
+        is_text_column: bool = True,
+        skip_v2: bool = False,
     ):
-        """Rotate encryption for a single table."""
-        # Get records not yet rotated
-        already_rotated = set()
-        async with self.storage.database.execute(
-            "SELECT record_id FROM rotation_progress WHERE rotation_id = ? AND table_name = ?",
-            (rotation.id, table)
-        ) as cursor:
-            async for row in cursor:
-                already_rotated.add(row[0])
+        """Rotate encryption for a single table.
 
-        # Validate identifiers for safe SQL interpolation
+        Handles three orthogonal correctness concerns from the #936 review:
+
+        1. **Per-agent HKDF rows.** When ``agent_id_column`` is set, each
+           row's cipher pair is derived from its ``agent_id`` and the
+           old/new masters. This is what ``conversation_history`` needs;
+           a global-cipher rotation would silently fail to decrypt these
+           rows and lose them on the post-rotation key swap.
+        2. **BLOB vs TEXT content columns.** ``files.content`` is BLOB,
+           ``conversation_history.content`` is TEXT. Read both as either
+           ``bytes`` or ``str``, normalize for the cipher, and write back
+           in the same shape we read.
+        3. **UPDATE + progress INSERT atomicity.** Wrapped in a
+           transaction so a crash between them cannot leave the row
+           rewritten under ``new_master`` with ``rotation_progress``
+           silently missing it.
+
+        ``skip_v2=True`` (set by ``_execute_rotation`` when masters are
+        equal) narrows the SELECT to ``gAAAAA%`` only — same-key upgrade
+        runs do not need to revisit already-v2 rows.
+        """
+        already_rotated_rows = await self.storage.database.fetchall(
+            "SELECT record_id FROM rotation_progress WHERE rotation_id = ? AND table_name = ?",
+            (rotation.id, table),
+        )
+        already_rotated = {row[0] for row in already_rotated_rows}
+
         safe_tbl = safe_table_name(table)
         safe_id_col = safe_column_name(id_column)
         safe_content_col = safe_column_name(content_column)
+        safe_agent_col = safe_column_name(agent_id_column) if agent_id_column else None
 
-        # Get all encrypted rows. Match both legacy Fernet (`gAAAAA%`) and v2
-        # AEAD (`KSAv2:%`) prefixes — Wave 0C (#915) made AEADCipher emit v2
-        # tokens for new writes, so a filter that only catches `gAAAAA%` would
-        # silently leave any post-Wave-0C row encrypted under the old key after
-        # rotation, creating permanent ciphertext rubble once KESTREL_DATA_KEY
-        # is swapped.
-        async with self.storage.database.execute(
-            f"SELECT {safe_id_col}, {safe_content_col} FROM {safe_tbl} "
-            f"WHERE {safe_content_col} LIKE 'gAAAAA%' "
-            f"   OR {safe_content_col} LIKE 'KSAv2:%'"
-        ) as cursor:
-            rows = await cursor.fetchall()
+        if safe_agent_col:
+            select_cols = f"{safe_id_col}, {safe_content_col}, {safe_agent_col}"
+        else:
+            select_cols = f"{safe_id_col}, {safe_content_col}"
 
-        for record_id, encrypted_content in rows:
+        # SQL-LIKE prefix filter only works for TEXT columns. PostgreSQL has
+        # no implicit text↔BYTEA cast, so a ``LIKE 'gAAAAA%'`` predicate
+        # against ``files.content`` (BLOB → BYTEA) does not compile. BLOB
+        # tables read all rows and apply the prefix check in Python below.
+        if is_text_column:
+            if skip_v2:
+                where = f"{safe_content_col} LIKE 'gAAAAA%'"
+            else:
+                where = (
+                    f"{safe_content_col} LIKE 'gAAAAA%' "
+                    f"   OR {safe_content_col} LIKE 'KSAv2:%'"
+                )
+            rows = await self.storage.database.fetchall(
+                f"SELECT {select_cols} FROM {safe_tbl} WHERE {where}"
+            )
+        else:
+            all_rows = await self.storage.database.fetchall(
+                f"SELECT {select_cols} FROM {safe_tbl}"
+            )
+            rows = []
+            wanted_prefixes: tuple
+            if skip_v2:
+                wanted_prefixes = (b"gAAAAA",)
+            else:
+                wanted_prefixes = self._ENCRYPTED_PREFIXES
+            for row in all_rows:
+                content = row[1]
+                if isinstance(content, str):
+                    content_bytes = content.encode("ascii", errors="ignore")
+                elif isinstance(content, (bytes, bytearray, memoryview)):
+                    content_bytes = bytes(content)
+                else:
+                    continue
+                if any(content_bytes.startswith(p) for p in wanted_prefixes):
+                    rows.append(row)
+
+        # Pre-build the global cipher pair; per-agent ciphers are derived per row
+        old_global = AEADCipher(old_master)
+        new_global = AEADCipher(new_master)
+
+        # Memoize per-agent cipher pairs to avoid re-running HKDF for every row
+        agent_cipher_cache: Dict[str, tuple] = {}
+
+        consecutive_failures = 0
+        for row in rows:
+            record_id = row[0]
+            encrypted_content = row[1]
+            agent_id = row[2] if safe_agent_col else None
+
             record_id_str = str(record_id)
             if record_id_str in already_rotated:
                 continue
 
+            # Pick the right NEW cipher (encrypt side). For per-agent tables
+            # we always write under the per-agent HKDF — matches production's
+            # ``add_conversation`` (key_version >= 1).
+            if agent_id and safe_agent_col:
+                pair = agent_cipher_cache.get(agent_id)
+                if pair is None:
+                    pair = (
+                        _derive_agent_cipher(old_master, agent_id),
+                        _derive_agent_cipher(new_master, agent_id),
+                    )
+                    agent_cipher_cache[agent_id] = pair
+                old_agent_cipher, new_cipher = pair
+                # Decrypt-side fallback list: per-agent first, then global —
+                # matches ``_decrypt_with_fallback`` in async_conversation_store.
+                # This handles mixed corpora where some rows were written with
+                # the global cipher (key_version 0 / pre-v1).
+                decrypt_candidates = [old_agent_cipher, old_global]
+            else:
+                new_cipher = new_global
+                decrypt_candidates = [old_global]
+
+            # Normalize bytes/str — file rows are BLOB, conversation rows TEXT
+            was_str = isinstance(encrypted_content, str)
+            ct_bytes = encrypted_content.encode() if was_str else encrypted_content
+
             try:
-                # Decrypt with old key
-                decrypted = old_fernet.decrypt(encrypted_content.encode())
+                decrypted = None
+                last_err: Optional[Exception] = None
+                for cand in decrypt_candidates:
+                    try:
+                        decrypted = cand.decrypt(ct_bytes)
+                        break
+                    except Exception as inner:
+                        last_err = inner
+                if decrypted is None:
+                    raise last_err if last_err else RuntimeError("no decrypt candidate")
 
-                # Re-encrypt with new key
-                new_encrypted = new_fernet.encrypt(decrypted).decode()
+                new_ct_bytes = new_cipher.encrypt(decrypted)
+                new_value = new_ct_bytes.decode() if was_str else new_ct_bytes
 
-                # Update record
-                await self.storage.database.execute(
-                    f"UPDATE {safe_tbl} SET {safe_content_col} = ? WHERE {safe_id_col} = ?",
-                    (new_encrypted, record_id)
-                )
-
-                # Mark as rotated
-                await self.storage.database.execute(
-                    "INSERT INTO rotation_progress (rotation_id, table_name, record_id, rotated_at) VALUES (?, ?, ?, ?)",
-                    (rotation.id, table, record_id_str, datetime.now(timezone.utc).isoformat())
-                )
+                # UPDATE + progress INSERT atomic
+                async with self.storage.database.transaction():
+                    await self.storage.database.execute(
+                        f"UPDATE {safe_tbl} SET {safe_content_col} = ? "
+                        f"WHERE {safe_id_col} = ?",
+                        (new_value, record_id),
+                    )
+                    await self.storage.database.execute(
+                        "INSERT INTO rotation_progress "
+                        "(rotation_id, table_name, record_id, rotated_at) "
+                        "VALUES (?, ?, ?, ?)",
+                        (
+                            rotation.id, table, record_id_str,
+                            datetime.now(timezone.utc).isoformat(),
+                        ),
+                    )
 
                 rotation.records_processed += 1
+                consecutive_failures = 0
 
-                # Update progress periodically
                 if rotation.records_processed % 100 == 0:
                     await self._save_rotation(rotation)
-                    logger.info(f"Rotation progress: {rotation.records_processed}/{rotation.records_total}")
+                    logger.info(
+                        f"Rotation progress: "
+                        f"{rotation.records_processed}/{rotation.records_total}"
+                    )
 
             except Exception as e:
-                logger.warning(f"Failed to rotate record {record_id} in {table}: {e}")
-                # Continue with other records
+                consecutive_failures += 1
+                logger.warning(
+                    f"Failed to rotate record {record_id} in {table} "
+                    f"(agent_id={agent_id}): {e}"
+                )
+                # Abort the run if the first 5 rows all fail — that smells
+                # like a key-derivation bug, not isolated row corruption.
+                # Keeps a regression like the #931 passphrase-derivation
+                # mismatch from silently completing with records_processed=0.
+                if consecutive_failures >= 5 and rotation.records_processed == 0:
+                    raise RuntimeError(
+                        f"Rotation aborting: first {consecutive_failures} rows "
+                        f"in {table} all failed to decrypt. Likely a key-"
+                        f"derivation drift between rotation and runtime. Last "
+                        f"error: {e}"
+                    ) from e
 
     async def _count_encrypted_records(self) -> int:
-        """Count total encrypted records across all tables."""
-        total = 0
+        """Count total encrypted records across all registered tables.
 
-        for table, column in [("conversations", "content"), ("files", "content")]:
+        TEXT columns use SQL ``LIKE``; BLOB columns (e.g. ``files.content`` →
+        BYTEA on PostgreSQL) cannot, because PostgreSQL has no implicit
+        text↔BYTEA cast. BLOB tables stream all rows and apply the prefix
+        check in Python.
+        """
+        total = 0
+        for entry in self.ENCRYPTED_TABLES:
+            table = entry["table"]
+            column = entry["content_column"]
+            is_text = entry.get("is_text_column", True)
             try:
                 safe_tbl = safe_table_name(table)
                 safe_col = safe_column_name(column)
-                async with self.storage.database.execute(
-                    f"SELECT COUNT(*) FROM {safe_tbl} "
-                    f"WHERE {safe_col} LIKE 'gAAAAA%' "
-                    f"   OR {safe_col} LIKE 'KSAv2:%'"
-                ) as cursor:
-                    row = await cursor.fetchone()
-                    if row:
-                        total += row[0]
+                if is_text:
+                    value = await self.storage.database.fetchval(
+                        f"SELECT COUNT(*) FROM {safe_tbl} "
+                        f"WHERE {safe_col} LIKE 'gAAAAA%' "
+                        f"   OR {safe_col} LIKE 'KSAv2:%'"
+                    )
+                    total += value or 0
+                else:
+                    rows = await self.storage.database.fetchall(
+                        f"SELECT {safe_col} FROM {safe_tbl}"
+                    )
+                    for (content,) in rows:
+                        if isinstance(content, str):
+                            cb = content.encode("ascii", errors="ignore")
+                        elif isinstance(content, (bytes, bytearray, memoryview)):
+                            cb = bytes(content)
+                        else:
+                            continue
+                        if any(cb.startswith(p) for p in self._ENCRYPTED_PREFIXES):
+                            total += 1
             except Exception as e:
                 # Table may not exist in this storage backend
                 logger.warning(f"Could not count encrypted data in {table}.{column}: {e}")
                 continue
-
         return total
+
+    # ------------------------------------------------------------------
+    # AEAD upgrade — same key, lift v1 Fernet rows to v2 AES-256-GCM
+    # ------------------------------------------------------------------
+
+    async def upgrade_to_aead(
+        self,
+        new_key: Optional[str] = None,
+        new_key_file: Optional[str] = None,
+    ) -> str:
+        """Re-encrypt every Fernet row as v2 AEAD without changing the key.
+
+        Wave 0C (#915) makes new writes emit ``KSAv2:`` v2 tokens; the
+        AEADCipher legacy-decrypt path keeps existing Fernet rows readable.
+        That is sufficient for ongoing operation, but a full corpus stays
+        on the weaker AES-128 primitive until each row is touched. This
+        method drives an eager re-encryption sweep using the current
+        ``KESTREL_DATA_KEY`` for both sides — the same key, just a
+        stronger format.
+
+        Optionally the caller can pass ``new_key`` / ``new_key_file`` to
+        rotate AND upgrade in one pass; otherwise the runtime key is used.
+
+        Returns the rotation id.
+        """
+        if new_key is None and new_key_file is None:
+            from kestrel_sovereign.security.encryption import _get_data_key
+            current = _get_data_key()
+            if not current:
+                raise ValueError("KESTREL_DATA_KEY is not configured")
+            new_key = current
+        return await self.start_rotation(new_key=new_key, new_key_file=new_key_file)
 
     async def _get_in_progress_rotation(self) -> Optional[RotationRecord]:
         """Check for any in-progress rotation."""
-        async with self.storage.database.execute(
+        row = await self.storage.database.fetchone(
             "SELECT * FROM key_rotations WHERE status = ?",
-            (RotationStatus.IN_PROGRESS.value,)
-        ) as cursor:
-            row = await cursor.fetchone()
-            if row:
-                return RotationRecord(
-                    id=row[0],
-                    started_at=datetime.fromisoformat(row[1]),
-                    old_key_hash=row[3],
-                    new_key_hash=row[4],
-                    status=RotationStatus(row[5]),
-                    records_processed=row[6],
-                    records_total=row[7],
-                )
+            (RotationStatus.IN_PROGRESS.value,),
+        )
+        if row:
+            return RotationRecord(
+                id=row[0],
+                started_at=datetime.fromisoformat(row[1]),
+                old_key_hash=row[3],
+                new_key_hash=row[4],
+                status=RotationStatus(row[5]),
+                records_processed=row[6],
+                records_total=row[7],
+            )
         return None
 
     async def _save_rotation(self, rotation: RotationRecord):
