@@ -45,7 +45,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Callable, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from kestrel_sovereign.identity.succession import (
     SuccessionStatement,
@@ -363,6 +363,7 @@ def verify_chain_signatures(
     predecessor_policy: Optional[VerifyPolicy] = None,
     successor_policy: VerifyPolicy = VerifyPolicy.HYBRID_REQUIRED,
     require_archival: bool = False,
+    trusted_archival_multibase: Optional[str] = None,
     did_web_resolver: Optional[Callable[[str], Mapping[str, object]]] = None,
 ) -> ChainSignaturesResult:
     """Verify every statement in the chain individually.
@@ -399,6 +400,7 @@ def verify_chain_signatures(
             predecessor_policy=predecessor_policy,
             successor_policy=successor_policy,
             require_archival=require_archival,
+            trusted_archival_multibase=trusted_archival_multibase,
             did_web_resolver=chain_resolver,
         )
         per_results.append(r)
@@ -513,6 +515,8 @@ def verify_artifact_against_chain(
     artifact_signatures: Sequence[Mapping[str, str]],
     policy: VerifyPolicy = VerifyPolicy.HYBRID_REQUIRED,
     verify_chain: bool = True,
+    require_archival: bool = False,
+    trusted_archival_multibase: Optional[str] = None,
     did_web_resolver: Optional[Callable[[str], Mapping]] = None,
 ) -> ArtifactChainVerifyResult:
     """Verify an artifact's signatures against the active identity at
@@ -621,7 +625,12 @@ def verify_artifact_against_chain(
     # validate chain signatures too (unless disabled for performance —
     # e.g. a hot-path verifier that already cached the chain result).
     if verify_chain:
-        chain_sigs = verify_chain_signatures(chain, did_web_resolver=did_web_resolver)
+        chain_sigs = verify_chain_signatures(
+            chain,
+            require_archival=require_archival,
+            trusted_archival_multibase=trusted_archival_multibase,
+            did_web_resolver=did_web_resolver,
+        )
     else:
         chain_sigs = ChainSignaturesResult(
             ok=True,
