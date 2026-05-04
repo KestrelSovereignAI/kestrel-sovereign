@@ -992,6 +992,49 @@ def test_did_binding_handles_non_mapping_vm(legacy_predecessor):
     assert not ok
 
 
+def test_adaptive_policy_promotes_hybrid_predecessor(hybrid_successor):
+    """Codex P2 round 9: when the predecessor itself is hybrid (its
+    VMs include a PQ key), the default predecessor_policy should
+    auto-promote to HYBRID_REQUIRED. A classical-only signature from
+    such a predecessor must NOT verify under the default — that would
+    let a future Shor-recovered ECDSA key forge a rotation despite
+    the predecessor having a PQ counterpart.
+    """
+    from kestrel_sovereign.identity.hybrid_keypair import generate_hybrid_keypair
+
+    # Hybrid predecessor: classical Ed25519 + PQ ML-DSA-65
+    hybrid_pred = generate_hybrid_keypair()
+    pred_did = "did:web:legit.example:hybrid-agent"
+    pred_vms = build_verification_methods(pred_did, hybrid_pred.public_keys())
+    classical_kid = pred_vms[0]["id"].rsplit("#", 1)[-1]
+
+    # New successor (different hybrid)
+    succ_did = hybrid_successor["did"]
+
+    s = SuccessionStatement(
+        predecessor_did=pred_did,
+        successor_did=succ_did,
+        effective_from="2027-01-01T00:00:00+00:00",
+        reason="hybrid → hybrid future rotation",
+        predecessor_verification_methods=pred_vms,
+        successor_verification_methods=hybrid_successor["vms"],
+    )
+    # Predecessor signs with ONLY their classical half (no PQ)
+    s = sign_predecessor(s, [(hybrid_pred.classical, classical_kid)])
+    s = sign_successor(s, [
+        (hybrid_successor["hybrid"].classical, hybrid_successor["classical_kid"]),
+        (hybrid_successor["hybrid"].pq, hybrid_successor["pq_kid"]),
+    ])
+    s = finalize(s)
+
+    # Default predecessor_policy (None → adaptive). The predecessor's
+    # VMs include a PQ key, so HYBRID_REQUIRED auto-applies and the
+    # classical-only signature is rejected.
+    result = verify_succession(s, did_web_resolver=_self_attesting_resolver(s))
+    assert not result.ok
+    assert "HYBRID_REQUIRED" in result.predecessor.reason
+
+
 def test_unfinalized_statement_rejected(
     base_statement, legacy_predecessor, hybrid_successor,
 ):

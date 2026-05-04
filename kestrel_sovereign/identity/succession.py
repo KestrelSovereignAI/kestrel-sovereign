@@ -762,10 +762,42 @@ def _verify_signatures_against(
     return verified
 
 
+def _adaptive_predecessor_policy(
+    verification_methods: Iterable[Mapping[str, Any]],
+) -> VerifyPolicy:
+    """Pick the predecessor policy based on the predecessor's keys.
+
+    Codex P2 round 9: a static default of ``LEGACY_ALLOWED`` is correct
+    for legacy → hybrid migrations (legacy agents only have ECDSA), but
+    it under-constrains hybrid → hybrid future rotations. If the
+    predecessor's VMs already include a post-quantum key, that
+    predecessor IS hybrid and a single classical signature would be a
+    quantum-hardening regression: a future Shor-recovered classical
+    key could forge a "rotation" without the PQ half.
+
+    Rule: if any predecessor VM resolves to a PQ-classified suite, the
+    policy is ``HYBRID_REQUIRED``. Otherwise ``LEGACY_ALLOWED`` (the
+    Wave 3 ceremony case for legacy ECDSA-only predecessors).
+    """
+    for vm in verification_methods:
+        if not isinstance(vm, Mapping):
+            continue
+        multibase = vm.get("publicKeyMultibase")
+        if not isinstance(multibase, str):
+            continue
+        try:
+            suite, _pub = multibase_to_public_key(multibase)
+        except CryptoSuiteError:
+            continue
+        if getattr(suite, "is_post_quantum", False):
+            return VerifyPolicy.HYBRID_REQUIRED
+    return VerifyPolicy.LEGACY_ALLOWED
+
+
 def verify_succession(
     statement: SuccessionStatement,
     *,
-    predecessor_policy: VerifyPolicy = VerifyPolicy.LEGACY_ALLOWED,
+    predecessor_policy: Optional[VerifyPolicy] = None,
     successor_policy: VerifyPolicy = VerifyPolicy.HYBRID_REQUIRED,
     require_archival: bool = False,
     trusted_archival_multibase: Optional[str] = None,
@@ -813,6 +845,14 @@ def verify_succession(
             is a did:web URI; otherwise binding fails-closed. Wrap
             ``identity.did_web.resolve`` as the typical implementation.
     """
+    # Resolve adaptive predecessor policy when the caller didn't specify
+    # one. This auto-promotes hybrid → hybrid rotations to HYBRID_REQUIRED
+    # without breaking the legacy → hybrid Wave 3 ceremony case.
+    if predecessor_policy is None:
+        predecessor_policy = _adaptive_predecessor_policy(
+            statement.predecessor_verification_methods
+        )
+
     payload = signable_payload(statement)
 
     # 0) effective_from must parse as a tz-aware UTC ISO 8601 timestamp.
