@@ -47,7 +47,7 @@ def storage_with_keypair(tmp_path, monkeypatch):
     suite = SLHDSASHA2128sSuite()
     kp = suite.generate_keypair()
     storage.save_secret_bytes(kp.private_key, "release-key")
-    storage.save_secret_bytes(kp.public_key, "release-key.pub")
+    storage.save_secret_bytes(kp.public_key, "release-key_pub")
     return storage_dir, kp
 
 
@@ -327,6 +327,41 @@ def test_verify_rejects_missing_artifact_file(
 # Posix paths in manifest
 # ---------------------------------------------------------------------------
 
+def test_sign_does_not_collide_with_dot_stripped_id(tmp_path, artifacts_dir, monkeypatch):
+    """Codex P2 round 5: SecureKeyStorage strips dots, so ``release-key.pub``
+    used to alias to ``release-keypub`` and could collide with a
+    legitimate ``release-keypub`` id.
+
+    Confirm the sidecar uses ``_pub`` and that a separate
+    ``release-keypub`` id can coexist without conflicts.
+    """
+    monkeypatch.setenv("KESTREL_DATA_KEY", "x" * 32)
+    storage_dir = tmp_path / "keys"
+    storage_dir.mkdir()
+    storage = SecureKeyStorage(storage_dir=storage_dir)
+    suite = SLHDSASHA2128sSuite()
+    release_kp = suite.generate_keypair()
+    storage.save_secret_bytes(release_kp.private_key, "release-key")
+    storage.save_secret_bytes(release_kp.public_key, "release-key_pub")
+
+    # An unrelated id that would have aliased under the .pub scheme
+    other_kp = suite.generate_keypair()
+    storage.save_secret_bytes(other_kp.private_key, "release-keypub")
+
+    # Sign should pick up release-key's public sidecar, not other_kp's
+    args = argparse.Namespace(
+        artifacts_dir=str(artifacts_dir),
+        release_tag="v1",
+        key_id="release-key",
+        signer_did="",
+        kid="k1",
+        output="-",
+        storage_dir=str(storage_dir),
+    )
+    rc = cmd_release_sign(args)
+    assert rc == 0
+
+
 def test_sign_rejects_mismatched_public_key(tmp_path, artifacts_dir, monkeypatch):
     """Codex P2 round 2: if ``<key_id>.pub`` is stale and doesn't pair
     with the secret, the previous CLI signed anyway and printed a
@@ -342,7 +377,7 @@ def test_sign_rejects_mismatched_public_key(tmp_path, artifacts_dir, monkeypatch
     kp_a = suite.generate_keypair()
     kp_b = suite.generate_keypair()
     storage.save_secret_bytes(kp_a.private_key, "release-key")
-    storage.save_secret_bytes(kp_b.public_key, "release-key.pub")  # WRONG pair
+    storage.save_secret_bytes(kp_b.public_key, "release-key_pub")  # WRONG pair
 
     args = argparse.Namespace(
         artifacts_dir=str(artifacts_dir),

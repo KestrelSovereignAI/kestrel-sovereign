@@ -200,13 +200,18 @@ def _load_slh_keypair(storage: SecureKeyStorage, key_id: str) -> Keypair:
     keypair (operator runbook step).
     """
     secret = storage.load_secret_bytes(key_id)
-    public_id = f"{key_id}.pub"
+    # Sidecar id uses ``_pub`` (not ``.pub``) because
+    # SecureKeyStorage._get_secret_bytes_path strips characters outside
+    # ``[A-Za-z0-9-_]``. ``release-key.pub`` would collide with a real
+    # ``release-keypub`` id (codex P2 round 5).
+    public_id = f"{key_id}_pub"
     if not storage.has_secret_bytes(public_id):
         raise ReleaseManifestError(
             f"public-key file not found for key_id={key_id!r}; "
             f"expected ``{public_id}`` next to the secret. The release "
             f"keypair must have been generated and persisted as a pair "
-            f"(see SUCCESSION_RUNBOOK.md style for the secret-bytes API)."
+            f"using SecureKeyStorage.save_secret_bytes(secret, key_id) + "
+            f"save_secret_bytes(public, key_id+'_pub')."
         )
     public = storage.load_secret_bytes(public_id)
     return Keypair(suite_id=ALG_SLH_DSA_SHA2_128S, private_key=secret, public_key=public)
