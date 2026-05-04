@@ -204,6 +204,27 @@ def test_tampered_pq_ciphertext_yields_different_secret(hybrid_kp):
 # Transcript binding (anti-malleability)
 # ---------------------------------------------------------------------------
 
+def test_hkdf_info_binds_algorithm_pair(hybrid_kp, monkeypatch):
+    """Codex P2: the HKDF info is now bound to the actual selected
+    algorithm pair. If a future combiner uses different suites with
+    the same SS/transcript inputs, it derives a different secret —
+    proper domain separation between hybrid suite combinations.
+
+    Construct two derivations whose ONLY difference is the algorithm
+    label fed to HKDF info. Same SS values, same transcript salt →
+    different output, proving the info participates in the KDF.
+    """
+    from kestrel_sovereign.security.hybrid_kem import _derive_secret
+
+    ss_c, ss_pq = b"\x01" * 32, b"\x02" * 32
+    ct_c, ct_pq = b"\x03" * 32, b"\x04" * 1088
+    pk_c, pk_pq = b"\x05" * 32, b"\x06" * 1184
+
+    a = _derive_secret(ss_c, ss_pq, ct_c, ct_pq, pk_c, pk_pq, "x25519", "ml-kem-768", 32)
+    b = _derive_secret(ss_c, ss_pq, ct_c, ct_pq, pk_c, pk_pq, "x25519", "ml-kem-1024", 32)
+    assert a != b
+
+
 def test_transcript_salt_distinguishes_recipients(hybrid_kp):
     """The HKDF salt includes both ciphertexts AND both public keys.
     A forged ciphertext that somehow produced the same SS values for
