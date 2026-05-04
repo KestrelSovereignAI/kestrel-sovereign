@@ -345,15 +345,25 @@ def open_capsule(
             "pq keypair's public key"
         )
 
-    # Hybrid decapsulate → 32-byte derived secret
+    # Hybrid decapsulate → 32-byte derived secret. Wrap KEM-layer
+    # exceptions in SealedCapsuleError so the public API has a single
+    # error type for callers (codex P2 review): a truncated
+    # ``classical_ct``, a malformed X25519 ephemeral pubkey, or a
+    # length-mismatched ML-KEM ciphertext used to leak KEMSuiteError
+    # past the capsule API boundary.
     hybrid_ct = HybridKEMCiphertext(
         classical_ct=parsed.classical_ct,
         pq_ct=parsed.pq_ct,
     )
-    derived_key = decapsulate_hybrid(
-        hybrid_ct, classical_kp, pq_kp,
-        out_len=DEFAULT_DERIVED_SECRET_BYTES,
-    )
+    try:
+        derived_key = decapsulate_hybrid(
+            hybrid_ct, classical_kp, pq_kp,
+            out_len=DEFAULT_DERIVED_SECRET_BYTES,
+        )
+    except KEMSuiteError as e:
+        raise SealedCapsuleError(
+            f"capsule KEM decapsulation failed: {e}"
+        ) from e
 
     # AEAD-decrypt with the same AAD binding. AES-GCM authentication
     # failure surfaces all tamper modes (KEM ct, PQ ct, AEAD ct).

@@ -413,6 +413,27 @@ def test_missing_kem_field_rejected(hybrid_kp):
         open_capsule(bad, hybrid_kp)
 
 
+def test_truncated_kem_ciphertext_surfaces_as_sealed_capsule_error(hybrid_kp):
+    """Codex P2: a malformed KEM ciphertext (e.g. truncated to wrong
+    length) used to leak KEMSuiteError past the capsule API boundary.
+    Now wrapped into SealedCapsuleError so callers have a single
+    error-type contract for any attacker-controlled capsule input."""
+    capsule = seal_capsule(
+        b"x",
+        recipient_classical_public_key=hybrid_kp.classical.public_key,
+        recipient_pq_public_key=hybrid_kp.pq.public_key,
+    )
+    env = json.loads(capsule)
+    # Truncate the classical_ct to half its length — wrong length will
+    # be rejected at the KEM layer
+    import base64
+    raw = base64.urlsafe_b64decode(env["kem"]["classical_ct"] + "==")
+    env["kem"]["classical_ct"] = base64.urlsafe_b64encode(raw[:16]).decode().rstrip("=")
+    bad = json.dumps(env, separators=(",", ":"))
+    with pytest.raises(SealedCapsuleError, match="KEM decapsulation failed"):
+        open_capsule(bad, hybrid_kp)
+
+
 def test_open_rejects_both_calling_conventions_at_once(hybrid_kp):
     capsule = seal_capsule(
         b"x",
