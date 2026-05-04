@@ -67,10 +67,12 @@ from kestrel_sovereign.security.kem_suite import (
 )
 
 
-# Hybrid combiner tag baked into the HKDF info parameter so that
-# ciphertexts produced under a different combiner spec (e.g. a future
-# concat-NEW or a separate KDF) cannot be confused with these.
-_HKDF_INFO = b"kestrel-hybrid-kem-v1: x25519+ml-kem-768; HKDF-SHA256(ss_C||ss_PQ)"
+# Hybrid combiner tag prefix for the HKDF info parameter. The actual
+# info bound to each derivation also includes the selected suite ids
+# (see _build_hkdf_info) so two different algorithm pairs (e.g.
+# X25519+ML-KEM-768 vs X25519+ML-KEM-1024) cannot accidentally collide
+# in their derived keys.
+_HKDF_INFO_PREFIX = b"kestrel-hybrid-kem-v1: HKDF-SHA256(ss_C||ss_PQ); algs="
 
 DEFAULT_DERIVED_SECRET_BYTES = 32  # AES-256 key size
 
@@ -146,6 +148,18 @@ class HybridKEMCiphertext:
     pq_ct: bytes
 
 
+def _build_hkdf_info(classical_alg: str, pq_alg: str) -> bytes:
+    """Domain-separation tag that includes the actual selected suite ids.
+
+    Codex P2: ``_HKDF_INFO_PREFIX`` alone hardcoded the default pair,
+    so a future suite combination (e.g. X25519 + ML-KEM-1024) could
+    derive the same key as the default pair if everything else matched.
+    Binding the algorithm ids into the info ensures every distinct
+    pair lives in its own domain.
+    """
+    return _HKDF_INFO_PREFIX + classical_alg.encode("utf-8") + b"+" + pq_alg.encode("utf-8")
+
+
 def _derive_secret(
     classical_ss: bytes,
     pq_ss: bytes,
@@ -153,6 +167,8 @@ def _derive_secret(
     pq_ct: bytes,
     classical_pub: bytes,
     pq_pub: bytes,
+    classical_alg: str,
+    pq_alg: str,
     out_len: int,
 ) -> bytes:
     """HKDF-SHA256 extract+expand over the concatenation of both shared
@@ -181,7 +197,7 @@ def _derive_secret(
         algorithm=hashes.SHA256(),
         length=out_len,
         salt=salt,
-        info=_HKDF_INFO,
+        info=_build_hkdf_info(classical_alg, pq_alg),
         backend=default_backend(),
     )
     return hkdf.derive(ikm)
@@ -243,6 +259,7 @@ def encapsulate_hybrid(
         classical_ss, pq_ss,
         classical_ct, pq_ct,
         classical_pub_bytes, pq_pub_bytes,
+        classical_alg, pq_alg,
         out_len,
     )
     return HybridKEMCiphertext(classical_ct=classical_ct, pq_ct=pq_ct), secret
@@ -298,6 +315,7 @@ def decapsulate_hybrid(
         classical_ss, pq_ss,
         ciphertext.classical_ct, ciphertext.pq_ct,
         classical_pub_bytes, pq_pub_bytes,
+        classical_keypair.suite_id, pq_keypair.suite_id,
         out_len,
     )
 
