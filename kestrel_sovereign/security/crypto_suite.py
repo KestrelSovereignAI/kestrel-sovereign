@@ -556,8 +556,136 @@ class MLDSA65Suite(CryptoSuite):
         return self.deserialize_public_key(raw)
 
 
-# Register suites at import time. Future PQ suites in Waves 3-4 (SLH-DSA,
-# ML-KEM) register themselves the same way from their own modules.
+# ---------------------------------------------------------------------------
+# SLHDSASHA2128sSuite — hash-based PQ, succession + checkpoint signing (Wave 3)
+# ---------------------------------------------------------------------------
+
+class SLHDSASHA2128sSuite(CryptoSuite):
+    """SLH-DSA-SHA2-128s (NIST FIPS 205) signing.
+
+    Conservative-tier post-quantum signature: security relies only on
+    the cryptographic hash function (SHA-2 here), so the only quantum
+    speedup is Grover's algorithm — which halves preimage security
+    (256-bit → ~128-bit) but does NOT break it the way Shor breaks
+    ECC and RSA. This is the most defensible long-horizon choice for
+    irrevocable, hand-signed events: succession statements, checkpoint
+    rotations, release signatures.
+
+    Trade-off: signatures are **7856 bytes** — ~2× ML-DSA-65 and ~120×
+    Ed25519. Public keys are tiny (32 bytes) but signature size is the
+    cost we pay for the hash-only security argument. SLH-DSA is
+    therefore reserved for **infrequent, long-lived** artifacts; the
+    high-throughput signing path remains hybrid (Ed25519 + ML-DSA-65).
+
+    Library
+    -------
+
+    Backed by ``pqcrypto.sign.sphincs_sha2_128s_simple`` — the FIPS 205
+    "SLH-DSA-SHA2-128s" parameter set is the same as the
+    ``sphincs+-sha2-128s-simple`` algorithm in PQClean's lineage.
+    pqcrypto exposes only the ``_simple`` variants (the FIPS-205-aligned
+    set), not the original SPHINCS+ "robust" variants. Same library
+    family as ML-DSA-65 (#950), no compile-on-deploy.
+
+    Multikey shape
+    --------------
+
+    - ``alg_id``: ``"slh-dsa-sha2-128s"``
+    - ``public_key_multicodec``: ``b"\\x88\\x24"`` (multicodec 0x1208,
+      varint-encoded). The W3C/IETF multicodec table entry is currently
+      *proposed*; treat as experimental until finalized.
+    - Public-key bytes: 32 raw bytes.
+
+    Sign/verify failure semantics
+    -----------------------------
+
+    Mirrors :class:`MLDSA65Suite`: pqcrypto's verify returns False
+    cleanly for any failure mode; sign raises only on broken inputs
+    (wrong-length secret key, etc.) and we wrap those into
+    :class:`CryptoSuiteError`.
+    """
+
+    alg_id: ClassVar[str] = ALG_SLH_DSA_SHA2_128S
+    # Multicodec 0x1208 (slh-dsa-sha2-128s-pub, proposed), varint-encoded.
+    public_key_multicodec: ClassVar[bytes] = b"\x88\x24"
+    is_post_quantum: ClassVar[bool] = True
+
+    # NIST FIPS 205 SLH-DSA-SHA2-128s sizes — pinned as class attributes
+    # so callers can size buffers without importing pqcrypto themselves.
+    PUBLIC_KEY_SIZE: ClassVar[int] = 32
+    SECRET_KEY_SIZE: ClassVar[int] = 64
+    SIGNATURE_SIZE: ClassVar[int] = 7856
+
+    def generate_keypair(self) -> Keypair:
+        from pqcrypto.sign import sphincs_sha2_128s_simple as slh
+        public_bytes, secret_bytes = slh.generate_keypair()
+        return Keypair(
+            suite_id=self.alg_id,
+            private_key=secret_bytes,
+            public_key=public_bytes,
+        )
+
+    def sign(self, data: bytes, private_key: Any) -> bytes:
+        from pqcrypto.sign import sphincs_sha2_128s_simple as slh
+        if not isinstance(private_key, (bytes, bytearray)):
+            raise CryptoSuiteError(
+                f"slh-dsa-sha2-128s private_key must be bytes "
+                f"({self.SECRET_KEY_SIZE} bytes); got "
+                f"{type(private_key).__name__}"
+            )
+        try:
+            return slh.sign(bytes(private_key), data)
+        except Exception as e:
+            raise CryptoSuiteError(f"slh-dsa-sha2-128s sign failed: {e}") from e
+
+    def verify(self, data: bytes, signature: bytes, public_key: Any) -> bool:
+        from pqcrypto.sign import sphincs_sha2_128s_simple as slh
+        if not isinstance(public_key, (bytes, bytearray)):
+            return False
+        if not isinstance(signature, (bytes, bytearray)):
+            return False
+        try:
+            return bool(slh.verify(bytes(public_key), data, bytes(signature)))
+        except Exception:
+            return False
+
+    def serialize_public_key(self, public_key: Any) -> bytes:
+        """Raw 32-byte SLH-DSA-SHA2-128s public key.
+
+        pqcrypto returns the public key as raw bytes, so this is an
+        identity cast with type validation.
+        """
+        if not isinstance(public_key, (bytes, bytearray)):
+            raise CryptoSuiteError(
+                f"slh-dsa-sha2-128s public_key must be bytes; got "
+                f"{type(public_key).__name__}"
+            )
+        return bytes(public_key)
+
+    def deserialize_public_key(self, raw: bytes) -> Any:
+        if not isinstance(raw, (bytes, bytearray)):
+            raise CryptoSuiteError(
+                f"slh-dsa-sha2-128s raw public key must be bytes; got "
+                f"{type(raw).__name__}"
+            )
+        if len(raw) != self.PUBLIC_KEY_SIZE:
+            raise CryptoSuiteError(
+                f"slh-dsa-sha2-128s public key must be "
+                f"{self.PUBLIC_KEY_SIZE} bytes; got {len(raw)}"
+            )
+        return bytes(raw)
+
+    # Single canonical wire form — matches legacy serialization exactly.
+    def serialize_public_key_for_multikey(self, public_key: Any) -> bytes:
+        return self.serialize_public_key(public_key)
+
+    def deserialize_public_key_from_multikey(self, raw: bytes) -> Any:
+        return self.deserialize_public_key(raw)
+
+
+# Register suites at import time. Wave 4 (ML-KEM) registers from its
+# own module since KEM has a distinct interface from signing.
 register_suite(Secp256k1Suite())
 register_suite(Ed25519Suite())
 register_suite(MLDSA65Suite())
+register_suite(SLHDSASHA2128sSuite())
