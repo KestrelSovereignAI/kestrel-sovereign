@@ -327,6 +327,23 @@ def test_verify_rejects_missing_artifact_file(
 # Posix paths in manifest
 # ---------------------------------------------------------------------------
 
+def test_sign_handles_empty_release_tag(storage_with_keypair, artifacts_dir):
+    """Codex P3 round 8: ``--release-tag ''`` used to crash with
+    ReleaseManifestError out of new_manifest. Now wrapped to exit 2."""
+    storage_dir, _ = storage_with_keypair
+    args = argparse.Namespace(
+        artifacts_dir=str(artifacts_dir),
+        release_tag="",
+        key_id="release-key",
+        signer_did="",
+        kid="k1",
+        output="-",
+        storage_dir=str(storage_dir),
+    )
+    rc = cmd_release_sign(args)
+    assert rc == 2
+
+
 def test_verify_rejects_extra_unmanifested_files(
     storage_with_keypair, artifacts_dir, tmp_path,
 ):

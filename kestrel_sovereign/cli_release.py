@@ -260,10 +260,17 @@ def cmd_release_sign(args) -> int:
             pass  # output is outside the artifacts dir
         else:
             skip.append(out_path)
-    manifest = new_manifest(
-        release_tag=args.release_tag,
-        signer_did=args.signer_did,
-    )
+    try:
+        manifest = new_manifest(
+            release_tag=args.release_tag,
+            signer_did=args.signer_did,
+        )
+    except ReleaseManifestError as e:
+        # Codex P3 round 8: ``--release-tag ''`` (or other operator-
+        # invalid inputs that the dataclass validates) used to raise
+        # past the CLI boundary. Wrap as a structured exit-2 error.
+        print(f"error: {e}", file=sys.stderr)
+        return 2
     artifact_count = 0
     try:
         for rel_path, abs_path in _walk_artifacts(artifacts_dir, skip=skip):
