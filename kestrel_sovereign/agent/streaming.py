@@ -268,8 +268,18 @@ class StreamingMixin:
             ):
                 tool_response_chunks.append(chunk)
                 yield chunk
-            # Store the full response after streaming completes, with tool events in metadata
-            tool_final_text = "".join(tool_response_chunks)
+            # Persist the FULL visible assistant text — pre-tool reasoning
+            # the LLM emitted before deciding to call tools (full_response,
+            # already yielded to the client at the first stream loop) plus
+            # the post-tool synthesizing answer (tool_response_chunks).
+            # The user saw both streams concatenated; persisting only the
+            # post-tool half meant the next turn's history loader was blind
+            # to any pre-tool explanation, and the agent couldn't see the
+            # reasoning it had just shown the user. Surfaced by Meridian's
+            # "I don't see my own quantum response" transcript.
+            pre_tool_text = "".join(full_response)
+            post_tool_text = "".join(tool_response_chunks)
+            tool_final_text = pre_tool_text + post_tool_text
             tool_final_text = await self._fire_post_response_hook(tool_final_text, session_id)
             meta = {'tool_events': tool_events} if tool_events else None
             await self.privacy_agent.add_conversation("assistant", tool_final_text, metadata=meta, session_id=session_id)
