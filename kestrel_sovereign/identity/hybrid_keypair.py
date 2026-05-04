@@ -201,9 +201,35 @@ def verify_hybrid(
     Returns a :class:`PolicyResult` so callers don't have to re-run the
     policy evaluation themselves.
     """
-    # Index verification methods by kid (last fragment after '#')
+    # Index verification methods by kid (last fragment after '#').
+    # Reject duplicate kids — codex P1 follow-up on the succession
+    # binding check: an attacker who can include duplicate kids in the
+    # VM array can have a later attacker-controlled VM silently
+    # overwrite a legitimate one. Refusing duplicates closes that path.
+    vms_list = list(verification_methods)
+    seen_kids: dict[str, str] = {}
+    for vm in vms_list:
+        if not isinstance(vm, Mapping):
+            continue
+        vm_id = vm.get("id") or ""
+        kid = vm_id.rsplit("#", 1)[-1] if "#" in vm_id else vm_id
+        if not kid:
+            continue
+        if kid in seen_kids:
+            return PolicyResult(
+                ok=False,
+                reason=(
+                    f"verification methods contain duplicate kid {kid!r} "
+                    f"(ids: {seen_kids[kid]!r} and {vm_id!r}); refusing "
+                    f"to silently overwrite"
+                ),
+                alg_ids_seen=frozenset(),
+            )
+        seen_kids[kid] = vm_id
     methods_by_kid: dict = {}
-    for vm in verification_methods:
+    for vm in vms_list:
+        if not isinstance(vm, Mapping):
+            continue
         vm_id = vm.get("id") or ""
         kid = vm_id.rsplit("#", 1)[-1] if "#" in vm_id else vm_id
         methods_by_kid[kid] = vm
