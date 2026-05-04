@@ -323,15 +323,65 @@ def test_verify_with_archival_countersignature(
     assert result.archival.ok
 
 
-def test_verify_archival_required_present(
+def test_verify_archival_required_present_with_pinned_key(
     base_statement, legacy_predecessor, hybrid_successor, slh_keypair_with_vm,
 ):
+    """Codex P2 round 7: ``require_archival=True`` is only meaningful
+    when paired with ``trusted_archival_multibase=`` because anyone can
+    mint a fresh SLH-DSA key. Pinning the expected archival key makes
+    the policy real."""
     statement = _build_full_succession(
         base_statement, legacy_predecessor, hybrid_successor,
         with_archival_kp_vm=slh_keypair_with_vm,
     )
-    result = verify_succession(statement, require_archival=True, did_web_resolver=_self_attesting_resolver(statement))
-    assert result.ok
+    _, slh_vm = slh_keypair_with_vm
+    pinned = slh_vm["publicKeyMultibase"]
+    result = verify_succession(
+        statement, require_archival=True,
+        trusted_archival_multibase=pinned,
+        did_web_resolver=_self_attesting_resolver(statement),
+    )
+    assert result.ok, result.reason
+
+
+def test_verify_archival_required_without_trusted_key_fails(
+    base_statement, legacy_predecessor, hybrid_successor, slh_keypair_with_vm,
+):
+    """Without a pinned archival key, ``require_archival=True`` is
+    paper-only and the verifier now rejects it explicitly."""
+    statement = _build_full_succession(
+        base_statement, legacy_predecessor, hybrid_successor,
+        with_archival_kp_vm=slh_keypair_with_vm,
+    )
+    result = verify_succession(
+        statement, require_archival=True,
+        did_web_resolver=_self_attesting_resolver(statement),
+    )
+    assert not result.ok
+    assert "trusted_archival_multibase" in result.reason
+
+
+def test_verify_archival_pinned_to_wrong_key_fails(
+    base_statement, legacy_predecessor, hybrid_successor, slh_keypair_with_vm,
+):
+    """If the embedded archival VM doesn't match the pinned key, fail."""
+    statement = _build_full_succession(
+        base_statement, legacy_predecessor, hybrid_successor,
+        with_archival_kp_vm=slh_keypair_with_vm,
+    )
+    # Pin to a different multibase
+    other_slh = SLHDSASHA2128sSuite()
+    other_kp = other_slh.generate_keypair()
+    from kestrel_sovereign.security.multikey import public_key_to_multibase
+    wrong_pin = public_key_to_multibase(other_slh, other_kp.public_key)
+
+    result = verify_succession(
+        statement, require_archival=True,
+        trusted_archival_multibase=wrong_pin,
+        did_web_resolver=_self_attesting_resolver(statement),
+    )
+    assert not result.ok
+    assert "does not match trusted_archival_multibase" in result.reason
 
 
 def test_verify_archival_required_missing(
