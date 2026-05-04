@@ -98,19 +98,38 @@ ALG_NONE = 0x00
 ALG_AES_256_GCM = 0x01
 
 
+_URLSAFE_B64_ALPHABET = frozenset(
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_="
+)
+
+
 def _strict_urlsafe_b64decode(data: bytes) -> bytes:
-    """Strict URL-safe base64 decode.
+    """Strict URL-safe base64 decode — single canonical encoding.
 
-    ``base64.urlsafe_b64decode`` is permissive: it silently ignores
-    characters outside the alphabet and accepts trailing junk. That lets
-    a tampered-with token like ``cipher.encrypt(pt) + b"!!!"`` round-trip
-    successfully — multiple encodings of the same ciphertext, despite
-    the AEAD authentication tag.
+    Two layers of strictness:
 
-    Use ``base64.b64decode`` with ``altchars=b"-_"`` and ``validate=True``
-    to enforce a single canonical encoding. Any non-base64 character or
-    non-multiple-of-4 length raises ``binascii.Error``.
+    1. **Alphabet pre-check.** Every byte of the input must be in the
+       URL-safe-base64 alphabet (``A-Z a-z 0-9 - _ =``). This rules out
+       not just whitespace and trailing junk, but also the standard-base64
+       characters ``+`` and ``/``. Without this check, ``base64.b64decode``
+       with ``altchars=b"-_"`` and ``validate=True`` silently accepts
+       ``+`` / ``/`` as aliases for ``-`` / ``_`` — they decode to the
+       same byte values, so the same plaintext can be carried by two
+       different token strings. AEAD authentication still works in that
+       case, but canonical-encoding guarantees do not. Pre-checking the
+       alphabet closes the hole.
+
+    2. **Validating decode.** ``base64.b64decode`` with ``validate=True``
+       rejects any character outside its known alphabets and any
+       non-multiple-of-4 length. Combined with (1), a v2 token has
+       exactly one valid textual form per ciphertext.
     """
+    for byte in data:
+        if byte not in _URLSAFE_B64_ALPHABET:
+            raise binascii.Error(
+                f"non-URL-safe-base64 character 0x{byte:02x} in token; "
+                "tokens must use only A-Z a-z 0-9 - _ ="
+            )
     return base64.b64decode(data, altchars=b"-_", validate=True)
 
 
