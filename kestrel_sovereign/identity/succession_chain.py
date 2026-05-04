@@ -77,9 +77,11 @@ def _parse_iso8601_utc(s: str) -> datetime:
     """Parse an ISO 8601 timestamp into a tz-aware UTC datetime.
 
     Tolerates the trailing ``Z`` suffix that some serializers emit.
-    Naive timestamps are rejected — temporal comparisons across
-    successions must be unambiguous about timezone.
+    Rejects naive timestamps AND non-UTC offsets — temporal
+    comparisons across successions must be unambiguous about
+    timezone, and the schema documents UTC-only.
     """
+    from datetime import timedelta
     if not isinstance(s, str) or not s:
         raise SuccessionChainError(f"timestamp must be a non-empty string; got {s!r}")
     candidate = s.replace("Z", "+00:00") if s.endswith("Z") else s
@@ -91,6 +93,12 @@ def _parse_iso8601_utc(s: str) -> datetime:
         raise SuccessionChainError(
             f"timestamp {s!r} is timezone-naive; chain walker requires UTC-explicit "
             f"timestamps to compare successions unambiguously"
+        )
+    if dt.utcoffset() != timedelta(0):
+        raise SuccessionChainError(
+            f"timestamp {s!r} is not UTC (offset {dt.utcoffset()}); chain "
+            f"walker requires UTC-only timestamps for cross-statement "
+            f"comparisons"
         )
     return dt
 
