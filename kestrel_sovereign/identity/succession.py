@@ -477,62 +477,97 @@ def _check_unique_vm_kids(vms: List[Mapping]) -> Tuple[bool, str]:
     return True, ""
 
 
-def _verify_did_pkh_eip155_binding(did: str, vms: List[Mapping]) -> bool:
-    """did:pkh:eip155:1:0x<addr> — verify a secp256k1 VM derives the address.
+def _verify_did_pkh_eip155_binding(did: str, vms: List[Mapping]) -> Tuple[bool, str]:
+    """did:pkh:eip155:1:0x<addr> — REQUIRE every VM to bind to the address.
 
-    Returns True iff at least one VM is a secp256k1 public key whose
-    EIP-55 (case-folded) Ethereum address equals the DID's address.
+    did:pkh is a self-certifying DID method: the DID is keyed to one
+    specific on-chain address derived from one keypair. The DID
+    document for a did:pkh agent legitimately contains exactly one
+    verification method. Any "extra" VM is unauthenticated by the DID
+    method itself, and an attacker who knows the victim's public key
+    can include it as a binding-passing decoy alongside their OWN
+    secp256k1 VM under a different kid (codex P1 round 4).
+
+    Mitigation: require ALL VMs to be secp256k1 public keys whose
+    EIP-55 address equals the DID's address. If any VM is a different
+    algorithm, or any secp256k1 VM doesn't match, refuse.
+
+    Returns ``(ok, reason)`` so the caller can surface the precise
+    failure mode.
     """
     prefix = "did:pkh:eip155:1:"
     if not did.startswith(prefix):
-        return False
+        return False, f"not a did:pkh:eip155 DID: {did!r}"
     expected_addr = did[len(prefix):].lower()
     if not (expected_addr.startswith("0x") and len(expected_addr) == 42):
-        return False
+        return False, f"did:pkh:eip155 address malformed: {did!r}"
+    if not vms:
+        return False, "did:pkh:eip155 requires at least one verification method"
 
-    # Lazy import to avoid a circular: inception_service imports identity.
     try:
         from kestrel_sovereign.inception_service import (
             public_key_to_ethereum_address,
         )
-    except Exception:
-        return False
+    except Exception as e:
+        return False, f"cannot import address derivation helper: {e}"
 
-    for vm in vms:
-        multibase = vm.get("publicKeyMultibase") if isinstance(vm, Mapping) else None
+    for i, vm in enumerate(vms):
+        if not isinstance(vm, Mapping):
+            return False, f"verification method[{i}] is not a dict"
+        multibase = vm.get("publicKeyMultibase")
         if not isinstance(multibase, str):
-            continue
+            return False, (
+                f"verification method[{i}] is missing publicKeyMultibase; "
+                f"did:pkh:eip155 requires every VM to be a Multikey"
+            )
         try:
             suite, pub = multibase_to_public_key(multibase)
-        except CryptoSuiteError:
-            continue
+        except CryptoSuiteError as e:
+            return False, f"verification method[{i}] multikey decode failed: {e}"
         if suite.alg_id != "ecdsa-secp256k1-sha256":
-            continue
+            return False, (
+                f"verification method[{i}] alg_id is {suite.alg_id!r}; "
+                f"did:pkh:eip155 only binds secp256k1 keys"
+            )
         try:
             actual = public_key_to_ethereum_address(pub).lower()
-        except Exception:
-            continue
-        if actual == expected_addr:
-            return True
-    return False
+        except Exception as e:
+            return False, f"verification method[{i}] address derivation failed: {e}"
+        if actual != expected_addr:
+            return False, (
+                f"verification method[{i}] derives address {actual} but "
+                f"did:pkh claims {expected_addr}; refusing decoy attack via "
+                f"unbound extra VM"
+            )
+    return True, ""
 
 
-def _verify_did_key_binding(did: str, vms: List[Mapping]) -> bool:
-    """did:key:zX — the DID is itself a Multikey; one VM must match it.
+def _verify_did_key_binding(did: str, vms: List[Mapping]) -> Tuple[bool, str]:
+    """did:key:zX — REQUIRE every VM to match the DID's encoded key.
 
-    The did:key string after the ``did:key:`` prefix is exactly the
-    multibase-encoded public key (z-prefix base58btc + multicodec varint
-    + raw key). A binding holds iff some VM has the same
-    ``publicKeyMultibase``.
+    Same self-certifying property as did:pkh: the DID literally encodes
+    the public key, so one VM is the legitimate shape and any extra VM
+    with a different publicKeyMultibase is unauthenticated by the
+    method. Reject any-match to defeat the same decoy attack.
+
+    Returns ``(ok, reason)``.
     """
     prefix = "did:key:"
     if not did.startswith(prefix):
-        return False
+        return False, f"not a did:key DID: {did!r}"
     expected_multibase = did[len(prefix):]
-    for vm in vms:
-        if isinstance(vm, Mapping) and vm.get("publicKeyMultibase") == expected_multibase:
-            return True
-    return False
+    if not vms:
+        return False, "did:key requires at least one verification method"
+    for i, vm in enumerate(vms):
+        if not isinstance(vm, Mapping):
+            return False, f"verification method[{i}] is not a dict"
+        actual = vm.get("publicKeyMultibase")
+        if actual != expected_multibase:
+            return False, (
+                f"verification method[{i}] publicKeyMultibase {actual!r} "
+                f"does not match did:key suffix {expected_multibase!r}"
+            )
+    return True, ""
 
 
 def verify_did_binding(
@@ -570,20 +605,16 @@ def verify_did_binding(
         return False, unique_reason
 
     if did.startswith("did:pkh:eip155:1:"):
-        if _verify_did_pkh_eip155_binding(did, verification_methods):
+        ok, reason = _verify_did_pkh_eip155_binding(did, verification_methods)
+        if ok:
             return True, "did:pkh:eip155 binding verified"
-        return False, (
-            f"did:pkh:eip155 binding FAILED: no embedded secp256k1 "
-            f"verification method derives the address in {did!r}"
-        )
+        return False, f"did:pkh:eip155 binding FAILED: {reason}"
 
     if did.startswith("did:key:"):
-        if _verify_did_key_binding(did, verification_methods):
+        ok, reason = _verify_did_key_binding(did, verification_methods)
+        if ok:
             return True, "did:key multibase binding verified"
-        return False, (
-            f"did:key binding FAILED: no embedded VM has publicKeyMultibase "
-            f"matching the did:key suffix"
-        )
+        return False, f"did:key binding FAILED: {reason}"
 
     if did.startswith("did:web:"):
         if did_web_resolver is None:
@@ -651,6 +682,12 @@ def _verify_signatures_against(
 
     methods_by_kid: dict = {}
     for vm in vms_list:
+        # Codex P2 round 4: ``_check_unique_vm_kids`` skips non-Mapping
+        # entries, but this loop used to crash on ``vm.get(...)`` with
+        # an AttributeError when handed malformed archived/remote data.
+        # Mirror the isinstance guard.
+        if not isinstance(vm, Mapping):
+            continue
         vm_id = vm.get("id") or ""
         kid = vm_id.rsplit("#", 1)[-1] if "#" in vm_id else vm_id
         methods_by_kid[kid] = vm
