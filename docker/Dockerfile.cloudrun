@@ -33,8 +33,8 @@ RUN --mount=type=secret,id=github_token \
     (uv pip uninstall --python /app/.venv/bin/python ollama || true) && \
     git config --global --unset-all url."https://${GIT_AUTH}@github.com/".insteadOf 2>/dev/null || true
 
-# Cloud LLM config (local llm_config.toml is excluded via .dockerignore)
-COPY docker/llm_config.cloudrun.toml /app/llm_config.toml
+# Cloud LLM config — LLMService reads [llm] from /app/kestrel.toml directly.
+COPY docker/kestrel.cloudrun.toml /app/kestrel.toml
 
 # Create directories for agent data
 RUN mkdir -p /app/agent_data

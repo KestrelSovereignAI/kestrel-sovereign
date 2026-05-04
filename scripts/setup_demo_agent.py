@@ -28,19 +28,28 @@ from kestrel_sovereign.inception_service import create_kestrel_identity_async
 DEMO_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "agent_data", "demo")
 
 
-def build_demo_llm_config() -> str:
-    """Build a demo-friendly LLM config using policy-based defaults."""
-    return """# Demo agent LLM config — provider intent first, discovery/cache resolves concrete models
-provider_priority = ["anthropic", "ollama"]
+def build_demo_kestrel_toml() -> str:
+    """Build a demo-friendly kestrel.toml using vendor/route/model defaults."""
+    return """# Demo agent config — vendor/route/model architecture, discovery picks concrete IDs
+[llm]
+route_priority = ["anthropic:api", "ollama:local"]
 
-[anthropic]
-model = "auto"
+[llm.vendors.anthropic]
+is_cloud = true
+
+[llm.vendors.anthropic.routes.api]
+adapter         = "AnthropicAdapter"
+api_key_env     = "ANTHROPIC_API_KEY"
+model           = "auto"
 selection_hints = ["opus"]
-api_key_env = "ANTHROPIC_API_KEY"
 
-[ollama]
-host = "http://localhost:11434"
-model = "auto"
+[llm.vendors.ollama]
+is_cloud = false
+
+[llm.vendors.ollama.routes.local]
+adapter         = "OllamaAdapter"
+host            = "http://localhost:11434"
+model           = "auto"
 selection_hints = ["llama3.2", "latest"]
 """
 
@@ -63,11 +72,11 @@ async def main():
         is_demo=True,  # #766: server-side guardrails permit destructive ops on this agent
     )
 
-    # Write demo-specific LLM config with policy-based defaults
-    llm_config_path = os.path.join(DEMO_DIR, "llm_config.toml")
-    with open(llm_config_path, "w") as f:
-        f.write(build_demo_llm_config())
-    print(f"  LLM config written: {llm_config_path}")
+    # Write demo-specific kestrel.toml with policy-based defaults
+    kestrel_toml_path = os.path.join(DEMO_DIR, "kestrel.toml")
+    with open(kestrel_toml_path, "w") as f:
+        f.write(build_demo_kestrel_toml())
+    print(f"  kestrel.toml written: {kestrel_toml_path}")
 
     print()
     print("=" * 60)

@@ -168,7 +168,7 @@ async def llm_service(mock_config, mock_mandate_config, mock_provider_registry):
         # Setup registry mocking
         mock_registry_class.return_value = mock_provider_registry
 
-        service = LLMService(config_path="llm_config.toml")
+        service = LLMService()
 
         # Mock the usage tracking and constitutional profiles (which set attributes)
         service._usage_db = None
@@ -713,7 +713,7 @@ class TestEdgeCases:
             mock_registry.initialize_providers = Mock(return_value=[])
             mock_registry_class.return_value = mock_registry
 
-            service = LLMService(config_path="llm_config.toml")
+            service = LLMService()
 
             # Mock the usage tracking attributes
             service._usage_db = None

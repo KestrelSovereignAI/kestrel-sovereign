@@ -1,7 +1,12 @@
-# LLM configuration for Cloud Run deployment.
+# Kestrel unified configuration for Cloud Run deployment.
 # Vendor/route/model architecture — see docs/architecture/LLM_SERVICE_ARCHITECTURE.md
 # Cloud-only: no Claude Max OAuth, no local llama_cpp, no local ollama.
+#
+# This file is copied to /app/kestrel.toml during the Docker build (see
+# docker/Dockerfile.cloudrun and docker/Dockerfile.rookery). LLMService reads
+# the [llm] section directly via load_section("llm").
 
+[llm]
 route_priority = [
     "anthropic:api",
     "openai:api",
@@ -13,10 +18,10 @@ route_priority = [
 # Anthropic
 # =============================================================================
 
-[vendors.anthropic]
+[llm.vendors.anthropic]
 is_cloud = true
 
-[vendors.anthropic.routes.api]
+[llm.vendors.anthropic.routes.api]
 adapter         = "AnthropicAdapter"
 api_key_env     = "ANTHROPIC_API_KEY"
 model           = "auto"
@@ -27,10 +32,10 @@ selection_hints = ["sonnet", "haiku", "opus"]
 # OpenAI
 # =============================================================================
 
-[vendors.openai]
+[llm.vendors.openai]
 is_cloud = true
 
-[vendors.openai.routes.api]
+[llm.vendors.openai.routes.api]
 adapter         = "OpenAIAdapter"
 api_key_env     = "OPENAI_API_KEY"
 model           = "auto"
@@ -41,10 +46,10 @@ selection_hints = ["gpt-5", "gpt-4"]
 # Google Vertex AI / AI Studio (Gemini)
 # =============================================================================
 
-[vendors.vertex_ai]
+[llm.vendors.vertex_ai]
 is_cloud = true
 
-[vendors.vertex_ai.routes.api]
+[llm.vendors.vertex_ai.routes.api]
 adapter         = "VertexAIAdapter"
 api_key_env     = "GOOGLE_API_KEY"
 model           = "auto"

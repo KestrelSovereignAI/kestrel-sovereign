@@ -78,7 +78,7 @@ class ModelDiscoveryMixin:
             elif isinstance(result, list):
                 all_models.extend(result)
 
-        # Add configured provider models (from llm_config.toml) that weren't discovered
+        # Add configured provider models (from kestrel.toml [llm]) that weren't discovered
         # This ensures models like xai/grok show up even without API discovery
         discovered_ids = set(m.id for m in all_models)
         api_discovered_ids = set(discovered_ids)  # Snapshot before synthetic additions

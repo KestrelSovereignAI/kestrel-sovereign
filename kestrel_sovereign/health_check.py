@@ -3,17 +3,29 @@ import requests
 import sqlite3
 import sys
 
-from kestrel_sovereign.config import load_config
+from kestrel_sovereign.config import load_section
 from kestrel_sovereign.kestrel_config.constants import HTTP_TIMEOUT_SHORT
 from kestrel_sovereign.kestrel_config.defaults import get_ollama_url
 from kestrel_sovereign.llm.model_selection import resolve_provider_default
 
 
 def _resolve_expected_ollama_model(installed_models: list[str]) -> str | None:
-    """Resolve the Ollama model Kestrel is configured to use."""
-    llm_config = load_config("llm_config.toml")
-    ollama_config = llm_config.get("ollama", {}) or {}
-    configured_model = ollama_config.get("model")
+    """Resolve the Ollama model Kestrel is configured to use.
+
+    Reads the route config under ``[llm.vendors.ollama.routes.local]`` (the
+    vendor/route schema established by #688). The pre-#688 flat ``[ollama]``
+    block is no longer recognised by anything else in the system; reading it
+    here would silently return stale data on configs that have been migrated.
+    """
+    llm_config = load_section("llm")
+    ollama_route = (
+        llm_config
+        .get("vendors", {})
+        .get("ollama", {})
+        .get("routes", {})
+        .get("local", {})
+    ) or {}
+    configured_model = ollama_route.get("model")
 
     if configured_model and configured_model != "auto":
         return str(configured_model)
@@ -21,7 +33,7 @@ def _resolve_expected_ollama_model(installed_models: list[str]) -> str | None:
     try:
         return resolve_provider_default("ollama", llm_config=llm_config)
     except Exception:
-        selection_hints = ollama_config.get("selection_hints", []) or []
+        selection_hints = ollama_route.get("selection_hints", []) or []
         for hint in selection_hints:
             hint_lower = str(hint).lower()
             for model_id in installed_models:
@@ -72,15 +84,22 @@ def run_health_check():
                     if installed_model_ids:
                         print(f"  Installed models: {', '.join(installed_model_ids[:5])}")
             elif installed_model_ids:
-                print("  Configured model: ⚠️  Unable to resolve active Ollama model from llm_config.toml")
+                print("  Configured model: ⚠️  Unable to resolve active Ollama model from kestrel.toml [llm]")
         else:
             print(f"Ollama: ❌ Responded with status {resp.status_code}")
     except requests.exceptions.RequestException:
         print(f'Ollama: ❌ Not responding at {ollama_url}')
 
     # Check config
-    config_exists = os.path.exists('llm_config.toml')
-    print(f'LLM Config: {"✅ Found" if config_exists else "❌ Missing llm_config.toml"}')
+    kestrel_toml_exists = os.path.exists('kestrel.toml')
+    if kestrel_toml_exists:
+        llm_section = load_section("llm")
+        if llm_section:
+            print('LLM Config: ✅ kestrel.toml [llm] populated')
+        else:
+            print('LLM Config: ⚠️  kestrel.toml found but [llm] section is empty')
+    else:
+        print('LLM Config: ❌ Missing kestrel.toml — run `kestrel setup` to create one')
 
     print('\n🚀 Ready to start!')
 

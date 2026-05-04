@@ -80,7 +80,7 @@ def service_with_providers():
             mock_config if "llm_config" in path else mock_mandate_config
         )
         mock_reg_cls.return_value = mock_registry
-        svc = LLMService(config_path="llm_config.toml")
+        svc = LLMService()
         svc._usage_db = None
         svc._db_initialized = False
         svc._usage_database_url = None
@@ -122,7 +122,7 @@ def service_with_openai_plan():
             mock_config if "llm_config" in path else mock_mandate_config
         )
         mock_reg_cls.return_value = mock_registry
-        svc = LLMService(config_path="llm_config.toml")
+        svc = LLMService()
         svc._usage_db = None
         svc._db_initialized = False
         svc._usage_database_url = None
@@ -337,7 +337,7 @@ class TestEmptyProviderListRaisesClearly:
 
         msg = str(exc_info.value)
         assert "No LLM routes" in msg
-        assert "llm_config.toml" in msg
+        assert "kestrel.toml [llm]" in msg
 
     def test_streaming_does_not_see_empty_provider_list(self, service_with_providers):
         """End-to-end shape: zero usable routes raises *before* the streaming
