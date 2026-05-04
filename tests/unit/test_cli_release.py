@@ -327,6 +327,62 @@ def test_verify_rejects_missing_artifact_file(
 # Posix paths in manifest
 # ---------------------------------------------------------------------------
 
+def test_verify_rejects_non_object_manifest_json(tmp_path, artifacts_dir, storage_with_keypair):
+    """Codex P2 round 6: a manifest file whose top-level JSON is an
+    array or scalar used to crash with AttributeError out of
+    ReleaseManifest.from_dict instead of returning the documented
+    exit code 2."""
+    _, kp = storage_with_keypair
+    pub_mb = public_key_to_multibase(SLHDSASHA2128sSuite(), kp.public_key)
+    bad = tmp_path / "manifest.json"
+    bad.write_text("[]")  # non-object top-level
+    args = argparse.Namespace(
+        manifest=str(bad),
+        artifacts_dir=str(artifacts_dir),
+        trusted_signer_multibase=pub_mb,
+    )
+    assert cmd_release_verify(args) == 2
+
+
+def test_verify_rejects_string_manifest_json(tmp_path, artifacts_dir, storage_with_keypair):
+    _, kp = storage_with_keypair
+    pub_mb = public_key_to_multibase(SLHDSASHA2128sSuite(), kp.public_key)
+    bad = tmp_path / "manifest.json"
+    bad.write_text('"just a string"')
+    args = argparse.Namespace(
+        manifest=str(bad),
+        artifacts_dir=str(artifacts_dir),
+        trusted_signer_multibase=pub_mb,
+    )
+    assert cmd_release_verify(args) == 2
+
+
+def test_sign_handles_corrupt_secret_bytes(tmp_path, artifacts_dir, monkeypatch):
+    """Codex P2 round 6: stored bytes that decrypt fine but are NOT
+    a valid SLH-DSA secret used to crash with CryptoSuiteError out of
+    sign_manifest. Now wrapped to exit code 2."""
+    monkeypatch.setenv("KESTREL_DATA_KEY", "x" * 32)
+    storage_dir = tmp_path / "keys"
+    storage_dir.mkdir()
+    storage = SecureKeyStorage(storage_dir=storage_dir)
+    # Write garbage of the right length under the secret key id, and
+    # a valid 32-byte public sidecar — sign will load both, then crash
+    # when pqcrypto rejects the secret.
+    storage.save_secret_bytes(b"\x00" * 64, "release-key")  # wrong length
+    storage.save_secret_bytes(b"\x00" * 32, "release-key_pub")
+    args = argparse.Namespace(
+        artifacts_dir=str(artifacts_dir),
+        release_tag="v1",
+        key_id="release-key",
+        signer_did="",
+        kid="k1",
+        output="-",
+        storage_dir=str(storage_dir),
+    )
+    rc = cmd_release_sign(args)
+    assert rc == 2
+
+
 def test_sign_does_not_collide_with_dot_stripped_id(tmp_path, artifacts_dir, monkeypatch):
     """Codex P2 round 5: SecureKeyStorage strips dots, so ``release-key.pub``
     used to alias to ``release-keypub`` and could collide with a

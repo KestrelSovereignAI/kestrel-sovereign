@@ -291,7 +291,23 @@ def cmd_release_sign(args) -> int:
         )
         return 2
 
-    manifest = sign_manifest(manifest, keypair, kid=args.kid)
+    # If the stored secret bytes are not a valid SLH-DSA secret (e.g.
+    # corrupted, wrong alg saved under this id), pqcrypto's sign call
+    # raises CryptoSuiteError out of sign_manifest. Catch it as a
+    # structured signing-key error (codex P2 round 6).
+    try:
+        manifest = sign_manifest(manifest, keypair, kid=args.kid)
+    except Exception as e:
+        # CryptoSuiteError isn't imported here on purpose — any
+        # unexpected exception during sign indicates corrupt key
+        # material rather than a programming bug we should propagate
+        # past the operator.
+        print(
+            f"error: signing failed (corrupt or wrong-alg key bytes "
+            f"under key_id={args.key_id!r}): {e}",
+            file=sys.stderr,
+        )
+        return 2
     manifest = finalize(manifest)
 
     # Self-verify against the LOADED public key before publishing
@@ -338,14 +354,21 @@ def cmd_release_verify(args) -> int:
         print(f"error: manifest not found: {manifest_path}", file=sys.stderr)
         return 2
     try:
-        manifest = ReleaseManifest.from_dict(
-            json.loads(manifest_path.read_text(encoding="utf-8"))
-        )
-    except (json.JSONDecodeError, KeyError, ReleaseManifestError, TypeError, ValueError) as e:
-        # Codex P2 round 1: a manifest with valid JSON but malformed
-        # field shapes (e.g. ``artifacts: [1]`` or non-int size) used
-        # to raise TypeError/ValueError out of from_dict instead of
-        # returning the documented exit code 2.
+        parsed = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if not isinstance(parsed, dict):
+            raise ReleaseManifestError(
+                f"manifest top-level must be an object; got "
+                f"{type(parsed).__name__}"
+            )
+        manifest = ReleaseManifest.from_dict(parsed)
+    except (
+        json.JSONDecodeError, KeyError, ReleaseManifestError,
+        TypeError, ValueError, AttributeError, OSError,
+    ) as e:
+        # Cover all the ways untrusted manifest input can fail to
+        # parse: malformed JSON, non-object top-level (codex P2 round
+        # 6), bad field shapes (round 1), file IO. All collapse to
+        # exit code 2.
         print(f"error: malformed manifest: {e}", file=sys.stderr)
         return 2
 
