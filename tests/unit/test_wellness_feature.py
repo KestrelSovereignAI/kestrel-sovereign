@@ -262,8 +262,14 @@ class TestInteractionDepthCalculator:
 
     @pytest.mark.asyncio
     async def test_short_messages(self):
-        # All messages under 100 chars, no tool usage
-        rows = [("short msg", None), ("hi", None), ("ok", None)]
+        # All messages under 100 chars, no tool usage. Tuple shape:
+        # (role, content, metadata) — role added so the calculator
+        # can strip sent-form wrappers from user-role rows.
+        rows = [
+            ("user", "short msg", None),
+            ("assistant", "hi", None),
+            ("user", "ok", None),
+        ]
         db = _make_db(
             table_exists_map={"conversation_history": True},
             fetchall_data=rows,
@@ -280,9 +286,9 @@ class TestInteractionDepthCalculator:
     async def test_substantive_messages_with_tools(self):
         long_msg = "x" * 250
         rows = [
-            (long_msg, '{"tool": "web_search"}'),
-            (long_msg, '{"tool": "file_read"}'),
-            ("hi", None),
+            ("assistant", long_msg, '{"tool": "web_search"}'),
+            ("assistant", long_msg, '{"tool": "file_read"}'),
+            ("user", "hi", None),
         ]
         db = _make_db(
             table_exists_map={"conversation_history": True},
