@@ -1,3 +1,22 @@
+# =============================================================================
+# DEPRECATED: standalone llm_config.toml is on its way out (#938).
+#
+# New users should configure LLM providers via:
+#
+#     kestrel setup llm        # interactive wizard
+#     # or hand-edit kestrel.toml's [llm] section
+#
+# Existing users with a populated llm_config.toml can migrate in one step:
+#
+#     kestrel migrate-llm-config
+#
+# (merges this file into kestrel.toml [llm], renames source to .bak)
+#
+# This file is kept only as a reference for the schema below; it is no
+# longer recommended as the source of LLM config. The schema itself —
+# vendor/route/model — remains canonical and unchanged in [llm].
+# =============================================================================
+#
 # LLM configuration for Kestrel — vendor/route/model architecture.
 #
 # A **vendor** is who makes the weights (openai, anthropic, ollama, ...).

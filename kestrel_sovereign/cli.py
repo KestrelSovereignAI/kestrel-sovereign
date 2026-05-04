@@ -906,6 +906,60 @@ def cmd_constitution_reanchor(args) -> int:
     return 0
 
 
+def cmd_migrate_llm_config(args) -> int:
+    """One-shot: merge legacy ``llm_config.toml`` into ``kestrel.toml [llm]``."""
+    from kestrel_sovereign.setup.migrate_llm_config import migrate_llm_config
+
+    project_dir = (
+        Path(args.project_dir).resolve()
+        if args.project_dir
+        else _get_project_dir()
+    )
+
+    result = migrate_llm_config(project_dir, force=args.force)
+
+    if result.action == "no_source":
+        print(
+            f"Nothing to migrate: {result.source_path} does not exist.\n"
+            f"Configure LLM providers in {result.kestrel_toml_path} under "
+            f"the [llm] section instead."
+        )
+        return 0
+
+    if result.action == "diverged":
+        print(
+            f"error: kestrel.toml [llm] differs from {result.source_path.name}.\n"
+            f"\n{result.diff}\n"
+            f"Re-run with --force to let llm_config.toml win, or hand-edit "
+            f"kestrel.toml first.",
+            file=sys.stderr,
+        )
+        return 1
+
+    if result.action == "already_clean":
+        print(
+            f"{result.kestrel_toml_path.name} [llm] already matches "
+            f"{result.source_path.name}. Renamed source to "
+            f"{result.bak_path.name}; nothing else to do."
+        )
+        return 0
+
+    # action == "migrated"
+    backup_msg = (
+        f"  Backup of prior kestrel.toml: {result.backup_path.name}\n"
+        if result.backup_path
+        else "  (no prior kestrel.toml; created fresh)\n"
+    )
+    print(
+        f"Migrated {result.source_path.name} -> {result.kestrel_toml_path.name} [llm].\n"
+        f"  Source renamed to: {result.bak_path.name}\n"
+        f"{backup_msg}"
+        f"You can now remove {result.bak_path.name} once you've confirmed "
+        f"the agent loads correctly."
+    )
+    return 0
+
+
 def _agent_appears_running(project_dir, agent_name, agent_cfg) -> bool:
     """Best-effort check that the agent process isn't holding the DB."""
     try:
@@ -1615,6 +1669,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Move existing .env and kestrel.toml aside before regenerating",
     )
 
+    # kestrel migrate-llm-config
+    migrate_llm_p = subparsers.add_parser(
+        "migrate-llm-config",
+        help="One-shot: merge legacy llm_config.toml into kestrel.toml [llm]",
+    )
+    migrate_llm_p.add_argument(
+        "--force", action="store_true",
+        help="Overwrite kestrel.toml [llm] when it differs from llm_config.toml. "
+             "Without --force, divergent content is reported and the file is left alone.",
+    )
+    migrate_llm_p.add_argument(
+        "--project-dir", default=None,
+        help="Project root containing llm_config.toml and kestrel.toml "
+             "(defaults to the Kestrel repo root).",
+    )
+
     # kestrel constitution {reanchor}
     constitution_p = subparsers.add_parser(
         "constitution",
@@ -1719,6 +1789,7 @@ def main() -> int:
         "doctor": cmd_doctor,
         "setup": cmd_setup,
         "constitution": cmd_constitution,
+        "migrate-llm-config": cmd_migrate_llm_config,
         "config": cmd_config,
         "feature": cmd_feature,
         "skills": cmd_skills,
