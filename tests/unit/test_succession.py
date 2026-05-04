@@ -261,6 +261,39 @@ def _build_full_succession(
     return finalize(s)
 
 
+def _self_attesting_resolver(statement):
+    """Test-only resolver: returns the statement's own successor VMs as
+    the "published" DID document for the successor's did:web URI.
+
+    Real production callers MUST use ``identity.did_web.resolve`` so the
+    resolver fetches the actual DID document from HTTPS — that's the
+    binding's whole point. Tests don't have a real network and would
+    otherwise have to spin up an HTTP server, so this synthesizes the
+    document directly. The result is structurally identical to what a
+    legitimate resolver would return for a correctly-published DID;
+    only the publication step is faked.
+    """
+    successor_doc = {
+        "id": statement.successor_did,
+        "verificationMethod": [
+            dict(vm) for vm in statement.successor_verification_methods
+        ],
+    }
+    predecessor_doc = {
+        "id": statement.predecessor_did,
+        "verificationMethod": [
+            dict(vm) for vm in statement.predecessor_verification_methods
+        ],
+    }
+    def _resolve(did):
+        if did == statement.successor_did:
+            return successor_doc
+        if did == statement.predecessor_did:
+            return predecessor_doc
+        raise ValueError(f"unknown did in test resolver: {did!r}")
+    return _resolve
+
+
 def test_verify_legacy_to_hybrid_succession_happy_path(
     base_statement, legacy_predecessor, hybrid_successor,
 ):
@@ -269,7 +302,7 @@ def test_verify_legacy_to_hybrid_succession_happy_path(
     statement = _build_full_succession(
         base_statement, legacy_predecessor, hybrid_successor,
     )
-    result = verify_succession(statement)
+    result = verify_succession(statement, did_web_resolver=_self_attesting_resolver(statement))
     assert result.ok, result.reason
     assert result.predecessor.ok
     assert result.successor.ok
@@ -284,7 +317,7 @@ def test_verify_with_archival_countersignature(
         base_statement, legacy_predecessor, hybrid_successor,
         with_archival_kp_vm=slh_keypair_with_vm,
     )
-    result = verify_succession(statement)
+    result = verify_succession(statement, did_web_resolver=_self_attesting_resolver(statement))
     assert result.ok, result.reason
     assert result.archival is not None
     assert result.archival.ok
@@ -297,7 +330,7 @@ def test_verify_archival_required_present(
         base_statement, legacy_predecessor, hybrid_successor,
         with_archival_kp_vm=slh_keypair_with_vm,
     )
-    result = verify_succession(statement, require_archival=True)
+    result = verify_succession(statement, require_archival=True, did_web_resolver=_self_attesting_resolver(statement))
     assert result.ok
 
 
@@ -308,7 +341,7 @@ def test_verify_archival_required_missing(
     statement = _build_full_succession(
         base_statement, legacy_predecessor, hybrid_successor,
     )
-    result = verify_succession(statement, require_archival=True)
+    result = verify_succession(statement, require_archival=True, did_web_resolver=_self_attesting_resolver(statement))
     assert not result.ok
     assert result.archival is not None
     assert "required but not present" in result.archival.reason
@@ -328,7 +361,7 @@ def test_tampered_reason_invalidates_predecessor_signature(
         base_statement, legacy_predecessor, hybrid_successor,
     )
     tampered = replace(statement, reason="MALICIOUS REWRITE")
-    result = verify_succession(tampered)
+    result = verify_succession(tampered, did_web_resolver=_self_attesting_resolver(tampered))
     assert not result.ok
     # predecessor sigs no longer crypto-verify
     assert not result.predecessor.ok
@@ -344,7 +377,7 @@ def test_tampered_effective_from_invalidates_signatures(
         base_statement, legacy_predecessor, hybrid_successor,
     )
     tampered = replace(statement, effective_from="1900-01-01T00:00:00+00:00")
-    result = verify_succession(tampered)
+    result = verify_succession(tampered, did_web_resolver=_self_attesting_resolver(tampered))
     assert not result.ok
 
 
@@ -360,7 +393,7 @@ def test_missing_predecessor_signature_fails(
         ],
     )
     s = finalize(s)
-    result = verify_succession(s)
+    result = verify_succession(s, did_web_resolver=_self_attesting_resolver(s))
     assert not result.ok
     assert not result.predecessor.ok
 
@@ -380,7 +413,7 @@ def test_successor_classical_only_fails_hybrid_required(
         [(hybrid_successor["hybrid"].classical, hybrid_successor["classical_kid"])],
     )
     s = finalize(s)
-    result = verify_succession(s)
+    result = verify_succession(s, did_web_resolver=_self_attesting_resolver(s))
     assert not result.ok
     assert not result.successor.ok
     assert "HYBRID_REQUIRED" in result.successor.reason
@@ -416,7 +449,7 @@ def test_archival_with_wrong_alg_rejected(
         archival_signature=fake_archival_entry,
         archival_verification_method=fake_vm,
     )
-    result = verify_succession(spoofed)
+    result = verify_succession(spoofed, did_web_resolver=_self_attesting_resolver(spoofed))
     assert not result.ok
     assert result.archival is not None
     assert "must use slh-dsa-sha2-128s" in result.archival.reason
@@ -433,7 +466,7 @@ def test_statement_id_mismatch_fails(
         base_statement, legacy_predecessor, hybrid_successor,
     )
     spoofed = replace(s, statement_id="0" * 64)
-    result = verify_succession(spoofed)
+    result = verify_succession(spoofed, did_web_resolver=_self_attesting_resolver(spoofed))
     assert not result.ok
     assert not result.statement_id_consistent
 
@@ -453,7 +486,7 @@ def test_dict_round_trip_preserves_verification(
     )
     wire = json.dumps(statement.to_dict())
     rehydrated = SuccessionStatement.from_dict(json.loads(wire))
-    result = verify_succession(rehydrated)
+    result = verify_succession(rehydrated, did_web_resolver=_self_attesting_resolver(rehydrated))
     assert result.ok, result.reason
     assert result.archival is not None and result.archival.ok
 
@@ -502,7 +535,7 @@ def test_attacker_takeover_with_forged_did_pkh_rejected(hybrid_successor):
     ])
     forged = finalize(forged)
 
-    result = verify_succession(forged)
+    result = verify_succession(forged, did_web_resolver=_self_attesting_resolver(forged))
     assert not result.ok, "attacker takeover with forged DID must be rejected"
     assert not result.predecessor_did_bound
     assert "binding" in result.reason
@@ -618,3 +651,99 @@ def test_unknown_did_method_rejected():
     ok, reason = verify_did_binding("did:unknown:foo", [])
     assert not ok
     assert "unsupported DID method" in reason
+
+
+# ---------------------------------------------------------------------------
+# Successor DID binding (P1 codex follow-up review of #963)
+# ---------------------------------------------------------------------------
+
+def test_successor_did_mismatch_rejected(legacy_predecessor):
+    """Codex P1 follow-up: a fully signed statement whose ``successor_did``
+    is one DID but whose embedded successor VMs are controlled by an
+    attacker (different DID) must be rejected.
+
+    Pre-fix: only the predecessor side was bound. ok=True returned even
+    when the successor_did was 'did:web:victim.example' but the VMs
+    were 'did:web:attacker.example'. A consumer indexing on
+    successor_did would be misled.
+
+    Post-fix: successor binding runs symmetrically with predecessor
+    binding; mismatch fails-closed.
+    """
+    from kestrel_sovereign.identity.hybrid_keypair import generate_hybrid_keypair
+
+    # Attacker's successor identity, published as did:web:attacker.example
+    attacker_hybrid = generate_hybrid_keypair()
+    attacker_real_did = "did:web:attacker.example"
+    attacker_vms = build_verification_methods(attacker_real_did, attacker_hybrid.public_keys())
+    attacker_classical_kid = attacker_vms[0]["id"].rsplit("#", 1)[-1]
+    attacker_pq_kid = attacker_vms[1]["id"].rsplit("#", 1)[-1]
+
+    # Statement claims a DIFFERENT successor DID
+    claimed_victim_did = "did:web:victim.example"
+
+    s = SuccessionStatement(
+        predecessor_did=legacy_predecessor["did"],
+        successor_did=claimed_victim_did,    # claimed
+        effective_from="2026-05-04T18:00:00+00:00",
+        reason="successor takeover attempt",
+        predecessor_verification_methods=legacy_predecessor["vms"],
+        successor_verification_methods=attacker_vms,  # actually attacker's
+    )
+    s = sign_predecessor(s, [(legacy_predecessor["kp"], legacy_predecessor["kid"])])
+    s = sign_successor(s, [
+        (attacker_hybrid.classical, attacker_classical_kid),
+        (attacker_hybrid.pq, attacker_pq_kid),
+    ])
+    s = finalize(s)
+
+    # Self-attesting resolver returns the statement's claimed successor
+    # DID with the embedded VMs — but the binding check sees the DID
+    # mismatch via the published-doc resolution and fails. Actually
+    # in our self-attesting setup the resolver returns the claimed DID
+    # with the attacker's VMs (because that's what's embedded), so the
+    # binding check has no published-doc to compare against. To
+    # actually catch the cross-DID issue, we use a resolver that
+    # returns a published doc for the claimed DID with DIFFERENT VMs
+    # (the legitimate ones the victim would have published).
+    def _victim_resolver(did):
+        if did == claimed_victim_did:
+            # Victim's REAL published VMs (different from attacker's)
+            real_hybrid = generate_hybrid_keypair()
+            real_vms = build_verification_methods(claimed_victim_did, real_hybrid.public_keys())
+            return {"id": claimed_victim_did, "verificationMethod": real_vms}
+        if did == legacy_predecessor["did"]:
+            return {"id": did, "verificationMethod": legacy_predecessor["vms"]}
+        raise ValueError(did)
+
+    result = verify_succession(s, did_web_resolver=_victim_resolver)
+    assert not result.ok, "successor takeover with mismatched DID must be rejected"
+    assert not result.successor_did_bound
+    assert "successor DID binding" in result.reason
+
+
+# ---------------------------------------------------------------------------
+# statement_id strictness (P2 codex follow-up review of #963)
+# ---------------------------------------------------------------------------
+
+def test_unfinalized_statement_rejected(
+    base_statement, legacy_predecessor, hybrid_successor,
+):
+    """Codex P2: an empty statement_id must NOT be silently treated as
+    consistent. Audit logs and chain walkers index by id; an
+    unaddressable statement is not safe to accept.
+    """
+    s = sign_predecessor(
+        base_statement, [(legacy_predecessor["kp"], legacy_predecessor["kid"])],
+    )
+    s = sign_successor(s, [
+        (hybrid_successor["hybrid"].classical, hybrid_successor["classical_kid"]),
+        (hybrid_successor["hybrid"].pq, hybrid_successor["pq_kid"]),
+    ])
+    # NOTE: NOT calling finalize() — statement_id stays empty
+    assert not s.statement_id
+
+    result = verify_succession(s, did_web_resolver=_self_attesting_resolver(s))
+    assert not result.ok
+    assert not result.statement_id_consistent
+    assert "statement_id is empty" in result.reason
