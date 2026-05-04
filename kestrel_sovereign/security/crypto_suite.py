@@ -428,8 +428,136 @@ class Ed25519Suite(CryptoSuite):
         return self.deserialize_public_key(raw)
 
 
-# Register suites at import time. Future PQ suites in Waves 2-4 (ML-DSA,
-# SLH-DSA, ML-KEM) register themselves the same way from their own
-# modules; this module registers the classical suites.
+# ---------------------------------------------------------------------------
+# MLDSA65Suite — post-quantum, hybrid-identity PQ half (Wave 2)
+# ---------------------------------------------------------------------------
+
+class MLDSA65Suite(CryptoSuite):
+    """ML-DSA-65 (NIST FIPS 204) signing.
+
+    Post-quantum half of the Wave 2 hybrid-identity composite. NIST Cat-3
+    parameter set: balanced security level (≈ AES-192 equivalent under
+    classical attacks), public key 1952 bytes, signature 3309 bytes.
+
+    Library
+    -------
+
+    Backed by ``pqcrypto.sign.ml_dsa_65`` — CFFI bindings to PQClean-
+    derived C implementations, prebuilt wheels available on PyPI for
+    our target platforms (macOS arm64, Linux x86_64, Windows). Selected
+    per the PRD-v2 §9 bake-off criterion: "prebuilt wheels /
+    no compile-on-deploy" beats FIPS-validation-status as the gating
+    factor (CNSA 2.0 supports planning now without a vetted impl).
+
+    The choice is reversible — multiple suites for the same algorithm
+    can coexist behind the registry while we run KAT vectors against
+    alternative implementations (oqs-python, upstream ``cryptography``
+    when it ships PQ).
+
+    Multikey shape
+    --------------
+
+    - ``alg_id``: ``"ml-dsa-65"``
+    - ``public_key_multicodec``: ``b"\\x87\\x24"`` (multicodec 0x1207
+      ``ml-dsa-65-pub``, varint-encoded). The W3C/IETF multicodec
+      table entry is currently *proposed*; treat as experimental until
+      finalized. Wire format will stay byte-stable as the spec firms up.
+    - Public key bytes: 1952 raw bytes (pqcrypto returns these directly).
+
+    Sign/verify failure semantics
+    -----------------------------
+
+    pqcrypto's ``verify`` returns ``False`` cleanly for all failure
+    modes — wrong key, tampered data, malformed signature — no
+    exceptions to catch. ``sign`` raises only on truly broken inputs
+    (wrong-length secret key, etc.); this suite wraps those into
+    ``CryptoSuiteError`` for uniform error handling.
+    """
+
+    alg_id: ClassVar[str] = ALG_ML_DSA_65
+    # Multicodec 0x1207 (ml-dsa-65-pub, proposed), varint-encoded.
+    # See https://github.com/multiformats/multicodec for the registry.
+    public_key_multicodec: ClassVar[bytes] = b"\x87\x24"
+    is_post_quantum: ClassVar[bool] = True
+
+    # NIST FIPS 204 Cat-3 sizes — pinned as class attributes so callers
+    # can size buffers without importing pqcrypto themselves.
+    PUBLIC_KEY_SIZE: ClassVar[int] = 1952
+    SECRET_KEY_SIZE: ClassVar[int] = 4032
+    SIGNATURE_SIZE: ClassVar[int] = 3309
+
+    def generate_keypair(self) -> Keypair:
+        from pqcrypto.sign import ml_dsa_65
+        # pqcrypto returns (public, secret) — note the order
+        public_bytes, secret_bytes = ml_dsa_65.generate_keypair()
+        return Keypair(
+            suite_id=self.alg_id,
+            private_key=secret_bytes,
+            public_key=public_bytes,
+        )
+
+    def sign(self, data: bytes, private_key: Any) -> bytes:
+        from pqcrypto.sign import ml_dsa_65
+        if not isinstance(private_key, (bytes, bytearray)):
+            raise CryptoSuiteError(
+                f"ml-dsa-65 private_key must be bytes ({self.SECRET_KEY_SIZE} "
+                f"bytes); got {type(private_key).__name__}"
+            )
+        try:
+            return ml_dsa_65.sign(bytes(private_key), data)
+        except Exception as e:
+            raise CryptoSuiteError(f"ml-dsa-65 sign failed: {e}") from e
+
+    def verify(self, data: bytes, signature: bytes, public_key: Any) -> bool:
+        from pqcrypto.sign import ml_dsa_65
+        if not isinstance(public_key, (bytes, bytearray)):
+            return False
+        if not isinstance(signature, (bytes, bytearray)):
+            return False
+        try:
+            return bool(ml_dsa_65.verify(bytes(public_key), data, bytes(signature)))
+        except Exception:
+            return False
+
+    def serialize_public_key(self, public_key: Any) -> bytes:
+        """Raw 1952-byte ML-DSA-65 public key.
+
+        pqcrypto already returns the public key as raw bytes, so this is
+        an identity cast (with type validation).
+        """
+        if not isinstance(public_key, (bytes, bytearray)):
+            raise CryptoSuiteError(
+                f"ml-dsa-65 public_key must be bytes; got "
+                f"{type(public_key).__name__}"
+            )
+        return bytes(public_key)
+
+    def deserialize_public_key(self, raw: bytes) -> Any:
+        if not isinstance(raw, (bytes, bytearray)):
+            raise CryptoSuiteError(
+                f"ml-dsa-65 raw public key must be bytes; got "
+                f"{type(raw).__name__}"
+            )
+        if len(raw) != self.PUBLIC_KEY_SIZE:
+            raise CryptoSuiteError(
+                f"ml-dsa-65 public key must be {self.PUBLIC_KEY_SIZE} bytes; "
+                f"got {len(raw)}"
+            )
+        return bytes(raw)
+
+    # Multikey serialization is identical to the legacy form — ML-DSA-65
+    # has only one canonical wire representation. Single canonical form
+    # = no chance of cross-implementation incompatibility under the
+    # multicodec.
+    def serialize_public_key_for_multikey(self, public_key: Any) -> bytes:
+        return self.serialize_public_key(public_key)
+
+    def deserialize_public_key_from_multikey(self, raw: bytes) -> Any:
+        return self.deserialize_public_key(raw)
+
+
+# Register suites at import time. Future PQ suites in Waves 3-4 (SLH-DSA,
+# ML-KEM) register themselves the same way from their own modules.
 register_suite(Secp256k1Suite())
 register_suite(Ed25519Suite())
+register_suite(MLDSA65Suite())

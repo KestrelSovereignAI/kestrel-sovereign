@@ -2610,6 +2610,7 @@ dependencies = [
     { name = "packaging" },
     { name = "pillow" },
     { name = "pluggy" },
+    { name = "pqcrypto" },
     { name = "psutil" },
     { name = "psycopg2-binary" },
     { name = "pycryptodome" },
@@ -2884,6 +2885,7 @@ requires-dist = [
     { name = "pillow", specifier = ">=12.1.1" },
     { name = "piper-tts", marker = "extra == 'voice-local'", specifier = ">=1.2.0" },
     { name = "pluggy", specifier = "==1.6.0" },
+    { name = "pqcrypto", specifier = ">=0.4.0" },
     { name = "prometheus-client", marker = "extra == 'observability'", specifier = ">=0.21.0" },
     { name = "psutil", specifier = ">=7.1.3" },
     { name = "psycopg2-binary", specifier = ">=2.9.10" },
@@ -4248,6 +4250,37 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/48/20/60ae67bb9d82f00427946218d49e2e7e80fb41c15dc5019482289ec9ce8d/posthog-5.4.0.tar.gz", hash = "sha256:701669261b8d07cdde0276e5bc096b87f9e200e3b9589c5ebff14df658c5893c", size = 88076, upload-time = "2025-06-20T23:19:23.485Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/4f/98/e480cab9a08d1c09b1c59a93dade92c1bb7544826684ff2acbfd10fcfbd4/posthog-5.4.0-py3-none-any.whl", hash = "sha256:284dfa302f64353484420b52d4ad81ff5c2c2d1d607c4e2db602ac72761831bd", size = 105364, upload-time = "2025-06-20T23:19:22.001Z" },
+]
+
+[[package]]
+name = "pqcrypto"
+version = "0.4.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "cffi" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/d8/75/8864b99d3fb703914b734b9a6e468e76a1c208c66a297124e3ee795336b3/pqcrypto-0.4.0-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:cdbf308452a183fc6c47a994207ff3ebd820c8a8aa1f09e9dbb1b697ab6e7cd9", size = 8945667, upload-time = "2026-01-25T20:59:06.325Z" },
+    { url = "https://files.pythonhosted.org/packages/9f/22/15f3f28b3e0763879336ae7c7d9f83e9bb3131beaf47ddece4418b9edbe1/pqcrypto-0.4.0-cp311-cp311-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:ce0e4ea504eabec4d51085fa62de61b471ac123a624fe44bd4dac289e8803b8f", size = 18247129, upload-time = "2026-01-25T20:59:09.167Z" },
+    { url = "https://files.pythonhosted.org/packages/d3/6a/2f15dacd72df897ba15e051d0517ad3b8676e27feac189d8ac540edfdde0/pqcrypto-0.4.0-cp311-cp311-manylinux_2_26_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:2a0f221f06f4af1029d55c21eaa4456630119d5205bb12390637ae31e710cd4f", size = 20470357, upload-time = "2026-01-25T20:59:12.187Z" },
+    { url = "https://files.pythonhosted.org/packages/e3/32/f63a16adec538fe74e3bb1f7cc208127d06e9333330d5b363e223461e27f/pqcrypto-0.4.0-cp311-cp311-musllinux_1_2_aarch64.whl", hash = "sha256:b098557eb6ed727f96f32d388a0a36494f347e8b4be3cdbd413997cfc82712bd", size = 18020987, upload-time = "2026-01-25T20:59:15.682Z" },
+    { url = "https://files.pythonhosted.org/packages/8f/ab/8d4270445ea0d5d5e4d5cbd28b9186e97b32185459a1b67273d3046bf288/pqcrypto-0.4.0-cp311-cp311-musllinux_1_2_x86_64.whl", hash = "sha256:f8fa254a42751bd3dc53dff0897c74bc1f0be2c100ab7c86bda17905983a7f4c", size = 20429001, upload-time = "2026-01-25T20:59:17.919Z" },
+    { url = "https://files.pythonhosted.org/packages/c2/f5/633a869fe0c0b9b7bb9086e7f767a06932b77db7d5ef7aea2162359f8c8a/pqcrypto-0.4.0-cp311-cp311-win32.whl", hash = "sha256:1517264111b95b572c0a73470f76795bd9aadce1af27f5fb02890c8bb92789b4", size = 4439677, upload-time = "2026-01-25T20:59:20.323Z" },
+    { url = "https://files.pythonhosted.org/packages/dd/8f/9dc4f354c594d86bb617dbacbeb09c8163ffa5223e09a8b9e029d5db9c1c/pqcrypto-0.4.0-cp311-cp311-win_amd64.whl", hash = "sha256:cae6d57a0098d9a703f627de72f9688b0cbcc6d4b6d9f67be7a44a98da9d063f", size = 5351587, upload-time = "2026-01-25T20:59:22.496Z" },
+    { url = "https://files.pythonhosted.org/packages/51/2b/3cfe832c7c365cf715d04a1cc220961ce442deb88888f259890fb6af175a/pqcrypto-0.4.0-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:001d2b473bd64c1ff59ed3ef57ad5b4d351a2b75b589015a8385a6e29d44cb55", size = 11005504, upload-time = "2026-01-25T20:59:24.369Z" },
+    { url = "https://files.pythonhosted.org/packages/4d/c9/13f965ada9bbccb9633cb13123327022dfd537e12d10ad033bd83053dab3/pqcrypto-0.4.0-cp312-cp312-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:2e79f8d9148db5a83e8a842ad59402f3421a2cc678f2c3c43015b26f4b5cad93", size = 24322618, upload-time = "2026-01-25T20:59:27.203Z" },
+    { url = "https://files.pythonhosted.org/packages/02/f4/80b7aacc93249d5735f8d150096f0b6eed8347cff99e0f032e3170c94aaf/pqcrypto-0.4.0-cp312-cp312-manylinux_2_26_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:280db9aa8e173b6756bf45a7eda042f02692c32e06ed47c57d6909026be17d48", size = 27288989, upload-time = "2026-01-25T20:59:30.143Z" },
+    { url = "https://files.pythonhosted.org/packages/d4/63/3f941d65571f4faa9dfa3ba0c672a72a8d783c1ac3dbfea041e3844eb9a2/pqcrypto-0.4.0-cp312-cp312-musllinux_1_2_aarch64.whl", hash = "sha256:61d5cad03791a892d9d1896fd268604a9912df1760e7fe70efe53fef7a3e31a4", size = 24019376, upload-time = "2026-01-25T20:59:33.051Z" },
+    { url = "https://files.pythonhosted.org/packages/12/e4/6f4a22da1e74eb925a5f08887c450af474abd6bc4d6898384a1fce554fa2/pqcrypto-0.4.0-cp312-cp312-musllinux_1_2_x86_64.whl", hash = "sha256:7a6515e74bf05bbefc8e1a33a18c0c2e0494185675b6f8aaa8c931191272b565", size = 27235541, upload-time = "2026-01-25T20:59:35.561Z" },
+    { url = "https://files.pythonhosted.org/packages/49/2c/333b2e41f863a3a6453192a18c1e437b471b02351154972e2add6d42f903/pqcrypto-0.4.0-cp312-cp312-win32.whl", hash = "sha256:ab62730b19e1d810bd8adbac783b5e7b2a21db03da39e05e7e175242ff556189", size = 6211191, upload-time = "2026-01-25T20:59:37.755Z" },
+    { url = "https://files.pythonhosted.org/packages/4d/b9/3425250bfad6e1bff4f855555c8d043a918d8b5619dc316ce0b6ad58ad54/pqcrypto-0.4.0-cp312-cp312-win_amd64.whl", hash = "sha256:8a5b74ddc4e257469b3ad44aa65e839eeb7da5c0fabc68a8e469507445e731cd", size = 7123468, upload-time = "2026-01-25T20:59:39.367Z" },
+    { url = "https://files.pythonhosted.org/packages/dd/5d/dd3752d741f8772eb7f0a49226bb02966c1fd7b85c7aa83027213a2e9973/pqcrypto-0.4.0-cp313-cp313-macosx_11_0_arm64.whl", hash = "sha256:ede8f0adfb30df35f0fedfab3277792792f5fae5eb66c4b4b3d7a7bd89a64778", size = 13065315, upload-time = "2026-01-25T20:59:41.564Z" },
+    { url = "https://files.pythonhosted.org/packages/0d/d6/98abb4e44df8c361a1a0f67e0306e6f0257c3ca8aef6bedefc0956047949/pqcrypto-0.4.0-cp313-cp313-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:239cc1b60cdf54f45e7f13c45caab784500ce8e4e7f9fde8657b9fadeb125008", size = 30396217, upload-time = "2026-01-25T20:59:44.086Z" },
+    { url = "https://files.pythonhosted.org/packages/bb/01/9c57f061b6798bc478cb552d3653bff4f447b34f989e0f49326fa558719e/pqcrypto-0.4.0-cp313-cp313-manylinux_2_26_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:1ee2954eca84149e29064b9f82f130bd1ac5e0d963b0a35e48a7c9737c2e394e", size = 34105773, upload-time = "2026-01-25T20:59:47.453Z" },
+    { url = "https://files.pythonhosted.org/packages/38/29/b63e8b9489bb8f7a41a63121cc442e9a6909a2ea761b921a75488e90f6df/pqcrypto-0.4.0-cp313-cp313-musllinux_1_2_aarch64.whl", hash = "sha256:68a7ce6889450732154405cc71a30233e16d47ba4588529ea365d46655c35889", size = 30017344, upload-time = "2026-01-25T20:59:50.287Z" },
+    { url = "https://files.pythonhosted.org/packages/86/35/18b6949229c3157d54feeee2a7dfe29d1e327a04b39b0b9fa3feb2f58e04/pqcrypto-0.4.0-cp313-cp313-musllinux_1_2_x86_64.whl", hash = "sha256:7f2de5cedff213cc874341c6618e5d70f050f444ee0793a3a3adec0f81d86f20", size = 34041682, upload-time = "2026-01-25T20:59:52.856Z" },
+    { url = "https://files.pythonhosted.org/packages/e3/19/76610175111e2e4298fd1e5fd48ef6eebbb5b54a8c685af3a7d4b3e90691/pqcrypto-0.4.0-cp313-cp313-win32.whl", hash = "sha256:af474a7530daec502642964a4a9ed0ac110ecb1abd7b6cb010ffee3405721cb5", size = 7983085, upload-time = "2026-01-25T20:59:55.236Z" },
+    { url = "https://files.pythonhosted.org/packages/1b/39/c22a01f0ae8b4e843d9aaf6095ad5a3708230f50fca523fd8c70081cd62b/pqcrypto-0.4.0-cp313-cp313-win_amd64.whl", hash = "sha256:04fce6e234727a96e94a7e7b05e8959edf7db39fa94b092f6bab5fe51ecdf29e", size = 8895365, upload-time = "2026-01-25T20:59:56.842Z" },
 ]
 
 [[package]]
