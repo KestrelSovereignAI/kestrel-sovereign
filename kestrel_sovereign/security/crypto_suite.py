@@ -337,6 +337,99 @@ class Secp256k1Suite(CryptoSuite):
             ) from e
 
 
-# Register the default suite at import time. Future suites in Waves 2-4
-# register themselves the same way from their own modules.
+# ---------------------------------------------------------------------------
+# Ed25519Suite — classical, hybrid-identity classical half (Wave 2)
+# ---------------------------------------------------------------------------
+
+class Ed25519Suite(CryptoSuite):
+    """Ed25519 (RFC 8032) signing.
+
+    Classical half of the Wave 2 hybrid-identity composite (Ed25519 +
+    ML-DSA-65). Already in use by ``storage/providers/storacha_ucan.py``
+    for UCAN v1 invocations; this suite registers it under the same
+    abstraction so the hybrid signer in Wave 2 sub-PR 4+ can pick it up.
+
+    Multikey shape
+    --------------
+
+    - ``alg_id``: ``"ed25519"``
+    - ``public_key_multicodec``: ``b"\\xed\\x01"`` (multicodec 0xed
+      = ``ed25519-pub``, varint-encoded; matches W3C did:key spec).
+    - Public-key bytes: 32-byte raw — Ed25519 has no compressed/uncompressed
+      distinction, so the legacy and multikey forms are identical.
+
+    Threat note
+    -----------
+
+    Ed25519 is Shor-vulnerable like all classical signatures. Wave 2
+    pairs it with ML-DSA-65 in a hybrid identity; the classical half
+    provides decades-aged cryptanalysis confidence while the PQ half
+    handles the future-quantum-adversary case.
+    """
+
+    alg_id: ClassVar[str] = ALG_ED25519
+    # Multicodec 0xed (ed25519-pub), varint-encoded.
+    public_key_multicodec: ClassVar[bytes] = b"\xed\x01"
+    is_post_quantum: ClassVar[bool] = False
+
+    def generate_keypair(self) -> Keypair:
+        from cryptography.hazmat.primitives.asymmetric import ed25519
+        priv = ed25519.Ed25519PrivateKey.generate()
+        return Keypair(
+            suite_id=self.alg_id,
+            private_key=priv,
+            public_key=priv.public_key(),
+        )
+
+    def sign(self, data: bytes, private_key: Any) -> bytes:
+        try:
+            # Ed25519 has built-in hashing; no separate hash algorithm needed.
+            return private_key.sign(data)
+        except Exception as e:
+            raise CryptoSuiteError(f"ed25519 sign failed: {e}") from e
+
+    def verify(self, data: bytes, signature: bytes, public_key: Any) -> bool:
+        try:
+            public_key.verify(signature, data)
+            return True
+        except Exception:
+            return False
+
+    def serialize_public_key(self, public_key: Any) -> bytes:
+        """Raw 32-byte Ed25519 public key.
+
+        Same shape used by ``storage/providers/storacha_ucan.py`` and by
+        the W3C Multikey codec — Ed25519 has only one canonical form.
+        """
+        from cryptography.hazmat.primitives.serialization import (
+            Encoding, PublicFormat,
+        )
+        return public_key.public_bytes(
+            encoding=Encoding.Raw,
+            format=PublicFormat.Raw,
+        )
+
+    def deserialize_public_key(self, raw: bytes) -> Any:
+        from cryptography.hazmat.primitives.asymmetric import ed25519
+        try:
+            return ed25519.Ed25519PublicKey.from_public_bytes(raw)
+        except Exception as e:
+            raise CryptoSuiteError(
+                f"ed25519 public-key deserialization failed: {e}"
+            ) from e
+
+    # Multikey serialization is identical to the legacy form for Ed25519
+    # (no compressed/uncompressed distinction); reuse the same methods so
+    # there's a single canonical wire format.
+    def serialize_public_key_for_multikey(self, public_key: Any) -> bytes:
+        return self.serialize_public_key(public_key)
+
+    def deserialize_public_key_from_multikey(self, raw: bytes) -> Any:
+        return self.deserialize_public_key(raw)
+
+
+# Register suites at import time. Future PQ suites in Waves 2-4 (ML-DSA,
+# SLH-DSA, ML-KEM) register themselves the same way from their own
+# modules; this module registers the classical suites.
 register_suite(Secp256k1Suite())
+register_suite(Ed25519Suite())
