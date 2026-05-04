@@ -386,6 +386,7 @@ def cmd_release_verify(args) -> int:
         return 2
 
     failed: List[str] = []
+    manifested_paths = {entry.path for entry in manifest.artifacts}
     for entry in manifest.artifacts:
         artifact_path = artifacts_dir / entry.path
         if not artifact_path.exists():
@@ -400,6 +401,22 @@ def cmd_release_verify(args) -> int:
             continue
         if not ok:
             failed.append(f"{entry.path}: hash or size mismatch")
+
+    # Codex P2 round 7: an attacker who can drop a file into the
+    # artifacts directory after signing would have it ride along
+    # alongside the verified release. Walk the directory and refuse
+    # any file that isn't in the manifest. Exempt the manifest file
+    # itself if it's colocated (sign-side already excludes it from
+    # the artifact walk per round 1's fix).
+    manifest_path_resolved = manifest_path.resolve()
+    for path in artifacts_dir.rglob("*"):
+        if not path.is_file():
+            continue
+        if path.resolve() == manifest_path_resolved:
+            continue
+        rel = path.relative_to(artifacts_dir).as_posix()
+        if rel not in manifested_paths:
+            failed.append(f"{rel}: present on disk but NOT in signed manifest")
 
     if failed:
         print(

@@ -327,6 +327,65 @@ def test_verify_rejects_missing_artifact_file(
 # Posix paths in manifest
 # ---------------------------------------------------------------------------
 
+def test_verify_rejects_extra_unmanifested_files(
+    storage_with_keypair, artifacts_dir, tmp_path,
+):
+    """Codex P2 round 7: an attacker drops an extra file into the
+    artifacts dir after signing. The verifier must catch it; otherwise
+    the release inventory guarantee breaks."""
+    storage_dir, kp = storage_with_keypair
+    output = tmp_path / "manifest.json"
+    sign_args = argparse.Namespace(
+        artifacts_dir=str(artifacts_dir),
+        release_tag="v1",
+        key_id="release-key",
+        signer_did="",
+        kid="k1",
+        output=str(output),
+        storage_dir=str(storage_dir),
+    )
+    assert cmd_release_sign(sign_args) == 0
+
+    # Inject extra file post-sign
+    (artifacts_dir / "INJECTED.txt").write_bytes(b"smuggled-payload")
+
+    pub_mb = public_key_to_multibase(SLHDSASHA2128sSuite(), kp.public_key)
+    args = argparse.Namespace(
+        manifest=str(output),
+        artifacts_dir=str(artifacts_dir),
+        trusted_signer_multibase=pub_mb,
+    )
+    assert cmd_release_verify(args) == 4  # artifact-bytes failure path
+
+
+def test_verify_exempts_colocated_manifest_file(
+    storage_with_keypair, artifacts_dir,
+):
+    """The manifest file itself is allowed to live inside the
+    artifacts dir (the sign-side already excludes it from the walk)
+    and must NOT be flagged as 'unmanifested' during verify."""
+    storage_dir, kp = storage_with_keypair
+    output = artifacts_dir / "release-manifest.json"
+    sign_args = argparse.Namespace(
+        artifacts_dir=str(artifacts_dir),
+        release_tag="v1",
+        key_id="release-key",
+        signer_did="",
+        kid="k1",
+        output=str(output),
+        storage_dir=str(storage_dir),
+    )
+    assert cmd_release_sign(sign_args) == 0
+
+    pub_mb = public_key_to_multibase(SLHDSASHA2128sSuite(), kp.public_key)
+    args = argparse.Namespace(
+        manifest=str(output),
+        artifacts_dir=str(artifacts_dir),
+        trusted_signer_multibase=pub_mb,
+    )
+    assert cmd_release_verify(args) == 0
+
+
 def test_verify_rejects_non_object_manifest_json(tmp_path, artifacts_dir, storage_with_keypair):
     """Codex P2 round 6: a manifest file whose top-level JSON is an
     array or scalar used to crash with AttributeError out of
