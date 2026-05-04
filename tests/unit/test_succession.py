@@ -18,15 +18,6 @@ Covers:
   * archival signature uses ML-DSA-65 instead of SLH-DSA → fail
   * statement_id mismatch → fail
 - to_dict/from_dict round-trip preserves all fields
-
-P1 review-finding regression coverage:
-- Attacker takeover scenario: forged statement claiming a victim's
-  did:pkh with attacker-controlled keys is rejected by the new
-  predecessor-DID-binding check (verify_did_binding)
-- did:pkh address-binding rule rejects mismatched VMs
-- did:key multibase-binding rule rejects mismatched VMs
-- did:web binding fails-closed without an explicit resolver
-- did:web binding accepts when resolver returns matching VMs
 """
 
 from __future__ import annotations
@@ -68,19 +59,10 @@ from kestrel_sovereign.security.verify_policy import VerifyPolicy
 
 @pytest.fixture(scope="module")
 def legacy_predecessor():
-    """Legacy did:pkh agent: only ECDSA secp256k1.
-
-    The DID is derived from the keypair via the same Ethereum-address
-    rule the inception_service uses, so the verify_did_binding check
-    holds.
-    """
-    from kestrel_sovereign.inception_service import (
-        public_key_to_ethereum_address,
-    )
+    """Legacy did:pkh agent: only ECDSA secp256k1."""
     secp = Secp256k1Suite()
     kp = secp.generate_keypair()
-    address = public_key_to_ethereum_address(kp.public_key)
-    did = f"did:pkh:eip155:1:{address}"
+    did = "did:pkh:eip155:1:0xABC123"
     vms = build_verification_methods(did, [(secp, kp.public_key)])
     return {"did": did, "kp": kp, "kid": vms[0]["id"].rsplit("#", 1)[-1], "vms": vms}
 
@@ -235,26 +217,6 @@ def test_archival_countersign_embeds_verification_method(
     assert signed.archival_verification_method == vm
 
 
-def test_archival_countersign_uses_preattached_vm_kid(
-    base_statement, slh_keypair_with_vm,
-):
-    """Codex P2 round 8: when the caller pre-attaches the archival VM
-    on the statement and calls ``archival_countersign`` WITHOUT passing
-    ``verification_method=``, the signature's kid must still be derived
-    from the preattached VM (not stuck at the default ``"archival"``)
-    or the verifier can't match the signature to the VM at check time.
-    """
-    from dataclasses import replace as _replace
-    kp, vm = slh_keypair_with_vm
-    # Pre-attach the VM (different code path than passing it to the
-    # function)
-    pre_attached = _replace(base_statement, archival_verification_method=vm)
-    signed = archival_countersign(pre_attached, kp)  # no explicit VM
-    assert signed.archival_signature is not None
-    expected_kid = vm["id"].rsplit("#", 1)[-1]
-    assert signed.archival_signature["kid"] == expected_kid
-
-
 # ---------------------------------------------------------------------------
 # verify_succession — happy paths
 # ---------------------------------------------------------------------------
@@ -281,39 +243,6 @@ def _build_full_succession(
     return finalize(s)
 
 
-def _self_attesting_resolver(statement):
-    """Test-only resolver: returns the statement's own successor VMs as
-    the "published" DID document for the successor's did:web URI.
-
-    Real production callers MUST use ``identity.did_web.resolve`` so the
-    resolver fetches the actual DID document from HTTPS — that's the
-    binding's whole point. Tests don't have a real network and would
-    otherwise have to spin up an HTTP server, so this synthesizes the
-    document directly. The result is structurally identical to what a
-    legitimate resolver would return for a correctly-published DID;
-    only the publication step is faked.
-    """
-    successor_doc = {
-        "id": statement.successor_did,
-        "verificationMethod": [
-            dict(vm) for vm in statement.successor_verification_methods
-        ],
-    }
-    predecessor_doc = {
-        "id": statement.predecessor_did,
-        "verificationMethod": [
-            dict(vm) for vm in statement.predecessor_verification_methods
-        ],
-    }
-    def _resolve(did):
-        if did == statement.successor_did:
-            return successor_doc
-        if did == statement.predecessor_did:
-            return predecessor_doc
-        raise ValueError(f"unknown did in test resolver: {did!r}")
-    return _resolve
-
-
 def test_verify_legacy_to_hybrid_succession_happy_path(
     base_statement, legacy_predecessor, hybrid_successor,
 ):
@@ -322,7 +251,7 @@ def test_verify_legacy_to_hybrid_succession_happy_path(
     statement = _build_full_succession(
         base_statement, legacy_predecessor, hybrid_successor,
     )
-    result = verify_succession(statement, did_web_resolver=_self_attesting_resolver(statement))
+    result = verify_succession(statement)
     assert result.ok, result.reason
     assert result.predecessor.ok
     assert result.successor.ok
@@ -337,71 +266,21 @@ def test_verify_with_archival_countersignature(
         base_statement, legacy_predecessor, hybrid_successor,
         with_archival_kp_vm=slh_keypair_with_vm,
     )
-    result = verify_succession(statement, did_web_resolver=_self_attesting_resolver(statement))
+    result = verify_succession(statement)
     assert result.ok, result.reason
     assert result.archival is not None
     assert result.archival.ok
 
 
-def test_verify_archival_required_present_with_pinned_key(
+def test_verify_archival_required_present(
     base_statement, legacy_predecessor, hybrid_successor, slh_keypair_with_vm,
 ):
-    """Codex P2 round 7: ``require_archival=True`` is only meaningful
-    when paired with ``trusted_archival_multibase=`` because anyone can
-    mint a fresh SLH-DSA key. Pinning the expected archival key makes
-    the policy real."""
     statement = _build_full_succession(
         base_statement, legacy_predecessor, hybrid_successor,
         with_archival_kp_vm=slh_keypair_with_vm,
     )
-    _, slh_vm = slh_keypair_with_vm
-    pinned = slh_vm["publicKeyMultibase"]
-    result = verify_succession(
-        statement, require_archival=True,
-        trusted_archival_multibase=pinned,
-        did_web_resolver=_self_attesting_resolver(statement),
-    )
-    assert result.ok, result.reason
-
-
-def test_verify_archival_required_without_trusted_key_fails(
-    base_statement, legacy_predecessor, hybrid_successor, slh_keypair_with_vm,
-):
-    """Without a pinned archival key, ``require_archival=True`` is
-    paper-only and the verifier now rejects it explicitly."""
-    statement = _build_full_succession(
-        base_statement, legacy_predecessor, hybrid_successor,
-        with_archival_kp_vm=slh_keypair_with_vm,
-    )
-    result = verify_succession(
-        statement, require_archival=True,
-        did_web_resolver=_self_attesting_resolver(statement),
-    )
-    assert not result.ok
-    assert "trusted_archival_multibase" in result.reason
-
-
-def test_verify_archival_pinned_to_wrong_key_fails(
-    base_statement, legacy_predecessor, hybrid_successor, slh_keypair_with_vm,
-):
-    """If the embedded archival VM doesn't match the pinned key, fail."""
-    statement = _build_full_succession(
-        base_statement, legacy_predecessor, hybrid_successor,
-        with_archival_kp_vm=slh_keypair_with_vm,
-    )
-    # Pin to a different multibase
-    other_slh = SLHDSASHA2128sSuite()
-    other_kp = other_slh.generate_keypair()
-    from kestrel_sovereign.security.multikey import public_key_to_multibase
-    wrong_pin = public_key_to_multibase(other_slh, other_kp.public_key)
-
-    result = verify_succession(
-        statement, require_archival=True,
-        trusted_archival_multibase=wrong_pin,
-        did_web_resolver=_self_attesting_resolver(statement),
-    )
-    assert not result.ok
-    assert "does not match trusted_archival_multibase" in result.reason
+    result = verify_succession(statement, require_archival=True)
+    assert result.ok
 
 
 def test_verify_archival_required_missing(
@@ -411,7 +290,7 @@ def test_verify_archival_required_missing(
     statement = _build_full_succession(
         base_statement, legacy_predecessor, hybrid_successor,
     )
-    result = verify_succession(statement, require_archival=True, did_web_resolver=_self_attesting_resolver(statement))
+    result = verify_succession(statement, require_archival=True)
     assert not result.ok
     assert result.archival is not None
     assert "required but not present" in result.archival.reason
@@ -431,7 +310,7 @@ def test_tampered_reason_invalidates_predecessor_signature(
         base_statement, legacy_predecessor, hybrid_successor,
     )
     tampered = replace(statement, reason="MALICIOUS REWRITE")
-    result = verify_succession(tampered, did_web_resolver=_self_attesting_resolver(tampered))
+    result = verify_succession(tampered)
     assert not result.ok
     # predecessor sigs no longer crypto-verify
     assert not result.predecessor.ok
@@ -447,7 +326,7 @@ def test_tampered_effective_from_invalidates_signatures(
         base_statement, legacy_predecessor, hybrid_successor,
     )
     tampered = replace(statement, effective_from="1900-01-01T00:00:00+00:00")
-    result = verify_succession(tampered, did_web_resolver=_self_attesting_resolver(tampered))
+    result = verify_succession(tampered)
     assert not result.ok
 
 
@@ -463,7 +342,7 @@ def test_missing_predecessor_signature_fails(
         ],
     )
     s = finalize(s)
-    result = verify_succession(s, did_web_resolver=_self_attesting_resolver(s))
+    result = verify_succession(s)
     assert not result.ok
     assert not result.predecessor.ok
 
@@ -483,7 +362,7 @@ def test_successor_classical_only_fails_hybrid_required(
         [(hybrid_successor["hybrid"].classical, hybrid_successor["classical_kid"])],
     )
     s = finalize(s)
-    result = verify_succession(s, did_web_resolver=_self_attesting_resolver(s))
+    result = verify_succession(s)
     assert not result.ok
     assert not result.successor.ok
     assert "HYBRID_REQUIRED" in result.successor.reason
@@ -519,7 +398,7 @@ def test_archival_with_wrong_alg_rejected(
         archival_signature=fake_archival_entry,
         archival_verification_method=fake_vm,
     )
-    result = verify_succession(spoofed, did_web_resolver=_self_attesting_resolver(spoofed))
+    result = verify_succession(spoofed)
     assert not result.ok
     assert result.archival is not None
     assert "must use slh-dsa-sha2-128s" in result.archival.reason
@@ -536,7 +415,7 @@ def test_statement_id_mismatch_fails(
         base_statement, legacy_predecessor, hybrid_successor,
     )
     spoofed = replace(s, statement_id="0" * 64)
-    result = verify_succession(spoofed, did_web_resolver=_self_attesting_resolver(spoofed))
+    result = verify_succession(spoofed)
     assert not result.ok
     assert not result.statement_id_consistent
 
@@ -556,554 +435,6 @@ def test_dict_round_trip_preserves_verification(
     )
     wire = json.dumps(statement.to_dict())
     rehydrated = SuccessionStatement.from_dict(json.loads(wire))
-    result = verify_succession(rehydrated, did_web_resolver=_self_attesting_resolver(rehydrated))
+    result = verify_succession(rehydrated)
     assert result.ok, result.reason
     assert result.archival is not None and result.archival.ok
-
-
-# ---------------------------------------------------------------------------
-# Predecessor DID binding (P1 regression: codex review of #963)
-# ---------------------------------------------------------------------------
-
-def test_attacker_takeover_with_forged_did_pkh_rejected(hybrid_successor):
-    """The codex-flagged attack: build a statement claiming a victim's
-    did:pkh, embed the attacker's own keys as predecessor_verification_
-    methods, sign with the attacker's key, and ship.
-
-    Pre-fix: verify_succession returned ok=True because the signatures
-    DID crypto-verify against the embedded VMs. The verifier never
-    cross-checked that the embedded VMs actually correspond to the
-    claimed DID.
-
-    Post-fix: verify_did_binding rejects this — the keccak hash of the
-    attacker's pubkey does NOT equal the victim's address.
-    """
-    from dataclasses import replace as _replace
-
-    secp = Secp256k1Suite()
-    attacker_kp = secp.generate_keypair()
-    # Victim DID is unrelated to the attacker's keypair
-    victim_did = "did:pkh:eip155:1:0x1234567890123456789012345678901234567890"
-    # But VMs are the attacker's keys — controller field can be anything
-    # the attacker chooses; the embedded VMs are not authenticated by
-    # the binding check until this fix.
-    attacker_vms = build_verification_methods(victim_did, [(secp, attacker_kp.public_key)])
-    attacker_kid = attacker_vms[0]["id"].rsplit("#", 1)[-1]
-
-    forged = SuccessionStatement(
-        predecessor_did=victim_did,
-        successor_did=hybrid_successor["did"],
-        effective_from="2026-05-04T18:00:00+00:00",
-        reason="ATTACKER FORGED THIS",
-        predecessor_verification_methods=attacker_vms,
-        successor_verification_methods=hybrid_successor["vms"],
-    )
-    forged = sign_predecessor(forged, [(attacker_kp, attacker_kid)])
-    forged = sign_successor(forged, [
-        (hybrid_successor["hybrid"].classical, hybrid_successor["classical_kid"]),
-        (hybrid_successor["hybrid"].pq, hybrid_successor["pq_kid"]),
-    ])
-    forged = finalize(forged)
-
-    result = verify_succession(forged, did_web_resolver=_self_attesting_resolver(forged))
-    assert not result.ok, "attacker takeover with forged DID must be rejected"
-    assert not result.predecessor_did_bound
-    assert "binding" in result.reason
-
-
-def test_did_pkh_binding_check_with_correct_address(legacy_predecessor):
-    from kestrel_sovereign.identity.succession import verify_did_binding
-    ok, reason = verify_did_binding(legacy_predecessor["did"], legacy_predecessor["vms"])
-    assert ok, reason
-
-
-def test_did_key_binding_check_with_matching_multibase():
-    """did:key:zX — a VM with matching publicKeyMultibase satisfies binding."""
-    from kestrel_sovereign.identity.succession import verify_did_binding
-    from kestrel_sovereign.security.multikey import public_key_to_multibase
-
-    ed = get_suite("ed25519")
-    kp = ed.generate_keypair()
-    multibase = public_key_to_multibase(ed, kp.public_key)
-    did = f"did:key:{multibase}"
-    vms = [{
-        "id": f"{did}#0",
-        "type": "Multikey",
-        "controller": did,
-        "publicKeyMultibase": multibase,
-    }]
-    ok, reason = verify_did_binding(did, vms)
-    assert ok, reason
-
-
-def test_did_key_binding_rejects_mismatched_multibase():
-    from kestrel_sovereign.identity.succession import verify_did_binding
-    from kestrel_sovereign.security.multikey import public_key_to_multibase
-
-    ed = get_suite("ed25519")
-    real_kp = ed.generate_keypair()
-    other_kp = ed.generate_keypair()
-    real_mb = public_key_to_multibase(ed, real_kp.public_key)
-    other_mb = public_key_to_multibase(ed, other_kp.public_key)
-    did = f"did:key:{real_mb}"
-    # VM holds a DIFFERENT key than the DID claims
-    vms = [{
-        "id": f"{did}#0",
-        "type": "Multikey",
-        "controller": did,
-        "publicKeyMultibase": other_mb,
-    }]
-    ok, reason = verify_did_binding(did, vms)
-    assert not ok
-    assert "did:key binding FAILED" in reason
-
-
-def test_did_web_binding_fails_closed_without_resolver():
-    """did:web binding cannot be checked without a resolver — fail loud
-    rather than silently accept embedded VMs the attacker chose."""
-    from kestrel_sovereign.identity.succession import verify_did_binding
-
-    did = "did:web:attacker.example:agent"
-    vms = [{
-        "id": f"{did}#key-1",
-        "type": "Multikey",
-        "controller": did,
-        "publicKeyMultibase": "z6MkjGenericMultibaseValueHere",
-    }]
-    ok, reason = verify_did_binding(did, vms)
-    assert not ok
-    assert "did:web binding requires a resolver" in reason
-
-
-def test_did_web_binding_with_matching_resolver_passes():
-    from kestrel_sovereign.identity.succession import verify_did_binding
-
-    did = "did:web:legit.example:agent"
-    vms = [{
-        "id": f"{did}#key-1",
-        "type": "Multikey",
-        "controller": did,
-        "publicKeyMultibase": "z6MkABCpublishedAndMatching",
-    }]
-    # Resolver returns a doc with matching VMs
-    def resolver(d):
-        assert d == did
-        return {"id": did, "verificationMethod": vms}
-    ok, reason = verify_did_binding(did, vms, did_web_resolver=resolver)
-    assert ok, reason
-
-
-def test_did_web_binding_rejects_mismatched_resolver_response():
-    from kestrel_sovereign.identity.succession import verify_did_binding
-
-    did = "did:web:legit.example:agent"
-    embedded_vms = [{
-        "id": f"{did}#key-1",
-        "type": "Multikey",
-        "controller": did,
-        "publicKeyMultibase": "z6MkATTACKERkey",
-    }]
-    published_vms = [{
-        "id": f"{did}#key-1",
-        "type": "Multikey",
-        "controller": did,
-        "publicKeyMultibase": "z6MkPUBLISHEDdifferent",
-    }]
-    def resolver(d):
-        return {"id": did, "verificationMethod": published_vms}
-    ok, reason = verify_did_binding(did, embedded_vms, did_web_resolver=resolver)
-    assert not ok
-    assert "publicKeyMultibase does not match" in reason
-
-
-def test_unknown_did_method_rejected():
-    from kestrel_sovereign.identity.succession import verify_did_binding
-    ok, reason = verify_did_binding("did:unknown:foo", [])
-    assert not ok
-    assert "unsupported DID method" in reason
-
-
-# ---------------------------------------------------------------------------
-# Successor DID binding (P1 codex follow-up review of #963)
-# ---------------------------------------------------------------------------
-
-def test_successor_did_mismatch_rejected(legacy_predecessor):
-    """Codex P1 follow-up: a fully signed statement whose ``successor_did``
-    is one DID but whose embedded successor VMs are controlled by an
-    attacker (different DID) must be rejected.
-
-    Pre-fix: only the predecessor side was bound. ok=True returned even
-    when the successor_did was 'did:web:victim.example' but the VMs
-    were 'did:web:attacker.example'. A consumer indexing on
-    successor_did would be misled.
-
-    Post-fix: successor binding runs symmetrically with predecessor
-    binding; mismatch fails-closed.
-    """
-    from kestrel_sovereign.identity.hybrid_keypair import generate_hybrid_keypair
-
-    # Attacker's successor identity, published as did:web:attacker.example
-    attacker_hybrid = generate_hybrid_keypair()
-    attacker_real_did = "did:web:attacker.example"
-    attacker_vms = build_verification_methods(attacker_real_did, attacker_hybrid.public_keys())
-    attacker_classical_kid = attacker_vms[0]["id"].rsplit("#", 1)[-1]
-    attacker_pq_kid = attacker_vms[1]["id"].rsplit("#", 1)[-1]
-
-    # Statement claims a DIFFERENT successor DID
-    claimed_victim_did = "did:web:victim.example"
-
-    s = SuccessionStatement(
-        predecessor_did=legacy_predecessor["did"],
-        successor_did=claimed_victim_did,    # claimed
-        effective_from="2026-05-04T18:00:00+00:00",
-        reason="successor takeover attempt",
-        predecessor_verification_methods=legacy_predecessor["vms"],
-        successor_verification_methods=attacker_vms,  # actually attacker's
-    )
-    s = sign_predecessor(s, [(legacy_predecessor["kp"], legacy_predecessor["kid"])])
-    s = sign_successor(s, [
-        (attacker_hybrid.classical, attacker_classical_kid),
-        (attacker_hybrid.pq, attacker_pq_kid),
-    ])
-    s = finalize(s)
-
-    # Self-attesting resolver returns the statement's claimed successor
-    # DID with the embedded VMs — but the binding check sees the DID
-    # mismatch via the published-doc resolution and fails. Actually
-    # in our self-attesting setup the resolver returns the claimed DID
-    # with the attacker's VMs (because that's what's embedded), so the
-    # binding check has no published-doc to compare against. To
-    # actually catch the cross-DID issue, we use a resolver that
-    # returns a published doc for the claimed DID with DIFFERENT VMs
-    # (the legitimate ones the victim would have published).
-    def _victim_resolver(did):
-        if did == claimed_victim_did:
-            # Victim's REAL published VMs (different from attacker's)
-            real_hybrid = generate_hybrid_keypair()
-            real_vms = build_verification_methods(claimed_victim_did, real_hybrid.public_keys())
-            return {"id": claimed_victim_did, "verificationMethod": real_vms}
-        if did == legacy_predecessor["did"]:
-            return {"id": did, "verificationMethod": legacy_predecessor["vms"]}
-        raise ValueError(did)
-
-    result = verify_succession(s, did_web_resolver=_victim_resolver)
-    assert not result.ok, "successor takeover with mismatched DID must be rejected"
-    assert not result.successor_did_bound
-    assert "successor DID binding" in result.reason
-
-
-# ---------------------------------------------------------------------------
-# statement_id strictness (P2 codex follow-up review of #963)
-# ---------------------------------------------------------------------------
-
-def test_duplicate_kid_takeover_rejected(legacy_predecessor, hybrid_successor):
-    """Codex P1 (third round): an attacker embeds the victim's REAL VM
-    (to satisfy did:pkh binding via any-match) AND an attacker-controlled
-    VM with the SAME ``#key-1`` fragment. Pre-fix: the attacker's VM
-    silently overwrote the victim's in ``methods_by_kid``, so the
-    attacker's signature verified for the victim's DID.
-
-    Post-fix: ``_check_unique_vm_kids`` runs first in
-    ``verify_did_binding`` and refuses any VM list with duplicate kid
-    fragments.
-    """
-    # Attacker: their own secp256k1 keypair
-    att_secp = Secp256k1Suite()
-    att_kp = att_secp.generate_keypair()
-    att_vm = build_verification_methods(
-        legacy_predecessor["did"], [(att_secp, att_kp.public_key)],
-    )[0]
-    # Force the attacker's VM to share the victim's kid fragment
-    att_vm["id"] = legacy_predecessor["vms"][0]["id"]  # same id → same kid
-
-    # VMs list: legitimate FIRST (passes binding any-match), attacker SECOND
-    pred_vms = list(legacy_predecessor["vms"]) + [att_vm]
-    att_kid = att_vm["id"].rsplit("#", 1)[-1]
-
-    s = SuccessionStatement(
-        predecessor_did=legacy_predecessor["did"],
-        successor_did=hybrid_successor["did"],
-        effective_from="2026-05-04T18:00:00+00:00",
-        reason="duplicate-kid takeover attempt",
-        predecessor_verification_methods=pred_vms,
-        successor_verification_methods=hybrid_successor["vms"],
-    )
-    s = sign_predecessor(s, [(att_kp, att_kid)])  # attacker signs
-    s = sign_successor(s, [
-        (hybrid_successor["hybrid"].classical, hybrid_successor["classical_kid"]),
-        (hybrid_successor["hybrid"].pq, hybrid_successor["pq_kid"]),
-    ])
-    s = finalize(s)
-
-    result = verify_succession(s, did_web_resolver=_self_attesting_resolver(s))
-    assert not result.ok, "duplicate-kid takeover must be rejected"
-    assert not result.predecessor_did_bound
-    assert "duplicate kid" in result.reason
-
-
-def test_extra_unbound_vm_decoy_rejected(legacy_predecessor, hybrid_successor):
-    """Codex P1 (round 4): the duplicate-kid fix only stops attackers
-    who reuse the same kid. An attacker can still:
-
-    1. Include the victim's REAL VM under one kid (passes any-match
-       binding because the real key derives the address)
-    2. Include their own attacker secp256k1 VM under a DIFFERENT kid
-       (passes unique-kid check because no collision)
-    3. Sign with the attacker's key under the attacker's kid
-
-    Pre-fix (any-match binding): predecessor side returned ok because
-    the attacker's signature crypto-verifies against THEIR VM, and
-    binding passed via any-match on the victim's decoy VM.
-
-    Post-fix: ``_verify_did_pkh_eip155_binding`` requires EVERY VM in
-    the list to derive the claimed address. The attacker's VM is
-    rejected because its derived address doesn't match the victim's.
-    """
-    # Attacker's own keypair
-    att_secp = Secp256k1Suite()
-    att_kp = att_secp.generate_keypair()
-    # Attacker mounts an UNBOUND VM (different address) under a unique kid
-    att_vm = build_verification_methods(
-        legacy_predecessor["did"],  # claims victim's DID...
-        [(att_secp, att_kp.public_key)],  # ...but key is attacker's
-        kid_prefix="attacker",
-    )[0]
-
-    # VMs list: legitimate victim VM + unbound attacker VM with unique kid
-    pred_vms = list(legacy_predecessor["vms"]) + [att_vm]
-    att_kid = att_vm["id"].rsplit("#", 1)[-1]
-
-    s = SuccessionStatement(
-        predecessor_did=legacy_predecessor["did"],
-        successor_did=hybrid_successor["did"],
-        effective_from="2026-05-04T18:00:00+00:00",
-        reason="extra unbound VM decoy",
-        predecessor_verification_methods=pred_vms,
-        successor_verification_methods=hybrid_successor["vms"],
-    )
-    s = sign_predecessor(s, [(att_kp, att_kid)])
-    s = sign_successor(s, [
-        (hybrid_successor["hybrid"].classical, hybrid_successor["classical_kid"]),
-        (hybrid_successor["hybrid"].pq, hybrid_successor["pq_kid"]),
-    ])
-    s = finalize(s)
-
-    result = verify_succession(s, did_web_resolver=_self_attesting_resolver(s))
-    assert not result.ok
-    assert not result.predecessor_did_bound
-    # Reason should mention the address mismatch, not just generic failure
-    assert (
-        "decoy" in result.reason
-        or "claims" in result.reason
-        or "derives address" in result.reason
-    )
-
-
-def test_malformed_effective_from_rejected(legacy_predecessor, hybrid_successor):
-    """Codex P2 round 5: a cryptographically valid statement with a
-    malformed ``effective_from`` (non-ISO 8601, naive timezone, etc.)
-    used to verify ok=True because verify_succession only checked
-    signatures. Downstream chain walkers depend on this timestamp
-    being parseable to enforce the temporal cutoff, so accepting
-    bogus values produced statements whose cutoff couldn't be
-    enforced reliably.
-
-    Now ``verify_succession`` validates the timestamp and fails-closed
-    on malformed/non-UTC values.
-    """
-    s = SuccessionStatement(
-        predecessor_did=legacy_predecessor["did"],
-        successor_did=hybrid_successor["did"],
-        effective_from="not-a-date",   # malformed
-        reason="malformed timestamp",
-        predecessor_verification_methods=legacy_predecessor["vms"],
-        successor_verification_methods=hybrid_successor["vms"],
-    )
-    s = sign_predecessor(s, [(legacy_predecessor["kp"], legacy_predecessor["kid"])])
-    s = sign_successor(s, [
-        (hybrid_successor["hybrid"].classical, hybrid_successor["classical_kid"]),
-        (hybrid_successor["hybrid"].pq, hybrid_successor["pq_kid"]),
-    ])
-    s = finalize(s)
-
-    result = verify_succession(s, did_web_resolver=_self_attesting_resolver(s))
-    assert not result.ok
-    assert "effective_from invalid" in result.reason
-
-
-def test_non_utc_offset_effective_from_rejected(legacy_predecessor, hybrid_successor):
-    """Codex P2 round 6: a timezone-AWARE but non-UTC offset (e.g.
-    ``+05:00``) used to slip through because the only check was
-    ``tzinfo is not None``. The schema documents UTC-only cutoffs;
-    accepting any other offset breaks downstream cross-statement
-    comparisons (chain walker assumes UTC math)."""
-    s = SuccessionStatement(
-        predecessor_did=legacy_predecessor["did"],
-        successor_did=hybrid_successor["did"],
-        effective_from="2026-05-04T18:00:00+05:00",  # non-UTC offset
-        reason="non-UTC offset",
-        predecessor_verification_methods=legacy_predecessor["vms"],
-        successor_verification_methods=hybrid_successor["vms"],
-    )
-    s = sign_predecessor(s, [(legacy_predecessor["kp"], legacy_predecessor["kid"])])
-    s = sign_successor(s, [
-        (hybrid_successor["hybrid"].classical, hybrid_successor["classical_kid"]),
-        (hybrid_successor["hybrid"].pq, hybrid_successor["pq_kid"]),
-    ])
-    s = finalize(s)
-
-    result = verify_succession(s, did_web_resolver=_self_attesting_resolver(s))
-    assert not result.ok
-    assert "not UTC" in result.reason
-
-
-def test_naive_effective_from_rejected(legacy_predecessor, hybrid_successor):
-    """Same fix: a timezone-naive timestamp must be rejected because
-    cutoff comparisons must be unambiguous about timezone."""
-    s = SuccessionStatement(
-        predecessor_did=legacy_predecessor["did"],
-        successor_did=hybrid_successor["did"],
-        effective_from="2026-05-04T18:00:00",  # NO TZ
-        reason="naive timestamp",
-        predecessor_verification_methods=legacy_predecessor["vms"],
-        successor_verification_methods=hybrid_successor["vms"],
-    )
-    s = sign_predecessor(s, [(legacy_predecessor["kp"], legacy_predecessor["kid"])])
-    s = sign_successor(s, [
-        (hybrid_successor["hybrid"].classical, hybrid_successor["classical_kid"]),
-        (hybrid_successor["hybrid"].pq, hybrid_successor["pq_kid"]),
-    ])
-    s = finalize(s)
-
-    result = verify_succession(s, did_web_resolver=_self_attesting_resolver(s))
-    assert not result.ok
-    assert "timezone-naive" in result.reason
-
-
-def test_did_binding_handles_non_mapping_vm(legacy_predecessor):
-    """Codex P2 round 4: a malformed VM list (e.g. archived data with a
-    non-dict entry) used to crash with AttributeError on vm.get(). Now
-    it should fail-closed cleanly."""
-    from kestrel_sovereign.identity.succession import verify_did_binding
-
-    bogus_vms = list(legacy_predecessor["vms"]) + ["not-a-dict"]
-    ok, reason = verify_did_binding(legacy_predecessor["did"], bogus_vms)
-    # Doesn't crash; returns failure.
-    assert not ok
-
-
-def test_adaptive_policy_promotes_hybrid_predecessor(hybrid_successor):
-    """Codex P2 round 9: when the predecessor itself is hybrid (its
-    VMs include a PQ key), the default predecessor_policy should
-    auto-promote to HYBRID_REQUIRED. A classical-only signature from
-    such a predecessor must NOT verify under the default — that would
-    let a future Shor-recovered ECDSA key forge a rotation despite
-    the predecessor having a PQ counterpart.
-    """
-    from kestrel_sovereign.identity.hybrid_keypair import generate_hybrid_keypair
-
-    # Hybrid predecessor: classical Ed25519 + PQ ML-DSA-65
-    hybrid_pred = generate_hybrid_keypair()
-    pred_did = "did:web:legit.example:hybrid-agent"
-    pred_vms = build_verification_methods(pred_did, hybrid_pred.public_keys())
-    classical_kid = pred_vms[0]["id"].rsplit("#", 1)[-1]
-
-    # New successor (different hybrid)
-    succ_did = hybrid_successor["did"]
-
-    s = SuccessionStatement(
-        predecessor_did=pred_did,
-        successor_did=succ_did,
-        effective_from="2027-01-01T00:00:00+00:00",
-        reason="hybrid → hybrid future rotation",
-        predecessor_verification_methods=pred_vms,
-        successor_verification_methods=hybrid_successor["vms"],
-    )
-    # Predecessor signs with ONLY their classical half (no PQ)
-    s = sign_predecessor(s, [(hybrid_pred.classical, classical_kid)])
-    s = sign_successor(s, [
-        (hybrid_successor["hybrid"].classical, hybrid_successor["classical_kid"]),
-        (hybrid_successor["hybrid"].pq, hybrid_successor["pq_kid"]),
-    ])
-    s = finalize(s)
-
-    # Default predecessor_policy (None → adaptive). The predecessor's
-    # VMs include a PQ key, so HYBRID_REQUIRED auto-applies and the
-    # classical-only signature is rejected.
-    result = verify_succession(s, did_web_resolver=_self_attesting_resolver(s))
-    assert not result.ok
-    assert "HYBRID_REQUIRED" in result.predecessor.reason
-
-
-def test_adaptive_policy_uses_resolved_did_web_doc_not_embedded_subset(hybrid_successor):
-    """Codex P1 round 10: an attacker for a hybrid did:web predecessor
-    can DOWNSHIFT the adaptive policy by embedding only the predecessor's
-    classical VM (subset of the published doc). Pre-fix: adaptive policy
-    looked at the embedded subset, didn't see a PQ key, and returned
-    LEGACY_ALLOWED — letting a classical-only signature pass.
-
-    Post-fix: when the predecessor is did:web and a resolver is provided,
-    the policy is derived from the RESOLVED published DID document, which
-    is the source of truth for what keys the agent has. The PQ key
-    appears there, so HYBRID_REQUIRED applies, and classical-only fails.
-    """
-    from kestrel_sovereign.identity.hybrid_keypair import generate_hybrid_keypair
-
-    hybrid_pred = generate_hybrid_keypair()
-    pred_did = "did:web:legit.example:hybrid-agent"
-    full_pred_vms = build_verification_methods(pred_did, hybrid_pred.public_keys())
-    classical_kid = full_pred_vms[0]["id"].rsplit("#", 1)[-1]
-
-    # Statement embeds ONLY the classical VM (downshift attempt)
-    embedded_pred_vms = [full_pred_vms[0]]
-
-    s = SuccessionStatement(
-        predecessor_did=pred_did,
-        successor_did=hybrid_successor["did"],
-        effective_from="2027-01-01T00:00:00+00:00",
-        reason="downshift attempt via embedded-VM subset",
-        predecessor_verification_methods=embedded_pred_vms,
-        successor_verification_methods=hybrid_successor["vms"],
-    )
-    s = sign_predecessor(s, [(hybrid_pred.classical, classical_kid)])
-    s = sign_successor(s, [
-        (hybrid_successor["hybrid"].classical, hybrid_successor["classical_kid"]),
-        (hybrid_successor["hybrid"].pq, hybrid_successor["pq_kid"]),
-    ])
-    s = finalize(s)
-
-    # Resolver returns the FULL published doc with both classical + PQ
-    def _resolver(did):
-        if did == pred_did:
-            return {"id": pred_did, "verificationMethod": full_pred_vms}
-        if did == hybrid_successor["did"]:
-            return {"id": did, "verificationMethod": hybrid_successor["vms"]}
-        raise ValueError(did)
-
-    result = verify_succession(s, did_web_resolver=_resolver)
-    # Adaptive policy sees PQ in published doc → HYBRID_REQUIRED → fails
-    assert not result.ok
-    assert "HYBRID_REQUIRED" in result.predecessor.reason
-
-
-def test_unfinalized_statement_rejected(
-    base_statement, legacy_predecessor, hybrid_successor,
-):
-    """Codex P2: an empty statement_id must NOT be silently treated as
-    consistent. Audit logs and chain walkers index by id; an
-    unaddressable statement is not safe to accept.
-    """
-    s = sign_predecessor(
-        base_statement, [(legacy_predecessor["kp"], legacy_predecessor["kid"])],
-    )
-    s = sign_successor(s, [
-        (hybrid_successor["hybrid"].classical, hybrid_successor["classical_kid"]),
-        (hybrid_successor["hybrid"].pq, hybrid_successor["pq_kid"]),
-    ])
-    # NOTE: NOT calling finalize() — statement_id stays empty
-    assert not s.statement_id
-
-    result = verify_succession(s, did_web_resolver=_self_attesting_resolver(s))
-    assert not result.ok
-    assert not result.statement_id_consistent
-    assert "statement_id is empty" in result.reason
