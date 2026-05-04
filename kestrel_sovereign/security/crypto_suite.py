@@ -105,10 +105,17 @@ class CryptoSuite(abc.ABC):
       ``did:web`` documents. If unset, the suite cannot produce a
       ``z...``-prefixed multibase string and ``multikey.public_key_to_multibase``
       raises.
+    - ``is_post_quantum`` — True for lattice/hash-based PQ suites
+      (ML-DSA, ML-KEM, SLH-DSA), False for classical suites
+      (secp256k1, Ed25519). The Wave 1 sub-PR 4 verify-policy module
+      uses this to enforce ``HYBRID_REQUIRED`` (≥1 classical + ≥1 PQ
+      signature) and ``PQ_REQUIRED`` (≥1 PQ signature) without
+      hardcoding alg_id lists.
     """
 
     alg_id: ClassVar[str]
     public_key_multicodec: ClassVar[bytes] = b""
+    is_post_quantum: ClassVar[bool] = False
 
     @abc.abstractmethod
     def generate_keypair(self) -> Keypair:
