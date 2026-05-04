@@ -257,6 +257,18 @@ def _parse_capsule(envelope_str: str) -> _ParsedCapsule:
     if not isinstance(aead_token_str, str):
         raise SealedCapsuleError("capsule missing 'ciphertext' string")
 
+    # Codex P2 round 2: AEAD tokens are ASCII (KSAv2: + base64-url),
+    # but an attacker-controlled JSON could put non-ASCII characters
+    # in the ciphertext field. ``encode("ascii")`` raises
+    # UnicodeEncodeError, which would escape the SealedCapsuleError
+    # contract. Wrap it.
+    try:
+        aead_token_bytes = aead_token_str.encode("ascii")
+    except UnicodeEncodeError as e:
+        raise SealedCapsuleError(
+            f"capsule ciphertext contains non-ASCII characters: {e}"
+        ) from e
+
     return _ParsedCapsule(
         classical_alg=kem["classical_alg"],
         pq_alg=kem["pq_alg"],
@@ -264,7 +276,7 @@ def _parse_capsule(envelope_str: str) -> _ParsedCapsule:
         pq_ct=_b64_decode(kem["pq_ct"]),
         classical_pub_multibase=kem["classical_pub_multibase"],
         pq_pub_multibase=kem["pq_pub_multibase"],
-        aead_token=aead_token_str.encode("ascii"),
+        aead_token=aead_token_bytes,
     )
 
 

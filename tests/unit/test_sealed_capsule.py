@@ -434,6 +434,21 @@ def test_truncated_kem_ciphertext_surfaces_as_sealed_capsule_error(hybrid_kp):
         open_capsule(bad, hybrid_kp)
 
 
+def test_non_ascii_ciphertext_surfaces_as_sealed_capsule_error(hybrid_kp):
+    """Codex P2 round 2: a capsule whose ciphertext field contains
+    non-ASCII chars used to leak UnicodeEncodeError. Now wrapped."""
+    capsule = seal_capsule(
+        b"x",
+        recipient_classical_public_key=hybrid_kp.classical.public_key,
+        recipient_pq_public_key=hybrid_kp.pq.public_key,
+    )
+    env = json.loads(capsule)
+    env["ciphertext"] = "snowman-☃-not-ascii"
+    bad = json.dumps(env)
+    with pytest.raises(SealedCapsuleError, match="non-ASCII"):
+        open_capsule(bad, hybrid_kp)
+
+
 def test_open_rejects_both_calling_conventions_at_once(hybrid_kp):
     capsule = seal_capsule(
         b"x",
