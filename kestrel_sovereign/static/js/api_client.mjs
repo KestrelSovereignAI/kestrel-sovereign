@@ -285,6 +285,12 @@ export function createApiClient({
         // Stop button target the wrong stream.
         streamAbortControllers: new Map(),
         currentStreamRequestIds: new Map(),
+        // Effective session_id reported by the most recent /stream or
+        // /invoke for each agent. The server resolves this via the 30-
+        // min-gap heuristic when the caller passes null, so before this
+        // map existed the frontend pane never learned its durable
+        // session id and stayed anchored on null indefinitely.
+        effectiveSessionIds: new Map(),
     };
 
     // Single-source the fetch + auth + 401-retry pipeline so both
@@ -452,10 +458,21 @@ export function createApiClient({
         },
         getIpfsStatus: () => client.request('/api/ipfs/status'),
         getWallet: () => client.request('/api/wallet'),
-        invoke: (input, model = null, sessionId = null, provider = null) => client.request('/api/agent/invoke', {
-            method: 'POST',
-            body: JSON.stringify({ input, model, session_id: sessionId, provider }),
-        }),
+        invoke: async (input, model = null, sessionId = null, provider = null) => {
+            // Capture dispatchAgent BEFORE the await so the session_id
+            // we record on the response is bound to the agent that
+            // owned this dispatch — not whichever agent was selected
+            // when the response landed.
+            const dispatchAgent = state.selectedHostAgent;
+            const result = await client.request('/api/agent/invoke', {
+                method: 'POST',
+                body: JSON.stringify({ input, model, session_id: sessionId, provider }),
+            });
+            if (result && typeof result === 'object' && result.session_id) {
+                state.effectiveSessionIds.set(dispatchAgent, result.session_id);
+            }
+            return result;
+        },
         // Explicit-agent invoke — mirrors stop(id, agent). sendMessage
         // dispatches a chat against a specific agent's pane; if the
         // user switches agents while sendMessage awaits this call, the
@@ -464,14 +481,19 @@ export function createApiClient({
         // pane. invokeForAgent pins the URL to the captured dispatch
         // agent so the request always reaches the agent the chat was
         // sent to.
-        invokeForAgent: (input, model = null, sessionId = null, provider = null, agent) => {
+        invokeForAgent: async (input, model = null, sessionId = null, provider = null, agent) => {
             const opts = {
                 method: 'POST',
                 body: JSON.stringify({ input, model, session_id: sessionId, provider }),
             };
-            return agent !== undefined
-                ? client.requestForAgent('/api/agent/invoke', opts, agent)
-                : client.request('/api/agent/invoke', opts);
+            const dispatchAgent = agent === undefined ? state.selectedHostAgent : agent;
+            const result = agent !== undefined
+                ? await client.requestForAgent('/api/agent/invoke', opts, agent)
+                : await client.request('/api/agent/invoke', opts);
+            if (result && typeof result === 'object' && result.session_id) {
+                state.effectiveSessionIds.set(dispatchAgent, result.session_id);
+            }
+            return result;
         },
         // Two-arg overload: pass `agent` to target a specific agent's
         // /stop endpoint regardless of which agent is currently
@@ -506,6 +528,16 @@ export function createApiClient({
         getCurrentStreamRequestId(agent) {
             const key = agent === undefined ? state.selectedHostAgent : agent;
             return state.currentStreamRequestIds.get(key) || null;
+        },
+        // Effective session_id surfaced by the server's most recent
+        // /stream or /invoke for this agent. Returns null until the
+        // first response has been received. sendMessage reads this to
+        // update pane.sessionId so each agent's pane learns its
+        // durable conversation id without relying on the prior
+        // pane.sessionId=null + server-side implicit-derive heuristic.
+        getEffectiveSessionId(agent) {
+            const key = agent === undefined ? state.selectedHostAgent : agent;
+            return state.effectiveSessionIds.get(key) || null;
         },
         async *streamInvoke(input, model = null, sessionId = null, provider = null, retried = false, agent) {
             // Pin the dispatch agent. The sixth `agent` parameter lets a
@@ -554,6 +586,15 @@ export function createApiClient({
 
                 if (!response.ok) throw new Error(`HTTP ${response.status}`);
                 state.currentStreamRequestIds.set(dispatchAgent, response.headers.get('X-Request-ID'));
+                // Capture the server-resolved session_id BEFORE the body
+                // streams. sendMessage reads it via getEffectiveSessionId
+                // immediately so pane.sessionId can be set on the very
+                // first turn; subsequent turns send it back as an
+                // explicit value, anchoring the pane to a durable id.
+                const headerSid = response.headers.get('X-Session-Id');
+                if (headerSid) {
+                    state.effectiveSessionIds.set(dispatchAgent, headerSid);
+                }
                 const reader = response.body.getReader();
                 const decoder = new DecoderCtor();
 

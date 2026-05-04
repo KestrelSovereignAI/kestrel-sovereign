@@ -365,6 +365,20 @@ class PrivacyEnforcingStorage:
             # Store in persistent storage
             await self._storage.add_conversation(role, processed_content, metadata, session_id)
     
+    async def resolve_session_id(self, provided: Optional[str]) -> Optional[str]:
+        """Surface the effective session_id to the caller.
+
+        EPHEMERAL: no persistence, return whatever was provided (or None).
+        ISOLATED: session-local; the in-memory buffer doesn't expose
+        time-gap heuristics, so an explicit value passes through and
+        ``None`` stays ``None``.
+        NORMAL/PUBLIC: delegate to the persistent store, which applies
+        the 30-min-gap heuristic.
+        """
+        if self._privacy_config.is_ephemeral() or self._policy.use_session_storage:
+            return provided
+        return await self._storage.resolve_session_id(provided)
+
     async def get_conversation_history(
         self, limit: int = 100, session_id: str = None
     ) -> List[Dict]:
