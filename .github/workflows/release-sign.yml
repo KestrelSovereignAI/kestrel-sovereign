@@ -153,26 +153,35 @@ jobs:
             --artifacts-dir ./dist \
             --trusted-signer-multibase "$PUB_MB"
 
-      - name: Upload signed manifest as workflow artifact
+      - name: Upload signed release as workflow artifact
+        # Codex P2 round 4: workflow_dispatch runs aren't on a tag ref
+        # so the GitHub Release attachment step is skipped — without
+        # the dist files in the workflow artifact, manual recovery
+        # signing left the signed wheels/sdists unpublished. Include
+        # everything that needs to reach a consumer.
         uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
         with:
-          name: release-manifest
+          name: signed-release-${{ steps.release_tag.outputs.tag }}
           path: |
+            dist/*.whl
+            dist/*.tar.gz
             dist/release-manifest.json
             signing-stderr/trusted-signer.txt
           retention-days: 90
 
       - name: Attach signed manifest to GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v')
+        # Run for both push-tag and dispatch flows. The dispatch
+        # branch needs the explicit tag_name (codex P2 round 4):
+        # ``github.ref`` is the workflow source branch, not the tag.
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
         uses: softprops/action-gh-release@72f2c25fcb47643c292f7107632f7a47c1df5cd8 # v2.3.4
         with:
+          tag_name: ${{ steps.release_tag.outputs.tag }}
           # Codex P2 round 2: only attach the artifacts that ARE in
           # the signed manifest. ``trusted-signer.txt`` is a workflow
-          # log, not a release artifact — attaching it would mean
-          # consumers who download every release asset into one
-          # directory would fail ``kestrel release verify`` because
-          # the verifier rejects files present-on-disk-but-absent-
-          # from-manifest (see #979 codex round 7).
+          # log; attaching it would let consumers fail
+          # ``kestrel release verify`` (the verifier rejects extra
+          # files in the artifact dir per #979 codex round 7).
           files: |
             dist/*.whl
             dist/*.tar.gz
