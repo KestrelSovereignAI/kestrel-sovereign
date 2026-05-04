@@ -118,6 +118,16 @@ class SuccessionChain:
         return not self.statements
 
 
+def _vm_dict_key(vm: Mapping) -> tuple:
+    """Stable identity key for a verification method (id + multibase).
+
+    Used by chain VM-linkage check. Compares only the fields that
+    matter for binding — ``id`` and ``publicKeyMultibase``. ``type``
+    is fixed (``Multikey``) and ``controller`` is administrative.
+    """
+    return (vm.get("id"), vm.get("publicKeyMultibase"))
+
+
 def build_chain(statements: Iterable[SuccessionStatement]) -> SuccessionChain:
     """Validate + freeze a list of statements into a :class:`SuccessionChain`.
 
@@ -126,6 +136,16 @@ def build_chain(statements: Iterable[SuccessionStatement]) -> SuccessionChain:
     - **Linkage**: each statement's ``predecessor_did`` MUST equal the
       previous statement's ``successor_did``. A chain with a fork or
       gap is rejected.
+    - **VM linkage** (added per #963 codex review): each statement's
+      ``predecessor_verification_methods`` MUST equal the previous
+      statement's ``successor_verification_methods`` (matched by
+      ``id`` + ``publicKeyMultibase``). Without this, an attacker
+      could fork the chain at link N+1 by claiming the right
+      predecessor_did but embedding their OWN keys; the per-statement
+      DID-binding check on a did:web predecessor can't catch that
+      without resolution. Chain linkage closes the gap because the
+      previous statement's successor signatures (which we already
+      verify) attest to those exact VMs.
     - **Temporal monotonicity**: each statement's ``effective_from``
       MUST be strictly after the previous one's. Chains that go
       backward in time would let an adversary unwind a rotation.
@@ -154,6 +174,20 @@ def build_chain(statements: Iterable[SuccessionStatement]) -> SuccessionChain:
                 f"chain link broken at statement[{i}]: "
                 f"predecessor_did={s.predecessor_did!r} != prev.successor_did="
                 f"{prev.successor_did!r}"
+            )
+        prev_succ_keys = sorted(
+            _vm_dict_key(vm) for vm in prev.successor_verification_methods
+        )
+        cur_pred_keys = sorted(
+            _vm_dict_key(vm) for vm in s.predecessor_verification_methods
+        )
+        if prev_succ_keys != cur_pred_keys:
+            raise SuccessionChainError(
+                f"chain VM linkage broken at statement[{i}]: "
+                f"predecessor_verification_methods don't match "
+                f"prev.successor_verification_methods (id + multibase). "
+                f"This blocks an attacker from forking the chain by "
+                f"substituting their own keys at a later link."
             )
         prev_t = _parse_iso8601_utc(prev.effective_from)
         cur_t = _parse_iso8601_utc(s.effective_from)
@@ -260,6 +294,40 @@ class ChainSignaturesResult:
     reason: str
 
 
+def _build_chain_internal_resolver(chain: SuccessionChain):
+    """Build a did:web resolver that satisfies binding for chain-internal
+    predecessors via chain linkage rather than network resolution.
+
+    For statement[i+1] (i >= 0), the predecessor is the previous link's
+    successor. ``build_chain`` already verified the VMs match. So when
+    ``verify_succession`` asks the resolver to validate a did:web
+    predecessor that is in fact a previous successor in this chain, the
+    resolver returns a synthetic DID document containing exactly the
+    same VMs the embedded statement carries — by construction the
+    binding check passes.
+
+    For did:web URIs that are NOT in the chain (e.g. an external
+    reference), the resolver raises so verify_succession's binding
+    check fails-closed. Callers wanting external resolution must pass
+    a different resolver.
+    """
+    successors_by_did = {
+        s.successor_did: tuple(dict(vm) for vm in s.successor_verification_methods)
+        for s in chain.statements
+    }
+
+    def _resolver(did: str) -> Mapping[str, object]:
+        vms = successors_by_did.get(did)
+        if vms is None:
+            raise SuccessionChainError(
+                f"chain-internal resolver cannot resolve {did!r}: "
+                f"not a successor in this chain"
+            )
+        return {"id": did, "verificationMethod": list(vms)}
+
+    return _resolver
+
+
 def verify_chain_signatures(
     chain: SuccessionChain,
     *,
@@ -270,9 +338,18 @@ def verify_chain_signatures(
     """Verify every statement in the chain individually.
 
     Each statement's :func:`verify_succession` runs with the supplied
-    policies. The composite ``ok`` is True only if every statement
-    passes. Per-statement results are returned for diagnostics.
+    policies. For chain-internal did:web predecessors (statement[i+1]'s
+    predecessor matches statement[i]'s successor), binding is satisfied
+    via :func:`_build_chain_internal_resolver` rather than network
+    resolution — chain VM linkage was already verified at
+    :func:`build_chain` time, so the resolver returning the chain's own
+    successor VMs is honest by construction.
+
+    The composite ``ok`` is True only if every statement passes.
+    Per-statement results are returned for diagnostics.
     """
+    chain_resolver = _build_chain_internal_resolver(chain)
+
     per_results: List[SuccessionVerifyResult] = []
     all_ok = True
     failure_summaries: List[str] = []
@@ -283,6 +360,7 @@ def verify_chain_signatures(
             predecessor_policy=predecessor_policy,
             successor_policy=successor_policy,
             require_archival=require_archival,
+            did_web_resolver=chain_resolver,
         )
         per_results.append(r)
         if not r.ok:
