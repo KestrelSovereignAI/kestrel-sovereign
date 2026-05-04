@@ -173,16 +173,17 @@ class ScriptSigner:
                 "forgeable and has been removed."
             )
 
+        # Wave 1 sub-PR 5: route through Secp256k1Suite. Byte-identical
+        # to the previous direct ec.ECDSA(SHA256) call; pinned by the
+        # CryptoSuite behavior-preservation pair test.
+        from kestrel_sovereign.security.crypto_suite import (
+            ALG_ECDSA_SECP256K1_SHA256, CryptoSuiteError, get_suite,
+        )
+        suite = get_suite(ALG_ECDSA_SECP256K1_SHA256)
         try:
-            from cryptography.hazmat.primitives.asymmetric import ec
-            from cryptography.hazmat.primitives import hashes
-
-            signature_bytes = self._private_key.sign(
-                content_hash_bytes,
-                ec.ECDSA(hashes.SHA256())
-            )
+            signature_bytes = suite.sign(content_hash_bytes, self._private_key)
             return "ecdsa:" + base64.b64encode(signature_bytes).decode()
-        except Exception as e:
+        except (CryptoSuiteError, Exception) as e:
             raise ScriptSigningKeysUnavailable(
                 f"ECDSA signing failed for script {script.id[:8]}…: {e}"
             ) from e
@@ -228,17 +229,17 @@ class ScriptSigner:
             logger.warning("Cannot verify ECDSA signature without public key")
             return False
 
+        # Wave 1 sub-PR 5: route through Secp256k1Suite for verification.
+        from kestrel_sovereign.security.crypto_suite import (
+            ALG_ECDSA_SECP256K1_SHA256, get_suite,
+        )
         try:
-            from cryptography.hazmat.primitives.asymmetric import ec
-            from cryptography.hazmat.primitives import hashes
-
             signature_bytes = base64.b64decode(script.signature[6:])
-            self._public_key.verify(
-                signature_bytes,
-                content_hash_bytes,
-                ec.ECDSA(hashes.SHA256())
-            )
-            return True
+            suite = get_suite(ALG_ECDSA_SECP256K1_SHA256)
+            if suite.verify(content_hash_bytes, signature_bytes, self._public_key):
+                return True
+            logger.warning("ECDSA signature verification failed")
+            return False
         except Exception as e:
             logger.warning(f"ECDSA signature verification failed: {e}")
             return False

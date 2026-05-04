@@ -80,11 +80,21 @@ def sign_mandate(
 ) -> SpawnMandate:
     """Sign the mandate with the parent's secp256k1 private key.
 
+    Wave 1 sub-PR 5: routed through ``Secp256k1Suite`` so Wave 2 can
+    swap in hybrid signing (Ed25519 + ML-DSA-65) without touching this
+    function. Byte-identical to the previous direct
+    ``parent_private_key.sign(payload, ec.ECDSA(SHA256))`` call.
+
     Returns the mandate with parent_signature set to the hex-encoded
     DER signature.
     """
+    from kestrel_sovereign.security.crypto_suite import (
+        ALG_ECDSA_SECP256K1_SHA256, get_suite,
+    )
+
     payload = mandate._signable_payload()
-    signature = parent_private_key.sign(payload, ec.ECDSA(hashes.SHA256()))
+    suite = get_suite(ALG_ECDSA_SECP256K1_SHA256)
+    signature = suite.sign(payload, parent_private_key)
     mandate.parent_signature = signature.hex()
     return mandate
 
@@ -101,18 +111,18 @@ def verify_mandate(
         logger.warning("Mandate has no signature to verify")
         return False
 
+    from kestrel_sovereign.security.crypto_suite import (
+        ALG_ECDSA_SECP256K1_SHA256, get_suite,
+    )
+
     payload = mandate._signable_payload()
     signature_bytes = bytes.fromhex(mandate.parent_signature)
 
-    try:
-        parent_public_key.verify(signature_bytes, payload, ec.ECDSA(hashes.SHA256()))
+    suite = get_suite(ALG_ECDSA_SECP256K1_SHA256)
+    if suite.verify(payload, signature_bytes, parent_public_key):
         return True
-    except InvalidSignature:
-        logger.warning("Mandate signature verification failed")
-        return False
-    except Exception as e:
-        logger.error("Unexpected error verifying mandate signature: %s", e)
-        return False
+    logger.warning("Mandate signature verification failed")
+    return False
 
 
 def create_child_did_document(

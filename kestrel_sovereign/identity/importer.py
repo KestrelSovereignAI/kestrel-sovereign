@@ -218,15 +218,15 @@ class IdentityImporter:
                 private_key, _ = load_kestrel_identity(key_id)
                 public_key = private_key.public_key()
 
-                # Verify signature
-                signature_bytes = bytes.fromhex(package.signature)
-                content_hash_bytes = package.content_hash.encode('utf-8')
-
-                public_key.verify(
-                    signature_bytes,
-                    content_hash_bytes,
-                    ec.ECDSA(hashes.SHA256())
+                # Verify signature via Secp256k1Suite (Wave 1 sub-PR 5).
+                from kestrel_sovereign.security.crypto_suite import (
+                    ALG_ECDSA_SECP256K1_SHA256, get_suite,
                 )
+                signature_bytes = bytes.fromhex(package.signature)
+                content_hash_bytes = package.content_hash.encode("utf-8")
+                suite = get_suite(ALG_ECDSA_SECP256K1_SHA256)
+                if not suite.verify(content_hash_bytes, signature_bytes, public_key):
+                    raise ValueError("ECDSA signature verification failed")
                 return True
         except Exception as e:
             logger.warning(f"Signature verification failed: {e}")
