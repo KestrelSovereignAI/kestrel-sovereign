@@ -93,13 +93,24 @@ async def invoke_agent(request: Request):
 
         agent = get_agent(request)
         caller = getattr(request.state, "caller", None)
+
+        # Pre-resolve the effective session_id so it can be returned to
+        # the client. Without this, the frontend pane never learns the
+        # implicit UUID derived inside add_conversation and stays
+        # anchored on `null`, causing later auto-load + context-status
+        # paths to lose continuity. Reviewer flagged at chat.js:520.
+        try:
+            effective_session_id = await agent.privacy_agent.resolve_session_id(session_id)
+        except Exception:
+            effective_session_id = session_id  # fall back; never block the request
+
         response = await agent.process_input(
             user_input,
             model_override=model_override,
-            session_id=session_id,
+            session_id=effective_session_id,
             caller=caller,
         )
-        return {"response": response}
+        return {"response": response, "session_id": effective_session_id}
     except HTTPException:
         raise
     except Exception as e:
@@ -148,12 +159,23 @@ async def stream_agent_response(request: Request):
         stream_tap = AgentStreamTap.get_instance()
         stream_tap.register(request_id)
 
+        # Pre-resolve the effective session_id and surface it via a
+        # response header. Resolved BEFORE StreamingResponse is created
+        # because headers are immutable once the body starts streaming.
+        # The frontend pane uses this to learn its durable conversation
+        # id on first send (replacing the prior pane.sessionId=null
+        # heuristic that left auto-load + context-status fragile).
+        try:
+            effective_session_id = await agent.privacy_agent.resolve_session_id(session_id)
+        except Exception:
+            effective_session_id = session_id  # fall back; never block the stream
+
         async def generate():
             try:
                 async for chunk in agent.process_input_streaming(
                     user_input,
                     model_override=model_override,
-                    session_id=session_id,
+                    session_id=effective_session_id,
                     audit_before_streaming=audit_before_streaming,
                     caller=caller,
                 ):
@@ -190,14 +212,17 @@ async def stream_agent_response(request: Request):
                 # Cleanup request tracking
                 agent._cleanup_cancelled_request(request_id)
 
+        headers = {
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "X-Request-ID": request_id,
+        }
+        if effective_session_id:
+            headers["X-Session-Id"] = effective_session_id
         return StreamingResponse(
             generate(),
             media_type="text/plain",
-            headers={
-                "Cache-Control": "no-cache",
-                "X-Accel-Buffering": "no",
-                "X-Request-ID": request_id,
-            }
+            headers=headers,
         )
     except HTTPException:
         raise
