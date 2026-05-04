@@ -44,10 +44,12 @@ legacy_did = "did:pkh:eip155:1:" + ETH_ADDRESS
 legacy_vms = build_verification_methods(legacy_did, [(secp, legacy_pub)])
 legacy_kid = legacy_vms[0]["id"].rsplit("#", 1)[-1]
 
-# 3) Mint the SLH-DSA archival keypair (one-time, store separately)
+# 3) Mint the SLH-DSA archival keypair (one-time, store separately).
+# PQ secrets are raw bytes, not cryptography key objects, so use the
+# raw-bytes persistence path rather than save_private_key.
 slh = SLHDSASHA2128sSuite()
 archival_kp = slh.generate_keypair()
-storage.save_private_key(archival_kp.private_key, f"archival_slhdsa_{AGENT_NAME}")
+storage.save_secret_bytes(archival_kp.private_key, f"archival_slhdsa_{AGENT_NAME}")
 
 # 4) Run the ceremony
 result = run_rotation_ceremony(
@@ -62,10 +64,12 @@ result = run_rotation_ceremony(
     archival_keypair=archival_kp,
 )
 
-# 5) Persist the new identity's private keys
+# 5) Persist the new identity's private keys. Ed25519 is a cryptography
+# key object → save_private_key. ML-DSA-65 is raw pqcrypto bytes →
+# save_secret_bytes.
 new_kp = result.new_identity.keypair
 storage.save_private_key(new_kp.classical.private_key, f"{AGENT_SLUG}_ed25519")
-storage.save_pq_secret(new_kp.pq.private_key, f"{AGENT_SLUG}_mldsa65")
+storage.save_secret_bytes(new_kp.pq.private_key, f"{AGENT_SLUG}_mldsa65")
 
 # 6) Publish the new DID document
 import json
