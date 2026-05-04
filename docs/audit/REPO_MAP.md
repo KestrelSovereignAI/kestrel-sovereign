@@ -3,8 +3,8 @@
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-05-03
-**Scope:** 1555 tracked files (947 `.py`, 237 `.md`, 371 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-05-04
+**Scope:** 1594 tracked files (977 `.py`, 246 `.md`, 371 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -170,6 +170,8 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/data/feature_template/feature.py.tpl** — —
 - **kestrel_sovereign/data/feature_template/pyproject.toml.tpl** — —
 - **kestrel_sovereign/data/feature_template/test_feature.py.tpl** — —
+- **kestrel_sovereign/doctor.py** — ``kestrel doctor`` — diagnose readiness without making any changes.
+  - `class DoctorReport`; `def diagnose(project_dir)`; `def format_report(report)`
 - **kestrel_sovereign/entrypoints.py** — Entry Point Discovery Utilities.
   - `def discover_entry_point_classes(group, base_class)`
 - **kestrel_sovereign/ephemeral_session.py** — Ephemeral Session Handler for Kestrel Privacy System.
@@ -234,7 +236,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/features/compute/script_analyzer.py** — Kestrel Compute Feature - Script Analyzer.
   - `class AnalysisResult`; `class ScriptAnalyzer`; `def analyze_script(script)`
 - **kestrel_sovereign/features/compute/script_signer.py** — Kestrel Compute Feature - Script Signer.
-  - `class ScriptSigner`
+  - `class ScriptSigningKeysUnavailable`; `class ScriptSigner`
 - **kestrel_sovereign/features/compute/script_store.py** — Kestrel Compute Feature - Script Store.
   - `class ScriptStore`
 - **kestrel_sovereign/features/compute/security_hook.py** — Kestrel Compute Feature - Security Hook.
@@ -759,6 +761,30 @@ Repo entry points and standard project files.
   - `class KeyNotConfiguredError`; `class KeyResolutionService`; `async def resolve_key(provider, agent_did, storage, require)`
 - **kestrel_sovereign/services/layered_key_resolver.py** — Layered Key Resolution Service for Kestrel.
   - `class KeyNotConfiguredError`; `class KeyResolutionResult`; `class LayeredKeyResolver`; `async def resolve_key(pool, provider, companion_id, user_id, …)`
+- **kestrel_sovereign/setup/__init__.py** — Kestrel setup wizard package.
+- **kestrel_sovereign/setup/context.py** — Shared state passed through every wizard step.
+  - `class Flow`; `class SetupContext`
+- **kestrel_sovereign/setup/env_file.py** — Read-merge-write helpers for ``.env`` files.
+  - `class EnvWriteResult`; `def read_env(path)`; `def write_env(path, updates)`
+- **kestrel_sovereign/setup/prompts.py** — Thin wrapper over ``questionary`` with a non-TTY fallback.
+  - `def is_tty()`; `class Prompter`; `class QuestionaryPrompter`; `class NonInteractivePrompter`; `class StubPrompter`
+- **kestrel_sovereign/setup/steps/__init__.py** — Wizard steps.
+- **kestrel_sovereign/setup/steps/agent.py** — Create (or recognise) a sovereign agent.
+  - `class CreateAgentResult`; `def create_agent()`; `def run(ctx)`
+- **kestrel_sovereign/setup/steps/integrations.py** — Optional cloud integration credentials step.
+  - `def run(ctx)`
+- **kestrel_sovereign/setup/steps/keys.py** — Generate encryption + API keys into ``.env``.
+  - `def run(ctx)`
+- **kestrel_sovereign/setup/steps/llm.py** — LLM provider step: pick vendor(s), capture keys, write ``[llm]``.
+  - `def run(ctx)`
+- **kestrel_sovereign/setup/steps/talon.py** — Optional Kestrel Talon integration step.
+  - `def run(ctx)`
+- **kestrel_sovereign/setup/steps/verify.py** — End-of-run readiness check.
+  - `def run(ctx)`
+- **kestrel_sovereign/setup/toml_file.py** — Read-merge-write helpers for ``kestrel.toml``.
+  - `class TomlWriteResult`; `def read_toml(path)`; `def write_toml(path, updates)`
+- **kestrel_sovereign/setup/wizard.py** — Wizard orchestrator.
+  - `def run_wizard(ctx)`; `def build_context(project_dir)`
 - **kestrel_sovereign/signals/__init__.py** — Signal Dispatcher — runtime.
 - **kestrel_sovereign/signals/dispatcher.py** — SignalDispatcher — the runtime engine.
   - `class DispatcherAgent`; `class SignalDispatcher`
@@ -990,6 +1016,8 @@ Repo entry points and standard project files.
 - **kestrel_sdk/hooks/base.py** — Kestrel Hooks - Core Types (Claude Code Aligned).
   - `class HookEvent`; `class PermissionDecision`; `class HookInput`; `class HookOutput`; `class Hook`
 - **kestrel_sdk/security/__init__.py** — Kestrel SDK — Security interfaces and encryption helpers.
+- **kestrel_sdk/security/aead.py** — AEAD container — versioned AES-256-GCM with Fernet-compatible read path.
+  - `class AEADCipher`
 - **kestrel_sdk/security/encryption.py** — Fernet encryption helpers for Kestrel SDK.
   - `def get_fernet()`; `def get_master_key_bytes()`; `def get_agent_fernet(agent_id)`; `def get_agent_key(agent_did, purpose)`; `def encrypt(agent_did, purpose, plaintext)`; `def decrypt(agent_did, purpose, ciphertext)`; `def encrypt_string(agent_did, purpose, plaintext)`; `def decrypt_string(agent_did, purpose, ciphertext)`; `…`
 - **kestrel_sdk/security/exceptions.py** — Unified exception hierarchy for Kestrel security module.
@@ -1070,6 +1098,8 @@ Repo entry points and standard project files.
 - **scripts/ci/__init__.py** — —
 - **scripts/ci/analyze_and_comment.py** — Analyze test feedback and post PR comment with insights.
   - `def get_feedback_entries(db_path)`; `def analyze_patterns(entries)`; `def format_pr_comment(insights, failures)`; `def post_pr_comment(comment)`; `def main()`
+- **scripts/ci/clean_install_verify.py** — CI verification helpers for the clean-install workflow.
+  - `def cmd_wizard_artifacts(args)`; `def cmd_identity(args)`; `def cmd_constitution(args)`; `def cmd_memory(args)`; `def cmd_start_and_health(args)`; `def cmd_did_persists(args)`; `def main(argv)`
 - **scripts/ci/create_issues.py** — Create GitHub issues for high-confidence recurring patterns.
   - `def get_feedback_entries(db_path)`; `def analyze_patterns(entries)`; `def issue_exists(title, repo, token)`; `def create_issue(insight, repo, token)`; `def main()`
 - **scripts/cloudrun/build.sh** — Build and push Kestrel Cloud Run image to GCR
@@ -1273,12 +1303,15 @@ Repo entry points and standard project files.
 - **docs/architecture/security/ANTI_CORRUPTION_ANALYSIS.md** — Preventing Corruption in Kestrel's Integrity Audit System — **Date:** November 9, 2025 **Analysis:** Anti-Corruption Safeguards & Risk Mitigation **Focus:** Addressing Economic Incentive Vulnerabilities
 - **docs/architecture/security/CONSTITUTION_EMBEDDING.md** — Kestrel Constitution Embedding Process — ## Overview
 - **docs/architecture/security/CRYPTOGRAPHIC_ANCHORING.md** — PRD: Cryptographic Log Anchoring — **1.
+- **docs/architecture/security/CRYPTO_INVENTORY.md** — Cryptographic Inventory — **Status:** Wave 0A deliverable.
 - **docs/architecture/security/INTEGRITY_AUDIT_SYSTEM.md** — Kestrel Integrity Audit System — **Date:** November 9, 2025 **Version:** 1.0 **Component:** Constitutional AI Enforcement Mechanism
 - **docs/architecture/security/KEY_MANAGEMENT.md** — Key Management Architecture — ## Overview
 - **docs/architecture/security/KEY_ROTATION.md** — Key Rotation Mechanism — ## Overview
-- **docs/architecture/security/POST_QUANTUM_CRYPTOGRAPHY_MIGRATION.md** — PRD: Post-Quantum Cryptography Migration — ## 1.
+- **docs/architecture/security/POST_QUANTUM_CRYPTOGRAPHY_MIGRATION.md** — Post-Quantum Cryptography Migration — PRD v2 — **Status:** Active.
+- **docs/architecture/security/PQ_THREAT_MODEL.md** — Post-Quantum Threat Model — **Status:** Wave 0A deliverable.
 - **docs/architecture/security/PRIVACY_AGENT.md** — PRD: PrivacyAgent — ## 1.
 - **docs/architecture/security/PRIVACY_MODES.md** — Privacy Modes: Complete Data Sovereignty — ## 1.
+- **docs/architecture/security/SERIALIZATION_COMPATIBILITY.md** — Serialization Compatibility Matrix — **Status:** Wave 0A deliverable.
 - **docs/architecture/storage/DECENTRALIZED_STORAGE.md** — Decentralized Storage Vision: IPFS & Filecoin Integration — **Last Updated:** March 11, 2026
 - **docs/architecture/storage/HUMAN_MEMORY_SYSTEM.md** — Human-Like Memory System — **Last Updated:** January 25, 2026 **Status:** 🟢 Implemented **Commit:** `0b83115`
 - **docs/architecture/storage/SOVEREIGNTY_IMPLEMENTATION.md** — Sovereignty Implementation — **Date:** November 21, 2025 **Status:** ✅ **COMPLETE** - V2 Architecture with Convergent Sharding **Tests:** 16/16 passing (100%) **Vision:** "Your AI companion can never be taken away from you"
@@ -1376,6 +1409,12 @@ Repo entry points and standard project files.
 - **docs/design/kestrel_flaps_down.png** — —
 - **docs/design/kestrel_icon.svg** — —
 - **docs/design/kestrel_logo.svg** — —
+- **docs/design/launch/LANDING_PAGE_HTML_STRUCTURE.md** — Kestrel Landing Page HTML Structure — This document translates the landing-page copy into an implementation-ready HTML structure for engineering.
+- **docs/design/launch/LANDING_PAGE_WIREFRAME.md** — Kestrel Landing Page Wireframe — Prepared for the open-source launch on Apr 23 / May 7 planning path.
+- **docs/design/launch/PREVIEW_PACKET_LANGUAGE.md** — Preview Packet Language — This document stores the current canonical preview-packet language for the Kestrel open-source launch so the team has one repo-based source of truth alongside the other launch assets.
+- **docs/design/launch/PUBLISH_READY_LANDING_PAGE_COPY.md** — Kestrel Landing Page Copy: Publish-Ready Draft — This draft is the tightened, publish-ready version of the earlier wireframe.
+- **docs/design/launch/README.md** — Launch Copy Drafts — This folder holds the current launch-copy assets for the Kestrel open-source launch.
+- **docs/design/launch/SIMPLE_LAUNCH_PAGE_ONE_SCREEN.md** — Kestrel Simple Launch Page: One-Screen Version — Use this if the team wants a single-screen launch page with minimal implementation overhead.
 - **docs/development/BIG_BRAIN.md** — Best Open-Weight LLMs for Agentic Chat (December 2025) Overview and Criteria
 - **docs/development/DEVCONTAINER_QUICKSTART.md** — Dev Container Quick Start — Get a complete Kestrel + Kestrel development environment running in Docker Desktop with one click.
 - **docs/development/README.md** — Development Documentation — Developer notes, experiments, and technical development guides.
@@ -1794,6 +1833,8 @@ Repo entry points and standard project files.
   - `class TestOpenAIAdapterListModels`; `class TestAnthropicAdapterListModels`; `class TestOllamaAdapterListModels`; `class TestGoogleAdapterListModels`; `class TestVertexAIAdapterListModels`; `class TestModelInfoSerialization`
 - **tests/unit/test_adapter_system_prompt_contribution.py** — Adapter-level tests for the ``contribute_system_prompt`` hook (#807 / #806).
   - `class TestBaseHookIdentity`; `class TestCodexAdapterOverlay`; `class TestOpenAIAdapterOverlay`; `class TestApplySystemPromptContributionToMessages`; `class TestCodexInstructionsAugmentation`
+- **tests/unit/test_aead_cipher.py** — AEADCipher unit tests — Wave 0C (#915).
+  - `def raw_key()`; `def random_key()`; `def cipher(raw_key)`; `def test_v2_round_trip_bytes(cipher)`; `def test_v2_round_trip_string_plaintext(cipher)`; `def test_v2_round_trip_empty(cipher)`; `def test_v2_round_trip_large(cipher)`; `def test_v2_token_decoded_form(cipher)`; `…`
 - **tests/unit/test_agent_backend_routing_contracts.py** — Contract tests for agent-specific backend routing (issue #425).
   - `def service_with_providers()`; `def service_with_openai_plan()`; `class TestPreferenceRoundTrip`; `class TestResolveProviderRouting`; `class TestUnavailableProviderFails`; `class TestEmptyProviderListRaisesClearly`; `class TestAnthropicPlanVsApi`; `class TestOpenAIPlanRouting`; `…`
 - **tests/unit/test_agent_cancellation.py** — Unit tests for agent request cancellation (stop button).
@@ -1855,10 +1896,14 @@ Repo entry points and standard project files.
   - `class StubAdapter`; `class FailingAdapter`; `class TestChannelMessage`; `class TestDeliveryReceipt`; `class TestChannelConfig`; `class TestChannelAdapterContract`; `class TestChannelRegistry`; `class TestChannelFeature`; `…`
 - **tests/unit/test_cheap_model_scoping_contracts.py** — Contract tests for vendor-scoped cheap-model selection.
   - `def test_no_config_no_hints_returns_none()`; `def test_hints_match_returns_vendor_scoped_selector()`; `def test_no_matching_hint_returns_none()`; `def test_explicit_cheap_model_selector_honored()`; `def test_cheap_model_auto_falls_through_to_hints()`; `def test_get_cheap_model_backcompat_returns_bare_model()`
+- **tests/unit/test_clean_install_verify.py** — Unit tests for scripts/ci/clean_install_verify.py.
+  - `def test_wizard_artifacts_passes_on_post_wizard_tree(tmp_path, monkeypatch, capsys)`; `def test_wizard_artifacts_fails_when_env_missing(tmp_path, monkeypatch, capsys)`; `def test_wizard_artifacts_fails_when_data_key_missing(tmp_path, monkeypatch, capsys)`; `def test_wizard_artifacts_fails_when_route_priority_empty(tmp_path, monkeypatch, capsys)`; `def test_identity_passes_when_did_present(tmp_path, monkeypatch, capsys)`; `def test_identity_fails_when_db_missing(tmp_path, monkeypatch, capsys)`; `def test_identity_fails_when_no_agent_node(tmp_path, monkeypatch, capsys)`; `def test_constitution_passes_with_full_anchor(tmp_path, monkeypatch, capsys)`; `…`
 - **tests/unit/test_cli.py** — Unit tests for the unified kestrel CLI.
   - `class TestArgumentParsing`; `class TestCommandDispatch`; `class TestProcessHelpers`; `def rookery_env(tmp_path)`; `class TestCmdList`; `class TestCmdStatus`; `class TestCmdStop`; `class TestCmdStart`; `…`
 - **tests/unit/test_cli_feature.py** — Tests for the Feature CLI commands (kestrel feature list/install/enable/disable/info/scaffold/skills).
   - `class TestFeatureList`; `class TestFeatureInstall`; `class TestFeatureEnableDisable`; `class TestFeatureInfo`; `class TestFeatureScaffold`; `class TestFeatureSkills`; `class TestSkillsSearch`; `class TestResolveFeatureName`; `…`
+- **tests/unit/test_cli_first_run.py** — Tests for the first-run setup hook in `kestrel start`.
+  - `def test_first_run_returns_none_when_env_exists(tmp_path)`; `def test_first_run_returns_none_when_agent_already_registered(tmp_path)`; `def test_first_run_fires_when_rookery_has_no_agents(tmp_path)`; `def test_first_run_tolerates_corrupt_rookery(tmp_path)`; `def test_first_run_returns_none_when_skip_env_set(tmp_path, monkeypatch)`; `def test_first_run_non_tty_exits_with_hint(tmp_path, capsys, monkeypatch)`; `def test_first_run_tty_yes_runs_wizard(tmp_path, monkeypatch)`; `def test_first_run_tty_no_returns_error(tmp_path, monkeypatch)`; `…`
 - **tests/unit/test_cloud_launcher_contracts.py** — Contracts for cloud launcher env handling and model identity.
   - `def test_gcp_session_preserves_absent_model_name()`; `def test_vast_session_preserves_absent_model_name()`; `def test_gcp_startup_script_skips_unset_env_values()`; `async def test_vast_feature_omits_target_model_override_when_unset()`; `async def test_runpod_feature_omits_target_model_override_when_unset()`; `def test_runpod_provider_drops_none_env_values()`
 - **tests/unit/test_code_edit_feature.py** — Direct contracts for the CodeEdit feature.
@@ -1882,7 +1927,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_commands_conversations_endpoint_contracts.py** — Focused contract tests for commands and conversations endpoints.
   - `def test_commands_endpoint_merges_builtin_and_feature_commands()`; `def test_commands_endpoint_builtin_inventory_matches_command_handler_specs()`; `def test_sessions_endpoint_returns_message_totals_from_history()`; `def test_conversations_endpoint_groups_rows_and_marks_encrypted_preview()`; `def test_get_conversation_filters_session_markers_and_decrypts_messages()`; `def test_get_conversation_unwraps_sent_form_user_content()`; `def test_rename_conversation_happy_path_returns_stored_name()`; `def test_rename_conversation_empty_string_clears_name()`; `…`
 - **tests/unit/test_compute_feature.py** — Unit tests for Kestrel Compute Feature.
-  - `def temp_db()`; `def temp_trash_dir(temp_dir)`; `def sample_script()`; `def sample_bash_script()`; `class TestModels`; `class TestScriptStore`; `class TestScriptSigner`; `class TestScriptAnalyzer`; `…`
+  - `def temp_db()`; `def temp_trash_dir(temp_dir)`; `def sample_script()`; `def signer_with_ecdsa_keys(temp_db)`; `def sample_bash_script()`; `class TestModels`; `class TestScriptStore`; `class TestScriptSigner`; `…`
 - **tests/unit/test_computer_use_audit.py** — Tests for the JSONL audit log (#836).
   - `async def test_writes_one_record(tmp_path)`; `async def test_records_in_order(tmp_path)`; `async def test_concurrent_writes_serialized(tmp_path)`; `async def test_creates_parent_dir(tmp_path)`; `async def test_forwards_to_feedback_hook(tmp_path)`; `async def test_record_includes_outcome_and_error(tmp_path)`
 - **tests/unit/test_computer_use_feature.py** — Tests for ComputerUseFeature gate ordering and lifecycle (#838).
@@ -1959,6 +2004,8 @@ Repo entry points and standard project files.
   - `class TestIsDockerNetwork`
 - **tests/unit/test_docstring_parser.py** — Unit tests for docstring parameter parsing in features/base.py.
   - `class TestParseDocstringParams`; `class TestToolDecorator`; `class TestToolDecoratorIntegration`
+- **tests/unit/test_doctor.py** — Unit tests for kestrel_sovereign.doctor.
+  - `def test_doctor_reports_ready_when_everything_set(tmp_path)`; `def test_doctor_blocks_on_missing_data_key(tmp_path)`; `def test_doctor_blocks_on_empty_route_priority(tmp_path)`; `def test_doctor_blocks_on_missing_api_key_env(tmp_path)`; `def test_doctor_blocks_when_no_agents(tmp_path)`; `def test_doctor_blocks_when_agent_db_missing(tmp_path)`; `def test_format_report_renders_lines(tmp_path)`; `def test_format_report_says_not_ready_when_blocked(tmp_path)`; `…`
 - **tests/unit/test_dynamic_tool_loading.py** — Unit tests for dynamic tool loading.
   - `def agent()`; `class TestDynamicToolLoadingInit`; `class TestRegisterExploredFeatureTools`; `class TestNameCollision`; `class TestBuildAllTools`; `class TestDirectToolExecution`; `class TestEviction`; `class TestFeatureDispatchUnaffected`
 - **tests/unit/test_embedding_service_missing_model.py** — Soften the first-run UX when Ollama hasn't pulled the embedding model yet — #657.
@@ -2175,6 +2222,8 @@ Repo entry points and standard project files.
   - `class TestActionItemExtractor`; `class TestDecisionExtractor`; `class TestInteractionSentiment`; `class TestPersonResolverPasses`; `async def router()`; `class TestSchemaRouterOrchestration`; `class TestRoutingSuppression`; `class TestUpsertSemantics`
 - **tests/unit/test_scoped_constitution.py** — Tests for ScopedConstitution — constitutional narrowing for spawned agents.
   - `class TestConstraintValidation`; `class TestWideningRejected`; `class TestEffectiveConstitution`; `class TestIntegrityVerification`; `class TestConstitutionMixinSpawnIntegration`; `class TestConstraintTypeValidation`
+- **tests/unit/test_script_signer_fail_closed.py** — Fail-closed tests for ScriptSigner — Wave 0B (#914).
+  - `def temp_db()`; `def script()`; `async def test_sign_without_keys_raises(temp_db, script)`; `async def test_sign_without_did_raises(temp_db, script)`; `async def test_sign_propagates_signing_failure(temp_db, script)`; `async def test_verify_rejects_hmac_prefix_even_when_math_verifies(temp_db, script)`; `async def test_verify_rejects_hmac_with_unsigned_default(temp_db, script)`; `async def test_verify_genuine_ecdsa_signature(temp_db, script)`; `…`
 - **tests/unit/test_secondary_endpoint_contracts.py** — Focused contract tests for remaining database/files/observability/saved-items routes.
   - `def test_database_table_query_contract_supports_search_and_pagination()`; `def test_file_get_and_observability_summary_contracts()`; `def test_saved_items_listing_filters_and_schema_contracts()`; `def test_saved_items_item_crud_search_and_pin_contracts()`
 - **tests/unit/test_security_endpoint_contracts.py** — Focused contract tests for security endpoints.
@@ -2189,6 +2238,26 @@ Repo entry points and standard project files.
   - `class TestSignatures`; `class TestOrchestratorThreadsSessionId`
 - **tests/unit/test_session_log_talon.py** — Tests for Talon PR detection in Session Log collector.
   - `class TestIsTalonPR`; `class TestReviewLatency`
+- **tests/unit/test_setup_env_file.py** — Unit tests for kestrel_sovereign.setup.env_file.
+  - `def test_read_env_missing_file_returns_empty(tmp_path)`; `def test_read_env_parses_key_value_pairs(tmp_path)`; `def test_read_env_strips_quotes(tmp_path)`; `def test_read_env_skips_comments_and_blanks(tmp_path)`; `def test_write_env_creates_file_when_absent(tmp_path)`; `def test_write_env_preserves_unrelated_keys(tmp_path)`; `def test_write_env_preserves_comments_and_blank_lines(tmp_path)`; `def test_write_env_backs_up_before_changing(tmp_path)`; `…`
+- **tests/unit/test_setup_imports.py** — Regression tests for setup-package import order.
+  - `def test_doctor_imports_cold()`; `def test_setup_wizard_imports_cold()`; `def test_setup_package_init_is_minimal()`; `def test_kestrel_doctor_cli_runs_without_circular_import(tmp_path)`; `def test_kestrel_setup_check_cli_runs_without_circular_import(tmp_path)`
+- **tests/unit/test_setup_prompts.py** — Unit tests for kestrel_sovereign.setup.prompts.
+  - `def test_is_tty_false_when_ci_env_set(monkeypatch)`; `def test_is_tty_false_when_kestrel_noninteractive(monkeypatch)`; `def test_noninteractive_prompter_returns_defaults()`; `def test_noninteractive_select_prefers_default()`; `def test_noninteractive_select_falls_back_to_first()`; `def test_noninteractive_select_empty_choices()`; `def test_stub_prompter_consumes_answers_in_order()`; `def test_stub_prompter_raises_when_out_of_answers()`; `…`
+- **tests/unit/test_setup_steps_agent.py** — Unit tests for the agent step.
+  - `def test_agent_quickstart_creates_kestrel_when_rookery_empty(tmp_path)`; `def test_agent_quickstart_skips_when_rookery_has_agent(tmp_path)`; `def test_agent_interactive_with_existing_can_decline_more(tmp_path)`; `def test_agent_interactive_creates_with_custom_name(tmp_path)`; `def test_agent_does_not_re_incept_existing_db(tmp_path)`; `def test_create_agent_helper_is_idempotent(tmp_path)`; `def test_create_agent_avoids_port_collisions(tmp_path)`; `def test_create_agent_respects_explicit_port(tmp_path)`
+- **tests/unit/test_setup_steps_integrations.py** — Unit tests for the cloud-integrations step.
+  - `def test_integrations_in_ordered_between_llm_and_agent()`; `def test_integrations_reachable_by_name()`; `def test_curated_onboarders_match_locked_in_list()`; `def test_decline_all_writes_nothing(tmp_path)`; `def test_select_tavily_writes_key_and_marks_managed(tmp_path)`; `def test_select_elevenlabs(tmp_path)`; `def test_select_deepgram(tmp_path)`; `def test_select_huggingface_uses_HF_TOKEN_not_HUGGINGFACE(tmp_path)`; `…`
+- **tests/unit/test_setup_steps_keys.py** — Unit tests for the keys step.
+  - `def test_keys_generates_data_key_when_absent(tmp_path)`; `def test_keys_never_regenerates_existing_data_key(tmp_path)`; `def test_keys_quickstart_generates_api_key_too(tmp_path)`; `def test_keys_check_mode_blocks_when_data_key_missing(tmp_path)`; `def test_keys_check_mode_silent_when_data_key_present(tmp_path)`; `def test_keys_interactive_asks_about_api_key(tmp_path)`; `def test_keys_interactive_skips_api_key_when_declined(tmp_path)`; `def test_keys_idempotent_when_everything_set(tmp_path)`
+- **tests/unit/test_setup_steps_llm.py** — Unit tests for the llm step.
+  - `def test_llm_quickstart_writes_ollama_block(tmp_path)`; `def test_llm_quickstart_with_no_keys_marks_blocker_for_cloud(tmp_path)`; `def test_llm_interactive_picks_openai_with_key(tmp_path)`; `def test_llm_interactive_with_existing_priority_offered_to_keep(tmp_path)`; `def test_llm_anthropic_path(tmp_path)`; `def test_llm_google_path(tmp_path)`; `def test_llm_openrouter_path(tmp_path)`; `def test_llm_multi_vendor_chain(tmp_path)`; `…`
+- **tests/unit/test_setup_steps_talon.py** — Unit tests for the (opt-in) talon step.
+  - `def test_talon_not_in_default_ordered_run()`; `def test_talon_reachable_by_name()`; `def test_default_full_run_skips_talon(tmp_path)`; `def test_talon_interactive_writes_token_and_reviewer(tmp_path)`; `def test_talon_interactive_token_only(tmp_path)`; `def test_talon_interactive_blank_token_skips(tmp_path)`; `def test_talon_interactive_keeps_existing_token_when_blank(tmp_path)`; `def test_talon_interactive_can_clear_reviewer(tmp_path)`; `…`
+- **tests/unit/test_setup_toml_file.py** — Unit tests for kestrel_sovereign.setup.toml_file.
+  - `def test_read_toml_missing_returns_empty(tmp_path)`; `def test_read_toml_corrupted_returns_empty(tmp_path)`; `def test_write_toml_creates_file_when_absent(tmp_path)`; `def test_write_toml_deep_merges_nested_tables(tmp_path)`; `def test_write_toml_no_op_when_identical(tmp_path)`; `def test_write_toml_backs_up_before_change(tmp_path)`; `def test_write_toml_shallow_merge_replaces_top_keys(tmp_path)`; `def test_write_toml_idempotent_across_runs(tmp_path)`; `…`
+- **tests/unit/test_setup_wizard.py** — End-to-end tests for the wizard orchestrator.
+  - `def test_wizard_quickstart_full_run(tmp_path)`; `def test_wizard_idempotent_second_run_is_noop(tmp_path)`; `def test_wizard_check_mode_never_writes(tmp_path)`; `def test_wizard_check_mode_returns_zero_when_ready(tmp_path)`; `def test_wizard_check_with_reset_does_not_move_files(tmp_path)`; `def test_wizard_reset_moves_existing_files_aside(tmp_path)`; `def test_wizard_only_step_runs_just_that_step(tmp_path)`; `def test_wizard_unknown_step_returns_error(tmp_path)`; `…`
 - **tests/unit/test_shared_model_cache.py** — Tests for SharedModelCache — process-wide model discovery cache.
   - `class TestSharedModelCache`; `class TestSharedModelCacheSingleton`
 - **tests/unit/test_shell_exit_tokens.py** — Shell exit tokens — #658.
