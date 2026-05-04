@@ -483,3 +483,59 @@ def test_verify_handles_empty_trusted_signer_multibase(signed_manifest):
     result = verify_manifest(signed_manifest, trusted_signer_multibase="")
     assert not result.ok
     assert "decode failed" in result.reason
+
+
+# ---------------------------------------------------------------------------
+# Codex P2 round 2 regressions
+# ---------------------------------------------------------------------------
+
+def test_artifact_path_rejects_windows_drive_prefix(base_manifest):
+    """Codex P2 round 2: ``C:\\\\...`` and ``C:/...`` are absolute on
+    Windows but the previous validator only rejected paths starting
+    with ``/`` or ``\\\\``. A signed manifest could still drive Windows
+    consumers outside the release dir."""
+    with pytest.raises(ReleaseManifestError, match="Windows drive prefix"):
+        add_artifact_entry(base_manifest, "C:\\Users\\victim\\thing.whl", b"x")
+    with pytest.raises(ReleaseManifestError, match="Windows drive prefix"):
+        add_artifact_entry(base_manifest, "D:/payload.exe", b"x")
+    with pytest.raises(ReleaseManifestError, match="Windows drive prefix"):
+        add_artifact_entry(base_manifest, "z:relative-but-volume.txt", b"x")
+
+
+def test_verify_handles_non_string_signature_fields(base_manifest, slh_kp, slh_pub_multibase):
+    """Codex P2 round 2: a manifest parsed from untrusted JSON could
+    carry e.g. ``{\"alg\": [\"list\"], \"sig\": [1,2]}`` — the previous
+    verifier raised TypeError out of ``bytes.fromhex`` instead of
+    returning a structured failure. Now those entries are silently
+    dropped (treated as not-a-signature)."""
+    from dataclasses import replace
+    m = add_artifact_entry(base_manifest, "wheel.whl", b"data")
+    m = sign_manifest(m, slh_kp, kid="k1")
+    m = finalize(m)
+    # Add a malformed signature entry alongside the legit one
+    bad_entry = {"alg": ["list-not-string"], "sig": [1, 2, 3]}
+    spoofed_sigs = list(m.signatures) + [bad_entry]
+    spoofed = replace(m, signatures=spoofed_sigs)
+    # Should not raise; trusted signer still matches the legit entry
+    result = verify_manifest(spoofed, trusted_signer_multibase=slh_pub_multibase)
+    assert result.ok, result.reason
+
+
+def test_verify_handles_only_malformed_signature_entries(
+    base_manifest, slh_kp, slh_pub_multibase,
+):
+    """Manifest with ONLY malformed signature entries → no verified
+    entries, policy fails with ``no signatures present``."""
+    from dataclasses import replace
+    m = add_artifact_entry(base_manifest, "wheel.whl", b"data")
+    m = finalize(m)
+    spoofed = replace(m, signatures=[
+        {"alg": None, "sig": "00"},          # alg is None
+        {"alg": "x", "sig": None},            # sig is None
+        {"alg": ["list"], "sig": "00"},       # alg is list
+        {"alg": "x", "sig": [1, 2]},          # sig is list
+        {"alg": "x", "sig": "not-hex-zzz"},   # malformed hex
+    ])
+    result = verify_manifest(spoofed, trusted_signer_multibase=slh_pub_multibase)
+    assert not result.ok
+    assert not result.signer_match

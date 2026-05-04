@@ -250,11 +250,22 @@ def _validate_artifact_path(path: str) -> None:
     disk; an attacker who controls a manifest could otherwise direct
     the verifier at ``/etc/passwd`` or ``../../../something``. Refuse
     at construction time so a malformed manifest never gets signed.
+
+    Windows drive-qualified paths (``C:\\Users\\...``, ``C:/Windows/...``)
+    are also rejected (codex P2 round 2): they're absolute on Windows
+    even though they don't start with ``/`` or ``\\``.
     """
     if not isinstance(path, str) or not path:
         raise ReleaseManifestError(f"artifact path must be a non-empty string; got {path!r}")
     if path.startswith("/") or path.startswith("\\"):
         raise ReleaseManifestError(f"artifact path must not be absolute: {path!r}")
+    # Windows drive prefix: a single letter followed by ``:`` at the
+    # very start (e.g. ``C:``, ``c:foo``, ``D:\\path``). Per Windows
+    # path rules, ``X:`` is the volume-relative or absolute prefix.
+    if len(path) >= 2 and path[1] == ":" and path[0].isalpha():
+        raise ReleaseManifestError(
+            f"artifact path must not be absolute (Windows drive prefix): {path!r}"
+        )
     if ".." in path.replace("\\", "/").split("/"):
         raise ReleaseManifestError(f"artifact path must not contain '..': {path!r}")
     if "\x00" in path:
@@ -486,7 +497,13 @@ def verify_manifest(
             ),
         )
 
-    # Verify each signature; collect verified entries.
+    # Verify each signature; collect verified entries. Be defensive
+    # about non-string fields — codex P2 round 2 flagged that
+    # ``ReleaseManifest.from_dict`` doesn't strictly validate the
+    # ``signatures`` array shape, so a manifest carrying e.g.
+    # ``{"alg": ["list"], "sig": [1,2]}`` could TypeError out of
+    # ``bytes.fromhex`` or ``get_suite`` rather than producing a
+    # structured failure.
     verified: List[dict] = []
     signer_match = False
     for entry in manifest.signatures:
@@ -494,15 +511,17 @@ def verify_manifest(
             continue
         alg = entry.get("alg")
         sig_hex = entry.get("sig")
-        if not alg or not sig_hex:
+        if not isinstance(alg, str) or not alg:
+            continue
+        if not isinstance(sig_hex, str) or not sig_hex:
             continue
         try:
             sig_bytes = bytes.fromhex(sig_hex)
-        except ValueError:
+        except (ValueError, TypeError):
             continue
         try:
             suite = get_suite(alg)
-        except CryptoSuiteError:
+        except (CryptoSuiteError, TypeError):
             continue
         # Attempt verify against trusted key (only matches if alg lines up)
         if alg == trusted_signer_alg:
