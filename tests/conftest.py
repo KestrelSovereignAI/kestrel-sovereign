@@ -175,16 +175,19 @@ def pytest_sessionfinish(session, exitstatus):
 
 @pytest.fixture(scope="session", autouse=True)
 def setup_test_config():
-    """Setup test configuration before running tests."""
-    # Create a temporary config for tests
+    """Ensure tests have a usable kestrel.toml.
+
+    LLMService reads ``[llm]`` from ``kestrel.toml`` directly (#940). If a
+    fresh checkout has only ``kestrel.toml.example``, materialise it so the
+    full discovery path works in unit tests without each test fixture
+    having to seed the file."""
     config_dir = Path(__file__).parent.parent
-    config_path = config_dir / "llm_config.toml"
-    
-    # Only create if it doesn't exist
-    if not config_path.exists():
-        example_path = config_dir / "llm_config.toml.example"
-        if example_path.exists():
-            config_path.write_text(example_path.read_text())
+    target = config_dir / "kestrel.toml"
+    if target.exists():
+        return
+    example = config_dir / "kestrel.toml.example"
+    if example.exists():
+        target.write_text(example.read_text(encoding="utf-8"), encoding="utf-8")
 
 
 @pytest.fixture(scope="session")
@@ -337,12 +340,6 @@ def sample_json_file(temp_dir: Path) -> Generator[Path, None, None]:
 # =============================================================================
 # Configuration fixtures
 # =============================================================================
-
-@pytest.fixture
-def default_config_path(project_root: Path) -> Path:
-    """Get the default config path."""
-    return project_root / "llm_config.toml"
-
 
 @pytest.fixture
 def test_master_key() -> str:
