@@ -213,10 +213,18 @@ def test_ceremony_with_archival_countersignature(legacy_kestrel):
     assert result.succession_statement.archival_signature is not None
     assert result.archival_keypair is archival_kp
 
-    # Verify with require_archival=True passes
+    # Verify with require_archival=True + trusted_archival_multibase pin
+    # passes. Without the pin, require_archival is meaningless (codex P2
+    # round 7) — that's tested elsewhere; this happy path uses the
+    # ceremony's own archival key as the trust anchor.
+    pinned_archival_mb = (
+        result.succession_statement.archival_verification_method
+            ["publicKeyMultibase"]
+    )
     verify = verify_succession(
         result.succession_statement,
         require_archival=True,
+        trusted_archival_multibase=pinned_archival_mb,
         did_web_resolver=_self_attesting_resolver(result.succession_statement),
     )
     assert verify.ok, verify.reason
