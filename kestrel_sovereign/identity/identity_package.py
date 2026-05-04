@@ -27,8 +27,29 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Package format version - increment on breaking changes
-IDENTITY_PACKAGE_VERSION = "1.0.0"
+# Package format version. Wave 1 sub-PR 3 of the Quantum Hardening epic
+# (#921, #916) bumps this from "1.0.0" to "2.0.0". The bump introduces:
+#
+#   - ``signatures: [{alg, kid, sig}]`` — array of signatures so a single
+#     package can carry hybrid (classical + post-quantum) signatures from
+#     Wave 2 onward.
+#   - ``verification_methods: [{type, id, controller, publicKeyMultibase}]``
+#     — W3C Multikey verification methods, the standards-aligned shape
+#     used by ``did:web`` and ``did:key`` documents.
+#
+# Reader supports BOTH v1 ("1.0.0") and v2 ("2.0.0") on input. v1 packages
+# are translated to a synthetic v2 in memory: the legacy ``signature`` hex
+# becomes the sole entry in ``signatures`` tagged ``ecdsa-secp256k1-sha256``,
+# and a synthetic verification method is materialized from the DID document
+# when available. Writer always emits v2.
+IDENTITY_PACKAGE_VERSION = "2.0.0"
+IDENTITY_PACKAGE_VERSION_LEGACY = "1.0.0"
+
+# Default suite for legacy v1 signatures (every existing v1 package was
+# signed with secp256k1 ECDSA over SHA-256 of the canonical hash).
+_LEGACY_SIGNATURE_ALG = "ecdsa-secp256k1-sha256"
+_LEGACY_VERIFICATION_METHOD_TYPE = "EcdsaSecp256k1VerificationKey2019"
+_V2_VERIFICATION_METHOD_TYPE = "Multikey"
 
 
 class SubstrateType(Enum):
@@ -270,7 +291,20 @@ class AgentIdentityPackage:
 
     # === VERIFICATION ===
     content_hash: str = ""  # SHA256 of package contents (before signature)
-    signature: str = ""  # DID-signed hash for authenticity
+    signature: str = ""  # Legacy v1 DID-signed hash (kept for backward compat)
+
+    # === V2 SIGNATURES + VERIFICATION METHODS (Wave 1 sub-PR 3) ===
+    # ``signatures`` is the v2 array form: each entry carries an alg, kid,
+    # and hex-encoded signature. Hybrid identity (Wave 2 onward) populates
+    # multiple entries here (Ed25519 + ML-DSA-65). v1 readers ignore this
+    # field; v2 readers prefer it over the legacy single ``signature``.
+    signatures: List[Dict[str, str]] = field(default_factory=list)
+
+    # ``verification_methods`` is the W3C Multikey shape used by ``did:web``
+    # / ``did:key`` documents: ``{type, id, controller, publicKeyMultibase}``.
+    # Each entry's ``id`` matches a ``signatures.kid`` so the verifier can
+    # resolve a public key from its kid without an external DID resolution.
+    verification_methods: List[Dict[str, str]] = field(default_factory=list)
 
     def __post_init__(self):
         """Set defaults after initialization."""
@@ -332,11 +366,25 @@ class AgentIdentityPackage:
             # Verification (excluded from hash computation)
             "content_hash": self.content_hash,
             "signature": self.signature,
+
+            # V2 signatures + verification methods. Always emitted; v1
+            # readers will ignore them.
+            "signatures": list(self.signatures),
+            "verification_methods": list(self.verification_methods),
         }
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "AgentIdentityPackage":
-        """Create from dict."""
+        """Create from dict.
+
+        Accepts both v1 (``package_version == "1.0.0"``) and v2 inputs.
+        v1 inputs have a single ``signature`` hex field and no
+        ``signatures`` array. They are translated to a synthetic v2
+        in-memory representation: the legacy ``signature`` becomes the
+        sole entry in ``signatures`` tagged ``ecdsa-secp256k1-sha256``,
+        so verifier code can iterate ``signatures`` uniformly without
+        special-casing v1.
+        """
         # Parse nested objects
         personality = PersonalityFingerprint.from_dict(data.get("personality", {}))
         relationships = [
@@ -351,6 +399,21 @@ class AgentIdentityPackage:
             MigrationRecord.from_dict(m) if isinstance(m, dict) else m
             for m in data.get("migration_history", [])
         ]
+
+        legacy_signature = data.get("signature", "")
+        signatures = list(data.get("signatures", []) or [])
+        verification_methods = list(data.get("verification_methods", []) or [])
+
+        # v1 → synthetic v2: if there's a legacy signature but no v2 array,
+        # materialize one entry tagged with the legacy alg so callers can
+        # iterate uniformly.
+        if legacy_signature and not signatures:
+            did = data.get("did", "")
+            signatures = [{
+                "alg": _LEGACY_SIGNATURE_ALG,
+                "kid": f"{did}#keys-1" if did else "#keys-1",
+                "sig": legacy_signature,
+            }]
 
         return cls(
             did=data.get("did", ""),
@@ -376,19 +439,26 @@ class AgentIdentityPackage:
             source_substrate=data.get("source_substrate", SubstrateType.UNKNOWN.value),
             migration_history=migration_history,
             content_hash=data.get("content_hash", ""),
-            signature=data.get("signature", ""),
+            signature=legacy_signature,
+            signatures=signatures,
+            verification_methods=verification_methods,
         )
 
     def compute_content_hash(self) -> str:
         """
         Compute SHA256 hash of package contents for signing.
 
-        Excludes content_hash and signature fields to avoid circular dependency.
+        Excludes ``content_hash`` and BOTH signature shapes (the legacy
+        ``signature`` string and the v2 ``signatures`` array) to avoid
+        circular dependency. ``verification_methods`` ARE included in
+        the hash — they carry public keys that must be authenticated by
+        the signature.
         """
         # Create a copy without verification fields
         data = self.to_dict()
         data.pop("content_hash", None)
         data.pop("signature", None)
+        data.pop("signatures", None)
 
         # Deterministic JSON serialization
         content = json.dumps(data, sort_keys=True, separators=(',', ':'))
@@ -403,6 +473,50 @@ class AgentIdentityPackage:
         """Deserialize from JSON string."""
         data = json.loads(json_str)
         return cls.from_dict(data)
+
+    # ------------------------------------------------------------------
+    # V2 helpers (Wave 1 sub-PR 3)
+    # ------------------------------------------------------------------
+
+    def add_signature(self, alg: str, kid: str, sig_hex: str) -> None:
+        """Append a v2 signature entry. Used by hybrid signers (Wave 2+)."""
+        self.signatures.append({"alg": alg, "kid": kid, "sig": sig_hex})
+
+    def add_verification_method(
+        self,
+        kid: str,
+        public_key_multibase: str,
+        controller: Optional[str] = None,
+        method_type: str = _V2_VERIFICATION_METHOD_TYPE,
+    ) -> None:
+        """Append a v2 W3C-Multikey verification method entry."""
+        self.verification_methods.append({
+            "type": method_type,
+            "id": kid,
+            "controller": controller or self.did,
+            "publicKeyMultibase": public_key_multibase,
+        })
+
+    def iter_signatures(self) -> List[Dict[str, str]]:
+        """Iterate v2 signatures, including a synthetic v1 entry when only
+        the legacy ``signature`` field is populated.
+
+        Lets verifier code iterate uniformly across both shapes without
+        having to special-case v1 packages.
+        """
+        if self.signatures:
+            return list(self.signatures)
+        if self.signature:
+            return [{
+                "alg": _LEGACY_SIGNATURE_ALG,
+                "kid": f"{self.did}#keys-1" if self.did else "#keys-1",
+                "sig": self.signature,
+            }]
+        return []
+
+    def is_v2(self) -> bool:
+        """True iff this package was written with the v2 schema."""
+        return self.package_version.startswith("2.")
 
     def verify_constitution(self) -> bool:
         """Verify that constitution_text matches constitution_hash."""
