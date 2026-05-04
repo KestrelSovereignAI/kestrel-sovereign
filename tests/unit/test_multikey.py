@@ -219,7 +219,7 @@ def test_multibase_unknown_codec_rejected():
     rather than silently mis-decode under a wrong suite."""
     # Construct a payload with codec 0x99 0x99 (unregistered)
     fake = MULTIBASE_BASE58BTC_PREFIX + base58btc_encode(b"\x99\x99" + b"\x00" * 30)
-    with pytest.raises(CryptoSuiteError, match="No registered suite for multicodec"):
+    with pytest.raises(CryptoSuiteError, match="No registered signing suite"):
         multibase_to_public_key(fake)
 
 
