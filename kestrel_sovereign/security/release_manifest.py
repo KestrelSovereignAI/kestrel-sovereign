@@ -417,33 +417,70 @@ class ManifestVerifyResult:
 def verify_manifest(
     manifest: ReleaseManifest,
     *,
-    trusted_signer_multibase: str,
+    trusted_signer_multibase: Optional[str] = None,
+    trusted_signer_multibases: Optional[List[str]] = None,
     trusted_signer_alg: str = ALG_SLH_DSA_SHA2_128S,
     policy: VerifyPolicy = VerifyPolicy.PQ_REQUIRED,
 ) -> ManifestVerifyResult:
-    """Verify a manifest's signatures against a pinned trusted signer.
+    """Verify a manifest's signatures against pinned trusted signers.
 
     Args:
         manifest: the parsed manifest (e.g. via ``ReleaseManifest.from_dict(json.loads(s))``)
-        trusted_signer_multibase: pinned public key (multibase z-prefix
-            base58btc with the alg's multicodec). Producer documents
-            this once at release time; consumers bake it into their
-            release-verification pipeline.
-        trusted_signer_alg: which algorithm the trusted key uses.
-            Default ``slh-dsa-sha2-128s`` — the conservative-tier
-            choice for release signing.
-        policy: signature policy. Default ``PQ_REQUIRED`` because
-            release signatures are long-horizon and a classical-only
-            signature would be Shor-vulnerable. Hybrid releases that
-            include both SLH-DSA and Ed25519 signatures still pass
-            this policy because PQ_REQUIRED accepts any set with at
-            least one PQ entry.
+        trusted_signer_multibase: legacy single-key form. Equivalent
+            to ``trusted_signer_multibases=[trusted_signer_multibase]``.
+        trusted_signer_multibases: list of pinned public keys. Each
+            decoded suite-id must be unique within the list. Codex P2
+            round 3: the previous single-key API made the documented
+            ``HYBRID_REQUIRED`` policy functionally unsatisfiable
+            because only one alg ever made it into the verified set.
+            Pass one trusted key per algorithm to use a hybrid policy.
+        trusted_signer_alg: required suite for the SINGLE-key
+            signature path. Ignored when ``trusted_signer_multibases``
+            is provided (each key's alg is checked individually).
+            Default ``slh-dsa-sha2-128s``.
+        policy: signature policy. Default ``PQ_REQUIRED`` — release
+            signatures are long-horizon and classical-only would be
+            Shor-vulnerable. ``HYBRID_REQUIRED`` requires at least
+            one classical AND one PQ trusted key (not just trusted
+            signature claim).
 
     Returns:
         ``ManifestVerifyResult`` with composite ``ok``, the per-policy
-        result, ``signer_match`` (the trusted key actually verified
-        one of the signatures), and ``manifest_id_consistent``.
+        result, ``signer_match`` (at least one trusted key actually
+        verified a signature), and ``manifest_id_consistent``.
     """
+    # Normalize to a list of (multibase, expected_alg or None) entries.
+    if trusted_signer_multibases is not None and trusted_signer_multibase is not None:
+        return ManifestVerifyResult(
+            ok=False,
+            signature_policy=PolicyResult(
+                ok=False, reason="conflicting trusted-signer arguments",
+                alg_ids_seen=frozenset(),
+            ),
+            manifest_id_consistent=False,
+            signer_match=False,
+            reason=(
+                "pass either trusted_signer_multibase (single) OR "
+                "trusted_signer_multibases (list), not both"
+            ),
+        )
+    if trusted_signer_multibases is None:
+        if trusted_signer_multibase is None:
+            return ManifestVerifyResult(
+                ok=False,
+                signature_policy=PolicyResult(
+                    ok=False, reason="no trusted signer provided",
+                    alg_ids_seen=frozenset(),
+                ),
+                manifest_id_consistent=False,
+                signer_match=False,
+                reason="must provide trusted_signer_multibase or trusted_signer_multibases",
+            )
+        trusted_signer_multibases = [trusted_signer_multibase]
+        # Single-key mode also enforces the alg pin
+        single_key_expected_alg = trusted_signer_alg
+    else:
+        single_key_expected_alg = None
     # Re-run invariants on the parsed/passed manifest. Without this a
     # signed manifest with ``../escape`` paths could verify ok=True
     # and drive consumer code outside the release directory (codex P2).
@@ -463,39 +500,61 @@ def verify_manifest(
 
     payload = signable_payload(manifest)
 
-    # Decode the trusted signer's public key. ``multibase_to_public_key``
-    # can raise both ``CryptoSuiteError`` (unknown codec / wrong suite)
-    # AND ``ValueError`` (non-base58btc input, varint truncation). Wrap
-    # both so a malformed pinned key produces a structured failure
-    # instead of crashing the verifier (codex P2).
-    try:
-        trusted_suite, trusted_pub = multibase_to_public_key(trusted_signer_multibase)
-    except (CryptoSuiteError, ValueError) as e:
-        return ManifestVerifyResult(
-            ok=False,
-            signature_policy=PolicyResult(
-                ok=False, reason="trusted_signer_multibase decode failed",
-                alg_ids_seen=frozenset(),
-            ),
-            manifest_id_consistent=False,
-            signer_match=False,
-            reason=f"trusted_signer_multibase decode failed: {e}",
-        )
-    if trusted_suite.alg_id != trusted_signer_alg:
-        return ManifestVerifyResult(
-            ok=False,
-            signature_policy=PolicyResult(
-                ok=False, reason="trusted_signer_alg mismatch",
-                alg_ids_seen=frozenset(),
-            ),
-            manifest_id_consistent=False,
-            signer_match=False,
-            reason=(
-                f"trusted_signer_multibase resolves to alg "
-                f"{trusted_suite.alg_id!r}, but trusted_signer_alg="
-                f"{trusted_signer_alg!r}"
-            ),
-        )
+    # Decode every trusted signer's public key. Index by alg_id so we
+    # can look up the right key when verifying a signature entry.
+    # Refuse duplicates (two keys for the same alg) — that ambiguity
+    # has no good resolution.
+    trusted_keys_by_alg: dict = {}
+    for i, mb in enumerate(trusted_signer_multibases):
+        try:
+            ts, tp = multibase_to_public_key(mb)
+        except (CryptoSuiteError, ValueError) as e:
+            return ManifestVerifyResult(
+                ok=False,
+                signature_policy=PolicyResult(
+                    ok=False, reason="trusted_signer_multibase decode failed",
+                    alg_ids_seen=frozenset(),
+                ),
+                manifest_id_consistent=False,
+                signer_match=False,
+                reason=f"trusted_signer_multibase[{i}] decode failed: {e}",
+            )
+        if ts.alg_id in trusted_keys_by_alg:
+            return ManifestVerifyResult(
+                ok=False,
+                signature_policy=PolicyResult(
+                    ok=False, reason="duplicate trusted alg",
+                    alg_ids_seen=frozenset(),
+                ),
+                manifest_id_consistent=False,
+                signer_match=False,
+                reason=(
+                    f"two trusted keys for alg {ts.alg_id!r}; refusing "
+                    f"because there is no good way to disambiguate"
+                ),
+            )
+        trusted_keys_by_alg[ts.alg_id] = (ts, tp)
+
+    # Single-key mode pins the alg; multi-key mode trusts each key
+    # under its own decoded alg.
+    if single_key_expected_alg is not None:
+        # Exactly one key in trusted_keys_by_alg
+        only_alg = next(iter(trusted_keys_by_alg))
+        if only_alg != single_key_expected_alg:
+            return ManifestVerifyResult(
+                ok=False,
+                signature_policy=PolicyResult(
+                    ok=False, reason="trusted_signer_alg mismatch",
+                    alg_ids_seen=frozenset(),
+                ),
+                manifest_id_consistent=False,
+                signer_match=False,
+                reason=(
+                    f"trusted_signer_multibase resolves to alg "
+                    f"{only_alg!r}, but trusted_signer_alg="
+                    f"{single_key_expected_alg!r}"
+                ),
+            )
 
     # Verify each signature; collect verified entries. Be defensive
     # about non-string fields — codex P2 round 2 flagged that
@@ -523,19 +582,20 @@ def verify_manifest(
             suite = get_suite(alg)
         except (CryptoSuiteError, TypeError):
             continue
-        # Attempt verify against trusted key (only matches if alg lines up)
-        if alg == trusted_signer_alg:
-            if trusted_suite.verify(payload, sig_bytes, trusted_pub):
-                verified.append(dict(entry))
-                signer_match = True
-                continue
-        # Other-alg signatures (e.g. Ed25519 alongside SLH-DSA) are
-        # intentionally NOT verified here — the policy only cares about
-        # the trusted signer's verdict, and accepting unverified
-        # signatures from other keys would defeat the trust pinning.
-        # The policy still sees their alg labels for informational
-        # purposes; ``policy_result.alg_ids_seen`` reflects what was
-        # CLAIMED, not what was verified.
+        # Attempt verify against each trusted key whose alg matches.
+        # Multi-key mode (codex P2 round 3) lets HYBRID_REQUIRED
+        # actually be satisfiable: if the manifest carries SLH-DSA
+        # AND Ed25519 sigs and the caller provided trusted keys for
+        # both, both verified entries land in ``verified``.
+        trusted = trusted_keys_by_alg.get(alg)
+        if trusted is None:
+            # Manifest carries a sig with an alg we don't have a
+            # trusted key for. Don't substitute it.
+            continue
+        ts_suite, ts_pub = trusted
+        if ts_suite.verify(payload, sig_bytes, ts_pub):
+            verified.append(dict(entry))
+            signer_match = True
 
     policy_result = evaluate_signatures(verified, policy)
 

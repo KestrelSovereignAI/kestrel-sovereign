@@ -521,6 +521,77 @@ def test_verify_handles_non_string_signature_fields(base_manifest, slh_kp, slh_p
     assert result.ok, result.reason
 
 
+def test_verify_hybrid_policy_with_two_trusted_keys(
+    base_manifest, slh_kp, ed_kp, slh_pub_multibase,
+):
+    """Codex P2 round 3: HYBRID_REQUIRED was functionally
+    unsatisfiable when only one trusted key was provided (single
+    alg made it into the verified set). New multi-key API takes a
+    list of trusted keys, one per alg.
+    """
+    ed_pub_multibase = public_key_to_multibase(Ed25519Suite(), ed_kp.public_key)
+    m = add_artifact_entry(base_manifest, "wheel.whl", b"data")
+    m = sign_manifest(m, slh_kp, kid="slh-1")
+    m = sign_manifest(m, ed_kp, kid="ed-1")
+    m = finalize(m)
+    result = verify_manifest(
+        m,
+        trusted_signer_multibases=[slh_pub_multibase, ed_pub_multibase],
+        policy=VerifyPolicy.HYBRID_REQUIRED,
+    )
+    assert result.ok, result.reason
+    assert result.signer_match
+
+
+def test_verify_hybrid_policy_fails_with_only_one_trusted_key(
+    base_manifest, slh_kp, ed_kp, slh_pub_multibase,
+):
+    """A hybrid policy needs trusted keys for both alg classes.
+    Trusting only the SLH-DSA key while the policy requires hybrid
+    must fail — the Ed25519 sig isn't verifiable."""
+    m = add_artifact_entry(base_manifest, "wheel.whl", b"data")
+    m = sign_manifest(m, slh_kp, kid="slh-1")
+    m = sign_manifest(m, ed_kp, kid="ed-1")
+    m = finalize(m)
+    result = verify_manifest(
+        m,
+        trusted_signer_multibase=slh_pub_multibase,
+        policy=VerifyPolicy.HYBRID_REQUIRED,
+    )
+    assert not result.ok
+
+
+def test_verify_rejects_two_trusted_keys_same_alg(
+    signed_manifest, slh_pub_multibase, slh_kp,
+):
+    """Two trusted keys for the same alg is ambiguous; refuse."""
+    other_kp = SLHDSASHA2128sSuite().generate_keypair()
+    other_mb = public_key_to_multibase(SLHDSASHA2128sSuite(), other_kp.public_key)
+    result = verify_manifest(
+        signed_manifest,
+        trusted_signer_multibases=[slh_pub_multibase, other_mb],
+    )
+    assert not result.ok
+    assert "duplicate trusted alg" in result.reason or "no good way" in result.reason
+
+
+def test_verify_rejects_both_singular_and_plural_args(signed_manifest, slh_pub_multibase):
+    """API hygiene: single-key vs multi-key form, not both."""
+    result = verify_manifest(
+        signed_manifest,
+        trusted_signer_multibase=slh_pub_multibase,
+        trusted_signer_multibases=[slh_pub_multibase],
+    )
+    assert not result.ok
+    assert "either" in result.reason
+
+
+def test_verify_rejects_no_trusted_signer(signed_manifest):
+    result = verify_manifest(signed_manifest)  # type: ignore[call-arg]
+    assert not result.ok
+    assert "must provide" in result.reason
+
+
 def test_verify_handles_only_malformed_signature_entries(
     base_manifest, slh_kp, slh_pub_multibase,
 ):
