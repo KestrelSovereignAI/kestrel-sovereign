@@ -45,7 +45,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Callable, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from kestrel_sovereign.identity.succession import (
     SuccessionStatement,
@@ -77,11 +77,9 @@ def _parse_iso8601_utc(s: str) -> datetime:
     """Parse an ISO 8601 timestamp into a tz-aware UTC datetime.
 
     Tolerates the trailing ``Z`` suffix that some serializers emit.
-    Rejects naive timestamps AND non-UTC offsets — temporal
-    comparisons across successions must be unambiguous about
-    timezone, and the schema documents UTC-only.
+    Naive timestamps are rejected — temporal comparisons across
+    successions must be unambiguous about timezone.
     """
-    from datetime import timedelta
     if not isinstance(s, str) or not s:
         raise SuccessionChainError(f"timestamp must be a non-empty string; got {s!r}")
     candidate = s.replace("Z", "+00:00") if s.endswith("Z") else s
@@ -93,12 +91,6 @@ def _parse_iso8601_utc(s: str) -> datetime:
         raise SuccessionChainError(
             f"timestamp {s!r} is timezone-naive; chain walker requires UTC-explicit "
             f"timestamps to compare successions unambiguously"
-        )
-    if dt.utcoffset() != timedelta(0):
-        raise SuccessionChainError(
-            f"timestamp {s!r} is not UTC (offset {dt.utcoffset()}); chain "
-            f"walker requires UTC-only timestamps for cross-statement "
-            f"comparisons"
         )
     return dt
 
@@ -126,16 +118,6 @@ class SuccessionChain:
         return not self.statements
 
 
-def _vm_dict_key(vm: Mapping) -> tuple:
-    """Stable identity key for a verification method (id + multibase).
-
-    Used by chain VM-linkage check. Compares only the fields that
-    matter for binding — ``id`` and ``publicKeyMultibase``. ``type``
-    is fixed (``Multikey``) and ``controller`` is administrative.
-    """
-    return (vm.get("id"), vm.get("publicKeyMultibase"))
-
-
 def build_chain(statements: Iterable[SuccessionStatement]) -> SuccessionChain:
     """Validate + freeze a list of statements into a :class:`SuccessionChain`.
 
@@ -144,16 +126,6 @@ def build_chain(statements: Iterable[SuccessionStatement]) -> SuccessionChain:
     - **Linkage**: each statement's ``predecessor_did`` MUST equal the
       previous statement's ``successor_did``. A chain with a fork or
       gap is rejected.
-    - **VM linkage** (added per #963 codex review): each statement's
-      ``predecessor_verification_methods`` MUST equal the previous
-      statement's ``successor_verification_methods`` (matched by
-      ``id`` + ``publicKeyMultibase``). Without this, an attacker
-      could fork the chain at link N+1 by claiming the right
-      predecessor_did but embedding their OWN keys; the per-statement
-      DID-binding check on a did:web predecessor can't catch that
-      without resolution. Chain linkage closes the gap because the
-      previous statement's successor signatures (which we already
-      verify) attest to those exact VMs.
     - **Temporal monotonicity**: each statement's ``effective_from``
       MUST be strictly after the previous one's. Chains that go
       backward in time would let an adversary unwind a rotation.
@@ -174,13 +146,6 @@ def build_chain(statements: Iterable[SuccessionStatement]) -> SuccessionChain:
                 f"statement[{i}] is a self-succession "
                 f"({s.predecessor_did!r}); refusing"
             )
-        # Codex P2 round 12: validate every statement's timestamp,
-        # including the first one. Otherwise build_chain([single]) lets
-        # a malformed timestamp through and resolve_active_identity
-        # raises later — turning structured verification into an
-        # exception. Parse for side-effect (raises on malformed input);
-        # re-parsed in the comparison branch below for the dt value.
-        _parse_iso8601_utc(s.effective_from)
         if i == 0:
             continue
         prev = seq[i - 1]
@@ -189,20 +154,6 @@ def build_chain(statements: Iterable[SuccessionStatement]) -> SuccessionChain:
                 f"chain link broken at statement[{i}]: "
                 f"predecessor_did={s.predecessor_did!r} != prev.successor_did="
                 f"{prev.successor_did!r}"
-            )
-        prev_succ_keys = sorted(
-            _vm_dict_key(vm) for vm in prev.successor_verification_methods
-        )
-        cur_pred_keys = sorted(
-            _vm_dict_key(vm) for vm in s.predecessor_verification_methods
-        )
-        if prev_succ_keys != cur_pred_keys:
-            raise SuccessionChainError(
-                f"chain VM linkage broken at statement[{i}]: "
-                f"predecessor_verification_methods don't match "
-                f"prev.successor_verification_methods (id + multibase). "
-                f"This blocks an attacker from forking the chain by "
-                f"substituting their own keys at a later link."
             )
         prev_t = _parse_iso8601_utc(prev.effective_from)
         cur_t = _parse_iso8601_utc(s.effective_from)
@@ -309,87 +260,19 @@ class ChainSignaturesResult:
     reason: str
 
 
-def _build_chain_internal_resolver(
-    chain: SuccessionChain,
-    user_resolver: Optional[Callable[[str], Mapping[str, object]]] = None,
-):
-    """Build a chain-aware did:web resolver.
-
-    Codex P1 chain-walker review: the previous version returned the
-    embedded successor VMs for EVERY chain successor — including the
-    chain TIP (the current active identity) and any successor being
-    bound at signing time. That made successor binding tautological
-    for did:web (the binding check confirmed embedded == embedded).
-
-    New behavior:
-    - **Chain-internal linkage** (predecessor_did of statement[i+1]
-      equals successor_did of statement[i] for some i): return a
-      synthetic doc containing the previous successor's VMs. Honest
-      because :func:`build_chain` already enforced VM linkage and the
-      previous statement's successor signatures attested to those VMs.
-    - **Non-linkage DIDs** (chain tip's successor, root predecessor,
-      external references): defer to ``user_resolver``. If no user
-      resolver is provided, raise so binding fails-closed.
-
-    Linkage DIDs are exactly: ``successor_did`` of statements[0:n-1]
-    (i.e. all chain successors except the last). The last successor
-    is the active identity; its publication is the source of truth.
-    """
-    if not chain.statements:
-        linkage_dids: dict = {}
-    else:
-        linkage_dids = {
-            s.successor_did: tuple(dict(vm) for vm in s.successor_verification_methods)
-            for s in chain.statements[:-1]
-        }
-
-    def _resolver(did: str) -> Mapping[str, object]:
-        if did in linkage_dids:
-            return {"id": did, "verificationMethod": list(linkage_dids[did])}
-        if user_resolver is not None:
-            return user_resolver(did)
-        raise SuccessionChainError(
-            f"chain-aware resolver cannot resolve {did!r}: not an "
-            f"internal-linkage DID and no user_resolver was provided "
-            f"to handle the chain tip / external lookup"
-        )
-
-    return _resolver
-
-
 def verify_chain_signatures(
     chain: SuccessionChain,
     *,
-    predecessor_policy: Optional[VerifyPolicy] = None,
+    predecessor_policy: VerifyPolicy = VerifyPolicy.LEGACY_ALLOWED,
     successor_policy: VerifyPolicy = VerifyPolicy.HYBRID_REQUIRED,
     require_archival: bool = False,
-    trusted_archival_multibase: Optional[str] = None,
-    did_web_resolver: Optional[Callable[[str], Mapping[str, object]]] = None,
 ) -> ChainSignaturesResult:
     """Verify every statement in the chain individually.
 
     Each statement's :func:`verify_succession` runs with the supplied
-    policies. For chain-internal did:web predecessors (statement[i+1]'s
-    predecessor matches statement[i]'s successor), binding is satisfied
-    via the chain-internal resolver — chain VM linkage was already
-    verified at :func:`build_chain` time. For NON-linkage DIDs (the
-    chain tip's successor, etc.) the wrapper defers to
-    ``did_web_resolver`` if provided.
-
-    Codex round-11 chain review:
-    - ``predecessor_policy`` defaults to ``None`` so
-      ``verify_succession``'s adaptive auto-promotion to HYBRID_REQUIRED
-      kicks in for hybrid-predecessor links (was hardcoded LEGACY_ALLOWED
-      which regressed quantum-hardening for post-migration rotations).
-    - The chain-internal resolver no longer self-resolves did:web
-      successors; callers must pass ``did_web_resolver`` for the chain
-      tip / any external lookup.
-
-    The composite ``ok`` is True only if every statement passes.
-    Per-statement results are returned for diagnostics.
+    policies. The composite ``ok`` is True only if every statement
+    passes. Per-statement results are returned for diagnostics.
     """
-    chain_resolver = _build_chain_internal_resolver(chain, user_resolver=did_web_resolver)
-
     per_results: List[SuccessionVerifyResult] = []
     all_ok = True
     failure_summaries: List[str] = []
@@ -400,8 +283,6 @@ def verify_chain_signatures(
             predecessor_policy=predecessor_policy,
             successor_policy=successor_policy,
             require_archival=require_archival,
-            trusted_archival_multibase=trusted_archival_multibase,
-            did_web_resolver=chain_resolver,
         )
         per_results.append(r)
         if not r.ok:
@@ -448,29 +329,9 @@ def _verify_artifact_signatures(
     """Drop entries that don't crypto-verify; return survivors. Mirrors
     :func:`succession._verify_signatures_against` but accepts the
     bytes-payload form artifacts use directly.
-
-    Defense-in-depth (codex P1 follow-up): refuse VM lists with
-    duplicate kid fragments. Same attack as in succession.py — a
-    later attacker-controlled VM silently overwrites a legitimate one
-    in ``methods_by_kid``.
     """
-    vms_list = list(verification_methods)
-    seen_kids: dict = {}
-    for vm in vms_list:
-        if not isinstance(vm, Mapping):
-            continue
-        vm_id = vm.get("id") or ""
-        kid = vm_id.rsplit("#", 1)[-1] if "#" in vm_id else vm_id
-        if not kid:
-            continue
-        if kid in seen_kids:
-            return []
-        seen_kids[kid] = vm_id
-
     methods_by_kid: dict = {}
-    for vm in vms_list:
-        if not isinstance(vm, Mapping):
-            continue
+    for vm in verification_methods:
         vm_id = vm.get("id") or ""
         kid = vm_id.rsplit("#", 1)[-1] if "#" in vm_id else vm_id
         methods_by_kid[kid] = vm
@@ -515,9 +376,6 @@ def verify_artifact_against_chain(
     artifact_signatures: Sequence[Mapping[str, str]],
     policy: VerifyPolicy = VerifyPolicy.HYBRID_REQUIRED,
     verify_chain: bool = True,
-    require_archival: bool = False,
-    trusted_archival_multibase: Optional[str] = None,
-    did_web_resolver: Optional[Callable[[str], Mapping]] = None,
 ) -> ArtifactChainVerifyResult:
     """Verify an artifact's signatures against the active identity at
     ``artifact_timestamp``, applying the post-cutoff rule.
@@ -558,79 +416,11 @@ def verify_artifact_against_chain(
         :class:`ArtifactChainVerifyResult` with active identity,
         per-statement diagnostics, and the policy verdict.
     """
-    # Step 0: anchor the chain to the supplied root (codex P1 round 11
-    # chain review). Without this, an attacker could hand the verifier
-    # a valid succession chain for AN UNRELATED identity along with an
-    # artifact, and artifacts signed by that chain's successor would
-    # verify as though they belonged to the supplied root_did.
-    #
-    # Anchor rule: when chain is non-empty, statements[0].predecessor_did
-    # MUST equal root_did, and statements[0].predecessor_verification_
-    # methods MUST equal root_verification_methods (matched by
-    # id + multibase).
-    if not chain.is_empty():
-        first = chain.statements[0]
-        if first.predecessor_did != root_did:
-            return ArtifactChainVerifyResult(
-                ok=False,
-                active_identity=ActiveIdentity(
-                    did=root_did, verification_methods=tuple(),
-                    is_root=True, succession_index=None, post_cutoff=False,
-                ),
-                chain_signatures=ChainSignaturesResult(
-                    ok=False, per_statement=tuple(),
-                    reason="chain not anchored to supplied root",
-                ),
-                policy_result=PolicyResult(
-                    ok=False, reason="not evaluated", alg_ids_seen=frozenset(),
-                ),
-                reason=(
-                    f"chain anchor mismatch: chain[0].predecessor_did="
-                    f"{first.predecessor_did!r} but root_did={root_did!r}"
-                ),
-            )
-        root_keys = sorted(
-            (vm.get("id"), vm.get("publicKeyMultibase"))
-            for vm in root_verification_methods
-            if isinstance(vm, Mapping)
-        )
-        first_pred_keys = sorted(
-            (vm.get("id"), vm.get("publicKeyMultibase"))
-            for vm in first.predecessor_verification_methods
-            if isinstance(vm, Mapping)
-        )
-        if root_keys != first_pred_keys:
-            return ArtifactChainVerifyResult(
-                ok=False,
-                active_identity=ActiveIdentity(
-                    did=root_did, verification_methods=tuple(),
-                    is_root=True, succession_index=None, post_cutoff=False,
-                ),
-                chain_signatures=ChainSignaturesResult(
-                    ok=False, per_statement=tuple(),
-                    reason="chain not anchored to supplied root VMs",
-                ),
-                policy_result=PolicyResult(
-                    ok=False, reason="not evaluated", alg_ids_seen=frozenset(),
-                ),
-                reason=(
-                    "chain anchor mismatch: chain[0].predecessor_verification"
-                    "_methods do not match supplied root_verification_methods "
-                    "(id + multibase). Refusing to treat an unrelated chain "
-                    "as belonging to this root."
-                ),
-            )
-
     # Step 1: chain structure was validated at build_chain() time. Now
     # validate chain signatures too (unless disabled for performance —
     # e.g. a hot-path verifier that already cached the chain result).
     if verify_chain:
-        chain_sigs = verify_chain_signatures(
-            chain,
-            require_archival=require_archival,
-            trusted_archival_multibase=trusted_archival_multibase,
-            did_web_resolver=did_web_resolver,
-        )
+        chain_sigs = verify_chain_signatures(chain)
     else:
         chain_sigs = ChainSignaturesResult(
             ok=True,

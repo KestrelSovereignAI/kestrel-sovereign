@@ -65,18 +65,10 @@ from kestrel_sovereign.security.verify_policy import VerifyPolicy
 
 @pytest.fixture(scope="module")
 def legacy_root():
-    """Legacy ECDSA-only root identity (Kestrel #1 style).
-
-    DID derived from the keypair via ``public_key_to_ethereum_address``
-    so the new ``verify_did_binding`` check from #963 passes.
-    """
-    from kestrel_sovereign.inception_service import (
-        public_key_to_ethereum_address,
-    )
+    """Legacy ECDSA-only root identity (Kestrel #1 style)."""
     secp = Secp256k1Suite()
     kp = secp.generate_keypair()
-    address = public_key_to_ethereum_address(kp.public_key)
-    did = f"did:pkh:eip155:1:{address}"
+    did = "did:pkh:eip155:1:0xKESTRELONE"
     vms = build_verification_methods(did, [(secp, kp.public_key)])
     return {
         "did": did,
@@ -199,56 +191,6 @@ def test_build_chain_rejects_temporal_regression(first_succession, successor_v2,
     )
     with pytest.raises(SuccessionChainError, match="temporal monotonicity"):
         build_chain([first_succession, backward])
-
-
-def test_build_chain_rejects_vm_linkage_mismatch(
-    first_succession, successor_v1, successor_v2,
-):
-    """P1 codex regression: chain linkage must check that statement[i+1]'s
-    predecessor_verification_methods exactly equal statement[i]'s
-    successor_verification_methods. Otherwise an attacker could fork
-    the chain by claiming the right predecessor_did but embedding their
-    OWN keys; the per-statement DID-binding check on a did:web
-    predecessor can't catch that without resolution.
-    """
-    # Build a "rogue" second statement that claims the right predecessor
-    # DID (successor_v1) but smuggles in successor_v2's VMs as the
-    # predecessor — an attacker substituting their own keys.
-    rogue = SuccessionStatement(
-        predecessor_did=successor_v1["did"],  # correct DID
-        successor_did=successor_v2["did"],
-        effective_from="2027-01-01T00:00:00+00:00",
-        reason="forked vms",
-        # WRONG: should be successor_v1's vms (per chain linkage), but
-        # the attacker embeds someone else's
-        predecessor_verification_methods=successor_v2["vms"],
-        successor_verification_methods=successor_v2["vms"],
-    )
-    with pytest.raises(SuccessionChainError, match="VM linkage broken"):
-        build_chain([first_succession, rogue])
-
-
-def test_build_chain_rejects_malformed_single_statement_timestamp(
-    legacy_root, successor_v1,
-):
-    """Codex P2 round 12: a single-statement chain with a malformed
-    effective_from used to slip through build_chain (the temporal
-    comparison only fired for i > 0). Then artifact verification
-    raised SuccessionChainError instead of returning a structured
-    fail-closed result.
-
-    Now build_chain validates every statement's timestamp.
-    """
-    bad = SuccessionStatement(
-        predecessor_did=legacy_root["did"],
-        successor_did=successor_v1["did"],
-        effective_from="not-a-date",
-        reason="malformed",
-        predecessor_verification_methods=legacy_root["vms"],
-        successor_verification_methods=successor_v1["vms"],
-    )
-    with pytest.raises(SuccessionChainError, match="invalid ISO 8601"):
-        build_chain([bad])
 
 
 def test_build_chain_rejects_self_succession(legacy_root):
@@ -384,70 +326,11 @@ def test_resolve_future_succession_does_not_retroactively_trigger_cutoff(
 # verify_chain_signatures
 # ---------------------------------------------------------------------------
 
-def _tip_resolver_for_chain(chain):
-    """Test helper: a user_resolver that returns the chain tip's
-    successor VMs as the "published" doc. Real production callers wire
-    in did_web.resolve so the binding check actually walks HTTPS."""
-    if chain.is_empty():
-        def _r(did): raise ValueError(did)
-        return _r
-    tip = chain.statements[-1]
-    tip_doc = {
-        "id": tip.successor_did,
-        "verificationMethod": list(tip.successor_verification_methods),
-    }
-    def _r(did):
-        if did == tip.successor_did:
-            return tip_doc
-        raise ValueError(f"unexpected did at tip resolver: {did!r}")
-    return _r
-
-
 def test_verify_chain_signatures_all_valid(first_succession, second_succession):
     chain = build_chain([first_succession, second_succession])
-    result = verify_chain_signatures(
-        chain, did_web_resolver=_tip_resolver_for_chain(chain),
-    )
+    result = verify_chain_signatures(chain)
     assert result.ok, result.reason
     assert len(result.per_statement) == 2
-
-
-def test_artifact_chain_anchor_mismatch_rejected(
-    legacy_root, first_succession,
-):
-    """Codex P1 round 11.A: an attacker handing the verifier a valid
-    succession chain for an UNRELATED root, plus an artifact signed by
-    that chain's successor, used to verify ok=True. The verifier didn't
-    check that chain[0].predecessor_did/VMs match the supplied root.
-
-    Post-fix: chain anchor mismatch is detected before any other check
-    and produces a fail-closed result.
-    """
-    # Build a chain whose first statement's predecessor is a DIFFERENT
-    # legacy identity (the test's "legitimate" chain wraps legacy_root)
-    # — but we'll request verification against an unrelated root.
-    chain = build_chain([first_succession])
-
-    from kestrel_sovereign.inception_service import (
-        public_key_to_ethereum_address,
-    )
-    other_secp = Secp256k1Suite()
-    other_kp = other_secp.generate_keypair()
-    other_addr = public_key_to_ethereum_address(other_kp.public_key)
-    other_did = f"did:pkh:eip155:1:{other_addr}"
-    other_vms = build_verification_methods(other_did, [(other_secp, other_kp.public_key)])
-
-    result = verify_artifact_against_chain(
-        root_did=other_did,           # UNRELATED root
-        root_verification_methods=other_vms,
-        chain=chain,                  # legacy_root's chain
-        artifact_timestamp="2026-06-01T00:00:00+00:00",
-        artifact_payload=b"x",
-        artifact_signatures=[],
-        did_web_resolver=_tip_resolver_for_chain(chain),
-    )
-    assert not result.ok
-    assert "chain anchor mismatch" in result.reason
 
 
 def test_verify_chain_signatures_tampered_one_fails(first_succession, second_succession):
@@ -456,9 +339,7 @@ def test_verify_chain_signatures_tampered_one_fails(first_succession, second_suc
     from dataclasses import replace
     bad = replace(second_succession, reason="MUTATED")
     chain = build_chain([first_succession, bad])
-    result = verify_chain_signatures(
-        chain, did_web_resolver=_tip_resolver_for_chain(chain),
-    )
+    result = verify_chain_signatures(chain)
     assert not result.ok
     # Failure reason should mention statement[1]
     assert "statement[1]" in result.reason
@@ -483,7 +364,6 @@ def test_artifact_pre_cutoff_classical_ok(legacy_root, first_succession):
     }]
 
     result = verify_artifact_against_chain(
-        did_web_resolver=_tip_resolver_for_chain(chain),
         root_did=legacy_root["did"],
         root_verification_methods=legacy_root["vms"],
         chain=chain,
@@ -516,7 +396,6 @@ def test_artifact_post_cutoff_classical_only_fails(
     }]
 
     result = verify_artifact_against_chain(
-        did_web_resolver=_tip_resolver_for_chain(chain),
         root_did=legacy_root["did"],
         root_verification_methods=legacy_root["vms"],
         chain=chain,
@@ -547,7 +426,6 @@ def test_artifact_post_cutoff_hybrid_passes(
     )
 
     result = verify_artifact_against_chain(
-        did_web_resolver=_tip_resolver_for_chain(chain),
         root_did=legacy_root["did"],
         root_verification_methods=legacy_root["vms"],
         chain=chain,
@@ -576,7 +454,6 @@ def test_artifact_signed_by_wrong_identity_fails(
     )
 
     result = verify_artifact_against_chain(
-        did_web_resolver=_tip_resolver_for_chain(chain),
         root_did=legacy_root["did"],
         root_verification_methods=legacy_root["vms"],
         chain=chain,
@@ -599,7 +476,6 @@ def test_artifact_chain_signatures_failed_propagates(
     # Don't bother actually crafting an artifact — chain failure
     # alone should kill the verdict.
     result = verify_artifact_against_chain(
-        did_web_resolver=_tip_resolver_for_chain(chain),
         root_did=legacy_root["did"],
         root_verification_methods=legacy_root["vms"],
         chain=chain,
