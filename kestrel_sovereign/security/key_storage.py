@@ -364,6 +364,65 @@ class SecureKeyStorage:
     def has_key(self, key_id: str) -> bool:
         """Check if an encrypted key exists."""
         return self._get_key_path(key_id).exists()
+
+    def save_secret_bytes(self, secret: bytes, key_id: str) -> Path:
+        """Save raw secret bytes (e.g. an ML-DSA-65 or SLH-DSA-128s
+        secret key) under the same encryption envelope as
+        :meth:`save_private_key`.
+
+        Wave 3 of Quantum Hardening (#921, #918): the existing
+        ``save_private_key`` path only accepts ``cryptography`` key
+        objects with ``.private_bytes()``. PQ secrets from pqcrypto
+        come back as raw bytes — we need a parallel persistence path
+        that doesn't fake them as PEM.
+
+        Storage shape mirrors ``save_private_key``: one
+        ``EncryptedKeyBundle`` JSON file per key id. The bundle's
+        ciphertext is the raw secret bytes (no PKCS8 wrapper); the
+        file extension is ``.bytes.enc`` so it's distinguishable from
+        the cryptography-object ``.key.enc`` files.
+
+        Args:
+            secret: raw secret-key bytes
+            key_id: identifier (e.g. ``"meridian_mldsa65"``)
+
+        Returns:
+            path to the saved encrypted-bytes file
+        """
+        if not isinstance(secret, (bytes, bytearray)):
+            raise TypeError(
+                f"save_secret_bytes requires bytes; got {type(secret).__name__}"
+            )
+        bundle = self._encrypt_key(bytes(secret))
+        key_path = self._get_secret_bytes_path(key_id)
+        with open(key_path, 'w', encoding='utf-8') as f:
+            f.write(bundle.to_json())
+        logger.info(f"Saved encrypted secret bytes: {key_path}")
+        return key_path
+
+    def load_secret_bytes(self, key_id: str) -> bytes:
+        """Inverse of :meth:`save_secret_bytes`."""
+        key_path = self._get_secret_bytes_path(key_id)
+        if not key_path.exists():
+            raise FileNotFoundError(f"Encrypted secret bytes not found: {key_path}")
+        with open(key_path, 'r', encoding='utf-8') as f:
+            bundle = EncryptedKeyBundle.from_json(f.read())
+        return self._decrypt_key(bundle)
+
+    def has_secret_bytes(self, key_id: str) -> bool:
+        return self._get_secret_bytes_path(key_id).exists()
+
+    def _get_secret_bytes_path(self, key_id: str) -> Path:
+        """Distinct from ``_get_key_path`` so ``.bytes.enc`` files don't
+        collide with ``.key.enc`` files used for cryptography objects.
+
+        Codex P2 review: path-traversal sanitation must mirror
+        :meth:`_get_key_path`. Without it, a caller passing an
+        unsanitized tenant/agent id like ``"../foo"`` could read or
+        write secret bundles outside ``storage_dir``.
+        """
+        safe_id = "".join(c for c in key_id if c.isalnum() or c in "-_")
+        return self.storage_dir / f"{safe_id}.bytes.enc"
     
     def migrate_plaintext_key(self, pem_path: Path, key_id: Optional[str] = None) -> Path:
         """
