@@ -52,9 +52,16 @@ def _b64(b: bytes) -> str:
     return base64.urlsafe_b64encode(b).decode("ascii").rstrip("=")
 
 
-def test_loader_happy_path(tmp_path):
+def test_loader_happy_path(tmp_path, monkeypatch):
     """Generate a real keypair, encode → load → assert SecureKeyStorage
-    holds both halves under the right ids."""
+    holds both halves under the right ids.
+
+    monkeypatch sets KESTREL_DATA_KEY in the TEST PROCESS so the
+    post-loader ``storage.load_secret_bytes`` calls succeed. The
+    loader subprocess's env is set by ``_run_loader`` separately —
+    both must use the same key for round-trip to work.
+    """
+    monkeypatch.setenv("KESTREL_DATA_KEY", "x" * 32)
     suite = SLHDSASHA2128sSuite()
     kp = suite.generate_keypair()
     storage_dir = tmp_path / "release-keys"
