@@ -17,6 +17,8 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict
 
+from kestrel_sovereign.agent.context_builder import extract_raw_user_content
+
 logger = logging.getLogger(__name__)
 
 
@@ -197,7 +199,7 @@ class InteractionDepthCalculator:
 
             rows = await db.fetchall(
                 """
-                SELECT content, metadata FROM conversation_history
+                SELECT role, content, metadata FROM conversation_history
                 WHERE agent_id = ?
                 ORDER BY created_at DESC
                 LIMIT ?
@@ -213,8 +215,18 @@ class InteractionDepthCalculator:
             substantive_count = 0
             tool_count = 0
 
-            for content, metadata in rows:
+            for role, content, metadata in rows:
                 content_str = content or ""
+                # User turns are persisted in fully-rendered prompt
+                # form (with <retrieved_context> + <user_input>
+                # wrappers) for prompt-cache stability. Wellness
+                # metrics measure how richly the user is engaging — a
+                # 5-character "hi" wrapped to 2000 characters of
+                # retrieved-context blob shouldn't count as 2000
+                # characters of substance. Strip back to raw user
+                # text for length-based scoring.
+                if role == "user":
+                    content_str = extract_raw_user_content(content_str)
                 length = len(content_str)
                 total_length += length
 
