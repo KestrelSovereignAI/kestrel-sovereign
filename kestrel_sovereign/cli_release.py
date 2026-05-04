@@ -147,25 +147,36 @@ def add_release_subcommands(subparsers: "argparse._SubParsersAction") -> None:
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _walk_artifacts(root: Path) -> List[Tuple[str, bytes]]:
+def _walk_artifacts(
+    root: Path,
+    *,
+    skip: List[Path] = None,
+) -> List[Tuple[str, bytes]]:
     """Walk ``root`` recursively. Returns ``[(relative_path, bytes), ...]``.
 
     Paths use forward slashes for cross-platform consistency; the
     manifest's path validator already rejects ``..`` / absolute /
     Windows drive prefixes that could let consumers escape the
     artifact dir.
+
+    ``skip`` lists absolute paths to exclude (e.g. the manifest
+    output if it lives inside the artifacts dir). Codex P2 round 1:
+    re-signing into a manifest path inside the artifact tree used to
+    produce a self-referential manifest that was unverifiable
+    immediately after the re-write.
     """
     if not root.exists():
         raise FileNotFoundError(f"artifacts directory not found: {root}")
     if not root.is_dir():
         raise NotADirectoryError(f"artifacts path is not a directory: {root}")
+    skip_resolved = {p.resolve() for p in (skip or [])}
     out: List[Tuple[str, bytes]] = []
     for path in sorted(root.rglob("*")):
         if not path.is_file():
             continue
+        if path.resolve() in skip_resolved:
+            continue
         rel = path.relative_to(root)
-        # Use forward slashes on every platform for byte-stable
-        # manifest entries
         rel_str = rel.as_posix()
         out.append((rel_str, path.read_bytes()))
     return out
@@ -230,8 +241,20 @@ def cmd_release_sign(args) -> int:
         return 2
 
     artifacts_dir = Path(args.artifacts_dir).resolve()
+    # Skip the output path if it lives inside the artifacts dir, so a
+    # stale manifest from a previous run doesn't get hashed into the
+    # new manifest (codex P2 round 1).
+    skip = []
+    if args.output and args.output != "-":
+        out_path = Path(args.output).resolve()
+        try:
+            out_path.relative_to(artifacts_dir)
+        except ValueError:
+            pass  # output is outside the artifacts dir
+        else:
+            skip.append(out_path)
     try:
-        artifacts = _walk_artifacts(artifacts_dir)
+        artifacts = _walk_artifacts(artifacts_dir, skip=skip)
     except (FileNotFoundError, NotADirectoryError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
@@ -287,7 +310,11 @@ def cmd_release_verify(args) -> int:
         manifest = ReleaseManifest.from_dict(
             json.loads(manifest_path.read_text(encoding="utf-8"))
         )
-    except (json.JSONDecodeError, KeyError, ReleaseManifestError) as e:
+    except (json.JSONDecodeError, KeyError, ReleaseManifestError, TypeError, ValueError) as e:
+        # Codex P2 round 1: a manifest with valid JSON but malformed
+        # field shapes (e.g. ``artifacts: [1]`` or non-int size) used
+        # to raise TypeError/ValueError out of from_dict instead of
+        # returning the documented exit code 2.
         print(f"error: malformed manifest: {e}", file=sys.stderr)
         return 2
 

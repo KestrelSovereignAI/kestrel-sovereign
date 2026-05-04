@@ -327,6 +327,74 @@ def test_verify_rejects_missing_artifact_file(
 # Posix paths in manifest
 # ---------------------------------------------------------------------------
 
+def test_resign_skips_existing_manifest_inside_artifacts_dir(
+    storage_with_keypair, artifacts_dir,
+):
+    """Codex P2 round 1: when --output points inside --artifacts-dir
+    and a stale manifest exists from a previous run, it used to be
+    hashed into the new manifest (which then verifies as 'manifest
+    artifact bytes mismatch' immediately after the rewrite)."""
+    storage_dir, kp = storage_with_keypair
+    output = artifacts_dir / "manifest.json"  # INSIDE artifacts_dir
+
+    # First sign
+    args = argparse.Namespace(
+        artifacts_dir=str(artifacts_dir),
+        release_tag="v1",
+        key_id="release-key",
+        signer_did="",
+        kid="k1",
+        output=str(output),
+        storage_dir=str(storage_dir),
+    )
+    assert cmd_release_sign(args) == 0
+    first = json.loads(output.read_text())
+    assert "manifest.json" not in {a["path"] for a in first["artifacts"]}
+
+    # Re-sign — the existing manifest must NOT appear as an artifact
+    assert cmd_release_sign(args) == 0
+    second = json.loads(output.read_text())
+    assert "manifest.json" not in {a["path"] for a in second["artifacts"]}
+
+    # And the re-signed manifest still verifies cleanly
+    pub_mb = public_key_to_multibase(SLHDSASHA2128sSuite(), kp.public_key)
+    verify_args = argparse.Namespace(
+        manifest=str(output),
+        artifacts_dir=str(artifacts_dir),
+        trusted_signer_multibase=pub_mb,
+    )
+    assert cmd_release_verify(verify_args) == 0
+
+
+def test_verify_handles_malformed_manifest_field_types(
+    storage_with_keypair, artifacts_dir, tmp_path,
+):
+    """Codex P2 round 1: a JSON-valid manifest with bad field types
+    (e.g. ``artifacts: [1]``, non-int size) used to raise TypeError/
+    ValueError out of from_dict. Now wrapped into the exit-2 path."""
+    _, kp = storage_with_keypair
+    pub_mb = public_key_to_multibase(SLHDSASHA2128sSuite(), kp.public_key)
+
+    # Manifest with non-dict artifact entry
+    bad = tmp_path / "bad-manifest.json"
+    bad.write_text(json.dumps({
+        "format": "kestrel-release-manifest-v1",
+        "version": 1,
+        "release_tag": "v1",
+        "released_at": "2026-05-04T20:00:00+00:00",
+        "signer_did": "",
+        "artifacts": [1, 2, 3],  # not dicts
+        "manifest_id": "0" * 64,
+        "signatures": [],
+    }))
+    args = argparse.Namespace(
+        manifest=str(bad),
+        artifacts_dir=str(artifacts_dir),
+        trusted_signer_multibase=pub_mb,
+    )
+    assert cmd_release_verify(args) == 2
+
+
 def test_manifest_uses_posix_paths_for_subdirs(
     storage_with_keypair, artifacts_dir, tmp_path,
 ):
