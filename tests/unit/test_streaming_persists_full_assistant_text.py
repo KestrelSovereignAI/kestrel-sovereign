@@ -112,6 +112,9 @@ async def test_streaming_persists_pre_tool_plus_post_tool_text():
     mock_agent._process_input_streaming_traced_locked = (
         StreamingMixin._process_input_streaming_traced_locked.__get__(mock_agent)
     )
+    mock_agent._persist_assistant_turn_safely = (
+        StreamingMixin._persist_assistant_turn_safely.__get__(mock_agent)
+    )
 
     # Drain the stream like an HTTP client would.
     yielded = []
@@ -206,6 +209,9 @@ async def test_streaming_no_tool_calls_persists_full_response_unchanged():
     mock_agent.process_input_streaming = StreamingMixin.process_input_streaming.__get__(mock_agent)
     mock_agent._process_input_streaming_traced_locked = (
         StreamingMixin._process_input_streaming_traced_locked.__get__(mock_agent)
+    )
+    mock_agent._persist_assistant_turn_safely = (
+        StreamingMixin._persist_assistant_turn_safely.__get__(mock_agent)
     )
 
     yielded = []
