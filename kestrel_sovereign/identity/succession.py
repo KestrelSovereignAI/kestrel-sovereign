@@ -65,7 +65,7 @@ import hashlib
 import json
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
-from typing import Any, Iterable, List, Mapping, Optional, Tuple
+from typing import Any, Callable, Iterable, List, Mapping, Optional, Tuple
 
 from kestrel_sovereign.security.crypto_suite import (
     ALG_SLH_DSA_SHA2_128S,
@@ -395,11 +395,14 @@ class SuccessionVerifyResult:
     """Outcome of :func:`verify_succession`.
 
     ``ok`` is the composite verdict — predecessor + successor (+ archival
-    if present) all satisfied their per-side policy.
+    if present) all satisfied their per-side policy AND the predecessor
+    DID is cryptographically bound to its embedded verification methods.
 
     Per-side ``PolicyResult`` instances are exposed so callers can log
     or re-check finer-grained outcomes. The ``statement_id_consistent``
-    flag flags integrity check on the embedded statement_id.
+    flag is the integrity check on the embedded statement_id;
+    ``predecessor_did_bound`` is the new attacker-takeover guard added
+    in response to a P1 review finding.
     """
 
     ok: bool
@@ -407,7 +410,176 @@ class SuccessionVerifyResult:
     successor: PolicyResult
     archival: Optional[PolicyResult]
     statement_id_consistent: bool
+    predecessor_did_bound: bool
     reason: str
+
+
+# ---------------------------------------------------------------------------
+# DID binding: the embedded VMs MUST belong to the claimed DID
+# ---------------------------------------------------------------------------
+#
+# Without this check, an attacker can build a SuccessionStatement that
+# claims any predecessor DID, embed verification methods the attacker
+# controls, sign with the attacker's own key, and have ``verify_succession``
+# return ok=True (the signatures DO crypto-verify — against keys the
+# attacker chose). The statement would then "succeed" the victim's
+# identity to an attacker-controlled successor.
+#
+# Mitigation: bind ``predecessor_did`` to its public-key material via
+# the DID method's binding rule:
+#
+# - did:pkh:eip155:1:0x<addr>: at least one secp256k1 VM's public key,
+#   when keccak-hashed, must produce the address in the DID
+#   (https://github.com/w3c-ccg/did-pkh)
+# - did:key:zX: the DID itself encodes a multibase public key; at least
+#   one VM's publicKeyMultibase must match (https://w3c-ccg.github.io/did-key-spec/)
+# - did:web:domain[:path]: the on-the-wire DID document at
+#   https://domain[/path]/did.json IS the source of truth. By default
+#   we refuse to validate this without a fetcher; callers MUST pass
+#   ``predecessor_did_resolver`` (typically wraps
+#   ``identity.did_web.resolve``) to opt in. Refusing-by-default
+#   prevents an attacker from getting a "free pass" by claiming a
+#   did:web that nobody resolves.
+
+def _verify_did_pkh_eip155_binding(did: str, vms: List[Mapping]) -> bool:
+    """did:pkh:eip155:1:0x<addr> — verify a secp256k1 VM derives the address.
+
+    Returns True iff at least one VM is a secp256k1 public key whose
+    EIP-55 (case-folded) Ethereum address equals the DID's address.
+    """
+    prefix = "did:pkh:eip155:1:"
+    if not did.startswith(prefix):
+        return False
+    expected_addr = did[len(prefix):].lower()
+    if not (expected_addr.startswith("0x") and len(expected_addr) == 42):
+        return False
+
+    # Lazy import to avoid a circular: inception_service imports identity.
+    try:
+        from kestrel_sovereign.inception_service import (
+            public_key_to_ethereum_address,
+        )
+    except Exception:
+        return False
+
+    for vm in vms:
+        multibase = vm.get("publicKeyMultibase") if isinstance(vm, Mapping) else None
+        if not isinstance(multibase, str):
+            continue
+        try:
+            suite, pub = multibase_to_public_key(multibase)
+        except CryptoSuiteError:
+            continue
+        if suite.alg_id != "ecdsa-secp256k1-sha256":
+            continue
+        try:
+            actual = public_key_to_ethereum_address(pub).lower()
+        except Exception:
+            continue
+        if actual == expected_addr:
+            return True
+    return False
+
+
+def _verify_did_key_binding(did: str, vms: List[Mapping]) -> bool:
+    """did:key:zX — the DID is itself a Multikey; one VM must match it.
+
+    The did:key string after the ``did:key:`` prefix is exactly the
+    multibase-encoded public key (z-prefix base58btc + multicodec varint
+    + raw key). A binding holds iff some VM has the same
+    ``publicKeyMultibase``.
+    """
+    prefix = "did:key:"
+    if not did.startswith(prefix):
+        return False
+    expected_multibase = did[len(prefix):]
+    for vm in vms:
+        if isinstance(vm, Mapping) and vm.get("publicKeyMultibase") == expected_multibase:
+            return True
+    return False
+
+
+def verify_did_binding(
+    did: str,
+    verification_methods: List[Mapping],
+    *,
+    did_web_resolver: Optional["DidWebResolver"] = None,
+) -> Tuple[bool, str]:
+    """Verify embedded VMs cryptographically belong to the claimed DID.
+
+    Returns ``(ok, reason)``. Refuses unknown DID methods rather than
+    accepting them — silent acceptance of an unknown method is the
+    exact attack codex caught.
+
+    Args:
+        did: the DID URI being attested
+        verification_methods: the embedded VM array from the statement
+        did_web_resolver: optional callable ``(did) -> dict`` that
+            returns the resolved DID document. When the DID is
+            ``did:web:`` and a resolver is provided, the published
+            VMs at the resolution URL must be a superset of the
+            embedded VMs (matched by id). When None and the DID is
+            did:web, this function refuses-by-default — callers must
+            opt in to skipping resolution by passing a no-op resolver.
+    """
+    if not did:
+        return False, "DID is empty"
+
+    if did.startswith("did:pkh:eip155:1:"):
+        if _verify_did_pkh_eip155_binding(did, verification_methods):
+            return True, "did:pkh:eip155 binding verified"
+        return False, (
+            f"did:pkh:eip155 binding FAILED: no embedded secp256k1 "
+            f"verification method derives the address in {did!r}"
+        )
+
+    if did.startswith("did:key:"):
+        if _verify_did_key_binding(did, verification_methods):
+            return True, "did:key multibase binding verified"
+        return False, (
+            f"did:key binding FAILED: no embedded VM has publicKeyMultibase "
+            f"matching the did:key suffix"
+        )
+
+    if did.startswith("did:web:"):
+        if did_web_resolver is None:
+            return False, (
+                f"did:web binding requires a resolver to verify against the "
+                f"published DID document; refusing to trust embedded VMs "
+                f"for {did!r} without one. Pass did_web_resolver= to opt in."
+            )
+        try:
+            resolved = did_web_resolver(did)
+        except Exception as e:
+            return False, f"did:web resolution failed for {did!r}: {e}"
+        if not isinstance(resolved, Mapping):
+            return False, f"did:web resolver returned non-dict for {did!r}"
+        published = resolved.get("verificationMethod") or []
+        published_by_id = {
+            m.get("id"): m for m in published if isinstance(m, Mapping)
+        }
+        for vm in verification_methods:
+            if not isinstance(vm, Mapping):
+                return False, "embedded verificationMethod is not a dict"
+            vm_id = vm.get("id")
+            if vm_id not in published_by_id:
+                return False, (
+                    f"embedded VM {vm_id!r} is not present in the published "
+                    f"DID document for {did!r}"
+                )
+            pub_mb = vm.get("publicKeyMultibase")
+            if pub_mb != published_by_id[vm_id].get("publicKeyMultibase"):
+                return False, (
+                    f"embedded VM {vm_id!r}'s publicKeyMultibase does not "
+                    f"match the published DID document"
+                )
+        return True, "did:web binding verified against resolved document"
+
+    return False, f"unsupported DID method for binding check: {did!r}"
+
+
+# Type alias for clarity
+DidWebResolver = "Callable[[str], Mapping[str, Any]]"
 
 
 def _verify_signatures_against(
@@ -466,33 +638,60 @@ def verify_succession(
     predecessor_policy: VerifyPolicy = VerifyPolicy.LEGACY_ALLOWED,
     successor_policy: VerifyPolicy = VerifyPolicy.HYBRID_REQUIRED,
     require_archival: bool = False,
+    did_web_resolver: Optional[Callable[[str], Mapping[str, Any]]] = None,
 ) -> SuccessionVerifyResult:
     """Verify a succession statement end-to-end.
 
-    Three independent checks:
+    Four independent checks (the 4th was added in response to a P1
+    review finding):
 
-    1. **Predecessor**: signatures crypto-verify against
+    1. **Predecessor DID binding**: the embedded
+       ``predecessor_verification_methods`` cryptographically belong
+       to the claimed ``predecessor_did`` (did:pkh keccak rule,
+       did:key multibase match, or did:web resolution against
+       ``did_web_resolver``). Without this check, an attacker can
+       forge a statement claiming any DID with attacker-controlled
+       VMs and have it verify trivially.
+    2. **Predecessor signatures**: crypto-verify against the embedded
        ``predecessor_verification_methods``, surviving set satisfies
        ``predecessor_policy``. Default ``LEGACY_ALLOWED`` because the
        most common Wave 3 case is a legacy ECDSA-only agent rotating
        to hybrid — they cannot produce a hybrid signature.
-    2. **Successor**: same crypto check against successor methods,
-       policy ``HYBRID_REQUIRED`` (the new identity IS hybrid by
-       construction; if the successor signature is classical-only
-       the rotation is malformed and we reject).
-    3. **Archival** (if present or ``require_archival=True``): the
+    3. **Successor signatures**: same crypto check against successor
+       methods, policy ``HYBRID_REQUIRED`` (the new identity IS hybrid
+       by construction). Successor binding is implicit: the predecessor
+       authorized whatever is in ``successor_verification_methods`` by
+       signing it.
+    4. **Archival** (if present or ``require_archival=True``): the
        single SLH-DSA-SHA2-128s entry must verify against
        ``archival_verification_method``.
 
     The composite ``ok`` is True only if all required checks pass.
     A consistency check on ``statement_id`` (must equal
-    :func:`compute_statement_id`) runs alongside; a mismatch sets
-    ``statement_id_consistent=False`` and forces ``ok=False`` (the
-    statement was tampered after signing or never finalized).
+    :func:`compute_statement_id`) runs alongside.
+
+    Args:
+        statement: the succession statement to verify.
+        predecessor_policy: policy for the predecessor signature side.
+            Default ``LEGACY_ALLOWED``.
+        successor_policy: policy for the successor signature side.
+            Default ``HYBRID_REQUIRED``.
+        require_archival: if True, demand an archival countersignature.
+        did_web_resolver: callable that resolves a did:web URI to its
+            published DID document. Required when ``predecessor_did``
+            is a did:web URI; otherwise binding fails-closed. Wrap
+            ``identity.did_web.resolve`` as the typical implementation.
     """
     payload = signable_payload(statement)
 
-    # Predecessor side
+    # 1) Predecessor DID binding — gate before anything else.
+    bound, bind_reason = verify_did_binding(
+        statement.predecessor_did,
+        statement.predecessor_verification_methods,
+        did_web_resolver=did_web_resolver,
+    )
+
+    # 2) Predecessor signatures
     pred_verified = _verify_signatures_against(
         payload,
         statement.predecessor_signatures,
@@ -549,7 +748,7 @@ def verify_succession(
     expected_id = compute_statement_id(statement)
     id_ok = (not statement.statement_id) or statement.statement_id == expected_id
 
-    composite_ok = predecessor_result.ok and successor_result.ok and id_ok
+    composite_ok = bound and predecessor_result.ok and successor_result.ok and id_ok
     if archival_result is not None:
         composite_ok = composite_ok and archival_result.ok
 
@@ -557,6 +756,8 @@ def verify_succession(
         reason = "succession statement verified"
     else:
         parts = []
+        if not bound:
+            parts.append(f"predecessor DID binding: {bind_reason}")
         if not predecessor_result.ok:
             parts.append(f"predecessor: {predecessor_result.reason}")
         if not successor_result.ok:
@@ -576,6 +777,7 @@ def verify_succession(
         successor=successor_result,
         archival=archival_result,
         statement_id_consistent=id_ok,
+        predecessor_did_bound=bound,
         reason=reason,
     )
 
@@ -589,5 +791,6 @@ __all__ = [
     "sign_predecessor",
     "sign_successor",
     "signable_payload",
+    "verify_did_binding",
     "verify_succession",
 ]
