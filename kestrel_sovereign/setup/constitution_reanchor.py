@@ -211,75 +211,90 @@ async def _write_reanchor(
     canonical_path: Path,
     authorization: str,
 ) -> None:
-    """Apply the five-location reanchor inside one AsyncStorage session.
+    """Apply the five-location reanchor atomically.
 
-    Order matters:
-      1. Store the new file blob first (idempotent INSERT OR IGNORE on
-         the content_hash). Doing this last would risk an "edge points
-         at a hash that has no file" inconsistency window.
+    Wrapped in ``storage.db.transaction()``: every mutation below is
+    a single SQLite transaction with automatic rollback on exception.
+    Without this, the underlying backend auto-commits each call and
+    a mid-write failure (RAG embedding, decode, edge deletion, the
+    final node update) would leave the DB partially reanchored.
+    The file-level DB backup the caller takes is the *outer* safety
+    net; this transaction is the *inner* one and is what makes
+    "reanchor is atomic" actually true.
+
+    Order matters within the transaction:
+      1. Store the new file blob first (idempotent INSERT OR IGNORE
+         on content_hash). Doing this last would risk an "edge points
+         at a hash that has no file" inconsistency under partial
+         visibility.
       2. Add the new graph document node (idempotent upsert on node_id).
       3. Replace the governed_by edge: add new first, then delete old —
-         so there's never a window where the agent has zero governing
-         constitutions.
+         so a concurrent reader inside the transaction (if any) never
+         sees zero governing constitutions.
       4. Re-index RAG: chunk the new content, then drop the old chunks
          (same "always have something" reasoning).
       5. Update the agent node's properties last — that's the pointer
          everyone reads, so flipping it is the conceptual commit.
+
+    If any step raises, the context manager rolls back and the DB is
+    byte-identical to its pre-transaction state. The caller's file-
+    level backup remains untouched and available either way.
     """
     async with AsyncStorage(str(db_path)) as storage:
-        # 1. File blob (encrypted at rest if KESTREL_DATA_KEY is set).
-        stored_hash = await storage.files.store_file(
-            new_content, "KESTREL_CONSTITUTION.md"
-        )
-        if stored_hash != new_hash:
-            # store_file computes its own SHA256; if it disagrees with
-            # ours something is profoundly wrong (different encoding,
-            # corruption). Fail loudly rather than write nonsense.
-            raise RuntimeError(
-                f"File store hash mismatch: stored {stored_hash}, expected {new_hash}"
+        async with storage.db.transaction():
+            # 1. File blob (encrypted at rest if KESTREL_DATA_KEY is set).
+            stored_hash = await storage.files.store_file(
+                new_content, "KESTREL_CONSTITUTION.md"
+            )
+            if stored_hash != new_hash:
+                # store_file computes its own SHA256; if it disagrees with
+                # ours something is profoundly wrong (different encoding,
+                # corruption). Fail loudly — the transaction will roll back.
+                raise RuntimeError(
+                    f"File store hash mismatch: stored {stored_hash}, expected {new_hash}"
+                )
+
+            # 2. Document graph node for the new constitution.
+            await storage.graph.add_node(
+                GraphNode(
+                    node_id=new_hash,
+                    node_type="document",
+                    label="KESTREL_CONSTITUTION",
+                    properties={
+                        "hash": new_hash,
+                        "type": "Constitution",
+                        "created_at": _now_iso(),
+                    },
+                )
             )
 
-        # 2. Document graph node for the new constitution.
-        await storage.graph.add_node(
-            GraphNode(
-                node_id=new_hash,
-                node_type="document",
-                label="KESTREL_CONSTITUTION",
-                properties={
-                    "hash": new_hash,
-                    "type": "Constitution",
-                    "created_at": _now_iso(),
-                },
+            # 3. Replace the governed_by edge — add new first.
+            await storage.graph.add_edge(agent_did, new_hash, "governed_by")
+            await storage.graph.delete_edge(agent_did, old_hash, "governed_by")
+
+            # 4. Re-index RAG.
+            await storage.rag.chunk_document(
+                file_hash=new_hash,
+                content=new_content.decode("utf-8"),
+                chunk_size=500,
+                compute_embeddings=True,
             )
-        )
+            await storage.rag.delete_chunks_for_file(old_hash)
 
-        # 3. Replace the governed_by edge — add new first.
-        await storage.graph.add_edge(agent_did, new_hash, "governed_by")
-        await storage.graph.delete_edge(agent_did, old_hash, "governed_by")
-
-        # 4. Re-index RAG.
-        await storage.rag.chunk_document(
-            file_hash=new_hash,
-            content=new_content.decode("utf-8"),
-            chunk_size=500,
-            compute_embeddings=True,
-        )
-        await storage.rag.delete_chunks_for_file(old_hash)
-
-        # 5. Update the agent's pointer + audit record.
-        agent_nodes = await storage.graph.get_nodes_by_type("agent")
-        if not agent_nodes:
-            raise RuntimeError("Agent node disappeared mid-reanchor")
-        agent = agent_nodes[0]
-        agent.properties["constitution_hash"] = new_hash
-        agent.properties["constitution_reanchor"] = {
-            "timestamp": _now_iso(),
-            "old_hash": old_hash,
-            "new_hash": new_hash,
-            "source_path": str(canonical_path),
-            "authorization": authorization,
-        }
-        await storage.graph.add_node(agent)
+            # 5. Update the agent's pointer + audit record.
+            agent_nodes = await storage.graph.get_nodes_by_type("agent")
+            if not agent_nodes:
+                raise RuntimeError("Agent node disappeared mid-reanchor")
+            agent = agent_nodes[0]
+            agent.properties["constitution_hash"] = new_hash
+            agent.properties["constitution_reanchor"] = {
+                "timestamp": _now_iso(),
+                "old_hash": old_hash,
+                "new_hash": new_hash,
+                "source_path": str(canonical_path),
+                "authorization": authorization,
+            }
+            await storage.graph.add_node(agent)
 
 
 def _backup_db(db_path: Path) -> Path:

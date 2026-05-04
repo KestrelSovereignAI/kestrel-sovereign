@@ -186,6 +186,72 @@ async def test_reanchor_no_op_when_already_anchored(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_reanchor_rolls_back_on_mid_write_failure(tmp_path):
+    """If anything inside the five-location update raises, the entire
+    transaction must roll back and the live DB is byte-identical to
+    its pre-reanchor state. (The file-level backup is the *outer*
+    safety net; this asserts the *inner* transaction works.)
+
+    Inject the failure at the *last* step so all earlier writes
+    (file blob, new document node, new+old governed_by edges, new+old
+    RAG chunks) have already been issued inside the transaction —
+    meaning rollback has real work to undo.
+    """
+    from unittest import mock
+
+    constitution_path = tmp_path / "KESTREL_CONSTITUTION.md"
+    constitution_path.write_bytes(CONSTITUTION_V1)
+    agent_dir = tmp_path / "agent_data" / "TestAgent"
+    creds = await create_kestrel_identity_async(
+        output_dir=str(agent_dir),
+        constitution_path=str(constitution_path),
+        agent_name="TestAgent",
+    )
+    db_path = agent_dir / "kestrel_prime.db"
+
+    constitution_path.write_bytes(CONSTITUTION_V2)
+    pre = await _snapshot(db_path, creds.agent_did)
+
+    # Boom: make the last write inside the transaction raise.
+    # `_now_iso` is called twice in `_write_reanchor` — once for the
+    # new document node's `created_at` (early) and once for the audit
+    # record's `timestamp` (right before the final agent-node update).
+    # Using a side_effect that succeeds the first call and raises
+    # the second targets the *last* mutation specifically — so all
+    # earlier writes have happened and rollback has real work to do.
+    real_now = __import__(
+        "kestrel_sovereign.setup.constitution_reanchor",
+        fromlist=["_now_iso"],
+    )._now_iso
+    boom = mock.Mock(side_effect=[real_now(), RuntimeError("simulated mid-write failure")])
+
+    with mock.patch(
+        "kestrel_sovereign.setup.constitution_reanchor._now_iso",
+        new=boom,
+    ):
+        result = await reanchor_constitution(
+            agent_name="TestAgent",
+            agent_dir=agent_dir,
+            canonical_path=constitution_path,
+            force=True,
+        )
+
+    # The helper must report the failure clearly.
+    assert result.error is not None
+    assert "simulated mid-write failure" in result.error
+    # Backup was taken before the transaction (outer safety net).
+    assert result.backup_path is not None
+    assert result.backup_path.exists()
+
+    # Live DB rolled back: every snapshot field is byte-identical.
+    post = await _snapshot(db_path, creds.agent_did)
+    assert post == pre, (
+        "Mid-write failure must roll back the entire reanchor "
+        f"transaction. Diff: pre={pre} vs post={post}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_reanchor_drift_unforced_does_not_write(tmp_path):
     constitution_path = tmp_path / "KESTREL_CONSTITUTION.md"
     constitution_path.write_bytes(CONSTITUTION_V1)
