@@ -1773,6 +1773,12 @@ def build_parser() -> argparse.ArgumentParser:
     skills_search = skills_sub.add_parser("search", help="Search skills by name/tag")
     skills_search.add_argument("query", help="Search query")
 
+    # kestrel release {sign,verify} — Wave 5 of Quantum Hardening (#920).
+    # Self-contained module; the import is local so an operator who never
+    # touches release commands doesn't pay for the SLH-DSA suite import.
+    from kestrel_sovereign.cli_release import add_release_subcommands
+    add_release_subcommands(subparsers)
+
     return parser
 
 
@@ -1802,6 +1808,8 @@ def main() -> int:
         parser.print_help()
         return 1
 
+    from kestrel_sovereign.cli_release import cmd_release
+
     commands = {
         "start": cmd_start,
         "stop": cmd_stop,
@@ -1819,6 +1827,7 @@ def main() -> int:
         "config": cmd_config,
         "feature": cmd_feature,
         "skills": cmd_skills,
+        "release": cmd_release,
     }
 
     handler = commands.get(args.command)
