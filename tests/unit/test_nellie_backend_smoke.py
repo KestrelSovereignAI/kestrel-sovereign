@@ -68,7 +68,7 @@ def _build_service(provider_names_and_models: dict) -> LLMService:
             config if "llm_config" in path else mandate_config
         )
         mock_reg_cls.return_value = mock_registry
-        svc = LLMService(config_path="llm_config.toml")
+        svc = LLMService()
         svc._usage_db = None
         svc._db_initialized = False
         svc._usage_database_url = None

@@ -90,7 +90,7 @@ class ModelCatalogService:
     - display_name_overrides: optional display name fixes
 
     Featured status is NOT managed here — it's computed dynamically:
-    - Models configured in llm_config.toml are featured
+    - Models configured in kestrel.toml [llm] are featured
     - Models recently used (frecency > 0) are featured
     """
 

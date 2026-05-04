@@ -58,7 +58,7 @@ class ArmsChecker(HealthChecker):
             check.severity = Severity.CRITICAL
             check.message = f"LLM unreachable: {e}"
             check.suggested_fix = "Check OPENAI_API_KEY or Ollama service"
-            check.file_path = "llm_config.toml"
+            check.file_path = "kestrel.toml"
 
         check.duration_ms = self._elapsed_ms(start)
         return check
@@ -353,14 +353,14 @@ class ArmsChecker(HealthChecker):
                 check.severity = Severity.MEDIUM
                 check.message = "No models found from list_models()"
                 check.suggested_fix = "Check LLM provider configuration"
-                check.file_path = "llm_config.toml"
+                check.file_path = "kestrel.toml"
 
         except Exception as e:
             check.status = CheckStatus.FAIL
             check.severity = Severity.HIGH
             check.message = f"Model operations error: {e}"
             check.suggested_fix = "Check LLM service configuration"
-            check.file_path = "llm_config.toml"
+            check.file_path = "kestrel.toml"
 
         check.duration_ms = self._elapsed_ms(start)
         return check

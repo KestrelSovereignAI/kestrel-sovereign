@@ -45,6 +45,19 @@ selection_hints = ["gpt-5", "mini"]
 #model          = "auto"
 #selection_hints = ["sonnet", "opus", "haiku"]
 
+# --- OpenRouter (optional) — set OPENROUTER_API_KEY in .env ------------------
+# OpenRouter brokers many models behind one API; agents created via inception
+# get an agent-scoped sub-key here. The route stays declared even when the env
+# key is absent so use_agent_key() can activate a stored agent key at runtime.
+[llm.vendors.openrouter]
+is_cloud = true
+
+[llm.vendors.openrouter.routes.api]
+adapter     = "OpenRouterAdapter"
+base_url    = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+model       = "auto"
+
 [llm.ensemble]
 # The number of agent instances to run in the ensemble.
 # Default is 1 (single-instance mode).

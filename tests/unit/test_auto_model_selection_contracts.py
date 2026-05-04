@@ -138,16 +138,19 @@ def test_auto_resolution_for_subscription_route_shares_vendor_catalog():
 
 
 def test_shipped_llm_config_uses_auto_models_for_primary_routes():
-    """Every shipped route in llm_config.toml has ``model = "auto"``.
+    """Every shipped route in kestrel.toml [llm] has ``model = "auto"``.
 
     Concrete IDs are never hardcoded in config; they resolve from discovery.
+    Repointed from llm_config.toml in #940 — the standalone file no longer
+    exists at the repo root; the seed config now lives in kestrel.toml.example.
     """
     import tomllib
 
-    with open(PROJECT_ROOT / "llm_config.toml", "rb") as handle:
+    with open(PROJECT_ROOT / "kestrel.toml.example", "rb") as handle:
         config = tomllib.load(handle)
 
-    vendors = config.get("vendors") or {}
+    llm = config.get("llm", {})
+    vendors = llm.get("vendors") or {}
     # Walk every (vendor, route) pair and assert it asks discovery to pick.
     for vendor_name, vendor_cfg in vendors.items():
         for route_name, route_cfg in (vendor_cfg.get("routes") or {}).items():

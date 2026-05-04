@@ -3,19 +3,33 @@
 from pathlib import Path
 
 import pytest
+import tomllib
 
 from kestrel_sovereign.features.council.feature import CouncilFeature
-from scripts.setup_demo_agent import build_demo_llm_config
+from scripts.setup_demo_agent import build_demo_kestrel_toml
 
 
-def test_demo_llm_config_uses_auto_selection_with_hints():
-    config = build_demo_llm_config()
+def test_demo_kestrel_toml_uses_auto_selection_with_hints():
+    """The demo agent's kestrel.toml [llm] block must use the vendor/route
+    schema with model='auto' on every route — no hardcoded model IDs."""
+    config = tomllib.loads(build_demo_kestrel_toml())
+    llm = config["llm"]
 
-    assert 'provider_priority = ["anthropic", "ollama"]' in config
-    assert '[anthropic]\nmodel = "auto"\nselection_hints = ["opus"]' in config
-    assert '[ollama]\nhost = "http://localhost:11434"\nmodel = "auto"' in config
-    assert "claude-opus-4-6" not in config
-    assert 'model = "llama3.2:latest"' not in config
+    assert llm["route_priority"] == ["anthropic:api", "ollama:local"]
+
+    anthropic_api = llm["vendors"]["anthropic"]["routes"]["api"]
+    assert anthropic_api["model"] == "auto"
+    assert anthropic_api["selection_hints"] == ["opus"]
+    assert anthropic_api["api_key_env"] == "ANTHROPIC_API_KEY"
+
+    ollama_local = llm["vendors"]["ollama"]["routes"]["local"]
+    assert ollama_local["model"] == "auto"
+    assert ollama_local["host"] == "http://localhost:11434"
+
+    # No hardcoded concrete IDs anywhere in the rendered config.
+    rendered = build_demo_kestrel_toml()
+    assert "claude-opus-4-6" not in rendered
+    assert "llama3.2:latest" not in rendered
 
 
 @pytest.mark.asyncio
