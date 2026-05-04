@@ -442,6 +442,29 @@ class SuccessionVerifyResult:
 #   prevents an attacker from getting a "free pass" by claiming a
 #   did:web that nobody resolves.
 
+def _validate_iso8601_utc(s: str) -> Tuple[bool, str]:
+    """Parse ``s`` as a tz-aware UTC ISO 8601 timestamp; return (ok, reason).
+
+    Identical semantics to ``succession_chain._parse_iso8601_utc`` but
+    inlined here to avoid succession.py importing from a module that
+    imports from itself. Tolerates the trailing ``Z`` suffix; rejects
+    timezone-naive strings (the cutoff comparison must be unambiguous).
+    """
+    if not isinstance(s, str) or not s:
+        return False, f"timestamp must be a non-empty string; got {s!r}"
+    candidate = s.replace("Z", "+00:00") if s.endswith("Z") else s
+    try:
+        dt = datetime.fromisoformat(candidate)
+    except ValueError as e:
+        return False, f"invalid ISO 8601 timestamp {s!r}: {e}"
+    if dt.tzinfo is None:
+        return False, (
+            f"timestamp {s!r} is timezone-naive; succession cutoff must "
+            f"be UTC-explicit"
+        )
+    return True, ""
+
+
 def _check_unique_vm_kids(vms: List[Mapping]) -> Tuple[bool, str]:
     """Reject verification-method lists that contain duplicate kids.
 
@@ -776,6 +799,29 @@ def verify_succession(
             ``identity.did_web.resolve`` as the typical implementation.
     """
     payload = signable_payload(statement)
+
+    # 0) effective_from must parse as a tz-aware UTC ISO 8601 timestamp.
+    # The chain walker already enforces this (its temporal-cutoff logic
+    # depends on it), but a single verify_succession call without a
+    # chain wouldn't catch a malformed timestamp like "not-a-date".
+    # Codex P2 round 5: fail-closed here so a cryptographically valid
+    # statement with a bogus cutoff is never accepted.
+    eff_ok, eff_reason = _validate_iso8601_utc(statement.effective_from)
+    if not eff_ok:
+        return SuccessionVerifyResult(
+            ok=False,
+            predecessor=PolicyResult(
+                ok=False, reason="not evaluated", alg_ids_seen=frozenset(),
+            ),
+            successor=PolicyResult(
+                ok=False, reason="not evaluated", alg_ids_seen=frozenset(),
+            ),
+            archival=None,
+            statement_id_consistent=False,
+            predecessor_did_bound=False,
+            successor_did_bound=False,
+            reason=f"effective_from invalid: {eff_reason}",
+        )
 
     # 1) Predecessor DID binding — gate before predecessor signatures.
     pred_bound, pred_bind_reason = verify_did_binding(
