@@ -99,21 +99,39 @@ jobs:
         with:
           enable-cache: true
 
-      - name: Configure git for private deps
-        run: git config --global url."https://x-access-token:${{ secrets.GH_PAT }}@github.com/".insteadOf "https://github.com/"
-
       - name: Set up Python
         run: uv python install ${{ env.PYTHON_VERSION }}
 
+      # Codex P1 round 7: configure GH_PAT-backed git auth ONLY when
+      # we install signing-tools (main). Don't leave it in the global
+      # git config when ``uv build`` runs against the untrusted tag —
+      # build-backend hooks can read ~/.gitconfig and exfiltrate the
+      # PAT even though release-signing secrets are withheld.
+
       - name: Install signing-tools dependencies (from main)
         working-directory: signing-tools
-        run: uv sync
+        run: |
+          # Configure auth ONLY for the duration of this step; clean up
+          # before any tag-built code runs.
+          git config --global \
+            url."https://x-access-token:${{ secrets.GH_PAT }}@github.com/".insteadOf \
+            "https://github.com/"
+          uv sync
+          # Strip the credential immediately so subsequent steps that
+          # run untrusted code can't read it from ~/.gitconfig.
+          git config --global --unset-all \
+            "url.https://x-access-token:${{ secrets.GH_PAT }}@github.com/.insteadOf" || true
+          # Belt-and-suspenders: also remove the URL prefix as a key,
+          # in case an alternative scheme was set
+          git config --global --remove-section \
+            "url.https://x-access-token:${{ secrets.GH_PAT }}@github.com/" || true
 
-      - name: Build wheel and sdist (from tag, no signing secrets in env)
+      - name: Build wheel and sdist (from tag, no signing secrets in env, no GH_PAT in gitconfig)
         working-directory: release-tree
         # IMPORTANT: this step runs build-backend hooks from the
-        # release tag's pyproject.toml. No release-signing secrets
-        # are exposed here, so a malicious tag cannot steal them.
+        # release tag's pyproject.toml. By this point neither
+        # release-signing secrets NOR the GH_PAT-backed git auth are
+        # available, so a malicious tag cannot steal either.
         run: |
           uv build --wheel --sdist --out-dir ../dist/
           ls -la ../dist/
