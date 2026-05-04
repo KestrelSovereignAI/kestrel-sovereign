@@ -143,6 +143,20 @@ class AsyncConversationStore:
         import uuid
         return str(uuid.uuid4())
 
+    async def resolve_session_id(self, provided: Optional[str]) -> Optional[str]:
+        """Resolve the effective session_id for an incoming turn.
+
+        If the caller provided one, use it. Otherwise apply the same
+        time-gap heuristic ``add_conversation`` uses internally — but
+        return the resolved value so the streaming/invoke endpoint can
+        echo it back to the client. Without this, the pane's
+        ``sessionId`` stays ``null`` forever because the implicit UUID
+        derived inside ``add_conversation`` is invisible to the caller.
+        """
+        if provided:
+            return provided
+        return await self._derive_implicit_session_id()
+
     async def add_conversation(self, role: str, content: str,
                                metadata: Optional[Dict] = None,
                                session_id: Optional[str] = None) -> None:

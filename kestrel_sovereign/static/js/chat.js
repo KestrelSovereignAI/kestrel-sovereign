@@ -554,8 +554,24 @@ export async function sendMessage() {
                 // user switches mid-flight or a 401 refresh forces a
                 // retry. Without this the URL would be recaptured
                 // from state.selectedHostAgent at fetch time.
+                let learnedSessionId = false;
                 for await (const chunk of API.streamInvoke(text, null, sessionId, null, false, dispatchAgent)) {
                     fullContent += chunk;
+                    // The server resolves the effective session_id and
+                    // returns it as the X-Session-Id response header,
+                    // which streamInvoke captures before yielding the
+                    // first body chunk. Adopt it onto the pane so the
+                    // next turn sends it back explicitly, anchoring
+                    // the pane to a durable conversation id. Only when
+                    // pane.sessionId was null — never overwrite an
+                    // explicit user-clicked conversation.
+                    if (!learnedSessionId && !pane.sessionId) {
+                        const effective = API.getEffectiveSessionId(dispatchAgent);
+                        if (effective) {
+                            pane.sessionId = effective;
+                        }
+                        learnedSessionId = true;
+                    }
                     // Per-pane gate only — chunks DO paint into the
                     // dispatch agent's pane element even when that
                     // pane is detached (the user is viewing a
@@ -585,6 +601,9 @@ export async function sendMessage() {
                     // selected agent and would land on the wrong
                     // backend if the user has switched.
                     const response = await API.invokeForAgent(text, null, sessionId, null, dispatchAgent);
+                    if (response && response.session_id && !pane.sessionId) {
+                        pane.sessionId = response.session_id;
+                    }
                     if (isPaneFresh()) {
                         await addMessage('agent', response.response, pane.element);
                     }
@@ -597,6 +616,9 @@ export async function sendMessage() {
             }
         } else {
             const response = await API.invokeForAgent(text, null, sessionId, null, dispatchAgent);
+            if (response && response.session_id && !pane.sessionId) {
+                pane.sessionId = response.session_id;
+            }
             if (isPaneFresh()) {
                 await addMessage('agent', response.response, pane.element);
             }
