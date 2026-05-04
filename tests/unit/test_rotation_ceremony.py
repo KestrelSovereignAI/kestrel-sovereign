@@ -42,6 +42,27 @@ from kestrel_sovereign.security.crypto_suite import (
 from kestrel_sovereign.security.verify_policy import VerifyPolicy
 
 
+def _self_attesting_resolver(statement):
+    """Test-only resolver — see test_succession.py for rationale.
+
+    Returns the statement's own VMs as the "published" doc. Production
+    callers use ``identity.did_web.resolve``.
+    """
+    def _resolve(did):
+        if did == statement.successor_did:
+            return {
+                "id": did,
+                "verificationMethod": list(statement.successor_verification_methods),
+            }
+        if did == statement.predecessor_did:
+            return {
+                "id": did,
+                "verificationMethod": list(statement.predecessor_verification_methods),
+            }
+        raise ValueError(f"unknown did: {did!r}")
+    return _resolve
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -89,8 +110,15 @@ def test_ceremony_produces_verifiable_succession_statement(legacy_kestrel):
     # New identity has the expected DID
     assert result.new_identity.did == "did:web:example.com:kestrel-v2"
 
-    # Statement crypto-verifies
-    verify = verify_succession(result.succession_statement)
+    # Statement crypto-verifies. Self-attesting resolver because the
+    # successor did:web URL hasn't been "published" in this test —
+    # but the embedded VMs are exactly what the ceremony just minted,
+    # which is what a real production resolver against the deployed
+    # URL would also return.
+    verify = verify_succession(
+        result.succession_statement,
+        did_web_resolver=_self_attesting_resolver(result.succession_statement),
+    )
     assert verify.ok, verify.reason
 
 
@@ -186,7 +214,11 @@ def test_ceremony_with_archival_countersignature(legacy_kestrel):
     assert result.archival_keypair is archival_kp
 
     # Verify with require_archival=True passes
-    verify = verify_succession(result.succession_statement, require_archival=True)
+    verify = verify_succession(
+        result.succession_statement,
+        require_archival=True,
+        did_web_resolver=_self_attesting_resolver(result.succession_statement),
+    )
     assert verify.ok, verify.reason
 
 
