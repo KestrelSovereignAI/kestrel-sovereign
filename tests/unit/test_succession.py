@@ -18,6 +18,15 @@ Covers:
   * archival signature uses ML-DSA-65 instead of SLH-DSA → fail
   * statement_id mismatch → fail
 - to_dict/from_dict round-trip preserves all fields
+
+P1 review-finding regression coverage:
+- Attacker takeover scenario: forged statement claiming a victim's
+  did:pkh with attacker-controlled keys is rejected by the new
+  predecessor-DID-binding check (verify_did_binding)
+- did:pkh address-binding rule rejects mismatched VMs
+- did:key multibase-binding rule rejects mismatched VMs
+- did:web binding fails-closed without an explicit resolver
+- did:web binding accepts when resolver returns matching VMs
 """
 
 from __future__ import annotations
@@ -59,10 +68,19 @@ from kestrel_sovereign.security.verify_policy import VerifyPolicy
 
 @pytest.fixture(scope="module")
 def legacy_predecessor():
-    """Legacy did:pkh agent: only ECDSA secp256k1."""
+    """Legacy did:pkh agent: only ECDSA secp256k1.
+
+    The DID is derived from the keypair via the same Ethereum-address
+    rule the inception_service uses, so the verify_did_binding check
+    holds.
+    """
+    from kestrel_sovereign.inception_service import (
+        public_key_to_ethereum_address,
+    )
     secp = Secp256k1Suite()
     kp = secp.generate_keypair()
-    did = "did:pkh:eip155:1:0xABC123"
+    address = public_key_to_ethereum_address(kp.public_key)
+    did = f"did:pkh:eip155:1:{address}"
     vms = build_verification_methods(did, [(secp, kp.public_key)])
     return {"did": did, "kp": kp, "kid": vms[0]["id"].rsplit("#", 1)[-1], "vms": vms}
 
@@ -438,3 +456,165 @@ def test_dict_round_trip_preserves_verification(
     result = verify_succession(rehydrated)
     assert result.ok, result.reason
     assert result.archival is not None and result.archival.ok
+
+
+# ---------------------------------------------------------------------------
+# Predecessor DID binding (P1 regression: codex review of #963)
+# ---------------------------------------------------------------------------
+
+def test_attacker_takeover_with_forged_did_pkh_rejected(hybrid_successor):
+    """The codex-flagged attack: build a statement claiming a victim's
+    did:pkh, embed the attacker's own keys as predecessor_verification_
+    methods, sign with the attacker's key, and ship.
+
+    Pre-fix: verify_succession returned ok=True because the signatures
+    DID crypto-verify against the embedded VMs. The verifier never
+    cross-checked that the embedded VMs actually correspond to the
+    claimed DID.
+
+    Post-fix: verify_did_binding rejects this — the keccak hash of the
+    attacker's pubkey does NOT equal the victim's address.
+    """
+    from dataclasses import replace as _replace
+
+    secp = Secp256k1Suite()
+    attacker_kp = secp.generate_keypair()
+    # Victim DID is unrelated to the attacker's keypair
+    victim_did = "did:pkh:eip155:1:0x1234567890123456789012345678901234567890"
+    # But VMs are the attacker's keys — controller field can be anything
+    # the attacker chooses; the embedded VMs are not authenticated by
+    # the binding check until this fix.
+    attacker_vms = build_verification_methods(victim_did, [(secp, attacker_kp.public_key)])
+    attacker_kid = attacker_vms[0]["id"].rsplit("#", 1)[-1]
+
+    forged = SuccessionStatement(
+        predecessor_did=victim_did,
+        successor_did=hybrid_successor["did"],
+        effective_from="2026-05-04T18:00:00+00:00",
+        reason="ATTACKER FORGED THIS",
+        predecessor_verification_methods=attacker_vms,
+        successor_verification_methods=hybrid_successor["vms"],
+    )
+    forged = sign_predecessor(forged, [(attacker_kp, attacker_kid)])
+    forged = sign_successor(forged, [
+        (hybrid_successor["hybrid"].classical, hybrid_successor["classical_kid"]),
+        (hybrid_successor["hybrid"].pq, hybrid_successor["pq_kid"]),
+    ])
+    forged = finalize(forged)
+
+    result = verify_succession(forged)
+    assert not result.ok, "attacker takeover with forged DID must be rejected"
+    assert not result.predecessor_did_bound
+    assert "binding" in result.reason
+
+
+def test_did_pkh_binding_check_with_correct_address(legacy_predecessor):
+    from kestrel_sovereign.identity.succession import verify_did_binding
+    ok, reason = verify_did_binding(legacy_predecessor["did"], legacy_predecessor["vms"])
+    assert ok, reason
+
+
+def test_did_key_binding_check_with_matching_multibase():
+    """did:key:zX — a VM with matching publicKeyMultibase satisfies binding."""
+    from kestrel_sovereign.identity.succession import verify_did_binding
+    from kestrel_sovereign.security.multikey import public_key_to_multibase
+
+    ed = get_suite("ed25519")
+    kp = ed.generate_keypair()
+    multibase = public_key_to_multibase(ed, kp.public_key)
+    did = f"did:key:{multibase}"
+    vms = [{
+        "id": f"{did}#0",
+        "type": "Multikey",
+        "controller": did,
+        "publicKeyMultibase": multibase,
+    }]
+    ok, reason = verify_did_binding(did, vms)
+    assert ok, reason
+
+
+def test_did_key_binding_rejects_mismatched_multibase():
+    from kestrel_sovereign.identity.succession import verify_did_binding
+    from kestrel_sovereign.security.multikey import public_key_to_multibase
+
+    ed = get_suite("ed25519")
+    real_kp = ed.generate_keypair()
+    other_kp = ed.generate_keypair()
+    real_mb = public_key_to_multibase(ed, real_kp.public_key)
+    other_mb = public_key_to_multibase(ed, other_kp.public_key)
+    did = f"did:key:{real_mb}"
+    # VM holds a DIFFERENT key than the DID claims
+    vms = [{
+        "id": f"{did}#0",
+        "type": "Multikey",
+        "controller": did,
+        "publicKeyMultibase": other_mb,
+    }]
+    ok, reason = verify_did_binding(did, vms)
+    assert not ok
+    assert "did:key binding FAILED" in reason
+
+
+def test_did_web_binding_fails_closed_without_resolver():
+    """did:web binding cannot be checked without a resolver — fail loud
+    rather than silently accept embedded VMs the attacker chose."""
+    from kestrel_sovereign.identity.succession import verify_did_binding
+
+    did = "did:web:attacker.example:agent"
+    vms = [{
+        "id": f"{did}#key-1",
+        "type": "Multikey",
+        "controller": did,
+        "publicKeyMultibase": "z6MkjGenericMultibaseValueHere",
+    }]
+    ok, reason = verify_did_binding(did, vms)
+    assert not ok
+    assert "did:web binding requires a resolver" in reason
+
+
+def test_did_web_binding_with_matching_resolver_passes():
+    from kestrel_sovereign.identity.succession import verify_did_binding
+
+    did = "did:web:legit.example:agent"
+    vms = [{
+        "id": f"{did}#key-1",
+        "type": "Multikey",
+        "controller": did,
+        "publicKeyMultibase": "z6MkABCpublishedAndMatching",
+    }]
+    # Resolver returns a doc with matching VMs
+    def resolver(d):
+        assert d == did
+        return {"id": did, "verificationMethod": vms}
+    ok, reason = verify_did_binding(did, vms, did_web_resolver=resolver)
+    assert ok, reason
+
+
+def test_did_web_binding_rejects_mismatched_resolver_response():
+    from kestrel_sovereign.identity.succession import verify_did_binding
+
+    did = "did:web:legit.example:agent"
+    embedded_vms = [{
+        "id": f"{did}#key-1",
+        "type": "Multikey",
+        "controller": did,
+        "publicKeyMultibase": "z6MkATTACKERkey",
+    }]
+    published_vms = [{
+        "id": f"{did}#key-1",
+        "type": "Multikey",
+        "controller": did,
+        "publicKeyMultibase": "z6MkPUBLISHEDdifferent",
+    }]
+    def resolver(d):
+        return {"id": did, "verificationMethod": published_vms}
+    ok, reason = verify_did_binding(did, embedded_vms, did_web_resolver=resolver)
+    assert not ok
+    assert "publicKeyMultibase does not match" in reason
+
+
+def test_unknown_did_method_rejected():
+    from kestrel_sovereign.identity.succession import verify_did_binding
+    ok, reason = verify_did_binding("did:unknown:foo", [])
+    assert not ok
+    assert "unsupported DID method" in reason
