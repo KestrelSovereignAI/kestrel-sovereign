@@ -2,6 +2,7 @@ import asyncio
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import List
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -197,6 +198,74 @@ class TestRotationEndToEnd:
             await db.close()
 
     @pytest.mark.asyncio
+    async def test_files_table_uses_no_sql_like_on_content(self):
+        """PostgreSQL has no implicit text↔BYTEA cast, so a SQL ``LIKE
+        'gAAAAA%'`` predicate against ``files.content`` (BLOB → BYTEA) does
+        not compile. The rotation must filter BLOB rows in Python instead.
+
+        This test wraps ``database.fetchall`` and asserts that no SQL
+        targeting the files table contains a ``LIKE`` predicate on the
+        content column.
+        """
+        db, path = await _fresh_db()
+        try:
+            captured_sql: List[str] = []
+            real_fetchall = db.fetchall
+
+            async def captured_fetchall(sql, params=()):
+                captured_sql.append(sql)
+                return await real_fetchall(sql, params)
+
+            old_master = _master_bytes_from_key(Fernet.generate_key().decode())
+            new_master = _master_bytes_from_key(Fernet.generate_key().decode())
+
+            storage = MagicMock()
+            wrapped_db = MagicMock()
+            wrapped_db.fetchall = captured_fetchall
+            wrapped_db.fetchone = db.fetchone
+            wrapped_db.fetchval = db.fetchval
+            wrapped_db.execute = db.execute
+            wrapped_db.transaction = db.transaction
+            storage.database = wrapped_db
+            service = KeyRotationService(storage=storage)
+            service._save_rotation = AsyncMock()
+
+            rotation = RotationRecord(
+                id="rot-blob-sql",
+                started_at=datetime.now(timezone.utc),
+                old_key_hash="old",
+                new_key_hash="new",
+                status=RotationStatus.IN_PROGRESS,
+            )
+            await service._rotate_table(
+                rotation, old_master, new_master,
+                table="files",
+                content_column="content",
+                id_column="content_hash",
+                agent_id_column=None,
+                is_text_column=False,
+            )
+
+            # Also drive the count path
+            await service._count_encrypted_records()
+
+            files_sql = [s for s in captured_sql if "files" in s.lower()]
+            assert files_sql, "test should have driven at least one query against files"
+            for sql in files_sql:
+                upper = sql.upper()
+                # 'LIKE' on a BLOB column would break Postgres
+                assert "LIKE 'GAAAAA%'" not in upper, (
+                    f"SQL must not LIKE-filter on BLOB content "
+                    f"(breaks BYTEA on PostgreSQL): {sql!r}"
+                )
+                assert "LIKE 'KSAV2:%'" not in upper, (
+                    f"SQL must not LIKE-filter on BLOB content "
+                    f"(breaks BYTEA on PostgreSQL): {sql!r}"
+                )
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
     async def test_rotate_files_blob_column(self):
         """``files.content`` is BLOB (bytes). Rotation must read/write
         bytes without crashing on ``.encode()`` like the pre-fix code."""
@@ -233,6 +302,7 @@ class TestRotationEndToEnd:
                 content_column="content",
                 id_column="content_hash",
                 agent_id_column=None,
+                is_text_column=False,
             )
 
             assert rotation.records_processed == 1, (

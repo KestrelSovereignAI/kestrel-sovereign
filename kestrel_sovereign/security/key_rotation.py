@@ -357,27 +357,35 @@ class KeyRotationService:
     # entry here so the rotation actually walks it; the previous
     # hardcoded list silently drifted from production for years.
 
-    # Each entry declares whether the table uses per-agent HKDF-derived
-    # encryption (``agent_id_column`` is set) or global encryption
-    # (``agent_id_column = None``). Per-agent rows are encrypted under
-    # ``HKDF(master, salt=agent_id, info=b"kestrel-agent-v1")``; rotation
-    # MUST derive the matching cipher per row, otherwise the global cipher
-    # cannot decrypt those rows and they're silently skipped — corrupting
-    # data after a key swap.
-    ENCRYPTED_TABLES: List[Dict[str, Optional[str]]] = [
+    # Each entry declares:
+    # - ``agent_id_column``: per-agent HKDF table (set) vs global (None).
+    #   Per-agent rows are encrypted under
+    #   ``HKDF(master, salt=agent_id, info=b"kestrel-agent-v1")``; rotation
+    #   MUST derive the matching cipher per row, or the global cipher fails
+    #   to decrypt and rows are silently skipped — corruption on key swap.
+    # - ``is_text_column``: TEXT (True) vs BLOB/BYTEA (False). SQL-side
+    #   ``LIKE 'gAAAAA%'`` works on TEXT and on SQLite's typeless BLOB but
+    #   does NOT compile against PostgreSQL BYTEA. BLOB tables therefore
+    #   route through a Python-side prefix filter instead of SQL LIKE.
+    ENCRYPTED_TABLES: List[Dict[str, Any]] = [
         {
             "table": "conversation_history",
             "content_column": "content",
             "id_column": "id",
             "agent_id_column": "agent_id",
+            "is_text_column": True,
         },
         {
             "table": "files",
             "content_column": "content",
             "id_column": "content_hash",
             "agent_id_column": None,
+            "is_text_column": False,  # BLOB/BYTEA — Python-side filter
         },
     ]
+
+    # Prefixes that mark an encrypted row, used by the BLOB Python-side filter.
+    _ENCRYPTED_PREFIXES = (b"gAAAAA", b"KSAv2:")
 
     async def _execute_rotation(
         self,
@@ -402,6 +410,7 @@ class KeyRotationService:
                     content_column=entry["content_column"],
                     id_column=entry["id_column"],
                     agent_id_column=entry.get("agent_id_column"),
+                    is_text_column=entry.get("is_text_column", True),
                     skip_v2=same_key,
                 )
 
@@ -431,6 +440,7 @@ class KeyRotationService:
         content_column: str,
         id_column: str,
         agent_id_column: Optional[str] = None,
+        is_text_column: bool = True,
         skip_v2: bool = False,
     ):
         """Rotate encryption for a single table.
@@ -466,22 +476,46 @@ class KeyRotationService:
         safe_content_col = safe_column_name(content_column)
         safe_agent_col = safe_column_name(agent_id_column) if agent_id_column else None
 
-        if skip_v2:
-            where = f"{safe_content_col} LIKE 'gAAAAA%'"
-        else:
-            where = (
-                f"{safe_content_col} LIKE 'gAAAAA%' "
-                f"   OR {safe_content_col} LIKE 'KSAv2:%'"
-            )
-
         if safe_agent_col:
             select_cols = f"{safe_id_col}, {safe_content_col}, {safe_agent_col}"
         else:
             select_cols = f"{safe_id_col}, {safe_content_col}"
 
-        rows = await self.storage.database.fetchall(
-            f"SELECT {select_cols} FROM {safe_tbl} WHERE {where}"
-        )
+        # SQL-LIKE prefix filter only works for TEXT columns. PostgreSQL has
+        # no implicit text↔BYTEA cast, so a ``LIKE 'gAAAAA%'`` predicate
+        # against ``files.content`` (BLOB → BYTEA) does not compile. BLOB
+        # tables read all rows and apply the prefix check in Python below.
+        if is_text_column:
+            if skip_v2:
+                where = f"{safe_content_col} LIKE 'gAAAAA%'"
+            else:
+                where = (
+                    f"{safe_content_col} LIKE 'gAAAAA%' "
+                    f"   OR {safe_content_col} LIKE 'KSAv2:%'"
+                )
+            rows = await self.storage.database.fetchall(
+                f"SELECT {select_cols} FROM {safe_tbl} WHERE {where}"
+            )
+        else:
+            all_rows = await self.storage.database.fetchall(
+                f"SELECT {select_cols} FROM {safe_tbl}"
+            )
+            rows = []
+            wanted_prefixes: tuple
+            if skip_v2:
+                wanted_prefixes = (b"gAAAAA",)
+            else:
+                wanted_prefixes = self._ENCRYPTED_PREFIXES
+            for row in all_rows:
+                content = row[1]
+                if isinstance(content, str):
+                    content_bytes = content.encode("ascii", errors="ignore")
+                elif isinstance(content, (bytes, bytearray, memoryview)):
+                    content_bytes = bytes(content)
+                else:
+                    continue
+                if any(content_bytes.startswith(p) for p in wanted_prefixes):
+                    rows.append(row)
 
         # Pre-build the global cipher pair; per-agent ciphers are derived per row
         old_global = AEADCipher(old_master)
@@ -586,20 +620,41 @@ class KeyRotationService:
                     ) from e
 
     async def _count_encrypted_records(self) -> int:
-        """Count total encrypted records across all registered tables."""
+        """Count total encrypted records across all registered tables.
+
+        TEXT columns use SQL ``LIKE``; BLOB columns (e.g. ``files.content`` →
+        BYTEA on PostgreSQL) cannot, because PostgreSQL has no implicit
+        text↔BYTEA cast. BLOB tables stream all rows and apply the prefix
+        check in Python.
+        """
         total = 0
         for entry in self.ENCRYPTED_TABLES:
             table = entry["table"]
             column = entry["content_column"]
+            is_text = entry.get("is_text_column", True)
             try:
                 safe_tbl = safe_table_name(table)
                 safe_col = safe_column_name(column)
-                value = await self.storage.database.fetchval(
-                    f"SELECT COUNT(*) FROM {safe_tbl} "
-                    f"WHERE {safe_col} LIKE 'gAAAAA%' "
-                    f"   OR {safe_col} LIKE 'KSAv2:%'"
-                )
-                total += value or 0
+                if is_text:
+                    value = await self.storage.database.fetchval(
+                        f"SELECT COUNT(*) FROM {safe_tbl} "
+                        f"WHERE {safe_col} LIKE 'gAAAAA%' "
+                        f"   OR {safe_col} LIKE 'KSAv2:%'"
+                    )
+                    total += value or 0
+                else:
+                    rows = await self.storage.database.fetchall(
+                        f"SELECT {safe_col} FROM {safe_tbl}"
+                    )
+                    for (content,) in rows:
+                        if isinstance(content, str):
+                            cb = content.encode("ascii", errors="ignore")
+                        elif isinstance(content, (bytes, bytearray, memoryview)):
+                            cb = bytes(content)
+                        else:
+                            continue
+                        if any(cb.startswith(p) for p in self._ENCRYPTED_PREFIXES):
+                            total += 1
             except Exception as e:
                 # Table may not exist in this storage backend
                 logger.warning(f"Could not count encrypted data in {table}.{column}: {e}")
