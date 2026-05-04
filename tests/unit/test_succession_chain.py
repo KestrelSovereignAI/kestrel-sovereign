@@ -228,6 +228,29 @@ def test_build_chain_rejects_vm_linkage_mismatch(
         build_chain([first_succession, rogue])
 
 
+def test_build_chain_rejects_malformed_single_statement_timestamp(
+    legacy_root, successor_v1,
+):
+    """Codex P2 round 12: a single-statement chain with a malformed
+    effective_from used to slip through build_chain (the temporal
+    comparison only fired for i > 0). Then artifact verification
+    raised SuccessionChainError instead of returning a structured
+    fail-closed result.
+
+    Now build_chain validates every statement's timestamp.
+    """
+    bad = SuccessionStatement(
+        predecessor_did=legacy_root["did"],
+        successor_did=successor_v1["did"],
+        effective_from="not-a-date",
+        reason="malformed",
+        predecessor_verification_methods=legacy_root["vms"],
+        successor_verification_methods=successor_v1["vms"],
+    )
+    with pytest.raises(SuccessionChainError, match="invalid ISO 8601"):
+        build_chain([bad])
+
+
 def test_build_chain_rejects_self_succession(legacy_root):
     self_loop = SuccessionStatement(
         predecessor_did=legacy_root["did"],
