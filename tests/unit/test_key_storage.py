@@ -432,3 +432,43 @@ class TestSecureDelete:
         
         assert result is True
         assert not empty_file.exists()
+
+
+class TestSaveLoadSecretBytes:
+    """Wave 3 sub-PR 4: raw-bytes persistence path for PQ secrets."""
+
+    def test_save_and_load_round_trip(self, storage):
+        """Round-trip a 64-byte SLH-DSA-style secret."""
+        import os
+        secret = os.urandom(64)
+        path = storage.save_secret_bytes(secret, "agent_slhdsa")
+        assert path.exists()
+        loaded = storage.load_secret_bytes("agent_slhdsa")
+        assert loaded == secret
+
+    def test_save_secret_bytes_rejects_non_bytes(self, storage):
+        import pytest
+        with pytest.raises(TypeError, match="requires bytes"):
+            storage.save_secret_bytes("not-bytes", "agent_x")  # type: ignore[arg-type]
+
+    def test_load_secret_bytes_missing_raises(self, storage):
+        import pytest
+        with pytest.raises(FileNotFoundError):
+            storage.load_secret_bytes("never_saved")
+
+    def test_has_secret_bytes(self, storage):
+        import os
+        assert not storage.has_secret_bytes("not_yet")
+        storage.save_secret_bytes(os.urandom(32), "now_present")
+        assert storage.has_secret_bytes("now_present")
+
+    def test_secret_bytes_path_distinct_from_private_key_path(self, storage, test_private_key):
+        """``.bytes.enc`` files don't collide with ``.key.enc`` files —
+        a key id can have BOTH a cryptography-object key file and a
+        raw-bytes secret file simultaneously without overwriting."""
+        import os
+        storage.save_private_key(test_private_key, "shared_id")
+        storage.save_secret_bytes(os.urandom(32), "shared_id")
+        # Both files exist; both load independently
+        assert storage.has_key("shared_id")
+        assert storage.has_secret_bytes("shared_id")
