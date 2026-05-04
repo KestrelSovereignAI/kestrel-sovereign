@@ -128,6 +128,55 @@ class ModelNotAvailableForRoute(LLMError):
         )
 
 
+def _warn_no_llm_config_found() -> None:
+    """Loud warning when ``[llm]`` is empty/missing on LLMService startup.
+
+    Pre-#940 the LLMService would auto-copy ``llm_config.toml.example`` to
+    ``llm_config.toml`` on first run. After #940 we read ``[llm]`` from
+    ``kestrel.toml`` directly with no auto-copy fallback, so a fresh
+    checkout (or one where the user never ran ``kestrel migrate-llm-config``)
+    silently boots with zero providers — the UI shows empty Provider and
+    "loading" Model with no log signal pointing at the real cause.
+
+    This makes the failure loud and tells the user exactly which command
+    fixes it. Logging at WARNING (not ERROR) because the registry will
+    raise a clearer LLMServiceError later if anyone actually tries to use
+    a route — this just guarantees the diagnostic shows up at startup.
+    """
+    from pathlib import Path
+
+    legacy = Path("llm_config.toml")
+    legacy_bak = Path("llm_config.toml.bak")
+    example = Path("kestrel.toml.example")
+
+    hint_lines = [
+        "LLM config: no [llm] section found in kestrel.toml.",
+        "Routes will not initialize and the model selector will appear empty.",
+    ]
+    if legacy.exists():
+        hint_lines.append(
+            "  Legacy llm_config.toml detected — run `kestrel migrate-llm-config` "
+            "to fold it into kestrel.toml [llm]."
+        )
+    elif legacy_bak.exists():
+        hint_lines.append(
+            "  Legacy llm_config.toml.bak detected — your previous migration "
+            "may have produced an empty [llm]; check kestrel.toml or restore "
+            "from .bak and re-run `kestrel migrate-llm-config --force`."
+        )
+    elif example.exists():
+        hint_lines.append(
+            "  Run `kestrel setup llm` for interactive setup, or "
+            "`cp kestrel.toml.example kestrel.toml` for the shipped defaults."
+        )
+    else:
+        hint_lines.append(
+            "  Run `kestrel setup llm` to create one."
+        )
+
+    logger.warning("\n  ".join(hint_lines))
+
+
 class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, StreamingMixin, ConstitutionalAwarenessMixin, RemoteBackendMixin):
     """Unified LLM service with provider fallback and remote GPU support."""
 
@@ -150,6 +199,8 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         # (see provider_registry and endpoints/models.py)
         self.default_model = None  # Deprecated: use providers[0] instead
         self.config = load_section("llm")
+        if not self.config:
+            _warn_no_llm_config_found()
         self.mandate_config = load_config("model_mandate.toml")
 
         # Initialize provider registry

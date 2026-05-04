@@ -1021,10 +1021,14 @@ def cmd_setup(args) -> int:
 def _maybe_first_run_setup(project_dir: Path) -> Optional[int]:
     """If this looks like a truly fresh checkout, offer to run setup.
 
-    Fires only when **both** of these are true:
+    Fires only when **all** of these are true:
 
-      1. ``.env`` is absent, AND
-      2. There are no agents registered in the rookery.
+      1. We are NOT inside a git worktree (worktrees never carry the
+         user's gitignored state — ``.env``, ``rookery.toml`` — and the
+         hook would always misfire there). Detected by ``.git`` being a
+         FILE (gitdir pointer) rather than a directory.
+      2. ``.env`` is absent, AND
+      3. There are no agents registered in the rookery.
 
     A user who has already inceptioned an agent (``kestrel create``) has
     done deliberate setup; we must not block ``kestrel start`` for them
@@ -1042,6 +1046,17 @@ def _maybe_first_run_setup(project_dir: Path) -> Optional[int]:
     """
     if os.environ.get("KESTREL_SKIP_FIRST_RUN", "").lower() in ("1", "true", "yes"):
         return None
+
+    # Worktree detection: the user's deliberate state (.env, rookery.toml)
+    # lives in the main checkout, not here. A worktree's .git is a file
+    # containing a `gitdir:` pointer; a main checkout's .git is a directory.
+    # Without this guard, running any `kestrel` command from inside a
+    # worktree (a normal dev workflow) misfires the wizard on real users
+    # who already have a valid setup at the main checkout.
+    git_marker = project_dir / ".git"
+    if git_marker.is_file():
+        return None
+
     env_path = project_dir / ".env"
     if env_path.exists():
         return None

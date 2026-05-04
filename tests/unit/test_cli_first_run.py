@@ -79,6 +79,37 @@ def test_first_run_returns_none_when_skip_env_set(tmp_path, monkeypatch):
     assert _maybe_first_run_setup(tmp_path) is None
 
 
+def test_first_run_skipped_inside_git_worktree(tmp_path, monkeypatch):
+    """Running any kestrel command from inside a git worktree must NOT
+    fire the first-run hook. Worktrees never carry the user's gitignored
+    state (.env, rookery.toml) — the user's real setup lives in the main
+    checkout. Pre-fix, running from a worktree misfired the wizard on
+    users who already had a perfectly valid setup at the main checkout.
+
+    Worktree marker: ``.git`` is a FILE containing ``gitdir: ...`` rather
+    than a directory.
+    """
+    monkeypatch.delenv("KESTREL_SKIP_FIRST_RUN", raising=False)
+    # Simulate a worktree: .git is a file pointer, not a directory.
+    (tmp_path / ".git").write_text(
+        "gitdir: /Volumes/data2/projects/kestrel-sovereign/.git/worktrees/foo\n"
+    )
+    # No .env, no rookery — would otherwise trigger the prompt path.
+    assert _maybe_first_run_setup(tmp_path) is None
+
+
+def test_first_run_still_fires_when_git_is_directory(tmp_path, monkeypatch):
+    """Negative case: a regular checkout has ``.git`` as a directory.
+    The worktree bypass must NOT short-circuit the genuine fresh-checkout
+    case."""
+    monkeypatch.delenv("KESTREL_SKIP_FIRST_RUN", raising=False)
+    monkeypatch.setenv("CI", "true")  # Force is_tty() -> False, deterministic
+    # Main-checkout shape: .git is a directory.
+    (tmp_path / ".git").mkdir()
+    rc = _maybe_first_run_setup(tmp_path)
+    assert rc == 1  # Falls through to the non-tty hint path
+
+
 def test_first_run_non_tty_exits_with_hint(tmp_path, capsys, monkeypatch):
     monkeypatch.delenv("KESTREL_SKIP_FIRST_RUN", raising=False)
     monkeypatch.setenv("CI", "true")  # Forces is_tty() -> False
