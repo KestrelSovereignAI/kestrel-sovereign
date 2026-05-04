@@ -53,7 +53,7 @@ from kestrel_sovereign.kestrel_config.constants import (
     HTTP_TIMEOUT_MEDIUM,
     CLIENT_CLOSE_TIMEOUT,
 )
-from kestrel_sovereign.config import load_config
+from kestrel_sovereign.config import load_config, load_section
 from kestrel_sovereign.telemetry import optional_span
 
 logger = logging.getLogger(__name__)
@@ -131,11 +131,15 @@ class ModelNotAvailableForRoute(LLMError):
 class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, StreamingMixin, ConstitutionalAwarenessMixin, RemoteBackendMixin):
     """Unified LLM service with provider fallback and remote GPU support."""
 
-    def __init__(self, config_path: str = "llm_config.toml", database_url: Optional[str] = None):
+    def __init__(self, database_url: Optional[str] = None):
         """Initialize LLM service.
 
+        Reads LLM configuration from the ``[llm]`` section of ``kestrel.toml``
+        in the current project. The legacy standalone ``llm_config.toml``
+        is no longer supported — run ``kestrel migrate-llm-config`` to fold
+        an old file in.
+
         Args:
-            config_path: Path to LLM configuration file.
             database_url: Optional PostgreSQL connection URL for usage tracking.
                          If provided, uses PostgreSQL. Otherwise checks env vars,
                          then falls back to SQLite.
@@ -145,7 +149,7 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         # default_model is derived from first provider in provider_priority
         # (see provider_registry and endpoints/models.py)
         self.default_model = None  # Deprecated: use providers[0] instead
-        self.config = load_config(config_path)
+        self.config = load_section("llm")
         self.mandate_config = load_config("model_mandate.toml")
 
         # Initialize provider registry
@@ -513,7 +517,7 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
                ``vendor`` filters routes; ``route``, if set, narrows to that
                exact route. Target model comes from the mandate.
             3. **Default route order** — all initialized routes, ordered per
-               ``route_priority`` in ``llm_config.toml``.
+               ``route_priority`` in ``kestrel.toml`` ``[llm]``.
 
         ``force_local_only=True`` additionally filters to local routes. If the
         resolved ``target_model`` isn't the configured default for any local
@@ -637,7 +641,7 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
                     f"({reasons}). Rotate keys and restart the service."
                 )
             raise LLMServiceError(
-                "No LLM routes are configured. Check llm_config.toml and "
+                "No LLM routes are configured. Check kestrel.toml [llm] and "
                 "vendor auth envs (e.g. ANTHROPIC_API_KEY, OPENAI_API_KEY)."
             )
 

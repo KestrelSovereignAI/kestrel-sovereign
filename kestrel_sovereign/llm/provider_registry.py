@@ -8,8 +8,9 @@ Vendor/route/model data model:
     - A **model** lives inside a vendor; all routes for that vendor share the
       model catalog.
 
-Config shape (llm_config.toml):
+Config shape (kestrel.toml ``[llm]`` section):
 
+    [llm]
     route_priority = ["anthropic:plan", "openai:api", ...]
 
     [vendors.anthropic]
@@ -182,7 +183,7 @@ class ProviderRegistry:
         if not initialized:
             raise ProviderInitializationError(
                 "No routes could be initialized. Check vendor auth envs "
-                "(e.g. ANTHROPIC_API_KEY, OPENAI_API_KEY) and llm_config.toml."
+                "(e.g. ANTHROPIC_API_KEY, OPENAI_API_KEY) and kestrel.toml [llm]."
             )
 
         self.providers = initialized

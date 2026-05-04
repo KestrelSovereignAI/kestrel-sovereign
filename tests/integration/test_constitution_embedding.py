@@ -246,7 +246,7 @@ async def test_agent_can_access_constitution_via_kestrel_agent(tmp_path):
     from kestrel_sovereign.llm.service import LLMService
     from kestrel_sovereign.kestrel_agent import KestrelAgent
 
-    llm_service = LLMService('llm_config.toml')
+    llm_service = LLMService()
 
     agent = KestrelAgent(
         did=credentials.agent_did,
@@ -285,7 +285,7 @@ async def test_genesis_audit_bypassed_temporarily(tmp_path):
     from kestrel_sovereign.llm.service import LLMService
     from kestrel_sovereign.kestrel_agent import KestrelAgent
 
-    llm_service = LLMService('llm_config.toml')
+    llm_service = LLMService()
 
     agent = KestrelAgent(
         did=credentials.agent_did,

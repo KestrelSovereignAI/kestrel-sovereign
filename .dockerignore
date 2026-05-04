@@ -8,8 +8,9 @@
 .env.local
 .env.*.local
 
-# Ignore local LLM config (local providers like llama_cpp bleed into cloud)
-llm_config.toml
+# Ignore local kestrel.toml (local providers like llama_cpp bleed into cloud).
+# Cloud images get their LLM config from docker/kestrel.cloudrun.toml instead.
+kestrel.toml
 
 # Ignore credentials
 credentials/

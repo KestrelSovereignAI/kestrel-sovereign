@@ -11,9 +11,15 @@ import logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Mapping of individual config files to their unified kestrel.toml section paths
+# Mapping of legacy standalone config files to their unified kestrel.toml
+# section paths. Callers using load_config(file_name) get the unified path
+# transparently when kestrel.toml is present.
+#
+# llm_config.toml was removed from this map in #940 — LLMService now reads
+# the [llm] section directly via load_section("llm"). The migration tool
+# kestrel migrate-llm-config (#939) folds legacy llm_config.toml files into
+# kestrel.toml [llm] in one shot.
 _UNIFIED_CONFIG_MAPPING = {
-    "llm_config.toml": "llm",
     "model_catalog.toml": "llm.catalog",
     "model_mandate.toml": "llm.mandate",
     "constitutional_profiles.toml": "constitution.profiles",
@@ -24,13 +30,17 @@ def load_config(file_name: str, section: Optional[str] = None) -> Dict[str, Any]
     """
     Loads a TOML configuration file from the project root.
 
-    This function now supports unified configuration via kestrel.toml:
+    This function supports unified configuration via kestrel.toml:
     - First tries to load from kestrel.toml using the mapped section
     - Falls back to individual config files for backward compatibility
     - Logs deprecation warning when individual files are used
 
+    For LLM config, prefer ``load_section("llm")`` directly. ``llm_config.toml``
+    was removed from the unified-mapping in #940; use the migration command
+    ``kestrel migrate-llm-config`` to fold a legacy file into kestrel.toml.
+
     Args:
-        file_name: The name of the configuration file (e.g., 'llm_config.toml').
+        file_name: The name of the configuration file (e.g., 'model_mandate.toml').
         section: The specific section to load from the TOML file. If None, loads the whole file.
 
     Returns:
@@ -59,12 +69,6 @@ def load_config(file_name: str, section: Optional[str] = None) -> Dict[str, Any]
                     result = config_data.get(section, {})
                 else:
                     result = config_data
-
-                # Special handling for llm_config.toml: needs provider_priority at root
-                if file_name == "llm_config.toml" and not section:
-                    # Ensure provider_priority is at root level for backward compat
-                    if "provider_priority" not in result and "provider_priority" in unified_data.get("llm", {}):
-                        result = unified_data["llm"].copy()
 
                 logger.debug(f"Loaded '{file_name}' from unified config (kestrel.toml)")
                 return result
@@ -185,7 +189,6 @@ TRUSTED_AGENTS_DIR = (
 # The constitution is stored in the package's data directory for portability
 _PACKAGE_DIR = os.path.dirname(__file__)
 CONSTITUTION_PATH = os.path.join(_PACKAGE_DIR, 'data', 'KESTREL_CONSTITUTION.md')
-DEFAULT_LLM_CONFIG_PATH = "llm_config.toml"  # Resolved from project root (CWD)
 
 # --- Inception Service ---
 # Ensure the directory for trusted agents' keys exists

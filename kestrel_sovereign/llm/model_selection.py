@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, Optional
 
-from kestrel_sovereign.config import load_config
+from kestrel_sovereign.config import load_config, load_section
 from kestrel_sovereign.llm.model_catalog import get_catalog_service
 from kestrel_sovereign.llm.model_metadata import ModelCategory, ModelInfo
 
@@ -69,7 +69,7 @@ def resolve_provider_default(
     (``"anthropic:plan"``). The vendor's discovery catalog is the source of
     truth — all routes for the same vendor share the same models.
     """
-    llm_config = llm_config or load_config("llm_config.toml")
+    llm_config = llm_config if llm_config is not None else load_section("llm")
     catalog_config = catalog_config or load_config("model_catalog.toml")
 
     if ":" in provider_name:

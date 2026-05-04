@@ -74,7 +74,8 @@ COPY ephemeral_session.py .
 COPY privacy.py .
 COPY config.py .
 COPY main.py .
-COPY llm_config.toml .
+# LLM config now lives in [llm] inside kestrel.toml; no separate file to copy.
+# Operators must mount or copy a populated kestrel.toml at runtime.
 
 # Install Python dependencies
 RUN uv pip install --system --no-cache \

@@ -10,7 +10,7 @@ from kestrel_sovereign.storage import AsyncStorage
 from kestrel_sovereign.security.encryption import DecryptionError
 from kestrel_sovereign.kestrel_agent import KestrelAgent
 from kestrel_sovereign.llm.service import LLMService
-from kestrel_sovereign.config import load_config, DEFAULT_LLM_CONFIG_PATH
+from kestrel_sovereign.config import load_config
 from kestrel_sovereign.filecoin_adapter import FilecoinAdapter
 import logging
 
@@ -62,12 +62,6 @@ async def main():
         type=str,
         default=None,
         help="Path to the agent's memory database. Overrides KESTREL_DB_PATH."
-    )
-    parser.add_argument(
-        "--llm-config",
-        type=str,
-        default=DEFAULT_LLM_CONFIG_PATH,
-        help=f"Path to LLM config. Defaults to {DEFAULT_LLM_CONFIG_PATH}"
     )
     parser.add_argument(
         "--app",
