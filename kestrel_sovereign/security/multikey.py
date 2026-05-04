@@ -184,10 +184,17 @@ def public_key_to_multibase(suite, public_key) -> str:
 def multibase_to_public_key(multibase_str: str):
     """Decode a Multikey ``z...`` string back to ``(suite, public_key)``.
 
-    Looks up the registered suite by its ``public_key_multicodec`` prefix
-    and routes the body through the suite's
-    ``deserialize_public_key_from_multikey``. Raises if the prefix doesn't
-    match any registered suite.
+    Looks up the registered SIGNING suite by its
+    ``public_key_multicodec`` prefix and routes the body through the
+    suite's ``deserialize_public_key_from_multikey``. Raises if the
+    prefix doesn't match any registered signing suite.
+
+    For KEM-suite codecs (x25519, ml-kem-768) use
+    :func:`multibase_to_kem_public_key` — the registries are deliberately
+    split so callers can't accidentally use a key-agreement key as a
+    signing key (or vice versa). DID documents distinguish these via
+    the ``authentication`` / ``assertionMethod`` vs ``keyAgreement``
+    verification relationships per W3C DID Core.
     """
     from .crypto_suite import _REGISTRY, CryptoSuiteError
 
@@ -210,6 +217,40 @@ def multibase_to_public_key(multibase_str: str):
             return suite, suite.deserialize_public_key_from_multikey(pub_bytes)
 
     raise CryptoSuiteError(
-        f"No registered suite for multicodec 0x{codec_value:x}. "
-        f"Registered suites: {sorted(_REGISTRY)}."
+        f"No registered signing suite for multicodec 0x{codec_value:x}. "
+        f"Registered signing suites: {sorted(_REGISTRY)}. "
+        f"For KEM codecs, use multibase_to_kem_public_key()."
+    )
+
+
+def multibase_to_kem_public_key(multibase_str: str):
+    """Decode a Multikey ``z...`` string back to ``(kem_suite, public_key)``.
+
+    Mirror of :func:`multibase_to_public_key` for the KEM registry.
+    The registries are split so callers can't accidentally use a
+    key-agreement key as a signing key (or vice versa).
+    """
+    from .kem_suite import _KEM_REGISTRY, KEMSuiteError
+
+    if not multibase_str.startswith(MULTIBASE_BASE58BTC_PREFIX):
+        raise KEMSuiteError(
+            f"Expected multibase base58btc prefix {MULTIBASE_BASE58BTC_PREFIX!r}; "
+            f"got {multibase_str[:1]!r}"
+        )
+    raw = base58btc_decode(multibase_str[len(MULTIBASE_BASE58BTC_PREFIX):])
+    if not raw:
+        raise KEMSuiteError("empty multibase payload")
+
+    codec_value, consumed = decode_varint(raw)
+    codec_bytes = raw[:consumed]
+    pub_bytes = raw[consumed:]
+
+    for suite in _KEM_REGISTRY.values():
+        if getattr(suite, "public_key_multicodec", b"") == codec_bytes:
+            return suite, suite.deserialize_public_key_from_multikey(pub_bytes)
+
+    raise KEMSuiteError(
+        f"No registered KEM suite for multicodec 0x{codec_value:x}. "
+        f"Registered KEM suites: {sorted(_KEM_REGISTRY)}. "
+        f"For signing codecs, use multibase_to_public_key()."
     )
