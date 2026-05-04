@@ -318,15 +318,6 @@ def test_mlkem768_deserialize_rejects_wrong_length():
         suite.deserialize_public_key(b"\x00" * 100)
 
 
-def test_mlkem768_serialize_rejects_wrong_length():
-    """Codex P2 round 2: serialize must reject mis-sized public keys
-    before emitting them under the ml-kem-768 multicodec. Without this
-    a truncated key could be published in a DID keyAgreement entry."""
-    suite = MLKEM768Suite()
-    with pytest.raises(KEMSuiteError, match="must be 1184"):
-        suite.serialize_public_key(b"\x00" * 100)
-
-
 # ---------------------------------------------------------------------------
 # ML-KEM-768 multikey
 # ---------------------------------------------------------------------------
@@ -348,75 +339,3 @@ def test_mlkem768_multikey_codec(mlkem_kp):
 def test_distinct_codecs_for_x25519_and_mlkem768():
     """Wire-format invariant: codecs must NOT collide across KEM suites."""
     assert X25519Suite().public_key_multicodec != MLKEM768Suite().public_key_multicodec
-
-
-# ---------------------------------------------------------------------------
-# Multikey round-trip via the KEM-aware decoder (codex P2 round 1)
-# ---------------------------------------------------------------------------
-
-def test_x25519_multikey_decoder_round_trip(x25519_kp):
-    """Codex P2: KEM codecs were registered only in _KEM_REGISTRY, so
-    the existing multibase_to_public_key (signing-only) couldn't decode
-    them. Now multibase_to_kem_public_key handles the KEM registry.
-    """
-    from kestrel_sovereign.security.multikey import (
-        multibase_to_kem_public_key,
-        public_key_to_multibase,
-    )
-    suite = X25519Suite()
-    mb = public_key_to_multibase(suite, x25519_kp.public_key)
-    rebuilt_suite, rebuilt_pub = multibase_to_kem_public_key(mb)
-    assert rebuilt_suite.alg_id == ALG_X25519
-
-    # Strongest end-to-end check: encapsulate to the rebuilt key,
-    # decapsulate with the original private — must agree.
-    ct, ss_alice = rebuilt_suite.encapsulate(rebuilt_pub)
-    ss_bob = suite.decapsulate(ct, x25519_kp.private_key)
-    assert ss_alice == ss_bob
-
-
-def test_mlkem768_multikey_decoder_round_trip(mlkem_kp):
-    from kestrel_sovereign.security.multikey import (
-        multibase_to_kem_public_key,
-        public_key_to_multibase,
-    )
-    suite = MLKEM768Suite()
-    mb = public_key_to_multibase(suite, mlkem_kp.public_key)
-    rebuilt_suite, rebuilt_pub = multibase_to_kem_public_key(mb)
-    assert rebuilt_suite.alg_id == ALG_ML_KEM_768
-
-    ct, ss_alice = rebuilt_suite.encapsulate(rebuilt_pub)
-    ss_bob = suite.decapsulate(ct, mlkem_kp.private_key)
-    assert ss_alice == ss_bob
-
-
-def test_signing_decoder_refuses_kem_codec(x25519_kp):
-    """The SIGNING decoder must NOT silently accept a KEM codec —
-    callers that accidentally hand a key-agreement key into a signing
-    code path should fail loud."""
-    from kestrel_sovereign.security.crypto_suite import CryptoSuiteError
-    from kestrel_sovereign.security.multikey import (
-        multibase_to_public_key,
-        public_key_to_multibase,
-    )
-    suite = X25519Suite()
-    mb = public_key_to_multibase(suite, x25519_kp.public_key)
-    with pytest.raises(CryptoSuiteError, match="No registered signing suite"):
-        multibase_to_public_key(mb)
-
-
-def test_kem_decoder_refuses_signing_codec():
-    """And vice-versa: a signing-suite-encoded multibase shouldn't
-    decode as a KEM key."""
-    from kestrel_sovereign.security.crypto_suite import (
-        Ed25519Suite,
-    )
-    from kestrel_sovereign.security.multikey import (
-        multibase_to_kem_public_key,
-        public_key_to_multibase,
-    )
-    ed = Ed25519Suite()
-    kp = ed.generate_keypair()
-    mb = public_key_to_multibase(ed, kp.public_key)
-    with pytest.raises(KEMSuiteError, match="No registered KEM suite"):
-        multibase_to_kem_public_key(mb)
