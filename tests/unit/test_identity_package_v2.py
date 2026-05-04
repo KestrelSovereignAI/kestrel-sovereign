@@ -234,13 +234,17 @@ def test_content_hash_includes_verification_methods(base_package):
     )
 
 
-def test_content_hash_v1_compat():
-    """A v1 package's content_hash, computed under the new code, must
-    match the value the old code would have produced. Pre-bump v1 hash
-    excluded only ``signature``; the new code also pops ``signatures``,
-    but for a v1 package ``signatures`` is empty so the popped JSON is
-    byte-identical to what v1 would have produced (the empty list field
-    didn't exist in v1's to_dict either).
+def test_content_hash_v1_byte_stable_with_legacy_canonicalization():
+    """A v1 package's ``compute_content_hash`` must produce the EXACT
+    bytes the original v1 signer produced. v1 ``to_dict()`` had no
+    ``signatures`` or ``verification_methods`` keys at all — the new
+    schema's empty defaults must NOT leak into the canonical hash, or
+    every already-exported v1 identity package would fail
+    ``verify_content_hash`` after this PR.
+
+    Reference v1 canonical shape: pop ``content_hash`` + ``signature``,
+    no v2-only keys at all. That's what the original signer produced;
+    that's what the new code must reproduce for v1 packages.
     """
     pkg = AgentIdentityPackage(
         did="did:pkh:eip155:1:0xabc",
@@ -252,31 +256,107 @@ def test_content_hash_v1_compat():
     pkg.package_version = IDENTITY_PACKAGE_VERSION_LEGACY
     pkg.signature = "fake-sig-hex"
 
-    # Manually compute what the OLD code would have hashed: emit the
-    # v1 dict shape (no signatures, no verification_methods keys), pop
-    # signature + content_hash, deterministic JSON.
-    legacy_data = pkg.to_dict()
-    legacy_data.pop("content_hash", None)
-    legacy_data.pop("signature", None)
-    legacy_data.pop("signatures", None)
-    legacy_data.pop("verification_methods", None)
-    expected = hashlib.sha256(
-        json.dumps(legacy_data, sort_keys=True, separators=(",", ":")).encode()
+    # Original v1 canonicalization: take to_dict, strip the v2-only keys
+    # (which the original v1 to_dict did not emit), pop content_hash and
+    # signature, sort + serialize.
+    v1_canonical = pkg.to_dict()
+    v1_canonical.pop("content_hash", None)
+    v1_canonical.pop("signature", None)
+    v1_canonical.pop("signatures", None)
+    v1_canonical.pop("verification_methods", None)
+    expected_v1_hash = hashlib.sha256(
+        json.dumps(v1_canonical, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
 
-    # New code's compute_content_hash includes verification_methods (empty
-    # for v1) but excludes signatures and signature. Hash should be
-    # different from `expected` because new to_dict adds verification_methods.
-    # The compat check is: a v1 package's hash today equals (computed with
-    # verification_methods=[] still in the dict). That's the actual
-    # invariant — verification of a v1 package's signature requires that
-    # the hash stays stable.
     actual = pkg.compute_content_hash()
-    legacy_data["verification_methods"] = []
-    expected_with_vm = hashlib.sha256(
-        json.dumps(legacy_data, sort_keys=True, separators=(",", ":")).encode()
+    assert actual == expected_v1_hash, (
+        "v1 package hash must equal the original v1 canonical shape "
+        "(no signatures/verification_methods keys). Otherwise stored "
+        "v1 packages fail verify_content_hash after the schema bump."
+    )
+
+
+def test_content_hash_v2_includes_verification_methods_only_for_v2():
+    """Symmetric check: a v2 package binds verification_methods into
+    the hash, while a v1 package with the same data does NOT (because
+    v1 had no such field at sign time)."""
+    common = dict(
+        did="did:web:agents.example:alice",
+        agent_name="alice",
+        created_at="2026-05-01T00:00:00Z",
+        constitution_hash="a" * 64,
+        constitution_text="content",
+    )
+    v1 = AgentIdentityPackage(**common)
+    v1.package_version = IDENTITY_PACKAGE_VERSION_LEGACY
+    v2 = AgentIdentityPackage(**common)  # default = v2
+
+    # No verification methods anywhere → v1 and v2 hashes can differ
+    # only because of the package_version string. Verify they're
+    # ordered: same except for `package_version` field — establish
+    # baseline.
+    v1_hash_baseline = v1.compute_content_hash()
+    v2_hash_baseline = v2.compute_content_hash()
+    assert v1_hash_baseline != v2_hash_baseline  # version differs
+
+    # Now add a verification method to BOTH:
+    v1.add_verification_method("kid", "zsomekey")
+    v2.add_verification_method("kid", "zsomekey")
+
+    # v1 hash must NOT have changed (verification_methods is excluded
+    # for v1 — preserves legacy-artifact verifiability).
+    assert v1.compute_content_hash() == v1_hash_baseline, (
+        "v1 hash must not change when v2-only fields are populated; "
+        "otherwise legacy v1 artifacts would fail verify_content_hash."
+    )
+    # v2 hash MUST have changed (verification_methods IS bound for v2).
+    assert v2.compute_content_hash() != v2_hash_baseline
+
+
+def test_v1_signed_artifact_still_verifies_after_round_trip():
+    """End-to-end: a v1 package serialized to JSON, deserialized through
+    the new code, and re-hashed must yield the same content_hash that
+    the original v1 signer produced.
+
+    Builds the v1 export by constructing a real v1 ``AgentIdentityPackage``,
+    snapshotting its v1-canonical to_dict shape, computing the hash that
+    v1 would have stored, then writing that hash + a placeholder
+    signature back to the export and reading it through the new code.
+    """
+    pkg = AgentIdentityPackage(
+        did="did:pkh:eip155:1:0xfeed",
+        agent_name="old-agent",
+        created_at="2024-06-01T00:00:00Z",
+        constitution_hash="h" * 64,
+        constitution_text="old text",
+        export_timestamp="2024-06-01T00:00:00Z",
+    )
+    pkg.package_version = IDENTITY_PACKAGE_VERSION_LEGACY
+
+    # Reproduce the v1 to_dict shape: drop the v2-only keys (which v1
+    # to_dict didn't emit) and the verification fields.
+    v1_canonical = pkg.to_dict()
+    v1_canonical.pop("signatures", None)
+    v1_canonical.pop("verification_methods", None)
+    v1_canonical.pop("content_hash", None)
+    v1_canonical.pop("signature", None)
+
+    expected_v1_hash = hashlib.sha256(
+        json.dumps(v1_canonical, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
-    assert actual == expected_with_vm
+
+    # Now write the v1 export with hash + signature
+    v1_export = pkg.to_dict()
+    v1_export.pop("signatures", None)
+    v1_export.pop("verification_methods", None)
+    v1_export["content_hash"] = expected_v1_hash
+    v1_export["signature"] = "signature-bytes-here"
+
+    # Read through the new code; the hash must round-trip
+    rebuilt = AgentIdentityPackage.from_json(json.dumps(v1_export))
+    assert rebuilt.is_v2() is False
+    assert rebuilt.compute_content_hash() == expected_v1_hash
+    assert rebuilt.verify_content_hash() is True
 
 
 # ---------------------------------------------------------------------------

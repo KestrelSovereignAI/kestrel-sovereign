@@ -448,21 +448,48 @@ class AgentIdentityPackage:
         """
         Compute SHA256 hash of package contents for signing.
 
-        Excludes ``content_hash`` and BOTH signature shapes (the legacy
-        ``signature`` string and the v2 ``signatures`` array) to avoid
-        circular dependency. ``verification_methods`` ARE included in
-        the hash — they carry public keys that must be authenticated by
-        the signature.
+        Excludes ``content_hash`` and the active signature shape to
+        avoid a circular dependency. The exact key set in the hashed
+        payload is **version-dependent** — v1 packages already on disk
+        were signed over a JSON shape that did not contain ``signatures``
+        or ``verification_methods`` keys at all (those fields didn't
+        exist), so emitting them with empty defaults would change the
+        canonical bytes and break ``verify_content_hash`` on every
+        legacy artifact.
+
+        Rules:
+
+        - **v1** (``package_version == "1.0.0"``): pop ``content_hash``,
+          ``signature``, AND the v2-only fields ``signatures`` and
+          ``verification_methods``. The remaining shape is byte-stable
+          with the original v1 canonicalization.
+        - **v2** (``package_version`` starts with ``"2."``): pop
+          ``content_hash``, ``signature``, and ``signatures``. Keep
+          ``verification_methods`` — they carry public keys that the
+          signature must authenticate; excluding them would let an
+          attacker swap public keys post-sign without invalidating the
+          signature.
+
+        ``signature`` (the legacy single-hex field) is popped under
+        both versions so a v1 package whose ``signature`` field is
+        populated still hashes consistently.
         """
-        # Create a copy without verification fields
         data = self.to_dict()
         data.pop("content_hash", None)
         data.pop("signature", None)
-        data.pop("signatures", None)
 
-        # Deterministic JSON serialization
-        content = json.dumps(data, sort_keys=True, separators=(',', ':'))
-        return hashlib.sha256(content.encode('utf-8')).hexdigest()
+        if self.is_v2():
+            # v2: signatures excluded; verification_methods bound.
+            data.pop("signatures", None)
+        else:
+            # v1: neither v2-only field existed at sign time. Pop both
+            # so the canonical bytes match what the original signer
+            # produced.
+            data.pop("signatures", None)
+            data.pop("verification_methods", None)
+
+        content = json.dumps(data, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
     def to_json(self, indent: int = 2) -> str:
         """Serialize to JSON string."""
