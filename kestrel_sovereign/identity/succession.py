@@ -762,6 +762,7 @@ def verify_succession(
     predecessor_policy: VerifyPolicy = VerifyPolicy.LEGACY_ALLOWED,
     successor_policy: VerifyPolicy = VerifyPolicy.HYBRID_REQUIRED,
     require_archival: bool = False,
+    trusted_archival_multibase: Optional[str] = None,
     did_web_resolver: Optional[Callable[[str], Mapping[str, Any]]] = None,
 ) -> SuccessionVerifyResult:
     """Verify a succession statement end-to-end.
@@ -901,6 +902,41 @@ def verify_succession(
                     ),
                     alg_ids_seen=archival_result.alg_ids_seen,
                 )
+            # Trust-anchor check (codex P2 round 7): without
+            # ``trusted_archival_multibase``, the embedded archival VM
+            # can be ANY SLH-DSA key the statement author chose, which
+            # makes ``require_archival=True`` a paper requirement. When
+            # the caller pins a known archival key, the embedded VM's
+            # publicKeyMultibase MUST match that pin. Without a pin AND
+            # with require_archival=True, fail-closed — the policy is
+            # only meaningful with a trust anchor.
+            if archival_result.ok:
+                embedded_mb = (
+                    statement.archival_verification_method.get("publicKeyMultibase")
+                    if statement.archival_verification_method else None
+                )
+                if trusted_archival_multibase is not None:
+                    if embedded_mb != trusted_archival_multibase:
+                        archival_result = PolicyResult(
+                            ok=False,
+                            reason=(
+                                f"archival key {embedded_mb!r} does not match "
+                                f"trusted_archival_multibase {trusted_archival_multibase!r}"
+                            ),
+                            alg_ids_seen=archival_result.alg_ids_seen,
+                        )
+                elif require_archival:
+                    archival_result = PolicyResult(
+                        ok=False,
+                        reason=(
+                            "require_archival=True without trusted_archival_multibase "
+                            "is meaningless: any caller can mint a fresh SLH-DSA "
+                            "key and self-sign. Pin a known archival key via "
+                            "trusted_archival_multibase= to make the requirement "
+                            "real."
+                        ),
+                        alg_ids_seen=archival_result.alg_ids_seen,
+                    )
 
     # Statement-id integrity. Codex P2: an empty statement_id used to
     # be silently accepted as "consistent". Now we require it to be
