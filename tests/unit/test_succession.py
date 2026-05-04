@@ -771,6 +771,76 @@ def test_duplicate_kid_takeover_rejected(legacy_predecessor, hybrid_successor):
     assert "duplicate kid" in result.reason
 
 
+def test_extra_unbound_vm_decoy_rejected(legacy_predecessor, hybrid_successor):
+    """Codex P1 (round 4): the duplicate-kid fix only stops attackers
+    who reuse the same kid. An attacker can still:
+
+    1. Include the victim's REAL VM under one kid (passes any-match
+       binding because the real key derives the address)
+    2. Include their own attacker secp256k1 VM under a DIFFERENT kid
+       (passes unique-kid check because no collision)
+    3. Sign with the attacker's key under the attacker's kid
+
+    Pre-fix (any-match binding): predecessor side returned ok because
+    the attacker's signature crypto-verifies against THEIR VM, and
+    binding passed via any-match on the victim's decoy VM.
+
+    Post-fix: ``_verify_did_pkh_eip155_binding`` requires EVERY VM in
+    the list to derive the claimed address. The attacker's VM is
+    rejected because its derived address doesn't match the victim's.
+    """
+    # Attacker's own keypair
+    att_secp = Secp256k1Suite()
+    att_kp = att_secp.generate_keypair()
+    # Attacker mounts an UNBOUND VM (different address) under a unique kid
+    att_vm = build_verification_methods(
+        legacy_predecessor["did"],  # claims victim's DID...
+        [(att_secp, att_kp.public_key)],  # ...but key is attacker's
+        kid_prefix="attacker",
+    )[0]
+
+    # VMs list: legitimate victim VM + unbound attacker VM with unique kid
+    pred_vms = list(legacy_predecessor["vms"]) + [att_vm]
+    att_kid = att_vm["id"].rsplit("#", 1)[-1]
+
+    s = SuccessionStatement(
+        predecessor_did=legacy_predecessor["did"],
+        successor_did=hybrid_successor["did"],
+        effective_from="2026-05-04T18:00:00+00:00",
+        reason="extra unbound VM decoy",
+        predecessor_verification_methods=pred_vms,
+        successor_verification_methods=hybrid_successor["vms"],
+    )
+    s = sign_predecessor(s, [(att_kp, att_kid)])
+    s = sign_successor(s, [
+        (hybrid_successor["hybrid"].classical, hybrid_successor["classical_kid"]),
+        (hybrid_successor["hybrid"].pq, hybrid_successor["pq_kid"]),
+    ])
+    s = finalize(s)
+
+    result = verify_succession(s, did_web_resolver=_self_attesting_resolver(s))
+    assert not result.ok
+    assert not result.predecessor_did_bound
+    # Reason should mention the address mismatch, not just generic failure
+    assert (
+        "decoy" in result.reason
+        or "claims" in result.reason
+        or "derives address" in result.reason
+    )
+
+
+def test_did_binding_handles_non_mapping_vm(legacy_predecessor):
+    """Codex P2 round 4: a malformed VM list (e.g. archived data with a
+    non-dict entry) used to crash with AttributeError on vm.get(). Now
+    it should fail-closed cleanly."""
+    from kestrel_sovereign.identity.succession import verify_did_binding
+
+    bogus_vms = list(legacy_predecessor["vms"]) + ["not-a-dict"]
+    ok, reason = verify_did_binding(legacy_predecessor["did"], bogus_vms)
+    # Doesn't crash; returns failure.
+    assert not ok
+
+
 def test_unfinalized_statement_rejected(
     base_statement, legacy_predecessor, hybrid_successor,
 ):
