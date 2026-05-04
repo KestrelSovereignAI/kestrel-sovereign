@@ -443,13 +443,15 @@ class SuccessionVerifyResult:
 #   did:web that nobody resolves.
 
 def _validate_iso8601_utc(s: str) -> Tuple[bool, str]:
-    """Parse ``s`` as a tz-aware UTC ISO 8601 timestamp; return (ok, reason).
+    """Parse ``s`` as a UTC ISO 8601 timestamp; return (ok, reason).
 
-    Identical semantics to ``succession_chain._parse_iso8601_utc`` but
-    inlined here to avoid succession.py importing from a module that
-    imports from itself. Tolerates the trailing ``Z`` suffix; rejects
-    timezone-naive strings (the cutoff comparison must be unambiguous).
+    Tolerates the trailing ``Z`` suffix; rejects timezone-naive strings
+    AND non-UTC offsets (codex P2 round 6: e.g.
+    ``2026-05-04T18:00:00+05:00`` had tzinfo and so used to pass, but
+    isn't UTC and breaks downstream archival comparisons that assume
+    a UTC contract).
     """
+    from datetime import timedelta
     if not isinstance(s, str) or not s:
         return False, f"timestamp must be a non-empty string; got {s!r}"
     candidate = s.replace("Z", "+00:00") if s.endswith("Z") else s
@@ -461,6 +463,12 @@ def _validate_iso8601_utc(s: str) -> Tuple[bool, str]:
         return False, (
             f"timestamp {s!r} is timezone-naive; succession cutoff must "
             f"be UTC-explicit"
+        )
+    if dt.utcoffset() != timedelta(0):
+        return False, (
+            f"timestamp {s!r} is not UTC (offset {dt.utcoffset()}); "
+            f"succession cutoff schema requires UTC for unambiguous "
+            f"cross-statement comparisons"
         )
     return True, ""
 

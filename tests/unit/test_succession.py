@@ -861,6 +861,32 @@ def test_malformed_effective_from_rejected(legacy_predecessor, hybrid_successor)
     assert "effective_from invalid" in result.reason
 
 
+def test_non_utc_offset_effective_from_rejected(legacy_predecessor, hybrid_successor):
+    """Codex P2 round 6: a timezone-AWARE but non-UTC offset (e.g.
+    ``+05:00``) used to slip through because the only check was
+    ``tzinfo is not None``. The schema documents UTC-only cutoffs;
+    accepting any other offset breaks downstream cross-statement
+    comparisons (chain walker assumes UTC math)."""
+    s = SuccessionStatement(
+        predecessor_did=legacy_predecessor["did"],
+        successor_did=hybrid_successor["did"],
+        effective_from="2026-05-04T18:00:00+05:00",  # non-UTC offset
+        reason="non-UTC offset",
+        predecessor_verification_methods=legacy_predecessor["vms"],
+        successor_verification_methods=hybrid_successor["vms"],
+    )
+    s = sign_predecessor(s, [(legacy_predecessor["kp"], legacy_predecessor["kid"])])
+    s = sign_successor(s, [
+        (hybrid_successor["hybrid"].classical, hybrid_successor["classical_kid"]),
+        (hybrid_successor["hybrid"].pq, hybrid_successor["pq_kid"]),
+    ])
+    s = finalize(s)
+
+    result = verify_succession(s, did_web_resolver=_self_attesting_resolver(s))
+    assert not result.ok
+    assert "not UTC" in result.reason
+
+
 def test_naive_effective_from_rejected(legacy_predecessor, hybrid_successor):
     """Same fix: a timezone-naive timestamp must be rejected because
     cutoff comparisons must be unambiguous about timezone."""
