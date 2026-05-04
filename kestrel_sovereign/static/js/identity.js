@@ -949,21 +949,38 @@ export async function loadConversations(_agentName) {
         }
 
         // Auto-load the most recent conversation on agent select (issue #714).
-        // Only when the chat pane is truly empty — i.e. no currentSessionId
-        // has been set since selectAgent wiped it.  This resumes where the
-        // user left off instead of dropping them into a cold, empty pane
-        // that still felt like "something is broken" in earlier iterations.
+        // Only when the chat pane is truly cold:
+        //   - no currentSessionId has been set since selectAgent mounted
+        //   - no in-flight stream against this agent
+        //   - no DOM activity in this agent's pane (user might have typed
+        //     during the parallel /api/conversations fetch)
         //
-        // If the user just hit "New Chat", state.currentSessionId will be
-        // populated by the time this code path runs from that flow — guard
-        // against clobbering it.
-        if (!state.currentSessionId && typeof window.loadConversation === 'function') {
+        // Without all three checks, an auto-load that lands AFTER the user
+        // started typing would call wipeAgentChatPane(), bump the pane
+        // generation, and gate out the in-flight stream — which surfaces
+        // user-side as "the agent keeps stopping mid-answer."
+        //
+        // Even with the synchronous checks there's a residual race between
+        // here and the actual wipe inside loadConversation. The auto path
+        // re-checks post-await; see the {auto: true} branch in
+        // window.loadConversation below.
+        const autoTargetAgent = selectedAgentName;
+        const autoTargetPane = state.chatPanes.get(autoTargetAgent);
+        const paneIsCold = autoTargetPane
+            && !autoTargetPane.streamingMsgDiv
+            && autoTargetPane.element.children.length === 0;
+        if (!state.currentSessionId
+            && !state.waitingAgents.has(autoTargetAgent)
+            && paneIsCold
+            && typeof window.loadConversation === 'function') {
             const mostRecent = _pickMostRecentConversation(conversations);
             if (mostRecent && mostRecent.session_id) {
-                // Fire-and-forget; loadConversation is async and handles its
-                // own errors via Toast. No await so a slow load doesn't stall
-                // the rest of selectAgent's parallel initialization.
-                window.loadConversation(mostRecent.session_id);
+                // Fire-and-forget; loadConversation is async and handles
+                // its own errors via Toast. The {auto: true} flag tells
+                // loadConversation to re-check pane coldness after its
+                // own fetch resolves and abort the wipe if the user has
+                // begun a turn in the meantime.
+                window.loadConversation(mostRecent.session_id, { auto: true });
             }
         }
     } catch (e) {
@@ -1048,7 +1065,7 @@ function beginRenameConversation(previewEl, conv) {
 }
 
 
-window.loadConversation = async function(sessionId) {
+window.loadConversation = async function(sessionId, options = {}) {
     activeConversationId = sessionId;
 
     // Update selection UI
@@ -1061,12 +1078,36 @@ window.loadConversation = async function(sessionId) {
         const data = await API.getConversation(sessionId);
         const messages = data.messages || [];
 
+        const currentAgent = API.getHostAgent();
+
+        // Auto-load defense-in-depth: the loadConversations() caller
+        // already checked the pane was cold synchronously, but the
+        // /api/conversations fetch + this getConversation() fetch above
+        // ran across multiple awaits — plenty of time for the user to
+        // type and submit. If they did, abort the wipe so we don't bump
+        // the pane generation under their in-flight stream. User-
+        // explicit clicks (no `auto` flag) skip this guard: the user's
+        // intent to switch conversations is overriding.
+        if (options.auto) {
+            const pane = state.chatPanes.get(currentAgent);
+            const paneIsCold = pane
+                && !pane.streamingMsgDiv
+                && pane.element.children.length === 0;
+            const userBusy = state.waitingAgents.has(currentAgent);
+            const sessionAlreadySet = !!state.currentSessionId;
+            if (!paneIsCold || userBusy || sessionAlreadySet) {
+                // User started a turn while auto-load was in flight.
+                // Drop the auto-load silently — the in-flight stream is
+                // what the user actually wants to see.
+                return;
+            }
+        }
+
         // Wipe ONLY the visible agent's pane and bump that agent's
         // pane-local generation. A stream still running against the
         // previous conversation on this agent gates out before its
         // chunks can paint the freshly-loaded view; other agents'
         // streams are untouched.
-        const currentAgent = API.getHostAgent();
         wipeAgentChatPane(currentAgent);
         state.currentSessionId = sessionId;
         // Append messages directly into this agent's pane element.
