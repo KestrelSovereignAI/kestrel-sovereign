@@ -20,6 +20,8 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
+from kestrel_sovereign.agent.context_builder import extract_raw_user_content
+
 from .identity_package import PersonalityFingerprint
 
 if TYPE_CHECKING:
@@ -438,7 +440,14 @@ class PersonalityAnalyzer:
         # Score and select diverse examples
         candidates = []
         for row in rows:
-            user_msg = row[0][:1000]  # Truncate for package size
+            # User turns are persisted in fully-rendered prompt form
+            # (<retrieved_context>...</retrieved_context> + <user_input>
+            # ... </user_input>) for prompt-cache stability. Calibration
+            # exports are meant to capture "how the user actually
+            # speaks" — strip the wrappers so the personality
+            # fingerprint isn't trained on retrieved-memory blocks the
+            # user never typed.
+            user_msg = extract_raw_user_content(row[0])[:1000]
             assistant_msg = row[1][:1500]
 
             # Calculate diversity score (prefer varied lengths and topics)
