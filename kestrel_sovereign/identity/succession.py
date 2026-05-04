@@ -763,23 +763,46 @@ def _verify_signatures_against(
 
 
 def _adaptive_predecessor_policy(
-    verification_methods: Iterable[Mapping[str, Any]],
+    predecessor_did: str,
+    embedded_vms: Iterable[Mapping[str, Any]],
+    *,
+    did_web_resolver: Optional[Callable[[str], Mapping[str, Any]]] = None,
 ) -> VerifyPolicy:
-    """Pick the predecessor policy based on the predecessor's keys.
+    """Pick the predecessor policy based on the predecessor's KNOWN keys.
 
     Codex P2 round 9: a static default of ``LEGACY_ALLOWED`` is correct
     for legacy → hybrid migrations (legacy agents only have ECDSA), but
     it under-constrains hybrid → hybrid future rotations. If the
     predecessor's VMs already include a post-quantum key, that
     predecessor IS hybrid and a single classical signature would be a
-    quantum-hardening regression: a future Shor-recovered classical
-    key could forge a "rotation" without the PQ half.
+    quantum-hardening regression.
 
-    Rule: if any predecessor VM resolves to a PQ-classified suite, the
-    policy is ``HYBRID_REQUIRED``. Otherwise ``LEGACY_ALLOWED`` (the
-    Wave 3 ceremony case for legacy ECDSA-only predecessors).
+    Codex P1 round 10: deriving the policy from the EMBEDDED VMs alone
+    is unsafe for did:web. For did:web a statement may legitimately
+    embed only a SUBSET of the published VMs, so an attacker could
+    omit the published PQ key and downshift the policy to LEGACY_ALLOWED.
+    Mitigation: when the predecessor is did:web AND a resolver is
+    available, source the policy decision from the RESOLVED published
+    DID document (the source of truth) instead of the embedded subset.
+
+    Rule applied to whichever VM set is authoritative:
+    - any PQ-classified suite present → ``HYBRID_REQUIRED``
+    - otherwise → ``LEGACY_ALLOWED``
     """
-    for vm in verification_methods:
+    # For did:web predecessors with a resolver, use the resolved doc's
+    # VMs as the source of truth rather than the embedded subset.
+    authoritative_vms = list(embedded_vms)
+    if predecessor_did.startswith("did:web:") and did_web_resolver is not None:
+        try:
+            resolved = did_web_resolver(predecessor_did)
+        except Exception:
+            resolved = None
+        if isinstance(resolved, Mapping):
+            published = resolved.get("verificationMethod")
+            if isinstance(published, list):
+                authoritative_vms = published
+
+    for vm in authoritative_vms:
         if not isinstance(vm, Mapping):
             continue
         multibase = vm.get("publicKeyMultibase")
@@ -850,7 +873,9 @@ def verify_succession(
     # without breaking the legacy → hybrid Wave 3 ceremony case.
     if predecessor_policy is None:
         predecessor_policy = _adaptive_predecessor_policy(
-            statement.predecessor_verification_methods
+            statement.predecessor_did,
+            statement.predecessor_verification_methods,
+            did_web_resolver=did_web_resolver,
         )
 
     payload = signable_payload(statement)
