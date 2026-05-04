@@ -1,19 +1,27 @@
-# Dockerfile for Kestrel Sovereign Agent - Isolated Local Execution
+# Dockerfile for Kestrel Sovereign Agent — Isolated Local Execution
 #
 # This image provides cryptographic isolation between the agent and the host.
+# The agent process runs in a sandbox with KESTREL_DATA_KEY but no view of
+# the host filesystem; the database and any user data are mounted at /data.
+#
+# Distinct from docker/Dockerfile.cloudrun (Cloud Run / serverless) and
+# docker/Dockerfile.rookery (multi-agent rookery on Cloud Run). Use this
+# image for local sovereign deployments where the operator wants the
+# agent's blast radius confined to a container.
 #
 # SECURITY: Use Docker Secrets instead of environment variables for the key.
-# Environment variables are visible via `docker inspect` - secrets are not.
+# Environment variables are visible via `docker inspect` — secrets are not.
 #
 # Recommended Usage (Docker Secrets):
 #   # Create a secrets file
 #   echo "your-fernet-key" > ~/.kestrel/secrets/data_key
 #   chmod 600 ~/.kestrel/secrets/data_key
 #
-#   # Run with mounted secret
+#   # Build and run with mounted secret + LLM config
 #   docker build -f docker/Dockerfile.sovereign -t kestrel-sovereign .
 #   docker run -it \
 #     -v ~/.kestrel/secrets/data_key:/run/secrets/kestrel_data_key:ro \
+#     -v ~/.kestrel/kestrel.toml:/app/kestrel.toml:ro \
 #     -v ~/emma_data:/data \
 #     kestrel-sovereign
 #
@@ -21,103 +29,74 @@
 #   echo "your-fernet-key" | docker secret create kestrel_data_key -
 #   docker service create --secret kestrel_data_key kestrel-sovereign
 #
-# Alternative (file path):
-#   docker run -it \
-#     -e KESTREL_DATA_KEY_FILE=/run/secrets/kestrel_data_key \
-#     -v /path/to/keyfile:/run/secrets/kestrel_data_key:ro \
-#     -v ~/emma_data:/data \
-#     kestrel-sovereign
+# LLM configuration:
+#   The image does NOT bake an LLM config in. Mount a populated kestrel.toml
+#   at /app/kestrel.toml (see docs/architecture/LLM_SERVICE_ARCHITECTURE.md
+#   and kestrel.toml.example for the [llm] schema), or run the wizard once
+#   on the host and bind-mount the resulting file.
 #
-# Legacy (NOT RECOMMENDED - visible via docker inspect):
-#   docker run -it \
-#     -e KESTREL_DATA_KEY="$KESTREL_DATA_KEY" \
-#     -v ~/emma_data:/data \
-#     kestrel-sovereign
-#
-FROM python:3.11-slim
+
+ARG TARGETARCH
+FROM ghcr.io/astral-sh/uv:latest AS uv
+FROM --platform=linux/${TARGETARCH:-amd64} python:3.11-slim
 
 LABEL maintainer="Kestrel AI"
 LABEL description="Isolated sovereign agent container"
 
-# Non-root user for security
 ARG UID=1000
 ARG GID=1000
 
 WORKDIR /app
 
-# Install minimal system dependencies
+# System dependencies:
+#   curl  — diagnostics
+#   git   — pyproject.toml git+https:// deps (kestrel-talon, kestrel-feature-mcp)
+#   gcc + python3-dev — needed to compile native extensions for core deps
+#                        like webrtcvad that don't ship arm64 wheels.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
+    git \
+    gcc \
+    python3-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Install uv for fast package management
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+# Install uv from the official image (faster than pip install uv).
+COPY --from=uv /uv /usr/local/bin/uv
 
-# Copy only what's needed for the agent (no dev tools, no tests)
-COPY pyproject.toml uv.lock ./
-COPY storage/ ./storage/
-COPY llm/ ./llm/
-COPY hooks/ ./hooks/
-COPY agent/ ./agent/
-COPY features/ ./features/
-COPY tools/ ./tools/
-COPY extensions/ ./extensions/
-COPY a2a/ ./a2a/
-COPY security/ ./security/
-COPY prompts/ ./prompts/
-COPY docs/principles/ ./docs/principles/
-COPY kestrel_agent.py .
-COPY command_handler.py .
-COPY inception_service.py .
-COPY retirement_service.py .
-COPY ephemeral_session.py .
-COPY privacy.py .
-COPY config.py .
-COPY main.py .
-# LLM config now lives in [llm] inside kestrel.toml; no separate file to copy.
-# Operators must mount or copy a populated kestrel.toml at runtime.
+# Copy application source. .dockerignore handles exclusions (.venv, .env,
+# tests, kestrel.toml, *.db, agent_data, etc. — see /.dockerignore).
+COPY . .
 
-# Install Python dependencies
-RUN uv pip install --system --no-cache \
-    cryptography>=41.0.0 \
-    aiosqlite>=0.19.0 \
-    httpx>=0.25.0 \
-    pydantic>=2.0.0 \
-    python-dotenv>=1.0.0 \
-    toml>=0.10.0 \
-    rank-bm25>=0.2.2 \
-    sentence-transformers>=2.2.0 \
-    spacy>=3.7.0 \
-    eth-account>=0.10.0 \
-    web3>=6.0.0 \
-    openai>=1.0.0 \
-    anthropic>=0.18.0 \
-    tiktoken>=0.5.0 \
-    tenacity>=8.2.0
+# Install the package and its declared dependencies via pyproject.toml.
+# Replaces the hand-curated dependency list this Dockerfile carried since
+# the pre-extraction monolith era — that list had drifted (missing rookery,
+# signals, kestrel_config, and the post-#688 LLM modules).
+RUN --mount=type=secret,id=github_token \
+    GIT_AUTH="$(cat /run/secrets/github_token 2>/dev/null || true)" && \
+    if [ -n "$GIT_AUTH" ]; then \
+        git config --global url."https://${GIT_AUTH}@github.com/".insteadOf "https://github.com/"; \
+    fi && \
+    uv pip install --system --no-cache . && \
+    git config --global --unset-all url."https://${GIT_AUTH}@github.com/".insteadOf 2>/dev/null || true
 
-# Download spaCy model for PII detection
-RUN python -m spacy download en_core_web_sm
-
-# Create non-root user
+# Create non-root user for runtime.
 RUN groupadd -g $GID kestrel && \
-    useradd -u $UID -g $GID -m -s /bin/bash kestrel
+    useradd -u $UID -g $GID -m -s /bin/bash kestrel && \
+    mkdir -p /data && \
+    chown -R kestrel:kestrel /app /data
 
-# Create data directory (will be mounted)
-RUN mkdir -p /data && chown kestrel:kestrel /data
-
-# Set environment
+# Environment
 ENV PYTHONUNBUFFERED=1
-ENV PYTHONPATH=/app
 ENV KESTREL_DB_PATH=/data
 
 # Switch to non-root user
 USER kestrel
 
-# Health check
+# Lightweight health check — agent process can import its own package.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
-    CMD python -c "import sys; sys.exit(0)"
+    CMD python -c "import kestrel_sovereign" || exit 1
 
-# Default: interactive chat mode
-# Override with: docker run ... kestrel-sovereign python inception_service.py --name Emma --output /data
+# Default: interactive chat against /data/kestrel_prime.db.
+# Override with: docker run ... kestrel-sovereign kestrel <subcommand>
 ENTRYPOINT ["python"]
 CMD ["main.py", "/data/kestrel_prime.db"]
