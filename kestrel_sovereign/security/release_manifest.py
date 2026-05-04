@@ -349,6 +349,9 @@ def add_artifact_entry(
     Returns a new manifest; the input is unchanged (frozen dataclass).
     Refuses duplicate paths so a producer can't accidentally include
     the same file twice with different hashes.
+
+    For multi-GB artifacts, prefer :func:`add_artifact_entry_from_path`
+    which streams the file rather than buffering it in memory.
     """
     _validate_artifact_path(path)
     if not isinstance(content, (bytes, bytearray)):
@@ -363,6 +366,80 @@ def add_artifact_entry(
     sha256 = hashlib.sha256(bytes(content)).hexdigest()
     entry = ArtifactEntry(path=path, sha256=sha256, size=len(content))
     return replace(manifest, artifacts=list(manifest.artifacts) + [entry])
+
+
+_STREAM_CHUNK_SIZE = 1 << 20  # 1 MiB
+
+
+def _stream_sha256_and_size(file_path: "Path") -> tuple:
+    """Compute SHA-256 hex + total size by streaming the file.
+
+    Codex P2 round 4: signing/verifying multi-GB releases used to
+    ``read_bytes()`` the whole file into memory at once. This streams
+    in 1 MiB chunks so peak memory is the chunk size, not the file size.
+    """
+    h = hashlib.sha256()
+    total = 0
+    with open(file_path, "rb") as f:
+        while True:
+            chunk = f.read(_STREAM_CHUNK_SIZE)
+            if not chunk:
+                break
+            h.update(chunk)
+            total += len(chunk)
+    return h.hexdigest(), total
+
+
+def add_artifact_entry_from_path(
+    manifest: ReleaseManifest,
+    rel_path: str,
+    abs_path: "Path",
+) -> ReleaseManifest:
+    """Append an artifact whose hash + size is computed by STREAMING
+    the file at ``abs_path``. Use for multi-GB releases.
+
+    Same validation rules as :func:`add_artifact_entry`. Returns a new
+    manifest.
+    """
+    from pathlib import Path
+    _validate_artifact_path(rel_path)
+    if not isinstance(abs_path, Path):
+        raise ReleaseManifestError(
+            f"abs_path must be a Path; got {type(abs_path).__name__}"
+        )
+    if not abs_path.is_file():
+        raise ReleaseManifestError(
+            f"artifact source is not a file: {abs_path}"
+        )
+    for existing in manifest.artifacts:
+        if existing.path == rel_path:
+            raise ReleaseManifestError(
+                f"duplicate artifact path: {rel_path!r}"
+            )
+    sha256, size = _stream_sha256_and_size(abs_path)
+    entry = ArtifactEntry(path=rel_path, sha256=sha256, size=size)
+    return replace(manifest, artifacts=list(manifest.artifacts) + [entry])
+
+
+def verify_artifact_path(
+    manifest: ReleaseManifest,
+    rel_path: str,
+    abs_path: "Path",
+) -> bool:
+    """Streaming version of :func:`verify_artifact_bytes`.
+
+    Reads the file in 1 MiB chunks and compares the running SHA-256
+    + size against the manifest's recorded entry. Returns True iff
+    the artifact entry exists AND the streamed hash + size match.
+    """
+    from pathlib import Path
+    if not isinstance(abs_path, Path) or not abs_path.is_file():
+        return False
+    sha256, size = _stream_sha256_and_size(abs_path)
+    for entry in manifest.artifacts:
+        if entry.path == rel_path:
+            return entry.sha256 == sha256 and entry.size == size
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -664,11 +741,13 @@ __all__ = [
     "ReleaseManifest",
     "ReleaseManifestError",
     "add_artifact_entry",
+    "add_artifact_entry_from_path",
     "compute_manifest_id",
     "finalize",
     "new_manifest",
     "sign_manifest",
     "signable_payload",
     "verify_artifact_bytes",
+    "verify_artifact_path",
     "verify_manifest",
 ]
