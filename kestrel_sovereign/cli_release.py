@@ -35,12 +35,12 @@ from kestrel_sovereign.security.multikey import public_key_to_multibase
 from kestrel_sovereign.security.release_manifest import (
     ReleaseManifest,
     ReleaseManifestError,
-    add_artifact_entry,
+    add_artifact_entry_from_path,
     finalize,
     new_manifest,
     sign_manifest,
     signable_payload,
-    verify_artifact_bytes,
+    verify_artifact_path,
     verify_manifest,
 )
 
@@ -262,20 +262,17 @@ def cmd_release_sign(args) -> int:
     artifact_count = 0
     try:
         for rel_path, abs_path in _walk_artifacts(artifacts_dir, skip=skip):
-            # Per-file read keeps peak memory bounded by the largest
-            # single artifact rather than the whole release tree
-            # (codex P2 round 3).
+            # Streaming hash + size: peak memory is the 1 MiB chunk
+            # size set in release_manifest._stream_sha256_and_size,
+            # not the size of the file (codex P2 round 4).
             try:
-                content = abs_path.read_bytes()
-            except OSError as e:
-                print(f"error: artifact {rel_path!r} read failed: {e}", file=sys.stderr)
-                return 2
-            try:
-                manifest = add_artifact_entry(manifest, rel_path, content)
+                manifest = add_artifact_entry_from_path(manifest, rel_path, abs_path)
             except ReleaseManifestError as e:
                 print(f"error: artifact {rel_path!r}: {e}", file=sys.stderr)
                 return 2
-            del content  # release before reading the next file
+            except OSError as e:
+                print(f"error: artifact {rel_path!r} read failed: {e}", file=sys.stderr)
+                return 2
             artifact_count += 1
     except (FileNotFoundError, NotADirectoryError) as e:
         print(f"error: {e}", file=sys.stderr)
@@ -367,11 +364,13 @@ def cmd_release_verify(args) -> int:
             failed.append(f"{entry.path}: file not present in artifacts dir")
             continue
         try:
-            content = artifact_path.read_bytes()
+            # Streaming verify — peak memory bounded by chunk size,
+            # not by artifact size (codex P2 round 4).
+            ok = verify_artifact_path(manifest, entry.path, artifact_path)
         except OSError as e:
             failed.append(f"{entry.path}: read failed: {e}")
             continue
-        if not verify_artifact_bytes(manifest, entry.path, content):
+        if not ok:
             failed.append(f"{entry.path}: hash or size mismatch")
 
     if failed:

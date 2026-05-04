@@ -592,6 +592,53 @@ def test_verify_rejects_no_trusted_signer(signed_manifest):
     assert "must provide" in result.reason
 
 
+def test_streaming_add_artifact_matches_buffered(tmp_path, base_manifest):
+    """add_artifact_entry_from_path streams the file; result must
+    match the buffered ``add_artifact_entry`` for the same content."""
+    from kestrel_sovereign.security.release_manifest import (
+        add_artifact_entry, add_artifact_entry_from_path,
+    )
+    content = b"Q" * (3 * (1 << 20) + 17)  # 3 MiB + change → spans chunks
+    p = tmp_path / "big.bin"
+    p.write_bytes(content)
+
+    via_bytes = add_artifact_entry(base_manifest, "big.bin", content)
+    via_path = add_artifact_entry_from_path(base_manifest, "big.bin", p)
+    assert via_bytes.artifacts[0].sha256 == via_path.artifacts[0].sha256
+    assert via_bytes.artifacts[0].size == via_path.artifacts[0].size
+
+
+def test_streaming_verify_artifact_path(tmp_path, base_manifest, slh_kp):
+    """verify_artifact_path streams the file and returns the same
+    verdict verify_artifact_bytes would return."""
+    from kestrel_sovereign.security.release_manifest import (
+        add_artifact_entry_from_path, verify_artifact_path,
+    )
+    content = b"V" * (1 << 20 + 5)  # > 1 chunk
+    p = tmp_path / "v.bin"
+    p.write_bytes(content)
+    m = add_artifact_entry_from_path(base_manifest, "v.bin", p)
+    m = sign_manifest(m, slh_kp, kid="k")
+    m = finalize(m)
+    assert verify_artifact_path(m, "v.bin", p) is True
+
+    # Tamper a single byte
+    bad = bytearray(content)
+    bad[100] ^= 0x01
+    p.write_bytes(bytes(bad))
+    assert verify_artifact_path(m, "v.bin", p) is False
+
+
+def test_add_artifact_entry_from_path_rejects_directory(tmp_path, base_manifest):
+    from kestrel_sovereign.security.release_manifest import (
+        add_artifact_entry_from_path,
+    )
+    d = tmp_path / "is-a-dir"
+    d.mkdir()
+    with pytest.raises(ReleaseManifestError, match="not a file"):
+        add_artifact_entry_from_path(base_manifest, "x", d)
+
+
 def test_verify_handles_only_malformed_signature_entries(
     base_manifest, slh_kp, slh_pub_multibase,
 ):
