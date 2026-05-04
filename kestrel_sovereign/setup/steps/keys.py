@@ -64,13 +64,16 @@ def run(ctx: SetupContext) -> None:
 
 
 def _generate_fernet_key() -> str:
-    """Return a fresh Fernet key (44-char url-safe base64).
+    """Return a fresh AEADCipher master key (44-char url-safe base64).
 
-    Imported lazily so this module stays cheap at CLI parse time.
+    Same shape as the historical Fernet key it replaces — backwards-compatible
+    with KESTREL_DATA_KEY consumers, but generated through ``AEADCipher`` so
+    this module no longer pulls in ``cryptography.fernet`` directly. Imported
+    lazily so this module stays cheap at CLI parse time.
     """
-    from cryptography.fernet import Fernet
+    from kestrel_sdk.security.aead import AEADCipher
 
-    return Fernet.generate_key().decode("ascii")
+    return AEADCipher.generate_key().decode("ascii")
 
 
 def _generate_api_key() -> str:

@@ -373,16 +373,16 @@ class StorachaProvider(StorageProvider, CryostasisCapable):
     async def _encrypt_content(self, content: bytes) -> tuple:
         """Encrypt content using Fernet with a master-key-wrapped content key."""
         try:
-            from cryptography.fernet import Fernet
+            from kestrel_sdk.security.aead import AEADCipher
         except ImportError:
             raise ImportError("cryptography package required for encryption")
 
-        content_key = Fernet.generate_key()
-        f = Fernet(content_key)
+        content_key = AEADCipher.generate_key()
+        f = AEADCipher(content_key)
         encrypted = f.encrypt(content)
 
         master_key = self._get_master_key()
-        f_master = Fernet(master_key)
+        f_master = AEADCipher(master_key)
         encrypted_key = f_master.encrypt(content_key)
         key_hash = hashlib.sha256(encrypted_key).hexdigest()
 
@@ -395,7 +395,7 @@ class StorachaProvider(StorageProvider, CryostasisCapable):
     async def _decrypt_content(self, encrypted: bytes, key_hash: str) -> bytes:
         """Decrypt content using stored Fernet key."""
         try:
-            from cryptography.fernet import Fernet
+            from kestrel_sdk.security.aead import AEADCipher
         except ImportError:
             raise ImportError("cryptography package required for decryption")
 
@@ -407,10 +407,10 @@ class StorachaProvider(StorageProvider, CryostasisCapable):
             encrypted_key = fh.read()
 
         master_key = self._get_master_key()
-        f_master = Fernet(master_key)
+        f_master = AEADCipher(master_key)
         content_key = f_master.decrypt(encrypted_key)
 
-        f_content = Fernet(content_key)
+        f_content = AEADCipher(content_key)
         return f_content.decrypt(encrypted)
 
     def _get_master_key(self) -> bytes:
