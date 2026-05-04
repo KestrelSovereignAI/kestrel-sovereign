@@ -287,6 +287,7 @@ def test_ceremony_chain_passes_artifact_verification_post_cutoff(legacy_kestrel)
         artifact_payload=payload,
         artifact_signatures=artifact_signatures,
         policy=VerifyPolicy.HYBRID_REQUIRED,
+        did_web_resolver=lambda did: {"id": did, "verificationMethod": list(result.new_identity.did_document["verificationMethod"])} if did == result.new_identity.did else (_ for _ in ()).throw(ValueError(did)),
     )
 
     assert chain_verdict.ok, chain_verdict.reason
