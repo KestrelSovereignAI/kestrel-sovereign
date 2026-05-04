@@ -250,16 +250,14 @@ def test_constitution_drift_fails_when_file_changed(tmp_path, monkeypatch):
     drift_msgs = [m for m in report.fail if "constitution drift" in m]
     assert len(drift_msgs) == 1
     msg = drift_msgs[0]
-    # The message must include both hashes (truncated) so the user can
-    # see exactly what diverged. The reanchor CLI lands in a follow-up
-    # PR, so the message must NOT name a command that doesn't exist yet
-    # — instead it states that reanchor support is planned.
+    # The message must include both hashes (truncated) and a remediation
+    # hint that points at the actual CLI command. The "Test" agent name
+    # must appear in the suggested command, parameterised so users can
+    # copy-paste.
     assert hashlib.sha256(original).hexdigest()[:12] in msg
     assert hashlib.sha256(edited).hexdigest()[:12] in msg
-    assert "reanchor support is planned" in msg.lower()
-    assert "kestrel constitution reanchor" not in msg.lower(), (
-        "Drift message must not promise a CLI that does not exist yet"
-    )
+    assert "kestrel constitution reanchor --agent-name Test --force" in msg
+    assert "DB is backed up first" in msg
 
 
 def test_constitution_drift_warns_on_missing_hash_property(tmp_path, monkeypatch):
