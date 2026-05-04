@@ -10,11 +10,14 @@ name: Release sign
 
 on:
   push:
-    tags: ['v[0-9]+.[0-9]+.[0-9]+']
+    # GH Actions tag filters use glob, not regex — ``+`` is literal.
+    # Codex P1 round 1: the previous ``v[0-9]+.[0-9]+.[0-9]+`` would
+    # never match a real semver tag like ``v1.2.3``.
+    tags: ['v[0-9]*.[0-9]*.[0-9]*']
   workflow_dispatch:
     inputs:
       ref:
-        description: 'Tag or commit to sign'
+        description: 'Tag or commit to sign (e.g. v1.2.3)'
         required: true
 
 permissions:
@@ -64,24 +67,44 @@ jobs:
             --storage-dir ./release-keys \
             --key-id release-key
 
+      - name: Determine release tag
+        id: release_tag
+        # Codex P2: ${GITHUB_REF##*/} resolves to the workflow's run
+        # ref. For workflow_dispatch that's the *branch* the operator
+        # picked from the GitHub UI, not their typed-in inputs.ref.
+        # Use the explicit input for dispatch; fall back to GITHUB_REF
+        # for tag pushes.
+        run: |
+          if [ -n "${{ github.event.inputs.ref }}" ]; then
+            TAG="${{ github.event.inputs.ref }}"
+          else
+            TAG="${GITHUB_REF##*/}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Release tag: $TAG"
+
       - name: Sign release manifest
         env:
           KESTREL_DATA_KEY: ${{ secrets.KESTREL_DATA_KEY }}
-        # The signer DID is informational; the trust anchor is the
-        # multibase pubkey baked into release docs / verification
-        # pipelines. The CLI prints it to stderr; we capture into a
-        # file for upload alongside the manifest.
+        # Codex P1 round 1: the trusted-signer stderr capture cannot
+        # land inside ``./dist`` — the shell creates the file at
+        # redirect time, the CLI walks dist and hashes the (then-empty)
+        # capture file into the manifest, then the CLI writes stderr
+        # to it AFTER hashing. Self-verify would then see different
+        # bytes than the manifest claims.
+        # Write the capture under workflow scratch dir; copy to dist
+        # AFTER signing so it lives alongside the manifest.
         run: |
+          mkdir -p ./signing-stderr
           uv run kestrel release sign \
             --artifacts-dir ./dist \
-            --release-tag "${GITHUB_REF##*/}" \
+            --release-tag "${{ steps.release_tag.outputs.tag }}" \
             --key-id release-key \
             --signer-did "did:web:kestrelsovereignai.github.io" \
             --kid "release-key-1" \
             --output ./dist/release-manifest.json \
-            --storage-dir ./release-keys 2> ./dist/trusted-signer.txt
-          # Surface the multibase line on stdout for log audit
-          grep "trusted_signer_multibase" ./dist/trusted-signer.txt || true
+            --storage-dir ./release-keys 2> ./signing-stderr/trusted-signer.txt
+          grep "trusted_signer_multibase" ./signing-stderr/trusted-signer.txt || true
 
       - name: Self-verify the just-signed release
         env:
@@ -113,7 +136,7 @@ jobs:
           name: release-manifest
           path: |
             dist/release-manifest.json
-            dist/trusted-signer.txt
+            signing-stderr/trusted-signer.txt
           retention-days: 90
 
       - name: Attach signed manifest to GitHub Release
@@ -124,6 +147,6 @@ jobs:
             dist/*.whl
             dist/*.tar.gz
             dist/release-manifest.json
-            dist/trusted-signer.txt
+            signing-stderr/trusted-signer.txt
           fail_on_unmatched_files: true
           generate_release_notes: true
