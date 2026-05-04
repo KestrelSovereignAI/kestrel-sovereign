@@ -14,6 +14,8 @@ from kestrel_sovereign.security.key_rotation import (
     KeyRotationService,
     RotationRecord,
     RotationStatus,
+    _derive_agent_cipher,
+    _master_bytes_from_key,
 )
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 
@@ -116,24 +118,37 @@ class TestRotationEndToEnd:
     """
 
     @pytest.mark.asyncio
-    async def test_rotate_picks_up_both_legacy_and_v2_rows(self):
+    async def test_rotate_per_agent_hkdf_rows(self):
+        """The big regression #936 found: conversation_history rows are
+        encrypted with per-agent HKDF-derived ciphers (matches production
+        ``async_conversation_store.add_conversation``). Rotation must
+        derive the matching cipher per row, not use a single global
+        cipher. Pre-fix the global cipher couldn't decrypt these rows
+        and they were silently skipped — permanent rubble after a swap.
+        """
         db, path = await _fresh_db()
         try:
-            key_b64 = Fernet.generate_key()
-            old_cipher = AEADCipher(key_b64)
-            new_cipher = AEADCipher(Fernet.generate_key())
+            old_master = _master_bytes_from_key(Fernet.generate_key().decode())
+            new_master = _master_bytes_from_key(Fernet.generate_key().decode())
 
-            # 1 legacy Fernet row + 1 v2 row + 1 plaintext (must NOT be touched)
+            # Two different agents, each with their own HKDF-derived cipher
+            old_alice = _derive_agent_cipher(old_master, "alice")
+            old_bob = _derive_agent_cipher(old_master, "bob")
+
             await db.execute(
-                "INSERT INTO conversation_history (id, agent_id, role, content) VALUES (1, 'a', 'user', ?)",
-                (Fernet(key_b64).encrypt(b"legacy-payload").decode(),),
+                "INSERT INTO conversation_history (id, agent_id, role, content) "
+                "VALUES (1, 'alice', 'user', ?)",
+                (old_alice.encrypt(b"alice-secret").decode(),),
             )
             await db.execute(
-                "INSERT INTO conversation_history (id, agent_id, role, content) VALUES (2, 'a', 'user', ?)",
-                (old_cipher.encrypt(b"new-payload").decode(),),
+                "INSERT INTO conversation_history (id, agent_id, role, content) "
+                "VALUES (2, 'bob', 'user', ?)",
+                (old_bob.encrypt(b"bob-secret").decode(),),
             )
+            # Plaintext row — must NOT be touched
             await db.execute(
-                "INSERT INTO conversation_history (id, agent_id, role, content) VALUES (3, 'a', 'user', 'plaintext-row')"
+                "INSERT INTO conversation_history (id, agent_id, role, content) "
+                "VALUES (3, 'alice', 'user', 'plaintext-row')"
             )
 
             storage = MagicMock()
@@ -142,36 +157,92 @@ class TestRotationEndToEnd:
             service._save_rotation = AsyncMock()
 
             rotation = RotationRecord(
-                id="rot-1",
+                id="rot-per-agent",
                 started_at=datetime.now(timezone.utc),
                 old_key_hash="old",
                 new_key_hash="new",
                 status=RotationStatus.IN_PROGRESS,
             )
             await service._rotate_table(
-                rotation, old_cipher, new_cipher,
+                rotation, old_master, new_master,
                 table="conversation_history",
                 content_column="content",
                 id_column="id",
+                agent_id_column="agent_id",
             )
 
-            # Both encrypted rows processed; plaintext row left alone
-            assert rotation.records_processed == 2
+            assert rotation.records_processed == 2, (
+                "Both per-agent encrypted rows must rotate. Pre-fix only "
+                "the global cipher was tried and both rows would have "
+                "raised DecryptionError and been silently skipped."
+            )
 
-            # Both encrypted rows now under the new cipher
+            # Each row must now decrypt under its own NEW per-agent cipher
+            new_alice = _derive_agent_cipher(new_master, "alice")
+            new_bob = _derive_agent_cipher(new_master, "bob")
             rows = await db.fetchall(
-                "SELECT id, content FROM conversation_history ORDER BY id"
+                "SELECT id, agent_id, content FROM conversation_history ORDER BY id"
             )
-            assert new_cipher.decrypt(rows[0][1].encode()) == b"legacy-payload"
-            assert new_cipher.decrypt(rows[1][1].encode()) == b"new-payload"
-            # Plaintext row preserved verbatim
-            assert rows[2][1] == "plaintext-row"
-
-            # Old cipher must no longer decrypt the rotated rows
+            assert new_alice.decrypt(rows[0][2].encode()) == b"alice-secret"
+            assert new_bob.decrypt(rows[1][2].encode()) == b"bob-secret"
+            # Cross-agent ciphers must NOT decrypt each other's rows
             from kestrel_sdk.security.exceptions import DecryptionError
-            for _id, ct in rows[:2]:
-                with pytest.raises(DecryptionError):
-                    old_cipher.decrypt(ct.encode())
+            with pytest.raises(DecryptionError):
+                new_alice.decrypt(rows[1][2].encode())
+            with pytest.raises(DecryptionError):
+                new_bob.decrypt(rows[0][2].encode())
+            # Plaintext row preserved
+            assert rows[2][2] == "plaintext-row"
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_rotate_files_blob_column(self):
+        """``files.content`` is BLOB (bytes). Rotation must read/write
+        bytes without crashing on ``.encode()`` like the pre-fix code."""
+        db, path = await _fresh_db()
+        try:
+            old_master = _master_bytes_from_key(Fernet.generate_key().decode())
+            new_master = _master_bytes_from_key(Fernet.generate_key().decode())
+            old_global = AEADCipher(old_master)
+            new_global = AEADCipher(new_master)
+
+            # Insert as BLOB — bytes, not str (matches async_file_store.store_file)
+            blob_token = old_global.encrypt(b"file-bytes")
+            await db.execute(
+                "INSERT INTO files (content_hash, original_name, content) "
+                "VALUES ('h1', 'a.bin', ?)",
+                (blob_token,),
+            )
+
+            storage = MagicMock()
+            storage.database = db
+            service = KeyRotationService(storage=storage)
+            service._save_rotation = AsyncMock()
+
+            rotation = RotationRecord(
+                id="rot-blob",
+                started_at=datetime.now(timezone.utc),
+                old_key_hash="old",
+                new_key_hash="new",
+                status=RotationStatus.IN_PROGRESS,
+            )
+            await service._rotate_table(
+                rotation, old_master, new_master,
+                table="files",
+                content_column="content",
+                id_column="content_hash",
+                agent_id_column=None,
+            )
+
+            assert rotation.records_processed == 1, (
+                "BLOB row must rotate without crashing. Pre-fix "
+                "encrypted_content.encode() raised AttributeError on bytes."
+            )
+            row = await db.fetchval("SELECT content FROM files WHERE content_hash = 'h1'")
+            # The rewritten value must be bytes (preserves BLOB column type)
+            assert isinstance(row, bytes), f"BLOB column must store bytes, got {type(row)}"
+            assert new_global.decrypt(row) == b"file-bytes"
         finally:
             await db.close()
 
@@ -216,16 +287,18 @@ class TestRotationEndToEnd:
     async def test_rotation_resumability_skips_already_rotated_rows(self):
         db, path = await _fresh_db()
         try:
-            key_b64 = Fernet.generate_key()
-            old_cipher = AEADCipher(key_b64)
-            new_cipher = AEADCipher(Fernet.generate_key())
+            old_master = _master_bytes_from_key(Fernet.generate_key().decode())
+            new_master = _master_bytes_from_key(Fernet.generate_key().decode())
+            old_alice = _derive_agent_cipher(old_master, "a")
+            new_alice = _derive_agent_cipher(new_master, "a")
+
             await db.execute(
                 "INSERT INTO conversation_history (id, agent_id, role, content) VALUES (1, 'a', 'user', ?)",
-                (old_cipher.encrypt(b"first").decode(),),
+                (old_alice.encrypt(b"first").decode(),),
             )
             await db.execute(
                 "INSERT INTO conversation_history (id, agent_id, role, content) VALUES (2, 'a', 'user', ?)",
-                (old_cipher.encrypt(b"second").decode(),),
+                (old_alice.encrypt(b"second").decode(),),
             )
             # Pretend row 1 was already rotated in a previous (interrupted) run
             await db.execute(
@@ -246,57 +319,86 @@ class TestRotationEndToEnd:
                 status=RotationStatus.IN_PROGRESS,
             )
             await service._rotate_table(
-                rotation, old_cipher, new_cipher,
+                rotation, old_master, new_master,
                 table="conversation_history",
                 content_column="content",
                 id_column="id",
+                agent_id_column="agent_id",
             )
 
             # Only row 2 should have been processed this run
             assert rotation.records_processed == 1
 
-            # Row 1 still under old_cipher (untouched); row 2 under new_cipher
+            # Row 1 still under old_alice (untouched); row 2 under new_alice
             row1 = await db.fetchval("SELECT content FROM conversation_history WHERE id = 1")
             row2 = await db.fetchval("SELECT content FROM conversation_history WHERE id = 2")
-            assert old_cipher.decrypt(row1.encode()) == b"first"
-            assert new_cipher.decrypt(row2.encode()) == b"second"
+            assert old_alice.decrypt(row1.encode()) == b"first"
+            assert new_alice.decrypt(row2.encode()) == b"second"
         finally:
             await db.close()
 
     @pytest.mark.asyncio
     async def test_upgrade_to_aead_rewrites_legacy_fernet_in_place(self, monkeypatch):
-        """The eager AEAD upgrade path: same key, lifts v1 Fernet rows to v2."""
+        """The eager AEAD upgrade path: same key, lifts v1 Fernet rows to v2.
+
+        Reproduces a mixed corpus: one row written by the OLD global Fernet
+        path (key_version 0), one by the per-agent HKDF Fernet path
+        (key_version 1, what production uses today). Both must lift to v2;
+        per-agent rows must remain readable under the per-agent NEW cipher,
+        global rows under the global NEW cipher.
+        """
         db, path = await _fresh_db()
         try:
-            # Set up a runtime key so _validate_key + get_fernet agree
             passphrase = "the-runtime-passphrase"
             monkeypatch.setenv("KESTREL_DATA_KEY", passphrase)
 
-            # Insert legacy Fernet rows under the runtime-derived key
-            runtime_cipher = encryption.get_fernet()
-            # The runtime cipher emits v2; force a Fernet row by going around it
-            import hashlib, base64 as _b64
-            digest = hashlib.sha256(passphrase.encode()).digest()
-            legacy_token = Fernet(_b64.urlsafe_b64encode(digest)).encrypt(b"legacy").decode()
+            master = _master_bytes_from_key(passphrase)
+            # Row 1: legacy global Fernet (matches pre-v1 / no-agent-id corpus)
+            global_b64 = master  # same shape Fernet expects
+            global_legacy = Fernet(global_b64).encrypt(b"global-legacy").decode()
             await db.execute(
-                "INSERT INTO conversation_history (id, agent_id, role, content) VALUES (1, 'a', 'user', ?)",
-                (legacy_token,),
+                "INSERT INTO conversation_history (id, agent_id, role, content) "
+                "VALUES (1, 'a', 'user', ?)",
+                (global_legacy,),
+            )
+            # Row 2: per-agent Fernet (matches what add_conversation writes today
+            # for an agent with key_version=1)
+            import base64 as _b64
+            agent_derived = _derive_agent_cipher(master, "a")
+            # Reproduce the per-agent Fernet path by raw HKDF + base64 → Fernet
+            from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+            from cryptography.hazmat.primitives import hashes as _h
+            hkdf = HKDF(algorithm=_h.SHA256(), length=32, salt=b"a", info=b"kestrel-agent-v1")
+            agent_raw = hkdf.derive(master)
+            agent_legacy = Fernet(_b64.urlsafe_b64encode(agent_raw)).encrypt(b"agent-legacy").decode()
+            await db.execute(
+                "INSERT INTO conversation_history (id, agent_id, role, content) "
+                "VALUES (2, 'a', 'user', ?)",
+                (agent_legacy,),
             )
 
             storage = MagicMock()
             storage.database = db
             service = KeyRotationService(storage=storage)
-            await service.initialize()  # creates tracking tables (idempotent)
+            await service.initialize()  # idempotent
 
-            rotation_id = await service.upgrade_to_aead()
+            await service.upgrade_to_aead()
             await service.drain_rotations()
 
-            row = await db.fetchval("SELECT content FROM conversation_history WHERE id = 1")
-            # Must now be v2 (KSAv2:) and decrypt under runtime cipher
-            assert row.startswith("KSAv2:"), (
-                f"upgrade_to_aead must rewrite the row as v2, got: {row[:20]!r}"
+            rows = await db.fetchall(
+                "SELECT id, content FROM conversation_history ORDER BY id"
             )
-            assert runtime_cipher.decrypt(row.encode()) == b"legacy"
+            assert all(r[1].startswith("KSAv2:") for r in rows), (
+                f"All rows must be lifted to v2; got prefixes "
+                f"{[r[1][:10] for r in rows]}"
+            )
+
+            # Row 1 (originally global Fernet) decrypts under the per-agent NEW
+            # cipher because the upgrade rewrites every per-agent table row
+            # under the per-agent cipher (matches production write semantics
+            # post-Wave-0C).
+            assert agent_derived.decrypt(rows[0][1].encode()) == b"global-legacy"
+            assert agent_derived.decrypt(rows[1][1].encode()) == b"agent-legacy"
         finally:
             await db.close()
 
