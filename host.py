@@ -101,9 +101,7 @@ def load_multi_agent_config() -> MultiAgentConfig:
     a PORT env var. Override the host port to match so the container binds
     to the correct port.
     """
-    from kestrel_sovereign.multi_agent.compat import get_config_env_value
-
-    config_path = get_config_env_value()
+    config_path = os.environ.get("KESTREL_MULTI_AGENT_CONFIG")
     if config_path:
         config = MultiAgentConfig.load(config_path)
     else:

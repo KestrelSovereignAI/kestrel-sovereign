@@ -74,7 +74,7 @@ def resolve_multi_agent_path(env: dict | os._Environ) -> Path:
      Inputs                        Result
     ============================  =====================================
      KESTREL_MULTI_AGENT_CONFIG    Honour it verbatim (operator opted in
-       (or legacy ROOKERY name)    to a specific path)
+       set                          to a specific path)
      KESTREL_DEMO_SERVER=1 + no    Refuse to auto-mount the project-root
        explicit config + the       ``multi_agent.toml``.  Returns a path that
        default ``multi_agent.toml``    does not exist so the lifespan skips
@@ -95,27 +95,11 @@ def resolve_multi_agent_path(env: dict | os._Environ) -> Path:
         caller still uses ``.exists()`` to decide whether to enter
         multi-agent mode.
     """
-    from kestrel_sovereign.multi_agent.compat import (
-        find_existing_config,
-        get_config_env_value,
-        is_config_env_var_set,
-        NEW_CONFIG_FILENAME,
-    )
-
-    explicit = get_config_env_value(env)
-    if explicit:
-        multi_agent_path = Path(explicit)
-    else:
-        # No explicit env var: look for the new filename, then fall back
-        # to the legacy rookery.toml. find_existing_config emits a
-        # one-time deprecation warning when it returns the legacy path.
-        existing = find_existing_config(Path.cwd())
-        multi_agent_path = existing if existing else Path(NEW_CONFIG_FILENAME)
-
+    multi_agent_path = Path(env.get("KESTREL_MULTI_AGENT_CONFIG", "multi_agent.toml"))
     demo_server_env = env.get("KESTREL_DEMO_SERVER", "").lower() in (
         "1", "true", "yes",
     )
-    multi_agent_explicit = is_config_env_var_set(env)
+    multi_agent_explicit = "KESTREL_MULTI_AGENT_CONFIG" in env
     if demo_server_env and not multi_agent_explicit and multi_agent_path.exists():
         logger.warning(
             "[demo-server] KESTREL_DEMO_SERVER=1 with no explicit "

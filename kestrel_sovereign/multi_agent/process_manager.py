@@ -398,10 +398,7 @@ class ProcessManager:
         # Force child agents into single-agent mode. Without this,
         # server.py detects multi_agent.toml in the CWD and enters multi-
         # agent mode, leaving app.state.agent = None → 503 on all endpoints.
-        # Also clears the legacy ROOKERY env var so it can't shadow the
-        # __none__ sentinel via the compat fallback.
-        from kestrel_sovereign.multi_agent.compat import write_config_env_value
-        write_config_env_value(env, "__none__")
+        env["KESTREL_MULTI_AGENT_CONFIG"] = "__none__"
 
         # Per-agent data key: KESTREL_DATA_KEY_CLAW overrides KESTREL_DATA_KEY
         agent_key_var = f"KESTREL_DATA_KEY_{name.upper()}"

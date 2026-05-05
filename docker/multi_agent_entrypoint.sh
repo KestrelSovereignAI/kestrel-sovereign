@@ -19,16 +19,6 @@ while IFS='=' read -r key val; do
 done < <(env)
 
 PORT="${PORT:-8080}"
-
-# Backward compat: accept KESTREL_ROOKERY_CONFIG (legacy) if the new
-# name isn't set. The Python loader emits a deprecation warning when
-# the legacy path is used; that warning hits the application logs.
-if [ -z "${KESTREL_MULTI_AGENT_CONFIG}" ] && [ -n "${KESTREL_ROOKERY_CONFIG}" ]; then
-    echo "WARNING: KESTREL_ROOKERY_CONFIG is set but KESTREL_MULTI_AGENT_CONFIG is not."
-    echo "         The legacy ROOKERY name is deprecated; rename to MULTI_AGENT_CONFIG."
-    export KESTREL_MULTI_AGENT_CONFIG="${KESTREL_ROOKERY_CONFIG}"
-fi
-
 MULTI_AGENT_CONFIG="${KESTREL_MULTI_AGENT_CONFIG:-/app/multi_agent.toml}"
 AGENT_DATA_DIR="${KESTREL_AGENT_DATA_DIR:-/app/agent_data}"
 

@@ -79,11 +79,8 @@ node_modules/
 npm-debug.log
 yarn-error.log
 
-# Local config (like .env — user-specific, not committed).
-# Both names listed: rookery.toml is the legacy name kept for backward
-# compat — see docs/migrations/rookery_to_multi_agent.md.
+# Local config (like .env — user-specific, not committed)
 multi_agent.toml
-rookery.toml
 
 # Data and caches
 agent_data/

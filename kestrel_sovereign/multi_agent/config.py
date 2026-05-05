@@ -294,37 +294,10 @@ class MultiAgentConfig(BaseModel):
         Returns:
             MultiAgentConfig instance
         """
-        from kestrel_sovereign.multi_agent.compat import (
-            LEGACY_CONFIG_FILENAME,
-            find_existing_config,
-        )
-
         if config_path is None:
-            # Look for the new filename, then the legacy rookery.toml.
-            existing = find_existing_config(Path.cwd())
-            if existing is not None:
-                config_path = existing
-            else:
-                config_path = Path.cwd() / MULTI_AGENT_CONFIG_FILENAME
+            config_path = Path.cwd() / MULTI_AGENT_CONFIG_FILENAME
 
         path = Path(config_path)
-
-        # Compat: caller passed an explicit path pointing at the new
-        # filename (e.g. project_dir / "multi_agent.toml") that doesn't
-        # exist. Look for rookery.toml in the same directory before
-        # falling through to auto-discovery, so existing installs that
-        # never renamed their config keep working.
-        if (
-            not path.exists()
-            and path.name == MULTI_AGENT_CONFIG_FILENAME
-        ):
-            legacy_sibling = path.with_name(LEGACY_CONFIG_FILENAME)
-            if legacy_sibling.exists():
-                from kestrel_sovereign.multi_agent.compat import (
-                    _warn_legacy_filename,
-                )
-                _warn_legacy_filename(legacy_sibling)
-                path = legacy_sibling
 
         if path.exists():
             logger.info(f"Loading multi_agent config from {path}")
