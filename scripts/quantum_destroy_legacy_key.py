@@ -186,20 +186,25 @@ def _check_hybrid_keys(agent_data: Path, slug: str) -> bool:
 
 
 def _check_https_did_doc(succession_path: Path) -> bool:
-    """Optional: confirm the new DID document is reachable over HTTPS."""
+    """Optional: confirm the new DID document is reachable over HTTPS.
+
+    Uses ``identity.did_web.did_to_url`` rather than hand-rolling
+    the URL: the helper handles host-only DIDs (``did:web:example.com``
+    resolves to ``/.well-known/did.json``), percent-encoded ports
+    (``did:web:host%3A8443:agent``), and other edge cases the spec
+    permits.
+    """
     statement = json.loads(succession_path.read_text())
     new_did = statement.get("successor_did", "")
     if not new_did.startswith("did:web:"):
         _warn(f"successor_did is not did:web: ({new_did}); skipping HTTPS check")
         return True
-    rest = new_did.removeprefix("did:web:")
-    parts = rest.split(":")
-    if not parts:
-        _err(f"malformed did:web: {new_did}")
+    try:
+        from kestrel_sovereign.identity.did_web import did_to_url
+        url = did_to_url(new_did)
+    except Exception as e:
+        _err(f"could not derive HTTPS URL from {new_did}: {e}")
         return False
-    domain = parts[0]
-    path_segments = parts[1:]
-    url = f"https://{domain}/" + "/".join(path_segments) + "/did.json"
     _info(f"checking {url}")
     try:
         import urllib.request
@@ -299,11 +304,29 @@ def main() -> int:
         return 1
     _ok(f"succession statement: {succession_path}")
     statement = json.loads(succession_path.read_text())
-    slug = statement.get("successor_did", "").rsplit(":", 1)[-1]
-    if not slug:
-        _err("could not derive slug from succession statement's successor_did")
+    # Derive slug by globbing for the hybrid classical-key file rather
+    # than parsing successor_did. The DID may include extra path
+    # segments (``did:web:domain:agent:v1``) where rsplit(':',1)[-1]
+    # returns 'v1' instead of the actual key-file prefix 'agent'.
+    # Same pattern as runtime_identity._detect_hybrid_slug.
+    classical_candidates = sorted(agent_data.glob("*_ed25519.key.enc"))
+    if not classical_candidates:
+        _err(
+            f"no hybrid classical key (*_ed25519.key.enc) in {agent_data}; "
+            f"the rotation ceremony either didn't run or its output is "
+            f"incomplete. Refusing to destroy the legacy key — that would "
+            f"strand the agent without a usable signing keypair."
+        )
         return 1
-    _info(f"derived slug: {slug}")
+    if len(classical_candidates) > 1:
+        _err(
+            f"multiple hybrid classical keys in {agent_data}: "
+            f"{[c.name for c in classical_candidates]}. Resolve before "
+            f"destroying."
+        )
+        return 1
+    slug = classical_candidates[0].name.removesuffix("_ed25519.key.enc")
+    _info(f"derived slug from key files: {slug}")
 
     _step("Gate 2: rollback window expired")
     if not _check_rollback_window(succession_path, args.rollback_window_days):
