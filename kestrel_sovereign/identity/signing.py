@@ -306,79 +306,48 @@ def _verify_v2_signatures(
         public_key_to_multibase,
     )
 
-    # Trust anchor resolution. The receiver needs a TRUSTED source
-    # for the claimed agent's hybrid VMs (never trust the package's
-    # self-supplied VMs). Resolution order:
+    # Trust anchor: load the agent's hybrid identity from the
+    # receiver's local agent_data. This is the same convention the
+    # legacy ECDSA path uses — the receiver's local custody IS the
+    # trust anchor. We never trust the package's self-supplied VMs.
     #
-    # 1. Receiver's local agent_data: if the receiver has already
-    #    completed the rotation ceremony for this agent (e.g. self
-    #    re-importing, or an operator who has key custody), the local
-    #    AgentIdentity is the authoritative source.
-    # 2. did:web HTTPS resolution: cross-substrate import — the
-    #    receiver doesn't have the agent's keys, but the agent's
-    #    new hybrid identity is published at a domain-controlled
-    #    HTTPS endpoint. Fetch the DID document and use ITS VMs.
-    #    This is the standard portability path.
-    # 3. Otherwise: refuse. did:pkh agents have no public anchor;
-    #    inter-agent transfer requires the receiver to have already
-    #    obtained a trusted copy of the agent's state.
-    trusted_vms = None
-    trust_source = "unknown"
+    # Cross-substrate import (Agent A exports → Agent B imports
+    # without local custody) is a future extension that requires the
+    # package to carry a SIGNED SUCCESSION CHAIN binding package.did
+    # to the new did:web identity, and the receiver to walk that
+    # chain via verify_artifact_against_chain. The naive shortcut of
+    # fetching whatever did:web URI the package claims is unsafe:
+    # an attacker can publish their own did:web, claim it as the
+    # successor of any victim DID, and self-validate. Until the
+    # in-package chain shape is implemented, this path requires
+    # local custody and rejects cross-substrate cleanly.
     try:
         from kestrel_sovereign.identity.runtime_identity import (
             load_agent_identity,
         )
         key_id = get_key_id(package.did)
         anchor = load_agent_identity(key_id, storage_dir=storage_dir)
-        if not anchor.is_hybrid:
-            return False, (
-                f"Package claims hybrid signatures for {package.did!r} "
-                f"but the receiver's local identity for that DID is "
-                f"legacy-only. Run the rotation ceremony before "
-                f"accepting hybrid packages."
-            )
-        trusted_vms = anchor.new_verification_methods or []
-        trust_source = "local"
     except FileNotFoundError:
-        # No local custody — try to resolve the SUCCESSOR via did:web.
-        # The package's verification_methods carry the kids/multibase
-        # but we don't trust them yet; we use them only to find the
-        # claimed successor DID's controller field. If it's did:web,
-        # fetch the canonical document.
-        successor_did = None
-        for vm in (package.verification_methods or []):
-            ctrl = vm.get("controller")
-            if ctrl and ctrl.startswith("did:web:"):
-                successor_did = ctrl
-                break
-        if not successor_did:
-            return False, (
-                f"Cannot verify v2 package: no local identity for "
-                f"{package.did!r} and the package's verification "
-                f"methods don't reference a did:web successor — no "
-                f"public trust anchor available. Receiver needs to "
-                f"either have local custody or the package must "
-                f"declare a did:web successor controller."
-            )
-        try:
-            from kestrel_sovereign.identity.did_web import resolve as did_web_resolve
-            resolved = did_web_resolve(successor_did)
-            trusted_vms = list(resolved.get("verificationMethod", []))
-            trust_source = f"did:web HTTPS ({successor_did})"
-        except Exception as e:
-            return False, (
-                f"did:web resolution of {successor_did!r} failed: {e}. "
-                f"Receiver cannot establish a trust anchor for "
-                f"{package.did!r}."
-            )
+        return False, (
+            f"Cannot verify v2 hybrid package: no local identity "
+            f"for {package.did!r}. Cross-substrate import of hybrid "
+            f"packages requires the receiver to have local key "
+            f"custody for the claimed agent (a trusted root anchor). "
+            f"Inter-substrate transfer over an untrusted network "
+            f"will land in a follow-up that ships a chain-bound "
+            f"package format."
+        )
     except Exception as e:
         return False, f"Failed to load trusted identity: {e}"
 
-    if not trusted_vms:
+    if not anchor.is_hybrid:
         return False, (
-            f"No trusted verification methods resolved for {package.did!r}"
+            f"Package claims hybrid signatures for {package.did!r} but "
+            f"the receiver's trusted identity for that DID is legacy-only. "
+            f"Run the rotation ceremony before accepting hybrid packages."
         )
-    logger.debug(f"Resolved trust anchor for {package.did!r} via {trust_source}")
+
+    trusted_vms = anchor.new_verification_methods or []
 
     kid_to_pub: dict = {}
     trusted_kids_to_mb: dict = {}
