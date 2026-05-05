@@ -253,6 +253,70 @@ def test_v1_package_with_synthetic_signatures_array_uses_legacy_verify(
 # Inconsistent post-ceremony state must NOT silently downgrade to legacy
 # ---------------------------------------------------------------------------
 
+def test_attacker_cannot_self_validate_with_own_keys(
+    post_ceremony_agent_dir, tmp_path,
+):
+    """Codex P1 defense: an attacker creates a package claiming the
+    victim's DID, embeds their OWN hybrid keys in verification_methods,
+    signs with those keys. The receiver must reject because the
+    package's keys don't match the receiver's trusted anchor.
+    """
+    storage_dir, _, victim_did, _, _ = post_ceremony_agent_dir
+
+    # Attacker mints their own legacy + hybrid identity
+    from kestrel_sovereign.identity.did_web import build_verification_methods
+    from kestrel_sovereign.identity.rotation_ceremony import run_rotation_ceremony
+    from kestrel_sovereign.identity.hybrid_keypair import sign_hybrid
+
+    attacker_dir = tmp_path / "attacker"
+    attacker_dir.mkdir()
+    secp = Secp256k1Suite()
+    attacker_legacy = secp.generate_keypair()
+    attacker_address = public_key_to_ethereum_address(attacker_legacy.public_key)
+    attacker_did = f"did:pkh:eip155:1:{attacker_address}"
+    attacker_legacy_vms = build_verification_methods(
+        attacker_did, [(secp, attacker_legacy.public_key)],
+    )
+    attacker_archival = SLHDSASHA2128sSuite().generate_keypair()
+    attacker_result = run_rotation_ceremony(
+        predecessor_did=attacker_did,
+        predecessor_keypair=attacker_legacy,
+        predecessor_kid=attacker_legacy_vms[0]["id"].rsplit("#", 1)[-1],
+        predecessor_verification_methods=attacker_legacy_vms,
+        new_did_domain="evil.example",
+        new_did_slug="impersonator",
+        reason="attacker forge",
+        archival_keypair=attacker_archival,
+    )
+
+    # Attacker forges a package claiming victim_did, embeds the
+    # attacker's hybrid VMs, signs with the attacker's hybrid keys.
+    forged = _make_package(victim_did)
+    forged.verification_methods = list(
+        attacker_result.new_identity.did_document["verificationMethod"]
+    )
+    forged.content_hash = forged.compute_content_hash()
+    classical_kid = forged.verification_methods[0]["id"].rsplit("#", 1)[-1]
+    pq_kid = forged.verification_methods[1]["id"].rsplit("#", 1)[-1]
+    forged.signatures = sign_hybrid(
+        forged.content_hash.encode("utf-8"),
+        attacker_result.new_identity.keypair,
+        classical_kid=classical_kid,
+        pq_kid=pq_kid,
+    )
+
+    # Receiver tries to verify against the VICTIM's storage_dir
+    # (the trusted anchor for victim_did). Must reject — the forged
+    # package's keys don't match the receiver's trusted identity.
+    ok, msg = verify_package_signature(forged, storage_dir=storage_dir)
+    assert not ok
+    assert (
+        "trusted" in msg.lower()
+        or "match" in msg.lower()
+        or "tamper" in msg.lower()
+    )
+
+
 def test_corrupt_succession_state_does_not_silently_downgrade(
     post_ceremony_agent_dir,
 ):

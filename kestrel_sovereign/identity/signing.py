@@ -245,7 +245,7 @@ def verify_package_signature(
         for s in (package.signatures or [])
     )
     if has_hybrid_sig:
-        return _verify_v2_signatures(package)
+        return _verify_v2_signatures(package, storage_dir)
 
     # Step 3: legacy v1 fallback
     if not package.signature:
@@ -278,33 +278,64 @@ def verify_package_signature(
 
 def _verify_v2_signatures(
     package: AgentIdentityPackage,
+    storage_dir: Optional[Path] = None,
 ) -> Tuple[bool, str]:
     """Verify the v2 ``signatures`` array on a hybrid identity package.
 
     Both ed25519 AND ml-dsa-65 signatures must be present and crypto-
-    verify. Stripping the PQ half (leaving only the classical) is
-    rejected — that's the canonical attack hybrid identity defends
-    against.
+    verify. Stripping the PQ half is rejected (HYBRID_REQUIRED).
 
-    Public keys come from ``package.verification_methods`` embedded in
-    the package itself: each entry's ``id`` ends in ``#<kid>`` matching
-    a ``signatures.kid``, and ``publicKeyMultibase`` carries the raw
-    pubkey in W3C Multikey form. No network fetch needed.
+    **Trust anchor**: the receiver's local AgentIdentity (loaded from
+    ``storage_dir``), NOT the verification_methods embedded inside
+    the package. Codex P1 catch: an attacker could otherwise create
+    a package claiming a victim DID, embed their own keys in the
+    package's verification_methods, sign with those keys, and have
+    self-validation succeed. We resolve pubkeys from the receiver's
+    actual on-disk identity for the claimed ``package.did`` and
+    require the package's verification_methods to MATCH (anti-tamper)
+    — but we never *trust* the package's own VMs as the source of truth.
     """
     from kestrel_sovereign.security.crypto_suite import (
         ALG_ED25519, ALG_ML_DSA_65, get_suite,
     )
-    from kestrel_sovereign.security.multikey import multibase_to_public_key
+    from kestrel_sovereign.security.multikey import (
+        multibase_to_public_key,
+        public_key_to_multibase,
+    )
 
-    if not package.verification_methods:
+    # Trust anchor: load the agent's actual hybrid identity from the
+    # receiver's local storage_dir. This is the SAME convention the
+    # legacy ECDSA path uses (load_kestrel_identity off the receiver's
+    # disk) — never trust the package's self-supplied VMs.
+    try:
+        from kestrel_sovereign.identity.runtime_identity import (
+            load_agent_identity,
+        )
+        key_id = get_key_id(package.did)
+        anchor = load_agent_identity(key_id, storage_dir=storage_dir)
+    except FileNotFoundError:
         return False, (
-            "v2 signatures present but verification_methods missing — "
-            "cannot resolve kids to public keys"
+            f"Cannot verify v2 package: no trusted identity for "
+            f"{package.did!r} in receiver's storage_dir. v2 hybrid "
+            f"verification requires the receiver to already know the "
+            f"agent's hybrid identity (e.g. via a fetched did:web "
+            f"document or local key custody)."
+        )
+    except Exception as e:
+        return False, f"Failed to load trusted identity: {e}"
+
+    if not anchor.is_hybrid:
+        return False, (
+            f"Package claims hybrid signatures for {package.did!r} but "
+            f"the receiver's trusted identity for that DID is legacy-only. "
+            f"Run the rotation ceremony before accepting hybrid packages."
         )
 
-    # Build kid -> (alg, public_key) from the package's VMs
+    # Build kid -> (alg, pubkey) from the TRUSTED anchor's VMs.
+    trusted_vms = anchor.new_verification_methods or []
     kid_to_pub: dict = {}
-    for vm in package.verification_methods:
+    trusted_kids_to_mb: dict = {}
+    for vm in trusted_vms:
         vm_id = vm.get("id") or ""
         kid = vm_id.rsplit("#", 1)[-1] if "#" in vm_id else vm_id
         mb = vm.get("publicKeyMultibase")
@@ -313,9 +344,34 @@ def _verify_v2_signatures(
         try:
             suite, pub = multibase_to_public_key(mb)
         except Exception as e:
-            logger.warning(f"VM {kid!r} multibase decode failed: {e}")
+            logger.warning(f"trusted VM {kid!r} multibase decode failed: {e}")
             continue
         kid_to_pub[kid] = (suite.alg_id, pub)
+        trusted_kids_to_mb[kid] = mb
+
+    # Anti-tamper: every VM the package SAYS it was signed under must
+    # match (kid + multibase) one of the trusted VMs. A package
+    # carrying VMs that don't match the trusted anchor is rejected
+    # before any crypto verify — so an attacker can't smuggle their
+    # own keys into the receiver's verification path.
+    pkg_vms = package.verification_methods or []
+    if not pkg_vms:
+        return False, (
+            "v2 hybrid signatures present but package has no "
+            "verification_methods to cross-check against trusted anchor"
+        )
+    for vm in pkg_vms:
+        vm_id = vm.get("id") or ""
+        kid = vm_id.rsplit("#", 1)[-1] if "#" in vm_id else vm_id
+        mb = vm.get("publicKeyMultibase")
+        trusted_mb = trusted_kids_to_mb.get(kid)
+        if trusted_mb is None or trusted_mb != mb:
+            return False, (
+                f"Package verification_method kid={kid!r} does not match "
+                f"the receiver's trusted identity for {package.did!r}. "
+                f"Package may have been tampered with, or the receiver's "
+                f"local identity is stale."
+            )
 
     payload = package.content_hash.encode("utf-8")
     algs_seen: set = set()
