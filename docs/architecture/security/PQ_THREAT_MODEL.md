@@ -1,6 +1,8 @@
 # Post-Quantum Threat Model
 
-**Status:** Wave 0A deliverable. Companion to [`CRYPTOGRAPHIC_INVENTORY`](CRYPTO_INVENTORY.md). Drives the wave plan in [`POST_QUANTUM_CRYPTOGRAPHY_MIGRATION.md`](POST_QUANTUM_CRYPTOGRAPHY_MIGRATION.md) (PRD-v2).
+**Status:** Wave 0A deliverable, threats now mitigated by waves 1–5 (May 2026). The threats below remain relevant — a threat model doesn't expire when defenses ship — but each is now addressed by a specific control. See [`SECURITY_OVERVIEW.md`](SECURITY_OVERVIEW.md) for the operator-facing summary or [`POST_QUANTUM_CRYPTOGRAPHY_MIGRATION.md`](POST_QUANTUM_CRYPTOGRAPHY_MIGRATION.md) for the wave-by-wave map.
+
+**Companion to:** [`SECURITY_OVERVIEW.md`](SECURITY_OVERVIEW.md), [`CRYPTOGRAPHIC_INVENTORY`](CRYPTO_INVENTORY.md), [`POST_QUANTUM_CRYPTOGRAPHY_MIGRATION.md`](POST_QUANTUM_CRYPTOGRAPHY_MIGRATION.md).
 
 ## What we are defending
 
