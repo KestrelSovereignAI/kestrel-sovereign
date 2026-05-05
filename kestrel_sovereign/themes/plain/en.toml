@@ -11,9 +11,6 @@ locale = "en"
 
 [labels]
 
-# Page-level
-document_title = "Kestrel Sovereign Console"
-
 # Navigation tabs
 tab_identity = "Identity"
 tab_chat = "Chat"
@@ -29,10 +26,8 @@ tab_security = "Security"
 
 # Sidebars
 sidebar_agents = "Agents"
-sidebar_conversations = "Conversations"
 btn_collapse = "Collapse"
 btn_new_conversation = "New Conversation"
-btn_show_trash = "Show Trash"
 empty_conversations = "Select an agent to view conversations"
 loading_agents = "Loading agents..."
 loading_trash = "Loading trash…"
@@ -95,6 +90,10 @@ sovereignty_db_explorer = "Database Explorer"
 sovereignty_db_description = "Read-only view of agent database tables and contents."
 sovereignty_ipfs_network = "IPFS Network"
 sovereignty_ipfs_description = "Check connectivity to local IPFS node and public gateways."
+sovereignty_display = "Display"
+sovereignty_display_description = "Choose a UI theme and language. Stored locally on this device."
+theme_picker_label = "Theme"
+locale_picker_label = "Language"
 btn_export_ipfs = "Export to IPFS"
 btn_import_cid = "Import from CID"
 btn_browse_local_files = "Browse Local Files"
@@ -121,7 +120,6 @@ resources_wallet_title = "Wallet"
 resources_usage_title = "Usage (Last 30 Days)"
 btn_add_key = "+ Add Key"
 btn_unlock = "Unlock"
-loading_generic = "Loading..."
 loading_keys = "Loading keys..."
 loading_platform = "Loading platform access..."
 loading_wallet = "Loading wallet..."

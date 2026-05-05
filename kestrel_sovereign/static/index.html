@@ -6,6 +6,8 @@
     <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
     <title>Kestrel Sovereign Console</title>
     <script src="js/icons.js"></script>
+    <script src="js/theme.js"></script>
+    <script src="js/theme_picker.js"></script>
     <style>
         /* Theme-aware CSS using system preferences */
         :root {
@@ -1187,12 +1189,12 @@
             <h1 id="nav-agent-name">Kestrel</h1>
         </div>
         <div class="nav-tabs">
-            <button class="nav-tab active" data-panel="identity">Identity</button>
-            <button class="nav-tab" data-panel="chat">Chat</button>
-            <button class="nav-tab" data-panel="constitution">Constitution</button>
-            <button class="nav-tab" data-panel="memories">Memories</button>
+            <button class="nav-tab active" data-panel="identity" data-label-key="tab_identity">Identity</button>
+            <button class="nav-tab" data-panel="chat" data-label-key="tab_chat">Chat</button>
+            <button class="nav-tab" data-panel="constitution" data-label-key="tab_constitution">Constitution</button>
+            <button class="nav-tab" data-panel="memories" data-label-key="tab_memories">Memories</button>
             <button class="nav-tab" data-panel="tasks">
-                Tasks
+                <span data-label-key="tab_tasks">Tasks</span>
                 <span id="tasks-badge" style="
                     display: none;
                     background: var(--accent-color);
@@ -1204,13 +1206,13 @@
                     font-weight: 600;
                 ">0</span>
             </button>
-            <button class="nav-tab" data-panel="sovereignty">Sovereignty</button>
-            <button class="nav-tab" data-panel="resources">Resources</button>
-            <button class="nav-tab" data-panel="metrics">Metrics</button>
-            <button class="nav-tab" data-panel="spawn">Spawn</button>
-            <button class="nav-tab" data-panel="features">Features</button>
+            <button class="nav-tab" data-panel="sovereignty" data-label-key="tab_sovereignty">Sovereignty</button>
+            <button class="nav-tab" data-panel="resources" data-label-key="tab_resources">Resources</button>
+            <button class="nav-tab" data-panel="metrics" data-label-key="tab_metrics">Metrics</button>
+            <button class="nav-tab" data-panel="spawn" data-label-key="tab_spawn">Spawn</button>
+            <button class="nav-tab" data-panel="features" data-label-key="tab_features">Features</button>
             <button class="nav-tab" data-panel="security">
-                <span class="ki ki-lock"></span> Security
+                <span class="ki ki-lock"></span> <span data-label-key="tab_security">Security</span>
                 <span id="security-pending-badge" style="
                     display: none;
                     background: var(--error);
@@ -1233,11 +1235,11 @@
         <!-- Agents Pane (Rookery) -->
         <aside id="agents-pane" class="pane-sidebar">
             <div class="pane-header">
-                <h3>Agents</h3>
-                <button id="collapse-agents-btn" class="collapse-btn" title="Collapse">‹</button>
+                <h3 data-label-key="sidebar_agents">Agents</h3>
+                <button id="collapse-agents-btn" class="collapse-btn" data-label-attr-title="btn_collapse" title="Collapse">‹</button>
             </div>
             <div id="agents-list" class="pane-content">
-                <div class="loading">Loading agents...</div>
+                <div class="loading" data-label-key="loading_agents">Loading agents...</div>
             </div>
             <div id="resize-agents" class="resize-handle"></div>
         </aside>
@@ -1246,15 +1248,15 @@
         <aside id="conversations-pane" class="pane-sidebar" style="display: none;">
             <div class="pane-header">
                 <h3 id="conversations-pane-title">Conversations</h3>
-                <button id="new-conversation-sidebar-btn" class="btn-icon" title="New Conversation">+</button>
+                <button id="new-conversation-sidebar-btn" class="btn-icon" data-label-attr-title="btn_new_conversation" title="New Conversation">+</button>
                 <button id="trash-toggle-btn" class="btn-icon" title="Show Trash" data-mode="conversations">🗑</button>
-                <button id="collapse-conversations-btn" class="collapse-btn" title="Collapse">‹</button>
+                <button id="collapse-conversations-btn" class="collapse-btn" data-label-attr-title="btn_collapse" title="Collapse">‹</button>
             </div>
             <div id="conversations-list" class="pane-content">
-                <p style="color: var(--text-secondary); padding: 1rem; text-align: center;">Select an agent to view conversations</p>
+                <p style="color: var(--text-secondary); padding: 1rem; text-align: center;" data-label-key="empty_conversations">Select an agent to view conversations</p>
             </div>
             <div id="conversations-trash" class="pane-content" style="display: none;">
-                <p style="color: var(--text-secondary); padding: 1rem; text-align: center;">Loading trash…</p>
+                <p style="color: var(--text-secondary); padding: 1rem; text-align: center;" data-label-key="loading_trash">Loading trash…</p>
             </div>
             <div id="resize-conversations" class="resize-handle"></div>
         </aside>
@@ -1263,7 +1265,7 @@
         <div class="panel active" id="panel-identity">
             <div class="panel-content">
                 <div class="identity-card" id="identity-card">
-                    <div class="loading">Loading identity...</div>
+                    <div class="loading" data-label-key="loading_identity">Loading identity...</div>
                 </div>
                 <div id="genesis-audit"></div>
             </div>
@@ -1284,7 +1286,7 @@
                     overflow: hidden;
                 ">
                     <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.75rem;">
-                        <h3 style="margin: 0; font-size: 1rem;">History</h3>
+                        <h3 style="margin: 0; font-size: 1rem;" data-label-key="chat_history_title">History</h3>
                         <button onclick="toggleHistorySidebar()" style="
                             background: none;
                             border: none;
@@ -1292,16 +1294,16 @@
                             cursor: pointer;
                             color: var(--text-secondary);
                             padding: 0.25rem;
-                        " title="Close sidebar">&times;</button>
+                        " data-label-attr-title="btn_close_sidebar" title="Close sidebar">&times;</button>
                     </div>
                     <button id="new-conversation-btn" onclick="startNewConversation()" class="btn btn-primary" style="
                         width: 100%;
                         margin-bottom: 0.75rem;
                         padding: 0.5rem;
                         font-size: 0.85rem;
-                    ">+ New Conversation</button>
+                    " data-label-key="btn_new_conversation_long">+ New Conversation</button>
                     <div id="history-container" style="flex: 1; overflow-y: auto;">
-                        <div class="loading">Loading history...</div>
+                        <div class="loading" data-label-key="loading_history">Loading history...</div>
                     </div>
                 </div>
 
@@ -1319,8 +1321,8 @@
                     ">
                         <!-- Left: Navigation buttons -->
                         <div style="display: flex; gap: 0.5rem; align-items: center;">
-                            <button id="toggle-history-btn" onclick="toggleHistorySidebar()" class="btn btn-secondary" title="Chat History" style="padding: 0.4rem 0.6rem; font-size: 0.85rem;"><span class="ki ki-scroll"></span></button>
-                            <button id="new-chat-btn" onclick="clearChat()" class="btn btn-primary" title="New Chat" style="padding: 0.4rem 0.6rem; font-size: 0.85rem;"><span class="ki ki-sparkles"></span></button>
+                            <button id="toggle-history-btn" onclick="toggleHistorySidebar()" class="btn btn-secondary" data-label-attr-title="btn_chat_history" title="Chat History" style="padding: 0.4rem 0.6rem; font-size: 0.85rem;"><span class="ki ki-scroll"></span></button>
+                            <button id="new-chat-btn" onclick="clearChat()" class="btn btn-primary" data-label-attr-title="btn_new_chat" title="New Chat" style="padding: 0.4rem 0.6rem; font-size: 0.85rem;"><span class="ki ki-sparkles"></span></button>
                         </div>
 
                         <!-- Center: Model Selection (Vendor → [Route] → Model).
@@ -1328,14 +1330,14 @@
                              vendor has >1 configured route (e.g. anthropic:api vs
                              anthropic:plan). Hidden otherwise. -->
                         <div style="display: flex; gap: 0.5rem; align-items: center; flex: 1; justify-content: center;">
-                            <select id="provider-selector" class="model-selector" title="Select vendor" style="min-width: 120px;">
-                                <option value="">Vendor...</option>
+                            <select id="provider-selector" class="model-selector" data-label-attr-title="model_selector_vendor_title" title="Select vendor" style="min-width: 120px;">
+                                <option value="" data-label-key="model_selector_vendor_placeholder">Vendor...</option>
                             </select>
-                            <select id="route-selector" class="model-selector" title="Select route (auth/endpoint)" style="min-width: 90px; display: none;">
-                                <option value="">Route...</option>
+                            <select id="route-selector" class="model-selector" data-label-attr-title="model_selector_route_title" title="Select route (auth/endpoint)" style="min-width: 90px; display: none;">
+                                <option value="" data-label-key="model_selector_route_placeholder">Route...</option>
                             </select>
-                            <select id="model-selector" class="model-selector" title="Select model" style="min-width: 180px;">
-                                <option value="">Model...</option>
+                            <select id="model-selector" class="model-selector" data-label-attr-title="model_selector_model_title" title="Select model" style="min-width: 180px;">
+                                <option value="" data-label-key="model_selector_model_placeholder">Model...</option>
                             </select>
                         </div>
 
@@ -1347,7 +1349,7 @@
                     <div class="chat-container" id="chat-container" style="flex: 1; overflow-y: auto;">
                         <div class="message agent-message">
                             <div class="message-content">
-                                <p>Hello! I am your Kestrel AI agent, bound by the Kestrel Constitution to be your truthful and honorable assistant. How can I help you today?</p>
+                                <p data-label-key="chat_welcome_message">Hello! I am your Kestrel AI agent, bound by the Kestrel Constitution to be your truthful and honorable assistant. How can I help you today?</p>
                             </div>
                         </div>
                     </div>
@@ -1357,8 +1359,8 @@
                         <span class="thinking-dots">
                             <span></span><span></span><span></span>
                         </span>
-                        <span class="thinking-text">Thinking...</span>
-                        <button id="stop-button" title="Stop" style="
+                        <span class="thinking-text" data-label-key="chat_thinking">Thinking...</span>
+                        <button id="stop-button" data-label-attr-title="btn_stop_title" title="Stop" style="
                             margin-left: 0.75rem;
                             padding: 0.25rem 0.75rem;
                             font-size: 0.875rem;
@@ -1367,13 +1369,13 @@
                             border: none;
                             border-radius: 4px;
                             cursor: pointer;
-                        ">Stop</button>
+                        " data-label-key="btn_stop">Stop</button>
                     </div>
 
                     <!-- Input Area -->
                     <div class="input-area">
-                        <textarea id="message-input" placeholder="Ask me anything or use !commands..." rows="1"></textarea>
-                        <button id="send-button" title="Send">&#8679;</button>
+                        <textarea id="message-input" data-label-attr-placeholder="chat_input_placeholder" placeholder="Ask me anything or use !commands..." rows="1"></textarea>
+                        <button id="send-button" data-label-attr-title="btn_send" title="Send">&#8679;</button>
                     </div>
                     <!-- Input Footer with Context Status -->
                     <div class="input-footer" style="
@@ -1394,11 +1396,11 @@
             <div class="panel-content">
                 <div class="constitution-viewer" id="constitution-viewer">
                     <div class="constitution-header">
-                        <h2>Kestrel Constitution</h2>
+                        <h2 data-label-key="constitution_title">Kestrel Constitution</h2>
                         <span id="constitution-hash" style="font-family: monospace; font-size: 0.75rem; color: var(--text-tertiary);"></span>
                     </div>
                     <div class="constitution-content" id="constitution-content">
-                        <div class="loading">Loading constitution...</div>
+                        <div class="loading" data-label-key="loading_constitution">Loading constitution...</div>
                     </div>
                 </div>
             </div>
@@ -1408,17 +1410,17 @@
         <div class="panel" id="panel-memories">
             <div class="panel-content">
                 <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem;">
-                    <h2 style="margin: 0;">Knowledge Graph</h2>
+                    <h2 style="margin: 0;" data-label-key="memories_title">Knowledge Graph</h2>
                     <select id="memory-filter" class="btn btn-secondary" style="padding: 0.5rem;">
-                        <option value="">All Types</option>
-                        <option value="agent">Agent</option>
-                        <option value="document">Documents</option>
-                        <option value="memory">Memories</option>
-                        <option value="backup_artifact">Backups</option>
+                        <option value="" data-label-key="memories_filter_all">All Types</option>
+                        <option value="agent" data-label-key="memories_filter_agent">Agent</option>
+                        <option value="document" data-label-key="memories_filter_documents">Documents</option>
+                        <option value="memory" data-label-key="memories_filter_memories">Memories</option>
+                        <option value="backup_artifact" data-label-key="memories_filter_backups">Backups</option>
                     </select>
                 </div>
                 <div class="memory-list" id="memory-list">
-                    <div class="loading">Loading memories...</div>
+                    <div class="loading" data-label-key="loading_memories">Loading memories...</div>
                 </div>
             </div>
         </div>
@@ -1427,9 +1429,9 @@
         <div class="panel" id="panel-tasks">
             <div class="panel-content">
                 <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem;">
-                    <h2 style="margin: 0;">Tasks & Activity</h2>
+                    <h2 style="margin: 0;" data-label-key="tasks_title">Tasks & Activity</h2>
                     <div style="display: flex; gap: 0.5rem;">
-                        <button class="btn btn-secondary" id="btn-refresh-tasks"><span class="ki ki-refresh"></span> Refresh</button>
+                        <button class="btn btn-secondary" id="btn-refresh-tasks"><span class="ki ki-refresh"></span> <span data-label-key="btn_refresh">Refresh</span></button>
                     </div>
                 </div>
 
@@ -1439,18 +1441,18 @@
                         flex: 1;
                         padding: 0.5rem;
                         font-size: 0.875rem;
-                    "><span class="ki ki-clipboard"></span> Background Tasks</button>
+                    "><span class="ki ki-clipboard"></span> <span data-label-key="tasks_view_tasks">Background Tasks</span></button>
                     <button class="btn btn-secondary" id="btn-view-activity" style="
                         flex: 1;
                         padding: 0.5rem;
                         font-size: 0.875rem;
-                    "><span class="ki ki-chart-bar"></span> Activity Log</button>
+                    "><span class="ki ki-chart-bar"></span> <span data-label-key="tasks_view_activity">Activity Log</span></button>
                 </div>
 
                 <!-- Tasks Container -->
                 <div id="tasks-container">
                     <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.75rem;">
-                        <p style="color: var(--text-secondary); margin: 0; font-size: 0.875rem;">
+                        <p style="color: var(--text-secondary); margin: 0; font-size: 0.875rem;" data-label-key="tasks_description">
                             A2A background tasks (image generation, training, etc.)
                         </p>
                         <select id="task-filter" style="
@@ -1462,24 +1464,24 @@
                             cursor: pointer;
                             font-size: 0.875rem;
                         ">
-                            <option value="">All</option>
-                            <option value="working">Working</option>
-                            <option value="completed">Completed</option>
-                            <option value="failed">Failed</option>
+                            <option value="" data-label-key="filter_all">All</option>
+                            <option value="working" data-label-key="tasks_filter_working">Working</option>
+                            <option value="completed" data-label-key="tasks_filter_completed">Completed</option>
+                            <option value="failed" data-label-key="tasks_filter_failed">Failed</option>
                         </select>
                     </div>
                     <div class="task-list" id="task-list">
-                        <div class="loading">Loading tasks...</div>
+                        <div class="loading" data-label-key="loading_tasks">Loading tasks...</div>
                     </div>
                 </div>
 
                 <!-- Activity Log Container (hidden by default) -->
                 <div id="activity-container" style="display: none;">
-                    <p style="color: var(--text-secondary); margin-bottom: 0.75rem; font-size: 0.875rem;">
+                    <p style="color: var(--text-secondary); margin-bottom: 0.75rem; font-size: 0.875rem;" data-label-key="activity_description">
                         Real-time log of tool calls, LLM invocations, and feature executions.
                     </p>
                     <div class="activity-list" id="activity-list">
-                        <div class="loading">Loading activity...</div>
+                        <div class="loading" data-label-key="loading_activity">Loading activity...</div>
                     </div>
                 </div>
             </div>
@@ -1489,32 +1491,73 @@
         <div class="panel" id="panel-sovereignty">
             <div class="panel-content">
                 <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem;">
-                    <h2 style="margin: 0;">Data Sovereignty</h2>
+                    <h2 style="margin: 0;" data-label-key="sovereignty_title">Data Sovereignty</h2>
                     <div style="display: flex; gap: 0.5rem;">
-                        <button class="btn btn-primary" id="btn-export-ipfs">Export to IPFS</button>
-                        <button class="btn btn-secondary" id="btn-import">Import from CID</button>
+                        <button class="btn btn-primary" id="btn-export-ipfs" data-label-key="btn_export_ipfs">Export to IPFS</button>
+                        <button class="btn btn-secondary" id="btn-import" data-label-key="btn_import_cid">Import from CID</button>
                     </div>
                 </div>
-                <p style="color: var(--text-secondary); margin-bottom: 1.5rem;">
+                <p style="color: var(--text-secondary); margin-bottom: 1.5rem;" data-label-key="sovereignty_tagline">
                     Your data is your own. Export to IPFS/Filecoin for true ownership and portability.
                 </p>
-                <h3 style="margin-bottom: 1rem;">Export History</h3>
+                <h3 style="margin-bottom: 1rem;" data-label-key="sovereignty_export_history">Export History</h3>
                 <div class="export-list" id="export-list">
-                    <div class="loading">Loading exports...</div>
+                    <div class="loading" data-label-key="loading_exports">Loading exports...</div>
+                </div>
+
+                <!-- Display (theme + locale picker, #991) -->
+                <div style="margin-top: 2rem; border-top: 1px solid var(--border-color); padding-top: 1.5rem;">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem;">
+                        <h3 style="margin: 0;" data-label-key="sovereignty_display">Display</h3>
+                    </div>
+                    <p style="color: var(--text-secondary); font-size: 0.875rem; margin-bottom: 1rem;" data-label-key="sovereignty_display_description">
+                        Choose a UI theme and language. Stored locally on this device.
+                    </p>
+                    <div style="display: flex; gap: 1.5rem; align-items: center; flex-wrap: wrap;">
+                        <label style="font-size: 0.875rem; color: var(--text-secondary); display: flex; align-items: center; gap: 0.5rem;">
+                            <span data-label-key="theme_picker_label">Theme</span>
+                            <select id="theme-picker-theme" style="
+                                padding: 0.375rem 0.75rem;
+                                background: var(--bg-secondary);
+                                border: 1px solid var(--border-color);
+                                border-radius: 6px;
+                                color: var(--text-primary);
+                                cursor: pointer;
+                                font-size: 0.875rem;
+                            ">
+                                <!-- options injected by theme_picker.js -->
+                            </select>
+                        </label>
+                        <label style="font-size: 0.875rem; color: var(--text-secondary); display: flex; align-items: center; gap: 0.5rem;">
+                            <span data-label-key="locale_picker_label">Language</span>
+                            <select id="theme-picker-locale" style="
+                                padding: 0.375rem 0.75rem;
+                                background: var(--bg-secondary);
+                                border: 1px solid var(--border-color);
+                                border-radius: 6px;
+                                color: var(--text-primary);
+                                cursor: pointer;
+                                font-size: 0.875rem;
+                            ">
+                                <option value="en" selected>English</option>
+                            </select>
+                        </label>
+                        <span id="theme-picker-status" style="color: var(--text-tertiary); font-size: 0.75rem;"></span>
+                    </div>
                 </div>
 
                 <!-- Local File Browser (Session 3) -->
                 <div style="margin-top: 2rem; border-top: 1px solid var(--border-color); padding-top: 1.5rem;">
                     <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem;">
-                        <h3 style="margin: 0;">Local Cache</h3>
-                        <button class="btn btn-secondary" id="toggle-file-browser" onclick="toggleFileBrowser()"><span class="ki ki-folder"></span> Browse Local Files</button>
+                        <h3 style="margin: 0;" data-label-key="sovereignty_local_cache">Local Cache</h3>
+                        <button class="btn btn-secondary" id="toggle-file-browser" onclick="toggleFileBrowser()"><span class="ki ki-folder"></span> <span data-label-key="btn_browse_local_files">Browse Local Files</span></button>
                     </div>
-                    <p style="color: var(--text-secondary); font-size: 0.875rem; margin-bottom: 1rem;">
+                    <p style="color: var(--text-secondary); font-size: 0.875rem; margin-bottom: 1rem;" data-label-key="sovereignty_local_cache_description">
                         Browse cached backup files stored locally on your device.
                     </p>
                     <div id="file-browser-section" style="display: none;">
                         <div id="file-browser-container">
-                            <div class="loading">Loading files...</div>
+                            <div class="loading" data-label-key="loading_files">Loading files...</div>
                         </div>
                     </div>
                 </div>
@@ -1522,15 +1565,15 @@
                 <!-- Database Explorer (Session 5) -->
                 <div style="margin-top: 2rem; border-top: 1px solid var(--border-color); padding-top: 1.5rem;">
                     <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem;">
-                        <h3 style="margin: 0;">Database Explorer</h3>
-                        <button class="btn btn-secondary" id="toggle-db-explorer" onclick="toggleDbExplorer()"><span class="ki ki-cabinet"></span> Browse Database</button>
+                        <h3 style="margin: 0;" data-label-key="sovereignty_db_explorer">Database Explorer</h3>
+                        <button class="btn btn-secondary" id="toggle-db-explorer" onclick="toggleDbExplorer()"><span class="ki ki-cabinet"></span> <span data-label-key="btn_browse_database">Browse Database</span></button>
                     </div>
-                    <p style="color: var(--text-secondary); font-size: 0.875rem; margin-bottom: 1rem;">
+                    <p style="color: var(--text-secondary); font-size: 0.875rem; margin-bottom: 1rem;" data-label-key="sovereignty_db_description">
                         Read-only view of agent database tables and contents.
                     </p>
                     <div id="db-explorer-section" style="display: none;">
                         <div id="db-explorer-container">
-                            <div class="loading">Loading database...</div>
+                            <div class="loading" data-label-key="loading_database">Loading database...</div>
                         </div>
                     </div>
                 </div>
@@ -1538,15 +1581,15 @@
                 <!-- IPFS Node Status (Session 5) -->
                 <div style="margin-top: 2rem; border-top: 1px solid var(--border-color); padding-top: 1.5rem;">
                     <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem;">
-                        <h3 style="margin: 0;">IPFS Network</h3>
-                        <button class="btn btn-secondary" id="toggle-ipfs-status" onclick="toggleIpfsStatus()"><span class="ki ki-globe"></span> Check Status</button>
+                        <h3 style="margin: 0;" data-label-key="sovereignty_ipfs_network">IPFS Network</h3>
+                        <button class="btn btn-secondary" id="toggle-ipfs-status" onclick="toggleIpfsStatus()"><span class="ki ki-globe"></span> <span data-label-key="btn_check_status">Check Status</span></button>
                     </div>
-                    <p style="color: var(--text-secondary); font-size: 0.875rem; margin-bottom: 1rem;">
+                    <p style="color: var(--text-secondary); font-size: 0.875rem; margin-bottom: 1rem;" data-label-key="sovereignty_ipfs_description">
                         Check connectivity to local IPFS node and public gateways.
                     </p>
                     <div id="ipfs-status-section" style="display: none;">
                         <div id="ipfs-status-container">
-                            <div class="loading">Checking IPFS...</div>
+                            <div class="loading" data-label-key="loading_ipfs">Checking IPFS...</div>
                         </div>
                     </div>
                 </div>
@@ -1556,8 +1599,8 @@
         <!-- Resources Panel -->
         <div class="panel" id="panel-resources">
             <div class="panel-content">
-                <h2 style="margin: 0 0 0.5rem 0;">Agent Resources</h2>
-                <p style="color: var(--text-secondary); margin-bottom: 1.5rem;">
+                <h2 style="margin: 0 0 0.5rem 0;" data-label-key="resources_title">Agent Resources</h2>
+                <p style="color: var(--text-secondary); margin-bottom: 1.5rem;" data-label-key="resources_description">
                     API keys, wallet balances, and usage tracking. Keys are resolved in priority order: Agent → User → Platform.
                 </p>
 
@@ -1572,7 +1615,7 @@
                     align-items: center;
                     gap: 0.75rem;
                 ">
-                    <span style="font-size: 0.875rem; color: var(--text-secondary);">Active Key Source:</span>
+                    <span style="font-size: 0.875rem; color: var(--text-secondary);" data-label-key="resources_active_key_label">Active Key Source:</span>
                     <span id="key-source-badge" style="
                         background: var(--accent-color);
                         color: white;
@@ -1586,63 +1629,63 @@
                 <!-- Agent Keys Section -->
                 <div style="margin-bottom: 2rem;">
                     <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem;">
-                        <h3 style="margin: 0;"><span class="ki ki-robot"></span> Agent Keys <span style="font-size: 0.75rem; color: var(--text-secondary); font-weight: normal;">(this companion only)</span></h3>
+                        <h3 style="margin: 0;"><span class="ki ki-robot"></span> <span data-label-key="resources_agent_keys_title">Agent Keys</span> <span style="font-size: 0.75rem; color: var(--text-secondary); font-weight: normal;" data-label-key="resources_agent_keys_subtitle">(this companion only)</span></h3>
                         <div style="display: flex; gap: 0.5rem;">
-                            <button class="btn btn-primary" onclick="showAddAgentKeyModal()">+ Add Key</button>
-                            <button class="btn btn-secondary" onclick="refreshAgentKeys()">Refresh</button>
+                            <button class="btn btn-primary" onclick="showAddAgentKeyModal()" data-label-key="btn_add_key">+ Add Key</button>
+                            <button class="btn btn-secondary" onclick="refreshAgentKeys()" data-label-key="btn_refresh">Refresh</button>
                         </div>
                     </div>
                     <div id="agent-keys-list">
-                        <div class="loading">Loading keys...</div>
+                        <div class="loading" data-label-key="loading_keys">Loading keys...</div>
                     </div>
                 </div>
 
                 <!-- User BYOK Section -->
                 <div style="margin-bottom: 2rem; border-top: 1px solid var(--border-color); padding-top: 1.5rem;">
                     <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem;">
-                        <h3 style="margin: 0;"><span class="ki ki-user"></span> Your Keys <span style="font-size: 0.75rem; color: var(--text-secondary); font-weight: normal;">(BYOK - shared across companions)</span></h3>
+                        <h3 style="margin: 0;"><span class="ki ki-user"></span> <span data-label-key="resources_user_keys_title">Your Keys</span> <span style="font-size: 0.75rem; color: var(--text-secondary); font-weight: normal;" data-label-key="resources_user_keys_subtitle">(BYOK - shared across companions)</span></h3>
                         <div style="display: flex; gap: 0.5rem;">
-                            <button class="btn btn-primary" onclick="showAddUserKeyModal()">+ Add Key</button>
-                            <button class="btn btn-secondary" id="unlock-byok-btn" onclick="showUnlockByokModal()" style="display: none;"><span class="ki ki-lock-open"></span> Unlock</button>
+                            <button class="btn btn-primary" onclick="showAddUserKeyModal()" data-label-key="btn_add_key">+ Add Key</button>
+                            <button class="btn btn-secondary" id="unlock-byok-btn" onclick="showUnlockByokModal()" style="display: none;"><span class="ki ki-lock-open"></span> <span data-label-key="btn_unlock">Unlock</span></button>
                         </div>
                     </div>
                     <div style="background: var(--bg-secondary); padding: 0.75rem; border-radius: 8px; margin-bottom: 1rem; font-size: 0.875rem; color: var(--text-secondary);">
-                        <span class="ki ki-lock"></span> Keys encrypted with your passphrase. No wallet charges when using your own keys.
+                        <span class="ki ki-lock"></span> <span data-label-key="resources_byok_description">Keys encrypted with your passphrase. No wallet charges when using your own keys.</span>
                     </div>
                     <div id="user-keys-list">
-                        <div class="loading">Loading keys...</div>
+                        <div class="loading" data-label-key="loading_keys">Loading keys...</div>
                     </div>
                 </div>
 
                 <!-- Platform Access Section -->
                 <div style="margin-bottom: 2rem; border-top: 1px solid var(--border-color); padding-top: 1.5rem;">
                     <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem;">
-                        <h3 style="margin: 0;"><span class="ki ki-building"></span> Platform Access <span style="font-size: 0.75rem; color: var(--text-secondary); font-weight: normal;">(pay-per-use)</span></h3>
+                        <h3 style="margin: 0;"><span class="ki ki-building"></span> <span data-label-key="resources_platform_title">Platform Access</span> <span style="font-size: 0.75rem; color: var(--text-secondary); font-weight: normal;" data-label-key="resources_platform_subtitle">(pay-per-use)</span></h3>
                     </div>
                     <div style="background: var(--bg-secondary); padding: 0.75rem; border-radius: 8px; margin-bottom: 1rem; font-size: 0.875rem; color: var(--text-secondary);">
-                        <span class="ki ki-credit-card"></span> Uses your wallet balance + platform margin. Fallback when no personal keys available.
+                        <span class="ki ki-credit-card"></span> <span data-label-key="resources_platform_description">Uses your wallet balance + platform margin. Fallback when no personal keys available.</span>
                     </div>
                     <div id="platform-access-list">
-                        <div class="loading">Loading platform access...</div>
+                        <div class="loading" data-label-key="loading_platform">Loading platform access...</div>
                     </div>
                 </div>
 
                 <!-- Wallet Section -->
                 <div style="margin-bottom: 2rem; border-top: 1px solid var(--border-color); padding-top: 1.5rem;">
                     <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem;">
-                        <h3 style="margin: 0;"><span class="ki ki-wallet"></span> Wallet</h3>
-                        <button class="btn btn-secondary" onclick="refreshWallet()">Refresh</button>
+                        <h3 style="margin: 0;"><span class="ki ki-wallet"></span> <span data-label-key="resources_wallet_title">Wallet</span></h3>
+                        <button class="btn btn-secondary" onclick="refreshWallet()" data-label-key="btn_refresh">Refresh</button>
                     </div>
                     <div id="wallet-details">
-                        <div class="loading">Loading wallet...</div>
+                        <div class="loading" data-label-key="loading_wallet">Loading wallet...</div>
                     </div>
                 </div>
 
                 <!-- Usage Section -->
                 <div style="border-top: 1px solid var(--border-color); padding-top: 1.5rem;">
-                    <h3 style="margin: 0 0 1rem 0;"><span class="ki ki-chart-bar"></span> Usage (Last 30 Days)</h3>
+                    <h3 style="margin: 0 0 1rem 0;"><span class="ki ki-chart-bar"></span> <span data-label-key="resources_usage_title">Usage (Last 30 Days)</span></h3>
                     <div id="usage-details">
-                        <div class="loading">Loading usage...</div>
+                        <div class="loading" data-label-key="loading_usage">Loading usage...</div>
                     </div>
                 </div>
             </div>
@@ -1652,7 +1695,7 @@
         <div class="panel" id="panel-metrics">
             <div class="panel-content">
                 <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.5rem;">
-                    <h2 style="margin: 0;">Metrics Dashboard</h2>
+                    <h2 style="margin: 0;" data-label-key="metrics_title">Metrics Dashboard</h2>
                     <div style="display: flex; align-items: center; gap: 0.75rem;">
                         <label style="font-size: 0.8rem; color: var(--text-secondary);">
                             Auto-refresh
@@ -1690,7 +1733,7 @@
                     gap: 1rem;
                     margin-bottom: 1.5rem;
                 ">
-                    <div class="loading">Loading metrics...</div>
+                    <div class="loading" data-label-key="loading_metrics">Loading metrics...</div>
                 </div>
 
                 <!-- Charts Row -->
@@ -1707,7 +1750,7 @@
                         border-radius: 8px;
                         padding: 1rem;
                     ">
-                        <h3 style="margin: 0 0 0.75rem 0; font-size: 0.95rem;">Event Timeline</h3>
+                        <h3 style="margin: 0 0 0.75rem 0; font-size: 0.95rem;" data-label-key="metrics_event_timeline">Event Timeline</h3>
                         <div style="position: relative; height: 250px;">
                             <canvas id="metrics-timeline-chart"></canvas>
                         </div>
@@ -1720,7 +1763,7 @@
                         border-radius: 8px;
                         padding: 1rem;
                     ">
-                        <h3 style="margin: 0 0 0.75rem 0; font-size: 0.95rem;">Tool Duration (avg ms)</h3>
+                        <h3 style="margin: 0 0 0.75rem 0; font-size: 0.95rem;" data-label-key="metrics_tool_duration">Tool Duration (avg ms)</h3>
                         <div style="position: relative; height: 250px;">
                             <canvas id="metrics-duration-chart"></canvas>
                         </div>
@@ -1741,7 +1784,7 @@
                         border-radius: 8px;
                         padding: 1rem;
                     ">
-                        <h3 style="margin: 0 0 0.75rem 0; font-size: 0.95rem;">Event Distribution</h3>
+                        <h3 style="margin: 0 0 0.75rem 0; font-size: 0.95rem;" data-label-key="metrics_event_distribution">Event Distribution</h3>
                         <div style="position: relative; height: 250px;">
                             <canvas id="metrics-distribution-chart"></canvas>
                         </div>
@@ -1754,9 +1797,9 @@
                         border-radius: 8px;
                         padding: 1rem;
                     ">
-                        <h3 style="margin: 0 0 0.75rem 0; font-size: 0.95rem;">Recent Errors</h3>
+                        <h3 style="margin: 0 0 0.75rem 0; font-size: 0.95rem;" data-label-key="metrics_recent_errors">Recent Errors</h3>
                         <div id="metrics-errors-list" style="max-height: 250px; overflow-y: auto;">
-                            <p style="color: var(--text-secondary); font-size: 0.85rem;">No errors recorded</p>
+                            <p style="color: var(--text-secondary); font-size: 0.85rem;" data-label-key="metrics_no_errors">No errors recorded</p>
                         </div>
                     </div>
                 </div>
@@ -1767,7 +1810,7 @@
         <div class="panel" id="panel-spawn">
             <div class="panel-content">
                 <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.5rem;">
-                    <h2 style="margin: 0;">Spawn Manager</h2>
+                    <h2 style="margin: 0;" data-label-key="spawn_title">Spawn Manager</h2>
                     <div style="display: flex; align-items: center; gap: 0.75rem;">
                         <label style="font-size: 0.8rem; color: var(--text-secondary);">
                             Auto-refresh
@@ -1800,10 +1843,10 @@
 
                 <!-- Active Children -->
                 <div style="margin-bottom: 1.5rem;">
-                    <h3 style="margin: 0 0 0.75rem 0; font-size: 0.95rem;">Active Children</h3>
+                    <h3 style="margin: 0 0 0.75rem 0; font-size: 0.95rem;" data-label-key="spawn_active_children">Active Children</h3>
                     <div id="spawn-children-list">
                         <div style="color: var(--text-secondary); font-size: 0.85rem; text-align: center; padding: 1rem;">
-                            Click refresh or switch to this tab to load spawn data
+                            <span data-label-key="spawn_empty_state">Click refresh or switch to this tab to load spawn data</span>
                         </div>
                     </div>
                 </div>
@@ -1822,9 +1865,9 @@
                         border-radius: 8px;
                         padding: 1rem;
                     ">
-                        <h3 style="margin: 0 0 0.75rem 0; font-size: 0.95rem;">Delegation Chain</h3>
+                        <h3 style="margin: 0 0 0.75rem 0; font-size: 0.95rem;" data-label-key="spawn_delegation_chain">Delegation Chain</h3>
                         <div id="spawn-delegation-chain" style="font-size: 0.875rem;">
-                            <div style="color: var(--text-secondary); font-size: 0.85rem;">No delegation chain</div>
+                            <div style="color: var(--text-secondary); font-size: 0.85rem;" data-label-key="spawn_no_delegation">No delegation chain</div>
                         </div>
                     </div>
 
@@ -1835,7 +1878,7 @@
                         border-radius: 8px;
                         padding: 1rem;
                     ">
-                        <h3 style="margin: 0 0 0.75rem 0; font-size: 0.95rem;">Budget Allocation</h3>
+                        <h3 style="margin: 0 0 0.75rem 0; font-size: 0.95rem;" data-label-key="spawn_budget_allocation">Budget Allocation</h3>
                         <div style="position: relative; height: 250px;">
                             <canvas id="spawn-budget-chart"></canvas>
                         </div>
@@ -1849,9 +1892,9 @@
                     border-radius: 8px;
                     padding: 1rem;
                 ">
-                    <h3 style="margin: 0 0 0.75rem 0; font-size: 0.95rem;">Spawn History</h3>
+                    <h3 style="margin: 0 0 0.75rem 0; font-size: 0.95rem;" data-label-key="spawn_history_title">Spawn History</h3>
                     <div id="spawn-history-list" style="max-height: 300px; overflow-y: auto;">
-                        <p style="color: var(--text-secondary); font-size: 0.85rem; text-align: center;">No spawn events recorded</p>
+                        <p style="color: var(--text-secondary); font-size: 0.85rem; text-align: center;" data-label-key="spawn_no_history">No spawn events recorded</p>
                     </div>
                 </div>
             </div>
@@ -1861,19 +1904,19 @@
         <div class="panel" id="panel-features">
             <div class="panel-content">
                 <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem;">
-                    <h2 style="margin: 0;">Feature Store</h2>
+                    <h2 style="margin: 0;" data-label-key="features_title">Feature Store</h2>
                     <button onclick="FeatureStore.reload()" class="btn btn-secondary" style="
                         padding: 0.25rem 0.75rem;
                         font-size: 0.8rem;
                     ">↻ Refresh</button>
                 </div>
-                <p style="color: var(--text-secondary); margin-bottom: 1rem; font-size: 0.875rem;">
+                <p style="color: var(--text-secondary); margin-bottom: 1rem; font-size: 0.875rem;" data-label-key="features_description">
                     Browse, install, and manage feature packages for your agent.
                 </p>
 
                 <!-- Search and Filter Bar -->
                 <div style="display: flex; gap: 0.75rem; margin-bottom: 1.25rem; flex-wrap: wrap; align-items: center;">
-                    <input type="text" id="feature-search" placeholder="Search features, tags, skills..."
+                    <input type="text" id="feature-search" data-label-attr-placeholder="features_search_placeholder" placeholder="Search features, tags, skills..."
                         style="
                             flex: 1;
                             min-width: 200px;
@@ -1894,7 +1937,7 @@
                             color: var(--text-primary);
                             font-size: 0.8rem;
                             cursor: pointer;
-                        ">All</button>
+                        " data-label-key="features_filter_all">All</button>
                         <button class="feature-filter-btn" data-filter="installed" style="
                             padding: 0.375rem 0.75rem;
                             border: 1px solid var(--border-color);
@@ -1903,7 +1946,7 @@
                             color: var(--text-secondary);
                             font-size: 0.8rem;
                             cursor: pointer;
-                        ">Installed</button>
+                        " data-label-key="features_filter_installed">Installed</button>
                         <button class="feature-filter-btn" data-filter="available" style="
                             padding: 0.375rem 0.75rem;
                             border: 1px solid var(--border-color);
@@ -1912,7 +1955,7 @@
                             color: var(--text-secondary);
                             font-size: 0.8rem;
                             cursor: pointer;
-                        ">Available</button>
+                        " data-label-key="features_filter_available">Available</button>
                     </div>
                 </div>
 
@@ -1922,7 +1965,7 @@
                     grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
                     gap: 1rem;
                 ">
-                    <div class="loading">Loading features...</div>
+                    <div class="loading" data-label-key="loading_features">Loading features...</div>
                 </div>
             </div>
         </div>
@@ -1930,15 +1973,15 @@
         <!-- Security Panel -->
         <div class="panel" id="panel-security">
             <div class="panel-content">
-                <h2 style="margin: 0 0 0.5rem 0;">Security Permissions</h2>
-                <p style="color: var(--text-secondary); margin-bottom: 1.5rem;">
+                <h2 style="margin: 0 0 0.5rem 0;" data-label-key="security_title">Security Permissions</h2>
+                <p style="color: var(--text-secondary); margin-bottom: 1.5rem;" data-label-key="security_description">
                     Control which tools can run automatically, require approval, or are blocked.
                 </p>
 
                 <!-- Pending Approvals Section -->
                 <div style="margin-bottom: 2rem;">
                     <h3 style="margin: 0 0 1rem 0; display: flex; align-items: center; gap: 0.5rem;">
-                        <span class="ki ki-hourglass"></span> Pending Approvals
+                        <span class="ki ki-hourglass"></span> <span data-label-key="security_pending_approvals">Pending Approvals</span>
                         <span id="pending-count-label" style="
                             background: var(--bg-tertiary);
                             padding: 0.125rem 0.5rem;
@@ -1948,7 +1991,7 @@
                         ">0</span>
                     </h3>
                     <div id="pending-approvals">
-                        <p class="empty-state" style="color: var(--text-secondary); padding: 0.5rem 0;">
+                        <p class="empty-state" style="color: var(--text-secondary); padding: 0.5rem 0;" data-label-key="security_no_pending">
                             No pending approvals
                         </p>
                     </div>
@@ -1957,34 +2000,34 @@
                 <!-- Permission Tree Section -->
                 <div style="margin-bottom: 2rem;">
                     <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem;">
-                        <h3 style="margin: 0;"><span class="ki ki-lock-key"></span> Permission Tree</h3>
+                        <h3 style="margin: 0;"><span class="ki ki-lock-key"></span> <span data-label-key="security_permission_tree">Permission Tree</span></h3>
                         <button onclick="Security.loadPermissionTree()" class="btn btn-secondary" style="
                             padding: 0.25rem 0.75rem;
                             font-size: 0.8rem;
                         ">↻ Refresh</button>
                     </div>
                     <div id="permission-tree">
-                        <p class="empty-state" style="color: var(--text-secondary);">
+                        <p class="empty-state" style="color: var(--text-secondary);" data-label-key="security_load_tree_prompt">
                             Click to load permission tree...
                         </p>
                     </div>
                     <p style="color: var(--text-tertiary); font-size: 0.75rem; margin-top: 0.75rem;">
-                        Legend: <span class="ki ki-check-box"></span> Allow | <span class="ki ki-empty-box"></span> Ask | <span class="ki ki-x-box"></span> Deny | <span class="ki ki-half-circle"></span> Mixed
+                        <span data-label-key="security_legend_label">Legend:</span> <span class="ki ki-check-box"></span> <span data-label-key="security_legend_allow">Allow</span> | <span class="ki ki-empty-box"></span> <span data-label-key="security_legend_ask">Ask</span> | <span class="ki ki-x-box"></span> <span data-label-key="security_legend_deny">Deny</span> | <span class="ki ki-half-circle"></span> <span data-label-key="security_legend_mixed">Mixed</span>
                     </p>
                 </div>
 
                 <!-- Session Controls Section -->
                 <div style="margin-bottom: 2rem; border-top: 1px solid var(--border-color); padding-top: 1.5rem;">
-                    <h3 style="margin: 0 0 1rem 0;"><span class="ki ki-gear"></span> Session Controls</h3>
+                    <h3 style="margin: 0 0 1rem 0;"><span class="ki ki-gear"></span> <span data-label-key="security_session_controls">Session Controls</span></h3>
                     <div style="display: flex; gap: 0.75rem; flex-wrap: wrap;">
-                        <button onclick="Security.resetSession()" class="btn btn-secondary" style="font-size: 0.85rem;">
+                        <button onclick="Security.resetSession()" class="btn btn-secondary" style="font-size: 0.85rem;" data-label-key="btn_reset_session">
                             Reset Session Permissions
                         </button>
-                        <button onclick="Security.cancelAllPending()" class="btn btn-danger" style="font-size: 0.85rem;">
+                        <button onclick="Security.cancelAllPending()" class="btn btn-danger" style="font-size: 0.85rem;" data-label-key="btn_cancel_pending">
                             Cancel All Pending
                         </button>
                     </div>
-                    <p style="color: var(--text-tertiary); font-size: 0.75rem; margin-top: 0.5rem;">
+                    <p style="color: var(--text-tertiary); font-size: 0.75rem; margin-top: 0.5rem;" data-label-key="security_session_note">
                         Session permissions are cleared when the browser is closed.
                     </p>
                 </div>
@@ -1992,14 +2035,14 @@
                 <!-- Audit Log Section -->
                 <div style="border-top: 1px solid var(--border-color); padding-top: 1.5rem;">
                     <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem;">
-                        <h3 style="margin: 0;"><span class="ki ki-clipboard"></span> Audit Log</h3>
+                        <h3 style="margin: 0;"><span class="ki ki-clipboard"></span> <span data-label-key="security_audit_log">Audit Log</span></h3>
                         <button onclick="Security.loadAuditLog()" class="btn btn-secondary" style="
                             padding: 0.25rem 0.75rem;
                             font-size: 0.8rem;
                         ">↻ Refresh</button>
                     </div>
                     <div id="security-audit-log">
-                        <p class="empty-state" style="color: var(--text-secondary);">
+                        <p class="empty-state" style="color: var(--text-secondary);" data-label-key="security_load_audit_prompt">
                             Click to load audit log...
                         </p>
                     </div>
