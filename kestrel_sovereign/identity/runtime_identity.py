@@ -86,7 +86,15 @@ class AgentIdentity:
     # Set iff the agent's data dir contains a succession statement
     hybrid_keypair: Optional[HybridKeypair] = None
     new_did: Optional[str] = None
-    new_did_document: Optional[dict] = None
+    # Verification methods (Multikey VMs) for the new DID, copied
+    # verbatim from the succession statement. We deliberately do NOT
+    # reconstruct a full DID document here: the published one at
+    # ``did:web``'s HTTPS URL may carry alsoKnownAs / service / context
+    # entries that the runtime can't reproduce from the statement
+    # alone. Callers that need the full document fetch it from the
+    # network or from the agent-identities repo. Callers that need to
+    # know which kid maps to which alg use this field directly.
+    new_verification_methods: Optional[list] = None
     succession_chain: Optional[SuccessionChain] = None
     archival_keypair: Optional[Keypair] = None
     succession_statement: Optional[SuccessionStatement] = None
@@ -105,13 +113,29 @@ class AgentIdentity:
         return self.new_did if self.is_hybrid else self.legacy_did
 
 
-def _slug_from_did(new_did: str) -> str:
-    """Extract the path-segment slug from a ``did:web:<domain>:<slug>``."""
-    if not new_did.startswith("did:web:"):
+def _detect_hybrid_slug(storage_dir: Path) -> str:
+    """Find the slug used for hybrid key files in this agent dir.
+
+    The ceremony writes ``<slug>_ed25519.key.enc`` (along with
+    ``<slug>_mldsa65.bytes.enc`` and the archival pair). We discover
+    the slug by globbing for the classical-half file rather than by
+    parsing the new DID URI — that way we don't break on multi-segment
+    DIDs like ``did:web:domain:agent:v1`` where ``rsplit(':')[-1]``
+    would return ``v1`` instead of the actual key-file prefix.
+    """
+    candidates = sorted(storage_dir.glob("*_ed25519.key.enc"))
+    if not candidates:
         raise RuntimeIdentityError(
-            f"successor DID is not did:web: {new_did!r}"
+            f"no hybrid classical key (*_ed25519.key.enc) in {storage_dir}; "
+            f"succession statement is present but the ceremony output "
+            f"is incomplete."
         )
-    return new_did.rsplit(":", 1)[-1]
+    if len(candidates) > 1:
+        raise RuntimeIdentityError(
+            f"multiple hybrid classical keys in {storage_dir}: "
+            f"{[c.name for c in candidates]}. Slug is ambiguous."
+        )
+    return candidates[0].name.removesuffix("_ed25519.key.enc")
 
 
 def _load_legacy_part(
@@ -194,10 +218,11 @@ def _load_hybrid_part(
     storage: SecureKeyStorage,
     storage_dir: Path,
     statement: SuccessionStatement,
-) -> tuple[HybridKeypair, dict, Keypair]:
-    """Load the hybrid keypair + new DID doc + archival keypair pinned
-    by ``statement``. Returns (hybrid_kp, new_did_doc, archival_kp)."""
-    slug = _slug_from_did(statement.successor_did)
+) -> tuple[HybridKeypair, list, Keypair]:
+    """Load the hybrid keypair + verification methods + archival keypair
+    pinned by ``statement``. Returns (hybrid_kp, verification_methods,
+    archival_kp)."""
+    slug = _detect_hybrid_slug(storage_dir)
 
     # 1) Hybrid classical (Ed25519, PEM-encoded)
     classical_key_id = f"{slug}_ed25519"
@@ -279,26 +304,14 @@ def _load_hybrid_part(
         public_key=storage.load_secret_bytes(archival_pub_id),
     )
 
-    # 5) Reconstruct the published DID document from statement fields.
-    # We could fetch it over HTTPS, but for runtime startup we want a
-    # self-contained, no-network path. The statement's successor VMs
-    # are exactly what got published.
-    new_did_document = {
-        "@context": [
-            "https://www.w3.org/ns/did/v1",
-            "https://w3id.org/security/multikey/v1",
-        ],
-        "id": statement.successor_did,
-        "verificationMethod": list(statement.successor_verification_methods),
-        "authentication": [
-            vm["id"] for vm in statement.successor_verification_methods
-        ],
-        "assertionMethod": [
-            vm["id"] for vm in statement.successor_verification_methods
-        ],
-    }
-
-    return hybrid, new_did_document, archival_kp
+    # Expose just the verification methods, not a full DID document.
+    # The published did.json may carry alsoKnownAs / service / context
+    # fields the statement doesn't capture — reproducing a "DID
+    # document" here would silently drift from what consumers fetch
+    # over HTTPS. The runtime only needs the VMs (kid -> alg mapping)
+    # to sign new artifacts.
+    new_verification_methods = list(statement.successor_verification_methods)
+    return hybrid, new_verification_methods, archival_kp
 
 
 def load_agent_identity(
@@ -357,7 +370,7 @@ def load_agent_identity(
             f"{legacy_did!r}. Wrong agent dir, or stale succession statement."
         )
 
-    hybrid_kp, new_did_doc, archival_kp = _load_hybrid_part(
+    hybrid_kp, new_vms, archival_kp = _load_hybrid_part(
         storage, storage_dir, statement,
     )
     chain = build_chain([statement])
@@ -372,7 +385,7 @@ def load_agent_identity(
         legacy_did_document=legacy_did_doc,
         hybrid_keypair=hybrid_kp,
         new_did=statement.successor_did,
-        new_did_document=new_did_doc,
+        new_verification_methods=new_vms,
         succession_chain=chain,
         archival_keypair=archival_kp,
         succession_statement=statement,

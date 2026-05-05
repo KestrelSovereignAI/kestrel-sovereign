@@ -187,10 +187,13 @@ def test_load_hybrid_agent(post_ceremony_agent_on_disk):
     # Succession statement readable
     assert identity.succession_statement.predecessor_did == legacy_did
     assert identity.succession_statement.successor_did == result.new_identity.did
-    # New DID document carries both verification methods
-    new_doc = identity.new_did_document
-    assert new_doc["id"] == result.new_identity.did
-    assert len(new_doc["verificationMethod"]) == 2
+    # Verification methods exposed (not a full DID doc — that would
+    # drift from the published did.json which carries alsoKnownAs etc).
+    vms = identity.new_verification_methods
+    assert len(vms) == 2
+    assert all("publicKeyMultibase" in vm for vm in vms)
+    assert all("controller" in vm for vm in vms)
+    assert all(vm["controller"] == result.new_identity.did for vm in vms)
 
 
 def test_hybrid_agent_can_sign_and_self_verify(post_ceremony_agent_on_disk):
@@ -199,9 +202,9 @@ def test_hybrid_agent_can_sign_and_self_verify(post_ceremony_agent_on_disk):
     identity = load_agent_identity(key_id, storage_dir)
 
     from kestrel_sovereign.identity.hybrid_keypair import sign_hybrid
-    classical_kid = identity.new_did_document["verificationMethod"][0]["id"]\
+    classical_kid = identity.new_verification_methods[0]["id"]\
         .rsplit("#", 1)[-1]
-    pq_kid = identity.new_did_document["verificationMethod"][1]["id"]\
+    pq_kid = identity.new_verification_methods[1]["id"]\
         .rsplit("#", 1)[-1]
     sigs = sign_hybrid(
         b"runtime-loaded hybrid signing test",
@@ -225,7 +228,9 @@ def test_succession_present_but_hybrid_keys_missing_raises(
     would mask a partial-ceremony failure)."""
     storage_dir, key_id, *_ = post_ceremony_agent_on_disk
     (storage_dir / "testbot_ed25519.key.enc").unlink()
-    with pytest.raises(RuntimeIdentityError, match="classical hybrid key.*missing"):
+    # Slug detection globs for the classical key; without it the
+    # ceremony output is incomplete from the loader's perspective.
+    with pytest.raises(RuntimeIdentityError, match="no hybrid classical key"):
         load_agent_identity(key_id, storage_dir)
 
 
@@ -249,6 +254,15 @@ def test_multiple_succession_statements_raises(post_ceremony_agent_on_disk):
     storage_dir, key_id, *_ = post_ceremony_agent_on_disk
     (storage_dir / "successions" / "second.json").write_text("{}")
     with pytest.raises(RuntimeIdentityError, match="multiple succession statements"):
+        load_agent_identity(key_id, storage_dir)
+
+
+def test_succession_present_but_pq_key_missing_raises(post_ceremony_agent_on_disk):
+    """Same shape as the classical-key-missing case but for the PQ
+    half. Without ML-DSA-65 there's no hybrid identity to load."""
+    storage_dir, key_id, *_ = post_ceremony_agent_on_disk
+    (storage_dir / "testbot_mldsa65.bytes.enc").unlink()
+    with pytest.raises(RuntimeIdentityError, match="post-quantum hybrid key.*missing"):
         load_agent_identity(key_id, storage_dir)
 
 
