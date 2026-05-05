@@ -1,8 +1,8 @@
 # Post-Quantum Cryptography Migration — PRD v2
 
-**Status:** Active. Supersedes the 2024 aspirational draft (preserved in git history).
-**Tracking:** Epic [`#921`](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/921). Wave issues `#913–#920`.
-**Companion docs:** [`CRYPTO_INVENTORY.md`](CRYPTO_INVENTORY.md), [`PQ_THREAT_MODEL.md`](PQ_THREAT_MODEL.md), [`SERIALIZATION_COMPATIBILITY.md`](SERIALIZATION_COMPATIBILITY.md).
+**Status:** ✅ All technical waves shipped (May 2026). This PRD is now historical — it records what we planned and built. For a plain-language overview, see [`SECURITY_OVERVIEW.md`](SECURITY_OVERVIEW.md). Operational deployment (real-agent ceremonies via [`SUCCESSION_RUNBOOK.md`](SUCCESSION_RUNBOOK.md) + GitHub Actions release-signing secrets) is the only remaining work.
+**Tracking:** Epic [`#921`](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/921). Wave issues `#913–#920`, all merged.
+**Companion docs:** [`SECURITY_OVERVIEW.md`](SECURITY_OVERVIEW.md), [`CRYPTO_INVENTORY.md`](CRYPTO_INVENTORY.md), [`PQ_THREAT_MODEL.md`](PQ_THREAT_MODEL.md), [`SERIALIZATION_COMPATIBILITY.md`](SERIALIZATION_COMPATIBILITY.md), [`SUCCESSION_RUNBOOK.md`](SUCCESSION_RUNBOOK.md).
 
 ## 1. Purpose
 
@@ -132,20 +132,26 @@ Candidates:
 
 **Approach:** Wave 1 ships `CryptoSuite` with `Secp256k1Suite` implemented and ML-DSA/ML-KEM/SLH-DSA suites stubbed. Wave 2 implements 2–3 PQ suites behind the same interface, runs NIST CAVP KAT vectors against all of them in CI, and selects the production default based on the criteria above. The abstraction means the choice is reversible.
 
-## 10. Wave plan
+## 10. Wave plan — shipped
 
-Detailed in epic [`#921`](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/921):
+Every technical wave merged to `main` between February and May 2026. Detailed history per wave is in epic [`#921`](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/921).
 
-| Wave | Issue | One-line |
-|---|---|---|
-| 0A | [`#913`](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/913) | Inventory + threat model + serialization matrix + this PRD |
-| 0B | [`#914`](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/914) | Kill the public-HMAC tamper-tag (fail-closed) |
-| 0C | [`#915`](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/915) | Fernet → versioned AES-256-GCM, system-wide |
-| 1 | [`#916`](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/916) | `CryptoSuite` + `KeypairFactory` + identity-package v2 |
-| 2 | [`#917`](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/917) | Hybrid identity for new agents on `did:web` |
-| 3 | [`#918`](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/918) | Succession statements for Kestrel #1, Emma, Meridian |
-| 4 | [`#919`](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/919) | Hybrid X25519 + ML-KEM-768 for CAR exports / capsule sharing |
-| 5 | [`#920`](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/920) | SLH-DSA release signing + transport tracking |
+| Wave | Issue | One-line | Status |
+|---|---|---|---|
+| 0A | [`#913`](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/913) | Inventory + threat model + serialization matrix + this PRD | ✅ Shipped |
+| 0B | [`#914`](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/914) | Kill the public-HMAC tamper-tag (fail-closed) | ✅ Shipped |
+| 0C | [`#915`](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/915) | Fernet → versioned AES-256-GCM, system-wide | ✅ Shipped |
+| 1 | [`#916`](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/916) | `CryptoSuite` + `KeypairFactory` + identity-package v2 | ✅ Shipped |
+| 2 | [`#917`](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/917) | Hybrid identity for new agents on `did:web` | ✅ Shipped |
+| 3 | [`#918`](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/918) | Succession statements for Kestrel #1, Emma, Meridian | ✅ Shipped |
+| 4 | [`#919`](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/919) | Hybrid X25519 + ML-KEM-768 for CAR exports / capsule sharing | ✅ Shipped |
+| 5 | [`#920`](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/920) | SLH-DSA release signing + transport tracking | ✅ Shipped |
+| Integration | [`#981`](https://github.com/KestrelSovereignAI/kestrel-sovereign/pull/981) | Cross-wave seam tests + dry-run script | ✅ Shipped |
+
+### Outstanding non-code work
+
+- **Real-agent rotation ceremonies** for Kestrel #1, Meridian, Emma, Frinz tenants. Procedure in [`SUCCESSION_RUNBOOK.md`](SUCCESSION_RUNBOOK.md). Rehearse with [`scripts/quantum_rotation_dry_run.py`](../../../scripts/quantum_rotation_dry_run.py) first.
+- **GitHub Actions release-signing secrets** (`KESTREL_RELEASE_SECRET_B64`, `KESTREL_RELEASE_PUBLIC_B64`, `KESTREL_DATA_KEY`) need to be provisioned in repo settings before the next `v*` tag push triggers the auto-sign workflow.
 
 Dependency graph:
 
@@ -168,15 +174,13 @@ Dependency graph:
 - Replacing PBKDF2 with Argon2id (separate hygiene issue).
 - Side-channel-resistant PQ implementations (separate hardware-custody track).
 
-## 12. Open decisions tracked here
+## 12. Decisions resolved
 
-| # | Decision | Owner | Target wave |
-|---|---|---|---|
-| D1 | Hybrid combiner construction (Chempat vs X-Wing vs concat-KDF) | TBD | Wave 4 |
-| D2 | Production-default PQ library after bake-off | TBD | Wave 2 |
-| D3 | DID hosting for `did:web` (KestrelSovereignAI domain vs self-hosted vs federation) | TBD | Wave 2 |
-| D4 | Succession ceremony custody — does the legacy secp256k1 key get destroyed after rotation, or held in cold storage for chain-walking? | TBD | Wave 3 |
-| D5 | Argon2id migration for `KESTREL_DATA_KEY` (separate epic, but this PRD references it) | TBD | Out of scope |
-| D6 | Constitution checkpoint cadence (every audit? every N audits? every rotation?) | TBD | Wave 3 |
-
-These decisions are intentionally deferred until the wave where they bind. Each will land in a follow-up addendum to this PRD when resolved.
+| # | Decision | Outcome |
+|---|---|---|
+| D1 | Hybrid combiner construction | **Concatenation hybrid** (X25519 ‖ ML-KEM-768 → HKDF-SHA256). HKDF salt binds the full transcript (both ciphertexts + both pubkeys); HKDF info binds the alg pair. See [`security/hybrid_kem.py`](../../../kestrel_sovereign/security/hybrid_kem.py). Chempat / X-Wing rejected as overconstrained for our envelope shape. |
+| D2 | Production-default PQ library | **`pqcrypto>=0.4.0`** (CFFI bindings to PQClean, prebuilt wheels, no compile-on-deploy). Reversible — `CryptoSuite` registry can host alternative implementations behind the same interface. |
+| D3 | `did:web` hosting | **Operator's choice.** Each operator picks a domain they control and publishes `did.json` files under `/<slug>/did.json`. Tenant operators (Frinz) host under their tenant domain; the framework does not bind to a single registry. |
+| D4 | Succession key destruction | **Manual, post-rollback-window.** The runbook recommends destroying the legacy secp256k1 key 7 days after the cutoff, after a representative-sample verification. The ceremony itself does NOT auto-delete — destruction is a one-way door operators take with eyes open. |
+| D5 | Argon2id migration | **Out of scope** for this epic. Tracked separately. |
+| D6 | Constitution checkpoint cadence | **Every rotation, plus on-demand on operator request.** The rotation ceremony already produces a chain anchor; constitution audit checkpoints fold into this naturally. |
