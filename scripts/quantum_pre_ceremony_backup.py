@@ -206,22 +206,40 @@ def collect_target(
 
     files_collected = 0
 
-    # Copy non-DB files via a regular file walk; SQLite files via online
-    # backup. The WAL/SHM siblings are not copied — the snapshot is a
-    # standalone DB that doesn't need them.
+    # First pass: discover every live SQLite database (anything ending in
+    # .db that is not a static snapshot). We snapshot these via the online-
+    # backup API and skip their WAL/SHM siblings in the regular file copy.
+    # Codex P2 catch: the previous implementation only snapshotted
+    # kestrel_prime.db while still skipping ALL *-wal/*-shm siblings, so
+    # secondary live DBs (llm_usage.db, github_cache.db) had their WAL
+    # contents dropped without a snapshot to merge them in.
+    live_dbs: list[Path] = []
+    for src_file in _walk_files(source):
+        if not src_file.name.endswith(".db"):
+            continue
+        # Static historical snapshots — copy raw, not via backup API.
+        if any(marker in src_file.name for marker in (
+            ".damaged-", ".db.backup", ".before-",
+        )):
+            continue
+        live_dbs.append(src_file)
+    live_db_set = {p.resolve() for p in live_dbs}
+
+    # Second pass: regular file walk. Skip WAL/SHM siblings of live DBs
+    # (the snapshot will merge them in) and skip the live DBs themselves
+    # (we'll snapshot below). Static historical .db files come through
+    # this path as raw copies.
     for src_file in _walk_files(source):
         rel = src_file.relative_to(source)
-        # Skip WAL/SHM/sync siblings of the live DB; they're consumed
-        # into the snapshot.
+        # WAL/SHM/sync siblings of any live DB — skip; the snapshot
+        # incorporates them.
         if src_file.name.endswith(("-wal", "-shm", ".db.sync")):
             continue
-        # Skip damaged backup snapshots from prior recovery events
+        # Damaged backup snapshots from prior recovery events
         if ".damaged-" in src_file.name:
             continue
-        # Skip prior ad-hoc backup files (we make a fresh snapshot below)
-        if src_file.name.endswith(".db.backup") or src_file.name.endswith(
-            ".db.before-meridian-recovery-20260429_103429"
-        ) or src_file.name == "kestrel_prime.db":
+        # Live DBs themselves — handled in the snapshot pass below
+        if src_file.resolve() in live_db_set:
             continue
 
         dest_file = dest / rel
@@ -236,15 +254,16 @@ def collect_target(
         })
         files_collected += 1
 
-    # SQLite consistent snapshot of kestrel_prime.db
-    src_db = source / "kestrel_prime.db"
-    if src_db.exists():
-        dest_db = dest / "kestrel_prime.db"
+    # Third pass: SQLite consistent snapshot of every live .db file.
+    for src_db in live_dbs:
+        rel = src_db.relative_to(source)
+        dest_db = dest / rel
+        dest_db.parent.mkdir(parents=True, exist_ok=True)
         sqlite_snapshot(src_db, dest_db)
         sha = _sha256_file(dest_db)
         manifest.append({
             "agent": name,
-            "rel_path": "kestrel_prime.db",
+            "rel_path": str(rel),
             "size": dest_db.stat().st_size,
             "sha256": sha,
             "source": "sqlite_online_backup",
