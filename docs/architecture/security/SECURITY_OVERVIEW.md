@@ -4,6 +4,8 @@
 
 If you want the deep technical version, see the linked documents at the end. This page tells you **what** we do, **why**, and **what's your job vs. the framework's**.
 
+> **Status (May 2026):** All four production agents (Kestrel #1 / Emma, Meridian, Nellie, Claw) are running on hybrid identities. The runtime detects each agent's `successions/<slug>.json` at startup and signs new artifacts with both Ed25519 and ML-DSA-65 by default. New artifacts use the v2 `signatures` array; pre-rotation artifacts continue to verify under the chain walker. See **"Operator playbook"** below for the rollout procedure.
+
 ## TL;DR
 
 - Every Kestrel agent has a cryptographic identity (a DID — pronounced "did," like the past tense of "do") that signs everything important. Today, **new agents sign with two algorithms at once**: a classical one (Ed25519) and a post-quantum one (ML-DSA-65). To forge a signature, an attacker must break **both**.
@@ -137,6 +139,50 @@ So the picture is:
 4. **Provisioning the release-signing GitHub secrets** (`KESTREL_RELEASE_SECRET_B64`, `KESTREL_RELEASE_PUBLIC_B64`, `KESTREL_DATA_KEY`) if you publish releases. Without those, the auto-sign workflow won't run on your tag pushes.
 5. **Backing up keys.** Encrypted key bundles + the master key should be in two independent locations. The framework does not make backups for you.
 6. **Eventually destroying legacy keys** (after the cutoff, after a rollback window). The runbook has the procedure; the framework deliberately does NOT auto-delete because key destruction is a one-way door.
+
+## Operator playbook — full hybrid rollout
+
+The end-to-end migration for an existing legacy agent runs like this. Each step is a separate concern and they can be days apart.
+
+### 1. Pre-flight: encrypted backup
+
+`scripts/quantum_pre_ceremony_backup.py` produces a verifiable encrypted tarball (AES-256-GCM, PBKDF2-HMAC-SHA256, 600k iterations) of the agent's data dir. Self-verifies by decrypting+extracting+hashing every file before declaring success. Copy the encrypted output off-disk (Google Drive, S3, etc.) and vault the passphrase separately.
+
+### 2. Ceremony
+
+`scripts/quantum_kestrel_1_ceremony.py` (despite the name, parameterized for any agent) runs the rotation: loads the legacy ECDSA private key, mints a hybrid Ed25519 + ML-DSA-65 keypair plus an SLH-DSA archival keypair, signs the succession statement, persists everything via `SecureKeyStorage`, and writes a fresh `did.json` ready to publish. Five gates including a key-cross-check against the existing DID document.
+
+### 3. Publish the new `did.json`
+
+Drop the produced `did.json` into the `agent-identities` repo (or wherever you serve `https://<domain>/<slug>/did.json`). Confirm `curl -sI` returns HTTP 200 with `Content-Type: application/json`.
+
+### 4. Restart the agent runtime
+
+`KestrelAgent.__init__` detects the succession statement on disk, loads the hybrid keypair, and the agent starts producing hybrid signatures by default. Verify via:
+
+```bash
+curl -H "X-API-Key: $KEY" http://localhost:8888/api/agents/<name>/api/identity | python3 -m json.tool
+```
+
+You should see `is_hybrid: true` and a `signing_did` of `did:web:<domain>:<slug>`. The UI's identity tab shows a green `[HYBRID]` badge with the new DID.
+
+### 5. Wait at least 7 days
+
+The legacy ECDSA private key still on disk is the rollback escape hatch — if anything about the new identity is broken, you can re-rotate or fall back. Don't destroy the legacy key until you have evidence the new identity is working in production: artifacts signed under it verify under the chain walker, the published `did.json` resolves cleanly, etc.
+
+### 6. Destroy the legacy private key
+
+`scripts/quantum_destroy_legacy_key.py` secure-deletes the legacy private key after seven gates pass:
+
+1. `--confirm` flag set (default is dry-run)
+2. `KESTREL_DESTROY_CONFIRM=I-have-verified-the-rollback-window` env var set
+3. Succession statement on disk
+4. Succession `effective_from` is at least `--rollback-window-days` (default 7) in the past
+5. Succession statement crypto-verifies (predecessor + successor signatures)
+6. Hybrid keys on disk + probe-sign verifies they actually match the published successor identity
+7. Published `did.json` reachable AND its verification methods match the succession statement
+
+The runtime tolerates the missing legacy private after destruction: `runtime_identity.load_agent_identity` derives the legacy public key from the on-disk DID document for the chain walker; signing call sites use the hybrid keypair.
 
 ## When something looks wrong
 
