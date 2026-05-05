@@ -658,6 +658,45 @@
             max-width: 360px;
         }
 
+        /* Hybrid identity row (post-Quantum-Hardening rotation).
+           Sits beneath the legacy DID line and surfaces the new
+           did:web identity + a HYBRID badge. */
+        .identity-hybrid-row {
+            display: flex;
+            align-items: center;
+            gap: 0.4rem;
+            font-family: var(--font-mono);
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+            margin-top: 0.25rem;
+            max-width: 480px;
+            flex-wrap: wrap;
+        }
+        .hybrid-badge {
+            display: inline-block;
+            padding: 0.1rem 0.45rem;
+            border-radius: 4px;
+            font-family: var(--font-mono);
+            font-size: 0.65rem;
+            font-weight: 700;
+            letter-spacing: 0.05em;
+            background: #0d8a4a;
+            color: #fff;
+            cursor: help;
+        }
+        .identity-signing-did-text {
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            min-width: 0;
+        }
+        .hybrid-chain-depth {
+            font-size: 0.7rem;
+            color: var(--text-tertiary);
+            font-style: italic;
+            cursor: help;
+        }
+
         /* Profile Editor */
         .identity-avatar-wrapper {
             position: relative;

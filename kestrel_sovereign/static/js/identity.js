@@ -232,6 +232,7 @@ export async function loadIdentity() {
                         <span class="identity-did-text">${identity.did || 'No DID assigned'}</span>
                         <button onclick="copyToClipboard('${identity.did}')" style="background:none;border:none;cursor:pointer;flex-shrink:0;" title="Copy DID">\u{1F4CB}</button>
                     </div>
+                    ${_renderHybridIdentityRow(identity)}
                 </div>
             </div>
             <div class="avatar-generate-panel" id="avatar-generate-panel" style="display:none;">
@@ -592,6 +593,37 @@ function escapeHtml(str) {
     const div = document.createElement('div');
     div.textContent = str;
     return div.innerHTML;
+}
+
+/**
+ * Render the hybrid-identity row beneath the legacy DID line.
+ *
+ * Three states the response can carry (from /api/identity, post-#1000):
+ *   - `is_hybrid === true`: post-rotation. Show the new did:web URI
+ *     and a green "HYBRID" badge with succession-chain depth.
+ *   - `is_hybrid === false` AND signing_did === did: pre-ceremony,
+ *     legacy-only. Render nothing here (identity-did line above is
+ *     enough; the agent hasn't migrated yet).
+ *   - field absent (older API or pre-#1000 server): also render
+ *     nothing — defensive against stale clients.
+ */
+function _renderHybridIdentityRow(identity) {
+    if (!identity || identity.is_hybrid !== true) {
+        return '';
+    }
+    const signingDid = identity.signing_did || identity.did;
+    const chain = identity.succession_chain_length;
+    const chainNote = (typeof chain === 'number' && chain > 0)
+        ? `<span class="hybrid-chain-depth" title="Succession chain depth (number of rotation ceremonies)">chain depth ${chain}</span>`
+        : '';
+    return `
+        <div class="identity-hybrid-row" title="${escapeHtml(signingDid)}">
+            <span class="hybrid-badge" title="Post-rotation hybrid identity (Ed25519 + ML-DSA-65). New artifacts are signed with both classical and post-quantum signatures.">HYBRID</span>
+            <span class="identity-signing-did-text">${escapeHtml(signingDid)}</span>
+            <button onclick="copyToClipboard('${escapeHtml(signingDid)}')" style="background:none;border:none;cursor:pointer;flex-shrink:0;" title="Copy signing DID">\u{1F4CB}</button>
+            ${chainNote}
+        </div>
+    `;
 }
 
 // ============================================================================
