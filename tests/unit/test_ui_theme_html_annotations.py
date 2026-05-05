@@ -157,6 +157,46 @@ def test_theme_picker_js_is_loaded_in_index_html(html_text):
     assert "js/theme_picker.js" in html_text, "index.html must include js/theme_picker.js"
 
 
+def test_inline_style_block_extracted(html_text):
+    """The ~1,200-line inline <style> block was extracted into index.css
+    (epic #994). Reverting that change inflates index.html past 2,000
+    lines and fragments the styles between two files. Guard against
+    silent re-inlining: index.html must reference index.css and must
+    NOT contain a top-level <style> block.
+
+    Inline `style="..."` attributes on individual elements are fine —
+    those are scoped to the element and not what this test catches.
+    """
+    assert '<link rel="stylesheet" href="/static/index.css">' in html_text, (
+        "index.html must reference /static/index.css — the extracted "
+        "stylesheet from #994. Restoring an inline <style> block here "
+        "would inflate the file past 2,000 lines and undo the extraction."
+    )
+    # No top-level <style> tag. Match optional attributes/whitespace.
+    import re
+    assert not re.search(r"<style[^>]*>", html_text), (
+        "index.html must not contain a top-level <style> block — CSS "
+        "lives in index.css since #994. Inline style=\"\" attributes on "
+        "individual elements are still fine."
+    )
+
+
+def test_index_css_exists_and_is_well_formed():
+    """The extracted stylesheet must exist at the documented path and
+    have balanced braces (rough well-formedness check)."""
+    css_path = (
+        Path(__file__).resolve().parents[2]
+        / "kestrel_sovereign" / "static" / "index.css"
+    )
+    assert css_path.exists(), f"{css_path} missing — CSS extraction lost"
+    css = css_path.read_text(encoding="utf-8")
+    assert css.count("{") == css.count("}"), (
+        f"{css_path}: brace count unbalanced "
+        f"({css.count('{')} open, {css.count('}')} close) — CSS broke during edit"
+    )
+    assert len(css) > 10_000, f"{css_path} is only {len(css)} bytes — looks truncated"
+
+
 def test_theme_picker_dom_elements_present(html_text):
     """The picker's anchor elements must exist; theme_picker.js targets them by id."""
     assert 'id="theme-picker-theme"' in html_text, "theme dropdown anchor missing"
