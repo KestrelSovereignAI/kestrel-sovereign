@@ -1,0 +1,181 @@
+schema_version = "1"
+theme = "legacy"
+locale = "en"
+
+# Legacy theme — matches what renders on `main` today.
+# This is the default theme on first load. Authoring discipline:
+# every value here MUST be byte-equivalent to the corresponding
+# string in kestrel_sovereign/static/index.html so the legacy theme
+# is visually indistinguishable from the un-themed UI.
+
+[labels]
+
+# Page-level
+document_title = "Kestrel Sovereign Console"
+
+# Navigation tabs
+tab_identity = "Identity"
+tab_chat = "Chat"
+tab_constitution = "Constitution"
+tab_memories = "Memories"
+tab_tasks = "Tasks"
+tab_sovereignty = "Sovereignty"
+tab_resources = "Resources"
+tab_metrics = "Metrics"
+tab_spawn = "Spawn"
+tab_features = "Features"
+tab_security = "Security"
+
+# Sidebars
+sidebar_agents = "Agents"
+sidebar_conversations = "Conversations"
+btn_collapse = "Collapse"
+btn_new_conversation = "New Conversation"
+btn_show_trash = "Show Trash"
+empty_conversations = "Select an agent to view conversations"
+loading_agents = "Loading agents..."
+loading_trash = "Loading trash…"
+
+# Identity panel
+loading_identity = "Loading identity..."
+
+# Chat panel
+chat_history_title = "History"
+chat_welcome_message = "Hello! I am your Kestrel AI agent, bound by the Kestrel Constitution to be your truthful and honorable assistant. How can I help you today?"
+chat_thinking = "Thinking..."
+chat_input_placeholder = "Ask me anything or use !commands..."
+btn_close_sidebar = "Close sidebar"
+btn_new_conversation_long = "+ New Conversation"
+btn_chat_history = "Chat History"
+btn_new_chat = "New Chat"
+btn_stop_title = "Stop"
+btn_stop = "Stop"
+btn_send = "Send"
+loading_history = "Loading history..."
+model_selector_vendor_title = "Select vendor"
+model_selector_vendor_placeholder = "Vendor..."
+model_selector_route_title = "Select route (auth/endpoint)"
+model_selector_route_placeholder = "Route..."
+model_selector_model_title = "Select model"
+model_selector_model_placeholder = "Model..."
+
+# Constitution panel
+constitution_title = "Kestrel Constitution"
+loading_constitution = "Loading constitution..."
+
+# Memories panel
+memories_title = "Knowledge Graph"
+memories_filter_all = "All Types"
+memories_filter_agent = "Agent"
+memories_filter_documents = "Documents"
+memories_filter_memories = "Memories"
+memories_filter_backups = "Backups"
+loading_memories = "Loading memories..."
+
+# Tasks panel
+tasks_title = "Tasks & Activity"
+tasks_view_tasks = "Background Tasks"
+tasks_view_activity = "Activity Log"
+tasks_description = "A2A background tasks (image generation, training, etc.)"
+activity_description = "Real-time log of tool calls, LLM invocations, and feature executions."
+tasks_filter_working = "Working"
+tasks_filter_completed = "Completed"
+tasks_filter_failed = "Failed"
+loading_tasks = "Loading tasks..."
+loading_activity = "Loading activity..."
+
+# Sovereignty panel
+sovereignty_title = "Data Sovereignty"
+sovereignty_tagline = "Your data is your own. Export to IPFS/Filecoin for true ownership and portability."
+sovereignty_export_history = "Export History"
+sovereignty_local_cache = "Local Cache"
+sovereignty_local_cache_description = "Browse cached backup files stored locally on your device."
+sovereignty_db_explorer = "Database Explorer"
+sovereignty_db_description = "Read-only view of agent database tables and contents."
+sovereignty_ipfs_network = "IPFS Network"
+sovereignty_ipfs_description = "Check connectivity to local IPFS node and public gateways."
+btn_export_ipfs = "Export to IPFS"
+btn_import_cid = "Import from CID"
+btn_browse_local_files = "Browse Local Files"
+btn_browse_database = "Browse Database"
+btn_check_status = "Check Status"
+loading_exports = "Loading exports..."
+loading_files = "Loading files..."
+loading_database = "Loading database..."
+loading_ipfs = "Checking IPFS..."
+
+# Resources panel
+resources_title = "Agent Resources"
+resources_description = "API keys, wallet balances, and usage tracking. Keys are resolved in priority order: Agent → User → Platform."
+resources_active_key_label = "Active Key Source:"
+resources_agent_keys_title = "Agent Keys"
+resources_agent_keys_subtitle = "(this companion only)"
+resources_user_keys_title = "Your Keys"
+resources_user_keys_subtitle = "(BYOK - shared across companions)"
+resources_byok_description = "Keys encrypted with your passphrase. No wallet charges when using your own keys."
+resources_platform_title = "Platform Access"
+resources_platform_subtitle = "(pay-per-use)"
+resources_platform_description = "Uses your wallet balance + platform margin. Fallback when no personal keys available."
+resources_wallet_title = "Wallet"
+resources_usage_title = "Usage (Last 30 Days)"
+btn_add_key = "+ Add Key"
+btn_unlock = "Unlock"
+loading_generic = "Loading..."
+loading_keys = "Loading keys..."
+loading_platform = "Loading platform access..."
+loading_wallet = "Loading wallet..."
+loading_usage = "Loading usage..."
+
+# Metrics panel
+metrics_title = "Metrics Dashboard"
+metrics_event_timeline = "Event Timeline"
+metrics_tool_duration = "Tool Duration (avg ms)"
+metrics_event_distribution = "Event Distribution"
+metrics_recent_errors = "Recent Errors"
+metrics_no_errors = "No errors recorded"
+loading_metrics = "Loading metrics..."
+
+# Spawn panel
+spawn_title = "Spawn Manager"
+spawn_active_children = "Active Children"
+spawn_delegation_chain = "Delegation Chain"
+spawn_budget_allocation = "Budget Allocation"
+spawn_history_title = "Spawn History"
+spawn_empty_state = "Click refresh or switch to this tab to load spawn data"
+spawn_no_delegation = "No delegation chain"
+spawn_no_history = "No spawn events recorded"
+
+# Features panel
+features_title = "Feature Store"
+features_description = "Browse, install, and manage feature packages for your agent."
+features_search_placeholder = "Search features, tags, skills..."
+features_filter_all = "All"
+features_filter_installed = "Installed"
+features_filter_available = "Available"
+loading_features = "Loading features..."
+
+# Security panel
+security_title = "Security Permissions"
+security_description = "Control which tools can run automatically, require approval, or are blocked."
+security_pending_approvals = "Pending Approvals"
+security_no_pending = "No pending approvals"
+security_permission_tree = "Permission Tree"
+security_load_tree_prompt = "Click to load permission tree..."
+security_legend_label = "Legend:"
+security_legend_allow = "Allow"
+security_legend_ask = "Ask"
+security_legend_deny = "Deny"
+security_legend_mixed = "Mixed"
+security_session_controls = "Session Controls"
+security_session_note = "Session permissions are cleared when the browser is closed."
+security_audit_log = "Audit Log"
+security_load_audit_prompt = "Click to load audit log..."
+btn_reset_session = "Reset Session Permissions"
+btn_cancel_pending = "Cancel All Pending"
+
+# Cross-cutting / shared
+btn_refresh = "Refresh"
+btn_refresh_with_glyph = "↻ Refresh"
+label_auto_refresh = "Auto-refresh"
+refresh_off = "Off"
+filter_all = "All"
