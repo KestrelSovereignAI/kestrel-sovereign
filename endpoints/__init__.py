@@ -14,6 +14,7 @@ from .files import router as files_router
 from .saved_items import router as saved_items_router
 from .metrics import router as metrics_router
 from .features import router as features_router
+from .ui import router as ui_router
 
 # Feature-contributed routers (voice, spawn, observability) are no longer
 # imported here. They are mounted dynamically via Feature.get_router()
@@ -32,4 +33,5 @@ __all__ = [
     "saved_items_router",
     "metrics_router",
     "features_router",
+    "ui_router",
 ]

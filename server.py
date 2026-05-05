@@ -466,6 +466,7 @@ from endpoints import (
     saved_items_router,
     metrics_router,
     features_router,
+    ui_router,
 )
 from endpoints.rasa_shim import router as rasa_shim_router
 
@@ -488,6 +489,7 @@ app.include_router(security_router)
 app.include_router(saved_items_router)
 app.include_router(metrics_router)
 app.include_router(features_router)
+app.include_router(ui_router)
 app.include_router(rasa_shim_router)
 
 
@@ -649,7 +651,7 @@ async def auth_middleware(request: Request, call_next):
     """
     public_paths = ["/health", "/health/detailed", "/favicon.ico", "/api/auth/key", "/metrics", "/webhooks/github-app"]
     auth_paths = ["/auth/login", "/auth/callback", "/auth/logout", "/auth/token"]
-    static_prefixes = ["/static", "/js/", "/shared/", "/utils/", "/api/github/"]
+    static_prefixes = ["/static", "/js/", "/shared/", "/utils/", "/api/github/", "/api/ui/"]
 
     if request.url.path in public_paths or request.url.path in auth_paths:
         return await call_next(request)
