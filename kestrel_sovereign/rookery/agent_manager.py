@@ -240,10 +240,19 @@ class AgentManager:
         Raises:
             ValueError: If an agent with this name already exists or inception fails.
         """
-        # Sign the mandate with the parent's private key if available
+        # Sign the mandate with the parent's keys if available.
+        # Hybrid parents (post-rotation ceremony) get an additional
+        # ``parent_identity`` arg so the mandate is signed with both
+        # Ed25519 and ML-DSA-65; legacy parents fall through to the
+        # bare-hex ECDSA path. The parent's runtime identity is set
+        # on the agent at startup by KestrelAgent.__init__ (#999).
         parent_private_key = getattr(parent_agent, '_private_key', None)
+        parent_identity = getattr(parent_agent, 'identity', None)
         if parent_private_key is not None:
-            sign_mandate(mandate, parent_private_key)
+            sign_mandate(
+                mandate, parent_private_key,
+                parent_identity=parent_identity,
+            )
 
         # Create the child via the existing create_agent flow
         child = await self.create_agent(name, parent_did=parent_agent.agent_id)

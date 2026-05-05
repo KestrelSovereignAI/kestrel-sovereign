@@ -330,9 +330,11 @@ Warnings:
                 else:
                     hash_status = "INVALID (package may have been modified)"
 
-            # Verify signature
+            # Verify signature. Hybrid packages carry sigs only on the
+            # v2 ``signatures`` array; ``package.signature`` is empty
+            # by design for post-ceremony agents.
             sig_status = "UNSIGNED"
-            if package.signature:
+            if package.signature or package.signatures:
                 is_valid, msg = verify_package_signature(package)
                 sig_status = "VALID" if is_valid else f"INVALID: {msg}"
 

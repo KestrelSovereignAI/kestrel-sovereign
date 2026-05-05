@@ -569,7 +569,10 @@ class AgentIdentityPackage:
             "relationships_count": len(self.relationships),
             "skills_count": len(self.skills),
             "migrations_count": len(self.migration_history),
-            "is_signed": bool(self.signature),
+            # Hybrid packages carry sigs only on the v2 ``signatures``
+            # array; ``signature`` is empty by design. Either carrier
+            # makes the package signed.
+            "is_signed": bool(self.signature) or bool(self.signatures),
             "constitution_verified": self.verify_constitution() if self.constitution_text else False,
             "legal_entity_status": self.legal_entity.get("status") if self.legal_entity else None,
         }
