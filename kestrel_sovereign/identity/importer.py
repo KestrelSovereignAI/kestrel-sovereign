@@ -141,7 +141,14 @@ class IdentityImporter:
                 return self._build_result(False, agent_id)
 
         if verify_signature:
-            if package.signature:
+            # Hybrid packages carry sigs only on package.signatures
+            # (the v2 array); the legacy package.signature field is
+            # empty by design for post-ceremony agents because that
+            # field can't be made byte-compatible with v1 readers
+            # over a v2 canonical hash. Treat either carrier as
+            # "signed" and let _verify_signature route by alg.
+            has_signature = bool(package.signature) or bool(package.signatures)
+            if has_signature:
                 sig_valid = await self._verify_signature(package)
                 if not sig_valid:
                     self.errors.append("DID signature verification failed")
@@ -202,37 +209,25 @@ class IdentityImporter:
         )
 
     async def _verify_signature(self, package: AgentIdentityPackage) -> bool:
-        """Verify DID signature on the package."""
+        """Verify the package's signature via the canonical verifier.
+
+        Routes through ``verify_package_signature`` so both legacy
+        ``signature`` (single ECDSA hex) and the v2 ``signatures``
+        array (hybrid Ed25519 + ML-DSA-65) are handled by their
+        appropriate paths. The verifier loads the trust anchor from
+        the receiver's local agent_data dir.
+        """
         try:
-            from kestrel_sovereign.inception_service import load_kestrel_identity
-            from cryptography.hazmat.primitives import hashes
-            from cryptography.hazmat.primitives.asymmetric import ec
-
-            # Extract key_id from DID (did:pkh:eip155:1:{address})
-            parts = package.did.split(":")
-            if len(parts) >= 5:
-                address = parts[4]
-                key_id = f"kestrel_{address}"
-
-                # Load private key (we need public key for verification)
-                private_key, _ = load_kestrel_identity(key_id)
-                public_key = private_key.public_key()
-
-                # Verify signature via Secp256k1Suite (Wave 1 sub-PR 5).
-                from kestrel_sovereign.security.crypto_suite import (
-                    ALG_ECDSA_SECP256K1_SHA256, get_suite,
-                )
-                signature_bytes = bytes.fromhex(package.signature)
-                content_hash_bytes = package.content_hash.encode("utf-8")
-                suite = get_suite(ALG_ECDSA_SECP256K1_SHA256)
-                if not suite.verify(content_hash_bytes, signature_bytes, public_key):
-                    raise ValueError("ECDSA signature verification failed")
-                return True
+            from kestrel_sovereign.identity.signing import verify_package_signature
+            ok, msg = verify_package_signature(package)
+            if not ok:
+                self.warnings.append(f"Signature verification failed: {msg}")
+                return False
+            return True
         except Exception as e:
             logger.warning(f"Signature verification failed: {e}")
             self.warnings.append(f"Signature verification failed: {str(e)}")
-
-        return False  # Reject packages with invalid/unverifiable signatures
+            return False
 
     async def _check_existing_data(self, agent_id: str) -> bool:
         """Check if there's existing data for this agent."""
