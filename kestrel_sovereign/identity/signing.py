@@ -105,18 +105,27 @@ def sign_package(
     try:
         # Try hybrid load first: if a succession statement exists in
         # storage_dir, this returns the AgentIdentity with both halves
-        # of the hybrid keypair. Pre-ceremony agents fall back to the
-        # legacy single-key path below.
+        # of the hybrid keypair. Pre-ceremony agents fall through.
+        # Codex P2 catch: only FileNotFoundError (no key/DID on disk)
+        # is a legitimate fall-through to legacy. RuntimeIdentityError
+        # signals an INCONSISTENT post-ceremony state (succession
+        # statement present but hybrid keys missing/corrupt) and must
+        # propagate — silently downgrading would emit non-hybrid
+        # signatures for an agent that should be hybrid-only, masking
+        # a security-critical key-state problem.
+        from kestrel_sovereign.identity.runtime_identity import (
+            RuntimeIdentityError, load_agent_identity,
+        )
         agent_identity = None
         try:
-            from kestrel_sovereign.identity.runtime_identity import (
-                load_agent_identity,
-            )
             key_id = get_key_id(package.did)
             agent_identity = load_agent_identity(key_id, storage_dir=storage_dir)
-        except Exception as e:
-            logger.debug(f"Hybrid identity load fell through to legacy: {e}")
-            agent_identity = None
+        except FileNotFoundError as e:
+            logger.debug(f"No identity on disk yet, using legacy path: {e}")
+        except RuntimeIdentityError:
+            # Inconsistent post-ceremony state — fail loud, do NOT
+            # downgrade to legacy.
+            raise
 
         from kestrel_sovereign.security.crypto_suite import (
             ALG_ECDSA_SECP256K1_SHA256, get_suite,
@@ -220,8 +229,22 @@ def verify_package_signature(
     if computed_hash != package.content_hash:
         return False, "Content hash mismatch - package may have been modified"
 
-    # Step 2: prefer v2 signatures array if present (hybrid agent)
-    if package.signatures:
+    # Step 2: prefer v2 signatures array if it actually carries hybrid
+    # algs. Codex P1 catch: ``AgentIdentityPackage.from_dict`` synthesizes
+    # a single-entry ``signatures`` array tagged ``ecdsa-secp256k1-sha256``
+    # for v1 packages on load, so a non-empty ``signatures`` is NOT
+    # sufficient to conclude a package is hybrid. Route by the alg in
+    # the array — hybrid algs use v2 verify, classical-only routes to
+    # the legacy hex verifier.
+    from kestrel_sovereign.security.crypto_suite import (
+        ALG_ED25519, ALG_ML_DSA_65,
+    )
+    has_hybrid_sig = any(
+        (s.get("alg") if isinstance(s, dict) else None)
+        in (ALG_ED25519, ALG_ML_DSA_65)
+        for s in (package.signatures or [])
+    )
+    if has_hybrid_sig:
         return _verify_v2_signatures(package)
 
     # Step 3: legacy v1 fallback

@@ -211,3 +211,66 @@ def test_v2_signature_with_wrong_alg_for_kid_rejected(post_ceremony_agent_dir):
     )
     ok, _ = verify_package_signature(signed, storage_dir=storage_dir)
     assert not ok
+
+
+# ---------------------------------------------------------------------------
+# Synthetic v1-loaded-as-v2 routes to legacy verify (codex P1 catch)
+# ---------------------------------------------------------------------------
+
+def test_v1_package_with_synthetic_signatures_array_uses_legacy_verify(
+    legacy_agent_dir,
+):
+    """``AgentIdentityPackage.from_dict`` materializes the legacy v1
+    ``signature`` into a synthetic single-entry ``signatures`` array
+    tagged ``ecdsa-secp256k1-sha256``. The verifier must NOT route
+    that to the hybrid path (which would reject for missing
+    verification_methods); it must fall through to the legacy hex
+    verifier.
+    """
+    storage_dir, _, legacy_did, _ = legacy_agent_dir
+    pkg = _make_package(legacy_did)
+    signed = sign_package(pkg, storage_dir=storage_dir)
+    assert signed.signature
+    assert not signed.signatures, "legacy agent must produce v1-only"
+
+    # Round-trip through to_dict -> from_dict to materialize the synthetic
+    # signatures array (the on-disk path).
+    from kestrel_sovereign.identity.identity_package import AgentIdentityPackage
+    reloaded = AgentIdentityPackage.from_dict(signed.to_dict())
+    # Synthetic v2 array now carries one ecdsa-secp256k1-sha256 entry
+    # (or it's empty if the package was emitted as v1; either way, no
+    # hybrid algs are present)
+    has_hybrid = any(
+        s.get("alg") in ("ed25519", "ml-dsa-65")
+        for s in reloaded.signatures
+    )
+    assert not has_hybrid, "v1 reload should not produce hybrid algs"
+    ok, msg = verify_package_signature(reloaded, storage_dir=storage_dir)
+    assert ok, msg
+
+
+# ---------------------------------------------------------------------------
+# Inconsistent post-ceremony state must NOT silently downgrade to legacy
+# ---------------------------------------------------------------------------
+
+def test_corrupt_succession_state_does_not_silently_downgrade(
+    post_ceremony_agent_dir,
+):
+    """If the agent has a succession statement on disk but the hybrid
+    private keys are missing, the loader raises RuntimeIdentityError.
+    sign_package must propagate that — silently emitting legacy
+    ECDSA signatures for an agent that should be hybrid-only would
+    mask a security-critical key-state problem.
+    """
+    storage_dir, _, legacy_did, _, _ = post_ceremony_agent_dir
+    # Delete the hybrid PQ key — the succession statement still
+    # references the new identity
+    (storage_dir / "testbot_mldsa65.bytes.enc").unlink()
+
+    pkg = _make_package(legacy_did)
+    with pytest.raises(Exception) as excinfo:
+        sign_package(pkg, storage_dir=storage_dir)
+    msg = str(excinfo.value)
+    # Either RuntimeIdentityError directly or wrapped in SigningError —
+    # the important property is "did not silently downgrade"
+    assert "hybrid" in msg.lower() or "succession" in msg.lower() or "missing" in msg.lower()

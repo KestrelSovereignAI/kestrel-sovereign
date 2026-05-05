@@ -114,12 +114,16 @@ class ScriptSigner:
             # is on disk, this returns an AgentIdentity carrying BOTH the
             # legacy ECDSA keypair (for verifying pre-rotation artifacts)
             # AND the new Ed25519 + ML-DSA-65 hybrid keypair (for signing
-            # NEW artifacts). Falls back to the legacy single-key loader
-            # if the agent is pre-ceremony.
+            # NEW artifacts). FileNotFoundError → pre-ceremony agent
+            # without any key on disk yet → fall through to legacy.
+            # RuntimeIdentityError → INCONSISTENT post-ceremony state
+            # (succession statement present but hybrid keys missing or
+            # corrupt) → propagate; silently downgrading to legacy would
+            # mask a security-critical key-state problem (codex P2 catch).
+            from kestrel_sovereign.identity.runtime_identity import (
+                RuntimeIdentityError, load_agent_identity,
+            )
             try:
-                from kestrel_sovereign.identity.runtime_identity import (
-                    load_agent_identity,
-                )
                 self._agent_identity = load_agent_identity(key_id, storage_dir=db_dir)
                 self._private_key = self._agent_identity.legacy_keypair.private_key
                 self._public_key = self._agent_identity.legacy_keypair.public_key
@@ -132,10 +136,15 @@ class ScriptSigner:
                 else:
                     logger.info(f"Loaded signing keys for {key_id} (legacy-only)")
                 return True
-            except Exception as e:
+            except FileNotFoundError as e:
                 logger.debug(
-                    f"Hybrid load fell through to legacy path: {e}"
+                    f"No identity on disk for {key_id}; falling through to "
+                    f"legacy load: {e}"
                 )
+            except RuntimeIdentityError:
+                # Inconsistent post-ceremony state — propagate. Do NOT
+                # silently downgrade to legacy single-key signing.
+                raise
 
             private_key, did_document = load_kestrel_identity(key_id, db_dir)
 
