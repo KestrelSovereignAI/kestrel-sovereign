@@ -137,17 +137,22 @@ def test_legacy_tamper_detected(legacy_agent_dir):
 # Post-ceremony: hybrid path
 # ---------------------------------------------------------------------------
 
-def test_hybrid_agent_signs_both_v1_and_v2(post_ceremony_agent_dir):
+def test_hybrid_agent_emits_v2_only(post_ceremony_agent_dir):
+    """Hybrid packages are v2-only: signatures + verification_methods
+    populated, but the legacy v1 ``signature`` field is intentionally
+    left empty. The v2 content_hash includes ``verification_methods``,
+    so a v1 reader couldn't actually verify a fallback sig anyway —
+    a stale signature would just be a footgun."""
     storage_dir, _, legacy_did, _, _ = post_ceremony_agent_dir
     pkg = _make_package(legacy_did)
     signed = sign_package(pkg, storage_dir=storage_dir)
-    # v1 fallback present (so old importers still work)
-    assert signed.signature, "v1 fallback signature must be populated"
-    # v2 hybrid array present with both algs
+    assert signed.signature == "", (
+        "hybrid agent must NOT populate the legacy .signature field — "
+        "it can never verify against v2 canonical bytes"
+    )
     assert len(signed.signatures) == 2
     algs = {entry["alg"] for entry in signed.signatures}
     assert algs == {"ed25519", "ml-dsa-65"}
-    # Verification methods mirrored
     assert len(signed.verification_methods) == 2
 
 

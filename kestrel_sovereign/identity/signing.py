@@ -161,17 +161,20 @@ def sign_package(
                 pq_kid=pq_kid,
             )
             package.signatures = list(hybrid_sigs)
-            # Legacy v1 fallback: also sign with the legacy ECDSA key
-            # so importers that don't yet read the v2 array continue
-            # to verify.
-            legacy_sig = secp.sign(
-                content_hash.encode("utf-8"),
-                agent_identity.legacy_keypair.private_key,
-            )
-            package.signature = legacy_sig.hex()
+            # Codex P2 catch: a "legacy v1 ECDSA fallback" on
+            # ``package.signature`` is NOT actually backward-compatible
+            # here. The v2 ``compute_content_hash`` includes
+            # ``verification_methods`` in the canonical bytes, while v1
+            # readers compute it without those fields — the hash
+            # mismatches before any signature even gets checked.
+            # Keeping a stale signature that will never verify is worse
+            # than no signature, so leave .signature empty for hybrid
+            # agents. The v2 ``signatures`` array is the authoritative
+            # form and every Wave 1+ reader prefers it.
+            package.signature = ""
             logger.info(
                 f"Signed package for {package.did[:20]}... HYBRID "
-                f"(ed25519 + ml-dsa-65) + legacy ecdsa fallback"
+                f"(ed25519 + ml-dsa-65, v2 only)"
             )
             return package
 
