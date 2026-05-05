@@ -90,28 +90,106 @@ from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.hazmat.primitives import hashes
 
 
-PROJECT_ROOT = Path("/Volumes/data2/projects/kestrel-sovereign")
-AGENT_DATA = PROJECT_ROOT / "agent_data"
-
-# Targets to back up. Each entry: (logical_name, source_dir, extra_files).
-# extra_files is a list of paths relative to PROJECT_ROOT to also copy
-# into the backup at <logical_name>/_extras/<basename>.
-BACKUP_TARGETS = [
+# Default backup targets (logical name -> agent_data sub-path + rescue
+# extras). Each entry's ``source_dir`` is resolved against the operator's
+# project root; ``extras`` are paths relative to the project root.
+#
+# Frinz tenants are intentionally NOT in this default list. Per the
+# operator's plan (May 2026), the Frinz multi-tenant pool is handled
+# separately by the Frinz agent itself: catalog-derived tenants get
+# unadopted, no-LoRA tenants get deleted, and only the survivors get
+# rotated. Use ``--target name=path`` to add specific Frinz tenants
+# when their migration is in scope.
+DEFAULT_BACKUP_TARGETS = [
     {
         "name": "kestrel-1-emma",
-        "source_dir": AGENT_DATA / "Emma",
+        "source_relpath": "agent_data/Emma",
         "extras": [
-            # Plaintext legacy PEM at project root — rescue copy.
+            # Plaintext legacy PEM at project root — rescue copy. Side
+            # effect of the Emma recovery; lives outside the agent dir
+            # and the agent-scoped backup tools miss it.
             "agent_data/kestrel_0xB4E7F05F9c39FcD0b0d2C516249BE960c863647E.pem",
             "agent_data/kestrel_0xB4E7F05F9c39FcD0b0d2C516249BE960c863647E.json",
         ],
     },
     {
         "name": "meridian",
-        "source_dir": AGENT_DATA / "meridian",
+        "source_relpath": "agent_data/meridian",
         "extras": [],
     },
 ]
+
+
+def _resolve_project_root(arg: str | None) -> Path:
+    """Resolve the project root containing ``agent_data/``.
+
+    Order of precedence:
+    1. ``--source-root`` CLI arg (explicit)
+    2. ``KESTREL_PROJECT_ROOT`` environment variable
+    3. Walk up from the script's location to find a directory containing
+       ``agent_data/``. Works when the script is run from a normal
+       checkout; worktree users (which don't have agent_data) must use
+       option 1 or 2.
+    """
+    if arg:
+        return Path(arg).resolve()
+    env = os.environ.get("KESTREL_PROJECT_ROOT")
+    if env:
+        return Path(env).resolve()
+    cur = Path(__file__).resolve().parent
+    for candidate in [cur, *cur.parents]:
+        if (candidate / "agent_data").is_dir():
+            return candidate
+    raise SystemExit(
+        "error: cannot locate the project root containing agent_data/. "
+        "Pass --source-root /path/to/project, or set KESTREL_PROJECT_ROOT."
+    )
+
+
+def _materialize_targets(
+    project_root: Path,
+    target_filter: list[str] | None,
+    extra_targets: list[str],
+) -> list[dict]:
+    """Resolve the default + extra target list against ``project_root``.
+
+    - ``target_filter``: if non-empty, only keep targets whose ``name``
+      appears in this list. Unknown names raise.
+    - ``extra_targets``: ``name=relpath`` entries, added to the list with
+      no ``extras``. Useful for one-off Frinz-tenant rotations.
+    """
+    materialized: list[dict] = []
+    for t in DEFAULT_BACKUP_TARGETS:
+        materialized.append({
+            "name": t["name"],
+            "source_dir": (project_root / t["source_relpath"]).resolve(),
+            "extras": list(t["extras"]),
+        })
+    for spec in extra_targets:
+        if "=" not in spec:
+            raise SystemExit(
+                f"error: --target must be NAME=RELPATH; got {spec!r}"
+            )
+        name, relpath = spec.split("=", 1)
+        materialized.append({
+            "name": name,
+            "source_dir": (project_root / relpath).resolve(),
+            "extras": [],
+        })
+    if target_filter:
+        names = {t["name"] for t in materialized}
+        unknown = set(target_filter) - names
+        if unknown:
+            raise SystemExit(
+                f"error: --targets references unknown name(s): {sorted(unknown)}. "
+                f"Known: {sorted(names)}"
+            )
+        materialized = [t for t in materialized if t["name"] in target_filter]
+    if not materialized:
+        raise SystemExit(
+            "error: no targets to back up after applying --targets filter"
+        )
+    return materialized
 
 # Passphrase env var
 PASSPHRASE_ENV = "KESTREL_BACKUP_PASSPHRASE"
@@ -191,6 +269,7 @@ def collect_target(
     target: dict,
     staging_root: Path,
     manifest: list[dict],
+    project_root: Path,
 ) -> int:
     """Collect one agent target into the staging tree.
 
@@ -276,7 +355,7 @@ def collect_target(
         extras_dir = dest / "_extras"
         extras_dir.mkdir(parents=True, exist_ok=True)
         for rel_path in extras:
-            src_extra = PROJECT_ROOT / rel_path
+            src_extra = project_root / rel_path
             if not src_extra.exists():
                 _info(f"  (extra not found, skipping: {rel_path})")
                 continue
@@ -399,7 +478,7 @@ def decrypt_archive(ciphertext_path: Path, passphrase: str, plaintext_path: Path
 # Backup driver
 # ---------------------------------------------------------------------------
 
-def cmd_backup(passphrase: str) -> int:
+def cmd_backup(passphrase: str, project_root: Path, targets: list[dict]) -> int:
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%SZ")
     output_dir = Path(f"/tmp/kestrel-pre-ceremony-backup-{timestamp}")
     if output_dir.exists():
@@ -408,7 +487,9 @@ def cmd_backup(passphrase: str) -> int:
     output_dir.mkdir(parents=True)
 
     print(f"Pre-ceremony backup — {timestamp}")
-    print(f"Output dir: {output_dir}")
+    print(f"Project root: {project_root}")
+    print(f"Output dir:   {output_dir}")
+    print(f"Targets:      {', '.join(t['name'] for t in targets)}")
 
     staging_root = output_dir / "staging"
     staging_root.mkdir()
@@ -417,9 +498,9 @@ def cmd_backup(passphrase: str) -> int:
     # ------------------------------------------------------------------
     # Collect each target into the staging tree
     # ------------------------------------------------------------------
-    for target in BACKUP_TARGETS:
+    for target in targets:
         _step(f"Collecting {target['name']} ({target['source_dir']})")
-        n = collect_target(target, staging_root, manifest)
+        n = collect_target(target, staging_root, manifest, project_root)
         _ok(f"{n} files collected")
 
     total_files = len(manifest)
@@ -441,7 +522,7 @@ def cmd_backup(passphrase: str) -> int:
                 "format": "kestrel-pre-ceremony-backup",
                 "format_version": BACKUP_FORMAT_VERSION,
                 "created_at": datetime.now(timezone.utc).isoformat(),
-                "targets": [t["name"] for t in BACKUP_TARGETS],
+                "targets": [t["name"] for t in targets],
                 "files": manifest,
             }, indent=2, sort_keys=True),
         )
@@ -504,7 +585,7 @@ def cmd_backup(passphrase: str) -> int:
         "format": "kestrel-pre-ceremony-backup",
         "format_version": BACKUP_FORMAT_VERSION,
         "created_at": datetime.now(timezone.utc).isoformat(),
-        "targets": [t["name"] for t in BACKUP_TARGETS],
+        "targets": [t["name"] for t in targets],
         "encrypted_archive_sha256": enc_sha,
         "plaintext_archive_sha256": archive_sha,
         "files": manifest,
@@ -517,7 +598,7 @@ def cmd_backup(passphrase: str) -> int:
 This backup was created by `scripts/quantum_pre_ceremony_backup.py` on
 {datetime.now(timezone.utc).isoformat()}.
 
-Targets: {', '.join(t['name'] for t in BACKUP_TARGETS)}
+Targets: {', '.join(t['name'] for t in targets)}
 
 ## To restore
 
@@ -628,6 +709,30 @@ def main() -> int:
     parser.add_argument("--restore", action="store_true", help="Restore mode")
     parser.add_argument("--archive", type=Path, help="(restore) encrypted archive path")
     parser.add_argument("--output", type=Path, help="(restore) output directory")
+    parser.add_argument(
+        "--source-root",
+        type=str,
+        default=None,
+        help="(backup) project root containing agent_data/. Defaults to "
+             "$KESTREL_PROJECT_ROOT or the first ancestor of this script "
+             "that contains agent_data/.",
+    )
+    parser.add_argument(
+        "--targets",
+        type=str,
+        default=None,
+        help="(backup) comma-separated list of target NAMES to back up. "
+             "Defaults to every target known to the script. Use this to "
+             "filter, e.g. --targets meridian.",
+    )
+    parser.add_argument(
+        "--target",
+        action="append",
+        default=[],
+        metavar="NAME=RELPATH",
+        help="(backup) ad-hoc additional target (e.g. for a Frinz tenant). "
+             "Repeatable. RELPATH is resolved against the project root.",
+    )
     args = parser.parse_args()
 
     passphrase = os.environ.get(PASSPHRASE_ENV)
@@ -643,7 +748,13 @@ def main() -> int:
             return 2
         return cmd_restore(args.archive, args.output, passphrase)
     else:
-        return cmd_backup(passphrase)
+        project_root = _resolve_project_root(args.source_root)
+        if not (project_root / "agent_data").is_dir():
+            _err(f"resolved project root {project_root} has no agent_data/ subdir")
+            return 2
+        target_filter = args.targets.split(",") if args.targets else None
+        targets = _materialize_targets(project_root, target_filter, args.target)
+        return cmd_backup(passphrase, project_root, targets)
 
 
 if __name__ == "__main__":
