@@ -219,7 +219,18 @@ class ScriptSigner:
         content_hash = self._content_hash(script)
         content_hash_bytes = hashlib.sha256(content_hash.encode()).digest()
 
-        if not await self._load_keys() or self._private_key is None:
+        # Either a legacy ECDSA private key OR a hybrid identity
+        # capable of signing must be available. Post-destruction
+        # agents (legacy key zapped per quantum_destroy_legacy_key.py)
+        # have ``self._private_key is None`` but
+        # ``self._agent_identity.is_hybrid`` True — that's a fully
+        # functional signing state.
+        loaded = await self._load_keys()
+        has_hybrid = (
+            self._agent_identity is not None
+            and self._agent_identity.is_hybrid
+        )
+        if not loaded or (self._private_key is None and not has_hybrid):
             raise ScriptSigningKeysUnavailable(
                 f"Cannot sign script {script.id[:8]}…: signing keys for "
                 f"DID {self.agent_did!r} are not available. Refusing to "
