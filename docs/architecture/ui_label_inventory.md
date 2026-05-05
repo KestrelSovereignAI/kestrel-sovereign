@@ -26,7 +26,7 @@ Every label is tagged with one of four classes:
 | Class | Varies by theme? | Varies by locale? | Example |
 |---|---|---|---|
 | `theme` | yes | yes | "Rookery" → "Mews" → "Multi-Agent" |
-| `locale` | no | yes | "Loading…" → "Cargando…" |
+| `locale` | no | yes | "Loading..." → "Cargando..." |
 | `mech` | no | no | Numbers, glyphs, brand glyphs, ISO codes |
 | `data` | n/a | n/a | Replaced at runtime from API/state (e.g. agent name) |
 
@@ -72,18 +72,18 @@ JS counts are sampled because most JS strings are operational status/error messa
 |---|---|---|---|---|
 | 1236 | Agents | sidebar_agents | theme | The "Rookery" rename target — already labeled "Agents" on screen, but this is the key the falconry theme would surface as "Mews" |
 | 1237 | Collapse (title) | btn_collapse | locale | |
-| 1240 | Loading agents… | loading_agents | locale | |
+| 1240 | Loading agents... | loading_agents | locale | |
 | 1248 | Conversations | sidebar_conversations | theme | |
 | 1249 | New Conversation (title) | btn_new_conversation | locale | |
 | 1250 | Show Trash (title) | btn_show_trash | locale | |
 | 1254 | Select an agent to view conversations | empty_conversations | locale | |
-| 1257 | Loading trash… | loading_trash | locale | |
+| 1257 | Loading trash… | loading_trash | locale | Note: this row is the *only* place in `index.html` that uses a Unicode ellipsis (`…`); all other "Loading X" / "Vendor..." / "Thinking..." strings use ASCII three dots. Source inconsistency — see open question below. |
 
 ### Identity panel
 
 | Line | Current text | Proposed key | Class | Notes |
 |---|---|---|---|---|
-| 1266 | Loading identity… | loading_identity | locale | |
+| 1266 | Loading identity... | loading_identity | locale | |
 
 ### Chat panel
 
@@ -92,28 +92,28 @@ JS counts are sampled because most JS strings are operational status/error messa
 | 1287 | History | chat_history_title | theme | |
 | 1295 | Close sidebar (title) | btn_close_sidebar | locale | |
 | 1302 | + New Conversation | btn_new_conversation_long | locale | |
-| 1304 | Loading history… | loading_history | locale | |
+| 1304 | Loading history... | loading_history | locale | |
 | 1322 | Chat History (title) | btn_chat_history | locale | |
 | 1323 | New Chat (title) | btn_new_chat | locale | |
 | 1331 | Select vendor (title) | model_selector_vendor_title | locale | |
-| 1332 | Vendor… | model_selector_vendor_placeholder | locale | |
+| 1332 | Vendor... | model_selector_vendor_placeholder | locale | |
 | 1334 | Select route (auth/endpoint) (title) | model_selector_route_title | locale | |
-| 1335 | Route… | model_selector_route_placeholder | locale | |
+| 1335 | Route... | model_selector_route_placeholder | locale | |
 | 1337 | Select model (title) | model_selector_model_title | locale | |
-| 1338 | Model… | model_selector_model_placeholder | locale | |
-| 1350 | Hello! I am your Kestrel AI agent, bound by the Kestrel Constitution… | chat_welcome_message | theme | Heaviest theme-variant content; falconry/plain rewrite the voice |
-| 1360 | Thinking… | chat_thinking | theme | falconry: "Hunting…"? plain: "Thinking…" |
+| 1338 | Model... | model_selector_model_placeholder | locale | |
+| 1350 | Hello! I am your Kestrel AI agent, bound by the Kestrel Constitution... | chat_welcome_message | theme | Heaviest theme-variant content; falconry/plain rewrite the voice |
+| 1360 | Thinking... | chat_thinking | theme | falconry: "Hunting..."? plain: "Thinking..." |
 | 1361 | Stop (title) | btn_stop_title | locale | |
 | 1370 | Stop | btn_stop | locale | |
-| 1375 | Ask me anything or use !commands… | chat_input_placeholder | theme | |
-| 1376 | Send (title) | btn_send | locale | |
+| 1375 | Ask me anything or use !commands... | chat_input_placeholder | theme | |
+| 1376 | Send (title) | btn_send | locale | Visible button content is `&#8679;` (⇧ glyph), not the word "Send"; only the `title` attribute carries the word | |
 
 ### Constitution panel
 
 | Line | Current text | Proposed key | Class | Notes |
 |---|---|---|---|---|
 | 1397 | Kestrel Constitution | constitution_title | theme | |
-| 1401 | Loading constitution… | loading_constitution | locale | |
+| 1401 | Loading constitution... | loading_constitution | locale | |
 
 ### Memories panel
 
@@ -125,7 +125,7 @@ JS counts are sampled because most JS strings are operational status/error messa
 | 1415 | Documents | memories_filter_documents | locale | |
 | 1416 | Memories | memories_filter_memories | locale | |
 | 1417 | Backups | memories_filter_backups | locale | |
-| 1421 | Loading memories… | loading_memories | locale | |
+| 1421 | Loading memories... | loading_memories | locale | |
 
 ### Tasks panel
 
@@ -140,9 +140,9 @@ JS counts are sampled because most JS strings are operational status/error messa
 | 1466 | Working | tasks_filter_working | locale | |
 | 1467 | Completed | tasks_filter_completed | locale | |
 | 1468 | Failed | tasks_filter_failed | locale | |
-| 1472 | Loading tasks… | loading_tasks | locale | |
+| 1472 | Loading tasks... | loading_tasks | locale | |
 | 1479 | Real-time log of tool calls, LLM invocations, and feature executions. | activity_description | locale | |
-| 1482 | Loading activity… | loading_activity | locale | |
+| 1482 | Loading activity... | loading_activity | locale | |
 
 ### Sovereignty panel
 
@@ -153,19 +153,19 @@ JS counts are sampled because most JS strings are operational status/error messa
 | 1495 | Import from CID | btn_import_cid | locale | |
 | 1499 | Your data is your own. Export to IPFS/Filecoin for true ownership and portability. | sovereignty_tagline | theme | |
 | 1501 | Export History | sovereignty_export_history | theme | |
-| 1503 | Loading exports… | loading_exports | locale | |
+| 1503 | Loading exports... | loading_exports | locale | |
 | 1509 | Local Cache | sovereignty_local_cache | theme | |
 | 1510 | Browse Local Files | btn_browse_local_files | locale | |
 | 1513 | Browse cached backup files stored locally on your device. | sovereignty_local_cache_description | locale | |
-| 1517 | Loading files… | loading_files | locale | |
+| 1517 | Loading files... | loading_files | locale | |
 | 1525 | Database Explorer | sovereignty_db_explorer | theme | |
 | 1526 | Browse Database | btn_browse_database | locale | |
 | 1529 | Read-only view of agent database tables and contents. | sovereignty_db_description | locale | |
-| 1533 | Loading database… | loading_database | locale | |
+| 1533 | Loading database... | loading_database | locale | |
 | 1541 | IPFS Network | sovereignty_ipfs_network | theme | |
 | 1542 | Check Status | btn_check_status | locale | |
 | 1545 | Check connectivity to local IPFS node and public gateways. | sovereignty_ipfs_description | locale | |
-| 1549 | Checking IPFS… | loading_ipfs | locale | |
+| 1549 | Checking IPFS... | loading_ipfs | locale | |
 
 ### Resources panel
 
@@ -174,12 +174,12 @@ JS counts are sampled because most JS strings are operational status/error messa
 | 1559 | Agent Resources | resources_title | theme | falconry candidate: "Equipage" |
 | 1561 | API keys, wallet balances, and usage tracking. Keys are resolved in priority order: Agent → User → Platform. | resources_description | locale | |
 | 1575 | Active Key Source: | resources_active_key_label | locale | |
-| 1583 | Loading… | loading_generic | locale | |
+| 1583 | Loading... | loading_generic | locale | |
 | 1589 | Agent Keys | resources_agent_keys_title | theme | |
 | 1589 | (this companion only) | resources_agent_keys_subtitle | locale | |
 | 1591 | + Add Key | btn_add_key | locale | |
 | 1592 | Refresh | btn_refresh | locale | |
-| 1596 | Loading keys… | loading_keys | locale | |
+| 1596 | Loading keys... | loading_keys | locale | |
 | 1603 | Your Keys | resources_user_keys_title | theme | |
 | 1603 | (BYOK - shared across companions) | resources_user_keys_subtitle | locale | |
 | 1606 | Unlock | btn_unlock | locale | |
@@ -187,11 +187,11 @@ JS counts are sampled because most JS strings are operational status/error messa
 | 1620 | Platform Access | resources_platform_title | theme | |
 | 1620 | (pay-per-use) | resources_platform_subtitle | locale | |
 | 1623 | Uses your wallet balance + platform margin. Fallback when no personal keys available. | resources_platform_description | locale | |
-| 1626 | Loading platform access… | loading_platform | locale | |
+| 1626 | Loading platform access... | loading_platform | locale | |
 | 1633 | Wallet | resources_wallet_title | theme | |
-| 1637 | Loading wallet… | loading_wallet | locale | |
+| 1637 | Loading wallet... | loading_wallet | locale | |
 | 1643 | Usage (Last 30 Days) | resources_usage_title | theme | |
-| 1645 | Loading usage… | loading_usage | locale | |
+| 1645 | Loading usage... | loading_usage | locale | |
 
 ### Metrics panel
 
@@ -202,7 +202,7 @@ JS counts are sampled because most JS strings are operational status/error messa
 | 1668 | Off | refresh_off | locale | |
 | 1669–1671 | 10s / 30s / 60s | refresh_10s / refresh_30s / refresh_60s | mech | Time codes; same in every locale |
 | 1682 | ↻ Refresh | btn_refresh_with_glyph | locale | |
-| 1693 | Loading metrics… | loading_metrics | locale | |
+| 1693 | Loading metrics... | loading_metrics | locale | |
 | 1710 | Event Timeline | metrics_event_timeline | theme | |
 | 1723 | Tool Duration (avg ms) | metrics_tool_duration | theme | |
 | 1744 | Event Distribution | metrics_event_distribution | theme | |
@@ -232,11 +232,11 @@ JS counts are sampled because most JS strings are operational status/error messa
 | 1864 | Feature Store | features_title | theme | |
 | 1868 | ↻ Refresh | btn_refresh_with_glyph | locale | |
 | 1871 | Browse, install, and manage feature packages for your agent. | features_description | locale | |
-| 1876 | Search features, tags, skills… | features_search_placeholder | locale | |
+| 1876 | Search features, tags, skills... | features_search_placeholder | locale | |
 | 1897 | All | features_filter_all | locale | |
 | 1906 | Installed | features_filter_installed | locale | |
 | 1915 | Available | features_filter_available | locale | |
-| 1925 | Loading features… | loading_features | locale | |
+| 1925 | Loading features... | loading_features | locale | |
 
 ### Security panel
 
@@ -248,7 +248,7 @@ JS counts are sampled because most JS strings are operational status/error messa
 | 1952 | No pending approvals | security_no_pending | locale | |
 | 1960 | Permission Tree | security_permission_tree | theme | |
 | 1964 | ↻ Refresh | btn_refresh_with_glyph | locale | |
-| 1968 | Click to load permission tree… | security_load_tree_prompt | locale | |
+| 1968 | Click to load permission tree... | security_load_tree_prompt | locale | |
 | 1972 | Legend: | security_legend_label | locale | |
 | 1972 | Allow | security_legend_allow | locale | |
 | 1972 | Ask | security_legend_ask | locale | |
@@ -260,7 +260,7 @@ JS counts are sampled because most JS strings are operational status/error messa
 | 1988 | Session permissions are cleared when the browser is closed. | security_session_note | locale | |
 | 1995 | Audit Log | security_audit_log | theme | |
 | 1999 | ↻ Refresh | btn_refresh_with_glyph | locale | |
-| 2003 | Click to load audit log… | security_load_audit_prompt | locale | |
+| 2003 | Click to load audit log... | security_load_audit_prompt | locale | |
 
 ### Page-level
 
@@ -297,8 +297,8 @@ Buttons swap their label between idle and active states. Sample:
 
 | File | Idle → Active | Proposed keys | Class |
 |---|---|---|---|
-| identity.js | Upload → Uploading… | btn_upload / btn_upload_active | locale |
-| identity.js | Generate → Generating… | btn_generate / btn_generate_active | locale |
+| identity.js | Upload → Uploading... | btn_upload / btn_upload_active | locale |
+| identity.js | Generate → Generating... | btn_generate / btn_generate_active | locale |
 | identity.js | Restore | btn_restore | locale |
 | identity.js | Delete permanently | btn_delete_permanent | locale |
 | identity.js | Trash items are automatically deleted after 30 days. | trash_retention_notice | locale |
@@ -315,7 +315,6 @@ The complete `theme`-class key set, with example mappings to the three initial t
 
 | Key | legacy | falconry | plain |
 |---|---|---|---|
-| brand_logo_alt | Kestrel | Kestrel | Kestrel |
 | tab_identity | Identity | Identity | Identity |
 | tab_chat | Chat | Chat | Chat |
 | tab_constitution | Constitution | Constitution | Constitution |
@@ -331,8 +330,8 @@ The complete `theme`-class key set, with example mappings to the three initial t
 | sidebar_conversations | Conversations | Conversations | Conversations |
 | chat_history_title | History | History | History |
 | chat_welcome_message | (current welcome) | (falconry-voiced rewrite) | (plain rewrite) |
-| chat_thinking | Thinking… | Hunting… | Thinking… |
-| chat_input_placeholder | Ask me anything… | Speak to your bird… | Type a message… |
+| chat_thinking | Thinking... | Hunting... | Thinking... |
+| chat_input_placeholder | Ask me anything... | Speak to your bird... | Type a message... |
 | constitution_title | Kestrel Constitution | Kestrel Constitution | Kestrel Constitution |
 | memories_title | Knowledge Graph | The Mews Library | Memories |
 | tasks_title | Tasks & Activity | Tasks & Activity | Tasks & Activity |
@@ -378,7 +377,7 @@ This is a useful finding: the theme system carries low semantic load per key but
 
 1. **Welcome message** — `chat_welcome_message` is a paragraph-length string. Should the falconry voice be a full rewrite or a tweak? Affects whether we're authoring a couple sentences per theme or just swapping a few nouns.
 2. **Recurring keys** — `btn_refresh`, `btn_refresh_with_glyph`, `label_auto_refresh`, `loading_X` patterns recur across panels. Worth namespacing (`common.btn_refresh`) or flat is fine?
-3. **Punctuation/whitespace in keys** — keys like `Loading…` use a Unicode ellipsis. Confirm theme files use the same (consistent rendering).
+3. **Ellipsis inconsistency in source** — `index.html` uses ASCII three dots (`...`) in 27 places (all `Loading...`, `Thinking...`, `Vendor...`, `Search...`, `Click to load...` etc.) and Unicode `…` in exactly one place (`Loading trash…` at line 1257). Locale files should normalize on one form (recommend ASCII `...` to match the dominant pattern); the source HTML inconsistency itself should be cleaned up as a small follow-up so theme/locale resolution is byte-stable.
 4. **Subtitle pattern** — `(this companion only)`, `(BYOK - shared across companions)`, `(pay-per-use)` are inline modifiers. Treated as separate keys here; alternative is to fold into the parent label.
 
 These don't block the schema design but should be answered before locale files get authored beyond English.
