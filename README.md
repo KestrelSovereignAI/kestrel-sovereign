@@ -12,8 +12,6 @@ Kestrel is a production-ready framework for creating autonomous AI agents with c
 | **Persistent memory you own** | SQLite-backed knowledge graph with full-text search and RAG. Conversations, documents, relationships — all searchable, portable, and encrypted at rest. |
 | **Constitutional governance** | Every agent runs under an audited set of principles enforced *above* the LLM. Genesis audit on creation. Amendment requires cryptographic signature. |
 
-> **In production:** Kestrel powers the AI Companion layer at Caprock Health, replacing static RPM bots with constitutional AI agents for remote patient monitoring.
-
 ### What's in core, what's an add-on
 
 `pip install kestrel-sovereign` gives you a complete, working sovereign agent: identity, memory, constitution, privacy modes, multi-LLM support, voice (Piper TTS + FasterWhisper STT), local sandboxed compute, and a Cloud Run deployment path. Everything you need to run an agent locally with zero cloud commitment.
@@ -294,7 +292,7 @@ Detailed documentation is available in the `docs/` directory:
 
 Kestrel is a foundation for AI agents that need to outlive any single vendor, deployment, or owner. Concrete deployments and good-fit use cases:
 
-- **Healthcare RPM agents** — Already running in a clinical study at Caprock Health: constitutional governance over an LLM, persistent patient-owned memory, audit trail for every clinically-relevant action.
+- **Healthcare RPM agents** — Constitutional governance over an LLM, persistent patient-owned memory, audit trail for every clinically-relevant action.
 - **Long-running personal research agents** — Memory accumulates across months without dependency on a single provider's chat history.
 - **Custodial agents for sensitive document workflows** — Privacy-mode tiers (EPHEMERAL → PUBLIC) let one agent handle both an off-the-record consult and a fully-anchored long-term contract.
 - **Multi-agent A2A networks** — JSON-RPC 2.0 agent-to-agent protocol lets sovereign agents collaborate without surrendering their identity to a central broker.

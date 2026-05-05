@@ -148,6 +148,6 @@ Own your AI. Kestrel is the open foundation for Sovereign AI: identity, memory, 
 
 - Keep `Own your AI.` as the headline.
 - Keep `Sovereign AI` as the category framing unless preview signal clearly rejects it.
-- Use Caprock as proof of seriousness, not as the page headline.
+- Use the regional home healthcare partnership as proof of seriousness, not as the page headline.
 - Do not let the page drift into product-suite messaging.
 - If the team needs a shorter version, fall back to `SIMPLE_LAUNCH_PAGE_ONE_SCREEN.md`.
