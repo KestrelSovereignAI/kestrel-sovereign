@@ -25,10 +25,8 @@ tab_security = "Security"
 
 # Sidebars
 sidebar_agents = "Mews"
-sidebar_conversations = "Conversations"
 btn_collapse = "Collapse"
 btn_new_conversation = "New Conversation"
-btn_show_trash = "Show Trash"
 empty_conversations = "Select a bird to view conversations"
 loading_agents = "Calling the mews..."
 loading_trash = "Loading trash…"

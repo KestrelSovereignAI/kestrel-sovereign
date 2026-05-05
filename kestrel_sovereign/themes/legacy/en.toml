@@ -25,10 +25,8 @@ tab_security = "Security"
 
 # Sidebars
 sidebar_agents = "Agents"
-sidebar_conversations = "Conversations"
 btn_collapse = "Collapse"
 btn_new_conversation = "New Conversation"
-btn_show_trash = "Show Trash"
 empty_conversations = "Select an agent to view conversations"
 loading_agents = "Loading agents..."
 loading_trash = "Loading trash…"

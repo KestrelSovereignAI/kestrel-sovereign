@@ -200,6 +200,32 @@ def test_dynamic_elements_are_not_themed(html_text):
         "writes the active key source into it dynamically"
     )
 
+    # conversations-pane-title is mutated by identity.js's initTrashToggle()
+    # to swap between 'Conversations' and 'Trash' based on the toggle state
+    title_match = re.search(
+        r'<h3[^>]*id="conversations-pane-title"[^>]*>',
+        html_text,
+    )
+    assert title_match, "no #conversations-pane-title element found"
+    assert "data-label-key" not in title_match.group(0), (
+        "#conversations-pane-title must not carry data-label-key — "
+        "identity.js initTrashToggle() swaps it between Conversations and "
+        "Trash based on toggle state"
+    )
+
+    # trash-toggle-btn's title attribute is also mutated by initTrashToggle
+    # ('Show Trash' vs 'Show Conversations')
+    trash_btn_match = re.search(
+        r'<button[^>]*id="trash-toggle-btn"[^>]*>',
+        html_text,
+    )
+    assert trash_btn_match, "no #trash-toggle-btn element found"
+    assert "data-label-attr-title" not in trash_btn_match.group(0), (
+        "#trash-toggle-btn must not carry data-label-attr-title — "
+        "identity.js initTrashToggle() rewrites its title between "
+        "'Show Trash' and 'Show Conversations' based on toggle state"
+    )
+
 
 def test_theme_picker_resyncs_on_themechange():
     """theme_picker.js must update its dropdowns when a themechange event
@@ -244,7 +270,7 @@ def test_no_orphan_label_keys_in_legacy_theme(html_text, legacy_labels):
         "tab_identity", "tab_chat", "tab_constitution", "tab_memories",
         "tab_tasks", "tab_sovereignty", "tab_resources", "tab_metrics",
         "tab_spawn", "tab_features", "tab_security",
-        "sidebar_agents", "sidebar_conversations",
+        "sidebar_agents",
         "chat_history_title", "chat_welcome_message", "chat_thinking",
         "chat_input_placeholder",
         "constitution_title", "memories_title", "tasks_title",
