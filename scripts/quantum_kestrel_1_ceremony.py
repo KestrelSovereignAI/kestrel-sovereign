@@ -331,16 +331,22 @@ def main() -> int:
     # ------------------------------------------------------------------
     # Step 4: persist the new keys
     # ------------------------------------------------------------------
+    # Match the persistence shape used by the dry-run + the runbook:
+    # - Ed25519 is a cryptography object → save_private_key (PEM-wrapped,
+    #   .key.enc). The agent's startup code uses load_private_key for
+    #   classical halves, which expects PEM. Storing as raw bytes via
+    #   save_secret_bytes would write to .bytes.enc and the load path
+    #   would not find it. Claude-CLI review P1 catch.
+    # - ML-DSA-65 + SLH-DSA are raw pqcrypto bytes → save_secret_bytes
     _step("Step 4: persist new keys via SecureKeyStorage")
     new_kp = result.new_identity.keypair
-    classical_priv_raw = new_kp.classical.private_key.private_bytes_raw()
-    storage.save_secret_bytes(classical_priv_raw, f"{args.did_slug}_ed25519")
+    storage.save_private_key(new_kp.classical.private_key, f"{args.did_slug}_ed25519")
     storage.save_secret_bytes(new_kp.pq.private_key, f"{args.did_slug}_mldsa65")
     storage.save_secret_bytes(archival_kp.private_key, f"{args.did_slug}_archival_slhdsa")
     storage.save_secret_bytes(archival_kp.public_key, f"{args.did_slug}_archival_slhdsa_pub")
-    _ok(f"{args.did_slug}_ed25519.bytes.enc        (classical hybrid half)")
-    _ok(f"{args.did_slug}_mldsa65.bytes.enc        (post-quantum hybrid half)")
-    _ok(f"{args.did_slug}_archival_slhdsa.bytes.enc(SLH-DSA archival)")
+    _ok(f"{args.did_slug}_ed25519.key.enc          (classical hybrid half, PEM)")
+    _ok(f"{args.did_slug}_mldsa65.bytes.enc        (post-quantum hybrid half, raw)")
+    _ok(f"{args.did_slug}_archival_slhdsa.bytes.enc(SLH-DSA archival, raw)")
 
     # ------------------------------------------------------------------
     # Step 5: write the new DID document + succession statement
@@ -373,8 +379,12 @@ def main() -> int:
 
     # Also archive the succession statement INSIDE the agent data dir
     # so the agent itself can find its own chain at startup.
+    # Claude-CLI review P1: mkdir(exist_ok=True) doesn't tighten perms
+    # on a pre-existing dir; explicitly chmod 0o700 after to handle
+    # both fresh and existing cases.
     agent_succession_dir = agent_data / "successions"
-    agent_succession_dir.mkdir(exist_ok=True)
+    agent_succession_dir.mkdir(mode=0o700, exist_ok=True)
+    agent_succession_dir.chmod(0o700)
     agent_succession_path = agent_succession_dir / f"{args.did_slug}.json"
     agent_succession_path.write_text(
         json.dumps(result.succession_statement.to_dict(), indent=2, sort_keys=True),
