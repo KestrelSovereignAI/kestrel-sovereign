@@ -94,9 +94,9 @@ def hybrid_parent(tmp_path, kestrel_data_key):
     return identity, legacy_kp, result
 
 
-def _make_mandate() -> SpawnMandate:
+def _make_mandate(parent_did: str = "did:pkh:eip155:1:0xPARENTPLACEHOLDER") -> SpawnMandate:
     return SpawnMandate(
-        parent_did="did:pkh:eip155:1:0xPARENTPLACEHOLDER",
+        parent_did=parent_did,
         purpose="test mandate",
         ttl_seconds=3600,
     )
@@ -132,7 +132,7 @@ def test_legacy_tamper_detected():
 
 def test_hybrid_mandate_uses_prefix(hybrid_parent):
     identity, legacy_kp, _ = hybrid_parent
-    mandate = _make_mandate()
+    mandate = _make_mandate(parent_did=identity.legacy_did)
     signed = sign_mandate(
         mandate, legacy_kp.private_key, parent_identity=identity,
     )
@@ -146,21 +146,21 @@ def test_hybrid_mandate_uses_prefix(hybrid_parent):
 
 def test_hybrid_mandate_round_trip_verifies(hybrid_parent):
     identity, legacy_kp, _ = hybrid_parent
-    mandate = _make_mandate()
+    mandate = _make_mandate(parent_did=identity.legacy_did)
     signed = sign_mandate(
         mandate, legacy_kp.private_key, parent_identity=identity,
     )
     ok = verify_mandate(
         signed,
         legacy_kp.public_key,  # legacy pub still passed; ignored for hybrid path
-        parent_verification_methods=identity.new_verification_methods,
+        parent_identity=identity,
     )
     assert ok is True
 
 
 def test_hybrid_mandate_tamper_detected(hybrid_parent):
     identity, legacy_kp, _ = hybrid_parent
-    mandate = _make_mandate()
+    mandate = _make_mandate(parent_did=identity.legacy_did)
     signed = sign_mandate(
         mandate, legacy_kp.private_key, parent_identity=identity,
     )
@@ -168,7 +168,7 @@ def test_hybrid_mandate_tamper_detected(hybrid_parent):
     ok = verify_mandate(
         signed,
         legacy_kp.public_key,
-        parent_verification_methods=identity.new_verification_methods,
+        parent_identity=identity,
     )
     assert ok is False
 
@@ -177,7 +177,7 @@ def test_hybrid_mandate_strip_pq_half_rejected(hybrid_parent):
     """Modify the encoded payload to remove the ml-dsa-65 entry. The
     classical signature is still valid, but HYBRID_REQUIRED rejects."""
     identity, legacy_kp, _ = hybrid_parent
-    mandate = _make_mandate()
+    mandate = _make_mandate(parent_did=identity.legacy_did)
     signed = sign_mandate(
         mandate, legacy_kp.private_key, parent_identity=identity,
     )
@@ -189,21 +189,98 @@ def test_hybrid_mandate_strip_pq_half_rejected(hybrid_parent):
     ok = verify_mandate(
         signed,
         legacy_kp.public_key,
-        parent_verification_methods=identity.new_verification_methods,
+        parent_identity=identity,
     )
     assert ok is False
 
 
-def test_hybrid_mandate_without_vms_rejected(hybrid_parent):
-    """Caller forgot to pass parent_verification_methods — must reject
-    rather than fall through to a wrong code path."""
+def test_hybrid_mandate_without_parent_identity_rejected(hybrid_parent):
+    """Caller forgot to pass parent_identity — must reject rather
+    than fall through to a wrong code path."""
     identity, legacy_kp, _ = hybrid_parent
-    mandate = _make_mandate()
+    mandate = _make_mandate(parent_did=identity.legacy_did)
     signed = sign_mandate(
         mandate, legacy_kp.private_key, parent_identity=identity,
     )
     ok = verify_mandate(signed, legacy_kp.public_key)
     assert ok is False
+
+
+def test_hybrid_mandate_with_wrong_parent_identity_rejected(
+    hybrid_parent, tmp_path,
+):
+    """Codex P2 catch: verifier loaded the wrong agent's identity
+    (or an attacker replays VMs from a different agent). The
+    binding check (parent_identity.legacy_did == mandate.parent_did)
+    must reject."""
+    identity, legacy_kp, _ = hybrid_parent
+
+    # Mint a SECOND, unrelated hybrid agent
+    other_dir = tmp_path / "other"
+    other_dir.mkdir()
+    other_storage = SecureKeyStorage(storage_dir=other_dir)
+    secp = Secp256k1Suite()
+    other_legacy = secp.generate_keypair()
+    other_address = public_key_to_ethereum_address(other_legacy.public_key)
+    other_did = f"did:pkh:eip155:1:{other_address}"
+    other_legacy_vms = build_verification_methods(
+        other_did, [(secp, other_legacy.public_key)],
+    )
+    from cryptography.hazmat.primitives.serialization import (
+        Encoding, PublicFormat,
+    )
+    pub_hex = other_legacy.public_key.public_bytes(
+        encoding=Encoding.X962, format=PublicFormat.UncompressedPoint,
+    ).hex()
+    other_storage.save_private_key(other_legacy.private_key, f"kestrel_{other_address}")
+    (other_dir / f"kestrel_{other_address}.json").write_text(json.dumps({
+        "@context": "https://w3id.org/did/v1",
+        "id": other_did,
+        "publicKey": [{
+            "id": f"{other_did}#keys-1",
+            "type": "EcdsaSecp256k1VerificationKey2019",
+            "controller": other_did,
+            "publicKeyHex": pub_hex,
+        }],
+    }))
+    other_archival = SLHDSASHA2128sSuite().generate_keypair()
+    other_result = run_rotation_ceremony(
+        predecessor_did=other_did,
+        predecessor_keypair=other_legacy,
+        predecessor_kid=other_legacy_vms[0]["id"].rsplit("#", 1)[-1],
+        predecessor_verification_methods=other_legacy_vms,
+        new_did_domain="agents.test.example",
+        new_did_slug="other",
+        reason="other agent",
+        archival_keypair=other_archival,
+    )
+    other_storage.save_private_key(other_result.new_identity.keypair.classical.private_key, "other_ed25519")
+    other_storage.save_secret_bytes(other_result.new_identity.keypair.pq.private_key, "other_mldsa65")
+    other_storage.save_secret_bytes(other_archival.private_key, "other_archival_slhdsa")
+    other_storage.save_secret_bytes(other_archival.public_key, "other_archival_slhdsa_pub")
+    other_successions = other_dir / "successions"
+    other_successions.mkdir()
+    (other_successions / "other.json").write_text(
+        json.dumps(other_result.succession_statement.to_dict(), indent=2)
+    )
+    from kestrel_sovereign.identity.runtime_identity import load_agent_identity
+    other_identity = load_agent_identity(f"kestrel_{other_address}", storage_dir=other_dir)
+
+    # Sign mandate with the FIRST agent's identity, claiming THE FIRST
+    # agent's parent_did
+    mandate = _make_mandate(parent_did=identity.legacy_did)
+    signed = sign_mandate(
+        mandate, legacy_kp.private_key, parent_identity=identity,
+    )
+
+    # Verifier loads the WRONG agent's identity
+    ok = verify_mandate(
+        signed, legacy_kp.public_key, parent_identity=other_identity,
+    )
+    assert ok is False, (
+        "binding check failed to detect that parent_identity.legacy_did "
+        "doesn't match mandate.parent_did"
+    )
 
 
 def test_garbage_signature_format_rejected(hybrid_parent):

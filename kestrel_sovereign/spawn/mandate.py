@@ -138,21 +138,29 @@ def verify_mandate(
     mandate: SpawnMandate,
     parent_public_key: ec.EllipticCurvePublicKey,
     *,
-    parent_verification_methods=None,
+    parent_identity=None,
 ) -> bool:
     """Verify the mandate's signature.
 
     The verify path is wire-format-aware:
 
-    - ``parent_signature`` starts with ``"hybrid:"`` → parse the
-      base64-wrapped JSON list of ``{alg, kid, sig}`` entries and
-      require BOTH ed25519 AND ml-dsa-65 to verify against the
-      caller-supplied ``parent_verification_methods`` (which list
-      the parent's hybrid public keys, multibase-encoded). Matches
-      the HYBRID_REQUIRED policy: stripping the PQ half is rejected.
+    - ``parent_signature`` starts with ``"hybrid:"`` → require
+      ``parent_identity`` (an :class:`AgentIdentity` from the caller's
+      TRUSTED source — typically the receiver's own loaded view of
+      the parent agent). The verifier:
+
+        1. Binds: ``parent_identity.legacy_did`` must equal
+           ``mandate.parent_did``. Catches the case where the caller
+           loaded the wrong agent's identity (or an attacker is
+           replaying VMs from a different DID).
+        2. Resolves pubkeys from ``parent_identity.new_verification_methods``
+           (the trusted hybrid VMs).
+        3. Requires every signature in the array to crypto-verify and
+           BOTH ed25519 + ml-dsa-65 to be present (HYBRID_REQUIRED).
+
     - Otherwise (bare hex) → classic secp256k1 ECDSA verify against
-      ``parent_public_key``. Same path mandates produced before this
-      PR follow.
+      ``parent_public_key``. Pre-ceremony mandates follow this path
+      unchanged.
     """
     if not mandate.parent_signature:
         logger.warning("Mandate has no signature to verify")
@@ -161,8 +169,27 @@ def verify_mandate(
     payload = mandate._signable_payload()
 
     if mandate.parent_signature.startswith(_HYBRID_PREFIX):
+        if parent_identity is None:
+            logger.warning(
+                "Mandate has hybrid: signature but no parent_identity "
+                "supplied; cannot verify hybrid mandates without a "
+                "trusted source for the parent's verification methods"
+            )
+            return False
+        # Binding check: the caller's loaded identity must be for
+        # mandate.parent_did. If they don't match the receiver loaded
+        # the wrong agent (or an attacker is feeding us VMs from a
+        # different agent's identity).
+        if parent_identity.legacy_did != mandate.parent_did:
+            logger.warning(
+                f"Mandate parent_did={mandate.parent_did!r} doesn't match "
+                f"parent_identity.legacy_did={parent_identity.legacy_did!r} "
+                f"— refusing to verify against unrelated identity"
+            )
+            return False
         return _verify_mandate_hybrid(
-            mandate, payload, parent_verification_methods,
+            mandate, payload,
+            parent_identity.new_verification_methods,
         )
 
     from kestrel_sovereign.security.crypto_suite import (
