@@ -10,9 +10,6 @@ locale = "en"
 
 [labels]
 
-# Page-level
-document_title = "Kestrel Sovereign Console"
-
 # Navigation tabs
 tab_identity = "Identity"
 tab_chat = "Chat"
@@ -124,7 +121,6 @@ resources_wallet_title = "Wallet"
 resources_usage_title = "Usage (Last 30 Days)"
 btn_add_key = "+ Add Key"
 btn_unlock = "Unlock"
-loading_generic = "Loading..."
 loading_keys = "Loading keys..."
 loading_platform = "Loading platform access..."
 loading_wallet = "Loading wallet..."

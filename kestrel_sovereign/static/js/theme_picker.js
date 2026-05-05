@@ -77,9 +77,10 @@
       console.warn('[theme-picker] failed to list themes:', err);
       themes = ['legacy'];  // fail-safe so the dropdown isn't empty
     }
-    const currentTheme = window.KestrelTheme.getCurrentTheme();
-    populateThemes(themeSelect, themes, currentTheme);
-
+    // Initial seeding from the current state. theme.js's applyTheme() may
+    // still be in flight at this point (it's async); the themechange
+    // listener below resyncs the dropdowns once the actual theme resolves.
+    populateThemes(themeSelect, themes, window.KestrelTheme.getCurrentTheme());
     const currentLocale = window.KestrelTheme.getCurrentLocale();
     if (localeSelect.querySelector(`option[value="${currentLocale}"]`)) {
       localeSelect.value = currentLocale;
@@ -91,8 +92,23 @@
     themeSelect.addEventListener('change', onChange);
     localeSelect.addEventListener('change', onChange);
 
-    // Reflect every successful theme application in the status line.
-    window.addEventListener('themechange', (ev) => updateStatus(ev.detail));
+    // Resync dropdowns AND status line after every successful theme load.
+    // Critical for first paint: if the user has a non-legacy theme stored,
+    // theme.js's initial applyTheme() resolves *after* our init runs, so
+    // the dropdowns would otherwise show the wrong selection until the
+    // user clicks them. Listening to themechange covers both first paint
+    // and subsequent switches.
+    window.addEventListener('themechange', (ev) => {
+      if (ev.detail) {
+        if (themeSelect.querySelector(`option[value="${CSS.escape(ev.detail.theme)}"]`)) {
+          themeSelect.value = ev.detail.theme;
+        }
+        if (localeSelect.querySelector(`option[value="${CSS.escape(ev.detail.locale)}"]`)) {
+          localeSelect.value = ev.detail.locale;
+        }
+      }
+      updateStatus(ev.detail);
+    });
     window.addEventListener('themeerror', () => {
       const status = document.getElementById('theme-picker-status');
       if (status) status.textContent = 'Theme load failed — keeping current labels.';

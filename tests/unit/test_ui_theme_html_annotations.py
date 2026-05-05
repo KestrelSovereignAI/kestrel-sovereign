@@ -171,6 +171,65 @@ def test_picker_section_labels_exist_in_legacy(legacy_labels):
         assert key in legacy_labels, f"{key} missing from legacy/en.toml"
 
 
+def test_dynamic_elements_are_not_themed(html_text):
+    """Elements that JS mutates after first paint must NOT carry
+    data-label-key — otherwise theme switches and re-hydrations would
+    overwrite the dynamic value with the legacy placeholder.
+
+    Each entry here is a specific (id, mutating_module) pair that was
+    found to be a real bug by codex CLI review. Add new entries when a
+    new dynamic element gets accidentally annotated.
+    """
+    # <title> is mutated by identity.js to include the agent name
+    title_tag = re.search(r"<title[^>]*>", html_text)
+    assert title_tag, "no <title> element found"
+    assert "data-label-key" not in title_tag.group(0), (
+        "<title> must not carry data-label-key — identity.js sets it "
+        "dynamically per agent"
+    )
+
+    # key-source-badge is mutated by resources.js to show the active key
+    # provider ('Agent Key' / 'Your Key (BYOK)' / 'Platform' / 'Unknown')
+    badge_match = re.search(
+        r'<span[^>]*id="key-source-badge"[^>]*>',
+        html_text,
+    )
+    assert badge_match, "no #key-source-badge element found"
+    assert "data-label-key" not in badge_match.group(0), (
+        "#key-source-badge must not carry data-label-key — resources.js "
+        "writes the active key source into it dynamically"
+    )
+
+
+def test_theme_picker_resyncs_on_themechange():
+    """theme_picker.js must update its dropdowns when a themechange event
+    fires — otherwise the picker shows the wrong theme on first paint
+    when the user has a non-legacy theme stored (theme.js's initial
+    applyTheme() resolves async, after the picker's init runs).
+    """
+    picker_path = (
+        Path(__file__).resolve().parents[2]
+        / "kestrel_sovereign" / "static" / "js" / "theme_picker.js"
+    )
+    src = picker_path.read_text(encoding="utf-8")
+    # Must register a themechange listener.
+    assert "addEventListener('themechange'" in src or 'addEventListener("themechange"' in src, (
+        "theme_picker.js must listen to themechange to keep the dropdowns "
+        "in sync with the actual applied theme"
+    )
+    # That listener must update the select values (not just the status line).
+    # Approximate check: themeSelect.value or localeSelect.value assigned
+    # inside the file. The exact form lives in the listener.
+    assert (
+        re.search(r"themeSelect\.value\s*=", src)
+        and re.search(r"localeSelect\.value\s*=", src)
+    ), (
+        "theme_picker.js must assign themeSelect.value and localeSelect.value "
+        "in response to themechange; otherwise the dropdowns drift from "
+        "the actual applied theme on first paint"
+    )
+
+
 def test_no_orphan_label_keys_in_legacy_theme(html_text, legacy_labels):
     """Inverse check: every theme-class key in legacy/en.toml should be
     referenced by the HTML. An orphan key suggests we lost an annotation
@@ -204,7 +263,6 @@ def test_no_orphan_label_keys_in_legacy_theme(html_text, legacy_labels):
         "security_title", "security_pending_approvals",
         "security_permission_tree", "security_session_controls",
         "security_audit_log",
-        "document_title",
         "sovereignty_display", "sovereignty_display_description",
         "theme_picker_label", "locale_picker_label",
     }
