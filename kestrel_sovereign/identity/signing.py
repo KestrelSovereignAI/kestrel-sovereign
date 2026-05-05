@@ -79,40 +79,115 @@ def sign_package(
     """
     Sign an identity package using the agent's private key.
 
+    Behavior:
+
+    - **Hybrid agent** (post-rotation ceremony): populates the v2
+      ``signatures`` array with both an Ed25519 and an ML-DSA-65
+      signature via ``sign_hybrid``, AND keeps a legacy ECDSA hex
+      in ``signature`` so v1 readers (importers that predate the
+      v2 array) still verify.
+    - **Legacy agent** (pre-ceremony): populates ``signature`` only,
+      same shape as before.
+
+    The v2 array is the authoritative form; v1 readers fall back to
+    ``signature``. ``content_hash`` is unchanged in either path.
+
     Args:
         package: The identity package to sign
         storage_dir: Directory containing the agent's keys
 
     Returns:
-        The package with content_hash and signature fields populated
+        The package with content_hash + signature(s) populated.
 
     Raises:
         SigningError: If signing fails
     """
     try:
-        from kestrel_sovereign.inception_service import load_kestrel_identity
+        # Try hybrid load first: if a succession statement exists in
+        # storage_dir, this returns the AgentIdentity with both halves
+        # of the hybrid keypair. Pre-ceremony agents fall through.
+        # Codex P2 catch: only FileNotFoundError (no key/DID on disk)
+        # is a legitimate fall-through to legacy. RuntimeIdentityError
+        # signals an INCONSISTENT post-ceremony state (succession
+        # statement present but hybrid keys missing/corrupt) and must
+        # propagate — silently downgrading would emit non-hybrid
+        # signatures for an agent that should be hybrid-only, masking
+        # a security-critical key-state problem.
+        from kestrel_sovereign.identity.runtime_identity import (
+            RuntimeIdentityError, load_agent_identity,
+        )
+        agent_identity = None
+        try:
+            key_id = get_key_id(package.did)
+            agent_identity = load_agent_identity(key_id, storage_dir=storage_dir)
+        except FileNotFoundError as e:
+            logger.debug(f"No identity on disk yet, using legacy path: {e}")
+        except RuntimeIdentityError:
+            # Inconsistent post-ceremony state — fail loud, do NOT
+            # downgrade to legacy.
+            raise
 
-        # Load private key
-        key_id = get_key_id(package.did)
-        private_key, _ = load_kestrel_identity(key_id, storage_dir)
-
-        # Compute content hash
-        content_hash = package.compute_content_hash()
-        package.content_hash = content_hash
-
-        # Sign the hash. Wave 1 sub-PR 5: route through Secp256k1Suite.
-        # Byte-identical to the previous direct ec.ECDSA(SHA256) call;
-        # pinned by the CryptoSuite behavior-preservation pair test.
         from kestrel_sovereign.security.crypto_suite import (
             ALG_ECDSA_SECP256K1_SHA256, get_suite,
         )
-        suite = get_suite(ALG_ECDSA_SECP256K1_SHA256)
-        signature = suite.sign(content_hash.encode("utf-8"), private_key)
+        secp = get_suite(ALG_ECDSA_SECP256K1_SHA256)
 
-        # Store signature as hex
+        if agent_identity is not None and agent_identity.is_hybrid:
+            # Hybrid path: populate v2 signatures array with sign_hybrid
+            # output, plus a legacy ECDSA in signature for v1 fallback.
+            #
+            # Order matters: ``compute_content_hash`` for a v2 package
+            # INCLUDES ``verification_methods`` in the hashed payload
+            # (so an attacker can't swap pubkeys post-sign). We must
+            # set verification_methods BEFORE computing the hash. The
+            # `signature` / `signatures` / `content_hash` fields are
+            # explicitly excluded by ``compute_content_hash`` so we
+            # populate them after.
+            from kestrel_sovereign.identity.hybrid_keypair import sign_hybrid
+            vms = agent_identity.new_verification_methods or []
+            package.verification_methods = list(vms)
+
+            content_hash = package.compute_content_hash()
+            package.content_hash = content_hash
+
+            classical_kid = vms[0]["id"].rsplit("#", 1)[-1] if vms else "key-1"
+            pq_kid = (
+                vms[1]["id"].rsplit("#", 1)[-1] if len(vms) > 1 else "key-2"
+            )
+            hybrid_sigs = sign_hybrid(
+                content_hash.encode("utf-8"),
+                agent_identity.hybrid_keypair,
+                classical_kid=classical_kid,
+                pq_kid=pq_kid,
+            )
+            package.signatures = list(hybrid_sigs)
+            # Codex P2 catch: a "legacy v1 ECDSA fallback" on
+            # ``package.signature`` is NOT actually backward-compatible
+            # here. The v2 ``compute_content_hash`` includes
+            # ``verification_methods`` in the canonical bytes, while v1
+            # readers compute it without those fields — the hash
+            # mismatches before any signature even gets checked.
+            # Keeping a stale signature that will never verify is worse
+            # than no signature, so leave .signature empty for hybrid
+            # agents. The v2 ``signatures`` array is the authoritative
+            # form and every Wave 1+ reader prefers it.
+            package.signature = ""
+            logger.info(
+                f"Signed package for {package.did[:20]}... HYBRID "
+                f"(ed25519 + ml-dsa-65, v2 only)"
+            )
+            return package
+
+        # Legacy path: single ECDSA signature, hex-encoded.
+        content_hash = package.compute_content_hash()
+        package.content_hash = content_hash
+
+        from kestrel_sovereign.inception_service import load_kestrel_identity
+        key_id = get_key_id(package.did)
+        private_key, _ = load_kestrel_identity(key_id, storage_dir)
+        signature = secp.sign(content_hash.encode("utf-8"), private_key)
         package.signature = signature.hex()
-
-        logger.info(f"Signed package for {package.did[:20]}...")
+        logger.info(f"Signed package for {package.did[:20]}... (legacy ecdsa)")
         return package
 
     except FileNotFoundError as e:
@@ -128,9 +203,19 @@ def verify_package_signature(
     """
     Verify the signature on an identity package.
 
-    This function:
-    1. Recomputes the content hash
-    2. Verifies the signature using the agent's public key
+    Verification order:
+
+    1. **Content hash check** — recompute from the package and compare
+       to ``package.content_hash``. Mismatch means the package was
+       modified after signing.
+    2. **v2 hybrid signatures** — if ``package.signatures`` is non-empty,
+       use it as the authoritative form. Both ed25519 AND ml-dsa-65
+       must be present and verify (HYBRID_REQUIRED on identity-package
+       signing). Verification methods come from ``package.verification_methods``
+       embedded in the package itself; no external fetch needed.
+    3. **Legacy v1 fallback** — if ``signatures`` is empty, fall back to
+       ``package.signature`` (single ECDSA hex over content_hash) for
+       v1 packages that predate the v2 array.
 
     Args:
         package: The identity package to verify
@@ -139,26 +224,41 @@ def verify_package_signature(
     Returns:
         Tuple of (is_valid, message)
     """
-    if not package.signature:
-        return False, "Package is not signed"
-
     if not package.content_hash:
         return False, "Package has no content hash"
 
-    # Verify content hash matches
+    # Step 1: content hash unchanged
     computed_hash = package.compute_content_hash()
     if computed_hash != package.content_hash:
         return False, "Content hash mismatch - package may have been modified"
 
+    # Step 2: prefer v2 signatures array if it actually carries hybrid
+    # algs. Codex P1 catch: ``AgentIdentityPackage.from_dict`` synthesizes
+    # a single-entry ``signatures`` array tagged ``ecdsa-secp256k1-sha256``
+    # for v1 packages on load, so a non-empty ``signatures`` is NOT
+    # sufficient to conclude a package is hybrid. Route by the alg in
+    # the array — hybrid algs use v2 verify, classical-only routes to
+    # the legacy hex verifier.
+    from kestrel_sovereign.security.crypto_suite import (
+        ALG_ED25519, ALG_ML_DSA_65,
+    )
+    has_hybrid_sig = any(
+        (s.get("alg") if isinstance(s, dict) else None)
+        in (ALG_ED25519, ALG_ML_DSA_65)
+        for s in (package.signatures or [])
+    )
+    if has_hybrid_sig:
+        return _verify_v2_signatures(package, storage_dir)
+
+    # Step 3: legacy v1 fallback
+    if not package.signature:
+        return False, "Package is not signed"
     try:
         from kestrel_sovereign.inception_service import load_kestrel_identity
-
-        # Load private key to get public key
         key_id = get_key_id(package.did)
-        private_key, did_document = load_kestrel_identity(key_id, storage_dir)
+        private_key, _ = load_kestrel_identity(key_id, storage_dir)
         public_key = private_key.public_key()
 
-        # Verify signature via Secp256k1Suite (Wave 1 sub-PR 5).
         from kestrel_sovereign.security.crypto_suite import (
             ALG_ECDSA_SECP256K1_SHA256, get_suite,
         )
@@ -169,7 +269,7 @@ def verify_package_signature(
             signature_bytes,
             public_key,
         ):
-            return True, "Signature valid"
+            return True, "Signature valid (legacy ecdsa)"
         return False, "Invalid signature"
 
     except FileNotFoundError:
@@ -177,6 +277,153 @@ def verify_package_signature(
         return _verify_with_did_document(package, storage_dir)
     except Exception as e:
         return False, f"Verification failed: {e}"
+
+
+def _verify_v2_signatures(
+    package: AgentIdentityPackage,
+    storage_dir: Optional[Path] = None,
+) -> Tuple[bool, str]:
+    """Verify the v2 ``signatures`` array on a hybrid identity package.
+
+    Both ed25519 AND ml-dsa-65 signatures must be present and crypto-
+    verify. Stripping the PQ half is rejected (HYBRID_REQUIRED).
+
+    **Trust anchor**: the receiver's local AgentIdentity (loaded from
+    ``storage_dir``), NOT the verification_methods embedded inside
+    the package. Codex P1 catch: an attacker could otherwise create
+    a package claiming a victim DID, embed their own keys in the
+    package's verification_methods, sign with those keys, and have
+    self-validation succeed. We resolve pubkeys from the receiver's
+    actual on-disk identity for the claimed ``package.did`` and
+    require the package's verification_methods to MATCH (anti-tamper)
+    — but we never *trust* the package's own VMs as the source of truth.
+    """
+    from kestrel_sovereign.security.crypto_suite import (
+        ALG_ED25519, ALG_ML_DSA_65, get_suite,
+    )
+    from kestrel_sovereign.security.multikey import (
+        multibase_to_public_key,
+        public_key_to_multibase,
+    )
+
+    # Trust anchor: load the agent's hybrid identity from the
+    # receiver's local agent_data. This is the same convention the
+    # legacy ECDSA path uses — the receiver's local custody IS the
+    # trust anchor. We never trust the package's self-supplied VMs.
+    #
+    # Cross-substrate import (Agent A exports → Agent B imports
+    # without local custody) is a future extension that requires the
+    # package to carry a SIGNED SUCCESSION CHAIN binding package.did
+    # to the new did:web identity, and the receiver to walk that
+    # chain via verify_artifact_against_chain. The naive shortcut of
+    # fetching whatever did:web URI the package claims is unsafe:
+    # an attacker can publish their own did:web, claim it as the
+    # successor of any victim DID, and self-validate. Until the
+    # in-package chain shape is implemented, this path requires
+    # local custody and rejects cross-substrate cleanly.
+    try:
+        from kestrel_sovereign.identity.runtime_identity import (
+            load_agent_identity,
+        )
+        key_id = get_key_id(package.did)
+        anchor = load_agent_identity(key_id, storage_dir=storage_dir)
+    except FileNotFoundError:
+        return False, (
+            f"Cannot verify v2 hybrid package: no local identity "
+            f"for {package.did!r}. Cross-substrate import of hybrid "
+            f"packages requires the receiver to have local key "
+            f"custody for the claimed agent (a trusted root anchor). "
+            f"Inter-substrate transfer over an untrusted network "
+            f"will land in a follow-up that ships a chain-bound "
+            f"package format."
+        )
+    except Exception as e:
+        return False, f"Failed to load trusted identity: {e}"
+
+    if not anchor.is_hybrid:
+        return False, (
+            f"Package claims hybrid signatures for {package.did!r} but "
+            f"the receiver's trusted identity for that DID is legacy-only. "
+            f"Run the rotation ceremony before accepting hybrid packages."
+        )
+
+    trusted_vms = anchor.new_verification_methods or []
+
+    kid_to_pub: dict = {}
+    trusted_kids_to_mb: dict = {}
+    for vm in trusted_vms:
+        vm_id = vm.get("id") or ""
+        kid = vm_id.rsplit("#", 1)[-1] if "#" in vm_id else vm_id
+        mb = vm.get("publicKeyMultibase")
+        if not kid or not mb:
+            continue
+        try:
+            suite, pub = multibase_to_public_key(mb)
+        except Exception as e:
+            logger.warning(f"trusted VM {kid!r} multibase decode failed: {e}")
+            continue
+        kid_to_pub[kid] = (suite.alg_id, pub)
+        trusted_kids_to_mb[kid] = mb
+
+    # Anti-tamper: every VM the package SAYS it was signed under must
+    # match (kid + multibase) one of the trusted VMs. A package
+    # carrying VMs that don't match the trusted anchor is rejected
+    # before any crypto verify — so an attacker can't smuggle their
+    # own keys into the receiver's verification path.
+    pkg_vms = package.verification_methods or []
+    if not pkg_vms:
+        return False, (
+            "v2 hybrid signatures present but package has no "
+            "verification_methods to cross-check against trusted anchor"
+        )
+    for vm in pkg_vms:
+        vm_id = vm.get("id") or ""
+        kid = vm_id.rsplit("#", 1)[-1] if "#" in vm_id else vm_id
+        mb = vm.get("publicKeyMultibase")
+        trusted_mb = trusted_kids_to_mb.get(kid)
+        if trusted_mb is None or trusted_mb != mb:
+            return False, (
+                f"Package verification_method kid={kid!r} does not match "
+                f"the receiver's trusted identity for {package.did!r}. "
+                f"Package may have been tampered with, or the receiver's "
+                f"local identity is stale."
+            )
+
+    payload = package.content_hash.encode("utf-8")
+    algs_seen: set = set()
+    for entry in package.signatures:
+        try:
+            alg = entry["alg"]
+            kid = entry["kid"]
+            sig_hex = entry["sig"]
+        except (TypeError, KeyError):
+            return False, "Malformed signature entry"
+        info = kid_to_pub.get(kid)
+        if info is None:
+            return False, f"No verification method for kid {kid!r}"
+        expected_alg, public_key = info
+        if expected_alg != alg:
+            return False, (
+                f"alg/kid mismatch: signature claims {alg!r} but "
+                f"verification method {kid!r} uses {expected_alg!r}"
+            )
+        try:
+            sig_bytes = bytes.fromhex(sig_hex)
+        except ValueError:
+            return False, f"Signature {kid!r} has malformed hex"
+        suite = get_suite(alg)
+        if not suite.verify(payload, sig_bytes, public_key):
+            return False, f"Signature {kid!r} ({alg}) failed crypto verify"
+        algs_seen.add(alg)
+
+    required = {ALG_ED25519, ALG_ML_DSA_65}
+    if not required.issubset(algs_seen):
+        missing = required - algs_seen
+        return False, (
+            f"Missing required hybrid algs: {sorted(missing)} "
+            f"(HYBRID_REQUIRED on identity-package signing)"
+        )
+    return True, "Signature valid (hybrid)"
 
 
 def _verify_with_did_document(
@@ -309,8 +556,14 @@ def verify_and_load(
                 raise VerificationError("Constitution hash verification failed")
             return package, False, "Constitution hash verification failed"
 
-    # Verify signature if present
-    if package.signature:
+    # Verify signature if present. Codex P2 catch: hybrid packages
+    # carry signatures only on the v2 ``signatures`` array (legacy
+    # ``signature`` is empty, because that field can't be made
+    # v1-compatible — see sign_package). Detect signed-ness by either
+    # of the two carriers; verify_package_signature routes correctly
+    # by alg.
+    has_signature = bool(package.signature) or bool(package.signatures)
+    if has_signature:
         is_valid, message = verify_package_signature(package, storage_dir)
         if not is_valid and require_valid_signature:
             raise VerificationError(message)
