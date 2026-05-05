@@ -221,7 +221,7 @@ def discover_features(agent, allowed_features: Optional[Set[str]] = None) -> Lis
     Returns:
         List of instantiated Feature objects
     """
-    from kestrel_sovereign.rookery.config import MANDATORY_FEATURES
+    from kestrel_sovereign.multi_agent.config import MANDATORY_FEATURES
 
     disabled = get_disabled_features()
     features = []

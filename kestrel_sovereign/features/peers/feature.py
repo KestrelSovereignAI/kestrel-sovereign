@@ -1,8 +1,8 @@
 """
-Peers Feature — Inter-agent communication for rookery environments.
+Peers Feature — Inter-agent communication for multi_agent environments.
 
 Allows agents to discover sibling agents and send messages to them
-through the rookery host proxy. Works in both local and cloud deployments.
+through the multi_agent host proxy. Works in both local and cloud deployments.
 
 Includes the Agent Mesh Protocol for structured message exchange between
 Falconer agents (Claws, Talon, Eye, Flight).
@@ -40,22 +40,22 @@ PEER_READ_TIMEOUT = 300.0  # Local LLM responses (e.g. Kimi K2.5) can be very sl
 
 
 def _discover_host_url() -> Optional[str]:
-    """Discover the rookery host URL.
+    """Discover the multi_agent host URL.
 
     Checks in order:
     1. KESTREL_HOST_URL env var (set by ProcessManager or manually)
-    2. rookery.toml in project directory (read host port)
-    3. None if not in a rookery environment
+    2. multi_agent.toml in project directory (read host port)
+    3. None if not in a multi_agent environment
     """
     # Explicit env var (most reliable)
     host_url = os.environ.get("KESTREL_HOST_URL")
     if host_url:
         return host_url.rstrip("/")
 
-    # Try reading rookery.toml to get host port
+    # Try reading multi_agent.toml to get host port
     for candidate in [
-        Path.cwd() / "rookery.toml",
-        Path(__file__).resolve().parents[3] / "rookery.toml",
+        Path.cwd() / "multi_agent.toml",
+        Path(__file__).resolve().parents[3] / "multi_agent.toml",
     ]:
         if candidate.exists():
             try:
@@ -70,12 +70,12 @@ def _discover_host_url() -> Optional[str]:
 
 
 class PeersFeature(Feature):
-    """Inter-agent communication — ask questions to sibling agents in the rookery."""
+    """Inter-agent communication — ask questions to sibling agents in the multi_agent."""
 
     @property
     def tool_description(self) -> str:
         return (
-            "Communicate with other agents in the rookery — "
+            "Communicate with other agents in the multi_agent — "
             "send messages to peer agents and list available peers"
         )
 
@@ -89,7 +89,7 @@ class PeersFeature(Feature):
         if self._host_url:
             logger.info(f"PeersFeature initialized: host={self._host_url}, self={self._own_name}")
         else:
-            logger.info("PeersFeature initialized but no rookery host found (standalone mode)")
+            logger.info("PeersFeature initialized but no multi_agent host found (standalone mode)")
 
     def _get_own_name(self) -> str:
         """Get this agent's name (from KESTREL_DB_PATH basename or agent node)."""
@@ -113,17 +113,17 @@ class PeersFeature(Feature):
 
     @tool(
         name="list_peers",
-        description="List all available peer agents in the rookery.",
+        description="List all available peer agents in the multi_agent.",
         category=ToolCategory.COMMUNICATION,
         command_prefix="!peers"
     )
     async def list_peers(self) -> Dict[str, Any]:
         """
-        Discover available peer agents via the rookery host.
+        Discover available peer agents via the multi_agent host.
         Returns their names, status, and capabilities.
         """
         if not self._host_url:
-            return {"peers": [], "note": "Not running in a rookery environment"}
+            return {"peers": [], "note": "Not running in a multi_agent environment"}
 
         try:
             async with httpx.AsyncClient() as client:
@@ -149,14 +149,14 @@ class PeersFeature(Feature):
             return {"peers": peers, "self": self._own_name}
 
         except httpx.ConnectError:
-            return {"peers": [], "error": "Could not connect to rookery host"}
+            return {"peers": [], "error": "Could not connect to multi_agent host"}
         except Exception as e:
             logger.error(f"Failed to list peers: {e}")
             return {"peers": [], "error": str(e)}
 
     @tool(
         name="ask_agent",
-        description="Send a message to another agent in the rookery and get their response. Use this to collaborate, ask questions, or delegate tasks to peer agents.",
+        description="Send a message to another agent in the multi_agent and get their response. Use this to collaborate, ask questions, or delegate tasks to peer agents.",
         category=ToolCategory.COMMUNICATION,
         command_prefix="!ask"
     )
@@ -171,7 +171,7 @@ class PeersFeature(Feature):
         if not self._host_url:
             return {
                 "response": None,
-                "error": "Not running in a rookery environment — no host to proxy through",
+                "error": "Not running in a multi_agent environment — no host to proxy through",
             }
 
         if agent_name.lower() == self._own_name.lower():
@@ -199,7 +199,7 @@ class PeersFeature(Feature):
             if resp.status_code == 404:
                 return {
                     "response": None,
-                    "error": f"Agent '{agent_name}' not found in the rookery",
+                    "error": f"Agent '{agent_name}' not found in the multi_agent",
                 }
             if resp.status_code == 503:
                 return {
@@ -221,7 +221,7 @@ class PeersFeature(Feature):
         except httpx.ConnectError:
             return {
                 "response": None,
-                "error": f"Could not reach agent '{agent_name}' — rookery host unreachable",
+                "error": f"Could not reach agent '{agent_name}' — multi_agent host unreachable",
             }
         except httpx.TimeoutException:
             return {
@@ -258,7 +258,7 @@ class PeersFeature(Feature):
         Send a structured mesh message to a peer agent.
 
         The message is delivered to the recipient's /agent/mesh endpoint
-        via the rookery host proxy. The recipient stores it in their
+        via the multi_agent host proxy. The recipient stores it in their
         mesh inbox for processing.
 
         Args:
@@ -272,7 +272,7 @@ class PeersFeature(Feature):
         from .mesh import MeshMessage, MeshMessageType, MeshPriority
 
         if not self._host_url:
-            return {"sent": False, "error": "Not running in a rookery environment"}
+            return {"sent": False, "error": "Not running in a multi_agent environment"}
 
         try:
             msg_type = MeshMessageType(message_type)
@@ -301,7 +301,7 @@ class PeersFeature(Feature):
             correlation_id=correlation_id or None,
         )
 
-        # Deliver via rookery host → recipient's /api/agent/mesh endpoint
+        # Deliver via multi_agent host → recipient's /api/agent/mesh endpoint
         url = f"{self._host_url}/api/agents/{recipient}/api/agent/mesh"
 
         try:

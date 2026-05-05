@@ -11,15 +11,15 @@ import pytest_asyncio
 
 @pytest.fixture(autouse=True)
 def _force_single_agent_mode(monkeypatch, tmp_path):
-    """Prevent rookery.toml detection in integration tests.
+    """Prevent multi_agent.toml detection in integration tests.
 
-    When rookery.toml exists in the project root, server.py starts in
+    When multi_agent.toml exists in the project root, server.py starts in
     multi-agent mode, which breaks TestClient-based tests that expect
     a single agent on app.state.agent.
     """
     monkeypatch.setenv(
-        "KESTREL_ROOKERY_CONFIG",
-        str(tmp_path / "nonexistent_rookery.toml"),
+        "KESTREL_MULTI_AGENT_CONFIG",
+        str(tmp_path / "nonexistent_multi_agent.toml"),
     )
 
 

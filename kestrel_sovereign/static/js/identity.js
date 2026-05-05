@@ -627,7 +627,7 @@ function _renderHybridIdentityRow(identity) {
 }
 
 // ============================================================================
-// Agents Pane (Rookery)
+// Agents Pane (MultiAgent)
 // ============================================================================
 
 let selectedAgentName = null;
@@ -680,10 +680,10 @@ function renderDemoModeBanner({ serverDemoMode, agents, isStandalone }) {
 }
 
 export async function loadAgents() {
-    // #879: hosts that aren't a rookery (e.g. Frinz) don't have an
+    // #879: hosts that aren't a multi_agent (e.g. Frinz) don't have an
     // /api/agents endpoint — skip the fetch entirely and hide the agents
     // pane so the user doesn't see a "Failed to load agents" card.
-    if (!API.hasCapability('rookery')) {
+    if (!API.hasCapability('multi_agent')) {
         const pane = document.getElementById('agents-pane');
         if (pane) pane.style.display = 'none';
         return;
@@ -717,7 +717,7 @@ export async function loadAgents() {
             item.className = `agent-item${selectedAgentName === agent.name ? ' selected' : ''}${!isOnline ? ' offline' : ''}${isThinking ? ' agent-thinking' : ''}`;
             item.dataset.agentName = agent.name;
 
-            // Only enable rookery agent selection in non-standalone mode
+            // Only enable multi_agent agent selection in non-standalone mode
             if (isOnline && !isStandalone) {
                 item.addEventListener('click', () => window.selectAgent(agent.name));
             }
@@ -758,7 +758,7 @@ export async function loadAgents() {
             (a) => a.is_demo !== true,
         );
 
-        // Auto-select first online agent only in rookery mode (not standalone)
+        // Auto-select first online agent only in multi_agent mode (not standalone)
         // and never when the demo server is in misconfig — the banner
         // explicitly tells the operator the auto-select is disabled.
         if (!selectedAgentName && !isStandalone && !hasLiveAgent) {
@@ -770,7 +770,7 @@ export async function loadAgents() {
 
         // Standalone mode: reveal the conversations pane (and its Trash sub-view
         // from #765) without going through selectAgent.  selectAgent installs a
-        // host-agent URL prefix that only exists in rookery routing — applying
+        // host-agent URL prefix that only exists in multi_agent routing — applying
         // it in standalone produces 404s for /api/conversations and /agent/invoke.
         // Standalone has exactly one agent, so just show the pane and let
         // loadConversations() populate the list against the un-prefixed routes.
@@ -1342,7 +1342,7 @@ window.restoreConversation = async function(sessionId, rowEl) {
 // The Trash button in the conversations pane header swaps the pane's
 // content between the live conversations list and a trash list. Both
 // share the pane shell so the user sees the toggle as a *view*, not a
-// modal — which keeps the rookery-and-conversation switcher behavior
+// modal — which keeps the multi_agent-and-conversation switcher behavior
 // undisturbed.
 
 export async function loadTrash() {

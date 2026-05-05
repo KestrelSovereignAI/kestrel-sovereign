@@ -12,12 +12,12 @@ from unittest.mock import patch, MagicMock
 import pytest
 import toml
 
-from kestrel_sovereign.rookery.config import (
-    RookeryConfig,
+from kestrel_sovereign.multi_agent.config import (
+    MultiAgentConfig,
     LocalAgentConfig,
     RemoteAgentConfig,
 )
-from kestrel_sovereign.rookery.process_manager import ProcessManager, AgentProcess
+from kestrel_sovereign.multi_agent.process_manager import ProcessManager, AgentProcess
 
 
 # -----------------------------------------------------------------------
@@ -43,9 +43,9 @@ def project_dir(tmp_path):
 
 
 @pytest.fixture
-def rookery_config():
-    """Create a rookery config with local and remote agents."""
-    return RookeryConfig(
+def multi_agent_config():
+    """Create a multi_agent config with local and remote agents."""
+    return MultiAgentConfig(
         agents={
             "claw": LocalAgentConfig(
                 data_dir=Path("agent_data/claw"), port=8801, autostart=True,
@@ -369,13 +369,13 @@ class TestStopAgent:
 class TestStartStopAll:
     """Test bulk start/stop operations."""
 
-    def test_start_autostart_agents(self, pm, project_dir, rookery_config):
+    def test_start_autostart_agents(self, pm, project_dir, multi_agent_config):
         """start_autostart_agents starts only autostart=True agents."""
         mock_process = MagicMock()
         mock_process.pid = 11111
 
         with patch("subprocess.Popen", return_value=mock_process):
-            started = pm.start_autostart_agents(rookery_config)
+            started = pm.start_autostart_agents(multi_agent_config)
 
         # Only "claw" has autostart=True
         assert "claw" in started
@@ -383,7 +383,7 @@ class TestStartStopAll:
 
     def test_start_autostart_handles_errors(self, pm, project_dir):
         """start_autostart_agents logs errors but continues."""
-        config = RookeryConfig(
+        config = MultiAgentConfig(
             agents={
                 "bad": LocalAgentConfig(
                     data_dir=Path("agent_data/nonexistent"), port=9901, autostart=True,

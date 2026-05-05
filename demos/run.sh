@@ -77,14 +77,14 @@ uv run python scripts/setup_demo_agent.py
 
 echo "[demo-runner] Starting isolated server on $DEMO_URL (DB=$DEMO_DB) ..."
 # Force standalone mode — both belt AND braces for #868:
-#   * KESTREL_ROOKERY_CONFIG points at a non-existent path so the server
-#     skips rookery loading.  Without this, server.py:201 auto-loads
-#     rookery.toml from the project root and mounts every sibling agent
+#   * KESTREL_MULTI_AGENT_CONFIG points at a non-existent path so the server
+#     skips multi_agent loading.  Without this, server.py:201 auto-loads
+#     multi_agent.toml from the project root and mounts every sibling agent
 #     (Meridian, Claw, Nellie) alongside the demo agent.
 #   * KESTREL_DEMO_SERVER=1 makes server.py refuse the auto-load even if
-#     someone removes the explicit KESTREL_ROOKERY_CONFIG line above.
+#     someone removes the explicit KESTREL_MULTI_AGENT_CONFIG line above.
 KESTREL_DB_PATH="$DEMO_DB" \
-KESTREL_ROOKERY_CONFIG="$DEMO_DB/rookery-disabled.toml" \
+KESTREL_MULTI_AGENT_CONFIG="$DEMO_DB/multi_agent-disabled.toml" \
 KESTREL_DEMO_SERVER=1 \
     uv run uvicorn server:app --host 127.0.0.1 --port "$DEMO_PORT" \
     > "$SERVER_LOG" 2>&1 &
@@ -129,7 +129,7 @@ fi
 
 # Sanity-check (#868 acceptance criterion #3) — abort startup if the demo
 # server somehow reports a non-demo agent.  The two upstream defences
-# (KESTREL_ROOKERY_CONFIG override + KESTREL_DEMO_SERVER=1) should make
+# (KESTREL_MULTI_AGENT_CONFIG override + KESTREL_DEMO_SERVER=1) should make
 # this unreachable in practice, but the cost of a false negative is
 # wiping a live agent — so we re-check at the boundary.
 echo "[demo-runner] Verifying every loaded agent is is_demo=true ..."

@@ -62,7 +62,7 @@ The wizard:
 1. Generates `.env` with a fresh `KESTREL_DATA_KEY` (Fernet) for encrypted memory
 2. Writes `[llm]` into `kestrel.toml` with the providers you choose
 3. Runs the **Inception Service**: generates a secp256k1 keypair, derives a cryptographic DID, creates the encrypted SQLite store at `./agent_data/<name>/`, anchors the Kestrel Constitution as the agent's first memory, and runs a genesis integrity audit
-4. Registers the new agent in `rookery.toml` and prints a readiness report
+4. Registers the new agent in `multi_agent.toml` and prints a readiness report
 
 Skip the prompts and accept Ollama defaults:
 
@@ -79,7 +79,7 @@ uv run kestrel doctor
 You'll see output like:
 ```
 Created agent 'Kestrel' with DID did:pkh:eip155:1:0x8955b8...
-Registered 'Kestrel' in rookery.toml on port 8801 (autostart)
+Registered 'Kestrel' in multi_agent.toml on port 8801 (autostart)
 ✅ Ready. Start with: kestrel start
 ```
 

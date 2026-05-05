@@ -18,7 +18,7 @@
  *
  * Prerequisites:
  *   - Server running in multi-agent mode: uv run uvicorn server:app --port 8888
- *     (rookery.toml must be present for multi-agent mode)
+ *     (multi_agent.toml must be present for multi-agent mode)
  *   - GITHUB_TOKEN in .env (for morning signal to scan repos)
  *   - KESTREL_API_KEY in .env
  *   - OPENROUTER_API_KEY in .env (or another working LLM provider)
@@ -206,11 +206,11 @@ test.beforeAll(async ({ request }) => {
     fs.mkdirSync(OUTPUT_DIR, { recursive: true });
 
     // Verify server is alive
-    let isRookery = false;
+    let isMultiAgent = false;
     try {
         const resp = await request.get(`${BASE_URL}/health`);
         const data = await resp.json();
-        isRookery = data.agents && typeof data.agents === 'object' && Object.keys(data.agents).length > 0;
+        isMultiAgent = data.agents && typeof data.agents === 'object' && Object.keys(data.agents).length > 0;
         narrator.narrate('Setup', `Server health: ${data.status}, agents: ${Object.keys(data.agents || {}).length || '?'}`);
     } catch (e) {
         narrator.narrate('Setup', `Server not reachable: ${e.message}`);
@@ -235,7 +235,7 @@ test.beforeAll(async ({ request }) => {
     // immediately.  After a cold start the agent enters discovery mode and
     // intercepts all non-bootstrap commands, sending them to the LLM instead.
     if (apiKey) {
-        const invokeUrl = isRookery
+        const invokeUrl = isMultiAgent
             ? `${BASE_URL}/api/agents/Kestrel/agent/invoke`
             : `${BASE_URL}/agent/invoke`;
         try {
@@ -348,12 +348,12 @@ test('Act 2: Meet the Sovereign Flock', async ({ page }) => {
         const onlineCount = await page.locator('.agent-status-dot.online').count();
 
         narrator.narrate('Act 2: The Sovereign Flock',
-            `${agentCount} agents in the rookery — ${onlineCount} online. Each is a sovereign agent with its own DID, constitution, and memory.`,
+            `${agentCount} agents in the multi_agent — ${onlineCount} online. Each is a sovereign agent with its own DID, constitution, and memory.`,
             'This is multi-agent mode. Every agent in the sidebar is an independent sovereign entity running on its own port.');
         await narrator.screenshot(page, 'flock-agents-list');
     } else {
         narrator.narrate('Act 2: The Sovereign Flock',
-            'Sovereign Console loaded (single-agent mode — enable rookery.toml for full flock view).');
+            'Sovereign Console loaded (single-agent mode — enable multi_agent.toml for full flock view).');
         await narrator.screenshot(page, 'console-single-agent');
     }
 

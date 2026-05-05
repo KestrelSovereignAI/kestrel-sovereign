@@ -1,7 +1,7 @@
 /**
  * E2E: Model Selector UI Flow (vendor/route/model refactor, epic #688)
  *
- * Runs against the live rookery on ``KESTREL_URL`` (default localhost:8888).
+ * Runs against the live multi_agent on ``KESTREL_URL`` (default localhost:8888).
  * Verifies the wire-level contract of the refactor:
  *
  *   1. ``/api/models`` returns ``by_vendor`` (not ``by_provider``) and a

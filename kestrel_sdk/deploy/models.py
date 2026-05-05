@@ -47,7 +47,7 @@ class DeploymentProfile:
     port: int = 8080
     timeout: int = 300  # seconds
     concurrency: int = 80
-    deployment_mode: str = "agent"  # "agent" (single agent) or "rookery" (multi-agent host)
+    deployment_mode: str = "agent"  # "agent" (single agent) or "multi_agent" (multi-agent host)
     dockerfile: str = "docker/Dockerfile.cloudrun"
     env_vars: Dict[str, str] = field(default_factory=dict)
     secrets: Dict[str, str] = field(default_factory=dict)
@@ -62,9 +62,9 @@ class DeploymentProfile:
         return self.min_instances == 0
 
     @property
-    def is_rookery(self) -> bool:
-        """Whether this profile deploys a multi-agent rookery host."""
-        return self.deployment_mode == "rookery"
+    def is_multi_agent(self) -> bool:
+        """Whether this profile deploys a multi-agent multi_agent host."""
+        return self.deployment_mode == "multi_agent"
 
 
 @dataclass

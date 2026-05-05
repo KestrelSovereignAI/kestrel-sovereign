@@ -1,4 +1,4 @@
-# Dockerfile for Kestrel Rookery Host — Cloud Run / Azure Container Apps
+# Dockerfile for Kestrel MultiAgent Host — Cloud Run / Azure Container Apps
 # Runs the multi-agent host (host.py) which spawns agent subprocesses.
 # Same base as Dockerfile.cloudrun but entrypoint is host:app, not server:app.
 ARG TARGETARCH
@@ -24,7 +24,7 @@ COPY --from=uv /uv /usr/local/bin/uv
 COPY . .
 
 # Make entrypoint executable
-RUN chmod +x /app/docker/rookery_entrypoint.sh
+RUN chmod +x /app/docker/multi_agent_entrypoint.sh
 
 # Create the virtual environment and install
 # Uses Docker secret for GitHub token to access private repos (kestrel-talon)
@@ -43,8 +43,8 @@ RUN --mount=type=secret,id=github_token \
 # Cloud LLM config — LLMService reads [llm] from /app/kestrel.toml directly.
 COPY docker/kestrel.cloudrun.toml /app/kestrel.toml
 
-# Cloud Run rookery config
-COPY docker/rookery.cloudrun.toml /app/rookery.toml
+# Cloud Run multi_agent config
+COPY docker/multi_agent.cloudrun.toml /app/multi_agent.toml
 
 # Create directories for agent data (auto-discover will find subdirs)
 RUN mkdir -p /app/agent_data
@@ -62,7 +62,7 @@ USER kestrel
 # Environment
 ENV PYTHONUNBUFFERED=1
 ENV KESTREL_ENV=production
-ENV KESTREL_ROOKERY_CONFIG=/app/rookery.toml
+ENV KESTREL_MULTI_AGENT_CONFIG=/app/multi_agent.toml
 ENV KESTREL_HOST_AUTOSTART=true
 ENV PORT=8080
 
@@ -73,5 +73,5 @@ EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
     CMD curl -f http://localhost:${PORT}/health || exit 1
 
-# Bootstrap agent identities and start the rookery host
-CMD ["/app/docker/rookery_entrypoint.sh"]
+# Bootstrap agent identities and start the multi_agent host
+CMD ["/app/docker/multi_agent_entrypoint.sh"]

@@ -186,7 +186,7 @@ class TestPeersFeatureMesh:
     def _make_feature(self, name="kestrel"):
         agent = SimpleNamespace(_agent_name=name)
         feature = PeersFeature(agent)
-        feature._host_url = "http://rookery:8888"
+        feature._host_url = "http://multi_agent:8888"
         feature._api_key = ""
         feature._own_name = name
         feature._mesh_inbox = []
@@ -212,7 +212,7 @@ class TestPeersFeatureMesh:
         assert len(feature._mesh_inbox) == 0
 
     def test_receive_mesh_message_accepts_any_recipient(self):
-        """Messages are routed by the rookery — the agent accepts all delivered messages."""
+        """Messages are routed by the multi_agent — the agent accepts all delivered messages."""
         feature = self._make_feature("kestrel")
         msg_dict = make_assign_message(
             sender="talon", recipient="kestrel",
@@ -249,7 +249,7 @@ class TestPeersFeatureMesh:
             payload_json='{"issue_number": 1}',
         )
         assert result["sent"] is False
-        assert "rookery" in result["error"].lower()
+        assert "multi_agent" in result["error"].lower()
 
 
 # =========================================================================
@@ -324,5 +324,5 @@ class TestTalonHandoff:
             return_value=None,
         ):
             result = await dispatch_to_talon({})
-            assert "no rookery host url" in result.lower()
+            assert "no multi_agent host url" in result.lower()
             assert "owner/repo#42" in result

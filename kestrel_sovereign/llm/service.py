@@ -967,7 +967,7 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         Also emits a single structured ``llm.usage:`` INFO line so callers
         that downcast the response to a plain string don't lose token /
         cache telemetry. Picked up by Cloud Run / Cloud Logging via the
-        rookery stdout tee (issue #812). See issue #819.
+        multi_agent stdout tee (issue #812). See issue #819.
         """
         # Log to observability store
         if self._observability_store:

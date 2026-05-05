@@ -9,27 +9,27 @@ import pytest
 import httpx
 from unittest.mock import patch, MagicMock
 
-from kestrel_sovereign.rookery.config import (
-    RookeryConfig,
+from kestrel_sovereign.multi_agent.config import (
+    MultiAgentConfig,
     HostConfig,
     LocalAgentConfig,
     RemoteAgentConfig,
 )
-from kestrel_sovereign.rookery.process_manager import ProcessManager, AgentProcess
+from kestrel_sovereign.multi_agent.process_manager import ProcessManager, AgentProcess
 
 
-async def make_host_app(config: RookeryConfig):
+async def make_host_app(config: MultiAgentConfig):
     """Create and start a host app with a given config.
 
-    Patches load_rookery_config so the lifespan uses our test config.
+    Patches load_multi_agent_config so the lifespan uses our test config.
     Returns (app, lifespan_manager) — caller must use them in async with.
     """
-    with patch("host.load_rookery_config", return_value=config):
+    with patch("host.load_multi_agent_config", return_value=config):
         # Reload to pick up the patched function reference
         import importlib
         import host as host_module
         # Patch at the module level BEFORE reload
-        host_module.load_rookery_config = lambda: config
+        host_module.load_multi_agent_config = lambda: config
         # Now the app references the patched function
 
         from asgi_lifespan import LifespanManager
@@ -50,15 +50,15 @@ class TestHealthEndpoint:
     @pytest.mark.asyncio
     async def test_health_returns_ok(self):
         """Health endpoint returns status ok with agent statuses."""
-        config = RookeryConfig(
+        config = MultiAgentConfig(
             agents={
                 "claw": LocalAgentConfig(data_dir="agent_data/claw", port=9901),
             }
         )
 
         import host as host_module
-        original_fn = host_module.load_rookery_config
-        host_module.load_rookery_config = lambda: config
+        original_fn = host_module.load_multi_agent_config
+        host_module.load_multi_agent_config = lambda: config
         try:
             from asgi_lifespan import LifespanManager
             async with LifespanManager(host_module.app) as manager:
@@ -74,12 +74,12 @@ class TestHealthEndpoint:
             assert data["role"] == "host"
             assert "agents" in data
         finally:
-            host_module.load_rookery_config = original_fn
+            host_module.load_multi_agent_config = original_fn
 
     @pytest.mark.asyncio
     async def test_health_shows_offline_agents(self):
         """Health endpoint shows offline agents when they can't be reached."""
-        config = RookeryConfig(
+        config = MultiAgentConfig(
             agents={
                 "claw": LocalAgentConfig(data_dir="agent_data/claw", port=9901),
                 "helper": LocalAgentConfig(data_dir="agent_data/helper", port=9902),
@@ -87,8 +87,8 @@ class TestHealthEndpoint:
         )
 
         import host as host_module
-        original_fn = host_module.load_rookery_config
-        host_module.load_rookery_config = lambda: config
+        original_fn = host_module.load_multi_agent_config
+        host_module.load_multi_agent_config = lambda: config
         try:
             from asgi_lifespan import LifespanManager
             async with LifespanManager(host_module.app) as manager:
@@ -102,16 +102,16 @@ class TestHealthEndpoint:
             for name, status in data["agents"].items():
                 assert status["status"] == "offline"
         finally:
-            host_module.load_rookery_config = original_fn
+            host_module.load_multi_agent_config = original_fn
 
     @pytest.mark.asyncio
     async def test_health_no_auth_required(self):
         """Health endpoint is accessible without auth."""
-        config = RookeryConfig(agents={})
+        config = MultiAgentConfig(agents={})
 
         import host as host_module
-        original_fn = host_module.load_rookery_config
-        host_module.load_rookery_config = lambda: config
+        original_fn = host_module.load_multi_agent_config
+        host_module.load_multi_agent_config = lambda: config
         try:
             from asgi_lifespan import LifespanManager
             async with LifespanManager(host_module.app) as manager:
@@ -123,7 +123,7 @@ class TestHealthEndpoint:
 
             assert resp.status_code == 200
         finally:
-            host_module.load_rookery_config = original_fn
+            host_module.load_multi_agent_config = original_fn
 
 
 class TestAuthMiddleware:
@@ -132,11 +132,11 @@ class TestAuthMiddleware:
     @pytest.mark.asyncio
     async def test_protected_endpoint_requires_auth(self):
         """Protected endpoints return 401 without auth."""
-        config = RookeryConfig(agents={})
+        config = MultiAgentConfig(agents={})
 
         import host as host_module
-        original_fn = host_module.load_rookery_config
-        host_module.load_rookery_config = lambda: config
+        original_fn = host_module.load_multi_agent_config
+        host_module.load_multi_agent_config = lambda: config
         try:
             from asgi_lifespan import LifespanManager
             async with LifespanManager(host_module.app) as manager:
@@ -148,17 +148,17 @@ class TestAuthMiddleware:
 
             assert resp.status_code == 401
         finally:
-            host_module.load_rookery_config = original_fn
+            host_module.load_multi_agent_config = original_fn
 
     @pytest.mark.asyncio
     async def test_api_key_header_auth(self):
         """X-API-Key header authentication works."""
         test_key = "test-key-12345"
-        config = RookeryConfig(agents={})
+        config = MultiAgentConfig(agents={})
 
         import host as host_module
-        original_fn = host_module.load_rookery_config
-        host_module.load_rookery_config = lambda: config
+        original_fn = host_module.load_multi_agent_config
+        host_module.load_multi_agent_config = lambda: config
         try:
             with patch.dict(os.environ, {"KESTREL_API_KEY": test_key}):
                 from asgi_lifespan import LifespanManager
@@ -174,17 +174,17 @@ class TestAuthMiddleware:
 
             assert resp.status_code == 200
         finally:
-            host_module.load_rookery_config = original_fn
+            host_module.load_multi_agent_config = original_fn
 
     @pytest.mark.asyncio
     async def test_bearer_token_auth(self):
         """Bearer token authentication works."""
         test_key = "test-bearer-key"
-        config = RookeryConfig(agents={})
+        config = MultiAgentConfig(agents={})
 
         import host as host_module
-        original_fn = host_module.load_rookery_config
-        host_module.load_rookery_config = lambda: config
+        original_fn = host_module.load_multi_agent_config
+        host_module.load_multi_agent_config = lambda: config
         try:
             with patch.dict(os.environ, {"KESTREL_API_KEY": test_key}):
                 from asgi_lifespan import LifespanManager
@@ -200,17 +200,17 @@ class TestAuthMiddleware:
 
             assert resp.status_code == 200
         finally:
-            host_module.load_rookery_config = original_fn
+            host_module.load_multi_agent_config = original_fn
 
     @pytest.mark.asyncio
     async def test_query_param_auth_rejected_on_non_sse_path(self):
         """Query parameter authentication is rejected on non-SSE paths (#160)."""
         test_key = "test-query-key"
-        config = RookeryConfig(agents={})
+        config = MultiAgentConfig(agents={})
 
         import host as host_module
-        original_fn = host_module.load_rookery_config
-        host_module.load_rookery_config = lambda: config
+        original_fn = host_module.load_multi_agent_config
+        host_module.load_multi_agent_config = lambda: config
         try:
             with patch.dict(os.environ, {"KESTREL_API_KEY": test_key}):
                 from asgi_lifespan import LifespanManager
@@ -226,7 +226,7 @@ class TestAuthMiddleware:
 
             assert resp.status_code == 401
         finally:
-            host_module.load_rookery_config = original_fn
+            host_module.load_multi_agent_config = original_fn
 
 
 class TestListAgents:
@@ -236,7 +236,7 @@ class TestListAgents:
     async def test_list_agents_returns_all_agents(self):
         """List agents returns all configured agents."""
         test_key = "test-key"
-        config = RookeryConfig(
+        config = MultiAgentConfig(
             agents={
                 "claw": LocalAgentConfig(data_dir="agent_data/claw", port=9901),
                 "helper": LocalAgentConfig(data_dir="agent_data/helper", port=9902),
@@ -244,8 +244,8 @@ class TestListAgents:
         )
 
         import host as host_module
-        original_fn = host_module.load_rookery_config
-        host_module.load_rookery_config = lambda: config
+        original_fn = host_module.load_multi_agent_config
+        host_module.load_multi_agent_config = lambda: config
         try:
             with patch.dict(os.environ, {"KESTREL_API_KEY": test_key}):
                 from asgi_lifespan import LifespanManager
@@ -266,21 +266,21 @@ class TestListAgents:
             names = {a["name"] for a in data["agents"]}
             assert names == {"claw", "helper"}
         finally:
-            host_module.load_rookery_config = original_fn
+            host_module.load_multi_agent_config = original_fn
 
     @pytest.mark.asyncio
     async def test_list_agents_shows_offline_status(self):
         """Agents that can't be reached show as offline."""
         test_key = "test-key"
-        config = RookeryConfig(
+        config = MultiAgentConfig(
             agents={
                 "claw": LocalAgentConfig(data_dir="agent_data/claw", port=9901),
             }
         )
 
         import host as host_module
-        original_fn = host_module.load_rookery_config
-        host_module.load_rookery_config = lambda: config
+        original_fn = host_module.load_multi_agent_config
+        host_module.load_multi_agent_config = lambda: config
         try:
             with patch.dict(os.environ, {"KESTREL_API_KEY": test_key}):
                 from asgi_lifespan import LifespanManager
@@ -297,13 +297,13 @@ class TestListAgents:
             data = resp.json()
             assert data["agents"][0]["status"] == "offline"
         finally:
-            host_module.load_rookery_config = original_fn
+            host_module.load_multi_agent_config = original_fn
 
     @pytest.mark.asyncio
     async def test_list_agents_includes_type(self):
         """Agent entries include type (local/remote)."""
         test_key = "test-key"
-        config = RookeryConfig(
+        config = MultiAgentConfig(
             agents={
                 "local-agent": LocalAgentConfig(data_dir="agent_data/a", port=9901),
                 "remote-agent": RemoteAgentConfig(url="https://example.com"),
@@ -311,8 +311,8 @@ class TestListAgents:
         )
 
         import host as host_module
-        original_fn = host_module.load_rookery_config
-        host_module.load_rookery_config = lambda: config
+        original_fn = host_module.load_multi_agent_config
+        host_module.load_multi_agent_config = lambda: config
         try:
             with patch.dict(os.environ, {"KESTREL_API_KEY": test_key}):
                 from asgi_lifespan import LifespanManager
@@ -331,7 +331,7 @@ class TestListAgents:
             assert types["local-agent"] == "local"
             assert types["remote-agent"] == "remote"
         finally:
-            host_module.load_rookery_config = original_fn
+            host_module.load_multi_agent_config = original_fn
 
 
 class TestProxyToAgent:
@@ -341,15 +341,15 @@ class TestProxyToAgent:
     async def test_proxy_nonexistent_agent_returns_404(self):
         """Proxying to unknown agent returns 404."""
         test_key = "test-key"
-        config = RookeryConfig(
+        config = MultiAgentConfig(
             agents={
                 "claw": LocalAgentConfig(data_dir="agent_data/claw", port=9901),
             }
         )
 
         import host as host_module
-        original_fn = host_module.load_rookery_config
-        host_module.load_rookery_config = lambda: config
+        original_fn = host_module.load_multi_agent_config
+        host_module.load_multi_agent_config = lambda: config
         try:
             with patch.dict(os.environ, {"KESTREL_API_KEY": test_key}):
                 from asgi_lifespan import LifespanManager
@@ -366,21 +366,21 @@ class TestProxyToAgent:
             assert resp.status_code == 404
             assert "not found" in resp.json()["detail"]
         finally:
-            host_module.load_rookery_config = original_fn
+            host_module.load_multi_agent_config = original_fn
 
     @pytest.mark.asyncio
     async def test_proxy_offline_agent_returns_503(self):
         """Proxying to offline agent returns 503."""
         test_key = "test-key"
-        config = RookeryConfig(
+        config = MultiAgentConfig(
             agents={
                 "claw": LocalAgentConfig(data_dir="agent_data/claw", port=9901),
             }
         )
 
         import host as host_module
-        original_fn = host_module.load_rookery_config
-        host_module.load_rookery_config = lambda: config
+        original_fn = host_module.load_multi_agent_config
+        host_module.load_multi_agent_config = lambda: config
         try:
             with patch.dict(os.environ, {"KESTREL_API_KEY": test_key}):
                 from asgi_lifespan import LifespanManager
@@ -397,7 +397,7 @@ class TestProxyToAgent:
             assert resp.status_code == 503
             assert "offline" in resp.json()["detail"]
         finally:
-            host_module.load_rookery_config = original_fn
+            host_module.load_multi_agent_config = original_fn
 
 
 # -----------------------------------------------------------------------
@@ -411,15 +411,15 @@ class TestProcessManagementEndpoints:
     async def test_start_nonexistent_agent_returns_404(self):
         """Starting an unknown agent returns 404."""
         test_key = "test-key"
-        config = RookeryConfig(
+        config = MultiAgentConfig(
             agents={
                 "claw": LocalAgentConfig(data_dir="agent_data/claw", port=9901),
             }
         )
 
         import host as host_module
-        original_fn = host_module.load_rookery_config
-        host_module.load_rookery_config = lambda: config
+        original_fn = host_module.load_multi_agent_config
+        host_module.load_multi_agent_config = lambda: config
         try:
             with patch.dict(os.environ, {"KESTREL_API_KEY": test_key}):
                 from asgi_lifespan import LifespanManager
@@ -435,21 +435,21 @@ class TestProcessManagementEndpoints:
 
             assert resp.status_code == 404
         finally:
-            host_module.load_rookery_config = original_fn
+            host_module.load_multi_agent_config = original_fn
 
     @pytest.mark.asyncio
     async def test_stop_nonexistent_agent_returns_404(self):
         """Stopping an unknown agent returns 404."""
         test_key = "test-key"
-        config = RookeryConfig(
+        config = MultiAgentConfig(
             agents={
                 "claw": LocalAgentConfig(data_dir="agent_data/claw", port=9901),
             }
         )
 
         import host as host_module
-        original_fn = host_module.load_rookery_config
-        host_module.load_rookery_config = lambda: config
+        original_fn = host_module.load_multi_agent_config
+        host_module.load_multi_agent_config = lambda: config
         try:
             with patch.dict(os.environ, {"KESTREL_API_KEY": test_key}):
                 from asgi_lifespan import LifespanManager
@@ -465,21 +465,21 @@ class TestProcessManagementEndpoints:
 
             assert resp.status_code == 404
         finally:
-            host_module.load_rookery_config = original_fn
+            host_module.load_multi_agent_config = original_fn
 
     @pytest.mark.asyncio
     async def test_status_nonexistent_agent_returns_404(self):
         """Status for unknown agent returns 404."""
         test_key = "test-key"
-        config = RookeryConfig(
+        config = MultiAgentConfig(
             agents={
                 "claw": LocalAgentConfig(data_dir="agent_data/claw", port=9901),
             }
         )
 
         import host as host_module
-        original_fn = host_module.load_rookery_config
-        host_module.load_rookery_config = lambda: config
+        original_fn = host_module.load_multi_agent_config
+        host_module.load_multi_agent_config = lambda: config
         try:
             with patch.dict(os.environ, {"KESTREL_API_KEY": test_key}):
                 from asgi_lifespan import LifespanManager
@@ -495,21 +495,21 @@ class TestProcessManagementEndpoints:
 
             assert resp.status_code == 404
         finally:
-            host_module.load_rookery_config = original_fn
+            host_module.load_multi_agent_config = original_fn
 
     @pytest.mark.asyncio
     async def test_logs_nonexistent_agent_returns_404(self):
         """Logs for unknown agent returns 404."""
         test_key = "test-key"
-        config = RookeryConfig(
+        config = MultiAgentConfig(
             agents={
                 "claw": LocalAgentConfig(data_dir="agent_data/claw", port=9901),
             }
         )
 
         import host as host_module
-        original_fn = host_module.load_rookery_config
-        host_module.load_rookery_config = lambda: config
+        original_fn = host_module.load_multi_agent_config
+        host_module.load_multi_agent_config = lambda: config
         try:
             with patch.dict(os.environ, {"KESTREL_API_KEY": test_key}):
                 from asgi_lifespan import LifespanManager
@@ -525,21 +525,21 @@ class TestProcessManagementEndpoints:
 
             assert resp.status_code == 404
         finally:
-            host_module.load_rookery_config = original_fn
+            host_module.load_multi_agent_config = original_fn
 
     @pytest.mark.asyncio
     async def test_status_registered_agent(self):
         """Status for registered agent returns process info."""
         test_key = "test-key"
-        config = RookeryConfig(
+        config = MultiAgentConfig(
             agents={
                 "claw": LocalAgentConfig(data_dir="agent_data/claw", port=9901),
             }
         )
 
         import host as host_module
-        original_fn = host_module.load_rookery_config
-        host_module.load_rookery_config = lambda: config
+        original_fn = host_module.load_multi_agent_config
+        host_module.load_multi_agent_config = lambda: config
         try:
             with patch.dict(os.environ, {"KESTREL_API_KEY": test_key}):
                 from asgi_lifespan import LifespanManager
@@ -559,21 +559,21 @@ class TestProcessManagementEndpoints:
             assert data["port"] == 9901
             assert data["status"] == "stopped"
         finally:
-            host_module.load_rookery_config = original_fn
+            host_module.load_multi_agent_config = original_fn
 
     @pytest.mark.asyncio
     async def test_stop_registered_agent(self):
         """Stopping a registered (but not running) agent succeeds."""
         test_key = "test-key"
-        config = RookeryConfig(
+        config = MultiAgentConfig(
             agents={
                 "claw": LocalAgentConfig(data_dir="agent_data/claw", port=9901),
             }
         )
 
         import host as host_module
-        original_fn = host_module.load_rookery_config
-        host_module.load_rookery_config = lambda: config
+        original_fn = host_module.load_multi_agent_config
+        host_module.load_multi_agent_config = lambda: config
         try:
             with patch.dict(os.environ, {"KESTREL_API_KEY": test_key}):
                 from asgi_lifespan import LifespanManager
@@ -592,21 +592,21 @@ class TestProcessManagementEndpoints:
             assert data["agent_id"] == "claw"
             assert data["status"] == "stopped"
         finally:
-            host_module.load_rookery_config = original_fn
+            host_module.load_multi_agent_config = original_fn
 
     @pytest.mark.asyncio
     async def test_remote_agent_not_manageable(self):
         """Remote agents cannot be started/stopped (returns 404)."""
         test_key = "test-key"
-        config = RookeryConfig(
+        config = MultiAgentConfig(
             agents={
                 "remote": RemoteAgentConfig(url="https://example.com"),
             }
         )
 
         import host as host_module
-        original_fn = host_module.load_rookery_config
-        host_module.load_rookery_config = lambda: config
+        original_fn = host_module.load_multi_agent_config
+        host_module.load_multi_agent_config = lambda: config
         try:
             with patch.dict(os.environ, {"KESTREL_API_KEY": test_key}):
                 from asgi_lifespan import LifespanManager
@@ -623,4 +623,4 @@ class TestProcessManagementEndpoints:
             assert resp.status_code == 404
             assert "not a local agent" in resp.json()["detail"]
         finally:
-            host_module.load_rookery_config = original_fn
+            host_module.load_multi_agent_config = original_fn

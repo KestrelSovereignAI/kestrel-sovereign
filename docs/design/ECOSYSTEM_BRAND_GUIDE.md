@@ -64,7 +64,7 @@ Fleet orchestration CLI. The whole foot — multiple toes gripping, kneading, pr
 
 ### Kestrel Castle — *The Enterprise Fortress*
 
-The enterprise deployment layer. A castle with four rook-shaped towers (the chess piece pun). Each tower is a rookery that launches falcon agents. Multi-tenant fleet management, RBAC, governance policies.
+The enterprise deployment layer. A castle with four rook-shaped towers (the chess piece pun). Each tower is a multi_agent that launches falcon agents. Multi-tenant fleet management, RBAC, governance policies.
 
 **Visual motif:** Four chess-rook towers in square formation, kestrels launching from each. A crown above the center. Enterprise scale.
 

@@ -28,8 +28,8 @@ from kestrel_sovereign.cli import (
     _get_project_dir,
     _host_pid_file,
 )
-from kestrel_sovereign.rookery.process_manager import ProcessManager
-from kestrel_sovereign.rookery.config import RookeryConfig
+from kestrel_sovereign.multi_agent.process_manager import ProcessManager
+from kestrel_sovereign.multi_agent.config import MultiAgentConfig
 
 
 # -----------------------------------------------------------------------
@@ -301,12 +301,12 @@ class TestProcessHelpers:
 
 
 # -----------------------------------------------------------------------
-# Rookery fixture
+# MultiAgent fixture
 # -----------------------------------------------------------------------
 
 @pytest.fixture
-def rookery_env(tmp_path):
-    """Set up a temporary rookery environment with config and agent dirs."""
+def multi_agent_env(tmp_path):
+    """Set up a temporary multi_agent environment with config and agent dirs."""
     # Create agent directories
     claw_dir = tmp_path / "agent_data" / "claw"
     claw_dir.mkdir(parents=True)
@@ -316,7 +316,7 @@ def rookery_env(tmp_path):
     testbot_dir.mkdir(parents=True)
     (testbot_dir / "kestrel_prime.db").touch()
 
-    # Create rookery.toml
+    # Create multi_agent.toml
     config = {
         "host": {"port": 18888, "bind": "127.0.0.1"},
         "agents": {
@@ -332,7 +332,7 @@ def rookery_env(tmp_path):
             },
         },
     }
-    config_path = tmp_path / "rookery.toml"
+    config_path = tmp_path / "multi_agent.toml"
     with open(config_path, "w") as f:
         toml.dump(config, f)
 
@@ -354,12 +354,12 @@ def rookery_env(tmp_path):
 class TestCmdList:
     """Tests for the 'list' command."""
 
-    def test_list_agents(self, rookery_env, capsys):
-        """List should show agents from rookery config."""
+    def test_list_agents(self, multi_agent_env, capsys):
+        """List should show agents from multi_agent config."""
         parser = build_parser()
         args = parser.parse_args(["list"])
 
-        with patch("kestrel_sovereign.cli._get_project_dir", return_value=rookery_env):
+        with patch("kestrel_sovereign.cli._get_project_dir", return_value=multi_agent_env):
             rc = cmd_list(args)
 
         assert rc == 0
@@ -371,8 +371,8 @@ class TestCmdList:
 
     def test_list_empty(self, tmp_path, capsys):
         """List with no agents should show empty message."""
-        # Create empty rookery.toml
-        config_path = tmp_path / "rookery.toml"
+        # Create empty multi_agent.toml
+        config_path = tmp_path / "multi_agent.toml"
         with open(config_path, "w") as f:
             toml.dump({"host": {}, "agents": {}}, f)
 
@@ -394,12 +394,12 @@ class TestCmdList:
 class TestCmdStatus:
     """Tests for the 'status' command."""
 
-    def test_status_all_offline(self, rookery_env, capsys):
+    def test_status_all_offline(self, multi_agent_env, capsys):
         """Status should show all processes as offline when nothing runs."""
         parser = build_parser()
         args = parser.parse_args(["status"])
 
-        with patch("kestrel_sovereign.cli._get_project_dir", return_value=rookery_env):
+        with patch("kestrel_sovereign.cli._get_project_dir", return_value=multi_agent_env):
             rc = cmd_status(args)
 
         assert rc == 0
@@ -410,12 +410,12 @@ class TestCmdStatus:
         assert "testbot" in output
         assert "offline" in output
 
-    def test_status_shows_header(self, rookery_env, capsys):
+    def test_status_shows_header(self, multi_agent_env, capsys):
         """Status should show column headers."""
         parser = build_parser()
         args = parser.parse_args(["status"])
 
-        with patch("kestrel_sovereign.cli._get_project_dir", return_value=rookery_env):
+        with patch("kestrel_sovereign.cli._get_project_dir", return_value=multi_agent_env):
             cmd_status(args)
 
         output = capsys.readouterr().out
@@ -431,39 +431,39 @@ class TestCmdStatus:
 class TestCmdStop:
     """Tests for the 'stop' command."""
 
-    def test_stop_single_agent_not_found(self, rookery_env, capsys):
+    def test_stop_single_agent_not_found(self, multi_agent_env, capsys):
         """Stop should return 1 if agent name not found."""
         parser = build_parser()
         args = parser.parse_args(["stop", "nonexistent"])
 
-        with patch("kestrel_sovereign.cli._get_project_dir", return_value=rookery_env):
+        with patch("kestrel_sovereign.cli._get_project_dir", return_value=multi_agent_env):
             rc = cmd_stop(args)
 
         assert rc == 1
         output = capsys.readouterr().out
         assert "not found" in output
 
-    def test_stop_single_not_running(self, rookery_env, capsys):
+    def test_stop_single_not_running(self, multi_agent_env, capsys):
         """Stop should succeed even if agent is not running."""
         parser = build_parser()
         args = parser.parse_args(["stop", "claw"])
 
-        with patch("kestrel_sovereign.cli._get_project_dir", return_value=rookery_env):
+        with patch("kestrel_sovereign.cli._get_project_dir", return_value=multi_agent_env):
             rc = cmd_stop(args)
 
         assert rc == 0
 
-    def test_stop_all(self, rookery_env, capsys):
+    def test_stop_all(self, multi_agent_env, capsys):
         """Stop all should stop agents and host."""
         parser = build_parser()
         args = parser.parse_args(["stop"])
 
-        with patch("kestrel_sovereign.cli._get_project_dir", return_value=rookery_env):
+        with patch("kestrel_sovereign.cli._get_project_dir", return_value=multi_agent_env):
             rc = cmd_stop(args)
 
         assert rc == 0
         output = capsys.readouterr().out
-        assert "Rookery stopped" in output
+        assert "MultiAgent stopped" in output
 
 
 # -----------------------------------------------------------------------
@@ -473,28 +473,28 @@ class TestCmdStop:
 class TestCmdStart:
     """Tests for the 'start' command."""
 
-    def test_start_single_not_found(self, rookery_env, capsys):
+    def test_start_single_not_found(self, multi_agent_env, capsys):
         """Start should return 1 if agent name not found."""
         parser = build_parser()
         args = parser.parse_args(["start", "nonexistent"])
 
-        with patch("kestrel_sovereign.cli._get_project_dir", return_value=rookery_env):
+        with patch("kestrel_sovereign.cli._get_project_dir", return_value=multi_agent_env):
             rc = cmd_start(args)
 
         assert rc == 1
         output = capsys.readouterr().out
         assert "not found" in output
 
-    def test_start_single_missing_db(self, rookery_env, capsys):
+    def test_start_single_missing_db(self, multi_agent_env, capsys):
         """Start should fail if agent data dir has no database."""
         # Remove the database file
-        db_file = rookery_env / "agent_data" / "claw" / "kestrel_prime.db"
+        db_file = multi_agent_env / "agent_data" / "claw" / "kestrel_prime.db"
         db_file.unlink()
 
         parser = build_parser()
         args = parser.parse_args(["start", "claw"])
 
-        with patch("kestrel_sovereign.cli._get_project_dir", return_value=rookery_env):
+        with patch("kestrel_sovereign.cli._get_project_dir", return_value=multi_agent_env):
             rc = cmd_start(args)
 
         assert rc == 1
@@ -507,50 +507,50 @@ class TestCmdStart:
 class TestCmdLogs:
     """Tests for the 'logs' command."""
 
-    def test_logs_agent_not_found(self, rookery_env, capsys):
+    def test_logs_agent_not_found(self, multi_agent_env, capsys):
         """Logs should return 1 if agent not found."""
         parser = build_parser()
         args = parser.parse_args(["logs", "nonexistent"])
 
-        with patch("kestrel_sovereign.cli._get_project_dir", return_value=rookery_env):
+        with patch("kestrel_sovereign.cli._get_project_dir", return_value=multi_agent_env):
             rc = cmd_logs(args)
 
         assert rc == 1
         output = capsys.readouterr().out
         assert "not found" in output
 
-    def test_logs_no_log_file(self, rookery_env, capsys):
+    def test_logs_no_log_file(self, multi_agent_env, capsys):
         """Logs should return 1 if log file doesn't exist."""
         parser = build_parser()
         args = parser.parse_args(["logs", "claw"])
 
-        with patch("kestrel_sovereign.cli._get_project_dir", return_value=rookery_env):
+        with patch("kestrel_sovereign.cli._get_project_dir", return_value=multi_agent_env):
             rc = cmd_logs(args)
 
         assert rc == 1
         output = capsys.readouterr().out
         assert "No log file found" in output
 
-    def test_logs_host_no_file(self, rookery_env, capsys):
+    def test_logs_host_no_file(self, multi_agent_env, capsys):
         """Logs for host should return 1 if log file doesn't exist."""
         parser = build_parser()
         args = parser.parse_args(["logs", "host"])
 
-        with patch("kestrel_sovereign.cli._get_project_dir", return_value=rookery_env):
+        with patch("kestrel_sovereign.cli._get_project_dir", return_value=multi_agent_env):
             rc = cmd_logs(args)
 
         assert rc == 1
 
-    def test_logs_host_with_file(self, rookery_env):
+    def test_logs_host_with_file(self, multi_agent_env):
         """Logs for host should call tail with correct arguments."""
         # Create the host log file
-        log_file = rookery_env / "logs" / "host.log"
+        log_file = multi_agent_env / "logs" / "host.log"
         log_file.write_text("test log line\n")
 
         parser = build_parser()
         args = parser.parse_args(["logs", "host", "-n", "20"])
 
-        with patch("kestrel_sovereign.cli._get_project_dir", return_value=rookery_env), \
+        with patch("kestrel_sovereign.cli._get_project_dir", return_value=multi_agent_env), \
              patch("subprocess.call", return_value=0) as mock_call:
             rc = cmd_logs(args)
 
@@ -561,15 +561,15 @@ class TestCmdLogs:
         assert "20" in call_args
         assert str(log_file) in call_args
 
-    def test_logs_follow_flag(self, rookery_env):
+    def test_logs_follow_flag(self, multi_agent_env):
         """Logs with -f flag should pass -f to tail."""
-        log_file = rookery_env / "logs" / "host.log"
+        log_file = multi_agent_env / "logs" / "host.log"
         log_file.write_text("test log\n")
 
         parser = build_parser()
         args = parser.parse_args(["logs", "host", "-f"])
 
-        with patch("kestrel_sovereign.cli._get_project_dir", return_value=rookery_env), \
+        with patch("kestrel_sovereign.cli._get_project_dir", return_value=multi_agent_env), \
              patch("subprocess.call", return_value=0) as mock_call:
             cmd_logs(args)
 
@@ -584,19 +584,19 @@ class TestCmdLogs:
 class TestCmdCreate:
     """Tests for the 'create' command."""
 
-    def test_create_already_exists(self, rookery_env, capsys):
+    def test_create_already_exists(self, multi_agent_env, capsys):
         """Create should fail if agent already exists."""
         parser = build_parser()
         args = parser.parse_args(["create", "claw"])
 
-        with patch("kestrel_sovereign.cli._get_project_dir", return_value=rookery_env):
+        with patch("kestrel_sovereign.cli._get_project_dir", return_value=multi_agent_env):
             rc = cmd_create(args)
 
         assert rc == 1
         output = capsys.readouterr().out
         assert "already exists" in output
 
-    def test_create_inception_failure(self, rookery_env, capsys):
+    def test_create_inception_failure(self, multi_agent_env, capsys):
         """Create should fail if inception raises."""
         parser = build_parser()
         args = parser.parse_args(["create", "newagent"])
@@ -604,7 +604,7 @@ class TestCmdCreate:
         async def boom(**_kwargs):
             raise RuntimeError("inception kaboom")
 
-        with patch("kestrel_sovereign.cli._get_project_dir", return_value=rookery_env), \
+        with patch("kestrel_sovereign.cli._get_project_dir", return_value=multi_agent_env), \
              patch(
                  "kestrel_sovereign.inception_service.create_kestrel_identity_async",
                  side_effect=boom,
@@ -613,12 +613,12 @@ class TestCmdCreate:
 
         assert rc == 1
 
-    def test_create_assigns_next_port(self, rookery_env, capsys):
+    def test_create_assigns_next_port(self, multi_agent_env, capsys):
         """Create should assign the next available port."""
         parser = build_parser()
         args = parser.parse_args(["create", "newagent"])
 
-        agent_dir = rookery_env / "agent_data" / "newagent"
+        agent_dir = multi_agent_env / "agent_data" / "newagent"
 
         async def fake_inception(*, output_dir, agent_name, **_kwargs):
             out = Path(output_dir)
@@ -631,7 +631,7 @@ class TestCmdCreate:
 
             return _Creds()
 
-        with patch("kestrel_sovereign.cli._get_project_dir", return_value=rookery_env), \
+        with patch("kestrel_sovereign.cli._get_project_dir", return_value=multi_agent_env), \
              patch(
                  "kestrel_sovereign.inception_service.create_kestrel_identity_async",
                  side_effect=fake_inception,
@@ -643,12 +643,12 @@ class TestCmdCreate:
         # Port 18801 and 18802 are taken, next is 18803
         assert "18803" in output
 
-        # Verify rookery.toml was updated
-        updated_config = toml.load(rookery_env / "rookery.toml")
+        # Verify multi_agent.toml was updated
+        updated_config = toml.load(multi_agent_env / "multi_agent.toml")
         assert "newagent" in updated_config["agents"]
         assert updated_config["agents"]["newagent"]["port"] == 18803
 
-    def test_create_with_explicit_port(self, rookery_env, capsys):
+    def test_create_with_explicit_port(self, multi_agent_env, capsys):
         """Create with --port should use specified port."""
         parser = build_parser()
         args = parser.parse_args(["create", "newagent", "--port", "9999"])
@@ -664,7 +664,7 @@ class TestCmdCreate:
 
             return _Creds()
 
-        with patch("kestrel_sovereign.cli._get_project_dir", return_value=rookery_env), \
+        with patch("kestrel_sovereign.cli._get_project_dir", return_value=multi_agent_env), \
              patch(
                  "kestrel_sovereign.inception_service.create_kestrel_identity_async",
                  side_effect=fake_inception,
@@ -707,34 +707,34 @@ class TestCmdHealth:
 class TestCmdShell:
     """Tests for the 'shell' command."""
 
-    def test_shell_agent_not_found(self, rookery_env, capsys):
-        """Shell should fail if agent not in rookery."""
+    def test_shell_agent_not_found(self, multi_agent_env, capsys):
+        """Shell should fail if agent not in multi_agent."""
         parser = build_parser()
         args = parser.parse_args(["shell", "nonexistent"])
 
-        with patch("kestrel_sovereign.cli._get_project_dir", return_value=rookery_env):
+        with patch("kestrel_sovereign.cli._get_project_dir", return_value=multi_agent_env):
             rc = cmd_shell(args)
 
         assert rc == 1
         output = capsys.readouterr().out
         assert "not found" in output
 
-    def test_shell_missing_db(self, rookery_env, capsys):
+    def test_shell_missing_db(self, multi_agent_env, capsys):
         """Shell should fail if agent database not found."""
         # Remove the database
-        (rookery_env / "agent_data" / "claw" / "kestrel_prime.db").unlink()
+        (multi_agent_env / "agent_data" / "claw" / "kestrel_prime.db").unlink()
 
         parser = build_parser()
         args = parser.parse_args(["shell", "claw"])
 
-        with patch("kestrel_sovereign.cli._get_project_dir", return_value=rookery_env):
+        with patch("kestrel_sovereign.cli._get_project_dir", return_value=multi_agent_env):
             rc = cmd_shell(args)
 
         assert rc == 1
         output = capsys.readouterr().out
         assert "not found" in output
 
-    def test_shell_routes_to_running_server_when_detected(self, rookery_env, capsys):
+    def test_shell_routes_to_running_server_when_detected(self, multi_agent_env, capsys):
         """If a server is up for the named agent, cmd_shell MUST route the
         chat session through HTTP — not spawn a second in-process agent.
         That's the #654 fix: `kestrel start X` + `kestrel shell X` should
@@ -744,7 +744,7 @@ class TestCmdShell:
         args = parser.parse_args(["shell", "claw"])
 
         with patch(
-            "kestrel_sovereign.cli._get_project_dir", return_value=rookery_env
+            "kestrel_sovereign.cli._get_project_dir", return_value=multi_agent_env
         ), patch(
             "kestrel_sovereign.cli._detect_running_agent_server",
             return_value=("http://localhost:18801", "test-key"),
@@ -762,7 +762,7 @@ class TestCmdShell:
         )
         local_shell.assert_not_called()  # MUST NOT fall back when server is up
 
-    def test_shell_falls_back_to_local_when_no_server(self, rookery_env):
+    def test_shell_falls_back_to_local_when_no_server(self, multi_agent_env):
         """No running server for this agent → spawn local in-process agent.
         Backward-compatible with pre-#654 behavior.
         """
@@ -770,7 +770,7 @@ class TestCmdShell:
         args = parser.parse_args(["shell", "claw"])
 
         with patch(
-            "kestrel_sovereign.cli._get_project_dir", return_value=rookery_env
+            "kestrel_sovereign.cli._get_project_dir", return_value=multi_agent_env
         ), patch(
             "kestrel_sovereign.cli._detect_running_agent_server",
             return_value=None,
@@ -785,7 +785,7 @@ class TestCmdShell:
         http_shell.assert_not_called()
         local_shell.assert_called_once()
 
-    def test_shell_with_app_extension_bypasses_http_route(self, rookery_env):
+    def test_shell_with_app_extension_bypasses_http_route(self, multi_agent_env):
         """Extensions (e.g. --app elderly) mutate the live agent object and
         are only wired into the in-process shell. When --app is passed,
         skip the HTTP-routing probe entirely so the extension loads.
@@ -794,7 +794,7 @@ class TestCmdShell:
         args = parser.parse_args(["shell", "claw", "--app", "elderly"])
 
         with patch(
-            "kestrel_sovereign.cli._get_project_dir", return_value=rookery_env
+            "kestrel_sovereign.cli._get_project_dir", return_value=multi_agent_env
         ), patch(
             "kestrel_sovereign.cli._detect_running_agent_server"
         ) as detect, patch(
@@ -818,30 +818,30 @@ class TestDetectRunningAgentServer:
     """Verify the detection helper that decides between HTTP-routed shell
     and local in-process fallback."""
 
-    def _make_cfg(self, rookery_env):
+    def _make_cfg(self, multi_agent_env):
         from kestrel_sovereign.cli import _detect_running_agent_server
-        rookery = RookeryConfig.load(rookery_env / "rookery.toml")
-        agent_cfg = rookery.get_local_agents()["claw"]
-        return _detect_running_agent_server, agent_cfg, rookery
+        multi_agent = MultiAgentConfig.load(multi_agent_env / "multi_agent.toml")
+        agent_cfg = multi_agent.get_local_agents()["claw"]
+        return _detect_running_agent_server, agent_cfg, multi_agent
 
-    def test_returns_none_when_no_server_reachable(self, rookery_env):
+    def test_returns_none_when_no_server_reachable(self, multi_agent_env):
         """Both probe candidates raise ConnectionError → detection returns
         None so cmd_shell falls back to local."""
         import httpx
-        detect, agent_cfg, rookery = self._make_cfg(rookery_env)
+        detect, agent_cfg, multi_agent = self._make_cfg(multi_agent_env)
 
         with patch(
             "httpx.get", side_effect=httpx.ConnectError("refused")
         ):
-            result = detect("claw", agent_cfg, rookery)
+            result = detect("claw", agent_cfg, multi_agent)
 
         assert result is None
 
-    def test_detects_standalone_agent_on_agent_port(self, rookery_env):
+    def test_detects_standalone_agent_on_agent_port(self, multi_agent_env):
         """Standalone / subprocess mode: the agent hosts itself on
         agent_cfg.port. /health returns 200 → detection returns the
         agent-port URL with no path prefix."""
-        detect, agent_cfg, rookery = self._make_cfg(rookery_env)
+        detect, agent_cfg, multi_agent = self._make_cfg(multi_agent_env)
 
         def fake_get(url, timeout=None, **kwargs):
             resp = MagicMock()
@@ -855,25 +855,25 @@ class TestDetectRunningAgentServer:
             raise AssertionError(f"unexpected probe: {url}")
 
         with patch("httpx.get", side_effect=fake_get):
-            result = detect("claw", agent_cfg, rookery)
+            result = detect("claw", agent_cfg, multi_agent)
 
         assert result == (f"http://localhost:{agent_cfg.port}", "agent-port-key")
 
-    def test_detects_multi_agent_under_host_port(self, rookery_env):
+    def test_detects_multi_agent_under_host_port(self, multi_agent_env):
         """In-process multi-agent mode: the agent's own port is dead, but
         the host port responds and routes /api/agents/{name}/ to our
         agent. Detection returns host URL with the agent prefix."""
         import httpx
-        detect, agent_cfg, rookery = self._make_cfg(rookery_env)
+        detect, agent_cfg, multi_agent = self._make_cfg(multi_agent_env)
 
         def fake_get(url, timeout=None, **kwargs):
             if url.endswith(f":{agent_cfg.port}/health"):
                 raise httpx.ConnectError("no standalone")
             resp = MagicMock()
-            if url.endswith(f":{rookery.host.port}/health"):
+            if url.endswith(f":{multi_agent.host.port}/health"):
                 resp.status_code = 200
                 return resp
-            if url.endswith(f":{rookery.host.port}/api/auth/key"):
+            if url.endswith(f":{multi_agent.host.port}/api/auth/key"):
                 resp.status_code = 200
                 resp.json.return_value = {"key": "host-key"}
                 return resp
@@ -883,29 +883,29 @@ class TestDetectRunningAgentServer:
             raise AssertionError(f"unexpected probe: {url}")
 
         with patch("httpx.get", side_effect=fake_get):
-            result = detect("claw", agent_cfg, rookery)
+            result = detect("claw", agent_cfg, multi_agent)
 
         assert result == (
-            f"http://localhost:{rookery.host.port}/api/agents/claw",
+            f"http://localhost:{multi_agent.host.port}/api/agents/claw",
             "host-key",
         )
 
-    def test_host_running_but_agent_not_routed_returns_none(self, rookery_env):
+    def test_host_running_but_agent_not_routed_returns_none(self, multi_agent_env):
         """Host port responds to /health, but scoped
         /api/agents/{name}/health returns 404 (agent not registered by
         this host). Detection must return None — don't misroute the
         session to a different agent."""
         import httpx
-        detect, agent_cfg, rookery = self._make_cfg(rookery_env)
+        detect, agent_cfg, multi_agent = self._make_cfg(multi_agent_env)
 
         def fake_get(url, timeout=None, **kwargs):
             if url.endswith(f":{agent_cfg.port}/health"):
                 raise httpx.ConnectError("no standalone")
             resp = MagicMock()
-            if url.endswith(f":{rookery.host.port}/health"):
+            if url.endswith(f":{multi_agent.host.port}/health"):
                 resp.status_code = 200
                 return resp
-            if url.endswith(f":{rookery.host.port}/api/auth/key"):
+            if url.endswith(f":{multi_agent.host.port}/api/auth/key"):
                 resp.status_code = 200
                 resp.json.return_value = {"key": "host-key"}
                 return resp
@@ -915,7 +915,7 @@ class TestDetectRunningAgentServer:
             raise AssertionError(f"unexpected probe: {url}")
 
         with patch("httpx.get", side_effect=fake_get):
-            result = detect("claw", agent_cfg, rookery)
+            result = detect("claw", agent_cfg, multi_agent)
 
         assert result is None
 
@@ -941,11 +941,11 @@ class TestEntryPoint:
 # -----------------------------------------------------------------------
 
 class TestAutoDiscovery:
-    """Test behavior when no rookery.toml exists."""
+    """Test behavior when no multi_agent.toml exists."""
 
     def test_start_auto_discovers(self, tmp_path, capsys):
-        """Start without rookery.toml should auto-discover agents."""
-        # Create agent directories (no rookery.toml)
+        """Start without multi_agent.toml should auto-discover agents."""
+        # Create agent directories (no multi_agent.toml)
         agent_dir = tmp_path / "agent_data" / "auto_agent"
         agent_dir.mkdir(parents=True)
         (agent_dir / "kestrel_prime.db").touch()

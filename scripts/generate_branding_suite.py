@@ -208,7 +208,7 @@ SUITE: dict[str, dict[str, str]] = {
             "Four rook chess piece silhouettes arranged in a 2x2 grid. Each rook has "
             "the distinctive crenellated chess-piece top. Tiny kestrel shapes depart "
             "upward from each tower. The negative space between towers forms a plus "
-            "sign at center — the rookery management hub. "
+            "sign at center — the multi_agent management hub. "
             "Single color: dark teal (#003F50) on white. Geometric, structured. "
             "No text. App-icon ready."
         ),

@@ -618,7 +618,7 @@ class TestWsForcesPipelineRoute:
     pass `prefer_realtime=False` when asking for STT/TTS providers, otherwise
     the resolver picks Realtime (which legitimately has no STT) and the
     handler closes 4403 'No STT provider available' — the bug the user hit
-    after merging the rookery WS routing fix.
+    after merging the multi_agent WS routing fix.
     """
 
     def test_handler_passes_prefer_realtime_false_to_provider_getters(self):

@@ -69,7 +69,7 @@ jobs:
       # All assertions below delegate to scripts/ci/clean_install_verify.py.
       # That script is pure Python (stdlib only, no shell idioms), so each
       # `run:` is a single command line — identical on bash, PowerShell, cmd.
-      - name: Verify wizard artifacts (.env, kestrel.toml, rookery.toml)
+      - name: Verify wizard artifacts (.env, kestrel.toml, multi_agent.toml)
         run: uv run python scripts/ci/clean_install_verify.py wizard-artifacts
 
       - name: Run kestrel doctor (readiness gate)

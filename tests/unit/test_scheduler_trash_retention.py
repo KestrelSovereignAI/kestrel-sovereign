@@ -110,7 +110,7 @@ async def test_trash_retention_skips_on_zero_or_negative_window():
 @pytest.mark.asyncio
 async def test_trash_retention_accepts_max_rows_override_via_args():
     """Operator can pass per-task overrides through schedule_add args.
-    A larger or smaller cap lets the rookery tune sweep cost per agent."""
+    A larger or smaller cap lets the multi_agent tune sweep cost per agent."""
     feature, storage = _make_feature(privacy_mode="normal")
 
     with patch(

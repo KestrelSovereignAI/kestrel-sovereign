@@ -29,7 +29,7 @@ from kestrel_sovereign.telemetry import setup_tracing
 
 # Load environment variables from .env file
 # override=False: Don't clobber env vars already set by ProcessManager
-# (e.g., KESTREL_DB_PATH is set per-agent in rookery mode)
+# (e.g., KESTREL_DB_PATH is set per-agent in multi_agent mode)
 load_dotenv(Path(__file__).parent / ".env", override=False)
 
 from kestrel_sovereign.logging_config import (
@@ -60,8 +60,8 @@ SSE_PATHS = {
 }
 
 
-def resolve_rookery_path(env: dict | os._Environ) -> Path:
-    """Compute the rookery.toml path the lifespan should load (#868).
+def resolve_multi_agent_path(env: dict | os._Environ) -> Path:
+    """Compute the multi_agent.toml path the lifespan should load (#868).
 
     Centralised so unit tests can exercise the real decision logic
     instead of reimplementing it locally — the bug class this guards
@@ -73,11 +73,11 @@ def resolve_rookery_path(env: dict | os._Environ) -> Path:
     ============================  =====================================
      Inputs                        Result
     ============================  =====================================
-     KESTREL_ROOKERY_CONFIG set    Honour it verbatim (operator opted in
-                                   to a specific path)
+     KESTREL_MULTI_AGENT_CONFIG    Honour it verbatim (operator opted in
+       set                          to a specific path)
      KESTREL_DEMO_SERVER=1 + no    Refuse to auto-mount the project-root
-       explicit config + the       ``rookery.toml``.  Returns a path that
-       default ``rookery.toml``    does not exist so the lifespan skips
+       explicit config + the       ``multi_agent.toml``.  Returns a path that
+       default ``multi_agent.toml``    does not exist so the lifespan skips
        exists at the project       multi-agent setup.  This is the
        root                        guard that would have stopped the
                                    #867 wipe.
@@ -95,21 +95,21 @@ def resolve_rookery_path(env: dict | os._Environ) -> Path:
         caller still uses ``.exists()`` to decide whether to enter
         multi-agent mode.
     """
-    rookery_path = Path(env.get("KESTREL_ROOKERY_CONFIG", "rookery.toml"))
+    multi_agent_path = Path(env.get("KESTREL_MULTI_AGENT_CONFIG", "multi_agent.toml"))
     demo_server_env = env.get("KESTREL_DEMO_SERVER", "").lower() in (
         "1", "true", "yes",
     )
-    rookery_explicit = "KESTREL_ROOKERY_CONFIG" in env
-    if demo_server_env and not rookery_explicit and rookery_path.exists():
+    multi_agent_explicit = "KESTREL_MULTI_AGENT_CONFIG" in env
+    if demo_server_env and not multi_agent_explicit and multi_agent_path.exists():
         logger.warning(
             "[demo-server] KESTREL_DEMO_SERVER=1 with no explicit "
-            "KESTREL_ROOKERY_CONFIG — refusing to auto-mount %s.  "
+            "KESTREL_MULTI_AGENT_CONFIG — refusing to auto-mount %s.  "
             "A demo server must not silently load live agents.  Pass "
-            "KESTREL_ROOKERY_CONFIG=<path> explicitly to opt in.",
-            rookery_path,
+            "KESTREL_MULTI_AGENT_CONFIG=<path> explicitly to opt in.",
+            multi_agent_path,
         )
-        return Path("/dev/null/rookery-disabled")
-    return rookery_path
+        return Path("/dev/null/multi_agent-disabled")
+    return multi_agent_path
 
 
 def _set_startup_error(app: FastAPI, error: Optional[Exception]) -> None:
@@ -257,16 +257,16 @@ async def lifespan(app: FastAPI):
 
     # Detect multi-agent mode
     multi_agent_env = os.environ.get("KESTREL_MULTI_AGENT", "").lower() in ("1", "true", "yes")
-    rookery_path = resolve_rookery_path(os.environ)
+    multi_agent_path = resolve_multi_agent_path(os.environ)
 
-    if multi_agent_env or rookery_path.exists():
+    if multi_agent_env or multi_agent_path.exists():
         # --- Multi-agent mode ---
         try:
-            from kestrel_sovereign.rookery.agent_manager import AgentManager
-            from kestrel_sovereign.rookery.config import RookeryConfig
+            from kestrel_sovereign.multi_agent.agent_manager import AgentManager
+            from kestrel_sovereign.multi_agent.config import MultiAgentConfig
 
-            config = RookeryConfig.load(
-                str(rookery_path) if rookery_path.exists() else None,
+            config = MultiAgentConfig.load(
+                str(multi_agent_path) if multi_agent_path.exists() else None,
                 auto_discover_fallback=True,
             )
             manager = AgentManager(base_data_dir=Path.cwd())
@@ -371,7 +371,7 @@ app = FastAPI(lifespan=lifespan)
 
 
 # ---------------------------------------------------------------------------
-# ASGI-level rookery routing for /api/agents/{name}/...
+# ASGI-level multi_agent routing for /api/agents/{name}/...
 #
 # Why this AND `agent_routing_middleware` below: FastAPI's
 # @app.middleware("http") only fires on HTTP scope. WebSocket upgrades
@@ -387,7 +387,7 @@ app = FastAPI(lifespan=lifespan)
 _AGENT_PATH_RE_ASGI = re.compile(r"^/api/agents/([^/]+)/(.+)$")
 
 
-class RookeryAgentRoutingMiddleware:
+class MultiAgentAgentRoutingMiddleware:
     """Strip /api/agents/{name}/ prefix + attach the resolved agent to scope.
 
     Works for both HTTP and WebSocket. For 404 (unknown agent) HTTP
@@ -436,7 +436,7 @@ class RookeryAgentRoutingMiddleware:
         await self.app(scope, receive, send)
 
 
-app.add_middleware(RookeryAgentRoutingMiddleware)
+app.add_middleware(MultiAgentAgentRoutingMiddleware)
 
 
 # Rate limiting

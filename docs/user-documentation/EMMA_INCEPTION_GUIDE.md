@@ -405,7 +405,7 @@ docker build --no-cache -f docker/Dockerfile.sovereign -t kestrel-sovereign .
 
 - [Sovereign Key Guide](SOVEREIGN_KEY_GUIDE.md) - User-friendly key management
 - [Key Management Architecture](../architecture/security/KEY_MANAGEMENT.md) - Technical key details
-- [Agent Rookery](../plans/AGENT_ROOKERY.md) - Future: self-determined companions
+- [Agent MultiAgent](../plans/AGENT_MULTI_AGENT.md) - Future: self-determined companions
 - [Constitution Embedding](../architecture/security/CONSTITUTION_EMBEDDING.md) - How constitution is anchored
 
 ---

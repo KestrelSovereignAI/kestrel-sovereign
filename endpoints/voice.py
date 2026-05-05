@@ -389,8 +389,8 @@ _STATE_SPEAKING = "speaking"
 def _ws_get_agent(websocket: WebSocket):
     """Get agent from WebSocket app state (mirrors get_agent for HTTP).
 
-    In rookery mode the agent is set on `scope["state"]["agent"]` by the
-    `RookeryAgentRoutingMiddleware` (server.py); in single-agent mode it
+    In multi_agent mode the agent is set on `scope["state"]["agent"]` by the
+    `MultiAgentAgentRoutingMiddleware` (server.py); in single-agent mode it
     falls through to `app.state.agent`. None means neither — the WS handler
     surfaces this as a 4503 close.
     """

@@ -102,8 +102,8 @@ class DeployManagerCore:
                 # Determine default dockerfile based on deployment mode
                 deployment_mode = data.get("deployment_mode", "agent")
                 default_dockerfile = (
-                    "docker/Dockerfile.rookery"
-                    if deployment_mode == "rookery"
+                    "docker/Dockerfile.multi_agent"
+                    if deployment_mode == "multi_agent"
                     else "docker/Dockerfile.cloudrun"
                 )
 

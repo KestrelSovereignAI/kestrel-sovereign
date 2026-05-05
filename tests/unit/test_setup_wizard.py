@@ -56,8 +56,8 @@ def test_wizard_quickstart_full_run(tmp_path):
     assert "KESTREL_DATA_KEY" in env
     assert config["llm"]["route_priority"] == ["ollama:local"]
     # Agent created and registered
-    rookery_path = tmp_path / "rookery.toml"
-    assert rookery_path.exists()
+    multi_agent_path = tmp_path / "multi_agent.toml"
+    assert multi_agent_path.exists()
 
 
 def test_wizard_idempotent_second_run_is_noop(tmp_path):
@@ -70,7 +70,7 @@ def test_wizard_idempotent_second_run_is_noop(tmp_path):
 
     env_text_1 = (tmp_path / ".env").read_text()
     toml_text_1 = (tmp_path / "kestrel.toml").read_text()
-    rookery_text_1 = (tmp_path / "rookery.toml").read_text()
+    multi_agent_text_1 = (tmp_path / "multi_agent.toml").read_text()
 
     with patch(
         "kestrel_sovereign.inception_service.create_kestrel_identity_async",
@@ -80,11 +80,11 @@ def test_wizard_idempotent_second_run_is_noop(tmp_path):
 
     env_text_2 = (tmp_path / ".env").read_text()
     toml_text_2 = (tmp_path / "kestrel.toml").read_text()
-    rookery_text_2 = (tmp_path / "rookery.toml").read_text()
+    multi_agent_text_2 = (tmp_path / "multi_agent.toml").read_text()
 
     assert env_text_1 == env_text_2
     assert toml_text_1 == toml_text_2
-    assert rookery_text_1 == rookery_text_2
+    assert multi_agent_text_1 == multi_agent_text_2
 
     # No new backups should have been created.
     assert list(tmp_path.glob(".env.backup-*")) == []
@@ -97,7 +97,7 @@ def test_wizard_check_mode_never_writes(tmp_path):
     assert rc != 0  # Empty project = blockers
     assert not (tmp_path / ".env").exists()
     assert not (tmp_path / "kestrel.toml").exists()
-    assert not (tmp_path / "rookery.toml").exists()
+    assert not (tmp_path / "multi_agent.toml").exists()
 
 
 def test_wizard_check_mode_returns_zero_when_ready(tmp_path):
@@ -199,8 +199,8 @@ def test_wizard_blockers_cause_nonzero_exit(tmp_path):
     # Force a blocker by running everything except agent:
     # (Easier: re-test by removing agent registration after running)
     ctx2 = _make_ctx(tmp_path, Flow.CHECK)
-    # Wipe the rookery to break verify
-    (tmp_path / "rookery.toml").unlink(missing_ok=True)
-    # The check run should now block on missing rookery
+    # Wipe the multi_agent to break verify
+    (tmp_path / "multi_agent.toml").unlink(missing_ok=True)
+    # The check run should now block on missing multi_agent
     rc2 = run_wizard(ctx2)
     assert rc2 != 0

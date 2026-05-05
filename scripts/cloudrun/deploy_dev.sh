@@ -4,7 +4,7 @@ set -e
 # Deploy Kestrel to Cloud Run — DEV environment
 PROJECT_ID="${GCP_PROJECT_ID:?Set GCP_PROJECT_ID env var}"
 SERVICE_NAME="kestrel-dev"
-IMAGE_NAME="kestrel-rookery"
+IMAGE_NAME="kestrel-multi-agent"
 REGION="us-central1"
 
 echo "Deploying Kestrel DEV to Cloud Run..."

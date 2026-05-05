@@ -376,7 +376,7 @@ class TestApprovalQueue:
         # New contract (replaces the old #877 spackle): when the
         # calling task is cancelled (HTTP stream dropped, browser
         # closed, user switched to a different agent in the
-        # rookery), the request MUST survive in ``_pending`` so the
+        # multi_agent), the request MUST survive in ``_pending`` so the
         # user's modal stays interactive. No ``approval_withdrawn``
         # event fires, because the user has not abandoned the
         # decision — only the agent's read of it.
