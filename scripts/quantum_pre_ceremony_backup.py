@@ -758,7 +758,13 @@ def cmd_restore(archive: Path, output: Path, passphrase: str) -> int:
     if output.exists() and any(output.iterdir()):
         _err(f"output dir {output} exists and is non-empty; refusing to clobber")
         return 2
+    # Codex P2: same /tmp world-traversal hazard as the backup path —
+    # decrypted private keys + DBs land here. Tighten umask for the run
+    # and chmod the output dir to 0o700 so extracted files inherit
+    # owner-only perms even on a multi-user host.
+    os.umask(0o077)
     output.mkdir(parents=True, exist_ok=True)
+    output.chmod(0o700)
 
     print(f"Restoring from {archive}")
     print(f"Output: {output}")
