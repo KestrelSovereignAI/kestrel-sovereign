@@ -402,14 +402,32 @@ def _secure_delete(path: Path) -> None:
     physical location. For high-assurance destruction, encrypt-at-rest
     + key-destruction is the only reliable path. We do best-effort
     overwrite anyway as defense-in-depth.
+
+    Refuses symlinked targets (codex P2 catch). If the legacy key
+    file is a symlink, ``open(path, 'r+b')`` and ``stat()`` both
+    follow it; zero-filling would clobber whatever the symlink
+    points at — possibly outside ``agent_data``. Bail out before
+    touching anything when we hit a symlink.
     """
+    if path.is_symlink():
+        raise RuntimeError(
+            f"refusing to destroy {path}: it is a symlink. "
+            f"Symlinked legacy-key paths could route the zero-fill "
+            f"to a target outside agent_data; manually resolve and "
+            f"re-run with the real file in place."
+        )
     try:
         size = path.stat().st_size
-        with open(path, "r+b") as f:
-            f.seek(0)
-            f.write(b"\x00" * size)
-            f.flush()
-            os.fsync(f.fileno())
+        # Use O_NOFOLLOW for an additional layer of TOCTOU defense:
+        # if path was replaced by a symlink between is_symlink() and
+        # open(), this open will refuse to follow it.
+        fd = os.open(path, os.O_RDWR | os.O_NOFOLLOW)
+        try:
+            os.lseek(fd, 0, 0)
+            os.write(fd, b"\x00" * size)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
     except Exception as e:
         _warn(f"could not zero-fill {path} before unlink: {e}")
     path.unlink()

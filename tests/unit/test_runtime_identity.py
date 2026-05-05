@@ -289,6 +289,19 @@ def test_empty_successions_dir_treated_as_legacy(legacy_agent_on_disk):
     assert identity.signing_did == legacy_did
 
 
+def test_legacy_only_agent_missing_private_fails_loud(legacy_agent_on_disk):
+    """A legacy-only agent (no successions/) that has lost its
+    private key has no signing capability. Loader must fail loud
+    rather than silently returning a public-only identity that
+    callers will mistakenly trust as signed-capable.
+    """
+    storage_dir, key_id, _, _ = legacy_agent_on_disk
+    # Remove the private key but keep the DID document
+    (storage_dir / f"{key_id}.key.enc").unlink()
+    with pytest.raises(FileNotFoundError, match="no succession statement"):
+        load_agent_identity(key_id, storage_dir)
+
+
 def test_load_after_legacy_key_destroyed_succeeds(post_ceremony_agent_on_disk):
     """Post-destruction: legacy private key is gone, but the legacy
     DID document remains on disk. Loader must still build a working
