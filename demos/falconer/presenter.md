@@ -81,7 +81,7 @@
 ### Narration
 > "This isn't a demo project.
 >
-> Right now, in Lubbock, Texas, Kestrel is reaching chronic-care patients — people managing COPD, congestive heart failure, diabetes — with a daily AI companion through our Caprock partner.
+> Right now, in Lubbock, Texas, Kestrel is reaching chronic-care patients — people managing COPD, congestive heart failure, diabetes — with a daily AI companion through our regional home healthcare partner.
 >
 > Every message from a patient passes through a constitutional safety gate before the AI ever sees it. If a message suggests a crisis, it routes to a human nurse — not to the AI, to a person. The AI is constitutionally prohibited from giving medical advice. Not by a guideline someone can remove. By the architecture itself.
 >
@@ -142,7 +142,7 @@
 ---
 
 ### Version B: Technical Advisor / Angel
-> "We're not raising a round right now. We're building in public starting in April, proving the healthcare model through Caprock, and we expect to have real deployment data within 90 days.
+> "We're not raising a round right now. We're building in public starting in April, proving the healthcare model with our regional home healthcare partner, and we expect to have real deployment data within 90 days.
 >
 > What we're genuinely looking for at this stage is technical perspective we don't have. If you have an instinct on the architecture, the open-source sequencing, or the enterprise healthcare path — we'd value thirty minutes to hear it.
 >
@@ -153,7 +153,7 @@
 ---
 
 ### Version C: VC / Institutional Investor
-> "We're not raising yet. We're opening the source in April, deploying with Caprock, and letting the architecture prove itself publicly before we have a funding conversation.
+> "We're not raising yet. We're opening the source in April, deploying with our regional home healthcare partner, and letting the architecture prove itself publicly before we have a funding conversation.
 >
 > But we want to be a company that investors who care about this space know about early — before it's obvious.
 >
@@ -164,7 +164,7 @@
 ---
 
 ### Version D: Enterprise Buyer (Healthcare / Regulated Industries)
-> "The Caprock deployment is a proof point for a specific architecture, not just a specific product. The governance model — constitutional safety gates, portable identity, full audit trail — is designed to be embedded in any enterprise system.
+> "The regional home healthcare deployment is a proof point for a specific architecture, not just a specific product. The governance model — constitutional safety gates, portable identity, full audit trail — is designed to be embedded in any enterprise system.
 >
 > If you're thinking about AI deployment in a regulated context, we'd want to have a CTO or CISO-level conversation. Not a sales call — a technical architecture conversation about where sovereign AI fits your deployment requirements.
 >
@@ -218,5 +218,5 @@
 ---
 
 *First draft — Gabi's agent, March 9, 2026*
-*Built from: KESTREL_FOUNDING_BRIEF.md, CASE_STUDY_CAPROCK.md, issue #133, #194, #195*
+*Built from: KESTREL_FOUNDING_BRIEF.md, CASE_STUDY_HEALTHCARE_PARTNER.md, issue #133, #194, #195*
 *Part of Kestrel Live Demo milestone — anchor issue #133*

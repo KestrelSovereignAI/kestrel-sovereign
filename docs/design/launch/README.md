@@ -33,5 +33,5 @@ These drafts are aligned to the current launch framing already visible across:
 - Keep `Sovereign AI` as the category frame.
 - Do not let the page read like a feature release.
 - Do not over-index on the product family; keep Kestrel as the foundation.
-- Use Caprock as proof of seriousness, not as the headline.
+- Use the regional home healthcare partnership as proof of seriousness, not as the headline.
 - Keep the first-screen message emotionally legible before it becomes technical.

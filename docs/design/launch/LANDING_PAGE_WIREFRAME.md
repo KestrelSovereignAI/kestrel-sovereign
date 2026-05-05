@@ -160,7 +160,7 @@ Kestrel is already being used in a real clinical setting, where continuity, trus
 
 #### Notes
 
-- Keep Caprock as proof of seriousness.
+- Keep the regional home healthcare partnership as proof of seriousness.
 - Do not let the clinical story become the page headline.
 
 ### 8. Who It Is For
