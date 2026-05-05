@@ -217,6 +217,15 @@ def main() -> int:
     print("Kestrel #1 / Emma — hybrid-rotation ceremony (LIVE)")
     print(f"Started:        {datetime.now(timezone.utc).isoformat()}")
 
+    # Tighten umask BEFORE any file writes — including the
+    # SecureKeyStorage.save_*() calls in step 4. Caught at runtime on
+    # the first live ceremony: with the default 022 umask the
+    # newly-written .key.enc / .bytes.enc files landed at 0644
+    # (group/world readable) and had to be chmod-tightened after the
+    # fact. Setting umask here makes every file the script touches
+    # owner-only by default.
+    os.umask(0o077)
+
     # Pre-flight: env vars and confirmation
     if "KESTREL_DATA_KEY" not in os.environ:
         _err("KESTREL_DATA_KEY is required to decrypt the legacy private key.")
@@ -359,9 +368,8 @@ def main() -> int:
     if args.output_dir.exists():
         _err(f"output dir {args.output_dir} already exists; refusing to clobber")
         return 1
-    # Tighten umask before any writes — the succession statement contains
-    # public keys (no secrets) but we keep dir access owner-only anyway.
-    os.umask(0o077)
+    # Owner-only output dir. (Umask was already set at the top of main(),
+    # but mkdir(mode=...) is explicit here for defense-in-depth.)
     args.output_dir.mkdir(parents=True, mode=0o700)
 
     did_doc_path = args.output_dir / "did.json"
