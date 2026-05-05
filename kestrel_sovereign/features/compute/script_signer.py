@@ -49,7 +49,7 @@ class ScriptSigner:
     def __init__(self, agent_did: Optional[str], db_path: str):
         """
         Initialize the script signer.
-        
+
         Args:
             agent_did: The agent's DID (did:ethr:0x...)
             db_path: Path to the database (for key retrieval)
@@ -59,6 +59,12 @@ class ScriptSigner:
         self._private_key = None
         self._public_key = None
         self._key_id: Optional[str] = None
+        # Set when the agent has completed a hybrid-rotation ceremony.
+        # When non-None, sign() emits a ``hybrid:`` token combining
+        # Ed25519 + ML-DSA-65 signatures; verify() accepts both
+        # ``hybrid:`` and the legacy ``ecdsa:`` formats so existing
+        # signed scripts on disk continue to verify.
+        self._agent_identity = None
     
     def _extract_key_id(self) -> Optional[str]:
         """Extract key_id from DID for key lookup."""
@@ -104,8 +110,35 @@ class ScriptSigner:
             if db_dir.name == "":
                 db_dir = Path(get_default_agent_data_dir())
             
+            # Try the hybrid-aware loader first. If a succession statement
+            # is on disk, this returns an AgentIdentity carrying BOTH the
+            # legacy ECDSA keypair (for verifying pre-rotation artifacts)
+            # AND the new Ed25519 + ML-DSA-65 hybrid keypair (for signing
+            # NEW artifacts). Falls back to the legacy single-key loader
+            # if the agent is pre-ceremony.
+            try:
+                from kestrel_sovereign.identity.runtime_identity import (
+                    load_agent_identity,
+                )
+                self._agent_identity = load_agent_identity(key_id, storage_dir=db_dir)
+                self._private_key = self._agent_identity.legacy_keypair.private_key
+                self._public_key = self._agent_identity.legacy_keypair.public_key
+                if self._agent_identity.is_hybrid:
+                    logger.info(
+                        f"Loaded HYBRID signing keys for {key_id}: "
+                        f"legacy={self._agent_identity.legacy_did} -> "
+                        f"new={self._agent_identity.new_did}"
+                    )
+                else:
+                    logger.info(f"Loaded signing keys for {key_id} (legacy-only)")
+                return True
+            except Exception as e:
+                logger.debug(
+                    f"Hybrid load fell through to legacy path: {e}"
+                )
+
             private_key, did_document = load_kestrel_identity(key_id, db_dir)
-            
+
             self._private_key = private_key
             self._public_key = private_key.public_key()
             logger.info(f"Loaded signing keys for {key_id}")
@@ -145,36 +178,85 @@ class ScriptSigner:
     
     async def sign(self, script: ComputeScript) -> str:
         """
-        Sign a script's content with secp256k1 ECDSA.
+        Sign a script's content.
 
         Sign-or-fail. If the agent's keys cannot be loaded, raises
         ``ScriptSigningKeysUnavailable``. There is no fallback.
+
+        Wire format:
+
+        - **Hybrid agent** (post-rotation ceremony, ``self._agent_identity.is_hybrid``):
+          returns ``hybrid:<base64>`` where the base64 wraps a JSON list of
+          ``{alg, kid, sig}`` objects (Ed25519 + ML-DSA-65). Verifiers that
+          understand the new format check both signatures; older verifiers
+          will see a non-``ecdsa:`` prefix and reject — which is the correct
+          behavior for a tamper-aware system.
+        - **Legacy agent** (pre-ceremony or fallback): returns
+          ``ecdsa:<base64>`` (single secp256k1 ECDSA signature, unchanged).
 
         Args:
             script: The script to sign
 
         Returns:
-            Base64-encoded signature string with ``ecdsa:`` prefix.
+            Signature string with either ``hybrid:`` or ``ecdsa:`` prefix.
 
         Raises:
             ScriptSigningKeysUnavailable: when keys cannot be loaded or the
                 signing operation fails.
         """
         import base64
+        import json
 
         content_hash = self._content_hash(script)
         content_hash_bytes = hashlib.sha256(content_hash.encode()).digest()
 
         if not await self._load_keys() or self._private_key is None:
             raise ScriptSigningKeysUnavailable(
-                f"Cannot sign script {script.id[:8]}…: secp256k1 keys for "
+                f"Cannot sign script {script.id[:8]}…: signing keys for "
                 f"DID {self.agent_did!r} are not available. Refusing to "
                 "produce a signature; the historical HMAC fallback was "
                 "forgeable and has been removed."
             )
 
-        # Wave 1 sub-PR 5: route through Secp256k1Suite. Byte-identical
-        # to the previous direct ec.ECDSA(SHA256) call; pinned by the
+        # Hybrid path: emit a hybrid token if the agent has completed
+        # the rotation ceremony.
+        identity = self._agent_identity
+        if identity is not None and identity.is_hybrid:
+            from kestrel_sovereign.identity.hybrid_keypair import sign_hybrid
+            try:
+                vms = identity.new_verification_methods or []
+                classical_kid = next(
+                    (
+                        vm["id"].rsplit("#", 1)[-1]
+                        for vm in vms
+                        if "ed25519" in (vm.get("publicKeyMultibase") or "").lower()
+                        or vm.get("type") == "Ed25519VerificationKey2020"
+                    ),
+                    vms[0]["id"].rsplit("#", 1)[-1] if vms else "key-1",
+                )
+                pq_kid = next(
+                    (
+                        vm["id"].rsplit("#", 1)[-1]
+                        for vm in vms
+                        if vm["id"].rsplit("#", 1)[-1] != classical_kid
+                    ),
+                    vms[1]["id"].rsplit("#", 1)[-1] if len(vms) > 1 else "key-2",
+                )
+                sigs = sign_hybrid(
+                    content_hash_bytes,
+                    identity.hybrid_keypair,
+                    classical_kid=classical_kid,
+                    pq_kid=pq_kid,
+                )
+                payload = base64.b64encode(json.dumps(sigs).encode()).decode()
+                return f"hybrid:{payload}"
+            except Exception as e:
+                raise ScriptSigningKeysUnavailable(
+                    f"Hybrid signing failed for script {script.id[:8]}…: {e}"
+                ) from e
+
+        # Legacy path: route through Secp256k1Suite. Byte-identical to
+        # the previous direct ec.ECDSA(SHA256) call; pinned by the
         # CryptoSuite behavior-preservation pair test.
         from kestrel_sovereign.security.crypto_suite import (
             ALG_ECDSA_SECP256K1_SHA256, CryptoSuiteError, get_suite,
@@ -192,17 +274,32 @@ class ScriptSigner:
         """
         Verify a script's signature.
 
-        Returns True only for a genuine ECDSA signature over the script's
-        canonical content hash, produced by the agent identified in the DID
-        document this signer can resolve. Rejects every other case — most
-        importantly the historical ``hmac:`` prefix, whose key was the public
-        DID and so could be forged by any reader of the script.
+        Accepts either:
+
+        - ``hybrid:<base64-of-json-array>`` — the post-ceremony format.
+          The base64 wraps a JSON list of ``{alg, kid, sig}`` objects.
+          Returns True if at least one signature in the list verifies
+          against the agent's loaded hybrid identity. (We don't require
+          BOTH halves to verify here — script signing is "did this agent
+          produce this byte sequence?" and either half answering yes is
+          a definitive yes. The chain walker enforces hybrid policy on
+          the artifacts where it matters — live identity assertion.)
+
+        - ``ecdsa:<base64>`` — the legacy single-signature format.
+          Continues to verify against the agent's legacy ECDSA key, so
+          scripts signed before the rotation ceremony stay valid.
+
+        Rejects:
+
+        - ``hmac:`` — the removed fallback that used the public DID
+          as the HMAC key (forgeable by any reader).
+        - Anything else — unknown format, refuse rather than guess.
 
         Args:
             script: The script to verify
 
         Returns:
-            True only if the ECDSA signature verifies; False otherwise.
+            True only if a valid signature verifies; False otherwise.
         """
         if not script.signature:
             logger.warning(f"Script {script.id[:8]}… has no signature")
@@ -217,24 +314,39 @@ class ScriptSigner:
             )
             return False
 
-        if not script.signature.startswith("ecdsa:"):
-            logger.warning(f"Unknown signature format: {script.signature[:10]}…")
-            return False
-
         import base64
         content_hash = self._content_hash(script)
         content_hash_bytes = hashlib.sha256(content_hash.encode()).digest()
 
-        if not await self._load_keys() or self._public_key is None:
-            logger.warning("Cannot verify ECDSA signature without public key")
+        if not await self._load_keys():
+            logger.warning("Cannot verify signature: failed to load keys")
             return False
 
-        # Wave 1 sub-PR 5: route through Secp256k1Suite for verification.
+        # Hybrid format
+        if script.signature.startswith("hybrid:"):
+            return self._verify_hybrid(script, content_hash_bytes)
+
+        # Legacy ECDSA format
+        if script.signature.startswith("ecdsa:"):
+            return self._verify_legacy_ecdsa(script, content_hash_bytes)
+
+        logger.warning(f"Unknown signature format: {script.signature[:10]}…")
+        return False
+
+    def _verify_legacy_ecdsa(
+        self, script: ComputeScript, content_hash_bytes: bytes,
+    ) -> bool:
+        """Verify the ``ecdsa:<base64>`` legacy format against the
+        agent's secp256k1 public key."""
+        import base64
+        if self._public_key is None:
+            logger.warning("Cannot verify ECDSA signature without public key")
+            return False
         from kestrel_sovereign.security.crypto_suite import (
             ALG_ECDSA_SECP256K1_SHA256, get_suite,
         )
         try:
-            signature_bytes = base64.b64decode(script.signature[6:])
+            signature_bytes = base64.b64decode(script.signature[len("ecdsa:"):])
             suite = get_suite(ALG_ECDSA_SECP256K1_SHA256)
             if suite.verify(content_hash_bytes, signature_bytes, self._public_key):
                 return True
@@ -243,6 +355,104 @@ class ScriptSigner:
         except Exception as e:
             logger.warning(f"ECDSA signature verification failed: {e}")
             return False
+
+    def _verify_hybrid(
+        self, script: ComputeScript, content_hash_bytes: bytes,
+    ) -> bool:
+        """Verify the ``hybrid:<base64-json>`` format against the
+        agent's loaded hybrid keypair. At least one signature in the
+        embedded array must verify."""
+        import base64, json
+        identity = self._agent_identity
+        if identity is None or not identity.is_hybrid:
+            logger.warning(
+                "Script carries a hybrid: signature but the agent's "
+                "runtime identity is not hybrid (no successions/<slug>.json "
+                "on disk, or load failed). Rejecting."
+            )
+            return False
+        try:
+            payload_b64 = script.signature[len("hybrid:"):]
+            sigs_json = base64.b64decode(payload_b64).decode("utf-8")
+            sigs = json.loads(sigs_json)
+            if not isinstance(sigs, list) or not sigs:
+                logger.warning("Hybrid signature payload is empty or not a list")
+                return False
+        except Exception as e:
+            logger.warning(f"Hybrid signature parse failed: {e}")
+            return False
+
+        from kestrel_sovereign.security.crypto_suite import get_suite
+        # Map kid (the fragment after #) → public key from the loaded
+        # hybrid keypair. We pull pubkeys directly off the in-memory
+        # AgentIdentity rather than re-resolving the did:web document
+        # over HTTPS — this is the same agent's runtime, so its loaded
+        # keys ARE authoritative.
+        kid_to_pub = {}
+        if identity.new_verification_methods and identity.hybrid_keypair:
+            vms = identity.new_verification_methods
+            # Convention from rotation_ceremony: VM[0] is classical, VM[1] is PQ
+            if len(vms) >= 1:
+                kid_to_pub[vms[0]["id"].rsplit("#", 1)[-1]] = (
+                    identity.hybrid_keypair.classical
+                )
+            if len(vms) >= 2:
+                kid_to_pub[vms[1]["id"].rsplit("#", 1)[-1]] = (
+                    identity.hybrid_keypair.pq
+                )
+
+        # Hybrid verify rules (HYBRID_REQUIRED on script signing):
+        # 1. EVERY entry in the payload must verify. A corrupted entry
+        #    fails the whole signature — flipping one signature byte
+        #    must not pass just because the other half still works.
+        # 2. Both ed25519 AND ml-dsa-65 must be present. Stripping the
+        #    PQ half to leave a classical-only payload is rejected;
+        #    that's the attack hybrid is here to prevent.
+        algs_seen: set[str] = set()
+        for entry in sigs:
+            try:
+                alg = entry["alg"]
+                kid = entry["kid"]
+                sig_hex = entry["sig"]
+            except (TypeError, KeyError):
+                logger.warning("Hybrid signature entry malformed; rejecting")
+                return False
+            kp = kid_to_pub.get(kid)
+            if kp is None or kp.suite_id != alg:
+                logger.warning(
+                    f"Hybrid signature kid={kid!r} alg={alg!r} doesn't map "
+                    f"to a known verification method; rejecting"
+                )
+                return False
+            try:
+                # sign_hybrid encodes signatures as hex (matches the
+                # identity-package v2 ``signatures`` array shape).
+                sig_bytes = bytes.fromhex(sig_hex)
+            except ValueError:
+                logger.warning(f"Hybrid signature {kid} has malformed hex; rejecting")
+                return False
+            suite = get_suite(alg)
+            if not suite.verify(content_hash_bytes, sig_bytes, kp.public_key):
+                logger.warning(
+                    f"Hybrid signature {kid} ({alg}) failed crypto verify; rejecting"
+                )
+                return False
+            algs_seen.add(alg)
+
+        # Require both halves of the hybrid identity. Removing the PQ
+        # half is the canonical attack the hybrid format defends against.
+        from kestrel_sovereign.security.crypto_suite import (
+            ALG_ED25519, ALG_ML_DSA_65,
+        )
+        required = {ALG_ED25519, ALG_ML_DSA_65}
+        if not required.issubset(algs_seen):
+            missing = required - algs_seen
+            logger.warning(
+                f"Hybrid signature missing required algs: {sorted(missing)}; "
+                f"rejecting (HYBRID_REQUIRED on script signing)"
+            )
+            return False
+        return True
     
     async def sign_and_update(self, script: ComputeScript) -> ComputeScript:
         """
