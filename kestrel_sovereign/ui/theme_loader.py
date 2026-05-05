@@ -11,6 +11,7 @@ See docs/architecture/ui_theme_schema.md for the file format.
 from __future__ import annotations
 
 import logging
+import re
 import tomllib
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -23,9 +24,26 @@ DEFAULT_LOCALE = "en"
 
 THEMES_DIR = Path(__file__).resolve().parent.parent / "themes"
 
+# Theme and locale names come from user-controlled query params and are
+# joined into a filesystem path. Reject anything that could traverse out
+# of the themes directory or hit a file outside the intended layout.
+# Allowed: ASCII letters, digits, underscore, hyphen. No dots, no slashes,
+# no separators. Locale codes follow ISO 639-1 with optional region
+# (e.g. "en", "en-US"); theme names are snake_case-ish.
+_SAFE_NAME = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
+
 
 class ThemeNotFoundError(LookupError):
     """Raised when the requested theme directory does not exist."""
+
+
+def _validate_name(value: str, kind: str) -> None:
+    """Reject path-traversal and other unsafe characters in theme/locale names."""
+    if not _SAFE_NAME.match(value):
+        raise ThemeNotFoundError(
+            f"invalid {kind} name: {value!r} "
+            f"(must match {_SAFE_NAME.pattern})"
+        )
 
 
 @dataclass(frozen=True)
@@ -79,6 +97,8 @@ def load_theme(theme: str = DEFAULT_THEME, locale: str = DEFAULT_LOCALE) -> Them
     Cached: themes are static files and the loader is a hot path on UI
     boot. Restart to pick up theme-file edits.
     """
+    _validate_name(theme, "theme")
+    _validate_name(locale, "locale")
     if not _theme_dir_exists(theme):
         raise ThemeNotFoundError(f"theme not found: {theme!r}")
 

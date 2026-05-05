@@ -152,3 +152,49 @@ def test_clear_cache_drops_results(isolated_themes):
     b = load_theme("legacy", "en")
     assert a == b
     assert a is not b  # cache was cleared
+
+
+# ---- Path traversal hardening ----------------------------------------------
+
+
+@pytest.mark.parametrize("bad_theme", [
+    "..",
+    "../etc",
+    "../../tmp",
+    "legacy/../legacy",
+    "legacy\x00",
+    "../",
+    "/etc",
+    "legacy.",
+    ".legacy",
+    "legacy ",
+    "",
+])
+def test_path_traversal_in_theme_rejected(bad_theme):
+    with pytest.raises(ThemeNotFoundError):
+        load_theme(bad_theme, "en")
+
+
+@pytest.mark.parametrize("bad_locale", [
+    "..",
+    "../passwd",
+    "../../etc/passwd",
+    "en/../en",
+    "en\x00",
+    "/en",
+    "en.",
+    ".en",
+    "en ",
+    "",
+])
+def test_path_traversal_in_locale_rejected(bad_locale):
+    with pytest.raises(ThemeNotFoundError):
+        load_theme("legacy", bad_locale)
+
+
+def test_safe_locale_with_region_accepted():
+    """ISO 639-1 + region tag (en-US) should pass the validator,
+    even though there's no en-US theme file (it'll fall back to en)."""
+    bundle = load_theme("legacy", "en-US")
+    # Falls back to en because en-US.toml doesn't ship
+    assert bundle.locale == "en"

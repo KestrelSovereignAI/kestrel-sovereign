@@ -109,3 +109,33 @@ def test_invalid_param_lengths_rejected(client):
     # Empty theme name fails Query min_length validation
     r = client.get("/api/ui/theme", params={"theme": ""})
     assert r.status_code == 422
+
+
+@pytest.mark.parametrize("hostile", [
+    "..",
+    "../etc",
+    "../../tmp",
+    "legacy/../legacy",
+    "legacy\x00",
+    "/etc",
+])
+def test_path_traversal_in_theme_param_rejected(client, hostile):
+    """User-controlled `theme` param must not allow filesystem traversal."""
+    r = client.get("/api/ui/theme", params={"theme": hostile})
+    assert r.status_code == 404
+    assert r.json()["detail"]["error"] == "theme_not_found"
+
+
+@pytest.mark.parametrize("hostile", [
+    "..",
+    "../passwd",
+    "../../etc/passwd",
+    "en/../en",
+    "en\x00",
+    "/en",
+])
+def test_path_traversal_in_locale_param_rejected(client, hostile):
+    """User-controlled `locale` param must not allow filesystem traversal."""
+    r = client.get("/api/ui/theme", params={"theme": "legacy", "locale": hostile})
+    assert r.status_code == 404
+    assert r.json()["detail"]["error"] == "theme_not_found"
