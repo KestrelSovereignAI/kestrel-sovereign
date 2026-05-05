@@ -578,6 +578,19 @@ def cmd_backup(passphrase: str, project_root: Path, targets: list[dict]) -> int:
         _ok(f"all {len(manifest)} files verified bit-identical after decrypt+extract")
 
     # ------------------------------------------------------------------
+    # Clean up plaintext intermediates
+    # ------------------------------------------------------------------
+    # Codex P1: leaving staging/ and backup.tar.gz alongside backup.tar.gz.enc
+    # silently leaks the live private keys + DBs in plaintext on disk. The
+    # encryption is only meaningful if the unencrypted copies are gone.
+    # Self-verification has already passed, so the encrypted file is known
+    # to round-trip — we no longer need either intermediate.
+    _step("Removing plaintext intermediates")
+    archive_path.unlink()
+    shutil.rmtree(staging_root)
+    _ok(f"deleted {archive_path.name} and staging/ (plaintext copies)")
+
+    # ------------------------------------------------------------------
     # Sidecar manifest + RESTORE.md
     # ------------------------------------------------------------------
     sidecar = output_dir / "backup-manifest.json"
