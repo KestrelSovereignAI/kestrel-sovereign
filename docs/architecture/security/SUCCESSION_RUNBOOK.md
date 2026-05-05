@@ -128,15 +128,28 @@ The `post_cutoff_classical_allowed=False` rule in `verify_policy.py` is what enf
 
 ## Post-cutoff: legacy key destruction
 
-Once the new identity has been live for the rollback window (e.g. 7 days) and you've verified a representative sample of artifacts under the chain walker, secure-delete the legacy private key:
+Once the new identity has been live for the rollback window (default 7 days) and you've verified a representative sample of artifacts under the chain walker, use the destruction tool:
 
-```python
-from kestrel_sovereign.security.key_storage import secure_delete
-
-secure_delete(AGENT_DATA_DIR / f"kestrel_{ETH_ADDRESS}.key.enc")
+```bash
+export KESTREL_DESTROY_CONFIRM='I-have-verified-the-rollback-window'
+uv run python scripts/quantum_destroy_legacy_key.py \
+    --agent-data-dir /Volumes/data2/projects/kestrel-sovereign/agent_data/<agent> \
+    --confirm
 ```
 
-**Do not auto-delete from the ceremony itself.** Operators should take this destructive step with eyes open, after manual verification.
+The script enforces seven independent gates before any file is touched:
+
+1. `--confirm` flag set (default is dry-run, deletes nothing)
+2. `KESTREL_DESTROY_CONFIRM` env var set to the exact magic value above
+3. `successions/<slug>.json` exists in the agent dir
+4. Succession `effective_from` is at least `--rollback-window-days` (default 7) in the past
+5. **Succession statement crypto-verifies** — every predecessor and successor signature checks against the embedded VMs. An unsigned or tampered statement fails here even if the JSON fields look right.
+6. **Hybrid keys probe sign+verify** — generates a deterministic test message, signs with the loaded hybrid keypair, verifies against the public keys in `successor_verification_methods`. Catches the case where the local hybrid key files were copied from a different agent (filenames match but private keys don't correspond to the published identity).
+7. **Published `did.json` HTTPS reachability + VM match** — fetches the successor's DID document over HTTPS and confirms its verification methods match (kid + multibase) the succession statement's. Skipped only with `--skip-https-check`.
+
+If any gate fails, the script exits non-zero and the legacy key is preserved. The runtime (post PR #1004) tolerates a missing legacy private once a succession is on disk: `runtime_identity` derives the legacy public from the on-disk DID document for chain-walker use, and signing call sites have already migrated to the hybrid path.
+
+The destruction itself uses `os.open` with `O_NOFOLLOW`, refuses symlinked targets, zero-fills before unlink (best-effort on copy-on-write filesystems).
 
 ## Rollback: what if something is wrong
 
@@ -147,14 +160,16 @@ If the new identity's DID document doesn't resolve, or smoke-test verification f
 
 ## Order of operations for the four current agents
 
-Recommended migration order (smallest blast radius first):
+**Status (May 2026)**: Kestrel #1 / Emma, Meridian, Nellie, and Claw have all completed the rotation ceremony and are running on hybrid identities. The DID documents are published at `https://agents.kestrelsovereign.com/<slug>/did.json` and the runtime is producing hybrid signatures by default. Remaining work is operational: wait the rollback window, then run `quantum_destroy_legacy_key.py` for each agent.
 
-1. **Kestrel #1** — operator (UncleSaurus) is the only consumer; rollback is cheap if anything goes wrong
-2. **Meridian** — newer agent, simpler artifact history
-3. **Emma** — has more migration history but no current dependents
-4. **Frinz tenants** — highest blast radius (multiple users); migrate after the protocol has been proven on the three above
+For new agents going through this in the future:
 
-Stage each migration at least 24 hours apart so any verifier-side issue surfaces before the next one fires.
+1. Run the parameterized ceremony script: `scripts/quantum_kestrel_1_ceremony.py --did-domain <domain> --did-slug <slug> --effective-from <iso8601> --agent-data-dir <path>` (despite the name, it works for any agent).
+2. Publish the produced `did.json` to your did:web hosting.
+3. Restart the agent runtime to pick up the hybrid keys.
+4. After the rollback window, destroy the legacy private with `quantum_destroy_legacy_key.py`.
+
+For the original four-agent staging order (kept for posterity): Kestrel #1 → Meridian → Emma → Frinz tenants, 24h between live stages. We did Kestrel #1, Meridian, Nellie, and Claw all on the same day in May 2026 because the ceremony tooling was new and we wanted them all on hybrid before the runtime restart. The Frinz tenant pool is deferred to the Frinz agent's own catalog cleanup before any rotation runs there.
 
 ## Related modules
 
