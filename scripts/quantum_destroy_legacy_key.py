@@ -325,13 +325,16 @@ def _verify_succession_signatures(succession_path: Path) -> bool:
 
 
 def _check_https_did_doc(succession_path: Path) -> bool:
-    """Optional: confirm the new DID document is reachable over HTTPS.
+    """Optional: confirm the new DID document is reachable AND its
+    verification methods MATCH the succession statement.
 
-    Uses ``identity.did_web.did_to_url`` rather than hand-rolling
-    the URL: the helper handles host-only DIDs (``did:web:example.com``
-    resolves to ``/.well-known/did.json``), percent-encoded ports
-    (``did:web:host%3A8443:agent``), and other edge cases the spec
-    permits.
+    Codex P2 catch: a published did.json that has the right ``id``
+    but stale or wrong ``verificationMethod`` would otherwise pass
+    this gate. After destruction, artifacts the agent signs would
+    fail to verify for any consumer who fetches the published doc
+    over HTTPS. Compare the published VMs to the statement's
+    successor_verification_methods (kid + multibase). Mismatch
+    refuses destruction so the operator can resolve the publication.
     """
     statement = json.loads(succession_path.read_text())
     new_did = statement.get("successor_did", "")
@@ -352,17 +355,41 @@ def _check_https_did_doc(succession_path: Path) -> bool:
                 _err(f"DID document URL returned HTTP {resp.status}")
                 return False
             body = resp.read()
-            doc = json.loads(body.decode())
-            if doc.get("id") != new_did:
-                _err(
-                    f"DID document at {url} has id={doc.get('id')!r} but "
-                    f"expected {new_did!r}"
-                )
-                return False
+            published_doc = json.loads(body.decode())
     except Exception as e:
         _err(f"HTTPS check failed for {url}: {e}")
         return False
-    _ok(f"DID document reachable: {url}")
+
+    if published_doc.get("id") != new_did:
+        _err(
+            f"DID document at {url} has id={published_doc.get('id')!r} but "
+            f"expected {new_did!r}"
+        )
+        return False
+
+    # Compare published VMs to the succession statement's successor VMs.
+    # Match on (kid, publicKeyMultibase). A mismatch means the
+    # published document is stale OR the succession is stale —
+    # either way, post-destruction signatures won't verify for
+    # public consumers.
+    def _vm_key(vm):
+        vm_id = vm.get("id", "")
+        kid = vm_id.rsplit("#", 1)[-1] if "#" in vm_id else vm_id
+        return (kid, vm.get("publicKeyMultibase"))
+
+    published_vms = published_doc.get("verificationMethod") or []
+    statement_vms = statement.get("successor_verification_methods") or []
+    pub_set = {_vm_key(vm) for vm in published_vms}
+    stmt_set = {_vm_key(vm) for vm in statement_vms}
+    if pub_set != stmt_set:
+        _err(
+            f"published DID document VMs at {url} do not match the "
+            f"succession statement's successor_verification_methods. "
+            f"Published: {sorted(pub_set)}; statement: {sorted(stmt_set)}. "
+            f"Re-publish the up-to-date document or refresh the succession."
+        )
+        return False
+    _ok(f"DID document reachable + VMs match the succession: {url}")
     return True
 
 

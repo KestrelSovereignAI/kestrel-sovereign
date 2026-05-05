@@ -143,7 +143,19 @@ def _load_legacy_part(
     storage_dir: Path,
     legacy_key_id: str,
 ) -> tuple[Keypair, dict, str]:
-    """Load the legacy ECDSA keypair + DID document. Returns (kp, doc, did)."""
+    """Load the legacy ECDSA keypair + DID document. Returns (kp, doc, did).
+
+    Tolerates a missing legacy private key when the agent's DID
+    document is still on disk: this is the post-destruction state
+    after ``scripts/quantum_destroy_legacy_key.py`` zaps the legacy
+    private but leaves the public DID document for chain-walker
+    use. In that case the returned Keypair carries
+    ``private_key=None`` and a public_key derived from the DID
+    document's hex-encoded pubkey; signing call sites that needed
+    the legacy private already migrated to the hybrid path in
+    PR #1002, so None on the legacy private is harmless.
+    """
+    priv = None
     if storage.has_key(legacy_key_id):
         priv = storage.load_private_key(legacy_key_id)
     else:
@@ -151,35 +163,29 @@ def _load_legacy_part(
         # load_kestrel_identity, kept here so this function is
         # standalone-callable in tests.
         pem_path = storage_dir / f"{legacy_key_id}.pem"
-        if not pem_path.exists():
-            raise FileNotFoundError(
-                f"No legacy key for {legacy_key_id} in {storage_dir} "
-                f"(checked .key.enc and .pem)"
+        if pem_path.exists():
+            from cryptography.hazmat.primitives.serialization import load_pem_private_key
+            from cryptography.hazmat.backends import default_backend
+            with open(pem_path, "rb") as f:
+                priv = load_pem_private_key(
+                    f.read(), password=None, backend=default_backend(),
+                )
+            logger.warning(
+                f"Loaded PLAINTEXT legacy key from {pem_path}. "
+                "Encrypt at rest with KESTREL_DATA_KEY when convenient."
             )
-        from cryptography.hazmat.primitives.serialization import load_pem_private_key
-        from cryptography.hazmat.backends import default_backend
-        with open(pem_path, "rb") as f:
-            priv = load_pem_private_key(
-                f.read(), password=None, backend=default_backend(),
-            )
-        logger.warning(
-            f"Loaded PLAINTEXT legacy key from {pem_path}. "
-            "Encrypt at rest with KESTREL_DATA_KEY when convenient."
-        )
-    if not isinstance(priv, ec.EllipticCurvePrivateKey):
+        # else: legacy private has been destroyed. Fall through; we
+        # build the keypair from the DID document's public-only data.
+    if priv is not None and not isinstance(priv, ec.EllipticCurvePrivateKey):
         raise RuntimeIdentityError(
             f"legacy key is not an ECDSA key: {type(priv).__name__}"
         )
-    pub = priv.public_key()
-    legacy_kp = Keypair(
-        suite_id=ALG_ECDSA_SECP256K1_SHA256,
-        private_key=priv,
-        public_key=pub,
-    )
+
     did_path = storage_dir / f"{legacy_key_id}.json"
     if not did_path.exists():
         raise FileNotFoundError(
-            f"DID document not found at {did_path}"
+            f"DID document not found at {did_path}. Cannot load identity "
+            f"with neither private key nor DID document."
         )
     did_document = json.loads(did_path.read_text())
     legacy_did = did_document.get("id")
@@ -187,6 +193,45 @@ def _load_legacy_part(
         raise RuntimeIdentityError(
             f"DID document at {did_path} has no 'id' field"
         )
+
+    if priv is not None:
+        pub = priv.public_key()
+    else:
+        # Post-destruction: derive public from the DID document.
+        # The legacy DID document carries publicKeyHex in the
+        # ``publicKey``/``verificationMethod`` array.
+        pub_hex = None
+        for vm in (
+            did_document.get("publicKey") or did_document.get("verificationMethod") or []
+        ):
+            pub_hex = vm.get("publicKeyHex")
+            if pub_hex:
+                break
+        if not pub_hex:
+            raise FileNotFoundError(
+                f"Legacy private key not on disk for {legacy_key_id} "
+                f"AND DID document at {did_path} has no publicKeyHex. "
+                f"Cannot reconstruct legacy public key."
+            )
+        try:
+            pub = ec.EllipticCurvePublicKey.from_encoded_point(
+                ec.SECP256K1(), bytes.fromhex(pub_hex),
+            )
+        except Exception as e:
+            raise RuntimeIdentityError(
+                f"Failed to decode legacy public key from DID document: {e}"
+            )
+        logger.info(
+            f"Legacy private key absent (post-destruction) for {legacy_did}; "
+            f"derived legacy public from DID document. Hybrid identity "
+            f"continues to provide signing capability."
+        )
+
+    legacy_kp = Keypair(
+        suite_id=ALG_ECDSA_SECP256K1_SHA256,
+        private_key=priv,  # may be None post-destruction
+        public_key=pub,
+    )
     return legacy_kp, did_document, legacy_did
 
 
