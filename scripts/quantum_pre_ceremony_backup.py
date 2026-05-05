@@ -200,8 +200,18 @@ SALT_SIZE = 32
 NONCE_SIZE = 12
 AES_KEY_SIZE = 32  # AES-256
 
-# Backup format version (so future restore can detect format changes)
-BACKUP_FORMAT_VERSION = 1
+# Backup format version (so future restore can detect format changes).
+# v1: monolithic AES-GCM (deprecated — entire plaintext in RAM).
+# v2: chunked AES-GCM, 16 MiB per chunk, deterministic per-chunk nonce =
+#     8-byte random prefix || 4-byte big-endian counter. Each chunk's
+#     AAD binds (magic, version, chunk_index, is_final). Streams without
+#     materializing either side in RAM.
+BACKUP_FORMAT_VERSION = 2
+CHUNK_SIZE = 16 * 1024 * 1024  # 16 MiB
+NONCE_PREFIX_SIZE = 8
+NONCE_COUNTER_SIZE = 4
+ASSERT_NONCE_TOTAL = NONCE_PREFIX_SIZE + NONCE_COUNTER_SIZE
+assert ASSERT_NONCE_TOTAL == NONCE_SIZE, "12-byte nonce = 8-byte prefix + 4-byte counter"
 
 
 # ---------------------------------------------------------------------------
@@ -393,39 +403,67 @@ def encrypt_archive(
 ) -> dict:
     """Encrypt an archive file with AES-256-GCM. PBKDF2-derived key.
 
-    Wire format::
+    Wire format (v2 — chunked, streaming)::
 
-        magic(4 bytes)='KSBA'  | "Kestrel Backup Archive"
-        version(1 byte)=1
-        salt_len(1 byte)=32
-        salt(32 bytes)
-        nonce_len(1 byte)=12
-        nonce(12 bytes)
-        iter_count(4 bytes BE)=600000
-        ciphertext_len(8 bytes BE)
-        ciphertext+gcm_tag
+        header:
+          magic(4)='KSBA'
+          version(1)=2
+          salt_len(1)=32         | salt(32)
+          iter_count(4 BE)=600000
+          nonce_prefix_len(1)=8  | nonce_prefix(8)
+          chunk_size(4 BE)=16777216
+        chunks (repeated, until is_final=1):
+          chunk_index(4 BE)
+          ct_len(4 BE)
+          is_final(1)
+          ciphertext+gcm_tag(ct_len bytes)
 
-    The format is self-describing so the restore path doesn't need
-    sidecar metadata to find the salt/nonce.
+    Each chunk's nonce is ``nonce_prefix || chunk_index_be4`` — 12 bytes
+    total. AAD per chunk is
+    ``b"kestrel-backup-v2:" || chunk_index_be4 || (b"\\x01" if is_final
+    else b"\\x00")``, which binds the index and finality into the GCM
+    tag (so reordering or truncating chunks breaks authentication).
+
+    Streams plaintext from disk in 16 MiB reads; never materializes the
+    full archive in memory. Codex P2 catch on the previous v1 format.
     """
     salt = os.urandom(SALT_SIZE)
-    nonce = os.urandom(NONCE_SIZE)
+    nonce_prefix = os.urandom(NONCE_PREFIX_SIZE)
     key = _derive_key(passphrase, salt)
     aes = AESGCM(key)
 
-    plaintext = plaintext_path.read_bytes()
-    ciphertext = aes.encrypt(nonce, plaintext, associated_data=b"kestrel-backup-v1")
+    with open(plaintext_path, "rb") as fin, open(ciphertext_path, "wb") as fout:
+        # Header (must precede any ciphertext)
+        fout.write(b"KSBA")
+        fout.write(bytes([BACKUP_FORMAT_VERSION]))
+        fout.write(bytes([SALT_SIZE]))
+        fout.write(salt)
+        fout.write(struct.pack(">I", PBKDF2_ITERATIONS))
+        fout.write(bytes([NONCE_PREFIX_SIZE]))
+        fout.write(nonce_prefix)
+        fout.write(struct.pack(">I", CHUNK_SIZE))
 
-    with open(ciphertext_path, "wb") as f:
-        f.write(b"KSBA")
-        f.write(bytes([BACKUP_FORMAT_VERSION]))
-        f.write(bytes([SALT_SIZE]))
-        f.write(salt)
-        f.write(bytes([NONCE_SIZE]))
-        f.write(nonce)
-        f.write(struct.pack(">I", PBKDF2_ITERATIONS))
-        f.write(struct.pack(">Q", len(ciphertext)))
-        f.write(ciphertext)
+        chunk_index = 0
+        # Read one extra byte beyond CHUNK_SIZE so we know the next chunk
+        # would be empty — that lets us mark the LAST non-empty chunk as
+        # final. Using a peek pattern via two-buffer rotation.
+        buf = fin.read(CHUNK_SIZE)
+        while buf:
+            next_buf = fin.read(CHUNK_SIZE)
+            is_final = 1 if not next_buf else 0
+            nonce = nonce_prefix + struct.pack(">I", chunk_index)
+            aad = (
+                b"kestrel-backup-v2:"
+                + struct.pack(">I", chunk_index)
+                + (b"\x01" if is_final else b"\x00")
+            )
+            ct = aes.encrypt(nonce, buf, aad)
+            fout.write(struct.pack(">I", chunk_index))
+            fout.write(struct.pack(">I", len(ct)))
+            fout.write(bytes([is_final]))
+            fout.write(ct)
+            chunk_index += 1
+            buf = next_buf
 
     return {
         "format": "KSBA",
@@ -433,45 +471,87 @@ def encrypt_archive(
         "kdf": "PBKDF2-HMAC-SHA256",
         "kdf_iterations": PBKDF2_ITERATIONS,
         "cipher": "AES-256-GCM",
+        "chunked": True,
+        "chunk_size": CHUNK_SIZE,
     }
 
 
 def decrypt_archive(ciphertext_path: Path, passphrase: str, plaintext_path: Path) -> None:
-    """Inverse of :func:`encrypt_archive`."""
-    with open(ciphertext_path, "rb") as f:
-        magic = f.read(4)
+    """Inverse of :func:`encrypt_archive`. Streams chunk-by-chunk."""
+    with open(ciphertext_path, "rb") as fin:
+        magic = fin.read(4)
         if magic != b"KSBA":
             raise SystemExit(
                 f"error: not a Kestrel backup archive (bad magic: {magic!r})"
             )
-        version = f.read(1)[0]
+        version = fin.read(1)[0]
         if version != BACKUP_FORMAT_VERSION:
             raise SystemExit(
                 f"error: unknown backup format version {version}; this build "
                 f"handles v{BACKUP_FORMAT_VERSION}"
             )
-        salt_len = f.read(1)[0]
-        salt = f.read(salt_len)
-        nonce_len = f.read(1)[0]
-        nonce = f.read(nonce_len)
-        iterations = struct.unpack(">I", f.read(4))[0]
-        ct_len = struct.unpack(">Q", f.read(8))[0]
-        ciphertext = f.read(ct_len)
+        salt_len = fin.read(1)[0]
+        salt = fin.read(salt_len)
+        iterations = struct.unpack(">I", fin.read(4))[0]
+        nonce_prefix_len = fin.read(1)[0]
+        nonce_prefix = fin.read(nonce_prefix_len)
+        chunk_size = struct.unpack(">I", fin.read(4))[0]
+        if chunk_size <= 0 or chunk_size > 1024 * 1024 * 1024:
+            raise SystemExit(f"error: implausible chunk_size {chunk_size}")
 
-    if iterations != PBKDF2_ITERATIONS:
-        # Allow but warn — a future format may change defaults
-        _info(f"(archive uses {iterations} PBKDF2 iterations, current is {PBKDF2_ITERATIONS})")
+        if iterations != PBKDF2_ITERATIONS:
+            _info(f"(archive uses {iterations} PBKDF2 iterations, current is {PBKDF2_ITERATIONS})")
 
-    kdf = PBKDF2HMAC(
-        algorithm=hashes.SHA256(),
-        length=AES_KEY_SIZE,
-        salt=salt,
-        iterations=iterations,
-    )
-    key = kdf.derive(passphrase.encode("utf-8"))
-    aes = AESGCM(key)
-    plaintext = aes.decrypt(nonce, ciphertext, associated_data=b"kestrel-backup-v1")
-    plaintext_path.write_bytes(plaintext)
+        kdf = PBKDF2HMAC(
+            algorithm=hashes.SHA256(),
+            length=AES_KEY_SIZE,
+            salt=salt,
+            iterations=iterations,
+        )
+        key = kdf.derive(passphrase.encode("utf-8"))
+        aes = AESGCM(key)
+
+        expected_index = 0
+        saw_final = False
+        with open(plaintext_path, "wb") as fout:
+            while True:
+                header = fin.read(4 + 4 + 1)
+                if not header:
+                    break
+                if len(header) != 4 + 4 + 1:
+                    raise SystemExit("error: truncated chunk header")
+                chunk_index = struct.unpack(">I", header[0:4])[0]
+                ct_len = struct.unpack(">I", header[4:8])[0]
+                is_final = header[8]
+                if chunk_index != expected_index:
+                    raise SystemExit(
+                        f"error: chunk index out of order (expected "
+                        f"{expected_index}, got {chunk_index}). Archive "
+                        "may be tampered with."
+                    )
+                if saw_final:
+                    raise SystemExit(
+                        "error: chunks present after the final-flagged one"
+                    )
+                ct = fin.read(ct_len)
+                if len(ct) != ct_len:
+                    raise SystemExit("error: truncated chunk ciphertext")
+                nonce = nonce_prefix + struct.pack(">I", chunk_index)
+                aad = (
+                    b"kestrel-backup-v2:"
+                    + struct.pack(">I", chunk_index)
+                    + (b"\x01" if is_final else b"\x00")
+                )
+                pt = aes.decrypt(nonce, ct, aad)
+                fout.write(pt)
+                expected_index += 1
+                if is_final:
+                    saw_final = True
+        if not saw_final:
+            raise SystemExit(
+                "error: archive ended without a final-flagged chunk; "
+                "may have been truncated"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -484,7 +564,15 @@ def cmd_backup(passphrase: str, project_root: Path, targets: list[dict]) -> int:
     if output_dir.exists():
         _err(f"output dir {output_dir} already exists; refusing to clobber")
         return 2
-    output_dir.mkdir(parents=True)
+    # Codex P1: tighten permissions before writing anything. /tmp is
+    # world-traversable and the default umask (022) makes new files
+    # group/world-readable. The plaintext intermediates live here for
+    # the duration of the backup; on a multi-user host they would be
+    # readable by anyone until the end-of-run cleanup. Set 0o077 umask
+    # for this whole run (so created files are mode 0600 / 0700) and
+    # explicitly chmod the output dir to 0700.
+    os.umask(0o077)
+    output_dir.mkdir(parents=True, mode=0o700)
 
     print(f"Pre-ceremony backup — {timestamp}")
     print(f"Project root: {project_root}")
