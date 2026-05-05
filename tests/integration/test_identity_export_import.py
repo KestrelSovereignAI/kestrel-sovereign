@@ -17,8 +17,6 @@ from kestrel_sovereign.identity import (
     IdentityImporter,
     export_identity,
     import_identity,
-    sign_package,
-    verify_package_signature,
     SubstrateType,
 )
 from kestrel_sovereign.storage.async_database import AsyncDatabase
