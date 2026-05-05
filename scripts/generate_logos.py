@@ -57,7 +57,7 @@ prompts = {
     ),
     "playful": (
         "A whimsical illustrated logo: a friendly rook castle tower with a face-like window "
-        "arrangement, serving as a birdhouse/rookery. Cute but elegant kestrel falcons perch on "
+        "arrangement, serving as a birdhouse/multi_agent. Cute but elegant kestrel falcons perch on "
         "and launch from various levels. Warm earth tones — terracotta, sage green, cream, "
         "with accents of gold. Storybook illustration quality, hand-drawn feel with clean lines. "
         "Could be a children's book cover detail. White background, no text."

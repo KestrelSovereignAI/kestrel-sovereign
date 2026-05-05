@@ -25,7 +25,7 @@ Every label is tagged with one of four classes:
 
 | Class | Varies by theme? | Varies by locale? | Example |
 |---|---|---|---|
-| `theme` | yes | yes | "Rookery" → "Mews" → "Multi-Agent" |
+| `theme` | yes | yes | "MultiAgent" → "Mews" → "Multi-Agent" |
 | `locale` | no | yes | "Loading..." → "Cargando..." |
 | `mech` | no | no | Numbers, glyphs, brand glyphs, ISO codes |
 | `data` | n/a | n/a | Replaced at runtime from API/state (e.g. agent name) |
@@ -70,7 +70,7 @@ JS counts are sampled because most JS strings are operational status/error messa
 
 | Line | Current text | Proposed key | Class | Notes |
 |---|---|---|---|---|
-| 1236 | Agents | sidebar_agents | theme | The "Rookery" rename target — already labeled "Agents" on screen, but this is the key the falconry theme would surface as "Mews" |
+| 1236 | Agents | sidebar_agents | theme | The "MultiAgent" rename target — already labeled "Agents" on screen, but this is the key the falconry theme would surface as "Mews" |
 | 1237 | Collapse (title) | btn_collapse | locale | |
 | 1240 | Loading agents... | loading_agents | locale | |
 | 1248 | Conversations | sidebar_conversations | theme | |
@@ -326,7 +326,7 @@ The complete `theme`-class key set, with example mappings to the three initial t
 | tab_spawn | Spawn | Hatchery | Spawn |
 | tab_features | Features | Features | Features |
 | tab_security | Security | Security | Security |
-| sidebar_agents | Rookery | Mews | Multi-Agent |
+| sidebar_agents | MultiAgent | Mews | Multi-Agent |
 | sidebar_conversations | Conversations | Conversations | Conversations |
 | chat_history_title | History | History | History |
 | chat_welcome_message | (current welcome) | (falconry-voiced rewrite) | (plain rewrite) |

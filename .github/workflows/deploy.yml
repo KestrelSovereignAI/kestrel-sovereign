@@ -60,16 +60,16 @@ jobs:
           docker push gcr.io/${{ env.PROJECT_ID }}/${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.tag }}
           docker push gcr.io/${{ env.PROJECT_ID }}/${{ env.IMAGE_NAME }}:latest
 
-      - name: Build and push rookery (multi-agent) image
+      - name: Build and push multi_agent (multi-agent) image
         run: |
           docker build \
-            -f docker/Dockerfile.rookery \
+            -f docker/Dockerfile.multi_agent \
             --secret id=github_token,env=GITHUB_TOKEN \
-            -t gcr.io/${{ env.PROJECT_ID }}/${{ env.IMAGE_NAME }}-rookery:${{ steps.tag.outputs.tag }} \
-            -t gcr.io/${{ env.PROJECT_ID }}/${{ env.IMAGE_NAME }}-rookery:latest \
+            -t gcr.io/${{ env.PROJECT_ID }}/${{ env.IMAGE_NAME }}-multi_agent:${{ steps.tag.outputs.tag }} \
+            -t gcr.io/${{ env.PROJECT_ID }}/${{ env.IMAGE_NAME }}-multi_agent:latest \
             .
-          docker push gcr.io/${{ env.PROJECT_ID }}/${{ env.IMAGE_NAME }}-rookery:${{ steps.tag.outputs.tag }}
-          docker push gcr.io/${{ env.PROJECT_ID }}/${{ env.IMAGE_NAME }}-rookery:latest
+          docker push gcr.io/${{ env.PROJECT_ID }}/${{ env.IMAGE_NAME }}-multi_agent:${{ steps.tag.outputs.tag }}
+          docker push gcr.io/${{ env.PROJECT_ID }}/${{ env.IMAGE_NAME }}-multi_agent:latest
         env:
           GITHUB_TOKEN: ${{ secrets.GH_PAT }}
 
@@ -90,7 +90,7 @@ jobs:
         uses: google-github-actions/deploy-cloudrun@251330ba9a8a34bfbc1622895f42e1d53fd14522 # v2.7.6
         with:
           service: kestrel-dev
-          image: gcr.io/${{ env.PROJECT_ID }}/${{ env.IMAGE_NAME }}-rookery:latest
+          image: gcr.io/${{ env.PROJECT_ID }}/${{ env.IMAGE_NAME }}-multi_agent:latest
           region: ${{ env.REGION }}
           flags: >-
             --memory=2Gi

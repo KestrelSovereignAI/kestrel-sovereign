@@ -80,7 +80,7 @@ npm-debug.log
 yarn-error.log
 
 # Local config (like .env — user-specific, not committed)
-rookery.toml
+multi_agent.toml
 
 # Data and caches
 agent_data/

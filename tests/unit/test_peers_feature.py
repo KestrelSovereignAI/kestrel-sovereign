@@ -19,7 +19,7 @@ def test_discover_host_url_from_env(monkeypatch):
 async def test_list_peers_filters_out_self():
     agent = SimpleNamespace(_agent_name="emma")
     feature = PeersFeature(agent)
-    feature._host_url = "http://rookery"
+    feature._host_url = "http://multi_agent"
     feature._api_key = ""
     feature._own_name = "emma"
 
@@ -46,7 +46,7 @@ async def test_list_peers_filters_out_self():
 async def test_ask_agent_rejects_self_target():
     agent = SimpleNamespace(_agent_name="emma")
     feature = PeersFeature(agent)
-    feature._host_url = "http://rookery"
+    feature._host_url = "http://multi_agent"
     feature._api_key = ""
     feature._own_name = "emma"
 
@@ -60,7 +60,7 @@ async def test_ask_agent_rejects_self_target():
 async def test_ask_agent_reports_offline_peer():
     agent = SimpleNamespace(_agent_name="emma")
     feature = PeersFeature(agent)
-    feature._host_url = "http://rookery"
+    feature._host_url = "http://multi_agent"
     feature._api_key = ""
     feature._own_name = "emma"
 
@@ -83,7 +83,7 @@ async def test_ask_agent_reports_offline_peer():
 async def test_ask_agent_returns_peer_response():
     agent = SimpleNamespace(_agent_name="emma")
     feature = PeersFeature(agent)
-    feature._host_url = "http://rookery"
+    feature._host_url = "http://multi_agent"
     feature._api_key = "key"
     feature._own_name = "emma"
 

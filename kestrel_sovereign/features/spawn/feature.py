@@ -62,7 +62,7 @@ class SpawnFeature(Feature):
     def _get_agent_manager(self):
         """Lazily resolve or create an AgentManager.
 
-        In rookery mode the manager already exists on the agent.  In
+        In multi_agent mode the manager already exists on the agent.  In
         single-agent mode we create a lightweight one on-the-fly so
         spawn_agent works regardless of deployment mode.
         """
@@ -76,7 +76,7 @@ class SpawnFeature(Feature):
 
         # Single-agent mode: create a lightweight AgentManager
         if manager is None:
-            from kestrel_sovereign.rookery.agent_manager import AgentManager
+            from kestrel_sovereign.multi_agent.agent_manager import AgentManager
             storage_dir = getattr(self.agent, 'storage_path', None)
             base_dir = Path(storage_dir).parent.parent if storage_dir else None
             manager = AgentManager(base_data_dir=base_dir)
@@ -147,7 +147,7 @@ class SpawnFeature(Feature):
         if manager is None:
             return {
                 "spawned": False,
-                "error": "No AgentManager available — agent is not running in a rookery",
+                "error": "No AgentManager available — agent is not running in a multi_agent",
             }
 
         # Parse comma-separated strings into lists

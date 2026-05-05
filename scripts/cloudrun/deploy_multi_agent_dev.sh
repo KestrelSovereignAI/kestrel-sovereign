@@ -1,17 +1,17 @@
 #!/bin/bash
 set -e
 
-# Deploy Kestrel Rookery (multi-agent host) to Cloud Run — DEV environment
+# Deploy Kestrel MultiAgent (multi-agent host) to Cloud Run — DEV environment
 PROJECT_ID="${GCP_PROJECT_ID:?Set GCP_PROJECT_ID env var}"
-SERVICE_NAME="kestrel-rookery-dev"
-IMAGE_NAME="kestrel-rookery"
+SERVICE_NAME="kestrel-multi-agent-dev"
+IMAGE_NAME="kestrel-multi-agent"
 REGION="us-central1"
 
-echo "Deploying Kestrel Rookery DEV to Cloud Run..."
+echo "Deploying Kestrel MultiAgent DEV to Cloud Run..."
 echo "  Project: $PROJECT_ID"
 echo "  Service: $SERVICE_NAME"
 echo "  Region: $REGION"
-echo "  Mode: Rookery (multi-agent host)"
+echo "  Mode: MultiAgent (multi-agent host)"
 echo "  Scaling: min=0 (scale to zero), max=10"
 echo "  Resources: 4Gi memory, 4 CPU (host + agents)"
 echo ""
@@ -34,7 +34,7 @@ gcloud run deploy "$SERVICE_NAME" \
     --quiet
 
 echo ""
-echo "Rookery DEV deployment complete!"
+echo "MultiAgent DEV deployment complete!"
 echo ""
 echo "Service URL (sign in with authorized Google account):"
 gcloud run services describe "$SERVICE_NAME" \

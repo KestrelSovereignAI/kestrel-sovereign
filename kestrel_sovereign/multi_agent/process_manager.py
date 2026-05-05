@@ -23,9 +23,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-from kestrel_sovereign.rookery.config import (
+from kestrel_sovereign.multi_agent.config import (
     LocalAgentConfig,
-    RookeryConfig,
+    MultiAgentConfig,
 )
 
 logger = logging.getLogger(__name__)
@@ -48,7 +48,7 @@ class ProcessManager:
 
     Usage:
         pm = ProcessManager(project_dir=Path("/path/to/kestrel"))
-        pm.start_all(rookery_config)
+        pm.start_all(multi_agent_config)
         ...
         pm.stop_all()
     """
@@ -341,7 +341,7 @@ class ProcessManager:
         """Start a single agent process.
 
         Args:
-            name: Agent name (from rookery config).
+            name: Agent name (from multi_agent config).
             config: The agent's LocalAgentConfig.
             host_bind: Interface to bind to.
             host_port: Host port (for inter-agent communication).
@@ -396,9 +396,9 @@ class ProcessManager:
         env["KESTREL_HOST_URL"] = f"http://localhost:{host_port}"
 
         # Force child agents into single-agent mode. Without this,
-        # server.py detects rookery.toml in the CWD and enters multi-
+        # server.py detects multi_agent.toml in the CWD and enters multi-
         # agent mode, leaving app.state.agent = None → 503 on all endpoints.
-        env["KESTREL_ROOKERY_CONFIG"] = "__none__"
+        env["KESTREL_MULTI_AGENT_CONFIG"] = "__none__"
 
         # Per-agent data key: KESTREL_DATA_KEY_CLAW overrides KESTREL_DATA_KEY
         agent_key_var = f"KESTREL_DATA_KEY_{name.upper()}"
@@ -470,12 +470,12 @@ class ProcessManager:
 
     def start_autostart_agents(
         self,
-        config: RookeryConfig,
+        config: MultiAgentConfig,
     ) -> dict[str, AgentProcess]:
         """Start all agents with autostart=True.
 
         Args:
-            config: Rookery configuration.
+            config: MultiAgent configuration.
 
         Returns:
             Dict of started agent processes.

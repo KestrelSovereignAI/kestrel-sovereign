@@ -16,10 +16,10 @@ import httpx
 from fastapi import Request
 from fastapi.responses import JSONResponse, StreamingResponse, Response
 
-from kestrel_sovereign.rookery.config import (
+from kestrel_sovereign.multi_agent.config import (
     LocalAgentConfig,
     RemoteAgentConfig,
-    RookeryConfig,
+    MultiAgentConfig,
 )
 
 logger = logging.getLogger(__name__)
@@ -46,13 +46,13 @@ def get_agent_base_url(
 
 
 def resolve_agent(
-    agent_id: str, config: RookeryConfig
+    agent_id: str, config: MultiAgentConfig
 ) -> Union[LocalAgentConfig, RemoteAgentConfig, None]:
     """Resolve an agent ID (alias or name) to its config.
 
     Args:
         agent_id: Agent name/alias from the URL path.
-        config: The rookery configuration.
+        config: The multi_agent configuration.
 
     Returns:
         Agent config if found, None otherwise.
@@ -81,7 +81,7 @@ async def proxy_request_streaming(
     request: Request,
     agent_id: str,
     path: str,
-    config: RookeryConfig,
+    config: MultiAgentConfig,
     client: httpx.AsyncClient,
 ) -> Response:
     """Proxy a request to the target agent with streaming support.
@@ -93,7 +93,7 @@ async def proxy_request_streaming(
         request: The incoming FastAPI request.
         agent_id: The agent name/alias.
         path: The path to forward.
-        config: The rookery configuration.
+        config: The multi_agent configuration.
         client: Shared httpx async client.
 
     Returns:
@@ -103,7 +103,7 @@ async def proxy_request_streaming(
     if agent_config is None:
         return JSONResponse(
             status_code=404,
-            content={"detail": f"Agent '{agent_id}' not found in rookery config"},
+            content={"detail": f"Agent '{agent_id}' not found in multi_agent config"},
         )
 
     base_url = get_agent_base_url(agent_config)

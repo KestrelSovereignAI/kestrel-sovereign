@@ -53,7 +53,7 @@ export let AGENT_COMMANDS = [
 
 /**
  * Load commands dynamically from /api/commands endpoint.
- * Called after agent selection (rookery) or during standalone init.
+ * Called after agent selection (multi_agent) or during standalone init.
  * Uses API module for proper auth and agent routing.
  */
 export async function loadCommands(apiModule) {

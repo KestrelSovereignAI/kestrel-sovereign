@@ -215,7 +215,7 @@
       <div class="icon"><span class="ki ki-classical-building"></span></div>
       <h4>Sovereign</h4>
       <span class="tag tag-built">BUILT</span>
-      <p>FastAPI server, DID system, Constitution, Memory (encrypted), 7 LLM providers, Voice (5 STT/TTS providers), Filebase storage, Privacy modes, Rookery multi-agent</p>
+      <p>FastAPI server, DID system, Constitution, Memory (encrypted), 7 LLM providers, Voice (5 STT/TTS providers), Filebase storage, Privacy modes, MultiAgent multi-agent</p>
     </div>
     <div class="status-card card-claws">
       <div class="icon"><span class="ki ki-kestrel"></span></div>
@@ -260,7 +260,7 @@
           <span class="file">kestrel_sovereign/voice/</span> — 5 STT/TTS providers (Deepgram, ElevenLabs, Faster Whisper, OpenAI, Piper)<br>
           <span class="file">kestrel_sovereign/storage/providers/filebase_provider.py</span> — Decentralized storage<br>
           <span class="file">kestrel_sovereign/features/privacy/</span> — 5 privacy levels (actively tested)<br>
-          <span class="file">rookery.toml</span> — Multi-agent hosting (5 agents configured)
+          <span class="file">multi_agent.toml</span> — Multi-agent hosting (5 agents configured)
         </td>
         <td>kestrel-sovereign</td>
         <td><span class="check"><span class="ki ki-checkmark"></span> Running</span></td>
@@ -329,10 +329,10 @@
   <div class="callout">
     <h4>Key Insight — The Infrastructure Is Already There</h4>
     <p>
-      <code>rookery.toml</code> already defines 5 agents (Kestrel, demo, gabi, jason, noel) on separate ports.
+      <code>multi_agent.toml</code> already defines 5 agents (Kestrel, demo, gabi, jason, noel) on separate ports.
       Each agent gets its own data directory and can load its own STRATEGY.yaml.
       The Falconer model doesn't require building a new platform — it requires
-      <strong>connecting the birds to each other and to the Rookery</strong>.
+      <strong>connecting the birds to each other and to the MultiAgent</strong>.
     </p>
   </div>
 </div>
@@ -374,7 +374,7 @@
       </tr>
       <tr>
         <td class="comp" style="color:#4ecdc4">Falconer Onboarding</td>
-        <td><code>kestrel falconer setup</code> CLI command (sovereign #433). Creates agent in Rookery, DID, STRATEGY.yaml, configures all 4 birds.</td>
+        <td><code>kestrel falconer setup</code> CLI command (sovereign #433). Creates agent in MultiAgent, DID, STRATEGY.yaml, configures all 4 birds.</td>
         <td>Jim partnership requires this. Can't scale if every falconer needs manual setup.</td>
         <td><span class="risk-med">MEDIUM</span></td>
       </tr>
@@ -448,7 +448,7 @@
     <div class="meta"><strong>Timeline:</strong> Already done &middot; <strong>Owner:</strong> Gabi &middot; <strong>Status:</strong> Complete</div>
     <ul>
       <li><strong>Sovereign runtime</strong> — FastAPI server, DID, Constitution, Memory all functional</li>
-      <li><strong>Rookery multi-agent</strong> — gabi:8805, jason:8806, noel:8807 configured in rookery.toml</li>
+      <li><strong>MultiAgent multi-agent</strong> — gabi:8805, jason:8806, noel:8807 configured in multi_agent.toml</li>
       <li><strong>STRATEGY.yaml per falconer</strong> — agent_data/gabi, agent_data/noel each have strategic context</li>
       <li><strong>Talon installed</strong> — kestrel-talon in pyproject.toml, issue claiming works via CLI</li>
       <li><strong>Morning Signal</strong> — Generates briefings across 7 repos and 16 milestones</li>
@@ -525,7 +525,7 @@
       Wire it all together. Every falconer has all 4 birds. The daily loop runs without human intervention.
     </p>
     <ul>
-      <li><strong>Falconer onboarding CLI (sovereign #433)</strong> — <code>kestrel falconer setup --name "Jim" --repos org/repo1,org/repo2</code>. Creates agent in Rookery, generates DID, creates STRATEGY.yaml, configures all 4 birds.</li>
+      <li><strong>Falconer onboarding CLI (sovereign #433)</strong> — <code>kestrel falconer setup --name "Jim" --repos org/repo1,org/repo2</code>. Creates agent in MultiAgent, generates DID, creates STRATEGY.yaml, configures all 4 birds.</li>
       <li><strong>Daily autonomous loop (sovereign #307)</strong> — 7am: Claws runs Morning Signal, prioritizes backlog. Talon picks top items, codes them. Eye reviews PRs. Flight generates daily summary. Falconer wakes up to a briefing + completed work.</li>
       <li><strong>Unified Falconer Dashboard (sovereign #434)</strong> — Real-time view of all 4 birds' status, backlog health, human bottleneck %, completed work. Per-falconer and org-wide views.</li>
       <li><strong>Scalable onboarding playbook (signal-and-ship #7)</strong> — Documentation + config templates for Jim/enterprise CIOs. How to onboard 100 falconers.</li>

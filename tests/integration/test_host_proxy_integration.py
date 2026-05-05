@@ -12,8 +12,8 @@ from unittest.mock import patch
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from kestrel_sovereign.rookery.config import (
-    RookeryConfig,
+from kestrel_sovereign.multi_agent.config import (
+    MultiAgentConfig,
     HostConfig,
     LocalAgentConfig,
 )
@@ -71,7 +71,7 @@ def integration_config(tmp_path):
     agent_dir = tmp_path / "agent_data" / "test"
     agent_dir.mkdir(parents=True)
     (agent_dir / "kestrel_prime.db").touch()
-    return RookeryConfig(
+    return MultiAgentConfig(
         host=HostConfig(port=8888),
         agents={
             "test-agent": LocalAgentConfig(
@@ -109,8 +109,8 @@ class TestHostAgentIntegration:
 
         import host as host_module
         the_app = host_module.app
-        original_fn = host_module.load_rookery_config
-        host_module.load_rookery_config = lambda: integration_config
+        original_fn = host_module.load_multi_agent_config
+        host_module.load_multi_agent_config = lambda: integration_config
         try:
             with patch.dict(os.environ, {"KESTREL_API_KEY": test_key}):
                 from asgi_lifespan import LifespanManager
@@ -135,7 +135,7 @@ class TestHostAgentIntegration:
                         await mock_client.aclose()
                         await original_client.aclose()
         finally:
-            host_module.load_rookery_config = original_fn
+            host_module.load_multi_agent_config = original_fn
 
     @pytest.mark.asyncio
     async def test_host_aggregates_agent_cards(self, mock_agent_app, integration_config):
@@ -144,8 +144,8 @@ class TestHostAgentIntegration:
 
         import host as host_module
         the_app = host_module.app
-        original_fn = host_module.load_rookery_config
-        host_module.load_rookery_config = lambda: integration_config
+        original_fn = host_module.load_multi_agent_config
+        host_module.load_multi_agent_config = lambda: integration_config
         try:
             with patch.dict(os.environ, {"KESTREL_API_KEY": test_key}):
                 from asgi_lifespan import LifespanManager
@@ -176,15 +176,15 @@ class TestHostAgentIntegration:
                         await mock_client.aclose()
                         await original_client.aclose()
         finally:
-            host_module.load_rookery_config = original_fn
+            host_module.load_multi_agent_config = original_fn
 
     @pytest.mark.asyncio
     async def test_host_health_shows_online_agent(self, mock_agent_app, integration_config):
         """GET /health shows agent as online when it's reachable."""
         import host as host_module
         the_app = host_module.app
-        original_fn = host_module.load_rookery_config
-        host_module.load_rookery_config = lambda: integration_config
+        original_fn = host_module.load_multi_agent_config
+        host_module.load_multi_agent_config = lambda: integration_config
         try:
             from asgi_lifespan import LifespanManager
             async with LifespanManager(the_app):
@@ -204,7 +204,7 @@ class TestHostAgentIntegration:
                     await mock_client.aclose()
                     await original_client.aclose()
         finally:
-            host_module.load_rookery_config = original_fn
+            host_module.load_multi_agent_config = original_fn
 
     @pytest.mark.asyncio
     async def test_host_proxies_post_with_body(self, mock_agent_app, integration_config):
@@ -213,8 +213,8 @@ class TestHostAgentIntegration:
 
         import host as host_module
         the_app = host_module.app
-        original_fn = host_module.load_rookery_config
-        host_module.load_rookery_config = lambda: integration_config
+        original_fn = host_module.load_multi_agent_config
+        host_module.load_multi_agent_config = lambda: integration_config
         try:
             with patch.dict(os.environ, {"KESTREL_API_KEY": test_key}):
                 from asgi_lifespan import LifespanManager
@@ -239,7 +239,7 @@ class TestHostAgentIntegration:
                         await mock_client.aclose()
                         await original_client.aclose()
         finally:
-            host_module.load_rookery_config = original_fn
+            host_module.load_multi_agent_config = original_fn
 
     @pytest.mark.asyncio
     async def test_host_proxies_sse_stream(self, mock_agent_app, integration_config):
@@ -248,8 +248,8 @@ class TestHostAgentIntegration:
 
         import host as host_module
         the_app = host_module.app
-        original_fn = host_module.load_rookery_config
-        host_module.load_rookery_config = lambda: integration_config
+        original_fn = host_module.load_multi_agent_config
+        host_module.load_multi_agent_config = lambda: integration_config
         try:
             with patch.dict(os.environ, {"KESTREL_API_KEY": test_key}):
                 from asgi_lifespan import LifespanManager
@@ -274,4 +274,4 @@ class TestHostAgentIntegration:
                         await mock_client.aclose()
                         await original_client.aclose()
         finally:
-            host_module.load_rookery_config = original_fn
+            host_module.load_multi_agent_config = original_fn

@@ -14,7 +14,7 @@ import {
 //     capabilities?: {
 //       // Boolean for simple on/off — missing keys default to true
 //       chat: false,
-//       rookery: false,
+//       multi_agent: false,
 //       spawn: false,
 //       featureStore: false,
 //       audit: false,

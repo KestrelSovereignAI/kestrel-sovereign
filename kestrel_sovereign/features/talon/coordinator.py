@@ -135,7 +135,7 @@ class TalonCoordinatorFeature(Feature):
             Failure returns ``{"dispatched": False, "error": ...}``.
         """
         # Mesh dispatch is preserved as a fast-path for environments
-        # where Talon IS a registered rookery agent. In the standard
+        # where Talon IS a registered multi_agent agent. In the standard
         # standalone-CLI layout it's not, and this returns dispatched
         # False quickly so we fall through to the CLI path.
         mesh_result = await self._dispatch_via_mesh(repo, issue)
@@ -991,7 +991,7 @@ class TalonCoordinatorFeature(Feature):
 
         Per-agent under the agent's data directory when available
         (``<storage_path>/talon_jobs/``) so logs survive process
-        restarts and aren't shared across agents in the rookery.
+        restarts and aren't shared across agents in the multi_agent.
         Falls back to ``/tmp`` when the agent has no storage_path
         (test stubs, ephemeral runs).
         """
@@ -1148,14 +1148,14 @@ class TalonCoordinatorFeature(Feature):
         return None
 
     def _discover_host_url(self) -> Optional[str]:
-        """Discover the rookery host URL."""
+        """Discover the multi_agent host URL."""
         host_url = os.environ.get("KESTREL_HOST_URL")
         if host_url:
             return host_url.rstrip("/")
 
         for candidate in [
-            Path.cwd() / "rookery.toml",
-            Path(__file__).resolve().parents[3] / "rookery.toml",
+            Path.cwd() / "multi_agent.toml",
+            Path(__file__).resolve().parents[3] / "multi_agent.toml",
         ]:
             if candidate.exists():
                 try:

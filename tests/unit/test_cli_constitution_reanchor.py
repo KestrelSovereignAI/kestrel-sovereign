@@ -20,12 +20,12 @@ from kestrel_sovereign.setup.constitution_reanchor import ReanchorResult
 
 @pytest.fixture
 def reanchor_env(tmp_path):
-    """Project tree with one rookery agent + a stub kestrel_prime.db."""
+    """Project tree with one multi_agent agent + a stub kestrel_prime.db."""
     agent_dir = tmp_path / "agent_data" / "Test"
     agent_dir.mkdir(parents=True)
     (agent_dir / "kestrel_prime.db").write_bytes(b"stub")
 
-    rookery = {
+    multi_agent = {
         "host": {"port": 8888, "bind": "0.0.0.0"},
         "agents": {
             "Test": {
@@ -35,7 +35,7 @@ def reanchor_env(tmp_path):
             }
         },
     }
-    (tmp_path / "rookery.toml").write_text(toml.dumps(rookery))
+    (tmp_path / "multi_agent.toml").write_text(toml.dumps(multi_agent))
     return tmp_path
 
 
@@ -77,7 +77,7 @@ def test_reanchor_accepts_constitution_path_override():
 # ---------------------------------------------------------------------------
 
 def test_reanchor_rejects_unknown_agent(reanchor_env, capsys):
-    args = _parse(["constitution", "reanchor", "--agent-name", "NotInRookery"])
+    args = _parse(["constitution", "reanchor", "--agent-name", "NotInMultiAgent"])
     with patch(
         "kestrel_sovereign.cli._get_project_dir", return_value=reanchor_env,
     ), patch(
@@ -85,7 +85,7 @@ def test_reanchor_rejects_unknown_agent(reanchor_env, capsys):
     ) as mock_reanchor:
         rc = cmd_constitution(args)
     assert rc == 2
-    assert "not in rookery" in capsys.readouterr().err.lower()
+    assert "not in multi_agent" in capsys.readouterr().err.lower()
     mock_reanchor.assert_not_called()
 
 

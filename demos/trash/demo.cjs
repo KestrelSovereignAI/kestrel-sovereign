@@ -51,7 +51,7 @@ let apiKey = null;
  *
  * Earlier versions of this helper tried to invoke window.selectAgent() to
  * force the reveal — but selectAgent calls API.setHostAgent(name), which
- * applies a /api/agents/<name>/ URL prefix that only exists in rookery
+ * applies a /api/agents/<name>/ URL prefix that only exists in multi_agent
  * routing.  Applying it in standalone 404s every subsequent call (chat
  * invoke, conversations, trash list).  The right fix is in identity.js;
  * the demo just waits.

@@ -1,5 +1,5 @@
 """
-Rookery Configuration - Registry of agents managed by a Kestrel Host.
+MultiAgent Configuration - Registry of agents managed by a Kestrel Host.
 
 Each agent is self-contained in its own directory with:
 - DID (Decentralized Identifier)
@@ -7,7 +7,7 @@ Each agent is self-contained in its own directory with:
 - Keys (agent-signing-key.pem, agent-encryption-key.pem)
 - Config (kestrel.toml)
 
-The rookery.toml file defines which agents exist and how to reach them.
+The multi_agent.toml file defines which agents exist and how to reach them.
 """
 
 import logging
@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_HOST_PORT = 8888
 DEFAULT_AGENT_START_PORT = 8801
-ROOKERY_CONFIG_FILENAME = "rookery.toml"
+MULTI_AGENT_CONFIG_FILENAME = "multi_agent.toml"
 AGENT_DATA_DIR = "agent_data"
 
 # Features that must always be loaded for sovereignty guarantees.
@@ -127,11 +127,11 @@ class RemoteAgentConfig(BaseModel):
         return v
 
 
-class RookeryConfig(BaseModel):
+class MultiAgentConfig(BaseModel):
     """
-    Rookery configuration - registry of agents managed by a Kestrel Host.
+    MultiAgent configuration - registry of agents managed by a Kestrel Host.
 
-    Example rookery.toml:
+    Example multi_agent.toml:
     ```toml
     [host]
     port = 8888
@@ -162,7 +162,7 @@ class RookeryConfig(BaseModel):
     )
 
     @model_validator(mode="after")
-    def validate_port_conflicts(self) -> "RookeryConfig":
+    def validate_port_conflicts(self) -> "MultiAgentConfig":
         """Validate that no two local agents use the same port."""
         used_ports: dict[int, str] = {}
 
@@ -183,15 +183,15 @@ class RookeryConfig(BaseModel):
         return self
 
     @classmethod
-    def from_file(cls, config_path: Union[str, Path]) -> "RookeryConfig":
+    def from_file(cls, config_path: Union[str, Path]) -> "MultiAgentConfig":
         """
-        Load rookery config from a TOML file.
+        Load multi_agent config from a TOML file.
 
         Args:
-            config_path: Path to rookery.toml
+            config_path: Path to multi_agent.toml
 
         Returns:
-            RookeryConfig instance
+            MultiAgentConfig instance
 
         Raises:
             FileNotFoundError: If config file doesn't exist
@@ -199,7 +199,7 @@ class RookeryConfig(BaseModel):
         """
         path = Path(config_path)
         if not path.exists():
-            raise FileNotFoundError(f"Rookery config not found: {path}")
+            raise FileNotFoundError(f"MultiAgent config not found: {path}")
 
         try:
             data = toml.load(path)
@@ -234,11 +234,11 @@ class RookeryConfig(BaseModel):
         cls,
         base_dir: Union[str, Path] = AGENT_DATA_DIR,
         include_empty: bool = False,
-    ) -> "RookeryConfig":
+    ) -> "MultiAgentConfig":
         """
         Auto-discover agents from agent_data/* subdirectories.
 
-        This is used as a fallback when no rookery.toml exists.
+        This is used as a fallback when no multi_agent.toml exists.
         Scans for directories containing kestrel_prime.db (or any subdirectory
         when include_empty=True) and assigns ports sequentially starting from 8801.
 
@@ -247,7 +247,7 @@ class RookeryConfig(BaseModel):
             include_empty: If True, include empty subdirectories (for fresh provisioning)
 
         Returns:
-            RookeryConfig with auto-discovered agents
+            MultiAgentConfig with auto-discovered agents
         """
         base_path = Path(base_dir)
         agents: dict[str, LocalAgentConfig] = {}
@@ -283,45 +283,45 @@ class RookeryConfig(BaseModel):
         cls,
         config_path: Optional[Union[str, Path]] = None,
         auto_discover_fallback: bool = True,
-    ) -> "RookeryConfig":
+    ) -> "MultiAgentConfig":
         """
-        Load rookery config with auto-discovery fallback.
+        Load multi_agent config with auto-discovery fallback.
 
         Args:
-            config_path: Path to rookery.toml (default: ./rookery.toml)
+            config_path: Path to multi_agent.toml (default: ./multi_agent.toml)
             auto_discover_fallback: If True and config doesn't exist, auto-discover agents
 
         Returns:
-            RookeryConfig instance
+            MultiAgentConfig instance
         """
         if config_path is None:
-            config_path = Path.cwd() / ROOKERY_CONFIG_FILENAME
+            config_path = Path.cwd() / MULTI_AGENT_CONFIG_FILENAME
 
         path = Path(config_path)
 
         if path.exists():
-            logger.info(f"Loading rookery config from {path}")
+            logger.info(f"Loading multi_agent config from {path}")
             return cls.from_file(path)
 
         if auto_discover_fallback:
             # Scan for agents relative to the config file's parent directory
             base_dir = path.parent / AGENT_DATA_DIR
-            logger.info(f"No rookery config found at {path}, auto-discovering agents in {base_dir}...")
+            logger.info(f"No multi_agent config found at {path}, auto-discovering agents in {base_dir}...")
             return cls.auto_discover(base_dir)
 
         # No config and no auto-discovery
-        logger.warning(f"No rookery config found at {path}")
+        logger.warning(f"No multi_agent config found at {path}")
         return cls(host=HostConfig(), agents={})
 
     def save(self, config_path: Optional[Union[str, Path]] = None) -> None:
         """
-        Save rookery config to a TOML file.
+        Save multi_agent config to a TOML file.
 
         Args:
-            config_path: Path to save to (default: ./rookery.toml)
+            config_path: Path to save to (default: ./multi_agent.toml)
         """
         if config_path is None:
-            config_path = Path.cwd() / ROOKERY_CONFIG_FILENAME
+            config_path = Path.cwd() / MULTI_AGENT_CONFIG_FILENAME
 
         path = Path(config_path)
 
@@ -350,7 +350,7 @@ class RookeryConfig(BaseModel):
         with open(path, "w", encoding="utf-8") as f:
             toml.dump(data, f)
 
-        logger.info(f"Saved rookery config to {path}")
+        logger.info(f"Saved multi_agent config to {path}")
 
     def get_local_agents(self) -> dict[str, LocalAgentConfig]:
         """Get only local agents."""

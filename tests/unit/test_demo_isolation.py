@@ -30,10 +30,10 @@ def _agent(*, is_demo: bool):
     return a
 
 
-def test_empty_rookery_is_live_mode():
+def test_empty_multi_agent_is_live_mode():
     """No agents loaded → server is live (rail engaged).
 
-    Rationale: an empty rookery shouldn't license destructive ops to
+    Rationale: an empty multi_agent shouldn't license destructive ops to
     fire freely — the operator may still spin up live agents later.
     """
     assert classify_server_mode({}) is False
@@ -45,10 +45,10 @@ def test_all_demo_agents_classifies_as_demo():
 
 
 def test_one_live_agent_keeps_server_live():
-    """A single live agent in the rookery flips the server to live mode.
+    """A single live agent in the multi_agent flips the server to live mode.
 
     The rail must protect that one live agent; demo agents in the same
-    rookery still pass the rail because they're demo-scoped at the
+    multi_agent still pass the rail because they're demo-scoped at the
     target level.
     """
     agents = {"demo": _agent(is_demo=True), "live": _agent(is_demo=False)}
@@ -196,7 +196,7 @@ async def test_demo_server_live_target_is_refused_loudly():
     """The reverse rail: a demo server that somehow has a live agent
     mounted refuses. This catches the misconfig where KESTREL_DB_PATH
     points at a directory containing both live and demo agents, or the
-    rookery.toml is wrong.
+    multi_agent.toml is wrong.
     """
     audit = AsyncMock()
     permission_store = SimpleNamespace(log_decision=audit)

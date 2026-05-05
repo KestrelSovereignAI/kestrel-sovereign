@@ -2,7 +2,7 @@
 
 These mock out :func:`create_kestrel_identity_async` since real inception
 takes ~1s of crypto + DB writes; we only care that the step orchestrates
-the call correctly and that rookery registration is right.
+the call correctly and that multi_agent registration is right.
 """
 
 from __future__ import annotations
@@ -12,12 +12,12 @@ from unittest.mock import patch
 
 import toml
 
-from kestrel_sovereign.rookery.config import (
+from kestrel_sovereign.multi_agent.config import (
     DEFAULT_AGENT_START_PORT,
     LocalAgentConfig,
-    ROOKERY_CONFIG_FILENAME,
+    MULTI_AGENT_CONFIG_FILENAME,
     HostConfig,
-    RookeryConfig,
+    MultiAgentConfig,
 )
 from kestrel_sovereign.setup.context import Flow, SetupContext
 from kestrel_sovereign.setup.prompts import StubPrompter
@@ -52,7 +52,7 @@ def _fake_inception_factory(did: str = "did:pkh:eip155:1:0xFakeFAKEfake"):
     return _inception
 
 
-def test_agent_quickstart_creates_kestrel_when_rookery_empty(tmp_path):
+def test_agent_quickstart_creates_kestrel_when_multi_agent_empty(tmp_path):
     ctx = _make_ctx(tmp_path, Flow.QUICKSTART)
     with patch(
         "kestrel_sovereign.inception_service.create_kestrel_identity_async",
@@ -60,15 +60,15 @@ def test_agent_quickstart_creates_kestrel_when_rookery_empty(tmp_path):
     ):
         agent.run(ctx)
 
-    rookery = RookeryConfig.load(tmp_path / ROOKERY_CONFIG_FILENAME)
-    assert "Kestrel" in rookery.get_local_agents()
-    cfg = rookery.get_local_agents()["Kestrel"]
+    multi_agent = MultiAgentConfig.load(tmp_path / MULTI_AGENT_CONFIG_FILENAME)
+    assert "Kestrel" in multi_agent.get_local_agents()
+    cfg = multi_agent.get_local_agents()["Kestrel"]
     assert cfg.port == DEFAULT_AGENT_START_PORT
     assert cfg.autostart is True
 
 
-def test_agent_quickstart_skips_when_rookery_has_agent(tmp_path):
-    rookery = RookeryConfig(
+def test_agent_quickstart_skips_when_multi_agent_has_agent(tmp_path):
+    multi_agent = MultiAgentConfig(
         host=HostConfig(),
         agents={
             "Existing": LocalAgentConfig(
@@ -76,7 +76,7 @@ def test_agent_quickstart_skips_when_rookery_has_agent(tmp_path):
             )
         },
     )
-    rookery.save(tmp_path / ROOKERY_CONFIG_FILENAME)
+    multi_agent.save(tmp_path / MULTI_AGENT_CONFIG_FILENAME)
     ctx = _make_ctx(tmp_path, Flow.QUICKSTART)
 
     with patch(
@@ -86,12 +86,12 @@ def test_agent_quickstart_skips_when_rookery_has_agent(tmp_path):
         mock_inc.assert_not_called()
 
     # Agent map unchanged.
-    rookery_after = RookeryConfig.load(tmp_path / ROOKERY_CONFIG_FILENAME)
-    assert list(rookery_after.get_local_agents()) == ["Existing"]
+    multi_agent_after = MultiAgentConfig.load(tmp_path / MULTI_AGENT_CONFIG_FILENAME)
+    assert list(multi_agent_after.get_local_agents()) == ["Existing"]
 
 
 def test_agent_interactive_with_existing_can_decline_more(tmp_path):
-    rookery = RookeryConfig(
+    multi_agent = MultiAgentConfig(
         host=HostConfig(),
         agents={
             "First": LocalAgentConfig(
@@ -99,7 +99,7 @@ def test_agent_interactive_with_existing_can_decline_more(tmp_path):
             )
         },
     )
-    rookery.save(tmp_path / ROOKERY_CONFIG_FILENAME)
+    multi_agent.save(tmp_path / MULTI_AGENT_CONFIG_FILENAME)
     # Only one bool answer needed: "Add another?" → False
     ctx = _make_ctx(tmp_path, Flow.INTERACTIVE, answers=[False])
 
@@ -114,7 +114,7 @@ def test_agent_interactive_creates_with_custom_name(tmp_path):
     answers = [
         False,  # Don't keep existing? (no existing, this answer ignored — but OK to omit)
     ]
-    # No existing rookery → goes straight to name prompt
+    # No existing multi_agent → goes straight to name prompt
     ctx = _make_ctx(
         tmp_path, Flow.INTERACTIVE, answers=["Falcon", True]
     )  # name="Falcon", autostart=True
@@ -124,8 +124,8 @@ def test_agent_interactive_creates_with_custom_name(tmp_path):
     ):
         agent.run(ctx)
 
-    rookery = RookeryConfig.load(tmp_path / ROOKERY_CONFIG_FILENAME)
-    assert "Falcon" in rookery.get_local_agents()
+    multi_agent = MultiAgentConfig.load(tmp_path / MULTI_AGENT_CONFIG_FILENAME)
+    assert "Falcon" in multi_agent.get_local_agents()
 
 
 def test_agent_does_not_re_incept_existing_db(tmp_path):
@@ -141,8 +141,8 @@ def test_agent_does_not_re_incept_existing_db(tmp_path):
         agent.run(ctx)
         mock_inc.assert_not_called()
 
-    rookery = RookeryConfig.load(tmp_path / ROOKERY_CONFIG_FILENAME)
-    assert "Kestrel" in rookery.get_local_agents()
+    multi_agent = MultiAgentConfig.load(tmp_path / MULTI_AGENT_CONFIG_FILENAME)
+    assert "Kestrel" in multi_agent.get_local_agents()
 
 
 def test_create_agent_helper_is_idempotent(tmp_path):
@@ -183,8 +183,8 @@ def test_create_agent_avoids_port_collisions(tmp_path):
         )
 
     assert a.port != b.port
-    rookery = RookeryConfig.load(tmp_path / ROOKERY_CONFIG_FILENAME)
-    ports = {cfg.port for cfg in rookery.get_local_agents().values()}
+    multi_agent = MultiAgentConfig.load(tmp_path / MULTI_AGENT_CONFIG_FILENAME)
+    ports = {cfg.port for cfg in multi_agent.get_local_agents().values()}
     assert ports == {a.port, b.port}
 
 
