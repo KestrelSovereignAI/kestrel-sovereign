@@ -543,8 +543,14 @@ def verify_and_load(
                 raise VerificationError("Constitution hash verification failed")
             return package, False, "Constitution hash verification failed"
 
-    # Verify signature if present
-    if package.signature:
+    # Verify signature if present. Codex P2 catch: hybrid packages
+    # carry signatures only on the v2 ``signatures`` array (legacy
+    # ``signature`` is empty, because that field can't be made
+    # v1-compatible — see sign_package). Detect signed-ness by either
+    # of the two carriers; verify_package_signature routes correctly
+    # by alg.
+    has_signature = bool(package.signature) or bool(package.signatures)
+    if has_signature:
         is_valid, message = verify_package_signature(package, storage_dir)
         if not is_valid and require_valid_signature:
             raise VerificationError(message)
