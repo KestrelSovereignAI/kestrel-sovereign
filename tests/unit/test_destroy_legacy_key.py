@@ -1,0 +1,382 @@
+"""
+Tests for ``scripts/quantum_destroy_legacy_key.py``.
+
+The script is paranoid by design — destruction is irreversible.
+Tests exercise:
+- Default dry-run preserves all files
+- --confirm without env var rejects
+- --confirm with env var deletes legacy keys, preserves DID doc +
+  hybrid keys + succession statement
+- Rollback-window gate refuses fresh successions
+- Missing hybrid keys gate refuses (don't strand the agent)
+- Missing succession refuses
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+import pytest
+
+from kestrel_sovereign.identity.did_web import build_verification_methods
+from kestrel_sovereign.identity.rotation_ceremony import run_rotation_ceremony
+from kestrel_sovereign.inception_service import (
+    public_key_to_ethereum_address,
+)
+from kestrel_sovereign.security.crypto_suite import (
+    Secp256k1Suite, SLHDSASHA2128sSuite,
+)
+from kestrel_sovereign.security.key_storage import SecureKeyStorage
+
+
+SCRIPT = (
+    Path(__file__).resolve().parents[2]
+    / "scripts" / "quantum_destroy_legacy_key.py"
+)
+
+
+@pytest.fixture
+def kestrel_data_key(monkeypatch):
+    monkeypatch.setenv("KESTREL_DATA_KEY", "x" * 32)
+
+
+@pytest.fixture
+def post_ceremony_dir(tmp_path, kestrel_data_key, monkeypatch):
+    """Set up a complete post-ceremony agent dir with legacy + hybrid
+    + succession material on disk. Returns the dir + slug."""
+    storage = SecureKeyStorage(storage_dir=tmp_path)
+    secp = Secp256k1Suite()
+    legacy_kp = secp.generate_keypair()
+    address = public_key_to_ethereum_address(legacy_kp.public_key)
+    legacy_did = f"did:pkh:eip155:1:{address}"
+    key_id = f"kestrel_{address}"
+    storage.save_private_key(legacy_kp.private_key, key_id)
+
+    from cryptography.hazmat.primitives.serialization import (
+        Encoding, PublicFormat,
+    )
+    pub_hex = legacy_kp.public_key.public_bytes(
+        encoding=Encoding.X962, format=PublicFormat.UncompressedPoint,
+    ).hex()
+    (tmp_path / f"{key_id}.json").write_text(json.dumps({
+        "@context": "https://w3id.org/did/v1",
+        "id": legacy_did,
+        "publicKey": [{
+            "id": f"{legacy_did}#keys-1",
+            "type": "EcdsaSecp256k1VerificationKey2019",
+            "controller": legacy_did,
+            "publicKeyHex": pub_hex,
+        }],
+    }))
+
+    legacy_vms = build_verification_methods(legacy_did, [(secp, legacy_kp.public_key)])
+    archival_kp = SLHDSASHA2128sSuite().generate_keypair()
+    # Set effective_from to 30 days ago so the rollback window has passed
+    eff = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+    result = run_rotation_ceremony(
+        predecessor_did=legacy_did,
+        predecessor_keypair=legacy_kp,
+        predecessor_kid=legacy_vms[0]["id"].rsplit("#", 1)[-1],
+        predecessor_verification_methods=legacy_vms,
+        new_did_domain="agents.test.example",
+        new_did_slug="testbot",
+        reason="destroy legacy test",
+        effective_from=eff,
+        archival_keypair=archival_kp,
+    )
+    new_kp = result.new_identity.keypair
+    storage.save_private_key(new_kp.classical.private_key, "testbot_ed25519")
+    storage.save_secret_bytes(new_kp.pq.private_key, "testbot_mldsa65")
+    storage.save_secret_bytes(archival_kp.private_key, "testbot_archival_slhdsa")
+    storage.save_secret_bytes(archival_kp.public_key, "testbot_archival_slhdsa_pub")
+    successions_dir = tmp_path / "successions"
+    successions_dir.mkdir()
+    (successions_dir / "testbot.json").write_text(
+        json.dumps(result.succession_statement.to_dict(), indent=2)
+    )
+    return tmp_path, key_id, "testbot"
+
+
+def _run(args: list[str], env_extra: dict | None = None):
+    env = dict(os.environ)
+    if env_extra:
+        env.update(env_extra)
+    return subprocess.run(
+        [sys.executable, str(SCRIPT), *args],
+        env=env, capture_output=True, text=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Dry-run preserves everything
+# ---------------------------------------------------------------------------
+
+def test_dry_run_preserves_legacy_key(post_ceremony_dir):
+    storage_dir, key_id, _ = post_ceremony_dir
+    legacy_enc = storage_dir / f"{key_id}.key.enc"
+    assert legacy_enc.exists()
+    res = _run([
+        "--agent-data-dir", str(storage_dir),
+        "--skip-https-check",
+    ])
+    assert res.returncode == 0, res.stderr
+    assert "DRY RUN" in res.stdout
+    assert legacy_enc.exists(), "dry run must not delete the legacy key"
+
+
+# ---------------------------------------------------------------------------
+# Confirmation gates
+# ---------------------------------------------------------------------------
+
+def test_confirm_without_env_var_rejects(post_ceremony_dir):
+    storage_dir, key_id, _ = post_ceremony_dir
+    legacy_enc = storage_dir / f"{key_id}.key.enc"
+    res = _run([
+        "--agent-data-dir", str(storage_dir),
+        "--skip-https-check", "--confirm",
+    ])
+    assert res.returncode == 2
+    assert "KESTREL_DESTROY_CONFIRM" in res.stderr
+    assert legacy_enc.exists(), "must not delete without env var"
+
+
+def test_confirm_with_env_var_deletes_legacy_only(post_ceremony_dir):
+    storage_dir, key_id, slug = post_ceremony_dir
+    legacy_enc = storage_dir / f"{key_id}.key.enc"
+    legacy_did_doc = storage_dir / f"{key_id}.json"
+    succession = storage_dir / "successions" / f"{slug}.json"
+    classical = storage_dir / f"{slug}_ed25519.key.enc"
+    pq = storage_dir / f"{slug}_mldsa65.bytes.enc"
+
+    assert all(p.exists() for p in [legacy_enc, legacy_did_doc, succession, classical, pq])
+
+    res = _run(
+        ["--agent-data-dir", str(storage_dir), "--skip-https-check", "--confirm"],
+        env_extra={
+            "KESTREL_DESTROY_CONFIRM": "I-have-verified-the-rollback-window",
+        },
+    )
+    assert res.returncode == 0, res.stderr
+
+    # Legacy private key destroyed
+    assert not legacy_enc.exists(), "legacy .key.enc should be deleted"
+    # Everything else preserved
+    assert legacy_did_doc.exists(), "legacy DID document must be kept"
+    assert succession.exists(), "succession statement must be kept"
+    assert classical.exists(), "hybrid classical key must be kept"
+    assert pq.exists(), "hybrid PQ key must be kept"
+
+
+# ---------------------------------------------------------------------------
+# Rollback window
+# ---------------------------------------------------------------------------
+
+def test_rollback_window_blocks_fresh_succession(post_ceremony_dir):
+    """Set effective_from to NOW; rollback window of 7 days must reject."""
+    storage_dir, key_id, slug = post_ceremony_dir
+    succession_path = storage_dir / "successions" / f"{slug}.json"
+    statement = json.loads(succession_path.read_text())
+    statement["effective_from"] = datetime.now(timezone.utc).isoformat()
+    succession_path.write_text(json.dumps(statement))
+
+    legacy_enc = storage_dir / f"{key_id}.key.enc"
+    res = _run(
+        ["--agent-data-dir", str(storage_dir), "--skip-https-check", "--confirm"],
+        env_extra={
+            "KESTREL_DESTROY_CONFIRM": "I-have-verified-the-rollback-window",
+        },
+    )
+    assert res.returncode == 1
+    assert "rollback window" in res.stderr.lower()
+    assert legacy_enc.exists(), "must not delete inside rollback window"
+
+
+# ---------------------------------------------------------------------------
+# Hybrid keys must exist (don't strand the agent)
+# ---------------------------------------------------------------------------
+
+def test_missing_hybrid_keys_blocks_destruction(post_ceremony_dir):
+    storage_dir, key_id, slug = post_ceremony_dir
+    # Delete the hybrid PQ half — agent would be left with no usable
+    # signing key if we destroyed the legacy now
+    (storage_dir / f"{slug}_mldsa65.bytes.enc").unlink()
+
+    legacy_enc = storage_dir / f"{key_id}.key.enc"
+    res = _run(
+        ["--agent-data-dir", str(storage_dir), "--skip-https-check", "--confirm"],
+        env_extra={
+            "KESTREL_DESTROY_CONFIRM": "I-have-verified-the-rollback-window",
+        },
+    )
+    assert res.returncode == 1
+    assert "hybrid post-quantum key missing" in res.stderr.lower()
+    assert legacy_enc.exists()
+
+
+# ---------------------------------------------------------------------------
+# No succession statement
+# ---------------------------------------------------------------------------
+
+def test_unrelated_succession_blocks_destruction(post_ceremony_dir, tmp_path):
+    """Codex P2 catch: an unrelated succession statement (one whose
+    predecessor_did doesn't match the legacy DID document on disk)
+    must not satisfy the destruction gates. Otherwise an operator
+    with a stray successions/*.json could destroy the wrong agent's
+    key."""
+    storage_dir, key_id, slug = post_ceremony_dir
+    # Tamper: rewrite the succession statement's predecessor_did
+    # to point at an unrelated DID.
+    succession_path = storage_dir / "successions" / f"{slug}.json"
+    statement = json.loads(succession_path.read_text())
+    statement["predecessor_did"] = (
+        "did:pkh:eip155:1:0x0000000000000000000000000000000000000000"
+    )
+    succession_path.write_text(json.dumps(statement))
+
+    legacy_enc = storage_dir / f"{key_id}.key.enc"
+    res = _run(
+        ["--agent-data-dir", str(storage_dir), "--skip-https-check", "--confirm"],
+        env_extra={
+            "KESTREL_DESTROY_CONFIRM": "I-have-verified-the-rollback-window",
+        },
+    )
+    assert res.returncode == 1
+    assert "predecessor" in res.stderr.lower() or "predecessor" in res.stdout.lower()
+    assert legacy_enc.exists()
+
+
+def test_tampered_succession_signatures_blocks_destruction(post_ceremony_dir):
+    """Codex P1 catch: zero out a signature in the succession statement.
+    Crypto verify must catch it and refuse destruction."""
+    storage_dir, key_id, slug = post_ceremony_dir
+    succession_path = storage_dir / "successions" / f"{slug}.json"
+    statement = json.loads(succession_path.read_text())
+    # Tamper: replace the first predecessor signature with garbage
+    statement["predecessor_signatures"][0]["sig"] = "00" * 64
+    succession_path.write_text(json.dumps(statement))
+
+    legacy_enc = storage_dir / f"{key_id}.key.enc"
+    res = _run(
+        ["--agent-data-dir", str(storage_dir), "--skip-https-check", "--confirm"],
+        env_extra={
+            "KESTREL_DESTROY_CONFIRM": "I-have-verified-the-rollback-window",
+        },
+    )
+    assert res.returncode == 1
+    assert "verification" in res.stderr.lower() or "verification" in res.stdout.lower()
+    assert legacy_enc.exists()
+
+
+def test_hybrid_keys_from_wrong_agent_blocks_destruction(
+    post_ceremony_dir, tmp_path, kestrel_data_key,
+):
+    """Codex P2 catch: replace this agent's hybrid keys with another
+    agent's keys (same filenames). The probe-sign + probe-verify gate
+    must detect the mismatch and refuse destruction. Otherwise the
+    legacy key would be destroyed leaving the agent with private keys
+    that don't match the published successor identity."""
+    storage_dir, key_id, slug = post_ceremony_dir
+
+    # Mint a SECOND, unrelated agent and run its rotation
+    other_dir = tmp_path / "other"
+    other_dir.mkdir()
+    other_storage = SecureKeyStorage(storage_dir=other_dir)
+    secp = Secp256k1Suite()
+    other_legacy = secp.generate_keypair()
+    other_address = public_key_to_ethereum_address(other_legacy.public_key)
+    other_did = f"did:pkh:eip155:1:{other_address}"
+    other_storage.save_private_key(other_legacy.private_key, f"kestrel_{other_address}")
+    from kestrel_sovereign.identity.did_web import build_verification_methods
+    from cryptography.hazmat.primitives.serialization import (
+        Encoding, PublicFormat,
+    )
+    other_pub_hex = other_legacy.public_key.public_bytes(
+        encoding=Encoding.X962, format=PublicFormat.UncompressedPoint,
+    ).hex()
+    (other_dir / f"kestrel_{other_address}.json").write_text(json.dumps({
+        "@context": "https://w3id.org/did/v1",
+        "id": other_did,
+        "publicKey": [{
+            "id": f"{other_did}#keys-1",
+            "type": "EcdsaSecp256k1VerificationKey2019",
+            "controller": other_did,
+            "publicKeyHex": other_pub_hex,
+        }],
+    }))
+    other_legacy_vms = build_verification_methods(
+        other_did, [(secp, other_legacy.public_key)],
+    )
+    other_archival = SLHDSASHA2128sSuite().generate_keypair()
+    other_result = run_rotation_ceremony(
+        predecessor_did=other_did,
+        predecessor_keypair=other_legacy,
+        predecessor_kid=other_legacy_vms[0]["id"].rsplit("#", 1)[-1],
+        predecessor_verification_methods=other_legacy_vms,
+        new_did_domain="agents.test.example",
+        new_did_slug="testbot",  # SAME slug — files will overwrite
+        reason="other agent rotation",
+        archival_keypair=other_archival,
+    )
+
+    # Overwrite THIS agent's hybrid private keys with the OTHER agent's.
+    # Filenames match (same slug 'testbot'), but the private keys
+    # don't match this agent's published successor pubkeys.
+    other_classical_priv = other_result.new_identity.keypair.classical.private_key
+    other_pq_priv = other_result.new_identity.keypair.pq.private_key
+    SecureKeyStorage(storage_dir=storage_dir).save_private_key(
+        other_classical_priv, "testbot_ed25519"
+    )
+    SecureKeyStorage(storage_dir=storage_dir).save_secret_bytes(
+        other_pq_priv, "testbot_mldsa65"
+    )
+
+    legacy_enc = storage_dir / f"{key_id}.key.enc"
+    res = _run(
+        ["--agent-data-dir", str(storage_dir), "--skip-https-check", "--confirm"],
+        env_extra={
+            "KESTREL_DESTROY_CONFIRM": "I-have-verified-the-rollback-window",
+        },
+    )
+    assert res.returncode == 1
+    assert (
+        "probe failed" in res.stderr.lower()
+        or "do not belong" in res.stderr.lower()
+        or "probe failed" in res.stdout.lower()
+    )
+    assert legacy_enc.exists()
+
+
+def test_path_traversal_in_legacy_key_id_rejected(post_ceremony_dir):
+    """Codex P2 catch: --legacy-key-id with path separators must be
+    rejected before any deletion can target files outside agent_data."""
+    storage_dir, _, _ = post_ceremony_dir
+    res = _run([
+        "--agent-data-dir", str(storage_dir),
+        "--legacy-key-id", "../escape_attempt",
+        "--skip-https-check", "--confirm",
+    ], env_extra={
+        "KESTREL_DESTROY_CONFIRM": "I-have-verified-the-rollback-window",
+    })
+    assert res.returncode == 2
+    assert "path traversal" in res.stderr.lower() or "characters outside" in res.stderr.lower()
+
+
+def test_missing_succession_blocks_destruction(post_ceremony_dir):
+    storage_dir, key_id, slug = post_ceremony_dir
+    (storage_dir / "successions" / f"{slug}.json").unlink()
+
+    legacy_enc = storage_dir / f"{key_id}.key.enc"
+    res = _run(
+        ["--agent-data-dir", str(storage_dir), "--skip-https-check", "--confirm"],
+        env_extra={
+            "KESTREL_DESTROY_CONFIRM": "I-have-verified-the-rollback-window",
+        },
+    )
+    assert res.returncode == 1
+    assert "succession" in res.stderr.lower() or "succession" in res.stdout.lower()
+    assert legacy_enc.exists()
