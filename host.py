@@ -178,8 +178,10 @@ from endpoints.auth_oauth import (
     register_oauth,
     oauth,
 )
+from endpoints.ui import router as ui_router
 
 app.include_router(auth_oauth_router)
+app.include_router(ui_router)
 register_oauth(app)
 
 
@@ -212,7 +214,7 @@ async def auth_middleware(request: Request, call_next):
         public_paths.add("/api/auth/key")
     # OAuth endpoints must be reachable without existing auth
     auth_paths = {"/auth/login", "/auth/callback", "/auth/logout", "/auth/me", "/auth/token"}
-    static_prefixes = ("/static", "/js/", "/shared/", "/utils/", "/api/github/")
+    static_prefixes = ("/static", "/js/", "/shared/", "/utils/", "/api/github/", "/api/ui/")
 
     if request.url.path in public_paths or request.url.path in auth_paths:
         return await call_next(request)
