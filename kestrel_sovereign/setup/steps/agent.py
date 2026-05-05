@@ -8,8 +8,8 @@ We do not duplicate inception logic — we just collect the inputs
 Idempotence rules:
 
   - If an agent directory already contains ``kestrel_prime.db``, we do
-    not re-incept; we just make sure rookery.toml lists it.
-  - Port collisions with existing rookery rows trigger a fresh probe
+    not re-incept; we just make sure multi_agent.toml lists it.
+  - Port collisions with existing multi_agent rows trigger a fresh probe
     starting at :data:`DEFAULT_AGENT_START_PORT`.
 """
 
@@ -21,11 +21,11 @@ from pathlib import Path
 
 from dataclasses import dataclass
 
-from kestrel_sovereign.rookery.config import (
+from kestrel_sovereign.multi_agent.config import (
     DEFAULT_AGENT_START_PORT,
     LocalAgentConfig,
-    ROOKERY_CONFIG_FILENAME,
-    RookeryConfig,
+    MULTI_AGENT_CONFIG_FILENAME,
+    MultiAgentConfig,
 )
 from kestrel_sovereign.setup.context import Flow, SetupContext
 
@@ -52,22 +52,22 @@ def create_agent(
     autostart: bool = True,
     port: int | None = None,
 ) -> CreateAgentResult:
-    """Idempotent agent creation: incept if needed, then register in rookery.
+    """Idempotent agent creation: incept if needed, then register in multi_agent.
 
     Used by both the wizard's ``agent`` step and ``kestrel create``. If
     the agent's ``kestrel_prime.db`` already exists, inception is skipped
     and the existing agent is just (re-)registered with the requested
     port/autostart.
     """
-    rookery_path = project_dir / ROOKERY_CONFIG_FILENAME
-    rookery = RookeryConfig.load(rookery_path)
+    multi_agent_path = project_dir / MULTI_AGENT_CONFIG_FILENAME
+    multi_agent = MultiAgentConfig.load(multi_agent_path)
 
     if port is None:
-        existing_entry = rookery.agents.get(name)
+        existing_entry = multi_agent.agents.get(name)
         if existing_entry is not None:
             port = existing_entry.port
         else:
-            port = _next_free_port(rookery)
+            port = _next_free_port(multi_agent)
 
     agent_dir = agent_data_root / name
     db_path = agent_dir / "kestrel_prime.db"
@@ -79,12 +79,12 @@ def create_agent(
         creds = _run_inception(agent_dir, name)
         did = creds.agent_did
 
-    rookery.agents[name] = LocalAgentConfig(
+    multi_agent.agents[name] = LocalAgentConfig(
         data_dir=Path("agent_data") / name,
         port=port,
         autostart=autostart,
     )
-    rookery.save(rookery_path)
+    multi_agent.save(multi_agent_path)
 
     return CreateAgentResult(
         name=name,
@@ -96,13 +96,13 @@ def create_agent(
     )
 
 
-def _next_free_port(rookery: RookeryConfig) -> int:
-    used = {rookery.host.port}
-    for cfg in rookery.get_local_agents().values():
+def _next_free_port(multi_agent: MultiAgentConfig) -> int:
+    used = {multi_agent.host.port}
+    for cfg in multi_agent.get_local_agents().values():
         used.add(cfg.port)
     port = max(
         DEFAULT_AGENT_START_PORT,
-        max((cfg.port for cfg in rookery.get_local_agents().values()), default=DEFAULT_AGENT_START_PORT - 1) + 1,
+        max((cfg.port for cfg in multi_agent.get_local_agents().values()), default=DEFAULT_AGENT_START_PORT - 1) + 1,
     )
     while port in used:
         port += 1
@@ -110,20 +110,20 @@ def _next_free_port(rookery: RookeryConfig) -> int:
 
 
 def run(ctx: SetupContext) -> None:
-    """Make sure at least one agent exists in the rookery."""
-    rookery_path = ctx.project_dir / ROOKERY_CONFIG_FILENAME
-    rookery = RookeryConfig.load(rookery_path)
+    """Make sure at least one agent exists in the multi_agent."""
+    multi_agent_path = ctx.project_dir / MULTI_AGENT_CONFIG_FILENAME
+    multi_agent = MultiAgentConfig.load(multi_agent_path)
 
-    existing = rookery.get_local_agents()
+    existing = multi_agent.get_local_agents()
     if existing and ctx.flow in (Flow.QUICKSTART, Flow.CHECK):
         # In quickstart, the presence of any agent is enough.
         if ctx.flow is Flow.CHECK and not existing:
-            ctx.block("No agents in rookery — run `kestrel setup agent`")
+            ctx.block("No agents in multi_agent — run `kestrel setup agent`")
         return
 
     if existing and ctx.flow is Flow.INTERACTIVE:
         wants_more = ctx.prompter.confirm(
-            f"Rookery already has {len(existing)} agent(s) "
+            f"MultiAgent already has {len(existing)} agent(s) "
             f"({', '.join(existing.keys())}). Add another?",
             default=False,
         )
@@ -132,7 +132,7 @@ def run(ctx: SetupContext) -> None:
 
     if ctx.flow is Flow.CHECK:
         if not existing:
-            ctx.block("No agents in rookery — run `kestrel setup agent`")
+            ctx.block("No agents in multi_agent — run `kestrel setup agent`")
         return
 
     name = _prompt_name(ctx, existing)
@@ -156,11 +156,11 @@ def run(ctx: SetupContext) -> None:
         return
 
     if result.already_existed:
-        ctx.record(f"Agent '{name}' already existed; rookery row refreshed")
+        ctx.record(f"Agent '{name}' already existed; multi_agent row refreshed")
     else:
         ctx.record(f"Created agent '{name}' with DID {result.did}")
     ctx.record(
-        f"Registered '{name}' in rookery.toml on port {result.port} "
+        f"Registered '{name}' in multi_agent.toml on port {result.port} "
         f"({'autostart' if result.autostart else 'manual'})"
     )
 
@@ -182,7 +182,7 @@ def _prompt_name(ctx: SetupContext, existing: dict) -> str:
         if not name:
             return ""
         if name in existing:
-            ctx.prompter.info(f"'{name}' is already in the rookery — pick another.")
+            ctx.prompter.info(f"'{name}' is already in the multi_agent — pick another.")
             continue
         if not name.replace("_", "").replace("-", "").isalnum():
             ctx.prompter.info("Names must be alphanumeric (with optional _ or -).")

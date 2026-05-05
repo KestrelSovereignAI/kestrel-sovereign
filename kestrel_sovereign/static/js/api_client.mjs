@@ -38,7 +38,7 @@ export const CAPABILITY_KEYS = Object.freeze({
     keys: true,           // object: { agent, user, platform }
     audit: true,
     permissions: true,
-    rookery: true,        // host-level: "Other agents" sidebar (/api/agents)
+    multi_agent: true,        // host-level: "Other agents" sidebar (/api/agents)
     spawn: true,
     featureStore: true,
     metrics: true,
@@ -643,7 +643,7 @@ export function createApiClient({
         getHostAgent() {
             return state.selectedHostAgent;
         },
-        isRookeryMode() {
+        isMultiAgentMode() {
             return state.selectedHostAgent !== null;
         },
         buildAgentUrl(path) {

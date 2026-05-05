@@ -193,7 +193,7 @@ kestrel-sovereign/
 │   ├── data/feature_registry.toml  # Runtime feature registry
 │   └── ...
 ├── server.py                  # FastAPI agent server
-├── host.py                    # Multi-agent rookery host
+├── host.py                    # Multi-agent multi_agent host
 ├── main.py                    # Direct interactive REPL
 ├── kestrel_sdk/               # Public SDK for feature authors
 ├── packages/                  # Extracted feature packages
@@ -504,7 +504,7 @@ Apache 2.0 — see [LICENSE](LICENSE) for details.
 |------|---------|
 | `kestrel_sovereign/cli.py` | Canonical `kestrel` CLI entry point |
 | `server.py` | FastAPI agent server |
-| `host.py` | Multi-agent rookery host (Cloud Run) |
+| `host.py` | Multi-agent multi_agent host (Cloud Run) |
 | `main.py` | Direct interactive REPL |
 | `llm_config.toml` | LLM provider configuration |
 | `KESTREL_FEATURES.md` | Canonical feature inventory |

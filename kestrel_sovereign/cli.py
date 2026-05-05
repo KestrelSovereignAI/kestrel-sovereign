@@ -13,8 +13,8 @@ Commands:
     kestrel stop <name>            # stop just one agent
     kestrel status                 # table: host + all agents with ports, PIDs, status
     kestrel logs <name>            # tail agent logs (or "host" for host logs)
-    kestrel list                   # list rookery agents, ports, data dirs
-    kestrel create <name>          # inception: generate DID, create agent folder, add to rookery.toml
+    kestrel list                   # list multi_agent agents, ports, data dirs
+    kestrel create <name>          # inception: generate DID, create agent folder, add to multi_agent.toml
     kestrel shell <name>           # interactive CLI chat (what main.py does today)
     kestrel health                 # run health check
     kestrel config <agent_dir>     # show/edit agent config
@@ -30,13 +30,13 @@ from pathlib import Path
 from typing import Optional
 
 from kestrel_sovereign import __version__
-from kestrel_sovereign.rookery.config import (
-    RookeryConfig,
+from kestrel_sovereign.multi_agent.config import (
+    MultiAgentConfig,
     LocalAgentConfig,
-    ROOKERY_CONFIG_FILENAME,
+    MULTI_AGENT_CONFIG_FILENAME,
     DEFAULT_AGENT_START_PORT,
 )
-from kestrel_sovereign.rookery.process_manager import ProcessManager
+from kestrel_sovereign.multi_agent.process_manager import ProcessManager
 
 
 # Tokens that terminate an interactive `kestrel shell` session. Matched
@@ -108,21 +108,21 @@ def cmd_start(args) -> int:
     if first_run_rc is not None:
         return first_run_rc
 
-    rookery = RookeryConfig.load(project_dir / ROOKERY_CONFIG_FILENAME)
+    multi_agent = MultiAgentConfig.load(project_dir / MULTI_AGENT_CONFIG_FILENAME)
     pm = ProcessManager(project_dir)
 
     if args.name:
         # Start a single agent by name
-        local_agents = rookery.get_local_agents()
+        local_agents = multi_agent.get_local_agents()
         if args.name not in local_agents:
-            print(f"Agent '{args.name}' not found in rookery config")
+            print(f"Agent '{args.name}' not found in multi_agent config")
             print(f"Available agents: {', '.join(local_agents.keys()) or '(none)'}")
             return 1
 
         agent_cfg = local_agents[args.name]
         print(f"   Starting {args.name} on :{agent_cfg.port}...", end="", flush=True)
         try:
-            pm.start_agent(args.name, agent_cfg, rookery.host.bind, standalone=True)
+            pm.start_agent(args.name, agent_cfg, multi_agent.host.bind, standalone=True)
         except RuntimeError as e:
             print(f"          \u274c")
             print(f"   {e}")
@@ -136,20 +136,20 @@ def cmd_start(args) -> int:
         return 0
 
     if getattr(args, "subprocess", False):
-        return _start_subprocess_mode(project_dir, rookery, pm)
-    return _start_inprocess_mode(project_dir, rookery, pm)
+        return _start_subprocess_mode(project_dir, multi_agent, pm)
+    return _start_inprocess_mode(project_dir, multi_agent, pm)
 
 
-def _start_inprocess_mode(project_dir: Path, rookery, pm: ProcessManager) -> int:
+def _start_inprocess_mode(project_dir: Path, multi_agent, pm: ProcessManager) -> int:
     """Start all agents in a single server process (default mode)."""
-    autostart = rookery.get_autostart_agents()
+    autostart = multi_agent.get_autostart_agents()
     manual = {
-        name: cfg for name, cfg in rookery.get_local_agents().items()
+        name: cfg for name, cfg in multi_agent.get_local_agents().items()
         if not cfg.autostart
     }
 
-    print("\U0001F985 Kestrel Rookery starting (in-process)...")
-    print(f"   URL:      http://localhost:{rookery.host.port}")
+    print("\U0001F985 Kestrel MultiAgent starting (in-process)...")
+    print(f"   URL:      http://localhost:{multi_agent.host.port}")
 
     if autostart or manual:
         print("   Agents:")
@@ -170,45 +170,45 @@ def _start_inprocess_mode(project_dir: Path, rookery, pm: ProcessManager) -> int
     if existing_host:
         pm.clear_pid(host_pid_file)
 
-    if pm.is_port_in_use(rookery.host.port):
-        orphans = pm.find_pids_on_port(rookery.host.port)
-        print(f"   Port {rookery.host.port} already in use"
+    if pm.is_port_in_use(multi_agent.host.port):
+        orphans = pm.find_pids_on_port(multi_agent.host.port)
+        print(f"   Port {multi_agent.host.port} already in use"
               + (f" by PID(s) {orphans}" if orphans else ""))
         print(f"   Run: kestrel stop   (add --force if it doesn't die)")
         return 1
 
     env = pm._load_env()
-    env["PORT"] = str(rookery.host.port)
+    env["PORT"] = str(multi_agent.host.port)
     env["KESTREL_MULTI_AGENT"] = "true"
     env["KESTREL_SERVE_UI"] = "true"
 
     log_file = _host_log_file(project_dir)
     cmd = [sys.executable, "-m", "uvicorn", "server:app",
-           "--host", rookery.host.bind, "--port", str(rookery.host.port)]
+           "--host", multi_agent.host.bind, "--port", str(multi_agent.host.port)]
 
-    print(f"   Starting server on :{rookery.host.port}...", end="", flush=True)
+    print(f"   Starting server on :{multi_agent.host.port}...", end="", flush=True)
     pm._spawn(cmd, env, log_file, host_pid_file)
 
-    if pm.wait_for_health(rookery.host.port, timeout=30):
+    if pm.wait_for_health(multi_agent.host.port, timeout=30):
         print("          \u2705")
     else:
         print("          \u274c")
         print(f"   Check log: {log_file}")
         return 1
 
-    print(f"\n\U0001F985 Rookery ready: http://localhost:{rookery.host.port}")
+    print(f"\n\U0001F985 MultiAgent ready: http://localhost:{multi_agent.host.port}")
     return 0
 
 
-def _start_subprocess_mode(project_dir: Path, rookery, pm: ProcessManager) -> int:
+def _start_subprocess_mode(project_dir: Path, multi_agent, pm: ProcessManager) -> int:
     """Start host + separate agent processes (legacy --subprocess mode)."""
-    # Start the full rookery (host + autostart agents)
-    print("\U0001F985 Kestrel Rookery starting (subprocess)...")
-    print(f"   Host:     http://localhost:{rookery.host.port}")
+    # Start the full multi_agent (host + autostart agents)
+    print("\U0001F985 Kestrel MultiAgent starting (subprocess)...")
+    print(f"   Host:     http://localhost:{multi_agent.host.port}")
 
-    autostart = rookery.get_autostart_agents()
+    autostart = multi_agent.get_autostart_agents()
     manual = {
-        name: cfg for name, cfg in rookery.get_local_agents().items()
+        name: cfg for name, cfg in multi_agent.get_local_agents().items()
         if not cfg.autostart
     }
 
@@ -231,25 +231,25 @@ def _start_subprocess_mode(project_dir: Path, rookery, pm: ProcessManager) -> in
         if existing_host:
             pm.clear_pid(host_pid_file)
 
-        if pm.is_port_in_use(rookery.host.port):
-            orphans = pm.find_pids_on_port(rookery.host.port)
-            print(f"   Host port {rookery.host.port} already in use"
+        if pm.is_port_in_use(multi_agent.host.port):
+            orphans = pm.find_pids_on_port(multi_agent.host.port)
+            print(f"   Host port {multi_agent.host.port} already in use"
                   + (f" by PID(s) {orphans}" if orphans else ""))
             print(f"   Run: kestrel stop   (add --force if it doesn't die)")
             return 1
 
         env = pm._load_env()
-        env["PORT"] = str(rookery.host.port)
+        env["PORT"] = str(multi_agent.host.port)
         # Host is NOT an agent — no DB path, no KESTREL_SERVE_UI
 
         log_file = _host_log_file(project_dir)
         cmd = [sys.executable, "-m", "uvicorn", "host:app",
-               "--host", rookery.host.bind, "--port", str(rookery.host.port)]
+               "--host", multi_agent.host.bind, "--port", str(multi_agent.host.port)]
 
-        print(f"   Starting host on :{rookery.host.port}...", end="", flush=True)
+        print(f"   Starting host on :{multi_agent.host.port}...", end="", flush=True)
         pm._spawn(cmd, env, log_file, host_pid_file)
 
-        if pm.wait_for_health(rookery.host.port, timeout=30):
+        if pm.wait_for_health(multi_agent.host.port, timeout=30):
             print("          \u2705")
         else:
             print("          \u274c")
@@ -260,7 +260,7 @@ def _start_subprocess_mode(project_dir: Path, rookery, pm: ProcessManager) -> in
     for name, cfg in autostart.items():
         print(f"   Starting {name} on :{cfg.port}...", end="", flush=True)
         try:
-            pm.start_agent(name, cfg, rookery.host.bind)
+            pm.start_agent(name, cfg, multi_agent.host.bind)
         except RuntimeError as e:
             print(f"          \u274c")
             print(f"   {e}")
@@ -271,7 +271,7 @@ def _start_subprocess_mode(project_dir: Path, rookery, pm: ProcessManager) -> in
         else:
             print("          \u274c")
 
-    print(f"\n\U0001F985 Rookery ready: http://localhost:{rookery.host.port}")
+    print(f"\n\U0001F985 MultiAgent ready: http://localhost:{multi_agent.host.port}")
     return 0
 
 
@@ -297,15 +297,15 @@ def _reap_orphans_on_port(port: int, label: str, force: bool) -> bool:
 def cmd_stop(args) -> int:
     """Stop host and/or agents."""
     project_dir = _get_project_dir()
-    rookery = RookeryConfig.load(project_dir / ROOKERY_CONFIG_FILENAME)
+    multi_agent = MultiAgentConfig.load(project_dir / MULTI_AGENT_CONFIG_FILENAME)
     pm = ProcessManager(project_dir)
     force = getattr(args, "force", False)
 
     if args.name:
         # Stop a single agent
-        local_agents = rookery.get_local_agents()
+        local_agents = multi_agent.get_local_agents()
         if args.name not in local_agents:
-            print(f"Agent '{args.name}' not found in rookery config")
+            print(f"Agent '{args.name}' not found in multi_agent config")
             return 1
 
         agent_cfg = local_agents[args.name]
@@ -322,9 +322,9 @@ def cmd_stop(args) -> int:
         return 0
 
     # Stop everything: agents first, then host
-    print("\U0001F6D1 Stopping Kestrel Rookery...")
+    print("\U0001F6D1 Stopping Kestrel MultiAgent...")
 
-    for name, cfg in rookery.get_local_agents().items():
+    for name, cfg in multi_agent.get_local_agents().items():
         pm.register_agent(name, cfg)
         ap = pm._agents.get(name)
         if ap and ap.pid:
@@ -352,9 +352,9 @@ def cmd_stop(args) -> int:
     else:
         if host_pid:
             pm.clear_pid(host_pid_file)
-        _reap_orphans_on_port(rookery.host.port, "host", force)
+        _reap_orphans_on_port(multi_agent.host.port, "host", force)
 
-    print("\u2705 Rookery stopped")
+    print("\u2705 MultiAgent stopped")
     return 0
 
 
@@ -370,7 +370,7 @@ def cmd_restart(args) -> int:
 def cmd_status(args) -> int:
     """Show status of host and all agents."""
     project_dir = _get_project_dir()
-    rookery = RookeryConfig.load(project_dir / ROOKERY_CONFIG_FILENAME)
+    multi_agent = MultiAgentConfig.load(project_dir / MULTI_AGENT_CONFIG_FILENAME)
 
     # Host/server status
     host_pid = ProcessManager.read_pid(_host_pid_file(project_dir))
@@ -379,7 +379,7 @@ def cmd_status(args) -> int:
     host_uptime = _format_uptime(host_pid) if host_running else "-"
 
     # Detect mode: check if any agent has its own PID file (subprocess mode)
-    local_agents = rookery.get_local_agents()
+    local_agents = multi_agent.get_local_agents()
     any_agent_pid = any(
         ProcessManager.read_pid(
             ProcessManager.agent_pid_file((project_dir / cfg.data_dir).resolve())
@@ -391,7 +391,7 @@ def cmd_status(args) -> int:
         # Subprocess mode: show per-agent PID status
         print(f"  {'NAME':12} {'PORT':>6}   {'STATUS':10} {'PID':>7}   {'UPTIME':>8}")
         host_status = "online" if host_running else "offline"
-        print(f"  {'host':12} {rookery.host.port:>6}   {host_status:10} {host_pid_str:>7}   {host_uptime:>8}")
+        print(f"  {'host':12} {multi_agent.host.port:>6}   {host_status:10} {host_pid_str:>7}   {host_uptime:>8}")
 
         for name, cfg in local_agents.items():
             resolved_dir = (project_dir / cfg.data_dir).resolve()
@@ -408,7 +408,7 @@ def cmd_status(args) -> int:
         print(f"  {'server':12} {server_status:10} {host_pid_str:>7}   {host_uptime:>8}")
 
         if host_running:
-            agents = _query_agents_api(rookery.host.port)
+            agents = _query_agents_api(multi_agent.host.port)
             if agents is not None:
                 for agent_info in agents:
                     name = agent_info.get("name", "?")
@@ -445,10 +445,10 @@ def cmd_logs(args) -> int:
     if args.name == "host" or args.name == "server":
         log_file = _host_log_file(project_dir)
     else:
-        rookery = RookeryConfig.load(project_dir / ROOKERY_CONFIG_FILENAME)
-        local_agents = rookery.get_local_agents()
+        multi_agent = MultiAgentConfig.load(project_dir / MULTI_AGENT_CONFIG_FILENAME)
+        local_agents = multi_agent.get_local_agents()
         if args.name not in local_agents:
-            print(f"Agent '{args.name}' not found in rookery config")
+            print(f"Agent '{args.name}' not found in multi_agent config")
             print("Use 'host' for host/server logs")
             return 1
 
@@ -478,12 +478,12 @@ def cmd_logs(args) -> int:
 
 
 def cmd_list(args) -> int:
-    """List all agents in rookery."""
+    """List all agents in multi_agent."""
     project_dir = _get_project_dir()
-    rookery = RookeryConfig.load(project_dir / ROOKERY_CONFIG_FILENAME)
+    multi_agent = MultiAgentConfig.load(project_dir / MULTI_AGENT_CONFIG_FILENAME)
 
-    local_agents = rookery.get_local_agents()
-    remote_agents = rookery.get_remote_agents()
+    local_agents = multi_agent.get_local_agents()
+    remote_agents = multi_agent.get_remote_agents()
 
     if not local_agents and not remote_agents:
         print("No agents configured")
@@ -533,7 +533,7 @@ def cmd_create(args) -> int:
     print(f"   DID: {result.did or '(unknown)'}")
     print(f"   Data dir: agent_data/{name}/")
     print(f"   Port: {result.port} (next available)")
-    print(f"   Added to {ROOKERY_CONFIG_FILENAME}")
+    print(f"   Added to {MULTI_AGENT_CONFIG_FILENAME}")
     print(f"\u2705 Agent created. Start with: kestrel start {name}")
     return 0
 
@@ -559,7 +559,7 @@ def _get_agent_did(agent_dir: Path) -> Optional[str]:
 def _detect_running_agent_server(
     agent_name: str,
     agent_cfg: LocalAgentConfig,
-    rookery: RookeryConfig,
+    multi_agent: MultiAgentConfig,
 ) -> Optional[tuple[str, str]]:
     """Probe for a running server that hosts this agent.
 
@@ -574,7 +574,7 @@ def _detect_running_agent_server(
     1. **Standalone / subprocess mode** — agent runs on its own port
        (``agent_cfg.port``). Base URL is that port's root; no path prefix.
     2. **In-process multi-agent mode** — all agents share the host port
-       (``rookery.host.port``) under ``/api/agents/{name}/``. Base URL is
+       (``multi_agent.host.port``) under ``/api/agents/{name}/``. Base URL is
        host:port + that prefix.
 
     Health probe uses ``GET /health`` (public, no auth). Key fetch uses
@@ -586,7 +586,7 @@ def _detect_running_agent_server(
     candidates = [
         (f"http://localhost:{agent_cfg.port}", ""),
         (
-            f"http://localhost:{rookery.host.port}",
+            f"http://localhost:{multi_agent.host.port}",
             f"/api/agents/{agent_name}",
         ),
     ]
@@ -678,11 +678,11 @@ def cmd_shell(args) -> int:
     for this agent; falls back to an in-process agent instance if not.
     """
     project_dir = _get_project_dir()
-    rookery = RookeryConfig.load(project_dir / ROOKERY_CONFIG_FILENAME)
-    local_agents = rookery.get_local_agents()
+    multi_agent = MultiAgentConfig.load(project_dir / MULTI_AGENT_CONFIG_FILENAME)
+    local_agents = multi_agent.get_local_agents()
 
     if args.name not in local_agents:
-        print(f"Agent '{args.name}' not found in rookery config")
+        print(f"Agent '{args.name}' not found in multi_agent config")
         print(f"Available agents: {', '.join(local_agents.keys()) or '(none)'}")
         return 1
 
@@ -699,7 +699,7 @@ def cmd_shell(args) -> int:
     # HTTP routing when the user passed --app so extensions still work.
     use_extension = bool(getattr(args, "app", None))
     if not use_extension:
-        server = _detect_running_agent_server(args.name, agent_cfg, rookery)
+        server = _detect_running_agent_server(args.name, agent_cfg, multi_agent)
         if server is not None:
             base_url, api_key = server
             return _run_http_shell(args.name, base_url, api_key)
@@ -830,22 +830,22 @@ def cmd_constitution_reanchor(args) -> int:
     import asyncio
 
     from kestrel_sovereign.config import CONSTITUTION_PATH
-    from kestrel_sovereign.rookery.config import (
-        ROOKERY_CONFIG_FILENAME, RookeryConfig,
+    from kestrel_sovereign.multi_agent.config import (
+        MULTI_AGENT_CONFIG_FILENAME, MultiAgentConfig,
     )
     from kestrel_sovereign.setup.constitution_reanchor import (
         reanchor_constitution,
     )
 
     project_dir = _get_project_dir()
-    rookery = RookeryConfig.load(
-        project_dir / ROOKERY_CONFIG_FILENAME, auto_discover_fallback=False,
+    multi_agent = MultiAgentConfig.load(
+        project_dir / MULTI_AGENT_CONFIG_FILENAME, auto_discover_fallback=False,
     )
-    agents = rookery.get_local_agents()
+    agents = multi_agent.get_local_agents()
 
     if args.agent_name not in agents:
         print(
-            f"error: '{args.agent_name}' not in rookery. "
+            f"error: '{args.agent_name}' not in multi_agent. "
             f"Available: {', '.join(agents.keys()) or '(none)'}",
             file=sys.stderr,
         )
@@ -855,7 +855,7 @@ def cmd_constitution_reanchor(args) -> int:
     canonical = Path(args.constitution_path or CONSTITUTION_PATH)
 
     # Pre-flight check: agent must not be running. SQLite WAL locking
-    # would corrupt mid-write. We check the rookery's PID file rather
+    # would corrupt mid-write. We check the multi_agent's PID file rather
     # than probing the network — same source-of-truth as `kestrel stop`.
     if _agent_appears_running(project_dir, args.agent_name, agents[args.agent_name]):
         print(
@@ -974,7 +974,7 @@ def cmd_migrate_llm_config(args) -> int:
 def _agent_appears_running(project_dir, agent_name, agent_cfg) -> bool:
     """Best-effort check that the agent process isn't holding the DB."""
     try:
-        from kestrel_sovereign.rookery.process_manager import ProcessManager
+        from kestrel_sovereign.multi_agent.process_manager import ProcessManager
 
         resolved_dir = (project_dir / agent_cfg.data_dir).resolve()
         pid_file = ProcessManager.agent_pid_file(resolved_dir)
@@ -1024,11 +1024,11 @@ def _maybe_first_run_setup(project_dir: Path) -> Optional[int]:
     Fires only when **all** of these are true:
 
       1. We are NOT inside a git worktree (worktrees never carry the
-         user's gitignored state — ``.env``, ``rookery.toml`` — and the
+         user's gitignored state — ``.env``, ``multi_agent.toml`` — and the
          hook would always misfire there). Detected by ``.git`` being a
          FILE (gitdir pointer) rather than a directory.
       2. ``.env`` is absent, AND
-      3. There are no agents registered in the rookery.
+      3. There are no agents registered in the multi_agent.
 
     A user who has already inceptioned an agent (``kestrel create``) has
     done deliberate setup; we must not block ``kestrel start`` for them
@@ -1039,7 +1039,7 @@ def _maybe_first_run_setup(project_dir: Path) -> Optional[int]:
     Returns:
         ``None`` to proceed with start as normal.
         ``0`` if the user just finished setup successfully — caller should
-            re-read rookery and continue starting.
+            re-read multi_agent and continue starting.
         Non-zero if the user declined / setup failed — caller exits.
 
     Honors ``KESTREL_SKIP_FIRST_RUN=1`` to bypass entirely.
@@ -1047,7 +1047,7 @@ def _maybe_first_run_setup(project_dir: Path) -> Optional[int]:
     if os.environ.get("KESTREL_SKIP_FIRST_RUN", "").lower() in ("1", "true", "yes"):
         return None
 
-    # Worktree detection: the user's deliberate state (.env, rookery.toml)
+    # Worktree detection: the user's deliberate state (.env, multi_agent.toml)
     # lives in the main checkout, not here. A worktree's .git is a file
     # containing a `gitdir:` pointer; a main checkout's .git is a directory.
     # Without this guard, running any `kestrel` command from inside a
@@ -1062,16 +1062,16 @@ def _maybe_first_run_setup(project_dir: Path) -> Optional[int]:
         return None
 
     # Only treat a missing .env as "fresh checkout" if no agents exist.
-    rookery_path = project_dir / ROOKERY_CONFIG_FILENAME
-    if rookery_path.exists():
+    multi_agent_path = project_dir / MULTI_AGENT_CONFIG_FILENAME
+    if multi_agent_path.exists():
         try:
-            existing_rookery = RookeryConfig.load(
-                rookery_path, auto_discover_fallback=False
+            existing_multi_agent = MultiAgentConfig.load(
+                multi_agent_path, auto_discover_fallback=False
             )
-            if existing_rookery.get_local_agents():
+            if existing_multi_agent.get_local_agents():
                 return None
         except Exception:
-            # If rookery parsing fails, fall through to the prompt path.
+            # If multi_agent parsing fails, fall through to the prompt path.
             pass
 
     from kestrel_sovereign.setup.prompts import is_tty
@@ -1651,7 +1651,7 @@ def build_parser() -> argparse.ArgumentParser:
     logs_p.add_argument("-f", "--follow", action="store_true")
 
     # kestrel list
-    subparsers.add_parser("list", help="List all agents in rookery")
+    subparsers.add_parser("list", help="List all agents in multi_agent")
 
     # kestrel create <name>
     create_p = subparsers.add_parser("create", help="Create a new agent")
@@ -1724,7 +1724,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     reanchor_p.add_argument(
         "--agent-name", required=True,
-        help="Name of the agent (must be in rookery.toml)",
+        help="Name of the agent (must be in multi_agent.toml)",
     )
     reanchor_p.add_argument(
         "--force", action="store_true",

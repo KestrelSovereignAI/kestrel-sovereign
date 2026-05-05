@@ -1,12 +1,12 @@
 #!/bin/bash
 set -e
 
-# Build and push Kestrel Rookery (multi-agent host) image to GCR
+# Build and push Kestrel MultiAgent (multi-agent host) image to GCR
 PROJECT_ID="${GCP_PROJECT_ID:?Set GCP_PROJECT_ID env var}"
-IMAGE_NAME="kestrel-rookery"
+IMAGE_NAME="kestrel-multi-agent"
 TAG="${1:-latest}"
 
-echo "Building Kestrel Rookery image (multi-agent host)..."
+echo "Building Kestrel MultiAgent image (multi-agent host)..."
 echo "  Project: $PROJECT_ID"
 echo "  Tag: $TAG"
 echo ""
@@ -15,7 +15,7 @@ echo ""
 cd "$(dirname "$0")/../.."
 
 docker build \
-    -f docker/Dockerfile.rookery \
+    -f docker/Dockerfile.multi_agent \
     -t "gcr.io/${PROJECT_ID}/${IMAGE_NAME}:${TAG}" \
     -t "gcr.io/${PROJECT_ID}/${IMAGE_NAME}:latest" \
     .

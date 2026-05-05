@@ -1,4 +1,4 @@
-# Kestrel Rookery Configuration — Cloud Run
+# Kestrel MultiAgent Configuration — Cloud Run
 #
 # Multi-agent configuration for the Falconer demo and staging.
 # Agents auto-discover their data directories under /app/agent_data/.

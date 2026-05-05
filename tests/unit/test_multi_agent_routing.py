@@ -6,7 +6,7 @@ Verifies that:
 - Path rewriting strips the /api/agents/{name}/ prefix
 - Unknown agents return 404
 - Single-agent mode is unaffected
-- /api/agents returns rookery mode with all agents
+- /api/agents returns multi_agent mode with all agents
 """
 
 import pytest
@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from kestrel_sovereign.rookery.agent_manager import AgentManager
+from kestrel_sovereign.multi_agent.agent_manager import AgentManager
 
 
 def _make_mock_agent(agent_id: str = "did:pkh:eip155:1:0xABC", name: str = "TestAgent"):
@@ -106,7 +106,7 @@ def _create_multi_agent_app(agents: dict[str, MagicMock]) -> FastAPI:
                     "name": name,
                     "status": "online",
                 })
-            return {"agents": agents_list, "mode": "rookery"}
+            return {"agents": agents_list, "mode": "multi_agent"}
         return {"agents": [], "mode": "standalone"}
 
     return app
@@ -153,8 +153,8 @@ class TestAgentRoutingMiddleware:
         assert resp.status_code == 200
         assert resp.json()["agent_id"] == "did:claw"
 
-    def test_api_agents_list_returns_rookery_mode(self):
-        """/api/agents should return all agents with mode: rookery."""
+    def test_api_agents_list_returns_multi_agent_mode(self):
+        """/api/agents should return all agents with mode: multi_agent."""
         claw = _make_mock_agent("did:claw", "Claw")
         emma = _make_mock_agent("did:emma", "Emma")
         app = _create_multi_agent_app({"Claw": claw, "Emma": emma})
@@ -163,7 +163,7 @@ class TestAgentRoutingMiddleware:
         resp = client.get("/api/agents")
         assert resp.status_code == 200
         data = resp.json()
-        assert data["mode"] == "rookery"
+        assert data["mode"] == "multi_agent"
         assert len(data["agents"]) == 2
         names = {a["name"] for a in data["agents"]}
         assert names == {"Claw", "Emma"}

@@ -200,7 +200,7 @@ class TestFeatureProfiles:
 
     def test_allowed_features_filters_to_allowlist(self, mock_agent):
         """Test that allowed_features restricts which features load."""
-        from kestrel_sovereign.rookery.config import MANDATORY_FEATURES
+        from kestrel_sovereign.multi_agent.config import MANDATORY_FEATURES
 
         # Load all features
         all_features = discover_features(mock_agent)
@@ -218,7 +218,7 @@ class TestFeatureProfiles:
 
     def test_mandatory_features_always_load(self, mock_agent):
         """Test that mandatory features load even when not in allowlist."""
-        from kestrel_sovereign.rookery.config import MANDATORY_FEATURES
+        from kestrel_sovereign.multi_agent.config import MANDATORY_FEATURES
 
         # Allow only non-mandatory features
         allowed = {"BootstrapFeature"}
@@ -245,7 +245,7 @@ class TestFeatureProfiles:
 
     def test_empty_allowed_features_loads_only_mandatory(self, mock_agent):
         """Test that empty set loads only mandatory features."""
-        from kestrel_sovereign.rookery.config import MANDATORY_FEATURES
+        from kestrel_sovereign.multi_agent.config import MANDATORY_FEATURES
 
         filtered = discover_features(mock_agent, allowed_features=set())
         filtered_names = {f.__class__.__name__ for f in filtered}
@@ -392,7 +392,7 @@ class TestEntryPointDiscovery:
 
     def test_entrypoint_features_respect_allowed_features(self):
         """Test that allowed_features filtering applies to entry_point features."""
-        from kestrel_sovereign.rookery.config import MANDATORY_FEATURES
+        from kestrel_sovereign.multi_agent.config import MANDATORY_FEATURES
 
         class AllowedExternal(Feature):
             @property

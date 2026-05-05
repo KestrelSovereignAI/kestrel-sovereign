@@ -8,11 +8,11 @@ import toml
 from cryptography.fernet import Fernet
 
 from kestrel_sovereign.doctor import diagnose, format_report
-from kestrel_sovereign.rookery.config import (
+from kestrel_sovereign.multi_agent.config import (
     HostConfig,
     LocalAgentConfig,
-    ROOKERY_CONFIG_FILENAME,
-    RookeryConfig,
+    MULTI_AGENT_CONFIG_FILENAME,
+    MultiAgentConfig,
 )
 from kestrel_sovereign.setup.env_file import write_env
 from kestrel_sovereign.setup.toml_file import write_toml
@@ -46,7 +46,7 @@ def _seed_ready(tmp_path: Path) -> None:
             }
         },
     )
-    rookery = RookeryConfig(
+    multi_agent = MultiAgentConfig(
         host=HostConfig(),
         agents={
             "Test": LocalAgentConfig(
@@ -54,7 +54,7 @@ def _seed_ready(tmp_path: Path) -> None:
             )
         },
     )
-    rookery.save(tmp_path / ROOKERY_CONFIG_FILENAME)
+    multi_agent.save(tmp_path / MULTI_AGENT_CONFIG_FILENAME)
     db_dir = tmp_path / "agent_data" / "test"
     db_dir.mkdir(parents=True)
     (db_dir / "kestrel_prime.db").write_bytes(b"")
@@ -99,7 +99,7 @@ def test_doctor_blocks_on_missing_api_key_env(tmp_path):
 
 def test_doctor_blocks_when_no_agents(tmp_path):
     _seed_ready(tmp_path)
-    (tmp_path / "rookery.toml").unlink()
+    (tmp_path / "multi_agent.toml").unlink()
     report = diagnose(tmp_path)
     assert not report.ready
     assert any("agent" in m.lower() for m in report.fail)
@@ -166,13 +166,13 @@ def _seed_with_anchored_constitution(
     Always writes to ``tmp_path / "agent_data" / "test"`` to match the
     lowercase data_dir produced by ``_seed_ready``. On case-sensitive
     filesystems (Linux) ``"test"`` and ``"Test"`` are different
-    directories, and the rookery's ``data_dir=Path("agent_data/test")``
+    directories, and the multi_agent's ``data_dir=Path("agent_data/test")``
     is what doctor reads — anchoring elsewhere would silently
     write into the wrong location.
     """
     _seed_ready(tmp_path)
 
-    # Match the path _seed_ready uses (rookery says data_dir is
+    # Match the path _seed_ready uses (multi_agent says data_dir is
     # "agent_data/test" — lowercase, regardless of the agent's name).
     db_path = tmp_path / "agent_data" / "test" / "kestrel_prime.db"
     db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -317,14 +317,14 @@ def test_constitution_drift_warns_when_canonical_file_missing(
 
 def test_constitution_drift_silent_when_no_agents(tmp_path, monkeypatch):
     """No registered agents → no per-agent drift checks. The empty
-    rookery is already failing the check_rookery step elsewhere; we
+    multi_agent is already failing the check_multi_agent step elsewhere; we
     should not pile on additional drift noise."""
     text = b"# constitution\n"
     canonical = _patch_canonical(tmp_path, text)
     monkeypatch.setattr(
         "kestrel_sovereign.config.CONSTITUTION_PATH", str(canonical)
     )
-    # No rookery written → no agents.
+    # No multi_agent written → no agents.
     report = diagnose(tmp_path)
     # Match only the exact phrases the drift check itself emits, NOT
     # substrings — pytest's tmp_path names include the test function
@@ -348,7 +348,7 @@ def test_constitution_drift_silent_when_no_agents(tmp_path, monkeypatch):
 
 
 def test_constitution_drift_skips_when_db_missing(tmp_path, monkeypatch):
-    """Missing DB is already a fail in check_rookery; drift check should
+    """Missing DB is already a fail in check_multi_agent; drift check should
     not pile on a duplicate message."""
     text = b"# constitution\n"
     canonical = _patch_canonical(tmp_path, text)

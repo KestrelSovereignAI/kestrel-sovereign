@@ -24,7 +24,7 @@ demos/run.sh <feature-name>
 ```
 
 The runner spins an isolated agent on `agent_data/demo/` (port 8900 by
-default) — no risk to your live `localhost:8888` rookery. See
+default) — no risk to your live `localhost:8888` multi_agent. See
 [`../README.md`](../README.md) for the full safety story.
 
 ## What each file is for

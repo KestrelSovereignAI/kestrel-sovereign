@@ -33,7 +33,7 @@ class CreateAgentRequest(BaseModel):
 async def get_agents(request: Request):
     """Get list of agents (A2A agent cards).
 
-    In multi-agent mode, returns all agents with mode: "rookery".
+    In multi-agent mode, returns all agents with mode: "multi_agent".
     In single-agent mode, returns one agent with mode: "standalone".
 
     Each agent surfaces ``is_demo`` (from the inception service) and the
@@ -68,7 +68,7 @@ async def get_agents(request: Request):
                 })
         return {
             "agents": agents_list,
-            "mode": "rookery",
+            "mode": "multi_agent",
             "server_demo_mode": server_demo_mode,
         }
 

@@ -6,7 +6,7 @@
  * session's message count / utilization because ``startNewConversation``
  * set ``state.currentSessionId`` but never called ``updateContextStatus``.
  *
- * Runs against the live rookery on ``KESTREL_URL`` (default localhost:8888).
+ * Runs against the live multi_agent on ``KESTREL_URL`` (default localhost:8888).
  */
 const { test, expect } = require('@playwright/test');
 

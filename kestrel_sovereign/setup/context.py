@@ -53,8 +53,8 @@ class SetupContext:
         return self.project_dir / "kestrel.toml"
 
     @property
-    def rookery_toml_path(self) -> Path:
-        return self.project_dir / "rookery.toml"
+    def multi_agent_toml_path(self) -> Path:
+        return self.project_dir / "multi_agent.toml"
 
     def record(self, message: str) -> None:
         """Add a human-readable note to the end-of-run summary."""

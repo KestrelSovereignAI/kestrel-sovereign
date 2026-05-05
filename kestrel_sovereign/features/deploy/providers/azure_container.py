@@ -2,7 +2,7 @@
 Azure Container Apps Deployment Provider.
 
 Implements deployment to Azure Container Apps using the azure-mgmt-appcontainers SDK.
-Supports both single-agent and rookery (multi-agent) deployment modes.
+Supports both single-agent and multi_agent (multi-agent) deployment modes.
 """
 
 import asyncio

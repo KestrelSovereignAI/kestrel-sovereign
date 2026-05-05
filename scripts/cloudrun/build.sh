@@ -34,17 +34,17 @@ docker buildx build \
 echo ""
 echo "Done! Single-agent image: gcr.io/${PROJECT_ID}/${IMAGE_NAME}:${TAG}"
 
-# Rookery (multi-agent) image
+# MultiAgent (multi-agent) image
 echo ""
-echo "Building Kestrel Rookery (multi-agent) image..."
+echo "Building Kestrel MultiAgent (multi-agent) image..."
 docker buildx build \
     --platform linux/amd64,linux/arm64 \
-    -f docker/Dockerfile.rookery \
+    -f docker/Dockerfile.multi_agent \
     --secret id=github_token,env=GITHUB_TOKEN \
-    -t "gcr.io/${PROJECT_ID}/${IMAGE_NAME}-rookery:${TAG}" \
-    -t "gcr.io/${PROJECT_ID}/${IMAGE_NAME}-rookery:latest" \
+    -t "gcr.io/${PROJECT_ID}/${IMAGE_NAME}-multi_agent:${TAG}" \
+    -t "gcr.io/${PROJECT_ID}/${IMAGE_NAME}-multi_agent:latest" \
     --push \
     .
 
 echo ""
-echo "Done! Rookery image: gcr.io/${PROJECT_ID}/${IMAGE_NAME}-rookery:${TAG}"
+echo "Done! MultiAgent image: gcr.io/${PROJECT_ID}/${IMAGE_NAME}-multi_agent:${TAG}"

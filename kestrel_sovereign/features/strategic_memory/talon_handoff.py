@@ -201,14 +201,14 @@ def _select_best_candidate(issues: List[Dict[str, Any]]) -> Optional[Dict[str, A
 
 
 def _discover_host_url() -> Optional[str]:
-    """Discover the rookery host URL (same logic as PeersFeature)."""
+    """Discover the multi_agent host URL (same logic as PeersFeature)."""
     host_url = os.environ.get("KESTREL_HOST_URL")
     if host_url:
         return host_url.rstrip("/")
 
     for candidate in [
-        Path.cwd() / "rookery.toml",
-        Path(__file__).resolve().parents[3] / "rookery.toml",
+        Path.cwd() / "multi_agent.toml",
+        Path(__file__).resolve().parents[3] / "multi_agent.toml",
     ]:
         if candidate.exists():
             try:
@@ -239,7 +239,7 @@ async def dispatch_to_talon(
     if not host_url:
         return (
             f"Found issue to dispatch ({issue['repo']}#{issue['issue_number']}: "
-            f"{issue['issue_title']}) but no rookery host URL configured."
+            f"{issue['issue_title']}) but no multi_agent host URL configured."
         )
 
     # Build the mesh assign message
@@ -253,7 +253,7 @@ async def dispatch_to_talon(
         context=issue.get("context", ""),
     )
 
-    # POST to recipient's mesh endpoint via rookery
+    # POST to recipient's mesh endpoint via multi_agent
     url = f"{host_url}/api/agents/{recipient}/api/agent/mesh"
     payload = json.dumps(msg.to_dict()).encode("utf-8")
     req = urllib.request.Request(

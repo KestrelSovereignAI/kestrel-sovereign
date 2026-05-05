@@ -8,11 +8,11 @@ All deployment scripts live in [`scripts/cloudrun/`](../../scripts/cloudrun/).
 
 | Script | Purpose |
 |---|---|
-| [`build.sh`](../../scripts/cloudrun/build.sh) | Build + push single-agent and rookery images to GCR |
-| [`build_rookery.sh`](../../scripts/cloudrun/build_rookery.sh) | Build + push rookery image only |
-| [`deploy_dev.sh`](../../scripts/cloudrun/deploy_dev.sh) | Deploy rookery to `kestrel-dev` service |
+| [`build.sh`](../../scripts/cloudrun/build.sh) | Build + push single-agent and multi_agent images to GCR |
+| [`build_multi_agent.sh`](../../scripts/cloudrun/build_multi_agent.sh) | Build + push multi_agent image only |
+| [`deploy_dev.sh`](../../scripts/cloudrun/deploy_dev.sh) | Deploy multi_agent to `kestrel-dev` service |
 | [`deploy_prod.sh`](../../scripts/cloudrun/deploy_prod.sh) | Deploy to `kestrel-prod` service |
-| [`deploy_rookery_dev.sh`](../../scripts/cloudrun/deploy_rookery_dev.sh) | Deploy rookery image to dev |
+| [`deploy_multi_agent_dev.sh`](../../scripts/cloudrun/deploy_multi_agent_dev.sh) | Deploy multi_agent image to dev |
 | [`setup_secrets.sh`](../../scripts/cloudrun/setup_secrets.sh) | One-time: create GCP Secret Manager entries |
 
 ## Environment variables
@@ -70,7 +70,7 @@ gcloud secrets versions add <secret-name> --data-file=<path>
 
 ## Kestrel GitHub Agent — update flow
 
-The GitHub Agent ([`kestrel_sovereign/features/github_app/`](../../kestrel_sovereign/features/github_app/)) runs on the same Cloud Run rookery as the main Kestrel agents. Its source code (and the codebase it reads when answering questions) is baked into the Docker image at build time.
+The GitHub Agent ([`kestrel_sovereign/features/github_app/`](../../kestrel_sovereign/features/github_app/)) runs on the same Cloud Run multi_agent as the main Kestrel agents. Its source code (and the codebase it reads when answering questions) is baked into the Docker image at build time.
 
 **When you change source code, it won't reflect on the agent until you redeploy:**
 
@@ -84,11 +84,11 @@ The agent uses `min-instances=1` to stay warm (LLM calls exceed GitHub's 10s web
 
 **Long-term:** Auto-deploy on merge to main via GitHub Actions (see #TBD).
 
-## Rookery vs single-agent
+## MultiAgent vs single-agent
 
-The dev deployment runs **rookery mode** — a host process routes traffic to per-agent subprocesses. See [`host.py`](../../host.py) for the host, [`server.py`](../../server.py) for individual agents.
+The dev deployment runs **multi_agent mode** — a host process routes traffic to per-agent subprocesses. See [`host.py`](../../host.py) for the host, [`server.py`](../../server.py) for individual agents.
 
-Two agents ship in the default rookery image:
+Two agents ship in the default multi_agent image:
 - `Kestrel` (port 8801) — main agent with all features including GitHubApp
 - `kestrel-demo` (port 8802) — demo agent for UI examples
 

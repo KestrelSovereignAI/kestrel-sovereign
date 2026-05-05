@@ -85,7 +85,7 @@ def _ok(msg: str) -> int:
 
 def cmd_wizard_artifacts(args: argparse.Namespace) -> int:
     """Sanity-check the files the wizard claims it produced."""
-    required_files = [Path(".env"), Path("kestrel.toml"), Path("rookery.toml")]
+    required_files = [Path(".env"), Path("kestrel.toml"), Path("multi_agent.toml")]
     missing = [str(p) for p in required_files if not p.exists()]
     if missing:
         return _fail(f"wizard did not produce: {', '.join(missing)}")
@@ -100,7 +100,7 @@ def cmd_wizard_artifacts(args: argparse.Namespace) -> int:
         return _fail("kestrel.toml missing [llm].route_priority")
 
     return _ok(
-        f".env, kestrel.toml ({len(priority)} routes), rookery.toml all present; "
+        f".env, kestrel.toml ({len(priority)} routes), multi_agent.toml all present; "
         f"KESTREL_DATA_KEY set"
     )
 
@@ -192,8 +192,8 @@ def cmd_memory(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 def _agent_port(agent_name: str) -> int | None:
-    rookery = _read_toml(Path("rookery.toml"))
-    return ((rookery.get("agents") or {}).get(agent_name) or {}).get("port")
+    multi_agent = _read_toml(Path("multi_agent.toml"))
+    return ((multi_agent.get("agents") or {}).get(agent_name) or {}).get("port")
 
 
 def _kestrel(*args: str) -> subprocess.CompletedProcess[str]:
@@ -236,8 +236,8 @@ def cmd_start_and_health(args: argparse.Namespace) -> int:
     """
     port = _agent_port(args.agent_name)
     if not port:
-        return _fail(f"rookery.toml missing port for {args.agent_name}")
-    print(f"Agent port from rookery.toml: {port}")
+        return _fail(f"multi_agent.toml missing port for {args.agent_name}")
+    print(f"Agent port from multi_agent.toml: {port}")
 
     start = _kestrel("start", args.agent_name)
     sys.stdout.write(start.stdout)
@@ -292,7 +292,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     sub = p.add_subparsers(dest="command", required=True)
 
-    sub.add_parser("wizard-artifacts", help="Verify wizard wrote .env, kestrel.toml, rookery.toml")
+    sub.add_parser("wizard-artifacts", help="Verify wizard wrote .env, kestrel.toml, multi_agent.toml")
 
     for name, help_text in (
         ("identity", "Verify Identity Pillar — DID in graph_nodes"),
@@ -304,7 +304,7 @@ def _build_parser() -> argparse.ArgumentParser:
         sp = sub.add_parser(name, help=help_text)
         sp.add_argument(
             "--agent-name", required=True,
-            help="Agent name (matches rookery.toml + agent_data/<name>/)",
+            help="Agent name (matches multi_agent.toml + agent_data/<name>/)",
         )
 
     return p

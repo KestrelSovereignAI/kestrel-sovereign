@@ -115,7 +115,7 @@ Uses a hold/release pattern, not a transfer:
 
 **Ephemeral** (default): In-memory storage, auto-terminates on task completion or TTL expiry. Results reported back to parent via `SpawnResult`.
 
-**Persistent**: Full data directory, registered in rookery for peer discovery. Parent can still terminate, but child survives restarts.
+**Persistent**: Full data directory, registered in multi_agent for peer discovery. Parent can still terminate, but child survives restarts.
 
 ### Depth Control
 

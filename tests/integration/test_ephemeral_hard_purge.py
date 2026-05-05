@@ -162,7 +162,7 @@ async def test_purge_does_not_touch_other_agents_data(tmp_path):
 
     AGENT_ID's purge must not affect OTHER_AGENT_ID's conversations,
     even when they share a database file. This guards against the
-    rookery scenario where multiple agents live in the same DB and
+    multi_agent scenario where multiple agents live in the same DB and
     one of them is briefly in EPHEMERAL mode.
     """
     db_path = tmp_path / "kestrel.db"

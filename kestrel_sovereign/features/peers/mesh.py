@@ -2,7 +2,7 @@
 Agent Mesh Protocol — structured message types for inter-agent communication.
 
 Defines the message schema used by Falconer agents (Claws, Talon, Eye, Flight)
-to communicate through the rookery. Messages flow through PeersFeature's
+to communicate through the multi_agent. Messages flow through PeersFeature's
 ask_agent() transport but carry structured payloads.
 
 Message types:

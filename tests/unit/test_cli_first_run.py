@@ -19,7 +19,7 @@ def test_first_run_returns_none_when_agent_already_registered(tmp_path):
     """Captures the CI clean-install scenario:
 
     A user (or CI) ran ``kestrel create`` first, which registered an
-    agent and wrote ``rookery.toml`` but did NOT create ``.env``
+    agent and wrote ``multi_agent.toml`` but did NOT create ``.env``
     (inception falls back to plaintext key storage with a warning).
     Then they run ``kestrel start``. The first-run hook must NOT
     intercept — they've clearly done setup, even if not via the wizard.
@@ -29,8 +29,8 @@ def test_first_run_returns_none_when_agent_already_registered(tmp_path):
     """
     import toml as _toml
 
-    rookery_path = tmp_path / "rookery.toml"
-    rookery_path.write_text(_toml.dumps({
+    multi_agent_path = tmp_path / "multi_agent.toml"
+    multi_agent_path.write_text(_toml.dumps({
         "host": {"port": 8888, "bind": "0.0.0.0"},
         "agents": {
             "CITestAgent": {
@@ -45,15 +45,15 @@ def test_first_run_returns_none_when_agent_already_registered(tmp_path):
     assert _maybe_first_run_setup(tmp_path) is None
 
 
-def test_first_run_fires_when_rookery_has_no_agents(tmp_path):
-    """An empty rookery is the same as no rookery — fire the prompt."""
+def test_first_run_fires_when_multi_agent_has_no_agents(tmp_path):
+    """An empty multi_agent is the same as no multi_agent — fire the prompt."""
     import toml as _toml
 
-    (tmp_path / "rookery.toml").write_text(_toml.dumps({
+    (tmp_path / "multi_agent.toml").write_text(_toml.dumps({
         "host": {"port": 8888, "bind": "0.0.0.0"},
         "agents": {},
     }))
-    # No .env, rookery exists but is empty.
+    # No .env, multi_agent exists but is empty.
     with (
         patch("kestrel_sovereign.setup.prompts.is_tty", return_value=False),
     ):
@@ -62,10 +62,10 @@ def test_first_run_fires_when_rookery_has_no_agents(tmp_path):
     assert rc == 1
 
 
-def test_first_run_tolerates_corrupt_rookery(tmp_path):
-    """If rookery.toml fails to parse, we still want to prompt setup —
+def test_first_run_tolerates_corrupt_multi_agent(tmp_path):
+    """If multi_agent.toml fails to parse, we still want to prompt setup —
     don't silently let the user proceed with broken config."""
-    (tmp_path / "rookery.toml").write_text("[broken\nthis = is not valid")
+    (tmp_path / "multi_agent.toml").write_text("[broken\nthis = is not valid")
     with (
         patch("kestrel_sovereign.setup.prompts.is_tty", return_value=False),
     ):
@@ -82,7 +82,7 @@ def test_first_run_returns_none_when_skip_env_set(tmp_path, monkeypatch):
 def test_first_run_skipped_inside_git_worktree(tmp_path, monkeypatch):
     """Running any kestrel command from inside a git worktree must NOT
     fire the first-run hook. Worktrees never carry the user's gitignored
-    state (.env, rookery.toml) — the user's real setup lives in the main
+    state (.env, multi_agent.toml) — the user's real setup lives in the main
     checkout. Pre-fix, running from a worktree misfired the wizard on
     users who already had a perfectly valid setup at the main checkout.
 
@@ -94,7 +94,7 @@ def test_first_run_skipped_inside_git_worktree(tmp_path, monkeypatch):
     (tmp_path / ".git").write_text(
         "gitdir: /Volumes/data2/projects/kestrel-sovereign/.git/worktrees/foo\n"
     )
-    # No .env, no rookery — would otherwise trigger the prompt path.
+    # No .env, no multi_agent — would otherwise trigger the prompt path.
     assert _maybe_first_run_setup(tmp_path) is None
 
 

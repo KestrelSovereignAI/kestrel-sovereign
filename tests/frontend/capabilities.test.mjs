@@ -65,7 +65,7 @@ test('CAPABILITY_KEYS lists every canonical key from the issue', () => {
     const expected = [
         'chat', 'identity', 'constitution', 'privacy', 'memory', 'tasks',
         'sovereignty', 'storage', 'wallet', 'conversations', 'keys',
-        'audit', 'permissions', 'rookery', 'spawn', 'featureStore', 'metrics',
+        'audit', 'permissions', 'multi_agent', 'spawn', 'featureStore', 'metrics',
     ];
     for (const key of expected) {
         assert.equal(CAPABILITY_KEYS[key], true, `missing canonical key: ${key}`);
@@ -74,7 +74,7 @@ test('CAPABILITY_KEYS lists every canonical key from the issue', () => {
 
 test('resolveCapability defaults to true for any missing key', () => {
     assert.equal(resolveCapability({}, 'chat'), true);
-    assert.equal(resolveCapability({}, 'rookery'), true);
+    assert.equal(resolveCapability({}, 'multi_agent'), true);
     assert.equal(resolveCapability(null, 'chat'), true);
     assert.equal(resolveCapability(undefined, 'chat'), true);
 });
@@ -125,10 +125,10 @@ test('client.hasCapability defaults to true when no capabilities passed', () => 
 
 test('client.hasCapability respects host-supplied false flags', () => {
     const client = makeClient({
-        capabilities: { chat: false, rookery: false, featureStore: false },
+        capabilities: { chat: false, multi_agent: false, featureStore: false },
     });
     assert.equal(client.hasCapability('chat'), false);
-    assert.equal(client.hasCapability('rookery'), false);
+    assert.equal(client.hasCapability('multi_agent'), false);
     assert.equal(client.hasCapability('featureStore'), false);
     // Untouched keys stay default-on.
     assert.equal(client.hasCapability('identity'), true);
@@ -178,9 +178,9 @@ test('loadSpawn short-circuits when spawn capability is off', () => {
     assert.equal(client.hasCapability('spawn'), false);
 });
 
-test('loadAgents short-circuits when rookery capability is off', () => {
-    const client = makeClient({ capabilities: { rookery: false } });
-    assert.equal(client.hasCapability('rookery'), false);
+test('loadAgents short-circuits when multi_agent capability is off', () => {
+    const client = makeClient({ capabilities: { multi_agent: false } });
+    assert.equal(client.hasCapability('multi_agent'), false);
 });
 
 test('loadConversations short-circuits when conversations capability is off', () => {
@@ -323,9 +323,9 @@ test('capabilities: { chat: false } removes the chat panel from nav rendering', 
     assert.equal(panelIsEnabled(client, 'tasks'), true);
 });
 
-test('capabilities: { rookery: false } removes the agents pane (no /api/agents fetch)', () => {
-    const client = makeClient({ capabilities: { rookery: false } });
-    assert.equal(client.hasCapability('rookery'), false);
+test('capabilities: { multi_agent: false } removes the agents pane (no /api/agents fetch)', () => {
+    const client = makeClient({ capabilities: { multi_agent: false } });
+    assert.equal(client.hasCapability('multi_agent'), false);
 });
 
 test('object-shaped keys cap: agent off, user/platform on → resources panel stays visible', () => {

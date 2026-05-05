@@ -36,16 +36,16 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 
-from kestrel_sovereign.rookery.config import (
-    RookeryConfig,
+from kestrel_sovereign.multi_agent.config import (
+    MultiAgentConfig,
     LocalAgentConfig,
     RemoteAgentConfig,
 )
-from kestrel_sovereign.rookery.proxy import (
+from kestrel_sovereign.multi_agent.proxy import (
     proxy_request_streaming,
     get_agent_base_url,
 )
-from kestrel_sovereign.rookery.process_manager import ProcessManager
+from kestrel_sovereign.multi_agent.process_manager import ProcessManager
 
 load_dotenv(Path(__file__).parent / ".env", override=True)
 
@@ -94,18 +94,18 @@ def get_api_key() -> str:
     return api_key
 
 
-def load_rookery_config() -> RookeryConfig:
-    """Load rookery configuration from file or auto-discover.
+def load_multi_agent_config() -> MultiAgentConfig:
+    """Load multi_agent configuration from file or auto-discover.
 
     When running on Cloud Run or Azure Container Apps, the platform injects
     a PORT env var. Override the host port to match so the container binds
     to the correct port.
     """
-    config_path = os.environ.get("KESTREL_ROOKERY_CONFIG")
+    config_path = os.environ.get("KESTREL_MULTI_AGENT_CONFIG")
     if config_path:
-        config = RookeryConfig.load(config_path)
+        config = MultiAgentConfig.load(config_path)
     else:
-        config = RookeryConfig.load()
+        config = MultiAgentConfig.load()
 
     # Cloud Run / Azure Container Apps override: bind to platform-assigned port
     cloud_port = os.environ.get("PORT")
@@ -125,8 +125,8 @@ async def lifespan(app: FastAPI):
     """
     logger.info("Kestrel Host starting up...")
 
-    config = load_rookery_config()
-    app.state.rookery_config = config
+    config = load_multi_agent_config()
+    app.state.multi_agent_config = config
     app.state.http_client = httpx.AsyncClient()
 
     # Create process manager
@@ -137,7 +137,7 @@ async def lifespan(app: FastAPI):
     local_count = len(config.get_local_agents())
     remote_count = len(config.get_remote_agents())
     logger.info(
-        f"Rookery loaded: {agent_count} agents "
+        f"MultiAgent loaded: {agent_count} agents "
         f"({local_count} local, {remote_count} remote)"
     )
 
@@ -172,7 +172,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Kestrel Host", lifespan=lifespan)
 
 # --- OAuth setup (Google sign-in for browser sessions) ---
-# Mirrors server.py wiring so rookery mode supports the same auth flow.
+# Mirrors server.py wiring so multi_agent mode supports the same auth flow.
 from endpoints.auth_oauth import (
     router as auth_oauth_router,
     register_oauth,
@@ -405,7 +405,7 @@ async def github_proxy(path: str, request: Request):
 @app.get("/health")
 async def health_check(request: Request):
     """Host health check with agent statuses."""
-    config: RookeryConfig = request.app.state.rookery_config
+    config: MultiAgentConfig = request.app.state.multi_agent_config
     client: httpx.AsyncClient = request.app.state.http_client
 
     agent_statuses = {}
@@ -443,7 +443,7 @@ async def list_agents(request: Request):
     2. If online, fetch A2A card from /api/agents
     3. Return aggregated list with online/offline status
     """
-    config: RookeryConfig = request.app.state.rookery_config
+    config: MultiAgentConfig = request.app.state.multi_agent_config
     client: httpx.AsyncClient = request.app.state.http_client
 
     agents = []
@@ -501,9 +501,9 @@ async def list_agents(request: Request):
 async def start_agent(request: Request, agent_id: str):
     """Start an agent process.
 
-    Only works for local agents configured in rookery.toml.
+    Only works for local agents configured in multi_agent.toml.
     """
-    config: RookeryConfig = request.app.state.rookery_config
+    config: MultiAgentConfig = request.app.state.multi_agent_config
     pm: ProcessManager = request.app.state.process_manager
 
     local_agents = config.get_local_agents()
@@ -534,7 +534,7 @@ async def start_agent(request: Request, agent_id: str):
 @app.post("/api/agents/{agent_id}/stop")
 async def stop_agent(request: Request, agent_id: str):
     """Stop an agent process."""
-    config: RookeryConfig = request.app.state.rookery_config
+    config: MultiAgentConfig = request.app.state.multi_agent_config
     pm: ProcessManager = request.app.state.process_manager
 
     local_agents = config.get_local_agents()
@@ -551,7 +551,7 @@ async def stop_agent(request: Request, agent_id: str):
 @app.get("/api/agents/{agent_id}/status")
 async def agent_process_status(request: Request, agent_id: str):
     """Get process status for an agent."""
-    config: RookeryConfig = request.app.state.rookery_config
+    config: MultiAgentConfig = request.app.state.multi_agent_config
     pm: ProcessManager = request.app.state.process_manager
 
     local_agents = config.get_local_agents()
@@ -571,7 +571,7 @@ async def agent_logs(request: Request, agent_id: str, lines: int = 50):
     Query params:
         lines: Number of lines to return (default 50, max 1000)
     """
-    config: RookeryConfig = request.app.state.rookery_config
+    config: MultiAgentConfig = request.app.state.multi_agent_config
     pm: ProcessManager = request.app.state.process_manager
 
     local_agents = config.get_local_agents()
@@ -599,7 +599,7 @@ async def agent_logs(request: Request, agent_id: str, lines: int = 50):
 @app.post("/webhooks/rest/webhook")
 async def rasa_webhook_proxy(request: Request):
     """Forward Rasa webhook requests to the first configured agent."""
-    config: RookeryConfig = request.app.state.rookery_config
+    config: MultiAgentConfig = request.app.state.multi_agent_config
     client: httpx.AsyncClient = request.app.state.http_client
     first_agent = next(iter(config.agents))
     return await proxy_request_streaming(
@@ -620,7 +620,7 @@ async def github_app_webhook_proxy(request: Request):
     import sys, json as _json
     # Cloud Run captures stdout as structured logs
     print(_json.dumps({"severity": "WARNING", "message": "HOST: /webhooks/github-app received"}), flush=True)
-    config: RookeryConfig = request.app.state.rookery_config
+    config: MultiAgentConfig = request.app.state.multi_agent_config
     client: httpx.AsyncClient = request.app.state.http_client
     first_agent = next(iter(config.agents))
     print(_json.dumps({"severity": "WARNING", "message": f"HOST: proxying to agent={first_agent}"}), flush=True)
@@ -654,7 +654,7 @@ async def proxy_to_agent(request: Request, agent_id: str, path: str):
         /api/agents/claw/v1/chat/completions → agent:8801/v1/chat/completions
         /api/agents/claw/health             → agent:8801/health
     """
-    config: RookeryConfig = request.app.state.rookery_config
+    config: MultiAgentConfig = request.app.state.multi_agent_config
     client: httpx.AsyncClient = request.app.state.http_client
 
     return await proxy_request_streaming(
@@ -681,7 +681,7 @@ def build_auth_headers(request: Request) -> dict[str, str]:
 if __name__ == "__main__":
     import uvicorn
 
-    config = load_rookery_config()
+    config = load_multi_agent_config()
     port = config.host.port
     bind = config.host.bind
     logger.info(f"Starting Kestrel Host on {bind}:{port}")

@@ -280,7 +280,7 @@ async function startSession() {
     try {
       client = await createRealtimeClient({
         onEvent,
-        // Rewrite to /api/agents/<host>/voice/realtime/session in rookery
+        // Rewrite to /api/agents/<host>/voice/realtime/session in multi_agent
         // mode; identity in standalone mode.
         endpoint: API.buildAgentUrl('/voice/realtime/session'),
         getAuthHeaders: voiceAuthHeaders,

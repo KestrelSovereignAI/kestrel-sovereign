@@ -5,7 +5,7 @@
 # the host filesystem; the database and any user data are mounted at /data.
 #
 # Distinct from docker/Dockerfile.cloudrun (Cloud Run / serverless) and
-# docker/Dockerfile.rookery (multi-agent rookery on Cloud Run). Use this
+# docker/Dockerfile.multi_agent (multi-agent multi_agent on Cloud Run). Use this
 # image for local sovereign deployments where the operator wants the
 # agent's blast radius confined to a container.
 #
@@ -69,7 +69,7 @@ COPY . .
 
 # Install the package and its declared dependencies via pyproject.toml.
 # Replaces the hand-curated dependency list this Dockerfile carried since
-# the pre-extraction monolith era — that list had drifted (missing rookery,
+# the pre-extraction monolith era — that list had drifted (missing multi_agent,
 # signals, kestrel_config, and the post-#688 LLM modules).
 RUN --mount=type=secret,id=github_token \
     GIT_AUTH="$(cat /run/secrets/github_token 2>/dev/null || true)" && \

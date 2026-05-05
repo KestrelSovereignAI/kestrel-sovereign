@@ -54,7 +54,7 @@ def _make_post_wizard_project(tmp_path: Path, agent_name: str = "Kestrel") -> Pa
     (tmp_path / "kestrel.toml").write_text(
         '[llm]\nroute_priority = ["ollama:local"]\n', encoding="utf-8"
     )
-    (tmp_path / "rookery.toml").write_text(
+    (tmp_path / "multi_agent.toml").write_text(
         "[host]\nport = 8888\nbind = \"0.0.0.0\"\n\n"
         f"[agents.{agent_name}]\n"
         f"data_dir = \"agent_data/{agent_name}\"\n"

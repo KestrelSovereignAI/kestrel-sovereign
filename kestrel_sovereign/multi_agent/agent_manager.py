@@ -20,7 +20,7 @@ from kestrel_sovereign.spawn.mandate import SpawnMandate, sign_mandate
 from kestrel_sovereign.llm.service import LLMService
 from kestrel_sovereign.storage.async_storage import AsyncStorage
 
-from .config import LocalAgentConfig, RookeryConfig
+from .config import LocalAgentConfig, MultiAgentConfig
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +59,7 @@ class AgentManager:
         self._lock = asyncio.Lock()
 
     async def load_agent(self, name: str, config: LocalAgentConfig) -> KestrelAgent:
-        """Create and initialize a KestrelAgent from a rookery config entry.
+        """Create and initialize a KestrelAgent from a multi_agent config entry.
 
         Args:
             name: Agent name (used as routing key).
@@ -117,8 +117,8 @@ class AgentManager:
         logger.info(f"Loaded agent '{name}' (DID: {agent_did[:30]}...)")
         return agent
 
-    async def load_from_config(self, config: RookeryConfig) -> int:
-        """Load all autostart agents from a RookeryConfig.
+    async def load_from_config(self, config: MultiAgentConfig) -> int:
+        """Load all autostart agents from a MultiAgentConfig.
 
         Returns:
             Number of agents successfully loaded.

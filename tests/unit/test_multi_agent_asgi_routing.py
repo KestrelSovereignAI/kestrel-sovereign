@@ -1,11 +1,11 @@
 """
-Tests for the ASGI-level rookery routing middleware.
+Tests for the ASGI-level multi_agent routing middleware.
 
 The HTTP-only `agent_routing_middleware` (decorated with
 `@app.middleware("http")`) does NOT fire on WebSocket scope, so prior
-to fix/voice-pipeline-ws-rookery the Pipeline voice client connecting to
+to fix/voice-pipeline-ws-multi_agent the Pipeline voice client connecting to
 `/api/agents/<name>/voice/chat` 4503'd because the WS handler couldn't
-find the agent. The replacement `RookeryAgentRoutingMiddleware` is a
+find the agent. The replacement `MultiAgentAgentRoutingMiddleware` is a
 class-based ASGI middleware that handles both `http` and `websocket`
 scopes — these tests exercise it directly against an ASGI scope dict so
 the WebSocket path is verified, not assumed.
@@ -36,7 +36,7 @@ def _make_middleware(agent_for: dict[str, Any] | None = None):
         # a real FastAPI route.
         inner_calls.append({"scope": dict(scope), "called": True})
 
-    mw = server_module.RookeryAgentRoutingMiddleware(_inner)
+    mw = server_module.MultiAgentAgentRoutingMiddleware(_inner)
 
     fake_manager = MagicMock()
     fake_manager.get_agent = MagicMock(side_effect=lambda name: (agent_for or {}).get(name))
@@ -198,7 +198,7 @@ async def test_no_agent_manager_passes_through():
     async def _inner(scope, receive, send):
         inner_calls.append({"scope": dict(scope), "called": True})
 
-    mw = server_module.RookeryAgentRoutingMiddleware(_inner)
+    mw = server_module.MultiAgentAgentRoutingMiddleware(_inner)
     # Force agent_manager to None.
     server_module.app.state.agent_manager = None
 
