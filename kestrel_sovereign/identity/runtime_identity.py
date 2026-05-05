@@ -142,8 +142,20 @@ def _load_legacy_part(
     storage: SecureKeyStorage,
     storage_dir: Path,
     legacy_key_id: str,
+    *,
+    allow_missing_private: bool = False,
 ) -> tuple[Keypair, dict, str]:
-    """Load the legacy ECDSA keypair + DID document. Returns (kp, doc, did)."""
+    """Load the legacy ECDSA keypair + DID document. Returns (kp, doc, did).
+
+    With ``allow_missing_private=True``, tolerates a missing legacy
+    private key by deriving the public key from the DID document.
+    This is ONLY safe in the post-destruction hybrid state: a
+    legacy-only agent that lost its private key has no signing
+    capability and should fail loud rather than silently loading.
+    Callers must only pass ``allow_missing_private=True`` after
+    confirming a succession statement is on disk.
+    """
+    priv = None
     if storage.has_key(legacy_key_id):
         priv = storage.load_private_key(legacy_key_id)
     else:
@@ -151,35 +163,40 @@ def _load_legacy_part(
         # load_kestrel_identity, kept here so this function is
         # standalone-callable in tests.
         pem_path = storage_dir / f"{legacy_key_id}.pem"
-        if not pem_path.exists():
+        if pem_path.exists():
+            from cryptography.hazmat.primitives.serialization import load_pem_private_key
+            from cryptography.hazmat.backends import default_backend
+            with open(pem_path, "rb") as f:
+                priv = load_pem_private_key(
+                    f.read(), password=None, backend=default_backend(),
+                )
+            logger.warning(
+                f"Loaded PLAINTEXT legacy key from {pem_path}. "
+                "Encrypt at rest with KESTREL_DATA_KEY when convenient."
+            )
+        elif not allow_missing_private:
+            # Legacy-only agent missing its private key has no signing
+            # capability and should fail loud — not silently fall
+            # through to a public-only state. The post-destruction
+            # case is handled at the caller, after a succession
+            # statement is confirmed on disk.
             raise FileNotFoundError(
                 f"No legacy key for {legacy_key_id} in {storage_dir} "
-                f"(checked .key.enc and .pem)"
+                f"(checked .key.enc and .pem) and no succession statement "
+                f"to justify a public-only fall-through."
             )
-        from cryptography.hazmat.primitives.serialization import load_pem_private_key
-        from cryptography.hazmat.backends import default_backend
-        with open(pem_path, "rb") as f:
-            priv = load_pem_private_key(
-                f.read(), password=None, backend=default_backend(),
-            )
-        logger.warning(
-            f"Loaded PLAINTEXT legacy key from {pem_path}. "
-            "Encrypt at rest with KESTREL_DATA_KEY when convenient."
-        )
-    if not isinstance(priv, ec.EllipticCurvePrivateKey):
+        # else: post-destruction hybrid state. Fall through; we
+        # build the keypair from the DID document's public-only data.
+    if priv is not None and not isinstance(priv, ec.EllipticCurvePrivateKey):
         raise RuntimeIdentityError(
             f"legacy key is not an ECDSA key: {type(priv).__name__}"
         )
-    pub = priv.public_key()
-    legacy_kp = Keypair(
-        suite_id=ALG_ECDSA_SECP256K1_SHA256,
-        private_key=priv,
-        public_key=pub,
-    )
+
     did_path = storage_dir / f"{legacy_key_id}.json"
     if not did_path.exists():
         raise FileNotFoundError(
-            f"DID document not found at {did_path}"
+            f"DID document not found at {did_path}. Cannot load identity "
+            f"with neither private key nor DID document."
         )
     did_document = json.loads(did_path.read_text())
     legacy_did = did_document.get("id")
@@ -187,6 +204,45 @@ def _load_legacy_part(
         raise RuntimeIdentityError(
             f"DID document at {did_path} has no 'id' field"
         )
+
+    if priv is not None:
+        pub = priv.public_key()
+    else:
+        # Post-destruction: derive public from the DID document.
+        # The legacy DID document carries publicKeyHex in the
+        # ``publicKey``/``verificationMethod`` array.
+        pub_hex = None
+        for vm in (
+            did_document.get("publicKey") or did_document.get("verificationMethod") or []
+        ):
+            pub_hex = vm.get("publicKeyHex")
+            if pub_hex:
+                break
+        if not pub_hex:
+            raise FileNotFoundError(
+                f"Legacy private key not on disk for {legacy_key_id} "
+                f"AND DID document at {did_path} has no publicKeyHex. "
+                f"Cannot reconstruct legacy public key."
+            )
+        try:
+            pub = ec.EllipticCurvePublicKey.from_encoded_point(
+                ec.SECP256K1(), bytes.fromhex(pub_hex),
+            )
+        except Exception as e:
+            raise RuntimeIdentityError(
+                f"Failed to decode legacy public key from DID document: {e}"
+            )
+        logger.info(
+            f"Legacy private key absent (post-destruction) for {legacy_did}; "
+            f"derived legacy public from DID document. Hybrid identity "
+            f"continues to provide signing capability."
+        )
+
+    legacy_kp = Keypair(
+        suite_id=ALG_ECDSA_SECP256K1_SHA256,
+        private_key=priv,  # may be None post-destruction
+        public_key=pub,
+    )
     return legacy_kp, did_document, legacy_did
 
 
@@ -347,11 +403,17 @@ def load_agent_identity(
         storage_dir = Path(storage_dir)
 
     storage = SecureKeyStorage(storage_dir=storage_dir)
+    # Look for a succession statement BEFORE loading the legacy
+    # keypair so we can decide whether a missing legacy private key
+    # is a recoverable post-destruction state (succession exists =
+    # hybrid signing covers us) or a hard failure (legacy-only agent
+    # missing its only signing key).
+    succession_path = _find_succession_statement(storage_dir)
     legacy_kp, legacy_did_doc, legacy_did = _load_legacy_part(
         storage, storage_dir, legacy_key_id,
+        allow_missing_private=(succession_path is not None),
     )
 
-    succession_path = _find_succession_statement(storage_dir)
     if succession_path is None:
         return AgentIdentity(
             legacy_did=legacy_did,

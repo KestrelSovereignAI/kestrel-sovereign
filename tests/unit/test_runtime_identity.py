@@ -287,3 +287,43 @@ def test_empty_successions_dir_treated_as_legacy(legacy_agent_on_disk):
     identity = load_agent_identity(key_id, storage_dir)
     assert identity.is_hybrid is False
     assert identity.signing_did == legacy_did
+
+
+def test_legacy_only_agent_missing_private_fails_loud(legacy_agent_on_disk):
+    """A legacy-only agent (no successions/) that has lost its
+    private key has no signing capability. Loader must fail loud
+    rather than silently returning a public-only identity that
+    callers will mistakenly trust as signed-capable.
+    """
+    storage_dir, key_id, _, _ = legacy_agent_on_disk
+    # Remove the private key but keep the DID document
+    (storage_dir / f"{key_id}.key.enc").unlink()
+    with pytest.raises(FileNotFoundError, match="no succession statement"):
+        load_agent_identity(key_id, storage_dir)
+
+
+def test_load_after_legacy_key_destroyed_succeeds(post_ceremony_agent_on_disk):
+    """Post-destruction: legacy private key is gone, but the legacy
+    DID document remains on disk. Loader must still build a working
+    AgentIdentity with hybrid_keypair populated and legacy_keypair
+    carrying just the public key (no private). Without this, the
+    destroy-legacy-keys script would strand the agent.
+    """
+    storage_dir, key_id, legacy_did, _, _ = post_ceremony_agent_on_disk
+    # Simulate destruction: remove the legacy .key.enc
+    (storage_dir / f"{key_id}.key.enc").unlink()
+    # DID JSON stays (chain walker still needs it)
+    assert (storage_dir / f"{key_id}.json").exists()
+
+    identity = load_agent_identity(key_id, storage_dir)
+    assert identity.is_hybrid is True
+    assert identity.legacy_did == legacy_did
+    assert identity.legacy_keypair.private_key is None, (
+        "legacy private key should be None post-destruction"
+    )
+    assert identity.legacy_keypair.public_key is not None, (
+        "legacy public key still derivable from DID document"
+    )
+    # Hybrid signing still works
+    assert identity.hybrid_keypair is not None
+    assert identity.archival_keypair is not None

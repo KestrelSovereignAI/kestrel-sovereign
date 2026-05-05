@@ -263,6 +263,27 @@ async def test_empty_signature_rejected(post_ceremony_agent_dir):
 
 
 @pytest.mark.asyncio
+async def test_post_destruction_hybrid_signing_still_works(post_ceremony_agent_dir):
+    """After scripts/quantum_destroy_legacy_key.py removes the legacy
+    .key.enc, the agent should still be able to sign new scripts via
+    the hybrid keypair. Codex P1 catch on PR #1004: the script_signer
+    gate previously raised because self._private_key was None even
+    though hybrid signing was viable."""
+    storage_dir, _, legacy_did, _, _ = post_ceremony_agent_dir
+    address = legacy_did.split(":")[-1]
+    # Simulate destruction
+    (storage_dir / f"kestrel_{address}.key.enc").unlink()
+
+    db_path = str(storage_dir / "x.db")
+    signer = ScriptSigner(agent_did=f"did:ethr:{address}", db_path=db_path)
+    script = _make_script("post-destruction signing")
+    sig = await signer.sign(script)
+    assert sig.startswith("hybrid:"), f"expected hybrid, got {sig[:20]}"
+    script.signature = sig
+    assert await signer.verify(script) is True
+
+
+@pytest.mark.asyncio
 async def test_hybrid_payload_not_a_list_rejected(post_ceremony_agent_dir):
     storage_dir, _, legacy_did, _, _ = post_ceremony_agent_dir
     db_path = str(storage_dir / "x.db")
