@@ -1,0 +1,237 @@
+name: Release sign
+
+# Auto-sign release artifacts with SLH-DSA-SHA2-128s when a v* tag is
+# pushed. Wave 5 sub-PR 3 of Quantum Hardening (#921, #920).
+#
+# Required GitHub Actions secrets:
+#   KESTREL_RELEASE_SECRET_B64 — base64-url-encoded raw SLH-DSA-128s secret (64 bytes)
+#   KESTREL_RELEASE_PUBLIC_B64 — base64-url-encoded raw SLH-DSA-128s public (32 bytes)
+#   KESTREL_DATA_KEY — encryption key for the SecureKeyStorage bundles at rest
+
+on:
+  push:
+    # GH Actions tag filters use glob, not regex — ``+`` is literal.
+    # Codex P1 round 1: the previous ``v[0-9]+.[0-9]+.[0-9]+`` would
+    # never match a real semver tag like ``v1.2.3``.
+    tags: ['v[0-9]*.[0-9]*.[0-9]*']
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Tag or commit to sign (e.g. v1.2.3)'
+        required: true
+
+permissions:
+  contents: write    # Needed to attach signed manifest to the GitHub Release
+
+env:
+  PYTHON_VERSION: "3.13"
+
+jobs:
+  sign:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      # Codex P1 round 5: validate the release tag BEFORE checking out
+      # any code from the dispatch ref. The previous order let
+      # ``Load signing key into SecureKeyStorage`` run with secrets
+      # AGAINST scripts from a not-yet-validated ref. If an operator
+      # supplied a malicious ref (or pushed a malicious tag matching
+      # the glob), the secret-bearing step ran from that code before
+      # we ever checked the ref shape. Reorder so format validation
+      # is step 1.
+      - name: Determine and validate release tag
+        id: release_tag
+        env:
+          # Codex P1 round 2: pass ``inputs.ref`` via env var, never
+          # ``${{ ... }}``-expanded into shell. A crafted dispatch ref
+          # containing ``$()`` / quotes / etc would otherwise execute
+          # arbitrary commands in this step.
+          DISPATCH_REF: ${{ github.event.inputs.ref || '' }}
+        run: |
+          if [ -n "$DISPATCH_REF" ]; then
+            TAG="$DISPATCH_REF"
+          else
+            TAG="${GITHUB_REF##*/}"
+          fi
+          # Codex P1 round 3: validate the tag-push branch too, not
+          # only the dispatch input.
+          if ! printf '%s' "$TAG" | grep -Eq '^v[0-9]+(\.[0-9]+){2}([-+][A-Za-z0-9.]+)?$'; then
+            echo "error: release tag must look like vX.Y.Z (got: $TAG)" >&2
+            exit 2
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Release tag: $TAG"
+
+      # Codex P1 round 6 — split signing tooling (from main, trusted)
+      # from the artifact source (from the tag, untrusted by review):
+      #
+      # - ./signing-tools/ : checked out from ``main``; provides the
+      #   ``kestrel release sign`` CLI + ``load_signing_key_from_env.py``.
+      #   Secrets only enter the env in steps that ``cd`` here.
+      # - ./release-tree/ : checked out from the validated tag; the
+      #   thing being built. ``uv build`` runs from here and may
+      #   execute build-backend hooks declared in the tag's
+      #   pyproject.toml, but the signing secrets are NOT in the env
+      #   for that step. Even a malicious tag cannot exfiltrate
+      #   release-signing keys.
+      #
+      # Without this split, a tag like ``v9.9.9`` pointing at malicious
+      # code would have its build hooks run with KESTREL_RELEASE_SECRET_B64
+      # in scope.
+
+      - name: Checkout signing tooling (main)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: main
+          path: signing-tools
+          fetch-depth: 1
+          # Codex P1 round 8: don't persist GITHUB_TOKEN in
+          # .git/config. Untrusted tag-build code could otherwise
+          # read this directory's checkout credentials and exfiltrate
+          # a write-scoped token (contents: write is granted to the
+          # job for release attachments).
+          persist-credentials: false
+
+      - name: Checkout release source (validated tag)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ steps.release_tag.outputs.tag }}
+          path: release-tree
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install ${{ env.PYTHON_VERSION }}
+
+      # Codex P1 round 7: configure GH_PAT-backed git auth ONLY when
+      # we install signing-tools (main). Don't leave it in the global
+      # git config when ``uv build`` runs against the untrusted tag —
+      # build-backend hooks can read ~/.gitconfig and exfiltrate the
+      # PAT even though release-signing secrets are withheld.
+
+      - name: Install signing-tools dependencies (from main)
+        working-directory: signing-tools
+        run: |
+          # Configure auth ONLY for the duration of this step; clean up
+          # before any tag-built code runs.
+          git config --global \
+            url."https://x-access-token:${{ secrets.GH_PAT }}@github.com/".insteadOf \
+            "https://github.com/"
+          uv sync
+          # Strip the credential immediately so subsequent steps that
+          # run untrusted code can't read it from ~/.gitconfig.
+          git config --global --unset-all \
+            "url.https://x-access-token:${{ secrets.GH_PAT }}@github.com/.insteadOf" || true
+          # Belt-and-suspenders: also remove the URL prefix as a key,
+          # in case an alternative scheme was set
+          git config --global --remove-section \
+            "url.https://x-access-token:${{ secrets.GH_PAT }}@github.com/" || true
+
+      - name: Build wheel and sdist (from tag, no signing secrets in env, no GH_PAT in gitconfig)
+        working-directory: release-tree
+        # IMPORTANT: this step runs build-backend hooks from the
+        # release tag's pyproject.toml. By this point neither
+        # release-signing secrets NOR the GH_PAT-backed git auth are
+        # available, so a malicious tag cannot steal either.
+        run: |
+          uv build --wheel --sdist --out-dir ../dist/
+          ls -la ../dist/
+
+      - name: Load signing key into SecureKeyStorage (using main's loader)
+        working-directory: signing-tools
+        env:
+          KESTREL_DATA_KEY: ${{ secrets.KESTREL_DATA_KEY }}
+          KESTREL_RELEASE_SECRET_B64: ${{ secrets.KESTREL_RELEASE_SECRET_B64 }}
+          KESTREL_RELEASE_PUBLIC_B64: ${{ secrets.KESTREL_RELEASE_PUBLIC_B64 }}
+        run: |
+          uv run python scripts/release/load_signing_key_from_env.py \
+            --storage-dir ../release-keys \
+            --key-id release-key
+
+      - name: Sign release manifest (using main's CLI over tag's dist/)
+        working-directory: signing-tools
+        env:
+          KESTREL_DATA_KEY: ${{ secrets.KESTREL_DATA_KEY }}
+        # Codex P1 round 1: the trusted-signer stderr capture cannot
+        # land inside the artifacts dir — the shell creates the file
+        # at redirect time, the CLI walks dist and hashes the (then-
+        # empty) capture file into the manifest, then the CLI writes
+        # stderr to it AFTER hashing. Self-verify would see different
+        # bytes than the manifest claims. Write outside dist instead.
+        #
+        # CLI is from main (signing-tools/); artifacts come from tag
+        # (../dist/, relative to this working dir).
+        run: |
+          mkdir -p ../signing-stderr
+          uv run kestrel release sign \
+            --artifacts-dir ../dist \
+            --release-tag "${{ steps.release_tag.outputs.tag }}" \
+            --key-id release-key \
+            --signer-did "did:web:kestrelsovereignai.github.io" \
+            --kid "release-key-1" \
+            --output ../dist/release-manifest.json \
+            --storage-dir ../release-keys 2> ../signing-stderr/trusted-signer.txt
+          grep "trusted_signer_multibase" ../signing-stderr/trusted-signer.txt || true
+
+      - name: Self-verify the just-signed release (using main's CLI)
+        working-directory: signing-tools
+        env:
+          KESTREL_DATA_KEY: ${{ secrets.KESTREL_DATA_KEY }}
+          KESTREL_RELEASE_PUBLIC_B64: ${{ secrets.KESTREL_RELEASE_PUBLIC_B64 }}
+        run: |
+          cat > /tmp/derive-pub-multibase.py <<'EOF'
+          import base64, os
+          from kestrel_sovereign.security.crypto_suite import SLHDSASHA2128sSuite
+          from kestrel_sovereign.security.multikey import public_key_to_multibase
+          pub_b64 = os.environ['KESTREL_RELEASE_PUBLIC_B64']
+          pad = '=' * ((4 - len(pub_b64) % 4) % 4)
+          pub = base64.urlsafe_b64decode(pub_b64 + pad)
+          print(public_key_to_multibase(SLHDSASHA2128sSuite(), pub))
+          EOF
+          PUB_MB=$(uv run python /tmp/derive-pub-multibase.py)
+          uv run kestrel release verify \
+            --manifest ../dist/release-manifest.json \
+            --artifacts-dir ../dist \
+            --trusted-signer-multibase "$PUB_MB"
+
+      - name: Upload signed release as workflow artifact
+        # Codex P2 round 4: workflow_dispatch runs aren't on a tag ref
+        # so the GitHub Release attachment step is skipped — without
+        # the dist files in the workflow artifact, manual recovery
+        # signing left the signed wheels/sdists unpublished. Include
+        # everything that needs to reach a consumer.
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        with:
+          name: signed-release-${{ steps.release_tag.outputs.tag }}
+          path: |
+            dist/*.whl
+            dist/*.tar.gz
+            dist/release-manifest.json
+            signing-stderr/trusted-signer.txt
+          retention-days: 90
+
+      - name: Attach signed manifest to GitHub Release
+        # Run for both push-tag and dispatch flows. The dispatch
+        # branch needs the explicit tag_name (codex P2 round 4):
+        # ``github.ref`` is the workflow source branch, not the tag.
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        uses: softprops/action-gh-release@72f2c25fcb47643c292f7107632f7a47c1df5cd8 # v2.3.4
+        with:
+          tag_name: ${{ steps.release_tag.outputs.tag }}
+          # Codex P2 round 2: only attach the artifacts that ARE in
+          # the signed manifest. ``trusted-signer.txt`` is a workflow
+          # log; attaching it would let consumers fail
+          # ``kestrel release verify`` (the verifier rejects extra
+          # files in the artifact dir per #979 codex round 7).
+          files: |
+            dist/*.whl
+            dist/*.tar.gz
+            dist/release-manifest.json
+          fail_on_unmatched_files: true
+          generate_release_notes: true
