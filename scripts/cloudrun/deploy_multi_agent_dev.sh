@@ -3,8 +3,8 @@ set -e
 
 # Deploy Kestrel MultiAgent (multi-agent host) to Cloud Run — DEV environment
 PROJECT_ID="${GCP_PROJECT_ID:?Set GCP_PROJECT_ID env var}"
-SERVICE_NAME="kestrel-multi_agent-dev"
-IMAGE_NAME="kestrel-multi_agent"
+SERVICE_NAME="kestrel-multi-agent-dev"
+IMAGE_NAME="kestrel-multi-agent"
 REGION="us-central1"
 
 echo "Deploying Kestrel MultiAgent DEV to Cloud Run..."

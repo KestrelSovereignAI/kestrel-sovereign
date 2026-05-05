@@ -96,13 +96,22 @@ def resolve_multi_agent_path(env: dict | os._Environ) -> Path:
         multi-agent mode.
     """
     from kestrel_sovereign.multi_agent.compat import (
+        find_existing_config,
         get_config_env_value,
         is_config_env_var_set,
         NEW_CONFIG_FILENAME,
     )
 
     explicit = get_config_env_value(env)
-    multi_agent_path = Path(explicit) if explicit else Path(NEW_CONFIG_FILENAME)
+    if explicit:
+        multi_agent_path = Path(explicit)
+    else:
+        # No explicit env var: look for the new filename, then fall back
+        # to the legacy rookery.toml. find_existing_config emits a
+        # one-time deprecation warning when it returns the legacy path.
+        existing = find_existing_config(Path.cwd())
+        multi_agent_path = existing if existing else Path(NEW_CONFIG_FILENAME)
+
     demo_server_env = env.get("KESTREL_DEMO_SERVER", "").lower() in (
         "1", "true", "yes",
     )

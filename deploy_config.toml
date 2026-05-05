@@ -72,10 +72,10 @@ LIGHTHOUSE_API_KEY = "kestrel-lighthouse-key:latest"
 # Uses docker/Dockerfile.multi_agent which runs the multi_agent host process manager.
 
 # MultiAgent Development - Cloud Run (scales to zero)
-[profiles.multi_agent-dev]
+[profiles.multi-agent-dev]
 name = "MultiAgent Development (Multi-Agent)"
 provider = "cloudrun"
-service_name = "kestrel-multi_agent-dev"
+service_name = "kestrel-multi-agent-dev"
 region = "us-central1"
 deployment_mode = "multi_agent"
 min_instances = 0
@@ -86,22 +86,22 @@ port = 8080
 timeout = 300
 concurrency = 80
 
-[profiles.multi_agent-dev.env_vars]
+[profiles.multi-agent-dev.env_vars]
 KESTREL_ENV = "development"
 KESTREL_DB_BACKEND = "sqlite"
 KESTREL_HOST_AUTOSTART = "true"
 
-[profiles.multi_agent-dev.secrets]
+[profiles.multi-agent-dev.secrets]
 OPENAI_API_KEY = "kestrel-openai-key:latest"
 KESTREL_API_KEY = "kestrel-api-key:latest"
 KESTREL_DATA_KEY = "kestrel-data-key:latest"
 LIGHTHOUSE_API_KEY = "kestrel-lighthouse-key:latest"
 
 # MultiAgent Production - Cloud Run (always warm)
-[profiles.multi_agent-prod]
+[profiles.multi-agent-prod]
 name = "MultiAgent Production (Multi-Agent)"
 provider = "cloudrun"
-service_name = "kestrel-multi_agent-prod"
+service_name = "kestrel-multi-agent-prod"
 region = "us-central1"
 deployment_mode = "multi_agent"
 min_instances = 1
@@ -112,12 +112,12 @@ port = 8080
 timeout = 300
 concurrency = 80
 
-[profiles.multi_agent-prod.env_vars]
+[profiles.multi-agent-prod.env_vars]
 KESTREL_ENV = "production"
 KESTREL_DB_BACKEND = "sqlite"
 KESTREL_HOST_AUTOSTART = "true"
 
-[profiles.multi_agent-prod.secrets]
+[profiles.multi-agent-prod.secrets]
 OPENAI_API_KEY = "kestrel-openai-key:latest"
 KESTREL_API_KEY = "kestrel-api-key:latest"
 KESTREL_DATA_KEY = "kestrel-data-key:latest"
@@ -128,10 +128,10 @@ LIGHTHOUSE_API_KEY = "kestrel-lighthouse-key:latest"
 # =============================================================================
 
 # Azure MultiAgent Development (scales to zero)
-[profiles.azure-multi_agent-dev]
+[profiles.azure-multi-agent-dev]
 name = "Azure MultiAgent Development (Multi-Agent)"
 provider = "azure"
-service_name = "kestrel-multi_agent-dev"
+service_name = "kestrel-multi-agent-dev"
 region = "eastus2"
 deployment_mode = "multi_agent"
 min_instances = 0
@@ -142,12 +142,12 @@ port = 8080
 timeout = 300
 concurrency = 80
 
-[profiles.azure-multi_agent-dev.env_vars]
+[profiles.azure-multi-agent-dev.env_vars]
 KESTREL_ENV = "development"
 KESTREL_DB_BACKEND = "sqlite"
 KESTREL_HOST_AUTOSTART = "true"
 
-[profiles.azure-multi_agent-dev.secrets]
+[profiles.azure-multi-agent-dev.secrets]
 OPENAI_API_KEY = "${OPENAI_API_KEY}"
 KESTREL_API_KEY = "${KESTREL_API_KEY}"
 KESTREL_DATA_KEY = "${KESTREL_DATA_KEY}"

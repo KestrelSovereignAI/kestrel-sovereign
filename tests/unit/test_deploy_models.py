@@ -132,7 +132,7 @@ class TestDeploymentProfile:
         """Test multi_agent deployment mode."""
         profile = DeploymentProfile(
             provider=DeployProviderType.CLOUD_RUN,
-            service_name="kestrel-multi_agent-dev",
+            service_name="kestrel-multi-agent-dev",
             region="us-central1",
             deployment_mode="multi_agent",
             dockerfile="docker/Dockerfile.multi_agent",
@@ -149,12 +149,12 @@ class TestDeploymentProfile:
         """Test that session to_dict includes deployment_mode."""
         profile = DeploymentProfile(
             provider=DeployProviderType.CLOUD_RUN,
-            service_name="kestrel-multi_agent-dev",
+            service_name="kestrel-multi-agent-dev",
             region="us-central1",
             deployment_mode="multi_agent",
         )
         session = DeploymentSession(
-            service_name="kestrel-multi_agent-dev",
+            service_name="kestrel-multi-agent-dev",
             provider=DeployProviderType.CLOUD_RUN,
             profile=profile,
             status=DeployStatus.ACTIVE,

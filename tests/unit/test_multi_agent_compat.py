@@ -173,3 +173,50 @@ def test_multi_agent_config_load_finds_legacy_filename(tmp_path, caplog,
     assert config.host.port == 9999
     assert any("DEPRECATED" in r.message and "rookery.toml" in r.message
                for r in caplog.records)
+
+
+def test_multi_agent_config_load_explicit_new_path_falls_back_to_legacy_sibling(
+    tmp_path, caplog,
+):
+    """If a caller passes an explicit `multi_agent.toml` path that doesn't
+    exist but a sibling `rookery.toml` does, load() must use the legacy
+    file. Codex review (PR #998 round 1 of rookery rename) caught this:
+    the CLI passes the new filename explicitly, so the previous compat
+    branch only firing when path=None left existing installs broken.
+    """
+    from kestrel_sovereign.multi_agent.config import MultiAgentConfig
+
+    (tmp_path / "rookery.toml").write_text(
+        '[host]\nport = 7777\n[agents]\n', encoding="utf-8",
+    )
+    explicit_new_path = tmp_path / "multi_agent.toml"
+    assert not explicit_new_path.exists()
+
+    with caplog.at_level(logging.WARNING):
+        config = MultiAgentConfig.load(
+            explicit_new_path, auto_discover_fallback=False,
+        )
+
+    assert config.host.port == 7777
+    assert any("DEPRECATED" in r.message and "rookery.toml" in r.message
+               for r in caplog.records)
+
+
+def test_resolve_multi_agent_path_falls_back_to_legacy_when_no_env_var(
+    tmp_path, monkeypatch, caplog,
+):
+    """server.py:resolve_multi_agent_path returns the legacy path when
+    no env var is set and only rookery.toml exists at cwd. Without this
+    fallback, the lifespan startup gate (`multi_agent_path.exists()`)
+    is false and the server boots in single-agent mode even though the
+    operator has a multi-agent config — codex review caught this."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "rookery.toml").write_text("[host]\nport = 5555\n[agents]\n")
+
+    from server import resolve_multi_agent_path
+
+    with caplog.at_level(logging.WARNING):
+        result = resolve_multi_agent_path({})
+
+    assert result.name == "rookery.toml"
+    assert result.exists()

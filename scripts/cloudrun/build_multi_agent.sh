@@ -3,7 +3,7 @@ set -e
 
 # Build and push Kestrel MultiAgent (multi-agent host) image to GCR
 PROJECT_ID="${GCP_PROJECT_ID:?Set GCP_PROJECT_ID env var}"
-IMAGE_NAME="kestrel-multi_agent"
+IMAGE_NAME="kestrel-multi-agent"
 TAG="${1:-latest}"
 
 echo "Building Kestrel MultiAgent image (multi-agent host)..."

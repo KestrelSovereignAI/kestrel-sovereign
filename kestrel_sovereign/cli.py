@@ -108,6 +108,8 @@ def cmd_start(args) -> int:
     if first_run_rc is not None:
         return first_run_rc
 
+    # MultiAgentConfig.load() falls back to legacy rookery.toml in the
+    # same directory if multi_agent.toml is missing — see compat module.
     multi_agent = MultiAgentConfig.load(project_dir / MULTI_AGENT_CONFIG_FILENAME)
     pm = ProcessManager(project_dir)
 
