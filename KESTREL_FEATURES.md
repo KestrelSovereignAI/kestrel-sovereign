@@ -354,6 +354,9 @@ The currently exported `Feature` subclasses discovered from those modules includ
   - `GET /api/features/{name}/skills`
   - `GET /api/skills`
   - `GET /api/skills/{skill_id}/schema`
+- [`endpoints/ui.py`](endpoints/ui.py)
+  - `GET /api/ui/theme` — UI theme + i18n labels for the active locale, with legacy-fallback reporting
+  - `GET /api/ui/themes` — list of installed UI themes
 
 ## Authentication Surface
 

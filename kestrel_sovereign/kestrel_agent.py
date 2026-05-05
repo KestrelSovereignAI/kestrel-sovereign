@@ -233,6 +233,53 @@ class KestrelAgent(
                         agent_toml, exc,
                     )
 
+        # Hybrid-aware identity load (Quantum Hardening epic, Wave 3 follow-up).
+        # Reads the legacy ECDSA key, the new hybrid keys (Ed25519 + ML-DSA-65),
+        # and the succession statement if present. ``self.identity`` is the
+        # ``AgentIdentity`` bundle; ``self.identity.is_hybrid`` is True for
+        # post-ceremony agents.
+        #
+        # ``self._private_key`` is set to the legacy ECDSA private key for
+        # backward compatibility with code that grabs it via getattr (most
+        # notably ``rookery.agent_manager.spawn_agent`` — pre-ceremony agents
+        # were silently broken there because nothing was setting this).
+        #
+        # Identity loading is best-effort: during inception the keys may not
+        # be on disk yet, so failure logs a warning rather than killing
+        # construction. Callers needing the identity check ``self.identity
+        # is not None`` and fall back to legacy paths if it is.
+        self.identity = None
+        self._private_key = None
+        if self.storage_path and self.did:
+            legacy_key_id = self._derive_legacy_key_id(self.did)
+            storage_dir = Path(self.storage_path).parent
+            if legacy_key_id and (storage_dir / f"{legacy_key_id}.json").exists():
+                try:
+                    from kestrel_sovereign.identity.runtime_identity import (
+                        load_agent_identity,
+                    )
+                    self.identity = load_agent_identity(
+                        legacy_key_id, storage_dir=storage_dir,
+                    )
+                    self._private_key = self.identity.legacy_keypair.private_key
+                    if self.identity.is_hybrid:
+                        logging.info(
+                            "Agent identity loaded as HYBRID: legacy=%s -> new=%s",
+                            self.identity.legacy_did, self.identity.new_did,
+                        )
+                    else:
+                        logging.info(
+                            "Agent identity loaded as legacy-only: %s",
+                            self.identity.legacy_did,
+                        )
+                except Exception as exc:
+                    logging.warning(
+                        "Could not load agent identity from %s: %s. "
+                        "Agent will run with self.identity=None; signing call "
+                        "sites will fall back to their existing legacy paths.",
+                        storage_dir, exc,
+                    )
+
         # Determine database backend
         self._db_backend = db_backend or os.environ.get("KESTREL_DB_BACKEND", "sqlite")
         self._database_url = database_url or os.environ.get("KESTREL_DATABASE_URL")
@@ -293,6 +340,38 @@ class KestrelAgent(
 
         # Initialize constitution audit tracking
         self._init_constitution_audit_tracking()
+
+    @staticmethod
+    def _derive_legacy_key_id(did: str) -> Optional[str]:
+        """Derive ``kestrel_<eth_address>`` from a ``did:pkh:eip155:1:0x…`` DID.
+
+        Returns ``None`` for DID methods we can't map to a legacy key
+        file (e.g. did:web on a fresh-minted hybrid agent that has no
+        legacy material). Callers handle the None case.
+        """
+        if did.startswith("did:pkh:eip155:1:"):
+            return f"kestrel_{did[len('did:pkh:eip155:1:'):]}"
+        return None
+
+    @property
+    def is_hybrid(self) -> bool:
+        """True iff a succession statement was loaded at construction."""
+        return self.identity is not None and self.identity.is_hybrid
+
+    @property
+    def signing_did(self) -> str:
+        """The DID the agent should sign new artifacts AS.
+
+        - Hybrid agent: the new ``did:web`` URI from the succession.
+        - Legacy or pre-inception agent: the constructor's ``did`` arg.
+
+        Existing code that uses ``agent.did`` keeps working — that
+        attribute is unchanged. Code that wants the post-rotation
+        identity reads ``agent.signing_did``.
+        """
+        if self.is_hybrid:
+            return self.identity.new_did
+        return self.did
 
     @property
     def agent_id(self) -> str:
