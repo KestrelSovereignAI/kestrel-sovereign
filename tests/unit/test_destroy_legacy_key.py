@@ -250,6 +250,107 @@ def test_unrelated_succession_blocks_destruction(post_ceremony_dir, tmp_path):
     assert legacy_enc.exists()
 
 
+def test_tampered_succession_signatures_blocks_destruction(post_ceremony_dir):
+    """Codex P1 catch: zero out a signature in the succession statement.
+    Crypto verify must catch it and refuse destruction."""
+    storage_dir, key_id, slug = post_ceremony_dir
+    succession_path = storage_dir / "successions" / f"{slug}.json"
+    statement = json.loads(succession_path.read_text())
+    # Tamper: replace the first predecessor signature with garbage
+    statement["predecessor_signatures"][0]["sig"] = "00" * 64
+    succession_path.write_text(json.dumps(statement))
+
+    legacy_enc = storage_dir / f"{key_id}.key.enc"
+    res = _run(
+        ["--agent-data-dir", str(storage_dir), "--skip-https-check", "--confirm"],
+        env_extra={
+            "KESTREL_DESTROY_CONFIRM": "I-have-verified-the-rollback-window",
+        },
+    )
+    assert res.returncode == 1
+    assert "verification" in res.stderr.lower() or "verification" in res.stdout.lower()
+    assert legacy_enc.exists()
+
+
+def test_hybrid_keys_from_wrong_agent_blocks_destruction(
+    post_ceremony_dir, tmp_path, kestrel_data_key,
+):
+    """Codex P2 catch: replace this agent's hybrid keys with another
+    agent's keys (same filenames). The probe-sign + probe-verify gate
+    must detect the mismatch and refuse destruction. Otherwise the
+    legacy key would be destroyed leaving the agent with private keys
+    that don't match the published successor identity."""
+    storage_dir, key_id, slug = post_ceremony_dir
+
+    # Mint a SECOND, unrelated agent and run its rotation
+    other_dir = tmp_path / "other"
+    other_dir.mkdir()
+    other_storage = SecureKeyStorage(storage_dir=other_dir)
+    secp = Secp256k1Suite()
+    other_legacy = secp.generate_keypair()
+    other_address = public_key_to_ethereum_address(other_legacy.public_key)
+    other_did = f"did:pkh:eip155:1:{other_address}"
+    other_storage.save_private_key(other_legacy.private_key, f"kestrel_{other_address}")
+    from kestrel_sovereign.identity.did_web import build_verification_methods
+    from cryptography.hazmat.primitives.serialization import (
+        Encoding, PublicFormat,
+    )
+    other_pub_hex = other_legacy.public_key.public_bytes(
+        encoding=Encoding.X962, format=PublicFormat.UncompressedPoint,
+    ).hex()
+    (other_dir / f"kestrel_{other_address}.json").write_text(json.dumps({
+        "@context": "https://w3id.org/did/v1",
+        "id": other_did,
+        "publicKey": [{
+            "id": f"{other_did}#keys-1",
+            "type": "EcdsaSecp256k1VerificationKey2019",
+            "controller": other_did,
+            "publicKeyHex": other_pub_hex,
+        }],
+    }))
+    other_legacy_vms = build_verification_methods(
+        other_did, [(secp, other_legacy.public_key)],
+    )
+    other_archival = SLHDSASHA2128sSuite().generate_keypair()
+    other_result = run_rotation_ceremony(
+        predecessor_did=other_did,
+        predecessor_keypair=other_legacy,
+        predecessor_kid=other_legacy_vms[0]["id"].rsplit("#", 1)[-1],
+        predecessor_verification_methods=other_legacy_vms,
+        new_did_domain="agents.test.example",
+        new_did_slug="testbot",  # SAME slug — files will overwrite
+        reason="other agent rotation",
+        archival_keypair=other_archival,
+    )
+
+    # Overwrite THIS agent's hybrid private keys with the OTHER agent's.
+    # Filenames match (same slug 'testbot'), but the private keys
+    # don't match this agent's published successor pubkeys.
+    other_classical_priv = other_result.new_identity.keypair.classical.private_key
+    other_pq_priv = other_result.new_identity.keypair.pq.private_key
+    SecureKeyStorage(storage_dir=storage_dir).save_private_key(
+        other_classical_priv, "testbot_ed25519"
+    )
+    SecureKeyStorage(storage_dir=storage_dir).save_secret_bytes(
+        other_pq_priv, "testbot_mldsa65"
+    )
+
+    legacy_enc = storage_dir / f"{key_id}.key.enc"
+    res = _run(
+        ["--agent-data-dir", str(storage_dir), "--skip-https-check", "--confirm"],
+        env_extra={
+            "KESTREL_DESTROY_CONFIRM": "I-have-verified-the-rollback-window",
+        },
+    )
+    assert res.returncode == 1
+    assert (
+        "probe failed" in res.stderr.lower()
+        or "do not belong" in res.stderr.lower()
+        or "probe failed" in res.stdout.lower()
+    )
+    assert legacy_enc.exists()
+
+
 def test_path_traversal_in_legacy_key_id_rejected(post_ceremony_dir):
     """Codex P2 catch: --legacy-key-id with path separators must be
     rejected before any deletion can target files outside agent_data."""

@@ -169,9 +169,7 @@ def _check_rollback_window(succession_path: Path, days: int) -> bool:
 
 def _check_hybrid_keys(agent_data: Path, slug: str) -> bool:
     """Verify both halves of the hybrid keypair are still on disk
-    BEFORE destroying the legacy key. Refusing to destroy when the
-    hybrid is missing prevents the operator from leaving the agent
-    with NO usable signing keys."""
+    BEFORE destroying the legacy key."""
     classical = agent_data / f"{slug}_ed25519.key.enc"
     pq = agent_data / f"{slug}_mldsa65.bytes.enc"
     if not classical.exists():
@@ -182,6 +180,147 @@ def _check_hybrid_keys(agent_data: Path, slug: str) -> bool:
         return False
     _ok(f"hybrid classical key present:  {classical.name}")
     _ok(f"hybrid post-quantum key present: {pq.name}")
+    return True
+
+
+def _check_hybrid_keys_match_successor(agent_data: Path, statement_dict: dict) -> bool:
+    """Codex P2 catch: the hybrid key FILES being on disk isn't enough
+    — they could be copies from a different agent. Probe-sign with each
+    half and verify against the statement's successor_verification_methods.
+    If the probe doesn't verify, the local private keys don't match
+    the succession's pubkeys; destroying the legacy now would strand
+    this agent."""
+    from kestrel_sovereign.identity.runtime_identity import (
+        RuntimeIdentityError, load_agent_identity,
+    )
+    from kestrel_sovereign.identity.hybrid_keypair import sign_hybrid
+    from kestrel_sovereign.security.crypto_suite import (
+        ALG_ED25519, ALG_ML_DSA_65, get_suite,
+    )
+    from kestrel_sovereign.security.multikey import multibase_to_public_key
+
+    pred_did = statement_dict.get("predecessor_did", "")
+    if not pred_did.startswith("did:pkh:eip155:1:"):
+        _warn(f"can't derive legacy_key_id from predecessor_did {pred_did!r}; skipping probe")
+        return True
+    legacy_key_id = "kestrel_" + pred_did.split(":")[-1]
+
+    try:
+        identity = load_agent_identity(legacy_key_id, storage_dir=agent_data)
+    except (FileNotFoundError, RuntimeIdentityError) as e:
+        _err(f"could not load agent identity for probe: {e}")
+        return False
+
+    if not identity.is_hybrid:
+        _err("identity loader did not return a hybrid identity")
+        return False
+
+    # Probe: sign a deterministic byte sequence and verify against the
+    # public keys recorded in the SUCCESSOR_VERIFICATION_METHODS of the
+    # succession statement (NOT against the private keys' own derived
+    # pubkeys — that would beg the question).
+    probe = b"kestrel-destroy-legacy-key-probe"
+    vms = statement_dict.get("successor_verification_methods", [])
+    classical_kid = (
+        vms[0]["id"].rsplit("#", 1)[-1] if vms else "key-1"
+    )
+    pq_kid = (
+        vms[1]["id"].rsplit("#", 1)[-1] if len(vms) > 1 else "key-2"
+    )
+    sigs = sign_hybrid(
+        probe, identity.hybrid_keypair,
+        classical_kid=classical_kid, pq_kid=pq_kid,
+    )
+
+    # Build kid -> (alg, pubkey) from the statement's successor VMs
+    kid_to_pub = {}
+    for vm in vms:
+        vm_id = vm.get("id", "")
+        kid = vm_id.rsplit("#", 1)[-1] if "#" in vm_id else vm_id
+        mb = vm.get("publicKeyMultibase")
+        if not kid or not mb:
+            continue
+        try:
+            suite, pub = multibase_to_public_key(mb)
+        except Exception:
+            continue
+        kid_to_pub[kid] = (suite.alg_id, pub)
+
+    algs_seen = set()
+    for entry in sigs:
+        alg = entry["alg"]
+        kid = entry["kid"]
+        sig_hex = entry["sig"]
+        info = kid_to_pub.get(kid)
+        if info is None:
+            _err(f"successor VM for kid={kid!r} not found in succession statement")
+            return False
+        expected_alg, public_key = info
+        if expected_alg != alg:
+            _err(
+                f"alg mismatch on probe: signed with {alg!r} but "
+                f"successor VM kid={kid!r} expects {expected_alg!r}"
+            )
+            return False
+        suite = get_suite(alg)
+        if not suite.verify(probe, bytes.fromhex(sig_hex), public_key):
+            _err(
+                f"PROBE FAILED: hybrid private key for {kid!r} ({alg}) "
+                f"does not produce signatures that verify against the "
+                f"successor's published public key. The hybrid key "
+                f"files on disk DO NOT belong to this agent — destroying "
+                f"the legacy key now would strand the agent."
+            )
+            return False
+        algs_seen.add(alg)
+    if {ALG_ED25519, ALG_ML_DSA_65} != algs_seen:
+        _err(
+            f"probe didn't cover both required algs (saw {sorted(algs_seen)}); "
+            f"refusing destruction"
+        )
+        return False
+    _ok("probe-sign + probe-verify: hybrid keys match the successor identity")
+    return True
+
+
+def _verify_succession_signatures(succession_path: Path) -> bool:
+    """Codex P1 catch: cryptographically verify the succession
+    statement before trusting its fields. Without this, an unsigned
+    or tampered statement that happens to have the right
+    predecessor_did and an old effective_from could pass every other
+    gate and trigger destruction.
+
+    Uses ``verify_succession`` with a self-attesting resolver: the
+    statement carries both the predecessor and successor verification
+    methods, which is exactly what a freshly-resolved did:web document
+    would also return at this point in the protocol. The check is
+    'do all signatures crypto-verify against the embedded VMs', which
+    is the integrity check for the statement-as-stored.
+    """
+    from kestrel_sovereign.identity.succession import (
+        SuccessionStatement, verify_succession,
+    )
+    statement = SuccessionStatement.from_dict(
+        json.loads(succession_path.read_text())
+    )
+    def _self_resolver(did):
+        if did == statement.successor_did:
+            return {
+                "id": did,
+                "verificationMethod": list(statement.successor_verification_methods),
+            }
+        if did == statement.predecessor_did:
+            return {
+                "id": did,
+                "verificationMethod": list(statement.predecessor_verification_methods),
+            }
+        raise ValueError(f"unknown did during destroy verify: {did!r}")
+
+    result = verify_succession(statement, did_web_resolver=_self_resolver)
+    if not result.ok:
+        _err(f"succession statement signatures failed verification: {result.reason}")
+        return False
+    _ok("succession statement crypto-verified (predecessor + successor signatures)")
     return True
 
 
@@ -376,15 +515,23 @@ def main() -> int:
     if not _check_hybrid_keys(agent_data, slug):
         return 1
 
+    _step("Gate 4: succession signatures crypto-verify")
+    if not _verify_succession_signatures(succession_path):
+        return 1
+
+    _step("Gate 5: hybrid keys match the successor identity (probe sign+verify)")
+    if not _check_hybrid_keys_match_successor(agent_data, statement):
+        return 1
+
     if not args.skip_https_check:
-        _step("Gate 4: new DID document reachable over HTTPS")
+        _step("Gate 6: new DID document reachable over HTTPS")
         if not _check_https_did_doc(succession_path):
             return 1
 
     # --------------------------------------------------------------
     # Confirmation
     # --------------------------------------------------------------
-    _step("Gate 5: explicit confirmation")
+    _step("Gate 7: explicit confirmation")
     if not args.confirm:
         _info("--confirm not passed; this is a dry run.")
     confirm_env = os.environ.get(GO_AHEAD_ENV, "")
