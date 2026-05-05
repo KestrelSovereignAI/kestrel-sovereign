@@ -69,11 +69,15 @@ async def compute_feature(mock_agent):
     await feature.initialize()
     mock_agent.features["ComputeFeature"] = feature
 
-    # Inject real ECDSA keys into the signer (no inception ceremony in tests)
+    # Inject real ECDSA keys into the signer (no inception ceremony in tests).
+    # Wave 1: go through Secp256k1Suite so the test exercises the same
+    # CryptoSuite path production code uses, not the raw cryptography API
+    # (which the rest of the codebase no longer touches outside the suite).
     if feature.signer is not None:
-        from cryptography.hazmat.primitives.asymmetric import ec
-        feature.signer._private_key = ec.generate_private_key(ec.SECP256K1())
-        feature.signer._public_key = feature.signer._private_key.public_key()
+        from kestrel_sovereign.security.crypto_suite import Secp256k1Suite
+        kp = Secp256k1Suite().generate_keypair()
+        feature.signer._private_key = kp.private_key
+        feature.signer._public_key = kp.public_key
         async def _ok():
             return True
         feature.signer._load_keys = _ok
