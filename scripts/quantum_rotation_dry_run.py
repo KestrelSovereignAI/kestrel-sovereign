@@ -244,16 +244,14 @@ def main() -> int:
             return {"id": did, "verificationMethod": new_did_doc_vms}
         raise ValueError(f"unknown did: {did!r}")
 
+    # 1 minute after the cutoff. Use timedelta — `.replace(minute=(m+1) % 60)`
+    # wraps wrong on the 59th minute (e.g. 13:59 -> 13:00, before the cutoff,
+    # which makes this a pre-cutoff verification and breaks the post_cutoff
+    # flag assertion below). Codex P2 catch.
+    from datetime import timedelta
     post_cutoff_ts = (
-        datetime.fromisoformat(cutoff) + (datetime.fromisoformat(cutoff) -
-        datetime.fromisoformat(cutoff))
+        datetime.fromisoformat(cutoff) + timedelta(minutes=1)
     ).isoformat()
-    # Use a timestamp 1 minute after cutoff to be safely post-cutoff
-    post_cutoff_dt = datetime.fromisoformat(cutoff)
-    post_cutoff_dt = post_cutoff_dt.replace(
-        minute=(post_cutoff_dt.minute + 1) % 60,
-    )
-    post_cutoff_ts = post_cutoff_dt.isoformat()
 
     verdict = verify_artifact_against_chain(
         root_did=legacy_did,
