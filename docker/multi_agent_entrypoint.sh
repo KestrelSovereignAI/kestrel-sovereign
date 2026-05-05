@@ -1,9 +1,9 @@
 #!/bin/bash
-# Rookery Host entrypoint for Cloud Run / Azure Container Apps
+# MultiAgent Host entrypoint for Cloud Run / Azure Container Apps
 # 1. Provisions agent directories from KESTREL_AGENTS env var (if set)
-# 2. Generates rookery.toml via auto-discovery if not mounted
+# 2. Generates multi_agent.toml via auto-discovery if not mounted
 # 3. Bootstraps agent identities for any new agent data dirs
-# 4. Starts the rookery host (host.py)
+# 4. Starts the multi_agent host (host.py)
 
 set -e
 
@@ -19,7 +19,17 @@ while IFS='=' read -r key val; do
 done < <(env)
 
 PORT="${PORT:-8080}"
-ROOKERY_CONFIG="${KESTREL_ROOKERY_CONFIG:-/app/rookery.toml}"
+
+# Backward compat: accept KESTREL_ROOKERY_CONFIG (legacy) if the new
+# name isn't set. The Python loader emits a deprecation warning when
+# the legacy path is used; that warning hits the application logs.
+if [ -z "${KESTREL_MULTI_AGENT_CONFIG}" ] && [ -n "${KESTREL_ROOKERY_CONFIG}" ]; then
+    echo "WARNING: KESTREL_ROOKERY_CONFIG is set but KESTREL_MULTI_AGENT_CONFIG is not."
+    echo "         The legacy ROOKERY name is deprecated; rename to MULTI_AGENT_CONFIG."
+    export KESTREL_MULTI_AGENT_CONFIG="${KESTREL_ROOKERY_CONFIG}"
+fi
+
+MULTI_AGENT_CONFIG="${KESTREL_MULTI_AGENT_CONFIG:-/app/multi_agent.toml}"
 AGENT_DATA_DIR="${KESTREL_AGENT_DATA_DIR:-/app/agent_data}"
 
 # Provision agent directories from KESTREL_AGENTS env var
@@ -37,22 +47,22 @@ if [ -n "$KESTREL_AGENTS" ]; then
     done
 fi
 
-# Generate rookery.toml from auto-discovery if not already present
-if [ ! -f "$ROOKERY_CONFIG" ]; then
-    echo "No rookery.toml found. Auto-discovering agents in $AGENT_DATA_DIR..."
+# Generate multi_agent.toml from auto-discovery if not already present
+if [ ! -f "$MULTI_AGENT_CONFIG" ]; then
+    echo "No multi_agent.toml found. Auto-discovering agents in $AGENT_DATA_DIR..."
     /app/.venv/bin/python -c "
 import os
-from kestrel_sovereign.rookery.config import RookeryConfig
+from kestrel_sovereign.multi_agent.config import MultiAgentConfig
 
-config = RookeryConfig.auto_discover('$AGENT_DATA_DIR', include_empty=True)
+config = MultiAgentConfig.auto_discover('$AGENT_DATA_DIR', include_empty=True)
 config.host.port = int(os.environ.get('PORT', '8080'))
-config.save('$ROOKERY_CONFIG')
-print(f'Generated rookery config: {len(config.agents)} agents on port {config.host.port}')
+config.save('$MULTI_AGENT_CONFIG')
+print(f'Generated multi_agent config: {len(config.agents)} agents on port {config.host.port}')
 for name in config.agents:
     print(f'  - {name}')
 "
 else
-    echo "Using existing rookery config: $ROOKERY_CONFIG"
+    echo "Using existing multi_agent config: $MULTI_AGENT_CONFIG"
 fi
 
 # Bootstrap identity and initialize DB for each agent data dir
@@ -90,5 +100,5 @@ print('  Database initialized.')
     fi
 done
 
-echo "Starting Kestrel Rookery Host on port $PORT..."
+echo "Starting Kestrel MultiAgent Host on port $PORT..."
 exec /app/.venv/bin/uvicorn host:app --host 0.0.0.0 --port "$PORT"

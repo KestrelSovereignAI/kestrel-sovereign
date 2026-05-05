@@ -205,7 +205,7 @@ class ApprovalQueue:
         # on every non-success exit path, including ``CancelledError`` —
         # which fires whenever the calling task dies (HTTP stream
         # dropped, agent loop torn down, user switched chat tabs in
-        # the rookery). PR #877 reframed the user-facing message but
+        # the multi_agent). PR #877 reframed the user-facing message but
         # kept the underlying behavior: a slow user lost the chance
         # to decide. That was spackle.
         #
@@ -258,7 +258,7 @@ class ApprovalQueue:
         except asyncio.CancelledError:
             # Calling task cancelled (HTTP stream dropped, browser
             # closed, user switched to a different agent in the
-            # rookery). The user has not yet decided. Leave the
+            # multi_agent). The user has not yet decided. Leave the
             # request in ``_pending`` so the modal stays interactive,
             # and re-raise without firing withdrawal — the modal must
             # NOT auto-close on us.

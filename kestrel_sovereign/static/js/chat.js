@@ -153,7 +153,7 @@ export function initChat() {
     //
     // The host-agent is null at init (selectAgent hasn't run); the
     // null-keyed pane is what standalone mode uses for its only
-    // conversation. In rookery mode, the first selectAgent call swaps
+    // conversation. In multi_agent mode, the first selectAgent call swaps
     // this pane out via mountChatPane.
     if (chatContainer) {
         const initialAgent = API.getHostAgent();
@@ -184,7 +184,7 @@ export function initChat() {
     // Note: Model selector events are now handled by SharedModelSelector in loadModels()
 
     // SSE notifications and context status are loaded after agent selection:
-    // - Rookery mode: selectAgent() handles both
+    // - MultiAgent mode: selectAgent() handles both
     // - Standalone mode: app.js init handles both after loadAgents()
 }
 
@@ -991,7 +991,7 @@ export async function loadModels() {
     }
 
     // Create the shared model selector instance
-    // Use API.buildAgentUrl() for proper rookery routing and pass auth headers
+    // Use API.buildAgentUrl() for proper multi_agent routing and pass auth headers
     sharedModelSelector = new window.SharedModelSelector({
         providerSelectId: 'provider-selector',
         routeSelectId: 'route-selector',

@@ -98,7 +98,7 @@ async def test_purge_never_touches_live_rows(tmp_path):
 @pytest.mark.asyncio
 async def test_per_agent_scoping(tmp_path):
     """Purging AGENT_ID's old trash must not touch OTHER_AGENT_ID's data,
-    even when they share the same database file (rookery scenario)."""
+    even when they share the same database file (multi_agent scenario)."""
     db = tmp_path / "kestrel.db"
 
     long_ago = datetime.now(timezone.utc) - timedelta(days=60)

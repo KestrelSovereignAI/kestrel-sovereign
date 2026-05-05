@@ -66,18 +66,18 @@ KESTREL_DATA_KEY = "kestrel-data-key:latest"
 LIGHTHOUSE_API_KEY = "kestrel-lighthouse-key:latest"
 
 # =============================================================================
-# Rookery Profiles (Multi-Agent Host)
+# MultiAgent Profiles (Multi-Agent Host)
 # =============================================================================
-# Rookery profiles deploy the host (host.py) + all agents in a single container.
-# Uses docker/Dockerfile.rookery which runs the rookery host process manager.
+# MultiAgent profiles deploy the host (host.py) + all agents in a single container.
+# Uses docker/Dockerfile.multi_agent which runs the multi_agent host process manager.
 
-# Rookery Development - Cloud Run (scales to zero)
-[profiles.rookery-dev]
-name = "Rookery Development (Multi-Agent)"
+# MultiAgent Development - Cloud Run (scales to zero)
+[profiles.multi_agent-dev]
+name = "MultiAgent Development (Multi-Agent)"
 provider = "cloudrun"
-service_name = "kestrel-rookery-dev"
+service_name = "kestrel-multi_agent-dev"
 region = "us-central1"
-deployment_mode = "rookery"
+deployment_mode = "multi_agent"
 min_instances = 0
 max_instances = 10
 memory = "4Gi"
@@ -86,24 +86,24 @@ port = 8080
 timeout = 300
 concurrency = 80
 
-[profiles.rookery-dev.env_vars]
+[profiles.multi_agent-dev.env_vars]
 KESTREL_ENV = "development"
 KESTREL_DB_BACKEND = "sqlite"
 KESTREL_HOST_AUTOSTART = "true"
 
-[profiles.rookery-dev.secrets]
+[profiles.multi_agent-dev.secrets]
 OPENAI_API_KEY = "kestrel-openai-key:latest"
 KESTREL_API_KEY = "kestrel-api-key:latest"
 KESTREL_DATA_KEY = "kestrel-data-key:latest"
 LIGHTHOUSE_API_KEY = "kestrel-lighthouse-key:latest"
 
-# Rookery Production - Cloud Run (always warm)
-[profiles.rookery-prod]
-name = "Rookery Production (Multi-Agent)"
+# MultiAgent Production - Cloud Run (always warm)
+[profiles.multi_agent-prod]
+name = "MultiAgent Production (Multi-Agent)"
 provider = "cloudrun"
-service_name = "kestrel-rookery-prod"
+service_name = "kestrel-multi_agent-prod"
 region = "us-central1"
-deployment_mode = "rookery"
+deployment_mode = "multi_agent"
 min_instances = 1
 max_instances = 100
 memory = "4Gi"
@@ -112,12 +112,12 @@ port = 8080
 timeout = 300
 concurrency = 80
 
-[profiles.rookery-prod.env_vars]
+[profiles.multi_agent-prod.env_vars]
 KESTREL_ENV = "production"
 KESTREL_DB_BACKEND = "sqlite"
 KESTREL_HOST_AUTOSTART = "true"
 
-[profiles.rookery-prod.secrets]
+[profiles.multi_agent-prod.secrets]
 OPENAI_API_KEY = "kestrel-openai-key:latest"
 KESTREL_API_KEY = "kestrel-api-key:latest"
 KESTREL_DATA_KEY = "kestrel-data-key:latest"
@@ -127,13 +127,13 @@ LIGHTHOUSE_API_KEY = "kestrel-lighthouse-key:latest"
 # Azure Container Apps Profiles
 # =============================================================================
 
-# Azure Rookery Development (scales to zero)
-[profiles.azure-rookery-dev]
-name = "Azure Rookery Development (Multi-Agent)"
+# Azure MultiAgent Development (scales to zero)
+[profiles.azure-multi_agent-dev]
+name = "Azure MultiAgent Development (Multi-Agent)"
 provider = "azure"
-service_name = "kestrel-rookery-dev"
+service_name = "kestrel-multi_agent-dev"
 region = "eastus2"
-deployment_mode = "rookery"
+deployment_mode = "multi_agent"
 min_instances = 0
 max_instances = 10
 memory = "4Gi"
@@ -142,12 +142,12 @@ port = 8080
 timeout = 300
 concurrency = 80
 
-[profiles.azure-rookery-dev.env_vars]
+[profiles.azure-multi_agent-dev.env_vars]
 KESTREL_ENV = "development"
 KESTREL_DB_BACKEND = "sqlite"
 KESTREL_HOST_AUTOSTART = "true"
 
-[profiles.azure-rookery-dev.secrets]
+[profiles.azure-multi_agent-dev.secrets]
 OPENAI_API_KEY = "${OPENAI_API_KEY}"
 KESTREL_API_KEY = "${KESTREL_API_KEY}"
 KESTREL_DATA_KEY = "${KESTREL_DATA_KEY}"

@@ -3,7 +3,7 @@
 Background
 ----------
 The 2026-04-24 incident wiped Claw, Meridian, and Nellie's conversation
-history because a Playwright demo harness pointed at the live rookery
+history because a Playwright demo harness pointed at the live multi_agent
 server on ``localhost:8888`` and called destructive APIs against
 whichever agents the server had mounted.
 
@@ -75,13 +75,13 @@ def classify_server_mode(agents: Mapping[str, "KestrelAgent"]) -> bool:
     """Return True when this server is running in demo mode.
 
     Demo mode is "every loaded agent is demo-scoped." A single live
-    agent in the rookery flips the server back to live mode — better
+    agent in the multi_agent flips the server back to live mode — better
     to be conservative than to mistakenly relax the rail because most
-    of the rookery is demo.
+    of the multi_agent is demo.
 
-    Empty rookery resolves to live mode. A server that hasn't loaded
+    Empty multi_agent resolves to live mode. A server that hasn't loaded
     agents yet should not be permissive about destructive ops; the
-    operator can still run demos against an empty rookery (no agents
+    operator can still run demos against an empty multi_agent (no agents
     to destroy).
     """
     if not agents:
@@ -202,7 +202,7 @@ async def enforce_destructive_op(request: Request) -> None:
     # --- Demo server: the reverse rail ---------------------------------
     # If the operator has set up an isolated demo server, never let it
     # touch a live agent — that almost certainly indicates a misconfig
-    # (wrong KESTREL_DB_PATH, bad rookery.toml). Refuse loud and audit.
+    # (wrong KESTREL_DB_PATH, bad multi_agent.toml). Refuse loud and audit.
     if server_demo_mode and not target_is_demo and agent is not None:
         summary = _audit_summary(
             request=request,
@@ -225,8 +225,8 @@ async def enforce_destructive_op(request: Request) -> None:
             detail=(
                 "Server is running in demo mode but the request targets a "
                 "live agent. This usually means the demo server was started "
-                "against a rookery that contains a live agent — check "
-                "KESTREL_DB_PATH and rookery.toml."
+                "against a multi_agent that contains a live agent — check "
+                "KESTREL_DB_PATH and multi_agent.toml."
             ),
         )
 

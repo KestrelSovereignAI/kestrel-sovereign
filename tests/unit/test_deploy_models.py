@@ -125,23 +125,23 @@ class TestDeploymentProfile:
             region="us-central1",
         )
         assert profile.deployment_mode == "agent"
-        assert profile.is_rookery is False
+        assert profile.is_multi_agent is False
         assert profile.dockerfile == "docker/Dockerfile.cloudrun"
 
-    def test_rookery_deployment_mode(self):
-        """Test rookery deployment mode."""
+    def test_multi_agent_deployment_mode(self):
+        """Test multi_agent deployment mode."""
         profile = DeploymentProfile(
             provider=DeployProviderType.CLOUD_RUN,
-            service_name="kestrel-rookery-dev",
+            service_name="kestrel-multi_agent-dev",
             region="us-central1",
-            deployment_mode="rookery",
-            dockerfile="docker/Dockerfile.rookery",
+            deployment_mode="multi_agent",
+            dockerfile="docker/Dockerfile.multi_agent",
             memory="4Gi",
             cpu=4,
         )
-        assert profile.deployment_mode == "rookery"
-        assert profile.is_rookery is True
-        assert profile.dockerfile == "docker/Dockerfile.rookery"
+        assert profile.deployment_mode == "multi_agent"
+        assert profile.is_multi_agent is True
+        assert profile.dockerfile == "docker/Dockerfile.multi_agent"
         assert profile.memory == "4Gi"
         assert profile.cpu == 4
 
@@ -149,19 +149,19 @@ class TestDeploymentProfile:
         """Test that session to_dict includes deployment_mode."""
         profile = DeploymentProfile(
             provider=DeployProviderType.CLOUD_RUN,
-            service_name="kestrel-rookery-dev",
+            service_name="kestrel-multi_agent-dev",
             region="us-central1",
-            deployment_mode="rookery",
+            deployment_mode="multi_agent",
         )
         session = DeploymentSession(
-            service_name="kestrel-rookery-dev",
+            service_name="kestrel-multi_agent-dev",
             provider=DeployProviderType.CLOUD_RUN,
             profile=profile,
             status=DeployStatus.ACTIVE,
             started_at=datetime.now(timezone.utc),
         )
         result = session.to_dict()
-        assert result["deployment_mode"] == "rookery"
+        assert result["deployment_mode"] == "multi_agent"
 
     def test_provider_specific_fields(self):
         """Test provider-specific fields."""

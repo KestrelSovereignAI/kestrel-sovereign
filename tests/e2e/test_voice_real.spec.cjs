@@ -15,7 +15,7 @@
  *
  * Agent selection:
  *   - KESTREL_E2E_AGENT picks a specific agent name.
- *   - Otherwise the first voice-capable agent on the rookery is used; this
+ *   - Otherwise the first voice-capable agent on the multi_agent is used; this
  *     keeps the spec portable across CI vs local dev where agent names
  *     differ.
  *
@@ -223,7 +223,7 @@ test.describe('voice realtime: API contract', () => {
  * Boot the SPA scoped to a specific agent. Auth-protected: we send the API
  * key as both an HTTP header (for the initial GET) and a sessionStorage
  * entry (for everything the SPA does after mount). Then call window.selectAgent
- * to put the SPA in rookery-mode for the named agent so #voice-toggle-btn
+ * to put the SPA in multi_agent-mode for the named agent so #voice-toggle-btn
  * mounts in the chat header.
  */
 async function loadChatForAgent(page, apiKey, agentName) {
@@ -236,7 +236,7 @@ async function loadChatForAgent(page, apiKey, agentName) {
   // The SPA wires window.selectAgent at boot.
   await page.waitForFunction(() => typeof window.selectAgent === 'function', { timeout: 10_000 });
   await page.evaluate((name) => window.selectAgent(name), agentName);
-  // selectAgent flips into rookery mode but leaves the active panel where it
+  // selectAgent flips into multi_agent mode but leaves the active panel where it
   // was (Identity by default). Navigate to Chat so the chat input + mic
   // button become visible — the voice UI mounted them at #send-button at
   // page init but the panel they live in is hidden until we switch to it.

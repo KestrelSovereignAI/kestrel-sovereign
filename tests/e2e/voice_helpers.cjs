@@ -23,7 +23,7 @@ const MIC_FIXTURE = path.resolve(
 );
 
 /**
- * Auth helper — single-agent mode hits /api/auth/key, rookery mode honors the
+ * Auth helper — single-agent mode hits /api/auth/key, multi_agent mode honors the
  * KESTREL_API_KEY env var directly. Mirrors the pattern in
  * test_heartbeat_and_bootstrap.spec.cjs.
  */
@@ -41,7 +41,7 @@ function authHeaders(apiKey) {
 }
 
 /**
- * Build the rookery-scoped URL for an agent. Replaces the older
+ * Build the multi_agent-scoped URL for an agent. Replaces the older
  * `agentUrl(suffix)` helper that hardcoded one agent name — every spec now
  * resolves an agent first via `discoverVoiceCapableAgent` and passes the
  * resolved name in.
@@ -51,7 +51,7 @@ function agentUrlFor(agentName, suffix) {
 }
 
 /**
- * Pick the first agent on the rookery that has voice configured. Used by E2E
+ * Pick the first agent on the multi_agent that has voice configured. Used by E2E
  * specs so they don't hardcode an agent name a CI server may not have.
  *
  * Selection order:

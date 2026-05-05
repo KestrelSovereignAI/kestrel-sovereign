@@ -5,8 +5,8 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 from pathlib import Path
 
-from kestrel_sovereign.rookery.agent_manager import AgentManager
-from kestrel_sovereign.rookery.config import LocalAgentConfig, RookeryConfig
+from kestrel_sovereign.multi_agent.agent_manager import AgentManager
+from kestrel_sovereign.multi_agent.config import LocalAgentConfig, MultiAgentConfig
 from kestrel_sovereign.spawn.mandate import SpawnMandate
 
 
@@ -112,17 +112,17 @@ class TestAgentManagerBasics:
 
 
 class TestLoadFromConfig:
-    """Test loading agents from RookeryConfig."""
+    """Test loading agents from MultiAgentConfig."""
 
     @pytest.mark.asyncio
-    @patch("kestrel_sovereign.rookery.agent_manager._get_agent_did", new_callable=AsyncMock)
-    @patch("kestrel_sovereign.rookery.agent_manager.KestrelAgent")
-    @patch("kestrel_sovereign.rookery.agent_manager.LLMService")
+    @patch("kestrel_sovereign.multi_agent.agent_manager._get_agent_did", new_callable=AsyncMock)
+    @patch("kestrel_sovereign.multi_agent.agent_manager.KestrelAgent")
+    @patch("kestrel_sovereign.multi_agent.agent_manager.LLMService")
     async def test_load_from_config_skips_non_autostart(
         self, mock_llm_cls, mock_agent_cls, mock_get_did
     ):
         """Agents with autostart=false should be skipped."""
-        config = RookeryConfig(
+        config = MultiAgentConfig(
             agents={
                 "active": LocalAgentConfig(data_dir=Path("/tmp/active"), port=8801, autostart=True),
                 "inactive": LocalAgentConfig(data_dir=Path("/tmp/inactive"), port=8802, autostart=False),
@@ -144,14 +144,14 @@ class TestLoadFromConfig:
         assert manager.get_agent("inactive") is None
 
     @pytest.mark.asyncio
-    @patch("kestrel_sovereign.rookery.agent_manager._get_agent_did", new_callable=AsyncMock)
-    @patch("kestrel_sovereign.rookery.agent_manager.KestrelAgent")
-    @patch("kestrel_sovereign.rookery.agent_manager.LLMService")
+    @patch("kestrel_sovereign.multi_agent.agent_manager._get_agent_did", new_callable=AsyncMock)
+    @patch("kestrel_sovereign.multi_agent.agent_manager.KestrelAgent")
+    @patch("kestrel_sovereign.multi_agent.agent_manager.LLMService")
     async def test_load_from_config_handles_errors(
         self, mock_llm_cls, mock_agent_cls, mock_get_did
     ):
         """Failed agent loads should log error but not crash."""
-        config = RookeryConfig(
+        config = MultiAgentConfig(
             agents={
                 "broken": LocalAgentConfig(data_dir=Path("/tmp/broken"), port=8801, autostart=True),
             }
@@ -193,9 +193,9 @@ class TestCreateAgent:
 
     @pytest.mark.asyncio
     @patch("kestrel_sovereign.inception_service.create_kestrel_identity_async", new_callable=AsyncMock)
-    @patch("kestrel_sovereign.rookery.agent_manager._get_agent_did", new_callable=AsyncMock)
-    @patch("kestrel_sovereign.rookery.agent_manager.KestrelAgent")
-    @patch("kestrel_sovereign.rookery.agent_manager.LLMService")
+    @patch("kestrel_sovereign.multi_agent.agent_manager._get_agent_did", new_callable=AsyncMock)
+    @patch("kestrel_sovereign.multi_agent.agent_manager.KestrelAgent")
+    @patch("kestrel_sovereign.multi_agent.agent_manager.LLMService")
     async def test_create_agent_success(
         self, mock_llm_cls, mock_agent_cls, mock_get_did, mock_inception, tmp_path
     ):
@@ -215,9 +215,9 @@ class TestCreateAgent:
 
     @pytest.mark.asyncio
     @patch("kestrel_sovereign.inception_service.create_kestrel_identity_async", new_callable=AsyncMock)
-    @patch("kestrel_sovereign.rookery.agent_manager._get_agent_did", new_callable=AsyncMock)
-    @patch("kestrel_sovereign.rookery.agent_manager.KestrelAgent")
-    @patch("kestrel_sovereign.rookery.agent_manager.LLMService")
+    @patch("kestrel_sovereign.multi_agent.agent_manager._get_agent_did", new_callable=AsyncMock)
+    @patch("kestrel_sovereign.multi_agent.agent_manager.KestrelAgent")
+    @patch("kestrel_sovereign.multi_agent.agent_manager.LLMService")
     async def test_create_agent_passes_parent_did(
         self, mock_llm_cls, mock_agent_cls, mock_get_did, mock_inception, tmp_path
     ):
@@ -243,9 +243,9 @@ class TestSpawnAgent:
 
     @pytest.mark.asyncio
     @patch("kestrel_sovereign.inception_service.create_kestrel_identity_async", new_callable=AsyncMock)
-    @patch("kestrel_sovereign.rookery.agent_manager._get_agent_did", new_callable=AsyncMock)
-    @patch("kestrel_sovereign.rookery.agent_manager.KestrelAgent")
-    @patch("kestrel_sovereign.rookery.agent_manager.LLMService")
+    @patch("kestrel_sovereign.multi_agent.agent_manager._get_agent_did", new_callable=AsyncMock)
+    @patch("kestrel_sovereign.multi_agent.agent_manager.KestrelAgent")
+    @patch("kestrel_sovereign.multi_agent.agent_manager.LLMService")
     async def test_spawn_passes_parent_did_to_create(
         self, mock_llm_cls, mock_agent_cls, mock_get_did, mock_inception, tmp_path
     ):
@@ -278,9 +278,9 @@ class TestSpawnAgent:
 
     @pytest.mark.asyncio
     @patch("kestrel_sovereign.inception_service.create_kestrel_identity_async", new_callable=AsyncMock)
-    @patch("kestrel_sovereign.rookery.agent_manager._get_agent_did", new_callable=AsyncMock)
-    @patch("kestrel_sovereign.rookery.agent_manager.KestrelAgent")
-    @patch("kestrel_sovereign.rookery.agent_manager.LLMService")
+    @patch("kestrel_sovereign.multi_agent.agent_manager._get_agent_did", new_callable=AsyncMock)
+    @patch("kestrel_sovereign.multi_agent.agent_manager.KestrelAgent")
+    @patch("kestrel_sovereign.multi_agent.agent_manager.LLMService")
     async def test_spawn_duplicate_name_raises(
         self, mock_llm_cls, mock_agent_cls, mock_get_did, mock_inception, tmp_path
     ):

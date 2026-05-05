@@ -10,7 +10,7 @@ Checks performed:
   - ``[llm]`` section present with a non-empty ``route_priority``
   - For each cloud route in ``route_priority``, the matching
     ``api_key_env`` is set in ``.env``
-  - At least one agent registered in ``rookery.toml``
+  - At least one agent registered in ``multi_agent.toml``
   - For each registered agent, ``kestrel_prime.db`` exists
   - For each registered agent, the anchored ``constitution_hash``
     matches the SHA256 of the canonical KESTREL_CONSTITUTION.md.
@@ -29,7 +29,7 @@ import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from kestrel_sovereign.rookery.config import ROOKERY_CONFIG_FILENAME, RookeryConfig
+from kestrel_sovereign.multi_agent.config import MULTI_AGENT_CONFIG_FILENAME, MultiAgentConfig
 from kestrel_sovereign.setup.env_file import read_env
 from kestrel_sovereign.setup.toml_file import read_toml
 
@@ -56,15 +56,15 @@ def diagnose(project_dir: Path) -> DoctorReport:
     report = DoctorReport()
     env_path = project_dir / ".env"
     toml_path = project_dir / "kestrel.toml"
-    rookery_path = project_dir / ROOKERY_CONFIG_FILENAME
+    multi_agent_path = project_dir / MULTI_AGENT_CONFIG_FILENAME
 
     env = read_env(env_path)
     config = read_toml(toml_path)
 
     _check_data_key(env, env_path, report)
     _check_llm(config, env, toml_path, report)
-    _check_rookery(rookery_path, project_dir, report)
-    _check_constitution_drift(rookery_path, project_dir, report)
+    _check_multi_agent(multi_agent_path, project_dir, report)
+    _check_constitution_drift(multi_agent_path, project_dir, report)
 
     return report
 
@@ -120,14 +120,14 @@ def _check_llm(
             report.ok.append(f"{api_key_env} set for {route_id}")
 
 
-def _check_rookery(
-    rookery_path: Path, project_dir: Path, report: DoctorReport
+def _check_multi_agent(
+    multi_agent_path: Path, project_dir: Path, report: DoctorReport
 ) -> None:
-    rookery = RookeryConfig.load(rookery_path, auto_discover_fallback=False)
-    agents = rookery.get_local_agents()
+    multi_agent = MultiAgentConfig.load(multi_agent_path, auto_discover_fallback=False)
+    agents = multi_agent.get_local_agents()
     if not agents:
         report.fail.append(
-            f"No local agents in {rookery_path} — run `kestrel setup agent`"
+            f"No local agents in {multi_agent_path} — run `kestrel setup agent`"
         )
         return
 
@@ -143,11 +143,11 @@ def _check_rookery(
 
 
 def _check_constitution_drift(
-    rookery_path: Path, project_dir: Path, report: DoctorReport
+    multi_agent_path: Path, project_dir: Path, report: DoctorReport
 ) -> None:
     """Compare each agent's anchored constitution_hash against the on-disk file.
 
-    For each local rookery agent: open ``kestrel_prime.db`` with stock
+    For each local multi_agent agent: open ``kestrel_prime.db`` with stock
     ``sqlite3``, read the agent node's ``constitution_hash`` property
     (plain JSON in ``graph_nodes.properties``), and compare to the SHA256
     of the canonical ``KESTREL_CONSTITUTION.md`` shipped in the package.
@@ -170,8 +170,8 @@ def _check_constitution_drift(
     for them to drift against. (If we ever start anchoring overlay
     text, this check needs an extension.)
     """
-    rookery = RookeryConfig.load(rookery_path, auto_discover_fallback=False)
-    agents = rookery.get_local_agents()
+    multi_agent = MultiAgentConfig.load(multi_agent_path, auto_discover_fallback=False)
+    agents = multi_agent.get_local_agents()
     if not agents:
         return
 
@@ -188,7 +188,7 @@ def _check_constitution_drift(
     for name, cfg in agents.items():
         db_path = (project_dir / cfg.data_dir / "kestrel_prime.db").resolve()
         if not db_path.exists():
-            # Already reported by _check_rookery; don't duplicate.
+            # Already reported by _check_multi_agent; don't duplicate.
             continue
 
         stored_hash = _read_anchored_constitution_hash(db_path)

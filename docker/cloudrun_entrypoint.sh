@@ -21,7 +21,7 @@ AGENT_DIR="${AGENT_BASE}/${AGENT_NAME}"
 PORT="${PORT:-8080}"
 
 # Bootstrap agent identity if none exists
-# Agent lives in a named subdirectory so rookery auto-discovery finds it
+# Agent lives in a named subdirectory so multi_agent auto-discovery finds it
 mkdir -p "$AGENT_DIR"
 if ! ls "$AGENT_DIR"/kestrel_*.json &>/dev/null; then
     echo "No agent identity found. Creating new Kestrel agent in ${AGENT_DIR}..."

@@ -134,7 +134,7 @@ test('init redirects to login when bootstrap is unavailable and OAuth session is
 test('request hits canonical paths — no companion-prefix rewriting (#863)', async () => {
     // Pre-#863, setAgentId() pushed every call through /api/kestrel/companions/{id}/...
     // — a Frinz-shaped URL embedded into Kestrel UI under a "multi-agent mode"
-    // misnomer (Kestrel's actual rookery uses /api/agents/{name}/..., a separate
+    // misnomer (Kestrel's actual multi_agent uses /api/agents/{name}/..., a separate
     // feature preserved by setHostAgent). #863 removed setAgentId entirely;
     // hosts now route canonical /api/* paths themselves.
     const fetchFn = createFetchQueue(jsonResponse(200, { models: ['ok'] }));
@@ -224,7 +224,7 @@ test('streamInvoke with API key refreshes bootstrap key once and retries the str
     assert.equal(fetchFn.calls[2].options.headers['X-API-Key'], 'fresh-key');
 });
 
-test('applyHostAgentPrefix preserves host-level routes and prefixes per-agent routes in rookery mode', () => {
+test('applyHostAgentPrefix preserves host-level routes and prefixes per-agent routes in multi_agent mode', () => {
     assert.equal(applyHostAgentPrefix('/api/auth/key', 'host-a'), '/api/auth/key');
     assert.equal(
         applyHostAgentPrefix('/api/models?featured_only=true', 'host-a'),

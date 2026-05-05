@@ -99,11 +99,18 @@ class DeployManagerCore:
                 raw_secrets = data.get("secrets", {})
                 expanded_secrets = self._expand_env_vars(raw_secrets)
 
-                # Determine default dockerfile based on deployment mode
-                deployment_mode = data.get("deployment_mode", "agent")
+                # Determine default dockerfile based on deployment mode.
+                # `deployment_mode = "rookery"` is the legacy name for
+                # "multi_agent" — accepted with a deprecation warning.
+                from kestrel_sovereign.multi_agent.compat import (
+                    normalize_deployment_mode,
+                )
+                deployment_mode = normalize_deployment_mode(
+                    data.get("deployment_mode", "agent")
+                )
                 default_dockerfile = (
-                    "docker/Dockerfile.rookery"
-                    if deployment_mode == "rookery"
+                    "docker/Dockerfile.multi_agent"
+                    if deployment_mode == "multi_agent"
                     else "docker/Dockerfile.cloudrun"
                 )
 
@@ -238,12 +245,22 @@ class DeployManagerCore:
         logger.warning(f"Health check timed out after {timeout}s")
         return False
 
+    # Legacy profile aliases (Rookery -> MultiAgent rename). When the
+    # deprecation period ends, drop this map and the alias lookup branch
+    # below.
+    _LEGACY_PROFILE_ALIASES = {
+        "rookery-dev": "multi-agent-dev",
+        "rookery-prod": "multi-agent-prod",
+    }
+
     def get_profile(self, profile_name: str) -> DeploymentProfile:
         """
         Get a deployment profile by name.
 
         Args:
-            profile_name: Name of the profile
+            profile_name: Name of the profile. Legacy ``rookery-*`` names
+                are accepted as aliases of ``multi-agent-*`` with a
+                deprecation warning.
 
         Returns:
             DeploymentProfile
@@ -252,6 +269,15 @@ class DeployManagerCore:
             DeployManagerError: If profile not found
         """
         profile = self.profiles.get(profile_name)
+        if profile is None and profile_name in self._LEGACY_PROFILE_ALIASES:
+            new_name = self._LEGACY_PROFILE_ALIASES[profile_name]
+            profile = self.profiles.get(new_name)
+            if profile is not None:
+                logger.warning(
+                    "DEPRECATED: profile %r was renamed to %r; update your "
+                    "deploy command. The legacy alias will be removed in a "
+                    "future release.", profile_name, new_name,
+                )
         if not profile:
             available = ", ".join(self.profiles.keys())
             raise DeployManagerError(

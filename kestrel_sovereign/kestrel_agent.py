@@ -241,7 +241,7 @@ class KestrelAgent(
         #
         # ``self._private_key`` is set to the legacy ECDSA private key for
         # backward compatibility with code that grabs it via getattr (most
-        # notably ``rookery.agent_manager.spawn_agent`` — pre-ceremony agents
+        # notably ``multi_agent.agent_manager.spawn_agent`` — pre-ceremony agents
         # were silently broken there because nothing was setting this).
         #
         # Identity loading is best-effort: during inception the keys may not
@@ -450,7 +450,7 @@ class KestrelAgent(
         """True when this agent was inceptioned with ``is_demo=True`` (#766).
 
         Demo-scoped agents bypass the destructive-op guardrails the server
-        applies to live agents — the rookery operator opted in to letting
+        applies to live agents — the multi_agent operator opted in to letting
         demos clear history, toggle permissions, and switch privacy modes
         without an explicit authorization header.
         """

@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from pathlib import Path
 
 from kestrel_sovereign.features.spawn.feature import SpawnFeature
-from kestrel_sovereign.rookery.agent_manager import AgentManager
+from kestrel_sovereign.multi_agent.agent_manager import AgentManager
 from kestrel_sovereign.spawn.lifecycle import SpawnedAgentLifecycle
 from kestrel_sovereign.spawn.mandate import SpawnMandate
 

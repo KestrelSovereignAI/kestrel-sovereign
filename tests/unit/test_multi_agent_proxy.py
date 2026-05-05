@@ -1,5 +1,5 @@
 """
-Unit tests for Rookery proxy routing logic.
+Unit tests for MultiAgent proxy routing logic.
 
 Tests proxy header building, agent resolution, URL construction,
 and the proxy request flow using httpx mock transport.
@@ -8,13 +8,13 @@ and the proxy request flow using httpx mock transport.
 import pytest
 import httpx
 
-from kestrel_sovereign.rookery.config import (
-    RookeryConfig,
+from kestrel_sovereign.multi_agent.config import (
+    MultiAgentConfig,
     HostConfig,
     LocalAgentConfig,
     RemoteAgentConfig,
 )
-from kestrel_sovereign.rookery.proxy import (
+from kestrel_sovereign.multi_agent.proxy import (
     get_agent_base_url,
     resolve_agent,
     build_proxy_headers,
@@ -52,7 +52,7 @@ class TestResolveAgent:
 
     def test_resolve_existing_local_agent(self):
         """Resolve a local agent by name."""
-        config = RookeryConfig(
+        config = MultiAgentConfig(
             agents={
                 "claw": LocalAgentConfig(data_dir="agent_data/claw", port=8801),
             }
@@ -64,7 +64,7 @@ class TestResolveAgent:
 
     def test_resolve_existing_remote_agent(self):
         """Resolve a remote agent by name."""
-        config = RookeryConfig(
+        config = MultiAgentConfig(
             agents={
                 "remote": RemoteAgentConfig(url="https://example.com"),
             }
@@ -75,13 +75,13 @@ class TestResolveAgent:
 
     def test_resolve_nonexistent_agent(self):
         """Return None for unknown agent ID."""
-        config = RookeryConfig(agents={})
+        config = MultiAgentConfig(agents={})
         result = resolve_agent("nonexistent", config)
         assert result is None
 
     def test_resolve_is_case_sensitive(self):
         """Agent names are case-sensitive."""
-        config = RookeryConfig(
+        config = MultiAgentConfig(
             agents={
                 "Claw": LocalAgentConfig(data_dir="agent_data/claw", port=8801),
             }
@@ -157,15 +157,15 @@ class TestProxyRequestStreaming:
     """Tests for proxy_request_streaming with SSE auto-detection."""
 
     @pytest.fixture
-    def rookery_config(self):
-        return RookeryConfig(
+    def multi_agent_config(self):
+        return MultiAgentConfig(
             agents={
                 "claw": LocalAgentConfig(data_dir="agent_data/claw", port=9901),
             }
         )
 
     @pytest.mark.asyncio
-    async def test_streaming_unknown_agent_returns_404(self, rookery_config):
+    async def test_streaming_unknown_agent_returns_404(self, multi_agent_config):
         """Streaming proxy to unknown agent returns 404."""
         scope = {
             "type": "http",
@@ -182,14 +182,14 @@ class TestProxyRequestStreaming:
                 request=request,
                 agent_id="unknown",
                 path="stream",
-                config=rookery_config,
+                config=multi_agent_config,
                 client=client,
             )
 
         assert response.status_code == 404
 
     @pytest.mark.asyncio
-    async def test_streaming_offline_agent_returns_503(self, rookery_config):
+    async def test_streaming_offline_agent_returns_503(self, multi_agent_config):
         """Streaming proxy to offline agent returns 503."""
         scope = {
             "type": "http",
@@ -210,14 +210,14 @@ class TestProxyRequestStreaming:
                 request=request,
                 agent_id="claw",
                 path="api/agent",
-                config=rookery_config,
+                config=multi_agent_config,
                 client=client,
             )
 
         assert response.status_code == 503
 
     @pytest.mark.asyncio
-    async def test_non_streaming_response_returned_normally(self, rookery_config):
+    async def test_non_streaming_response_returned_normally(self, multi_agent_config):
         """Non-SSE responses are returned as regular Response objects."""
 
         async def mock_handler(request: httpx.Request) -> httpx.Response:
@@ -248,7 +248,7 @@ class TestProxyRequestStreaming:
                 request=request,
                 agent_id="claw",
                 path="api/health",
-                config=rookery_config,
+                config=multi_agent_config,
                 client=client,
             )
 
@@ -268,7 +268,7 @@ class TestProxyRemoteAgent:
 
     def test_resolve_remote_agent(self):
         """Remote agents are resolved by name."""
-        config = RookeryConfig(
+        config = MultiAgentConfig(
             agents={
                 "remote-buddy": RemoteAgentConfig(url="https://agent.example.com"),
             }

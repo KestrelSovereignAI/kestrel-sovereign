@@ -1,5 +1,5 @@
 """
-Unit tests for Rookery configuration.
+Unit tests for MultiAgent configuration.
 
 Tests config parsing, validation, and auto-discovery.
 """
@@ -9,8 +9,8 @@ import toml
 from pathlib import Path
 from pydantic import ValidationError
 
-from kestrel_sovereign.rookery import (
-    RookeryConfig,
+from kestrel_sovereign.multi_agent import (
+    MultiAgentConfig,
     HostConfig,
     LocalAgentConfig,
     RemoteAgentConfig,
@@ -27,9 +27,9 @@ def temp_agent_dir(tmp_path):
 
 
 @pytest.fixture
-def temp_rookery_config(tmp_path):
-    """Create a temporary rookery.toml file"""
-    config_path = tmp_path / "rookery.toml"
+def temp_multi_agent_config(tmp_path):
+    """Create a temporary multi_agent.toml file"""
+    config_path = tmp_path / "multi_agent.toml"
 
     def _create_config(content: dict):
         with open(config_path, "w") as f:
@@ -168,7 +168,7 @@ class TestMandatoryFeatures:
 
     def test_mandatory_features_contains_required(self):
         """Test that mandatory features include sovereignty guarantees."""
-        from kestrel_sovereign.rookery.config import MANDATORY_FEATURES
+        from kestrel_sovereign.multi_agent.config import MANDATORY_FEATURES
         assert "IdentityFeature" in MANDATORY_FEATURES
         assert "SecurityFeature" in MANDATORY_FEATURES
         assert "PeersFeature" in MANDATORY_FEATURES
@@ -176,7 +176,7 @@ class TestMandatoryFeatures:
 
     def test_mandatory_features_is_frozenset(self):
         """Test that mandatory features cannot be accidentally modified."""
-        from kestrel_sovereign.rookery.config import MANDATORY_FEATURES
+        from kestrel_sovereign.multi_agent.config import MANDATORY_FEATURES
         assert isinstance(MANDATORY_FEATURES, frozenset)
 
 
@@ -206,19 +206,19 @@ class TestRemoteAgentConfig:
         assert "must start with http://" in str(exc_info.value)
 
 
-class TestRookeryConfig:
-    """Tests for RookeryConfig model."""
+class TestMultiAgentConfig:
+    """Tests for MultiAgentConfig model."""
 
     def test_empty_config(self):
-        """Test creating an empty rookery config."""
-        config = RookeryConfig()
+        """Test creating an empty multi_agent config."""
+        config = MultiAgentConfig()
         assert config.host.port == 8888
         assert config.host.bind == "0.0.0.0"
         assert len(config.agents) == 0
 
     def test_config_with_local_agent(self, temp_agent_dir):
         """Test config with a local agent."""
-        config = RookeryConfig(
+        config = MultiAgentConfig(
             agents={
                 "test_agent": LocalAgentConfig(
                     data_dir=temp_agent_dir,
@@ -231,7 +231,7 @@ class TestRookeryConfig:
 
     def test_config_with_remote_agent(self):
         """Test config with a remote agent."""
-        config = RookeryConfig(
+        config = MultiAgentConfig(
             agents={
                 "remote": RemoteAgentConfig(url="https://example.com")
             }
@@ -241,7 +241,7 @@ class TestRookeryConfig:
 
     def test_config_with_mixed_agents(self, temp_agent_dir):
         """Test config with both local and remote agents."""
-        config = RookeryConfig(
+        config = MultiAgentConfig(
             agents={
                 "local": LocalAgentConfig(
                     data_dir=temp_agent_dir,
@@ -261,7 +261,7 @@ class TestRookeryConfig:
         (agent_dir2 / "kestrel_prime.db").touch()
 
         with pytest.raises(ValidationError) as exc_info:
-            RookeryConfig(
+            MultiAgentConfig(
                 agents={
                     "agent1": LocalAgentConfig(
                         data_dir=temp_agent_dir,
@@ -278,7 +278,7 @@ class TestRookeryConfig:
     def test_host_port_conflict(self, temp_agent_dir):
         """Test that host port conflicts with agent ports are detected."""
         with pytest.raises(ValidationError) as exc_info:
-            RookeryConfig(
+            MultiAgentConfig(
                 host=HostConfig(port=8801),
                 agents={
                     "agent": LocalAgentConfig(
@@ -290,10 +290,10 @@ class TestRookeryConfig:
         assert "Port conflict" in str(exc_info.value)
 
 
-class TestRookeryConfigLoading:
-    """Tests for loading rookery config from files."""
+class TestMultiAgentConfigLoading:
+    """Tests for loading multi_agent config from files."""
 
-    def test_load_from_file(self, temp_rookery_config, temp_agent_dir):
+    def test_load_from_file(self, temp_multi_agent_config, temp_agent_dir):
         """Test loading config from a TOML file."""
         config_data = {
             "host": {"port": 9999, "bind": "127.0.0.1"},
@@ -305,15 +305,15 @@ class TestRookeryConfigLoading:
                 }
             },
         }
-        config_path = temp_rookery_config(config_data)
+        config_path = temp_multi_agent_config(config_data)
 
-        config = RookeryConfig.from_file(config_path)
+        config = MultiAgentConfig.from_file(config_path)
         assert config.host.port == 9999
         assert config.host.bind == "127.0.0.1"
         assert "test_agent" in config.agents
         assert config.agents["test_agent"].port == 8801
 
-    def test_load_from_file_with_features(self, temp_rookery_config, temp_agent_dir):
+    def test_load_from_file_with_features(self, temp_multi_agent_config, temp_agent_dir):
         """Test loading config with per-agent feature profiles."""
         config_data = {
             "agents": {
@@ -333,8 +333,8 @@ class TestRookeryConfigLoading:
                 },
             },
         }
-        config_path = temp_rookery_config(config_data)
-        config = RookeryConfig.from_file(config_path)
+        config_path = temp_multi_agent_config(config_data)
+        config = MultiAgentConfig.from_file(config_path)
 
         full = config.agents["full_agent"]
         minimal = config.agents["minimal_agent"]
@@ -346,7 +346,7 @@ class TestRookeryConfigLoading:
         """Test loading from a non-existent file raises error."""
         config_path = tmp_path / "does_not_exist.toml"
         with pytest.raises(FileNotFoundError):
-            RookeryConfig.from_file(config_path)
+            MultiAgentConfig.from_file(config_path)
 
     def test_load_invalid_toml(self, tmp_path):
         """Test loading invalid TOML raises error."""
@@ -354,10 +354,10 @@ class TestRookeryConfigLoading:
         config_path.write_text("invalid toml content {{{")
 
         with pytest.raises(ValueError) as exc_info:
-            RookeryConfig.from_file(config_path)
+            MultiAgentConfig.from_file(config_path)
         assert "Invalid TOML" in str(exc_info.value)
 
-    def test_load_remote_agent(self, temp_rookery_config):
+    def test_load_remote_agent(self, temp_multi_agent_config):
         """Test loading config with remote agents."""
         config_data = {
             "agents": {
@@ -366,14 +366,14 @@ class TestRookeryConfigLoading:
                 }
             }
         }
-        config_path = temp_rookery_config(config_data)
+        config_path = temp_multi_agent_config(config_data)
 
-        config = RookeryConfig.from_file(config_path)
+        config = MultiAgentConfig.from_file(config_path)
         assert "remote" in config.agents
         assert isinstance(config.agents["remote"], RemoteAgentConfig)
         assert config.agents["remote"].url == "https://example.com"
 
-    def test_load_agent_without_required_fields(self, temp_rookery_config):
+    def test_load_agent_without_required_fields(self, temp_multi_agent_config):
         """Test that agents without url or data_dir raise error."""
         config_data = {
             "agents": {
@@ -382,10 +382,10 @@ class TestRookeryConfigLoading:
                 }
             }
         }
-        config_path = temp_rookery_config(config_data)
+        config_path = temp_multi_agent_config(config_data)
 
         with pytest.raises(ValueError) as exc_info:
-            RookeryConfig.from_file(config_path)
+            MultiAgentConfig.from_file(config_path)
         assert "must have either 'url'" in str(exc_info.value)
 
 
@@ -397,7 +397,7 @@ class TestAutoDiscovery:
         agent_data = tmp_path / "agent_data"
         agent_data.mkdir()
 
-        config = RookeryConfig.auto_discover(agent_data)
+        config = MultiAgentConfig.auto_discover(agent_data)
         assert len(config.agents) == 0
 
     def test_auto_discover_single_agent(self, tmp_path):
@@ -409,7 +409,7 @@ class TestAutoDiscovery:
         agent1.mkdir()
         (agent1 / "kestrel_prime.db").touch()
 
-        config = RookeryConfig.auto_discover(agent_data)
+        config = MultiAgentConfig.auto_discover(agent_data)
         assert len(config.agents) == 1
         assert "agent1" in config.agents
         assert config.agents["agent1"].port == 8801
@@ -426,7 +426,7 @@ class TestAutoDiscovery:
             agent_dir.mkdir()
             (agent_dir / "kestrel_prime.db").touch()
 
-        config = RookeryConfig.auto_discover(agent_data)
+        config = MultiAgentConfig.auto_discover(agent_data)
         assert len(config.agents) == 3
 
         # Check sequential port assignment
@@ -451,7 +451,7 @@ class TestAutoDiscovery:
         # File, not directory
         (agent_data / "file.txt").touch()
 
-        config = RookeryConfig.auto_discover(agent_data)
+        config = MultiAgentConfig.auto_discover(agent_data)
         assert len(config.agents) == 1
         assert "valid" in config.agents
 
@@ -459,14 +459,14 @@ class TestAutoDiscovery:
         """Test auto-discovery with non-existent directory."""
         nonexistent = tmp_path / "does_not_exist"
 
-        config = RookeryConfig.auto_discover(nonexistent)
+        config = MultiAgentConfig.auto_discover(nonexistent)
         assert len(config.agents) == 0
 
 
-class TestRookeryConfigLoad:
+class TestMultiAgentConfigLoad:
     """Tests for the load() method with fallback."""
 
-    def test_load_existing_config(self, temp_rookery_config, temp_agent_dir, tmp_path):
+    def test_load_existing_config(self, temp_multi_agent_config, temp_agent_dir, tmp_path):
         """Test load() uses existing config file."""
         config_data = {
             "agents": {
@@ -476,9 +476,9 @@ class TestRookeryConfigLoad:
                 }
             }
         }
-        config_path = temp_rookery_config(config_data)
+        config_path = temp_multi_agent_config(config_data)
 
-        config = RookeryConfig.load(config_path)
+        config = MultiAgentConfig.load(config_path)
         assert "test" in config.agents
 
     def test_load_auto_discover_fallback(self, tmp_path):
@@ -491,24 +491,24 @@ class TestRookeryConfigLoad:
         (agent / "kestrel_prime.db").touch()
 
         # Try to load non-existent config — auto_discover scans relative to config parent
-        config_path = tmp_path / "rookery.toml"
-        config = RookeryConfig.load(config_path, auto_discover_fallback=True)
+        config_path = tmp_path / "multi_agent.toml"
+        config = MultiAgentConfig.load(config_path, auto_discover_fallback=True)
 
         assert "discovered" in config.agents
 
     def test_load_no_fallback(self, tmp_path):
         """Test load() without auto-discovery fallback."""
-        config_path = tmp_path / "rookery.toml"
-        config = RookeryConfig.load(config_path, auto_discover_fallback=False)
+        config_path = tmp_path / "multi_agent.toml"
+        config = MultiAgentConfig.load(config_path, auto_discover_fallback=False)
         assert len(config.agents) == 0
 
 
-class TestRookeryConfigSave:
-    """Tests for saving rookery config."""
+class TestMultiAgentConfigSave:
+    """Tests for saving multi_agent config."""
 
     def test_save_to_file(self, tmp_path, temp_agent_dir):
         """Test saving config to a TOML file."""
-        config = RookeryConfig(
+        config = MultiAgentConfig(
             host=HostConfig(port=9999),
             agents={
                 "test": LocalAgentConfig(
@@ -519,11 +519,11 @@ class TestRookeryConfigSave:
             },
         )
 
-        config_path = tmp_path / "rookery.toml"
+        config_path = tmp_path / "multi_agent.toml"
         config.save(config_path)
 
         # Load and verify
-        loaded = RookeryConfig.from_file(config_path)
+        loaded = MultiAgentConfig.from_file(config_path)
         assert loaded.host.port == 9999
         assert "test" in loaded.agents
         assert loaded.agents["test"].port == 8801
@@ -531,13 +531,13 @@ class TestRookeryConfigSave:
 
     def test_save_with_remote_agents(self, tmp_path):
         """Test saving config with remote agents."""
-        config = RookeryConfig(
+        config = MultiAgentConfig(
             agents={
                 "remote": RemoteAgentConfig(url="https://example.com")
             }
         )
 
-        config_path = tmp_path / "rookery.toml"
+        config_path = tmp_path / "multi_agent.toml"
         config.save(config_path)
 
         # Verify TOML structure
@@ -545,12 +545,12 @@ class TestRookeryConfigSave:
         assert data["agents"]["remote"]["url"] == "https://example.com"
 
 
-class TestRookeryConfigHelpers:
+class TestMultiAgentConfigHelpers:
     """Tests for helper methods."""
 
     def test_get_local_agents(self, temp_agent_dir):
         """Test get_local_agents() filters correctly."""
-        config = RookeryConfig(
+        config = MultiAgentConfig(
             agents={
                 "local": LocalAgentConfig(
                     data_dir=temp_agent_dir,
@@ -566,7 +566,7 @@ class TestRookeryConfigHelpers:
 
     def test_get_remote_agents(self, temp_agent_dir):
         """Test get_remote_agents() filters correctly."""
-        config = RookeryConfig(
+        config = MultiAgentConfig(
             agents={
                 "local": LocalAgentConfig(
                     data_dir=temp_agent_dir,
@@ -586,7 +586,7 @@ class TestRookeryConfigHelpers:
         agent2.mkdir()
         (agent2 / "kestrel_prime.db").touch()
 
-        config = RookeryConfig(
+        config = MultiAgentConfig(
             agents={
                 "auto": LocalAgentConfig(
                     data_dir=temp_agent_dir,

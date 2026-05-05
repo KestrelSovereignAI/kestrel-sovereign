@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 # mounts this router via ``parent.include_router(realtime_router)`` where the
 # parent already has ``prefix="/voice"`` — FastAPI concatenates the two, so a
 # `/voice/realtime` here would land at `/voice/voice/realtime/...` in
-# production (and 404 cleanly on every rookery host). Tests fixture-wrap with
+# production (and 404 cleanly on every multi_agent host). Tests fixture-wrap with
 # the parent router so the same nesting is exercised.
 router = APIRouter(prefix="/realtime", tags=["voice"])
 

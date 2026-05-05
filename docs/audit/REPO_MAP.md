@@ -41,7 +41,7 @@ Repo entry points and standard project files.
 - **filecoin_config.toml.example** — —
 - **gcp_compute_config.toml** — (configuration)
 - **host.py** — Kestrel Host - Thin FastAPI proxy + static file server + process manager.
-  - `def get_api_key()`; `def load_rookery_config()`; `async def lifespan(app)`; `async def auth_middleware(request, call_next)`; `async def serve_index()`; `async def get_bootstrap_key(request)`; `async def github_proxy(path, request)`; `async def health_check(request)`; `…`
+  - `def get_api_key()`; `def load_multi_agent_config()`; `async def lifespan(app)`; `async def auth_middleware(request, call_next)`; `async def serve_index()`; `async def get_bootstrap_key(request)`; `async def github_proxy(path, request)`; `async def health_check(request)`; `…`
 - **kestrel.toml.example** — —
 - **main.py** — The main entry point for the Kestrel Agent.
   - `async def get_agent_did_async(storage_dir)`; `async def get_agent_by_did(did)`; `async def main()`
@@ -51,12 +51,12 @@ Repo entry points and standard project files.
 - **package-lock.json** — (configuration)
 - **package.json** — (configuration)
 - **pyproject.toml** — (configuration)
-- **rookery.toml.example** — —
+- **multi_agent.toml.example** — —
 - **run_tests.py** — Kestrel Smart Test Runner - Unified Test System
   - `def get_database_url()`; `def get_redis_url()`; `class ServiceChecker`; `class SmartTestRunner`; `def main()`
 - **runpod_config.toml.example** — —
 - **server.py** — A FastAPI server to expose Kestrel agent functionality as a service.
-  - `def resolve_rookery_path(env)`; `def get_api_key()`; `async def verify_api_key(request, api_key_header, token)`; `async def lifespan(app)`; `class RookeryAgentRoutingMiddleware`; `async def github_proxy(path, request)`; `async def logging_context_middleware(request, call_next)`; `async def request_metrics_middleware(request, call_next)`; `…`
+  - `def resolve_multi_agent_path(env)`; `def get_api_key()`; `async def verify_api_key(request, api_key_header, token)`; `async def lifespan(app)`; `class MultiAgentAgentRoutingMiddleware`; `async def github_proxy(path, request)`; `async def logging_context_middleware(request, call_next)`; `async def request_metrics_middleware(request, call_next)`; `…`
 - **start_kestrel.sh** — DEPRECATED: Use 'kestrel start' instead.
 - **stop_kestrel.sh** — DEPRECATED: Use 'kestrel stop' instead.
 - **test_llm_providers.py** — Test LLM providers: OpenAI, Anthropic, and Vertex AI (Gemini).
@@ -369,7 +369,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/features/ollama/ollama_manager.py** — Ollama GPU Manager - Cloud Ollama Pod Lifecycle Management
   - `class OllamaSession`; `class OllamaGPUManagerError`; `class OllamaGPUManager`
 - **kestrel_sovereign/features/peers/__init__.py** — —
-- **kestrel_sovereign/features/peers/feature.py** — Peers Feature — Inter-agent communication for rookery environments.
+- **kestrel_sovereign/features/peers/feature.py** — Peers Feature — Inter-agent communication for multi_agent environments.
   - `class PeersFeature`
 - **kestrel_sovereign/features/peers/mesh.py** — Agent Mesh Protocol — structured message types for inter-agent communication.
   - `class MeshMessageType`; `class MeshPriority`; `class RedActionRisk`; `def is_critical_path(changed_files)`; `class MeshMessage`; `def make_assign_message(sender, recipient, repo, issue_number, …)`; `def make_complete_message(sender, recipient, correlation_id, repo, …)`; `def make_review_message(sender, recipient, repo, pr_number, …)`; `…`
@@ -741,14 +741,14 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/rate_limit.py** — Shared rate limiter instance for the Kestrel server.
 - **kestrel_sovereign/retirement_service.py** — Retirement Service: Graceful retirement protocol for Kestrel agents.
   - `class RetirementRecord`; `async def get_agent_info(db_path)`; `async def count_conversations(db_path)`; `async def retire_agent(db_path, reason, archive_dir, force)`; `async def list_retired_agents(archive_dir)`; `def retire_agent_sync(db_path, reason, force)`; `async def retire_test_agent(db_path, reason, archive_dir)`; `def main()`
-- **kestrel_sovereign/rookery/__init__.py** — Kestrel Rookery - Multi-Agent Registry.
-- **kestrel_sovereign/rookery/agent_manager.py** — In-process multi-agent manager for Kestrel.
+- **kestrel_sovereign/multi_agent/__init__.py** — Kestrel MultiAgent - Multi-Agent Registry.
+- **kestrel_sovereign/multi_agent/agent_manager.py** — In-process multi-agent manager for Kestrel.
   - `class AgentManager`
-- **kestrel_sovereign/rookery/config.py** — Rookery Configuration - Registry of agents managed by a Kestrel Host.
-  - `class HostConfig`; `class LocalAgentConfig`; `class RemoteAgentConfig`; `class RookeryConfig`
-- **kestrel_sovereign/rookery/process_manager.py** — Agent Process Manager - Starts, stops, and monitors agent subprocesses.
+- **kestrel_sovereign/multi_agent/config.py** — MultiAgent Configuration - Registry of agents managed by a Kestrel Host.
+  - `class HostConfig`; `class LocalAgentConfig`; `class RemoteAgentConfig`; `class MultiAgentConfig`
+- **kestrel_sovereign/multi_agent/process_manager.py** — Agent Process Manager - Starts, stops, and monitors agent subprocesses.
   - `class AgentProcess`; `class ProcessManager`
-- **kestrel_sovereign/rookery/proxy.py** — Kestrel Host Proxy - Routes requests to the correct agent process.
+- **kestrel_sovereign/multi_agent/proxy.py** — Kestrel Host Proxy - Routes requests to the correct agent process.
   - `def get_agent_base_url(agent_config)`; `def resolve_agent(agent_id, config)`; `def build_proxy_headers(request)`; `async def proxy_request_streaming(request, agent_id, path, config, …)`
 - **kestrel_sovereign/security/__init__.py** — Security module for Kestrel Agent.
 - **kestrel_sovereign/security/agent_encryption.py** — Backward-compatible agent encryption re-exports.
@@ -1135,10 +1135,10 @@ Repo entry points and standard project files.
 - **scripts/ci/create_issues.py** — Create GitHub issues for high-confidence recurring patterns.
   - `def get_feedback_entries(db_path)`; `def analyze_patterns(entries)`; `def issue_exists(title, repo, token)`; `def create_issue(insight, repo, token)`; `def main()`
 - **scripts/cloudrun/build.sh** — Build and push Kestrel Cloud Run image to GCR
-- **scripts/cloudrun/build_rookery.sh** — Build and push Kestrel Rookery (multi-agent host) image to GCR
+- **scripts/cloudrun/build_multi_agent.sh** — Build and push Kestrel MultiAgent (multi-agent host) image to GCR
 - **scripts/cloudrun/deploy_dev.sh** — Deploy Kestrel to Cloud Run — DEV environment
 - **scripts/cloudrun/deploy_prod.sh** — Deploy Kestrel to Cloud Run — PRODUCTION environment
-- **scripts/cloudrun/deploy_rookery_dev.sh** — Deploy Kestrel Rookery (multi-agent host) to Cloud Run — DEV environment
+- **scripts/cloudrun/deploy_multi_agent_dev.sh** — Deploy Kestrel MultiAgent (multi-agent host) to Cloud Run — DEV environment
 - **scripts/cloudrun/setup_secrets.sh** — One-time setup: Create GCP Secret Manager secrets for Kestrel Cloud Run
 - **scripts/convene_agent_participation.py** — Convene Constitutional Council: Agent Participation in Own Governance
   - `def print_token_usage(session)`; `def load_council_config()`; `def build_evidence()`; `async def run_council_session()`
@@ -1243,7 +1243,7 @@ Repo entry points and standard project files.
 - **docker/Dockerfile.lora-trainer** — —
 - **docker/Dockerfile.ollama-server** — —
 - **docker/Dockerfile.remote** — —
-- **docker/Dockerfile.rookery** — —
+- **docker/Dockerfile.multi_agent** — —
 - **docker/Dockerfile.simpletuner** — —
 - **docker/Dockerfile.sovereign** — —
 - **docker/Dockerfile.standalone** — —
@@ -1272,8 +1272,8 @@ Repo entry points and standard project files.
 - **docker/ipfs/init.sh** — Kestrel IPFS node initialization
 - **docker/kestrel.cloudrun.toml** — (configuration)
 - **docker/ollama-startup.sh** — Startup script for RunPod Ollama Server
-- **docker/rookery.cloudrun.toml** — (configuration)
-- **docker/rookery_entrypoint.sh** — Rookery Host entrypoint for Cloud Run / Azure Container Apps
+- **docker/multi_agent.cloudrun.toml** — (configuration)
+- **docker/multi_agent_entrypoint.sh** — MultiAgent Host entrypoint for Cloud Run / Azure Container Apps
 - **docker/seed_agents/Kestrel/SOUL.md** — SOUL.md - Default Personality — **CRITICAL INSTRUCTION:** When answering personal questions, respond in natural paragraphs.
 - **docker/seed_agents/kestrel-demo/SOUL.md** — SOUL.md - Kestrel Demo Agent — **CRITICAL INSTRUCTION:** When answering personal questions, respond in natural paragraphs.
 - **docker/simpletuner_api.py** — SimpleTuner API Wrapper for Kestrel LoRA Training
@@ -1941,13 +1941,13 @@ Repo entry points and standard project files.
 - **tests/unit/test_clean_install_verify.py** — Unit tests for scripts/ci/clean_install_verify.py.
   - `def test_wizard_artifacts_passes_on_post_wizard_tree(tmp_path, monkeypatch, capsys)`; `def test_wizard_artifacts_fails_when_env_missing(tmp_path, monkeypatch, capsys)`; `def test_wizard_artifacts_fails_when_data_key_missing(tmp_path, monkeypatch, capsys)`; `def test_wizard_artifacts_fails_when_route_priority_empty(tmp_path, monkeypatch, capsys)`; `def test_identity_passes_when_did_present(tmp_path, monkeypatch, capsys)`; `def test_identity_fails_when_db_missing(tmp_path, monkeypatch, capsys)`; `def test_identity_fails_when_no_agent_node(tmp_path, monkeypatch, capsys)`; `def test_constitution_passes_with_full_anchor(tmp_path, monkeypatch, capsys)`; `…`
 - **tests/unit/test_cli.py** — Unit tests for the unified kestrel CLI.
-  - `class TestArgumentParsing`; `class TestCommandDispatch`; `class TestProcessHelpers`; `def rookery_env(tmp_path)`; `class TestCmdList`; `class TestCmdStatus`; `class TestCmdStop`; `class TestCmdStart`; `…`
+  - `class TestArgumentParsing`; `class TestCommandDispatch`; `class TestProcessHelpers`; `def multi_agent_env(tmp_path)`; `class TestCmdList`; `class TestCmdStatus`; `class TestCmdStop`; `class TestCmdStart`; `…`
 - **tests/unit/test_cli_constitution_reanchor.py** — Unit tests for the ``kestrel constitution reanchor`` CLI surface.
   - `def reanchor_env(tmp_path)`; `def test_reanchor_requires_agent_name()`; `def test_reanchor_parses_force_flag()`; `def test_reanchor_force_default_false()`; `def test_reanchor_accepts_constitution_path_override()`; `def test_reanchor_rejects_unknown_agent(reanchor_env, capsys)`; `def test_reanchor_refuses_when_agent_appears_running(reanchor_env, capsys)`; `def test_reanchor_unchanged_returns_zero(reanchor_env, capsys)`; `…`
 - **tests/unit/test_cli_feature.py** — Tests for the Feature CLI commands (kestrel feature list/install/enable/disable/info/scaffold/skills).
   - `class TestFeatureList`; `class TestFeatureInstall`; `class TestFeatureEnableDisable`; `class TestFeatureInfo`; `class TestFeatureScaffold`; `class TestFeatureSkills`; `class TestSkillsSearch`; `class TestResolveFeatureName`; `…`
 - **tests/unit/test_cli_first_run.py** — Tests for the first-run setup hook in `kestrel start`.
-  - `def test_first_run_returns_none_when_env_exists(tmp_path)`; `def test_first_run_returns_none_when_agent_already_registered(tmp_path)`; `def test_first_run_fires_when_rookery_has_no_agents(tmp_path)`; `def test_first_run_tolerates_corrupt_rookery(tmp_path)`; `def test_first_run_returns_none_when_skip_env_set(tmp_path, monkeypatch)`; `def test_first_run_skipped_inside_git_worktree(tmp_path, monkeypatch)`; `def test_first_run_still_fires_when_git_is_directory(tmp_path, monkeypatch)`; `def test_first_run_non_tty_exits_with_hint(tmp_path, capsys, monkeypatch)`; `…`
+  - `def test_first_run_returns_none_when_env_exists(tmp_path)`; `def test_first_run_returns_none_when_agent_already_registered(tmp_path)`; `def test_first_run_fires_when_multi_agent_has_no_agents(tmp_path)`; `def test_first_run_tolerates_corrupt_multi_agent(tmp_path)`; `def test_first_run_returns_none_when_skip_env_set(tmp_path, monkeypatch)`; `def test_first_run_skipped_inside_git_worktree(tmp_path, monkeypatch)`; `def test_first_run_still_fires_when_git_is_directory(tmp_path, monkeypatch)`; `def test_first_run_non_tty_exits_with_hint(tmp_path, capsys, monkeypatch)`; `…`
 - **tests/unit/test_cli_migrate_llm_config.py** — Unit tests for the ``kestrel migrate-llm-config`` CLI surface (#939).
   - `def test_parser_defaults()`; `def test_parser_accepts_force_and_project_dir(tmp_path)`; `def test_no_source_exits_zero_with_helpful_message(tmp_path, capsys)`; `def test_diverged_exits_one_with_diff(tmp_path, capsys)`; `def test_clean_migrate_exits_zero_and_reports_paths(tmp_path, capsys)`; `def test_already_clean_exits_zero(tmp_path, capsys)`; `def test_parse_error_exits_one_and_preserves_source(tmp_path, capsys)`; `def test_force_overrides_divergence(tmp_path, capsys)`
 - **tests/unit/test_cli_release.py** — ``kestrel release {sign,verify}`` CLI tests — Wave 5 sub-PR 2 (#920).
@@ -2035,9 +2035,9 @@ Repo entry points and standard project files.
 - **tests/unit/test_delivery_feature.py** — Unit tests for the DeliveryFeature, DeliveryQueue, and data models.
   - `async def feature()`; `async def feature_no_db()`; `async def queue()`; `class TestBackoffComputation`; `class TestDeliveryStatusEnum`; `class TestQueueEntryModel`; `class TestDeliveryResult`; `class TestDeliveryToolRegistration`; `…`
 - **tests/unit/test_demo_isolation.py** — Unit tests for the server-side demo-mode isolation rail (#766).
-  - `def test_empty_rookery_is_live_mode()`; `def test_all_demo_agents_classifies_as_demo()`; `def test_one_live_agent_keeps_server_live()`; `def test_truthy_non_bool_is_demo_does_not_flip_classification()`; `async def test_live_server_live_target_no_header_is_refused_with_audit()`; `async def test_live_server_live_target_with_header_is_allowed_and_audited()`; `async def test_live_server_demo_target_passes_silently()`; `async def test_demo_server_demo_target_passes_silently()`; `…`
-- **tests/unit/test_demo_server_rookery_guard.py** — Unit tests for the demo-server rookery auto-mount guard (#868-1).
-  - `def test_demo_marker_with_existing_rookery_disables_auto_mount(tmp_path, monkeypatch)`; `def test_explicit_rookery_config_honored_even_in_demo_mode(tmp_path)`; `def test_no_demo_marker_uses_rookery_normally(tmp_path, monkeypatch)`; `def test_demo_marker_without_rookery_file_no_op(tmp_path, monkeypatch)`; `def test_demo_marker_truthy_variants(tmp_path, monkeypatch)`; `def test_lifespan_actually_calls_resolve_rookery_path()`
+  - `def test_empty_multi_agent_is_live_mode()`; `def test_all_demo_agents_classifies_as_demo()`; `def test_one_live_agent_keeps_server_live()`; `def test_truthy_non_bool_is_demo_does_not_flip_classification()`; `async def test_live_server_live_target_no_header_is_refused_with_audit()`; `async def test_live_server_live_target_with_header_is_allowed_and_audited()`; `async def test_live_server_demo_target_passes_silently()`; `async def test_demo_server_demo_target_passes_silently()`; `…`
+- **tests/unit/test_demo_server_multi_agent_guard.py** — Unit tests for the demo-server multi_agent auto-mount guard (#868-1).
+  - `def test_demo_marker_with_existing_multi_agent_disables_auto_mount(tmp_path, monkeypatch)`; `def test_explicit_multi_agent_config_honored_even_in_demo_mode(tmp_path)`; `def test_no_demo_marker_uses_multi_agent_normally(tmp_path, monkeypatch)`; `def test_demo_marker_without_multi_agent_file_no_op(tmp_path, monkeypatch)`; `def test_demo_marker_truthy_variants(tmp_path, monkeypatch)`; `def test_lifespan_actually_calls_resolve_multi_agent_path()`
 - **tests/unit/test_denied_tools_dispatch.py** — Tests for security DENY enforcement at orchestrator dispatch level.
   - `class TestDeniedToolsStripping`; `class TestSubagentDeniedToolsExclusion`
 - **tests/unit/test_deploy_bugs.py** — Unit tests for deploy feature bug fixes (#101).
@@ -2249,7 +2249,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_privacy_wrapper.py** — Tests for the Privacy-Enforcing Storage Wrapper.
   - `class TestPrivacyPolicy`; `class TestEphemeralMode`; `class TestIsolatedMode`; `class TestAnonymousMode`; `class TestNormalMode`; `class TestModeTransitions`; `class TestWrapperFactory`; `class TestDeprecationWarnings`; `…`
 - **tests/unit/test_process_manager.py** — Unit tests for the Kestrel ProcessManager.
-  - `def project_dir(tmp_path)`; `def rookery_config()`; `def pm(project_dir)`; `class TestProcessManagerInit`; `class TestStaticHelpers`; `class TestRegisterAgent`; `class TestStartAgent`; `class TestStopAgent`; `…`
+  - `def project_dir(tmp_path)`; `def multi_agent_config()`; `def pm(project_dir)`; `class TestProcessManagerInit`; `class TestStaticHelpers`; `class TestRegisterAgent`; `class TestStartAgent`; `class TestStopAgent`; `…`
 - **tests/unit/test_prometheus_metrics.py** — Tests for Prometheus metrics endpoint and instrumentation.
   - `class TestMetricDefinitions`; `class TestGenerateMetrics`; `class TestMetricsEndpoint`; `class TestObservabilityHookPrometheus`; `class TestLLMServicePrometheus`; `class TestGracefulDegradation`; `class TestLabelCardinality`
 - **tests/unit/test_provider_entrypoints.py** — Tests for provider entry_point discovery across all registries.
@@ -2282,11 +2282,11 @@ Repo entry points and standard project files.
   - `async def test_retirement_archives_under_agent_data_dir(tmp_path, monkeypatch)`; `async def test_retirement_prefers_kestrel_db_path_env(tmp_path, monkeypatch)`
 - **tests/unit/test_retry_policy_contracts.py** — Contract tests for the retry policy.
   - `def test_non_retryable_classifications(msg)`; `def test_retryable_classifications(msg)`; `def test_unknown_defaults_non_retryable(msg)`; `def test_non_retryable_wins_over_retryable_pattern()`; `def test_status_code_word_boundary()`
-- **tests/unit/test_rookery_asgi_routing.py** — Tests for the ASGI-level rookery routing middleware.
+- **tests/unit/test_multi_agent_asgi_routing.py** — Tests for the ASGI-level multi_agent routing middleware.
   - `async def test_http_request_with_known_agent_strips_prefix_and_attaches_agent()`; `async def test_websocket_with_known_agent_strips_prefix_and_attaches_agent()`; `async def test_websocket_with_unknown_agent_closes_with_4404()`; `async def test_http_with_unknown_agent_returns_404_json()`; `async def test_non_agent_path_passes_through_unchanged()`; `async def test_no_agent_manager_passes_through()`; `async def test_lifespan_scope_passes_through()`
-- **tests/unit/test_rookery_config.py** — Unit tests for Rookery configuration.
-  - `def temp_agent_dir(tmp_path)`; `def temp_rookery_config(tmp_path)`; `class TestHostConfig`; `class TestLocalAgentConfig`; `class TestMandatoryFeatures`; `class TestRemoteAgentConfig`; `class TestRookeryConfig`; `class TestRookeryConfigLoading`; `…`
-- **tests/unit/test_rookery_proxy.py** — Unit tests for Rookery proxy routing logic.
+- **tests/unit/test_multi_agent_config.py** — Unit tests for MultiAgent configuration.
+  - `def temp_agent_dir(tmp_path)`; `def temp_multi_agent_config(tmp_path)`; `class TestHostConfig`; `class TestLocalAgentConfig`; `class TestMandatoryFeatures`; `class TestRemoteAgentConfig`; `class TestMultiAgentConfig`; `class TestMultiAgentConfigLoading`; `…`
+- **tests/unit/test_multi_agent_proxy.py** — Unit tests for MultiAgent proxy routing logic.
   - `class TestGetAgentBaseUrl`; `class TestResolveAgent`; `class TestBuildProxyHeaders`; `class TestProxyRequestStreaming`; `class TestProxyRemoteAgent`
 - **tests/unit/test_rotation_ceremony.py** — Rotation ceremony tests — Wave 3 sub-PR 4 (#918).
   - `def legacy_kestrel()`; `def test_ceremony_produces_verifiable_succession_statement(legacy_kestrel)`; `def test_ceremony_default_aka_links_predecessor(legacy_kestrel)`; `def test_ceremony_explicit_aka_overrides_default(legacy_kestrel)`; `def test_ceremony_default_effective_from_is_now_utc(legacy_kestrel)`; `def test_ceremony_explicit_effective_from_is_used(legacy_kestrel)`; `def test_ceremony_with_archival_countersignature(legacy_kestrel)`; `def test_ceremony_refuses_non_slhdsa_archival_keypair(legacy_kestrel)`; `…`
@@ -2331,7 +2331,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_setup_prompts.py** — Unit tests for kestrel_sovereign.setup.prompts.
   - `def test_is_tty_false_when_ci_env_set(monkeypatch)`; `def test_is_tty_false_when_kestrel_noninteractive(monkeypatch)`; `def test_noninteractive_prompter_returns_defaults()`; `def test_noninteractive_select_prefers_default()`; `def test_noninteractive_select_falls_back_to_first()`; `def test_noninteractive_select_empty_choices()`; `def test_stub_prompter_consumes_answers_in_order()`; `def test_stub_prompter_raises_when_out_of_answers()`; `…`
 - **tests/unit/test_setup_steps_agent.py** — Unit tests for the agent step.
-  - `def test_agent_quickstart_creates_kestrel_when_rookery_empty(tmp_path)`; `def test_agent_quickstart_skips_when_rookery_has_agent(tmp_path)`; `def test_agent_interactive_with_existing_can_decline_more(tmp_path)`; `def test_agent_interactive_creates_with_custom_name(tmp_path)`; `def test_agent_does_not_re_incept_existing_db(tmp_path)`; `def test_create_agent_helper_is_idempotent(tmp_path)`; `def test_create_agent_avoids_port_collisions(tmp_path)`; `def test_create_agent_respects_explicit_port(tmp_path)`
+  - `def test_agent_quickstart_creates_kestrel_when_multi_agent_empty(tmp_path)`; `def test_agent_quickstart_skips_when_multi_agent_has_agent(tmp_path)`; `def test_agent_interactive_with_existing_can_decline_more(tmp_path)`; `def test_agent_interactive_creates_with_custom_name(tmp_path)`; `def test_agent_does_not_re_incept_existing_db(tmp_path)`; `def test_create_agent_helper_is_idempotent(tmp_path)`; `def test_create_agent_avoids_port_collisions(tmp_path)`; `def test_create_agent_respects_explicit_port(tmp_path)`
 - **tests/unit/test_setup_steps_integrations.py** — Unit tests for the cloud-integrations step.
   - `def test_integrations_in_ordered_between_llm_and_agent()`; `def test_integrations_reachable_by_name()`; `def test_curated_onboarders_match_locked_in_list()`; `def test_decline_all_writes_nothing(tmp_path)`; `def test_select_tavily_writes_key_and_marks_managed(tmp_path)`; `def test_select_elevenlabs(tmp_path)`; `def test_select_deepgram(tmp_path)`; `def test_select_huggingface_uses_HF_TOKEN_not_HUGGINGFACE(tmp_path)`; `…`
 - **tests/unit/test_setup_steps_keys.py** — Unit tests for the keys step.
