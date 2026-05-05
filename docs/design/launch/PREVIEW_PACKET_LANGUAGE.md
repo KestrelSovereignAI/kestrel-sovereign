@@ -22,7 +22,7 @@ Today's the day — Kestrel is live for the preview group, and you're one of the
 
 Repo: **https://github.com/KestrelSovereignAI/kestrel-sovereign**
 
-Start with [QUICKSTART.md](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/main/QUICKSTART.md) — about 30 minutes to a running sovereign agent with your own cryptographic identity, persistent memory, and a constitutional governance layer enforced above the LLM. It's already deployed in a clinical study at Caprock Health, so this isn't a thought experiment — it's running in production for real patients.
+Start with [QUICKSTART.md](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/main/QUICKSTART.md) — about 30 minutes to a running sovereign agent with your own cryptographic identity, persistent memory, and a constitutional governance layer enforced above the LLM. It's already deployed in a clinical study with a regional home healthcare organization, so this isn't a thought experiment — it's running in production for real patients.
 
 **Four questions I'm hoping you'll answer afterward** (bullets are perfect, a 10-minute voice note is even better):
 
@@ -56,7 +56,7 @@ Hey [Name],
 
 Hope you and the family are doing well. Quick ask — I'm launching a project called Kestrel publicly on May 7 and could really use your eyes on it before then.
 
-It's an open-source AI tool (already running in a clinical study at Caprock Health). I'm not asking you to be an AI expert — quite the opposite. I want to know if it makes sense to a smart technical person who isn't deep in AI agents.
+It's an open-source AI tool (already running in a clinical study with a regional home healthcare organization). I'm not asking you to be an AI expert — quite the opposite. I want to know if it makes sense to a smart technical person who isn't deep in AI agents.
 
 Repo: **https://github.com/KestrelSovereignAI/kestrel-sovereign**
 

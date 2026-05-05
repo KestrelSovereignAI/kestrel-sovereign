@@ -61,7 +61,7 @@ Repo entry points and standard project files.
 - **stop_kestrel.sh** — DEPRECATED: Use 'kestrel stop' instead.
 - **test_llm_providers.py** — Test LLM providers: OpenAI, Anthropic, and Vertex AI (Gemini).
   - `async def test_providers()`
-- **test_rcs_integration.py** — RCS (RemoteCares + Kestrel) Integration Test Suite — Caprock Validation CV-005 Simulates exactly what RemoteCares staging sends to Kestrel via the Rasa shim.
+- **test_rcs_integration.py** — RCS (RemoteCares + Kestrel) Integration Test Suite — Healthcare Validation CV-005 Simulates exactly what RemoteCares staging sends to Kestrel via the Rasa shim.
   - `class RCSIntegrationTester`; `async def main()`
 - **uv.lock** — —
 
