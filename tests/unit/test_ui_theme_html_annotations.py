@@ -152,6 +152,25 @@ def test_theme_js_is_loaded_in_index_html(html_text):
     assert "js/theme.js" in html_text, "index.html must include js/theme.js"
 
 
+def test_theme_picker_js_is_loaded_in_index_html(html_text):
+    """theme_picker.js must be referenced or the picker dropdowns sit dead."""
+    assert "js/theme_picker.js" in html_text, "index.html must include js/theme_picker.js"
+
+
+def test_theme_picker_dom_elements_present(html_text):
+    """The picker's anchor elements must exist; theme_picker.js targets them by id."""
+    assert 'id="theme-picker-theme"' in html_text, "theme dropdown anchor missing"
+    assert 'id="theme-picker-locale"' in html_text, "locale dropdown anchor missing"
+    assert 'id="theme-picker-status"' in html_text, "status line anchor missing"
+
+
+def test_picker_section_labels_exist_in_legacy(legacy_labels):
+    """The picker chrome itself is themable — these keys must exist."""
+    for key in ("sovereignty_display", "sovereignty_display_description",
+                "theme_picker_label", "locale_picker_label"):
+        assert key in legacy_labels, f"{key} missing from legacy/en.toml"
+
+
 def test_no_orphan_label_keys_in_legacy_theme(html_text, legacy_labels):
     """Inverse check: every theme-class key in legacy/en.toml should be
     referenced by the HTML. An orphan key suggests we lost an annotation
@@ -186,6 +205,8 @@ def test_no_orphan_label_keys_in_legacy_theme(html_text, legacy_labels):
         "security_permission_tree", "security_session_controls",
         "security_audit_log",
         "document_title",
+        "sovereignty_display", "sovereignty_display_description",
+        "theme_picker_label", "locale_picker_label",
     }
     referenced = set(_KEY_PATTERN.findall(html_text))
     referenced |= set(_ATTR_PATTERN.findall(html_text))

@@ -7,6 +7,7 @@
     <title data-label-key="document_title">Kestrel Sovereign Console</title>
     <script src="js/icons.js"></script>
     <script src="js/theme.js"></script>
+    <script src="js/theme_picker.js"></script>
     <style>
         /* Theme-aware CSS using system preferences */
         :root {
@@ -1502,6 +1503,47 @@
                 <h3 style="margin-bottom: 1rem;" data-label-key="sovereignty_export_history">Export History</h3>
                 <div class="export-list" id="export-list">
                     <div class="loading" data-label-key="loading_exports">Loading exports...</div>
+                </div>
+
+                <!-- Display (theme + locale picker, #991) -->
+                <div style="margin-top: 2rem; border-top: 1px solid var(--border-color); padding-top: 1.5rem;">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem;">
+                        <h3 style="margin: 0;" data-label-key="sovereignty_display">Display</h3>
+                    </div>
+                    <p style="color: var(--text-secondary); font-size: 0.875rem; margin-bottom: 1rem;" data-label-key="sovereignty_display_description">
+                        Choose a UI theme and language. Stored locally on this device.
+                    </p>
+                    <div style="display: flex; gap: 1.5rem; align-items: center; flex-wrap: wrap;">
+                        <label style="font-size: 0.875rem; color: var(--text-secondary); display: flex; align-items: center; gap: 0.5rem;">
+                            <span data-label-key="theme_picker_label">Theme</span>
+                            <select id="theme-picker-theme" style="
+                                padding: 0.375rem 0.75rem;
+                                background: var(--bg-secondary);
+                                border: 1px solid var(--border-color);
+                                border-radius: 6px;
+                                color: var(--text-primary);
+                                cursor: pointer;
+                                font-size: 0.875rem;
+                            ">
+                                <!-- options injected by theme_picker.js -->
+                            </select>
+                        </label>
+                        <label style="font-size: 0.875rem; color: var(--text-secondary); display: flex; align-items: center; gap: 0.5rem;">
+                            <span data-label-key="locale_picker_label">Language</span>
+                            <select id="theme-picker-locale" style="
+                                padding: 0.375rem 0.75rem;
+                                background: var(--bg-secondary);
+                                border: 1px solid var(--border-color);
+                                border-radius: 6px;
+                                color: var(--text-primary);
+                                cursor: pointer;
+                                font-size: 0.875rem;
+                            ">
+                                <option value="en" selected>English</option>
+                            </select>
+                        </label>
+                        <span id="theme-picker-status" style="color: var(--text-tertiary); font-size: 0.75rem;"></span>
+                    </div>
                 </div>
 
                 <!-- Local File Browser (Session 3) -->
