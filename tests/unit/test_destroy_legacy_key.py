@@ -222,6 +222,49 @@ def test_missing_hybrid_keys_blocks_destruction(post_ceremony_dir):
 # No succession statement
 # ---------------------------------------------------------------------------
 
+def test_unrelated_succession_blocks_destruction(post_ceremony_dir, tmp_path):
+    """Codex P2 catch: an unrelated succession statement (one whose
+    predecessor_did doesn't match the legacy DID document on disk)
+    must not satisfy the destruction gates. Otherwise an operator
+    with a stray successions/*.json could destroy the wrong agent's
+    key."""
+    storage_dir, key_id, slug = post_ceremony_dir
+    # Tamper: rewrite the succession statement's predecessor_did
+    # to point at an unrelated DID.
+    succession_path = storage_dir / "successions" / f"{slug}.json"
+    statement = json.loads(succession_path.read_text())
+    statement["predecessor_did"] = (
+        "did:pkh:eip155:1:0x0000000000000000000000000000000000000000"
+    )
+    succession_path.write_text(json.dumps(statement))
+
+    legacy_enc = storage_dir / f"{key_id}.key.enc"
+    res = _run(
+        ["--agent-data-dir", str(storage_dir), "--skip-https-check", "--confirm"],
+        env_extra={
+            "KESTREL_DESTROY_CONFIRM": "I-have-verified-the-rollback-window",
+        },
+    )
+    assert res.returncode == 1
+    assert "predecessor" in res.stderr.lower() or "predecessor" in res.stdout.lower()
+    assert legacy_enc.exists()
+
+
+def test_path_traversal_in_legacy_key_id_rejected(post_ceremony_dir):
+    """Codex P2 catch: --legacy-key-id with path separators must be
+    rejected before any deletion can target files outside agent_data."""
+    storage_dir, _, _ = post_ceremony_dir
+    res = _run([
+        "--agent-data-dir", str(storage_dir),
+        "--legacy-key-id", "../escape_attempt",
+        "--skip-https-check", "--confirm",
+    ], env_extra={
+        "KESTREL_DESTROY_CONFIRM": "I-have-verified-the-rollback-window",
+    })
+    assert res.returncode == 2
+    assert "path traversal" in res.stderr.lower() or "characters outside" in res.stderr.lower()
+
+
 def test_missing_succession_blocks_destruction(post_ceremony_dir):
     storage_dir, key_id, slug = post_ceremony_dir
     (storage_dir / "successions" / f"{slug}.json").unlink()

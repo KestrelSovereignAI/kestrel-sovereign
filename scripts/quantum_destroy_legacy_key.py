@@ -288,6 +288,20 @@ def main() -> int:
     if not legacy_key_id:
         _err(f"no kestrel_0x*.json in {agent_data}; pass --legacy-key-id")
         return 2
+    # Path-traversal sanitation. The legacy_key_id is used to build
+    # paths like agent_data/<key_id>.key.enc; an operator-supplied
+    # value containing path separators would let deletion escape
+    # the selected agent dir. SecureKeyStorage applies the same
+    # ``isalnum or in '-_'`` rule on key ids; mirror it here for
+    # destructive parity.
+    if any(c not in "-_" and not c.isalnum() for c in legacy_key_id):
+        _err(
+            f"--legacy-key-id contains characters outside [A-Za-z0-9_-]: "
+            f"{legacy_key_id!r}. Refusing to construct destruction "
+            f"targets from a value that could escape agent_data via "
+            f"path traversal."
+        )
+        return 2
     _info(f"legacy key id: {legacy_key_id}")
 
     # --------------------------------------------------------------
@@ -304,6 +318,32 @@ def main() -> int:
         return 1
     _ok(f"succession statement: {succession_path}")
     statement = json.loads(succession_path.read_text())
+
+    # Bind the succession to the legacy DID we're about to destroy.
+    # An unrelated/stale successions/*.json (e.g. from an operator
+    # who copied the wrong dir) plus hybrid key files would otherwise
+    # satisfy every other gate and delete the wrong agent's ECDSA key.
+    legacy_did_doc_path = agent_data / f"{legacy_key_id}.json"
+    if not legacy_did_doc_path.exists():
+        _err(f"legacy DID document not found at {legacy_did_doc_path}")
+        return 1
+    legacy_did_doc = json.loads(legacy_did_doc_path.read_text())
+    legacy_did = legacy_did_doc.get("id")
+    if not legacy_did:
+        _err(f"legacy DID document has no 'id' field: {legacy_did_doc_path}")
+        return 1
+    pred = statement.get("predecessor_did")
+    if pred != legacy_did:
+        _err(
+            f"succession statement at {succession_path} has "
+            f"predecessor_did={pred!r}, but the legacy DID document "
+            f"on disk says id={legacy_did!r}. The succession is for "
+            f"a different agent. Refusing to destroy this agent's "
+            f"key — that would orphan it without a verified rotation."
+        )
+        return 1
+    _ok(f"succession predecessor binds to legacy DID {legacy_did}")
+
     # Derive slug by globbing for the hybrid classical-key file rather
     # than parsing successor_did. The DID may include extra path
     # segments (``did:web:domain:agent:v1``) where rsplit(':',1)[-1]
