@@ -56,6 +56,18 @@ To restore::
         --archive /path/to/backup.tar.gz.enc \\
         --output  /path/to/restore-dir
 
+Per-backup passphrase env vars (recommended for operators keeping
+multiple backups around)::
+
+    # In ~/.zshenv or a dedicated, gitignored .secrets file:
+    export KESTREL_BACKUP_PASSPHRASE1='<passphrase for backup #1>'
+    export KESTREL_BACKUP_PASSPHRASE2='<passphrase for backup #2>'
+
+    # When restoring backup #1:
+    uv run python scripts/quantum_pre_ceremony_backup.py \\
+        --restore --archive backup1.tar.gz.enc \\
+        --output /tmp/restore --passphrase-env KESTREL_BACKUP_PASSPHRASE1
+
 What this script does NOT do
 ----------------------------
 
@@ -191,8 +203,12 @@ def _materialize_targets(
         )
     return materialized
 
-# Passphrase env var
-PASSPHRASE_ENV = "KESTREL_BACKUP_PASSPHRASE"
+# Default passphrase env var. Override with --passphrase-env when an
+# operator wants to maintain a numbered suffix scheme per backup
+# (KESTREL_BACKUP_PASSPHRASE1 for backup #1, KESTREL_BACKUP_PASSPHRASE2
+# for backup #2, etc) so old passphrases stay reachable from $HOME for
+# restoring older archives.
+DEFAULT_PASSPHRASE_ENV = "KESTREL_BACKUP_PASSPHRASE"
 
 # Encryption parameters
 PBKDF2_ITERATIONS = 600_000
@@ -558,7 +574,7 @@ def decrypt_archive(ciphertext_path: Path, passphrase: str, plaintext_path: Path
 # Backup driver
 # ---------------------------------------------------------------------------
 
-def cmd_backup(passphrase: str, project_root: Path, targets: list[dict]) -> int:
+def cmd_backup(passphrase: str, project_root: Path, targets: list[dict], passphrase_env: str) -> int:
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%SZ")
     output_dir = Path(f"/tmp/kestrel-pre-ceremony-backup-{timestamp}")
     if output_dir.exists():
@@ -694,26 +710,31 @@ def cmd_backup(passphrase: str, project_root: Path, targets: list[dict]) -> int:
     }, indent=2, sort_keys=True))
 
     restore_md = output_dir / "RESTORE.md"
+    passphrase_env_flag = (
+        f" \\\n    --passphrase-env {passphrase_env}"
+        if passphrase_env != DEFAULT_PASSPHRASE_ENV else ""
+    )
     restore_md.write_text(f"""# Restoring this backup
 
 This backup was created by `scripts/quantum_pre_ceremony_backup.py` on
 {datetime.now(timezone.utc).isoformat()}.
 
 Targets: {', '.join(t['name'] for t in targets)}
+Passphrase env var: `{passphrase_env}`
 
 ## To restore
 
 You need:
 - The encrypted archive: `backup.tar.gz.enc`
-- The passphrase you set in `KESTREL_BACKUP_PASSPHRASE` when creating it
+- The passphrase you set in `{passphrase_env}` when creating it
 - The script: `scripts/quantum_pre_ceremony_backup.py`
 
 ```bash
-export KESTREL_BACKUP_PASSPHRASE='<the same one>'
+export {passphrase_env}='<the same one>'
 uv run python scripts/quantum_pre_ceremony_backup.py \\
     --restore \\
     --archive  /path/to/backup.tar.gz.enc \\
-    --output   /tmp/kestrel-restore
+    --output   /tmp/kestrel-restore{passphrase_env_flag}
 ```
 
 The output dir will contain one subdirectory per target. To re-anchor an
@@ -840,13 +861,31 @@ def main() -> int:
         help="(backup) ad-hoc additional target (e.g. for a Frinz tenant). "
              "Repeatable. RELPATH is resolved against the project root.",
     )
+    parser.add_argument(
+        "--passphrase-env",
+        type=str,
+        default=DEFAULT_PASSPHRASE_ENV,
+        metavar="VAR_NAME",
+        help=f"Environment variable holding the backup passphrase. "
+             f"Defaults to {DEFAULT_PASSPHRASE_ENV}. Use a numbered "
+             f"suffix (e.g. {DEFAULT_PASSPHRASE_ENV}1) when keeping "
+             f"distinct passphrases for distinct backups in the same "
+             f"shell profile, so old passphrases stay reachable for "
+             f"restoring older archives.",
+    )
     args = parser.parse_args()
 
-    passphrase = os.environ.get(PASSPHRASE_ENV)
+    passphrase_env = args.passphrase_env
+    passphrase = os.environ.get(passphrase_env)
     if not passphrase:
-        _err(f"{PASSPHRASE_ENV} is required. Pick a strong passphrase and:")
-        _err(f"  export {PASSPHRASE_ENV}='<your passphrase>'")
+        _err(f"{passphrase_env} is required. Pick a strong passphrase and:")
+        _err(f"  export {passphrase_env}='<your passphrase>'")
         _err("Lose the passphrase and the backup is unrecoverable.")
+        if passphrase_env != DEFAULT_PASSPHRASE_ENV:
+            _err(
+                f"(or use the default env var {DEFAULT_PASSPHRASE_ENV} by "
+                "omitting --passphrase-env)"
+            )
         return 2
 
     if args.restore:
@@ -861,7 +900,7 @@ def main() -> int:
             return 2
         target_filter = args.targets.split(",") if args.targets else None
         targets = _materialize_targets(project_root, target_filter, args.target)
-        return cmd_backup(passphrase, project_root, targets)
+        return cmd_backup(passphrase, project_root, targets, passphrase_env)
 
 
 if __name__ == "__main__":

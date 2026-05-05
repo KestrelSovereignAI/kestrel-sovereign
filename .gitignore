@@ -6,6 +6,10 @@
 .env.*
 !.env.example
 !.env.test.example
+.secrets
+.secrets.*
+.secrets/
+secrets/
 
 # Credentials
 credentials/
