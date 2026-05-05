@@ -188,8 +188,31 @@ async def get_identity(request: Request):
             except Exception:
                 pass
 
+        # Hybrid identity surfacing (Quantum Hardening epic, follow-up to PR #999).
+        # ``did`` stays the legacy did:pkh for backward compat with everything
+        # already reading it. Post-ceremony agents additionally expose the new
+        # did:web URI on ``signing_did``, plus ``is_hybrid`` / chain depth /
+        # explicit ``legacy_did`` alias. Pre-ceremony agents return
+        # ``is_hybrid=False`` and ``signing_did`` equals ``did``.
+        identity_runtime = getattr(agent, "identity", None)
+        is_hybrid = bool(identity_runtime and identity_runtime.is_hybrid)
+        signing_did = (
+            identity_runtime.new_did
+            if is_hybrid and identity_runtime.new_did
+            else agent.agent_id
+        )
+        chain_len = (
+            len(identity_runtime.succession_chain)
+            if identity_runtime and identity_runtime.succession_chain
+            else 0
+        )
+
         return {
             "did": agent.agent_id,
+            "legacy_did": agent.agent_id,
+            "signing_did": signing_did,
+            "is_hybrid": is_hybrid,
+            "succession_chain_length": chain_len,
             "name": agent_name,
             "description": description,
             "node_type": agent_node.node_type if agent_node else "agent",
