@@ -19,7 +19,10 @@ credentials/
 agent_data/
 test_files/
 
-# Ignore local rookery config (auto-discovered in container)
+# Ignore local multi-agent config (auto-discovered in container).
+# Both names are listed because rookery.toml is the legacy name kept for
+# backward compat — see docs/migrations/rookery_to_multi_agent.md.
+multi_agent.toml
 rookery.toml
 
 # Ignore local databases
