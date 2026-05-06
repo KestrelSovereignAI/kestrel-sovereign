@@ -5,8 +5,7 @@ Covers:
 - Round-trip sign/verify
 - Tampering rejection
 - Wrong-key rejection
-- 32-byte raw public-key serialization (matches storacha UCAN's wire
-  format and W3C did:key multicodec 0xed)
+- 32-byte raw public-key serialization (matches W3C did:key multicodec 0xed)
 - RFC 8032 Test 1 known-answer vector (deterministic ed25519 sig)
 - Multikey integration (multicodec 0xed -> 32-byte raw payload)
 - Registry self-registration at import time
@@ -138,7 +137,7 @@ def test_verify_rejects_empty_signature(suite, keypair):
 
 def test_serialize_emits_32_raw_bytes(suite, keypair):
     """Ed25519 public keys are 32 raw bytes — same shape as the W3C
-    did:key multicodec 0xed body and storacha UCAN's wire format."""
+    did:key multicodec 0xed body."""
     raw = suite.serialize_public_key(keypair.public_key)
     assert len(raw) == 32, f"expected 32-byte ed25519 pubkey, got {len(raw)}"
 

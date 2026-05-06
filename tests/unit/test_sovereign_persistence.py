@@ -20,7 +20,6 @@ from kestrel_sovereign.storage.sync.targets import (
     SovereignIPFSTarget,
     GCSTarget,
     LighthouseTarget,
-    StorachaTarget,
     S3Target,
 )
 from kestrel_sovereign.storage.sync.service import SyncService
