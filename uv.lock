@@ -1889,22 +1889,6 @@ wheels = [
 ]
 
 [[package]]
-name = "google-cloud-compute"
-version = "1.40.0"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "google-api-core", extra = ["grpc"] },
-    { name = "google-auth" },
-    { name = "grpcio" },
-    { name = "proto-plus" },
-    { name = "protobuf" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/92/c0/21fe9a8cadc0f8455b98e8e5ca8a3866b5ad745960023705b4f23d7a2aad/google_cloud_compute-1.40.0.tar.gz", hash = "sha256:6a5ca519ac82caafc0a8600b1aa724d22fc00255501e1f99ff7a5907db73e011", size = 4550048, upload-time = "2025-10-17T02:34:10.995Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/ce/f1/202eec05ce8e5c6a6a3e77f45b8e5625095ca7840b9a7f4927a776c35c9b/google_cloud_compute-1.40.0-py3-none-any.whl", hash = "sha256:e0181c2a9a44a4797d6888f550f088e5257e7700d93cb98a31eb1ed2c5086ee6", size = 3505474, upload-time = "2025-10-17T02:31:32.725Z" },
-]
-
-[[package]]
 name = "google-cloud-core"
 version = "2.5.0"
 source = { registry = "https://pypi.org/simple" }
@@ -2537,7 +2521,7 @@ wheels = [
 
 [[package]]
 name = "kestrel-sovereign"
-version = "0.5.0"
+version = "0.6.0"
 source = { editable = "." }
 dependencies = [
     { name = "aiohttp" },
@@ -2601,7 +2585,6 @@ all-features = [
     { name = "diffusers" },
     { name = "elevenlabs" },
     { name = "faster-whisper" },
-    { name = "google-cloud-compute" },
     { name = "google-cloud-run" },
     { name = "langchain" },
     { name = "langchain-community" },
@@ -2634,7 +2617,6 @@ all-features = [
 cloud = [
     { name = "azure-identity" },
     { name = "azure-mgmt-appcontainers" },
-    { name = "google-cloud-compute" },
     { name = "google-cloud-run" },
     { name = "runpod" },
     { name = "vastai-sdk" },
@@ -2654,7 +2636,6 @@ full = [
     { name = "diffusers" },
     { name = "elevenlabs" },
     { name = "faster-whisper" },
-    { name = "google-cloud-compute" },
     { name = "google-cloud-run" },
     { name = "langchain" },
     { name = "langchain-community" },
@@ -2785,7 +2766,6 @@ requires-dist = [
     { name = "fastapi", specifier = "==0.128.1" },
     { name = "faster-whisper", marker = "extra == 'voice-local'", specifier = ">=1.1.0" },
     { name = "google-auth", specifier = ">=2.40.3" },
-    { name = "google-cloud-compute", marker = "extra == 'cloud'", specifier = ">=1.15.0" },
     { name = "google-cloud-logging", specifier = ">=3.5.0" },
     { name = "google-cloud-run", marker = "extra == 'cloud'", specifier = ">=0.10.0" },
     { name = "google-cloud-storage", specifier = ">=3.4.1" },

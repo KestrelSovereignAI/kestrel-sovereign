@@ -60,14 +60,20 @@ class GCPComputeTrainingAdapter:
         self._active_jobs: dict[str, dict] = {}  # job_id -> {session, companion_id, ...}
 
     def _get_manager(self):
-        """Lazy load the GCP Compute Engine manager."""
+        """Lazy load the GCP Compute Engine manager.
+
+        GCP support lives in the kestrel-cloud-gcp feature package now
+        (extracted in #462). If it's not installed, this adapter cleanly
+        reports the provider as unavailable.
+        """
         if self._manager is None:
             try:
-                from kestrel_sovereign.features.gcp_compute.manager import GCPComputeEngineManager
+                from kestrel_cloud_gcp.compute.manager import GCPComputeEngineManager
                 self._manager = GCPComputeEngineManager()
             except ImportError as e:
                 raise ProviderNotAvailableError(
-                    f"GCP Compute manager not available: {e}"
+                    f"GCP Compute manager not available — install kestrel-cloud-gcp "
+                    f"to enable GCP-as-training-provider: {e}"
                 )
             except Exception as e:
                 raise ProviderNotAvailableError(

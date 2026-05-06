@@ -1,6 +1,6 @@
 [project]
 name = "kestrel_sovereign"
-version = "0.5.0"
+version = "0.6.0"
 description = "Kestrel Sovereign AI Agent Framework - Constitutional AI with cryptographic identity"
 readme = "README.md"
 requires-python = ">=3.11,<3.14"
@@ -177,11 +177,13 @@ observability = [
     "opentelemetry-exporter-otlp-proto-grpc>=1.20.0",
     "prometheus-client>=0.21.0",
 ]
-# Feature: Cloud GPU/serverless deployment (RunPod, Vast.ai, GCP, Azure)
+# Feature: Cloud GPU/serverless deployment (RunPod, Vast.ai, Azure)
+# Note: GCP Compute Engine support is in the extracted kestrel-cloud-gcp
+# package (#462). google-cloud-run stays here because the framework's
+# deploy feature still owns CloudRunProvider directly.
 cloud = [
     "runpod>=1.8.1",
     "vastai-sdk>=0.1.0",
-    "google-cloud-compute>=1.15.0",
     "google-cloud-run>=0.10.0",
     "azure-mgmt-appcontainers>=3.0.0",
     "azure-identity>=1.15.0",
