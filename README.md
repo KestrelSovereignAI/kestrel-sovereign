@@ -16,7 +16,7 @@ Kestrel is a production-ready framework for creating autonomous AI agents with c
 
 `pip install kestrel-sovereign` gives you a complete, working sovereign agent: identity, memory, constitution, privacy modes, multi-LLM support, voice (Piper TTS + FasterWhisper STT), local sandboxed compute, and a Cloud Run deployment path. Everything you need to run an agent locally with zero cloud commitment.
 
-Cloud providers (RunPod, Vast.ai), specialized integrations (MCP, GitHub App, wallet), and proprietary training adapters are **installable add-ons** — separate Python packages that register themselves via entry points. This split is being completed across [#462](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/462) and [#560](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/560); current state is documented in [`KESTREL_FEATURES.md`](KESTREL_FEATURES.md).
+Cloud providers (RunPod, Vast.ai), specialized integrations (MCP, GitHub App, wallet), and proprietary training adapters are **installable add-ons** — separate Python packages that register themselves via entry points. This split is being completed across [#462](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/462) and [#560](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/560); current state is documented in [`KESTREL_FEATURES.md`](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/main/KESTREL_FEATURES.md).
 
 ## 🚀 Quick Start
 
@@ -104,7 +104,7 @@ uv run kestrel feature disable <name>         # Disable without uninstalling
 uv run kestrel feature scaffold <name>        # Generate a new feature package skeleton
 ```
 
-The canonical inventory of features lives in [`KESTREL_FEATURES.md`](KESTREL_FEATURES.md); the runtime registry is in [`kestrel_sovereign/data/feature_registry.toml`](kestrel_sovereign/data/feature_registry.toml).
+The canonical inventory of features lives in [`KESTREL_FEATURES.md`](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/main/KESTREL_FEATURES.md); the runtime registry is in [`kestrel_sovereign/data/feature_registry.toml`](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/main/kestrel_sovereign/data/feature_registry.toml).
 
 ### Per-Agent Configuration
 
@@ -256,7 +256,7 @@ Kestrel covers a wide surface; not all of it ships at the same maturity. **Verif
 - **Vast.ai GPU marketplace** — broader test coverage than RunPod, but recent extraction/revert churn; integration tests skip without `VASTAI_API_KEY`.
 - **GCP Compute GPU VMs** — similar maturity to Vast.ai; integration tests skip without `GCP_PROJECT_ID`.
 - **Azure Container Apps deploy** — provider stub; not the recommended deploy target.
-- **GitHub code introspection** — file reading, code search, definition lookup, issue tools all work (48 unit tests). The deeper static-analysis surface promised in [`docs/architecture/GITHUB_FEATURE_DESIGN.md`](docs/architecture/GITHUB_FEATURE_DESIGN.md) (call graphs, inheritance trees, dependency analysis) is not implemented.
+- **GitHub code introspection** — file reading, code search, definition lookup, issue tools all work (48 unit tests). The deeper static-analysis surface promised in [`docs/architecture/GITHUB_FEATURE_DESIGN.md`](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/main/docs/architecture/GITHUB_FEATURE_DESIGN.md) (call graphs, inheritance trees, dependency analysis) is not implemented.
 - **Training (LoRA pipeline)** — core ships the protocol + factory; the local-MPS adapter is actively maintained. Cloud-training adapters (RunPod/Vertex/Replicate) work but skip CI without API keys; production-grade adapters are being moved to private packages.
 
 ### ⚠️ Work-in-progress
@@ -280,16 +280,16 @@ These are not on the kestrel-sovereign roadmap; if you need them, OpenClaw or a 
 
 Detailed documentation is available in the `docs/` directory:
 
-- [Documentation Index](docs/README.md)
+- [Documentation Index](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/main/docs/README.md)
 
-- [Agent Ecosystem](docs/architecture/core/AGENT_ECOSYSTEM.md)
-- [Agent Economics](docs/architecture/economics/AGENT_ECONOMICS.md)
-- [Kestrel Constitution](docs/principles/KESTREL_CONSTITUTION.md)
-- [Cryptographic Anchoring](docs/architecture/security/CRYPTOGRAPHIC_ANCHORING.md)
-- [Decentralized Storage](docs/architecture/storage/DECENTRALIZED_STORAGE.md)
-- [Multi-Model Support](docs/architecture/core/MULTI_MODEL_SUPPORT.md)
-- [Privacy Modes](docs/architecture/security/PRIVACY_MODES.md)
-- [LLM Service Architecture](docs/architecture/LLM_SERVICE_ARCHITECTURE.md)
+- [Agent Ecosystem](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/main/docs/architecture/core/AGENT_ECOSYSTEM.md)
+- [Agent Economics](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/main/docs/architecture/economics/AGENT_ECONOMICS.md)
+- [Kestrel Constitution](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/main/docs/principles/KESTREL_CONSTITUTION.md)
+- [Cryptographic Anchoring](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/main/docs/architecture/security/CRYPTOGRAPHIC_ANCHORING.md)
+- [Decentralized Storage](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/main/docs/architecture/storage/DECENTRALIZED_STORAGE.md)
+- [Multi-Model Support](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/main/docs/architecture/core/MULTI_MODEL_SUPPORT.md)
+- [Privacy Modes](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/main/docs/architecture/security/PRIVACY_MODES.md)
+- [LLM Service Architecture](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/main/docs/architecture/LLM_SERVICE_ARCHITECTURE.md)
 
 ## 💡 Example Applications
 
@@ -342,7 +342,7 @@ uv run pytest tests/integration/test_clean_install_verification.py -v
 
 LLM config lives under the `[llm]` section of `kestrel.toml`. The setup wizard (`kestrel setup llm`) will write it for you; you can also hand-edit `kestrel.toml` after copying from `kestrel.toml.example`.
 
-Kestrel uses a **vendor/route/model** schema. A *vendor* is who makes the weights; a *route* is how to reach them (adapter + base URL + auth). API keys belong in `.env` and are referenced by `api_key_env`. See [`kestrel.toml.example`](kestrel.toml.example) and [`docs/architecture/LLM_SERVICE_ARCHITECTURE.md`](docs/architecture/LLM_SERVICE_ARCHITECTURE.md) for the canonical spec.
+Kestrel uses a **vendor/route/model** schema. A *vendor* is who makes the weights; a *route* is how to reach them (adapter + base URL + auth). API keys belong in `.env` and are referenced by `api_key_env`. See [`kestrel.toml.example`](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/main/kestrel.toml.example) and [`docs/architecture/LLM_SERVICE_ARCHITECTURE.md`](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/main/docs/architecture/LLM_SERVICE_ARCHITECTURE.md) for the canonical spec.
 
 ```toml
 [llm]
@@ -388,7 +388,7 @@ See `.env.example` for a complete list. Key variables:
 
 ## 🚢 Deployment
 
-Kestrel supports multiple deployment targets. See [KESTREL_FEATURES.md](KESTREL_FEATURES.md#11-deployment) for the full catalog.
+Kestrel supports multiple deployment targets. See [KESTREL_FEATURES.md](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/main/KESTREL_FEATURES.md#11-deployment) for the full catalog.
 
 ### Cloud Run (Serverless)
 
@@ -406,7 +406,7 @@ scripts/cloudrun/deploy_dev.sh
 scripts/cloudrun/deploy_prod.sh
 ```
 
-Auto-deploys on version tags via [GitHub Actions](.github/workflows/deploy.yml).
+Auto-deploys on version tags via [GitHub Actions](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/main/.github/workflows/deploy.yml).
 
 ### Docker (Local)
 
@@ -494,7 +494,7 @@ For most users, the built-in **Sovereign Console** at `http://localhost:8888` is
 
 ## 📄 License
 
-Apache 2.0 — see [LICENSE](LICENSE) for details.
+Apache 2.0 — see [LICENSE](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/main/LICENSE) for details.
 
 ## 🆘 Support
 

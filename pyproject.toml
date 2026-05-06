@@ -290,8 +290,14 @@ build-backend = "hatchling.build"
 [tool.hatch.metadata]
 allow-direct-references = true
 
-[tool.hatch.build.targets.wheel]
-packages = ["kestrel_sovereign", "kestrel_feature_wallet", "kestrel_voice_elevenlabs", "kestrel_voice_deepgram", "kestrel_voice_openai", "kestrel_cloud_vastai", "kestrel_cloud_gcp", "kestrel_cloud_azure"]
+# Only the in-repo package. The kestrel_feature_*, kestrel_voice_*, and
+# kestrel_cloud_* packages used to be listed here from the pre-extraction
+# era — they live in their own repos now and ship as separate distributions
+# discovered via the `kestrel_sovereign.features` entry-point group.
+# Hatchling silently skipped the missing dirs at build time so the
+# published wheel was always correct; the listing was just misleading.
+# Caught in the Noel post-launch review (2026-05-06).
+packages = ["kestrel_sovereign"]
 
 [tool.hatch.build.targets.sdist]
-include = ["kestrel_sovereign/**/*", "kestrel_feature_wallet/**/*", "kestrel_voice_elevenlabs/**/*", "kestrel_voice_deepgram/**/*", "kestrel_voice_openai/**/*", "kestrel_cloud_vastai/**/*", "kestrel_cloud_gcp/**/*", "kestrel_cloud_azure/**/*"]
+include = ["kestrel_sovereign/**/*"]
