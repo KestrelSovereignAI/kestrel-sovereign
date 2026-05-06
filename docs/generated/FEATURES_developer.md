@@ -120,7 +120,6 @@ Audited snapshot: **42** discoverable modules · **42** exported `Feature` subcl
 | `council` | `CouncilFeature` |
 | `delivery` | `DeliveryFeature` |
 | `deploy` | `DeployFeature` |
-| `gcp_compute` | `GCPComputeFeature` |
 | `github` | `GitHubFeature` |
 | `github_app` | `GitHubAppFeature` |
 | `health` | `HealthFeature` |
