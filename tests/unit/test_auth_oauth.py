@@ -153,6 +153,20 @@ class TestEmailAllowlist:
             emails = _get_allowed_emails()
             assert emails == {"user@gmail.com"}
 
+    def test_get_allowed_emails_semicolon_separator(self):
+        """`;` works as separator (Cloud Run deploys can't use `,`)."""
+        with patch.dict(os.environ, {"KESTREL_ALLOWED_EMAILS": "a@b.com;c@d.com"}, clear=False):
+            from endpoints.auth_oauth import _get_allowed_emails
+            emails = _get_allowed_emails()
+            assert emails == {"a@b.com", "c@d.com"}
+
+    def test_get_allowed_emails_mixed_separators(self):
+        """Mixed `,` and `;` separators both work."""
+        with patch.dict(os.environ, {"KESTREL_ALLOWED_EMAILS": "a@b.com, c@d.com;e@f.com"}, clear=False):
+            from endpoints.auth_oauth import _get_allowed_emails
+            emails = _get_allowed_emails()
+            assert emails == {"a@b.com", "c@d.com", "e@f.com"}
+
 
 class TestAuthMiddleware:
     """Test that auth middleware accepts both API key and OAuth session."""
