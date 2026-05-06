@@ -102,7 +102,7 @@ Features come from two sources:
 
 The inventory below lists **core features only**. Installed feature packages appear at runtime via `discover_entrypoint_feature_classes()` and are not enumerated here.
 
-- Current audited snapshot: `41` discoverable modules and `41` exported `Feature` subclasses.
+- Current audited snapshot: `40` discoverable modules and `40` exported `Feature` subclasses.
 
 - `audit_anchor`
 - `bootstrap`
@@ -139,7 +139,6 @@ The inventory below lists **core features only**. Installed feature packages app
 - `strategic_memory`
 - `talon`
 - `tasks`
-- `vastai`
 - `voice`
 - `wallet`
 - `web_search`
@@ -183,7 +182,6 @@ The currently exported `Feature` subclasses discovered from those modules includ
 - `StrategicMemoryFeature`
 - `TalonCoordinatorFeature`
 - `TaskFeature`
-- `VastAIFeature`
 - `VoiceFeature`
 - `WalletFeature`
 - `WebSearchFeature`
