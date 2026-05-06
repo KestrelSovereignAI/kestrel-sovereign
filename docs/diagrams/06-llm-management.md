@@ -40,8 +40,8 @@ graph TB
     end
     
     subgraph config["Configuration"]
-        TOML[llm_config.toml]
-        PRIO[priority order]
+        TOML["kestrel.toml [llm]"]
+        PRIO[route_priority]
         KEYS[API keys]
     end
     
@@ -250,33 +250,46 @@ graph LR
 ## Slide 10: Configuration Example
 
 ```toml
-# llm_config.toml
+# kestrel.toml — [llm] section
 
-provider_priority = ["openai", "anthropic", "ollama"]
+[llm]
+route_priority = ["openai:api", "anthropic:api", "ollama:local"]
 
-[openai]
-api_key = "sk-..."
-model = "gpt-4o"
+[llm.vendors.openai]
+is_cloud = true
+[llm.vendors.openai.routes.api]
+adapter         = "OpenAIAdapter"
+api_key_env     = "OPENAI_API_KEY"   # in .env, never here
+model           = "auto"
+selection_hints = ["gpt-5", "mini"]
 
-[anthropic]
-api_key = "sk-ant-..."
-model = "claude-3-5-sonnet"
+[llm.vendors.anthropic]
+is_cloud = true
+[llm.vendors.anthropic.routes.api]
+adapter         = "AnthropicAdapter"
+api_key_env     = "ANTHROPIC_API_KEY"
+model           = "auto"
+selection_hints = ["sonnet", "haiku"]
 
-[ollama]
-host = "http://localhost:11434"
-model = "llama3.2"
+[llm.vendors.ollama]
+is_cloud = false
+[llm.vendors.ollama.routes.local]
+adapter         = "OllamaAdapter"
+host            = "http://localhost:11434"
+model           = "auto"
+selection_hints = ["llama3.2", "qwen"]
 ```
 
 ```mermaid
 graph LR
-    CONFIG[llm_config.toml] --> SERVICE[LLMService]
+    CONFIG["kestrel.toml [llm]"] --> SERVICE[LLMService]
     SERVICE --> ADAPTERS[Initialized Adapters]
     ADAPTERS --> READY[Ready to generate]
     
     style CONFIG fill:#7d6608,stroke:#f4d03f
 ```
 
-**Simple config.** One file, all providers.
+**Vendor/route/model.** Vendors group routes; routes carry adapter + auth. `model = "auto"` resolves via discovery from `selection_hints` — never hardcode IDs. API keys live in `.env`, referenced by `api_key_env`.
 
 ---
 

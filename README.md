@@ -52,11 +52,12 @@ uv sync  # Creates .venv and installs all dependencies
 ollama serve
 ollama pull llama3.2:3b
 
-# 3. Configure LLM - edit with your API keys or Ollama settings
-cp llm_config.toml.example llm_config.toml
+# 3. Run the setup wizard (interactive: configures .env, kestrel.toml [llm], agent)
+uv run kestrel setup
+# Or hand-edit: cp kestrel.toml.example kestrel.toml
 
-# 4. Health check (verify prerequisites)
-uv run kestrel health
+# 4. Doctor check (verify readiness)
+uv run kestrel doctor
 
 # 5. Create your agent
 uv run kestrel create MyAgent
@@ -64,6 +65,8 @@ uv run kestrel create MyAgent
 # 6. Start your agent
 uv run kestrel start MyAgent
 ```
+
+If you're upgrading from a pre-2026-05 setup that used a standalone `llm_config.toml`, run `uv run kestrel migrate-llm-config` to fold it into `kestrel.toml [llm]`. The legacy file is no longer read.
 
 Your agent is now running at `http://localhost:8888`.
 
@@ -335,31 +338,36 @@ uv run pytest tests/integration/test_clean_install_verification.py -v
 
 ## 🔧 Configuration
 
-### LLM Configuration (`llm_config.toml`)
+### LLM Configuration (`kestrel.toml` `[llm]`)
 
-Kestrel uses a **vendor/route/model** schema. A *vendor* is who makes the weights; a *route* is how to reach them (adapter + base URL + auth). API keys belong in `.env` and are referenced by `api_key_env`. See [`llm_config.toml.example`](llm_config.toml.example) and [`docs/architecture/LLM_SERVICE_ARCHITECTURE.md`](docs/architecture/LLM_SERVICE_ARCHITECTURE.md) for the canonical spec.
+LLM config lives under the `[llm]` section of `kestrel.toml`. The setup wizard (`kestrel setup llm`) will write it for you; you can also hand-edit `kestrel.toml` after copying from `kestrel.toml.example`.
+
+Kestrel uses a **vendor/route/model** schema. A *vendor* is who makes the weights; a *route* is how to reach them (adapter + base URL + auth). API keys belong in `.env` and are referenced by `api_key_env`. See [`kestrel.toml.example`](kestrel.toml.example) and [`docs/architecture/LLM_SERVICE_ARCHITECTURE.md`](docs/architecture/LLM_SERVICE_ARCHITECTURE.md) for the canonical spec.
 
 ```toml
+[llm]
 route_priority = ["openai:api", "ollama:local"]
 
-[vendors.openai]
+[llm.vendors.openai]
 is_cloud = true
 
-[vendors.openai.routes.api]
+[llm.vendors.openai.routes.api]
 adapter        = "OpenAIAdapter"
 api_key_env    = "OPENAI_API_KEY"
 model          = "auto"
 selection_hints = ["gpt-5", "mini"]
 
-[vendors.ollama]
+[llm.vendors.ollama]
 is_cloud = false
 
-[vendors.ollama.routes.local]
+[llm.vendors.ollama.routes.local]
 adapter        = "OllamaAdapter"
 host           = "http://localhost:11434"
 model          = "auto"
 selection_hints = ["llama3.2", "qwen"]
 ```
+
+> Pre-2026-05 setups used a standalone `llm_config.toml` at the repo root. That path was removed (epic #938). Run `kestrel migrate-llm-config` to fold a legacy file into `kestrel.toml [llm]`; the source is renamed to `.bak`, your prior `kestrel.toml` is timestamp-backed-up, and the operation is idempotent.
 
 ### Environment Variables
 
@@ -506,7 +514,7 @@ Apache 2.0 — see [LICENSE](LICENSE) for details.
 | `server.py` | FastAPI agent server |
 | `host.py` | Multi-agent multi_agent host (Cloud Run) |
 | `main.py` | Direct interactive REPL |
-| `llm_config.toml` | LLM provider configuration |
+| `kestrel.toml` | Unified config (LLM, agents, features). `[llm]` holds provider config. |
 | `KESTREL_FEATURES.md` | Canonical feature inventory |
 | `kestrel_sovereign/kestrel_agent.py` | Core agent logic |
 | `kestrel_sovereign/agent_config.py` | Per-agent config loader |
