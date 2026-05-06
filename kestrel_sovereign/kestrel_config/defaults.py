@@ -15,7 +15,6 @@ from kestrel_sdk.config.defaults import (  # noqa: F401
     get_lighthouse_api_url,
     get_openrouter_api_base,
     get_lighthouse_gateway_url,
-    get_storacha_gateway_url,
     get_sovereign_ipfs_url,
     get_xai_api_url,
     get_groq_api_url,

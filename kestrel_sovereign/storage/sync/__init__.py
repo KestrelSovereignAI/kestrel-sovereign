@@ -9,7 +9,6 @@ Architecture:
     SQLite (primary) ---> SyncService ---> Targets (ordered by trust)
 
     SOVEREIGN   Self-hosted IPFS (Kubo)
-    FEDERATED   Storacha (UCAN/DID)
     DELEGATED   Lighthouse (API key)
     EXPEDIENT   GCS / S3
 
@@ -23,7 +22,6 @@ from kestrel_sovereign.storage.sync.targets import (
     TrustTier,
     GCSTarget,
     LighthouseTarget,
-    StorachaTarget,
     SovereignIPFSTarget,
     S3Target,
 )
@@ -35,7 +33,6 @@ __all__ = [
     "TrustTier",
     "GCSTarget",
     "LighthouseTarget",
-    "StorachaTarget",
     "SovereignIPFSTarget",
     "S3Target",
 ]

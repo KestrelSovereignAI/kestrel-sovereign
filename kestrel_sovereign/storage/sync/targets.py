@@ -5,7 +5,6 @@ Abstractions for sync destinations. Each target declares a TrustTier
 reflecting how much sovereignty the agent retains over its data:
 
     SOVEREIGN   Infrastructure we own and operate (self-hosted IPFS)
-    FEDERATED   Agent-controlled auth, open protocol (Storacha/UCAN)
     DELEGATED   Third-party service with API key (Lighthouse)
     EXPEDIENT   Centralized cloud, fast but not sovereign (GCS, S3)
 
@@ -32,7 +31,7 @@ class TrustTier(Enum):
     Lower value = higher trust. Restore walks tiers in this order.
     """
     SOVEREIGN = 1   # Own infrastructure — self-hosted IPFS/Kubo
-    FEDERATED = 2   # Agent-controlled auth — Storacha/UCAN
+    FEDERATED = 2   # Agent-controlled auth (DID/UCAN); reserved
     DELEGATED = 3   # API-key gated — Lighthouse
     EXPEDIENT = 4   # Centralized cloud — GCS, S3
 
@@ -149,7 +148,6 @@ class SyncTarget(ABC):
 from kestrel_sovereign.storage.sync.s3_target import S3Target  # noqa: E402, F401
 from kestrel_sovereign.storage.sync.gcs_target import GCSTarget  # noqa: E402, F401
 from kestrel_sovereign.storage.sync.lighthouse_target import LighthouseTarget  # noqa: E402, F401
-from kestrel_sovereign.storage.sync.storacha_target import StorachaTarget  # noqa: E402, F401
 from kestrel_sovereign.storage.sync.sovereign_ipfs_target import SovereignIPFSTarget  # noqa: E402, F401
 
 __all__ = [
@@ -160,6 +158,5 @@ __all__ = [
     "S3Target",
     "GCSTarget",
     "LighthouseTarget",
-    "StorachaTarget",
     "SovereignIPFSTarget",
 ]

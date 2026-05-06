@@ -3,8 +3,8 @@
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-05-05
-**Scope:** 1645 tracked files (1025 `.py`, 247 `.md`, 373 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-05-06
+**Scope:** 1675 tracked files (1007 `.py`, 251 `.md`, 417 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -48,10 +48,10 @@ Repo entry points and standard project files.
 - **model_catalog.toml** — (configuration)
 - **model_mandate.toml** — (configuration)
 - **model_mandate.toml.example** — —
+- **multi_agent.toml.example** — —
 - **package-lock.json** — (configuration)
 - **package.json** — (configuration)
 - **pyproject.toml** — (configuration)
-- **multi_agent.toml.example** — —
 - **run_tests.py** — Kestrel Smart Test Runner - Unified Test System
   - `def get_database_url()`; `def get_redis_url()`; `class ServiceChecker`; `class SmartTestRunner`; `def main()`
 - **runpod_config.toml.example** — —
@@ -637,6 +637,8 @@ Repo entry points and standard project files.
   - `class AnalysisResult`; `class PersonalityAnalyzer`; `class CalibrationPromptGenerator`; `async def analyze_personality(db, agent_id, sample_limit)`; `def generate_calibration_prompt(fingerprint)`
 - **kestrel_sovereign/identity/rotation_ceremony.py** — Hybrid-identity rotation ceremony — Wave 3 sub-PR 4 of Quantum Hardening (#921, #918).
   - `class RotationCeremonyResult`; `def run_rotation_ceremony()`
+- **kestrel_sovereign/identity/runtime_identity.py** — Runtime identity loader — Wave 3 follow-up of Quantum Hardening (#921).
+  - `class RuntimeIdentityError`; `class AgentIdentity`; `def load_agent_identity(legacy_key_id, storage_dir)`
 - **kestrel_sovereign/identity/signing.py** — Identity Signing: DID-based cryptographic signing for identity packages.
   - `class SigningError`; `class VerificationError`; `def extract_address_from_did(did)`; `def get_key_id(did)`; `def sign_package(package, storage_dir)`; `def verify_package_signature(package, storage_dir)`; `async def sign_and_export(package, storage_dir, output_path)`; `def verify_and_load(json_str, storage_dir, require_valid_signature, allow_unsigned)`; `…`
 - **kestrel_sovereign/identity/substrate_adapter.py** — Substrate Adapter: Adapt agent identity to different LLM substrates.
@@ -730,6 +732,15 @@ Repo entry points and standard project files.
   - `def get_correlation_id()`; `class JSONFormatter`; `def setup_logging(fmt, level)`
 - **kestrel_sovereign/metrics.py** — Kestrel Prometheus Metrics — optional metric definitions for enterprise monitoring.
   - `def generate_metrics()`; `def get_content_type()`
+- **kestrel_sovereign/multi_agent/__init__.py** — Kestrel MultiAgent - registry of agents managed by a single Kestrel Host.
+- **kestrel_sovereign/multi_agent/agent_manager.py** — In-process multi-agent manager for Kestrel.
+  - `class AgentManager`
+- **kestrel_sovereign/multi_agent/config.py** — MultiAgent Configuration - Registry of agents managed by a Kestrel Host.
+  - `class HostConfig`; `class LocalAgentConfig`; `class RemoteAgentConfig`; `class MultiAgentConfig`
+- **kestrel_sovereign/multi_agent/process_manager.py** — Agent Process Manager - Starts, stops, and monitors agent subprocesses.
+  - `class AgentProcess`; `class ProcessManager`
+- **kestrel_sovereign/multi_agent/proxy.py** — Kestrel Host Proxy - Routes requests to the correct agent process.
+  - `def get_agent_base_url(agent_config)`; `def resolve_agent(agent_id, config)`; `def build_proxy_headers(request)`; `async def proxy_request_streaming(request, agent_id, path, config, …)`
 - **kestrel_sovereign/privacy.py** — —
   - `class PrivacyConfig`; `def get_privacy_preset(name)`; `class PrivacyMode`; `def privacy_mode_to_config(mode)`
 - **kestrel_sovereign/prompts/companion_system_prompt.md** — Companion System Prompt — ## Platform Awareness
@@ -741,15 +752,6 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/rate_limit.py** — Shared rate limiter instance for the Kestrel server.
 - **kestrel_sovereign/retirement_service.py** — Retirement Service: Graceful retirement protocol for Kestrel agents.
   - `class RetirementRecord`; `async def get_agent_info(db_path)`; `async def count_conversations(db_path)`; `async def retire_agent(db_path, reason, archive_dir, force)`; `async def list_retired_agents(archive_dir)`; `def retire_agent_sync(db_path, reason, force)`; `async def retire_test_agent(db_path, reason, archive_dir)`; `def main()`
-- **kestrel_sovereign/multi_agent/__init__.py** — Kestrel MultiAgent - Multi-Agent Registry.
-- **kestrel_sovereign/multi_agent/agent_manager.py** — In-process multi-agent manager for Kestrel.
-  - `class AgentManager`
-- **kestrel_sovereign/multi_agent/config.py** — MultiAgent Configuration - Registry of agents managed by a Kestrel Host.
-  - `class HostConfig`; `class LocalAgentConfig`; `class RemoteAgentConfig`; `class MultiAgentConfig`
-- **kestrel_sovereign/multi_agent/process_manager.py** — Agent Process Manager - Starts, stops, and monitors agent subprocesses.
-  - `class AgentProcess`; `class ProcessManager`
-- **kestrel_sovereign/multi_agent/proxy.py** — Kestrel Host Proxy - Routes requests to the correct agent process.
-  - `def get_agent_base_url(agent_config)`; `def resolve_agent(agent_id, config)`; `def build_proxy_headers(request)`; `async def proxy_request_streaming(request, agent_id, path, config, …)`
 - **kestrel_sovereign/security/__init__.py** — Security module for Kestrel Agent.
 - **kestrel_sovereign/security/agent_encryption.py** — Backward-compatible agent encryption re-exports.
 - **kestrel_sovereign/security/crypto_suite.py** — CryptoSuite — pluggable signature suites for Kestrel.
@@ -848,7 +850,9 @@ Repo entry points and standard project files.
   - `class ScopedConstitution`
 - **kestrel_sovereign/sql_utils.py** — Shared SQL safety utilities.
   - `def safe_table_name(name)`; `def safe_column_name(name)`
+- **kestrel_sovereign/static/favicon.ico** — —
 - **kestrel_sovereign/static/favicon.svg** — —
+- **kestrel_sovereign/static/index.css** — (css asset)
 - **kestrel_sovereign/static/index.html** — (html asset)
 - **kestrel_sovereign/static/js/api.js** — (js asset)
 - **kestrel_sovereign/static/js/api_client.mjs** — (mjs asset)
@@ -871,6 +875,8 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/static/js/sovereignty.js** — (js asset)
 - **kestrel_sovereign/static/js/spawn.js** — (js asset)
 - **kestrel_sovereign/static/js/tasks.js** — (js asset)
+- **kestrel_sovereign/static/js/theme.js** — (js asset)
+- **kestrel_sovereign/static/js/theme_picker.js** — (js asset)
 - **kestrel_sovereign/static/js/trash_grouping.js** — (js asset)
 - **kestrel_sovereign/static/js/ui.js** — (js asset)
 - **kestrel_sovereign/static/js/voice/capture-worklet.js** — (js asset)
@@ -948,12 +954,6 @@ Repo entry points and standard project files.
   - `class LighthouseProvider`; `def create_lighthouse_provider(api_key, tier, key_resolver)`
 - **kestrel_sovereign/storage/providers/lighthouse_rest.py** — Async REST client for Lighthouse storage API.
   - `class LighthouseRestClient`
-- **kestrel_sovereign/storage/providers/storacha_provider.py** — Storacha (web3.storage) Storage Provider
-  - `class StorachaProvider`; `def create_storacha_provider(space_did, agent_key, proof)`
-- **kestrel_sovereign/storage/providers/storacha_rest.py** — Async HTTP client for the Storacha (web3.storage) w3up bridge API.
-  - `class StorachaError`; `class StorachaRestClient`
-- **kestrel_sovereign/storage/providers/storacha_ucan.py** — UCAN v1 Invocation Builder for Storacha (web3.storage)
-  - `def cid_v1(data, codec)`; `def cid_to_string(cid_bytes)`; `def build_car(root_cids, blocks)`; `def parse_car(car_bytes)`; `class StorachaUCAN`
 - **kestrel_sovereign/storage/retention.py** — Retention helpers for the soft-delete migration (#764).
   - `def load_trash_config()`; `def resolve_retention_days()`; `def agent_privacy_mode(agent)`
 - **kestrel_sovereign/storage/saved_items_store.py** — Saved Items Store for Kestrel.
@@ -975,8 +975,6 @@ Repo entry points and standard project files.
   - `class SyncStats`; `class SyncState`; `class SyncService`
 - **kestrel_sovereign/storage/sync/sovereign_ipfs_target.py** — Sovereign IPFS Sync Target
   - `class SovereignIPFSTarget`
-- **kestrel_sovereign/storage/sync/storacha_target.py** — Storacha Sync Target
-  - `class StorachaTarget`
 - **kestrel_sovereign/storage/sync/targets.py** — Sync Targets
   - `class TrustTier`; `class SyncResult`; `class SyncTarget`
 - **kestrel_sovereign/storage/sync_protocol.py** — Sync Protocol for Multi-Tier Storage
@@ -995,8 +993,14 @@ Repo entry points and standard project files.
   - `def mock_agent()`; `async def mock_agent_with_storage()`; `def mock_agent_factory()`
 - **kestrel_sovereign/testing/mock_agent.py** — MockAgent — lightweight KestrelAgent stub for feature testing.
   - `class MockLLMService`; `class MockHooksManager`; `class MockPrivacyAgent`; `class MockAgent`
+- **kestrel_sovereign/themes/falconry/en.toml** — (configuration)
+- **kestrel_sovereign/themes/legacy/en.toml** — (configuration)
+- **kestrel_sovereign/themes/plain/en.toml** — (configuration)
 - **kestrel_sovereign/tools/__init__.py** — Kestrel Agent Tools
 - **kestrel_sovereign/tools/base.py** — Base classes and interfaces for Kestrel agent tools.
+- **kestrel_sovereign/ui/__init__.py** — —
+- **kestrel_sovereign/ui/theme_loader.py** — Theme/locale label resolver for the UI theme + i18n system (epic #986).
+  - `class ThemeNotFoundError`; `class ThemeBundle`; `def load_theme(theme, locale)`; `def list_available_themes()`; `def clear_cache()`
 - **kestrel_sovereign/voice/__init__.py** — Kestrel Voice Provider Abstraction Layer.
 - **kestrel_sovereign/voice/agent_prompt_snippet.md** — <!-- Injected into the agent's system prompt by kestrel_sovereign.voice.routing when the active turn is being voiced.
 - **kestrel_sovereign/voice/base.py** — Base classes for voice providers (TTS and STT).
@@ -1014,58 +1018,6 @@ Repo entry points and standard project files.
   - `class TagToken`; `class ParsedText`; `def parse_tags(text, known)`; `class NormalizedOutput`; `class ProviderTagAdapter`; `class ElevenLabsV3Adapter`; `class OpenAITTSAdapter`; `class OpenAIRealtimeAdapter`; `…`
 - **kestrel_sovereign/voice/vad.py** — Voice Activity Detection for WebSocket turn-taking.
   - `class VoiceActivityDetector`; `def load_vad_config(config)`
-
-## `kestrel_sdk/`
-
-- **kestrel_sdk/__init__.py** — Kestrel Sovereign SDK — lightweight interfaces for feature packages.
-- **kestrel_sdk/a2a/__init__.py** — Kestrel SDK — A2A Protocol interfaces.
-- **kestrel_sdk/a2a/agent_card.py** — Agent Card Types for A2A Protocol.
-  - `class AgentProvider`; `class AgentCapabilities`; `class AgentAuthentication`; `class AgentSkill`; `class AgentCard`
-- **kestrel_sdk/a2a/types.py** — A2A Protocol Types for Kestrel.
-  - `class JSONRPCMessage`; `class JSONRPCRequest`; `class JSONRPCError`; `class JSONRPCResponse`; `class TaskState`; `class TextPart`; `class FileContent`; `class FilePart`; `…`
-- **kestrel_sdk/config/__init__.py** — Kestrel SDK — Configuration constants and defaults.
-- **kestrel_sdk/config/constants.py** — Kestrel Configuration Constants.
-  - `class Currency`
-- **kestrel_sdk/config/defaults.py** — Default configuration values for Kestrel.
-  - `def get_ollama_url()`; `def get_ipfs_api_url()`; `def get_mcp_gateway_url()`; `def get_lotus_rpc_url()`; `def get_lighthouse_api_url()`; `def get_openrouter_api_base()`; `def get_lighthouse_gateway_url()`; `def get_storacha_gateway_url()`; `…`
-- **kestrel_sdk/deploy/__init__.py** — Kestrel SDK — Deployment provider interfaces.
-- **kestrel_sdk/deploy/base.py** — Deploy Provider Abstract Base Class.
-  - `class DeployProvider`
-- **kestrel_sdk/deploy/models.py** — Deploy Data Models and Exceptions.
-  - `class DeployStatus`; `class DeployProviderType`; `class DeploymentProfile`; `class DeploymentSession`; `class DeployManagerError`
-- **kestrel_sdk/features/__init__.py** — Kestrel SDK — Feature interfaces.
-- **kestrel_sdk/features/base.py** — Base class for Kestrel Features — SDK interface.
-  - `class TaskHandler`; `def parse_docstring_params(docstring)`; `class Feature`; `def tool(name, description, category, command_prefix)`
-- **kestrel_sdk/hooks/__init__.py** — Kestrel SDK — Hook interfaces.
-- **kestrel_sdk/hooks/base.py** — Kestrel Hooks - Core Types (Claude Code Aligned).
-  - `class HookEvent`; `class PermissionDecision`; `class HookInput`; `class HookOutput`; `class Hook`
-- **kestrel_sdk/security/__init__.py** — Kestrel SDK — Security interfaces and encryption helpers.
-- **kestrel_sdk/security/aead.py** — AEAD container — versioned AES-256-GCM with Fernet-compatible read path.
-  - `class AEADCipher`
-- **kestrel_sdk/security/encryption.py** — Symmetric encryption helpers for Kestrel SDK.
-  - `def get_fernet()`; `def get_master_key_bytes()`; `def get_agent_fernet(agent_id)`; `def get_agent_key(agent_did, purpose)`; `def encrypt(agent_did, purpose, plaintext)`; `def decrypt(agent_did, purpose, ciphertext)`; `def encrypt_string(agent_did, purpose, plaintext)`; `def decrypt_string(agent_did, purpose, ciphertext)`; `…`
-- **kestrel_sdk/security/exceptions.py** — Unified exception hierarchy for Kestrel security module.
-  - `class SecurityError`; `class KeyStorageError`; `class KeyNotFoundError`; `class KeyNotConfiguredError`; `class EncryptionError`; `class DecryptionError`; `class MasterKeyNotConfiguredError`; `class InvalidPurposeError`; `…`
-- **kestrel_sdk/signals/__init__.py** — Kestrel SDK — Signal Dispatcher interfaces.
-- **kestrel_sdk/signals/models.py** — Signal Dispatcher data model — public contract.
-  - `class SignalMode`; `class Trust`; `class Urgency`; `class Visibility`; `class Status`; `class ResourceLock`; `class CausationFrame`; `class RateLimit`; `…`
-- **kestrel_sdk/storage/__init__.py** — Kestrel SDK — Storage provider interfaces.
-- **kestrel_sdk/storage/providers/__init__.py** — Kestrel SDK — Storage provider interfaces.
-- **kestrel_sdk/storage/providers/base.py** — Storage Provider Protocol
-  - `class StorageTier`; `class SyncStatus`; `class StorageResult`; `class SyncItem`; `class SyncManifest`; `class StorageProvider`; `class CryostasisCapable`; `class MultiCurrencyPayment`
-- **kestrel_sdk/tools/__init__.py** — Kestrel SDK — Tool interfaces.
-- **kestrel_sdk/tools/base.py** — Base classes and interfaces for Kestrel agent tools.
-  - `class ToolCategory`; `class ToolParameter`; `class ToolSchema`; `class AgentTool`; `class ToolExecutionError`
-- **kestrel_sdk/training/__init__.py** — Training provider interfaces for Kestrel SDK.
-- **kestrel_sdk/training/protocol.py** — TrainingProvider Protocol for unified LoRA training across providers.
-  - `class TrainingProvider`; `class TrainingProviderError`; `class ProviderNotAvailableError`; `class TrainingSubmissionError`; `class TrainingStatusError`; `class DownloadError`; `class GenerationError`
-- **kestrel_sdk/training/types.py** — Unified types for TrainingProvider protocol.
-  - `class TrainingState`; `class ProviderType`; `class ProviderCapabilities`; `class TrainingConfig`; `class TrainingJob`; `class TrainingStatus`; `class GenerationState`; `class GenerationConfig`; `…`
-- **kestrel_sdk/voice/__init__.py** — Kestrel SDK — Voice provider interfaces.
-- **kestrel_sdk/voice/base.py** — Base classes for voice providers (TTS and STT).
-  - `class VoiceInfo`; `class VoiceConfig`; `class PersonalityFingerprint`; `def match_voice(personality, available_voices)`; `def split_sentences(text)`; `class TTSProvider`; `class STTProvider`
-- **kestrel_sdk/voice/conversation_base.py** — ConversationProvider — speech-to-speech provider contract.
-  - `class AudioFormat`; `class TurnDetectionConfig`; `class ToolDef`; `class SessionCreatedEvent`; `class SessionUpdatedEvent`; `class SpeechStartedEvent`; `class SpeechStoppedEvent`; `class TranscriptDeltaEvent`; `…`
 
 ## `endpoints/`
 
@@ -1103,6 +1055,8 @@ Repo entry points and standard project files.
 - **endpoints/sovereignty.py** — Sovereignty export/import and file browser endpoints.
   - `async def get_storage_stats(request)`; `async def list_sovereignty_exports(request)`; `async def trigger_sovereignty_export(request)`; `async def trigger_sovereignty_import(request)`; `async def list_sovereignty_files(request)`; `async def download_sovereignty_file(request, filename)`; `async def preview_sovereignty_file(request, filename, max_size)`
 - **endpoints/spawn.py** — Spawn panel API endpoints — re-exported from kestrel-feature-spawn.
+- **endpoints/ui.py** — UI theme + i18n endpoint.
+  - `async def get_theme(theme, locale)`; `async def list_themes()`
 - **endpoints/voice.py** — Voice HTTP endpoints and WebSocket real-time voice chat.
   - `class VoiceConfigRequest`; `class TTSRequest`; `class TTSStreamRequest`; `async def list_voices(request, provider)`; `async def providers_status(request)`; `async def get_voice_config(request)`; `async def set_voice_config(request, body)`; `async def synthesize_speech(request, body)`; `…`
 - **endpoints/voice_realtime.py** — Voice Realtime ephemeral-session mint endpoint.
@@ -1117,6 +1071,8 @@ Repo entry points and standard project files.
 - **scripts/bench_prompt_cache_providers.py** — Multi-provider prompt-cache benchmark for issue #703.
   - `class TurnResult`; `class ProviderResult`
 - **scripts/build_docker_remote.sh** — Build Kestrel Agent Docker image (Remote LLM mode)
+- **scripts/build_logo_assets.py** — Build the Kestrel logo asset bundle (SVG + PNG + ICO) from a source PNG.
+  - `class PaletteEntry`; `def extract_palette(rgb, k)`; `def classify_palette(palette)`; `def background_mask(rgb, tol)`; `def colour_mask(rgb, target, bg, tolerance)`; `def drop_small_components(mask, min_area)`; `def trace_mask_to_paths(mask)`; `class TracedLayer`; `…`
 - **scripts/bundle_code.sh** — This script bundles all project source code into a single markdown file.
 - **scripts/bundle_docs.sh** — This script bundles all project documentation into a single markdown file.
 - **scripts/ci/__init__.py** — —
@@ -1129,8 +1085,8 @@ Repo entry points and standard project files.
 - **scripts/cloudrun/build.sh** — Build and push Kestrel Cloud Run image to GCR
 - **scripts/cloudrun/build_multi_agent.sh** — Build and push Kestrel MultiAgent (multi-agent host) image to GCR
 - **scripts/cloudrun/deploy_dev.sh** — Deploy Kestrel to Cloud Run — DEV environment
-- **scripts/cloudrun/deploy_prod.sh** — Deploy Kestrel to Cloud Run — PRODUCTION environment
 - **scripts/cloudrun/deploy_multi_agent_dev.sh** — Deploy Kestrel MultiAgent (multi-agent host) to Cloud Run — DEV environment
+- **scripts/cloudrun/deploy_prod.sh** — Deploy Kestrel to Cloud Run — PRODUCTION environment
 - **scripts/cloudrun/setup_secrets.sh** — One-time setup: Create GCP Secret Manager secrets for Kestrel Cloud Run
 - **scripts/convene_agent_participation.py** — Convene Constitutional Council: Agent Participation in Own Governance
   - `def print_token_usage(session)`; `def load_council_config()`; `def build_evidence()`; `async def run_council_session()`
@@ -1184,6 +1140,14 @@ Repo entry points and standard project files.
 - **scripts/public_repo_files/CONTRIBUTING.md** — Contributing to Kestrel — ## Code of Conduct
 - **scripts/public_repo_files/LICENSE** — —
 - **scripts/public_repo_files/SECURITY.md** — Security Policy — ## Reporting a Vulnerability
+- **scripts/quantum_destroy_legacy_key.py** — Secure-delete the legacy ECDSA private key for an agent that has completed the hybrid-rotation ceremony — the documented step 7 of ``docs/architecture/security/SUCCESSION_RUNBOOK.md``.
+  - `def main()`
+- **scripts/quantum_kestrel_1_ceremony.py** — Live hybrid-rotation ceremony for Kestrel #1 (a.k.a.
+  - `def main()`
+- **scripts/quantum_pre_ceremony_backup.py** — Pre-ceremony backup — encrypted, verifiable, restorable snapshot of every agent we are about to rotate under the Quantum Hardening epic ([#921]).
+  - `def sqlite_snapshot(source_db, dest_db)`; `def collect_target(target, staging_root, manifest, project_root)`; `def encrypt_archive(plaintext_path, passphrase, ciphertext_path)`; `def decrypt_archive(ciphertext_path, passphrase, plaintext_path)`; `def cmd_backup(passphrase, project_root, targets, passphrase_env)`; `def cmd_restore(archive, output, passphrase)`; `def main()`
+- **scripts/quantum_rotation_dry_run.py** — Hybrid-rotation ceremony **dry run** against a throwaway staging agent.
+  - `def main()`
 - **scripts/release/load_signing_key_from_env.py** — Load SLH-DSA-SHA2-128s release-signing key material from environment variables into a SecureKeyStorage directory, then exit.
   - `def main()`
 - **scripts/rotate_emma_key.py** — Rotate Emma's encryption key from temp passphrase to a secure passphrase.
@@ -1233,9 +1197,9 @@ Repo entry points and standard project files.
 - **docker/Dockerfile.flux1-uncensored** — —
 - **docker/Dockerfile.gpu** — —
 - **docker/Dockerfile.lora-trainer** — —
+- **docker/Dockerfile.multi_agent** — —
 - **docker/Dockerfile.ollama-server** — —
 - **docker/Dockerfile.remote** — —
-- **docker/Dockerfile.multi_agent** — —
 - **docker/Dockerfile.simpletuner** — —
 - **docker/Dockerfile.sovereign** — —
 - **docker/Dockerfile.standalone** — —
@@ -1263,9 +1227,9 @@ Repo entry points and standard project files.
 - **docker/ipfs/gcs-backup.sh** — Sync IPFS blocks to GCS for durability
 - **docker/ipfs/init.sh** — Kestrel IPFS node initialization
 - **docker/kestrel.cloudrun.toml** — (configuration)
-- **docker/ollama-startup.sh** — Startup script for RunPod Ollama Server
 - **docker/multi_agent.cloudrun.toml** — (configuration)
 - **docker/multi_agent_entrypoint.sh** — MultiAgent Host entrypoint for Cloud Run / Azure Container Apps
+- **docker/ollama-startup.sh** — Startup script for RunPod Ollama Server
 - **docker/seed_agents/Kestrel/SOUL.md** — SOUL.md - Default Personality — **CRITICAL INSTRUCTION:** When answering personal questions, respond in natural paragraphs.
 - **docker/seed_agents/kestrel-demo/SOUL.md** — SOUL.md - Kestrel Demo Agent — **CRITICAL INSTRUCTION:** When answering personal questions, respond in natural paragraphs.
 - **docker/simpletuner_api.py** — SimpleTuner API Wrapper for Kestrel LoRA Training
@@ -1319,7 +1283,7 @@ Repo entry points and standard project files.
 - **docs/architecture/core/AGENT_ECOSYSTEM.md** — PRD: The Kestrel Agent Ecosystem — ## 1.
 - **docs/architecture/core/FEATURE_AGENT_FRAMEWORK.md** — PRD: Feature Agent Framework — ## 1.
 - **docs/architecture/core/INFRASTRUCTURE.md** — Kestrel Development Infrastructure — Complete toolkit for accelerated parallel development with Claude Code.
-- **docs/architecture/core/MULTI_MODEL_SUPPORT.md** — PRD: Multi-Model Foundational Support — ## 1.
+- **docs/architecture/core/MULTI_MODEL_SUPPORT.md** — PRD: Multi-Model Foundational Support — > **Historical PRD.** This document describes the original multi-model support architecture as designed and built.
 - **docs/architecture/economics/AGENT_ECONOMICS.md** — Agent Economics: Autonomous Economic Entities — ## 1.
 - **docs/architecture/economics/ECONOMICS_WORK_SESSION.md** — Economics Work Session – Kestrel / Sovereign Agents — **Purpose:** Shared scratchpad for coordinating between top-level models (and humans) on Kestrel / Kestrel economics: pricing, fee containment (LLM, Runpod, Filecoin, infra), revenue distribution (pl…
 - **docs/architecture/economics/ECONOMIC_INCENTIVES_DEEP_DIVE.md** — Economic Incentives Deep Dive - Constitutional AI System — **Date:** November 11, 2025 **Focus:** Detailed explanation of payment flows and economic mechanisms **Audience:** Users and stakeholders
@@ -1333,10 +1297,11 @@ Repo entry points and standard project files.
 - **docs/architecture/security/INTEGRITY_AUDIT_SYSTEM.md** — Kestrel Integrity Audit System — **Date:** November 9, 2025 **Version:** 1.0 **Component:** Constitutional AI Enforcement Mechanism
 - **docs/architecture/security/KEY_MANAGEMENT.md** — Key Management Architecture — ## Overview
 - **docs/architecture/security/KEY_ROTATION.md** — Key Rotation Mechanism — ## Overview
-- **docs/architecture/security/POST_QUANTUM_CRYPTOGRAPHY_MIGRATION.md** — Post-Quantum Cryptography Migration — PRD v2 — **Status:** Active.
-- **docs/architecture/security/PQ_THREAT_MODEL.md** — Post-Quantum Threat Model — **Status:** Wave 0A deliverable.
+- **docs/architecture/security/POST_QUANTUM_CRYPTOGRAPHY_MIGRATION.md** — Post-Quantum Cryptography Migration — PRD v2 — **Status:** ✅ All technical waves shipped (May 2026).
+- **docs/architecture/security/PQ_THREAT_MODEL.md** — Post-Quantum Threat Model — **Status:** Wave 0A deliverable, threats now mitigated by waves 1–5 (May 2026).
 - **docs/architecture/security/PRIVACY_AGENT.md** — PRD: PrivacyAgent — ## 1.
 - **docs/architecture/security/PRIVACY_MODES.md** — Privacy Modes: Complete Data Sovereignty — ## 1.
+- **docs/architecture/security/SECURITY_OVERVIEW.md** — Kestrel Security Overview — > A plain-language tour of Kestrel's cryptographic posture as of the Quantum Hardening epic ([`#921`](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/921)).
 - **docs/architecture/security/SERIALIZATION_COMPATIBILITY.md** — Serialization Compatibility Matrix — **Status:** Wave 0A deliverable.
 - **docs/architecture/security/SUCCESSION_RUNBOOK.md** — Hybrid-Identity Rotation Runbook — > **Wave 3 of Quantum Hardening (#921, #918)** — operational procedure for migrating a legacy `did:pkh` Kestrel agent to a hybrid `did:web` identity (Ed25519 + ML-DSA-65) via a signed succession stat…
 - **docs/architecture/storage/DECENTRALIZED_STORAGE.md** — Decentralized Storage Vision: IPFS & Filecoin Integration — **Last Updated:** March 11, 2026
@@ -1350,6 +1315,8 @@ Repo entry points and standard project files.
 - **docs/architecture/tools/AGENT_TOOLS.md** — Agent Tools Documentation — ## Overview
 - **docs/architecture/tools/AGENT_TOOLS_ARCHITECTURE.md** — Agent Tools Architecture - Design Document — **Status:** IMPLEMENTED (Phases 1-4) **Priority:** HIGH - Core agent capability **Last Updated:** November 22, 2025
 - **docs/architecture/tools/AGENT_TOOLS_IMPLEMENTATION.md** — Agent Tools Implementation Summary — **Date:** November 7, 2025 **Status:** ✅ Complete and Ready for Testing/Deployment
+- **docs/architecture/ui_label_inventory.md** — UI Label Inventory — Catalog of every user-facing string in the Kestrel Sovereign main console, classified for the theme + i18n system (epic #986).
+- **docs/architecture/ui_theme_schema.md** — UI Theme File Schema — Theme files define the user-facing labels for the Kestrel UI under the theme + i18n system established by epic #986.
 - **docs/archive/KESTREL_FEATURES_legacy.md** — Kestrel Sovereign Legacy Feature Catalog — > Historical snapshot of the pre-canonical feature catalog.
 - **docs/audit/API_ENDPOINT_MATRIX.md** — API Endpoint Matrix — ## App-level routes
 - **docs/audit/API_SURFACE_RECONCILIATION.md** — API Surface Reconciliation — The legacy catalog under-described the live HTTP surface.
@@ -1359,6 +1326,8 @@ Repo entry points and standard project files.
 - **docs/audit/FEATURE_MODULE_MATRIX.md** — Feature Module Matrix — Discovery rule: [`kestrel_sovereign/features/__init__.py`](../../kestrel_sovereign/features/__init__.py) scans single-file modules, package `__init__.py`, and package `feature.py`.
 - **docs/audit/FEATURE_PROOF_MATRIX.md** — Feature Proof Matrix — This is the first pass at mapping each discoverable feature module to direct proof.
 - **docs/audit/README.md** — Kestrel Whole-of-Vision Audit — This directory is the canonical source for the GitHub issue bodies used to track the feature-by-feature audit, inspection, and red-team program derived from `KESTREL_FEATURES.md`.
+- **docs/audit/REPO_MAP.md** — Kestrel Sovereign — Repo Map — Auto-generated file-tree + per-file purpose index.
+- **docs/audit/REPO_MAP.md** — Kestrel Sovereign — Repo Map — Auto-generated file-tree + per-file purpose index.
 - **docs/audit/REPO_MAP.md** — Kestrel Sovereign — Repo Map — Auto-generated file-tree + per-file purpose index.
 - **docs/audit/SEAM_CAMPAIGNS.md** — Cross-Feature Seam Campaigns — This matrix tracks adversarial campaigns that cross feature boundaries.
 - **docs/audit/SYNC_ASYNC_AUDIT.md** — Sync/Async Audit — Control document for the original issue `#300` and the refreshed current-runtime audit in issue `#624`, focused on maintained runtime surfaces.
@@ -1422,13 +1391,21 @@ Repo entry points and standard project files.
 - **docs/design/KESTREL_LOGO.png** — —
 - **docs/design/KESTREL_LOGO_ASCII_CONCEPT.md** — Kestrel Logo - ASCII Art Representation — **Date:** November 11, 2025 **Purpose:** Visual concept representation **Note:** This is a text-based approximation of the logo design
 - **docs/design/KESTREL_LOGO_DESIGN_SPEC.md** — Kestrel Logo Design Specification — **Date:** November 11, 2025 **Designer:** AI Assistant **Client:** Kestrel Sovereign AI Platform **Version:** 1.0
-- **docs/design/_comparison_icon.png** — —
-- **docs/design/_comparison_logo.png** — —
-- **docs/design/_mask_bird_silhouette.png** — —
-- **docs/design/_mask_bright_teal.png** — —
-- **docs/design/_mask_dark_teal.png** — —
-- **docs/design/_mask_gold.png** — —
-- **docs/design/_mask_silver.png** — —
+- **docs/design/_backup_2026-05-05/docs-design/KESTREL_LOGO.png** — —
+- **docs/design/_backup_2026-05-05/docs-design/_comparison_icon.png** — —
+- **docs/design/_backup_2026-05-05/docs-design/_comparison_logo.png** — —
+- **docs/design/_backup_2026-05-05/docs-design/_mask_bird_silhouette.png** — —
+- **docs/design/_backup_2026-05-05/docs-design/_mask_bright_teal.png** — —
+- **docs/design/_backup_2026-05-05/docs-design/_mask_dark_teal.png** — —
+- **docs/design/_backup_2026-05-05/docs-design/_mask_gold.png** — —
+- **docs/design/_backup_2026-05-05/docs-design/_mask_silver.png** — —
+- **docs/design/_backup_2026-05-05/docs-design/kestrel_avatar_400x400.png** — —
+- **docs/design/_backup_2026-05-05/docs-design/kestrel_avatar_400x400_circle.png** — —
+- **docs/design/_backup_2026-05-05/docs-design/kestrel_bird_only.svg** — —
+- **docs/design/_backup_2026-05-05/docs-design/kestrel_icon.svg** — —
+- **docs/design/_backup_2026-05-05/docs-design/kestrel_logo.svg** — —
+- **docs/design/_backup_2026-05-05/static/favicon.svg** — —
+- **docs/design/_backup_2026-05-05/static/kestrel_logo.svg** — —
 - **docs/design/kestrel_avatar_400x400.png** — —
 - **docs/design/kestrel_avatar_400x400_circle.png** — —
 - **docs/design/kestrel_banks.png** — —
@@ -1442,6 +1419,46 @@ Repo entry points and standard project files.
 - **docs/design/launch/PUBLISH_READY_LANDING_PAGE_COPY.md** — Kestrel Landing Page Copy: Publish-Ready Draft — This draft is the tightened, publish-ready version of the earlier wireframe.
 - **docs/design/launch/README.md** — Launch Copy Drafts — This folder holds the current launch-copy assets for the Kestrel open-source launch.
 - **docs/design/launch/SIMPLE_LAUNCH_PAGE_ONE_SCREEN.md** — Kestrel Simple Launch Page: One-Screen Version — Use this if the team wants a single-screen launch page with minimal implementation overhead.
+- **docs/design/launch/fonts/Montserrat-VF.ttf** — —
+- **docs/design/launch/lockup/kestrel_lockup.min.svg** — —
+- **docs/design/launch/lockup/kestrel_lockup.svg** — —
+- **docs/design/launch/lockup/png/kestrel_lockup_1024.png** — —
+- **docs/design/launch/lockup/png/kestrel_lockup_1024_white.png** — —
+- **docs/design/launch/lockup/png/kestrel_lockup_1280.png** — —
+- **docs/design/launch/lockup/png/kestrel_lockup_1280_white.png** — —
+- **docs/design/launch/lockup/png/kestrel_lockup_2048.png** — —
+- **docs/design/launch/lockup/png/kestrel_lockup_2048_white.png** — —
+- **docs/design/launch/lockup/png/kestrel_lockup_256.png** — —
+- **docs/design/launch/lockup/png/kestrel_lockup_256_white.png** — —
+- **docs/design/launch/lockup/png/kestrel_lockup_512.png** — —
+- **docs/design/launch/lockup/png/kestrel_lockup_512_white.png** — —
+- **docs/design/launch/mark/kestrel_mark.ico** — —
+- **docs/design/launch/mark/kestrel_mark.min.svg** — —
+- **docs/design/launch/mark/kestrel_mark.svg** — —
+- **docs/design/launch/mark/png/kestrel_mark_1024.png** — —
+- **docs/design/launch/mark/png/kestrel_mark_1024_white.png** — —
+- **docs/design/launch/mark/png/kestrel_mark_128.png** — —
+- **docs/design/launch/mark/png/kestrel_mark_128_white.png** — —
+- **docs/design/launch/mark/png/kestrel_mark_16.png** — —
+- **docs/design/launch/mark/png/kestrel_mark_16_white.png** — —
+- **docs/design/launch/mark/png/kestrel_mark_180.png** — —
+- **docs/design/launch/mark/png/kestrel_mark_180_white.png** — —
+- **docs/design/launch/mark/png/kestrel_mark_192.png** — —
+- **docs/design/launch/mark/png/kestrel_mark_192_white.png** — —
+- **docs/design/launch/mark/png/kestrel_mark_256.png** — —
+- **docs/design/launch/mark/png/kestrel_mark_256_white.png** — —
+- **docs/design/launch/mark/png/kestrel_mark_32.png** — —
+- **docs/design/launch/mark/png/kestrel_mark_32_white.png** — —
+- **docs/design/launch/mark/png/kestrel_mark_400.png** — —
+- **docs/design/launch/mark/png/kestrel_mark_400_white.png** — —
+- **docs/design/launch/mark/png/kestrel_mark_48.png** — —
+- **docs/design/launch/mark/png/kestrel_mark_48_white.png** — —
+- **docs/design/launch/mark/png/kestrel_mark_512.png** — —
+- **docs/design/launch/mark/png/kestrel_mark_512_white.png** — —
+- **docs/design/launch/mark/png/kestrel_mark_64.png** — —
+- **docs/design/launch/mark/png/kestrel_mark_64_white.png** — —
+- **docs/design/launch/sources/kestrel_lockup_source.png** — —
+- **docs/design/launch/sources/kestrel_mark_source.png** — —
 - **docs/development/BIG_BRAIN.md** — Best Open-Weight LLMs for Agentic Chat (December 2025) Overview and Criteria
 - **docs/development/DEVCONTAINER_QUICKSTART.md** — Dev Container Quick Start — Get a complete Kestrel + Kestrel development environment running in Docker Desktop with one click.
 - **docs/development/README.md** — Development Documentation — Developer notes, experiments, and technical development guides.
@@ -1601,7 +1618,6 @@ Repo entry points and standard project files.
 - **tests/__init__.py** — —
 - **tests/conftest.py** — Pytest configuration and shared fixtures for Kestrel tests.
   - `def pytest_addoption(parser)`; `def pytest_collection_modifyitems(config, items)`; `def pytest_configure(config)`; `def pytest_sessionfinish(session, exitstatus)`; `def setup_test_config()`; `def project_root()`; `def temp_dir()`; `def temp_file()`; `…`
-- **tests/e2e/_test_dashboard.cjs** — —
 - **tests/e2e/playwright.config.cjs** — —
 - **tests/e2e/spawn/spawn-console.spec.cjs** — —
 - **tests/e2e/spawn/spawn-lifecycle.spec.cjs** — —
@@ -1771,6 +1787,8 @@ Repo entry points and standard project files.
   - `class MockAgent`; `def temp_db()`; `async def permission_store(temp_db)`; `def approval_queue(permission_store)`; `def security_hook(permission_store, approval_queue)`; `def hooks_manager(security_hook)`; `def mock_agent(hooks_manager)`; `class TestDenyBlocksTool`; `…`
 - **tests/integration/test_prompt_cache_stability.py** — End-to-end test for prompt-cache stability (issue #703).
   - `async def test_messages_prefix_stable_across_turns_with_different_retrieval()`; `async def test_cache_covers_system_and_older_history_on_third_turn()`
+- **tests/integration/test_quantum_hardening_e2e.py** — Quantum Hardening epic — cross-wave end-to-end integration (#921).
+  - `def kestrel_data_key(monkeypatch)`; `def legacy_kestrel_identity()`; `def test_wave_2_3_seam_legacy_to_hybrid_rotation_and_artifact_verification(legacy_kestrel_identity, kestrel_data_key, tmp_path)`; `def test_chain_anchor_mismatch_rejects_unrelated_chain(legacy_kestrel_identity, kestrel_data_key)`; `def test_aead_v2_round_trip_through_secure_key_storage(kestrel_data_key, tmp_path)`; `def test_aead_cross_version_legacy_fernet_then_v2_write(kestrel_data_key)`; `def test_aead_aad_binding_rejects_swapped_context(kestrel_data_key)`; `def test_wave_4_sealed_capsule_with_persisted_recipient_keys(kestrel_data_key, tmp_path)`; `…`
 - **tests/integration/test_reflection_e2e.py** — End-to-end tests for the Reflection feature.
   - `class MockLLMService`; `class MockConversationStore`; `class MockDatabase`; `class MockAgent`; `async def test_analyzer_generates_insights()`; `async def test_analyzer_handles_empty_conversations()`; `async def test_analyzer_handles_llm_error()`; `async def test_reflect_runs_layered_checks()`; `…`
 - **tests/integration/test_reflection_propose_to_ticket.py** — Cross-seam regression test for the propose → approve → ticket flow.
@@ -2040,6 +2058,8 @@ Repo entry points and standard project files.
   - `def sample_config()`; `class TestDeployManagerCoreInit`; `class TestDeployManagerCoreProfiles`; `class TestDeployManagerCoreProvider`; `class TestDeployManagerCoreSessions`; `class TestDeployFeature`; `class TestDeployManager`
 - **tests/unit/test_deploy_models.py** — Unit tests for deploy models.
   - `class TestDeployStatus`; `class TestDeployProviderType`; `class TestDeploymentProfile`; `class TestDeploymentSession`; `class TestDeployManagerError`
+- **tests/unit/test_destroy_legacy_key.py** — Tests for ``scripts/quantum_destroy_legacy_key.py``.
+  - `def kestrel_data_key(monkeypatch)`; `def post_ceremony_dir(tmp_path, kestrel_data_key, monkeypatch)`; `def test_dry_run_preserves_legacy_key(post_ceremony_dir)`; `def test_confirm_without_env_var_rejects(post_ceremony_dir)`; `def test_confirm_with_env_var_deletes_legacy_only(post_ceremony_dir)`; `def test_rollback_window_blocks_fresh_succession(post_ceremony_dir)`; `def test_missing_hybrid_keys_blocks_destruction(post_ceremony_dir)`; `def test_unrelated_succession_blocks_destruction(post_ceremony_dir, tmp_path)`; `…`
 - **tests/unit/test_did_web.py** — did:web producer + resolver — Wave 2 sub-PR 3 (#917).
   - `def test_build_did_host_only()`; `def test_build_did_with_path()`; `def test_build_did_with_port_encoded_as_percent_3a()`; `def test_build_did_rejects_bare_colon_in_domain()`; `def test_build_did_rejects_scheme_in_domain()`; `def test_build_did_rejects_slash_in_domain()`; `def test_build_did_rejects_colon_in_segment()`; `def test_build_did_rejects_empty_segment()`; `…`
 - **tests/unit/test_diminishing_returns.py** — Tests for diminishing returns detection in orchestrator loops.
@@ -2198,6 +2218,12 @@ Repo entry points and standard project files.
   - `class TestModelSetOpenRouter`
 - **tests/unit/test_models_configuration_endpoint_contracts.py** — Focused contract tests for model/configuration endpoints.
   - `def test_ipfs_status_reports_local_node_gateways_and_filecoin_adapter()`; `def test_wallet_endpoint_prefers_wallet_agent_and_falls_back_to_identity_balance()`; `def test_keys_endpoints_use_storage_contract_without_exposing_secrets()`; `def test_key_update_delete_and_usage_endpoints_preserve_provider_contracts()`; `def test_models_endpoint_groups_results_and_rejects_invalid_category()`; `def test_current_and_set_model_endpoints_share_runtime_preference_contract()`; `def test_available_sources_reports_only_agent_tier_on_sqlite_deployments()`; `def test_available_sources_returns_all_false_when_agent_has_no_key()`; `…`
+- **tests/unit/test_multi_agent_asgi_routing.py** — Tests for the ASGI-level multi_agent routing middleware.
+  - `async def test_http_request_with_known_agent_strips_prefix_and_attaches_agent()`; `async def test_websocket_with_known_agent_strips_prefix_and_attaches_agent()`; `async def test_websocket_with_unknown_agent_closes_with_4404()`; `async def test_http_with_unknown_agent_returns_404_json()`; `async def test_non_agent_path_passes_through_unchanged()`; `async def test_no_agent_manager_passes_through()`; `async def test_lifespan_scope_passes_through()`
+- **tests/unit/test_multi_agent_config.py** — Unit tests for MultiAgent configuration.
+  - `def temp_agent_dir(tmp_path)`; `def temp_multi_agent_config(tmp_path)`; `class TestHostConfig`; `class TestLocalAgentConfig`; `class TestMandatoryFeatures`; `class TestRemoteAgentConfig`; `class TestMultiAgentConfig`; `class TestMultiAgentConfigLoading`; `…`
+- **tests/unit/test_multi_agent_proxy.py** — Unit tests for MultiAgent proxy routing logic.
+  - `class TestGetAgentBaseUrl`; `class TestResolveAgent`; `class TestBuildProxyHeaders`; `class TestProxyRequestStreaming`; `class TestProxyRemoteAgent`
 - **tests/unit/test_multi_agent_routing.py** — Tests for multi-agent routing middleware and /api/agents endpoint.
   - `class TestAgentRoutingMiddleware`; `class TestAgentCRUDEndpoints`; `class TestAgentNameValidation`; `class TestSSEConnectionIsolation`; `class TestSingleAgentMode`
 - **tests/unit/test_multikey.py** — multikey + KeypairFactory tests — Wave 1 sub-PR 2 (#916).
@@ -2274,18 +2300,14 @@ Repo entry points and standard project files.
   - `async def test_retirement_archives_under_agent_data_dir(tmp_path, monkeypatch)`; `async def test_retirement_prefers_kestrel_db_path_env(tmp_path, monkeypatch)`
 - **tests/unit/test_retry_policy_contracts.py** — Contract tests for the retry policy.
   - `def test_non_retryable_classifications(msg)`; `def test_retryable_classifications(msg)`; `def test_unknown_defaults_non_retryable(msg)`; `def test_non_retryable_wins_over_retryable_pattern()`; `def test_status_code_word_boundary()`
-- **tests/unit/test_multi_agent_asgi_routing.py** — Tests for the ASGI-level multi_agent routing middleware.
-  - `async def test_http_request_with_known_agent_strips_prefix_and_attaches_agent()`; `async def test_websocket_with_known_agent_strips_prefix_and_attaches_agent()`; `async def test_websocket_with_unknown_agent_closes_with_4404()`; `async def test_http_with_unknown_agent_returns_404_json()`; `async def test_non_agent_path_passes_through_unchanged()`; `async def test_no_agent_manager_passes_through()`; `async def test_lifespan_scope_passes_through()`
-- **tests/unit/test_multi_agent_config.py** — Unit tests for MultiAgent configuration.
-  - `def temp_agent_dir(tmp_path)`; `def temp_multi_agent_config(tmp_path)`; `class TestHostConfig`; `class TestLocalAgentConfig`; `class TestMandatoryFeatures`; `class TestRemoteAgentConfig`; `class TestMultiAgentConfig`; `class TestMultiAgentConfigLoading`; `…`
-- **tests/unit/test_multi_agent_proxy.py** — Unit tests for MultiAgent proxy routing logic.
-  - `class TestGetAgentBaseUrl`; `class TestResolveAgent`; `class TestBuildProxyHeaders`; `class TestProxyRequestStreaming`; `class TestProxyRemoteAgent`
 - **tests/unit/test_rotation_ceremony.py** — Rotation ceremony tests — Wave 3 sub-PR 4 (#918).
   - `def legacy_kestrel()`; `def test_ceremony_produces_verifiable_succession_statement(legacy_kestrel)`; `def test_ceremony_default_aka_links_predecessor(legacy_kestrel)`; `def test_ceremony_explicit_aka_overrides_default(legacy_kestrel)`; `def test_ceremony_default_effective_from_is_now_utc(legacy_kestrel)`; `def test_ceremony_explicit_effective_from_is_used(legacy_kestrel)`; `def test_ceremony_with_archival_countersignature(legacy_kestrel)`; `def test_ceremony_refuses_non_slhdsa_archival_keypair(legacy_kestrel)`; `…`
 - **tests/unit/test_runpod_logs.py** — —
   - `def mock_runpod()`; `def mock_paramiko()`; `def mock_utils()`; `class TestRunPodLogs`
 - **tests/unit/test_runpod_model_contracts.py** — Contracts for RunPod profile-owned model defaults.
   - `async def test_resume_stopped_pod_requires_profile_default_model()`; `async def test_start_ollama_pod_uses_profile_default_model_without_hidden_fallback()`; `async def test_start_ollama_pod_resumes_existing_pod_without_new_model_override()`
+- **tests/unit/test_runtime_identity.py** — Tests for :mod:`kestrel_sovereign.identity.runtime_identity`.
+  - `def kestrel_data_key(monkeypatch)`; `def legacy_agent_on_disk(tmp_path, kestrel_data_key)`; `def post_ceremony_agent_on_disk(legacy_agent_on_disk, kestrel_data_key)`; `def test_load_legacy_only_agent(legacy_agent_on_disk)`; `def test_legacy_agent_missing_did_doc_raises(tmp_path, kestrel_data_key)`; `def test_load_hybrid_agent(post_ceremony_agent_on_disk)`; `def test_hybrid_agent_can_sign_and_self_verify(post_ceremony_agent_on_disk)`; `def test_succession_present_but_hybrid_keys_missing_raises(post_ceremony_agent_on_disk)`; `…`
 - **tests/unit/test_saved_items.py** — Tests for the Saved Items system.
   - `class TestSavedItemsStore`; `class TestSavedItemModel`; `class TestSavedItemTypes`; `class TestContentHash`; `class TestEmbeddingSerialization`; `class TestStashSaveIntegration`
 - **tests/unit/test_scheduler_feature.py** — Unit tests for the SchedulerFeature and SchedulerRunner.
@@ -2300,6 +2322,8 @@ Repo entry points and standard project files.
   - `class TestConstraintValidation`; `class TestWideningRejected`; `class TestEffectiveConstitution`; `class TestIntegrityVerification`; `class TestConstitutionMixinSpawnIntegration`; `class TestConstraintTypeValidation`
 - **tests/unit/test_script_signer_fail_closed.py** — Fail-closed tests for ScriptSigner — Wave 0B (#914).
   - `def temp_db()`; `def script()`; `async def test_sign_without_keys_raises(temp_db, script)`; `async def test_sign_without_did_raises(temp_db, script)`; `async def test_sign_propagates_signing_failure(temp_db, script)`; `async def test_verify_rejects_hmac_prefix_even_when_math_verifies(temp_db, script)`; `async def test_verify_rejects_hmac_with_unsigned_default(temp_db, script)`; `async def test_verify_genuine_ecdsa_signature(temp_db, script)`; `…`
+- **tests/unit/test_script_signer_hybrid.py** — ScriptSigner hybrid-format tests — Quantum Hardening epic, signing-path follow-up to PR #999.
+  - `def kestrel_data_key(monkeypatch)`; `def legacy_agent_dir(tmp_path, kestrel_data_key)`; `def post_ceremony_agent_dir(legacy_agent_dir, kestrel_data_key)`; `async def test_legacy_agent_signs_ecdsa(legacy_agent_dir)`; `async def test_hybrid_agent_signs_hybrid_format(post_ceremony_agent_dir)`; `async def test_hybrid_round_trip_verifies(post_ceremony_agent_dir)`; `async def test_hybrid_tamper_detected(post_ceremony_agent_dir)`; `async def test_hybrid_payload_tamper_detected(post_ceremony_agent_dir)`; `…`
 - **tests/unit/test_sealed_capsule.py** — Sealed capsule tests — Wave 4 sub-PR 3 (#919).
   - `def hybrid_kp()`; `def test_round_trip_basic(hybrid_kp)`; `def test_open_capsule_two_calling_conventions(hybrid_kp)`; `def test_round_trip_empty_payload(hybrid_kp)`; `def test_round_trip_large_payload(hybrid_kp)`; `def test_distinct_seals_produce_distinct_envelopes(hybrid_kp)`; `def test_envelope_has_expected_structure(hybrid_kp)`; `def test_wrong_recipient_aead_authentication_fails(hybrid_kp)`; `…`
 - **tests/unit/test_secondary_endpoint_contracts.py** — Focused contract tests for remaining database/files/observability/saved-items routes.
@@ -2312,6 +2336,8 @@ Repo entry points and standard project files.
   - `def test_kestrel_agent_get_feature_resolves_class_name()`; `def test_kestrel_agent_get_feature_resolves_lowercase_alias()`; `def test_kestrel_agent_get_feature_resolves_against_real_security_feature()`; `def test_kestrel_agent_get_feature_resolves_tool_name()`; `def test_kestrel_agent_get_feature_returns_none_when_missing()`; `def test_feature_security_lookup_finds_registered_security_feature(module_path, handler_attr, handler_kwargs, tmp_path)`; `def test_reflection_ticket_handler_finds_security()`; `def test_reflection_approval_handler_finds_security()`
 - **tests/unit/test_server_health.py** — Focused tests for server health endpoint behavior.
   - `def test_health_returns_503_when_agent_missing()`; `def test_health_detailed_uses_health_feature_from_feature_dict()`
+- **tests/unit/test_session_id_in_hooks.py** — Verify session_id is correctly threaded to hook calls during tool dispatch (#885).
+  - `class TestSessionIdInHooks`
 - **tests/unit/test_session_id_threading.py** — Verify ``session_id`` threads from agent loop to LLMService callers (#821).
   - `class TestSignatures`; `class TestOrchestratorThreadsSessionId`
 - **tests/unit/test_session_log_talon.py** — Tests for Talon PR detection in Session Log collector.
@@ -2340,6 +2366,8 @@ Repo entry points and standard project files.
   - `class TestSharedModelCache`; `class TestSharedModelCacheSingleton`
 - **tests/unit/test_shell_exit_tokens.py** — Shell exit tokens — #658.
   - `class TestExitTokenSet`
+- **tests/unit/test_sign_package_hybrid.py** — sign_package / verify_package_signature hybrid-format tests.
+  - `def kestrel_data_key(monkeypatch)`; `def legacy_agent_dir(tmp_path, kestrel_data_key)`; `def post_ceremony_agent_dir(legacy_agent_dir, kestrel_data_key)`; `def test_legacy_agent_signs_v1_only(legacy_agent_dir)`; `def test_legacy_tamper_detected(legacy_agent_dir)`; `def test_hybrid_agent_emits_v2_only(post_ceremony_agent_dir)`; `def test_hybrid_round_trip_verifies(post_ceremony_agent_dir)`; `def test_hybrid_tamper_detected(post_ceremony_agent_dir)`; `…`
 - **tests/unit/test_signals_a2a_source.py** — Phase 5 of #889: a2a.task_complete source registration + causation chain propagation + the cycle detection mechanism's first real-world exercise.
   - `async def components(tmp_path)`; `def test_registration_is_cognition_only_and_trusted()`; `def test_registration_schema_rejects_missing_required_fields()`; `def test_registration_redaction_caps_long_summaries()`; `def test_build_signal_extracts_text_from_status_message()`; `def test_build_signal_falls_back_when_no_status_message()`; `def test_build_signal_with_no_metadata_yields_empty_chain()`; `def test_build_signal_rehydrates_chain_from_metadata()`; `…`
 - **tests/unit/test_signals_dispatcher.py** — Unit tests for the SignalDispatcher pipeline.
@@ -2384,6 +2412,8 @@ Repo entry points and standard project files.
   - `class TestSpawnResult`; `class TestSpawnStatus`; `class TestSpawnMode`; `class TestLifecycleRegistration`; `class TestTTLExpiration`; `class TestResultCollection`; `class TestEphemeralCleanup`; `class TestExplicitTermination`; `…`
 - **tests/unit/test_spawn_mandate.py** — Tests for SpawnMandate data structure and DID delegation chains.
   - `def parent_keys()`; `def child_keys()`; `def sample_mandate()`; `class TestSpawnMandate`; `class TestMandateSigning`; `class TestChildDIDDocument`
+- **tests/unit/test_spawn_mandate_hybrid.py** — sign_mandate / verify_mandate hybrid-format tests.
+  - `def kestrel_data_key(monkeypatch)`; `def hybrid_parent(tmp_path, kestrel_data_key)`; `def test_legacy_mandate_signs_bare_hex()`; `def test_legacy_tamper_detected()`; `def test_hybrid_mandate_uses_prefix(hybrid_parent)`; `def test_hybrid_mandate_round_trip_verifies(hybrid_parent)`; `def test_hybrid_mandate_tamper_detected(hybrid_parent)`; `def test_hybrid_mandate_strip_pq_half_rejected(hybrid_parent)`; `…`
 - **tests/unit/test_sql_utils.py** — Tests for kestrel_sovereign.sql_utils — SQL identifier validation.
   - `class TestSafeTableName`; `class TestSafeColumnName`
 - **tests/unit/test_sse_approval_events.py** — Tests that the /agent/notifications/sse endpoint forwards events from the agent's event bus (e.g.
@@ -2392,10 +2422,6 @@ Repo entry points and standard project files.
   - `def clean_sse_connections()`; `def app_with_mock_agent()`; `class TestSSEConnectionLimits`; `class TestSSEConnectionTrackerModule`
 - **tests/unit/test_state_of_mind_feature.py** — Direct contracts for the StateOfMind feature.
   - `async def test_state_of_mind_requires_llm_service()`; `async def test_state_of_mind_formats_via_profile_service()`
-- **tests/unit/test_storacha_rest.py** — Tests for storacha_rest.py — Storacha w3up HTTP client.
-  - `def ucan()`; `def client(ucan)`; `def mock_response()`; `class TestWrapInCar`; `class TestCIDStrToBytes`; `class TestParseBridgeResponse`; `class TestUpload`; `class TestGetByCID`; `…`
-- **tests/unit/test_storacha_ucan.py** — Tests for storacha_ucan.py — UCAN v1 builder and CAR utilities.
-  - `class TestVarint`; `class TestCID`; `class TestCAR`; `class TestDIDEncoding`; `class TestStorachaUCAN`
 - **tests/unit/test_storage.py** — —
   - `async def storage(temp_dir)`; `def test_file(tmpdir)`; `async def test_file_storage(storage, test_file)`; `async def test_knowledge_graph(storage)`; `async def test_rag_pipeline(storage, test_file)`; `async def test_conversation_history(storage)`; `async def test_backup_local_only(storage)`
 - **tests/unit/test_storage_providers.py** — Unit tests for Storage Provider Protocol and Implementations.
@@ -2430,6 +2456,12 @@ Repo entry points and standard project files.
   - `class TestBuildPersistedPreview`
 - **tests/unit/test_turn_lifecycle.py** — Race regression tests for the shared turn lifecycle.
   - `async def test_two_concurrent_turns_serialize()`; `async def test_three_concurrent_turns_serialize_in_order()`; `async def test_exception_in_turn_body_releases_lock()`; `async def test_conversation_lock_is_held_inside_turn()`; `async def test_turn_id_is_unique_per_call()`; `async def test_process_input_enters_lifecycle_before_bootstrap_and_commands()`; `async def test_lifecycle_shares_lock_manager_with_dispatcher()`; `async def test_concurrent_set_current_chain_is_task_local()`; `…`
+- **tests/unit/test_ui_theme_endpoint.py** — Contract tests for the /api/ui/theme endpoint (epic #986, sub-issue #989).
+  - `def client()`; `def test_default_returns_legacy_en(client)`; `def test_falconry_theme(client)`; `def test_plain_theme(client)`; `def test_explicit_theme_and_locale(client)`; `def test_unknown_theme_returns_404(client)`; `def test_response_shape_is_consistent(client)`; `def test_themes_endpoint_lists_available(client)`; `…`
+- **tests/unit/test_ui_theme_html_annotations.py** — Verify HTML annotations match the legacy theme file (epic #986, #990).
+  - `def html_text()`; `def legacy_labels()`; `def test_index_html_has_annotations(html_text)`; `def test_every_data_label_key_exists_in_legacy_theme(html_text, legacy_labels)`; `def test_every_data_label_attr_value_exists_in_legacy_theme(html_text, legacy_labels)`; `def test_inline_text_for_a_few_keys_matches_legacy_value(html_text, legacy_labels)`; `def test_attribute_inline_values_match_legacy(html_text, legacy_labels)`; `def test_theme_js_is_loaded_in_index_html(html_text)`; `…`
+- **tests/unit/test_ui_theme_loader.py** — Unit tests for the UI theme loader (epic #986, sub-issue #989).
+  - `def isolated_themes(tmp_path, monkeypatch)`; `def test_load_legacy_returns_full_label_map()`; `def test_load_falconry_overrides_legacy_on_diverging_keys()`; `def test_load_plain_overrides_legacy_on_diverging_keys()`; `def test_unknown_theme_raises()`; `def test_list_available_themes_includes_shipped_themes()`; `def test_default_theme_and_locale_constants()`; `def test_load_theme_caches_results()`; `…`
 - **tests/unit/test_vad.py** — Unit tests for Voice Activity Detection (kestrel_sovereign/voice/vad.py).
   - `class TestVADConstruction`; `class TestIsSpeech`; `class TestDetectUtterances`; `class TestLoadVADConfig`
 - **tests/unit/test_vastai_feature.py** — Unit tests for Vast.ai GPU feature.
@@ -2571,6 +2603,7 @@ Repo entry points and standard project files.
 - **.github/workflows/ci.yml** — (configuration)
 - **.github/workflows/clean-install.yml** — (configuration)
 - **.github/workflows/deploy.yml** — (configuration)
+- **.github/workflows/publish.yml** — (configuration)
 - **.github/workflows/release-sign.yml** — (configuration)
 - **.github/workflows/repo-map.yml** — (configuration)
 - **.github/workflows/weekly-analysis.yml** — (configuration)
