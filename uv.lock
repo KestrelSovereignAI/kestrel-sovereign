@@ -2537,7 +2537,7 @@ wheels = [
 
 [[package]]
 name = "kestrel-sovereign"
-version = "0.4.0"
+version = "0.5.0"
 source = { editable = "." }
 dependencies = [
     { name = "aiohttp" },
@@ -2614,7 +2614,6 @@ all-features = [
     { name = "peft" },
     { name = "piper-tts" },
     { name = "prometheus-client" },
-    { name = "replicate" },
     { name = "resend" },
     { name = "runpod" },
     { name = "safetensors" },
@@ -2672,7 +2671,6 @@ full = [
     { name = "pytest-asyncio" },
     { name = "pytest-timeout" },
     { name = "pytest-xdist" },
-    { name = "replicate" },
     { name = "resend" },
     { name = "runpod" },
     { name = "safetensors" },
@@ -2725,9 +2723,6 @@ test = [
     { name = "pytest-asyncio" },
     { name = "pytest-timeout" },
     { name = "pytest-xdist" },
-]
-visual = [
-    { name = "replicate" },
 ]
 voice = [
     { name = "deepgram-sdk" },
@@ -2808,7 +2803,6 @@ requires-dist = [
     { name = "kestrel-sovereign", extras = ["observability"], marker = "extra == 'all-features'" },
     { name = "kestrel-sovereign", extras = ["search"], marker = "extra == 'all-features'" },
     { name = "kestrel-sovereign", extras = ["test"], marker = "extra == 'full'" },
-    { name = "kestrel-sovereign", extras = ["visual"], marker = "extra == 'all-features'" },
     { name = "kestrel-sovereign", extras = ["voice"], marker = "extra == 'all-features'" },
     { name = "kestrel-sovereign", extras = ["voice-cloud"], marker = "extra == 'voice'" },
     { name = "kestrel-sovereign", extras = ["voice-local"], marker = "extra == 'voice'" },
@@ -2849,7 +2843,6 @@ requires-dist = [
     { name = "questionary", specifier = ">=2.0.1" },
     { name = "rank-bm25", specifier = ">=0.2.2" },
     { name = "redis", specifier = ">=6.4.0" },
-    { name = "replicate", marker = "extra == 'visual'", specifier = ">=1.0.4" },
     { name = "requests", specifier = ">=2.32.5" },
     { name = "resend", marker = "extra == 'delivery'", specifier = ">=2.19.0" },
     { name = "runpod", marker = "extra == 'cloud'", specifier = ">=1.8.1" },
@@ -2874,7 +2867,7 @@ requires-dist = [
     { name = "web3", marker = "extra == 'wallet'", specifier = ">=7.0.0" },
     { name = "webrtcvad", specifier = ">=2.0.10" },
 ]
-provides-extras = ["test", "ml", "local", "voice-local", "voice-cloud", "voice", "observability", "cloud", "wallet", "visual", "delivery", "search", "all-features", "full"]
+provides-extras = ["test", "ml", "local", "voice-local", "voice-cloud", "voice", "observability", "cloud", "wallet", "delivery", "search", "all-features", "full"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -5145,21 +5138,6 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/4f/f9/8bd6b656592f925b6845fcbb4d57603a3ac2fb2373344ffa1ed70aa6820a/regex-2025.11.3-cp313-cp313t-win32.whl", hash = "sha256:9ddc42e68114e161e51e272f667d640f97e84a2b9ef14b7477c53aac20c2d59a", size = 268792, upload-time = "2025-11-03T21:32:44.13Z" },
     { url = "https://files.pythonhosted.org/packages/e5/87/0e7d603467775ff65cd2aeabf1b5b50cc1c3708556a8b849a2fa4dd1542b/regex-2025.11.3-cp313-cp313t-win_amd64.whl", hash = "sha256:7a7c7fdf755032ffdd72c77e3d8096bdcb0eb92e89e17571a196f03d88b11b3c", size = 280214, upload-time = "2025-11-03T21:32:45.853Z" },
     { url = "https://files.pythonhosted.org/packages/8d/d0/2afc6f8e94e2b64bfb738a7c2b6387ac1699f09f032d363ed9447fd2bb57/regex-2025.11.3-cp313-cp313t-win_arm64.whl", hash = "sha256:df9eb838c44f570283712e7cff14c16329a9f0fb19ca492d21d4b7528ee6821e", size = 271469, upload-time = "2025-11-03T21:32:48.026Z" },
-]
-
-[[package]]
-name = "replicate"
-version = "1.0.7"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "httpx" },
-    { name = "packaging" },
-    { name = "pydantic" },
-    { name = "typing-extensions" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/4b/fd/caf6c59a6b8007366bd52ab5a320bf8d828f3860a60039309cfc0e375ec9/replicate-1.0.7.tar.gz", hash = "sha256:d88cb2c37ba39fb370c87fc3291601c67aae64bb918a20a85b5ce399c23ee84c", size = 62226, upload-time = "2025-05-27T11:29:08.111Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/c2/5a/b3aa02a11a33de08e7771579154af3193decfb9d923b30b14c17b4e8bbce/replicate-1.0.7-py3-none-any.whl", hash = "sha256:667c50a9eb83be17de6278ff89483102b3b50f49a2c7fbcaa2e2b14df13816f9", size = 48626, upload-time = "2025-05-27T11:29:06.801Z" },
 ]
 
 [[package]]
