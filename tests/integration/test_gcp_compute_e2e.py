@@ -220,35 +220,8 @@ class TestGCPComputeFeature:
             assert feature.manager.project_id == "test-project"
 
 
-@pytest.mark.cloud_resource
-class TestVisualIdentityGCPIntegration:
-    """Test GCP integration in VisualIdentityFeature.
-
-    Run with: pytest --run-cloud tests/integration/test_gcp_compute_e2e.py -v
-    """
-
-    @pytest.mark.asyncio
-    async def test_gcp_provider_detection(self, monkeypatch):
-        """Test that GCP is detected as a LoRA training provider."""
-        # VisualIdentityFeature was extracted to kestrel-feature-visual (epic #462).
-        # Skip if the package isn't installed alongside kestrel-sovereign.
-        pytest.importorskip("kestrel_feature_visual")
-        from kestrel_feature_visual.feature import VisualIdentityFeature
-
-        # Clear any existing env vars using monkeypatch
-        for k in ["VASTAI_API_KEY", "RUNPOD_API_KEY", "GCP_PROJECT_ID", "GOOGLE_APPLICATION_CREDENTIALS"]:
-            monkeypatch.delenv(k, raising=False)
-
-        # Set only GCP credentials
-        monkeypatch.setenv("GCP_PROJECT_ID", "test-project")
-
-        feature = VisualIdentityFeature(agent=None)
-        await feature.initialize()
-
-        # Check that GCP would be initialized
-        result = feature._ensure_lora_services()
-
-        # Should have initialized GCP manager
-        assert feature.gcp_manager is not None
-        assert feature.vastai_manager is None
-        assert feature.runpod_manager is None
+# TestVisualIdentityGCPIntegration (test_gcp_provider_detection) was moved
+# to kestrel-feature-visual/tests/test_gcp_integration.py as part of the
+# open-source split (#462). The visual feature is now an external package
+# and that test exercises feature-side provider-selection behavior; it
+# belongs with the feature it tests, not with the framework.
