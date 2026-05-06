@@ -1,7 +1,11 @@
 name: Publish to PyPI
 
-# Triggered on a semver tag push (e.g. v0.3.0). Builds sdist + wheel
-# and uploads to PyPI via OIDC trusted publishing — no API token needed.
+# Triggered on a semver tag push (e.g. v0.3.0). The `ci` job calls
+# Kestrel CI as a reusable workflow — lint, unit, integration, and llm
+# tests must ALL pass on the tag's SHA before `build` and `publish` fire.
+# Then `build` produces sdist + wheel, asserts tag version == pyproject
+# version, and `publish` uploads to PyPI via OIDC trusted publishing.
+# No API token used.
 #
 # Trusted publisher binding on PyPI:
 #   project:     kestrel-sovereign
@@ -12,7 +16,7 @@ name: Publish to PyPI
 
 on:
   push:
-    tags: ['v[0-9]*.[0-9]*.[0-9]*']
+    tags: ['v[0-9]+.[0-9]+.[0-9]+']
   workflow_dispatch:
     inputs:
       ref:
@@ -23,8 +27,18 @@ permissions:
   contents: read
 
 jobs:
+  # CI gate — must pass before anything builds/publishes.
+  # Calls Kestrel CI (.github/workflows/ci.yml) as a reusable workflow
+  # so lint + unit + integration + llm tests run on the tag's SHA.
+  # If any of those fail, build + publish don't fire.
+  ci:
+    name: CI gate
+    uses: ./.github/workflows/ci.yml
+    secrets: inherit
+
   build:
     name: Build sdist + wheel
+    needs: ci
     runs-on: ubuntu-latest
     steps:
       - name: Checkout

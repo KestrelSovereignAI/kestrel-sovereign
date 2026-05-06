@@ -10,6 +10,9 @@ on:
   pull_request:
     branches: [main]  # Run on PRs targeting main
   workflow_dispatch:  # Manual trigger
+  workflow_call:      # Callable as a reusable workflow — publish.yml gates on this so a
+                      # release never fires unless lint + unit + integration + llm tests
+                      # all pass on the same SHA.
 
 env:
   PYTHON_VERSION: "3.13"
