@@ -66,14 +66,20 @@ class VastAITrainingAdapter:
         self._active_jobs: dict[str, dict] = {}  # job_id -> {session, companion_id, ...}
 
     def _get_manager(self):
-        """Lazy load the Vast.ai manager."""
+        """Lazy load the Vast.ai manager.
+
+        Vast.ai support lives in the kestrel-cloud-vastai feature package
+        now (extracted in #462). If it's not installed, this adapter
+        cleanly reports the provider as unavailable.
+        """
         if self._manager is None:
             try:
-                from kestrel_sovereign.features.vastai.manager import VastAIManager
+                from kestrel_cloud_vastai.manager import VastAIManager
                 self._manager = VastAIManager()
             except ImportError as e:
                 raise ProviderNotAvailableError(
-                    f"Vast.ai manager not available: {e}"
+                    f"Vast.ai manager not available — install kestrel-cloud-vastai "
+                    f"to enable Vast.ai-as-training-provider: {e}"
                 )
             except Exception as e:
                 raise ProviderNotAvailableError(

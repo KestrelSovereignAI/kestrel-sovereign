@@ -142,7 +142,6 @@ Audited snapshot: **42** discoverable modules · **42** exported `Feature` subcl
 | `strategic_memory` | `StrategicMemoryFeature` |
 | `talon` | `TalonCoordinatorFeature` |
 | `tasks` | `TaskFeature` |
-| `vastai` | `VastAIFeature` |
 | `voice` | `VoiceFeature` |
 | `wallet` | `WalletFeature` |
 | `web_search` | `WebSearchFeature` |
