@@ -1,6 +1,6 @@
 [project]
 name = "kestrel_sovereign"
-version = "0.4.1"
+version = "0.5.0"
 description = "Kestrel Sovereign AI Agent Framework - Constitutional AI with cryptographic identity"
 readme = "README.md"
 requires-python = ">=3.11,<3.14"
@@ -191,10 +191,6 @@ wallet = [
     "web3>=7.0.0",
     "stripe>=10.0.0",
 ]
-# Feature: Visual (image generation via Replicate)
-visual = [
-    "replicate>=1.0.4",
-]
 # Feature: Delivery (email/SMS notifications)
 delivery = [
     "resend>=2.19.0",
@@ -219,7 +215,6 @@ search = [
 all-features = [
     "kestrel_sovereign[cloud]",
     "kestrel_sovereign[wallet]",
-    "kestrel_sovereign[visual]",
     "kestrel_sovereign[delivery]",
     "kestrel_sovereign[search]",
     "kestrel_sovereign[local]",
