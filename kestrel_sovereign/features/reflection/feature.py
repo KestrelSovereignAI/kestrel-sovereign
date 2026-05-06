@@ -257,21 +257,8 @@ class ReflectionFeature(Feature):
         """
         Return the best available decentralized storage provider.
 
-        Checks in priority order: Storacha → Lighthouse.
         Falls back to the agent's storage attribute for forward compatibility.
         """
-        # Storacha (preferred — UCAN/DID native)
-        storacha = (
-            getattr(self.agent, 'storacha_provider', None)
-            or (
-                hasattr(self.agent, 'storage')
-                and getattr(self.agent.storage, 'storacha_provider', None)
-            )
-        )
-        if storacha and storacha.is_available():
-            return storacha
-
-        # Lighthouse (fallback)
         lighthouse = (
             getattr(self.agent, 'lighthouse_provider', None)
             or (

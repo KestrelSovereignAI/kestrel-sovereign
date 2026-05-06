@@ -52,51 +52,25 @@ The technical realization of this vision is detailed in **[SOVEREIGNTY_V2_TECHNI
 - **Merkle DAG:** Structures agent history as a directed acyclic graph, enabling efficient incremental backups.
 - **Time-Based Sharding:** Seals history into immutable monthly blocks.
 
-## Providers: Lighthouse vs Storacha
+## Providers
 
-Two IPFS/Filecoin providers are now implemented. Use both, or choose one:
-
-| | Storacha (web3.storage) | Lighthouse |
+| | Lighthouse | Filebase |
 |---|---|---|
-| Auth | UCAN/DID — agent's Ed25519 key signs every request | Opaque API key |
-| Gateway | Open source (`local.storage`, `w3s.link`) | Closed-source hosted |
-| Self-hostable | Yes (`storacha/local.storage`) | No |
-| Python client | Custom w3up bridge client (in-tree) | Custom REST client (in-tree) |
+| Auth | Opaque API key | S3-compatible access key/secret |
+| Gateway | Closed-source hosted | Hosted IPFS + S3 endpoint |
+| Self-hostable | No | No |
 | Free tier | 5 GB | 5 GB |
-| Paid | ~$0.05/GB/month | ~$0.05/GB/month (hot) / ~$4/GB perpetual (cold) |
-| Cold storage | IPFS + Filecoin w3up shards | Filecoin endowment pool (perpetual) |
-| Cryostasis | Supported (store + retrieve) | Supported (with endowment pool) |
-| DID alignment | Native (space/agent/proof are DIDs) | None |
-| Confidence | **High** — preferred path | Declining (closed gateway, no DID) |
+| Paid | ~$0.05/GB/month (hot) / ~$4/GB perpetual (cold) | S3-style usage pricing |
+| Cold storage | Filecoin endowment pool (perpetual) | IPFS pinning |
+| Cryostasis | Supported (with endowment pool) | Pinning only |
+| DID alignment | None | None |
 
-**Recommendation:** Use Storacha for new deployments. Keep Lighthouse configured as a CLOUD_COLD fallback until the Filecoin cold-storage story matures for Storacha.
-
-### Storacha Setup (one-time per deployment)
-
-```bash
-npm install -g @web3-storage/w3cli
-w3 key create                                        # → STORACHA_AGENT_KEY
-w3 space create kestrel                              # → STORACHA_SPACE_DID
-w3 delegation create --can '*' <agent-did> | base64  # → STORACHA_PROOF
-```
-
-The agent's Ed25519 DID key can serve double duty as the UCAN signing key —
-no separate credentials to manage.
-
-### Key Files (Storacha)
-
-| File | Purpose |
-|---|---|
-| `storage/providers/storacha_ucan.py` | UCAN v1 invocation builder, CIDv1, CARv1 |
-| `storage/providers/storacha_rest.py` | Async HTTP client (two-phase upload, gateway retrieval) |
-| `storage/providers/storacha_provider.py` | `StorageProvider` + `CryostasisCapable` implementation |
-| `storage/sync/targets.py` → `StorachaTarget` | DB snapshot backup/restore for ephemeral environments |
+**Recommendation:** Lighthouse remains the default for both CLOUD_HOT pinning and CLOUD_COLD perpetual storage. Filebase is registered as a CLOUD_HOT alternative when its keys are present.
 
 ## Pricing Reality (Mar 2026)
 
 | Storage Type | Cost | Duration | Notes |
 |--------------|------|----------|-------|
-| Storacha IPFS hot | $0/month (≤5 GB) then $0.05/GB/month | Until unpinned | w3s.link gateway |
 | Lighthouse IPFS hot | $0.05/GB/month | Until unpinned | Dedicated gateway |
 | Raw Filecoin deal | ~$0.00005/GB | ~1 year per deal | Must manually renew |
 | Lighthouse perpetual | ~$2-5/GB one-time | Forever | Endowment pool auto-renews |
@@ -107,7 +81,7 @@ no separate credentials to manage.
 - Navigator: $100 (25 GB)
 - Harbor: $500 (150 GB)
 
-**Cryostasis cost for typical agent (10-100 MB): $0.04-$0.40 one-time perpetual (Lighthouse) or ~$0 within free tier (Storacha).**
+**Cryostasis cost for typical agent (10-100 MB): $0.04-$0.40 one-time perpetual (Lighthouse).**
 
 ## Roadmap
 
@@ -119,13 +93,6 @@ no separate credentials to manage.
   - `LighthouseProvider` for CLOUD_HOT (IPFS pinning) and CLOUD_COLD (Filecoin).
   - `CryostasisCapable` interface with archive/restore methods.
   - `TieredStorageManager` routes storage by privacy mode.
-
-- [x] **Phase 2b: Storacha Integration** (Implemented Mar 2026)
-  - `StorachaProvider` for CLOUD_HOT (IPFS via w3up, UCAN/DID auth).
-  - `StorachaTarget` for DB snapshot backup/cold-start restore.
-  - `TieredStorageManager` prefers Storacha over Lighthouse for CLOUD_HOT.
-  - Reflection self-model manager accepts any `StorageProvider` (not just Lighthouse).
-  - `CryostasisCapable` implemented; cold Filecoin deals via w3up (Phase 3 enhancement).
 
 - [ ] **Phase 3: Kavach Encryption Migration** (Planned Q2 2026)
   - Replace Fernet local encryption with Kavach threshold cryptography.

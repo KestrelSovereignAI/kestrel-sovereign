@@ -345,8 +345,7 @@ class Ed25519Suite(CryptoSuite):
     """Ed25519 (RFC 8032) signing.
 
     Classical half of the Wave 2 hybrid-identity composite (Ed25519 +
-    ML-DSA-65). Already in use by ``storage/providers/storacha_ucan.py``
-    for UCAN v1 invocations; this suite registers it under the same
+    ML-DSA-65). This suite registers it under the shared CryptoSuite
     abstraction so the hybrid signer in Wave 2 sub-PR 4+ can pick it up.
 
     Multikey shape
@@ -398,8 +397,7 @@ class Ed25519Suite(CryptoSuite):
     def serialize_public_key(self, public_key: Any) -> bytes:
         """Raw 32-byte Ed25519 public key.
 
-        Same shape used by ``storage/providers/storacha_ucan.py`` and by
-        the W3C Multikey codec — Ed25519 has only one canonical form.
+        Matches the W3C Multikey codec — Ed25519 has only one canonical form.
         """
         from cryptography.hazmat.primitives.serialization import (
             Encoding, PublicFormat,

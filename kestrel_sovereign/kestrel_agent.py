@@ -651,16 +651,6 @@ class KestrelAgent(
 
             # Initialize storage providers for features (reflection self-model, etc.)
             self.lighthouse_provider = None
-            self.storacha_provider = None
-
-            if os.environ.get("STORACHA_SPACE_DID") and os.environ.get("STORACHA_AGENT_KEY"):
-                try:
-                    from kestrel_sovereign.storage.providers.storacha_provider import StorachaProvider
-                    self.storacha_provider = StorachaProvider()
-                    if not self.storacha_provider.is_available():
-                        self.storacha_provider = None
-                except Exception as e:
-                    logging.warning(f"StorachaProvider init failed: {e}")
 
             if os.environ.get("LIGHTHOUSE_API_KEY"):
                 try:
@@ -679,7 +669,7 @@ class KestrelAgent(
                 try:
                     from kestrel_sovereign.storage.sync.service import SyncService
                     from kestrel_sovereign.storage.sync.targets import (
-                        SovereignIPFSTarget, StorachaTarget, LighthouseTarget, GCSTarget,
+                        SovereignIPFSTarget, LighthouseTarget, GCSTarget,
                     )
 
                     agent_id = self.did or "default"
@@ -693,18 +683,6 @@ class KestrelAgent(
                         self._sync_service.add_target(SovereignIPFSTarget(
                             api_url=sovereign_url, agent_id=agent_id, state_dir=state_dir,
                         ))
-
-                    # Federated: Storacha (UCAN/DID auth)
-                    if os.environ.get("STORACHA_SPACE_DID") and os.environ.get("STORACHA_AGENT_KEY"):
-                        try:
-                            self._sync_service.add_target(StorachaTarget(
-                                space_did=os.environ["STORACHA_SPACE_DID"],
-                                agent_key=os.environ["STORACHA_AGENT_KEY"],
-                                proof=os.environ.get("STORACHA_PROOF", ""),
-                                agent_id=agent_id, state_dir=state_dir,
-                            ))
-                        except Exception as e:
-                            logging.warning(f"StorachaTarget init failed: {e}")
 
                     # Delegated: Lighthouse (API key)
                     if os.environ.get("LIGHTHOUSE_API_KEY"):

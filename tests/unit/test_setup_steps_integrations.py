@@ -1,6 +1,6 @@
 """Unit tests for the cloud-integrations step.
 
-Covers all six curated onboarders, the three flow modes, the
+Covers all five curated onboarders, the three flow modes, the
 "managed but missing required key" blocker path, the partial-config
 rule (blank required key never marks managed), and a couple of
 file-preservation guarantees (existing [features.disabled] survives;
@@ -46,11 +46,11 @@ def test_integrations_reachable_by_name():
 
 
 def test_curated_onboarders_match_locked_in_list():
-    """Adding a 7th integration is a deliberate code change — surface it
+    """Adding a 6th integration is a deliberate code change — surface it
     so reviewers notice when this list grows."""
     ids = [i.id for i in integrations._INTEGRATIONS]
     assert ids == [
-        "tavily", "elevenlabs", "deepgram", "huggingface", "runpod", "storacha",
+        "tavily", "elevenlabs", "deepgram", "huggingface", "runpod",
     ]
 
 
@@ -60,7 +60,7 @@ def test_curated_onboarders_match_locked_in_list():
 
 def test_decline_all_writes_nothing(tmp_path):
     """User says no to every integration → no .env, no kestrel.toml."""
-    answers = [False, False, False, False, False, False]
+    answers = [False, False, False, False, False]
     ctx = _make_ctx(tmp_path, Flow.INTERACTIVE, answers=answers)
     integrations.run(ctx)
     assert not (tmp_path / ".env").exists()
@@ -70,7 +70,7 @@ def test_decline_all_writes_nothing(tmp_path):
 def test_select_tavily_writes_key_and_marks_managed(tmp_path):
     answers = [
         True, "tvly-test-key",  # tavily yes + key
-        False, False, False, False, False,  # decline the rest
+        False, False, False, False,  # decline the rest
     ]
     ctx = _make_ctx(tmp_path, Flow.INTERACTIVE, answers=answers)
     integrations.run(ctx)
@@ -84,7 +84,7 @@ def test_select_elevenlabs(tmp_path):
     answers = [
         False,  # tavily no
         True, "el-test-key",
-        False, False, False, False,
+        False, False, False,
     ]
     ctx = _make_ctx(tmp_path, Flow.INTERACTIVE, answers=answers)
     integrations.run(ctx)
@@ -96,7 +96,7 @@ def test_select_deepgram(tmp_path):
     answers = [
         False, False,
         True, "dg-test-key",
-        False, False, False,
+        False, False,
     ]
     ctx = _make_ctx(tmp_path, Flow.INTERACTIVE, answers=answers)
     integrations.run(ctx)
@@ -109,7 +109,7 @@ def test_select_huggingface_uses_HF_TOKEN_not_HUGGINGFACE(tmp_path):
     answers = [
         False, False, False,
         True, "hf_real_token",
-        False, False,
+        False,
     ]
     ctx = _make_ctx(tmp_path, Flow.INTERACTIVE, answers=answers)
     integrations.run(ctx)
@@ -122,48 +122,10 @@ def test_select_runpod(tmp_path):
     answers = [
         False, False, False, False,
         True, "rp-key",
-        False,
     ]
     ctx = _make_ctx(tmp_path, Flow.INTERACTIVE, answers=answers)
     integrations.run(ctx)
     assert read_env(tmp_path / ".env")["RUNPOD_API_KEY"] == "rp-key"
-
-
-def test_select_storacha_with_required_only(tmp_path):
-    """Optional STORACHA_PROOF and STORACHA_GATEWAY_URL left blank —
-    the wizard must not write empty optional keys."""
-    answers = [
-        False, False, False, False, False,  # decline first 5
-        True,  # storacha yes
-        "did:key:z6Mktest",  # space did
-        "agent-key-secret",  # agent key
-        "",  # proof blank → optional, skip
-        "",  # gateway blank → optional, skip
-    ]
-    ctx = _make_ctx(tmp_path, Flow.INTERACTIVE, answers=answers)
-    integrations.run(ctx)
-    env = read_env(tmp_path / ".env")
-    assert env["STORACHA_SPACE_DID"] == "did:key:z6Mktest"
-    assert env["STORACHA_AGENT_KEY"] == "agent-key-secret"
-    assert "STORACHA_PROOF" not in env
-    assert "STORACHA_GATEWAY_URL" not in env
-    assert read_toml(tmp_path / "kestrel.toml")["features"]["managed"]["storacha"] is True
-
-
-def test_select_storacha_with_all_keys(tmp_path):
-    answers = [
-        False, False, False, False, False,
-        True,
-        "did:key:z6Mkfull",
-        "agent-key",
-        "base64-proof-car",
-        "https://custom-gateway.example/ipfs",
-    ]
-    ctx = _make_ctx(tmp_path, Flow.INTERACTIVE, answers=answers)
-    integrations.run(ctx)
-    env = read_env(tmp_path / ".env")
-    assert env["STORACHA_PROOF"] == "base64-proof-car"
-    assert env["STORACHA_GATEWAY_URL"] == "https://custom-gateway.example/ipfs"
 
 
 # ---------------------------------------------------------------------------
@@ -176,7 +138,7 @@ def test_blank_required_key_blocks_and_does_not_mark_managed(tmp_path):
     means 'opted in AND has enough config to verify later.'"""
     answers = [
         True, "",  # tavily yes, but key blank
-        False, False, False, False, False,
+        False, False, False, False,
     ]
     ctx = _make_ctx(tmp_path, Flow.INTERACTIVE, answers=answers)
     integrations.run(ctx)
@@ -194,31 +156,6 @@ def test_blank_required_key_blocks_and_does_not_mark_managed(tmp_path):
         "TAVILY_API_KEY" in b and "blank" in b.lower()
         for b in ctx.blockers
     )
-
-
-def test_storacha_blank_required_blocks_partial(tmp_path):
-    """If the user provides the space DID but blanks the agent key, the
-    integration is partial — block, don't mark managed, don't write
-    a half-configured set of env vars."""
-    answers = [
-        False, False, False, False, False,
-        True,
-        "did:key:z6Mktest",  # space did ok
-        "",  # agent key blank → required → blocker
-        # The wizard aborts the integration on the first blank required
-        # key, so no further prompts (proof/gateway) are consumed.
-    ]
-    ctx = _make_ctx(tmp_path, Flow.INTERACTIVE, answers=answers)
-    integrations.run(ctx)
-
-    env = read_env(tmp_path / ".env")
-    # Don't half-configure: even the space DID we got is dropped because
-    # the integration is incomplete.
-    assert "STORACHA_SPACE_DID" not in env
-    assert "STORACHA_AGENT_KEY" not in env
-    config = read_toml(tmp_path / "kestrel.toml")
-    assert "storacha" not in (config.get("features", {}).get("managed") or {})
-    assert any("STORACHA_AGENT_KEY" in b for b in ctx.blockers)
 
 
 # ---------------------------------------------------------------------------
@@ -302,7 +239,7 @@ def test_keep_existing_managed_with_existing_key_is_no_diff(tmp_path):
 
     answers = [
         True, "tvly-prior",  # keep tavily, key unchanged
-        False, False, False, False, False,
+        False, False, False, False,
     ]
     ctx = _make_ctx(tmp_path, Flow.INTERACTIVE, answers=answers)
     integrations.run(ctx)
@@ -325,7 +262,7 @@ def test_decline_previously_managed_unmanages(tmp_path):
 
     answers = [
         False,  # decline tavily this time
-        False, False, False, False, False,
+        False, False, False, False,
     ]
     ctx = _make_ctx(tmp_path, Flow.INTERACTIVE, answers=answers)
     integrations.run(ctx)
@@ -349,7 +286,7 @@ def test_preserves_existing_features_disabled_list(tmp_path):
     )
     answers = [
         True, "tvly-key",
-        False, False, False, False, False,
+        False, False, False, False,
     ]
     ctx = _make_ctx(tmp_path, Flow.INTERACTIVE, answers=answers)
     integrations.run(ctx)
@@ -366,7 +303,7 @@ def test_preserves_unknown_user_authored_feature_table(tmp_path):
     )
     answers = [
         True, "tvly-key",
-        False, False, False, False, False,
+        False, False, False, False,
     ]
     ctx = _make_ctx(tmp_path, Flow.INTERACTIVE, answers=answers)
     integrations.run(ctx)
@@ -386,7 +323,7 @@ def test_preserves_unrelated_env_keys(tmp_path):
     )
     answers = [
         True, "tvly-key",
-        False, False, False, False, False,
+        False, False, False, False,
     ]
     ctx = _make_ctx(tmp_path, Flow.INTERACTIVE, answers=answers)
     integrations.run(ctx)

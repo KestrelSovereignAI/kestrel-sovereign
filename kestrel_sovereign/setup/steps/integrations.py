@@ -7,8 +7,8 @@ to ``.env``, and records the user's selection in
 
 Scope (v1) — strictly credential capture + selection metadata:
 
-  - Hand-curated list of six integrations: Tavily, ElevenLabs, Deepgram,
-    Hugging Face, RunPod, Storacha. Adding a seventh means a code change.
+  - Hand-curated list of five integrations: Tavily, ElevenLabs, Deepgram,
+    Hugging Face, RunPod. Adding a sixth means a code change.
   - We do NOT pip install, do NOT mutate agent DBs, do NOT touch the
     runtime feature toggle (``[features.disabled]`` is left alone).
   - We do NOT validate keys against provider APIs (no key burning).
@@ -105,30 +105,6 @@ _INTEGRATIONS: tuple[_Integration, ...] = (
         registry_key="cloud",
         env_vars=(
             _EnvVar("RUNPOD_API_KEY", required=True, secret=True, label="RunPod API key"),
-        ),
-    ),
-    _Integration(
-        id="storacha",
-        label="Storacha (web3.storage)",
-        description="IPFS/Filecoin storage via UCAN/DID auth.",
-        registry_key=None,  # Storage subsystem, not a registry feature.
-        env_vars=(
-            _EnvVar(
-                "STORACHA_SPACE_DID", required=True, secret=False,
-                label="Space DID (from `w3 space create`)",
-            ),
-            _EnvVar(
-                "STORACHA_AGENT_KEY", required=True, secret=True,
-                label="Agent key (from `w3 key create`)",
-            ),
-            _EnvVar(
-                "STORACHA_PROOF", required=False, secret=True,
-                label="Delegation proof (base64 CAR; optional)",
-            ),
-            _EnvVar(
-                "STORACHA_GATEWAY_URL", required=False, secret=False,
-                label="Gateway URL (optional, default: https://w3s.link/ipfs)",
-            ),
         ),
     ),
 )

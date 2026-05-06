@@ -53,7 +53,7 @@ class SelfModelManager:
         """Initialize the self-model manager.
 
         Args:
-            storage_provider: Decentralized storage provider (Storacha or Lighthouse)
+            storage_provider: Decentralized storage provider (Lighthouse)
             agent_did: The agent's DID (decentralized identifier)
             db: Database connection for storing model pointers
 
@@ -61,12 +61,10 @@ class SelfModelManager:
             ConfigurationError: If no decentralized storage provider is available
         """
         # FAIL FAST - no fallbacks
-        _has_storacha = os.environ.get("STORACHA_SPACE_DID") and os.environ.get("STORACHA_AGENT_KEY")
-        _has_lighthouse = os.environ.get("LIGHTHOUSE_API_KEY")
-        if not _has_storacha and not _has_lighthouse:
+        if not os.environ.get("LIGHTHOUSE_API_KEY"):
             raise ConfigurationError(
                 "A decentralized storage provider is required for self-model storage. "
-                "Set STORACHA_SPACE_DID + STORACHA_AGENT_KEY (preferred) or LIGHTHOUSE_API_KEY."
+                "Set LIGHTHOUSE_API_KEY."
             )
         if not storage_provider.is_available():
             raise ConfigurationError(
