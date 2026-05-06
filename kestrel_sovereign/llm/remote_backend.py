@@ -10,21 +10,19 @@ import logging
 import os
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from enum import Enum
 from typing import Dict, Any, Optional
 
 import openai
 
 from kestrel_sovereign.kestrel_config.constants import HTTP_TIMEOUT_MEDIUM
 
+# BackendType lives in kestrel-sovereign-sdk so feature packages
+# (gcp_compute, vastai, runpod, etc.) can import it without depending
+# on the full framework. Re-exported here so existing callers like
+# `from kestrel_sovereign.llm.service import BackendType` keep working.
+from kestrel_sdk.llm.types import BackendType  # noqa: F401
+
 logger = logging.getLogger(__name__)
-
-
-class BackendType(str, Enum):
-    """LLM backend types."""
-    CLOUD = "cloud"
-    LOCAL = "local"
-    REMOTE_GPU = "remote_gpu"
 
 
 @dataclass

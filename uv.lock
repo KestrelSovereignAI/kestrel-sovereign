@@ -2807,7 +2807,7 @@ requires-dist = [
     { name = "kestrel-sovereign", extras = ["voice-cloud"], marker = "extra == 'voice'" },
     { name = "kestrel-sovereign", extras = ["voice-local"], marker = "extra == 'voice'" },
     { name = "kestrel-sovereign", extras = ["wallet"], marker = "extra == 'all-features'" },
-    { name = "kestrel-sovereign-sdk", specifier = ">=0.1,<1" },
+    { name = "kestrel-sovereign-sdk", specifier = ">=0.2,<1" },
     { name = "langchain", marker = "extra == 'local'", specifier = ">=0.3.31" },
     { name = "langchain-community", marker = "extra == 'local'", specifier = ">=0.3.31" },
     { name = "networkx", specifier = "==3.5" },
@@ -2887,14 +2887,14 @@ test = [
 
 [[package]]
 name = "kestrel-sovereign-sdk"
-version = "0.1.0"
+version = "0.2.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "pydantic" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/18/f3/5cd74b0d15fd8ffca324bdc11463bfa23240f38769084a1ec0e0180c6253/kestrel_sovereign_sdk-0.1.0.tar.gz", hash = "sha256:a820e6c27ac85491d4573cd804b3dfebdaf2169ed6afe05fc507be824ea63218", size = 49067, upload-time = "2026-05-06T17:42:06.299Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/a9/09/4c62d114be0addb8c366c211ea646b5cdcd8c74e6d39c0a890bc10c8be8c/kestrel_sovereign_sdk-0.2.0.tar.gz", hash = "sha256:83f98f45ce0f4e3c0271777f0838456aea2abaa9e30c1ee7b63e1a2082b2ea10", size = 49568, upload-time = "2026-05-06T21:53:04.23Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/7b/56/b56aea4ce652aad541c9ac900448f8d75a2f76ee280b96441dfacccce14a/kestrel_sovereign_sdk-0.1.0-py3-none-any.whl", hash = "sha256:2f041f0ac1451a7560a264aa4cf2c32bab3c0faaf46c95f010ca422f79457b75", size = 61906, upload-time = "2026-05-06T17:42:05.065Z" },
+    { url = "https://files.pythonhosted.org/packages/c9/6c/6a105d91a21ee9788bda4f8da1f9d775186b8e25cd97c5d747a9be14b3fd/kestrel_sovereign_sdk-0.2.0-py3-none-any.whl", hash = "sha256:e09c8bbcdf4b4cf51a9639bbefe65ba2efc25091747f16ac0e3a627c46fb96f8", size = 62927, upload-time = "2026-05-06T21:53:03.055Z" },
 ]
 
 [[package]]

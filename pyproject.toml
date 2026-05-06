@@ -37,7 +37,7 @@ dependencies = [
     # Lives at https://github.com/KestrelSovereignAI/kestrel-sovereign-sdk and is
     # published independently to PyPI. The 35 `from kestrel_sdk.*` imports across
     # kestrel_sovereign/ resolve against this installed package.
-    "kestrel-sovereign-sdk>=0.1,<1",
+    "kestrel-sovereign-sdk>=0.2,<1",
     # Core web framework
     "fastapi==0.128.1",
     "uvicorn==0.35.0",
