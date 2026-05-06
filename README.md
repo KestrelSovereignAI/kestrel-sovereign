@@ -155,6 +155,7 @@ uv run python main.py ./agent_data/myagent
 
 > **Note:** `KESTREL_DB_PATH` is a **directory** path, not a file path. The database file `kestrel_prime.db` is created inside the specified directory. For example, setting `KESTREL_DB_PATH=./agent_data/myagent` stores the database at `./agent_data/myagent/kestrel_prime.db`.
 
+<a id="web-ui-sovereign-console"></a>
 ## 🖥️ Web UI (Sovereign Console)
 
 Kestrel includes a built-in web interface called the **Sovereign Console**. Once your agent is running, open `http://localhost:8888` in any browser -- no additional software required.
@@ -482,7 +483,7 @@ The server exposes OpenAI-compatible endpoints for use with third-party clients:
 - `GET /v1/models`
 - `POST /v1/chat/completions`
 
-For most users, the built-in **Sovereign Console** at `http://localhost:8888` is the easiest way to interact with your agent (see [Web UI](#-web-ui-sovereign-console) above). If you prefer an external client, point any OpenAI-compatible tool (e.g., [Open WebUI](https://github.com/open-webui/open-webui)) at your server's `/v1/chat/completions` endpoint. Use the model name from `/v1/models`.
+For most users, the built-in **Sovereign Console** at `http://localhost:8888` is the easiest way to interact with your agent (see the [Web UI section](#web-ui-sovereign-console) above). If you prefer an external client, point any OpenAI-compatible tool (e.g., [Open WebUI](https://github.com/open-webui/open-webui)) at your server's `/v1/chat/completions` endpoint. Use the model name from `/v1/models`.
 
 ## 🤝 Contributing
 
