@@ -4,7 +4,6 @@ Builds the Morning Signal report from STRATEGY.yaml data
 enriched with live GitHub data.
 """
 
-import os
 from datetime import date, datetime
 from typing import Any, Dict, List
 
@@ -184,59 +183,5 @@ async def generate_morning_signal(data: Dict[str, Any]) -> str:
         lines.append("*Set GITHUB_TOKEN to enable live repo scanning.*")
         lines.append("")
     lines.append("**Your call. What resonates?**")
-
-    return "\n".join(lines)
-
-
-async def generate_portfolio_dashboard(data: Dict[str, Any]) -> str:
-    """Generate the Portfolio Dashboard summary.
-
-    Args:
-        data: The strategic memory data dict.
-
-    Returns:
-        Formatted markdown dashboard string.
-    """
-    config = data.get("morning_signal_config", {})
-    repos = config.get("scan_repos", [])
-
-    # Try to detect the host port from environment or default
-    host_port = os.environ.get("KESTREL_HOST_PORT", "8888")
-
-    lines = ["# Portfolio Dashboard", ""]
-    lines.append(f"**Open in browser:** http://localhost:{host_port}/static/dashboard.html")
-    lines.append("")
-
-    # Quick summary from live data
-    from .github_integration import get_github_token, github_api_get
-
-    token = get_github_token()
-    if token and repos:
-        total_issues = 0
-        total_prs = 0
-        for repo in repos:
-            issues = await github_api_get(
-                f"/repos/{repo}/issues?state=open&per_page=100", token,
-            )
-            if isinstance(issues, list):
-                real = [i for i in issues if "pull_request" not in i]
-                total_issues += len(real)
-
-            prs = await github_api_get(
-                f"/repos/{repo}/pulls?state=open&per_page=20", token,
-            )
-            if isinstance(prs, list):
-                total_prs += len(prs)
-
-        lines.append(f"**Quick snapshot:** {total_issues} open issues, {total_prs} open PRs across {len(repos)} repos")
-    else:
-        lines.append("*Set GITHUB_TOKEN to see live data in the dashboard.*")
-
-    lines.append("")
-    lines.append("The dashboard has 4 tabs:")
-    lines.append("1. **Operational** -- open issues, PRs, blockers, backlog health, activity")
-    lines.append("2. **Strategic** -- milestones, velocity trend, decision log")
-    lines.append("3. **Scoreboard** -- outcome rankings by contributor")
-    lines.append("4. **Budget** -- engineering cost savings, ceremony cost avoided")
 
     return "\n".join(lines)
