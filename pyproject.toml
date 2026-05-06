@@ -2,7 +2,36 @@
 name = "kestrel_sovereign"
 version = "0.3.0"
 description = "Kestrel Sovereign AI Agent Framework - Constitutional AI with cryptographic identity"
+readme = "README.md"
 requires-python = ">=3.11,<3.14"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "UncleSaurus" }]
+maintainers = [{ name = "UncleSaurus" }]
+keywords = [
+    "ai",
+    "agents",
+    "sovereign",
+    "constitutional-ai",
+    "did",
+    "cryptographic-identity",
+    "open-source",
+    "llm",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
+    "Typing :: Typed",
+]
 dependencies = [
     # Core web framework
     "fastapi==0.128.1",
@@ -80,6 +109,13 @@ dependencies = [
     "webrtcvad>=2.0.10",
     "pqcrypto>=0.4.0",
 ]
+
+[project.urls]
+Homepage = "https://kestrelsovereign.com"
+Source = "https://github.com/KestrelSovereignAI/kestrel-sovereign"
+Issues = "https://github.com/KestrelSovereignAI/kestrel-sovereign/issues"
+Documentation = "https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/main/README.md"
+Discussions = "https://github.com/KestrelSovereignAI/kestrel-sovereign/discussions"
 
 [project.optional-dependencies]
 # Test dependencies (not needed in production)
