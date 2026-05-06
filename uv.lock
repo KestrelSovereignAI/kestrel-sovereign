@@ -2537,7 +2537,7 @@ wheels = [
 
 [[package]]
 name = "kestrel-sovereign"
-version = "0.3.0"
+version = "0.4.0"
 source = { editable = "." }
 dependencies = [
     { name = "aiohttp" },
@@ -2561,6 +2561,7 @@ dependencies = [
     { name = "idna" },
     { name = "iniconfig" },
     { name = "itsdangerous" },
+    { name = "kestrel-sovereign-sdk" },
     { name = "networkx" },
     { name = "numpy" },
     { name = "ollama" },
@@ -2812,6 +2813,7 @@ requires-dist = [
     { name = "kestrel-sovereign", extras = ["voice-cloud"], marker = "extra == 'voice'" },
     { name = "kestrel-sovereign", extras = ["voice-local"], marker = "extra == 'voice'" },
     { name = "kestrel-sovereign", extras = ["wallet"], marker = "extra == 'all-features'" },
+    { name = "kestrel-sovereign-sdk", specifier = ">=0.1,<1" },
     { name = "langchain", marker = "extra == 'local'", specifier = ">=0.3.31" },
     { name = "langchain-community", marker = "extra == 'local'", specifier = ">=0.3.31" },
     { name = "networkx", specifier = "==3.5" },
@@ -2888,6 +2890,18 @@ test = [
     { name = "pytest-asyncio", specifier = ">=1.1.0" },
     { name = "pytest-timeout", specifier = ">=2.3.1" },
     { name = "pytest-xdist", specifier = ">=3.0.0" },
+]
+
+[[package]]
+name = "kestrel-sovereign-sdk"
+version = "0.1.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "pydantic" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/18/f3/5cd74b0d15fd8ffca324bdc11463bfa23240f38769084a1ec0e0180c6253/kestrel_sovereign_sdk-0.1.0.tar.gz", hash = "sha256:a820e6c27ac85491d4573cd804b3dfebdaf2169ed6afe05fc507be824ea63218", size = 49067, upload-time = "2026-05-06T17:42:06.299Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/7b/56/b56aea4ce652aad541c9ac900448f8d75a2f76ee280b96441dfacccce14a/kestrel_sovereign_sdk-0.1.0-py3-none-any.whl", hash = "sha256:2f041f0ac1451a7560a264aa4cf2c32bab3c0faaf46c95f010ca422f79457b75", size = 61906, upload-time = "2026-05-06T17:42:05.065Z" },
 ]
 
 [[package]]
