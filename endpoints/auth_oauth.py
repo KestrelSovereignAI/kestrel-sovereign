@@ -10,6 +10,7 @@ Auth priority: OAuth session → JWT Bearer → API key header
 """
 
 import os
+import re
 import logging
 import secrets
 from datetime import datetime, timedelta, timezone
@@ -28,9 +29,17 @@ oauth = OAuth()
 
 
 def _get_allowed_emails() -> set[str]:
-    """Get the set of allowed email addresses from env."""
+    """Get the set of allowed email addresses from env.
+
+    Accepts ``,`` or ``;`` as the separator. Cloud Run deploys via
+    ``--update-env-vars ^,^...`` use ``,`` as the env-var separator,
+    so commas inside any single value get misparsed as additional env
+    vars (with ``@`` in the name → invalid POSIX → revision fails to
+    start). Setting the secret with ``;`` avoids the collision; ``,``
+    still works for local/dev configs.
+    """
     raw = os.environ.get("KESTREL_ALLOWED_EMAILS", "")
-    return {e.strip().lower() for e in raw.split(",") if e.strip()}
+    return {e.strip().lower() for e in re.split(r"[,;]", raw) if e.strip()}
 
 
 def register_oauth(app):
