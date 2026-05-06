@@ -159,12 +159,16 @@ class TestAvatarStorageIntegration:
 
 
 class TestVisualIdentityFeatureIntegration:
-    """Test !avatar command integration (requires agent with feature)"""
+    """Test !avatar command integration (requires kestrel-feature-visual installed)."""
 
     @pytest.mark.slow
     def test_avatar_command_available(self, client: TestClient):
-        """Verify !avatar command is recognized"""
-        # Check available commands
+        """Verify !avatar command is recognized when the feature package is installed."""
+        # VisualIdentityFeature was extracted to kestrel-feature-visual (epic #462).
+        # The !avatar / !selfie commands only register when that package is
+        # installed alongside kestrel-sovereign. Skip if it's not.
+        pytest.importorskip("kestrel_feature_visual")
+
         response = client.get("/api/commands")
 
         if response.status_code == 503:
@@ -173,9 +177,7 @@ class TestVisualIdentityFeatureIntegration:
         assert response.status_code == 200, f"Expected 200, got {response.status_code}"
         data = response.json()
         commands = data.get("commands", [])
-        # Look for avatar-related command - API uses "cmd" field
         command_cmds = [c.get("cmd", "") for c in commands]
-        # Either !avatar or !selfie should exist if feature enabled
         has_avatar_cmd = any(
             "avatar" in cmd.lower() or "selfie" in cmd.lower()
             for cmd in command_cmds
