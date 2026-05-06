@@ -25,7 +25,8 @@ git clone https://github.com/KestrelSovereignAI/kestrel-sovereign.git
 cd kestrel-sovereign
 uv sync                    # install all dependencies including dev/test deps
 cp .env.example .env       # configure your local environment
-cp llm_config.toml.example llm_config.toml
+uv run kestrel setup       # interactive: writes kestrel.toml [llm] + .env
+# or hand-edit: cp kestrel.toml.example kestrel.toml
 ```
 
 Start Ollama in a separate terminal (needed for tests that exercise the LLM layer):

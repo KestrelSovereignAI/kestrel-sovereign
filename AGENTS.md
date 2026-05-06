@@ -98,7 +98,7 @@ are all signals.
 - **Hooks ≠ signals**: hooks intercept work in flight, signals originate work. The dispatcher module docstring covers the distinction loudly.
 
 ### Working with LLM providers
-1. Config in `[llm]` section of `kestrel.toml` (or `llm_config.toml` for backward compat)
+1. Config in the `[llm]` section of `kestrel.toml`. Legacy standalone `llm_config.toml` was retired in epic #938 — run `kestrel migrate-llm-config` to fold a legacy file in.
 2. Provider implementations in `kestrel_sovereign/llm/`
 
 ### Deploying to Cloud Run

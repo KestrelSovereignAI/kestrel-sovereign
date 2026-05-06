@@ -61,9 +61,10 @@ Which weights. Lives inside a vendor. Always an opaque ID string — **never** a
 
 ## Configuration shape
 
-Canonical `llm_config.toml`:
+Canonical `[llm]` section of `kestrel.toml`:
 
 ```toml
+[llm]
 # Fallback order at the route level. Each entry is "<vendor>:<route>".
 route_priority = [
     "anthropic:plan",
@@ -74,51 +75,53 @@ route_priority = [
     "ollama:local",
 ]
 
-[vendors.anthropic]
+[llm.vendors.anthropic]
 is_cloud = true
 
-[vendors.anthropic.routes.api]
+[llm.vendors.anthropic.routes.api]
 adapter        = "AnthropicAdapter"
 api_key_env    = "ANTHROPIC_API_KEY"
 model          = "auto"
 selection_hints = ["sonnet", "haiku", "opus"]
 
-[vendors.anthropic.routes.plan]
+[llm.vendors.anthropic.routes.plan]
 adapter        = "ClaudeMaxAdapter"
 auth_token_env = "ANTHROPIC_AUTH_TOKEN"
 model          = "auto"
 
-[vendors.openai]
+[llm.vendors.openai]
 is_cloud = true
 
-[vendors.openai.routes.api]
+[llm.vendors.openai.routes.api]
 adapter        = "OpenAIAdapter"
 api_key_env    = "OPENAI_API_KEY"
 model          = "auto"
 
-[vendors.openai.routes.plan]
+[llm.vendors.openai.routes.plan]
 adapter        = "CodexAdapter"
 auth_token_env = "CODEX_AUTH_TOKEN"
 model          = "auto"
 
-[vendors.ollama]
+[llm.vendors.ollama]
 is_cloud = false
 
-[vendors.ollama.routes.local]
+[llm.vendors.ollama.routes.local]
 adapter        = "OllamaAdapter"
 host           = "http://localhost:11434"
 model          = "auto"
 
-[vendors.openrouter]
+[llm.vendors.openrouter]
 is_cloud = true
 
-[vendors.openrouter.routes.api]
+[llm.vendors.openrouter.routes.api]
 adapter        = "OpenRouterAdapter"
 base_url       = "https://openrouter.ai/api/v1"
 api_key_env    = "OPENROUTER_API_KEY"
 model          = "auto"
 selection_hints = ["chat"]
 ```
+
+> Pre-2026-05 setups put this same content in a standalone `llm_config.toml` at the repo root. That path was removed in epic #938; run `kestrel migrate-llm-config` to fold a legacy file into `kestrel.toml [llm]`.
 
 ### Rules
 
@@ -227,7 +230,7 @@ Model identifiers must never appear as literals inside `kestrel_sovereign/**/*.p
 
 - `model_catalog.toml` — `featured_models`, `display_overrides`, `[hidden]`. Config.
 - `model_mandate.toml` — `defaults.preferred`, `defaults.cheap_model`, role mandates. Config.
-- `llm_config.toml` — `selection_hints` (substring patterns, not IDs), `model = "auto"`. Config.
+- `kestrel.toml` `[llm]` (or `[llm.vendors.*.routes.*]`) — `selection_hints` (substring patterns, not IDs), `model = "auto"`. Config.
 - Parameterized test fixtures — documented as historical examples.
 - This spec, when giving an example — marked as "example as of YYYY-MM; consult discovery" so the doc never becomes a source of truth for specific IDs.
 
