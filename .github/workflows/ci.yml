@@ -2,14 +2,16 @@ name: Kestrel CI
 
 on:
   push:
-    tags:
-      - 'v[0-9]+.[0-9]+.[0-9]+'  # Run on version tags like v1.0.0, v2.3.4
     branches:
       - 'main'     # Run on main pushes — lint-and-imports only (see `if:` on heavier jobs)
       - 'issue-*'  # Run on kestrel-talon feature branches
   pull_request:
     branches: [main]  # Run on PRs targeting main
   workflow_dispatch:  # Manual trigger
+  workflow_call:      # Callable as a reusable workflow — publish.yml invokes this on
+                      # tag pushes via its `ci` gate job. The direct tag trigger was
+                      # removed so a tag push results in exactly ONE CI run (nested
+                      # inside publish.yml), not two.
 
 env:
   PYTHON_VERSION: "3.13"
