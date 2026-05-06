@@ -485,7 +485,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/features/strategic_memory/github_integration.py** — GitHub API integration helpers for Strategic Memory.
   - `def get_github_token()`; `async def github_api_get(path, token)`; `async def github_api_post(path, token, body)`; `def short_repo(repo, all_repos)`; `async def fetch_github_signal(data)`
 - **kestrel_sovereign/features/strategic_memory/morning_signal.py** — Morning Signal briefing generator for Strategic Memory.
-  - `async def generate_morning_signal(data)`; `async def generate_portfolio_dashboard(data)`
+  - `async def generate_morning_signal(data)`
 - **kestrel_sovereign/features/strategic_memory/session_log.py** — Session Log collector for Strategic Memory.
   - `async def collect_session_log(data, session_id, focus)`
 - **kestrel_sovereign/features/strategic_memory/talon_handoff.py** — Signal -> Talon Dispatch.
@@ -848,9 +848,6 @@ Repo entry points and standard project files.
   - `class ScopedConstitution`
 - **kestrel_sovereign/sql_utils.py** — Shared SQL safety utilities.
   - `def safe_table_name(name)`; `def safe_column_name(name)`
-- **kestrel_sovereign/static/dashboard.html** — (html asset)
-- **kestrel_sovereign/static/falconer-dashboard.html** — (html asset)
-- **kestrel_sovereign/static/falconer-implementation-plan.html** — (html asset)
 - **kestrel_sovereign/static/favicon.svg** — —
 - **kestrel_sovereign/static/index.html** — (html asset)
 - **kestrel_sovereign/static/js/api.js** — (js asset)
@@ -886,17 +883,12 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/static/js/voice/realtime.js** — (js asset)
 - **kestrel_sovereign/static/js/voice/state-machine.js** — (js asset)
 - **kestrel_sovereign/static/js/voice/ui.js** — (js asset)
-- **kestrel_sovereign/static/kestrel-falconer-v2.html** — (html asset)
-- **kestrel_sovereign/static/kestrel-falconer.html** — (html asset)
 - **kestrel_sovereign/static/kestrel_logo.svg** — —
-- **kestrel_sovereign/static/saved-items.html** — (html asset)
 - **kestrel_sovereign/static/shared/markdown/highlight.js** — (js asset)
 - **kestrel_sovereign/static/shared/markdown/index.js** — (js asset)
 - **kestrel_sovereign/static/shared/markdown/mermaid.js** — (js asset)
 - **kestrel_sovereign/static/shared/markdown/parse.js** — (js asset)
 - **kestrel_sovereign/static/shared/model-selector/index.js** — (js asset)
-- **kestrel_sovereign/static/signal-and-ship-overview.html** — (html asset)
-- **kestrel_sovereign/static/signal-and-ship-product-family.html** — (html asset)
 - **kestrel_sovereign/static/utils/api.js** — (js asset)
 - **kestrel_sovereign/static/utils/formatting.js** — (js asset)
 - **kestrel_sovereign/static/voice-test.html** — (html asset)
@@ -2508,10 +2500,6 @@ Repo entry points and standard project files.
 - **demos/ephemeral-purge/demo.cjs** — —
 - **demos/ephemeral-purge/eye.toml** — (configuration)
 - **demos/ephemeral-purge/narration.md** — EPHEMERAL Purge Vignette — Narration — ## Why this feature exists
-- **demos/falconer/config.cjs** — —
-- **demos/falconer/dashboard_screenshot.cjs** — —
-- **demos/falconer/demo.cjs** — —
-- **demos/falconer/presenter.md** — Track B — Investor / Emotional Demo Script — **Status:** First draft — ready for Noel review **Owner:** Gabi (script) → Noel (narration) **Demo Date:** March 15, 2026 (live) / Apr 1, 2026 (Loom recording) **Audience:** VCs, non-technical adviso…
 - **demos/feature-store/config.cjs** — —
 - **demos/feature-store/demo.cjs** — —
 - **demos/feature-store/eye.toml** — (configuration)
