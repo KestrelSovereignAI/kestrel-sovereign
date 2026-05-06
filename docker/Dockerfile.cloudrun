@@ -6,10 +6,16 @@ FROM --platform=linux/${TARGETARCH} python:3.11-slim
 
 WORKDIR /app
 
-# Install system dependencies
+# Install system dependencies. gcc + python3-dev are needed to build webrtcvad
+# (C extension, pulled in by core deps after voice PR #799). Without them, uv
+# pip install fails to compile webrtcvad and the chained `|| true` in the next
+# RUN masks the failure — the venv ends up empty and Cloud Run revisions can't
+# start. Same fix that's already in Dockerfile.multi_agent.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     git \
+    gcc \
+    python3-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy uv from official image (faster than pip install uv)
@@ -21,17 +27,23 @@ COPY . .
 # Make entrypoint executable
 RUN chmod +x /app/docker/cloudrun_entrypoint.sh
 
-# Create the virtual environment and install
-# Uses Docker secret for GitHub token to access private repos (kestrel-talon)
-RUN --mount=type=secret,id=github_token \
-    uv venv /app/.venv && \
-    GIT_AUTH="$(cat /run/secrets/github_token 2>/dev/null || true)" && \
-    if [ -n "$GIT_AUTH" ]; then \
-        git config --global url."https://${GIT_AUTH}@github.com/".insteadOf "https://github.com/"; \
-    fi && \
-    uv pip install --python /app/.venv/bin/python . && \
-    (uv pip uninstall --python /app/.venv/bin/python ollama || true) && \
-    git config --global --unset-all url."https://${GIT_AUTH}@github.com/".insteadOf 2>/dev/null || true
+# Create the virtual environment and install.
+# Uses Docker secret for GitHub token to access private repos (kestrel-talon).
+# Heredoc + `set -e` ensures any failure (notably uv pip install) propagates
+# as a non-zero exit. The previous form ended the chain in `... || true`,
+# which under shell precedence wrapped the entire `&&`-chain — silently
+# swallowing install failures and tagging an empty image.
+RUN --mount=type=secret,id=github_token <<'EOF'
+set -e
+uv venv /app/.venv
+GIT_AUTH="$(cat /run/secrets/github_token 2>/dev/null || true)"
+if [ -n "$GIT_AUTH" ]; then
+    git config --global url."https://${GIT_AUTH}@github.com/".insteadOf "https://github.com/"
+fi
+uv pip install --python /app/.venv/bin/python .
+uv pip uninstall --python /app/.venv/bin/python ollama || true
+git config --global --unset-all url."https://${GIT_AUTH}@github.com/".insteadOf 2>/dev/null || true
+EOF
 
 # Cloud LLM config — LLMService reads [llm] from /app/kestrel.toml directly.
 COPY docker/kestrel.cloudrun.toml /app/kestrel.toml
