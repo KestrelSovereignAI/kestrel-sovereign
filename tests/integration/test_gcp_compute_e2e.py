@@ -230,7 +230,10 @@ class TestVisualIdentityGCPIntegration:
     @pytest.mark.asyncio
     async def test_gcp_provider_detection(self, monkeypatch):
         """Test that GCP is detected as a LoRA training provider."""
-        from kestrel_sovereign.features.visual_identity.feature import VisualIdentityFeature
+        # VisualIdentityFeature was extracted to kestrel-feature-visual (epic #462).
+        # Skip if the package isn't installed alongside kestrel-sovereign.
+        pytest.importorskip("kestrel_feature_visual")
+        from kestrel_feature_visual.feature import VisualIdentityFeature
 
         # Clear any existing env vars using monkeypatch
         for k in ["VASTAI_API_KEY", "RUNPOD_API_KEY", "GCP_PROJECT_ID", "GOOGLE_APPLICATION_CREDENTIALS"]:

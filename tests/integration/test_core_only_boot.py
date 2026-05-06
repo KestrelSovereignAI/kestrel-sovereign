@@ -52,7 +52,6 @@ NON_CORE_FEATURES = ",".join([
     "StateOfMindFeature",
     "StrategicMemoryFeature",
     "VastAIFeature",
-    "VisualIdentityFeature",
     "VoiceFeature",
     "WalletFeature",
     "WebSearchFeature",

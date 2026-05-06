@@ -144,7 +144,6 @@ Audited snapshot: **42** discoverable modules · **42** exported `Feature` subcl
 | `talon` | `TalonCoordinatorFeature` |
 | `tasks` | `TaskFeature` |
 | `vastai` | `VastAIFeature` |
-| `visual_identity` | `VisualIdentityFeature` |
 | `voice` | `VoiceFeature` |
 | `wallet` | `WalletFeature` |
 | `web_search` | `WebSearchFeature` |
