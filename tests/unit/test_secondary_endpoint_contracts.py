@@ -15,6 +15,15 @@ def _prepare_app(agent):
     async def noop_lifespan(_app):
         yield
 
+    # ObservabilityFeature was moved to dynamic feature-mounting in #466
+    # (`Feature.get_router()`), so its routes aren't on the core `app` until
+    # an actual agent registers the feature at startup. This test uses a
+    # MagicMock agent and bypasses the lifespan, so that mount never runs.
+    # Mount the router once here, idempotently — without it, any test that
+    # hits /api/observability/* gets a 404 unless another test on the same
+    # pytest-xdist worker has already mounted it (race-y false-passes).
+    _ensure_observability_router(app)
+
     original = {
         "lifespan": app.router.lifespan_context,
         "agent": getattr(app.state, "agent", None),
@@ -24,6 +33,19 @@ def _prepare_app(agent):
     app.state.agent = agent
     app.state.agent_manager = None
     return app, original
+
+
+def _ensure_observability_router(app):
+    """Idempotently include endpoints/observability.py on ``app``.
+
+    ``FastAPI.include_router`` would otherwise add duplicate routes on every
+    call. Detect the presence of the summary route and skip if present."""
+    target = "/api/observability/summary"
+    for route in app.routes:
+        if getattr(route, "path", None) == target:
+            return
+    from endpoints.observability import router as observability_router
+    app.include_router(observability_router)
 
 
 def _restore_app(app, original):
