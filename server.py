@@ -651,7 +651,14 @@ async def auth_middleware(request: Request, call_next):
     """
     public_paths = ["/health", "/health/detailed", "/favicon.ico", "/api/auth/key", "/metrics", "/webhooks/github-app"]
     auth_paths = ["/auth/login", "/auth/callback", "/auth/logout", "/auth/token"]
-    static_prefixes = ["/static", "/js/", "/shared/", "/utils/", "/api/github/", "/api/ui/"]
+    # `/api/github/` was previously here — that exempted the GitHub-API
+    # proxy at server.py:498 from auth, which let any unauthenticated
+    # caller spend the server's GITHUB_TOKEN. Removed per the post-launch
+    # review (2026-05-06). The proxy now requires API key or OAuth session
+    # like every other /api/ endpoint. The static dashboards that consumed
+    # it (dashboard.html, falconer-dashboard.html) are scheduled for removal
+    # in #675; until they go, they work only when the caller is signed in.
+    static_prefixes = ["/static", "/js/", "/shared/", "/utils/", "/api/ui/"]
 
     if request.url.path in public_paths or request.url.path in auth_paths:
         return await call_next(request)
