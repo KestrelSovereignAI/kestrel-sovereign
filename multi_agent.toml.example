@@ -1,10 +1,10 @@
-# Kestrel Rookery Configuration Example
+# Kestrel Multi-Agent Configuration Example
 #
-# The rookery is the registry of agents managed by a single Kestrel Host.
+# This file is the registry of agents managed by a single Kestrel Host.
 # Each agent is self-contained in its own directory with its own DID,
 # database, keys, and configuration.
 #
-# Copy this file to "rookery.toml" and customize with your agents.
+# Copy this file to "multi_agent.toml" and customize with your agents.
 
 # =============================================================================
 # Host Configuration
@@ -84,7 +84,7 @@ url = "https://friend-kestrel.example.com"
 # =============================================================================
 #
 # 1. Auto-Discovery:
-#    If no rookery.toml exists, Kestrel will auto-discover agents by scanning
+#    If no multi_agent.toml exists, Kestrel will auto-discover agents by scanning
 #    agent_data/*/ subdirectories and assigning ports sequentially from 8801.
 #
 # 2. Port Conflicts:
