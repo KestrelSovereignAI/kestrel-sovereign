@@ -15,13 +15,19 @@ while IFS='=' read -r key val; do
     fi
 done < <(env)
 
-AGENT_BASE="${KESTREL_DB_PATH:-/app/agent_data}"
-AGENT_NAME="${KESTREL_AGENT_NAME:-kestrel}"
-AGENT_DIR="${AGENT_BASE}/${AGENT_NAME}"
+# Single-agent Cloud Run: bootstrap DID + database in KESTREL_DB_PATH
+# directly. server.py's lifespan calls get_agent_did_async(KESTREL_DB_PATH)
+# and opens "${KESTREL_DB_PATH}/kestrel_prime.db", so the entrypoint must
+# write identity in the same dir.
+#
+# (Earlier this script used a "${KESTREL_DB_PATH}/${KESTREL_AGENT_NAME}"
+# subdir to align with the multi_agent image's auto-discovery layout —
+# but cloudrun runs single-agent, so the subdir was vestigial and put the
+# DID one level deeper than the lifespan reads. Reproduced + fixed in #1029.)
+AGENT_DIR="${KESTREL_DB_PATH:-/app/agent_data}"
 PORT="${PORT:-8080}"
 
 # Bootstrap agent identity if none exists
-# Agent lives in a named subdirectory so multi_agent auto-discovery finds it
 mkdir -p "$AGENT_DIR"
 if ! ls "$AGENT_DIR"/kestrel_*.json &>/dev/null; then
     echo "No agent identity found. Creating new Kestrel agent in ${AGENT_DIR}..."
