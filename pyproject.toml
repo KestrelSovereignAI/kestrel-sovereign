@@ -150,10 +150,6 @@ wallet = [
     "web3>=7.0.0",
     "stripe>=10.0.0",
 ]
-# Feature: MCP (extracted to kestrel-feature-mcp)
-mcp = [
-    "kestrel-feature-mcp @ git+https://github.com/KestrelSovereignAI/kestrel-feature-mcp.git",
-]
 # Feature: Visual (image generation via Replicate)
 visual = [
     "replicate>=1.0.4",
@@ -164,22 +160,26 @@ delivery = [
     "sendgrid>=6.12.5",
     "twilio>=9.9.1",
 ]
-# Feature: GitHub issue processing
-github = [
-    "kestrel-talon @ git+https://github.com/KestrelSovereignAI/kestrel-talon.git",
-]
 # Feature: Search (Tavily web search)
 search = [
     "tavily-python>=0.3.0",
 ]
+# Note on extracted feature packages:
+# Out-of-tree feature packages (kestrel-feature-mcp, kestrel-talon, the
+# kestrel-cloud-* / kestrel-storage-* / kestrel-voice-* family, etc.) are
+# installed independently — `pip install kestrel-feature-mcp` adds MCP
+# support and registers itself via the `kestrel_sovereign.features`
+# entry-point group at startup. The framework deliberately doesn't list
+# those packages here as optional-deps, because doing so inverts the
+# open-core dependency direction (framework → feature instead of
+# feature → framework).
+#
 # All feature packages — restores pre-split behavior
 all-features = [
     "kestrel_sovereign[cloud]",
     "kestrel_sovereign[wallet]",
-    "kestrel_sovereign[mcp]",
     "kestrel_sovereign[visual]",
     "kestrel_sovereign[delivery]",
-    "kestrel_sovereign[github]",
     "kestrel_sovereign[search]",
     "kestrel_sovereign[local]",
     "kestrel_sovereign[ml]",
