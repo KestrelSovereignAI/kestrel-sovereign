@@ -342,5 +342,4 @@ Size: 89949 bytes
 | `demos/technical/demo-output/narration.md` | Auto-generated timestamped transcript |
 | `demos/technical/demo-output/*.png` | 20 screenshots at key moments |
 | `demos/technical/presenter.md` | Presenter reference (slides, speaker notes) |
-| `demos/falconer/presenter.md` | Investor demo narration (5 slides) |
 | `docs/demos/DEMO_SCRIPT.md` | This file — the presenter's guide |

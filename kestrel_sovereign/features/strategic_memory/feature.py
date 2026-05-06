@@ -19,7 +19,7 @@ from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.tools.base import ToolCategory
 
 from .backlog_hygiene import run_backlog_hygiene
-from .morning_signal import generate_morning_signal, generate_portfolio_dashboard
+from .morning_signal import generate_morning_signal
 from .session_log import collect_session_log
 from .talon_handoff import dispatch_to_talon, pick_top_issue
 
@@ -355,16 +355,6 @@ class StrategicMemoryFeature(Feature):
                 if type(f).__name__ == "TalonCoordinatorFeature":
                     return f
         return None
-
-    @tool(
-        name="portfolio_dashboard",
-        description="Open the Portfolio Dashboard -- live operational and strategic intelligence from all repos, milestone tracking, outcome scoreboard, and budget info.",
-        category=ToolCategory.SYSTEM,
-        command_prefix="!dashboard",
-    )
-    async def portfolio_dashboard(self) -> str:
-        """Generate a link to the Portfolio Dashboard with a live summary."""
-        return await generate_portfolio_dashboard(self._data)
 
     @tool(
         name="backlog_hygiene",

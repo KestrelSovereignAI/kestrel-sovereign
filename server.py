@@ -655,9 +655,7 @@ async def auth_middleware(request: Request, call_next):
     # proxy at server.py:498 from auth, which let any unauthenticated
     # caller spend the server's GITHUB_TOKEN. Removed per the post-launch
     # review (2026-05-06). The proxy now requires API key or OAuth session
-    # like every other /api/ endpoint. The static dashboards that consumed
-    # it (dashboard.html, falconer-dashboard.html) are scheduled for removal
-    # in #675; until they go, they work only when the caller is signed in.
+    # like every other /api/ endpoint.
     static_prefixes = ["/static", "/js/", "/shared/", "/utils/", "/api/ui/"]
 
     if request.url.path in public_paths or request.url.path in auth_paths:
