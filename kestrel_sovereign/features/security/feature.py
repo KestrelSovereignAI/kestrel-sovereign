@@ -517,6 +517,16 @@ class SecurityFeature(Feature):
 
         lines = [f"Security Audit Log (last {len(logs)} entries):\n"]
 
+        # Honesty + privacy: the LLM receives ``ToolResult.data`` in
+        # the next turn's context. Audit rows can carry an
+        # ``args_summary`` that includes tool arguments (paths,
+        # request payloads, sometimes unmasked direct-ApprovalQueue
+        # callers). Surfacing those into the LLM context is a
+        # privacy regression versus the str-only pre-fix shape, which
+        # deliberately omitted args. Filter ``entries`` to the same
+        # fields the confirmation displays. (Round 1 codex finding.)
+        _SAFE_AUDIT_FIELDS = ("feature", "tool", "decision", "user_choice", "timestamp")
+        safe_entries = []
         for entry in logs:
             decision_icon = {
                 "auto_allowed": "☑",
@@ -533,12 +543,16 @@ class SecurityFeature(Feature):
             if entry["user_choice"]:
                 lines.append(f"     ↳ scope: {entry['user_choice']}")
 
+            safe_entries.append({
+                k: entry.get(k) for k in _SAFE_AUDIT_FIELDS if k in entry
+            })
+
         return ToolResult.ok(
             confirmation="\n".join(lines),
             data={
                 "count": len(logs),
                 "limit_requested": limit_val,
-                "entries": list(logs),
+                "entries": safe_entries,
             },
         )
 

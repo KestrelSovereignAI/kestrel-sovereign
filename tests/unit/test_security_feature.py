@@ -959,6 +959,50 @@ class TestSecurityFeature:
         assert result.data["requests"][0]["feature_name"] == "WalletAgent"
 
     @pytest.mark.asyncio
+    async def test_security_audit_filters_sensitive_fields_from_data(self):
+        """Round 1 codex finding: security_audit's data.entries goes
+        back into the LLM context. Audit rows carry ``args_summary``
+        (sometimes unmasked direct-ApprovalQueue callers) with paths,
+        tokens, request payloads. The pre-fix str output deliberately
+        omitted args; the new ToolResult must do the same in
+        ``data.entries``."""
+        from kestrel_sdk.tools.result import ToolResultStatus
+        agent = MagicMock()
+        feature = SecurityFeature(agent)
+        # Mock permission_store.get_audit_log to return rows with sensitive fields
+        feature.permission_store = MagicMock()
+        feature.permission_store.get_audit_log = AsyncMock(return_value=[
+            {
+                "feature": "WalletAgent",
+                "tool": "send_tokens",
+                "decision": "user_approved",
+                "user_choice": "always",
+                "timestamp": "2026-05-07T22:00:00",
+                # Fields that MUST NOT be exposed to the LLM
+                "args_summary": '{"recipient": "0xSECRET", "amount": 9999, "token": "FIL"}',
+                "raw_args": {"private_key": "0xDEADBEEF"},
+            },
+        ])
+
+        result = await feature.security_audit(limit=10)
+
+        assert result.status is ToolResultStatus.OK
+        # data.entries must NOT include args_summary or raw_args
+        for entry in result.data["entries"]:
+            assert "args_summary" not in entry, (
+                "args_summary leaked into LLM context — "
+                "would expose tool arguments to the model"
+            )
+            assert "raw_args" not in entry
+            # Safe fields are present
+            assert "feature" in entry
+            assert "tool" in entry
+            assert "decision" in entry
+        # Confirmation text already omitted args (pre-fix) — preserve that
+        assert "0xSECRET" not in result.confirmation
+        assert "0xDEADBEEF" not in result.confirmation
+
+    @pytest.mark.asyncio
     async def test_pending_approvals_handles_legacy_naive_timestamps(self):
         from kestrel_sdk.tools.result import ToolResultStatus
         agent = MagicMock()
