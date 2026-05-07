@@ -43,7 +43,7 @@ from kestrel_sovereign.bootstrap import BootstrapService, BootstrapState
 from kestrel_sovereign.security.input_guardrails import (
     wrap_user_input,
     check_prompt_injection,
-    ANTI_INJECTION_SYSTEM_PROMPT,
+    append_security_addendum,
 )
 from kestrel_sovereign.telemetry import optional_span
 
@@ -1623,12 +1623,13 @@ Expected Duration: {expected_duration}
         except DecryptionError:
             logging.warning("DecryptionError storing user input - continuing in degraded mode")
 
-        # Build system prompt with features and anti-injection defense
+        # Build system prompt with features and security + honesty addenda
         force_local_only = not self.privacy_agent.privacy_config.allows_cloud_llm()
         system_prompt = context_result.system_prompt
 
-        # Add anti-injection instructions to system prompt
-        system_prompt = f"{system_prompt}\n{ANTI_INJECTION_SYSTEM_PROMPT}"
+        # Append the security + honesty addenda. Single source of truth
+        # for assembly order; see append_security_addendum's docstring.
+        system_prompt = append_security_addendum(system_prompt)
 
         # Add cached features section (built once at session start)
         if self._cached_features_prompt:
