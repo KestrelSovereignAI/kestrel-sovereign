@@ -144,6 +144,40 @@ class DeployManagerCore:
         return profiles
 
     @staticmethod
+    def _validate_no_unresolved_placeholders(
+        profile_name: str, profile: DeploymentProfile
+    ) -> None:
+        """Raise DeployManagerError if any expanded value still contains
+        ``${VAR}`` — meaning the runtime env didn't have the variable
+        set. We refuse to deploy with broken config rather than push it
+        to Cloud Run silently. Mirrors the bash scripts'
+        ``${VAR:?Set VAR env var ...}`` shape.
+        """
+        unresolved = []
+        for key, value in (profile.env_vars or {}).items():
+            if isinstance(value, str) and "${" in value:
+                unresolved.append(("env_vars", key, value))
+        for key, value in (profile.secrets or {}).items():
+            if isinstance(value, str) and "${" in value:
+                unresolved.append(("secrets", key, value))
+
+        if unresolved:
+            details = "; ".join(
+                f"{section}.{key}={value!r}" for section, key, value in unresolved
+            )
+            missing_vars = sorted({
+                m.group(1)
+                for _, _, value in unresolved
+                for m in re.finditer(r'\$\{([^}]+)\}', value)
+            })
+            raise DeployManagerError(
+                f"profile '{profile_name}' has unresolved ${{...}} placeholders "
+                f"(missing env vars: {', '.join(missing_vars)}). "
+                f"Export them before running `kestrel deploy {profile_name}`. "
+                f"Affected: {details}"
+            )
+
+    @staticmethod
     def _expand_env_vars(env_dict: Dict[str, str]) -> Dict[str, str]:
         """
         Expand ${VAR} syntax in environment variable values.
@@ -326,21 +360,46 @@ class DeployManagerCore:
         """
         Build container image reference for a profile.
 
+        The image name is derived from the profile's ``deployment_mode``:
+
+        * ``deployment_mode = "agent"`` (default) → ``<image_name>``
+          (e.g. ``kestrel``) — built from ``docker/Dockerfile.cloudrun``.
+        * ``deployment_mode = "multi_agent"`` → ``<image_name>-multi_agent``
+          (e.g. ``kestrel-multi_agent``) — built from
+          ``docker/Dockerfile.multi_agent``.
+
+        These names match :data:`kestrel_sovereign.features.deploy.build.DEFAULT_TARGETS`
+        and ``.github/workflows/deploy.yml`` so ``kestrel deploy build`` and
+        ``kestrel deploy <profile>`` always reference the same registry refs.
+        The legacy bash ``deploy_dev.sh``/``deploy_multi_agent_dev.sh`` used
+        a hyphenated ``kestrel-multi-agent`` orphan that no build path ever
+        produced; epic #1050 sub-PR 1.4 reconciled on the underscore form.
+
         Args:
-            profile_name: Name of the profile (currently informational —
-                only used to disambiguate per-profile image overrides if
-                we add them later; the image name today is global).
-            tag: Image tag
+            profile_name: Profile to look up. Unknown profiles fall back
+                to the manager-level ``image_name`` so callers exercising
+                the manager outside a profile context (legacy tests) still
+                get a sensible ref.
+            tag: Image tag (default ``latest``).
 
         Returns:
-            Full image reference (e.g. ``gcr.io/project/kestrel:latest``).
+            Full image reference (e.g. ``gcr.io/project/kestrel-multi_agent:v1.2.3``).
         """
+        # Resolve the image name from the profile's deployment_mode. We
+        # don't raise on an unknown profile because some legacy callers
+        # build a manager from a stripped-down config; they'll get the
+        # global single-agent name, which is the historical default.
+        image_name = self.image_name
+        profile = self.profiles.get(profile_name)
+        if profile is not None and profile.is_multi_agent:
+            image_name = f"{self.image_name}-multi_agent"
+
         # For Cloud Run, use GCR
         if self.gcp_project_id:
-            return f"gcr.io/{self.gcp_project_id}/{self.image_name}:{tag}"
+            return f"gcr.io/{self.gcp_project_id}/{image_name}:{tag}"
 
         # Fallback to generic reference
-        return f"{self.image_name}:{tag}"
+        return f"{image_name}:{tag}"
 
     async def deploy_profile(
         self, profile_name: str, tag: str = "latest"
@@ -354,6 +413,16 @@ class DeployManagerCore:
         """
         try:
             profile = self.get_profile(profile_name)
+
+            # Validate that every ``${VAR}`` placeholder in the profile's
+            # env_vars / secrets actually resolved against runtime env.
+            # ``_expand_env_vars`` returns the literal ``${VAR}`` when a
+            # variable is unset — pushing that to Cloud Run silently
+            # produces broken config (e.g. an OAuth allowlist with the
+            # literal string ``${KESTREL_ALLOWED_EMAILS}``). The bash
+            # scripts errored on missing env via ``${VAR:?...}``;
+            # mirror that here. Codex review on PR #1064.
+            self._validate_no_unresolved_placeholders(profile_name, profile)
 
             image = self.build_image_reference(profile_name, tag)
 

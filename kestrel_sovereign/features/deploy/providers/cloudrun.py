@@ -212,6 +212,14 @@ class CloudRunProvider(DeployProvider):
             logger.info(f"Waiting for Cloud Run operation to complete...")
             result = await asyncio.to_thread(operation.result, timeout=600)
 
+            # Allow unauthenticated invocations — matches the bash
+            # ``gcloud run deploy --allow-unauthenticated`` flag, which
+            # binds ``allUsers`` to ``roles/run.invoker``. Without this
+            # the freshly-created service returns 401 to public traffic
+            # and the app's OAuth flow / /health endpoint can't be
+            # reached. Codex review on PR #1064 caught the regression.
+            await self._allow_unauthenticated(client, service_path)
+
             # Get service URL
             service_url = result.uri
 
@@ -228,6 +236,60 @@ class CloudRunProvider(DeployProvider):
         except Exception as e:
             logger.error(f"Deployment failed: {e}", exc_info=True)
             raise DeployManagerError(f"Deployment failed: {e}") from e
+
+    async def _allow_unauthenticated(self, client, service_path: str) -> None:
+        """Bind ``allUsers`` to ``roles/run.invoker`` on the service.
+
+        Equivalent to ``gcloud run deploy --allow-unauthenticated``,
+        which the bash deploy_*.sh scripts always passed. Without this
+        binding Cloud Run rejects public traffic with 401, so the
+        application's OAuth flow and /health endpoint are unreachable
+        for new services or services recreated after teardown.
+
+        We fetch the current IAM policy, add the binding only if it's
+        not already present (idempotent), and set it back. Logs at
+        WARNING if the operation fails so the deploy itself doesn't
+        regress on transient IAM API errors — the operator can grant
+        the role manually as a backstop.
+        """
+        try:
+            from google.iam.v1 import iam_policy_pb2, policy_pb2
+
+            get_req = iam_policy_pb2.GetIamPolicyRequest(resource=service_path)
+            policy = await asyncio.to_thread(client.get_iam_policy, request=get_req)
+
+            already_set = any(
+                b.role == "roles/run.invoker" and "allUsers" in b.members
+                for b in policy.bindings
+            )
+            if already_set:
+                logger.debug("allUsers already has run.invoker; no IAM change needed")
+                return
+
+            policy.bindings.add(
+                role="roles/run.invoker",
+                members=["allUsers"],
+            )
+            set_req = iam_policy_pb2.SetIamPolicyRequest(
+                resource=service_path, policy=policy
+            )
+            await asyncio.to_thread(client.set_iam_policy, request=set_req)
+            logger.info(
+                f"Granted allUsers run.invoker on {service_path} "
+                f"(equivalent to --allow-unauthenticated)"
+            )
+        except ImportError as e:  # protobuf module missing
+            logger.warning(
+                "Could not import google.iam.v1 — skipping "
+                f"allUsers/run.invoker binding: {e}. The service may "
+                "require manual IAM granting before public traffic works."
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "Failed to grant allUsers/run.invoker (the service is "
+                "deployed but may not accept public traffic until you "
+                f"run `gcloud run services add-iam-policy-binding`): {e}"
+            )
 
     async def get_status(self, service_name: str) -> Dict[str, Any]:
         """Get Cloud Run service status."""

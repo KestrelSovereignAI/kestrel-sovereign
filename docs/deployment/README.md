@@ -2,25 +2,36 @@
 
 How to build, deploy, and update Kestrel Sovereign on Cloud Run.
 
-## Scripts
+## Commands
 
-All deployment scripts live in [`scripts/cloudrun/`](../../scripts/cloudrun/).
+All deployment operations run through the `kestrel deploy` CLI — a Python
+entry point that works on Linux, macOS, and Windows (no bash required).
+Configuration lives in [`deploy_config.toml`](../../deploy_config.toml);
+the CLI is a thin wrapper over `DeployManager` and the build/secrets ports.
 
-| Script | Purpose |
+| Command | Purpose |
 |---|---|
-| [`build.sh`](../../scripts/cloudrun/build.sh) | Build + push single-agent and multi_agent images to GCR |
-| [`build_multi_agent.sh`](../../scripts/cloudrun/build_multi_agent.sh) | Build + push multi_agent image only |
-| [`deploy_dev.sh`](../../scripts/cloudrun/deploy_dev.sh) | Deploy multi_agent to `kestrel-dev` service |
-| [`deploy_prod.sh`](../../scripts/cloudrun/deploy_prod.sh) | Deploy to `kestrel-prod` service |
-| [`deploy_multi_agent_dev.sh`](../../scripts/cloudrun/deploy_multi_agent_dev.sh) | Deploy multi_agent image to dev |
-| [`setup_secrets.sh`](../../scripts/cloudrun/setup_secrets.sh) | One-time: create GCP Secret Manager entries |
+| `uv run kestrel deploy build` | Build + push single-agent and multi_agent images to GCR |
+| `uv run kestrel deploy build --target kestrel-multi_agent` | Build + push the multi_agent image only |
+| `uv run kestrel deploy dev` | Deploy `[profiles.dev]` (multi-agent host) to `kestrel-dev` |
+| `uv run kestrel deploy prod` | Deploy `[profiles.prod]` to `kestrel-prod` |
+| `uv run kestrel deploy multi-agent-dev` | Deploy the standalone multi_agent profile |
+| `uv run kestrel deploy secrets sync` | One-time / on-rotate: push `.env` values into GCP Secret Manager |
+| `uv run kestrel deploy status` | List active deployments |
+| `uv run kestrel deploy logs <profile>` | Tail Cloud Run logs |
+| `uv run kestrel deploy teardown <profile>` | Delete a deployed service |
+| `uv run kestrel deploy health <profile>` | Probe the service's `/health` endpoint |
+
+Run `uv run kestrel deploy --help` for the full flag set.
 
 ## Environment variables
 
-Scripts read from `.env` at repo root. Required:
+The CLI reads from your shell env (or `.env` if you `set -a && source .env`).
+Required:
 
-- `GCP_PROJECT_ID` — e.g. `kestel-469222`
-- `KESTREL_ALLOWED_EMAILS` — comma-separated list of authorized Google accounts
+- `GCP_PROJECT_ID` — e.g. `kestel-469222` (also reads `[manager].gcp_project_id` in `deploy_config.toml`)
+- `KESTREL_ALLOWED_EMAILS` — comma-separated list of authorized Google accounts; expanded into `[profiles.*.env_vars]` via `${KESTREL_ALLOWED_EMAILS}` placeholders.
+- `GITHUB_TOKEN` (build only) — env-first, falls back to `gh auth token`. Needed for Dockerfiles that install private deps.
 
 ## Typical dev deploy flow
 
@@ -28,11 +39,11 @@ Scripts read from `.env` at repo root. Required:
 # 1. Load env
 set -a && source .env && set +a
 
-# 2. Build + push images (takes ~5 min)
-GITHUB_TOKEN=$(gh auth token --user UncleSaurus) bash scripts/cloudrun/build.sh
+# 2. Build + push images (takes ~5 min, multi-arch via docker buildx)
+uv run kestrel deploy build
 
 # 3. Deploy to dev
-bash scripts/cloudrun/deploy_dev.sh
+uv run kestrel deploy dev
 ```
 
 Dev service URL (stable): `https://kestrel-dev-7jpbsywhdq-uc.a.run.app`
@@ -41,14 +52,16 @@ Dev service URL (stable): `https://kestrel-dev-7jpbsywhdq-uc.a.run.app`
 
 | Workflow | Trigger | Purpose |
 |---|---|---|
-| [`deploy.yml`](../../.github/workflows/deploy.yml) | `v*` tag push or manual | Build + deploy to Cloud Run |
+| [`deploy.yml`](../../.github/workflows/deploy.yml) | `v*` tag push (via `Publish to PyPI`) or manual | Calls `uv run kestrel deploy build` then `kestrel deploy dev` / `prod` |
 | [`ci.yml`](../../.github/workflows/ci.yml) | Every PR/push | Unit + integration tests |
 | [`clean-install.yml`](../../.github/workflows/clean-install.yml) | Scheduled | Verify `pip install` works from clean venv |
 | [`weekly-analysis.yml`](../../.github/workflows/weekly-analysis.yml) | Weekly cron | Codebase analysis reports |
 
 ## Secrets
 
-Stored in GCP Secret Manager. The deploy scripts mount them as env vars.
+Stored in GCP Secret Manager. `kestrel deploy secrets sync` reads `.env` and
+creates / updates secret versions per the `[profiles.*.secrets]` map in
+`deploy_config.toml`. The deploy command mounts them as env vars on Cloud Run.
 
 | Secret | Purpose |
 |---|---|
@@ -58,12 +71,20 @@ Stored in GCP Secret Manager. The deploy scripts mount them as env vars.
 | `kestrel-data-key` | Encryption key for agent data |
 | `kestrel-session-secret` | Session cookie signing |
 | `kestrel-google-client-id` / `-secret` | Google OAuth |
+| `kestrel-lighthouse-key` | Lighthouse pricing/oversight feed |
 | `github-read-kestrel` | GitHub PAT for private package installs |
 | `github-app-id` | Kestrel GitHub App ID |
 | `github-app-private-key` | Kestrel GitHub App PEM |
 | `github-app-webhook-secret` | Webhook HMAC secret |
 
-Rotate by creating a new version:
+Rotate by adding a new secret value to `.env` and re-running:
+
+```bash
+uv run kestrel deploy secrets sync
+```
+
+Or directly via `gcloud`:
+
 ```bash
 gcloud secrets versions add <secret-name> --data-file=<path>
 ```
@@ -76,8 +97,8 @@ The GitHub Agent ([`kestrel_sovereign/features/github_app/`](../../kestrel_sover
 
 ```bash
 set -a && source .env && set +a
-GITHUB_TOKEN=$(gh auth token --user UncleSaurus) bash scripts/cloudrun/build.sh
-bash scripts/cloudrun/deploy_dev.sh
+uv run kestrel deploy build
+uv run kestrel deploy dev
 ```
 
 The agent uses `min-instances=1` to stay warm (LLM calls exceed GitHub's 10s webhook timeout, so responses are async — instance must persist after returning 200).
