@@ -9,6 +9,7 @@ if TYPE_CHECKING:
     from kestrel_sdk.hooks.base import Hook
 from abc import ABC, abstractmethod
 from kestrel_sdk.tools.base import ToolSchema, ToolParameter, ToolCategory, AgentTool
+from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
 from kestrel_sovereign.a2a.agent_card import AgentCard, AgentSkill, AgentCapabilities
 from kestrel_sovereign.a2a.types import Task, TaskState, TaskStatus, Artifact, DataPart, Message, TextPart
 
@@ -815,18 +816,74 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
                     async def execute(self, **kwargs) -> Dict[str, Any]:
                         try:
                             result = await self.func(**kwargs)
-                            return {
-                                "success": True,
-                                "result": result,
-                                "tool": self.name
-                            }
                         except Exception as e:
                             logger.error(f"Error executing tool {self.name}: {e}")
                             return {
                                 "success": False,
                                 "error": str(e),
-                                "tool": self.name
+                                "tool": self.name,
                             }
+
+                        # ToolResult-returning @tool methods (#1042
+                        # layer 4 contract) get serialized at the wrap
+                        # site so downstream readers never see the raw
+                        # frozen-dataclass instance. Without this,
+                        # in-process callers (run_workflow,
+                        # check_task_status) end up with a non-JSON-
+                        # serializable object embedded in the wire
+                        # payload — the workaround was per-callsite
+                        # ``_serialize_step_payload`` helpers in
+                        # PR-E pilot (#1066) which this fix
+                        # supersedes. See #1070.
+                        #
+                        # Honesty: the wrapper's ``success`` flag
+                        # historically meant "the call did not raise."
+                        # That conflated transport with semantic
+                        # outcome — a migrated tool returning
+                        # ``ToolResult.failed`` would still surface
+                        # ``success: True`` to callers like
+                        # ``command_handler`` that branch on it.
+                        # We now derive ``success`` from the
+                        # ToolResult status:
+                        #   - OK → success=True
+                        #   - PARTIAL → success=True (it succeeded
+                        #     enough to produce a confirmation; the
+                        #     ``error`` field is also populated so
+                        #     callers that surface both still get the
+                        #     full picture)
+                        #   - ERROR → success=False, error copied
+                        #     into the wrapper's top-level error
+                        if isinstance(result, ToolResult):
+                            wire = result.to_dict()
+                            response: Dict[str, Any] = {
+                                "result": wire,
+                                "tool": self.name,
+                            }
+                            status = result.status
+                            if status is ToolResultStatus.ERROR:
+                                response["success"] = False
+                                response["error"] = result.error
+                            else:
+                                # OK and PARTIAL both ran the action.
+                                response["success"] = True
+                                if status is ToolResultStatus.PARTIAL:
+                                    # Surface the partial caveat at
+                                    # the wrapper level so legacy
+                                    # callers that only read ``error``
+                                    # don't miss it.
+                                    response["error"] = result.error
+                            return response
+
+                        # Pre-migration return shape (Dict[str, Any]
+                        # or other) — keep the original wrapper. The
+                        # ``success: True`` here remains transport-
+                        # level for un-migrated tools; the #1061
+                        # bulk waves migrate them away one by one.
+                        return {
+                            "success": True,
+                            "result": result,
+                            "tool": self.name,
+                        }
 
                 tools.append(DynamicTool(method, schema_data, agent_skill))
         return tools
