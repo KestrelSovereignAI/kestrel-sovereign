@@ -179,7 +179,8 @@ class OllamaAdapter(LLMAdapter):
                         try:
                             args = json.loads(args)
                         except json.JSONDecodeError:
-                            args = {"raw": args}
+                            # SDK 0.7.0 malformed-JSON sentinel.
+                            args = {"_raw": args}
 
                     parsed_tool_calls.append(ToolCall(
                         id=f"ollama_call_{i}",  # Ollama doesn't provide IDs
