@@ -36,6 +36,12 @@ Subcommands
 ``kestrel deploy health <profile>``
     Health-check the deployed service for a profile.
 
+``kestrel deploy secrets sync``
+    Push values from ``.env`` into GCP Secret Manager for every
+    ``[profiles.*.secrets]`` entry in ``deploy_config.toml``. Replaces
+    ``scripts/cloudrun/setup_secrets.sh`` for Windows-friendly operators.
+    See ``kestrel deploy secrets sync --help``.
+
 Each subcommand returns process exit code 0 if the operation reports
 ``success=True``, 1 otherwise. Initialization failures (e.g. no
 ``GCP_PROJECT_ID``) print a friendly error and return 1; we do not
@@ -48,7 +54,9 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import sys
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 from kestrel_sovereign.features.deploy.manager import DeployManager
@@ -85,7 +93,7 @@ def add_deploy_subcommands(subparsers: "argparse._SubParsersAction") -> None:
         default=None,
         help=(
             "Profile name (deploys it) OR one of: status, teardown, logs, "
-            "list, health"
+            "list, health, secrets"
         ),
     )
     deploy_p.add_argument(
@@ -94,8 +102,9 @@ def add_deploy_subcommands(subparsers: "argparse._SubParsersAction") -> None:
         default=None,
         help=(
             "Profile name when ``target`` is a subcommand "
-            "(e.g. ``kestrel deploy teardown dev``). Ignored when "
-            "``target`` is itself a profile name."
+            "(e.g. ``kestrel deploy teardown dev``); subverb when "
+            "``target`` is ``secrets`` (currently only ``sync``). "
+            "Ignored when ``target`` is itself a profile name."
         ),
     )
     deploy_p.add_argument(
@@ -116,6 +125,44 @@ def add_deploy_subcommands(subparsers: "argparse._SubParsersAction") -> None:
         help="Print the raw result dict as JSON instead of a pretty summary",
     )
 
+    # ---- ``kestrel deploy secrets sync`` flags --------------------------
+    # We share one parser for all subcommands (rather than nested
+    # subparsers) to keep ``kestrel deploy <profile>`` ergonomic. The
+    # secrets-only flags below are inert when ``target`` isn't
+    # ``secrets``. ``--profile`` would collide with the positional
+    # ``profile``, so its dest is ``secrets_profile``.
+    deploy_p.add_argument(
+        "--profile",
+        dest="secrets_profile",
+        type=str,
+        default=None,
+        help=(
+            "[secrets sync] Limit secrets sync to one profile's "
+            "[profiles.<name>.secrets] section. Default: all profiles, "
+            "deduped."
+        ),
+    )
+    deploy_p.add_argument(
+        "--env-file",
+        dest="env_file",
+        type=str,
+        default=None,
+        help=(
+            "[secrets sync] Path to the .env file with secret values "
+            "(default: <project_root>/.env)."
+        ),
+    )
+    deploy_p.add_argument(
+        "--dry-run",
+        dest="dry_run",
+        action="store_true",
+        help=(
+            "[secrets sync] Print what would happen without mutating "
+            "Secret Manager. With every secret skipped (e.g. an empty "
+            ".env), no GCP client is constructed at all."
+        ),
+    )
+
 
 # ---------------------------------------------------------------------------
 # Pretty printers
@@ -123,7 +170,7 @@ def add_deploy_subcommands(subparsers: "argparse._SubParsersAction") -> None:
 
 # Subcommand keywords. Anything else in the ``target`` slot is treated as
 # a profile name and triggers a deploy.
-_SUBCOMMANDS = {"status", "teardown", "logs", "list", "health"}
+_SUBCOMMANDS = {"status", "teardown", "logs", "list", "health", "secrets"}
 
 
 def _print_kv(result: Dict[str, Any], skip: Optional[set] = None) -> None:
@@ -353,6 +400,230 @@ def _cmd_deploy_health(args) -> int:
 
 
 # ---------------------------------------------------------------------------
+# ``kestrel deploy secrets sync`` — port of scripts/cloudrun/setup_secrets.sh
+# ---------------------------------------------------------------------------
+
+# Pretty rendering for one SecretSyncResult line.
+_SECRETS_ACTION_PADDING = len("dry-run-update")
+
+
+def _render_secret_result(result) -> str:
+    """``"created   kestrel-openai-key <- OPENAI_API_KEY"``."""
+    action = result.action.ljust(_SECRETS_ACTION_PADDING)
+    line = f"{action} {result.secret_name} <- {result.env_var or '(unknown)'}"
+    if result.detail:
+        line += f"  ({result.detail})"
+    return line
+
+
+def _load_deploy_config_for_secrets() -> Optional[Dict[str, Any]]:
+    """Load deploy_config.toml for the secrets path.
+
+    Returns None and prints a friendly error if the file is missing or
+    malformed. We intentionally don't reuse ``DeployManager`` here —
+    secrets sync is independent of provider/session machinery, and
+    constructing a DeployManager would force the operator to have a
+    valid GCP_PROJECT_ID set even if they only want a dry-run preview.
+    """
+    import toml
+
+    config_path = Path("deploy_config.toml")
+    if not config_path.exists():
+        print(
+            f"error: deploy_config.toml not found at {config_path.resolve()}. "
+            f"Copy deploy_config.toml.example and configure it.",
+            file=sys.stderr,
+        )
+        return None
+
+    try:
+        with config_path.open("r", encoding="utf-8") as f:
+            return toml.load(f)
+    except Exception as e:
+        print(f"error: failed to parse {config_path}: {e}", file=sys.stderr)
+        return None
+
+
+def _resolve_project_id() -> Optional[str]:
+    """Find the GCP project ID for the secrets sync.
+
+    Order of precedence:
+
+    1. ``GCP_PROJECT_ID`` env var (matches the bash script).
+    2. ``[manager].gcp_project_id`` from ``deploy_config.toml``.
+
+    Returns None and prints an error if neither is set. We do NOT
+    silently fall back to ``"your-gcp-project-id"`` (the example value);
+    that's exactly the kind of silent failure the project's
+    no-blind-fallbacks rule forbids.
+    """
+    env_value = os.getenv("GCP_PROJECT_ID")
+    if env_value:
+        return env_value
+
+    config = _load_deploy_config_for_secrets()
+    if config is None:
+        return None
+    manager_section = config.get("manager", {}) or {}
+    config_value = manager_section.get("gcp_project_id")
+    if config_value and config_value != "your-gcp-project-id":
+        return config_value
+
+    print(
+        "error: GCP project ID not set. Either export GCP_PROJECT_ID or "
+        "set [manager].gcp_project_id in deploy_config.toml.",
+        file=sys.stderr,
+    )
+    return None
+
+
+def _cmd_deploy_secrets(args) -> int:
+    """``kestrel deploy secrets <subverb>`` dispatcher.
+
+    Currently only ``sync`` is implemented — future verbs (``list``,
+    ``rotate``) would land here. The subverb is in ``args.profile``
+    because the existing CLI shape uses ``profile`` as the second
+    positional slot regardless of what the first slot means.
+    """
+    subverb = args.profile  # second positional = secrets subverb
+
+    if subverb is None:
+        print(
+            "Usage: kestrel deploy secrets sync [--profile NAME] "
+            "[--env-file PATH] [--dry-run] [--json]",
+            file=sys.stderr,
+        )
+        return 1
+
+    if subverb != "sync":
+        print(
+            f"error: unknown secrets subverb '{subverb}'. "
+            f"Available: sync.",
+            file=sys.stderr,
+        )
+        return 1
+
+    return _cmd_deploy_secrets_sync(args)
+
+
+def _cmd_deploy_secrets_sync(args) -> int:
+    """Run the actual sync — port of scripts/cloudrun/setup_secrets.sh.
+
+    Always prints a per-secret result line and a summary footer so the
+    operator can see exactly what happened. Exit code is 0 unless any
+    result has ``action == "error"``.
+    """
+    # Lazy import keeps test_cli_deploy.py's existing tests independent
+    # of the secrets module surface.
+    from kestrel_sovereign.features.deploy.secrets import (
+        ACTION_CREATED,
+        ACTION_DRY_RUN_CREATE,
+        ACTION_DRY_RUN_UPDATE,
+        ACTION_ERROR,
+        ACTION_SKIPPED,
+        ACTION_UPDATED,
+        sync_all_secrets,
+    )
+
+    config = _load_deploy_config_for_secrets()
+    if config is None:
+        return 1
+
+    project_id = _resolve_project_id()
+    if project_id is None:
+        return 1
+
+    env_path = Path(args.env_file) if args.env_file else Path(".env")
+
+    # ``--profile`` (dest=secrets_profile) is the secrets-namespace flag —
+    # the second positional ``profile`` is the subverb name (``sync``).
+    profile = args.secrets_profile
+
+    try:
+        results = sync_all_secrets(
+            config,
+            env_path,
+            project_id,
+            profile=profile,
+            dry_run=args.dry_run,
+        )
+    except FileNotFoundError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    except KeyError as e:
+        # derive_secret_mapping raises KeyError for unknown profile name.
+        print(f"error: {e.args[0] if e.args else e}", file=sys.stderr)
+        return 1
+    except ValueError as e:
+        # Conflicting secret name across profiles.
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    except Exception as e:  # noqa: BLE001
+        # SDK construction failure (e.g. no ADC creds) shows up here. We
+        # surface the message rather than a traceback because operators
+        # care about "fix your auth" not "look at line 412".
+        print(f"error: secrets sync failed: {e}", file=sys.stderr)
+        return 1
+
+    if args.json:
+        # Render dataclasses as plain dicts for stable JSON.
+        payload = {
+            "success": all(r.action != ACTION_ERROR for r in results),
+            "project_id": project_id,
+            "profile": profile,
+            "dry_run": args.dry_run,
+            "results": [
+                {
+                    "secret_name": r.secret_name,
+                    "env_var": r.env_var,
+                    "action": r.action,
+                    "detail": r.detail,
+                }
+                for r in results
+            ],
+        }
+        print(json.dumps(payload, indent=2))
+        return 0 if payload["success"] else 1
+
+    # Pretty output.
+    if not results:
+        print(
+            "no Secret Manager refs found in deploy_config "
+            f"(profile={profile or 'all'}); nothing to sync."
+        )
+        return 0
+
+    for r in results:
+        print(_render_secret_result(r))
+
+    counts = {
+        ACTION_CREATED: 0,
+        ACTION_UPDATED: 0,
+        ACTION_SKIPPED: 0,
+        ACTION_ERROR: 0,
+        ACTION_DRY_RUN_CREATE: 0,
+        ACTION_DRY_RUN_UPDATE: 0,
+    }
+    for r in results:
+        counts[r.action] = counts.get(r.action, 0) + 1
+
+    summary_parts = []
+    if counts[ACTION_CREATED]:
+        summary_parts.append(f"{counts[ACTION_CREATED]} created")
+    if counts[ACTION_UPDATED]:
+        summary_parts.append(f"{counts[ACTION_UPDATED]} updated")
+    if counts[ACTION_DRY_RUN_CREATE]:
+        summary_parts.append(f"{counts[ACTION_DRY_RUN_CREATE]} would-create")
+    if counts[ACTION_DRY_RUN_UPDATE]:
+        summary_parts.append(f"{counts[ACTION_DRY_RUN_UPDATE]} would-update")
+    summary_parts.append(f"{counts[ACTION_SKIPPED]} skipped")
+    summary_parts.append(f"{counts[ACTION_ERROR]} errors")
+    print(", ".join(summary_parts))
+
+    return 0 if counts[ACTION_ERROR] == 0 else 1
+
+
+# ---------------------------------------------------------------------------
 # Top-level dispatcher
 # ---------------------------------------------------------------------------
 
@@ -360,9 +631,9 @@ def cmd_deploy(args) -> int:
     """Top-level dispatcher for ``kestrel deploy ...``.
 
     Disambiguates positional ``target``: if it matches a known subcommand
-    keyword (``status``, ``teardown``, ``logs``, ``list``, ``health``)
-    we route to that handler; otherwise we treat it as a profile name
-    to deploy.
+    keyword (``status``, ``teardown``, ``logs``, ``list``, ``health``,
+    ``secrets``) we route to that handler; otherwise we treat it as a
+    profile name to deploy.
     """
     target = args.target
 
@@ -373,7 +644,8 @@ def cmd_deploy(args) -> int:
             "       kestrel deploy teardown <profile>\n"
             "       kestrel deploy logs <profile> [--lines N]\n"
             "       kestrel deploy list\n"
-            "       kestrel deploy health <profile>",
+            "       kestrel deploy health <profile>\n"
+            "       kestrel deploy secrets sync [--profile NAME] [--env-file PATH] [--dry-run]",
             file=sys.stderr,
         )
         return 1
@@ -388,6 +660,8 @@ def cmd_deploy(args) -> int:
         return _cmd_deploy_list(args)
     if target == "health":
         return _cmd_deploy_health(args)
+    if target == "secrets":
+        return _cmd_deploy_secrets(args)
 
     # Anything else: treat as a profile name to deploy.
     return _cmd_deploy_profile(args, target)
