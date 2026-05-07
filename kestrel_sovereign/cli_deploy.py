@@ -827,8 +827,19 @@ def _cmd_deploy_build(args) -> int:
     # operator deploys to). Codex review on PR #1060 caught the
     # cross-purpose reuse.
     env_project = os.getenv("GCP_PROJECT_ID")
-    if env_project:
+    if env_project and _is_real_project_id(env_project):
         project_id: Optional[str] = env_project
+    elif env_project:
+        # Env var set to the example placeholder — a misconfiguration
+        # the operator probably wants surfaced before docker runs and
+        # tries to push to ``gcr.io/your-gcp-project-id/...``. Codex
+        # review on PR #1060.
+        print(
+            f"error: GCP_PROJECT_ID is set to the example placeholder "
+            f"'{env_project}'. Set it to your real GCP project ID.",
+            file=sys.stderr,
+        )
+        return 1
     else:
         config = _load_deploy_config_for_secrets()
         if config is None:

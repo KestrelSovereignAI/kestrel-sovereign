@@ -302,14 +302,19 @@ def _build_plain_command(
     project_id: str,
     tag: str,
     project_root: Path,
+    has_github_token: bool = False,
 ) -> List[str]:
     """Construct the legacy single-arch ``docker build`` argv used when
     ``multi_arch=False`` — mirrors ``scripts/cloudrun/build_multi_agent.sh``.
 
-    No ``--secret`` flag here: classic ``docker build`` (without
-    BuildKit explicitly enabled) doesn't support BuildKit secrets the
-    same way, and operators using this fallback path have already
-    accepted the reduced functionality.
+    The cloudrun + multi_agent Dockerfiles already use BuildKit's
+    ``RUN --mount=type=secret,id=github_token`` to install private
+    deps. If the operator has a GITHUB_TOKEN, pass ``--secret`` here
+    too — modern ``docker build`` enables BuildKit by default and
+    accepts the same flag (we also set ``DOCKER_BUILDKIT=1`` in the
+    subprocess env at the call site for older docker installs). Codex
+    review on PR #1060: dropping the secret here silently broke
+    Dockerfiles that depend on it.
     """
     dockerfile_path = project_root / target.dockerfile
     image_base = f"gcr.io/{project_id}/{target.image_name}"
@@ -317,8 +322,10 @@ def _build_plain_command(
     cmd: List[str] = [
         "docker", "build",
         "-f", str(dockerfile_path),
-        "-t", f"{image_base}:{tag}",
     ]
+    if has_github_token:
+        cmd.extend(["--secret", "id=github_token,env=GITHUB_TOKEN"])
+    cmd.extend(["-t", f"{image_base}:{tag}"])
     if tag != "latest":
         cmd.extend(["-t", f"{image_base}:latest"])
     cmd.append(str(project_root))
@@ -447,12 +454,22 @@ def build_target(
             stderr = getattr(completed, "stderr", "") or ""
             raise BuildError(refs[0], cmd, stderr=stderr)
     else:
-        # Plain ``docker build`` — single-arch local build.
+        # Plain ``docker build`` — single-arch local build. Pass the
+        # GitHub token along: modern ``docker build`` honors BuildKit
+        # secrets, and DOCKER_BUILDKIT=1 forces older installs onto
+        # the BuildKit path so ``RUN --mount=type=secret,id=github_token``
+        # in Dockerfile.cloudrun / Dockerfile.multi_agent can read it.
+        # Codex review on PR #1060: dropping the secret in fallback
+        # mode silently broke private-dep installs.
+        if env is None:
+            env = os.environ.copy()
+        env.setdefault("DOCKER_BUILDKIT", "1")
         cmd = _build_plain_command(
             target,
             project_id=project_id,
             tag=tag,
             project_root=project_root,
+            has_github_token=has_token,
         )
         completed = runner(cmd, env=env)
         rc = getattr(completed, "returncode", 0)

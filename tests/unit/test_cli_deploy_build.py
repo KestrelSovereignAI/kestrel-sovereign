@@ -261,6 +261,24 @@ def test_cmd_deploy_build_target_filter_unknown_errors(fake_project_root, monkey
     assert "kestrel-multi_agent" in captured.err
 
 
+def test_cmd_deploy_build_rejects_env_placeholder_project_id(
+    fake_project_root, monkeypatch, capsys
+):
+    """Codex review on PR #1060: ``GCP_PROJECT_ID=your-gcp-project-id``
+    (the example placeholder) must be rejected the same way the config
+    fallback rejects it — silently building gcr.io/your-gcp-project-id/
+    is a misconfiguration the operator wants surfaced before docker
+    runs."""
+    monkeypatch.setenv("GCP_PROJECT_ID", "your-gcp-project-id")
+
+    rc = cmd_deploy(_make_args(target="build"))
+
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "placeholder" in captured.err
+    assert "your-gcp-project-id" in captured.err
+
+
 def test_cmd_deploy_build_unaffected_by_profile_project_disagreement(
     fake_project_root, monkeypatch
 ):

@@ -314,6 +314,38 @@ def test_build_target_no_multi_arch_legacy_flow(kestrel_target, tmp_path):
     assert result.pushed is True
 
 
+def test_build_target_no_multi_arch_with_token_passes_secret(kestrel_target, tmp_path):
+    """Codex review on PR #1060: plain (``--no-multi-arch``) builds
+    with a resolved GITHUB_TOKEN must still pass ``--secret`` to
+    docker — the cloudrun + multi_agent Dockerfiles use BuildKit
+    secrets and would otherwise see an empty token. ``DOCKER_BUILDKIT=1``
+    is also set in the subprocess env so older docker installs use
+    BuildKit.
+    """
+    runner = MagicMock(return_value=MagicMock(returncode=0, stderr=""))
+
+    build_target(
+        kestrel_target,
+        project_id="test-project",
+        tag="latest",
+        push=False,
+        multi_arch=False,
+        github_token="token-from-test",
+        project_root=tmp_path,
+        runner=runner,
+    )
+
+    cmd = runner.call_args.args[0]
+    assert cmd[0:2] == ["docker", "build"]
+    assert "--secret" in cmd
+    secret_idx = cmd.index("--secret")
+    assert cmd[secret_idx + 1] == "id=github_token,env=GITHUB_TOKEN"
+    # GITHUB_TOKEN must be in the subprocess env.
+    env = runner.call_args.kwargs.get("env") or {}
+    assert env.get("GITHUB_TOKEN") == "token-from-test"
+    assert env.get("DOCKER_BUILDKIT") == "1"
+
+
 def test_build_target_no_multi_arch_no_push(kestrel_target, tmp_path):
     """Plain mode + --no-push: only the build call, no push calls."""
     runner = MagicMock(return_value=MagicMock(returncode=0, stderr=""))
