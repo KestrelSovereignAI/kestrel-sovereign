@@ -347,6 +347,26 @@ def add_agent_docker_subcommand(
              "for scripted retirement flows",
     )
 
+    # ``kestrel agent docker build [--no-cache]`` — explicit rebuild
+    # path. Codex review on PR #1071 caught that the helper had a
+    # ``force_rebuild`` branch but no argparse path could reach it, so
+    # operators with stale images had no way to force a refresh after
+    # Dockerfile or code changes short of running ``docker rmi`` first.
+    build_p = docker_sub.add_parser(
+        "build",
+        help="Build the kestrel-sovereign Docker image (run this after "
+             "Dockerfile.sovereign or kestrel_sovereign/ changes; "
+             "create/chat/retire skip the build when the image already "
+             "exists).",
+    )
+    build_p.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Pass ``--no-cache`` to ``docker build`` so layers are "
+             "rebuilt from scratch — slower, but the right escape hatch "
+             "if a base-image refresh is needed.",
+    )
+
 
 # ---------------------------------------------------------------------------
 # Top-level handler
@@ -375,20 +395,36 @@ def cmd_agent(args) -> int:
         return _cmd_chat(args)
     if docker_sub == "retire":
         return _cmd_retire(args)
+    if docker_sub == "build":
+        return _cmd_build(args)
 
     print(
         "Usage:\n"
         "  kestrel agent docker create <name> <data_dir>\n"
         "  kestrel agent docker chat   <data_dir>\n"
         "  kestrel agent docker retire <data_dir> [--yes]\n"
+        "  kestrel agent docker build  [--no-cache]\n"
         "\n"
         "Examples:\n"
         "  KESTREL_DATA_KEY=... kestrel agent docker create Emma ~/emma_data\n"
         "  KESTREL_DATA_KEY=... kestrel agent docker chat ~/emma_data\n"
-        "  KESTREL_DATA_KEY=... kestrel agent docker retire ~/test_agent",
+        "  KESTREL_DATA_KEY=... kestrel agent docker retire ~/test_agent\n"
+        "  kestrel agent docker build --no-cache",
         file=sys.stderr,
     )
     return 1
+
+
+def _cmd_build(args) -> int:
+    """``kestrel agent docker build [--no-cache]`` — explicit rebuild
+    path. The bash predecessor's image lifecycle was implicit
+    (``docker image inspect`` → build if missing); this gives operators
+    a way to force a rebuild after Dockerfile or kestrel_sovereign/
+    changes without remembering the underlying ``docker build`` argv.
+    Codex review on PR #1071 caught the missing surface.
+    """
+    repo = _repo_root()
+    return _ensure_image(repo, force_rebuild=bool(getattr(args, "no_cache", False)))
 
 
 __all__ = [

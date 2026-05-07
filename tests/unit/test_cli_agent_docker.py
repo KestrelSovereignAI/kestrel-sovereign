@@ -361,6 +361,33 @@ def test_ensure_image_builds_when_missing(monkeypatch):
     assert "docker/Dockerfile.sovereign" in " ".join(calls[1])
 
 
+def test_kestrel_agent_docker_build_subverb_force_rebuilds(monkeypatch):
+    """Codex review on PR #1071: ``kestrel agent docker build [--no-cache]``
+    must reach ``_ensure_image(force_rebuild=True)``. Without this
+    surface, operators with stale images had no way to refresh after
+    Dockerfile / kestrel_sovereign/ changes short of running
+    ``docker rmi`` first.
+    """
+    captured: list = []
+
+    def fake_ensure(repo, *, force_rebuild=False):
+        captured.append({"repo": repo, "force_rebuild": force_rebuild})
+        return 0
+
+    monkeypatch.setattr(cli_agent_docker, "_ensure_image", fake_ensure)
+    monkeypatch.setenv("KESTREL_DATA_KEY", "test-key")
+
+    import argparse
+    args = argparse.Namespace(
+        agent_command="docker",
+        agent_docker_command="build",
+        no_cache=True,
+    )
+    rc = cli_agent_docker.cmd_agent(args)
+    assert rc == 0
+    assert captured == [{"repo": cli_agent_docker._repo_root(), "force_rebuild": True}]
+
+
 def test_ensure_image_returns_build_failure(monkeypatch):
     def fake_run(cmd, *, cwd=None, env=None, check=False):
         if "inspect" in cmd:
