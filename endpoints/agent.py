@@ -178,6 +178,7 @@ async def stream_agent_response(request: Request):
                     session_id=effective_session_id,
                     audit_before_streaming=audit_before_streaming,
                     caller=caller,
+                    request_id=request_id,
                 ):
                     # Check if request was cancelled
                     if agent.is_request_cancelled(request_id):

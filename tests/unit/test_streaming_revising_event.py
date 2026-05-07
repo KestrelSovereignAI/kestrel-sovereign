@@ -237,6 +237,99 @@ async def test_emit_event_failure_does_not_break_stream():
 
 
 @pytest.mark.asyncio
+async def test_explicit_request_id_overrides_agent_global():
+    """When the endpoint passes ``request_id`` to ``process_input_streaming``,
+    the emitted revising event carries that id — NOT the legacy
+    ``self._current_request_id`` global.
+
+    This prevents the race where stream B's ``register_active_request``
+    overwrites ``_current_request_id`` between stream A's start and
+    stream A's first ToolCallStarted marker. Without the explicit
+    plumb-through, A's revising event would carry B's request id and
+    the frontend would clear the wrong pane's bubble.
+    """
+    from kestrel_sovereign.llm.adapter import LLMResponse, ToolCall
+
+    agent = _build_mock_agent()
+    agent.emit_event = AsyncMock()
+
+    # Simulate the race: agent-global was set by stream A, then stream B
+    # came in and overwrote it before stream A reached its marker.
+    agent._current_request_id = "req-from-stream-B"
+
+    async def stream():
+        yield "stream A pre-tool. "
+        yield ToolCallStarted(index=0, id="tcA", name="search")
+        yield LLMResponse(
+            content="",
+            tool_calls=[ToolCall(id="tcA", name="search", arguments={})],
+        )
+
+    agent.llm_service = MagicMock()
+    agent.llm_service.stream_with_tool_detection = lambda **kw: stream()
+
+    async def post_tool(**kw):
+        yield "done."
+
+    agent._handle_orchestrator_response_streaming = post_tool
+
+    # Call with the explicit request_id for stream A.
+    async for _ in agent.process_input_streaming(
+        "go", session_id="s", request_id="req-from-stream-A",
+    ):
+        pass
+
+    revising_calls = [
+        call for call in agent.emit_event.call_args_list
+        if call.args and call.args[0] == "revising"
+    ]
+    assert len(revising_calls) == 1
+    payload = revising_calls[0].args[1]
+    # Must carry stream A's id even though the agent-global says B.
+    assert payload["request_id"] == "req-from-stream-A", (
+        "explicit request_id must override the racy _current_request_id global"
+    )
+
+
+@pytest.mark.asyncio
+async def test_request_id_falls_back_to_global_when_not_passed():
+    """Backwards-compat: pre-Wave-5B callers that don't pass request_id
+    still get the legacy ``_current_request_id`` value. Single-stream
+    deployments work unchanged.
+    """
+    from kestrel_sovereign.llm.adapter import LLMResponse, ToolCall
+
+    agent = _build_mock_agent()
+    agent.emit_event = AsyncMock()
+    agent._current_request_id = "legacy-rid"
+
+    async def stream():
+        yield ToolCallStarted(index=0, id="tc1", name="t")
+        yield LLMResponse(
+            content="",
+            tool_calls=[ToolCall(id="tc1", name="t", arguments={})],
+        )
+
+    agent.llm_service = MagicMock()
+    agent.llm_service.stream_with_tool_detection = lambda **kw: stream()
+
+    async def post_tool(**kw):
+        yield "x"
+
+    agent._handle_orchestrator_response_streaming = post_tool
+
+    # No request_id passed — legacy call shape.
+    async for _ in agent.process_input_streaming("go", session_id="s"):
+        pass
+
+    revising_calls = [
+        call for call in agent.emit_event.call_args_list
+        if call.args and call.args[0] == "revising"
+    ]
+    assert revising_calls[0].args[1]["request_id"] == "legacy-rid"
+
+
+@pytest.mark.asyncio
 async def test_agent_without_emit_event_is_safe():
     """If the host class doesn't expose ``emit_event`` at all, the
     wrapper short-circuits silently and the stream completes normally.
