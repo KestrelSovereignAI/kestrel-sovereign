@@ -312,12 +312,6 @@ The eight in-tree adapters live at [`kestrel_sovereign/llm/`][in-tree-llm]. Read
 
 ---
 
-## Cookiecutter template (Wave 4C-3)
-
-A `kestrel-provider-template` cookiecutter that generates the three-file scaffold described above is being prepared. Until it lands, copy the minimum-viable plugin from the section above and adapt.
-
----
-
 ## Version pins
 
 | SDK version | Adds |
