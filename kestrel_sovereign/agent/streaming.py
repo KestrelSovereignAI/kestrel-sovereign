@@ -5,6 +5,7 @@ import time
 from typing import Dict, Any, Optional
 
 from kestrel_sdk.hooks.base import HookEvent, HookInput, PermissionDecision
+from kestrel_sdk.llm import ToolCallStarted
 from kestrel_sovereign.llm.adapter import LLMResponse
 from kestrel_sovereign.security.input_guardrails import (
     wrap_user_input,
@@ -229,6 +230,15 @@ class StreamingMixin:
                 # Text chunk - yield immediately for real-time streaming
                 full_response.append(item)
                 yield item
+            elif isinstance(item, ToolCallStarted):
+                # Honesty-layer signal (#1042 layer 2 / #1045): the LLM
+                # has just begun emitting a tool call. Any pre-tool prose
+                # the user is currently watching is about to be obsolete
+                # — the agent will substitute the tool's actual result.
+                # Fire a "revising" SSE event so subscribers can clear
+                # the in-flight bubble; carries the request_id for pane
+                # routing and the marker's `index` for ordering.
+                await self._emit_revising_event(item, session_id=session_id)
             elif isinstance(item, LLMResponse):
                 # Tool calls detected at end of stream
                 tool_response = item
@@ -304,6 +314,43 @@ class StreamingMixin:
             )
             await hooks_manager.execute_hooks_parallel(
                 HookEvent.STOP, hook_input
+            )
+
+    async def _emit_revising_event(
+        self,
+        marker: ToolCallStarted,
+        session_id: Optional[str] = None,
+    ) -> None:
+        """Emit a ``revising`` event when a ToolCallStarted marker arrives.
+
+        Routed through ``self.emit_event`` so the existing
+        ``/api/agent/notifications/sse`` channel forwards it to the
+        browser as ``event: revising / data: {...}``. Frontend (Wave 5C)
+        listens on that channel and clears the in-flight optimistic
+        message bubble for the matching ``request_id``.
+
+        Failures here must never break the chat stream — the user is
+        already receiving text through the parallel channel. ``emit_event``
+        itself swallows per-listener errors; this wrapper additionally
+        guards the case where the host class doesn't expose ``emit_event``
+        at all (e.g. tests mocking a bare agent).
+        """
+        emit_event = getattr(self, "emit_event", None)
+        if not callable(emit_event):
+            return
+        try:
+            await emit_event("revising", {
+                "type": "revising",
+                "request_id": getattr(self, "_current_request_id", None),
+                "session_id": session_id,
+                "index": marker.index,
+                "tool_call_id": marker.id,
+                "tool_name": marker.name,
+            })
+        except Exception:
+            logging.warning(
+                "Failed to emit revising event for index=%s",
+                getattr(marker, "index", None), exc_info=True,
             )
 
     async def _persist_assistant_turn_safely(
