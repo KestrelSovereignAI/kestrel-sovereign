@@ -53,16 +53,15 @@ def _make_args(**overrides):
 
 @pytest.fixture
 def fake_project_root(tmp_path, monkeypatch):
-    """Make ``_get_project_dir()`` resolve to ``tmp_path`` so the tests
-    can plant ``deploy_config.toml`` / ``.env`` somewhere harmless.
+    """``chdir`` into ``tmp_path`` so the tests can plant
+    ``deploy_config.toml`` / ``.env`` somewhere harmless.
 
-    The CLI helper resolves these files relative to the project root
-    (cli._get_project_dir) — caller-CWD lookup was the regression codex
-    flagged on PR #1057. Tests must mirror that resolution path.
+    The CLI helper resolves these files relative to the operator's CWD
+    (matching ``kestrel_sovereign.config.load_config`` and the agent
+    ``!deploy`` path). Codex rounds 3 and 9 stress-tested both
+    directions of this — the final convention is plain CWD.
     """
-    monkeypatch.setattr(
-        "kestrel_sovereign.cli._get_project_dir", lambda: tmp_path
-    )
+    monkeypatch.chdir(tmp_path)
     return tmp_path
 
 

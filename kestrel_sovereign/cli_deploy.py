@@ -149,7 +149,7 @@ def add_deploy_subcommands(subparsers: "argparse._SubParsersAction") -> None:
         default=None,
         help=(
             "[secrets sync] Path to the .env file with secret values "
-            "(default: <project_root>/.env)."
+            "(default: ./.env, relative to the directory you ran kestrel from)."
         ),
     )
     deploy_p.add_argument(
@@ -427,20 +427,20 @@ def _load_deploy_config_for_secrets() -> Optional[Dict[str, Any]]:
     """
     import toml
 
-    # Resolve relative to the project root, not the caller's CWD — the
-    # bash script we're porting (``setup_secrets.sh``) explicitly ``cd``s
-    # to the project root before reading these files, and the help text
-    # promises the same. Without this, ``kestrel deploy secrets sync``
-    # invoked from a subdirectory of the repo (or from anywhere when
-    # installed as a global CLI) fails with "deploy_config.toml not
-    # found" even though the project has it.
-    from kestrel_sovereign.cli import _get_project_dir
-
-    config_path = _get_project_dir() / "deploy_config.toml"
+    # Resolve from the operator's CWD — same semantics as
+    # ``kestrel_sovereign.config.load_config``, which is what the agent
+    # ``!deploy`` tool already uses. An installed/global ``kestrel`` CLI
+    # invoked from the operator's project directory works; running from
+    # an unrelated CWD errors clearly. Codex round 3 flagged the
+    # in-repo-subdirectory case; round 9 flagged that resolving to
+    # ``_get_project_dir()`` broke the installed-CLI case. CWD matches
+    # the existing convention and works for both via the same rule.
+    config_path = Path("deploy_config.toml")
     if not config_path.exists():
         print(
-            f"error: deploy_config.toml not found at {config_path}. "
-            f"Copy deploy_config.toml.example and configure it.",
+            f"error: deploy_config.toml not found at {config_path.resolve()}. "
+            f"Run from the project directory containing deploy_config.toml, "
+            f"or copy deploy_config.toml.example and configure it.",
             file=sys.stderr,
         )
         return None
@@ -638,15 +638,11 @@ def _cmd_deploy_secrets_sync(args) -> int:
     if project_id is None:
         return 1
 
-    # Default ``.env`` resolves to ``<project_root>/.env`` (matches the
-    # bash script's behavior + the documented default). An explicit
-    # ``--env-file`` value is used as-given (relative paths to caller CWD).
-    if args.env_file:
-        env_path = Path(args.env_file)
-    else:
-        from kestrel_sovereign.cli import _get_project_dir
-
-        env_path = _get_project_dir() / ".env"
+    # Default ``.env`` resolves to CWD (same convention as
+    # ``deploy_config.toml`` above — see _load_deploy_config_for_secrets
+    # for the rationale). An explicit ``--env-file`` value is used as-
+    # given (caller-CWD relative).
+    env_path = Path(args.env_file) if args.env_file else Path(".env")
 
     try:
         results = sync_all_secrets(
