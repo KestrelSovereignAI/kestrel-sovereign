@@ -161,12 +161,15 @@ def load_config(path: Path, overrides: argparse.Namespace) -> DaemonConfig:
     else:
         example = path.with_name(path.stem + ".example" + path.suffix)
         if path == DEFAULT_CONFIG and example.exists():
-            logger.error(
-                "Config file not found: %s. Bootstrap with: cp %s %s && $EDITOR %s",
-                path, example, path, path,
+            # Default config is gitignored, so a fresh checkout has only the
+            # tracked .example file. Fail fast with a non-zero exit so any
+            # supervising process (workload_manager.py, launchd) doesn't enter
+            # a tight restart loop on an empty config.
+            raise SystemExit(
+                f"FATAL: {path} not found.\n"
+                f"Bootstrap with: cp {example} {path} && $EDITOR {path}"
             )
-        else:
-            logger.warning(f"Config file not found: {path}, using defaults")
+        logger.warning(f"Config file not found: {path}, using defaults")
 
     # CLI overrides
     if overrides.backend:
