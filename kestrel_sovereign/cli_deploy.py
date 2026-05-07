@@ -42,6 +42,12 @@ Subcommands
     ``scripts/cloudrun/setup_secrets.sh`` for Windows-friendly operators.
     See ``kestrel deploy secrets sync --help``.
 
+``kestrel deploy build``
+    Build (and push) the cloudrun docker images. Replaces
+    ``scripts/cloudrun/build.sh`` (multi-arch buildx) and
+    ``scripts/cloudrun/build_multi_agent.sh`` (single-arch fallback).
+    See ``kestrel deploy build --help``.
+
 Each subcommand returns process exit code 0 if the operation reports
 ``success=True``, 1 otherwise. Initialization failures (e.g. no
 ``GCP_PROJECT_ID``) print a friendly error and return 1; we do not
@@ -93,7 +99,7 @@ def add_deploy_subcommands(subparsers: "argparse._SubParsersAction") -> None:
         default=None,
         help=(
             "Profile name (deploys it) OR one of: status, teardown, logs, "
-            "list, health, secrets"
+            "list, health, secrets, build"
         ),
     )
     deploy_p.add_argument(
@@ -104,7 +110,8 @@ def add_deploy_subcommands(subparsers: "argparse._SubParsersAction") -> None:
             "Profile name when ``target`` is a subcommand "
             "(e.g. ``kestrel deploy teardown dev``); subverb when "
             "``target`` is ``secrets`` (currently only ``sync``). "
-            "Ignored when ``target`` is itself a profile name."
+            "Ignored when ``target`` is itself a profile name or "
+            "``build``."
         ),
     )
     deploy_p.add_argument(
@@ -163,6 +170,53 @@ def add_deploy_subcommands(subparsers: "argparse._SubParsersAction") -> None:
         ),
     )
 
+    # ---- ``kestrel deploy build`` flags ---------------------------------
+    # These flags share the same parser (rather than nested subparsers)
+    # for the same ergonomic reason as the secrets flags above. They
+    # are inert when ``target`` isn't ``build``.
+    deploy_p.add_argument(
+        "--target",
+        dest="build_target",
+        type=str,
+        default=None,
+        help=(
+            "[build] Build only one image by name "
+            "(e.g. ``kestrel`` or ``kestrel-multi_agent``). Default: "
+            "build all DEFAULT_TARGETS."
+        ),
+    )
+    deploy_p.add_argument(
+        "--no-push",
+        dest="no_push",
+        action="store_true",
+        help=(
+            "[build] Skip the docker push step — produces local-only "
+            "images. Default: push to gcr.io after building."
+        ),
+    )
+    deploy_p.add_argument(
+        "--no-multi-arch",
+        dest="no_multi_arch",
+        action="store_true",
+        help=(
+            "[build] Use plain ``docker build`` instead of "
+            "``docker buildx build`` (single-arch local). Mirrors the "
+            "legacy ``build_multi_agent.sh`` flow for operators who "
+            "can't run buildx."
+        ),
+    )
+    deploy_p.add_argument(
+        "--platforms",
+        dest="build_platforms",
+        type=str,
+        default=None,
+        help=(
+            "[build] Comma-separated buildx platforms (e.g. "
+            "``linux/amd64,linux/arm64``). Default: "
+            "``linux/amd64,linux/arm64`` matching scripts/cloudrun/build.sh."
+        ),
+    )
+
 
 # ---------------------------------------------------------------------------
 # Pretty printers
@@ -170,7 +224,7 @@ def add_deploy_subcommands(subparsers: "argparse._SubParsersAction") -> None:
 
 # Subcommand keywords. Anything else in the ``target`` slot is treated as
 # a profile name and triggers a deploy.
-_SUBCOMMANDS = {"status", "teardown", "logs", "list", "health", "secrets"}
+_SUBCOMMANDS = {"status", "teardown", "logs", "list", "health", "secrets", "build"}
 
 
 def _print_kv(result: Dict[str, Any], skip: Optional[set] = None) -> None:
@@ -729,6 +783,201 @@ def _cmd_deploy_secrets_sync(args) -> int:
 
 
 # ---------------------------------------------------------------------------
+# ``kestrel deploy build`` — port of scripts/cloudrun/build.sh
+# ---------------------------------------------------------------------------
+
+def _cmd_deploy_build(args) -> int:
+    """Run the cloudrun image build — port of ``scripts/cloudrun/build.sh``.
+
+    Builds (and, by default, pushes) the canonical
+    :data:`DEFAULT_TARGETS`. ``--target NAME`` narrows to one image;
+    ``--no-push`` keeps the build local; ``--no-multi-arch`` falls back
+    to plain ``docker build`` (mirroring ``build_multi_agent.sh``);
+    ``--platforms`` overrides the buildx platform list.
+
+    Project-ID resolution reuses ``_resolve_project_id`` (CWD
+    ``deploy_config.toml`` → ``[manager].gcp_project_id``); the build
+    isn't profile-scoped, so we call with ``profile=None``. A missing
+    or placeholder project ID prints a friendly error and returns 1.
+
+    GitHub token resolution: env first, then ``gh auth token``. Missing
+    token is a warning, not an error — Dockerfiles without private
+    repo deps build fine without it.
+    """
+    # Lazy import — keeps existing test_cli_deploy.py tests independent
+    # of the build module surface (same idiom as secrets sync above).
+    from kestrel_sovereign.features.deploy.build import (
+        DEFAULT_TARGETS,
+        BuildError,
+        build_all,
+        resolve_github_token,
+    )
+
+    # Project ID: env wins outright (matches build.sh exactly — the
+    # bash script uses ``${GCP_PROJECT_ID:?...}``, never reads any
+    # config). Fall back to deploy_config.toml so operators don't have
+    # to export the var if it's already in their config. The build is
+    # project-wide so we always pass profile=None.
+    env_project = os.getenv("GCP_PROJECT_ID")
+    if env_project:
+        project_id: Optional[str] = env_project
+    else:
+        # No env var — try deploy_config.toml. If config is missing and
+        # the operator hasn't exported the var, that's a hard error
+        # (matches the bash script's ``${GCP_PROJECT_ID:?Set GCP_PROJECT_ID env var}``
+        # but with the friendly Python config-driven fallback).
+        config = _load_deploy_config_for_secrets()
+        if config is None:
+            # _load_deploy_config_for_secrets already printed the error.
+            return 1
+        project_id = _resolve_project_id(config=config, profile=None)
+        if project_id is None:
+            return 1
+
+    # Filter targets by --target name if given.
+    targets = list(DEFAULT_TARGETS)
+    if args.build_target:
+        matching = [t for t in targets if t.image_name == args.build_target]
+        if not matching:
+            available = ", ".join(t.image_name for t in DEFAULT_TARGETS)
+            print(
+                f"error: unknown build target '{args.build_target}'. "
+                f"Available: {available}.",
+                file=sys.stderr,
+            )
+            return 1
+        targets = matching
+
+    # Platforms: comma-split if provided, else use the function default.
+    if args.build_platforms:
+        platforms = tuple(
+            p.strip() for p in args.build_platforms.split(",") if p.strip()
+        )
+        if not platforms:
+            print(
+                "error: --platforms must be a non-empty comma-separated list "
+                "(e.g. linux/amd64,linux/arm64).",
+                file=sys.stderr,
+            )
+            return 1
+    else:
+        platforms = ("linux/amd64", "linux/arm64")
+
+    push = not args.no_push
+    multi_arch = not args.no_multi_arch
+    tag = args.tag
+
+    github_token = resolve_github_token()
+    if github_token is None:
+        # Match the bash script wording verbatim — operators who recognize
+        # this from setup_secrets.sh / build.sh shouldn't have to wonder
+        # if it means something different here.
+        print(
+            "WARNING: No GITHUB_TOKEN found. Build may fail if private "
+            "repos are dependencies.",
+            file=sys.stderr,
+        )
+
+    # Pre-build banner so the operator sees what's about to happen
+    # before docker buildx prints its own (long) progress lines.
+    if not args.json:
+        for tgt in targets:
+            ref_base = f"gcr.io/{project_id}/{tgt.image_name}"
+            tags = f"{{{tag},latest}}" if tag != "latest" else "{latest}"
+            print(
+                f"building {tgt.image_name}: {tgt.dockerfile} -> {ref_base}:{tags}"
+            )
+
+    try:
+        results = build_all(
+            project_id=project_id,
+            tag=tag,
+            targets=targets,
+            platforms=platforms,
+            push=push,
+            multi_arch=multi_arch,
+            github_token=github_token,
+        )
+    except BuildError as e:
+        # ``build_all`` attaches partial successes; render them so the
+        # operator sees what got built before the failure.
+        if args.json:
+            payload = {
+                "success": False,
+                "project_id": project_id,
+                "tag": tag,
+                "error": {
+                    "image_ref": e.image_ref,
+                    "command": e.command,
+                    "stderr": e.stderr,
+                },
+                "results": [
+                    {
+                        "image_name": r.target.image_name,
+                        "image_refs": r.image_refs,
+                        "pushed": r.pushed,
+                        "duration_seconds": r.duration_seconds,
+                    }
+                    for r in e.partial_results
+                ],
+            }
+            print(json.dumps(payload, indent=2))
+        else:
+            for r in e.partial_results:
+                duration = (
+                    f"{r.duration_seconds:.1f}s"
+                    if r.duration_seconds is not None else "?s"
+                )
+                state = "pushed" if r.pushed else "local only"
+                print(f"built {r.target.image_name} in {duration} ({state})")
+            print(
+                f"error: docker build failed for {e.image_ref}",
+                file=sys.stderr,
+            )
+            if e.stderr:
+                print(e.stderr, file=sys.stderr)
+        return 1
+    except Exception as e:  # noqa: BLE001 — surface as friendly error
+        # Anything else — docker not installed, etc. The
+        # ``_default_runner`` raises FileNotFoundError when docker
+        # isn't on PATH; we don't want a traceback at the CLI boundary.
+        if args.json:
+            print(json.dumps({"success": False, "error": str(e)}, indent=2))
+        else:
+            print(f"error: build failed: {e}", file=sys.stderr)
+        return 1
+
+    if args.json:
+        payload = {
+            "success": True,
+            "project_id": project_id,
+            "tag": tag,
+            "results": [
+                {
+                    "image_name": r.target.image_name,
+                    "image_refs": r.image_refs,
+                    "pushed": r.pushed,
+                    "duration_seconds": r.duration_seconds,
+                }
+                for r in results
+            ],
+        }
+        print(json.dumps(payload, indent=2))
+        return 0
+
+    # Pretty per-target line + summary footer.
+    errors = 0  # by construction zero here, but symmetric with secrets
+    for r in results:
+        duration = (
+            f"{r.duration_seconds:.1f}s" if r.duration_seconds is not None else "?s"
+        )
+        state = "pushed" if r.pushed else "local only"
+        print(f"built {r.target.image_name} in {duration} ({state})")
+    print(f"{len(results)} built, {errors} errors")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Top-level dispatcher
 # ---------------------------------------------------------------------------
 
@@ -750,7 +999,8 @@ def cmd_deploy(args) -> int:
             "       kestrel deploy logs <profile> [--lines N]\n"
             "       kestrel deploy list\n"
             "       kestrel deploy health <profile>\n"
-            "       kestrel deploy secrets sync [--profile NAME] [--env-file PATH] [--dry-run]",
+            "       kestrel deploy secrets sync [--profile NAME] [--env-file PATH] [--dry-run]\n"
+            "       kestrel deploy build [--tag TAG] [--target NAME] [--no-push] [--no-multi-arch] [--platforms LIST]",
             file=sys.stderr,
         )
         return 1
@@ -767,6 +1017,8 @@ def cmd_deploy(args) -> int:
         return _cmd_deploy_health(args)
     if target == "secrets":
         return _cmd_deploy_secrets(args)
+    if target == "build":
+        return _cmd_deploy_build(args)
 
     # Anything else: treat as a profile name to deploy.
     return _cmd_deploy_profile(args, target)
