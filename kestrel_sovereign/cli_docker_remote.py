@@ -276,6 +276,39 @@ def _wait_for_container_health(url: str, *, timeout: float) -> bool:
 # Argparse subcommand wiring
 # ---------------------------------------------------------------------------
 
+def get_or_create_docker_subparsers(
+    subparsers: "argparse._SubParsersAction",
+) -> "argparse._SubParsersAction":
+    """Create (or fetch) the shared ``kestrel docker`` parent subparsers.
+
+    The ``kestrel docker`` parent is shared by multiple modules:
+
+    - :mod:`cli_docker_remote` owns ``remote`` (this file).
+    - :mod:`cli_docker_build` owns ``build`` (Cloud Build / GCR
+      specialty images, epic #1050 tier 4).
+
+    Whichever module is wired up first creates the parser; the second
+    one fetches the existing parser via the private
+    ``_name_parser_map`` of the parent ``_SubParsersAction``. That is
+    a documented attribute of argparse's subparsers action and is the
+    standard way to compose subverb registrations across modules.
+    """
+    existing = subparsers.choices.get("docker")
+    if existing is not None:
+        # Find the docker subparsers action attached to the existing parser.
+        for action in existing._actions:  # type: ignore[attr-defined]
+            if isinstance(action, argparse._SubParsersAction):
+                return action
+        # Defensive: existing parser without subparsers — recreate.
+        return existing.add_subparsers(dest="docker_command")
+    docker_p = subparsers.add_parser(
+        "docker",
+        help="Docker workflows for Kestrel — local remote-LLM container "
+             "(remote) and Cloud Build / GCR specialty images (build).",
+    )
+    return docker_p.add_subparsers(dest="docker_command")
+
+
 def add_docker_subcommand(
     subparsers: "argparse._SubParsersAction",
 ) -> None:
@@ -287,12 +320,7 @@ def add_docker_subcommand(
     for future docker subverbs (e.g. ``kestrel docker local``) without
     breaking flags.
     """
-    docker_p = subparsers.add_parser(
-        "docker",
-        help="Local Docker workflows for Kestrel — port of "
-             "scripts/{build,run}_docker_remote.sh (epic #1050 tier 3).",
-    )
-    docker_sub = docker_p.add_subparsers(dest="docker_command")
+    docker_sub = get_or_create_docker_subparsers(subparsers)
 
     remote_p = docker_sub.add_parser(
         "remote",
@@ -350,27 +378,40 @@ def add_docker_subcommand(
 def cmd_docker(args) -> int:
     """Dispatch ``kestrel docker ...``.
 
+    Routes the ``build`` subverb into :mod:`cli_docker_build` and the
+    ``remote`` subverb into the local handlers.
+
     Exit codes:
         0 — success
         1 — runtime error (missing .env, missing OPENAI_API_KEY,
-            docker build/run non-zero)
+            docker build/run non-zero, missing GCP_PROJECT_ID for
+            ``build``, etc.)
     """
     docker_sub = getattr(args, "docker_command", None)
-    if docker_sub != "remote":
+    if docker_sub == "build":
+        # Local import — keeps cli_docker_build off the hot path for
+        # operators who only run ``kestrel docker remote``.
+        from kestrel_sovereign.cli_docker_build import cmd_docker_build
+        return cmd_docker_build(args)
+
+    if docker_sub == "remote":
+        remote_sub = getattr(args, "docker_remote_command", None)
+        if remote_sub == "build":
+            return _cmd_build(args)
+        if remote_sub == "run":
+            return _cmd_run(args)
         print(
-            "Usage: kestrel docker remote {build|run} ...",
+            "Usage:\n"
+            "  kestrel docker remote build [--tag latest] [--platform linux/amd64]\n"
+            "  kestrel docker remote run   [--port 8888] [--env-file .env] [--tag latest]",
             file=sys.stderr,
         )
         return 1
 
-    remote_sub = getattr(args, "docker_remote_command", None)
-    if remote_sub == "build":
-        return _cmd_build(args)
-    if remote_sub == "run":
-        return _cmd_run(args)
-
     print(
         "Usage:\n"
+        "  kestrel docker build  <preset> [--tag latest] [--no-cache]\n"
+        "  kestrel docker build  --list\n"
         "  kestrel docker remote build [--tag latest] [--platform linux/amd64]\n"
         "  kestrel docker remote run   [--port 8888] [--env-file .env] [--tag latest]",
         file=sys.stderr,
