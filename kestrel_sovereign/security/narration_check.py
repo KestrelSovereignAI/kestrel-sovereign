@@ -127,12 +127,16 @@ def summarize_tool_result_for_audit(result: Any) -> Any:
       envelope.
     * ``error`` — capped at 500 chars to prevent log-bomb amplification.
 
-    Non-dict results are returned unchanged — the narration check
-    treats them as failure and the slim envelope can't represent
-    "raw return".
+    Non-dict results (raw strings, numbers, lists, ``None``, etc.)
+    are coerced to an opaque ``{"status": "unknown"}`` envelope so the
+    raw value never reaches a POST_RESPONSE hook. Codex re-review of
+    #1076 caught this: tools that return primitive strings (file
+    contents, search snippets, raw model output) would otherwise pass
+    through verbatim. ``analyze_narration`` treats unknown / non-dict
+    as failure either way, so audit semantics are preserved.
     """
     if not isinstance(result, dict):
-        return result
+        return {"status": "unknown"}
     summary: Dict[str, Any] = {}
     if "status" in result:
         summary["status"] = result["status"]

@@ -226,13 +226,43 @@ class TestSummarizeForAudit:
         assert s["status"] == "error"
         assert len(s["error"]) == 500
 
-    def test_non_dict_returned_unchanged(self):
+    def test_non_dict_coerced_to_opaque_unknown_envelope(self):
+        """Codex re-review of #1076: tools that return raw primitives
+        (string file contents, search snippets, etc.) MUST NOT leak
+        verbatim through tool_results. The summarizer coerces to an
+        opaque ``{status: unknown}`` envelope; analyze_narration
+        treats unknown/non-dict as failure either way so the audit
+        verdict is preserved."""
         from kestrel_sovereign.security.narration_check import (
             summarize_tool_result_for_audit,
         )
-        assert summarize_tool_result_for_audit("raw string") == "raw string"
-        assert summarize_tool_result_for_audit(None) is None
-        assert summarize_tool_result_for_audit(42) == 42
+        # Each leak-prone primitive becomes the opaque envelope:
+        assert summarize_tool_result_for_audit(
+            "ssn=123-45-6789, dob=1980-01-01"
+        ) == {"status": "unknown"}
+        assert summarize_tool_result_for_audit(None) == {"status": "unknown"}
+        assert summarize_tool_result_for_audit(42) == {"status": "unknown"}
+        # Lists / tuples (search-results-style) likewise:
+        assert summarize_tool_result_for_audit(
+            [{"hit": "secret"}, {"hit": "more"}]
+        ) == {"status": "unknown"}
+
+    def test_non_dict_summary_still_drives_failure_verdict(self):
+        """Audit verdict equivalence: a non-dict input through the
+        summarizer + analyze_narration produces the same risk_boost
+        as the non-dict input direct, so the privacy fix doesn't
+        weaken the audit."""
+        from kestrel_sovereign.security.narration_check import (
+            summarize_tool_result_for_audit,
+        )
+        v_direct = analyze_narration(
+            "Saved.", [{"name": "x", "result": "raw secret"}],
+        )
+        slim = summarize_tool_result_for_audit("raw secret")
+        v_slim = analyze_narration(
+            "Saved.", [{"name": "x", "result": slim}],
+        )
+        assert v_direct.risk_boost == v_slim.risk_boost == 2
 
     def test_summary_still_supports_narration_check(self):
         """The whole point: the slim envelope must still drive the
