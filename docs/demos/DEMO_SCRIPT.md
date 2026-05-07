@@ -54,16 +54,16 @@ The demo agent is flagged as a test instance with proper disclosure so it knows 
 ### Automated (for recording)
 
 ```bash
-# One command — spins up an isolated demo agent on port 8889,
+# One command — spins up an isolated demo agent on port 8900,
 # runs the demo against it, then tears the server down.
-demos/run.sh technical
+kestrel demo run technical
 ```
 
-The runner internally does `scripts/setup_demo_agent.py` + `KESTREL_DB_PATH=agent_data/demo uv run uvicorn server:app --port 8889` + the Playwright run, with a trap to stop the server on exit.
+The runner internally does `scripts/setup_demo_agent.py` + `KESTREL_DB_PATH=agent_data/demo uv run uvicorn server:app --port 8900` + the Playwright run, with a `finally`-trap to stop the server on exit.
 
 Output lands in `demos/technical/demo-output/` — video (.webm), 20 screenshots, and `narration.md`.
 
-> **Never** run `npx playwright test --config=config.cjs` directly against your live server — the demo clears conversation history and toggles permissions, and will mutate real data if `KESTREL_URL` points at your working instance. `demos/run.sh` exists specifically to prevent this.
+> **Never** run `npx playwright test --config=config.cjs` directly against your live server — the demo clears conversation history and toggles permissions, and will mutate real data if `KESTREL_URL` points at your working instance. `kestrel demo run` exists specifically to prevent this.
 
 ### Live (with presenter)
 
@@ -315,7 +315,7 @@ Size: 89949 bytes
 | Agent hallucinating instead of using tools | Model quality issue — switch to a stronger model via `/api/model/set` |
 | Privacy mode doesn't visually change | Skip to explanation: "The storage engine enforces it — here's the architecture" |
 | Observability has no events | Skip timing breakdown — say "the audit log is queryable via the API" |
-| Browser crashes | Run Playwright demo instead — `demos/run.sh technical` |
+| Browser crashes | Run Playwright demo instead — `kestrel demo run technical` |
 | Windows terminal crashes on startup | Set `$env:PYTHONIOENCODING = "utf-8"` before starting server |
 
 ---
@@ -324,11 +324,11 @@ Size: 89949 bytes
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `KESTREL_URL` | set by `demos/run.sh` to `http://localhost:$DEMO_PORT` | Server URL |
+| `KESTREL_URL` | set by `kestrel demo run` to `http://localhost:$DEMO_PORT` | Server URL |
 | `KESTREL_API_KEY` | auto-fetched from demo DB | API authentication |
 | `DEMO_SLOWMO` | `150` | Milliseconds between actions (Playwright) |
-| `KESTREL_DB_PATH` | `agent_data/demo` | Set by `demos/run.sh` for the isolated server |
-| `DEMO_PORT` | `8900` | Port for the isolated demo server (runner refuses `8888`) |
+| `KESTREL_DB_PATH` | `agent_data/demo` | Set by `kestrel demo run` for the isolated server |
+| `--port` | `8900` | Port for the isolated demo server (runner refuses `8888`) |
 
 ---
 

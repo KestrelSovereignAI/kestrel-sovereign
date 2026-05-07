@@ -31,7 +31,7 @@ This vignette walks the eight beats of an end-to-end voice session:
 ## Running the vignette
 
 ```bash
-demos/run.sh voice
+kestrel demo run voice
 kestrel-eye review --config demos/voice/eye.toml
 ```
 

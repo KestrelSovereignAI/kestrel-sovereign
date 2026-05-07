@@ -52,7 +52,7 @@ purge to `security_audit_log` so an operator can audit what was destroyed.
 ## Running the vignette
 
 ```bash
-demos/run.sh trash
+kestrel demo run trash
 ```
 
 Outputs in `demos/trash/demo-output/` — screenshots, generated narration

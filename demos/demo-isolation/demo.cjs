@@ -9,7 +9,7 @@
  *   which requires the X-Kestrel-Allow-Destructive header on a live agent.
  *
  * Honesty note:
- *   `demos/run.sh` runs against a demo-scoped agent (is_demo=True).  The
+ *   `kestrel demo run` runs against a demo-scoped agent (is_demo=True).  The
  *   rail INTENTIONALLY allows destructive ops on demo-scoped targets — that's
  *   what makes demos safe to run.  So this vignette can't actually trigger
  *   the 403 path against the demo agent.  Instead it RENDERS the

@@ -20,7 +20,7 @@
  *   2-6. Walk each mode in turn (EPHEMERAL → ISOLATED → ANONYMOUS → NORMAL → PUBLIC).
  *   7. Bookend in NORMAL.
  *
- * Run: demos/run.sh privacy-modes
+ * Run: kestrel demo run privacy-modes
  */
 const { test } = require('@playwright/test');
 const fs = require('fs');

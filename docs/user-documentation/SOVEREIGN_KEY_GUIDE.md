@@ -76,8 +76,8 @@ Copy the output. This is your master key.
 ### 3. Create Your Agent (Docker)
 
 ```bash
-# Using the sovereign-agent script
-./scripts/sovereign-agent.sh create Emma ~/emma_data
+# Using the kestrel CLI
+kestrel agent docker create Emma ~/emma_data
 
 # Or manually with Docker
 docker run --rm \
@@ -90,8 +90,8 @@ docker run --rm \
 ### 4. Chat with Your Agent
 
 ```bash
-# Using the script
-./scripts/sovereign-agent.sh chat ~/emma_data
+# Using the kestrel CLI
+kestrel agent docker chat ~/emma_data
 
 # Or manually
 docker run -it --rm \
