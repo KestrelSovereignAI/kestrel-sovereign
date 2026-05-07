@@ -16,15 +16,56 @@ Security safeguards:
 - Protected content cannot be excluded or stashed
 - All operations logged for audit trail
 - Rate limiting to prevent manipulation loops
+
+@tool methods return ``kestrel_sdk.tools.result.ToolResult`` per the
+kestrel-sovereign #1042 narration-honesty contract (see #1061).
 """
 
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sdk.tools.base import ToolCategory
+from kestrel_sdk.tools.result import ToolResult
 
 logger = logging.getLogger(__name__)
+
+
+def _wrap_manager_result(
+    result: Any,
+    *,
+    ok_confirmation: str,
+    failure_prefix: str = "context_manager",
+) -> ToolResult:
+    """Translate a context_manager method's dict return into a ToolResult.
+
+    The manager's ``mark_messages`` / ``compress_session`` / ``stash_*``
+    helpers all return dicts with an inconsistent honesty shape:
+
+      - some include ``success: True`` and the data
+      - some include ``error: "..."`` and ``success: False``
+      - some return data without any explicit success marker
+
+    This helper normalizes all three:
+
+      - dict with ``error`` key → ToolResult.failed(error, data=rest)
+      - dict with ``success: False`` (no error) → ToolResult.failed("unknown error")
+      - anything else → ToolResult.ok(ok_confirmation, data=result)
+    """
+    if isinstance(result, dict):
+        err = result.get("error")
+        success_flag = result.get("success", True)
+        if err:
+            data = {k: v for k, v in result.items() if k != "error"}
+            return ToolResult.failed(str(err), data=data or None)
+        if success_flag is False:
+            return ToolResult.failed(
+                f"{failure_prefix} returned success=False without an error message",
+                data=result or None,
+            )
+        return ToolResult.ok(ok_confirmation, data=dict(result))
+    # Non-dict — preserve as data so the LLM can still inspect it.
+    return ToolResult.ok(ok_confirmation, data={"result": result})
 
 
 class ContextFeature(Feature):
@@ -54,36 +95,90 @@ class ContextFeature(Feature):
 
         logger.info("ContextFeature initialized")
 
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    async def _resolve_target_messages(
+        self,
+        target: str,
+    ) -> Tuple[Optional[List[Dict[str, Any]]], Optional[str]]:
+        """Parse a target string and return (messages, error).
+
+        Target syntax:
+          - "last_N"       → last N messages
+          - "search:query" → semantic match
+          - "ids:1,2,3"    → explicit message ids
+
+        Returns ``(messages, None)`` on success or ``(None, error_str)`` on
+        a parse / lookup failure.
+        """
+        if not isinstance(target, str) or not target:
+            return None, f"target must be a non-empty string, got {target!r}"
+
+        try:
+            if target.startswith("last_"):
+                n = target.split("_", 1)[1]
+                # ``get_messages_for_selection`` accepts the criteria as
+                # a string for last_n; do not pre-coerce so the manager
+                # can surface its own malformed-input error.
+                messages = await self.context_manager.get_messages_for_selection(
+                    mode="last_n", criteria=n,
+                )
+            elif target.startswith("search:"):
+                query = target[len("search:"):]
+                messages = await self.context_manager.get_messages_for_selection(
+                    mode="topic", criteria=query,
+                )
+            elif target.startswith("ids:"):
+                ids_str = target[len("ids:"):]
+                messages = await self.context_manager.get_messages_for_selection(
+                    mode="messages", criteria=ids_str,
+                )
+            else:
+                return None, (
+                    f"Invalid target format: {target}. "
+                    "Use 'last_N', 'search:query', or 'ids:1,2,3'"
+                )
+        except (AttributeError, TypeError, ValueError, KeyError, IndexError) as e:
+            return None, str(e)
+        return messages, None
+
     @tool(
         name="context_status",
         description="Check current context window utilization. Use this to understand how much context space is available before deciding to summarize or prune.",
         category=ToolCategory.SYSTEM,
         command_prefix="!context status"
     )
-    async def context_status(self) -> Dict[str, Any]:
-        """
-        Get detailed context window status.
-
-        Returns information about:
-        - Total budget and used tokens by category
-        - Message count and estimated tokens
-        - Compression recommendation (if utilization > 70%)
-        - Available headroom for new content
-        """
+    async def context_status(self) -> ToolResult:
+        """Get detailed context window status."""
         if not self.context_manager:
-            return {"success": False, "error": "Context manager not available"}
+            return ToolResult.failed("Context manager not available")
 
         try:
-            # Pass context_stats from the agent for duplicate/attribution analysis
             context_stats = getattr(self.agent, 'context_stats', None)
             status = await self.context_manager.get_status(context_stats=context_stats)
-            return status
         except (AttributeError, TypeError, ValueError) as e:
             logger.error(f"context_status failed: {e}")
-            return {"success": False, "error": str(e)}
+            return ToolResult.failed(str(e))
         except Exception as e:
             logger.error(f"context_status failed: {e}", exc_info=True)
-            return {"success": False, "error": str(e)}
+            return ToolResult.failed(str(e))
+
+        if not isinstance(status, dict):
+            return ToolResult.failed(
+                f"context_manager.get_status returned non-dict: {type(status).__name__}"
+            )
+
+        utilization = status.get("utilization_percent")
+        msg_count = status.get("message_count")
+        return ToolResult.ok(
+            confirmation=(
+                f"Context status: {msg_count} message(s), "
+                f"{utilization}% utilization"
+            ),
+            data=dict(status),
+        )
 
     @tool(
         name="summarize_section",
@@ -95,64 +190,71 @@ class ContextFeature(Feature):
         self,
         mode: str,
         criteria: str,
-        preserve_key_facts: bool = True
-    ) -> Dict[str, Any]:
+        preserve_key_facts: bool = True,
+    ) -> ToolResult:
         """
         Summarize a section of conversation.
 
         Args:
             mode: Selection mode - "time_range", "topic", "messages", or "last_n"
-                - time_range: Use criteria like "before_today", "last_2_hours"
-                - topic: Semantic search query like "debugging issues"
-                - messages: Comma-separated message IDs like "1,2,3,4,5"
-                - last_n: Number of messages like "10"
             criteria: Selection criteria based on mode
             preserve_key_facts: Keep explicit facts, decisions, commitments (default True)
         """
-        if not self.context_manager:
-            return {"success": False, "error": "Context manager not available"}
-
-        if not self.llm_service:
-            return {"success": False, "error": "LLM service not available for summarization"}
-
-        try:
-            # Get messages matching criteria
-            messages = await self.context_manager.get_messages_for_selection(
-                mode=mode,
-                criteria=criteria
+        if not isinstance(preserve_key_facts, bool):
+            return ToolResult.failed(
+                "preserve_key_facts must be a boolean, got "
+                f"{type(preserve_key_facts).__name__}={preserve_key_facts!r}"
             )
 
-            if not messages:
-                return {
-                    "success": False,
-                    "error": f"No messages found for {mode}={criteria}"
-                }
+        if not self.context_manager:
+            return ToolResult.failed("Context manager not available")
+        if not self.llm_service:
+            return ToolResult.failed("LLM service not available for summarization")
 
-            if len(messages) < 2:
-                return {
-                    "success": False,
-                    "error": "Need at least 2 messages to summarize",
-                    "found": len(messages)
-                }
+        try:
+            messages = await self.context_manager.get_messages_for_selection(
+                mode=mode, criteria=criteria,
+            )
+        except (AttributeError, TypeError, ValueError, KeyError) as e:
+            logger.error(f"summarize_section selection failed: {e}")
+            return ToolResult.failed(str(e))
+        except Exception as e:
+            logger.error(f"summarize_section selection failed: {e}", exc_info=True)
+            return ToolResult.failed(str(e))
 
-            # Extract message IDs
-            message_ids = [m["id"] for m in messages]
+        if not messages:
+            return ToolResult.failed(
+                f"No messages found for {mode}={criteria}",
+                data={"mode": mode, "criteria": criteria},
+            )
+        if len(messages) < 2:
+            return ToolResult.failed(
+                "Need at least 2 messages to summarize",
+                data={"found": len(messages), "mode": mode, "criteria": criteria},
+            )
 
-            # Perform summarization
+        message_ids = [m["id"] for m in messages]
+        try:
             result = await self.context_manager.summarize_messages(
                 llm_service=self.llm_service,
                 message_ids=message_ids,
-                preserve_key_facts=preserve_key_facts
+                preserve_key_facts=preserve_key_facts,
             )
-
-            return result
-
         except (AttributeError, TypeError, ValueError, KeyError) as e:
             logger.error(f"summarize_section failed: {e}")
-            return {"success": False, "error": str(e)}
+            return ToolResult.failed(str(e))
         except Exception as e:
             logger.error(f"summarize_section failed: {e}", exc_info=True)
-            return {"success": False, "error": str(e)}
+            return ToolResult.failed(str(e))
+
+        return _wrap_manager_result(
+            result,
+            ok_confirmation=(
+                f"Summarized {len(message_ids)} message(s) from "
+                f"{mode}={criteria}"
+            ),
+            failure_prefix="summarize_messages",
+        )
 
     @tool(
         name="mark_content",
@@ -164,8 +266,8 @@ class ContextFeature(Feature):
         self,
         action: str,
         target: str,
-        reason: str = ""
-    ) -> Dict[str, Any]:
+        reason: str = "",
+    ) -> ToolResult:
         """
         Mark content for context management.
 
@@ -175,57 +277,45 @@ class ContextFeature(Feature):
             reason: Optional reason for marking (logged for audit)
         """
         if not self.context_manager:
-            return {"success": False, "error": "Context manager not available"}
+            return ToolResult.failed("Context manager not available")
 
+        if action not in ("protect", "droppable", "clear"):
+            return ToolResult.failed(
+                f"action must be 'protect', 'droppable', or 'clear', "
+                f"got {action!r}"
+            )
+
+        messages, err = await self._resolve_target_messages(target)
+        if err:
+            return ToolResult.failed(err)
+        if not messages:
+            return ToolResult.failed(
+                f"No messages found for target: {target}",
+                data={"target": target},
+            )
+
+        message_ids = [m["id"] for m in messages]
         try:
-            # Parse target to get messages
-            if target.startswith("last_"):
-                n = target.split("_")[1]
-                messages = await self.context_manager.get_messages_for_selection(
-                    mode="last_n",
-                    criteria=n
-                )
-            elif target.startswith("search:"):
-                query = target[7:]  # Remove "search:" prefix
-                messages = await self.context_manager.get_messages_for_selection(
-                    mode="topic",
-                    criteria=query
-                )
-            elif target.startswith("ids:"):
-                ids_str = target[4:]  # Remove "ids:" prefix
-                messages = await self.context_manager.get_messages_for_selection(
-                    mode="messages",
-                    criteria=ids_str
-                )
-            else:
-                return {
-                    "success": False,
-                    "error": f"Invalid target format: {target}. Use 'last_N', 'search:query', or 'ids:1,2,3'"
-                }
-
-            if not messages:
-                return {
-                    "success": False,
-                    "error": f"No messages found for target: {target}"
-                }
-
-            message_ids = [m["id"] for m in messages]
-
-            # Perform marking
             result = await self.context_manager.mark_messages(
                 message_ids=message_ids,
                 action=action,
-                reason=reason
+                reason=reason,
             )
-
-            return result
-
         except (AttributeError, TypeError, ValueError, KeyError, IndexError) as e:
             logger.error(f"mark_content failed: {e}")
-            return {"success": False, "error": str(e)}
+            return ToolResult.failed(str(e))
         except Exception as e:
             logger.error(f"mark_content failed: {e}", exc_info=True)
-            return {"success": False, "error": str(e)}
+            return ToolResult.failed(str(e))
+
+        return _wrap_manager_result(
+            result,
+            ok_confirmation=(
+                f"Marked {len(message_ids)} message(s) as {action}"
+                + (f" ({reason})" if reason else "")
+            ),
+            failure_prefix="mark_messages",
+        )
 
     @tool(
         name="compress_context",
@@ -237,8 +327,8 @@ class ContextFeature(Feature):
         self,
         keep_recent: int = 10,
         force: bool = False,
-        dry_run: bool = False
-    ) -> Dict[str, Any]:
+        dry_run: bool = False,
+    ) -> ToolResult:
         """
         Compress context window by summarizing older messages.
 
@@ -247,47 +337,78 @@ class ContextFeature(Feature):
             force: Compress even if utilization is below threshold (default False)
             dry_run: Show what would be compressed without doing it (default False)
         """
-        if not self.context_manager:
-            return {"success": False, "error": "Context manager not available"}
+        for name, val in (("force", force), ("dry_run", dry_run)):
+            if not isinstance(val, bool):
+                return ToolResult.failed(
+                    f"{name} must be a boolean, got "
+                    f"{type(val).__name__}={val!r}"
+                )
 
         try:
-            # Check compression status first
-            if dry_run:
+            keep_val = int(keep_recent)
+        except (TypeError, ValueError):
+            return ToolResult.failed(
+                f"keep_recent must be an integer, got {keep_recent!r}"
+            )
+        if keep_val < 0:
+            return ToolResult.failed("keep_recent must be >= 0")
+
+        if not self.context_manager:
+            return ToolResult.failed("Context manager not available")
+
+        if dry_run:
+            try:
                 status = await self.context_manager.check_compression_needed()
-                return {
-                    "success": True,
+            except (AttributeError, TypeError, ValueError) as e:
+                logger.error(f"compress_context dry-run failed: {e}")
+                return ToolResult.failed(str(e))
+            except Exception as e:
+                logger.error(f"compress_context dry-run failed: {e}", exc_info=True)
+                return ToolResult.failed(str(e))
+
+            return ToolResult.ok(
+                confirmation=(
+                    f"Dry run: would compress "
+                    f"{max(0, status['message_count'] - keep_val)} message(s), "
+                    f"preserve {min(keep_val, status['message_count'])}"
+                ),
+                data={
                     "dry_run": True,
-                    "compression_recommended": status["compression_recommended"],
-                    "utilization_percent": status["utilization_percent"],
-                    "message_count": status["message_count"],
-                    "would_compress": max(0, status["message_count"] - keep_recent),
-                    "would_preserve": min(keep_recent, status["message_count"])
-                }
-
-            # Check if llm_service is available
-            if not self.llm_service:
-                return {"success": False, "error": "LLM service not available for compression"}
-
-            # Perform compression
-            result = await self.context_manager.compress_session(
-                llm_service=self.llm_service,
-                preserve_recent=keep_recent,
-                force=force
+                    "compression_recommended": status.get("compression_recommended"),
+                    "utilization_percent": status.get("utilization_percent"),
+                    "message_count": status.get("message_count"),
+                    "would_compress": max(0, status["message_count"] - keep_val),
+                    "would_preserve": min(keep_val, status["message_count"]),
+                },
             )
 
-            # Reset context stats after compression (accumulated data is stale)
+        if not self.llm_service:
+            return ToolResult.failed("LLM service not available for compression")
+
+        try:
+            result = await self.context_manager.compress_session(
+                llm_service=self.llm_service,
+                preserve_recent=keep_val,
+                force=force,
+            )
+
+            # Reset context stats after compression — accumulated
+            # duplicate/attribution data is stale post-compression.
             context_stats = getattr(self.agent, 'context_stats', None)
             if context_stats is not None:
                 context_stats.reset()
-
-            return result
-
         except (AttributeError, TypeError, ValueError) as e:
             logger.error(f"compress_context failed: {e}")
-            return {"success": False, "error": str(e)}
+            return ToolResult.failed(str(e))
         except Exception as e:
             logger.error(f"compress_context failed: {e}", exc_info=True)
-            return {"success": False, "error": str(e)}
+            return ToolResult.failed(str(e))
+
+        return _wrap_manager_result(
+            result,
+            ok_confirmation=f"Compressed context, preserved last {keep_val}",
+            failure_prefix="compress_session",
+        )
 
     @tool(
         name="exclude_from_context",
@@ -298,72 +419,48 @@ class ContextFeature(Feature):
     async def exclude_from_context(
         self,
         target: str,
-        reason: str
-    ) -> Dict[str, Any]:
+        reason: str,
+    ) -> ToolResult:
         """
         Exclude content from context assembly.
 
         Args:
             target: Message selection - "ids:1,2,3", "search:old debug output", "last_5"
             reason: Required reason for exclusion (logged for audit)
-
-        Note: Cannot exclude protected content. User messages with explicit
-        importance markers are protected by default.
         """
         if not self.context_manager:
-            return {"success": False, "error": "Context manager not available"}
-
+            return ToolResult.failed("Context manager not available")
         if not reason:
-            return {"success": False, "error": "Reason is required for exclusion"}
+            return ToolResult.failed("Reason is required for exclusion")
 
-        try:
-            # Parse target to get messages
-            if target.startswith("last_"):
-                n = target.split("_")[1]
-                messages = await self.context_manager.get_messages_for_selection(
-                    mode="last_n",
-                    criteria=n
-                )
-            elif target.startswith("search:"):
-                query = target[7:]
-                messages = await self.context_manager.get_messages_for_selection(
-                    mode="topic",
-                    criteria=query
-                )
-            elif target.startswith("ids:"):
-                ids_str = target[4:]
-                messages = await self.context_manager.get_messages_for_selection(
-                    mode="messages",
-                    criteria=ids_str
-                )
-            else:
-                return {
-                    "success": False,
-                    "error": f"Invalid target format: {target}. Use 'last_N', 'search:query', or 'ids:1,2,3'"
-                }
-
-            if not messages:
-                return {
-                    "success": False,
-                    "error": f"No messages found for target: {target}"
-                }
-
-            message_ids = [m["id"] for m in messages]
-
-            # Perform exclusion
-            result = await self.context_manager.exclude_messages(
-                message_ids=message_ids,
-                reason=reason
+        messages, err = await self._resolve_target_messages(target)
+        if err:
+            return ToolResult.failed(err)
+        if not messages:
+            return ToolResult.failed(
+                f"No messages found for target: {target}",
+                data={"target": target},
             )
 
-            return result
-
+        message_ids = [m["id"] for m in messages]
+        try:
+            result = await self.context_manager.exclude_messages(
+                message_ids=message_ids, reason=reason,
+            )
         except (AttributeError, TypeError, ValueError, KeyError, IndexError) as e:
             logger.error(f"exclude_from_context failed: {e}")
-            return {"success": False, "error": str(e)}
+            return ToolResult.failed(str(e))
         except Exception as e:
             logger.error(f"exclude_from_context failed: {e}", exc_info=True)
-            return {"success": False, "error": str(e)}
+            return ToolResult.failed(str(e))
+
+        return _wrap_manager_result(
+            result,
+            ok_confirmation=(
+                f"Excluded {len(message_ids)} message(s) ({reason})"
+            ),
+            failure_prefix="exclude_messages",
+        )
 
     @tool(
         name="restore_excluded",
@@ -371,10 +468,7 @@ class ContextFeature(Feature):
         category=ToolCategory.MEMORY,
         command_prefix="!context restore"
     )
-    async def restore_excluded(
-        self,
-        target: str = "all"
-    ) -> Dict[str, Any]:
+    async def restore_excluded(self, target: str = "all") -> ToolResult:
         """
         Restore excluded content.
 
@@ -382,59 +476,57 @@ class ContextFeature(Feature):
             target: What to restore - "all", "recent" (last exclusion), or "ids:1,2,3"
         """
         if not self.context_manager:
-            return {"success": False, "error": "Context manager not available"}
+            return ToolResult.failed("Context manager not available")
 
         try:
             if target == "all":
-                # Restore all excluded messages
                 result = await self.context_manager.restore_messages(message_ids=None)
             elif target == "recent":
-                # Get recently excluded and restore them
                 conv_store = self.context_manager._get_conversation_store()
-                if conv_store:
-                    excluded = await conv_store.get_excluded_messages(limit=10)
-                    if excluded:
-                        # Sort by excluded_at to get most recent
-                        excluded.sort(
-                            key=lambda m: m.get("metadata", {}).get("excluded_at", ""),
-                            reverse=True
-                        )
-                        # Restore the most recent exclusion batch
-                        # (messages excluded at the same time)
-                        recent_time = excluded[0].get("metadata", {}).get("excluded_at")
-                        recent_ids = [
-                            m["id"] for m in excluded
-                            if m.get("metadata", {}).get("excluded_at") == recent_time
-                        ]
-                        result = await self.context_manager.restore_messages(message_ids=recent_ids)
-                    else:
-                        result = {"success": True, "restored_count": 0, "note": "No excluded messages found"}
-                else:
-                    result = {"success": False, "error": "Conversation store not available"}
+                if not conv_store:
+                    return ToolResult.failed("Conversation store not available")
+                excluded = await conv_store.get_excluded_messages(limit=10)
+                if not excluded:
+                    return ToolResult.ok(
+                        confirmation="No excluded messages to restore",
+                        data={"restored_count": 0},
+                    )
+                excluded.sort(
+                    key=lambda m: m.get("metadata", {}).get("excluded_at", ""),
+                    reverse=True,
+                )
+                recent_time = excluded[0].get("metadata", {}).get("excluded_at")
+                recent_ids = [
+                    m["id"] for m in excluded
+                    if m.get("metadata", {}).get("excluded_at") == recent_time
+                ]
+                result = await self.context_manager.restore_messages(message_ids=recent_ids)
             elif target.startswith("ids:"):
-                ids_str = target[4:]
+                ids_str = target[len("ids:"):]
                 try:
                     message_ids = [int(x.strip()) for x in ids_str.split(",")]
-                    result = await self.context_manager.restore_messages(message_ids=message_ids)
                 except ValueError:
-                    return {"success": False, "error": f"Invalid message IDs: {ids_str}"}
+                    return ToolResult.failed(f"Invalid message IDs: {ids_str}")
+                result = await self.context_manager.restore_messages(message_ids=message_ids)
             else:
-                return {
-                    "success": False,
-                    "error": f"Invalid target: {target}. Use 'all', 'recent', or 'ids:1,2,3'"
-                }
-
-            return result
-
+                return ToolResult.failed(
+                    f"Invalid target: {target}. Use 'all', 'recent', or 'ids:1,2,3'"
+                )
         except ValueError as e:
             logger.error(f"restore_excluded failed: {e}")
-            return {"success": False, "error": str(e)}
+            return ToolResult.failed(str(e))
         except (AttributeError, TypeError, KeyError) as e:
             logger.error(f"restore_excluded failed: {e}")
-            return {"success": False, "error": str(e)}
+            return ToolResult.failed(str(e))
         except Exception as e:
             logger.error(f"restore_excluded failed: {e}", exc_info=True)
-            return {"success": False, "error": str(e)}
+            return ToolResult.failed(str(e))
+
+        return _wrap_manager_result(
+            result,
+            ok_confirmation=f"Restored excluded messages (target={target})",
+            failure_prefix="restore_messages",
+        )
 
     # =========================================================================
     # Stash Tools (Temporary Context Parking)
@@ -449,8 +541,8 @@ class ContextFeature(Feature):
     async def context_stash(
         self,
         target: str = "last_10",
-        name: str = ""
-    ) -> Dict[str, Any]:
+        name: str = "",
+    ) -> ToolResult:
         """
         Stash messages for later restoration.
 
@@ -459,45 +551,48 @@ class ContextFeature(Feature):
             name: Optional name for this stash (e.g., "debugging-session")
         """
         if not self.context_manager:
-            return {"success": False, "error": "Context manager not available"}
+            return ToolResult.failed("Context manager not available")
 
         try:
             if target.startswith("last_"):
                 try:
-                    n = int(target.split("_")[1])
-                    result = await self.context_manager.stash_messages(
-                        last_n=n,
-                        name=name if name else None
-                    )
+                    n = int(target.split("_", 1)[1])
                 except ValueError:
-                    return {"success": False, "error": f"Invalid last_N format: {target}"}
+                    return ToolResult.failed(f"Invalid last_N format: {target}")
+                result = await self.context_manager.stash_messages(
+                    last_n=n, name=name if name else None,
+                )
             elif target.startswith("ids:"):
+                ids_str = target[len("ids:"):]
                 try:
-                    ids_str = target[4:]
                     message_ids = [int(x.strip()) for x in ids_str.split(",")]
-                    result = await self.context_manager.stash_messages(
-                        message_ids=message_ids,
-                        name=name if name else None
-                    )
                 except ValueError:
-                    return {"success": False, "error": f"Invalid message IDs: {target}"}
+                    return ToolResult.failed(f"Invalid message IDs: {target}")
+                result = await self.context_manager.stash_messages(
+                    message_ids=message_ids, name=name if name else None,
+                )
             else:
-                return {
-                    "success": False,
-                    "error": f"Invalid target: {target}. Use 'last_N' or 'ids:1,2,3'"
-                }
-
-            return result
-
+                return ToolResult.failed(
+                    f"Invalid target: {target}. Use 'last_N' or 'ids:1,2,3'"
+                )
         except ValueError as e:
             logger.error(f"context_stash failed: {e}")
-            return {"success": False, "error": str(e)}
+            return ToolResult.failed(str(e))
         except (AttributeError, TypeError, IndexError) as e:
             logger.error(f"context_stash failed: {e}")
-            return {"success": False, "error": str(e)}
+            return ToolResult.failed(str(e))
         except Exception as e:
             logger.error(f"context_stash failed: {e}", exc_info=True)
-            return {"success": False, "error": str(e)}
+            return ToolResult.failed(str(e))
+
+        return _wrap_manager_result(
+            result,
+            ok_confirmation=(
+                f"Stashed messages (target={target})"
+                + (f" as {name!r}" if name else "")
+            ),
+            failure_prefix="stash_messages",
+        )
 
     @tool(
         name="context_stash_pop",
@@ -505,30 +600,29 @@ class ContextFeature(Feature):
         category=ToolCategory.MEMORY,
         command_prefix="!context stash pop"
     )
-    async def context_stash_pop(
-        self,
-        stash_id: str = ""
-    ) -> Dict[str, Any]:
-        """
-        Pop a stash - restore messages to context and remove from stash list.
-
-        Args:
-            stash_id: Optional specific stash ID to pop (default: most recent)
-        """
+    async def context_stash_pop(self, stash_id: str = "") -> ToolResult:
+        """Pop a stash - restore messages and remove from stash list."""
         if not self.context_manager:
-            return {"success": False, "error": "Context manager not available"}
+            return ToolResult.failed("Context manager not available")
 
         try:
             result = await self.context_manager.stash_pop(
-                stash_id=stash_id if stash_id else None
+                stash_id=stash_id if stash_id else None,
             )
-            return result
         except (AttributeError, TypeError, ValueError, KeyError) as e:
             logger.error(f"context_stash_pop failed: {e}")
-            return {"success": False, "error": str(e)}
+            return ToolResult.failed(str(e))
         except Exception as e:
             logger.error(f"context_stash_pop failed: {e}", exc_info=True)
-            return {"success": False, "error": str(e)}
+            return ToolResult.failed(str(e))
+
+        return _wrap_manager_result(
+            result,
+            ok_confirmation=(
+                f"Popped stash {stash_id!r}" if stash_id else "Popped most recent stash"
+            ),
+            failure_prefix="stash_pop",
+        )
 
     @tool(
         name="context_stash_apply",
@@ -536,30 +630,29 @@ class ContextFeature(Feature):
         category=ToolCategory.MEMORY,
         command_prefix="!context stash apply"
     )
-    async def context_stash_apply(
-        self,
-        stash_id: str = ""
-    ) -> Dict[str, Any]:
-        """
-        Apply a stash - restore messages to context but keep stash reference.
-
-        Args:
-            stash_id: Optional specific stash ID to apply (default: most recent)
-        """
+    async def context_stash_apply(self, stash_id: str = "") -> ToolResult:
+        """Apply a stash - restore messages but keep stash reference."""
         if not self.context_manager:
-            return {"success": False, "error": "Context manager not available"}
+            return ToolResult.failed("Context manager not available")
 
         try:
             result = await self.context_manager.stash_apply(
-                stash_id=stash_id if stash_id else None
+                stash_id=stash_id if stash_id else None,
             )
-            return result
         except (AttributeError, TypeError, ValueError, KeyError) as e:
             logger.error(f"context_stash_apply failed: {e}")
-            return {"success": False, "error": str(e)}
+            return ToolResult.failed(str(e))
         except Exception as e:
             logger.error(f"context_stash_apply failed: {e}", exc_info=True)
-            return {"success": False, "error": str(e)}
+            return ToolResult.failed(str(e))
+
+        return _wrap_manager_result(
+            result,
+            ok_confirmation=(
+                f"Applied stash {stash_id!r}" if stash_id else "Applied most recent stash"
+            ),
+            failure_prefix="stash_apply",
+        )
 
     @tool(
         name="context_stash_list",
@@ -567,28 +660,33 @@ class ContextFeature(Feature):
         category=ToolCategory.MEMORY,
         command_prefix="!context stash list"
     )
-    async def context_stash_list(self) -> Dict[str, Any]:
-        """
-        List all available stashes.
-
-        Returns list of stashes with:
-        - stash_id: Short identifier for the stash
-        - name: Human-readable name
-        - message_count: Number of messages in stash
-        - stashed_at: When the stash was created
-        """
+    async def context_stash_list(self) -> ToolResult:
+        """List all available stashes."""
         if not self.context_manager:
-            return {"success": False, "error": "Context manager not available"}
+            return ToolResult.failed("Context manager not available")
 
         try:
             result = await self.context_manager.stash_list()
-            return result
         except (AttributeError, TypeError) as e:
             logger.error(f"context_stash_list failed: {e}")
-            return {"success": False, "error": str(e)}
+            return ToolResult.failed(str(e))
         except Exception as e:
             logger.error(f"context_stash_list failed: {e}", exc_info=True)
-            return {"success": False, "error": str(e)}
+            return ToolResult.failed(str(e))
+
+        # Honest count — derive from the manager's response so the LLM
+        # cannot claim "Listed N stashes" when the manager returned 0.
+        if isinstance(result, dict):
+            count = len(result.get("stashes", []))
+            return _wrap_manager_result(
+                result,
+                ok_confirmation=f"Listed {count} stash(es)",
+                failure_prefix="stash_list",
+            )
+        return ToolResult.ok(
+            confirmation="Listed stashes",
+            data={"result": result},
+        )
 
     @tool(
         name="context_stash_drop",
@@ -596,32 +694,29 @@ class ContextFeature(Feature):
         category=ToolCategory.MEMORY,
         command_prefix="!context stash drop"
     )
-    async def context_stash_drop(
-        self,
-        stash_id: str = ""
-    ) -> Dict[str, Any]:
-        """
-        Drop a stash without restoring messages.
-
-        Messages are excluded from context (can be recovered with restore_excluded).
-
-        Args:
-            stash_id: Optional specific stash ID to drop (default: most recent)
-        """
+    async def context_stash_drop(self, stash_id: str = "") -> ToolResult:
+        """Drop a stash without restoring messages."""
         if not self.context_manager:
-            return {"success": False, "error": "Context manager not available"}
+            return ToolResult.failed("Context manager not available")
 
         try:
             result = await self.context_manager.stash_drop(
-                stash_id=stash_id if stash_id else None
+                stash_id=stash_id if stash_id else None,
             )
-            return result
         except (AttributeError, TypeError, ValueError, KeyError) as e:
             logger.error(f"context_stash_drop failed: {e}")
-            return {"success": False, "error": str(e)}
+            return ToolResult.failed(str(e))
         except Exception as e:
             logger.error(f"context_stash_drop failed: {e}", exc_info=True)
-            return {"success": False, "error": str(e)}
+            return ToolResult.failed(str(e))
+
+        return _wrap_manager_result(
+            result,
+            ok_confirmation=(
+                f"Dropped stash {stash_id!r}" if stash_id else "Dropped most recent stash"
+            ),
+            failure_prefix="stash_drop",
+        )
 
     @tool(
         name="context_stash_save",
@@ -634,39 +729,35 @@ class ContextFeature(Feature):
         stash_id: str = "",
         name: str = "",
         summary: str = "",
-        tags: str = ""
-    ) -> Dict[str, Any]:
-        """
-        Save a stash to SavedItems for long-term retrieval.
-
-        The stash content is stored with an embedding for semantic search,
-        allowing later retrieval via !recall or search_saved_items.
-
-        Args:
-            stash_id: Optional specific stash ID to save (default: most recent)
-            name: Optional name for the saved item (default: stash name)
-            summary: Optional summary for search (auto-generated if not provided)
-            tags: Comma-separated tags for filtering (e.g., "debugging,session")
-        """
+        tags: str = "",
+    ) -> ToolResult:
+        """Save a stash to SavedItems for long-term retrieval."""
         if not self.context_manager:
-            return {"success": False, "error": "Context manager not available"}
+            return ToolResult.failed("Context manager not available")
 
         try:
             tags_list = [t.strip() for t in tags.split(",")] if tags else None
-
             result = await self.context_manager.stash_save(
                 stash_id=stash_id if stash_id else None,
                 name=name if name else None,
                 summary=summary if summary else None,
-                tags=tags_list
+                tags=tags_list,
             )
-            return result
         except (AttributeError, TypeError, ValueError, KeyError) as e:
             logger.error(f"context_stash_save failed: {e}")
-            return {"success": False, "error": str(e)}
+            return ToolResult.failed(str(e))
         except Exception as e:
             logger.error(f"context_stash_save failed: {e}", exc_info=True)
-            return {"success": False, "error": str(e)}
+            return ToolResult.failed(str(e))
+
+        return _wrap_manager_result(
+            result,
+            ok_confirmation=(
+                f"Saved stash {stash_id!r}" if stash_id
+                else "Saved most recent stash"
+            ),
+            failure_prefix="stash_save",
+        )
 
     @tool(
         name="context_stash_peek",
@@ -677,33 +768,42 @@ class ContextFeature(Feature):
     async def context_stash_peek(
         self,
         stash_id: str = "",
-        max_chars: int = 5000
-    ) -> Dict[str, Any]:
-        """
-        Peek at stash contents without fully restoring.
-
-        This allows programmatic exploration of stashed context
-        without loading everything into the context window.
-
-        Args:
-            stash_id: Optional specific stash ID to peek (default: most recent)
-            max_chars: Maximum characters to return (default: 5000)
-        """
+        max_chars: int = 5000,
+    ) -> ToolResult:
+        """Peek at stash contents without fully restoring."""
         if not self.context_manager:
-            return {"success": False, "error": "Context manager not available"}
+            return ToolResult.failed("Context manager not available")
+
+        try:
+            max_chars_val = int(max_chars)
+        except (TypeError, ValueError):
+            return ToolResult.failed(
+                f"max_chars must be an integer, got {max_chars!r}"
+            )
+        if max_chars_val < 1:
+            return ToolResult.failed("max_chars must be >= 1")
 
         try:
             result = await self.context_manager.stash_peek(
                 stash_id=stash_id if stash_id else None,
-                max_chars=max_chars
+                max_chars=max_chars_val,
             )
-            return result
         except (AttributeError, TypeError, ValueError, KeyError) as e:
             logger.error(f"context_stash_peek failed: {e}")
-            return {"success": False, "error": str(e)}
+            return ToolResult.failed(str(e))
         except Exception as e:
             logger.error(f"context_stash_peek failed: {e}", exc_info=True)
-            return {"success": False, "error": str(e)}
+            return ToolResult.failed(str(e))
+
+        return _wrap_manager_result(
+            result,
+            ok_confirmation=(
+                f"Peeked at stash {stash_id!r}"
+                if stash_id else "Peeked at most recent stash"
+            )
+            + f" (max_chars={max_chars_val})",
+            failure_prefix="stash_peek",
+        )
 
     # =========================================================================
     # RLM-Inspired Advanced Compression
@@ -719,18 +819,10 @@ class ContextFeature(Feature):
         self,
         chunk_size: int = 4000,
         keep_recent: int = 5,
-        max_depth: int = 3
-    ) -> Dict[str, Any]:
+        max_depth: int = 3,
+    ) -> ToolResult:
         """
         Hierarchical compression using recursive summarization.
-
-        Unlike linear compression which flattens everything, this:
-        1. Splits messages into chunks
-        2. Summarizes each chunk
-        3. Recursively merges summaries
-        4. Preserves more structure
-
-        Inspired by RLM paper's approach to long context.
 
         Args:
             chunk_size: Target characters per chunk (default: 4000)
@@ -738,25 +830,45 @@ class ContextFeature(Feature):
             max_depth: Maximum recursion depth (default: 3)
         """
         if not self.context_manager:
-            return {"success": False, "error": "Context manager not available"}
-
+            return ToolResult.failed("Context manager not available")
         if not self.llm_service:
-            return {"success": False, "error": "LLM service not available for compression"}
+            return ToolResult.failed("LLM service not available for compression")
+
+        try:
+            chunk_val = int(chunk_size)
+            keep_val = int(keep_recent)
+            depth_val = int(max_depth)
+        except (TypeError, ValueError):
+            return ToolResult.failed(
+                "chunk_size, keep_recent, max_depth must all be integers"
+            )
+        if chunk_val < 1 or keep_val < 0 or depth_val < 1:
+            return ToolResult.failed(
+                "chunk_size and max_depth must be >= 1, keep_recent >= 0"
+            )
 
         try:
             result = await self.context_manager.hierarchical_compress(
                 llm_service=self.llm_service,
-                chunk_size=chunk_size,
-                preserve_recent=keep_recent,
-                max_depth=max_depth
+                chunk_size=chunk_val,
+                preserve_recent=keep_val,
+                max_depth=depth_val,
             )
-            return result
         except (AttributeError, TypeError, ValueError) as e:
             logger.error(f"hierarchical_compress failed: {e}")
-            return {"success": False, "error": str(e)}
+            return ToolResult.failed(str(e))
         except Exception as e:
             logger.error(f"hierarchical_compress failed: {e}", exc_info=True)
-            return {"success": False, "error": str(e)}
+            return ToolResult.failed(str(e))
+
+        return _wrap_manager_result(
+            result,
+            ok_confirmation=(
+                f"Hierarchical compress complete (chunk_size={chunk_val}, "
+                f"keep_recent={keep_val}, max_depth={depth_val})"
+            ),
+            failure_prefix="hierarchical_compress",
+        )
 
     @tool(
         name="recursive_query",
@@ -768,114 +880,111 @@ class ContextFeature(Feature):
         self,
         context_source: str,
         query: str,
-        use_cheap_model: bool = True
-    ) -> Dict[str, Any]:
+        use_cheap_model: bool = True,
+    ) -> ToolResult:
         """
         Query context subset using recursive sub-LM call.
-
-        This allows exploring stashed, excluded, or compressed context using a
-        cheaper model, preserving main model quota for important work.
 
         Args:
             context_source: Source - "stash:name", "excluded", "compressed:ID", "summary:ID", "last_N"
             query: Question to ask about the context
             use_cheap_model: Use cheaper model for query (default: True)
         """
+        if not isinstance(use_cheap_model, bool):
+            return ToolResult.failed(
+                "use_cheap_model must be a boolean, got "
+                f"{type(use_cheap_model).__name__}={use_cheap_model!r}"
+            )
         if not self.context_manager:
-            return {"success": False, "error": "Context manager not available"}
-
+            return ToolResult.failed("Context manager not available")
         if not self.llm_service:
-            return {"success": False, "error": "LLM service not available"}
+            return ToolResult.failed("LLM service not available")
 
         try:
-            # Get the context to query
             context_text = ""
 
             if context_source.startswith("stash:"):
-                stash_name = context_source[6:]
+                stash_name = context_source[len("stash:"):]
                 peek_result = await self.context_manager.stash_peek(
-                    stash_id=stash_name,
-                    max_chars=10000  # Allow larger for query
+                    stash_id=stash_name, max_chars=10000,
                 )
                 if peek_result.get("success"):
                     context_text = peek_result.get("preview", "")
                 else:
-                    return {"success": False, "error": peek_result.get("error", "Stash not found")}
+                    return ToolResult.failed(
+                        peek_result.get("error", "Stash not found")
+                    )
 
             elif context_source == "excluded":
                 conv_store = self.context_manager._get_conversation_store()
-                if conv_store:
-                    excluded = await conv_store.get_excluded_messages(limit=50)
-                    context_text = "\n".join([
-                        f"{m.get('role', 'user').upper()}: {m.get('content', '')}"
-                        for m in excluded
-                    ])[:10000]
-                else:
-                    return {"success": False, "error": "Conversation store not available"}
+                if not conv_store:
+                    return ToolResult.failed("Conversation store not available")
+                excluded = await conv_store.get_excluded_messages(limit=50)
+                context_text = "\n".join([
+                    f"{m.get('role', 'user').upper()}: {m.get('content', '')}"
+                    for m in excluded
+                ])[:10000]
 
             elif context_source.startswith("compressed:") or context_source.startswith("summary:"):
-                # View original messages that were compressed/summarized
                 try:
                     marker_id = context_source.split(":", 1)[1]
                     conv_store = self.context_manager._get_conversation_store()
                     if not conv_store:
-                        return {"success": False, "error": "Conversation store not available"}
+                        return ToolResult.failed("Conversation store not available")
 
-                    # Try to parse as int, but fall back to string for UUID/string IDs
                     try:
-                        marker_id_parsed = int(marker_id)
+                        marker_id_parsed: Any = int(marker_id)
                     except ValueError:
-                        # Keep as string for UUID or other string-based IDs
                         marker_id_parsed = marker_id
 
-                    # Get the compression/summary marker
                     marker_messages = await conv_store.get_messages_by_ids([marker_id_parsed])
                     if not marker_messages:
-                        return {"success": False, "error": f"Marker message {marker_id} not found"}
+                        return ToolResult.failed(
+                            f"Marker message {marker_id} not found"
+                        )
 
                     marker = marker_messages[0]
                     meta = marker.get("metadata", {})
                     original_ids = meta.get("original_message_ids", [])
-
                     if not original_ids:
-                        return {"success": False, "error": f"No original message IDs found in marker {marker_id}"}
+                        return ToolResult.failed(
+                            f"No original message IDs found in marker {marker_id}"
+                        )
 
-                    # Get the original messages
                     original_messages = await conv_store.get_messages_by_ids(original_ids)
                     if not original_messages:
-                        return {"success": False, "error": "Original messages not found"}
+                        return ToolResult.failed("Original messages not found")
 
                     context_text = "\n".join([
                         f"{m.get('role', 'user').upper()}: {m.get('content', '')}"
                         for m in original_messages
                     ])[:10000]
-
                 except (IndexError, KeyError) as e:
-                    return {"success": False, "error": f"Invalid format: {context_source} - {str(e)}"}
+                    return ToolResult.failed(
+                        f"Invalid format: {context_source} - {e}"
+                    )
 
             elif context_source.startswith("last_"):
                 try:
-                    n = int(context_source.split("_")[1])
-                    messages = await self.context_manager.get_messages_for_selection(
-                        mode="last_n",
-                        criteria=str(n)
-                    )
-                    context_text = "\n".join([
-                        f"{m.get('role', 'user').upper()}: {m.get('content', '')}"
-                        for m in messages
-                    ])[:10000]
+                    n = int(context_source.split("_", 1)[1])
                 except ValueError:
-                    return {"success": False, "error": f"Invalid format: {context_source}"}
+                    return ToolResult.failed(f"Invalid format: {context_source}")
+                messages = await self.context_manager.get_messages_for_selection(
+                    mode="last_n", criteria=str(n),
+                )
+                context_text = "\n".join([
+                    f"{m.get('role', 'user').upper()}: {m.get('content', '')}"
+                    for m in messages
+                ])[:10000]
             else:
-                return {
-                    "success": False,
-                    "error": f"Invalid source: {context_source}. Use 'stash:name', 'excluded', 'compressed:ID', 'summary:ID', or 'last_N'"
-                }
+                return ToolResult.failed(
+                    f"Invalid source: {context_source}. "
+                    "Use 'stash:name', 'excluded', 'compressed:ID', 'summary:ID', or 'last_N'"
+                )
 
             if not context_text:
-                return {"success": False, "error": "No context found to query"}
+                return ToolResult.failed("No context found to query")
 
-            # Build prompt for recursive query
             prompt = f"""Answer the following question based ONLY on this context:
 
 CONTEXT:
@@ -885,43 +994,48 @@ QUESTION: {query}
 
 ANSWER:"""
 
-            # Use cheap model if requested. We pull the vendor-scoped selector
-            # ("<vendor>/<model>") so routing constrains to the one vendor that
-            # serves the cheap model — preventing the old "broadcast one model
-            # id across every provider" cascade.
+            # Vendor-scoped cheap-model selector. We pull
+            # ``<vendor>/<model>`` so routing constrains to the one
+            # vendor that serves the cheap model — preventing the old
+            # "broadcast one model id across every provider" cascade.
             model_override = None
             if use_cheap_model and hasattr(self.llm_service, "get_cheap_model_selector"):
                 model_override = self.llm_service.get_cheap_model_selector()
             elif use_cheap_model and hasattr(self.llm_service, "get_cheap_model"):
-                # Older services only expose the bare id — caller's behavior
-                # without vendor scoping is best-effort.
+                # Older services only expose the bare id — caller's
+                # behavior without vendor scoping is best-effort.
                 model_override = self.llm_service.get_cheap_model()
 
-            # Generate response
             response = await self.llm_service.generate(
                 prompt=prompt,
                 system_prompt="You are answering questions about conversation context. Be concise and accurate.",
-                model_override=model_override
+                model_override=model_override,
             )
+        except ValueError as e:
+            logger.error(f"recursive_query failed: {e}")
+            return ToolResult.failed(str(e))
+        except (IndexError, KeyError) as e:
+            logger.error(f"recursive_query failed: {e}")
+            return ToolResult.failed(str(e))
+        except (AttributeError, TypeError) as e:
+            logger.error(f"recursive_query failed: {e}")
+            return ToolResult.failed(str(e))
+        except Exception as e:
+            logger.error(f"recursive_query failed: {e}", exc_info=True)
+            return ToolResult.failed(str(e))
 
-            return {
-                "success": True,
-                "answer": response.strip() if isinstance(response, str) else str(response),
+        answer = response.strip() if isinstance(response, str) else str(response)
+        return ToolResult.ok(
+            confirmation=(
+                f"Answered query against {context_source} "
+                f"({len(context_text)} chars of context, "
+                f"model={model_override or 'default'})"
+            ),
+            data={
+                "answer": answer,
                 "context_source": context_source,
                 "query": query,
                 "model_used": model_override or "default",
-                "context_chars": len(context_text)
-            }
-
-        except ValueError as e:
-            logger.error(f"recursive_query failed: {e}")
-            return {"success": False, "error": str(e)}
-        except (IndexError, KeyError) as e:
-            logger.error(f"recursive_query failed: {e}")
-            return {"success": False, "error": str(e)}
-        except (AttributeError, TypeError) as e:
-            logger.error(f"recursive_query failed: {e}")
-            return {"success": False, "error": str(e)}
-        except Exception as e:
-            logger.error(f"recursive_query failed: {e}", exc_info=True)
-            return {"success": False, "error": str(e)}
+                "context_chars": len(context_text),
+            },
+        )

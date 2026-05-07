@@ -23,6 +23,7 @@ from kestrel_sovereign.a2a.types import (
 )
 from kestrel_sovereign.a2a.task_manager import TaskManager, create_task_manager
 from kestrel_sovereign.a2a.agent_card import AgentCard, AgentCapabilities, AgentSkill
+from kestrel_sdk.tools.result import ToolResultStatus
 from kestrel_sovereign.features.tasks.feature import TaskFeature
 
 
@@ -205,13 +206,14 @@ class TestRunWorkflow:
             {"feature": "model_agent", "skill": "get_current_model"},
         ])
 
-        assert result["success"] is True
-        assert result["workflow_steps"] == 1
-        assert result["completed"] == 1
-        assert result["failed"] == 0
-        assert len(result["results"]) == 1
+        assert result.status is ToolResultStatus.OK
+        data = result.data
+        assert data["workflow_steps"] == 1
+        assert data["completed"] == 1
+        assert data["failed"] == 0
+        assert len(data["results"]) == 1
 
-        step = result["results"][0]
+        step = data["results"][0]
         assert step["status"] == "completed"
         assert step["result"]["model"] == "claude-sonnet-4-5-20250929"
 
@@ -224,15 +226,15 @@ class TestRunWorkflow:
             {"feature": "wallet_feature", "skill": "check_balance"},
         ])
 
-        assert result["success"] is True
-        assert result["workflow_steps"] == 3
-        assert result["completed"] == 3
-        assert result["failed"] == 0
+        assert result.status is ToolResultStatus.OK
+        data = result.data
+        assert data["workflow_steps"] == 3
+        assert data["completed"] == 3
+        assert data["failed"] == 0
 
-        # Check each step has results
-        assert result["results"][0]["result"]["model"] == "claude-sonnet-4-5-20250929"
-        assert result["results"][1]["result"]["episodes"] == 42
-        assert result["results"][2]["result"]["balance"] == "12.50"
+        assert data["results"][0]["result"]["model"] == "claude-sonnet-4-5-20250929"
+        assert data["results"][1]["result"]["episodes"] == 42
+        assert data["results"][2]["result"]["balance"] == "12.50"
 
     @pytest.mark.asyncio
     async def test_step_with_args(self, task_feature):
@@ -241,8 +243,8 @@ class TestRunWorkflow:
             {"feature": "model_agent", "skill": "list_models", "args": {"provider": "openai"}},
         ])
 
-        assert result["success"] is True
-        step = result["results"][0]
+        assert result.status is ToolResultStatus.OK
+        step = result.data["results"][0]
         assert step["result"]["provider"] == "openai"
 
     @pytest.mark.asyncio
@@ -252,9 +254,10 @@ class TestRunWorkflow:
             {"feature": "nonexistent_feature", "skill": "do_something"},
         ])
 
-        assert result["success"] is False
-        assert result["failed"] == 1
-        step = result["results"][0]
+        # Every step failed → ERROR (no successes to surface as PARTIAL).
+        assert result.status is ToolResultStatus.ERROR
+        assert result.data["failed"] == 1
+        step = result.data["results"][0]
         assert step["status"] == "failed"
         assert "Unknown agent" in step["error"]
 
@@ -265,43 +268,47 @@ class TestRunWorkflow:
             {"feature": "model_agent", "skill": "nonexistent_skill"},
         ])
 
-        assert result["success"] is False
-        assert result["failed"] == 1
-        step = result["results"][0]
+        assert result.status is ToolResultStatus.ERROR
+        assert result.data["failed"] == 1
+        step = result.data["results"][0]
         assert step["status"] == "failed"
 
     @pytest.mark.asyncio
     async def test_partial_failure(self, task_feature):
-        """A failed step doesn't prevent other steps from running."""
+        """A failed step doesn't prevent other steps from running.
+
+        Mix of success+failure surfaces as PARTIAL — the LLM cannot
+        claim "workflow complete" while a step actually failed.
+        """
         result = await task_feature.run_workflow(steps=[
             {"feature": "model_agent", "skill": "get_current_model"},
             {"feature": "nonexistent_feature", "skill": "bad_skill"},
             {"feature": "wallet_feature", "skill": "check_balance"},
         ])
 
-        assert result["success"] is False  # overall fails because one step failed
-        assert result["completed"] == 2
-        assert result["failed"] == 1
+        assert result.status is ToolResultStatus.PARTIAL
+        data = result.data
+        assert data["completed"] == 2
+        assert data["failed"] == 1
 
-        # First and third steps succeeded
-        assert result["results"][0]["status"] == "completed"
-        assert result["results"][1]["status"] == "failed"
-        assert result["results"][2]["status"] == "completed"
+        assert data["results"][0]["status"] == "completed"
+        assert data["results"][1]["status"] == "failed"
+        assert data["results"][2]["status"] == "completed"
 
     @pytest.mark.asyncio
     async def test_empty_steps(self, task_feature):
         """Empty steps list returns error."""
         result = await task_feature.run_workflow(steps=[])
-        assert result["success"] is False
-        assert "non-empty" in result["error"]
+        assert result.status is ToolResultStatus.ERROR
+        assert "non-empty" in result.error
 
     @pytest.mark.asyncio
     async def test_invalid_step_format(self, task_feature):
         """Non-dict step is handled gracefully."""
         result = await task_feature.run_workflow(steps=["not a dict"])
-        assert result["success"] is False
-        assert result["results"][0]["status"] == "failed"
-        assert "object" in result["results"][0]["error"]
+        assert result.status is ToolResultStatus.ERROR
+        assert result.data["results"][0]["status"] == "failed"
+        assert "object" in result.data["results"][0]["error"]
 
     @pytest.mark.asyncio
     async def test_step_missing_required_fields(self, task_feature):
@@ -310,8 +317,8 @@ class TestRunWorkflow:
             {"feature": "model_agent"},  # missing skill
         ])
 
-        assert result["success"] is False
-        assert "requires" in result["results"][0]["error"]
+        assert result.status is ToolResultStatus.ERROR
+        assert "requires" in result.data["results"][0]["error"]
 
     @pytest.mark.asyncio
     async def test_no_task_manager(self):
@@ -322,8 +329,8 @@ class TestRunWorkflow:
             {"feature": "model_agent", "skill": "list_models"},
         ])
 
-        assert result["success"] is False
-        assert "not available" in result["error"]
+        assert result.status is ToolResultStatus.ERROR
+        assert "not available" in result.error
 
     @pytest.mark.asyncio
     async def test_duration_tracking(self, task_feature):
@@ -332,10 +339,11 @@ class TestRunWorkflow:
             {"feature": "model_agent", "skill": "get_current_model"},
         ])
 
-        assert "total_duration_ms" in result
-        assert result["total_duration_ms"] >= 0
+        data = result.data
+        assert "total_duration_ms" in data
+        assert data["total_duration_ms"] >= 0
 
-        step = result["results"][0]
+        step = data["results"][0]
         assert "duration_ms" in step
         assert step["duration_ms"] >= 0
 
@@ -347,10 +355,11 @@ class TestRunWorkflow:
             {"feature": "wallet_feature", "skill": "check_balance"},
         ])
 
-        assert result["results"][0]["feature"] == "model_agent"
-        assert result["results"][0]["skill"] == "list_models"
-        assert result["results"][1]["feature"] == "wallet_feature"
-        assert result["results"][1]["skill"] == "check_balance"
+        results = result.data["results"]
+        assert results[0]["feature"] == "model_agent"
+        assert results[0]["skill"] == "list_models"
+        assert results[1]["feature"] == "wallet_feature"
+        assert results[1]["skill"] == "check_balance"
 
 
 class TestListAvailableSkills:
@@ -361,18 +370,19 @@ class TestListAvailableSkills:
         """Returns all registered features with their skills."""
         result = await task_feature.list_available_skills()
 
-        assert result["success"] is True
-        assert result["feature_count"] == 3
-        assert "model_agent" in result["features"]
-        assert "memory_feature" in result["features"]
-        assert "wallet_feature" in result["features"]
+        assert result.status is ToolResultStatus.OK
+        data = result.data
+        assert data["feature_count"] == 3
+        assert "model_agent" in data["features"]
+        assert "memory_feature" in data["features"]
+        assert "wallet_feature" in data["features"]
 
     @pytest.mark.asyncio
     async def test_lists_skills_per_feature(self, task_feature):
         """Each feature includes its skill list with descriptions."""
         result = await task_feature.list_available_skills()
 
-        model = result["features"]["model_agent"]
+        model = result.data["features"]["model_agent"]
         skill_names = [s["skill"] for s in model["skills"]]
         assert "list_models" in skill_names
         assert "get_current_model" in skill_names
@@ -387,5 +397,5 @@ class TestListAvailableSkills:
         """Without task_manager, returns error."""
         feature = TaskFeature(agent=None)
         result = await feature.list_available_skills()
-        assert result["success"] is False
-        assert "not available" in result["error"]
+        assert result.status is ToolResultStatus.ERROR
+        assert "not available" in result.error

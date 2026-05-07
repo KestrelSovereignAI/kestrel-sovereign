@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 import pytest_asyncio
 
+from kestrel_sdk.tools.result import ToolResultStatus
 from kestrel_sovereign.features.memory.feature import MemoryFeature
 from kestrel_sovereign.storage.async_graph_store import Edge, GraphNode
 
@@ -86,10 +87,12 @@ class TestRecallActionItems:
                          created_at="2026-04-19T09:00:00+00:00"),
         ])
         result = await feature.recall_action_items()
-        assert result["count"] == 2
+        assert result.status is ToolResultStatus.OK
+        assert result.data["count"] == 2
+        items = result.data["action_items"]
         # Sorted by created_at desc (SQL ORDER BY)
-        assert result["action_items"][0]["text"] == "Call mom"
-        assert result["action_items"][1]["status"] == "done"
+        assert items[0]["text"] == "Call mom"
+        assert items[1]["status"] == "done"
 
     @pytest.mark.asyncio
     async def test_filters_by_status(self, feature):
@@ -97,8 +100,9 @@ class TestRecallActionItems:
             _action_node("a1", "Pending one", status="pending"),
         ])
         result = await feature.recall_action_items(status="pending")
-        assert result["count"] == 1
-        assert result["action_items"][0]["text"] == "Pending one"
+        assert result.status is ToolResultStatus.OK
+        assert result.data["count"] == 1
+        assert result.data["action_items"][0]["text"] == "Pending one"
 
     @pytest.mark.asyncio
     async def test_filters_by_assignee(self, feature):
@@ -106,8 +110,9 @@ class TestRecallActionItems:
             _action_node("a1", "Call mom", assignee="concept:agent:alice"),
         ])
         result = await feature.recall_action_items(assignee_concept_id="concept:agent:alice")
-        assert result["count"] == 1
-        assert result["action_items"][0]["assignee_concept_id"] == "concept:agent:alice"
+        assert result.status is ToolResultStatus.OK
+        assert result.data["count"] == 1
+        assert result.data["action_items"][0]["assignee_concept_id"] == "concept:agent:alice"
 
     @pytest.mark.asyncio
     async def test_filters_by_days_window(self, feature):
@@ -117,8 +122,9 @@ class TestRecallActionItems:
             _action_node("a1", "Recent", created_at=recent),
         ])
         result = await feature.recall_action_items(days=7)
-        assert result["count"] == 1
-        assert result["action_items"][0]["text"] == "Recent"
+        assert result.status is ToolResultStatus.OK
+        assert result.data["count"] == 1
+        assert result.data["action_items"][0]["text"] == "Recent"
 
     @pytest.mark.asyncio
     async def test_passes_filters_to_query(self, feature):
@@ -136,20 +142,20 @@ class TestRecallActionItems:
     @pytest.mark.asyncio
     async def test_rejects_invalid_status(self, feature):
         result = await feature.recall_action_items(status="nonsense")
-        assert result["success"] is False
-        assert "pending/done/cancelled" in result["error"]
+        assert result.status is ToolResultStatus.ERROR
+        assert "pending/done/cancelled" in result.error
 
     @pytest.mark.asyncio
     async def test_rejects_invalid_days(self, feature):
         for bad in (0, -1, 10_000):
             result = await feature.recall_action_items(days=bad)
-            assert result["success"] is False
+            assert result.status is ToolResultStatus.ERROR
 
     @pytest.mark.asyncio
     async def test_rejects_invalid_limit(self, feature):
         for bad in (0, -5, 500):
             result = await feature.recall_action_items(limit=bad)
-            assert result["success"] is False
+            assert result.status is ToolResultStatus.ERROR
 
 
 # =============================================================================
@@ -165,7 +171,7 @@ class TestUpdateActionItem:
             "action_1", "Call mom"
         ))
         result = await feature.update_action_item(item_id="action_1", status="done")
-        assert result["success"] is True
+        assert result.status is ToolResultStatus.OK
         # Must have upserted a node with the new status
         feature.agent.storage.graph.add_node.assert_awaited()
         persisted = feature.agent.storage.graph.add_node.await_args[0][0]
@@ -175,8 +181,8 @@ class TestUpdateActionItem:
     async def test_missing_item(self, feature):
         feature.agent.storage.graph.get_node = AsyncMock(return_value=None)
         result = await feature.update_action_item(item_id="missing", status="done")
-        assert result["success"] is False
-        assert "not found" in result["error"].lower()
+        assert result.status is ToolResultStatus.ERROR
+        assert "not found" in result.error.lower()
 
     @pytest.mark.asyncio
     async def test_wrong_node_type(self, feature):
@@ -184,8 +190,8 @@ class TestUpdateActionItem:
             node_id="some-decision", node_type="decision", label="x", properties={},
         ))
         result = await feature.update_action_item(item_id="some-decision", status="done")
-        assert result["success"] is False
-        assert "not found" in result["error"].lower()
+        assert result.status is ToolResultStatus.ERROR
+        assert "not found" in result.error.lower()
 
     @pytest.mark.asyncio
     async def test_cross_agent_mutation_blocked(self, feature):
@@ -194,19 +200,19 @@ class TestUpdateActionItem:
             "action_x", "Their item", agent_id="did:other",
         ))
         result = await feature.update_action_item(item_id="action_x", status="done")
-        assert result["success"] is False
+        assert result.status is ToolResultStatus.ERROR
         feature.agent.storage.graph.add_node.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_rejects_invalid_status(self, feature):
         result = await feature.update_action_item(item_id="action_1", status="bogus")
-        assert result["success"] is False
+        assert result.status is ToolResultStatus.ERROR
 
     @pytest.mark.asyncio
     async def test_no_fields_to_update(self, feature):
         result = await feature.update_action_item(item_id="action_1")
-        assert result["success"] is False
-        assert "no fields" in result["error"].lower()
+        assert result.status is ToolResultStatus.ERROR
+        assert "no fields" in result.error.lower()
 
     @pytest.mark.asyncio
     async def test_multi_field_update(self, feature):
@@ -219,7 +225,7 @@ class TestUpdateActionItem:
             due_date="2026-05-01",
             assignee_concept_id="concept:agent-1:alice",
         )
-        assert result["success"] is True
+        assert result.status is ToolResultStatus.OK
         persisted = feature.agent.storage.graph.add_node.await_args[0][0]
         assert persisted.properties["status"] == "pending"
         assert persisted.properties["due_date"] == "2026-05-01"
@@ -253,15 +259,17 @@ class TestRecallDecisions:
         )
 
         result = await feature.recall_decisions()
-        labels = [d["label"] for d in result["decisions"]]
+        assert result.status is ToolResultStatus.OK
+        labels = [d["label"] for d in result.data["decisions"]]
         assert "Move to Brooklyn" in labels
-        assert result["count"] == 1
+        assert result.data["count"] == 1
 
     @pytest.mark.asyncio
     async def test_empty(self, feature):
         result = await feature.recall_decisions()
-        assert result["decisions"] == []
-        assert result["count"] == 0
+        assert result.status is ToolResultStatus.OK
+        assert result.data["decisions"] == []
+        assert result.data["count"] == 0
 
     @pytest.mark.asyncio
     async def test_passes_agent_filter_to_query(self, feature):
@@ -300,13 +308,15 @@ class TestRecallInteractions:
         feature.agent.storage.graph.get_edges = AsyncMock(return_value=edges)
         result = await feature.recall_interactions(person_concept_id="concept:did:test:recall-agent:alice")
         # Only 'mentions' edges are interactions
-        assert result["count"] == 1
-        assert result["interactions"][0]["properties"]["sentiment"] == "positive"
+        assert result.status is ToolResultStatus.OK
+        assert result.data["count"] == 1
+        assert result.data["interactions"][0]["properties"]["sentiment"] == "positive"
 
     @pytest.mark.asyncio
     async def test_empty(self, feature):
         result = await feature.recall_interactions(person_concept_id="concept:agent-1:nobody")
-        assert result["interactions"] == []
+        assert result.status is ToolResultStatus.OK
+        assert result.data["interactions"] == []
 
 
 # =============================================================================
@@ -330,7 +340,7 @@ class TestConfirmPersonMatch:
             mentioned_label="alice",
             concept_id="concept:did:test:recall-agent:alice-smith",
         )
-        assert result["success"] is True
+        assert result.status is ToolResultStatus.OK
         # A mentions edge must be written with the canonical concept
         feature.agent.storage.graph.add_edge.assert_awaited()
         call = feature.agent.storage.graph.add_edge.await_args
@@ -356,8 +366,8 @@ class TestConfirmPersonMatch:
             mentioned_label="alice",
             concept_id="concept:did:test:recall-agent:alice-smith",
         )
-        assert result["success"] is True
-        assert result["ambiguous_edge_removed"] is True
+        assert result.status is ToolResultStatus.OK
+        assert result.data["ambiguous_edge_removed"] is True
         # delete_edge called with the ambiguous (guessed) target
         feature.agent.storage.graph.delete_edge.assert_awaited_once()
         del_call = feature.agent.storage.graph.delete_edge.await_args
@@ -381,8 +391,8 @@ class TestConfirmPersonMatch:
             mentioned_label="alice",
             concept_id="concept:did:test:recall-agent:alice",
         )
-        assert result["success"] is True
-        assert result["ambiguous_edge_removed"] is False
+        assert result.status is ToolResultStatus.OK
+        assert result.data["ambiguous_edge_removed"] is False
         feature.agent.storage.graph.delete_edge.assert_not_called()
 
     @pytest.mark.asyncio
@@ -393,7 +403,7 @@ class TestConfirmPersonMatch:
             mentioned_label="alice",
             concept_id="concept:agent-1:ghost",
         )
-        assert result["success"] is False
+        assert result.status is ToolResultStatus.ERROR
 
 
 # =============================================================================
@@ -411,8 +421,8 @@ class TestDueDateValidation:
         result = await feature.update_action_item(
             item_id="action_1", due_date="not-a-date"
         )
-        assert result["success"] is False
-        assert "iso-8601" in result["error"].lower()
+        assert result.status is ToolResultStatus.ERROR
+        assert "iso-8601" in result.error.lower()
 
     @pytest.mark.asyncio
     async def test_accepts_iso_date(self, feature):
@@ -422,7 +432,7 @@ class TestDueDateValidation:
         result = await feature.update_action_item(
             item_id="action_1", due_date="2026-05-01"
         )
-        assert result["success"] is True
+        assert result.status is ToolResultStatus.OK
 
     @pytest.mark.asyncio
     async def test_accepts_iso_datetime(self, feature):
@@ -432,7 +442,7 @@ class TestDueDateValidation:
         result = await feature.update_action_item(
             item_id="action_1", due_date="2026-05-01T14:00:00+00:00"
         )
-        assert result["success"] is True
+        assert result.status is ToolResultStatus.OK
 
 
 # =============================================================================
@@ -463,8 +473,9 @@ class TestRecallInteractionsAgentScope:
         ]
         feature.agent.storage.graph.get_edges = AsyncMock(return_value=edges)
         result = await feature.recall_interactions(person_concept_id="concept:x:alice")
-        assert result["count"] == 1
-        assert result["interactions"][0]["message_node_id"].endswith("my-msg")
+        assert result.status is ToolResultStatus.OK
+        assert result.data["count"] == 1
+        assert result.data["interactions"][0]["message_node_id"].endswith("my-msg")
 
 
 if __name__ == "__main__":

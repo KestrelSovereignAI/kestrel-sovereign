@@ -10,6 +10,9 @@ Integrates with the human-like memory system:
 - Importance weighting (life events stick)
 - Recency with decay (Ebbinghaus forgetting curve)
 - Access frequency (rehearsal effect)
+
+@tool methods return ``kestrel_sdk.tools.result.ToolResult`` per the
+kestrel-sovereign #1042 narration-honesty contract (see #1061).
 """
 
 import logging
@@ -22,6 +25,7 @@ from kestrel_sovereign.features.storage_access import (
     resolve_feature_database,
 )
 from kestrel_sdk.tools.base import ToolCategory
+from kestrel_sdk.tools.result import ToolResult
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +61,23 @@ def _strip_sent_form_for_recall(messages: List[Dict[str, Any]]) -> List[Dict[str
         else:
             out.append(msg)
     return out
+
+
+def _coerce_int(value: Any, name: str, *, lo: int, hi: int) -> tuple[Optional[int], Optional[str]]:
+    """Coerce a tool arg to an int in [lo, hi].
+
+    Returns ``(value, None)`` on success or ``(None, error_string)`` so
+    callers can return a ToolResult.failed without re-formatting. Used
+    for the schema-aware recall tools where malformed JSON args from
+    the LLM (string ``"25"``, float ``25.0``) are common.
+    """
+    try:
+        coerced = int(value)
+    except (TypeError, ValueError):
+        return None, f"{name} must be an integer, got {value!r}"
+    if coerced < lo or coerced > hi:
+        return None, f"{name} must be in [{lo}, {hi}], got {coerced}"
+    return coerced, None
 
 
 class MemoryFeature(Feature):
@@ -111,6 +132,47 @@ class MemoryFeature(Feature):
         """Navigate storage hierarchy to get the conversation store."""
         return resolve_feature_conversation_store(self.agent)
 
+    # ------------------------------------------------------------------
+    # Internal helper used by `recall_emotional` fallback. Keeping it
+    # separate from the @tool wrapper means the fallback consumer
+    # doesn't have to unpack a ToolResult envelope.
+    # ------------------------------------------------------------------
+
+    async def _search_memory_impl(
+        self,
+        query: str,
+        limit: int,
+        session_id: Optional[str],
+    ) -> Dict[str, Any]:
+        """Run the conversation-history search and return a dict.
+
+        Returns ``{"ok": True, "results": [...], "count": N, ...}`` or
+        ``{"ok": False, "error": str}``.
+        """
+        try:
+            conv_store = self._get_conversation_store()
+            if not conv_store:
+                return {"ok": False, "error": "Conversation store unavailable"}
+
+            results = await conv_store.search_history(
+                query=query,
+                limit=limit,
+                session_id=session_id,
+            )
+            return {
+                "ok": True,
+                "results": _strip_sent_form_for_recall(results),
+                "count": len(results),
+                "query": query,
+                "session_id": session_id,
+            }
+        except (AttributeError, TypeError, KeyError) as e:
+            logger.error(f"_search_memory_impl failed: {e}")
+            return {"ok": False, "error": str(e)}
+        except Exception as e:
+            logger.error(f"_search_memory_impl failed: {e}", exc_info=True)
+            return {"ok": False, "error": str(e)}
+
     @tool(
         name="search_memory",
         description="PRIMARY TOOL for recalling past conversations. Use this when asked 'do you remember', 'what did we discuss', or any question about past conversations. Decrypts and searches conversation history client-side for reliable results. Pass session_id to scope to a single conversation thread.",
@@ -122,7 +184,7 @@ class MemoryFeature(Feature):
         query: str,
         limit: int = 20,
         session_id: Optional[str] = None,
-    ) -> Dict[str, Any]:
+    ) -> ToolResult:
         """
         Search conversation history for matching content.
 
@@ -132,35 +194,37 @@ class MemoryFeature(Feature):
 
         Args:
             query: Search term or phrase to find in past conversations
-            limit: Maximum number of results to return (default 20)
+            limit: Maximum number of results to return (the request — actual
+                   count returned may be lower if fewer matches exist).
             session_id: If provided, only search messages tagged with this
                 session_id. Useful for "what did we discuss in this
                 conversation" queries.
         """
         try:
-            conv_store = self._get_conversation_store()
-            if not conv_store:
-                return {"success": False, "error": "Conversation store unavailable"}
+            limit_val = int(limit)
+        except (TypeError, ValueError):
+            return ToolResult.failed(f"limit must be an integer, got {limit!r}")
+        if limit_val < 1:
+            return ToolResult.failed("limit must be >= 1")
 
-            results = await conv_store.search_history(
-                query=query,
-                limit=limit,
-                session_id=session_id,
-            )
+        data = await self._search_memory_impl(query, limit_val, session_id)
+        if not data["ok"]:
+            return ToolResult.failed(data["error"])
 
-            return {
-                "success": True,
-                "results": _strip_sent_form_for_recall(results),
-                "count": len(results),
-                "query": query,
-                "session_id": session_id,
-            }
-        except (AttributeError, TypeError, KeyError) as e:
-            logger.error(f"search_memory failed: {e}")
-            return {"success": False, "error": str(e)}
-        except Exception as e:
-            logger.error(f"search_memory failed: {e}", exc_info=True)
-            return {"success": False, "error": str(e)}
+        scope = f" in session {session_id}" if session_id else ""
+        return ToolResult.ok(
+            confirmation=(
+                f"Found {data['count']} match(es) for {query!r}{scope} "
+                f"(limit requested: {limit_val})"
+            ),
+            data={
+                "results": data["results"],
+                "count": data["count"],
+                "query": data["query"],
+                "session_id": data["session_id"],
+                "limit_requested": limit_val,
+            },
+        )
 
     @tool(
         name="recall_recent",
@@ -168,26 +232,42 @@ class MemoryFeature(Feature):
         category=ToolCategory.MEMORY,
         command_prefix="!memory recent"
     )
-    async def recall_recent(self, limit: int = 20) -> Dict[str, Any]:
+    async def recall_recent(self, limit: int = 20) -> ToolResult:
         """
         Get recent conversation history.
 
         Args:
-            limit: Number of recent messages to retrieve (default 20)
+            limit: Number of recent messages to retrieve (the request —
+                   actual count returned may be lower if fewer messages exist).
         """
         try:
-            history = await self.storage.get_conversation_history(limit=limit)
-            return {
-                "success": True,
-                "messages": _strip_sent_form_for_recall(history),
-                "count": len(history)
-            }
+            limit_val = int(limit)
+        except (TypeError, ValueError):
+            return ToolResult.failed(f"limit must be an integer, got {limit!r}")
+        if limit_val < 1:
+            return ToolResult.failed("limit must be >= 1")
+
+        try:
+            history = await self.storage.get_conversation_history(limit=limit_val)
         except (AttributeError, TypeError) as e:
             logger.error(f"recall_recent failed: {e}")
-            return {"success": False, "error": str(e)}
+            return ToolResult.failed(str(e))
         except Exception as e:
             logger.error(f"recall_recent failed: {e}", exc_info=True)
-            return {"success": False, "error": str(e)}
+            return ToolResult.failed(str(e))
+
+        cleaned = _strip_sent_form_for_recall(history)
+        return ToolResult.ok(
+            confirmation=(
+                f"Retrieved {len(cleaned)} recent message(s) "
+                f"(limit requested: {limit_val})"
+            ),
+            data={
+                "messages": cleaned,
+                "count": len(cleaned),
+                "limit_requested": limit_val,
+            },
+        )
 
     @tool(
         name="search_documents",
@@ -195,37 +275,50 @@ class MemoryFeature(Feature):
         category=ToolCategory.MEMORY,
         command_prefix="!memory docs"
     )
-    async def search_documents(self, query: str, limit: int = 5) -> Dict[str, Any]:
+    async def search_documents(self, query: str, limit: int = 5) -> ToolResult:
         """
         Search RAG document chunks using hybrid semantic + keyword search.
 
         Args:
             query: Search query for finding relevant documents
-            limit: Maximum number of document chunks to return (default 5)
+            limit: Maximum number of document chunks to return (the request).
         """
         try:
-            results = await self.storage.search_chunks(query, limit)
-            # Format results for readability
-            formatted = []
-            for res in results:
-                formatted.append({
-                    "source": res.get("document_name") or res.get("file_hash", "unknown"),
-                    "content": res.get("content", "")[:500],  # Truncate for preview
-                    "score": res.get("score", 0),
-                    "full_content": res.get("content", "")
-                })
-            return {
-                "success": True,
-                "results": formatted,
-                "count": len(formatted),
-                "query": query
-            }
+            limit_val = int(limit)
+        except (TypeError, ValueError):
+            return ToolResult.failed(f"limit must be an integer, got {limit!r}")
+        if limit_val < 1:
+            return ToolResult.failed("limit must be >= 1")
+
+        try:
+            results = await self.storage.search_chunks(query, limit_val)
         except (AttributeError, TypeError, KeyError) as e:
             logger.error(f"search_documents failed: {e}")
-            return {"success": False, "error": str(e)}
+            return ToolResult.failed(str(e))
         except Exception as e:
             logger.error(f"search_documents failed: {e}", exc_info=True)
-            return {"success": False, "error": str(e)}
+            return ToolResult.failed(str(e))
+
+        formatted = []
+        for res in results:
+            formatted.append({
+                "source": res.get("document_name") or res.get("file_hash", "unknown"),
+                "content": res.get("content", "")[:500],
+                "score": res.get("score", 0),
+                "full_content": res.get("content", ""),
+            })
+        return ToolResult.ok(
+            confirmation=(
+                f"Found {len(formatted)} document chunk(s) for {query!r} "
+                f"(limit requested: {limit_val})"
+            ),
+            data={
+                "results": formatted,
+                "count": len(formatted),
+                "query": query,
+                "limit_requested": limit_val,
+            },
+        )
 
     @tool(
         name="search_case_law",
@@ -233,36 +326,48 @@ class MemoryFeature(Feature):
         category=ToolCategory.MEMORY,
         command_prefix="!memory cases"
     )
-    async def search_case_law(self, query: str, limit: int = 3) -> Dict[str, Any]:
+    async def search_case_law(self, query: str, limit: int = 3) -> ToolResult:
         """
         Search past audit decisions for precedent.
 
         Args:
             query: Query describing the ethical/governance situation
-            limit: Maximum number of cases to return (default 3)
+            limit: Maximum number of cases to return (the request).
         """
         try:
-            # Use the case law search if available
-            if hasattr(self.storage, 'search_case_law'):
-                results = await self.storage.search_case_law(query, limit)
-                return {
-                    "success": True,
-                    "cases": results,
-                    "count": len(results),
-                    "query": query
-                }
-            else:
-                return {
-                    "success": False,
-                    "error": "Case law search not available",
-                    "note": "This feature requires audit history to be enabled"
-                }
+            limit_val = int(limit)
+        except (TypeError, ValueError):
+            return ToolResult.failed(f"limit must be an integer, got {limit!r}")
+        if limit_val < 1:
+            return ToolResult.failed("limit must be >= 1")
+
+        if not hasattr(self.storage, 'search_case_law'):
+            return ToolResult.failed(
+                "Case law search not available",
+                data={"reason": "audit history is not enabled on this storage"},
+            )
+
+        try:
+            results = await self.storage.search_case_law(query, limit_val)
         except (AttributeError, TypeError, KeyError) as e:
             logger.error(f"search_case_law failed: {e}")
-            return {"success": False, "error": str(e)}
+            return ToolResult.failed(str(e))
         except Exception as e:
             logger.error(f"search_case_law failed: {e}", exc_info=True)
-            return {"success": False, "error": str(e)}
+            return ToolResult.failed(str(e))
+
+        return ToolResult.ok(
+            confirmation=(
+                f"Found {len(results)} case(s) for {query!r} "
+                f"(limit requested: {limit_val})"
+            ),
+            data={
+                "cases": results,
+                "count": len(results),
+                "query": query,
+                "limit_requested": limit_val,
+            },
+        )
 
     @tool(
         name="get_episodes",
@@ -270,34 +375,48 @@ class MemoryFeature(Feature):
         category=ToolCategory.MEMORY,
         command_prefix="!memory episodes"
     )
-    async def get_episodes(self, limit: int = 10) -> Dict[str, Any]:
+    async def get_episodes(self, limit: int = 10) -> ToolResult:
         """
         Get memory episodes from consolidation.
 
         Args:
-            limit: Maximum episodes to return (default 10)
+            limit: Maximum episodes to return (the request).
         """
         if not self.consolidator:
-            return {
-                "success": False,
-                "error": "Memory consolidator not available",
-                "note": "Episodes are created during memory consolidation cycles"
-            }
+            return ToolResult.failed(
+                "Memory consolidator not available",
+                data={"reason": "episodes are created during memory consolidation cycles"},
+            )
+
+        try:
+            limit_val = int(limit)
+        except (TypeError, ValueError):
+            return ToolResult.failed(f"limit must be an integer, got {limit!r}")
+        if limit_val < 1:
+            return ToolResult.failed("limit must be >= 1")
+
         try:
             episodes = await self.consolidator.get_recent_episodes_for_context(
-                max_episodes=limit
+                max_episodes=limit_val
             )
-            return {
-                "success": True,
-                "episodes": episodes,
-                "count": len(episodes)
-            }
         except (AttributeError, TypeError) as e:
             logger.error(f"get_episodes failed: {e}")
-            return {"success": False, "error": str(e)}
+            return ToolResult.failed(str(e))
         except Exception as e:
             logger.error(f"get_episodes failed: {e}", exc_info=True)
-            return {"success": False, "error": str(e)}
+            return ToolResult.failed(str(e))
+
+        return ToolResult.ok(
+            confirmation=(
+                f"Retrieved {len(episodes)} episode(s) "
+                f"(limit requested: {limit_val})"
+            ),
+            data={
+                "episodes": episodes,
+                "count": len(episodes),
+                "limit_requested": limit_val,
+            },
+        )
 
     @tool(
         name="memory_status",
@@ -305,27 +424,19 @@ class MemoryFeature(Feature):
         category=ToolCategory.SYSTEM,
         command_prefix="!memory status"
     )
-    async def memory_status(self) -> Dict[str, Any]:
-        """
-        Get memory system status and statistics.
-
-        Returns:
-            Dict with 'success': True and status info on success.
-            Dict with 'success': False, 'error': str on failure.
-        """
+    async def memory_status(self) -> ToolResult:
+        """Get memory system status and statistics."""
         try:
-            # Get conversation count
             history = await self.storage.get_conversation_history(limit=10000)
             total_messages = len(history)
 
-            # Get conversation store encryption status
             conv_store = self._get_conversation_store()
-            encryption_enabled = getattr(conv_store, 'encryption_enabled', False) if conv_store else False
+            encryption_enabled = (
+                getattr(conv_store, 'encryption_enabled', False) if conv_store else False
+            )
 
-            # Get RAG stats if available
-            rag_stats = {}
+            rag_stats: Dict[str, Any] = {}
             if hasattr(self.storage, 'rag'):
-                # Try to get chunk count
                 try:
                     count_result = await self._db.fetchone(
                         "SELECT COUNT(*) FROM document_chunks"
@@ -334,7 +445,6 @@ class MemoryFeature(Feature):
                 except Exception:
                     rag_stats["document_chunks"] = "unknown"
 
-            # Get file count
             file_count = 0
             try:
                 file_result = await self._db.fetchone(
@@ -345,28 +455,36 @@ class MemoryFeature(Feature):
             except Exception:
                 pass
 
-            # Include MemorySystem summary if available
-            memory_system_info = {}
+            memory_system_info: Dict[str, Any] = {}
             if self.memory_system:
                 memory_system_info = self.memory_system.get_summary()
+        except (AttributeError, TypeError, KeyError) as e:
+            logger.error(f"memory_status failed: {e}")
+            return ToolResult.failed(str(e))
+        except Exception as e:
+            logger.error(f"memory_status failed: {e}", exc_info=True)
+            return ToolResult.failed(str(e))
 
-            return {
-                "success": True,
+        agent_id_short = (
+            (self.agent_id[:30] + "...") if len(self.agent_id) > 30 else self.agent_id
+        )
+        return ToolResult.ok(
+            confirmation=(
+                f"Memory status: {total_messages} message(s), "
+                f"{file_count} file(s), "
+                f"encryption={'on' if encryption_enabled else 'off'}"
+            ),
+            data={
                 "total_messages": total_messages,
                 "files_stored": file_count,
                 "encryption_enabled": encryption_enabled,
-                "agent_id": (self.agent_id[:30] + "...") if len(self.agent_id) > 30 else self.agent_id,
+                "agent_id": agent_id_short,
                 "consolidator_available": self.consolidator is not None,
                 "retriever_available": self.memory_retriever is not None,
                 "memory_system": memory_system_info,
-                "rag": rag_stats
-            }
-        except (AttributeError, TypeError, KeyError) as e:
-            logger.error(f"memory_status failed: {e}")
-            return {"success": False, "error": str(e)}
-        except Exception as e:
-            logger.error(f"memory_status failed: {e}", exc_info=True)
-            return {"success": False, "error": str(e)}
+                "rag": rag_stats,
+            },
+        )
 
     @tool(
         name="recall_emotional",
@@ -379,7 +497,7 @@ class MemoryFeature(Feature):
         query: str,
         mood: str = "neutral",
         limit: int = 10
-    ) -> Dict[str, Any]:
+    ) -> ToolResult:
         """
         Retrieve memories with human-like weighting.
 
@@ -394,74 +512,99 @@ class MemoryFeature(Feature):
         Args:
             query: What you're trying to remember
             mood: Current emotional context (positive, negative, neutral)
-            limit: Maximum memories to retrieve (default 10)
+            limit: Maximum memories to retrieve (the request).
         """
+        try:
+            limit_val = int(limit)
+        except (TypeError, ValueError):
+            return ToolResult.failed(f"limit must be an integer, got {limit!r}")
+        if limit_val < 1:
+            return ToolResult.failed("limit must be >= 1")
+
         if not self.memory_retriever:
-            return {
-                "success": False,
-                "error": "Memory retriever not available",
-                "note": "Falling back to basic search",
-                "fallback": await self.search_memory(query, limit)
-            }
+            # Fallback path: surface as PARTIAL so the LLM cannot claim
+            # the emotionally-weighted recall ran when the retriever was
+            # unavailable and we degraded to keyword search.
+            fallback = await self._search_memory_impl(query, limit_val, None)
+            if not fallback["ok"]:
+                return ToolResult.failed(
+                    "Memory retriever not available; basic search also failed: "
+                    f"{fallback['error']}",
+                    data={"limit_requested": limit_val},
+                )
+            return ToolResult.partial(
+                confirmation=(
+                    f"Memory retriever unavailable; fell back to keyword "
+                    f"search and found {fallback['count']} match(es)"
+                ),
+                error=(
+                    "emotional weighting (mood/importance/recency) was NOT "
+                    "applied — results are basic keyword matches"
+                ),
+                data={
+                    "fallback_results": fallback["results"],
+                    "count": fallback["count"],
+                    "query": query,
+                    "limit_requested": limit_val,
+                },
+            )
 
         try:
-            # Import here to avoid circular dependency
             from kestrel_sovereign.storage.memory_models import MemoryMetadata
 
-            # Create emotional context based on mood
             mood_valence = {
                 "positive": 0.6,
                 "negative": -0.6,
-                "neutral": 0.0
+                "neutral": 0.0,
             }.get(mood.lower(), 0.0)
 
             emotional_context = MemoryMetadata(
                 emotional_valence=mood_valence,
-                emotional_intensity=0.5 if mood != "neutral" else 0.0
+                emotional_intensity=0.5 if mood != "neutral" else 0.0,
             )
 
-            # Retrieve with human-like weighting
             memories = await self.memory_retriever.retrieve(
                 query=query,
                 agent_id=self.agent_id,
                 emotional_context=emotional_context,
-                limit=limit
+                limit=limit_val,
             )
+        except (AttributeError, TypeError, KeyError, ValueError) as e:
+            logger.error(f"recall_emotional failed: {e}")
+            return ToolResult.failed(str(e))
+        except Exception as e:
+            logger.error(f"recall_emotional failed: {e}", exc_info=True)
+            return ToolResult.failed(str(e))
 
-            # Format for readability. Strip sent-form wrappers from
-            # user-role rows so the returned content is what the user
-            # actually said, not a rendered prompt with retrieved-context
-            # blocks (see _strip_sent_form_for_recall).
-            formatted = []
-            for mem in memories:
-                meta = mem.get("metadata", {})
-                role = mem.get("role", "unknown")
-                content = mem.get("content", "")
-                if role == "user" and isinstance(content, str):
-                    content = extract_raw_user_content(content)
-                formatted.append({
-                    "content": content,
-                    "role": role,
-                    "score": mem.get("score", 0),
-                    "emotional_valence": meta.get("emotional_valence", 0),
-                    "importance": meta.get("importance", 0.5),
-                    "timestamp": mem.get("timestamp", "")
-                })
+        formatted = []
+        for mem in memories:
+            meta = mem.get("metadata", {})
+            role = mem.get("role", "unknown")
+            content = mem.get("content", "")
+            if role == "user" and isinstance(content, str):
+                content = extract_raw_user_content(content)
+            formatted.append({
+                "content": content,
+                "role": role,
+                "score": mem.get("score", 0),
+                "emotional_valence": meta.get("emotional_valence", 0),
+                "importance": meta.get("importance", 0.5),
+                "timestamp": mem.get("timestamp", ""),
+            })
 
-            return {
-                "success": True,
+        return ToolResult.ok(
+            confirmation=(
+                f"Retrieved {len(formatted)} memory(ies) with human-like "
+                f"weighting (mood={mood}, limit requested: {limit_val})"
+            ),
+            data={
                 "memories": formatted,
                 "count": len(formatted),
                 "query": query,
                 "mood_context": mood,
-                "note": "Retrieved using human-like memory weighting"
-            }
-        except (AttributeError, TypeError, KeyError, ValueError) as e:
-            logger.error(f"recall_emotional failed: {e}")
-            return {"success": False, "error": str(e)}
-        except Exception as e:
-            logger.error(f"recall_emotional failed: {e}", exc_info=True)
-            return {"success": False, "error": str(e)}
+                "limit_requested": limit_val,
+            },
+        )
 
     @tool(
         name="delete_messages",
@@ -469,49 +612,77 @@ class MemoryFeature(Feature):
         category=ToolCategory.MEMORY,
         command_prefix="!memory delete"
     )
-    async def delete_messages(self, pattern: str, confirm: bool = False) -> Dict[str, Any]:
+    async def delete_messages(self, pattern: str, confirm: bool = False) -> ToolResult:
         """
         Delete messages matching a content pattern.
 
         Args:
             pattern: Text pattern to match (case-insensitive)
-            confirm: Must be True to actually delete (safety check)
+            confirm: Must be True to actually delete (safety check). The
+                LLM occasionally passes truthy strings like "false"; we
+                accept only the literal Python bool ``True`` for the
+                destructive path.
         """
-        try:
-            conv_store = self._get_conversation_store()
-            if not conv_store:
-                return {"success": False, "error": "Conversation store not available"}
+        # ``confirm`` is destructive — refuse anything that isn't the
+        # actual ``True`` bool, including the truthy strings "true"/"false".
+        if not isinstance(confirm, bool):
+            return ToolResult.failed(
+                "confirm must be a boolean (True/False), "
+                f"got {type(confirm).__name__}={confirm!r}"
+            )
 
-            if not confirm:
-                # Preview mode - show what would be deleted
-                history = await conv_store.get_full_history_with_ids(include_excluded=True, include_stashed=True)
-                pattern_lower = pattern.lower()
-                matches = [
-                    {"id": msg["id"], "role": msg["role"], "preview": msg.get("content", "")[:100]}
-                    for msg in history
-                    if pattern_lower in msg.get("content", "").lower()
-                ]
-                return {
-                    "success": True,
+        conv_store = self._get_conversation_store()
+        if not conv_store:
+            return ToolResult.failed("Conversation store not available")
+
+        if not confirm:
+            try:
+                history = await conv_store.get_full_history_with_ids(
+                    include_excluded=True, include_stashed=True
+                )
+            except (AttributeError, TypeError, KeyError) as e:
+                logger.error(f"delete_messages preview failed: {e}")
+                return ToolResult.failed(str(e))
+            except Exception as e:
+                logger.error(f"delete_messages preview failed: {e}", exc_info=True)
+                return ToolResult.failed(str(e))
+
+            pattern_lower = pattern.lower()
+            matches = [
+                {"id": msg["id"], "role": msg["role"], "preview": msg.get("content", "")[:100]}
+                for msg in history
+                if pattern_lower in msg.get("content", "").lower()
+            ]
+            return ToolResult.ok(
+                confirmation=(
+                    f"Preview only — {len(matches)} message(s) match pattern "
+                    f"{pattern!r} (call with confirm=True to delete)"
+                ),
+                data={
                     "mode": "preview",
                     "would_delete": len(matches),
-                    "matches": matches[:20],  # Limit preview
-                    "note": "Set confirm=True to actually delete these messages"
-                }
+                    "matches": matches[:20],
+                    "pattern": pattern,
+                },
+            )
 
-            # Actually delete
+        try:
             deleted = await conv_store.delete_messages_matching(pattern)
-            return {
-                "success": True,
-                "deleted": deleted,
-                "pattern": pattern
-            }
         except (AttributeError, TypeError, KeyError) as e:
             logger.error(f"delete_messages failed: {e}")
-            return {"success": False, "error": str(e)}
+            return ToolResult.failed(str(e))
         except Exception as e:
             logger.error(f"delete_messages failed: {e}", exc_info=True)
-            return {"success": False, "error": str(e)}
+            return ToolResult.failed(str(e))
+
+        return ToolResult.ok(
+            confirmation=f"Deleted {deleted} message(s) matching {pattern!r}",
+            data={
+                "mode": "delete",
+                "deleted": deleted,
+                "pattern": pattern,
+            },
+        )
 
     @tool(
         name="memory_consolidate",
@@ -519,7 +690,7 @@ class MemoryFeature(Feature):
         category=ToolCategory.MEMORY,
         command_prefix="!memory consolidate"
     )
-    async def memory_consolidate(self) -> Dict[str, Any]:
+    async def memory_consolidate(self) -> ToolResult:
         """
         Run the memory consolidation pipeline.
 
@@ -527,28 +698,34 @@ class MemoryFeature(Feature):
         - Creates narrative episodes from recent message clusters
         - Detects temporal behavioral patterns
         - Archives memories whose decay strength has fallen below threshold
-
-        This is the missing automatic invocation — without this tool being
-        scheduled, memory_episodes table stays empty and the cognitive
-        memory layer never compounds beyond the raw conversation history.
-
-        Returns:
-            Dict with episodes_created, patterns_found, messages_archived counts
         """
-        try:
-            memory_system = getattr(self.agent, "memory_system", None)
-            if not memory_system:
-                return {"success": False, "error": "MemorySystem not available on agent"}
+        memory_system = getattr(self.agent, "memory_system", None)
+        if not memory_system:
+            return ToolResult.failed("MemorySystem not available on agent")
 
-            # Go through the MemorySystem facade so None-safety is consistent
-            # with all other consolidate callers (sleep cycle, etc.)
+        try:
             result = await memory_system.consolidate()
-            if "error" in result:
-                return {"success": False, **result}
-            return {"success": True, **result}
         except Exception as e:
             logger.error(f"memory_consolidate failed: {e}", exc_info=True)
-            return {"success": False, "error": str(e)}
+            return ToolResult.failed(str(e))
+
+        if isinstance(result, dict) and "error" in result:
+            return ToolResult.failed(
+                str(result["error"]),
+                data={k: v for k, v in result.items() if k != "error"},
+            )
+
+        episodes_created = (result or {}).get("episodes_created", 0)
+        patterns_found = (result or {}).get("patterns_found", 0)
+        messages_archived = (result or {}).get("messages_archived", 0)
+        return ToolResult.ok(
+            confirmation=(
+                f"Consolidation complete: {episodes_created} episode(s), "
+                f"{patterns_found} pattern(s), "
+                f"{messages_archived} message(s) archived"
+            ),
+            data=dict(result or {}),
+        )
 
     # ------------------------------------------------------------------
     # Schema-aware recall tools (#628)
@@ -570,7 +747,7 @@ class MemoryFeature(Feature):
         assignee_concept_id: Optional[str] = None,
         limit: int = 25,
         include_superseded: bool = False,
-    ) -> Dict[str, Any]:
+    ) -> ToolResult:
         """Query action_item graph nodes with optional property filters.
 
         Action items live as graph nodes of type `action_item` (no
@@ -590,30 +767,32 @@ class MemoryFeature(Feature):
             include_superseded: If False (default), excludes items that
                 have been superseded by a newer claim.
         """
+        if not isinstance(include_superseded, bool):
+            return ToolResult.failed(
+                "include_superseded must be a boolean, "
+                f"got {type(include_superseded).__name__}={include_superseded!r}"
+            )
+
         storage = getattr(self.agent, "storage", None)
         if storage is None or not hasattr(storage, "graph"):
-            return {"success": False, "error": "Graph store not available"}
+            return ToolResult.failed("Graph store not available")
 
-        try:
-            limit = int(limit)
-        except (TypeError, ValueError):
-            return {"success": False, "error": f"limit must be an integer, got {limit!r}"}
-        if limit < 1 or limit > 200:
-            return {"success": False, "error": "limit must be in [1, 200]"}
+        limit_val, err = _coerce_int(limit, "limit", lo=1, hi=200)
+        if err:
+            return ToolResult.failed(err)
 
         if status is not None and status not in ("pending", "done", "cancelled"):
-            return {"success": False, "error": f"status must be pending/done/cancelled, got {status!r}"}
+            return ToolResult.failed(
+                f"status must be pending/done/cancelled, got {status!r}"
+            )
 
         since: Optional[str] = None
         if days is not None:
-            try:
-                days = int(days)
-            except (TypeError, ValueError):
-                return {"success": False, "error": f"days must be an integer, got {days!r}"}
-            if days < 1 or days > 3650:
-                return {"success": False, "error": "days must be in [1, 3650]"}
+            days_val, err = _coerce_int(days, "days", lo=1, hi=3650)
+            if err:
+                return ToolResult.failed(err)
             from datetime import datetime, timezone, timedelta
-            since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+            since = (datetime.now(timezone.utc) - timedelta(days=days_val)).isoformat()
 
         filters: dict = {"agent_id": self.agent_id}
         if status is not None:
@@ -627,11 +806,11 @@ class MemoryFeature(Feature):
                 filters=filters,
                 created_since=since,
                 order_by_created=True,
-                limit=limit,
+                limit=limit_val,
             )
         except Exception as e:
             logger.error("recall_action_items query failed: %s", e)
-            return {"success": False, "error": str(e)}
+            return ToolResult.failed(str(e))
 
         matching = []
         for n in nodes:
@@ -652,7 +831,26 @@ class MemoryFeature(Feature):
                 "temporal_validity": props.get("temporal_validity"),
                 "superseded_by": props.get("superseded_by"),
             })
-        return {"action_items": matching, "count": len(matching)}
+
+        filter_clause = ""
+        if status:
+            filter_clause += f" status={status}"
+        if days is not None:
+            filter_clause += f" within last {days_val}d"
+        if assignee_concept_id:
+            filter_clause += f" assignee={assignee_concept_id}"
+        return ToolResult.ok(
+            confirmation=(
+                f"Retrieved {len(matching)} action item(s){filter_clause} "
+                f"(limit requested: {limit_val})"
+            ),
+            data={
+                "action_items": matching,
+                "count": len(matching),
+                "limit_requested": limit_val,
+                "include_superseded": include_superseded,
+            },
+        )
 
     @tool(
         name="update_action_item",
@@ -666,48 +864,53 @@ class MemoryFeature(Feature):
         status: Optional[str] = None,
         due_date: Optional[str] = None,
         assignee_concept_id: Optional[str] = None,
-    ) -> Dict[str, Any]:
+    ) -> ToolResult:
         """Update a single action item graph node. Null fields are preserved."""
         storage = getattr(self.agent, "storage", None)
         if storage is None or not hasattr(storage, "graph"):
-            return {"success": False, "error": "Graph store not available"}
+            return ToolResult.failed("Graph store not available")
 
         if status is not None and status not in ("pending", "done", "cancelled"):
-            return {"success": False, "error": f"status must be pending/done/cancelled, got {status!r}"}
+            return ToolResult.failed(
+                f"status must be pending/done/cancelled, got {status!r}"
+            )
 
         if due_date is not None:
-            # Accept ISO-8601 date or datetime strings.
             from datetime import datetime as _dt
             try:
                 _dt.fromisoformat(due_date)
             except (TypeError, ValueError):
-                return {
-                    "success": False,
-                    "error": f"due_date must be ISO-8601 (YYYY-MM-DD or full datetime), got {due_date!r}",
-                }
+                return ToolResult.failed(
+                    "due_date must be ISO-8601 (YYYY-MM-DD or full datetime), "
+                    f"got {due_date!r}"
+                )
 
         if status is None and due_date is None and assignee_concept_id is None:
-            return {"success": False, "error": "no fields to update"}
+            return ToolResult.failed("no fields to update")
 
         try:
             node = await storage.graph.get_node(item_id)
         except Exception as e:
             logger.error("update_action_item lookup failed: %s", e)
-            return {"success": False, "error": str(e)}
+            return ToolResult.failed(str(e))
         if node is None or node.node_type != "action_item":
-            return {"success": False, "error": f"Action item {item_id} not found"}
+            return ToolResult.failed(f"Action item {item_id} not found")
 
         props = dict(node.properties or {})
         if props.get("agent_id") != self.agent_id:
             # Don't leak cross-agent mutations.
-            return {"success": False, "error": f"Action item {item_id} not found"}
+            return ToolResult.failed(f"Action item {item_id} not found")
 
+        updates: List[str] = []
         if status is not None:
             props["status"] = status
+            updates.append(f"status={status}")
         if due_date is not None:
             props["due_date"] = due_date
+            updates.append(f"due_date={due_date}")
         if assignee_concept_id is not None:
             props["assignee_concept_id"] = assignee_concept_id
+            updates.append(f"assignee={assignee_concept_id}")
         props["updated_at"] = _utc_now_iso()
 
         from kestrel_sovereign.storage.async_graph_store import GraphNode
@@ -720,8 +923,12 @@ class MemoryFeature(Feature):
             ))
         except Exception as e:
             logger.error("update_action_item write failed: %s", e)
-            return {"success": False, "error": str(e)}
-        return {"success": True, "item_id": item_id}
+            return ToolResult.failed(str(e))
+
+        return ToolResult.ok(
+            confirmation=f"Updated action item {item_id}: {', '.join(updates)}",
+            data={"item_id": item_id, "updates": updates},
+        )
 
     @tool(
         name="recall_decisions",
@@ -733,29 +940,32 @@ class MemoryFeature(Feature):
         self,
         limit: int = 25,
         include_superseded: bool = False,
-    ) -> Dict[str, Any]:
+    ) -> ToolResult:
         """List decisions from the graph."""
+        if not isinstance(include_superseded, bool):
+            return ToolResult.failed(
+                "include_superseded must be a boolean, "
+                f"got {type(include_superseded).__name__}={include_superseded!r}"
+            )
+
         storage = getattr(self.agent, "storage", None)
         if storage is None or not hasattr(storage, "graph"):
-            return {"success": False, "error": "Graph store not available"}
+            return ToolResult.failed("Graph store not available")
 
-        try:
-            limit = int(limit)
-        except (TypeError, ValueError):
-            return {"success": False, "error": f"limit must be an integer, got {limit!r}"}
-        if limit < 1 or limit > 200:
-            return {"success": False, "error": "limit must be in [1, 200]"}
+        limit_val, err = _coerce_int(limit, "limit", lo=1, hi=200)
+        if err:
+            return ToolResult.failed(err)
 
         try:
             nodes = await storage.graph.query_nodes_by_type_and_property(
                 "decision",
                 filters={"agent_id": self.agent_id},
                 order_by_created=True,
-                limit=limit,
+                limit=limit_val,
             )
         except Exception as e:
             logger.error("recall_decisions failed: %s", e)
-            return {"success": False, "error": str(e)}
+            return ToolResult.failed(str(e))
 
         own = []
         for n in nodes:
@@ -774,7 +984,18 @@ class MemoryFeature(Feature):
                 "temporal_validity": props.get("temporal_validity"),
                 "superseded_by": props.get("superseded_by"),
             })
-        return {"decisions": own, "count": len(own)}
+        return ToolResult.ok(
+            confirmation=(
+                f"Retrieved {len(own)} decision(s) "
+                f"(limit requested: {limit_val})"
+            ),
+            data={
+                "decisions": own,
+                "count": len(own),
+                "limit_requested": limit_val,
+                "include_superseded": include_superseded,
+            },
+        )
 
     @tool(
         name="recall_interactions",
@@ -786,24 +1007,21 @@ class MemoryFeature(Feature):
         self,
         person_concept_id: str,
         limit: int = 25,
-    ) -> Dict[str, Any]:
+    ) -> ToolResult:
         """Return recent mentions edges pointing at a person concept."""
         storage = getattr(self.agent, "storage", None)
         if storage is None or not hasattr(storage, "graph"):
-            return {"success": False, "error": "Graph store not available"}
+            return ToolResult.failed("Graph store not available")
 
-        try:
-            limit = int(limit)
-        except (TypeError, ValueError):
-            return {"success": False, "error": f"limit must be an integer, got {limit!r}"}
-        if limit < 1 or limit > 200:
-            return {"success": False, "error": "limit must be in [1, 200]"}
+        limit_val, err = _coerce_int(limit, "limit", lo=1, hi=200)
+        if err:
+            return ToolResult.failed(err)
 
         try:
             edges = await storage.graph.get_edges(person_concept_id, direction="in")
         except Exception as e:
             logger.error("recall_interactions failed: %s", e)
-            return {"success": False, "error": str(e)}
+            return ToolResult.failed(str(e))
 
         # Message nodes are namespaced by agent id: `message:{agent_id}:{msg}`.
         # Without this guard, a caller passing a shared concept id could
@@ -821,7 +1039,19 @@ class MemoryFeature(Feature):
             key=lambda i: (i.get("properties") or {}).get("recorded_at") or "",
             reverse=True,
         )
-        return {"interactions": interactions[:limit], "count": min(len(interactions), limit)}
+        truncated = interactions[:limit_val]
+        return ToolResult.ok(
+            confirmation=(
+                f"Retrieved {len(truncated)} interaction(s) for "
+                f"{person_concept_id} (limit requested: {limit_val})"
+            ),
+            data={
+                "interactions": truncated,
+                "count": len(truncated),
+                "person_concept_id": person_concept_id,
+                "limit_requested": limit_val,
+            },
+        )
 
     @tool(
         name="confirm_person_match",
@@ -834,22 +1064,15 @@ class MemoryFeature(Feature):
         message_id: str,
         mentioned_label: str,
         concept_id: str,
-    ) -> Dict[str, Any]:
-        """Resolve an ambiguous person mention.
-
-        Removes the ambiguous label-based mentions edge
-        (message → concept:{agent}:{mentioned_label}) and writes a canonical
-        mentions edge pointing at the confirmed concept id. After this runs,
-        recall_interactions on the confirmed concept includes the message;
-        recall on the ambiguous label-concept does not.
-        """
+    ) -> ToolResult:
+        """Resolve an ambiguous person mention."""
         storage = getattr(self.agent, "storage", None)
         if storage is None or not hasattr(storage, "graph"):
-            return {"success": False, "error": "Graph store not available"}
+            return ToolResult.failed("Graph store not available")
 
         target = await storage.graph.get_node(concept_id)
         if target is None:
-            return {"success": False, "error": f"Concept {concept_id} not found"}
+            return ToolResult.failed(f"Concept {concept_id} not found")
 
         message_node = f"message:{self.agent_id}:{message_id}"
         # The ambiguous edge was written by SchemaRouter using the same
@@ -873,25 +1096,57 @@ class MemoryFeature(Feature):
                     "confirmed_at": _utc_now_iso(),
                 },
             )
-            # Then remove the ambiguous one — but only if it's different
-            # from the canonical target. Otherwise we would be deleting
-            # the edge we just wrote.
-            removed = False
-            if ambiguous_target != concept_id:
+        except Exception as e:
+            logger.error("confirm_person_match canonical edge write failed: %s", e)
+            return ToolResult.failed(str(e))
+
+        removed = False
+        ambiguous_remove_error: Optional[str] = None
+        if ambiguous_target != concept_id:
+            try:
                 await storage.graph.delete_edge(
                     message_node, ambiguous_target, "mentions"
                 )
                 removed = True
-        except Exception as e:
-            logger.error("confirm_person_match failed: %s", e)
-            return {"success": False, "error": str(e)}
-        return {
-            "success": True,
-            "message_id": message_id,
-            "resolved_to": concept_id,
-            "ambiguous_edge_removed": removed,
-        }
+            except Exception as e:
+                # The canonical edge IS in place; the orphaned ambiguous
+                # edge is still readable. Surface it as PARTIAL so the
+                # LLM cannot claim a clean resolution.
+                logger.error(
+                    "confirm_person_match: canonical edge written but "
+                    "ambiguous edge removal failed: %s", e
+                )
+                ambiguous_remove_error = str(e)
 
+        if ambiguous_remove_error:
+            return ToolResult.partial(
+                confirmation=(
+                    f"Resolved {message_id} → {concept_id}; canonical edge "
+                    "written"
+                ),
+                error=(
+                    f"orphaned ambiguous edge {ambiguous_target} could not "
+                    f"be removed: {ambiguous_remove_error}"
+                ),
+                data={
+                    "message_id": message_id,
+                    "resolved_to": concept_id,
+                    "ambiguous_edge_removed": False,
+                    "orphan_edge_target": ambiguous_target,
+                },
+            )
+
+        return ToolResult.ok(
+            confirmation=(
+                f"Resolved {message_id} → {concept_id}"
+                + (" (ambiguous edge removed)" if removed else "")
+            ),
+            data={
+                "message_id": message_id,
+                "resolved_to": concept_id,
+                "ambiguous_edge_removed": removed,
+            },
+        )
 
     @tool(
         name="mark_superseded",
@@ -904,7 +1159,7 @@ class MemoryFeature(Feature):
         old_id: str,
         new_id: str,
         reason: Optional[str] = None,
-    ) -> Dict[str, Any]:
+    ) -> ToolResult:
         """Mark old_id as superseded by new_id.
 
         Only claim-shaped node types (decision, action_item) can be
@@ -919,45 +1174,39 @@ class MemoryFeature(Feature):
 
         storage = getattr(self.agent, "storage", None)
         if storage is None or not hasattr(storage, "graph"):
-            return {"success": False, "error": "Graph store not available"}
+            return ToolResult.failed("Graph store not available")
 
-        # Fetch both nodes
         try:
             old_node = await storage.graph.get_node(old_id)
             new_node = await storage.graph.get_node(new_id)
         except Exception as e:
             logger.error("mark_superseded lookup failed: %s", e)
-            return {"success": False, "error": str(e)}
+            return ToolResult.failed(str(e))
 
-        # Validate old node exists and belongs to this agent
         if old_node is None:
-            return {"success": False, "error": f"Node {old_id} not found"}
+            return ToolResult.failed(f"Node {old_id} not found")
         old_props = old_node.properties or {}
         if old_props.get("agent_id") != self.agent_id:
-            return {"success": False, "error": f"Node {old_id} not found"}
+            return ToolResult.failed(f"Node {old_id} not found")
 
-        # Validate new node exists and belongs to this agent
         if new_node is None:
-            return {"success": False, "error": f"Node {new_id} not found"}
+            return ToolResult.failed(f"Node {new_id} not found")
         new_props = new_node.properties or {}
         if new_props.get("agent_id") != self.agent_id:
-            return {"success": False, "error": f"Node {new_id} not found"}
+            return ToolResult.failed(f"Node {new_id} not found")
 
-        # Restrict to claim-shaped node types
         if old_node.node_type not in CLAIM_SHAPED_NODE_TYPES:
-            return {
-                "success": False,
-                "error": f"Cannot supersede node of type '{old_node.node_type}'. "
-                         f"Only {sorted(CLAIM_SHAPED_NODE_TYPES)} nodes can be superseded.",
-            }
+            return ToolResult.failed(
+                f"Cannot supersede node of type '{old_node.node_type}'. "
+                f"Only {sorted(CLAIM_SHAPED_NODE_TYPES)} nodes can be superseded."
+            )
         if new_node.node_type not in CLAIM_SHAPED_NODE_TYPES:
-            return {
-                "success": False,
-                "error": f"Replacement node must be a claim type ({sorted(CLAIM_SHAPED_NODE_TYPES)}), "
-                         f"got '{new_node.node_type}'.",
-            }
+            return ToolResult.failed(
+                f"Replacement node must be a claim type "
+                f"({sorted(CLAIM_SHAPED_NODE_TYPES)}), "
+                f"got '{new_node.node_type}'."
+            )
 
-        # Write the supersedes edge: new → old
         edge_props = {"reason": reason, "superseded_at": _utc_now_iso()}
         try:
             await storage.graph.add_edge(
@@ -965,9 +1214,8 @@ class MemoryFeature(Feature):
             )
         except Exception as e:
             logger.error("mark_superseded edge write failed: %s", e)
-            return {"success": False, "error": str(e)}
+            return ToolResult.failed(str(e))
 
-        # Set superseded_by property on the old node
         old_props["superseded_by"] = new_id
         old_props["superseded_at"] = edge_props["superseded_at"]
         if reason:
@@ -982,15 +1230,41 @@ class MemoryFeature(Feature):
                 properties=old_props,
             ))
         except Exception as e:
+            # The 'supersedes' edge has been written; the old node's
+            # superseded_by property is stale. Surface as PARTIAL so the
+            # LLM cannot claim a clean supersession.
             logger.error("mark_superseded property update failed: %s", e)
-            return {"success": False, "error": str(e)}
+            return ToolResult.partial(
+                confirmation=(
+                    f"supersedes edge written: {new_id} -> {old_id}"
+                ),
+                error=(
+                    f"superseded_by property could not be set on {old_id}: "
+                    f"{e}; recall_action_items / recall_decisions will not "
+                    "filter the old claim out until this is repaired"
+                ),
+                data={
+                    "old_id": old_id,
+                    "new_id": new_id,
+                    "reason": reason,
+                    "edge_written": True,
+                    "property_updated": False,
+                },
+            )
 
-        return {
-            "success": True,
-            "old_id": old_id,
-            "new_id": new_id,
-            "reason": reason,
-        }
+        return ToolResult.ok(
+            confirmation=(
+                f"Marked {old_id} as superseded by {new_id}"
+                + (f" ({reason})" if reason else "")
+            ),
+            data={
+                "old_id": old_id,
+                "new_id": new_id,
+                "reason": reason,
+                "edge_written": True,
+                "property_updated": True,
+            },
+        )
 
 
 def _utc_now_iso() -> str:

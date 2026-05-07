@@ -1436,13 +1436,15 @@ class TestContextFeature:
         await feature.initialize()
         result = await feature.context_status()
 
-        assert result["success"] is True
-        assert "total_budget" in result
+        from kestrel_sdk.tools.result import ToolResultStatus
+        assert result.status is ToolResultStatus.OK
+        assert "total_budget" in result.data
 
     @pytest.mark.asyncio
     async def test_recursive_query_tool(self, mock_agent):
         """Test recursive_query tool queries context slice."""
         from kestrel_sovereign.features.context import ContextFeature
+        from kestrel_sdk.tools.result import ToolResultStatus
 
         mock_agent.context_manager.stash_peek = AsyncMock(return_value={
             "success": True,
@@ -1458,14 +1460,15 @@ class TestContextFeature:
             query="What was the error?"
         )
 
-        assert result["success"] is True
-        assert "answer" in result
+        assert result.status is ToolResultStatus.OK
+        assert "answer" in result.data
         mock_agent.context_manager.stash_peek.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_hierarchical_compress_tool(self, mock_agent):
         """Test hierarchical_compress tool."""
         from kestrel_sovereign.features.context import ContextFeature
+        from kestrel_sdk.tools.result import ToolResultStatus
 
         mock_agent.context_manager.hierarchical_compress = AsyncMock(return_value={
             "success": True,
@@ -1482,8 +1485,8 @@ class TestContextFeature:
             max_depth=3
         )
 
-        assert result["success"] is True
-        assert result["chunks_processed"] == 5
+        assert result.status is ToolResultStatus.OK
+        assert result.data["chunks_processed"] == 5
 
 
 class TestLLMServiceCheapModel:

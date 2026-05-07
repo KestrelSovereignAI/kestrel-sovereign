@@ -77,9 +77,10 @@ class TestMemoryConsolidateEndToEnd:
         feature.agent = MagicMock()
         feature.agent.memory_system = None  # no memory system
 
+        from kestrel_sdk.tools.result import ToolResultStatus
         result = await feature.memory_consolidate()
-        assert result["success"] is False
-        assert "not available" in result["error"].lower()
+        assert result.status is ToolResultStatus.ERROR
+        assert "not available" in result.error.lower()
 
 
 class TestRetrievalScoreChangesWithAccess:

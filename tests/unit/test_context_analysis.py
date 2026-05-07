@@ -325,7 +325,8 @@ class TestContextStatsResetOnCompression:
         # Compress
         result = await feature.compress_context(keep_recent=10)
 
-        assert result["success"] is True
+        from kestrel_sdk.tools.result import ToolResultStatus
+        assert result.status is ToolResultStatus.OK
         # After compression, stats should be reset
         assert stats.get_analysis()["total_tool_calls"] == 0
 
