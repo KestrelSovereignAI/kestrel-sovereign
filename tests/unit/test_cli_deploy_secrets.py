@@ -51,6 +51,21 @@ def _make_args(**overrides):
     return argparse.Namespace(**base)
 
 
+@pytest.fixture
+def fake_project_root(tmp_path, monkeypatch):
+    """Make ``_get_project_dir()`` resolve to ``tmp_path`` so the tests
+    can plant ``deploy_config.toml`` / ``.env`` somewhere harmless.
+
+    The CLI helper resolves these files relative to the project root
+    (cli._get_project_dir) — caller-CWD lookup was the regression codex
+    flagged on PR #1057. Tests must mirror that resolution path.
+    """
+    monkeypatch.setattr(
+        "kestrel_sovereign.cli._get_project_dir", lambda: tmp_path
+    )
+    return tmp_path
+
+
 # ---------------------------------------------------------------------------
 # Argparse wiring
 # ---------------------------------------------------------------------------
@@ -113,9 +128,8 @@ def test_cmd_deploy_secrets_unknown_subverb_errors(capsys):
 # Dispatcher: configuration prerequisites
 # ---------------------------------------------------------------------------
 
-def test_cmd_deploy_secrets_sync_missing_deploy_config(tmp_path, monkeypatch, capsys):
+def test_cmd_deploy_secrets_sync_missing_deploy_config(fake_project_root, monkeypatch, capsys):
     """No deploy_config.toml → friendly error, return 1."""
-    monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("GCP_PROJECT_ID", "test-project")
 
     rc = cmd_deploy(_make_args(target="secrets", profile="sync"))
@@ -125,13 +139,12 @@ def test_cmd_deploy_secrets_sync_missing_deploy_config(tmp_path, monkeypatch, ca
     assert "deploy_config.toml not found" in captured.err
 
 
-def test_cmd_deploy_secrets_sync_no_project_id(tmp_path, monkeypatch, capsys):
+def test_cmd_deploy_secrets_sync_no_project_id(fake_project_root, monkeypatch, capsys):
     """No ``GCP_PROJECT_ID`` env and config has placeholder value → error."""
-    monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("GCP_PROJECT_ID", raising=False)
 
     # Write a minimal deploy_config.toml that uses the example placeholder.
-    (tmp_path / "deploy_config.toml").write_text(
+    (fake_project_root / "deploy_config.toml").write_text(
         '[manager]\n'
         'gcp_project_id = "your-gcp-project-id"\n'
         '\n'
@@ -150,10 +163,10 @@ def test_cmd_deploy_secrets_sync_no_project_id(tmp_path, monkeypatch, capsys):
 # Dispatcher: full sync paths (mocked sync_all_secrets)
 # ---------------------------------------------------------------------------
 
-def _write_minimal_deploy_config(tmp_path: Path) -> None:
+def _write_minimal_deploy_config(project_root: Path) -> None:
     """Write a deploy_config.toml that satisfies the secrets path's
     prerequisite checks (project_id, [profiles.dev.secrets])."""
-    (tmp_path / "deploy_config.toml").write_text(
+    (project_root / "deploy_config.toml").write_text(
         '[manager]\n'
         'gcp_project_id = "test-project"\n'
         '\n'
@@ -163,10 +176,9 @@ def _write_minimal_deploy_config(tmp_path: Path) -> None:
     )
 
 
-def test_cmd_deploy_secrets_sync_happy_path(tmp_path, monkeypatch, capsys):
+def test_cmd_deploy_secrets_sync_happy_path(fake_project_root, monkeypatch, capsys):
     """Happy path: prints per-secret lines + summary, exits 0."""
-    monkeypatch.chdir(tmp_path)
-    _write_minimal_deploy_config(tmp_path)
+    _write_minimal_deploy_config(fake_project_root)
 
     fake_results = [
         SecretSyncResult("kestrel-openai-key", "OPENAI_API_KEY", ACTION_CREATED),
@@ -198,11 +210,10 @@ def test_cmd_deploy_secrets_sync_happy_path(tmp_path, monkeypatch, capsys):
     assert call.kwargs.get("dry_run") is False
 
 
-def test_cmd_deploy_secrets_sync_uses_env_var_project_id(tmp_path, monkeypatch):
+def test_cmd_deploy_secrets_sync_uses_env_var_project_id(fake_project_root, monkeypatch):
     """``GCP_PROJECT_ID`` env var beats the deploy_config.toml value."""
-    monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("GCP_PROJECT_ID", "env-project")
-    _write_minimal_deploy_config(tmp_path)  # config says "test-project"
+    _write_minimal_deploy_config(fake_project_root)  # config says "test-project"
 
     with patch(
         "kestrel_sovereign.features.deploy.secrets.sync_all_secrets",
@@ -217,11 +228,10 @@ def test_cmd_deploy_secrets_sync_uses_env_var_project_id(tmp_path, monkeypatch):
     assert project_id_arg == "env-project"
 
 
-def test_cmd_deploy_secrets_sync_dry_run_passes_flag(tmp_path, monkeypatch):
+def test_cmd_deploy_secrets_sync_dry_run_passes_flag(fake_project_root, monkeypatch):
     """``--dry-run`` propagates into ``sync_all_secrets(dry_run=True)``."""
-    monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("GCP_PROJECT_ID", "test-project")
-    _write_minimal_deploy_config(tmp_path)
+    _write_minimal_deploy_config(fake_project_root)
 
     fake_results = [
         SecretSyncResult(
@@ -243,12 +253,11 @@ def test_cmd_deploy_secrets_sync_dry_run_passes_flag(tmp_path, monkeypatch):
     assert mock_sync.call_args.kwargs.get("dry_run") is True
 
 
-def test_cmd_deploy_secrets_sync_error_result_returns_1(tmp_path, monkeypatch, capsys):
+def test_cmd_deploy_secrets_sync_error_result_returns_1(fake_project_root, monkeypatch, capsys):
     """Any ``action == "error"`` result yields exit code 1 even though
     sync_all_secrets returned (didn't raise)."""
-    monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("GCP_PROJECT_ID", "test-project")
-    _write_minimal_deploy_config(tmp_path)
+    _write_minimal_deploy_config(fake_project_root)
 
     fake_results = [
         SecretSyncResult("kestrel-openai-key", "OPENAI_API_KEY", ACTION_CREATED),
@@ -268,12 +277,11 @@ def test_cmd_deploy_secrets_sync_error_result_returns_1(tmp_path, monkeypatch, c
     assert "1 errors" in captured.out
 
 
-def test_cmd_deploy_secrets_sync_skipped_does_not_error(tmp_path, monkeypatch, capsys):
+def test_cmd_deploy_secrets_sync_skipped_does_not_error(fake_project_root, monkeypatch, capsys):
     """A 'skipped' result (env var missing) still exits 0 — partial sync
     is the documented behaviour, not a failure."""
-    monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("GCP_PROJECT_ID", "test-project")
-    _write_minimal_deploy_config(tmp_path)
+    _write_minimal_deploy_config(fake_project_root)
 
     fake_results = [
         SecretSyncResult("kestrel-openai-key", "OPENAI_API_KEY", ACTION_CREATED),
@@ -295,13 +303,12 @@ def test_cmd_deploy_secrets_sync_skipped_does_not_error(tmp_path, monkeypatch, c
     assert "not set in .env" in captured.out
 
 
-def test_cmd_deploy_secrets_sync_json_output(tmp_path, monkeypatch, capsys):
+def test_cmd_deploy_secrets_sync_json_output(fake_project_root, monkeypatch, capsys):
     """``--json`` emits a structured payload with success + results array."""
     import json as _json
 
-    monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("GCP_PROJECT_ID", "test-project")
-    _write_minimal_deploy_config(tmp_path)
+    _write_minimal_deploy_config(fake_project_root)
 
     fake_results = [
         SecretSyncResult("kestrel-openai-key", "OPENAI_API_KEY", ACTION_CREATED),
@@ -327,12 +334,11 @@ def test_cmd_deploy_secrets_sync_json_output(tmp_path, monkeypatch, capsys):
     assert parsed["results"][0]["action"] == "created"
 
 
-def test_cmd_deploy_secrets_sync_missing_env_file(tmp_path, monkeypatch, capsys):
+def test_cmd_deploy_secrets_sync_missing_env_file(fake_project_root, monkeypatch, capsys):
     """``sync_all_secrets`` raises FileNotFoundError → CLI returns 1
     with a friendly message (no traceback)."""
-    monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("GCP_PROJECT_ID", "test-project")
-    _write_minimal_deploy_config(tmp_path)
+    _write_minimal_deploy_config(fake_project_root)
 
     with patch(
         "kestrel_sovereign.features.deploy.secrets.sync_all_secrets",
@@ -345,11 +351,10 @@ def test_cmd_deploy_secrets_sync_missing_env_file(tmp_path, monkeypatch, capsys)
     assert ".env file not found" in captured.err
 
 
-def test_cmd_deploy_secrets_sync_unknown_profile_returns_1(tmp_path, monkeypatch, capsys):
+def test_cmd_deploy_secrets_sync_unknown_profile_returns_1(fake_project_root, monkeypatch, capsys):
     """``--profile bogus`` (unknown profile name) → KeyError → exit 1."""
-    monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("GCP_PROJECT_ID", "test-project")
-    _write_minimal_deploy_config(tmp_path)
+    _write_minimal_deploy_config(fake_project_root)
 
     with patch(
         "kestrel_sovereign.features.deploy.secrets.sync_all_secrets",

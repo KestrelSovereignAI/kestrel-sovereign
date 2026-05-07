@@ -427,10 +427,19 @@ def _load_deploy_config_for_secrets() -> Optional[Dict[str, Any]]:
     """
     import toml
 
-    config_path = Path("deploy_config.toml")
+    # Resolve relative to the project root, not the caller's CWD — the
+    # bash script we're porting (``setup_secrets.sh``) explicitly ``cd``s
+    # to the project root before reading these files, and the help text
+    # promises the same. Without this, ``kestrel deploy secrets sync``
+    # invoked from a subdirectory of the repo (or from anywhere when
+    # installed as a global CLI) fails with "deploy_config.toml not
+    # found" even though the project has it.
+    from kestrel_sovereign.cli import _get_project_dir
+
+    config_path = _get_project_dir() / "deploy_config.toml"
     if not config_path.exists():
         print(
-            f"error: deploy_config.toml not found at {config_path.resolve()}. "
+            f"error: deploy_config.toml not found at {config_path}. "
             f"Copy deploy_config.toml.example and configure it.",
             file=sys.stderr,
         )
@@ -533,7 +542,15 @@ def _cmd_deploy_secrets_sync(args) -> int:
     if project_id is None:
         return 1
 
-    env_path = Path(args.env_file) if args.env_file else Path(".env")
+    # Default ``.env`` resolves to ``<project_root>/.env`` (matches the
+    # bash script's behavior + the documented default). An explicit
+    # ``--env-file`` value is used as-given (relative paths to caller CWD).
+    if args.env_file:
+        env_path = Path(args.env_file)
+    else:
+        from kestrel_sovereign.cli import _get_project_dir
+
+        env_path = _get_project_dir() / ".env"
 
     # ``--profile`` (dest=secrets_profile) is the secrets-namespace flag —
     # the second positional ``profile`` is the subverb name (``sync``).
