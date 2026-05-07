@@ -261,6 +261,49 @@ def test_cmd_deploy_build_target_filter_unknown_errors(fake_project_root, monkey
     assert "kestrel-multi_agent" in captured.err
 
 
+def test_cmd_deploy_build_unaffected_by_profile_project_disagreement(
+    fake_project_root, monkeypatch
+):
+    """Codex review on PR #1060 v3: secrets sync rejects configs whose
+    cloudrun profiles target different gcp_project_ids — correct there,
+    wrong for ``kestrel deploy build`` (one registry push regardless of
+    how many run targets the deploy_config defines). The build resolver
+    must use a build-specific path that only consults env +
+    ``[manager].gcp_project_id``.
+    """
+    monkeypatch.delenv("GCP_PROJECT_ID", raising=False)
+    (fake_project_root / "deploy_config.toml").write_text(
+        '[manager]\n'
+        'gcp_project_id = "build-registry-project"\n'
+        '\n'
+        '[profiles.dev]\n'
+        'provider = "cloudrun"\n'
+        'gcp_project_id = "alpha-project"\n'
+        '[profiles.dev.secrets]\n'
+        'KEY1 = "kestrel-key-a:latest"\n'
+        '\n'
+        '[profiles.prod]\n'
+        'provider = "cloudrun"\n'
+        'gcp_project_id = "beta-project"\n'
+        '[profiles.prod.secrets]\n'
+        'KEY2 = "kestrel-key-b:latest"\n'
+    )
+
+    fake_results = [_ok_build_result("kestrel")]
+    with patch(
+        "kestrel_sovereign.features.deploy.build.build_all",
+        return_value=fake_results,
+    ) as mock_build:
+        with patch(
+            "kestrel_sovereign.features.deploy.build.resolve_github_token",
+            return_value=None,
+        ):
+            rc = cmd_deploy(_make_args(target="build"))
+
+    assert rc == 0, "build must succeed even if cloudrun profiles disagree on project_id"
+    assert mock_build.call_args.kwargs["project_id"] == "build-registry-project"
+
+
 def test_cmd_deploy_build_positional_tag_honored(fake_project_root, monkeypatch):
     """Codex review on PR #1060: the bash ``build.sh v1.2.3`` shape
     accepted the tag as a positional arg. The CLI's second positional

@@ -817,22 +817,34 @@ def _cmd_deploy_build(args) -> int:
     # bash script uses ``${GCP_PROJECT_ID:?...}``, never reads any
     # config). Fall back to deploy_config.toml so operators don't have
     # to export the var if it's already in their config. The build is
-    # project-wide so we always pass profile=None.
+    # project-wide. Use a build-specific resolver: env wins, else
+    # ``[manager].gcp_project_id``. We deliberately do NOT reuse the
+    # secrets-sync resolver — it deliberately rejects deploy configs
+    # whose Cloud Run profiles target different GCP projects, which is
+    # correct for syncing Secret Manager entries (each profile would
+    # need its own sync run) but wrong for the build (we push one
+    # image to one registry regardless of how many run targets the
+    # operator deploys to). Codex review on PR #1060 caught the
+    # cross-purpose reuse.
     env_project = os.getenv("GCP_PROJECT_ID")
     if env_project:
         project_id: Optional[str] = env_project
     else:
-        # No env var — try deploy_config.toml. If config is missing and
-        # the operator hasn't exported the var, that's a hard error
-        # (matches the bash script's ``${GCP_PROJECT_ID:?Set GCP_PROJECT_ID env var}``
-        # but with the friendly Python config-driven fallback).
         config = _load_deploy_config_for_secrets()
         if config is None:
             # _load_deploy_config_for_secrets already printed the error.
             return 1
-        project_id = _resolve_project_id(config=config, profile=None)
-        if project_id is None:
+        manager_section = config.get("manager", {}) or {}
+        manager_value = manager_section.get("gcp_project_id")
+        if not _is_real_project_id(manager_value):
+            print(
+                "error: GCP project ID not set. Either export "
+                "GCP_PROJECT_ID or set [manager].gcp_project_id in "
+                "deploy_config.toml.",
+                file=sys.stderr,
+            )
             return 1
+        project_id = manager_value
 
     # Filter targets by --target name if given.
     targets = list(DEFAULT_TARGETS)
