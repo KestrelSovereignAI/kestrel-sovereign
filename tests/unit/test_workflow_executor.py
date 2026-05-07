@@ -492,16 +492,24 @@ class TestRunWorkflowSemanticHonesty:
         Defends against future regressions in the dispatch path's
         wire format — adding a new wire layer should be matched by
         a new row here.
+
+        The "raw ToolResult instance" cases are the production path
+        (DynamicTool.execute stores the raw object pre-serialization).
         """
         from kestrel_sdk.tools.result import ToolResult
         # (transport_state, result_data, expected_status, expected_error)
         cases = [
-            # Bare envelope shapes
+            # Bare envelope shapes (post-serialize)
             ("completed", {"status": "ok", "confirmation": "ok"}, "completed", None),
             ("completed", {"status": "error", "error": "x"}, "failed", "x"),
             ("completed", {"status": "partial", "confirmation": "c", "error": "e"},
              "partial", "e"),
-            # DynamicTool-wrapped shapes
+            # Bare raw ToolResult instance (pre-serialize)
+            ("completed", ToolResult.ok("ok"), "completed", None),
+            ("completed", ToolResult.failed("raw err"), "failed", "raw err"),
+            ("completed", ToolResult.partial(confirmation="c", error="raw partial"),
+             "partial", "raw partial"),
+            # DynamicTool-wrapped shapes — wire-serialized (dict result)
             ("completed", {
                 "success": True,
                 "result": {"status": "ok", "confirmation": "ok"},
@@ -517,11 +525,29 @@ class TestRunWorkflowSemanticHonesty:
                 "result": {"status": "partial", "confirmation": "c", "error": "wrapped partial"},
                 "tool": "t",
             }, "partial", "wrapped partial"),
+            # DynamicTool-wrapped shapes — RAW instance (in-process,
+            # pre-serialize). This is the path codex round 4 caught.
+            ("completed", {
+                "success": True,
+                "result": ToolResult.ok("ok"),
+                "tool": "t",
+            }, "completed", None),
+            ("completed", {
+                "success": True,
+                "result": ToolResult.failed("raw wrapped err"),
+                "tool": "t",
+            }, "failed", "raw wrapped err"),
+            ("completed", {
+                "success": True,
+                "result": ToolResult.partial(confirmation="c", error="raw wrapped partial"),
+                "tool": "t",
+            }, "partial", "raw wrapped partial"),
             # Legacy dict
             ("completed", {"success": False, "error": "legacy"}, "failed", "legacy"),
             ("completed", {"success": True, "model": "m"}, "completed", None),
             # Transport failure overrides everything
             ("failed", {"status": "ok"}, "failed", None),
+            ("failed", ToolResult.ok("would have been ok"), "failed", None),
             # Non-dict result
             ("completed", "string result", "completed", None),
             ("completed", None, "completed", None),
@@ -537,6 +563,36 @@ class TestRunWorkflowSemanticHonesty:
                     f"transport={transport!r} data={data!r} → "
                     f"expected error {expected_err!r}, got {actual_err!r}"
                 )
+
+    @pytest.mark.asyncio
+    async def test_workflow_step_with_raw_tool_result_in_dynamictool_wrapper(self, task_feature):
+        """End-to-end: simulate the realistic in-process path where
+        the artifact carries a raw ToolResult inside the DynamicTool
+        wrapper (no wire serialization happens for sync workflows).
+        Round 4 codex finding: classifier must handle this shape."""
+        from kestrel_sdk.tools.result import ToolResult
+        agent_card, _ = task_feature.task_manager._agents["memory_feature"]
+        task_feature.task_manager._agents["memory_feature"] = (
+            agent_card,
+            MockHandler({
+                # Raw ToolResult, NOT .to_dict() — matches what
+                # DynamicTool.execute() actually stores
+                "memory_status": lambda args: {
+                    "success": True,
+                    "result": ToolResult.failed("ObservabilityStore not available"),
+                    "tool": "memory_status",
+                },
+            }),
+        )
+
+        result = await task_feature.run_workflow(steps=[
+            {"feature": "memory_feature", "skill": "memory_status"},
+        ])
+
+        assert result.status is ToolResultStatus.ERROR
+        step = result.data["results"][0]
+        assert step["status"] == "failed"
+        assert "ObservabilityStore not available" in step["error"]
 
 
 class TestListAvailableSkills:
