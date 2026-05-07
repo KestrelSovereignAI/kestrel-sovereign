@@ -29,7 +29,7 @@ from kestrel_sovereign.features import (
     discover_entrypoint_feature_classes,
 )
 from kestrel_sovereign.features.base import Feature, tool
-from kestrel_sovereign.tools.base import ToolCategory
+from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sovereign.kestrel_agent import KestrelAgent
 from kestrel_sovereign.llm.service import LLMService
 from kestrel_sovereign.privacy import PrivacyMode

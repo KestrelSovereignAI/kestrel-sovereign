@@ -1,6 +1,6 @@
 """Response audit hook - evaluates LLM responses for integrity."""
 import logging
-from kestrel_sovereign.hooks.base import Hook, HookEvent, HookInput, HookOutput
+from kestrel_sdk.hooks.base import Hook, HookEvent, HookInput, HookOutput
 
 logger = logging.getLogger(__name__)
 

@@ -188,7 +188,7 @@ class TestTransactionSecurityHook:
     @pytest.mark.asyncio
     async def test_allows_non_transaction_tools(self, hook):
         """Test hook allows non-transaction tools."""
-        from kestrel_sovereign.hooks import HookInput
+        from kestrel_sdk.hooks.base import HookInput
 
         input = HookInput(tool_name="some_other_tool", tool_input={})
         result = await hook.execute(input)
@@ -197,7 +197,7 @@ class TestTransactionSecurityHook:
     @pytest.mark.asyncio
     async def test_blocks_mainnet_by_default(self, hook):
         """Test mainnet transactions are blocked by default."""
-        from kestrel_sovereign.hooks import HookInput
+        from kestrel_sdk.hooks.base import HookInput
 
         input = HookInput(
             tool_name="wallet_send",
@@ -214,7 +214,7 @@ class TestTransactionSecurityHook:
     @pytest.mark.asyncio
     async def test_allows_testnet_transactions(self, hook):
         """Test testnet transactions are allowed."""
-        from kestrel_sovereign.hooks import HookInput
+        from kestrel_sdk.hooks.base import HookInput
 
         input = HookInput(
             tool_name="wallet_send",
@@ -230,7 +230,7 @@ class TestTransactionSecurityHook:
     @pytest.mark.asyncio
     async def test_validates_address_format(self, hook):
         """Test invalid addresses are rejected."""
-        from kestrel_sovereign.hooks import HookInput
+        from kestrel_sdk.hooks.base import HookInput
 
         input = HookInput(
             tool_name="wallet_send",

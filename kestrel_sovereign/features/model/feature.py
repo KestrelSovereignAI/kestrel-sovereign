@@ -3,7 +3,7 @@ from typing import List, Dict, Any, Optional
 from kestrel_sovereign.llm.service import LLMService
 from kestrel_sovereign.llm.model_metadata import ModelInfo
 from kestrel_sovereign.features.base import Feature, tool
-from kestrel_sovereign.tools.base import ToolCategory
+from kestrel_sdk.tools.base import ToolCategory
 
 logger = logging.getLogger(__name__)
 

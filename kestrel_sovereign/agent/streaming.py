@@ -4,7 +4,7 @@ import logging
 import time
 from typing import Dict, Any, Optional
 
-from kestrel_sovereign.hooks import HookEvent, HookInput, PermissionDecision
+from kestrel_sdk.hooks.base import HookEvent, HookInput, PermissionDecision
 from kestrel_sovereign.llm.adapter import LLMResponse
 from kestrel_sovereign.security.input_guardrails import (
     wrap_user_input,

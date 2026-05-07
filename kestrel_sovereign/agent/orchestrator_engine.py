@@ -18,7 +18,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Union
 
-from kestrel_sovereign.hooks import HookEvent, HookInput, PermissionDecision
+from kestrel_sdk.hooks.base import HookEvent, HookInput, PermissionDecision
 from kestrel_sovereign.llm.adapter import LLMResponse
 from kestrel_sovereign.security.input_guardrails import validate_tool_arguments
 from kestrel_sovereign.telemetry import optional_span

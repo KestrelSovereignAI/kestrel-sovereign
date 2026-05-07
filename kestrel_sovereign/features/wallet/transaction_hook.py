@@ -15,7 +15,7 @@ import logging
 from decimal import Decimal
 from typing import Optional
 
-from kestrel_sovereign.hooks import Hook, HookEvent, HookInput, HookOutput
+from kestrel_sdk.hooks.base import Hook, HookEvent, HookInput, HookOutput
 from kestrel_sovereign.features.wallet.chain_adapters import ChainNetwork, EVMAdapter
 
 logger = logging.getLogger(__name__)

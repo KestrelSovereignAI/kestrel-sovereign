@@ -7,7 +7,7 @@ import pytest
 from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock
 
-from kestrel_sovereign.hooks.base import HookEvent, HookInput, HookOutput
+from kestrel_sdk.hooks.base import HookEvent, HookInput, HookOutput
 from kestrel_sovereign.hooks.manager import HooksManager
 from kestrel_sovereign.spawn.lifecycle import (
     SpawnedAgentLifecycle,

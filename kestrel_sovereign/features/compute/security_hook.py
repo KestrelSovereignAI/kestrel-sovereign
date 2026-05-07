@@ -8,7 +8,7 @@ and gate critical security risks.
 import logging
 from typing import Optional
 
-from kestrel_sovereign.hooks.base import Hook, HookEvent, HookInput, HookOutput
+from kestrel_sdk.hooks.base import Hook, HookEvent, HookInput, HookOutput
 
 from .models import ComputeScript, DenialResponse, ScriptState, calculate_risk_score
 from .script_store import ScriptStore

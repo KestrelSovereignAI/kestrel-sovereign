@@ -9,7 +9,7 @@ import json
 import logging
 from typing import Optional
 
-from kestrel_sovereign.hooks import Hook, HookEvent, HookInput, HookOutput
+from kestrel_sdk.hooks.base import Hook, HookEvent, HookInput, HookOutput
 from kestrel_sovereign.features.security.permissions import PermissionLevel, PermissionStore
 from kestrel_sovereign.features.security.approval_queue import ApprovalQueue
 

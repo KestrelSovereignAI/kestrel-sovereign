@@ -33,7 +33,7 @@ from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.scheduler.cron import CronParseError, next_run, parse
 from kestrel_sovereign.features.scheduler.runner import SchedulerRunner
 from kestrel_sovereign.features.storage_access import resolve_feature_database
-from kestrel_sovereign.tools.base import ToolCategory
+from kestrel_sdk.tools.base import ToolCategory
 
 logger = logging.getLogger(__name__)
 

@@ -17,7 +17,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from kestrel_sovereign.hooks.base import (
+from kestrel_sdk.hooks.base import (
     HookEvent,
     HookInput,
     HookOutput,

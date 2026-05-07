@@ -139,7 +139,7 @@ class TestObservabilityHookPrometheus:
         return agent
 
     def _make_input(self, event_name="PostToolUse", **overrides):
-        from kestrel_sovereign.hooks.base import HookInput
+        from kestrel_sdk.hooks.base import HookInput
         defaults = {
             "session_id": "sess-1",
             "hook_event_name": event_name,
@@ -361,7 +361,7 @@ class TestGracefulDegradation:
     async def test_hook_works_without_prometheus(self):
         """ObservabilityHook works when PROMETHEUS_AVAILABLE is False."""
         from kestrel_sovereign.features.observability.hook import ObservabilityHook
-        from kestrel_sovereign.hooks.base import HookInput
+        from kestrel_sdk.hooks.base import HookInput
 
         agent = MagicMock()
         agent.agent_name = "test"

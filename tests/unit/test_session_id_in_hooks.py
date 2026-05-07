@@ -4,7 +4,7 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock, call
 
 from kestrel_sovereign.agent.orchestrator_engine import OrchestratorEngineMixin
-from kestrel_sovereign.hooks import HookEvent, HookInput, HookOutput, PermissionDecision
+from kestrel_sdk.hooks.base import HookEvent, HookInput, HookOutput, PermissionDecision
 from kestrel_sovereign.llm.adapter import ToolCall
 
 

@@ -19,7 +19,8 @@ import pytest
 # Import components
 from kestrel_sovereign.features.compute import ComputeFeature, ComputeScript, ScriptState
 from kestrel_sovereign.features.security import SecurityFeature, ApprovalQueue, ApprovalStatus
-from kestrel_sovereign.hooks import HooksManager, HookEvent, HookInput
+from kestrel_sovereign.hooks import HooksManager
+from kestrel_sdk.hooks.base import HookEvent, HookInput
 
 
 class MockAgent:

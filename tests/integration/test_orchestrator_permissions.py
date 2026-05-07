@@ -93,7 +93,7 @@ async def _execute_tool_with_hooks(
     """
     import time
 
-    from kestrel_sovereign.hooks import HookEvent, HookInput, PermissionDecision
+    from kestrel_sdk.hooks.base import HookEvent, HookInput, PermissionDecision
 
     hook_input = HookInput(
         session_id=session_id,

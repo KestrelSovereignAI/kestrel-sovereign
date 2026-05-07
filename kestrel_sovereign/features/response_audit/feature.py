@@ -3,8 +3,8 @@ import logging
 import os
 from typing import List
 from kestrel_sovereign.features.base import Feature, tool
-from kestrel_sovereign.hooks.base import Hook
-from kestrel_sovereign.tools.base import ToolCategory
+from kestrel_sdk.hooks.base import Hook
+from kestrel_sdk.tools.base import ToolCategory
 
 logger = logging.getLogger(__name__)
 

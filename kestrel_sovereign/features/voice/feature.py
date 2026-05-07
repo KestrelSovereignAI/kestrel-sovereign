@@ -15,7 +15,7 @@ from typing import Any, AsyncIterator, Dict, Optional
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.identity.identity_package import PersonalityFingerprint
 from kestrel_sovereign.privacy import PrivacyConfig, get_privacy_preset
-from kestrel_sovereign.tools.base import ToolCategory
+from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sovereign.voice.base import VoiceConfig, VoiceInfo, TTSProvider, STTProvider, match_voice, split_sentences
 from kestrel_sovereign.voice.provider_registry import VoiceProviderRegistry
 from kestrel_sovereign.voice.routing import (

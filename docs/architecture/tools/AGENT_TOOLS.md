@@ -1,5 +1,18 @@
 # Agent Tools Documentation
 
+> **⚠ DEPRECATED — describes a removed architecture.**
+> This doc covers the `AgentToolMixin` / `kestrel_agent_tools.py` /
+> top-level `tools/` directory pattern, all of which have been
+> removed. Tool delivery now happens through feature packages
+> registered via the `kestrel_sovereign.features` entry-point group
+> using the `@tool` decorator from `kestrel_sdk.features.base`.
+>
+> See [`docs/architecture/core/FEATURE_AGENT_FRAMEWORK.md`](../core/FEATURE_AGENT_FRAMEWORK.md)
+> for the modern pattern.
+>
+> Rewrite tracked in [#1047](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/1047);
+> kept here meanwhile for git-archaeology context.
+
 ## Overview
 
 Kestrel agents now have access to powerful tools that enhance their capabilities:

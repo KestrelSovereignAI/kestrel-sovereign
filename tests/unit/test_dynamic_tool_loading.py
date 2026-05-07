@@ -9,7 +9,7 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from kestrel_sovereign.kestrel_agent import KestrelAgent
-from kestrel_sovereign.tools.base import ToolSchema, ToolParameter, ToolCategory
+from kestrel_sdk.tools.base import ToolSchema, ToolParameter, ToolCategory
 
 
 # =============================================================================

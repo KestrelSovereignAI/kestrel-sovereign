@@ -66,7 +66,7 @@ from kestrel_sovereign.features.security.permissions import (
 from kestrel_sovereign.features.security.approval_queue import ApprovalQueue, ApprovalRequest
 from kestrel_sovereign.features.security.hooks import SecurityHook
 from kestrel_sovereign.features.security.feature import SecurityFeature
-from kestrel_sovereign.hooks import HookInput, HookEvent, PermissionDecision
+from kestrel_sdk.hooks.base import HookInput, HookEvent, PermissionDecision
 
 
 # === PermissionStore Tests ===
