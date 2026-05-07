@@ -9,7 +9,7 @@ from kestrel_sovereign.llm.adapter import LLMResponse
 from kestrel_sovereign.security.input_guardrails import (
     wrap_user_input,
     check_prompt_injection,
-    ANTI_INJECTION_SYSTEM_PROMPT,
+    append_security_addendum,
 )
 from kestrel_sovereign.telemetry import start_span, end_span
 
@@ -155,8 +155,9 @@ class StreamingMixin:
         )
         system_prompt = context_result.system_prompt
 
-        # Add anti-injection instructions to system prompt
-        system_prompt = f"{system_prompt}\n{ANTI_INJECTION_SYSTEM_PROMPT}"
+        # Append the security + honesty addenda. Single source of truth
+        # for assembly order; see append_security_addendum's docstring.
+        system_prompt = append_security_addendum(system_prompt)
 
         # Add cached features section
         if self._cached_features_prompt:

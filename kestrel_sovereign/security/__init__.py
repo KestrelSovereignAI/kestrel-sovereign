@@ -18,6 +18,8 @@ from .input_guardrails import (
     check_prompt_injection,
     validate_tool_arguments,
     ANTI_INJECTION_SYSTEM_PROMPT,
+    TOOL_HONESTY_SYSTEM_PROMPT,
+    append_security_addendum,
 )
 
 __all__ = [
@@ -31,4 +33,6 @@ __all__ = [
     "check_prompt_injection",
     "validate_tool_arguments",
     "ANTI_INJECTION_SYSTEM_PROMPT",
+    "TOOL_HONESTY_SYSTEM_PROMPT",
+    "append_security_addendum",
 ]
