@@ -133,7 +133,16 @@ _PRESETS: Dict[str, BuildPreset] = {
             "one preset for that GCR slot."
         ),
         timeout_seconds=1800,
-        cloudbuild_yaml="docker/cloudbuild-simpletuner.yaml",
+        # We deliberately do NOT use docker/cloudbuild-simpletuner.yaml
+        # here — that vendored config has a hardcoded
+        # ``gcr.io/YOUR_PROJECT_ID/kestrel-lora`` placeholder that
+        # would override the operator's resolved GCP_PROJECT_ID and
+        # ``--tag``. Codex review on PR #1074 caught the silent
+        # ignore. The synthesized yaml from
+        # ``_synthesize_cloudbuild_yaml`` substitutes both correctly.
+        # The vendored yaml stays in-tree for direct
+        # ``gcloud builds submit --config=...`` use as a reference.
+        cloudbuild_yaml=None,
     ),
 }
 
@@ -192,18 +201,25 @@ def _synthesize_cloudbuild_yaml(
 ) -> str:
     """Render a single-step Cloud Build yaml for ``preset``.
 
-    Mirrors the inline heredocs in the bash predecessors.
+    Always tags both ``:<tag>`` and ``:latest`` (deduped when
+    ``tag == "latest"``) — matches the bash predecessors and the
+    Tier 1.3 ``kestrel deploy build`` convention so ``:latest``-pinning
+    deploys keep working after a versioned build.
     """
     image_ref = f"gcr.io/{project}/{preset.image}:{tag}"
+    latest_ref = f"gcr.io/{project}/{preset.image}:latest"
     args: List[str] = ["build"]
     if no_cache:
         args.append("--no-cache")
-    args.extend([
-        "-f", preset.dockerfile,
-        "-t", image_ref,
-        ".",
-    ])
+    args.extend(["-f", preset.dockerfile, "-t", image_ref])
+    if tag != "latest":
+        args.extend(["-t", latest_ref])
+    args.append(".")
     args_yaml = ", ".join(f"'{a}'" for a in args)
+
+    images_block = f"  - '{image_ref}'\n"
+    if tag != "latest":
+        images_block += f"  - '{latest_ref}'\n"
 
     return (
         f"steps:\n"
@@ -211,7 +227,7 @@ def _synthesize_cloudbuild_yaml(
         f"    args: [{args_yaml}]\n"
         f"    timeout: {preset.timeout_seconds}s\n"
         f"images:\n"
-        f"  - '{image_ref}'\n"
+        f"{images_block}"
         f"timeout: {preset.timeout_seconds}s\n"
     )
 

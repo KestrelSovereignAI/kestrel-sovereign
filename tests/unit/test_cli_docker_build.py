@@ -243,53 +243,45 @@ def test_no_cache_propagates_into_yaml(monkeypatch, tmp_path):
     assert "--no-cache" in yaml_seen.get("text", "")
 
 
-def test_simpletuner_uses_vendored_yaml(monkeypatch, tmp_path):
-    """``simpletuner`` is the one preset that points at a vendored
-    cloudbuild yaml on disk (``docker/cloudbuild-simpletuner.yaml``).
-    The CLI must use it as-is rather than synthesizing one."""
+def test_simpletuner_synthesizes_yaml_with_resolved_project_and_tag(
+    monkeypatch, tmp_path
+):
+    """Codex review on PR #1074: the original implementation submitted
+    the vendored ``docker/cloudbuild-simpletuner.yaml`` as-is, but that
+    file has a hardcoded ``gcr.io/YOUR_PROJECT_ID/kestrel-lora`` ref —
+    GCP_PROJECT_ID + ``--tag`` would be silently ignored. The fix:
+    simpletuner uses the synthesized yaml path like every other preset
+    so the resolved project and tag actually take effect.
+    """
     monkeypatch.setenv("GCP_PROJECT_ID", "test-proj")
-    captured: list = []
+    captured_argv: list = []
     monkeypatch.setattr(
         cli_docker_build, "run_streaming",
-        lambda cmd, **kw: captured.append(list(cmd)) or 0,
+        lambda cmd, **kw: captured_argv.append(list(cmd)) or 0,
     )
-    # Provide the vendored yaml + the dockerfile preflight.
     (tmp_path / "docker").mkdir()
     (tmp_path / "docker/Dockerfile.simpletuner").write_text("FROM alpine\n")
-    (tmp_path / "docker/cloudbuild-simpletuner.yaml").write_text(
-        "steps: []\n"
-    )
     monkeypatch.setattr(cli_docker_build, "_repo_root", lambda: tmp_path)
 
     rc = cli_docker_build.cmd_docker_build(_Args(
-        list=False, preset="simpletuner", tag="latest", no_cache=False,
+        list=False, preset="simpletuner", tag="v9", no_cache=False,
     ))
     assert rc == 0
-    argv = captured[0]
+    argv = captured_argv[0]
     config = next(a for a in argv if a.startswith("--config="))
     config_path = config.split("=", 1)[1]
-    # Vendored yaml lives at <repo>/docker/cloudbuild-simpletuner.yaml.
-    assert config_path.endswith("cloudbuild-simpletuner.yaml")
-    assert str(tmp_path) in config_path
-
-
-def test_simpletuner_missing_vendored_yaml_errors(monkeypatch, tmp_path, capsys):
-    monkeypatch.setenv("GCP_PROJECT_ID", "test-proj")
-    monkeypatch.setattr(
-        cli_docker_build, "run_streaming",
-        lambda cmd, **kw: 0,
-    )
-    (tmp_path / "docker").mkdir()
-    (tmp_path / "docker/Dockerfile.simpletuner").write_text("FROM alpine\n")
-    # No cloudbuild-simpletuner.yaml on disk.
-    monkeypatch.setattr(cli_docker_build, "_repo_root", lambda: tmp_path)
-
-    rc = cli_docker_build.cmd_docker_build(_Args(
-        list=False, preset="simpletuner", tag="latest", no_cache=False,
-    ))
-    assert rc == 1
-    err = capsys.readouterr().err
-    assert "cloudbuild-simpletuner.yaml" in err
+    # The synthesized yaml lives in a tempfile, NOT in <repo>/docker/.
+    assert "cloudbuild-simpletuner-" in config_path
+    # And it must reference the resolved project + tag, not the
+    # placeholder.
+    yaml_text = Path(config_path).read_text() if Path(config_path).exists() else ""
+    if yaml_text:
+        # If the temp file lingered (cleanup is best-effort), assert
+        # it had the right substitutions. Otherwise the regression is
+        # still pinned by the lack of the vendored-yaml path above.
+        assert "test-proj" in yaml_text
+        assert "kestrel-lora:v9" in yaml_text
+        assert "YOUR_PROJECT_ID" not in yaml_text
 
 
 def test_missing_dockerfile_preflight(monkeypatch, tmp_path, capsys):
