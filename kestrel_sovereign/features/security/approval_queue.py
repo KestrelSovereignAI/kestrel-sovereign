@@ -415,6 +415,23 @@ class ApprovalQueue:
             logger.warning(f"Decision submitted for unknown request: {request_id}")
             return False
 
+        # Idempotency / CAS: a request that already has a decision must
+        # not accept another one. Without this guard, callers that race
+        # (UI double-click, polling responder ticking faster than the
+        # awaiter's finally-block can pop _pending) silently overwrite
+        # the user's first decision and inflate any per-call counters
+        # downstream. The pop happens in request_approval()'s
+        # finally-block on the awaiter's next scheduled tick — so the
+        # request lingers in _pending for one or more event-loop
+        # iterations after resume_event.set(), which is the exact race
+        # window this guard closes.
+        if request.status != ApprovalStatus.PENDING:
+            logger.warning(
+                f"Decision submitted for already-decided request "
+                f"{request_id[:8]} (status={request.status.value}); ignored"
+            )
+            return False
+
         request.status = ApprovalStatus.APPROVED if approved else ApprovalStatus.DENIED
         request.user_decision = scope
         request.resume_event.set()  # Unblock the waiting coroutine

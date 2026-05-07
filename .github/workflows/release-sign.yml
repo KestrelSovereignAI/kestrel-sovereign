@@ -9,11 +9,9 @@ name: Release sign
 #   KESTREL_DATA_KEY — encryption key for the SecureKeyStorage bundles at rest
 
 on:
-  push:
-    # GH Actions tag filters use glob, not regex — ``+`` is literal.
-    # Codex P1 round 1: the previous ``v[0-9]+.[0-9]+.[0-9]+`` would
-    # never match a real semver tag like ``v1.2.3``.
-    tags: ['v[0-9]*.[0-9]*.[0-9]*']
+  workflow_run:
+    workflows: ["Publish to PyPI"]
+    types: [completed]
   workflow_dispatch:
     inputs:
       ref:
@@ -27,15 +25,23 @@ env:
   PYTHON_VERSION: "3.13"
 
 jobs:
-  # CI gate — must pass before anything signs.
-  ci:
-    name: CI gate
-    uses: ./.github/workflows/ci.yml
-    secrets: inherit
-
+  # No re-run of CI here. Triggered via workflow_run after Publish
+  # to PyPI succeeds; that is the canonical CI gate for the release.
+  # Re-running pytest here would just be a third independent flake-
+  # roll on the same SHA — see v0.10.0 (commit 448801f6) where this
+  # workflow's previous CI gate hit a state leak in
+  # test_fs_write_requires_real_approval on the tag-time re-run
+  # while the same code was already on PyPI.
   sign:
     runs-on: ubuntu-latest
-    needs: ci
+    # Only fire when upstream Publish to PyPI succeeded on a tag
+    # (or on workflow_dispatch). head_branch on workflow_run is the
+    # tag name like 'v0.10.0'.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_run' &&
+       github.event.workflow_run.conclusion == 'success' &&
+       startsWith(github.event.workflow_run.head_branch, 'v'))
     timeout-minutes: 20
 
     steps:
@@ -53,11 +59,16 @@ jobs:
           # Codex P1 round 2: pass ``inputs.ref`` via env var, never
           # ``${{ ... }}``-expanded into shell. A crafted dispatch ref
           # containing ``$()`` / quotes / etc would otherwise execute
-          # arbitrary commands in this step.
+          # arbitrary commands in this step. Same applies to the
+          # workflow_run head_branch — it can be any string the
+          # upstream workflow saw as a ref.
           DISPATCH_REF: ${{ github.event.inputs.ref || '' }}
+          UPSTREAM_BRANCH: ${{ github.event.workflow_run.head_branch || '' }}
         run: |
           if [ -n "$DISPATCH_REF" ]; then
             TAG="$DISPATCH_REF"
+          elif [ -n "$UPSTREAM_BRANCH" ]; then
+            TAG="$UPSTREAM_BRANCH"
           else
             TAG="${GITHUB_REF##*/}"
           fi
@@ -224,10 +235,11 @@ jobs:
           retention-days: 90
 
       - name: Attach signed manifest to GitHub Release
-        # Run for both push-tag and dispatch flows. The dispatch
-        # branch needs the explicit tag_name (codex P2 round 4):
-        # ``github.ref`` is the workflow source branch, not the tag.
-        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        # Run for workflow_run (post-publish), push-tag, and
+        # dispatch flows. ``tag_name`` is supplied explicitly because
+        # ``github.ref`` is the workflow source branch under
+        # workflow_run + workflow_dispatch (codex P2 round 4).
+        if: github.event_name == 'workflow_run' || github.event_name == 'push' || github.event_name == 'workflow_dispatch'
         uses: softprops/action-gh-release@72f2c25fcb47643c292f7107632f7a47c1df5cd8 # v2.3.4
         with:
           tag_name: ${{ steps.release_tag.outputs.tag }}
