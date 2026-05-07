@@ -130,6 +130,34 @@ def test_derive_secret_mapping_skips_dollar_substitutions(
     assert mapping == {"OPENAI_API_KEY": "kestrel-openai-key"}
 
 
+def test_derive_secret_mapping_accepts_unusual_secret_names():
+    """Codex review on PR #1057: GCP Secret Manager allows IDs starting
+    with a digit or underscore. The old regex excluded those, silently
+    skipping valid refs and leaving deploys without their Secret Manager
+    entries. The validator should accept any name with a colon and a
+    non-empty version, defer character-class validation to the GCP API.
+    """
+    config = {
+        "profiles": {
+            "dev": {
+                "secrets": {
+                    "OPENAI_API_KEY": "0_legacy-secret:latest",     # leading digit
+                    "DATA_KEY": "_internal-secret:1",               # leading underscore
+                    "ALT_NAME": "name-with-many-dashes:v2.5.0",     # dotted version
+                },
+            },
+        },
+    }
+
+    mapping = derive_secret_mapping(config)
+
+    assert mapping == {
+        "OPENAI_API_KEY": "0_legacy-secret",
+        "DATA_KEY": "_internal-secret",
+        "ALT_NAME": "name-with-many-dashes",
+    }
+
+
 def test_derive_secret_mapping_conflicting_names_raises():
     """Two profiles mapping the same env var to different secret names
     is a config inconsistency — surface it loudly so the user fixes

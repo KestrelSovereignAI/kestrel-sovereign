@@ -44,7 +44,6 @@ project setup time.
 from __future__ import annotations
 
 import logging
-import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -93,26 +92,42 @@ class SecretSyncResult:
 
 # A Secret Manager secret reference in ``deploy_config.toml`` looks like
 # ``"<secret-name>:<version>"`` — e.g. ``"kestrel-openai-key:latest"``.
-# Anything that doesn't match (notably the ``${VAR}`` placeholders used in
-# the azure-style profile section) is skipped. We don't try to match the
-# secret-name character class strictly because GCP allows
-# ``[a-zA-Z][a-zA-Z0-9_-]*`` and we'd rather let GCP itself reject malformed
-# names with a clear error than reinvent the rules.
-_SECRET_REF_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*:[A-Za-z0-9_.-]+$")
+# We deliberately do not validate the secret-name character class here:
+# GCP allows ``[A-Za-z0-9_-]+`` (no leading-letter restriction), and the
+# CloudRunProvider will mount whatever name the operator wrote regardless.
+# An overly strict regex was a real bug — codex caught a case where a
+# valid name starting with a digit or underscore was silently skipped,
+# leaving deploys without their Secret Manager entries.
+#
+# The only thing we *must* exclude is the ``${VAR}`` substitution shape
+# used by the azure-style profile section — those aren't GCP Secret
+# Manager refs and would point at nothing if synced.
 
 
 def _is_secret_manager_ref(value: str) -> bool:
-    """Return True if ``value`` looks like ``<secret-name>:<version>``.
+    """Return True if ``value`` looks like a GCP Secret Manager
+    ``<secret-name>:<version>`` reference.
 
-    ``${...}`` substitution placeholders (azure-style) and other unexpected
-    shapes return False — they're not GCP Secret Manager refs and must be
-    skipped to avoid garbage names being created.
+    ``${...}`` substitution placeholders (azure-style) and values that
+    don't have the ``name:version`` colon shape are excluded so we don't
+    try to sync azure profiles or create garbage entries. We DON'T
+    validate the secret-name character class — let the GCP API itself
+    reject malformed names with a clear error rather than reinventing
+    its (changing) rules here.
     """
     if not isinstance(value, str):
         return False
     if value.startswith("${") and value.endswith("}"):
         return False
-    return bool(_SECRET_REF_PATTERN.match(value))
+    if ":" not in value:
+        return False
+    name, _, version = value.partition(":")
+    # Both halves must be non-empty; ``${...}`` has already been excluded
+    # above so any leftover leading-``$`` would be a config typo and is
+    # safer skipped than synced.
+    if not name or not version or name.startswith("$"):
+        return False
+    return True
 
 
 def _strip_version(secret_ref: str) -> str:
