@@ -97,6 +97,12 @@ class ModelDiscoveryMixin:
                         is_featured=True,  # Configured models are featured
                         is_hidden=False,
                         supports_tools=is_cloud,
+                        # Configured chat models — assume streaming. The SDK
+                        # 0.5.0 ModelInfo default is False (conservative);
+                        # this synthetic-model path predates that and
+                        # encodes the legacy "every chat model streams"
+                        # assumption explicitly so it doesn't drift.
+                        supports_streaming=True,
                     ))
                     discovered_ids.add(model_id)
                     logger.debug(f"Added configured model: {provider_name}/{model_id}")
@@ -280,29 +286,42 @@ class ModelDiscoveryMixin:
         from .openai_adapter import OpenAIAdapter
 
         adapter = route.get("adapter")
+        client = route.get("client")
         base_url = route.get("base_url")
         is_local = route.get("is_local")
         route_cfg = dict(route)
 
-        # OpenAI-compatible clients (xai, runpod, groq, llama.cpp, ...) must be
-        # queried by base_url. OpenAIAdapter.list_models() is hardcoded to
-        # OPENAI_API_KEY, which would return OpenAI's catalog for every such route.
+        # OpenAI-compatible clients (xai, runpod, groq, llama.cpp, ...) used to
+        # be a special case here because the pre-SDK-0.5.0
+        # OpenAIAdapter.list_models() rebuilt a fresh client from
+        # OPENAI_API_KEY, which returned api.openai.com's catalog for every
+        # such route. As of 0.5.0 the contract passes the route's own
+        # client into list_models, so canonical-OpenAI and OpenAI-compatible
+        # routes can take the same path. The is_local / base_url branches
+        # remain because they query the /v1/models endpoint with extra
+        # context (server_context_limit, etc.) that the adapter cannot
+        # know about.
         if isinstance(adapter, OpenAIAdapter):
             if vendor == "openai" and not base_url:
-                # Canonical OpenAI — adapter's list_models hits api.openai.com correctly.
-                return await self._safe_list_models(vendor, adapter)
+                return await self._safe_list_models(vendor, adapter, client)
             if base_url and is_local:
                 return await self._discover_local_openai_compatible(vendor, route_cfg)
             if base_url:
                 return await self._discover_openai_compatible_remote(vendor, route_cfg)
 
-        return await self._safe_list_models(vendor, adapter)
+        return await self._safe_list_models(vendor, adapter, client)
 
-    async def _safe_list_models(self, vendor: str, adapter) -> List[ModelInfo]:
-        """Call adapter.list_models() with full error tolerance."""
+    async def _safe_list_models(self, vendor: str, adapter, client) -> List[ModelInfo]:
+        """Call adapter.list_models(client) with full error tolerance.
+
+        ``client`` is the route's framework-initialized provider-native
+        client; the SDK 0.5.0 contract requires it be passed to
+        discovery so authenticated /models endpoints reach the right
+        endpoint for routes with custom ``base_url``.
+        """
         try:
             if hasattr(adapter, 'list_models'):
-                models = await adapter.list_models()
+                models = await adapter.list_models(client)
                 logger.debug("%s: discovered %d models", vendor, len(models))
                 return models
         except NotImplementedError:
@@ -350,6 +369,7 @@ class ModelDiscoveryMixin:
                     display_name=model_id.split("/")[-1].replace(".gguf", ""),
                     category=ModelCategory.CHAT,
                     supports_tools=True,
+                    supports_streaming=True,  # OpenAI-compat servers stream
                     is_featured=True,
                     context_limit=server_context_limit,
                 ))
@@ -406,6 +426,7 @@ class ModelDiscoveryMixin:
                     display_name=m.get("name") or model_id,
                     category=ModelCategory.CHAT,
                     supports_tools=True,
+                    supports_streaming=True,  # OpenAI-compat servers stream
                     is_featured=False,
                     context_limit=m.get("context_length") or m.get("context_window"),
                     created_at=str(m.get("created")) if m.get("created") else None,

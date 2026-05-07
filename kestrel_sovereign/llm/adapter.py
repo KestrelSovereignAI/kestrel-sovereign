@@ -1,96 +1,148 @@
-"""
-Base LLM Adapter
+"""Framework-side LLM adapter base.
 
-Provides a standardized interface for interacting with different LLM providers.
-Supports:
-- Streaming and non-streaming responses
-- Structured output (Pydantic models)
-- Vision capabilities (images)
-- Tool/function calling (OpenAI format)
-- API-based model discovery
+The abstract contract — :class:`LLMAdapter`, :class:`LLMResponse`,
+:class:`ToolCall` — lives in :mod:`kestrel_sdk.llm` (promoted in
+SDK 0.5.0) so third-party provider plugins can depend only on
+``kestrel-sovereign-sdk`` without pulling in the framework. This
+module re-exports those names for the historical
+``kestrel_sovereign.llm.adapter`` import path and adds the in-tree
+helpers that depend on framework-only utilities.
+
+In-tree adapters subclass :class:`LLMAdapter` (the framework-enriched
+version exported here) to inherit OpenAI-format message construction
+and image processing for free. Third-party plugins subclass
+:class:`kestrel_sdk.llm.LLMAdapter` directly and bring their own
+message construction (or import these helpers when running in-tree).
+
+The framework-only addition is :meth:`LLMAdapter.create_messages`
+plus :meth:`LLMAdapter._handle_images`, both of which depend on
+:mod:`kestrel_sovereign.llm.image_utils` (PIL-aware image resize and
+provider-specific dimension limits). That helper is heavier than the
+SDK's pydantic-only-by-default discipline allows, so it stays
+framework-side.
 """
-from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional, Union, Type, AsyncIterator, TYPE_CHECKING
-import logging
-import os
-from pydantic import BaseModel
-from dataclasses import dataclass
+
+from typing import Any, Dict, List, Optional, Union
+
+from kestrel_sdk.llm import LLMResponse, ToolCall
+from kestrel_sdk.llm import LLMAdapter as _SDKLLMAdapter
 
 from .image_utils import process_images
 
-if TYPE_CHECKING:
-    from .model_metadata import ModelInfo
-
-logger = logging.getLogger(__name__)
+__all__ = ["LLMAdapter", "LLMResponse", "ToolCall", "build_messages", "messages_for"]
 
 
-@dataclass
-class ToolCall:
-    """Represents a tool call from the LLM."""
-    id: str
-    name: str
-    arguments: Dict[str, Any]
+def build_messages(
+    user_prompt: Optional[str] = None,
+    system_prompt: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Build a text-only chat-completions message list in OpenAI format.
 
+    The fallback used by :func:`messages_for` for adapters that don't
+    expose a ``create_messages`` method (third-party plugins
+    subclassing ``kestrel_sdk.llm.LLMAdapter`` directly). Plain
+    ``role`` / ``content`` strings — no images, no provider-specific
+    parts. Plugin backends that don't speak OpenAI shape should
+    override :meth:`LLMAdapter.create_messages` instead of relying on
+    this fallback.
 
-@dataclass
-class LLMResponse:
+    Args:
+        user_prompt: User-role text content, or ``None`` to omit the
+            user message.
+        system_prompt: System-role text content, or ``None`` to omit
+            the system message.
+
+    Returns:
+        A list of message dicts ready to pass into ``get_response``.
+        Empty if both prompts are ``None``.
     """
-    Unified response from an LLM adapter.
+    messages: List[Dict[str, Any]] = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    if user_prompt:
+        messages.append({"role": "user", "content": user_prompt})
+    return messages
 
-    Attributes:
-        content: Text content of the response (may be None if tool_calls present)
-        tool_calls: List of tool calls requested by the model
-        raw: The raw response object from the provider (for debugging)
-        input_tokens: Number of tokens in the prompt/input (uncached portion)
-        output_tokens: Number of tokens in the completion/output
-        total_tokens: Total tokens used (input + output, excluding cache reads)
-        cache_creation_input_tokens: Tokens written to the prompt cache this call
-        cache_read_input_tokens: Tokens read from the prompt cache this call
+
+def messages_for(
+    adapter: Any,
+    *,
+    user_prompt: Optional[str] = None,
+    system_prompt: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Build messages for ``adapter``, preferring its provider-specific shape.
+
+    Single entry point used by every text-only call site in the
+    framework (``LLMService.generate`` / ``audit`` / ``remote-first``
+    / ``get_response_with_model``, the streaming pipeline, council
+    deliberation). Dispatches:
+
+    1. If ``adapter`` has a ``create_messages`` method (in-tree
+       adapters and any plugin that subclassed the framework's
+       enriched ``LLMAdapter`` or overrode the method), call it. This
+       preserves provider-native shapes — Gemini ``parts``, Vertex
+       ``_system`` markers, Anthropic content blocks — that
+       :meth:`LLMAdapter.get_response` expects.
+    2. Otherwise (SDK-only plugin subclassing
+       ``kestrel_sdk.llm.LLMAdapter`` directly with no
+       ``create_messages`` override), fall back to
+       :func:`build_messages` for plain OpenAI-shape text messages.
+       This is the right default for OpenAI-compatible plugin
+       backends (Kimi, DeepSeek, etc., which is the primary intended
+       use case for SDK-only plugins). Plugins targeting non-
+       OpenAI-shape backends should override ``create_messages`` to
+       return their native format.
+
+    Image-bearing message construction stays on the adapter via
+    ``create_messages(images=...)`` — there is no fallback for that
+    case because image parts are inherently provider-specific.
     """
-    content: Optional[str] = None
-    tool_calls: Optional[List[ToolCall]] = None
-    raw: Any = None
-    # Usage tracking for billing/metering
-    input_tokens: Optional[int] = None
-    output_tokens: Optional[int] = None
-    total_tokens: Optional[int] = None
-    # Anthropic prompt-cache breakdown. Either may be 0 (no cache write/read on
-    # this call); both will be None for providers that don't report cache usage.
-    cache_creation_input_tokens: Optional[int] = None
-    cache_read_input_tokens: Optional[int] = None
-
-    @property
-    def has_tool_calls(self) -> bool:
-        return self.tool_calls is not None and len(self.tool_calls) > 0
+    if hasattr(adapter, "create_messages"):
+        return adapter.create_messages(
+            user_prompt=user_prompt,
+            system_prompt=system_prompt,
+        )
+    return build_messages(user_prompt=user_prompt, system_prompt=system_prompt)
 
 
-class LLMAdapter(ABC):
-    """
-    Base class for LLM adapters.
+class LLMAdapter(_SDKLLMAdapter):
+    """Framework-enriched LLM adapter base.
 
-    Standardizes the interface for sending prompts and receiving responses
-    from different LLM providers (OpenAI, Ollama, Anthropic, etc.).
+    Inherits the abstract contract from :class:`kestrel_sdk.llm.LLMAdapter`
+    (``get_response`` abstract; ``get_streaming_response``,
+    ``list_models``, ``contribute_system_prompt`` optional) and adds
+    OpenAI-format message construction with image handling, which
+    depends on the framework's image utilities.
+
+    In-tree adapters should subclass this; third-party plugins should
+    subclass :class:`kestrel_sdk.llm.LLMAdapter` directly to keep
+    their dependency surface minimal.
     """
 
     def create_messages(
         self,
         user_prompt: Optional[str] = None,
         system_prompt: Optional[str] = None,
-        images: Optional[List[Union[str, bytes]]] = None
+        images: Optional[List[Union[str, bytes]]] = None,
     ) -> List[Dict[str, Any]]:
-        """
-        Creates a message list in OpenAI format.
+        """Build a chat-completions message list in OpenAI format.
 
         Args:
-            user_prompt: The user's query
-            system_prompt: Optional system prompt
-            images: Optional list of images (file paths, base64, or bytes)
+            user_prompt: The user's query. Becomes a single text part
+                inside the user-role message's content list.
+            system_prompt: Optional system prompt. Becomes a
+                system-role message prepended to the conversation.
+            images: Optional list of images (file paths, base64
+                strings, or raw bytes). Each is processed via
+                :func:`process_images` with provider="openai" limits
+                and appended to the user message's content list as
+                an ``image_url`` part.
 
         Returns:
-            List of message dictionaries
+            A list of message dicts ready to pass into ``get_response``.
         """
-        messages = []
-        user_prompt_content = []
+        messages: List[Dict[str, Any]] = []
+        user_prompt_content: List[Dict[str, Any]] = []
 
         if user_prompt:
             user_prompt_content.append({"type": "text", "text": user_prompt})
@@ -105,141 +157,27 @@ class LLMAdapter(ABC):
 
         return messages
 
-    @abstractmethod
-    async def get_response(
-        self,
-        client: Any,
-        model: str,
-        messages: List[Dict[str, Any]],
-        format: Optional[str] = None,
-        tools: Optional[List[Dict[str, Any]]] = None,
-        response_format: Optional[Type[BaseModel]] = None,
-        **kwargs
-    ) -> LLMResponse:
-        """
-        Get a response from the LLM.
-
-        Args:
-            client: The provider-specific client
-            model: Model name to use
-            messages: Chat messages
-            format: Response format (e.g., "json") - DEPRECATED, use response_format
-            tools: Optional list of tools in OpenAI function calling format
-            response_format: Optional Pydantic model for structured output.
-                When provided, the LLM response will be validated against this schema.
-            **kwargs: Additional provider-specific parameters (max_tokens, temperature, etc.)
-
-        Returns:
-            LLMResponse with content and/or tool calls
-        """
-        pass
-
-    async def get_streaming_response(
-        self,
-        client: Any,
-        model: str,
-        messages: List[Dict[str, Any]],
-        tools: Optional[List[Dict[str, Any]]] = None,
-        response_format: Optional[Type[BaseModel]] = None,
-        **kwargs
-    ) -> AsyncIterator[str]:
-        """
-        Get a streaming response from the LLM.
-
-        Default implementation raises NotImplementedError.
-        Override in subclasses that support streaming.
-
-        Args:
-            client: The provider-specific client
-            model: Model name to use
-            messages: Chat messages
-            tools: Optional tools (note: streaming with tools is provider-specific)
-            response_format: Optional Pydantic model for structured output.
-                Note: Streaming with structured output may not be supported by all providers.
-            **kwargs: Additional provider-specific parameters
-
-        Yields:
-            Text chunks as they arrive
-        """
-        raise NotImplementedError(f"{self.__class__.__name__} does not support streaming")
-
-    async def list_models(self) -> List["ModelInfo"]:
-        """
-        List available models from this provider.
-
-        Default implementation raises NotImplementedError.
-        Override in subclasses to call the provider's models API.
-
-        Returns:
-            List of ModelInfo objects with model metadata
-        """
-        raise NotImplementedError(f"{self.__class__.__name__} does not support model listing")
-
-    def contribute_system_prompt(
-        self, model_id: str, base: Optional[str]
-    ) -> Optional[str]:
-        """Augment a system prompt with provider/model-specific contributions.
-
-        Default returns ``base`` unchanged. Subclasses override to inject
-        behavior contracts, format hints, or other model-family discipline
-        that does not belong in the universal system prompt. The contribution
-        must be byte-stable across turns for any given ``model_id`` so that
-        the prefix-cache invariant from #703 / #706 is preserved.
-
-        See ``gpt5_overlay.prepend_gpt5_overlay`` for the canonical example.
-        """
-        return base
-
-    def _apply_system_prompt_contribution(
-        self,
-        messages: List[Dict[str, Any]],
-        model_id: str,
-    ) -> List[Dict[str, Any]]:
-        """Apply ``contribute_system_prompt`` to a chat-completions message list.
-
-        Returns a new list — does not mutate the input. The first ``system``-role
-        message has its content replaced by ``contribute_system_prompt(model_id,
-        original)``. If no system message is present and the contribution is
-        non-empty, a new system message is prepended.
-        """
-        new_messages: List[Dict[str, Any]] = []
-        augmented = False
-        for msg in messages:
-            if not augmented and msg.get("role") == "system":
-                content = msg.get("content")
-                if isinstance(content, str):
-                    contributed = self.contribute_system_prompt(model_id, content)
-                    if contributed != content:
-                        new_messages.append({**msg, "content": contributed})
-                        augmented = True
-                        continue
-            new_messages.append(msg)
-
-        if not augmented:
-            contributed = self.contribute_system_prompt(model_id, None)
-            if contributed:
-                return [{"role": "system", "content": contributed}, *new_messages]
-        return new_messages
-
     def _handle_images(
         self,
         images: Optional[List[Union[str, bytes]]],
-        user_prompt_content: List[Dict[str, Any]]
+        user_prompt_content: List[Dict[str, Any]],
     ) -> None:
-        """
-        Handle images using centralized image_utils with auto-resize.
+        """Process images and append them to a user-message content list.
 
-        Uses OpenAI's 2048x2048 limit for the base adapter (OpenAI-format messages).
-        Provider-specific adapters override or pass their own provider limits.
+        Uses OpenAI's 2048x2048 limit for the base adapter
+        (OpenAI-format messages). Provider-specific adapters can
+        override or pass their own provider limits to
+        :func:`process_images` if they need different behavior.
         """
         if not images:
             return
 
-        # Use centralized image processing with auto-resize for OpenAI limits
         for processed in process_images(images, provider="openai"):
-            user_prompt_content.append({
-                "type": "image_url",
-                "image_url": {
-                    "url": f"data:{processed.mime_type};base64,{processed.data}"
+            user_prompt_content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:{processed.mime_type};base64,{processed.data}"
+                    },
                 }
-            })
+            )

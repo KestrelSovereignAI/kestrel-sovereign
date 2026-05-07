@@ -475,9 +475,13 @@ class OllamaAdapter(LLMAdapter):
             logger.warning(f"Could not check tool support for {model_name}: {e}")
             return False
 
-    async def list_models(self) -> List[ModelInfo]:
-        """
-        List available models from local Ollama instance.
+    async def list_models(self, client: Any = None) -> List[ModelInfo]:
+        """List available models from the local Ollama instance.
+
+        ``client`` is accepted for contract symmetry with
+        :meth:`get_response` (SDK 0.5.0). Ollama's discovery uses its
+        own ``ollama.AsyncClient()`` against a fixed local endpoint, so
+        the parameter is ignored here.
 
         Uses ollama.list() to discover locally available models,
         then ollama.show() per model to detect tool calling capability.

@@ -528,23 +528,47 @@ class OpenAIAdapter(LLMAdapter):
             tools=tools
         )
 
-    async def list_models(self) -> List[ModelInfo]:
-        """
-        List available models from OpenAI API.
+    async def list_models(self, client: Any = None) -> List[ModelInfo]:
+        """List available models from OpenAI API (or any OpenAI-compatible
+        endpoint the route was initialized against).
 
-        Calls client.models.list() to get all available models.
+        Uses the framework-initialized ``client`` so the call goes to the
+        same ``base_url`` and authenticates with the same key the route's
+        ``get_response`` calls do. Routes pointed at custom endpoints
+        (Azure, Kimi, DeepSeek, OpenRouter-via-OpenAI-compat) get their
+        own catalog rather than silently falling through to api.openai.com.
+
+        Args:
+            client: The route's ``openai.AsyncOpenAI`` client. The
+                framework always passes this; the env-var fallback below
+                is only for legacy callers (existing tests, scripts that
+                build a bare ``OpenAIAdapter()`` and call ``list_models()``
+                directly) that pass ``None`` or omit the argument.
+                Liskov-widened to optional from the SDK 0.5.0 abstract
+                signature so those callers keep working.
 
         Returns:
-            List of ModelInfo objects
+            List of ModelInfo objects.
         """
         try:
-            # Create a client for listing models
-            api_key = os.environ.get("OPENAI_API_KEY")
-            if not api_key:
-                logger.warning("OPENAI_API_KEY not set, returning empty model list")
-                return []
+            if client is None:
+                # Legacy fallback. Modern callers always pass the route
+                # client; warn and let env vars rebuild a canonical-OpenAI
+                # client so we don't lose discovery for callers that
+                # haven't migrated yet.
+                api_key = os.environ.get("OPENAI_API_KEY")
+                if not api_key:
+                    logger.warning(
+                        "OpenAIAdapter.list_models called with client=None "
+                        "and no OPENAI_API_KEY; returning empty model list"
+                    )
+                    return []
+                logger.warning(
+                    "OpenAIAdapter.list_models called with client=None — "
+                    "rebuilding from OPENAI_API_KEY (canonical OpenAI only)"
+                )
+                client = openai.AsyncOpenAI(api_key=api_key)
 
-            client = openai.AsyncOpenAI(api_key=api_key)
             response = await client.models.list()
 
             models = []
@@ -558,6 +582,7 @@ class OpenAIAdapter(LLMAdapter):
                     display_name=display_name,
                     category=ModelCategory.CHAT,  # Will be enriched by catalog service
                     supports_tools=True,  # OpenAI models support tools
+                    supports_streaming=True,  # OpenAI streams every chat model
                     created_at=str(model.created) if hasattr(model, 'created') else None,
                 ))
 

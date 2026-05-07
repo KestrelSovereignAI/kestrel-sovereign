@@ -956,9 +956,16 @@ class AnthropicAdapter(LLMAdapter):
             **kwargs
         )
 
-    async def list_models(self) -> List[ModelInfo]:
-        """
-        List available models from Anthropic API.
+    async def list_models(self, client: Any = None) -> List[ModelInfo]:
+        """List available models from Anthropic API.
+
+        ``client`` is accepted for contract symmetry with
+        :meth:`get_response` (the SDK 0.5.0 contract requires the
+        framework-initialized client be passed to discovery so routes
+        with custom ``base_url`` reach the right endpoint). This
+        implementation uses an ``httpx.AsyncClient`` directly because
+        the Anthropic ``/v1/models`` endpoint does not require the
+        Anthropic SDK client; the parameter is ignored here.
 
         Uses the /v1/models endpoint to discover available Claude models.
         See: https://docs.anthropic.com/en/api/models

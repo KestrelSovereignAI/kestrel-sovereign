@@ -50,6 +50,8 @@ try:
 except ImportError:
     ollama = None
 
+from kestrel_sdk.llm import LLMAdapter as _SDKLLMAdapter, ProviderInfo
+
 from .adapter import LLMAdapter
 from .ollama_adapter import OllamaAdapter
 from .openai_adapter import OpenAIAdapter
@@ -77,26 +79,6 @@ _ADAPTER_REGISTRY: Dict[str, type] = {
     "GoogleAdapter": GoogleAdapter,
     "VertexAIAdapter": VertexAIAdapter,
 }
-
-
-@dataclass
-class ProviderInfo:
-    """Information about one initialized route for a vendor.
-
-    A ProviderInfo represents a (vendor, route) pair. ``name`` is the composite
-    key ``"<vendor>:<route>"`` used for routing lookups. Discovery groups by
-    ``vendor``.
-    """
-    name: str                # "anthropic:plan", "openai:api", ...
-    vendor: str              # "anthropic"
-    route: str               # "plan"
-    client: Any
-    adapter: Any
-    model: str               # default model for this route ("auto" resolves via discovery)
-    is_cloud: bool = True
-    is_local: bool = False
-    base_url: Optional[str] = None
-    selection_hints: List[str] = field(default_factory=list)
 
 
 class ProviderInitializationError(Exception):
@@ -418,7 +400,14 @@ class ProviderRegistry:
         from kestrel_sovereign.entrypoints import discover_entry_point_classes
 
         providers: List[ProviderInfo] = []
-        classes = discover_entry_point_classes(LLM_PROVIDER_ENTRY_POINT_GROUP, LLMAdapter)
+        # Validate against the SDK base, not the framework-enriched
+        # subclass, so third-party plugins that subclass
+        # ``kestrel_sdk.llm.LLMAdapter`` directly (the documented and
+        # intended entry point — they should not need to depend on
+        # kestrel-sovereign) are accepted. The framework's own
+        # ``LLMAdapter`` inherits from the SDK base, so in-tree
+        # subclasses pass this check as well.
+        classes = discover_entry_point_classes(LLM_PROVIDER_ENTRY_POINT_GROUP, _SDKLLMAdapter)
 
         for ep_name, cls in classes.items():
             try:

@@ -24,7 +24,7 @@ from typing import List, Dict, Any, Optional, Union, Type, AsyncIterator
 
 from pydantic import BaseModel
 
-from .adapter import LLMResponse
+from .adapter import LLMResponse, messages_for
 from .error_handling import LLMError
 from .provider_registry import provider_cache_body
 
@@ -174,7 +174,7 @@ class StreamingMixin:
                 model_to_use = target_model or provider["model"]
 
                 logger.info(f"Attempting streaming from {provider_name} with {model_to_use}")
-                messages = provider["adapter"].create_messages(user_prompt=user_prompt, system_prompt=system_prompt)
+                messages = messages_for(provider["adapter"], user_prompt=user_prompt, system_prompt=system_prompt)
 
                 adapter = provider["adapter"]
 
@@ -277,7 +277,7 @@ class StreamingMixin:
         ):
             try:
                 self._ensure_remote_active()
-                messages = self._remote_adapter.create_messages(user_prompt=user_prompt, system_prompt=system_prompt)
+                messages = messages_for(self._remote_adapter, user_prompt=user_prompt, system_prompt=system_prompt)
                 model = model_override or self._remote_config.model
                 async for chunk in self._remote_adapter.get_streaming_response(
                     client=self._remote_client,

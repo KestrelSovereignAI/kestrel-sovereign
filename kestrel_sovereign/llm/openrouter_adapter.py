@@ -150,9 +150,14 @@ class OpenRouterAdapter(OpenAIAdapter):
         ):
             yield item
 
-    async def list_models(self) -> List[ModelInfo]:
-        """
-        Fetch models from OpenRouter API with rich metadata.
+    async def list_models(self, client: Any = None) -> List[ModelInfo]:
+        """Fetch models from OpenRouter API with rich metadata.
+
+        ``client`` is accepted for contract symmetry with
+        :meth:`get_response` (SDK 0.5.0). OpenRouter's catalog is
+        served from a fixed URL with bearer-token auth that this
+        adapter manages via its own ``httpx.AsyncClient``, so the
+        parameter is ignored here.
 
         OpenRouter's /models endpoint returns detailed information including:
         - Model ID (e.g., "anthropic/claude-3-opus")
@@ -224,6 +229,7 @@ class OpenRouterAdapter(OpenAIAdapter):
                     context_limit=m.get("context_length", 4096),
                     supports_vision=supports_vision,
                     supports_tools=supports_tools,
+                    supports_streaming=True,  # OpenRouter streams every chat route
                 ))
 
             logger.info(f"OpenRouter: discovered {len(models)} models")
