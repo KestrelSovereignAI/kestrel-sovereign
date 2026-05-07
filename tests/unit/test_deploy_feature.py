@@ -394,23 +394,26 @@ class TestDeployFeature:
             assert "available_actions" in result
 
     def test_build_image_reference(self, sample_config):
-        """Test image reference building."""
-        with patch("kestrel_sovereign.features.deploy.feature.DeployManager") as mock_mgr:
-            mock_instance = MagicMock()
-            mock_instance.profiles = {"dev": MagicMock()}
-            mock_instance.gcp_project_id = "test-project"
-            mock_instance.image_name = "kestrel"
-            mock_mgr.return_value = mock_instance
+        """Test image reference building.
 
-            feature = DeployFeature(agent=MagicMock())
-            feature.manager = mock_instance
+        ``_build_image_reference`` was removed from DeployFeature in
+        sub-PR 1.1 of the bash-to-Python port (#1050). Both the agent
+        tool and the ``kestrel deploy`` CLI now call
+        :meth:`DeployManagerCore.build_image_reference` directly. This
+        test exercises the manager method end-to-end.
+        """
+        # Clear GCP_PROJECT_ID env var so the config value
+        # ("test-project") wins; otherwise the developer's real GCP
+        # project leaks into the assertion.
+        with patch.dict(os.environ, {}, clear=True):
+            manager = DeployManagerCore(config=sample_config)
 
-            # Test with default tag
-            ref = feature._build_image_reference("dev", "latest")
+            # Default tag
+            ref = manager.build_image_reference("dev", "latest")
             assert ref == "gcr.io/test-project/kestrel:latest"
 
-            # Test with custom tag
-            ref = feature._build_image_reference("dev", "v1.2.3")
+            # Custom tag
+            ref = manager.build_image_reference("dev", "v1.2.3")
             assert ref == "gcr.io/test-project/kestrel:v1.2.3"
 
 
