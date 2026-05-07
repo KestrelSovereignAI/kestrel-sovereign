@@ -215,7 +215,14 @@ def load_env_file(path: Path) -> Dict[str, str]:
     # derive_secret_mapping) doesn't require dotenv to be importable.
     from dotenv import dotenv_values
 
-    raw = dotenv_values(str(path))
+    # ``interpolate=False`` is critical — secrets are values, not templates.
+    # The bash script we're porting (`scripts/cloudrun/setup_secrets.sh`)
+    # used ``cut -d'=' -f2-`` which is a literal byte slice, so a secret
+    # like ``KESTREL_DATA_KEY=${SALT}`` would have been uploaded verbatim.
+    # ``dotenv_values`` defaults to ``interpolate=True``, which would
+    # silently expand ``${SALT}`` against earlier entries / ``os.environ``
+    # — corrupting any password/key that happens to contain ``${...}``.
+    raw = dotenv_values(str(path), interpolate=False)
     # dotenv_values returns Dict[str, Optional[str]]; drop None values.
     return {k: v for k, v in raw.items() if v is not None}
 

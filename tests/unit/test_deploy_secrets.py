@@ -201,6 +201,41 @@ def test_load_env_file_missing_file_raises(tmp_path: Path):
         load_env_file(missing)
 
 
+def test_load_env_file_does_not_interpolate_dollar_braces(
+    tmp_path: Path, monkeypatch
+):
+    """Secret values containing ``${...}`` must be returned verbatim.
+
+    Regression test for codex review on PR #1057: ``dotenv_values``
+    defaults to ``interpolate=True``, which would silently expand
+    ``${SALT}`` against earlier .env entries or ``os.environ``. Secrets
+    are values, not templates — passing ``interpolate=False`` to
+    dotenv preserves the literal byte sequence the operator wrote.
+
+    The bash script we're porting (``setup_secrets.sh``) used a literal
+    ``cut -d'=' -f2-`` which is byte-exact; the Python port must match.
+    """
+    monkeypatch.setenv("SALT", "PROD_SALT_VALUE")
+    monkeypatch.setenv("KESTREL_API_KEY", "AMBIENT_KEY")
+
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "FIRST=alpha\n"
+        # Literal ${SALT} — must NOT be expanded to PROD_SALT_VALUE.
+        "KESTREL_DATA_KEY=${SALT}\n"
+        # Reference to an earlier entry — must NOT be expanded to alpha.
+        "DERIVED=${FIRST}-suffix\n"
+        # Reference to an ambient env var — must NOT shadow the .env value.
+        'KESTREL_API_KEY="explicit-from-env-file"\n'
+    )
+
+    values = load_env_file(env_file)
+
+    assert values["KESTREL_DATA_KEY"] == "${SALT}"
+    assert values["DERIVED"] == "${FIRST}-suffix"
+    assert values["KESTREL_API_KEY"] == "explicit-from-env-file"
+
+
 # ---------------------------------------------------------------------------
 # sync_secret
 # ---------------------------------------------------------------------------
