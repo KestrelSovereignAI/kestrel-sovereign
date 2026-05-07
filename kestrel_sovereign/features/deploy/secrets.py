@@ -459,7 +459,16 @@ def sync_all_secrets(
 
         if client is None:
             # Lazy import + lazy construct — see module docstring.
+            # Reuse the deploy package's GCP auth chain so this command
+            # works in the same scenarios as `kestrel deploy <profile>`
+            # (project-local credentials/kestrel-agent-admin.json,
+            # GCP_SERVICE_ACCOUNT_KEY inline JSON, etc.). codex review on
+            # PR #1057 caught that constructing the client directly
+            # bypassed the project-local cred path.
+            from ._gcp_auth import setup_gcp_auth
             from google.cloud import secretmanager
+
+            setup_gcp_auth()
             client = secretmanager.SecretManagerServiceClient()
 
         result = sync_secret(

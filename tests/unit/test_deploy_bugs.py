@@ -358,7 +358,15 @@ class TestBug3TempFileCleanup:
 
     def test_setup_auth_with_inline_key_registers_cleanup(self):
         """When GCP_SERVICE_ACCOUNT_KEY is set, _setup_auth must create a temp file
-        and register atexit cleanup."""
+        and register atexit cleanup.
+
+        Auth setup was extracted to ``deploy/_gcp_auth.py`` (PR #1057
+        post-codex), so the atexit registration target is now the
+        module-level ``_cleanup_temp_creds`` keyed on the temp path.
+        We assert the contract — temp file exists + an atexit handler
+        was registered that can clean it up — without binding the test
+        to the exact callable identity.
+        """
         fake_key_json = '{"type": "service_account", "project_id": "test"}'
 
         with patch.dict(
@@ -372,7 +380,9 @@ class TestBug3TempFileCleanup:
             # Remove GOOGLE_APPLICATION_CREDENTIALS to hit the inline key path
             os.environ.pop("GOOGLE_APPLICATION_CREDENTIALS", None)
 
-            with patch("atexit.register") as mock_atexit:
+            with patch(
+                "kestrel_sovereign.features.deploy._gcp_auth.atexit.register"
+            ) as mock_atexit:
                 provider = CloudRunProvider(project_id="test-project")
 
                 # Temp file should exist
@@ -380,8 +390,12 @@ class TestBug3TempFileCleanup:
                 temp_path = provider._temp_cred_file
                 assert os.path.exists(temp_path)
 
-                # atexit should have been registered
-                mock_atexit.assert_called_once_with(provider._cleanup_temp_creds)
+                # atexit should have been registered with a callable that
+                # cleans up the same temp file we just created.
+                mock_atexit.assert_called_once()
+                registered_callable, *registered_args = mock_atexit.call_args.args
+                assert callable(registered_callable)
+                assert registered_args == [temp_path]
 
                 # Clean up
                 provider.cleanup()
