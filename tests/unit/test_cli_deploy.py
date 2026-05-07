@@ -188,16 +188,25 @@ def test_cmd_deploy_success_failed_result_returns_1():
     assert rc == 1
 
 
-def test_cmd_deploy_rejects_placeholder_project_id(capsys):
+def test_cmd_deploy_rejects_placeholder_project_id_for_cloudrun(capsys):
     """Codex review on the final epic→main PR: the deploy CLI must
     reject ``manager.gcp_project_id == "your-gcp-project-id"`` (the
-    deploy_config.toml example placeholder) so deploys fail fast with
-    an actionable error rather than building Cloud Run image refs
-    against ``gcr.io/your-gcp-project-id/`` and crashing inside the SDK.
+    deploy_config.toml example placeholder) for Cloud Run profiles so
+    deploys fail fast with an actionable error rather than building
+    image refs against ``gcr.io/your-gcp-project-id/`` and crashing
+    inside the SDK.
     """
+    from kestrel_sovereign.features.deploy.models import DeployProviderType
+
     with patch("kestrel_sovereign.cli_deploy.DeployManager") as mock_mgr_cls:
         mock_instance = MagicMock()
         mock_instance.gcp_project_id = "your-gcp-project-id"
+        # get_profile returns a Cloud Run profile with no profile-scoped
+        # override (so the manager value is the effective project).
+        fake_profile = MagicMock()
+        fake_profile.provider = DeployProviderType.CLOUD_RUN
+        fake_profile.gcp_project_id = None
+        mock_instance.get_profile.return_value = fake_profile
         mock_instance.deploy_profile = AsyncMock()
         mock_mgr_cls.return_value = mock_instance
 
@@ -208,6 +217,55 @@ def test_cmd_deploy_rejects_placeholder_project_id(capsys):
     assert "GCP project ID is not configured" in err
     # And we did NOT attempt the deploy.
     mock_instance.deploy_profile.assert_not_awaited()
+
+
+def test_cmd_deploy_azure_profile_skips_gcp_preflight():
+    """Azure profiles have no GCP project requirement; the preflight
+    must not block ``kestrel deploy azure-dev`` even when
+    ``manager.gcp_project_id`` is the placeholder. Codex review caught
+    the over-eager check on PR #1079."""
+    from kestrel_sovereign.features.deploy.models import DeployProviderType
+
+    with patch("kestrel_sovereign.cli_deploy.DeployManager") as mock_mgr_cls:
+        mock_instance = MagicMock()
+        mock_instance.gcp_project_id = "your-gcp-project-id"  # placeholder
+        fake_profile = MagicMock()
+        fake_profile.provider = DeployProviderType.AZURE_CONTAINER_APPS
+        fake_profile.gcp_project_id = None
+        mock_instance.get_profile.return_value = fake_profile
+        mock_instance.deploy_profile = AsyncMock(
+            return_value={"success": True, "session": {}},
+        )
+        mock_mgr_cls.return_value = mock_instance
+
+        rc = cmd_deploy(_make_args(target="azure-dev"))
+
+    assert rc == 0
+    mock_instance.deploy_profile.assert_awaited_once()
+
+
+def test_cmd_deploy_profile_scoped_project_overrides_placeholder_manager():
+    """Profile-scoped ``gcp_project_id`` wins over the manager default;
+    a real value at the profile level satisfies the preflight even
+    when the manager has the placeholder."""
+    from kestrel_sovereign.features.deploy.models import DeployProviderType
+
+    with patch("kestrel_sovereign.cli_deploy.DeployManager") as mock_mgr_cls:
+        mock_instance = MagicMock()
+        mock_instance.gcp_project_id = "your-gcp-project-id"  # manager placeholder
+        fake_profile = MagicMock()
+        fake_profile.provider = DeployProviderType.CLOUD_RUN
+        fake_profile.gcp_project_id = "real-prod-project"  # profile override
+        mock_instance.get_profile.return_value = fake_profile
+        mock_instance.deploy_profile = AsyncMock(
+            return_value={"success": True, "session": {}},
+        )
+        mock_mgr_cls.return_value = mock_instance
+
+        rc = cmd_deploy(_make_args(target="prod"))
+
+    assert rc == 0
+    mock_instance.deploy_profile.assert_awaited_once()
 
 
 def test_cmd_deploy_status(capsys):

@@ -67,7 +67,10 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from kestrel_sovereign.features.deploy.manager import DeployManager
-from kestrel_sovereign.features.deploy.models import DeployManagerError
+from kestrel_sovereign.features.deploy.models import (
+    DeployManagerError,
+    DeployProviderType,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -333,16 +336,34 @@ def _cmd_deploy_profile(args, profile_name: str) -> int:
     # and crashing inside the GCP SDK. Mirrors the build / secrets-sync
     # paths' placeholder rejection. Codex review on the final epic→main
     # PR caught the omission.
-    if not _is_real_project_id(getattr(manager, "gcp_project_id", None)):
-        print(
-            f"error: GCP project ID is not configured for `kestrel deploy "
-            f"{profile_name}`. Either export GCP_PROJECT_ID, set "
-            f"[manager].gcp_project_id in deploy_config.toml, or set "
-            f"[profiles.{profile_name}].gcp_project_id. Got: "
-            f"{getattr(manager, 'gcp_project_id', None)!r}.",
-            file=sys.stderr,
-        )
+    #
+    # Scope: Cloud Run profiles only. Azure profiles have no
+    # ``gcp_project_id`` requirement; we route them straight through to
+    # AzureContainerProvider. The profile-scoped value (preferred when
+    # a profile sets its own ``gcp_project_id``) wins over the manager
+    # default — DeployManagerCore._load_profiles already picks the
+    # right value when constructing DeploymentProfile.
+    try:
+        profile = manager.get_profile(profile_name)
+    except DeployManagerError as e:
+        # Unknown profile / config error — surface immediately.
+        print(f"error: {e}", file=sys.stderr)
         return 1
+
+    if profile.provider == DeployProviderType.CLOUD_RUN:
+        effective_project = (
+            profile.gcp_project_id or getattr(manager, "gcp_project_id", None)
+        )
+        if not _is_real_project_id(effective_project):
+            print(
+                f"error: GCP project ID is not configured for `kestrel deploy "
+                f"{profile_name}`. Either export GCP_PROJECT_ID, set "
+                f"[manager].gcp_project_id in deploy_config.toml, or set "
+                f"[profiles.{profile_name}].gcp_project_id. Got: "
+                f"{effective_project!r}.",
+                file=sys.stderr,
+            )
+            return 1
 
     try:
         result = asyncio.run(manager.deploy_profile(profile_name, args.tag))
