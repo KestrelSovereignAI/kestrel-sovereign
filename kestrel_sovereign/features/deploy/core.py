@@ -2,7 +2,15 @@
 Deploy Core Manager Operations.
 
 Contains the core DeployManagerCore class with config loading,
-profile management, provider registry, and health verification.
+profile management, provider registry, health verification, and
+the orchestration logic shared between the agent-tool surface
+(``DeployFeature``) and the operator CLI surface (``kestrel deploy``).
+
+The ``deploy_profile``/``teardown_profile``/``get_profile_logs``/
+``list_all_deployments``/``health_check_profile`` methods own the
+"talk to a provider, manage sessions, handle errors" workflow so
+both surfaces (`!deploy <action>` and `kestrel deploy <profile>`)
+delegate to the same code path.
 """
 
 import asyncio
@@ -10,6 +18,7 @@ import logging
 import os
 import re
 import time
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 from kestrel_sovereign.config import load_config
@@ -304,3 +313,222 @@ class DeployManagerCore:
         """
         async with self._lock:
             return dict(self._sessions)
+
+    # ------------------------------------------------------------------
+    # Orchestration: shared by DeployFeature (`!deploy`) and the
+    # `kestrel deploy` CLI. These methods own provider dispatch, session
+    # bookkeeping, and DeployManagerError handling. Both surfaces wrap
+    # them with surface-specific guards (CLI prints to stderr, the
+    # feature returns structured ``error`` dicts).
+    # ------------------------------------------------------------------
+
+    def build_image_reference(self, profile_name: str, tag: str = "latest") -> str:
+        """
+        Build container image reference for a profile.
+
+        Args:
+            profile_name: Name of the profile (currently informational —
+                only used to disambiguate per-profile image overrides if
+                we add them later; the image name today is global).
+            tag: Image tag
+
+        Returns:
+            Full image reference (e.g. ``gcr.io/project/kestrel:latest``).
+        """
+        # For Cloud Run, use GCR
+        if self.gcp_project_id:
+            return f"gcr.io/{self.gcp_project_id}/{self.image_name}:{tag}"
+
+        # Fallback to generic reference
+        return f"{self.image_name}:{tag}"
+
+    async def deploy_profile(
+        self, profile_name: str, tag: str = "latest"
+    ) -> Dict[str, Any]:
+        """
+        Deploy an agent to the cloud platform configured by ``profile_name``.
+
+        Returns the same shape DeployFeature historically returned:
+            ``{"success": True, "action": "deploy", "session": {...}}``
+        on success, ``{"success": False, "error": "..."}`` on failure.
+        """
+        try:
+            profile = self.get_profile(profile_name)
+
+            image = self.build_image_reference(profile_name, tag)
+
+            # Check if session already exists
+            existing_session = await self.get_session(profile.service_name)
+            if existing_session:
+                return {
+                    "success": False,
+                    "error": f"Service {profile.service_name} already deployed",
+                    "session": existing_session.to_dict(),
+                    "hint": f"Tear it down first (e.g. `kestrel deploy teardown {profile_name}`)",
+                }
+
+            # Create deployment session
+            session = DeploymentSession(
+                service_name=profile.service_name,
+                provider=profile.provider,
+                profile=profile,
+                status=DeployStatus.DEPLOYING,
+                started_at=datetime.now(timezone.utc),
+            )
+            await self.add_session(session)
+
+            provider = self._get_provider(profile.provider)
+
+            logger.info(f"Deploying {image} to {profile.service_name}...")
+            session.status = DeployStatus.DEPLOYING
+
+            deploy_result = await provider.deploy(
+                image=image,
+                service_name=profile.service_name,
+                profile=profile,
+            )
+
+            session.status = DeployStatus.ACTIVE
+            session.service_url = deploy_result.get("service_url")
+            session.revision = deploy_result.get("revision")
+            session.last_updated = datetime.now(timezone.utc)
+
+            if session.service_url:
+                logger.info(f"Verifying health of {session.service_url}...")
+                healthy = await self._verify_health(session.service_url)
+                session.health_status = "healthy" if healthy else "unknown"
+
+            logger.info(f"Deployment complete: {session.service_url}")
+
+            return {
+                "success": True,
+                "action": "deploy",
+                "session": session.to_dict(),
+            }
+
+        except DeployManagerError as e:
+            # Best-effort session cleanup on failure so a retry can
+            # re-create one. We swallow the inner exception because the
+            # outer DeployManagerError is what the operator needs to see.
+            try:
+                profile = self.get_profile(profile_name)
+                await self.remove_session(profile.service_name)
+            except Exception:
+                pass
+
+            return {"success": False, "error": str(e)}
+
+    async def teardown_profile(self, profile_name: str) -> Dict[str, Any]:
+        """Delete a deployed service for ``profile_name``."""
+        try:
+            profile = self.get_profile(profile_name)
+            provider = self._get_provider(profile.provider)
+
+            logger.info(f"Tearing down service {profile.service_name}...")
+            result = await provider.teardown(profile.service_name)
+
+            await self.remove_session(profile.service_name)
+
+            return {
+                "success": True,
+                "action": "teardown",
+                "service": profile.service_name,
+                "result": result,
+            }
+
+        except DeployManagerError as e:
+            return {"success": False, "error": str(e)}
+
+    async def get_profile_logs(
+        self, profile_name: str, lines: int = 100
+    ) -> Dict[str, Any]:
+        """Fetch the last ``lines`` log lines from the deployed service."""
+        try:
+            profile = self.get_profile(profile_name)
+            provider = self._get_provider(profile.provider)
+
+            logs = await provider.get_logs(profile.service_name, lines=lines)
+
+            return {
+                "success": True,
+                "action": "logs",
+                "service": profile.service_name,
+                "lines": lines,
+                "logs": logs,
+            }
+
+        except DeployManagerError as e:
+            return {"success": False, "error": str(e)}
+
+    async def list_all_deployments(self) -> Dict[str, Any]:
+        """List every deployment across every provider configured in profiles."""
+        try:
+            all_deployments = []
+
+            provider_types = set(p.provider for p in self.profiles.values())
+
+            for provider_type in provider_types:
+                try:
+                    provider = self._get_provider(provider_type)
+                    deployments = await provider.list_deployments()
+                    all_deployments.extend(deployments)
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to list {provider_type.value} deployments: {e}"
+                    )
+
+            return {
+                "success": True,
+                "action": "list",
+                "count": len(all_deployments),
+                "deployments": all_deployments,
+            }
+
+        except DeployManagerError as e:
+            return {"success": False, "error": str(e)}
+
+    async def health_check_profile(self, profile_name: str) -> Dict[str, Any]:
+        """Health-check the deployed service for ``profile_name``."""
+        try:
+            profile = self.get_profile(profile_name)
+
+            session = await self.get_session(profile.service_name)
+            if not session or not session.service_url:
+                # No tracked session — query the provider directly so
+                # `kestrel deploy health` works against services that
+                # were deployed in a previous process.
+                provider = self._get_provider(profile.provider)
+                status = await provider.get_status(profile.service_name)
+
+                if status.get("status") == "offline":
+                    return {
+                        "success": True,
+                        "action": "health",
+                        "service": profile.service_name,
+                        "status": "offline",
+                        "message": "Service not deployed",
+                    }
+
+                service_url = status.get("service_url")
+            else:
+                service_url = session.service_url
+
+            if not service_url:
+                return {
+                    "success": False,
+                    "error": "Service URL not available",
+                }
+
+            provider = self._get_provider(profile.provider)
+            health_result = await provider.health_check(service_url)
+
+            return {
+                "success": True,
+                "action": "health",
+                "service": profile.service_name,
+                "url": service_url,
+                "health": health_result,
+            }
+
+        except DeployManagerError as e:
+            return {"success": False, "error": str(e)}
