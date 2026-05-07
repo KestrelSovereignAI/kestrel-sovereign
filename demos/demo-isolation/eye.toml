@@ -3,7 +3,7 @@
 [eye]
 name = "Kestrel Demo-Isolation Rail Vignette"
 screenshot_dir = "demos/demo-isolation/demo-output"
-test_cmd = "demos/run.sh demo-isolation"
+test_cmd = "kestrel demo run demo-isolation"
 
 [eye.model]
 provider = "anthropic"

@@ -45,6 +45,6 @@ The Security panel surfaces the purge audit row.
 ## Running the vignette
 
 ```bash
-demos/run.sh ephemeral-purge
+kestrel demo run ephemeral-purge
 kestrel-eye review --config demos/ephemeral-purge/eye.toml
 ```

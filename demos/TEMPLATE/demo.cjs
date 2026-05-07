@@ -4,7 +4,7 @@
  * Copy this whole directory to demos/<feature-name>/ and rewrite the beats.
  * A vignette covers ONE feature with 5–8 screenshots.
  *
- * Run: demos/run.sh <feature-name>
+ * Run: kestrel demo run <feature-name>
  *
  * Output (in demo-output/):
  *   - narration.md    — generated transcript with screenshot refs

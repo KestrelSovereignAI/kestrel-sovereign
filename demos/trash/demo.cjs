@@ -12,7 +12,7 @@
  *   delete a message, find it in Trash, restore it, and (only if they really
  *   mean it) hard-purge it forever.
  *
- * Run: demos/run.sh trash
+ * Run: kestrel demo run trash
  */
 const { test } = require('@playwright/test');
 const fs = require('fs');

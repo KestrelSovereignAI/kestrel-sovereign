@@ -19,6 +19,12 @@ Commands:
     kestrel config <agent_dir>     # show/edit agent config
     kestrel deploy <profile>       # deploy agent to Cloud Run / Azure Container Apps
     kestrel verify-install [TESTS...]  # run the 5-test clean-install matrix in throwaway venvs
+    kestrel demo run <name>        # run a demo against an isolated demo agent
+    kestrel agent docker create    # create a Docker-isolated agent (KESTREL_DATA_KEY rail)
+    kestrel agent docker chat      # interactive chat with a Docker-isolated agent
+    kestrel agent docker retire    # retire a Docker-isolated agent
+    kestrel docker remote build    # build the lightweight remote-LLM image
+    kestrel docker remote run      # run the lightweight remote-LLM container
 """
 
 import argparse
@@ -1794,6 +1800,27 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_verify_install_subcommand(subparsers)
 
+    # kestrel demo run <name> — sub-PR 3.1 of epic #1050 (port of
+    # demos/run.sh). Local import — playwright/uvicorn machinery is
+    # dead weight for operators who never run demos.
+    from kestrel_sovereign.cli_demo import add_demo_subcommand
+    add_demo_subcommand(subparsers)
+
+    # kestrel agent docker {create,chat,retire} — sub-PR 3.2 of epic
+    # #1050 (port of scripts/sovereign-agent.sh). Local import — docker
+    # subprocess shell-out is dead weight for operators who never use
+    # the Docker-isolated lifecycle.
+    from kestrel_sovereign.cli_agent_docker import (
+        add_agent_docker_subcommand,
+    )
+    add_agent_docker_subcommand(subparsers)
+
+    # kestrel docker remote {build,run} — sub-PR 3.3 of epic #1050
+    # (port of scripts/{build,run}_docker_remote.sh). Local import for
+    # the same reason.
+    from kestrel_sovereign.cli_docker_remote import add_docker_subcommand
+    add_docker_subcommand(subparsers)
+
     return parser
 
 
@@ -1826,6 +1853,9 @@ def main() -> int:
     from kestrel_sovereign.cli_release import cmd_release
     from kestrel_sovereign.cli_deploy import cmd_deploy
     from kestrel_sovereign.cli_verify_install import cmd_verify_install
+    from kestrel_sovereign.cli_demo import cmd_demo
+    from kestrel_sovereign.cli_agent_docker import cmd_agent
+    from kestrel_sovereign.cli_docker_remote import cmd_docker
 
     commands = {
         "start": cmd_start,
@@ -1847,6 +1877,9 @@ def main() -> int:
         "release": cmd_release,
         "deploy": cmd_deploy,
         "verify-install": cmd_verify_install,
+        "demo": cmd_demo,
+        "agent": cmd_agent,
+        "docker": cmd_docker,
     }
 
     handler = commands.get(args.command)

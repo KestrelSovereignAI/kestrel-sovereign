@@ -2,7 +2,7 @@
 
 The 2026-04-24 incident wiped three live agents because a Playwright
 demo harness pointed at the live server. The convention layer
-(`demos/run.sh`) is discipline; this rail is enforcement. Every test
+(`kestrel demo run`) is discipline; this rail is enforcement. Every test
 below corresponds to an acceptance-criterion bullet on the ticket.
 """
 from __future__ import annotations
@@ -176,8 +176,8 @@ async def test_live_server_demo_target_passes_silently():
 
 @pytest.mark.asyncio
 async def test_demo_server_demo_target_passes_silently():
-    """The blessed path: demos/run.sh starts a demo server, the demo
-    runner exercises a demo agent. Zero rail friction.
+    """The blessed path: ``kestrel demo run`` starts a demo server,
+    the demo runner exercises a demo agent. Zero rail friction.
     """
     audit = AsyncMock()
     permission_store = SimpleNamespace(log_decision=audit)

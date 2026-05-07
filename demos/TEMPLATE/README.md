@@ -20,7 +20,7 @@ cd demos/<feature-name>
 # 2. Edit narration.md — beat-by-beat story (consumed by kestrel-eye)
 # 3. Edit eye.toml — list expected screenshots and what each should show
 # 4. Run it:
-demos/run.sh <feature-name>
+kestrel demo run <feature-name>
 ```
 
 The runner spins an isolated agent on `agent_data/demo/` (port 8900 by

@@ -42,15 +42,15 @@ Each demo directory contains:
 
 ## Running a demo
 
-**Always use `demos/run.sh`.** It spins up an isolated demo agent on its own port so the demo never touches your live `localhost:8888` data.
+**Always use `kestrel demo run`.** It spins up an isolated demo agent on its own port so the demo never touches your live `localhost:8888` data.
 
 ```bash
-demos/run.sh technical
-demos/run.sh spawn
-demos/run.sh falconer
+kestrel demo run technical
+kestrel demo run spawn
+kestrel demo run falconer
 
 # Different port if 8900 is busy:
-DEMO_PORT=9001 demos/run.sh technical
+kestrel demo run technical --port 9001
 ```
 
 The runner:
@@ -78,7 +78,7 @@ kestrel-eye run    --config demos/<name>/eye.toml --loop
 cp -R demos/TEMPLATE demos/<feature-name>
 cd demos/<feature-name>
 # Edit demo.cjs (beats), narration.md (the story), eye.toml (expectations)
-demos/run.sh <feature-name>
+kestrel demo run <feature-name>
 ```
 
 See `demos/TEMPLATE/README.md` for the full convention.

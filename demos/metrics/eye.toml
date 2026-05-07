@@ -4,7 +4,7 @@
 [eye]
 name = "Kestrel Metrics Dashboard Demo"
 screenshot_dir = "demos/metrics/demo-output"
-test_cmd = "demos/run.sh metrics"
+test_cmd = "kestrel demo run metrics"
 
 [eye.model]
 provider = "anthropic"

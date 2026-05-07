@@ -6,7 +6,7 @@ const { buildDemoConfig } = require('@kestrel/flight');
  * Demo Template — Playwright Configuration
  *
  * Run via the canonical isolating runner:
- *   demos/run.sh <feature-name>
+ *   kestrel demo run <feature-name>
  *
  * Direct invocation (skips isolation; you've been warned):
  *   cd demos/<feature-name> && npx playwright test --config=config.cjs

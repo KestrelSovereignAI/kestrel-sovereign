@@ -8,7 +8,7 @@ const { buildDemoConfig } = require('@kestrel/flight');
  * Narrated demo of the Feature Store panel: browse, search, drill into a
  * feature, inspect its skills.
  *
- * Run: demos/run.sh feature-store
+ * Run: kestrel demo run feature-store
  * Env: DEMO_SLOWMO=200, KESTREL_URL (set by run.sh)
  */
 module.exports = buildDemoConfig(
