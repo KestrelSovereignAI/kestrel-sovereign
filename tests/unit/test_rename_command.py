@@ -107,7 +107,9 @@ class TestRenameValidation:
         result = await feature.rename_agent(valid_name)
         node = await mock_agent.storage.get_node(mock_agent.agent_id)
 
-        assert "Renamed" in result
+        from kestrel_sdk.tools.result import ToolResultStatus
+        assert result.status is ToolResultStatus.OK
+        assert "Renamed" in result.confirmation
         assert mock_agent._agent_name == valid_name
         assert mock_agent.bootstrap_service.agent_name == valid_name
         assert node.properties["name"] == valid_name
@@ -136,7 +138,9 @@ class TestRenameValidation:
         result = await feature.rename_agent("A" * 65)
         node = await mock_agent.storage.get_node(mock_agent.agent_id)
 
-        assert "too long" in result.lower()
+        from kestrel_sdk.tools.result import ToolResultStatus
+        assert result.status is ToolResultStatus.ERROR
+        assert "too long" in result.error.lower()
         assert mock_agent._agent_name == "OldName"
         assert mock_agent.bootstrap_service.agent_name == "OldName"
         assert node.properties["name"] == "OldName"
@@ -175,7 +179,9 @@ class TestRenameExecution:
 
         result = await feature.rename_agent("NewName")
 
-        assert "NewName" in result
+        from kestrel_sdk.tools.result import ToolResultStatus
+        assert result.status is ToolResultStatus.OK
+        assert "NewName" in result.confirmation
         assert mock_agent._agent_name == "NewName"
 
     @pytest.mark.asyncio
@@ -211,9 +217,11 @@ class TestRenameExecution:
 
         result = await feature.rename_agent("NewName")
 
-        assert "OldName" in result
-        assert "NewName" in result
-        assert "Renamed" in result
+        from kestrel_sdk.tools.result import ToolResultStatus
+        assert result.status is ToolResultStatus.OK
+        assert "OldName" in result.confirmation
+        assert "NewName" in result.confirmation
+        assert "Renamed" in result.confirmation
 
 
 class TestSoulMdUpdate:
@@ -242,10 +250,12 @@ class TestSoulMdUpdate:
 
         result = await feature.rename_agent("NewName")
 
+        from kestrel_sdk.tools.result import ToolResultStatus
+        assert result.status is ToolResultStatus.OK
         # Check SOUL.md was updated
         updated_content = soul_path.read_text()
         assert "NewName" in updated_content
-        assert "SOUL.md updated" in result
+        assert "SOUL.md updated" in result.confirmation
 
     @pytest.mark.asyncio
     async def test_rename_updates_soul_content(self, mock_agent, temp_agent_dir):
@@ -295,8 +305,10 @@ class TestSoulMdUpdate:
 
         result = await feature.rename_agent("NewName")
 
-        assert "NewName" in result
-        assert "SOUL.md updated" not in result
+        from kestrel_sdk.tools.result import ToolResultStatus
+        assert result.status is ToolResultStatus.OK
+        assert "NewName" in result.confirmation
+        assert "SOUL.md updated" not in result.confirmation
 
 
 class TestRenameEdgeCases:
@@ -312,24 +324,29 @@ class TestRenameEdgeCases:
 
         result = await feature.rename_agent("")
 
-        assert "provide a new name" in result.lower() or "usage" in result.lower()
+        from kestrel_sdk.tools.result import ToolResultStatus
+        assert result.status is ToolResultStatus.ERROR
+        assert "provide a new name" in result.error.lower() or "usage" in result.error.lower()
 
     @pytest.mark.asyncio
     async def test_rename_whitespace_only_rejected(self, mock_agent):
         """Whitespace-only name should be rejected."""
         from kestrel_sovereign.features.bootstrap.feature import BootstrapFeature
+        from kestrel_sdk.tools.result import ToolResultStatus
 
         feature = BootstrapFeature(mock_agent)
         await feature.initialize()
 
         result = await feature.rename_agent("   ")
 
-        assert "provide a new name" in result.lower() or "usage" in result.lower()
+        assert result.status is ToolResultStatus.ERROR
+        assert "provide a new name" in result.error.lower() or "usage" in result.error.lower()
 
     @pytest.mark.asyncio
     async def test_rename_long_name_rejected(self, mock_agent):
         """Names over 64 characters should be rejected."""
         from kestrel_sovereign.features.bootstrap.feature import BootstrapFeature
+        from kestrel_sdk.tools.result import ToolResultStatus
 
         feature = BootstrapFeature(mock_agent)
         await feature.initialize()
@@ -337,7 +354,8 @@ class TestRenameEdgeCases:
         long_name = "A" * 65
         result = await feature.rename_agent(long_name)
 
-        assert "too long" in result.lower()
+        assert result.status is ToolResultStatus.ERROR
+        assert "too long" in result.error.lower()
 
     @pytest.mark.asyncio
     async def test_rename_strips_whitespace(self, mock_agent):
