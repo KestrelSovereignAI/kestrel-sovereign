@@ -2,8 +2,7 @@
 Unified Kestrel CLI for host and agent management.
 
 This is the single entry point for managing the Kestrel Host and all agents.
-It replaces start_kestrel.sh / stop_kestrel.sh and subsumes main.py's
-interactive chat into `kestrel shell <name>`.
+It subsumes main.py's interactive chat into `kestrel shell <name>`.
 
 Commands:
     kestrel start                  # start all agents in-process (default)
