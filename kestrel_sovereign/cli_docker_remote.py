@@ -206,8 +206,25 @@ def _cmd_run(args) -> int:
         print("error: docker run failed", file=sys.stderr)
         return rc
 
-    print(f"Kestrel Agent starting at http://localhost:{host_port}")
-    print(f"   Health: http://localhost:{host_port}/health")
+    # Wait for /health — if Kestrel inside the container crashes
+    # immediately, ``docker run -d`` still returns 0. Codex review on
+    # PR #1071 caught the false-success path: the bash predecessor
+    # waited and curled /health, surfacing logs on failure.
+    health_url = f"http://localhost:{host_port}/health"
+    print(f"   Polling {health_url} (up to 30s) ...")
+    if not _wait_for_container_health(health_url, timeout=30.0):
+        print(
+            "error: container started but /health did not respond within 30s",
+            file=sys.stderr,
+        )
+        print("   Last 50 log lines:", file=sys.stderr)
+        # Stream the last 50 log lines so the operator sees why startup
+        # failed without having to re-run ``docker logs`` themselves.
+        run_streaming(["docker", "logs", "--tail", "50", _CONTAINER_NAME])
+        return 1
+
+    print(f"Kestrel Agent running at http://localhost:{host_port}")
+    print(f"   Health: {health_url}")
     print(f"   API Docs: http://localhost:{host_port}/docs")
     if not env_vars.get("KESTREL_API_KEY"):
         print(
@@ -215,6 +232,27 @@ def _cmd_run(args) -> int:
             f"Check logs: docker logs {_CONTAINER_NAME} | grep -i key"
         )
     return 0
+
+
+def _wait_for_container_health(url: str, *, timeout: float) -> bool:
+    """Poll ``<url>`` until 200 or timeout. Returns False on timeout
+    or persistent error. Used to verify the container actually serves
+    Kestrel after ``docker run -d`` rather than just trusting the
+    container-start exit code."""
+    import time
+    import urllib.error
+    import urllib.request
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(url, timeout=2) as resp:
+                if resp.status == 200:
+                    return True
+        except (urllib.error.URLError, urllib.error.HTTPError, OSError):
+            pass
+        time.sleep(1.0)
+    return False
 
 
 # ---------------------------------------------------------------------------

@@ -167,7 +167,7 @@ def test_build_demo_env_strips_api_key_sets_signal_flags(tmp_path):
         "PATH": "/usr/bin",
     }
     demo_db = tmp_path / "demo"
-    env = cli_demo._build_demo_env(parent, demo_db)
+    env = cli_demo._build_demo_env(parent, demo_db, tmp_path)
     assert "KESTREL_API_KEY" not in env
     assert env["KESTREL_DB_PATH"] == str(demo_db)
     assert env["KESTREL_DEMO_SERVER"] == "1"
@@ -178,7 +178,34 @@ def test_build_demo_env_strips_api_key_sets_signal_flags(tmp_path):
     assert env["ANTHROPIC_API_KEY"] == "sk-ant-..."
 
 
-def test_build_playwright_env_strips_api_key_preserves_provider_keys():
+def test_build_demo_env_loads_dotenv_under_parent(tmp_path):
+    """Codex review on PR #1071: ``demos/run.sh`` did ``source $ROOT/.env``;
+    the Python port skipped this so demos with provider keys only in
+    .env failed silently. Now .env is loaded UNDERNEATH parent_env so
+    explicit shell exports still win on collision.
+    """
+    repo = tmp_path
+    (repo / ".env").write_text(
+        "ANTHROPIC_API_KEY=from-dotenv\n"
+        "OPENAI_API_KEY=from-dotenv\n"
+        # Operator's shell exports the same key with a different value;
+        # parent_env wins.
+        "OVERRIDDEN=stale\n"
+    )
+    parent = {
+        "OVERRIDDEN": "shell-export",
+        "KESTREL_API_KEY": "leak",
+        "PATH": "/usr/bin",
+    }
+    demo_db = tmp_path / "demo"
+    env = cli_demo._build_demo_env(parent, demo_db, repo)
+    assert env["ANTHROPIC_API_KEY"] == "from-dotenv"  # only in .env
+    assert env["OPENAI_API_KEY"] == "from-dotenv"     # only in .env
+    assert env["OVERRIDDEN"] == "shell-export"        # parent wins
+    assert "KESTREL_API_KEY" not in env               # always stripped
+
+
+def test_build_playwright_env_strips_api_key_preserves_provider_keys(tmp_path):
     parent = {
         "KESTREL_API_KEY": "production-key-must-not-leak",
         "ANTHROPIC_API_KEY": "sk-ant-prod",
@@ -192,7 +219,7 @@ def test_build_playwright_env_strips_api_key_preserves_provider_keys():
         "OLLAMA_HOST": "http://localhost:11434",
         "PATH": "/usr/bin",
     }
-    env = cli_demo._build_playwright_env(parent, "http://127.0.0.1:8900")
+    env = cli_demo._build_playwright_env(parent, "http://127.0.0.1:8900", tmp_path)
     assert "KESTREL_API_KEY" not in env
     assert env["KESTREL_URL"] == "http://127.0.0.1:8900"
     assert env["KESTREL_DEMO_SERVER"] == "1"

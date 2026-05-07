@@ -140,7 +140,33 @@ def _port_is_busy(port: int, host: str = "127.0.0.1") -> bool:
         s.close()
 
 
-def _build_demo_env(parent_env: dict, demo_db: Path) -> dict:
+def _load_dotenv_for_demo(repo: Path) -> dict:
+    """Load ``<repo>/.env`` and return its values as a dict.
+
+    The bash predecessor did ``source "$ROOT/.env"`` so LLM provider
+    keys (ANTHROPIC_API_KEY, OPENAI_API_KEY, OPENROUTER_API_KEY, etc.)
+    flowed into both the demo server process and the Playwright runner.
+    Codex review on PR #1071 caught that the Python port skipped this,
+    so demos that depend on a key only set in .env failed silently
+    until the operator manually exported it.
+
+    ``interpolate=False`` matches the Tier 1.2 secrets-sync rule —
+    keys are values, not templates; ``${VAR}`` shouldn't expand.
+    Returns ``{}`` if .env isn't present (legitimate — operator may
+    have keys exported in their shell already).
+    """
+    env_file = repo / ".env"
+    if not env_file.exists():
+        return {}
+    try:
+        from dotenv import dotenv_values
+    except ImportError:  # pragma: no cover — python-dotenv is a dep
+        return {}
+    raw = dotenv_values(str(env_file), interpolate=False)
+    return {k: v for k, v in raw.items() if v is not None}
+
+
+def _build_demo_env(parent_env: dict, demo_db: Path, repo: Path) -> dict:
     """Build the env for the ``uvicorn`` demo-server subprocess.
 
     Strips ``KESTREL_API_KEY`` (production key must not auth against
@@ -153,8 +179,17 @@ def _build_demo_env(parent_env: dict, demo_db: Path) -> dict:
       ALLOW (Playwright can't click modals) AND lets ``server.py``
       refuse multi_agent auto-load even if someone removes the override
       above.
+
+    ``<repo>/.env`` is loaded UNDERNEATH the parent env (parent wins on
+    collisions) so operators who already exported a key in their shell
+    don't have it overridden by a stale .env value, but operators who
+    only have keys in .env still get them through. Mirrors the bash's
+    ``source "$ROOT/.env"`` behaviour without trampling explicit shell
+    state.
     """
-    env = dict(parent_env)
+    env: dict = {}
+    env.update(_load_dotenv_for_demo(repo))
+    env.update(parent_env)
     env.pop("KESTREL_API_KEY", None)
     env["KESTREL_DB_PATH"] = str(demo_db)
     env["KESTREL_MULTI_AGENT_CONFIG"] = str(
@@ -164,22 +199,26 @@ def _build_demo_env(parent_env: dict, demo_db: Path) -> dict:
     return env
 
 
-def _build_playwright_env(parent_env: dict, demo_url: str) -> dict:
+def _build_playwright_env(parent_env: dict, demo_url: str, repo: Path) -> dict:
     """Build the env for ``npx playwright test``.
 
     Strips ``KESTREL_API_KEY`` (the demo fetches its own key via
     ``/api/auth/key``); sets ``KESTREL_URL`` to the isolated demo
     server; sets ``KESTREL_DEMO_SERVER=1`` (some demo helpers branch
-    on this — same flag the server reads). Provider keys explicitly
-    survive so the demo agent can actually call an LLM.
+    on this — same flag the server reads). Provider keys come from
+    ``<repo>/.env`` (loaded under parent_env so shell exports win on
+    collision), preserving the bash predecessor's behaviour.
     """
-    env = {k: v for k, v in parent_env.items() if k != "KESTREL_API_KEY"}
+    env: dict = {}
+    env.update(_load_dotenv_for_demo(repo))
+    env.update(parent_env)
+    env.pop("KESTREL_API_KEY", None)
     # Make sure we explicitly carry every provider key forward, even if
-    # the parent process scrubbed PATH-style enrichment. ``parent_env``
-    # already has them post-``os.environ.copy()`` but this list documents
-    # the intent for future readers.
+    # the parent process scrubbed PATH-style enrichment. The dict is
+    # already populated above; this list documents the intent for
+    # future readers.
     for key in _PROVIDER_KEY_ENV:
-        if key in parent_env:
+        if key in parent_env and key not in env:
             env[key] = parent_env[key]
     env["KESTREL_URL"] = demo_url
     env["KESTREL_DEMO_SERVER"] = "1"
@@ -284,7 +323,7 @@ def _cmd_demo_run(args) -> int:
     # we can ``tail``-print on health-check failure.
     server_log = Path(tempfile.gettempdir()) / f"kestrel-demo-server-{port}.log"
     log_fd = open(server_log, "wb")
-    server_env = _build_demo_env(os.environ.copy(), demo_db)
+    server_env = _build_demo_env(os.environ.copy(), demo_db, repo)
     # Use sys.executable -m uvicorn so we don't depend on whether the
     # operator has ``uvicorn`` on PATH — matches the in-process startup
     # idiom in cli.py:_start_inprocess_mode.
@@ -336,7 +375,7 @@ def _cmd_demo_run(args) -> int:
 
         # 5. Run the demo via npx.
         print(f"[demo-runner] Running demos/{name} ...")
-        playwright_env = _build_playwright_env(os.environ.copy(), demo_url)
+        playwright_env = _build_playwright_env(os.environ.copy(), demo_url, repo)
         rc = run_streaming(
             ["npx", "playwright", "test", "--config=config.cjs"],
             cwd=demo_dir,

@@ -235,6 +235,11 @@ def test_run_happy_path_argv_shape(tmp_path, monkeypatch):
         cli_docker_remote, "_detect_ollama_host",
         lambda: "http://host.docker.internal:11434",
     )
+    # Skip the post-run /health probe — that's tested separately.
+    monkeypatch.setattr(
+        cli_docker_remote, "_wait_for_container_health",
+        lambda url, *, timeout: True,
+    )
 
     args = _Args(
         docker_command="remote",
@@ -273,6 +278,10 @@ def test_run_default_port_is_8888(tmp_path, monkeypatch):
         cli_docker_remote, "run_streaming",
         lambda cmd, **kw: captured.append(list(cmd)) or 0,
     )
+    monkeypatch.setattr(
+        cli_docker_remote, "_wait_for_container_health",
+        lambda url, *, timeout: True,
+    )
 
     args = _Args(
         docker_command="remote",
@@ -285,6 +294,37 @@ def test_run_default_port_is_8888(tmp_path, monkeypatch):
     assert rc == 0
     run_argv = captured[2]
     assert "8888:8888" in run_argv
+
+
+def test_run_unhealthy_container_returns_1_and_dumps_logs(tmp_path, monkeypatch):
+    """Codex review on PR #1071: the bash predecessor curled /health
+    after ``docker run -d`` and returned non-zero on failure with the
+    container logs printed. The Python port must do the same — without
+    the probe a crashed container falsely reports success."""
+    env_file = _write_env(tmp_path, OPENAI_API_KEY="sk-oai")
+    captured: list = []
+    monkeypatch.setattr(
+        cli_docker_remote, "run_streaming",
+        lambda cmd, **kw: captured.append(list(cmd)) or 0,
+    )
+    monkeypatch.setattr(
+        cli_docker_remote, "_wait_for_container_health",
+        lambda url, *, timeout: False,  # /health never returns 200
+    )
+
+    args = _Args(
+        docker_command="remote",
+        docker_remote_command="run",
+        port=None,
+        env_file=str(env_file),
+        tag="latest",
+    )
+    rc = cli_docker_remote.cmd_docker(args)
+    assert rc == 1, "must surface failure, not falsely report success"
+    # Log dump invocation (``docker logs --tail 50 <container>``) was made.
+    assert any(
+        c[:3] == ["docker", "logs", "--tail"] for c in captured
+    ), f"expected docker logs --tail to be called; saw {captured}"
 
 
 def test_run_drops_empty_optional_keys(tmp_path, monkeypatch):
@@ -300,6 +340,10 @@ def test_run_drops_empty_optional_keys(tmp_path, monkeypatch):
     monkeypatch.setattr(
         cli_docker_remote, "run_streaming",
         lambda cmd, **kw: captured.append(list(cmd)) or 0,
+    )
+    monkeypatch.setattr(
+        cli_docker_remote, "_wait_for_container_health",
+        lambda url, *, timeout: True,
     )
 
     args = _Args(
