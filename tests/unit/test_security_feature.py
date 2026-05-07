@@ -929,6 +929,7 @@ class TestSecurityFeature:
 
     @pytest.mark.asyncio
     async def test_pending_approvals_uses_wall_clock_age(self):
+        from kestrel_sdk.tools.result import ToolResultStatus
         agent = MagicMock()
         feature = SecurityFeature(agent)
         feature.approval_queue = ApprovalQueue()
@@ -944,12 +945,22 @@ class TestSecurityFeature:
 
         result = await feature.pending_approvals()
 
-        assert "Pending Approvals (1):" in result
-        assert "[req-1234] WalletAgent.send_tokens" in result
-        assert "(12s ago)" in result or "(11s ago)" in result or "(13s ago)" in result
+        assert result.status is ToolResultStatus.OK
+        assert "Pending Approvals (1):" in result.confirmation
+        assert "[req-1234] WalletAgent.send_tokens" in result.confirmation
+        assert (
+            "(12s ago)" in result.confirmation
+            or "(11s ago)" in result.confirmation
+            or "(13s ago)" in result.confirmation
+        )
+        # Structured data also surfaces the request
+        assert result.data["count"] == 1
+        assert result.data["requests"][0]["id"] == "req-12345678"
+        assert result.data["requests"][0]["feature_name"] == "WalletAgent"
 
     @pytest.mark.asyncio
     async def test_pending_approvals_handles_legacy_naive_timestamps(self):
+        from kestrel_sdk.tools.result import ToolResultStatus
         agent = MagicMock()
         feature = SecurityFeature(agent)
         feature.approval_queue = ApprovalQueue()
@@ -965,8 +976,9 @@ class TestSecurityFeature:
 
         result = await feature.pending_approvals()
 
-        assert "WalletAgent.get_balance" in result
-        assert "ago)" in result
+        assert result.status is ToolResultStatus.OK
+        assert "WalletAgent.get_balance" in result.confirmation
+        assert "ago)" in result.confirmation
 
 
 # === Run tests ===
