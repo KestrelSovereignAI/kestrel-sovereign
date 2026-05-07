@@ -483,33 +483,37 @@ class TestBootstrapFeatureTools:
 
     @pytest.mark.asyncio
     async def test_bootstrap_list_empty(self, feature_with_loader):
+        from kestrel_sdk.tools.result import ToolResultStatus
         feature, loader, _ = feature_with_loader
         result = await feature.bootstrap_list()
-        assert result["success"] is True
-        assert result["total_files"] == 0
+        assert result.status is ToolResultStatus.OK
+        assert result.data["total_files"] == 0
 
     @pytest.mark.asyncio
     async def test_bootstrap_list_with_files(self, feature_with_loader):
+        from kestrel_sdk.tools.result import ToolResultStatus
         feature, loader, agent_dir = feature_with_loader
         (agent_dir / "SOUL.md").write_text("Test soul")
         (agent_dir / "AGENTS.md").write_text("Test agents")
         loader.reload()
 
         result = await feature.bootstrap_list()
-        assert result["success"] is True
-        assert result["total_files"] == 2
-        assert result["total_chars"] > 0
+        assert result.status is ToolResultStatus.OK
+        assert result.data["total_files"] == 2
+        assert result.data["total_chars"] > 0
 
     @pytest.mark.asyncio
     async def test_bootstrap_list_no_loader(self, mock_agent):
+        from kestrel_sdk.tools.result import ToolResultStatus
         from kestrel_sovereign.features.bootstrap.feature import BootstrapFeature
         mock_agent.context_builder = MagicMock(spec=[])  # No _bootstrap_loader
         feature = BootstrapFeature(mock_agent)
         result = await feature.bootstrap_list()
-        assert result["success"] is False
+        assert result.status is ToolResultStatus.ERROR
 
     @pytest.mark.asyncio
     async def test_bootstrap_reload(self, feature_with_loader):
+        from kestrel_sdk.tools.result import ToolResultStatus
         feature, loader, agent_dir = feature_with_loader
         (agent_dir / "SOUL.md").write_text("Initial")
         loader.load()
@@ -517,65 +521,72 @@ class TestBootstrapFeatureTools:
 
         (agent_dir / "SOUL.md").write_text("Updated")
         result = await feature.bootstrap_reload()
-        assert result["success"] is True
-        assert "SOUL.md" in result["files"]
+        assert result.status is ToolResultStatus.OK
+        assert "SOUL.md" in result.data["files"]
         assert loader.get_file("SOUL.md") == "Updated"
 
     @pytest.mark.asyncio
     async def test_bootstrap_add(self, feature_with_loader):
+        from kestrel_sdk.tools.result import ToolResultStatus
         feature, loader, agent_dir = feature_with_loader
         custom_file = agent_dir / "NOTES.md"
         custom_file.write_text("My notes")
 
         result = await feature.bootstrap_add("NOTES.md")
-        assert result["success"] is True
-        assert result["loaded"] is True
+        assert result.status is ToolResultStatus.OK
+        assert result.data["loaded"] is True
         assert "NOTES.md" in loader.file_order
 
     @pytest.mark.asyncio
     async def test_bootstrap_add_file_not_found(self, feature_with_loader):
+        from kestrel_sdk.tools.result import ToolResultStatus
         feature, loader, agent_dir = feature_with_loader
         result = await feature.bootstrap_add("NONEXISTENT.md")
-        assert result["success"] is False
-        assert "not found" in result["error"].lower()
+        assert result.status is ToolResultStatus.ERROR
+        assert "not found" in result.error.lower()
 
     @pytest.mark.asyncio
     async def test_bootstrap_add_duplicate(self, feature_with_loader):
+        from kestrel_sdk.tools.result import ToolResultStatus
         feature, loader, _ = feature_with_loader
         result = await feature.bootstrap_add("SOUL.md")  # Already in defaults
-        assert result["success"] is False
-        assert "already" in result["error"].lower()
+        assert result.status is ToolResultStatus.ERROR
+        assert "already" in result.error.lower()
 
     @pytest.mark.asyncio
     async def test_bootstrap_remove(self, feature_with_loader):
+        from kestrel_sdk.tools.result import ToolResultStatus
         feature, loader, agent_dir = feature_with_loader
         (agent_dir / "GOALS.md").write_text("My goals")
         loader.load()
 
         result = await feature.bootstrap_remove("GOALS.md")
-        assert result["success"] is True
+        assert result.status is ToolResultStatus.OK
         assert "GOALS.md" not in loader.file_order
 
     @pytest.mark.asyncio
     async def test_bootstrap_remove_not_found(self, feature_with_loader):
+        from kestrel_sdk.tools.result import ToolResultStatus
         feature, _, _ = feature_with_loader
         result = await feature.bootstrap_remove("NOPE.md")
-        assert result["success"] is False
+        assert result.status is ToolResultStatus.ERROR
 
     @pytest.mark.asyncio
     async def test_bootstrap_no_context_builder(self, mock_agent):
         """All tools return graceful error when context_builder is missing."""
+        from kestrel_sdk.tools.result import ToolResultStatus
         from kestrel_sovereign.features.bootstrap.feature import BootstrapFeature
         mock_agent.context_builder = None
         feature = BootstrapFeature(mock_agent)
 
         for tool_fn in [feature.bootstrap_list, feature.bootstrap_reload]:
             result = await tool_fn()
-            assert result["success"] is False
+            assert result.status is ToolResultStatus.ERROR
 
     @pytest.mark.asyncio
     async def test_existing_tools_still_work(self, mock_agent):
         """Verify existing skip_discovery, restart_discovery, bootstrap_status."""
+        from kestrel_sdk.tools.result import ToolResultStatus
         from kestrel_sovereign.features.bootstrap.feature import BootstrapFeature
         feature = BootstrapFeature(mock_agent)
 
@@ -584,7 +595,8 @@ class TestBootstrapFeatureTools:
             return_value="**Bootstrap State:** complete"
         )
         result = await feature.bootstrap_status()
-        assert "Bootstrap State" in result
+        assert result.status is ToolResultStatus.OK
+        assert "Bootstrap State" in result.confirmation
 
 
 # ---------------------------------------------------------------------------

@@ -10,15 +10,19 @@ Provides commands to control the bootstrap/discovery process:
 - !bootstrap reload - Force reload all bootstrap files
 - !bootstrap add <path> - Add a new bootstrap file
 - !bootstrap remove <name> - Remove a bootstrap file from loading
+
+@tool methods return ``kestrel_sdk.tools.result.ToolResult`` per the
+kestrel-sovereign #1042 narration-honesty contract (#1061).
 """
 
 import logging
 import re
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Any, Optional
 
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sdk.tools.base import ToolCategory
+from kestrel_sdk.tools.result import ToolResult
 from kestrel_sovereign.bootstrap import BootstrapState
 
 logger = logging.getLogger(__name__)
@@ -105,8 +109,8 @@ async def _update_soul_name(agent, old_name: str, new_name: str) -> bool:
         content = soul_path.read_text(encoding="utf-8")
 
         patterns = [
-            (rf"# SOUL\.md\s*[-\u2014]\s*You Are {re.escape(old_name)}", f"# SOUL.md - You Are {new_name}"),
-            (rf"# SOUL\.md\s*[-\u2014]\s*{re.escape(old_name)}", f"# SOUL.md - {new_name}"),
+            (rf"# SOUL\.md\s*[-—]\s*You Are {re.escape(old_name)}", f"# SOUL.md - You Are {new_name}"),
+            (rf"# SOUL\.md\s*[-—]\s*{re.escape(old_name)}", f"# SOUL.md - {new_name}"),
             (rf"You're {re.escape(old_name)}", f"You're {new_name}"),
             (rf"I'm {re.escape(old_name)}", f"I'm {new_name}"),
         ]
@@ -168,7 +172,7 @@ class BootstrapFeature(Feature):
         category=ToolCategory.SYSTEM,
         command_prefix="!bootstrap list"
     )
-    async def bootstrap_list(self) -> Dict[str, Any]:
+    async def bootstrap_list(self) -> ToolResult:
         """
         List all bootstrap files and their loading status.
 
@@ -183,19 +187,25 @@ class BootstrapFeature(Feature):
         """
         loader = self._get_loader()
         if loader is None:
-            return {
-                "success": False,
-                "error": "Bootstrap loader not available (no context_builder).",
-            }
+            return ToolResult.failed(
+                "Bootstrap loader not available (no context_builder).",
+            )
 
         files = loader.list_files()
-        return {
-            "success": True,
-            "files": files,
-            "total_files": loader.file_count,
-            "total_chars": loader.total_chars,
-            "file_order": loader.file_order,
-        }
+        loaded = sum(1 for f in files if f.get("status") == "loaded")
+        return ToolResult.ok(
+            confirmation=(
+                f"Bootstrap catalog: {loader.file_count} file(s) configured, "
+                f"{loaded} loaded, {loader.total_chars} char(s) total"
+            ),
+            data={
+                "files": files,
+                "total_files": loader.file_count,
+                "total_chars": loader.total_chars,
+                "file_order": loader.file_order,
+                "loaded_count": loaded,
+            },
+        )
 
     @tool(
         name="bootstrap_reload",
@@ -203,7 +213,7 @@ class BootstrapFeature(Feature):
         category=ToolCategory.SYSTEM,
         command_prefix="!bootstrap reload"
     )
-    async def bootstrap_reload(self) -> Dict[str, Any]:
+    async def bootstrap_reload(self) -> ToolResult:
         """
         Force reload all bootstrap files from disk.
 
@@ -215,26 +225,66 @@ class BootstrapFeature(Feature):
         """
         loader = self._get_loader()
         if loader is None:
-            return {
-                "success": False,
-                "error": "Bootstrap loader not available (no context_builder).",
-            }
+            return ToolResult.failed(
+                "Bootstrap loader not available (no context_builder).",
+            )
 
-        loader.reload()
+        try:
+            loader.reload()
+        except Exception as e:
+            logger.error(f"bootstrap_reload failed during loader.reload(): {e}", exc_info=True)
+            return ToolResult.failed(str(e))
 
         # Also refresh the context_builder cache if it wraps the loader
         if hasattr(self.agent, 'context_builder'):
             cb = self.agent.context_builder
             if hasattr(cb, 'reload_bootstrap_files'):
-                cb.reload_bootstrap_files()
+                try:
+                    cb.reload_bootstrap_files()
+                except Exception as e:
+                    # The loader did reload; the context_builder cache
+                    # refresh is the secondary side-effect. Surface as
+                    # PARTIAL so the LLM can't claim a clean reload
+                    # while a stale cache is still serving prompt
+                    # assembly.
+                    logger.error(
+                        f"bootstrap_reload: loader reloaded but "
+                        f"context_builder cache refresh failed: {e}",
+                        exc_info=True,
+                    )
+                    files = loader.list_files()
+                    loaded = [f["name"] for f in files if f.get("status") == "loaded"]
+                    return ToolResult.partial(
+                        confirmation=(
+                            f"Reloaded {loader.file_count} file(s) from disk; "
+                            f"{loader.total_chars} char(s) total"
+                        ),
+                        error=(
+                            f"context_builder cache refresh failed: {e}; "
+                            "stale prompt assembly until next agent restart"
+                        ),
+                        data={
+                            "loaded_count": loader.file_count,
+                            "total_chars": loader.total_chars,
+                            "files": loaded,
+                            "cache_refresh_error": str(e),
+                        },
+                    )
 
-        return {
-            "success": True,
-            "message": "Bootstrap files reloaded.",
-            "loaded_count": loader.file_count,
-            "total_chars": loader.total_chars,
-            "files": [f["name"] for f in loader.list_files() if f["status"] == "loaded"],
-        }
+        files = loader.list_files()
+        loaded = [f["name"] for f in files if f.get("status") == "loaded"]
+        return ToolResult.ok(
+            confirmation=(
+                f"Reloaded {loader.file_count} file(s) from disk; "
+                f"{len(loaded)} successfully loaded, "
+                f"{loader.total_chars} char(s) total"
+            ),
+            data={
+                "loaded_count": loader.file_count,
+                "total_chars": loader.total_chars,
+                "files": loaded,
+            },
+        )
 
     @tool(
         name="bootstrap_add",
@@ -242,7 +292,7 @@ class BootstrapFeature(Feature):
         category=ToolCategory.SYSTEM,
         command_prefix="!bootstrap add"
     )
-    async def bootstrap_add(self, file_path: str) -> Dict[str, Any]:
+    async def bootstrap_add(self, file_path: str) -> ToolResult:
         """
         Add a new bootstrap file to the loading convention.
 
@@ -257,42 +307,42 @@ class BootstrapFeature(Feature):
         """
         loader = self._get_loader()
         if loader is None:
-            return {
-                "success": False,
-                "error": "Bootstrap loader not available (no context_builder).",
-            }
+            return ToolResult.failed(
+                "Bootstrap loader not available (no context_builder).",
+            )
 
         # Resolve the path
         resolved = Path(file_path)
         if not resolved.is_absolute():
-            # Try relative to agent data path
             agent_data = self._get_agent_data_path()
             if agent_data:
                 resolved = Path(agent_data) / file_path
             else:
-                return {
-                    "success": False,
-                    "error": f"Cannot resolve relative path '{file_path}' -- no agent data path configured.",
-                }
+                return ToolResult.failed(
+                    f"Cannot resolve relative path '{file_path}' -- "
+                    "no agent data path configured.",
+                )
 
         filename = resolved.name
 
         # Check for duplicate before checking file existence
         if filename in loader.file_order:
-            return {
-                "success": False,
-                "error": f"File '{filename}' is already in the bootstrap file list.",
-            }
+            return ToolResult.failed(
+                f"File '{filename}' is already in the bootstrap file list.",
+                data={"file_order": list(loader.file_order)},
+            )
 
         if not resolved.exists():
-            return {
-                "success": False,
-                "error": f"File not found: {resolved}",
-            }
+            return ToolResult.failed(
+                f"File not found: {resolved}",
+                data={"resolved_path": str(resolved)},
+            )
 
         loader.add_file(filename)
 
         # Persist to DB if available
+        db_persisted = True
+        db_persist_error: Optional[str] = None
         db = self._get_db()
         agent_id = self.agent.did
         if db and agent_id:
@@ -305,15 +355,63 @@ class BootstrapFeature(Feature):
                 )
             except Exception as e:
                 logger.warning(f"Failed to persist bootstrap config to DB: {e}")
+                db_persisted = False
+                db_persist_error = str(e)
 
         # Reload to pick up the new file
         loader.reload()
 
-        return {
-            "success": True,
-            "message": f"Added '{filename}' to bootstrap files.",
-            "loaded": filename in loader.get_bootstrap_content(),
-        }
+        loaded = filename in loader.get_bootstrap_content()
+        if not loaded:
+            # The loader accepted the entry but the file's content was
+            # not pulled into the bootstrap content (read failure,
+            # disabled, etc.). Surface as PARTIAL so the LLM doesn't
+            # claim a clean add when the file isn't actually in the
+            # prompt.
+            return ToolResult.partial(
+                confirmation=(
+                    f"Registered '{filename}' in the bootstrap file list "
+                    f"(persisted to DB: {db_persisted})"
+                ),
+                error=(
+                    f"file '{filename}' is in the load order but its "
+                    "content was not pulled into the bootstrap prompt; "
+                    "check the loader's file status"
+                ),
+                data={
+                    "filename": filename,
+                    "resolved_path": str(resolved),
+                    "loaded": False,
+                    "db_persisted": db_persisted,
+                    "db_persist_error": db_persist_error,
+                },
+            )
+        if not db_persisted:
+            return ToolResult.partial(
+                confirmation=(
+                    f"Added '{filename}' to bootstrap files (loaded into prompt)"
+                ),
+                error=(
+                    f"DB persistence failed: {db_persist_error}; the entry "
+                    "will not survive an agent restart"
+                ),
+                data={
+                    "filename": filename,
+                    "resolved_path": str(resolved),
+                    "loaded": True,
+                    "db_persisted": False,
+                    "db_persist_error": db_persist_error,
+                },
+            )
+        return ToolResult.ok(
+            confirmation=f"Added '{filename}' to bootstrap files (loaded into prompt)",
+            data={
+                "filename": filename,
+                "resolved_path": str(resolved),
+                "loaded": True,
+                "db_persisted": True,
+            },
+        )
 
     @tool(
         name="bootstrap_remove",
@@ -321,7 +419,7 @@ class BootstrapFeature(Feature):
         category=ToolCategory.SYSTEM,
         command_prefix="!bootstrap remove"
     )
-    async def bootstrap_remove(self, name: str) -> Dict[str, Any]:
+    async def bootstrap_remove(self, name: str) -> ToolResult:
         """
         Remove a bootstrap file from loading.
 
@@ -336,20 +434,20 @@ class BootstrapFeature(Feature):
         """
         loader = self._get_loader()
         if loader is None:
-            return {
-                "success": False,
-                "error": "Bootstrap loader not available (no context_builder).",
-            }
+            return ToolResult.failed(
+                "Bootstrap loader not available (no context_builder).",
+            )
 
         removed = loader.remove_file(name)
         if not removed:
-            return {
-                "success": False,
-                "error": f"File '{name}' is not in the bootstrap file list.",
-                "available": loader.file_order,
-            }
+            return ToolResult.failed(
+                f"File '{name}' is not in the bootstrap file list.",
+                data={"available": list(loader.file_order)},
+            )
 
         # Remove from DB if available
+        db_removed = True
+        db_remove_error: Optional[str] = None
         db = self._get_db()
         agent_id = self.agent.did
         if db and agent_id:
@@ -357,18 +455,50 @@ class BootstrapFeature(Feature):
                 await loader.delete_db_entry(name)
             except Exception as e:
                 logger.warning(f"Failed to remove bootstrap config from DB: {e}")
+                db_removed = False
+                db_remove_error = str(e)
 
         # Refresh context builder
+        cache_refreshed = True
+        cache_refresh_error: Optional[str] = None
         if hasattr(self.agent, 'context_builder'):
             cb = self.agent.context_builder
             if hasattr(cb, 'reload_bootstrap_files'):
-                cb.reload_bootstrap_files()
+                try:
+                    cb.reload_bootstrap_files()
+                except Exception as e:
+                    logger.warning(f"Failed to refresh context_builder cache: {e}")
+                    cache_refreshed = False
+                    cache_refresh_error = str(e)
 
-        return {
-            "success": True,
-            "message": f"Removed '{name}' from bootstrap files.",
-            "remaining": loader.file_order,
-        }
+        if not db_removed or not cache_refreshed:
+            err_parts = []
+            if not db_removed:
+                err_parts.append(f"DB removal failed: {db_remove_error}")
+            if not cache_refreshed:
+                err_parts.append(f"cache refresh failed: {cache_refresh_error}")
+            return ToolResult.partial(
+                confirmation=(
+                    f"Removed '{name}' from in-memory load order"
+                ),
+                error="; ".join(err_parts),
+                data={
+                    "name": name,
+                    "remaining": list(loader.file_order),
+                    "db_removed": db_removed,
+                    "cache_refreshed": cache_refreshed,
+                    "db_remove_error": db_remove_error,
+                    "cache_refresh_error": cache_refresh_error,
+                },
+            )
+
+        return ToolResult.ok(
+            confirmation=f"Removed '{name}' from bootstrap files",
+            data={
+                "name": name,
+                "remaining": list(loader.file_order),
+            },
+        )
 
     # ------------------------------------------------------------------
     # Existing discovery/identity tools
@@ -380,7 +510,7 @@ class BootstrapFeature(Feature):
         category=ToolCategory.SYSTEM,
         command_prefix="!skip-discovery"
     )
-    async def skip_discovery(self) -> str:
+    async def skip_discovery(self) -> ToolResult:
         """
         Skip the discovery process and use the default personality.
 
@@ -393,19 +523,54 @@ class BootstrapFeature(Feature):
         - Allow normal agent operation to begin
         """
         if not hasattr(self.agent, 'bootstrap_service') or not self.agent.bootstrap_service:
-            return "Bootstrap service not available."
+            return ToolResult.failed("Bootstrap service not available.")
 
-        state = await self.agent.bootstrap_service.get_bootstrap_state()
+        try:
+            state = await self.agent.bootstrap_service.get_bootstrap_state()
+        except Exception as e:
+            logger.error(f"skip_discovery state lookup failed: {e}", exc_info=True)
+            return ToolResult.failed(str(e))
+
         if state == BootstrapState.COMPLETE:
-            return "Discovery already complete. Use !restart-discovery to start over."
+            # Honesty: this is a no-op, not a failure or a fresh skip.
+            return ToolResult.ok(
+                confirmation=(
+                    "Discovery already complete; nothing to skip "
+                    "(use !restart-discovery to start over)"
+                ),
+                data={"state": state.value if hasattr(state, "value") else str(state)},
+            )
 
-        result = await self.agent.bootstrap_service.skip_discovery()
+        try:
+            result = await self.agent.bootstrap_service.skip_discovery()
+        except Exception as e:
+            logger.error(f"skip_discovery failed: {e}", exc_info=True)
+            return ToolResult.failed(str(e))
 
         # Reload SOUL.md into context builder
         if hasattr(self.agent, 'context_builder'):
-            self.agent.context_builder._load_soul_md()
+            try:
+                self.agent.context_builder._load_soul_md()
+            except Exception as e:
+                logger.error(
+                    f"skip_discovery: bootstrap skipped but SOUL.md "
+                    f"reload failed: {e}",
+                    exc_info=True,
+                )
+                return ToolResult.partial(
+                    confirmation=str(result) if result else "Discovery skipped",
+                    error=(
+                        f"SOUL.md reload into context_builder failed: {e}; "
+                        "personality will not take effect until next "
+                        "agent restart"
+                    ),
+                    data={"service_result": str(result)},
+                )
 
-        return result
+        return ToolResult.ok(
+            confirmation=str(result) if result else "Discovery skipped",
+            data={"service_result": str(result)},
+        )
 
     @tool(
         name="restart_discovery",
@@ -413,7 +578,7 @@ class BootstrapFeature(Feature):
         category=ToolCategory.SYSTEM,
         command_prefix="!restart-discovery"
     )
-    async def restart_discovery(self) -> str:
+    async def restart_discovery(self) -> ToolResult:
         """
         Reset and restart the discovery process.
 
@@ -427,15 +592,39 @@ class BootstrapFeature(Feature):
         - The next message will trigger the wake-up greeting
         """
         if not hasattr(self.agent, 'bootstrap_service') or not self.agent.bootstrap_service:
-            return "Bootstrap service not available."
+            return ToolResult.failed("Bootstrap service not available.")
 
-        result = await self.agent.bootstrap_service.restart_discovery()
+        try:
+            result = await self.agent.bootstrap_service.restart_discovery()
+        except Exception as e:
+            logger.error(f"restart_discovery failed: {e}", exc_info=True)
+            return ToolResult.failed(str(e))
 
         # Clear SOUL.md from context builder
         if hasattr(self.agent, 'context_builder'):
-            self.agent.context_builder._soul_content = None
+            try:
+                self.agent.context_builder._soul_content = None
+            except Exception as e:
+                # Setting an attribute almost never fails, but if it
+                # somehow did the reset is incomplete.
+                logger.error(
+                    f"restart_discovery: bootstrap reset but SOUL.md "
+                    f"cache clear failed: {e}",
+                    exc_info=True,
+                )
+                return ToolResult.partial(
+                    confirmation=str(result) if result else "Discovery restarted",
+                    error=(
+                        f"SOUL.md cache clear failed: {e}; "
+                        "stale personality may persist until restart"
+                    ),
+                    data={"service_result": str(result)},
+                )
 
-        return result
+        return ToolResult.ok(
+            confirmation=str(result) if result else "Discovery restarted",
+            data={"service_result": str(result)},
+        )
 
     @tool(
         name="bootstrap_status",
@@ -443,7 +632,7 @@ class BootstrapFeature(Feature):
         category=ToolCategory.SYSTEM,
         command_prefix="!bootstrap-status"
     )
-    async def bootstrap_status(self) -> str:
+    async def bootstrap_status(self) -> ToolResult:
         """
         Show the current bootstrap status.
 
@@ -456,9 +645,18 @@ class BootstrapFeature(Feature):
         - Whether SOUL.md exists
         """
         if not hasattr(self.agent, 'bootstrap_service') or not self.agent.bootstrap_service:
-            return "Bootstrap service not available."
+            return ToolResult.failed("Bootstrap service not available.")
 
-        return await self.agent.bootstrap_service.get_bootstrap_status()
+        try:
+            status = await self.agent.bootstrap_service.get_bootstrap_status()
+        except Exception as e:
+            logger.error(f"bootstrap_status failed: {e}", exc_info=True)
+            return ToolResult.failed(str(e))
+
+        return ToolResult.ok(
+            confirmation=str(status) if status else "Bootstrap status retrieved",
+            data={"status": str(status)},
+        )
 
     @tool(
         name="rename_agent",
@@ -466,7 +664,7 @@ class BootstrapFeature(Feature):
         category=ToolCategory.SYSTEM,
         command_prefix="!rename"
     )
-    async def rename_agent(self, new_name: str) -> str:
+    async def rename_agent(self, new_name: str) -> ToolResult:
         """
         Rename the agent.
 
@@ -481,17 +679,31 @@ class BootstrapFeature(Feature):
         - Update the SOUL.md header if it exists
         - The change takes effect immediately
         """
+        if not isinstance(new_name, str):
+            return ToolResult.failed(
+                f"new_name must be a string, got "
+                f"{type(new_name).__name__}={new_name!r}"
+            )
         if not new_name or not new_name.strip():
-            return "Please provide a new name. Usage: !rename <new_name>"
+            return ToolResult.failed(
+                "Please provide a new name. Usage: !rename <new_name>"
+            )
 
         try:
-            result, _ = await rename_agent_core(self.agent, new_name)
-            return result
+            result, soul_updated = await rename_agent_core(self.agent, new_name)
         except ValueError as e:
-            return str(e)
+            return ToolResult.failed(str(e))
         except Exception as e:
             logger.error(f"Failed to rename agent: {e}")
-            return f"Failed to rename: {str(e)}"
+            return ToolResult.failed(f"Failed to rename: {str(e)}")
+
+        return ToolResult.ok(
+            confirmation=str(result),
+            data={
+                "new_name": new_name.strip(),
+                "soul_updated": soul_updated,
+            },
+        )
 
     # ------------------------------------------------------------------
     # Internal helpers
