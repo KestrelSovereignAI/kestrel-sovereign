@@ -48,46 +48,16 @@ class CloudRunProvider(DeployProvider):
         self._setup_auth()
 
     def _setup_auth(self):
-        """Setup GCP authentication from environment or project credentials."""
-        import tempfile
+        """Setup GCP authentication from environment or project credentials.
 
-        # Priority 1: Explicit GOOGLE_APPLICATION_CREDENTIALS env var
-        creds_file = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
-        if creds_file and os.path.exists(creds_file):
-            logger.info(
-                f"Using credentials from GOOGLE_APPLICATION_CREDENTIALS: {creds_file}"
-            )
-            return
+        Delegates to :func:`kestrel_sovereign.features.deploy._gcp_auth.setup_gcp_auth`
+        so this provider and ``kestrel deploy secrets sync`` share one
+        credential discovery chain. The temp file path (if any) is
+        captured for cleanup via :meth:`cleanup` / ``__del__``.
+        """
+        from .._gcp_auth import setup_gcp_auth
 
-        # Priority 2: Inline JSON key from GCP_SERVICE_ACCOUNT_KEY
-        key_json = os.getenv("GCP_SERVICE_ACCOUNT_KEY")
-        if key_json:
-            with tempfile.NamedTemporaryFile(
-                mode="w", suffix=".json", delete=False
-            ) as f:
-                f.write(key_json)
-                self._temp_cred_file = f.name
-                os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = f.name
-                logger.info("Using service account key from GCP_SERVICE_ACCOUNT_KEY")
-            atexit.register(self._cleanup_temp_creds)
-            return
-
-        # Priority 3: Project-local service account file
-        project_creds = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))),
-            "credentials",
-            "kestrel-agent-admin.json",
-        )
-        if os.path.exists(project_creds):
-            os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = project_creds
-            logger.info(f"Using project service account: {project_creds}")
-            return
-
-        # Fallback: Application Default Credentials
-        logger.warning(
-            "No explicit credentials found. Using Application Default Credentials. "
-            "Set GOOGLE_APPLICATION_CREDENTIALS or place credentials/kestrel-agent-admin.json"
-        )
+        self._temp_cred_file = setup_gcp_auth()
 
     def _cleanup_temp_creds(self):
         """Remove temporary credentials file created from GCP_SERVICE_ACCOUNT_KEY."""
