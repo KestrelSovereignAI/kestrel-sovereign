@@ -363,28 +363,38 @@ class TestRunWorkflow:
 
 
 class TestRunWorkflowSemanticHonesty:
-    """Codex round 1 P1: A2A's task.status is *transport-level* — a tool
+    """Codex round 1+2 P1: A2A's task.status is *transport-level* — a tool
     that returns ToolResult.failed lands here as task.state == COMPLETED.
     The workflow rollup must inspect the wire-data and downgrade those
     steps to "failed" / "partial" so it doesn't claim "Workflow complete"
     while a step semantically failed.
+
+    Wire shapes covered:
+      - DynamicTool-wrapped (realistic Feature.handle_task path):
+        ``{"success": True, "result": ToolResult.to_dict(), "tool": "..."}``
+      - Bare ToolResult envelope (some handlers bypass DynamicTool)
+      - Pre-migration dict ``{"success": False, "error": ...}``
     """
 
     @pytest.mark.asyncio
-    async def test_tool_result_failed_inside_completed_task_downgrades_step(self, task_feature):
-        """Migrated tool returned ToolResult.failed → step counted as failed."""
-        # Replace one mock skill with one that returns a ToolResult.failed
-        # wire-shape, so when the artifact's part.data is inspected the
-        # workflow can see the semantic failure.
+    async def test_tool_result_failed_dynamictool_wrapped_downgrades_step(self, task_feature):
+        """Realistic A2A path: DynamicTool.execute() wraps the @tool's
+        return as ``{"success": True, "result": <envelope>, "tool": ...}``.
+        Round 2 codex finding: classifier must peek inside ``result``.
+        """
         from kestrel_sdk.tools.result import ToolResult
-        # Re-register memory_feature's memory_status with a failed result
         agent_card, _ = task_feature.task_manager._agents["memory_feature"]
         task_feature.task_manager._agents["memory_feature"] = (
             agent_card,
             MockHandler({
-                "memory_status": lambda args: ToolResult.failed(
-                    "ObservabilityStore not available"
-                ).to_dict(),
+                # Mimic DynamicTool.execute()'s wrapping behavior
+                "memory_status": lambda args: {
+                    "success": True,
+                    "result": ToolResult.failed(
+                        "ObservabilityStore not available"
+                    ).to_dict(),
+                    "tool": "memory_status",
+                },
             }),
         )
 
@@ -392,8 +402,6 @@ class TestRunWorkflowSemanticHonesty:
             {"feature": "memory_feature", "skill": "memory_status"},
         ])
 
-        # Step's wire-shape said error → step downgrades to failed
-        # → workflow rollup sees 0 completed, 1 failed → ERROR
         assert result.status is ToolResultStatus.ERROR
         assert result.data["failed"] == 1
         step = result.data["results"][0]
@@ -401,18 +409,21 @@ class TestRunWorkflowSemanticHonesty:
         assert "ObservabilityStore not available" in step["error"]
 
     @pytest.mark.asyncio
-    async def test_tool_result_partial_inside_completed_task_marks_step_partial(self, task_feature):
-        """Migrated tool returned ToolResult.partial → step counted as partial,
-        workflow rollup is PARTIAL even when the other step succeeded."""
+    async def test_tool_result_partial_dynamictool_wrapped_marks_step_partial(self, task_feature):
+        """ToolResult.partial inside DynamicTool wrapper → step partial."""
         from kestrel_sdk.tools.result import ToolResult
         agent_card, _ = task_feature.task_manager._agents["memory_feature"]
         task_feature.task_manager._agents["memory_feature"] = (
             agent_card,
             MockHandler({
-                "memory_status": lambda args: ToolResult.partial(
-                    confirmation="Got partial stats",
-                    error="rag chunks count unknown",
-                ).to_dict(),
+                "memory_status": lambda args: {
+                    "success": True,
+                    "result": ToolResult.partial(
+                        confirmation="Got partial stats",
+                        error="rag chunks count unknown",
+                    ).to_dict(),
+                    "tool": "memory_status",
+                },
             }),
         )
 
@@ -426,6 +437,30 @@ class TestRunWorkflowSemanticHonesty:
         partial_step = result.data["results"][1]
         assert partial_step["status"] == "partial"
         assert "rag chunks count unknown" in partial_step["error"]
+
+    @pytest.mark.asyncio
+    async def test_bare_envelope_failed_downgrades_step(self, task_feature):
+        """Some handlers bypass DynamicTool and put the bare envelope
+        in part.data. The classifier must still detect it."""
+        from kestrel_sdk.tools.result import ToolResult
+        agent_card, _ = task_feature.task_manager._agents["memory_feature"]
+        task_feature.task_manager._agents["memory_feature"] = (
+            agent_card,
+            MockHandler({
+                "memory_status": lambda args: ToolResult.failed(
+                    "bare envelope path"
+                ).to_dict(),
+            }),
+        )
+
+        result = await task_feature.run_workflow(steps=[
+            {"feature": "memory_feature", "skill": "memory_status"},
+        ])
+
+        assert result.status is ToolResultStatus.ERROR
+        step = result.data["results"][0]
+        assert step["status"] == "failed"
+        assert "bare envelope path" in step["error"]
 
     @pytest.mark.asyncio
     async def test_old_dict_shape_with_success_false_downgrades_step(self, task_feature):
@@ -450,6 +485,58 @@ class TestRunWorkflowSemanticHonesty:
         step = result.data["results"][0]
         assert step["status"] == "failed"
         assert "legacy shape failure" in step["error"]
+
+    def test_classify_step_result_unit_table(self):
+        """Direct table-test of the classifier against every wire shape.
+
+        Defends against future regressions in the dispatch path's
+        wire format — adding a new wire layer should be matched by
+        a new row here.
+        """
+        from kestrel_sdk.tools.result import ToolResult
+        # (transport_state, result_data, expected_status, expected_error)
+        cases = [
+            # Bare envelope shapes
+            ("completed", {"status": "ok", "confirmation": "ok"}, "completed", None),
+            ("completed", {"status": "error", "error": "x"}, "failed", "x"),
+            ("completed", {"status": "partial", "confirmation": "c", "error": "e"},
+             "partial", "e"),
+            # DynamicTool-wrapped shapes
+            ("completed", {
+                "success": True,
+                "result": {"status": "ok", "confirmation": "ok"},
+                "tool": "t",
+            }, "completed", None),
+            ("completed", {
+                "success": True,
+                "result": {"status": "error", "error": "wrapped err"},
+                "tool": "t",
+            }, "failed", "wrapped err"),
+            ("completed", {
+                "success": True,
+                "result": {"status": "partial", "confirmation": "c", "error": "wrapped partial"},
+                "tool": "t",
+            }, "partial", "wrapped partial"),
+            # Legacy dict
+            ("completed", {"success": False, "error": "legacy"}, "failed", "legacy"),
+            ("completed", {"success": True, "model": "m"}, "completed", None),
+            # Transport failure overrides everything
+            ("failed", {"status": "ok"}, "failed", None),
+            # Non-dict result
+            ("completed", "string result", "completed", None),
+            ("completed", None, "completed", None),
+        ]
+        for transport, data, expected_status, expected_err in cases:
+            actual_status, actual_err = TaskFeature._classify_step_result(transport, data)
+            assert actual_status == expected_status, (
+                f"transport={transport!r} data={data!r} → "
+                f"expected {expected_status}, got {actual_status}"
+            )
+            if expected_err is not None:
+                assert actual_err == expected_err, (
+                    f"transport={transport!r} data={data!r} → "
+                    f"expected error {expected_err!r}, got {actual_err!r}"
+                )
 
 
 class TestListAvailableSkills:

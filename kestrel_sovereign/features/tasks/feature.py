@@ -450,33 +450,75 @@ class TaskFeature(Feature):
         "the python call returned." A migrated tool that returns
         ``ToolResult.failed`` is *transport-completed* but *semantically
         failed*. To keep the workflow rollup honest, this helper
-        inspects the wire-shape:
+        inspects the wire-shape.
 
-          - ToolResult envelope (``{"status": "ok"|"error"|"partial",
-            ...}``) → use the envelope's status
-          - Old-style dict with ``success: False`` → "failed"
-          - Old-style dict with ``error: "..."`` → "failed"
-          - Anything else → defer to the transport state
+        Wire shapes seen in the wild:
+
+          - **DynamicTool-wrapped** (the realistic A2A path through
+            ``Feature.handle_task`` → ``DynamicTool.execute``):
+            ``{"success": True, "result": <ToolResult-as-dict-or-object>,
+            "tool": "<name>"}``. The ``result`` field is what the @tool
+            method returned, possibly with the wrapping layer's own
+            ``success: True`` masking a ``status: "error"`` inside.
+          - **Bare ToolResult envelope** (some test fixtures + handlers
+            that bypass DynamicTool): ``{"status": "ok"|"error"|"partial",
+            ...}``.
+          - **Pre-migration dict** (``{"success": False, "error": ...}``).
+          - **Anything else** → defer to the transport state.
+
+        We check the bare envelope first, then peek inside ``result`` if
+        the outer dict looks like a DynamicTool wrapper, then fall back
+        to the legacy success/error shape.
 
         Returns ``(status, error_or_None)``. ``status`` is one of
         ``"completed" | "failed" | "partial"``.
         """
         if transport_state == "failed":
             return "failed", None
-        if isinstance(result_data, dict):
-            envelope_status = result_data.get("status")
-            if envelope_status in ("ok",):
+        if not isinstance(result_data, dict):
+            return "completed" if transport_state == "completed" else transport_state, None
+
+        # Resolve to whichever shape carries the @tool's return:
+        #  - bare envelope: result_data IS the ToolResult.to_dict()
+        #  - wrapped: result_data['result'] is the ToolResult.to_dict()
+        candidates: List[Any] = [result_data]
+        if (
+            isinstance(result_data.get("result"), dict)
+            and "tool" in result_data
+            and "success" in result_data
+        ):
+            # DynamicTool wrapper signature
+            candidates.append(result_data["result"])
+
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            envelope_status = candidate.get("status")
+            if envelope_status == "ok":
+                # The @tool said OK explicitly. Even if the outer
+                # wrapper had its own success flag, this is the
+                # source of truth.
                 return "completed", None
             if envelope_status == "error":
-                return "failed", result_data.get("error")
+                return "failed", candidate.get("error")
             if envelope_status == "partial":
-                return "partial", result_data.get("error")
-            # Pre-migration dict shape — `success: False` or `error: ...`
-            if result_data.get("success") is False:
-                return "failed", result_data.get("error")
-            if result_data.get("error"):
-                return "failed", result_data.get("error")
-        return transport_state if transport_state != "completed" else "completed", None
+                return "partial", candidate.get("error")
+
+        # Pre-migration dict shape on the OUTER result_data only —
+        # the wrapper's own ``success: True`` is not authoritative
+        # (it just means DynamicTool.execute didn't raise), so don't
+        # treat outer success=True as a clean completion if we
+        # didn't find an envelope above.
+        if result_data.get("success") is False:
+            return "failed", result_data.get("error")
+        # ``error`` at the outer level only counts if it's not part
+        # of a wrapper (the wrapper writes ``error`` only on
+        # success=False, so outer error+no-success-False shouldn't
+        # happen — but defend against it).
+        if result_data.get("error") and result_data.get("success") is not True:
+            return "failed", result_data.get("error")
+
+        return "completed" if transport_state == "completed" else transport_state, None
 
     @staticmethod
     def _resolve_step_refs(
