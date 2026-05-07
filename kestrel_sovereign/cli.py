@@ -18,6 +18,7 @@ Commands:
     kestrel health                 # run health check
     kestrel config <agent_dir>     # show/edit agent config
     kestrel deploy <profile>       # deploy agent to Cloud Run / Azure Container Apps
+    kestrel verify-install [TESTS...]  # run the 5-test clean-install matrix in throwaway venvs
 """
 
 import argparse
@@ -1785,6 +1786,14 @@ def build_parser() -> argparse.ArgumentParser:
     from kestrel_sovereign.cli_deploy import add_deploy_subcommands
     add_deploy_subcommands(subparsers)
 
+    # kestrel verify-install [TESTS...] — sub-PR 2.2 of epic #1050.
+    # Local import for the same reason: tempdir/venv/uvicorn machinery
+    # is dead weight for operators who never run install verification.
+    from kestrel_sovereign.cli_verify_install import (
+        add_verify_install_subcommand,
+    )
+    add_verify_install_subcommand(subparsers)
+
     return parser
 
 
@@ -1816,6 +1825,7 @@ def main() -> int:
 
     from kestrel_sovereign.cli_release import cmd_release
     from kestrel_sovereign.cli_deploy import cmd_deploy
+    from kestrel_sovereign.cli_verify_install import cmd_verify_install
 
     commands = {
         "start": cmd_start,
@@ -1836,6 +1846,7 @@ def main() -> int:
         "skills": cmd_skills,
         "release": cmd_release,
         "deploy": cmd_deploy,
+        "verify-install": cmd_verify_install,
     }
 
     handler = commands.get(args.command)

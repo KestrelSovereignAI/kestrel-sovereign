@@ -321,10 +321,10 @@ Kestrel supports multiple installation configurations. Use the verification scri
 
 ```bash
 # Run all 5 install scenarios (creates isolated venvs)
-./scripts/verify_clean_install.sh
+uv run kestrel verify-install
 
 # Run specific tests only
-./scripts/verify_clean_install.sh 1 3    # SDK-only and wallet package
+uv run kestrel verify-install 1 3    # SDK-only and wallet package
 ```
 
 The install matrix covers:

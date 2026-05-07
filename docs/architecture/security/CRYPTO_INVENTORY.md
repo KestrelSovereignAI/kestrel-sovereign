@@ -79,7 +79,7 @@ None in use. ML-DSA, ML-KEM, SLH-DSA, hybrid combiners — all unimplemented.
 |---|---|---|
 | Demo script | [`examples/demo_sovereignty.py`](../../../examples/demo_sovereignty.py) | Migrates with the rest |
 | Emma rotation script | [`scripts/rotate_emma_key.py`](../../../scripts/rotate_emma_key.py) | Will need to handle both v1 Fernet and v2 AEAD during transition |
-| Backup-restore test harness | [`scripts/test_backup_restore.sh`](../../../scripts/test_backup_restore.sh) | Generates Fernet keys for round-trip testing; update once v2 AEAD ships |
+| Backup-restore test harness | [`tests/integration/test_backup_restore.py`](../../../tests/integration/test_backup_restore.py) | Drives the full export/import round-trip via `SovereignStorageAdapter` (AES-256-GCM); replaced the bash + Fernet harness in epic #1050 tier 2.3 |
 
 #### Test files (downstream consumers, not direct migration targets)
 
