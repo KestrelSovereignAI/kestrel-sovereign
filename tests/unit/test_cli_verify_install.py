@@ -250,6 +250,97 @@ def test_venv_exec_picks_per_platform(monkeypatch, tmp_path):
 # Streaming subprocess — no capture_output
 # ---------------------------------------------------------------------------
 
+def test_install_targets_use_pypi_packages_not_dead_local_paths(monkeypatch):
+    """Codex review on PR #1067: post-OSS-split (epic #462) the
+    ``sdk/`` and feature directories no longer exist locally — the SDK
+    and feature packages live on PyPI. The verifier must install from
+    PyPI, not point at dead repo subpaths.
+
+    Captures every ``_pip_install`` call argv across all 5 tests with
+    a mocked subprocess and asserts none of the dead local paths
+    appear.
+    """
+    from kestrel_sovereign import cli_verify_install as mod
+
+    captured: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        captured.append(list(cmd))
+
+        class _R:
+            returncode = 0
+
+        return _R()
+
+    monkeypatch.setattr(mod.subprocess, "run", fake_run)
+    # Skip uvicorn / urllib so test 2's /health probe doesn't try to
+    # exercise a real server in this dry-run.
+    monkeypatch.setattr(mod, "_start_uvicorn", lambda *a, **kw: None)
+    monkeypatch.setattr(mod, "_stop_process", lambda proc: None)
+    monkeypatch.setattr(mod, "_wait_for_health", lambda port, timeout=8.0: True)
+    # Pretend every venv-exec resolves so _python_check / _pip_install
+    # fall through to subprocess.run. Path.exists is class-wide so we
+    # patch the cli_verify_install Path attribute.
+    monkeypatch.setattr(
+        mod.Path, "exists", lambda self: True, raising=False
+    )
+
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        for fn in (
+            mod._test_1_sdk_only,
+            mod._test_3_feature_package,
+            mod._test_4_sdk_feature_dev,
+            mod._test_5_full_stack,
+        ):
+            fn(mod.Path(tmp))
+
+    # Walk every ``pip install`` argv and confirm the install target is
+    # a PyPI package name, not a local repo subpath. We can't just grep
+    # the flattened command line — the Python ``import`` statements
+    # legitimately contain ``kestrel_feature_wallet`` (the module name),
+    # which collides with the dead-path string. So look at each pip-install
+    # invocation specifically and check the LAST positional (the target).
+    pip_install_targets: list[str] = []
+    for argv in captured:
+        # First arg is the pip exec path (ends with ``/pip`` or
+        # ``\\pip.exe``); next must be ``install``; rest are flags +
+        # the target.
+        if not argv:
+            continue
+        first = argv[0]
+        if not (first.endswith("/pip") or first.endswith("\\pip.exe")):
+            continue
+        if "install" not in argv:
+            continue
+        positionals = [
+            a for a in argv[1:]
+            if not a.startswith("-") and a != "install"
+        ]
+        if positionals:
+            pip_install_targets.append(positionals[-1])
+
+    for target in pip_install_targets:
+        assert not target.endswith("/sdk"), (
+            f"Test 1/4 must install kestrel-sovereign-sdk from PyPI, not "
+            f"the dead $REPO/sdk path. pip install target: {target!r}"
+        )
+        assert not target.endswith("/kestrel_feature_wallet"), (
+            f"Tests 3/4/5 must install kestrel-feature-wallet from PyPI, "
+            f"not the dead $REPO/kestrel_feature_wallet path. "
+            f"pip install target: {target!r}"
+        )
+        assert not target.endswith("/kestrel-feature-intelligence"), (
+            f"Test 5 must install kestrel-feature-intelligence from PyPI, "
+            f"not the dead $REPO/... path. pip install target: {target!r}"
+        )
+
+    # And the PyPI names must each appear at least once.
+    assert "kestrel-sovereign-sdk" in pip_install_targets
+    assert "kestrel-feature-wallet" in pip_install_targets
+    assert "kestrel-feature-intelligence" in pip_install_targets
+
+
 def test_run_streaming_does_not_capture(monkeypatch):
     """Codex's Tier 1.3 lesson: subprocess output must stream live,
     not be buffered with ``capture_output=True``. Asserts the helper

@@ -153,15 +153,29 @@ def _pip_install(
     return rc == 0
 
 
-def _python_check(venv_dir: Path, snippet: str) -> bool:
+def _python_check(
+    venv_dir: Path,
+    snippet: str,
+    *,
+    env_extra: Optional[dict] = None,
+) -> bool:
     """Run a Python ``-c`` snippet in the venv. Returns True on
     exit code 0. The snippet is executed verbatim — assertions inside
     raise + propagate non-zero on failure.
+
+    ``env_extra`` overlays variables on top of the parent env (used by
+    test 2's identity bootstrap to set ``KESTREL_DB_PATH`` so the
+    Sovereign DB initializes in the test agent dir, not the operator's
+    real one).
     """
     py = _venv_exec(venv_dir, "python")
     if not py.exists():
         return False
-    rc = _run_streaming([str(py), "-c", snippet])
+    env = None
+    if env_extra:
+        env = os.environ.copy()
+        env.update(env_extra)
+    rc = _run_streaming([str(py), "-c", snippet], env=env)
     return rc == 0
 
 
@@ -170,16 +184,21 @@ def _python_check(venv_dir: Path, snippet: str) -> bool:
 # ---------------------------------------------------------------------------
 
 def _test_1_sdk_only(work_dir: Path) -> VerifyResult:
-    """``pip install $REPO/sdk`` then assert
+    """``pip install kestrel-sovereign-sdk`` (from PyPI) then assert
     ``from kestrel_sdk.features.base import Feature`` works.
+
+    The SDK lives at https://github.com/KestrelSovereignAI/kestrel-sovereign-sdk
+    and is published as ``kestrel-sovereign-sdk`` on PyPI (see
+    pyproject.toml ``dependencies``). The bash predecessor pointed at a
+    local ``$REPO/sdk`` path that no longer exists post-OSS-split;
+    codex review on PR #1067 caught the dead path.
     """
     name = "Test 1: SDK only"
-    repo = _repo_root()
     venv_dir = work_dir / "test1" / ".venv"
     if not _make_venv(venv_dir):
         return VerifyResult(name, False, "uv venv creation failed")
-    if not _pip_install(venv_dir, str(repo / "sdk")):
-        return VerifyResult(name, False, "pip install of sdk failed")
+    if not _pip_install(venv_dir, "kestrel-sovereign-sdk"):
+        return VerifyResult(name, False, "pip install of kestrel-sovereign-sdk failed")
     ok = _python_check(
         venv_dir,
         "from kestrel_sdk.features.base import Feature; print('SDK OK')",
@@ -311,9 +330,35 @@ def _test_2_core_sovereign(work_dir: Path) -> List[VerifyResult]:
         "import kestrel_sovereign.features.base.Feature failed",
     ))
 
-    # Sub-result B: /health probe
+    # Sub-result B: /health probe.
+    #
+    # Codex review on PR #1067 caught that the bash predecessor seeded an
+    # identity via ``create_kestrel_identity(...)`` before launching
+    # uvicorn — without that the /health route's
+    # ``get_agent_did_async()`` raises and the endpoint returns 503.
+    # Bootstrap the agent in-venv so the test reflects a real fresh
+    # install + first run, not a half-configured server.
     agent_dir = work_dir / "test2" / "agent_data"
     agent_dir.mkdir(parents=True, exist_ok=True)
+    constitution_path = repo / "docs" / "principles" / "KESTREL_CONSTITUTION.md"
+    if not _python_check(
+        venv_dir,
+        (
+            "from kestrel_sovereign.inception_service "
+            "import create_kestrel_identity\n"
+            f"create_kestrel_identity({str(agent_dir)!r}, "
+            f"{str(constitution_path)!r})\n"
+            "print('identity bootstrapped')\n"
+        ),
+        env_extra={"KESTREL_DB_PATH": str(agent_dir)},
+    ):
+        results.append(VerifyResult(
+            f"{name} (/health)",
+            False,
+            "agent identity bootstrap (create_kestrel_identity) failed",
+        ))
+        return results
+
     port = 18548
     proc = _start_uvicorn(venv_dir, repo, port, agent_dir)
     try:
@@ -334,8 +379,15 @@ def _test_2_core_sovereign(work_dir: Path) -> List[VerifyResult]:
 # ---------------------------------------------------------------------------
 
 def _test_3_feature_package(work_dir: Path) -> VerifyResult:
-    """``pip install $REPO`` + ``pip install $REPO/kestrel_feature_wallet``
-    + ``import WalletFeature``."""
+    """``pip install $REPO`` + ``pip install kestrel-feature-wallet``
+    (from PyPI) + ``import WalletFeature``.
+
+    Post-OSS-split (epic #462), feature packages are published
+    independently; the wallet lives at
+    https://github.com/KestrelSovereignAI/kestrel-feature-wallet and is
+    on PyPI as ``kestrel-feature-wallet``. The bash predecessor pointed
+    at ``$REPO/kestrel_feature_wallet`` which no longer exists.
+    """
     name = "Test 3: Feature package"
     repo = _repo_root()
     venv_dir = work_dir / "test3" / ".venv"
@@ -343,8 +395,8 @@ def _test_3_feature_package(work_dir: Path) -> VerifyResult:
         return VerifyResult(name, False, "uv venv creation failed")
     if not _pip_install(venv_dir, str(repo)):
         return VerifyResult(name, False, "pip install of sovereign failed")
-    if not _pip_install(venv_dir, str(repo / "kestrel_feature_wallet")):
-        return VerifyResult(name, False, "pip install of wallet feature failed")
+    if not _pip_install(venv_dir, "kestrel-feature-wallet"):
+        return VerifyResult(name, False, "pip install of kestrel-feature-wallet failed")
     ok = _python_check(
         venv_dir,
         "from kestrel_feature_wallet import WalletFeature; print('Wallet OK')",
@@ -359,27 +411,30 @@ def _test_3_feature_package(work_dir: Path) -> VerifyResult:
 # ---------------------------------------------------------------------------
 
 def _test_4_sdk_feature_dev(work_dir: Path) -> VerifyResult:
-    """``pip install $REPO/sdk`` + ``pip install --no-deps -e
-    $REPO/kestrel_feature_wallet`` + assert ``WalletFeature`` is a
+    """``pip install kestrel-sovereign-sdk`` + ``pip install --no-deps
+    kestrel-feature-wallet`` + assert ``WalletFeature`` is a
     ``kestrel_sdk.features.base.Feature`` subclass.
 
     Proves that a feature package author can develop against the SDK
-    alone, without pulling in the full sovereign tree.
+    alone, without pulling in the full sovereign tree. ``--no-deps``
+    keeps the install minimal — if the SDK interface is sufficient for
+    the wallet to import, the dev-mode contract holds.
+
+    Both packages come from PyPI (post-OSS-split). The bash predecessor
+    used local repo paths that no longer exist.
     """
     name = "Test 4: SDK + feature dev mode"
-    repo = _repo_root()
     venv_dir = work_dir / "test4" / ".venv"
     if not _make_venv(venv_dir):
         return VerifyResult(name, False, "uv venv creation failed")
-    if not _pip_install(venv_dir, str(repo / "sdk")):
-        return VerifyResult(name, False, "pip install of sdk failed")
+    if not _pip_install(venv_dir, "kestrel-sovereign-sdk"):
+        return VerifyResult(name, False, "pip install of kestrel-sovereign-sdk failed")
     if not _pip_install(
         venv_dir,
         "--no-deps",
-        "-e",
-        str(repo / "kestrel_feature_wallet"),
+        "kestrel-feature-wallet",
     ):
-        return VerifyResult(name, False, "editable wallet install failed")
+        return VerifyResult(name, False, "no-deps wallet install failed")
     ok = _python_check(
         venv_dir,
         (
@@ -417,10 +472,10 @@ def _test_5_full_stack(work_dir: Path) -> List[VerifyResult]:
         return [VerifyResult(name, False, "uv venv creation failed")]
     if not _pip_install(venv_dir, str(repo)):
         return [VerifyResult(name, False, "pip install of sovereign failed")]
-    if not _pip_install(venv_dir, str(repo / "kestrel_feature_wallet")):
-        return [VerifyResult(name, False, "pip install of wallet failed")]
-    if not _pip_install(venv_dir, str(repo / "kestrel-feature-intelligence")):
-        return [VerifyResult(name, False, "pip install of intelligence failed")]
+    if not _pip_install(venv_dir, "kestrel-feature-wallet"):
+        return [VerifyResult(name, False, "pip install of kestrel-feature-wallet failed")]
+    if not _pip_install(venv_dir, "kestrel-feature-intelligence"):
+        return [VerifyResult(name, False, "pip install of kestrel-feature-intelligence failed")]
 
     ok_imports = _python_check(
         venv_dir,
