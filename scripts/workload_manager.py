@@ -30,11 +30,12 @@ from threading import Thread
 from typing import Optional
 
 # Add project root to path
-project_root = Path(__file__).parent.parent
+project_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(project_root))
 
 # Ensure logs directory exists
-Path("/Volumes/data2/projects/kestrel-sovereign/logs").mkdir(exist_ok=True)
+LOG_DIR = project_root / "logs"
+LOG_DIR.mkdir(exist_ok=True)
 
 from scripts.memory_guard import MemoryGuard, PressureLevel
 
@@ -45,7 +46,7 @@ logging.basicConfig(
     handlers=[
         logging.StreamHandler(),
         logging.handlers.RotatingFileHandler(
-            "/Volumes/data2/projects/kestrel-sovereign/logs/workload_manager.log",
+            str(LOG_DIR / "workload_manager.log"),
             maxBytes=10 * 1024 * 1024,  # 10MB
             backupCount=7,
         ),

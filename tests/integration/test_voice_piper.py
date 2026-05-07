@@ -15,12 +15,16 @@ try:
 except ImportError:
     PIPER_AVAILABLE = False
 
-# Default model dir — override with PIPER_DATA_DIR env var
-PIPER_DATA_DIR = os.environ.get("PIPER_DATA_DIR", "/Volumes/data2/models/piper")
+# Set PIPER_DATA_DIR env var to point at a local piper voice model dir.
+PIPER_DATA_DIR = os.environ.get("PIPER_DATA_DIR")
 
 pytestmark = [
     pytest.mark.integration,
     pytest.mark.skipif(not PIPER_AVAILABLE, reason="piper-tts not installed"),
+    pytest.mark.skipif(
+        not PIPER_DATA_DIR,
+        reason="PIPER_DATA_DIR env var not set — point at a local piper model dir",
+    ),
 ]
 
 

@@ -394,7 +394,8 @@ def process_svg_file(input_path: Path, output_path: Path,
 
 
 def main():
-    design_dir = Path("/Volumes/data2/projects/kestrel-sovereign/docs/design")
+    repo_root = Path(__file__).resolve().parent.parent
+    design_dir = repo_root / "docs" / "design"
 
     print("Smoothing SVG paths (parse -> resample -> RDP simplify -> bezier refit)...\n")
 

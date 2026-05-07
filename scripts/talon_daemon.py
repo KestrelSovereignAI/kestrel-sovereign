@@ -7,14 +7,22 @@ kestrel-talon. Supports both Claude (Max OAuth) and OpenCode (local Kimi)
 backends.
 
 Usage:
+    # First-time setup (config is gitignored — copy from the example):
+    cp scripts/talon_daemon.example.toml scripts/talon_daemon.toml
+    $EDITOR scripts/talon_daemon.toml      # set repo_dir paths for your machine
+
     python scripts/talon_daemon.py
     python scripts/talon_daemon.py --config scripts/talon_daemon.toml
     python scripts/talon_daemon.py --backend opencode --opencode-model kimi-local/kimi-k2.5
     python scripts/talon_daemon.py --dry-run
 
 Environment Variables:
-    GITHUB_TOKEN - Required (or uses gh auth token --user UncleSaurus)
-    ANTHROPIC_API_KEY - Not used (Claude Max OAuth)
+    GITHUB_TOKEN                    Required (or uses `gh auth token --user <gh_user>`)
+    ANTHROPIC_API_KEY               Not used (Claude Max OAuth)
+    KESTREL_TALON_DIR               Override location of the kestrel-talon checkout
+                                    (default: sibling of this repo)
+    KESTREL_TALON_WORKTREE_BASE     Override worktree base directory
+                                    (default: parent of this repo)
 """
 
 import argparse
@@ -44,8 +52,12 @@ logging.basicConfig(
 logger = logging.getLogger("talon_daemon")
 
 # Paths
-TALON_DIR = Path("/Volumes/data2/projects/kestrel-talon")
-WORKTREE_BASE = Path("/Volumes/data2/projects")
+# Defaults assume kestrel-talon is checked out as a sibling of this repo and
+# worktrees live alongside it. Override with env vars on other layouts.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_PROJECTS_DIR = _REPO_ROOT.parent
+TALON_DIR = Path(os.environ.get("KESTREL_TALON_DIR", _PROJECTS_DIR / "kestrel-talon"))
+WORKTREE_BASE = Path(os.environ.get("KESTREL_TALON_WORKTREE_BASE", _PROJECTS_DIR))
 DEFAULT_CONFIG = Path(__file__).parent / "talon_daemon.toml"
 
 
@@ -147,7 +159,14 @@ def load_config(path: Path, overrides: argparse.Namespace) -> DaemonConfig:
                 )
             )
     else:
-        logger.warning(f"Config file not found: {path}, using defaults")
+        example = path.with_name(path.stem + ".example" + path.suffix)
+        if path == DEFAULT_CONFIG and example.exists():
+            logger.error(
+                "Config file not found: %s. Bootstrap with: cp %s %s && $EDITOR %s",
+                path, example, path, path,
+            )
+        else:
+            logger.warning(f"Config file not found: {path}, using defaults")
 
     # CLI overrides
     if overrides.backend:

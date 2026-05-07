@@ -18,7 +18,7 @@ llama-server \
   --reasoning-format deepseek \
   \
   --cache-reuse 256                       # see below
-  --slot-save-path /Volumes/data2/llama-slots   # see below
+  --slot-save-path "$LLAMA_SLOT_DIR"      # see below; e.g. ~/llama-slots
   --parallel 1                            # bump if running multiple
                                           # concurrent Kestrel agents
                                           # against the same server

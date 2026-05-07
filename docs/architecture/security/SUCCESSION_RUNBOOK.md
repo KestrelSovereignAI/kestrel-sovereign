@@ -133,7 +133,7 @@ Once the new identity has been live for the rollback window (default 7 days) and
 ```bash
 export KESTREL_DESTROY_CONFIRM='I-have-verified-the-rollback-window'
 uv run python scripts/quantum_destroy_legacy_key.py \
-    --agent-data-dir /Volumes/data2/projects/kestrel-sovereign/agent_data/<agent> \
+    --agent-data-dir agent_data/<agent> \
     --confirm
 ```
 

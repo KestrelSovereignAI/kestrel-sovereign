@@ -92,7 +92,7 @@ def test_first_run_skipped_inside_git_worktree(tmp_path, monkeypatch):
     monkeypatch.delenv("KESTREL_SKIP_FIRST_RUN", raising=False)
     # Simulate a worktree: .git is a file pointer, not a directory.
     (tmp_path / ".git").write_text(
-        "gitdir: /Volumes/data2/projects/kestrel-sovereign/.git/worktrees/foo\n"
+        f"gitdir: {tmp_path}/main-checkout/.git/worktrees/foo\n"
     )
     # No .env, no multi_agent — would otherwise trigger the prompt path.
     assert _maybe_first_run_setup(tmp_path) is None

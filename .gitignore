@@ -151,6 +151,8 @@ vastai_config.toml
 kestrel_sovereign/vastai_config.toml
 kestrel.toml
 kestrel_sovereign/kestrel.toml
+scripts/talon_daemon.toml
+scripts/launchd/com.kestrel.workload-manager.plist
 
 # Control panel env files
 control-panel/.env*

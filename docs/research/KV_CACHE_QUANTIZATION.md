@@ -100,7 +100,7 @@ Switch to `q4_0` only if you need the extra 8GB and can tolerate ~3% quality deg
 ```bash
 # Recommended (q8_0 — lossless)
 llama-server \
-    --model /Volumes/data2/models/Kimi-K2.5-GGUF/UD-Q2_K_XL/Kimi-K2.5-UD-Q2_K_XL-00001-of-00008.gguf \
+    --model "$KIMI_MODEL_DIR/UD-Q2_K_XL/Kimi-K2.5-UD-Q2_K_XL-00001-of-00008.gguf" \
     --ctx-size 131072 \
     --port 8001 \
     --kv-unified \
@@ -109,7 +109,7 @@ llama-server \
     --reasoning-format deepseek
 ```
 
-Or use the start script: `bash /Volumes/data2/models/start-kimi.sh`
+Or use the start script in your local model directory (e.g. `bash "$KIMI_MODEL_DIR/../start-kimi.sh"`).
 
 ## What the Freed 150GB Enables
 
@@ -126,7 +126,7 @@ With q8_0 KV cache, the Mac Studio can run multiple workloads simultaneously:
 
 ## TurboQuant Fork
 
-A TurboQuant-enabled llama.cpp build exists at `/Volumes/data2/projects/turboquant-llama-cpp/` (branch `feature/turboquant-kv-cache` from `TheTom/llama-cpp-turboquant`). Builds and runs on Metal but turbo3/turbo4 are not usable with Kimi K2.5 Q2_K_XL.
+A TurboQuant-enabled llama.cpp build (branch `feature/turboquant-kv-cache` from `TheTom/llama-cpp-turboquant`) was checked out as a sibling of this repo for testing. Builds and runs on Metal but turbo3/turbo4 are not usable with Kimi K2.5 Q2_K_XL.
 
 **Worth revisiting when:**
 - We run a different primary model (Qwen3.5, Llama 3.3) with Q4_K_M+ weights

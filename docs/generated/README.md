@@ -1,6 +1,6 @@
 # Generated Feature Docs
 
-These documents are derived artifacts generated from the canonical feature inventory at [`/Volumes/data2/projects/kestrel-sovereign/KESTREL_FEATURES.md`](/Volumes/data2/projects/kestrel-sovereign/KESTREL_FEATURES.md).
+These documents are derived artifacts generated from the canonical feature inventory at [`KESTREL_FEATURES.md`](../../KESTREL_FEATURES.md).
 
 Rules:
 
