@@ -3,8 +3,8 @@
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-05-06
-**Scope:** 1675 tracked files (1007 `.py`, 251 `.md`, 417 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-05-07
+**Scope:** 1629 tracked files (969 `.py`, 249 `.md`, 411 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -39,7 +39,6 @@ Repo entry points and standard project files.
 - **docker-compose.yml** — (configuration)
 - **docker_entrypoint.sh** — Startup script for Kestrel Agent container
 - **filecoin_config.toml.example** — —
-- **gcp_compute_config.toml** — (configuration)
 - **host.py** — Kestrel Host - Thin FastAPI proxy + static file server + process manager.
   - `def get_api_key()`; `def load_multi_agent_config()`; `async def lifespan(app)`; `async def auth_middleware(request, call_next)`; `async def serve_index()`; `async def get_bootstrap_key(request)`; `async def github_proxy(path, request)`; `async def health_check(request)`; `…`
 - **kestrel.toml.example** — —
@@ -54,7 +53,6 @@ Repo entry points and standard project files.
 - **pyproject.toml** — (configuration)
 - **run_tests.py** — Kestrel Smart Test Runner - Unified Test System
   - `def get_database_url()`; `def get_redis_url()`; `class ServiceChecker`; `class SmartTestRunner`; `def main()`
-- **runpod_config.toml.example** — —
 - **server.py** — A FastAPI server to expose Kestrel agent functionality as a service.
   - `def resolve_multi_agent_path(env)`; `def get_api_key()`; `async def verify_api_key(request, api_key_header, token)`; `async def lifespan(app)`; `class MultiAgentAgentRoutingMiddleware`; `async def github_proxy(path, request)`; `async def logging_context_middleware(request, call_next)`; `async def request_metrics_middleware(request, call_next)`; `…`
 - **start_kestrel.sh** — DEPRECATED: Use 'kestrel start' instead.
@@ -213,9 +211,6 @@ Repo entry points and standard project files.
   - `class MessageDirection`; `class DeliveryStatus`; `class ChannelMessage`; `class DeliveryReceipt`; `class ChannelConfig`
 - **kestrel_sovereign/features/channels/registry.py** — Channel Registry -- central manager for channel adapters.
   - `class ChannelRegistry`
-- **kestrel_sovereign/features/code_edit/__init__.py** — Code Edit Feature - Self-modification with constitutional approval.
-- **kestrel_sovereign/features/code_edit/feature.py** — Code Edit Feature - Self-modification capabilities for Kestrel agents.
-  - `class CodeEditFeature`
 - **kestrel_sovereign/features/compute/__init__.py** — Kestrel Compute Feature - Execute scripts with constitutional security controls.
 - **kestrel_sovereign/features/compute/component.yaml** — (configuration)
 - **kestrel_sovereign/features/compute/destructive_policy.py** — Kestrel Compute Feature - Destructive Operation Policy.
@@ -306,20 +301,6 @@ Repo entry points and standard project files.
   - `class DeployProvider`
 - **kestrel_sovereign/features/deploy/providers/cloudrun.py** — Cloud Run Deployment Provider.
   - `class CloudRunProvider`
-- **kestrel_sovereign/features/gcp_compute/__init__.py** — GCP Compute Engine GPU management for Kestrel.
-- **kestrel_sovereign/features/gcp_compute/component.yaml** — (configuration)
-- **kestrel_sovereign/features/gcp_compute/core.py** — GCP Compute Engine Core SDK Operations.
-  - `class GCPComputeEngineManagerCore`
-- **kestrel_sovereign/features/gcp_compute/feature.py** — GCP Compute Engine GPU Feature for Kestrel agents.
-  - `class GCPComputeFeature`
-- **kestrel_sovereign/features/gcp_compute/manager.py** — GCP Compute Engine Manager - Combined Class.
-  - `class GCPComputeEngineManager`
-- **kestrel_sovereign/features/gcp_compute/models.py** — GCP Compute Engine Data Models and Exceptions.
-  - `class InstanceStatus`; `class GPUProfile`; `class GCPComputeSession`; `class GCPComputeManagerError`
-- **kestrel_sovereign/features/gcp_compute/ssh_training.py** — GCP Compute SSH-based Training Methods.
-  - `class GCPSSHTrainingMixin`
-- **kestrel_sovereign/features/gcp_compute/workflows.py** — GCP Compute Workflow Methods.
-  - `class GCPWorkflowsMixin`
 - **kestrel_sovereign/features/github/__init__.py** — —
 - **kestrel_sovereign/features/github/ast_analyzer.py** — AST-based code analysis for Python files.
   - `class ASTAnalyzer`; `def extract_definition(source, name, path)`; `def list_definitions(source, path)`
@@ -425,22 +406,6 @@ Repo entry points and standard project files.
   - `class ResponseAuditFeature`
 - **kestrel_sovereign/features/response_audit/hook.py** — Response audit hook - evaluates LLM responses for integrity.
   - `class ResponseAuditHook`
-- **kestrel_sovereign/features/runpod/__init__.py** — RunPod GPU management for Kestrel.
-- **kestrel_sovereign/features/runpod/component.yaml** — (configuration)
-- **kestrel_sovereign/features/runpod/core.py** — RunPod Core Manager Operations.
-  - `class RunPodManagerCore`
-- **kestrel_sovereign/features/runpod/feature.py** — —
-  - `class RunPodFeature`
-- **kestrel_sovereign/features/runpod/manager.py** — RunPod Manager - Combined Class.
-  - `class RunPodManager`
-- **kestrel_sovereign/features/runpod/models.py** — RunPod Data Models and Exceptions.
-  - `class PodStatus`; `class GPUProfile`; `class RunPodSession`; `class RunPodManagerError`
-- **kestrel_sovereign/features/runpod/ollama.py** — RunPod Ollama Cloud Server Methods.
-  - `class RunPodOllamaMixin`
-- **kestrel_sovereign/features/runpod/providers.py** — RunPod GPU Providers.
-  - `class GPUProvider`; `class DirectRunPodProvider`; `class ManagedRunPodProvider`
-- **kestrel_sovereign/features/runpod/training.py** — RunPod LoRA Training Methods.
-  - `class RunPodTrainingMixin`
 - **kestrel_sovereign/features/save/__init__.py** — Save Feature - Persistent storage with semantic search.
 - **kestrel_sovereign/features/save/feature.py** — Save Feature for Kestrel Agent.
   - `class SaveFeature`
@@ -517,29 +482,9 @@ Repo entry points and standard project files.
   - `class TrainingProvider`; `class TrainingProviderError`; `class ProviderNotAvailableError`; `class TrainingSubmissionError`; `class TrainingStatusError`; `class DownloadError`; `class GenerationError`
 - **kestrel_sovereign/features/training/types.py** — Unified types for TrainingProvider protocol.
   - `class TrainingState`; `class ProviderType`; `class ProviderCapabilities`; `class TrainingConfig`; `class TrainingJob`; `class TrainingStatus`; `class GenerationState`; `class GenerationConfig`; `…`
-- **kestrel_sovereign/features/vastai/__init__.py** — Vast.ai GPU Compute Feature for Kestrel Agents.
-- **kestrel_sovereign/features/vastai/component.yaml** — (configuration)
-- **kestrel_sovereign/features/vastai/core.py** — Vast.ai GPU Instance Manager - Core SDK Operations.
-  - `class VastAIManagerCore`
-- **kestrel_sovereign/features/vastai/feature.py** — Vast.ai GPU Feature for Kestrel agents.
-  - `class VastAIFeature`
-- **kestrel_sovereign/features/vastai/http_api.py** — Vast.ai HTTP API Methods for SimpleTuner Docker Image.
-  - `class VastAIHTTPAPIMixin`
-- **kestrel_sovereign/features/vastai/manager.py** — Vast.ai GPU Instance Manager.
-  - `class VastAIManager`
-- **kestrel_sovereign/features/vastai/models.py** — Vast.ai Data Models and Exceptions.
-  - `class InstanceStatus`; `class GPUProfile`; `class VastAISession`; `class VastAIManagerError`
-- **kestrel_sovereign/features/vastai/ssh_training.py** — Vast.ai SSH-Based Training and Inference.
-  - `class VastAISSHTrainingMixin`
-- **kestrel_sovereign/features/vastai/workflows.py** — Vast.ai Convenience Workflow Methods.
-  - `class VastAIWorkflowsMixin`
 - **kestrel_sovereign/features/vertex_ai/__init__.py** — Vertex AI Feature for Kestrel.
 - **kestrel_sovereign/features/vertex_ai/vertex_ai_manager.py** — Vertex AI Custom Job Manager for LoRA Training.
   - `class JobState`; `class VertexAITrainingJob`; `class VertexAIManagerError`; `class VertexAIManager`
-- **kestrel_sovereign/features/visual_identity/__init__.py** — —
-- **kestrel_sovereign/features/visual_identity/component.yaml** — (configuration)
-- **kestrel_sovereign/features/visual_identity/feature.py** — Visual Identity Feature - Companion Image Generation
-  - `class VisualIdentityFeature`
 - **kestrel_sovereign/features/voice/__init__.py** — Voice Feature — TTS synthesis, STT transcription, voice selection.
 - **kestrel_sovereign/features/voice/feature.py** — Voice Feature — TTS synthesis, STT transcription, voice selection.
   - `class VoicePrivacyError`; `class VoiceFeature`
@@ -605,7 +550,6 @@ Repo entry points and standard project files.
   - `class FrictionCalculator`; `class ContextPressureCalculator`; `class InteractionDepthCalculator`; `class SessionContinuityCalculator`; `class MemoryHealthCalculator`
 - **kestrel_sovereign/filecoin_adapter.py** — Filecoin/IPFS adapter for Kestrel's sovereign storage system.
   - `class FilecoinAdapter`
-- **kestrel_sovereign/gcp_compute_config.toml** — (configuration)
 - **kestrel_sovereign/graduate_service.py** — Graduate Service - Promote a test agent to permanent status.
   - `class GraduationError`; `class ValidationChecklist`; `async def validate_agent(storage, agent_id)`; `async def graduate_agent(db_path, council_session, dry_run)`; `def main()`
 - **kestrel_sovereign/health_check.py** — —
@@ -717,7 +661,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/llm/provider_registry.py** — Provider Registry for LLM Service.
   - `class ProviderInfo`; `class ProviderInitializationError`; `class ProviderRegistry`; `def provider_cache_body(provider)`
 - **kestrel_sovereign/llm/remote_backend.py** — Remote GPU backend management for LLM Service.
-  - `class BackendType`; `class RemoteGPUConfig`; `class RemoteBackendMixin`
+  - `class RemoteGPUConfig`; `class RemoteBackendMixin`
 - **kestrel_sovereign/llm/retry.py** — Retry Utilities for LLM Adapters
   - `def is_retryable_error(error)`; `async def with_retry(func)`; `async def retry_with_backoff(func)`
 - **kestrel_sovereign/llm/service.py** — LLM Service - Unified LLM provider management with remote GPU support.
@@ -1327,8 +1271,6 @@ Repo entry points and standard project files.
 - **docs/audit/FEATURE_PROOF_MATRIX.md** — Feature Proof Matrix — This is the first pass at mapping each discoverable feature module to direct proof.
 - **docs/audit/README.md** — Kestrel Whole-of-Vision Audit — This directory is the canonical source for the GitHub issue bodies used to track the feature-by-feature audit, inspection, and red-team program derived from `KESTREL_FEATURES.md`.
 - **docs/audit/REPO_MAP.md** — Kestrel Sovereign — Repo Map — Auto-generated file-tree + per-file purpose index.
-- **docs/audit/REPO_MAP.md** — Kestrel Sovereign — Repo Map — Auto-generated file-tree + per-file purpose index.
-- **docs/audit/REPO_MAP.md** — Kestrel Sovereign — Repo Map — Auto-generated file-tree + per-file purpose index.
 - **docs/audit/SEAM_CAMPAIGNS.md** — Cross-Feature Seam Campaigns — This matrix tracks adversarial campaigns that cross feature boundaries.
 - **docs/audit/SYNC_ASYNC_AUDIT.md** — Sync/Async Audit — Control document for the original issue `#300` and the refreshed current-runtime audit in issue `#624`, focused on maintained runtime surfaces.
 - **docs/audit/issues/00-umbrella-whole-of-vision-audit.md** — ## Problem
@@ -1745,8 +1687,6 @@ Repo entry points and standard project files.
   - `class TransactionSecurityHookStub`; `class AuditLogHookStub`; `class LifecycleTestFeature`; `def hooks_manager()`; `def mock_agent(hooks_manager)`; `def lifecycle_feature(mock_agent)`; `class TestFeatureLifecycleE2E`; `class TestHookRegistrationGuarantees`; `…`
 - **tests/integration/test_filecoin_testnet_e2e.py** — —
   - `class TestFilecoinKeyManager`; `class TestFilecoinTestnetAdapter`; `class TestWalletFilecoinIntegration`; `class TestWalletFeatureFilecoinCommands`; `class TestFilecoinAddressPersistence`; `class TestEconomicGateMethods`
-- **tests/integration/test_gcp_compute_e2e.py** — Integration tests for GCP Compute Engine GPU management.
-  - `class TestGCPComputeManagerUnit`; `class TestGCPComputeManagerIntegration`; `class TestGCPComputeFeature`; `class TestVisualIdentityGCPIntegration`
 - **tests/integration/test_genesis_audit_e2e.py** — Integration tests for genesis audit (CW-001 fix).
   - `def temp_db()`; `async def llm_service()`; `async def kestrel_agent(temp_db, llm_service)`; `async def test_genesis_audit_with_valid_constitution(kestrel_agent)`; `async def test_genesis_audit_with_malicious_constitution(temp_db, llm_service)`; `async def test_genesis_audit_with_missing_constitution(temp_db, llm_service)`; `async def test_genesis_audit_stores_result_in_node(temp_db, llm_service)`; `async def test_genesis_audit_logs_to_conversation_history(temp_db, llm_service)`
 - **tests/integration/test_host_proxy_integration.py** — Integration test: Kestrel Host proxying to a real agent backend.
@@ -1795,10 +1735,6 @@ Repo entry points and standard project files.
   - `async def wired_feature(tmp_path, monkeypatch)`; `async def test_propose_then_create_ticket_with_proposal_id(wired_feature)`; `async def test_unapproved_proposal_blocks_ticket(tmp_path, monkeypatch)`; `async def test_unknown_id_returns_clear_not_found(wired_feature)`
 - **tests/integration/test_retention_purge_primitive.py** — Integration tests for the retention-purge primitive (#764).
   - `async def test_purge_trash_older_than_destroys_aged_rows(tmp_path)`; `async def test_purge_does_not_touch_rows_within_window(tmp_path)`; `async def test_purge_never_touches_live_rows(tmp_path)`; `async def test_per_agent_scoping(tmp_path)`; `async def test_max_rows_caps_a_single_sweep(tmp_path)`; `async def test_idempotent_when_nothing_to_purge(tmp_path)`; `async def test_max_rows_zero_or_negative_is_a_safe_noop(tmp_path)`; `async def test_privacy_wrapper_exposes_purge_trash_older_than(tmp_path)`; `…`
-- **tests/integration/test_runpod_feature.py** — —
-  - `class FakeRunPodManager`; `class DummyLLMService`; `async def runpod_feature(monkeypatch)`; `async def test_manage_gpu_start_and_stop(runpod_feature)`; `async def test_image_generation_tears_down_session(runpod_feature)`
-- **tests/integration/test_runpod_real_integration.py** — —
-  - `class TestRunPodRealIntegration`
 - **tests/integration/test_security_hook_alive.py** — Sanity tests for the SecurityHook chain in integration mode.
   - `async def bare_agent(temp_db)`; `async def test_security_guard_hook_is_registered_on_pre_tool_use(bare_agent)`; `async def test_ungranted_tool_queues_for_approval(bare_agent)`; `async def test_explicit_grant_lets_hook_short_circuit(bare_agent)`
 - **tests/integration/test_session_context.py** — Tests for session-based conversation context loading.
@@ -1827,8 +1763,6 @@ Repo entry points and standard project files.
   - `class MockSyncState`; `class MockSyncTarget`; `def temp_db(tmp_path)`; `def temp_db_with_keeper(tmp_path)`; `def temp_db_with_data(tmp_path)`; `def mock_target()`; `def failing_target()`; `def network_partition_target()`; `…`
 - **tests/integration/test_tool_calling_e2e.py** — Integration tests for OpenAI-style tool calling with Features as Subagents.
   - `class TestToolCall`; `class TestLLMResponse`; `class TestFeatureAsSubagent`; `class TestOpenAIAdapterToolCalling`; `class TestToolFormatConversion`; `class TestE2EToolCallingFlow`; `class TestToolSchemaGeneration`; `class TestAutonomousToolCalling`
-- **tests/integration/test_vastai_e2e.py** — E2E Integration tests for Vast.ai GPU feature.
-  - `class TestVastAIConnectivity`; `class TestVastAIInstanceLifecycle`; `class TestVastAITrainingContainer`; `def create_test_png_image(width, height)`; `class TestVastAIFullPipeline`; `class TestVastAIGeneration`
 - **tests/integration/test_voice_faster_whisper.py** — Integration tests for faster-whisper STT — real local transcription.
   - `def provider()`; `class TestFasterWhisperReal`
 - **tests/integration/test_voice_piper.py** — Integration tests for Piper TTS — real local synthesis.
@@ -1962,10 +1896,6 @@ Repo entry points and standard project files.
   - `def test_parser_defaults()`; `def test_parser_accepts_force_and_project_dir(tmp_path)`; `def test_no_source_exits_zero_with_helpful_message(tmp_path, capsys)`; `def test_diverged_exits_one_with_diff(tmp_path, capsys)`; `def test_clean_migrate_exits_zero_and_reports_paths(tmp_path, capsys)`; `def test_already_clean_exits_zero(tmp_path, capsys)`; `def test_parse_error_exits_one_and_preserves_source(tmp_path, capsys)`; `def test_force_overrides_divergence(tmp_path, capsys)`
 - **tests/unit/test_cli_release.py** — ``kestrel release {sign,verify}`` CLI tests — Wave 5 sub-PR 2 (#920).
   - `def storage_with_keypair(tmp_path, monkeypatch)`; `def artifacts_dir(tmp_path)`; `def test_release_sign_argparse_required_args()`; `def test_release_verify_argparse_required_args()`; `def test_release_sign_argparse_minimal()`; `def test_sign_writes_manifest_and_returns_zero(storage_with_keypair, artifacts_dir, tmp_path, capsys)`; `def test_sign_rejects_empty_artifacts_dir(storage_with_keypair, tmp_path)`; `def test_sign_handles_missing_artifacts_dir(storage_with_keypair)`; `…`
-- **tests/unit/test_cloud_launcher_contracts.py** — Contracts for cloud launcher env handling and model identity.
-  - `def test_gcp_session_preserves_absent_model_name()`; `def test_vast_session_preserves_absent_model_name()`; `def test_gcp_startup_script_skips_unset_env_values()`; `async def test_vast_feature_omits_target_model_override_when_unset()`; `async def test_runpod_feature_omits_target_model_override_when_unset()`; `def test_runpod_provider_drops_none_env_values()`
-- **tests/unit/test_code_edit_feature.py** — Direct contracts for the CodeEdit feature.
-  - `def feature(tmp_path)`; `def test_resolve_path_rejects_escape(feature)`; `async def test_code_read_returns_file_contents(feature)`; `async def test_code_read_file_io_is_offloaded(feature)`; `async def test_code_search_limits_and_reports_matches(feature)`; `async def test_code_search_file_io_is_offloaded(feature)`; `async def test_code_edit_requires_unique_match_before_approval(feature)`; `async def test_code_edit_applies_change_after_approval(feature)`; `…`
 - **tests/unit/test_codex_adapter.py** — Tests for the OpenAI plan adapter and registry integration.
   - `class TestOpenAIPlanAdapterClass`; `class TestOpenAIPlanListModels`; `class TestMessageHelpers`; `class TestAccountIdExtraction`; `class TestBuildHeaders`; `class TestOpenAIPlanProviderRegistry`; `class TestReadCodexAuthFile`
 - **tests/unit/test_codex_continuation.py** — Codex adapter cursor-tracking tests.
@@ -2110,8 +2040,6 @@ Repo entry points and standard project files.
   - `class TestListFeatures`; `class TestListInstalledFeatures`; `class TestGetFeatureDetail`; `class TestEnableFeature`; `class TestDisableFeature`; `class TestInstallFeature`; `class TestRemoveFeature`; `class TestGetFeatureConfig`; `…`
 - **tests/unit/test_filecoin_miner_selection.py** — Unit tests for Filecoin miner selection logic.
   - `class TestMinerSelection`; `class TestMinerSelectionIntegration`; `class TestMinerSelectionEdgeCases`
-- **tests/unit/test_gcp_compute_feature_contracts.py** — Direct contracts for the GCP compute feature surface.
-  - `async def test_start_requires_profile()`; `async def test_start_forwards_model_ttl_and_enables_routing()`; `async def test_start_skips_routing_without_inference_url()`; `async def test_start_returns_manager_error_cleanly()`; `async def test_status_adds_estimated_cost_for_active_session()`; `async def test_stop_clears_remote_backend_before_stopping()`; `async def test_manage_gcp_reports_unknown_action()`
 - **tests/unit/test_generate_feature_docs.py** — Tests for the feature-doc generation pipeline.
   - `def test_generator_uses_canonical_source_path()`; `def test_dry_run_returns_expected_output_paths(capsys)`; `def test_generator_uses_provider_default_resolution_for_anthropic()`; `def test_generator_uses_provider_default_resolution_for_openai()`; `def test_generator_refreshes_provider_discovery_before_default_resolution()`
 - **tests/unit/test_github_feature.py** — Unit tests for GitHub feature.
@@ -2302,10 +2230,6 @@ Repo entry points and standard project files.
   - `def test_non_retryable_classifications(msg)`; `def test_retryable_classifications(msg)`; `def test_unknown_defaults_non_retryable(msg)`; `def test_non_retryable_wins_over_retryable_pattern()`; `def test_status_code_word_boundary()`
 - **tests/unit/test_rotation_ceremony.py** — Rotation ceremony tests — Wave 3 sub-PR 4 (#918).
   - `def legacy_kestrel()`; `def test_ceremony_produces_verifiable_succession_statement(legacy_kestrel)`; `def test_ceremony_default_aka_links_predecessor(legacy_kestrel)`; `def test_ceremony_explicit_aka_overrides_default(legacy_kestrel)`; `def test_ceremony_default_effective_from_is_now_utc(legacy_kestrel)`; `def test_ceremony_explicit_effective_from_is_used(legacy_kestrel)`; `def test_ceremony_with_archival_countersignature(legacy_kestrel)`; `def test_ceremony_refuses_non_slhdsa_archival_keypair(legacy_kestrel)`; `…`
-- **tests/unit/test_runpod_logs.py** — —
-  - `def mock_runpod()`; `def mock_paramiko()`; `def mock_utils()`; `class TestRunPodLogs`
-- **tests/unit/test_runpod_model_contracts.py** — Contracts for RunPod profile-owned model defaults.
-  - `async def test_resume_stopped_pod_requires_profile_default_model()`; `async def test_start_ollama_pod_uses_profile_default_model_without_hidden_fallback()`; `async def test_start_ollama_pod_resumes_existing_pod_without_new_model_override()`
 - **tests/unit/test_runtime_identity.py** — Tests for :mod:`kestrel_sovereign.identity.runtime_identity`.
   - `def kestrel_data_key(monkeypatch)`; `def legacy_agent_on_disk(tmp_path, kestrel_data_key)`; `def post_ceremony_agent_on_disk(legacy_agent_on_disk, kestrel_data_key)`; `def test_load_legacy_only_agent(legacy_agent_on_disk)`; `def test_legacy_agent_missing_did_doc_raises(tmp_path, kestrel_data_key)`; `def test_load_hybrid_agent(post_ceremony_agent_on_disk)`; `def test_hybrid_agent_can_sign_and_self_verify(post_ceremony_agent_on_disk)`; `def test_succession_present_but_hybrid_keys_missing_raises(post_ceremony_agent_on_disk)`; `…`
 - **tests/unit/test_saved_items.py** — Tests for the Saved Items system.
@@ -2464,12 +2388,8 @@ Repo entry points and standard project files.
   - `def isolated_themes(tmp_path, monkeypatch)`; `def test_load_legacy_returns_full_label_map()`; `def test_load_falconry_overrides_legacy_on_diverging_keys()`; `def test_load_plain_overrides_legacy_on_diverging_keys()`; `def test_unknown_theme_raises()`; `def test_list_available_themes_includes_shipped_themes()`; `def test_default_theme_and_locale_constants()`; `def test_load_theme_caches_results()`; `…`
 - **tests/unit/test_vad.py** — Unit tests for Voice Activity Detection (kestrel_sovereign/voice/vad.py).
   - `class TestVADConstruction`; `class TestIsSpeech`; `class TestDetectUtterances`; `class TestLoadVADConfig`
-- **tests/unit/test_vastai_feature.py** — Unit tests for Vast.ai GPU feature.
-  - `def mock_vastai_sdk()`; `def sample_profile()`; `def sample_session(sample_profile)`; `class TestGPUProfile`; `class TestVastAISession`; `class TestVastAIManager`; `class TestVastAIManagerErrors`; `class TestInstanceStatusMapping`
 - **tests/unit/test_verify_policy.py** — verify_policy tests — Wave 1 sub-PR 4 (#916).
   - `def test_archival_import_defaults_to_legacy_allowed()`; `def test_live_identity_defaults_to_legacy_allowed_pre_wave_2()`; `def test_new_identity_issuance_defaults_to_hybrid_required()`; `def test_constitution_checkpoint_defaults_to_pq_required()`; `def test_every_context_has_a_default()`; `def test_legacy_allowed_accepts_classical_only()`; `def test_legacy_allowed_accepts_pq_only()`; `def test_legacy_allowed_accepts_hybrid()`; `…`
-- **tests/unit/test_visual_identity_feature.py** — Unit tests for VisualIdentityFeature basic functionality.
-  - `def mock_agent()`; `async def feature_standalone()`; `async def feature_with_agent(mock_agent)`; `class TestVisualIdentityFeatureInit`; `class TestScenePrompts`; `class TestToolDecorators`; `class TestGenerateSelfieErrors`; `class TestGenerateAvatar`; `…`
 - **tests/unit/test_voice_base.py** — Unit tests for voice provider abstraction layer.
   - `class FakeTTSLocal`; `class FakeTTSCloud`; `class FakeSTTLocal`; `class FakeSTTCloud`; `class TestVoiceConfig`; `class TestVoiceInfo`; `class TestVoiceProviderRegistry`; `class TestABCEnforcement`; `…`
 - **tests/unit/test_voice_conversation_base.py** — Unit tests for the ConversationProvider ABC.
@@ -2606,6 +2526,7 @@ Repo entry points and standard project files.
 - **.github/workflows/publish.yml** — (configuration)
 - **.github/workflows/release-sign.yml** — (configuration)
 - **.github/workflows/repo-map.yml** — (configuration)
+- **.github/workflows/website-pages.yml** — (configuration)
 - **.github/workflows/weekly-analysis.yml** — (configuration)
 
 ## `.devcontainer/`
