@@ -261,6 +261,59 @@ def test_cmd_deploy_build_target_filter_unknown_errors(fake_project_root, monkey
     assert "kestrel-multi_agent" in captured.err
 
 
+def test_cmd_deploy_build_positional_tag_honored(fake_project_root, monkeypatch):
+    """Codex review on PR #1060: the bash ``build.sh v1.2.3`` shape
+    accepted the tag as a positional arg. The CLI's second positional
+    slot (named ``profile`` in argparse) must be honored as the tag
+    when ``target == "build"``, otherwise users get a silent
+    ``:latest`` push instead of their requested release tag.
+    """
+    monkeypatch.setenv("GCP_PROJECT_ID", "test-project")
+
+    fake_results = [_ok_build_result("kestrel")]
+    with patch(
+        "kestrel_sovereign.features.deploy.build.build_all",
+        return_value=fake_results,
+    ) as mock_build:
+        with patch(
+            "kestrel_sovereign.features.deploy.build.resolve_github_token",
+            return_value=None,
+        ):
+            rc = cmd_deploy(_make_args(
+                target="build",
+                profile="v1.2.3",
+            ))
+
+    assert rc == 0
+    assert mock_build.call_args.kwargs["tag"] == "v1.2.3"
+
+
+def test_cmd_deploy_build_explicit_tag_wins_over_positional(
+    fake_project_root, monkeypatch
+):
+    """``--tag`` explicit value beats a positional value (explicit
+    beats implicit, matching the rest of the CLI)."""
+    monkeypatch.setenv("GCP_PROJECT_ID", "test-project")
+
+    fake_results = [_ok_build_result("kestrel")]
+    with patch(
+        "kestrel_sovereign.features.deploy.build.build_all",
+        return_value=fake_results,
+    ) as mock_build:
+        with patch(
+            "kestrel_sovereign.features.deploy.build.resolve_github_token",
+            return_value=None,
+        ):
+            rc = cmd_deploy(_make_args(
+                target="build",
+                profile="v1.2.3",
+                tag="v9.9.9",
+            ))
+
+    assert rc == 0
+    assert mock_build.call_args.kwargs["tag"] == "v9.9.9"
+
+
 def test_cmd_deploy_build_no_push_propagates(fake_project_root, monkeypatch, capsys):
     """``--no-push`` flows into build_all(push=False) and the rendered
     line says ``(local only)``.

@@ -850,7 +850,21 @@ def _cmd_deploy_build(args) -> int:
 
     push = not args.no_push
     multi_arch = not args.no_multi_arch
-    tag = args.tag
+    # The bash script accepted the tag as a positional arg
+    # (``./scripts/cloudrun/build.sh v1.2.3``). The CLI's existing
+    # second positional ``profile`` slot — used as a profile name for
+    # ``kestrel deploy <profile>`` and as a subverb for
+    # ``kestrel deploy secrets sync`` — also receives that value when
+    # ``target == "build"``. Honor it as the tag so users typing the
+    # same shape they used in bash don't silently push ``:latest``.
+    # Codex review on PR #1060 caught the silent fallback. ``--tag``
+    # still wins if both are present (explicit beats positional).
+    if args.tag and args.tag != "latest":
+        tag = args.tag
+    elif getattr(args, "profile", None):
+        tag = args.profile
+    else:
+        tag = args.tag  # default "latest"
 
     # Platforms: comma-split if provided. Defaults differ between push
     # and no-push: ``--push`` defaults to multi-arch (matches build.sh);
