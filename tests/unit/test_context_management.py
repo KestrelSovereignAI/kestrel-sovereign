@@ -1489,6 +1489,111 @@ class TestContextFeature:
         assert result.data["chunks_processed"] == 5
 
 
+class TestContextManagerWrapperHonesty:
+    """Codex round 1 P2/P3: the context_manager wrapper must surface
+    PARTIAL when the manager skipped some requested messages
+    (protected_count / skipped_count > 0), and must phrase no-op
+    stash operations honestly instead of claiming an action ran."""
+
+    @pytest.fixture
+    def mock_agent(self):
+        agent = MagicMock()
+        agent.context_manager = MagicMock()
+        agent.llm_service = MagicMock()
+        return agent
+
+    @pytest.mark.asyncio
+    async def test_mark_content_partial_when_some_messages_protected(self, mock_agent):
+        """mark_messages reports protected_count > 0 → PARTIAL."""
+        from kestrel_sovereign.features.context import ContextFeature
+        from kestrel_sdk.tools.result import ToolResultStatus
+
+        mock_agent.context_manager.get_messages_for_selection = AsyncMock(
+            return_value=[{"id": 1}, {"id": 2}, {"id": 3}]
+        )
+        mock_agent.context_manager.mark_messages = AsyncMock(return_value={
+            "success": True,
+            "marked_count": 2,
+            "protected_count": 1,
+        })
+
+        feature = ContextFeature(mock_agent)
+        await feature.initialize()
+        result = await feature.mark_content(
+            action="droppable", target="last_3", reason="cleanup",
+        )
+
+        assert result.status is ToolResultStatus.PARTIAL
+        assert "protected" in result.error.lower()
+        assert result.data["protected_count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_stash_pop_no_op_when_no_stashes(self, mock_agent):
+        """stash_pop with no stashes → OK with a no-op confirmation,
+        not a misleading 'Popped most recent stash'."""
+        from kestrel_sovereign.features.context import ContextFeature
+        from kestrel_sdk.tools.result import ToolResultStatus
+
+        mock_agent.context_manager.stash_pop = AsyncMock(return_value={
+            "success": True,
+            "restored_count": 0,
+            "note": "No stashes to pop",
+        })
+
+        feature = ContextFeature(mock_agent)
+        await feature.initialize()
+        result = await feature.context_stash_pop()
+
+        assert result.status is ToolResultStatus.OK
+        # Confirmation must NOT claim a successful pop
+        assert "popped" not in result.confirmation.lower()
+        assert (
+            "no stashes" in result.confirmation.lower()
+            or "no stash" in result.confirmation.lower()
+        )
+
+    @pytest.mark.asyncio
+    async def test_stash_drop_actual_action_says_dropped(self, mock_agent):
+        """stash_drop with a real dropped_count > 0 still says 'Dropped'."""
+        from kestrel_sovereign.features.context import ContextFeature
+        from kestrel_sdk.tools.result import ToolResultStatus
+
+        mock_agent.context_manager.stash_drop = AsyncMock(return_value={
+            "success": True,
+            "dropped_count": 5,
+        })
+
+        feature = ContextFeature(mock_agent)
+        await feature.initialize()
+        result = await feature.context_stash_drop()
+
+        assert result.status is ToolResultStatus.OK
+        assert "dropped" in result.confirmation.lower()
+        assert result.data["dropped_count"] == 5
+
+    @pytest.mark.asyncio
+    async def test_restore_excluded_no_op_when_none_excluded(self, mock_agent):
+        """restore_excluded with restored_count=0 says 'No excluded
+        messages to restore', not 'Restored excluded messages'."""
+        from kestrel_sovereign.features.context import ContextFeature
+        from kestrel_sdk.tools.result import ToolResultStatus
+
+        mock_agent.context_manager.restore_messages = AsyncMock(return_value={
+            "success": True,
+            "restored_count": 0,
+        })
+
+        feature = ContextFeature(mock_agent)
+        await feature.initialize()
+        result = await feature.restore_excluded(target="all")
+
+        assert result.status is ToolResultStatus.OK
+        assert (
+            "no excluded" in result.confirmation.lower()
+            or "no-op" in result.confirmation.lower()
+        )
+
+
 class TestLLMServiceCheapModel:
     """Tests for LLMService.get_cheap_model()."""
 

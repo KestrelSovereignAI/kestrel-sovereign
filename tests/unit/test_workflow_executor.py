@@ -362,6 +362,96 @@ class TestRunWorkflow:
         assert results[1]["skill"] == "check_balance"
 
 
+class TestRunWorkflowSemanticHonesty:
+    """Codex round 1 P1: A2A's task.status is *transport-level* — a tool
+    that returns ToolResult.failed lands here as task.state == COMPLETED.
+    The workflow rollup must inspect the wire-data and downgrade those
+    steps to "failed" / "partial" so it doesn't claim "Workflow complete"
+    while a step semantically failed.
+    """
+
+    @pytest.mark.asyncio
+    async def test_tool_result_failed_inside_completed_task_downgrades_step(self, task_feature):
+        """Migrated tool returned ToolResult.failed → step counted as failed."""
+        # Replace one mock skill with one that returns a ToolResult.failed
+        # wire-shape, so when the artifact's part.data is inspected the
+        # workflow can see the semantic failure.
+        from kestrel_sdk.tools.result import ToolResult
+        # Re-register memory_feature's memory_status with a failed result
+        agent_card, _ = task_feature.task_manager._agents["memory_feature"]
+        task_feature.task_manager._agents["memory_feature"] = (
+            agent_card,
+            MockHandler({
+                "memory_status": lambda args: ToolResult.failed(
+                    "ObservabilityStore not available"
+                ).to_dict(),
+            }),
+        )
+
+        result = await task_feature.run_workflow(steps=[
+            {"feature": "memory_feature", "skill": "memory_status"},
+        ])
+
+        # Step's wire-shape said error → step downgrades to failed
+        # → workflow rollup sees 0 completed, 1 failed → ERROR
+        assert result.status is ToolResultStatus.ERROR
+        assert result.data["failed"] == 1
+        step = result.data["results"][0]
+        assert step["status"] == "failed"
+        assert "ObservabilityStore not available" in step["error"]
+
+    @pytest.mark.asyncio
+    async def test_tool_result_partial_inside_completed_task_marks_step_partial(self, task_feature):
+        """Migrated tool returned ToolResult.partial → step counted as partial,
+        workflow rollup is PARTIAL even when the other step succeeded."""
+        from kestrel_sdk.tools.result import ToolResult
+        agent_card, _ = task_feature.task_manager._agents["memory_feature"]
+        task_feature.task_manager._agents["memory_feature"] = (
+            agent_card,
+            MockHandler({
+                "memory_status": lambda args: ToolResult.partial(
+                    confirmation="Got partial stats",
+                    error="rag chunks count unknown",
+                ).to_dict(),
+            }),
+        )
+
+        result = await task_feature.run_workflow(steps=[
+            {"feature": "model_agent", "skill": "get_current_model"},
+            {"feature": "memory_feature", "skill": "memory_status"},
+        ])
+
+        assert result.status is ToolResultStatus.PARTIAL
+        assert result.data["partial"] == 1
+        partial_step = result.data["results"][1]
+        assert partial_step["status"] == "partial"
+        assert "rag chunks count unknown" in partial_step["error"]
+
+    @pytest.mark.asyncio
+    async def test_old_dict_shape_with_success_false_downgrades_step(self, task_feature):
+        """Pre-migration tool that returns {"success": False, ...} also
+        gets downgraded — the rollup is honest during the migration window."""
+        agent_card, _ = task_feature.task_manager._agents["memory_feature"]
+        task_feature.task_manager._agents["memory_feature"] = (
+            agent_card,
+            MockHandler({
+                "memory_status": lambda args: {
+                    "success": False,
+                    "error": "legacy shape failure",
+                },
+            }),
+        )
+
+        result = await task_feature.run_workflow(steps=[
+            {"feature": "memory_feature", "skill": "memory_status"},
+        ])
+
+        assert result.status is ToolResultStatus.ERROR
+        step = result.data["results"][0]
+        assert step["status"] == "failed"
+        assert "legacy shape failure" in step["error"]
+
+
 class TestListAvailableSkills:
     """Tests for TaskFeature.list_available_skills."""
 

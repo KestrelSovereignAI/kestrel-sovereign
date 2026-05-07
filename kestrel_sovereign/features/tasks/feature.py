@@ -306,21 +306,56 @@ class TaskFeature(Feature):
                                         result_data = part.data
 
                     step_duration = int((time.time() - step_start) * 1000)
-                    results.append({
+
+                    # Honesty: A2A's task.status reports the *transport*
+                    # outcome — the call returned without raising — not
+                    # the *semantic* outcome. A migrated step that
+                    # returned ``ToolResult.failed`` lands here with
+                    # ``task.status.state == COMPLETED`` and would be
+                    # counted as a success in the workflow rollup.
+                    # Inspect the wire-shape (status / error fields)
+                    # and downgrade. Old-style dict tools with
+                    # ``success: False`` are also surfaced as failed so
+                    # the rollup is honest during the migration window.
+                    semantic_status, semantic_error = self._classify_step_result(
+                        task.status.state.value, result_data,
+                    )
+                    step_record = {
                         "step": i,
                         "feature": feature_name,
                         "skill": skill_name,
-                        "status": task.status.state.value,
+                        "status": semantic_status,
                         "result": result_data,
                         "duration_ms": step_duration,
                         "attempts": attempt + 1,
-                    })
+                    }
+                    if semantic_error is not None:
+                        step_record["error"] = semantic_error
+                    results.append(step_record)
                     logger.info(
                         f"[WORKFLOW] Step {i}: {feature_name}.{skill_name} "
-                        f"-> {task.status.state.value} ({step_duration}ms, attempt {attempt + 1})"
+                        f"-> {semantic_status} (transport={task.status.state.value}, "
+                        f"{step_duration}ms, attempt {attempt + 1})"
                     )
                     last_error = None
-                    break
+                    if semantic_status != "failed":
+                        break
+                    # Semantic failure with retries left: fall through
+                    # to retry like a transport exception.
+                    if attempt < attempts - 1:
+                        delay_s = retry_delay_ms / 1000.0
+                        logger.warning(
+                            f"[WORKFLOW] Step {i}: {feature_name}.{skill_name} "
+                            f"attempt {attempt + 1} returned failed: {semantic_error}, "
+                            f"retrying in {delay_s}s"
+                        )
+                        # Pop the failed record so a successful retry
+                        # writes a clean record (mirrors the transport
+                        # retry path which also overwrites).
+                        results.pop()
+                        await asyncio.sleep(delay_s)
+                    else:
+                        break
 
                 except Exception as e:
                     last_error = e
@@ -351,21 +386,24 @@ class TaskFeature(Feature):
         total_duration = int((time.time() - workflow_start) * 1000)
         completed = sum(1 for r in results if r.get("status") == "completed")
         failed = sum(1 for r in results if r.get("status") == "failed")
+        partial = sum(1 for r in results if r.get("status") == "partial")
 
         logger.info(
             f"[WORKFLOW] Complete: {completed}/{len(steps)} succeeded, "
-            f"{failed} failed, {total_duration}ms total"
+            f"{partial} partial, {failed} failed, {total_duration}ms total"
         )
 
         data = {
             "workflow_steps": len(steps),
             "completed": completed,
+            "partial": partial,
             "failed": failed,
             "total_duration_ms": total_duration,
             "results": results,
         }
 
-        if failed == 0 and completed == len(steps):
+        # All-clean: every step OK. Cleanest path → OK.
+        if failed == 0 and partial == 0 and completed == len(steps):
             return ToolResult.ok(
                 confirmation=(
                     f"Workflow complete: {completed}/{len(steps)} step(s) "
@@ -373,22 +411,72 @@ class TaskFeature(Feature):
                 ),
                 data=data,
             )
-        if completed == 0:
+        # All failures, no successes or partials. PARTIAL would require
+        # a confirmation to be honestly speakable — there is none.
+        if completed == 0 and partial == 0:
             return ToolResult.failed(
                 f"Workflow failed: 0/{len(steps)} step(s) succeeded "
                 f"({failed} failed)",
                 data=data,
             )
-        # Some succeeded, some failed — PARTIAL forces the LLM to surface
-        # the failures rather than claim "workflow complete".
+        # Anything else (any mixture of succeeded/partial/failed)
+        # → PARTIAL forces the LLM to surface the failed/partial half
+        # rather than claim "workflow complete".
+        error_parts = []
+        if failed:
+            error_parts.append(f"{failed} step(s) failed")
+        if partial:
+            error_parts.append(f"{partial} step(s) partially completed")
         return ToolResult.partial(
             confirmation=(
                 f"Workflow partially complete: {completed}/{len(steps)} "
-                f"step(s) succeeded in {total_duration}ms"
+                f"step(s) cleanly succeeded in {total_duration}ms"
             ),
-            error=f"{failed} step(s) failed; see results[*].error for details",
+            error=(
+                "; ".join(error_parts) + "; see results[*].error for details"
+            ),
             data=data,
         )
+
+    @staticmethod
+    def _classify_step_result(
+        transport_state: str,
+        result_data: Any,
+    ) -> tuple[str, Optional[str]]:
+        """Translate the A2A task state + tool wire-data into a
+        workflow-step status.
+
+        A2A's ``task.status.state`` is transport-level: COMPLETED means
+        "the python call returned." A migrated tool that returns
+        ``ToolResult.failed`` is *transport-completed* but *semantically
+        failed*. To keep the workflow rollup honest, this helper
+        inspects the wire-shape:
+
+          - ToolResult envelope (``{"status": "ok"|"error"|"partial",
+            ...}``) → use the envelope's status
+          - Old-style dict with ``success: False`` → "failed"
+          - Old-style dict with ``error: "..."`` → "failed"
+          - Anything else → defer to the transport state
+
+        Returns ``(status, error_or_None)``. ``status`` is one of
+        ``"completed" | "failed" | "partial"``.
+        """
+        if transport_state == "failed":
+            return "failed", None
+        if isinstance(result_data, dict):
+            envelope_status = result_data.get("status")
+            if envelope_status in ("ok",):
+                return "completed", None
+            if envelope_status == "error":
+                return "failed", result_data.get("error")
+            if envelope_status == "partial":
+                return "partial", result_data.get("error")
+            # Pre-migration dict shape — `success: False` or `error: ...`
+            if result_data.get("success") is False:
+                return "failed", result_data.get("error")
+            if result_data.get("error"):
+                return "failed", result_data.get("error")
+        return transport_state if transport_state != "completed" else "completed", None
 
     @staticmethod
     def _resolve_step_refs(

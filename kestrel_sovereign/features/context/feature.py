@@ -31,11 +31,58 @@ from kestrel_sdk.tools.result import ToolResult
 logger = logging.getLogger(__name__)
 
 
+def _detect_partial_signal(result: Dict[str, Any]) -> Optional[str]:
+    """Inspect a manager dict for partial-success signals.
+
+    Honesty: when the context_manager skipped some requested
+    messages (because they were protected, or already excluded, or
+    not found) it still returns ``success: True``. The wire-shape
+    leaks this only via a count field. Translating those into
+    PARTIAL forces the LLM to surface the skipped half rather than
+    claim "Marked N messages" when M < N actually changed.
+
+    Returns a human-readable error string when partial, else None.
+    """
+    protected = result.get("protected_count")
+    if isinstance(protected, int) and protected > 0:
+        return f"{protected} message(s) were protected and skipped"
+    skipped = result.get("skipped_count")
+    if isinstance(skipped, int) and skipped > 0:
+        reason = result.get("skipped_reason") or "could not be processed"
+        return f"{skipped} message(s) skipped: {reason}"
+    # The action-count field varies across managers; treat any
+    # known-zero with a "no-op" note as a no-op confirmation, not
+    # as partial. The no-op detection lives in the caller.
+    return None
+
+
+def _is_noop_result(result: Dict[str, Any], action_count_keys: tuple[str, ...]) -> bool:
+    """Detect a no-op manager response.
+
+    The context_manager's stash_pop/apply/drop and restore_excluded
+    happily return ``success: True, count: 0, note: "no stashes"``
+    when there's nothing to do. The honest framing is "no-op", not
+    "popped most recent stash". Caller passes the count keys it
+    expects (e.g. ``("restored_count", "popped_count")``).
+    """
+    for key in action_count_keys:
+        if key in result and isinstance(result[key], int) and result[key] > 0:
+            return False
+    # If none of the action counts were touched, this was a no-op
+    # iff at least one of the count keys appeared as zero. (Avoids
+    # false-positive on results that simply don't carry counts.)
+    if any(key in result for key in action_count_keys):
+        return True
+    return False
+
+
 def _wrap_manager_result(
     result: Any,
     *,
     ok_confirmation: str,
     failure_prefix: str = "context_manager",
+    noop_count_keys: tuple[str, ...] = (),
+    noop_confirmation: Optional[str] = None,
 ) -> ToolResult:
     """Translate a context_manager method's dict return into a ToolResult.
 
@@ -45,11 +92,20 @@ def _wrap_manager_result(
       - some include ``success: True`` and the data
       - some include ``error: "..."`` and ``success: False``
       - some return data without any explicit success marker
+      - some return ``success: True`` with a partial-skip count
+        (``protected_count``) — those must surface as PARTIAL
+      - stash_pop/apply/drop return ``success: True, count: 0``
+        when there is nothing to do — the caller passes
+        ``noop_count_keys`` so we can phrase the confirmation
+        as a no-op rather than "popped most recent stash"
 
-    This helper normalizes all three:
+    Behavior:
 
       - dict with ``error`` key → ToolResult.failed(error, data=rest)
-      - dict with ``success: False`` (no error) → ToolResult.failed("unknown error")
+      - dict with ``success: False`` (no error) → ToolResult.failed
+      - dict with a partial signal → ToolResult.partial
+      - dict that satisfies ``_is_noop_result`` → ToolResult.ok with
+        ``noop_confirmation`` (or a generic "no-op" message)
       - anything else → ToolResult.ok(ok_confirmation, data=result)
     """
     if isinstance(result, dict):
@@ -62,6 +118,21 @@ def _wrap_manager_result(
             return ToolResult.failed(
                 f"{failure_prefix} returned success=False without an error message",
                 data=result or None,
+            )
+        partial_msg = _detect_partial_signal(result)
+        if partial_msg:
+            return ToolResult.partial(
+                confirmation=ok_confirmation,
+                error=partial_msg,
+                data=dict(result),
+            )
+        if noop_count_keys and _is_noop_result(result, noop_count_keys):
+            return ToolResult.ok(
+                noop_confirmation or (
+                    result.get("note")
+                    or f"{failure_prefix}: nothing to do (no-op)"
+                ),
+                data=dict(result),
             )
         return ToolResult.ok(ok_confirmation, data=dict(result))
     # Non-dict — preserve as data so the LLM can still inspect it.
@@ -526,6 +597,8 @@ class ContextFeature(Feature):
             result,
             ok_confirmation=f"Restored excluded messages (target={target})",
             failure_prefix="restore_messages",
+            noop_count_keys=("restored_count", "message_count"),
+            noop_confirmation=f"No excluded messages to restore (target={target})",
         )
 
     # =========================================================================
@@ -622,6 +695,11 @@ class ContextFeature(Feature):
                 f"Popped stash {stash_id!r}" if stash_id else "Popped most recent stash"
             ),
             failure_prefix="stash_pop",
+            noop_count_keys=("restored_count", "popped_count", "message_count"),
+            noop_confirmation=(
+                f"No stash to pop (stash_id={stash_id!r})" if stash_id
+                else "No stashes to pop"
+            ),
         )
 
     @tool(
@@ -652,6 +730,11 @@ class ContextFeature(Feature):
                 f"Applied stash {stash_id!r}" if stash_id else "Applied most recent stash"
             ),
             failure_prefix="stash_apply",
+            noop_count_keys=("restored_count", "applied_count", "message_count"),
+            noop_confirmation=(
+                f"No stash to apply (stash_id={stash_id!r})" if stash_id
+                else "No stashes to apply"
+            ),
         )
 
     @tool(
@@ -716,6 +799,11 @@ class ContextFeature(Feature):
                 f"Dropped stash {stash_id!r}" if stash_id else "Dropped most recent stash"
             ),
             failure_prefix="stash_drop",
+            noop_count_keys=("dropped_count", "message_count"),
+            noop_confirmation=(
+                f"No stash to drop (stash_id={stash_id!r})" if stash_id
+                else "No stashes to drop"
+            ),
         )
 
     @tool(
