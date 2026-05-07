@@ -8,6 +8,7 @@ import tempfile
 import os
 from pathlib import Path
 
+from kestrel_sdk.tools.result import ToolResultStatus
 from kestrel_sovereign.features.memory import MemoryFeature
 from kestrel_sovereign.storage import AsyncStorage
 
@@ -95,25 +96,25 @@ class TestSearchMemory:
         """
         result = await memory_feature.search_memory("blue", limit=5)
 
-        assert result["success"] is True
-        assert result["count"] >= 1
-        assert result["query"] == "blue"
+        assert result.status is ToolResultStatus.OK
+        assert result.data["count"] >= 1
+        assert result.data["query"] == "blue"
 
     @pytest.mark.asyncio
     async def test_search_with_no_matches(self, memory_feature):
         """Should return empty results for non-matching query."""
         result = await memory_feature.search_memory("xyznonexistent123", limit=5)
 
-        assert result["success"] is True
-        assert result["count"] == 0
+        assert result.status is ToolResultStatus.OK
+        assert result.data["count"] == 0
 
     @pytest.mark.asyncio
     async def test_search_limit_is_respected(self, memory_feature):
         """Should respect the limit parameter."""
         result = await memory_feature.search_memory("", limit=2)
 
-        assert result["success"] is True
-        assert result["count"] <= 2
+        assert result.status is ToolResultStatus.OK
+        assert result.data["count"] <= 2
 
 
 class TestRecallRecent:
@@ -124,18 +125,18 @@ class TestRecallRecent:
         """Should return recent conversation messages."""
         result = await memory_feature.recall_recent(limit=10)
 
-        assert result["success"] is True
-        assert result["count"] >= 1
-        assert "messages" in result
-        assert len(result["messages"]) >= 1
+        assert result.status is ToolResultStatus.OK
+        assert result.data["count"] >= 1
+        assert "messages" in result.data
+        assert len(result.data["messages"]) >= 1
 
     @pytest.mark.asyncio
     async def test_recall_limit_works(self, memory_feature):
         """Should respect the limit parameter."""
         result = await memory_feature.recall_recent(limit=2)
 
-        assert result["success"] is True
-        assert result["count"] <= 2
+        assert result.status is ToolResultStatus.OK
+        assert result.data["count"] <= 2
 
 
 class TestMemoryStatus:
@@ -146,11 +147,12 @@ class TestMemoryStatus:
         """Should return memory system status."""
         result = await memory_feature.memory_status()
 
-        assert result["success"] is True
-        assert "total_messages" in result
-        assert result["total_messages"] >= 5  # We added 5 test messages
-        assert "agent_id" in result
-        assert "consolidator_available" in result
+        assert result.status is ToolResultStatus.OK
+        data = result.data
+        assert "total_messages" in data
+        assert data["total_messages"] >= 5  # We added 5 test messages
+        assert "agent_id" in data
+        assert "consolidator_available" in data
 
 
 class TestSearchMemoryEncryptionAware:
@@ -164,17 +166,17 @@ class TestSearchMemoryEncryptionAware:
         """Should find content via the encryption-aware search."""
         result = await memory_feature.search_memory("blue", limit=5)
 
-        assert result["success"] is True
-        assert result["count"] >= 1
-        assert result["query"] == "blue"
+        assert result.status is ToolResultStatus.OK
+        assert result.data["count"] >= 1
+        assert result.data["query"] == "blue"
 
     @pytest.mark.asyncio
     async def test_search_case_insensitive(self, memory_feature):
         """Search should be case insensitive."""
         result = await memory_feature.search_memory("BLUE", limit=5)
 
-        assert result["success"] is True
-        assert result["count"] >= 1
+        assert result.status is ToolResultStatus.OK
+        assert result.data["count"] >= 1
 
 
 class TestSearchDocuments:
@@ -186,8 +188,8 @@ class TestSearchDocuments:
         result = await memory_feature.search_documents("anything", limit=5)
 
         # Should succeed even with no documents
-        assert result["success"] is True
-        assert "results" in result
+        assert result.status is ToolResultStatus.OK
+        assert "results" in result.data
 
 
 class TestGetEpisodes:
@@ -199,8 +201,8 @@ class TestGetEpisodes:
         result = await memory_feature.get_episodes(limit=5)
 
         # Our mock agent doesn't have a consolidator
-        assert result["success"] is False
-        assert "consolidator" in result["error"].lower()
+        assert result.status is ToolResultStatus.ERROR
+        assert "consolidator" in result.error.lower()
 
 
 class TestRecallEmotional:
@@ -208,14 +210,21 @@ class TestRecallEmotional:
 
     @pytest.mark.asyncio
     async def test_recall_without_retriever(self, memory_feature):
-        """Should fallback gracefully without memory_retriever."""
+        """Should fallback gracefully without memory_retriever.
+
+        Without a retriever, recall_emotional degrades to keyword search.
+        That's a real action (the search runs) but the *promised*
+        emotional weighting did NOT happen — so the contract surfaces
+        the result as PARTIAL and the LLM cannot claim it ran the
+        weighted recall.
+        """
         result = await memory_feature.recall_emotional("memory test", mood="positive")
 
-        # Our mock agent doesn't have memory_retriever
-        assert result["success"] is False
-        assert "retriever" in result["error"].lower()
-        # Should have fallback results
-        assert "fallback" in result
+        assert result.status is ToolResultStatus.PARTIAL
+        # The error half names the missing weighting
+        assert "emotional weighting" in result.error.lower()
+        # Fallback search results carried through under a clearly-named key
+        assert "fallback_results" in result.data
 
 
 class TestCommandParsing:

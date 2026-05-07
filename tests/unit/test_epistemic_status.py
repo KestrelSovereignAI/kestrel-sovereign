@@ -19,6 +19,7 @@ from unittest.mock import AsyncMock, MagicMock, PropertyMock
 import pytest
 import pytest_asyncio
 
+from kestrel_sdk.tools.result import ToolResultStatus
 from kestrel_sovereign.storage.memory_models import MemoryMetadata
 from kestrel_sovereign.storage.emotional_tagger import EmotionalTagger
 from kestrel_sovereign.storage.async_graph_store import GraphNode
@@ -369,7 +370,7 @@ class TestMarkSuperseded:
             new_id=new_node.node_id,
             reason="Changed database",
         )
-        assert result["success"] is True
+        assert result.status is ToolResultStatus.OK
 
         # Verify supersedes edge was written
         edge_calls = agent.storage.graph.add_edge.await_args_list
@@ -419,7 +420,7 @@ class TestMarkSuperseded:
             old_id=old_node.node_id,
             new_id=new_node.node_id,
         )
-        assert result["success"] is True
+        assert result.status is ToolResultStatus.OK
 
     @pytest.mark.asyncio
     async def test_rejects_non_claim_node_type(self):
@@ -454,8 +455,8 @@ class TestMarkSuperseded:
             old_id=concept_node.node_id,
             new_id=decision_node.node_id,
         )
-        assert result["success"] is False
-        assert "concept" in result["error"].lower()
+        assert result.status is ToolResultStatus.ERROR
+        assert "concept" in result.error.lower()
 
     @pytest.mark.asyncio
     async def test_rejects_non_claim_replacement_node(self):
@@ -489,8 +490,8 @@ class TestMarkSuperseded:
             old_id=decision_node.node_id,
             new_id=concept_node.node_id,
         )
-        assert result["success"] is False
-        assert "claim type" in result["error"].lower()
+        assert result.status is ToolResultStatus.ERROR
+        assert "claim type" in result.error.lower()
 
     @pytest.mark.asyncio
     async def test_cross_agent_mutation_returns_not_found(self):
@@ -527,8 +528,8 @@ class TestMarkSuperseded:
             old_id=other_agent_node.node_id,
             new_id=own_node.node_id,
         )
-        assert result["success"] is False
-        assert "not found" in result["error"].lower()
+        assert result.status is ToolResultStatus.ERROR
+        assert "not found" in result.error.lower()
 
         # No edge or node mutation should have happened
         agent.storage.graph.add_edge.assert_not_awaited()
@@ -566,8 +567,8 @@ class TestMarkSuperseded:
             old_id=own_node.node_id,
             new_id=other_node.node_id,
         )
-        assert result["success"] is False
-        assert "not found" in result["error"].lower()
+        assert result.status is ToolResultStatus.ERROR
+        assert "not found" in result.error.lower()
 
     @pytest.mark.asyncio
     async def test_nonexistent_old_node_returns_not_found(self):
@@ -579,8 +580,8 @@ class TestMarkSuperseded:
             old_id="decision:agent-1:ghost",
             new_id="decision:agent-1:new",
         )
-        assert result["success"] is False
-        assert "not found" in result["error"].lower()
+        assert result.status is ToolResultStatus.ERROR
+        assert "not found" in result.error.lower()
 
 
 # =============================================================================
@@ -619,8 +620,9 @@ class TestRecallSupersededFilter:
 
         # Default: exclude superseded
         result = await feature.recall_decisions(limit=25, include_superseded=False)
-        assert result["count"] == 1
-        assert result["decisions"][0]["id"] == active_node.node_id
+        assert result.status is ToolResultStatus.OK
+        assert result.data["count"] == 1
+        assert result.data["decisions"][0]["id"] == active_node.node_id
 
     @pytest.mark.asyncio
     async def test_recall_decisions_includes_superseded_when_asked(self):
@@ -650,7 +652,8 @@ class TestRecallSupersededFilter:
         )
 
         result = await feature.recall_decisions(limit=25, include_superseded=True)
-        assert result["count"] == 2
+        assert result.status is ToolResultStatus.OK
+        assert result.data["count"] == 2
 
     @pytest.mark.asyncio
     async def test_recall_action_items_excludes_superseded_by_default(self):
@@ -681,8 +684,9 @@ class TestRecallSupersededFilter:
         )
 
         result = await feature.recall_action_items(limit=25, include_superseded=False)
-        assert result["count"] == 1
-        assert result["action_items"][0]["id"] == active.node_id
+        assert result.status is ToolResultStatus.OK
+        assert result.data["count"] == 1
+        assert result.data["action_items"][0]["id"] == active.node_id
 
     @pytest.mark.asyncio
     async def test_recall_returns_epistemic_fields(self):
@@ -708,7 +712,8 @@ class TestRecallSupersededFilter:
         )
 
         result = await feature.recall_decisions(limit=25)
-        decision = result["decisions"][0]
+        assert result.status is ToolResultStatus.OK
+        decision = result.data["decisions"][0]
         assert decision["claim_certainty"] == 0.9
         assert decision["claim_source"] == "direct"
         assert decision["temporal_validity"] == "durable"

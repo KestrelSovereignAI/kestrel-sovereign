@@ -23,6 +23,7 @@ from kestrel_sovereign.a2a.types import (
 )
 from kestrel_sovereign.a2a.task_manager import TaskManager, create_task_manager
 from kestrel_sovereign.a2a.agent_card import AgentCard, AgentCapabilities, AgentSkill
+from kestrel_sdk.tools.result import ToolResultStatus
 from kestrel_sovereign.features.tasks.feature import TaskFeature
 
 
@@ -205,13 +206,14 @@ class TestRunWorkflow:
             {"feature": "model_agent", "skill": "get_current_model"},
         ])
 
-        assert result["success"] is True
-        assert result["workflow_steps"] == 1
-        assert result["completed"] == 1
-        assert result["failed"] == 0
-        assert len(result["results"]) == 1
+        assert result.status is ToolResultStatus.OK
+        data = result.data
+        assert data["workflow_steps"] == 1
+        assert data["completed"] == 1
+        assert data["failed"] == 0
+        assert len(data["results"]) == 1
 
-        step = result["results"][0]
+        step = data["results"][0]
         assert step["status"] == "completed"
         assert step["result"]["model"] == "claude-sonnet-4-5-20250929"
 
@@ -224,15 +226,15 @@ class TestRunWorkflow:
             {"feature": "wallet_feature", "skill": "check_balance"},
         ])
 
-        assert result["success"] is True
-        assert result["workflow_steps"] == 3
-        assert result["completed"] == 3
-        assert result["failed"] == 0
+        assert result.status is ToolResultStatus.OK
+        data = result.data
+        assert data["workflow_steps"] == 3
+        assert data["completed"] == 3
+        assert data["failed"] == 0
 
-        # Check each step has results
-        assert result["results"][0]["result"]["model"] == "claude-sonnet-4-5-20250929"
-        assert result["results"][1]["result"]["episodes"] == 42
-        assert result["results"][2]["result"]["balance"] == "12.50"
+        assert data["results"][0]["result"]["model"] == "claude-sonnet-4-5-20250929"
+        assert data["results"][1]["result"]["episodes"] == 42
+        assert data["results"][2]["result"]["balance"] == "12.50"
 
     @pytest.mark.asyncio
     async def test_step_with_args(self, task_feature):
@@ -241,8 +243,8 @@ class TestRunWorkflow:
             {"feature": "model_agent", "skill": "list_models", "args": {"provider": "openai"}},
         ])
 
-        assert result["success"] is True
-        step = result["results"][0]
+        assert result.status is ToolResultStatus.OK
+        step = result.data["results"][0]
         assert step["result"]["provider"] == "openai"
 
     @pytest.mark.asyncio
@@ -252,9 +254,10 @@ class TestRunWorkflow:
             {"feature": "nonexistent_feature", "skill": "do_something"},
         ])
 
-        assert result["success"] is False
-        assert result["failed"] == 1
-        step = result["results"][0]
+        # Every step failed → ERROR (no successes to surface as PARTIAL).
+        assert result.status is ToolResultStatus.ERROR
+        assert result.data["failed"] == 1
+        step = result.data["results"][0]
         assert step["status"] == "failed"
         assert "Unknown agent" in step["error"]
 
@@ -265,43 +268,47 @@ class TestRunWorkflow:
             {"feature": "model_agent", "skill": "nonexistent_skill"},
         ])
 
-        assert result["success"] is False
-        assert result["failed"] == 1
-        step = result["results"][0]
+        assert result.status is ToolResultStatus.ERROR
+        assert result.data["failed"] == 1
+        step = result.data["results"][0]
         assert step["status"] == "failed"
 
     @pytest.mark.asyncio
     async def test_partial_failure(self, task_feature):
-        """A failed step doesn't prevent other steps from running."""
+        """A failed step doesn't prevent other steps from running.
+
+        Mix of success+failure surfaces as PARTIAL — the LLM cannot
+        claim "workflow complete" while a step actually failed.
+        """
         result = await task_feature.run_workflow(steps=[
             {"feature": "model_agent", "skill": "get_current_model"},
             {"feature": "nonexistent_feature", "skill": "bad_skill"},
             {"feature": "wallet_feature", "skill": "check_balance"},
         ])
 
-        assert result["success"] is False  # overall fails because one step failed
-        assert result["completed"] == 2
-        assert result["failed"] == 1
+        assert result.status is ToolResultStatus.PARTIAL
+        data = result.data
+        assert data["completed"] == 2
+        assert data["failed"] == 1
 
-        # First and third steps succeeded
-        assert result["results"][0]["status"] == "completed"
-        assert result["results"][1]["status"] == "failed"
-        assert result["results"][2]["status"] == "completed"
+        assert data["results"][0]["status"] == "completed"
+        assert data["results"][1]["status"] == "failed"
+        assert data["results"][2]["status"] == "completed"
 
     @pytest.mark.asyncio
     async def test_empty_steps(self, task_feature):
         """Empty steps list returns error."""
         result = await task_feature.run_workflow(steps=[])
-        assert result["success"] is False
-        assert "non-empty" in result["error"]
+        assert result.status is ToolResultStatus.ERROR
+        assert "non-empty" in result.error
 
     @pytest.mark.asyncio
     async def test_invalid_step_format(self, task_feature):
         """Non-dict step is handled gracefully."""
         result = await task_feature.run_workflow(steps=["not a dict"])
-        assert result["success"] is False
-        assert result["results"][0]["status"] == "failed"
-        assert "object" in result["results"][0]["error"]
+        assert result.status is ToolResultStatus.ERROR
+        assert result.data["results"][0]["status"] == "failed"
+        assert "object" in result.data["results"][0]["error"]
 
     @pytest.mark.asyncio
     async def test_step_missing_required_fields(self, task_feature):
@@ -310,8 +317,8 @@ class TestRunWorkflow:
             {"feature": "model_agent"},  # missing skill
         ])
 
-        assert result["success"] is False
-        assert "requires" in result["results"][0]["error"]
+        assert result.status is ToolResultStatus.ERROR
+        assert "requires" in result.data["results"][0]["error"]
 
     @pytest.mark.asyncio
     async def test_no_task_manager(self):
@@ -322,8 +329,8 @@ class TestRunWorkflow:
             {"feature": "model_agent", "skill": "list_models"},
         ])
 
-        assert result["success"] is False
-        assert "not available" in result["error"]
+        assert result.status is ToolResultStatus.ERROR
+        assert "not available" in result.error
 
     @pytest.mark.asyncio
     async def test_duration_tracking(self, task_feature):
@@ -332,10 +339,11 @@ class TestRunWorkflow:
             {"feature": "model_agent", "skill": "get_current_model"},
         ])
 
-        assert "total_duration_ms" in result
-        assert result["total_duration_ms"] >= 0
+        data = result.data
+        assert "total_duration_ms" in data
+        assert data["total_duration_ms"] >= 0
 
-        step = result["results"][0]
+        step = data["results"][0]
         assert "duration_ms" in step
         assert step["duration_ms"] >= 0
 
@@ -347,10 +355,326 @@ class TestRunWorkflow:
             {"feature": "wallet_feature", "skill": "check_balance"},
         ])
 
-        assert result["results"][0]["feature"] == "model_agent"
-        assert result["results"][0]["skill"] == "list_models"
-        assert result["results"][1]["feature"] == "wallet_feature"
-        assert result["results"][1]["skill"] == "check_balance"
+        results = result.data["results"]
+        assert results[0]["feature"] == "model_agent"
+        assert results[0]["skill"] == "list_models"
+        assert results[1]["feature"] == "wallet_feature"
+        assert results[1]["skill"] == "check_balance"
+
+
+class TestRunWorkflowSemanticHonesty:
+    """Codex round 1+2 P1: A2A's task.status is *transport-level* — a tool
+    that returns ToolResult.failed lands here as task.state == COMPLETED.
+    The workflow rollup must inspect the wire-data and downgrade those
+    steps to "failed" / "partial" so it doesn't claim "Workflow complete"
+    while a step semantically failed.
+
+    Wire shapes covered:
+      - DynamicTool-wrapped (realistic Feature.handle_task path):
+        ``{"success": True, "result": ToolResult.to_dict(), "tool": "..."}``
+      - Bare ToolResult envelope (some handlers bypass DynamicTool)
+      - Pre-migration dict ``{"success": False, "error": ...}``
+    """
+
+    @pytest.mark.asyncio
+    async def test_tool_result_failed_dynamictool_wrapped_downgrades_step(self, task_feature):
+        """Realistic A2A path: DynamicTool.execute() wraps the @tool's
+        return as ``{"success": True, "result": <envelope>, "tool": ...}``.
+        Round 2 codex finding: classifier must peek inside ``result``.
+        """
+        from kestrel_sdk.tools.result import ToolResult
+        agent_card, _ = task_feature.task_manager._agents["memory_feature"]
+        task_feature.task_manager._agents["memory_feature"] = (
+            agent_card,
+            MockHandler({
+                # Mimic DynamicTool.execute()'s wrapping behavior
+                "memory_status": lambda args: {
+                    "success": True,
+                    "result": ToolResult.failed(
+                        "ObservabilityStore not available"
+                    ).to_dict(),
+                    "tool": "memory_status",
+                },
+            }),
+        )
+
+        result = await task_feature.run_workflow(steps=[
+            {"feature": "memory_feature", "skill": "memory_status"},
+        ])
+
+        assert result.status is ToolResultStatus.ERROR
+        assert result.data["failed"] == 1
+        step = result.data["results"][0]
+        assert step["status"] == "failed"
+        assert "ObservabilityStore not available" in step["error"]
+
+    @pytest.mark.asyncio
+    async def test_tool_result_partial_dynamictool_wrapped_marks_step_partial(self, task_feature):
+        """ToolResult.partial inside DynamicTool wrapper → step partial."""
+        from kestrel_sdk.tools.result import ToolResult
+        agent_card, _ = task_feature.task_manager._agents["memory_feature"]
+        task_feature.task_manager._agents["memory_feature"] = (
+            agent_card,
+            MockHandler({
+                "memory_status": lambda args: {
+                    "success": True,
+                    "result": ToolResult.partial(
+                        confirmation="Got partial stats",
+                        error="rag chunks count unknown",
+                    ).to_dict(),
+                    "tool": "memory_status",
+                },
+            }),
+        )
+
+        result = await task_feature.run_workflow(steps=[
+            {"feature": "model_agent", "skill": "get_current_model"},
+            {"feature": "memory_feature", "skill": "memory_status"},
+        ])
+
+        assert result.status is ToolResultStatus.PARTIAL
+        assert result.data["partial"] == 1
+        partial_step = result.data["results"][1]
+        assert partial_step["status"] == "partial"
+        assert "rag chunks count unknown" in partial_step["error"]
+
+    @pytest.mark.asyncio
+    async def test_bare_envelope_failed_downgrades_step(self, task_feature):
+        """Some handlers bypass DynamicTool and put the bare envelope
+        in part.data. The classifier must still detect it."""
+        from kestrel_sdk.tools.result import ToolResult
+        agent_card, _ = task_feature.task_manager._agents["memory_feature"]
+        task_feature.task_manager._agents["memory_feature"] = (
+            agent_card,
+            MockHandler({
+                "memory_status": lambda args: ToolResult.failed(
+                    "bare envelope path"
+                ).to_dict(),
+            }),
+        )
+
+        result = await task_feature.run_workflow(steps=[
+            {"feature": "memory_feature", "skill": "memory_status"},
+        ])
+
+        assert result.status is ToolResultStatus.ERROR
+        step = result.data["results"][0]
+        assert step["status"] == "failed"
+        assert "bare envelope path" in step["error"]
+
+    @pytest.mark.asyncio
+    async def test_old_dict_shape_with_success_false_downgrades_step(self, task_feature):
+        """Pre-migration tool that returns {"success": False, ...} also
+        gets downgraded — the rollup is honest during the migration window."""
+        agent_card, _ = task_feature.task_manager._agents["memory_feature"]
+        task_feature.task_manager._agents["memory_feature"] = (
+            agent_card,
+            MockHandler({
+                "memory_status": lambda args: {
+                    "success": False,
+                    "error": "legacy shape failure",
+                },
+            }),
+        )
+
+        result = await task_feature.run_workflow(steps=[
+            {"feature": "memory_feature", "skill": "memory_status"},
+        ])
+
+        assert result.status is ToolResultStatus.ERROR
+        step = result.data["results"][0]
+        assert step["status"] == "failed"
+        assert "legacy shape failure" in step["error"]
+
+    def test_classify_step_result_unit_table(self):
+        """Direct table-test of the classifier against every wire shape.
+
+        Defends against future regressions in the dispatch path's
+        wire format — adding a new wire layer should be matched by
+        a new row here.
+
+        The "raw ToolResult instance" cases are the production path
+        (DynamicTool.execute stores the raw object pre-serialization).
+        """
+        from kestrel_sdk.tools.result import ToolResult
+        # (transport_state, result_data, expected_status, expected_error)
+        cases = [
+            # Bare envelope shapes (post-serialize)
+            ("completed", {"status": "ok", "confirmation": "ok"}, "completed", None),
+            ("completed", {"status": "error", "error": "x"}, "failed", "x"),
+            ("completed", {"status": "partial", "confirmation": "c", "error": "e"},
+             "partial", "e"),
+            # Bare raw ToolResult instance (pre-serialize)
+            ("completed", ToolResult.ok("ok"), "completed", None),
+            ("completed", ToolResult.failed("raw err"), "failed", "raw err"),
+            ("completed", ToolResult.partial(confirmation="c", error="raw partial"),
+             "partial", "raw partial"),
+            # DynamicTool-wrapped shapes — wire-serialized (dict result)
+            ("completed", {
+                "success": True,
+                "result": {"status": "ok", "confirmation": "ok"},
+                "tool": "t",
+            }, "completed", None),
+            ("completed", {
+                "success": True,
+                "result": {"status": "error", "error": "wrapped err"},
+                "tool": "t",
+            }, "failed", "wrapped err"),
+            ("completed", {
+                "success": True,
+                "result": {"status": "partial", "confirmation": "c", "error": "wrapped partial"},
+                "tool": "t",
+            }, "partial", "wrapped partial"),
+            # DynamicTool-wrapped shapes — RAW instance (in-process,
+            # pre-serialize). This is the path codex round 4 caught.
+            ("completed", {
+                "success": True,
+                "result": ToolResult.ok("ok"),
+                "tool": "t",
+            }, "completed", None),
+            ("completed", {
+                "success": True,
+                "result": ToolResult.failed("raw wrapped err"),
+                "tool": "t",
+            }, "failed", "raw wrapped err"),
+            ("completed", {
+                "success": True,
+                "result": ToolResult.partial(confirmation="c", error="raw wrapped partial"),
+                "tool": "t",
+            }, "partial", "raw wrapped partial"),
+            # Legacy dict
+            ("completed", {"success": False, "error": "legacy"}, "failed", "legacy"),
+            ("completed", {"success": True, "model": "m"}, "completed", None),
+            # Transport failure overrides everything
+            ("failed", {"status": "ok"}, "failed", None),
+            ("failed", ToolResult.ok("would have been ok"), "failed", None),
+            # Non-dict result
+            ("completed", "string result", "completed", None),
+            ("completed", None, "completed", None),
+        ]
+        for transport, data, expected_status, expected_err in cases:
+            actual_status, actual_err = TaskFeature._classify_step_result(transport, data)
+            assert actual_status == expected_status, (
+                f"transport={transport!r} data={data!r} → "
+                f"expected {expected_status}, got {actual_status}"
+            )
+            if expected_err is not None:
+                assert actual_err == expected_err, (
+                    f"transport={transport!r} data={data!r} → "
+                    f"expected error {expected_err!r}, got {actual_err!r}"
+                )
+
+    @pytest.mark.asyncio
+    async def test_workflow_step_record_is_json_serializable(self, task_feature):
+        """Round 5 finding: a step's stored result must not contain
+        raw ToolResult objects, otherwise downstream JSON serialization
+        for the LLM tool-history wire fails. _serialize_step_payload
+        walks the dict and ToolResult.to_dict()s any instances it
+        finds.
+        """
+        import json
+        from kestrel_sdk.tools.result import ToolResult
+        agent_card, _ = task_feature.task_manager._agents["memory_feature"]
+        task_feature.task_manager._agents["memory_feature"] = (
+            agent_card,
+            MockHandler({
+                # Raw ToolResult inside the wrapper — not .to_dict()
+                "memory_status": lambda args: {
+                    "success": True,
+                    "result": ToolResult.failed("store down"),
+                    "tool": "memory_status",
+                },
+            }),
+        )
+
+        result = await task_feature.run_workflow(steps=[
+            {"feature": "memory_feature", "skill": "memory_status"},
+        ])
+
+        # The full ToolResult must round-trip through JSON without
+        # crashing — that's what the LLM tool-history wire requires.
+        wire_payload = result.to_dict()
+        json.dumps(wire_payload)  # would raise on a raw ToolResult
+
+        # And the step record's nested 'result' must be a dict, not
+        # a raw ToolResult. (Allow None for steps where the artifact
+        # had no data, but if there IS data it has to be serializable.)
+        nested_result = wire_payload["data"]["results"][0]["result"]
+        assert nested_result is None or isinstance(nested_result, dict)
+
+    @pytest.mark.asyncio
+    async def test_check_task_status_artifact_is_json_serializable(self, task_feature):
+        """Round 6 finding: check_task_status / get_task_result / wait_for_task
+        all read task artifacts. A migrated @tool's artifact data can
+        carry a raw ToolResult inside the DynamicTool wrapper. Returning
+        part.data unchanged would embed the raw object inside this
+        tool's ToolResult.data, breaking the wire's JSON serialization.
+        Same fix shape as run_workflow's _serialize_step_payload.
+        """
+        import asyncio as _asyncio
+        import json
+        from kestrel_sdk.tools.result import ToolResult
+        # Drive a task through the manager that produces an artifact
+        # with a raw ToolResult inside the DynamicTool wrapper.
+        agent_card, _ = task_feature.task_manager._agents["memory_feature"]
+        task_feature.task_manager._agents["memory_feature"] = (
+            agent_card,
+            MockHandler({
+                "memory_status": lambda args: {
+                    "success": True,
+                    "result": ToolResult.ok("got stats", data={"n": 1}),
+                    "tool": "memory_status",
+                },
+            }),
+        )
+
+        # Run a workflow step that produces the task with the artifact,
+        # then look the task up via check_task_status. We can grab the
+        # task id from the workflow step's result_data once the
+        # workflow finishes.
+        task = await task_feature.task_manager.execute_skill(
+            agent_id="memory_feature",
+            skill_id="memory_status",
+            args={},
+            sync=True,
+        )
+
+        result = await task_feature.check_task_status(task_id=task.id)
+        # Wire-serialize the whole tool result via to_dict + json.dumps.
+        # Without the round-6 fix, this would raise TypeError on the
+        # raw ToolResult embedded in artifacts[0].data.
+        wire = result.to_dict()
+        json.dumps(wire)
+
+    @pytest.mark.asyncio
+    async def test_workflow_step_with_raw_tool_result_in_dynamictool_wrapper(self, task_feature):
+        """End-to-end: simulate the realistic in-process path where
+        the artifact carries a raw ToolResult inside the DynamicTool
+        wrapper (no wire serialization happens for sync workflows).
+        Round 4 codex finding: classifier must handle this shape."""
+        from kestrel_sdk.tools.result import ToolResult
+        agent_card, _ = task_feature.task_manager._agents["memory_feature"]
+        task_feature.task_manager._agents["memory_feature"] = (
+            agent_card,
+            MockHandler({
+                # Raw ToolResult, NOT .to_dict() — matches what
+                # DynamicTool.execute() actually stores
+                "memory_status": lambda args: {
+                    "success": True,
+                    "result": ToolResult.failed("ObservabilityStore not available"),
+                    "tool": "memory_status",
+                },
+            }),
+        )
+
+        result = await task_feature.run_workflow(steps=[
+            {"feature": "memory_feature", "skill": "memory_status"},
+        ])
+
+        assert result.status is ToolResultStatus.ERROR
+        step = result.data["results"][0]
+        assert step["status"] == "failed"
+        assert "ObservabilityStore not available" in step["error"]
 
 
 class TestListAvailableSkills:
@@ -361,18 +685,19 @@ class TestListAvailableSkills:
         """Returns all registered features with their skills."""
         result = await task_feature.list_available_skills()
 
-        assert result["success"] is True
-        assert result["feature_count"] == 3
-        assert "model_agent" in result["features"]
-        assert "memory_feature" in result["features"]
-        assert "wallet_feature" in result["features"]
+        assert result.status is ToolResultStatus.OK
+        data = result.data
+        assert data["feature_count"] == 3
+        assert "model_agent" in data["features"]
+        assert "memory_feature" in data["features"]
+        assert "wallet_feature" in data["features"]
 
     @pytest.mark.asyncio
     async def test_lists_skills_per_feature(self, task_feature):
         """Each feature includes its skill list with descriptions."""
         result = await task_feature.list_available_skills()
 
-        model = result["features"]["model_agent"]
+        model = result.data["features"]["model_agent"]
         skill_names = [s["skill"] for s in model["skills"]]
         assert "list_models" in skill_names
         assert "get_current_model" in skill_names
@@ -387,5 +712,5 @@ class TestListAvailableSkills:
         """Without task_manager, returns error."""
         feature = TaskFeature(agent=None)
         result = await feature.list_available_skills()
-        assert result["success"] is False
-        assert "not available" in result["error"]
+        assert result.status is ToolResultStatus.ERROR
+        assert "not available" in result.error

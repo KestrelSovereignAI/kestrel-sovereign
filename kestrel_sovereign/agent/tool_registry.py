@@ -9,6 +9,8 @@ individual tools with LRU eviction.
 import logging
 from typing import Any, Dict, List
 
+from kestrel_sovereign.tools.result_contract import enforce_tool_result_contract
+
 
 class ToolRegistryMixin:
     """Mixin providing dynamic tool loading and management for KestrelAgent."""
@@ -67,6 +69,13 @@ class ToolRegistryMixin:
         """
         if feature.tool_name in self._explored_features:
             return
+        # Enforce the ToolResult return contract for migrated features
+        # (#1042 layer 4 / #1061). No-op for non-migrated modules; raises
+        # ToolResultContractError for migrated modules whose @tool
+        # methods don't annotate ``-> ToolResult``. Catching the
+        # registration failure rather than letting it propagate would
+        # silently ship an honesty-violating tool, so we let it surface.
+        enforce_tool_result_contract(feature)
         self._explored_features[feature.tool_name] = True
         registered = 0
         for tool in feature.get_tools():

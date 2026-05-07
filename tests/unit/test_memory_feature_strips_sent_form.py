@@ -27,6 +27,7 @@ rows pass through unchanged.
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 
+from kestrel_sdk.tools.result import ToolResultStatus
 from kestrel_sovereign.features.memory.feature import (
     MemoryFeature,
     _strip_sent_form_for_recall,
@@ -91,11 +92,12 @@ async def test_search_memory_returns_raw_user_text_to_llm():
 
     out = await feature.search_memory(query="Article IV", limit=10)
 
-    assert out["success"] is True
-    user_rows = [r for r in out["results"] if r["role"] == "user"]
+    assert out.status is ToolResultStatus.OK
+    results = out.data["results"]
+    user_rows = [r for r in results if r["role"] == "user"]
     assert user_rows[0]["content"] == RAW_USER
     # Assistant unchanged — guards against over-stripping.
-    assistant_rows = [r for r in out["results"] if r["role"] == "assistant"]
+    assistant_rows = [r for r in results if r["role"] == "assistant"]
     assert assistant_rows[0]["content"] == "I remember."
 
 
@@ -112,9 +114,10 @@ async def test_recall_recent_returns_raw_user_text_to_llm():
 
     out = await feature.recall_recent(limit=10)
 
-    assert out["success"] is True
-    assert out["messages"][0]["content"] == RAW_USER
-    assert out["messages"][1]["content"] == "Got it."
+    assert out.status is ToolResultStatus.OK
+    messages = out.data["messages"]
+    assert messages[0]["content"] == RAW_USER
+    assert messages[1]["content"] == "Got it."
 
 
 def test_idempotent_on_assistant_content_that_happens_to_contain_user_input_tag():
