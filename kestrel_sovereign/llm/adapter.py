@@ -29,7 +29,44 @@ from kestrel_sdk.llm import LLMAdapter as _SDKLLMAdapter
 
 from .image_utils import process_images
 
-__all__ = ["LLMAdapter", "LLMResponse", "ToolCall"]
+__all__ = ["LLMAdapter", "LLMResponse", "ToolCall", "build_messages"]
+
+
+def build_messages(
+    user_prompt: Optional[str] = None,
+    system_prompt: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Build a text-only chat-completions message list in OpenAI format.
+
+    A free function rather than a method on :class:`LLMAdapter` so the
+    framework's runtime call paths (``LLMService.generate``, the
+    streaming pipeline, council deliberation) can construct messages
+    for ANY adapter — including third-party plugins that subclass
+    ``kestrel_sdk.llm.LLMAdapter`` directly and therefore do not have
+    the framework's :meth:`LLMAdapter.create_messages` helper.
+
+    Image construction stays on the adapter
+    (:meth:`LLMAdapter.create_messages` with ``images=...``) because
+    each provider formats vision parts differently — that polymorphism
+    is real and worth keeping. The text-only path has no
+    polymorphism, so a free function is correct.
+
+    Args:
+        user_prompt: User-role text content, or ``None`` to omit the
+            user message.
+        system_prompt: System-role text content, or ``None`` to omit
+            the system message.
+
+    Returns:
+        A list of message dicts ready to pass into ``get_response``.
+        Empty if both prompts are ``None``.
+    """
+    messages: List[Dict[str, Any]] = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    if user_prompt:
+        messages.append({"role": "user", "content": user_prompt})
+    return messages
 
 
 class LLMAdapter(_SDKLLMAdapter):

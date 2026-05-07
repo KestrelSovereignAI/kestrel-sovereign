@@ -42,7 +42,7 @@ from .error_handling import (
     LLMAllProvidersFailedError
 )
 from .openai_adapter import OpenAIAdapter
-from .adapter import LLMResponse
+from .adapter import LLMResponse, build_messages
 from .model_discovery import ModelDiscoveryMixin
 from .mandate import ModelMandateMixin
 from .usage_tracking import UsageTrackingMixin
@@ -1133,7 +1133,7 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         Skipping raises ``ModelNotAvailableForRoute`` so the outer fallback
         loop can move on to the next provider.
         """
-        messages = provider["adapter"].create_messages(user_prompt=user_prompt, system_prompt=system_prompt)
+        messages = build_messages(user_prompt=user_prompt, system_prompt=system_prompt)
 
         model_to_use = provider["model"]
         if target_model:
@@ -1265,7 +1265,7 @@ No other text or formatting.
                         provider["name"], target_model,
                     )
                     continue
-                messages = provider["adapter"].create_messages(
+                messages = build_messages(
                     user_prompt=text_to_audit,
                     system_prompt=system_prompt,
                 )
@@ -1574,7 +1574,7 @@ No other text or formatting.
             ):
                 try:
                     self._ensure_remote_active()
-                    messages = self._remote_adapter.create_messages(user_prompt=user_prompt, system_prompt=system_prompt)
+                    messages = build_messages(user_prompt=user_prompt, system_prompt=system_prompt)
                     model = model_override or self._remote_config.model
                     response = await self._remote_adapter.get_response(
                         client=self._remote_client,
