@@ -5,6 +5,7 @@ import time
 from typing import Dict, Any, Optional
 
 from kestrel_sdk.hooks.base import HookEvent, HookInput, PermissionDecision
+from kestrel_sdk.llm import ToolCallStarted
 from kestrel_sovereign.llm.adapter import LLMResponse
 from kestrel_sovereign.security.input_guardrails import (
     wrap_user_input,
@@ -24,6 +25,7 @@ class StreamingMixin:
         audit_before_streaming: bool = False,
         session_id: str = None,
         caller=None,
+        request_id: Optional[str] = None,
     ):
         """
         Streaming version of process_input. Yields text chunks as generated.
@@ -40,6 +42,15 @@ class StreamingMixin:
             audit_before_streaming: Deprecated, ignored. Kept for API compat.
             session_id: Optional session ID to load conversation context from a specific session
             caller: Optional CallerContext with auth identity and role.
+            request_id: The endpoint-assigned id for this stream. Used as
+                the routing key on emitted ``revising`` events so the
+                frontend can match the event to the correct in-flight
+                pane when multiple streams are active concurrently.
+                Falls back to ``self._current_request_id`` (the legacy
+                agent-global) when omitted, but callers should prefer
+                explicit values — the global is overwritten by the next
+                ``register_active_request`` call and races between
+                overlapping streams can otherwise misroute events.
         """
         # CONSTITUTION AUDIT CHECK: Trigger periodic integrity audits
         await self._maybe_audit()
@@ -63,7 +74,8 @@ class StreamingMixin:
             async with transition_lock:
                 async with self._turn_lifecycle():
                     async for chunk in self._process_input_streaming_traced_locked(
-                        user_input, model_override, session_id, _otel_span
+                        user_input, model_override, session_id, _otel_span,
+                        request_id=request_id,
                     ):
                         yield chunk
         except Exception as exc:
@@ -74,7 +86,8 @@ class StreamingMixin:
             return
 
     async def _process_input_streaming_traced_locked(
-        self, user_input, model_override, session_id, _otel_span
+        self, user_input, model_override, session_id, _otel_span,
+        request_id: Optional[str] = None,
     ):
         """Inner streaming logic wrapped in an OTEL span.
 
@@ -229,6 +242,17 @@ class StreamingMixin:
                 # Text chunk - yield immediately for real-time streaming
                 full_response.append(item)
                 yield item
+            elif isinstance(item, ToolCallStarted):
+                # Honesty-layer signal (#1042 layer 2 / #1045): the LLM
+                # has just begun emitting a tool call. Any pre-tool prose
+                # the user is currently watching is about to be obsolete
+                # — the agent will substitute the tool's actual result.
+                # Fire a "revising" SSE event so subscribers can clear
+                # the in-flight bubble; carries the request_id for pane
+                # routing and the marker's `index` for ordering.
+                await self._emit_revising_event(
+                    item, session_id=session_id, request_id=request_id,
+                )
             elif isinstance(item, LLMResponse):
                 # Tool calls detected at end of stream
                 tool_response = item
@@ -304,6 +328,54 @@ class StreamingMixin:
             )
             await hooks_manager.execute_hooks_parallel(
                 HookEvent.STOP, hook_input
+            )
+
+    async def _emit_revising_event(
+        self,
+        marker: ToolCallStarted,
+        session_id: Optional[str] = None,
+        request_id: Optional[str] = None,
+    ) -> None:
+        """Emit a ``revising`` event when a ToolCallStarted marker arrives.
+
+        Routed through ``self.emit_event`` so the existing
+        ``/api/agent/notifications/sse`` channel forwards it to the
+        browser as ``event: revising / data: {...}``. Frontend (Wave 5C)
+        listens on that channel and clears the in-flight optimistic
+        message bubble for the matching ``request_id``.
+
+        ``request_id`` is the routing key. Callers should always pass
+        the endpoint-assigned id for the stream that produced the
+        marker — the legacy ``self._current_request_id`` fallback is
+        agent-global and is overwritten by the next concurrent stream's
+        ``register_active_request`` call, so two overlapping streams
+        could otherwise misroute events to the wrong pane.
+
+        Failures here must never break the chat stream — the user is
+        already receiving text through the parallel channel. ``emit_event``
+        itself swallows per-listener errors; this wrapper additionally
+        guards the case where the host class doesn't expose ``emit_event``
+        at all (e.g. tests mocking a bare agent).
+        """
+        emit_event = getattr(self, "emit_event", None)
+        if not callable(emit_event):
+            return
+        effective_request_id = request_id
+        if effective_request_id is None:
+            effective_request_id = getattr(self, "_current_request_id", None)
+        try:
+            await emit_event("revising", {
+                "type": "revising",
+                "request_id": effective_request_id,
+                "session_id": session_id,
+                "index": marker.index,
+                "tool_call_id": marker.id,
+                "tool_name": marker.name,
+            })
+        except Exception:
+            logging.warning(
+                "Failed to emit revising event for index=%s",
+                getattr(marker, "index", None), exc_info=True,
             )
 
     async def _persist_assistant_turn_safely(
