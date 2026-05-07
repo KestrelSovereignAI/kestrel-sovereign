@@ -132,7 +132,6 @@ Audited snapshot: **42** discoverable modules · **42** exported `Feature` subcl
 | `peers` | `PeersFeature` |
 | `reflection` | `ReflectionFeature` |
 | `response_audit` | `ResponseAuditFeature` |
-| `runpod` | `RunPodFeature` |
 | `save` | `SaveFeature` |
 | `scheduler` | `SchedulerFeature` |
 | `security` | `SecurityFeature` |
