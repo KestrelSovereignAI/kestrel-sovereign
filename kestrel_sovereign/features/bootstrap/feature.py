@@ -630,13 +630,42 @@ class BootstrapFeature(Feature):
             return ToolResult.failed(str(e))
 
         if state == BootstrapState.COMPLETE:
-            # Honesty: this is a no-op, not a failure or a fresh skip.
+            # Honesty: this is a no-op for the bootstrap state — but a
+            # previous skip may have marked COMPLETE while
+            # save_soul_md() failed (no agent_data_path, write error).
+            # The user-visible "already complete" framing implies a
+            # working SOUL.md; we must surface the missing file so the
+            # operator knows the durable artifact isn't there.
+            # (Round 4 codex finding.)
+            soul_exists, soul_check_path = self._verify_soul_md_exists()
+            state_str = state.value if hasattr(state, "value") else str(state)
+            if not soul_exists:
+                return ToolResult.partial(
+                    confirmation=(
+                        "Bootstrap state is already COMPLETE; nothing to skip "
+                        "(use !restart-discovery to start over)"
+                    ),
+                    error=(
+                        f"SOUL.md is missing on disk "
+                        f"(checked: {soul_check_path or 'no agent_data_path configured'}); "
+                        "a previous skip likely failed to write it. "
+                        "The agent has no persisted personality."
+                    ),
+                    data={
+                        "state": state_str,
+                        "soul_exists": False,
+                        "soul_check_path": soul_check_path,
+                    },
+                )
             return ToolResult.ok(
                 confirmation=(
                     "Discovery already complete; nothing to skip "
                     "(use !restart-discovery to start over)"
                 ),
-                data={"state": state.value if hasattr(state, "value") else str(state)},
+                data={
+                    "state": state_str,
+                    "soul_exists": True,
+                },
             )
 
         try:

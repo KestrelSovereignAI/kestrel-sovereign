@@ -777,23 +777,50 @@ class TestBootstrapFeatureTools:
         assert result.data["soul_exists"] is True
 
     @pytest.mark.asyncio
-    async def test_skip_discovery_no_op_when_already_complete(self, mock_agent):
-        """When state is already COMPLETE, skip is a no-op (OK with the
-        no-op confirmation, not a failed action)."""
+    async def test_skip_discovery_no_op_when_already_complete_with_soul(self, mock_agent, tmp_agent_dir):
+        """When state is COMPLETE and SOUL.md exists on disk, skip is a
+        clean no-op."""
         from kestrel_sdk.tools.result import ToolResultStatus
         from kestrel_sovereign.features.bootstrap.feature import BootstrapFeature
         from kestrel_sovereign.bootstrap import BootstrapState
 
+        mock_agent.bootstrap_service.agent_data_path = str(tmp_agent_dir)
         mock_agent.bootstrap_service.get_bootstrap_state = AsyncMock(
             return_value=BootstrapState.COMPLETE
         )
+        (tmp_agent_dir / "SOUL.md").write_text("# Persisted personality")
 
         feature = BootstrapFeature(mock_agent)
         result = await feature.skip_discovery()
 
         assert result.status is ToolResultStatus.OK
         assert "already complete" in result.confirmation.lower()
-        assert "nothing to skip" in result.confirmation.lower()
+        assert result.data["soul_exists"] is True
+
+    @pytest.mark.asyncio
+    async def test_skip_discovery_already_complete_but_soul_missing_is_partial(
+        self, mock_agent, tmp_agent_dir,
+    ):
+        """Round 4 finding: when state is COMPLETE but SOUL.md is
+        missing (a prior skip silently failed to write it), the
+        no-op path must surface the missing file rather than hide
+        it behind 'already complete'."""
+        from kestrel_sdk.tools.result import ToolResultStatus
+        from kestrel_sovereign.features.bootstrap.feature import BootstrapFeature
+        from kestrel_sovereign.bootstrap import BootstrapState
+
+        mock_agent.bootstrap_service.agent_data_path = str(tmp_agent_dir)
+        mock_agent.bootstrap_service.get_bootstrap_state = AsyncMock(
+            return_value=BootstrapState.COMPLETE
+        )
+        # No SOUL.md on disk
+
+        feature = BootstrapFeature(mock_agent)
+        result = await feature.skip_discovery()
+
+        assert result.status is ToolResultStatus.PARTIAL
+        assert "missing" in result.error.lower()
+        assert result.data["soul_exists"] is False
 
     @pytest.mark.asyncio
     async def test_existing_tools_still_work(self, mock_agent):
