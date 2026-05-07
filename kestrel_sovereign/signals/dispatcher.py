@@ -588,8 +588,10 @@ class SignalDispatcher:
         action_result: Any = None,
         cognition_result: Any = None,
     ) -> SignalResult:
-        # COGNITION's "result" is whatever process_input returned. Stash it
-        # in the artifact slot for now — Phase 2/3 may grow turn_id capture.
+        # SignalResult has separate fields for side-effect action results and
+        # generated artifacts. A cognition dispatch produces user-visible turn
+        # output, so we return it through artifact: callers already consume that
+        # field as the generic signal output payload for non-ACTION modes.
         result = SignalResult(
             signal_id=signal.id,
             status=Status.OK,

@@ -81,6 +81,7 @@ yarn-error.log
 
 # Local config (like .env — user-specific, not committed)
 multi_agent.toml
+config/
 
 # Data and caches
 agent_data/
@@ -188,4 +189,3 @@ tests/e2e/simpletuner/playwright.config.cjs
 /_*.md
 /_*.json
 /_*.js
-

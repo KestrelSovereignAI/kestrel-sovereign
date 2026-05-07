@@ -52,7 +52,6 @@ from ..protocol import (
     DownloadError,
 )
 from kestrel_sovereign.kestrel_config.constants import (
-    HTTP_TIMEOUT_MEDIUM,
     HTTP_TIMEOUT_DOWNLOAD,
 )
 from kestrel_sovereign.kestrel_config.defaults import get_lighthouse_gateway_url
@@ -176,10 +175,11 @@ class ReplicateTrainingAdapter:
         try:
             import replicate
 
-            # Step 1: Create training zip and upload
+            # Step 1: Create training zip. The Replicate Python client accepts
+            # local file objects as inputs and uploads them through Replicate's
+            # own file path, avoiding ad hoc public temporary hosting.
             job.state = TrainingState.PREPARING
-            zip_url = await self._upload_training_zip(avatar_data)
-            logger.info(f"Uploaded training zip for {job.companion_id}")
+            zip_data = self._build_training_zip(avatar_data)
 
             # Step 2: Create model destination
             model_name = f"lora-{job.companion_id[:8]}"
@@ -187,21 +187,25 @@ class ReplicateTrainingAdapter:
 
             # Step 3: Start Replicate training
             job.state = TrainingState.PROVISIONING
-            training = replicate.trainings.create(
-                destination=destination,
-                version=self.TRAINER_VERSION,
-                input={
-                    "input_images": zip_url,
-                    "trigger_word": trigger_word,
-                    "steps": job.config.steps,
-                    "lora_rank": job.config.lora_rank,
-                    "optimizer": "adamw8bit",
-                    "batch_size": job.config.batch_size,
-                    "resolution": job.config.resolution,
-                    "autocaption": True,
-                    "autocaption_prefix": f"a photo of {trigger_word}, "
-                }
-            )
+            with tempfile.NamedTemporaryFile(suffix=".zip") as training_zip:
+                training_zip.write(zip_data)
+                training_zip.flush()
+                training_zip.seek(0)
+                training = replicate.trainings.create(
+                    destination=destination,
+                    version=self.TRAINER_VERSION,
+                    input={
+                        "input_images": training_zip,
+                        "trigger_word": trigger_word,
+                        "steps": job.config.steps,
+                        "lora_rank": job.config.lora_rank,
+                        "optimizer": "adamw8bit",
+                        "batch_size": job.config.batch_size,
+                        "resolution": job.config.resolution,
+                        "autocaption": True,
+                        "autocaption_prefix": f"a photo of {trigger_word}, "
+                    }
+                )
 
             self._training_data[job.job_id]["replicate_training_id"] = training.id
             job.provider_job_id = training.id
@@ -243,26 +247,15 @@ class ReplicateTrainingAdapter:
             job.error_message = str(e)
             job.completed_at = datetime.now(timezone.utc)
 
-    async def _upload_training_zip(self, avatar_data: bytes) -> str:
-        """Create and upload training zip to temporary storage."""
+    def _build_training_zip(self, avatar_data: bytes) -> bytes:
+        """Create the Replicate training zip in memory."""
         # Create in-memory zip
         zip_buffer = io.BytesIO()
         with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
             zf.writestr("avatar_01.jpg", avatar_data)
 
         zip_buffer.seek(0)
-        zip_data = zip_buffer.read()
-
-        # Upload to file.io for temporary hosting
-        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_MEDIUM) as client:
-            files = {"file": ("training_images.zip", zip_data, "application/zip")}
-            response = await client.post("https://file.io", files=files)
-
-            if response.status_code == 200:
-                result = response.json()
-                return result.get("link")
-            else:
-                raise RuntimeError(f"Failed to upload training zip: {response.text}")
+        return zip_buffer.read()
 
     async def get_status(self, job_id: str) -> TrainingStatus:
         """Get job status."""

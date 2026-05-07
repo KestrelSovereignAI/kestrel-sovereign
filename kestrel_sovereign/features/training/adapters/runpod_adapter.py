@@ -468,10 +468,8 @@ class RunPodTrainingAdapter:
             is_persistent = resolved_pod_id is not None
 
             if is_persistent:
-                # TODO: Re-enable auto-pause once training is stable
-                # For now, keep pod running for debugging
-                logger.info(f"Keeping persistent pod {session.pod_id} running (auto-pause disabled for debugging)")
-                # await manager.stop_session()
+                logger.info(f"Pausing persistent pod {session.pod_id} after training cleanup")
+                await manager.stop_session()
             else:
                 # Terminate on-demand pod
                 logger.info(f"Terminating on-demand pod {session.pod_id}")
