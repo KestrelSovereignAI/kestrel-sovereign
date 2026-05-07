@@ -50,6 +50,8 @@ try:
 except ImportError:
     ollama = None
 
+from kestrel_sdk.llm import ProviderInfo
+
 from .adapter import LLMAdapter
 from .ollama_adapter import OllamaAdapter
 from .openai_adapter import OpenAIAdapter
@@ -77,26 +79,6 @@ _ADAPTER_REGISTRY: Dict[str, type] = {
     "GoogleAdapter": GoogleAdapter,
     "VertexAIAdapter": VertexAIAdapter,
 }
-
-
-@dataclass
-class ProviderInfo:
-    """Information about one initialized route for a vendor.
-
-    A ProviderInfo represents a (vendor, route) pair. ``name`` is the composite
-    key ``"<vendor>:<route>"`` used for routing lookups. Discovery groups by
-    ``vendor``.
-    """
-    name: str                # "anthropic:plan", "openai:api", ...
-    vendor: str              # "anthropic"
-    route: str               # "plan"
-    client: Any
-    adapter: Any
-    model: str               # default model for this route ("auto" resolves via discovery)
-    is_cloud: bool = True
-    is_local: bool = False
-    base_url: Optional[str] = None
-    selection_hints: List[str] = field(default_factory=list)
 
 
 class ProviderInitializationError(Exception):

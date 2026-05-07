@@ -264,9 +264,13 @@ class GoogleAdapter(LLMAdapter):
             **kwargs
         )
 
-    async def list_models(self) -> List[ModelInfo]:
-        """
-        List available models from Google Gemini API.
+    async def list_models(self, client: Any = None) -> List[ModelInfo]:
+        """List available models from Google Gemini API.
+
+        ``client`` is accepted for contract symmetry with
+        :meth:`get_response` (SDK 0.5.0). The Google generative-ai SDK
+        is module-scoped (``genai.configure`` + ``genai.list_models``)
+        rather than client-scoped, so the parameter is ignored here.
 
         Uses the google-generativeai SDK's genai.list_models().
 

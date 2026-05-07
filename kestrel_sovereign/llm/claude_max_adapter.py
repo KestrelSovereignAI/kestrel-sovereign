@@ -36,8 +36,13 @@ class ClaudeMaxAdapter(AnthropicAdapter):
     and structured output are inherited from AnthropicAdapter.
     """
 
-    async def list_models(self):
-        """Claude plan uses Anthropic discovery; this execution wrapper has no catalog."""
+    async def list_models(self, client=None):
+        """Claude plan uses Anthropic discovery; this execution wrapper has no catalog.
+
+        ``client`` is accepted for contract symmetry with the SDK 0.5.0
+        :meth:`LLMAdapter.list_models` signature; not used because this
+        wrapper deliberately raises rather than producing a catalog.
+        """
         raise NotImplementedError(
             "Claude plan model discovery is provided by the canonical anthropic provider."
         )

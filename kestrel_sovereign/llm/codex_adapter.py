@@ -1031,8 +1031,13 @@ class CodexAdapter(LLMAdapter):
             f"Tool calls: {len(func_calls)}"
         )
 
-    async def list_models(self) -> List[ModelInfo]:
-        """OpenAI plan uses canonical OpenAI discovery; this wrapper has no catalog."""
+    async def list_models(self, client: Any = None) -> List[ModelInfo]:
+        """OpenAI plan uses canonical OpenAI discovery; this wrapper has no catalog.
+
+        ``client`` is accepted for contract symmetry with the SDK 0.5.0
+        :meth:`LLMAdapter.list_models` signature; not used because this
+        wrapper deliberately raises rather than producing a catalog.
+        """
         raise NotImplementedError(
             "OpenAI plan model discovery is provided by the canonical openai provider."
         )

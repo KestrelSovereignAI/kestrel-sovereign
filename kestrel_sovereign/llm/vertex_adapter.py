@@ -547,9 +547,13 @@ class VertexAIAdapter(LLMAdapter):
             **kwargs
         )
 
-    async def list_models(self) -> List[ModelInfo]:
-        """
-        List available models from Vertex AI.
+    async def list_models(self, client: Any = None) -> List[ModelInfo]:
+        """List available models from Vertex AI.
+
+        ``client`` is accepted for contract symmetry with
+        :meth:`get_response` (SDK 0.5.0). Vertex discovery uses the
+        adapter's own ``_get_client()`` (project_id + location bound at
+        construction time), so the parameter is ignored here.
 
         Uses the google-genai SDK's models.list() API.
 
