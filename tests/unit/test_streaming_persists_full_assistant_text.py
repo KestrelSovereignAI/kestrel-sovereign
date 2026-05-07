@@ -66,7 +66,7 @@ async def test_streaming_persists_pre_tool_plus_post_tool_text():
     mock_agent._get_governing_constitution = AsyncMock(return_value="")
     mock_agent.check_solvency = AsyncMock(return_value="test-model")
     mock_agent._build_all_tools = MagicMock(return_value=[])
-    mock_agent._fire_post_response_hook = AsyncMock(side_effect=lambda text, sid: text)
+    mock_agent._fire_post_response_hook = AsyncMock(side_effect=lambda text, sid, **_: text)
     mock_agent.user_prompt_template = MagicMock()
     mock_agent.user_prompt_template.format.return_value = "rendered prompt"
 
@@ -184,7 +184,7 @@ async def test_streaming_no_tool_calls_persists_full_response_unchanged():
     mock_agent._get_governing_constitution = AsyncMock(return_value="")
     mock_agent.check_solvency = AsyncMock(return_value="test-model")
     mock_agent._build_all_tools = MagicMock(return_value=[])
-    mock_agent._fire_post_response_hook = AsyncMock(side_effect=lambda text, sid: text)
+    mock_agent._fire_post_response_hook = AsyncMock(side_effect=lambda text, sid, **_: text)
     mock_agent.user_prompt_template = MagicMock()
     mock_agent.user_prompt_template.format.return_value = "rendered"
 

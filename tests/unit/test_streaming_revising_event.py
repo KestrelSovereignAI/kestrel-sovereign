@@ -52,7 +52,7 @@ def _build_mock_agent():
     agent._get_governing_constitution = AsyncMock(return_value="")
     agent.check_solvency = AsyncMock(return_value="test-model")
     agent._build_all_tools = MagicMock(return_value=[])
-    agent._fire_post_response_hook = AsyncMock(side_effect=lambda text, sid: text)
+    agent._fire_post_response_hook = AsyncMock(side_effect=lambda text, sid, **_: text)
     agent.user_prompt_template = MagicMock()
     agent.user_prompt_template.format.return_value = "rendered"
     agent._current_request_id = "req-abc"

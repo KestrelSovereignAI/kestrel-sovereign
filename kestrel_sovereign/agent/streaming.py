@@ -229,6 +229,13 @@ class StreamingMixin:
         # Accumulate text and watch for tool response at end
         full_response = []
         tool_response = None
+        # Snapshot of streamed text at the moment the FIRST
+        # ToolCallStarted marker arrives — this is the boundary between
+        # "what the agent said it was about to do" and "what the agent
+        # actually saw the tool return" for the narration check
+        # (#1042 layer 3). ``None`` when no marker fired this turn;
+        # empty string when the marker fired before any text arrived.
+        pre_tool_prose_snapshot: Optional[str] = None
 
         async for item in self.llm_service.stream_with_tool_detection(
             messages=messages,
@@ -253,6 +260,14 @@ class StreamingMixin:
                 await self._emit_revising_event(
                     item, session_id=session_id, request_id=request_id,
                 )
+                # Snapshot pre-tool prose at the FIRST marker only —
+                # subsequent markers arrive between tool calls of the
+                # same LLM turn and don't introduce new pre-tool text
+                # the user hadn't already seen. The narration check
+                # downstream wants the user-visible prose that
+                # PRECEDED any tool call, not the inter-tool prose.
+                if pre_tool_prose_snapshot is None:
+                    pre_tool_prose_snapshot = "".join(full_response)
             elif isinstance(item, LLMResponse):
                 # Tool calls detected at end of stream
                 tool_response = item
@@ -279,9 +294,15 @@ class StreamingMixin:
                     metadata={"arguments": tc.arguments}
                 )
 
-            # Stream tokens as they arrive from LLM after tool execution
+            # Stream tokens as they arrive from LLM after tool execution.
+            # ``tool_results`` accumulates each call's serialized return
+            # envelope as ``{tool_call_id, name, result}``. The orchestrator
+            # writes into it from ``_dispatch_tool_call`` so the post-
+            # response hook can run the narration check (#1042 layer 3)
+            # over the same envelopes the LLM saw.
             tool_response_chunks = []
             tool_events = []
+            tool_results: list = []
             async for chunk in self._handle_orchestrator_response_streaming(
                 response=tool_response,
                 feature_tools=feature_tools,
@@ -290,6 +311,7 @@ class StreamingMixin:
                 effective_model=effective_model,
                 user_message=user_input,
                 tool_events=tool_events,
+                tool_results=tool_results,
                 session_id=session_id,
             ):
                 tool_response_chunks.append(chunk)
@@ -306,15 +328,46 @@ class StreamingMixin:
             pre_tool_text = "".join(full_response)
             post_tool_text = "".join(tool_response_chunks)
             tool_final_text = pre_tool_text + post_tool_text
-            tool_final_text = await self._fire_post_response_hook(tool_final_text, session_id)
+            # Narration check (#1042 layer 3): the hook receives the
+            # pre-tool prose snapshot taken at the first ToolCallStarted
+            # marker boundary, plus the tool calls + result envelopes.
+            # If the marker never fired (model emitted tool_use without
+            # streaming markers), fall back to the pre-tool half of
+            # full_response — that's still the text the user saw before
+            # the tool ran.
+            pre_tool_for_audit = (
+                pre_tool_prose_snapshot
+                if pre_tool_prose_snapshot is not None
+                else pre_tool_text
+            )
+            tool_calls_payload = [
+                {
+                    "id": tc.id,
+                    "name": tc.name,
+                    "arguments": tc.arguments,
+                }
+                for tc in tool_response.tool_calls
+            ]
+            tool_final_text = await self._fire_post_response_hook(
+                tool_final_text, session_id,
+                pre_tool_prose=pre_tool_for_audit,
+                tool_calls=tool_calls_payload,
+                tool_results=tool_results,
+            )
             meta = {'tool_events': tool_events} if tool_events else None
             await self._persist_assistant_turn_safely(
                 tool_final_text, metadata=meta, session_id=session_id
             )
         else:
-            # No tool calls - text was already streamed above
+            # No tool calls - text was already streamed above. Pre-tool
+            # prose / tool_calls / tool_results all stay None: a hook
+            # writing the narration check should treat ``tool_results
+            # is None`` as "this turn didn't call any tools, no
+            # narration to verify".
             final_text = "".join(full_response)
-            final_text = await self._fire_post_response_hook(final_text, session_id)
+            final_text = await self._fire_post_response_hook(
+                final_text, session_id,
+            )
             await self._persist_assistant_turn_safely(
                 final_text, metadata=None, session_id=session_id
             )
@@ -436,12 +489,38 @@ class StreamingMixin:
                 # defense.
                 pass
 
-    async def _fire_post_response_hook(self, response_text: str, session_id: str = None) -> str:
+    async def _fire_post_response_hook(
+        self,
+        response_text: str,
+        session_id: str = None,
+        *,
+        pre_tool_prose: Optional[str] = None,
+        tool_calls: Optional[list] = None,
+        tool_results: Optional[list] = None,
+    ) -> str:
         """Fire POST_RESPONSE hooks on completed response text.
 
         In streaming mode the text has already been sent to the client, so
         DENY prevents storage (and logs the issue) while MODIFY can annotate
         what gets stored.
+
+        Args:
+            response_text: Final assembled assistant text (post-tool
+                synthesis when tools fired; otherwise the only text).
+            session_id: Active session id.
+            pre_tool_prose: Text the agent streamed before the first
+                ``ToolCallStarted`` marker arrived. ResponseAuditHook
+                narration check (#1042 layer 3) compares this against
+                the actual ``tool_results`` to catch confident-lie
+                patterns ("Saved!" before the tool returned). ``None``
+                or empty string means no pre-tool prose was streamed.
+            tool_calls: Tool calls issued in this turn, as JSON-shaped
+                dicts ``{id, name, arguments}``.
+            tool_results: Tool result envelopes observed in this turn,
+                as ``{tool_call_id, name, result}`` dicts. ``result``
+                is whatever ``_serialize_tool_result`` produced —
+                usually a ``ToolResult.to_dict()`` envelope (#1042
+                layer 4) or a legacy ``{success, ...}`` dict.
 
         Returns:
             Possibly modified response_text.
@@ -454,10 +533,13 @@ class StreamingMixin:
             session_id=session_id or "",
             hook_event_name=HookEvent.POST_RESPONSE.value,
             response_text=response_text,
+            pre_tool_prose=pre_tool_prose,
+            tool_calls=tool_calls,
+            tool_results=tool_results,
         )
         hook_output = await hooks_manager.execute_hooks(HookEvent.POST_RESPONSE, hook_input)
         if hook_output.permission_decision == PermissionDecision.DENY:
-            logger.warning(f"POST_RESPONSE hook denied (streaming): {hook_output.permission_reason}")
+            logging.warning(f"POST_RESPONSE hook denied (streaming): {hook_output.permission_reason}")
             return f"[Response blocked by audit: {hook_output.permission_reason}]"
         elif hook_output.updated_input and "response_text" in hook_output.updated_input:
             return hook_output.updated_input["response_text"]
