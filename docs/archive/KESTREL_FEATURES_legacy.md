@@ -3,7 +3,7 @@
 > Historical snapshot of the pre-canonical feature catalog.
 >
 > This file is preserved for historical context only. It is not the maintained source of truth.
-> The maintained canonical inventory is [`/Volumes/data2/projects/kestrel-sovereign/KESTREL_FEATURES.md`](/Volumes/data2/projects/kestrel-sovereign/KESTREL_FEATURES.md).
+> The maintained canonical inventory is [`KESTREL_FEATURES.md`](../../KESTREL_FEATURES.md).
 
 ## Why This File Exists
 
@@ -19,7 +19,7 @@
 
 ## Superseded By
 
-- Canonical inventory: [`/Volumes/data2/projects/kestrel-sovereign/KESTREL_FEATURES.md`](/Volumes/data2/projects/kestrel-sovereign/KESTREL_FEATURES.md)
-- Audit working papers: [`/Volumes/data2/projects/kestrel-sovereign/docs/audit/README.md`](/Volumes/data2/projects/kestrel-sovereign/docs/audit/README.md)
+- Canonical inventory: [`KESTREL_FEATURES.md`](../../KESTREL_FEATURES.md)
+- Audit working papers: [`docs/audit/README.md`](../audit/README.md)
 
 Use the canonical inventory for any current engineering, product, or audience-generation work.

@@ -65,12 +65,12 @@ Usage
 
     # Dry run — shows what WOULD be deleted, deletes nothing
     uv run python scripts/quantum_destroy_legacy_key.py \\
-        --agent-data-dir /Volumes/data2/projects/kestrel-sovereign/agent_data/Emma
+        --agent-data-dir agent_data/Emma
 
     # Real deletion — both gates required:
     export KESTREL_DESTROY_CONFIRM='I-have-verified-the-rollback-window'
     uv run python scripts/quantum_destroy_legacy_key.py \\
-        --agent-data-dir /Volumes/data2/projects/kestrel-sovereign/agent_data/Emma \\
+        --agent-data-dir agent_data/Emma \\
         --confirm
 """
 

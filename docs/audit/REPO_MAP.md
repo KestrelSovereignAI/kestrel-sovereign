@@ -4,7 +4,7 @@ Auto-generated file-tree + per-file purpose index. Always-loaded context for the
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
 **Generated:** 2026-05-07
-**Scope:** 1629 tracked files (969 `.py`, 249 `.md`, 411 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Scope:** 1617 tracked files (964 `.py`, 247 `.md`, 406 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -22,8 +22,8 @@ Repo entry points and standard project files.
 - **.gcloudignore** — —
 - **.gitignore** — —
 - **.windsurfrules** — —
-- **AGENTS.md** — Kestrel Sovereign — Agent Instructions — > **🐢 See [/Volumes/data2/projects/AGENTS.md](../AGENTS.md) for the Tortoise Philosophy and global coding standards.**
-- **CLAUDE.md** — Kestrel Sovereign — Agent Instructions — > **🐢 See [/Volumes/data2/projects/AGENTS.md](../AGENTS.md) for the Tortoise Philosophy and global coding standards.**
+- **AGENTS.md** — Kestrel Sovereign — Agent Instructions — > **🐢 See [docs/TORTOISE_DOCTRINE.md](docs/TORTOISE_DOCTRINE.md) for the Tortoise Philosophy and coding standards.**
+- **CLAUDE.md** — Claude Code Instructions — This file is a pointer for Claude Code.
 - **CODE_OF_CONDUCT.md** — Contributor Covenant Code of Conduct — ## Our Pledge
 - **CONTRIBUTING.md** — Contributing to Kestrel — Thank you for your interest in contributing.
 - **Dockerfile** — —
@@ -55,8 +55,6 @@ Repo entry points and standard project files.
   - `def get_database_url()`; `def get_redis_url()`; `class ServiceChecker`; `class SmartTestRunner`; `def main()`
 - **server.py** — A FastAPI server to expose Kestrel agent functionality as a service.
   - `def resolve_multi_agent_path(env)`; `def get_api_key()`; `async def verify_api_key(request, api_key_header, token)`; `async def lifespan(app)`; `class MultiAgentAgentRoutingMiddleware`; `async def github_proxy(path, request)`; `async def logging_context_middleware(request, call_next)`; `async def request_metrics_middleware(request, call_next)`; `…`
-- **start_kestrel.sh** — DEPRECATED: Use 'kestrel start' instead.
-- **stop_kestrel.sh** — DEPRECATED: Use 'kestrel stop' instead.
 - **test_llm_providers.py** — Test LLM providers: OpenAI, Anthropic, and Vertex AI (Gemini).
   - `async def test_providers()`
 - **test_rcs_integration.py** — RCS (RemoteCares + Kestrel) Integration Test Suite — Healthcare Validation CV-005 Simulates exactly what RemoteCares staging sends to Kestrel via the Rasa shim.
@@ -556,8 +554,7 @@ Repo entry points and standard project files.
   - `def run_health_check()`
 - **kestrel_sovereign/heartbeat.py** — Heartbeat system for Kestrel Sovereign.
   - `class HeartbeatConfig`; `class HeartbeatResult`; `class HeartbeatRunner`
-- **kestrel_sovereign/hooks/__init__.py** — Kestrel Hooks System - Event-driven middleware for tool and agent calls.
-- **kestrel_sovereign/hooks/base.py** — Kestrel Hooks - Core Types (Claude Code Aligned).
+- **kestrel_sovereign/hooks/__init__.py** — Kestrel Hooks — HooksManager (framework implementation).
 - **kestrel_sovereign/hooks/manager.py** — Kestrel Hooks Manager - Central registration and execution.
   - `class HooksManager`
 - **kestrel_sovereign/identity/__init__.py** — Kestrel Identity Module: Substrate-Independent Agent Portability.
@@ -597,8 +594,6 @@ Repo entry points and standard project files.
   - `class AgentCredentials`; `def generate_secp256k1_keypair()`; `def public_key_to_hex(public_key)`; `def public_key_to_ethereum_address(public_key)`; `def apply_checksum(address)`; `def create_did_document(public_key_hex, ethereum_address)`; `def save_kestrel_identity(did_document, keys, key_id, output_dir)`; `def load_kestrel_identity(key_id, storage_dir)`; `…`
 - **kestrel_sovereign/kestrel_agent.py** — —
   - `class PrivacyTransitionResult`; `class KestrelAgent`
-- **kestrel_sovereign/kestrel_agent_tools.py** — Extension to KestrelAgent to add tool capabilities Includes web search and feedback/diagnostic tools
-  - `class AgentToolMixin`
 - **kestrel_sovereign/kestrel_config/__init__.py** — Kestrel Configuration Module.
 - **kestrel_sovereign/kestrel_config/constants.py** — Kestrel Configuration Constants.
 - **kestrel_sovereign/kestrel_config/defaults.py** — Default configuration values for Kestrel.
@@ -674,8 +669,6 @@ Repo entry points and standard project files.
   - `class VertexAIConfig`; `class VertexAIAdapter`; `def create_vertex_adapter(project_id, location, credentials_file)`
 - **kestrel_sovereign/logging_config.py** — Structured JSON logging with configurable formatters.
   - `def get_correlation_id()`; `class JSONFormatter`; `def setup_logging(fmt, level)`
-- **kestrel_sovereign/metrics.py** — Kestrel Prometheus Metrics — optional metric definitions for enterprise monitoring.
-  - `def generate_metrics()`; `def get_content_type()`
 - **kestrel_sovereign/multi_agent/__init__.py** — Kestrel MultiAgent - registry of agents managed by a single Kestrel Host.
 - **kestrel_sovereign/multi_agent/agent_manager.py** — In-process multi-agent manager for Kestrel.
   - `class AgentManager`
@@ -707,7 +700,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/security/hybrid_kem.py** — Hybrid KEM combiner — Wave 4 sub-PR 2 of Quantum Hardening (#921, #919).
   - `class HybridKEMKeypair`; `def generate_hybrid_kem_keypair()`; `class HybridKEMCiphertext`; `def encapsulate_hybrid(classical_public_key, pq_public_key)`; `def decapsulate_hybrid(ciphertext, classical_keypair, pq_keypair)`
 - **kestrel_sovereign/security/input_guardrails.py** — Prompt injection detection and input sanitization for Kestrel Agent.
-  - `def wrap_user_input(user_message)`; `def check_prompt_injection(user_message)`; `def validate_tool_arguments(tool_name, arguments, known_tools)`
+  - `def wrap_user_input(user_message)`; `def check_prompt_injection(user_message)`; `def validate_tool_arguments(tool_name, arguments, known_tools)`; `def append_security_addendum(base_system_prompt)`
 - **kestrel_sovereign/security/kem_suite.py** — KEMSuite — pluggable Key Encapsulation Mechanism suites for Kestrel.
   - `class KEMSuiteError`; `class KEMKeypair`; `class KEMSuite`; `def register_kem_suite(suite)`; `def get_kem_suite(alg_id)`; `def list_registered_kems()`; `class X25519Suite`; `class MLKEM768Suite`
 - **kestrel_sovereign/security/key_rotation.py** — Key Rotation Service
@@ -940,8 +933,6 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/themes/falconry/en.toml** — (configuration)
 - **kestrel_sovereign/themes/legacy/en.toml** — (configuration)
 - **kestrel_sovereign/themes/plain/en.toml** — (configuration)
-- **kestrel_sovereign/tools/__init__.py** — Kestrel Agent Tools
-- **kestrel_sovereign/tools/base.py** — Base classes and interfaces for Kestrel agent tools.
 - **kestrel_sovereign/ui/__init__.py** — —
 - **kestrel_sovereign/ui/theme_loader.py** — Theme/locale label resolver for the UI theme + i18n system (epic #986).
   - `class ThemeNotFoundError`; `class ThemeBundle`; `def load_theme(theme, locale)`; `def list_available_themes()`; `def clear_cache()`
@@ -1063,7 +1054,7 @@ Repo entry points and standard project files.
 - **scripts/ipfs/build.sh** — Build and push Kestrel IPFS (Kubo + GCS datastore) image to GCR
 - **scripts/ipfs/deploy.sh** — Deploy Kestrel IPFS node to GCE
 - **scripts/ipfs/pin_agents.sh** — Pin all agent database snapshots to the IPFS node
-- **scripts/launchd/com.kestrel.workload-manager.plist** — —
+- **scripts/launchd/com.kestrel.workload-manager.plist.example** — —
 - **scripts/make_ecosystem_grid.py** — Create a comparison grid of the full Kestrel ecosystem branding suite.
   - `def load_fonts()`; `def draw_image_cell(canvas, draw, img_path, x, …)`; `def main()`
 - **scripts/make_grid.py** — Create a grid of all logo concepts for easy comparison.
@@ -1113,9 +1104,9 @@ Repo entry points and standard project files.
   - `async def main()`
 - **scripts/sync_session_to_agent.py** — Sync a Claude Code session transcript into a kestrel agent's memory.
   - `def extract_messages(jsonl_path)`; `def content_hash(text)`; `def sync_to_agent(messages, db_path, agent_id)`; `def main()`
+- **scripts/talon_daemon.example.toml** — (configuration)
 - **scripts/talon_daemon.py** — Talon Daemon - Continuous GitHub Issue Processing.
   - `class RepoConfig`; `class DaemonConfig`; `class DaemonStats`; `def load_config(path, overrides)`; `def get_gh_token(gh_user)`; `def list_claimable_issues(repo, label, gh_token)`; `def build_talon_command(repo_config, issue_number, daemon_config)`; `async def process_issue(repo_config, issue, daemon_config, gh_token)`; `…`
-- **scripts/talon_daemon.toml** — (configuration)
 - **scripts/test_backup_restore.sh** — —
 - **scripts/test_runpod_e2e_companion.py** — E2E Test: RunPod LoRA Training Workflow
   - `class E2ETestRunner`; `def main()`
@@ -1256,9 +1247,9 @@ Repo entry points and standard project files.
 - **docs/architecture/subagent_isolation_audit.md** — Subagent Isolation Audit — **Issue:** [#569 - Subagent isolation audit -- explicit opt-in for shared state in feature dispatch](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/569) **Phase:** 1 (Audit Only -- No…
 - **docs/architecture/testing/LLM_ROUTER_TESTING_PLAN.md** — LLM Router Enhancement - Comprehensive Testing Plan — ## Testing Philosophy - **REAL TESTS ONLY - NO MOCKS** - Tests use real Ollama (localhost:11434), real OpenAI API, real filesystem - Tests create and verify real data - Tests measure real performance…
 - **docs/architecture/testing/TESTING_GUIDE.md** — Kestrel Test Strategy Guide — A comprehensive guide to running and writing tests for Kestrel Sovereign.
-- **docs/architecture/tools/AGENT_TOOLS.md** — Agent Tools Documentation — ## Overview
-- **docs/architecture/tools/AGENT_TOOLS_ARCHITECTURE.md** — Agent Tools Architecture - Design Document — **Status:** IMPLEMENTED (Phases 1-4) **Priority:** HIGH - Core agent capability **Last Updated:** November 22, 2025
-- **docs/architecture/tools/AGENT_TOOLS_IMPLEMENTATION.md** — Agent Tools Implementation Summary — **Date:** November 7, 2025 **Status:** ✅ Complete and Ready for Testing/Deployment
+- **docs/architecture/tools/AGENT_TOOLS.md** — Agent Tools Documentation — > **⚠ DEPRECATED — describes a removed architecture.** This doc covers the `AgentToolMixin` / `kestrel_agent_tools.py` / top-level `tools/` directory pattern, all of which have been removed.
+- **docs/architecture/tools/AGENT_TOOLS_ARCHITECTURE.md** — Agent Tools Architecture - Design Document — > **⚠ DEPRECATED — describes a removed architecture.** The Phase 1-4 implementation centred on `AgentToolMixin` (`kestrel_agent_tools.py`), `tools/registry.py`, and the legacy top-level `tools/` dire…
+- **docs/architecture/tools/AGENT_TOOLS_IMPLEMENTATION.md** — Agent Tools Implementation Summary — > **⚠ DEPRECATED — describes a removed architecture.** The files this doc references (`/tools/web_search.py`, `/tools/feedback_tool.py`, `kestrel_agent_tools.py`, `AgentToolMixin`, the top-level `too…
 - **docs/architecture/ui_label_inventory.md** — UI Label Inventory — Catalog of every user-facing string in the Kestrel Sovereign main console, classified for the theme + i18n system (epic #986).
 - **docs/architecture/ui_theme_schema.md** — UI Theme File Schema — Theme files define the user-facing labels for the Kestrel UI under the theme + i18n system established by epic #986.
 - **docs/archive/KESTREL_FEATURES_legacy.md** — Kestrel Sovereign Legacy Feature Catalog — > Historical snapshot of the pre-canonical feature catalog.
@@ -1434,7 +1425,7 @@ Repo entry points and standard project files.
 - **docs/generated/FEATURES_developer.md** — <!-- AUTO-GENERATED from KESTREL_FEATURES.md — do not edit manually --> <!-- Audience: developer | Generated: 2026-04-13 | Model: anthropic/claude-sonnet-4-6 --> <!-- Regenerate: uv run python script…
 - **docs/generated/FEATURES_investor.md** — <!-- AUTO-GENERATED from KESTREL_FEATURES.md — do not edit manually --> <!-- Audience: investor | Generated: 2026-04-13 | Model: anthropic/claude-sonnet-4-6 --> <!-- Regenerate: uv run python scripts…
 - **docs/generated/FEATURES_user.md** — <!-- AUTO-GENERATED from KESTREL_FEATURES.md — do not edit manually --> <!-- Audience: user | Generated: 2026-04-13 | Model: anthropic/claude-sonnet-4-6 --> <!-- Regenerate: uv run python scripts/gen…
-- **docs/generated/README.md** — Generated Feature Docs — These documents are derived artifacts generated from the canonical feature inventory at [`/Volumes/data2/projects/kestrel-sovereign/KESTREL_FEATURES.md`](/Volumes/data2/projects/kestrel-sovereign/KES…
+- **docs/generated/README.md** — Generated Feature Docs — These documents are derived artifacts generated from the canonical feature inventory at [`KESTREL_FEATURES.md`](../../KESTREL_FEATURES.md).
 - **docs/guides/BUILDING_FEATURES.md** — Building Your First Kestrel Feature — This guide walks you through creating a feature package for Kestrel Sovereign from scratch.
 - **docs/logo-concepts/all-concepts-grid.png** — —
 - **docs/logo-concepts/ecosystem-v2/castle/dramatic.png** — —
@@ -2376,6 +2367,8 @@ Repo entry points and standard project files.
   - `class TestBudgetOverflow`; `class TestReallocateUnused`; `class TestCrossModelBudgets`; `class TestModelSwitching`; `class TestConcurrentBudgetAllocation`; `class TestBudgetSummary`; `class TestAdaptiveBudgetEdgeCases`; `class TestTokenAllocationProperties`
 - **tests/unit/test_tool_concurrency.py** — Tests for tool concurrency batching (#562 v2).
   - `class FakeToolCall`; `class FakeToolSchema`; `class FakeTool`; `class FakeFeature`; `class TestPartitionToolCalls`; `class TestIsConcurrencySafe`; `class TestMaxConcurrency`
+- **tests/unit/test_tool_honesty_prompt.py** — Tests for the tool-honesty system prompt addendum (issue #1042 Fix 1).
+  - `class TestToolHonestyPromptConstant`; `class TestAppendSecurityAddendum`; `class TestProductionCallSites`
 - **tests/unit/test_tool_result_persistence.py** — Tests for large tool result persistence — preview with head+tail.
   - `class TestBuildPersistedPreview`
 - **tests/unit/test_turn_lifecycle.py** — Race regression tests for the shared turn lifecycle.
@@ -2497,14 +2490,6 @@ Repo entry points and standard project files.
 - **prompts/test_instance_disclosure.md** — Test Instance Disclosure — This disclosure is prepended to the system prompt for test agents.
 - **prompts/user_prompt.md** — User Prompt Template — This template is used to format the user's query with context.
 
-## `sdk/`
-
-- **sdk/.gitignore** — —
-- **sdk/AGENTS.md** — kestrel-sovereign-sdk — Agent Instructions — See [README.md](README.md) for package overview.
-- **sdk/README.md** — kestrel-sovereign-sdk — Lightweight SDK providing base interfaces, protocols, and utilities for Kestrel Sovereign feature package development.
-- **sdk/kestrel_sdk** — —
-- **sdk/pyproject.toml** — (configuration)
-
 ## `control-panel/`
 
 - **control-panel/.gitignore** — —
@@ -2542,8 +2527,6 @@ Repo entry points and standard project files.
   - `async def main()`
 - **examples/demo_sovereignty.py** — Demonstration of Kestrel's Sovereignty System
   - `async def demo_sovereignty_export()`; `async def demo_sovereignty_workflow()`
-- **examples/tool_usage_example.py** — Example: Using Agent Tools Demonstrates web search and feedback tools
-  - `async def main()`
 
 ## `website/`
 

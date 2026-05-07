@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  launchd template for the workload manager.
+
+  On first install (macOS):
+    1. cp scripts/launchd/com.kestrel.workload-manager.plist.example \
+          scripts/launchd/com.kestrel.workload-manager.plist
+    2. Edit the new file: replace __REPO_ROOT__ with the absolute path of
+       this checkout, and __HOME__ with your $HOME.
+    3. cp scripts/launchd/com.kestrel.workload-manager.plist \
+          ~/Library/LaunchAgents/
+    4. launchctl load ~/Library/LaunchAgents/com.kestrel.workload-manager.plist
+
+  scripts/launchd/com.kestrel.workload-manager.plist is gitignored — keep
+  your edited copy local.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.kestrel.workload-manager</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/bin/python3</string>
+        <string>__REPO_ROOT__/scripts/workload_manager.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__REPO_ROOT__</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>__REPO_ROOT__/logs/workload_manager_stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>__REPO_ROOT__/logs/workload_manager_stderr.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>HOME</key>
+        <string>__HOME__</string>
+    </dict>
+
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

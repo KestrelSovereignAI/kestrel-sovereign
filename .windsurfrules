@@ -1,7 +1,7 @@
 # Windsurf Rules for Kestrel Sovereign
 
 ## Global Standards
-Read and follow /Volumes/data2/projects/AGENTS.md for the Tortoise Philosophy and coding standards.
+Read and follow [`docs/TORTOISE_DOCTRINE.md`](docs/TORTOISE_DOCTRINE.md) for the Tortoise Philosophy and coding standards.
 
 Key principles:
 - 🐢 "Slow is smooth, smooth is fast" - do things RIGHT over FAST

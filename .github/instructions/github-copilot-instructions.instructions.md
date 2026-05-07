@@ -3,16 +3,17 @@ applyTo: '**'
 ---
 # Global Standards
 
-**🐢 See /Volumes/data2/projects/AGENTS.md for the Tortoise Philosophy and complete coding standards.**
+**🐢 See [`docs/TORTOISE_DOCTRINE.md`](../../docs/TORTOISE_DOCTRINE.md) for the Tortoise Philosophy and complete coding standards.**
 
-Always read AGENTS.md (local and global) when starting a new session or after compaction.
+Always read [`AGENTS.md`](../../AGENTS.md) and the doctrine when starting a new session or after compaction.
 
-Quick reference - the 5 core principles:
+Quick reference - the 6 core principles:
 1. ONE SOURCE OF TRUTH - Every concept has ONE canonical implementation
 2. FIX ROOT CAUSES - The symptom is not the disease
 3. DESIGN BEFORE IMPLEMENTATION - Think end-to-end before writing code
 4. INTERFACES OVER IMPLEMENTATIONS - Build contracts, honor them
 5. TECHNICAL DEBT IS REAL DEBT - Every shortcut has interest payments
+6. WHEN YOU SEE SOMETHING, SAY SOMETHING - Don't walk past unrelated bugs; fix easy ones, ticket the rest
 
 # Project Context
 

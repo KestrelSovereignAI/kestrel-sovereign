@@ -90,7 +90,7 @@ from kestrel_sovereign.security.crypto_suite import (
 from kestrel_sovereign.security.key_storage import SecureKeyStorage
 
 
-PROJECT_ROOT = Path("/Volumes/data2/projects/kestrel-sovereign")
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_AGENT_DATA = PROJECT_ROOT / "agent_data" / "Emma"
 GO_AHEAD_ENV = "KESTREL_CEREMONY_CONFIRM"
 

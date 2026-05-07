@@ -17,13 +17,17 @@ try:
 except ImportError:
     FASTER_WHISPER_AVAILABLE = False
 
-WHISPER_DATA_DIR = os.environ.get("WHISPER_DATA_DIR", "/Volumes/data2/models/whisper")
+WHISPER_DATA_DIR = os.environ.get("WHISPER_DATA_DIR")
 
 pytestmark = [
     pytest.mark.integration,
     pytest.mark.skipif(
         not FASTER_WHISPER_AVAILABLE,
         reason="faster-whisper not installed",
+    ),
+    pytest.mark.skipif(
+        not WHISPER_DATA_DIR,
+        reason="WHISPER_DATA_DIR env var not set — point at a local whisper model dir",
     ),
 ]
 
@@ -51,8 +55,8 @@ def _generate_speech_wav() -> bytes | None:
         from kestrel_sovereign.voice.piper_tts import PiperTTSProvider
         from pathlib import Path
 
-        data_dir = os.environ.get("PIPER_DATA_DIR", "/Volumes/data2/models/piper")
-        if not Path(data_dir).exists() or not any(Path(data_dir).glob("*.onnx")):
+        data_dir = os.environ.get("PIPER_DATA_DIR")
+        if not data_dir or not Path(data_dir).exists() or not any(Path(data_dir).glob("*.onnx")):
             return None
 
         import asyncio

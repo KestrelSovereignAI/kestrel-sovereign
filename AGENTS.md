@@ -1,6 +1,6 @@
 # Kestrel Sovereign — Agent Instructions
 
-> **🐢 See [/Volumes/data2/projects/AGENTS.md](../AGENTS.md) for the Tortoise Philosophy and global coding standards.**
+> **🐢 See [docs/TORTOISE_DOCTRINE.md](docs/TORTOISE_DOCTRINE.md) for the Tortoise Philosophy and coding standards.**
 
 ---
 
