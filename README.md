@@ -403,15 +403,17 @@ Scales to zero when idle ($0/month), auto-scales under load. Each sovereign agen
 
 ```bash
 # One-time: set up GCP secrets from .env
-scripts/cloudrun/setup_secrets.sh
+uv run kestrel deploy secrets sync
 
-# Build and push to GCR
-scripts/cloudrun/build.sh
+# Build and push to GCR (both single-agent and multi_agent images)
+uv run kestrel deploy build
 
-# Deploy to dev (scales to zero) or prod (always warm)
-scripts/cloudrun/deploy_dev.sh
-scripts/cloudrun/deploy_prod.sh
+# Deploy to dev (multi-agent host, always warm) or prod (single-agent, auto-scales)
+uv run kestrel deploy dev
+uv run kestrel deploy prod
 ```
+
+Profiles live in [`deploy_config.toml`](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/main/deploy_config.toml). See [`docs/deployment/README.md`](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/main/docs/deployment/README.md) for the full runbook (status, logs, teardown, health).
 
 Auto-deploys on version tags via [GitHub Actions](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/main/.github/workflows/deploy.yml).
 

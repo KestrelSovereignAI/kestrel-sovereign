@@ -23,7 +23,8 @@ Audit the platform surfaces so provider capabilities, model mandate behavior, AP
 - `kestrel_sovereign/cli.py`
 - `kestrel_sovereign/config.py`
 - `docker/`
-- `scripts/cloudrun/`
+- `kestrel_sovereign/cli_deploy.py` and `kestrel_sovereign/features/deploy/` (the `kestrel deploy` CLI; replaces the removed `scripts/cloudrun/*.sh` per epic #1050)
+- `deploy_config.toml`
 
 ## Required Proof
 

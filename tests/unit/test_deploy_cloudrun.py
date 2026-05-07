@@ -117,6 +117,26 @@ class TestCloudRunProviderDeploy:
         # Verify create_service was called
         assert mock_client.create_service.called
 
+        # Codex review on PR #1064 caught that the bash deploy_*.sh
+        # scripts always passed ``--allow-unauthenticated`` but the
+        # Python deploy() didn't grant ``allUsers/run.invoker``. We
+        # now call get_iam_policy + set_iam_policy after the deploy.
+        assert mock_client.get_iam_policy.called, (
+            "deploy() must fetch the IAM policy to grant "
+            "allUsers/run.invoker (--allow-unauthenticated equivalent)"
+        )
+        assert mock_client.set_iam_policy.called, (
+            "deploy() must set the IAM policy to grant "
+            "allUsers/run.invoker so public traffic can reach the service"
+        )
+        # The new binding must include allUsers / roles/run.invoker.
+        set_call = mock_client.set_iam_policy.call_args
+        policy = set_call.kwargs.get("request").policy
+        assert any(
+            b.role == "roles/run.invoker" and "allUsers" in b.members
+            for b in policy.bindings
+        )
+
     @pytest.mark.asyncio
     async def test_deploy_update_existing(self, mock_services_client, deployment_profile):
         """Test updating an existing service."""
