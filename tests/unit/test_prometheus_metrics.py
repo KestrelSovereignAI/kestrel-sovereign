@@ -36,36 +36,36 @@ requires_prometheus = pytest.mark.skipif(
 @requires_prometheus
 class TestMetricDefinitions:
     def test_prometheus_available_flag(self):
-        from kestrel_sovereign.metrics import PROMETHEUS_AVAILABLE
+        from kestrel_sdk.metrics import PROMETHEUS_AVAILABLE
         assert PROMETHEUS_AVAILABLE is True
 
     def test_registry_exists(self):
-        from kestrel_sovereign.metrics import REGISTRY
+        from kestrel_sdk.metrics import REGISTRY
         assert REGISTRY is not None
 
     def test_request_metrics_defined(self):
-        from kestrel_sovereign.metrics import REQUEST_COUNT, REQUEST_DURATION
+        from kestrel_sdk.metrics import REQUEST_COUNT, REQUEST_DURATION
         assert REQUEST_COUNT is not None
         assert REQUEST_DURATION is not None
 
     def test_llm_metrics_defined(self):
-        from kestrel_sovereign.metrics import LLM_CALLS, LLM_DURATION, LLM_TOKENS
+        from kestrel_sdk.metrics import LLM_CALLS, LLM_DURATION, LLM_TOKENS
         assert LLM_CALLS is not None
         assert LLM_DURATION is not None
         assert LLM_TOKENS is not None
 
     def test_tool_metrics_defined(self):
-        from kestrel_sovereign.metrics import TOOL_CALLS, TOOL_DURATION
+        from kestrel_sdk.metrics import TOOL_CALLS, TOOL_DURATION
         assert TOOL_CALLS is not None
         assert TOOL_DURATION is not None
 
     def test_hook_metrics_defined(self):
-        from kestrel_sovereign.metrics import HOOK_EVENTS, HOOK_DENIALS
+        from kestrel_sdk.metrics import HOOK_EVENTS, HOOK_DENIALS
         assert HOOK_EVENTS is not None
         assert HOOK_DENIALS is not None
 
     def test_system_metrics_defined(self):
-        from kestrel_sovereign.metrics import CONTEXT_PRESSURE, ACTIVE_SESSIONS
+        from kestrel_sdk.metrics import CONTEXT_PRESSURE, ACTIVE_SESSIONS
         assert CONTEXT_PRESSURE is not None
         assert ACTIVE_SESSIONS is not None
 
@@ -77,17 +77,17 @@ class TestMetricDefinitions:
 @requires_prometheus
 class TestGenerateMetrics:
     def test_generates_bytes(self):
-        from kestrel_sovereign.metrics import generate_metrics
+        from kestrel_sdk.metrics import generate_metrics
         output = generate_metrics()
         assert isinstance(output, bytes)
 
     def test_content_type(self):
-        from kestrel_sovereign.metrics import get_content_type
+        from kestrel_sdk.metrics import get_content_type
         ct = get_content_type()
         assert "text/plain" in ct or "text/openmetrics" in ct
 
     def test_metrics_contain_kestrel_prefix(self):
-        from kestrel_sovereign.metrics import generate_metrics, HOOK_EVENTS
+        from kestrel_sdk.metrics import generate_metrics, HOOK_EVENTS
         # Increment a counter to ensure output is non-empty
         HOOK_EVENTS.labels(event_type="test_gen").inc()
         output = generate_metrics().decode("utf-8")
@@ -150,7 +150,7 @@ class TestObservabilityHookPrometheus:
     @pytest.mark.asyncio
     async def test_hook_events_counter_incremented(self):
         from kestrel_sovereign.features.observability.hook import ObservabilityHook
-        from kestrel_sovereign.metrics import HOOK_EVENTS, REGISTRY
+        from kestrel_sdk.metrics import HOOK_EVENTS, REGISTRY
 
         agent = self._make_agent()
         hook = ObservabilityHook(agent=agent)
@@ -173,7 +173,7 @@ class TestObservabilityHookPrometheus:
     @pytest.mark.asyncio
     async def test_tool_calls_counter_on_post_tool_use(self):
         from kestrel_sovereign.features.observability.hook import ObservabilityHook
-        from kestrel_sovereign.metrics import TOOL_CALLS, REGISTRY
+        from kestrel_sdk.metrics import TOOL_CALLS, REGISTRY
 
         agent = self._make_agent()
         hook = ObservabilityHook(agent=agent)
@@ -200,7 +200,7 @@ class TestObservabilityHookPrometheus:
     @pytest.mark.asyncio
     async def test_tool_duration_recorded(self):
         from kestrel_sovereign.features.observability.hook import ObservabilityHook
-        from kestrel_sovereign.metrics import TOOL_DURATION, REGISTRY
+        from kestrel_sdk.metrics import TOOL_DURATION, REGISTRY
 
         agent = self._make_agent()
         hook = ObservabilityHook(agent=agent)
@@ -222,7 +222,7 @@ class TestObservabilityHookPrometheus:
     @pytest.mark.asyncio
     async def test_non_tool_event_does_not_increment_tool_calls(self):
         from kestrel_sovereign.features.observability.hook import ObservabilityHook
-        from kestrel_sovereign.metrics import REGISTRY
+        from kestrel_sdk.metrics import REGISTRY
 
         agent = self._make_agent()
         hook = ObservabilityHook(agent=agent)
@@ -252,7 +252,7 @@ class TestLLMServicePrometheus:
     @pytest.mark.asyncio
     async def test_llm_call_increments_counters(self):
         from kestrel_sovereign.llm.service import LLMService
-        from kestrel_sovereign.metrics import REGISTRY
+        from kestrel_sdk.metrics import REGISTRY
 
         service = LLMService.__new__(LLMService)
         service._observability_store = None
@@ -282,7 +282,7 @@ class TestLLMServicePrometheus:
     @pytest.mark.asyncio
     async def test_llm_tokens_counted(self):
         from kestrel_sovereign.llm.service import LLMService
-        from kestrel_sovereign.metrics import REGISTRY
+        from kestrel_sdk.metrics import REGISTRY
 
         service = LLMService.__new__(LLMService)
         service._observability_store = None
@@ -321,7 +321,7 @@ class TestLLMServicePrometheus:
     @pytest.mark.asyncio
     async def test_llm_duration_histogram(self):
         from kestrel_sovereign.llm.service import LLMService
-        from kestrel_sovereign.metrics import REGISTRY
+        from kestrel_sdk.metrics import REGISTRY
 
         service = LLMService.__new__(LLMService)
         service._observability_store = None
@@ -349,7 +349,7 @@ class TestLLMServicePrometheus:
 class TestGracefulDegradation:
     def test_metrics_module_loads_without_prometheus(self):
         """Metrics module loads regardless of prometheus-client availability."""
-        import kestrel_sovereign.metrics as m
+        import kestrel_sdk.metrics as m
         # PROMETHEUS_AVAILABLE reflects whether the package is installed
         assert m.PROMETHEUS_AVAILABLE is _HAS_PROMETHEUS
         if _HAS_PROMETHEUS:
@@ -385,7 +385,7 @@ class TestGracefulDegradation:
 class TestLabelCardinality:
     def test_no_user_data_in_labels(self):
         """Verify metric label names don't include user/session identifiers."""
-        from kestrel_sovereign.metrics import (
+        from kestrel_sdk.metrics import (
             REQUEST_COUNT, REQUEST_DURATION,
             LLM_CALLS, LLM_DURATION, LLM_TOKENS,
             TOOL_CALLS, TOOL_DURATION,

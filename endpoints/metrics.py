@@ -6,7 +6,7 @@ If prometheus-client is not installed, returns 404 with an informative message.
 from fastapi import APIRouter, Response
 from fastapi.responses import JSONResponse
 
-from kestrel_sovereign.metrics import (
+from kestrel_sdk.metrics import (
     PROMETHEUS_AVAILABLE,
     generate_metrics,
     get_content_type,
