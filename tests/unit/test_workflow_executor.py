@@ -603,6 +603,50 @@ class TestRunWorkflowSemanticHonesty:
         assert nested_result is None or isinstance(nested_result, dict)
 
     @pytest.mark.asyncio
+    async def test_check_task_status_artifact_is_json_serializable(self, task_feature):
+        """Round 6 finding: check_task_status / get_task_result / wait_for_task
+        all read task artifacts. A migrated @tool's artifact data can
+        carry a raw ToolResult inside the DynamicTool wrapper. Returning
+        part.data unchanged would embed the raw object inside this
+        tool's ToolResult.data, breaking the wire's JSON serialization.
+        Same fix shape as run_workflow's _serialize_step_payload.
+        """
+        import asyncio as _asyncio
+        import json
+        from kestrel_sdk.tools.result import ToolResult
+        # Drive a task through the manager that produces an artifact
+        # with a raw ToolResult inside the DynamicTool wrapper.
+        agent_card, _ = task_feature.task_manager._agents["memory_feature"]
+        task_feature.task_manager._agents["memory_feature"] = (
+            agent_card,
+            MockHandler({
+                "memory_status": lambda args: {
+                    "success": True,
+                    "result": ToolResult.ok("got stats", data={"n": 1}),
+                    "tool": "memory_status",
+                },
+            }),
+        )
+
+        # Run a workflow step that produces the task with the artifact,
+        # then look the task up via check_task_status. We can grab the
+        # task id from the workflow step's result_data once the
+        # workflow finishes.
+        task = await task_feature.task_manager.execute_skill(
+            agent_id="memory_feature",
+            skill_id="memory_status",
+            args={},
+            sync=True,
+        )
+
+        result = await task_feature.check_task_status(task_id=task.id)
+        # Wire-serialize the whole tool result via to_dict + json.dumps.
+        # Without the round-6 fix, this would raise TypeError on the
+        # raw ToolResult embedded in artifacts[0].data.
+        wire = result.to_dict()
+        json.dumps(wire)
+
+    @pytest.mark.asyncio
     async def test_workflow_step_with_raw_tool_result_in_dynamictool_wrapper(self, task_feature):
         """End-to-end: simulate the realistic in-process path where
         the artifact carries a raw ToolResult inside the DynamicTool

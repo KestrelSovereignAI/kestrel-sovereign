@@ -122,7 +122,17 @@ class TaskFeature(Feature):
                 if artifact.parts:
                     for part in artifact.parts:
                         if hasattr(part, "data"):
-                            artifact_data["data"] = part.data
+                            # Same hazard as run_workflow: a migrated
+                            # tool's artifact data can carry a raw
+                            # ToolResult inside the DynamicTool wrapper
+                            # (only serialized on wire output, not on
+                            # in-process reads). Serialize here so
+                            # check_task_status / get_task_result /
+                            # wait_for_task all return JSON-clean
+                            # payloads. Round 6 codex finding.
+                            artifact_data["data"] = self._serialize_step_payload(
+                                part.data
+                            )
                 artifacts.append(artifact_data)
 
         return {
