@@ -3,7 +3,10 @@
 # This file configures deployment profiles for agents to deploy themselves
 # to cloud platforms like Cloud Run, Azure Container Apps, etc.
 #
-# Copy to deploy_config.toml and configure for your environment.
+# Source of truth (epic #1050 sub-PR 1.4): the legacy bash scripts under
+# ``scripts/cloudrun/*.sh`` were retired and the equivalent flags are
+# encoded here. ``kestrel deploy <profile>`` is byte-equivalent to what
+# ``bash scripts/cloudrun/deploy_*.sh`` did on Linux/macOS.
 
 [manager]
 default_provider = "cloudrun"
@@ -13,13 +16,26 @@ build_strategy = "prebuilt"      # prebuilt | local | cloudbuild
 health_check_timeout_seconds = 120
 health_check_path = "/health"
 
-# Development Profile - Cloud Run (scales to zero)
+# =============================================================================
+# Cloud Run profiles (live)
+# =============================================================================
+
+# Development Profile - Cloud Run (multi-agent host, always warm)
+#
+# Mirrors legacy scripts/cloudrun/deploy_dev.sh. The dev profile runs the
+# multi-agent host (``Kestrel,kestrel-demo``) and so deploys the
+# ``kestrel-multi_agent`` image — DeployManagerCore.build_image_reference
+# derives that suffix from ``deployment_mode = "multi_agent"``. The legacy
+# bash deploy_dev.sh referenced ``kestrel-multi-agent`` (hyphen) which no
+# build path produced; sub-PR 1.4 reconciles on the underscore form that
+# ``scripts/cloudrun/build.sh`` and .github/workflows/deploy.yml both use.
 [profiles.dev]
 name = "Cloud Run Development"
 provider = "cloudrun"
 service_name = "kestrel-dev"
 region = "us-central1"
-min_instances = 0
+deployment_mode = "multi_agent"
+min_instances = 1
 max_instances = 10
 memory = "2Gi"
 cpu = 2
@@ -31,16 +47,37 @@ concurrency = 80
 KESTREL_ENV = "development"
 KESTREL_DB_BACKEND = "sqlite"
 KESTREL_DB_PATH = "/app/agent_data"
+KESTREL_AGENTS = "Kestrel,kestrel-demo"
+KESTREL_REQUIRE_OAUTH = "true"
+# ``${KESTREL_ALLOWED_EMAILS}`` is expanded by DeployManagerCore._expand_env_vars
+# at deploy time. The legacy bash used ``${KESTREL_ALLOWED_EMAILS:?...}`` to
+# fail loudly when unset; here, an unset var simply yields the literal
+# placeholder which Cloud Run will reject — same outcome, different shape.
+KESTREL_ALLOWED_EMAILS = "${KESTREL_ALLOWED_EMAILS}"
 
 [profiles.dev.secrets]
 # Secrets are mounted from GCP Secret Manager
 # Format: secret-name:version
 OPENAI_API_KEY = "kestrel-openai-key:latest"
+ANTHROPIC_API_KEY = "kestrel-anthropic-key:latest"
 KESTREL_API_KEY = "kestrel-api-key:latest"
 KESTREL_DATA_KEY = "kestrel-data-key:latest"
 LIGHTHOUSE_API_KEY = "kestrel-lighthouse-key:latest"
+GOOGLE_CLIENT_ID = "kestrel-google-client-id:latest"
+GOOGLE_CLIENT_SECRET = "kestrel-google-client-secret:latest"
+KESTREL_SESSION_SECRET = "kestrel-session-secret:latest"
+GITHUB_TOKEN = "github-read-kestrel:latest"
+GITHUB_APP_ID = "github-app-id:latest"
+GITHUB_APP_PRIVATE_KEY = "github-app-private-key:latest"
+GITHUB_APP_WEBHOOK_SECRET = "github-app-webhook-secret:latest"
 
-# Production Profile - Cloud Run (always warm, auto-scales)
+# Production Profile - Cloud Run (single-agent image, always warm, auto-scales)
+#
+# Mirrors legacy scripts/cloudrun/deploy_prod.sh. The prod profile uses the
+# single-agent image (``kestrel``) but sets KESTREL_MULTI_AGENT=true to run
+# the host inside the single-agent container — that's what the bash did.
+# deployment_mode therefore stays ``"agent"`` (the default) so the image
+# reference resolves to ``gcr.io/<project>/kestrel:<tag>``.
 [profiles.prod]
 name = "Cloud Run Production"
 provider = "cloudrun"
@@ -58,12 +95,17 @@ concurrency = 80
 KESTREL_ENV = "production"
 KESTREL_DB_BACKEND = "sqlite"
 KESTREL_DB_PATH = "/app/agent_data"
+KESTREL_MULTI_AGENT = "true"
+KESTREL_REQUIRE_OAUTH = "true"
+KESTREL_ALLOWED_EMAILS = "${KESTREL_ALLOWED_EMAILS}"
 
 [profiles.prod.secrets]
 OPENAI_API_KEY = "kestrel-openai-key:latest"
 KESTREL_API_KEY = "kestrel-api-key:latest"
 KESTREL_DATA_KEY = "kestrel-data-key:latest"
-LIGHTHOUSE_API_KEY = "kestrel-lighthouse-key:latest"
+GOOGLE_CLIENT_ID = "kestrel-google-client-id:latest"
+GOOGLE_CLIENT_SECRET = "kestrel-google-client-secret:latest"
+KESTREL_SESSION_SECRET = "kestrel-session-secret:latest"
 
 # =============================================================================
 # MultiAgent Profiles (Multi-Agent Host)
@@ -72,6 +114,9 @@ LIGHTHOUSE_API_KEY = "kestrel-lighthouse-key:latest"
 # Uses docker/Dockerfile.multi_agent which runs the multi_agent host process manager.
 
 # MultiAgent Development - Cloud Run (scales to zero)
+#
+# Mirrors legacy scripts/cloudrun/deploy_multi_agent_dev.sh. Uses the
+# multi_agent image (``kestrel-multi_agent``), 4Gi/4CPU for host + agents.
 [profiles.multi-agent-dev]
 name = "MultiAgent Development (Multi-Agent)"
 provider = "cloudrun"
@@ -90,14 +135,21 @@ concurrency = 80
 KESTREL_ENV = "development"
 KESTREL_DB_BACKEND = "sqlite"
 KESTREL_HOST_AUTOSTART = "true"
+KESTREL_ALLOWED_EMAILS = "${KESTREL_ALLOWED_EMAILS}"
 
 [profiles.multi-agent-dev.secrets]
 OPENAI_API_KEY = "kestrel-openai-key:latest"
 KESTREL_API_KEY = "kestrel-api-key:latest"
 KESTREL_DATA_KEY = "kestrel-data-key:latest"
 LIGHTHOUSE_API_KEY = "kestrel-lighthouse-key:latest"
+GOOGLE_CLIENT_ID = "kestrel-google-client-id:latest"
+GOOGLE_CLIENT_SECRET = "kestrel-google-client-secret:latest"
+KESTREL_SESSION_SECRET = "kestrel-session-secret:latest"
 
 # MultiAgent Production - Cloud Run (always warm)
+#
+# No legacy bash script — this profile is Python-native and was added
+# alongside the deploy CLI. Kept as-is by sub-PR 1.4.
 [profiles.multi-agent-prod]
 name = "MultiAgent Production (Multi-Agent)"
 provider = "cloudrun"

@@ -326,21 +326,46 @@ class DeployManagerCore:
         """
         Build container image reference for a profile.
 
+        The image name is derived from the profile's ``deployment_mode``:
+
+        * ``deployment_mode = "agent"`` (default) → ``<image_name>``
+          (e.g. ``kestrel``) — built from ``docker/Dockerfile.cloudrun``.
+        * ``deployment_mode = "multi_agent"`` → ``<image_name>-multi_agent``
+          (e.g. ``kestrel-multi_agent``) — built from
+          ``docker/Dockerfile.multi_agent``.
+
+        These names match :data:`kestrel_sovereign.features.deploy.build.DEFAULT_TARGETS`
+        and ``.github/workflows/deploy.yml`` so ``kestrel deploy build`` and
+        ``kestrel deploy <profile>`` always reference the same registry refs.
+        The legacy bash ``deploy_dev.sh``/``deploy_multi_agent_dev.sh`` used
+        a hyphenated ``kestrel-multi-agent`` orphan that no build path ever
+        produced; epic #1050 sub-PR 1.4 reconciled on the underscore form.
+
         Args:
-            profile_name: Name of the profile (currently informational —
-                only used to disambiguate per-profile image overrides if
-                we add them later; the image name today is global).
-            tag: Image tag
+            profile_name: Profile to look up. Unknown profiles fall back
+                to the manager-level ``image_name`` so callers exercising
+                the manager outside a profile context (legacy tests) still
+                get a sensible ref.
+            tag: Image tag (default ``latest``).
 
         Returns:
-            Full image reference (e.g. ``gcr.io/project/kestrel:latest``).
+            Full image reference (e.g. ``gcr.io/project/kestrel-multi_agent:v1.2.3``).
         """
+        # Resolve the image name from the profile's deployment_mode. We
+        # don't raise on an unknown profile because some legacy callers
+        # build a manager from a stripped-down config; they'll get the
+        # global single-agent name, which is the historical default.
+        image_name = self.image_name
+        profile = self.profiles.get(profile_name)
+        if profile is not None and profile.is_multi_agent:
+            image_name = f"{self.image_name}-multi_agent"
+
         # For Cloud Run, use GCR
         if self.gcp_project_id:
-            return f"gcr.io/{self.gcp_project_id}/{self.image_name}:{tag}"
+            return f"gcr.io/{self.gcp_project_id}/{image_name}:{tag}"
 
         # Fallback to generic reference
-        return f"{self.image_name}:{tag}"
+        return f"{image_name}:{tag}"
 
     async def deploy_profile(
         self, profile_name: str, tag: str = "latest"

@@ -1,11 +1,12 @@
 """
-``kestrel deploy`` CLI commands — sub-PR 1.1 of epic #1050 (bash-to-Python port).
+``kestrel deploy`` CLI commands — epic #1050 (bash-to-Python port).
 
 Exposes the existing :class:`DeployManager` Python implementation as a
 first-class CLI subcommand so Kestrel can be deployed to Cloud Run from
-Windows hosts that don't have bash. The bash scripts under
-``scripts/cloudrun/`` continue to work for now and are removed in
-sub-PR 1.4 once ``deploy_config.toml`` reconciliation lands.
+Windows hosts that don't have bash. Sub-PR 1.4 retired the bash scripts
+that previously lived under ``scripts/cloudrun/``; this CLI is the only
+host-side path now (``.github/workflows/deploy.yml`` calls into it for
+CI deploys).
 
 This module is a thin shell around
 :class:`kestrel_sovereign.features.deploy.manager.DeployManager`. The

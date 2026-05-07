@@ -241,8 +241,8 @@ export DATABASE_URL="postgresql://user:pass@host:port/dbname"
 3. **Build and Deploy:**
    ```bash
    cd kestrel
-   ./scripts/build_with_kestrel.sh
-   ./scripts/deploy_dev.sh
+   uv run kestrel deploy build
+   uv run kestrel deploy dev
    ./scripts/test_environment.sh dev https://dev.YOUR_DOMAIN.com
    ```
 

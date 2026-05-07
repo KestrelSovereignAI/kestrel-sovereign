@@ -13,13 +13,19 @@ build_strategy = "prebuilt"      # prebuilt | local | cloudbuild
 health_check_timeout_seconds = 120
 health_check_path = "/health"
 
-# Development Profile - Cloud Run (scales to zero)
+# Development Profile - Cloud Run (multi-agent host, always warm)
+#
+# ``deployment_mode = "multi_agent"`` makes ``kestrel deploy dev`` push the
+# ``gcr.io/<project>/kestrel-multi_agent:<tag>`` image (built by
+# ``kestrel deploy build``). ``min_instances = 1`` matches the legacy bash
+# scripts/cloudrun/deploy_dev.sh — flip to 0 if you want scale-to-zero.
 [profiles.dev]
 name = "Cloud Run Development"
 provider = "cloudrun"
 service_name = "kestrel-dev"
 region = "us-central1"
-min_instances = 0
+deployment_mode = "multi_agent"
+min_instances = 1
 max_instances = 10
 memory = "2Gi"
 cpu = 2
@@ -31,15 +37,30 @@ concurrency = 80
 KESTREL_ENV = "development"
 KESTREL_DB_BACKEND = "sqlite"
 KESTREL_DB_PATH = "/app/agent_data"
+KESTREL_AGENTS = "Kestrel,kestrel-demo"
+KESTREL_REQUIRE_OAUTH = "true"
+# Expanded from the runtime env at deploy time. Export
+# KESTREL_ALLOWED_EMAILS in your shell before ``kestrel deploy dev``.
+KESTREL_ALLOWED_EMAILS = "${KESTREL_ALLOWED_EMAILS}"
 
 [profiles.dev.secrets]
-# Secrets are mounted from GCP Secret Manager
-# Format: secret-name:version
+# Secrets are mounted from GCP Secret Manager.
+# Format: secret-name:version. Run ``kestrel deploy secrets sync`` to
+# populate them from .env once the secret refs are configured below.
 OPENAI_API_KEY = "kestrel-openai-key:latest"
+ANTHROPIC_API_KEY = "kestrel-anthropic-key:latest"
 KESTREL_API_KEY = "kestrel-api-key:latest"
 KESTREL_DATA_KEY = "kestrel-data-key:latest"
+GOOGLE_CLIENT_ID = "kestrel-google-client-id:latest"
+GOOGLE_CLIENT_SECRET = "kestrel-google-client-secret:latest"
+KESTREL_SESSION_SECRET = "kestrel-session-secret:latest"
+GITHUB_TOKEN = "github-read-kestrel:latest"
 
-# Production Profile - Cloud Run (always warm, auto-scales)
+# Production Profile - Cloud Run (single-agent image, always warm)
+#
+# Uses the single-agent ``kestrel`` image but sets KESTREL_MULTI_AGENT=true
+# so the host process is started inside the container — same shape as the
+# legacy scripts/cloudrun/deploy_prod.sh.
 [profiles.prod]
 name = "Cloud Run Production"
 provider = "cloudrun"
@@ -57,11 +78,17 @@ concurrency = 80
 KESTREL_ENV = "production"
 KESTREL_DB_BACKEND = "sqlite"
 KESTREL_DB_PATH = "/app/agent_data"
+KESTREL_MULTI_AGENT = "true"
+KESTREL_REQUIRE_OAUTH = "true"
+KESTREL_ALLOWED_EMAILS = "${KESTREL_ALLOWED_EMAILS}"
 
 [profiles.prod.secrets]
 OPENAI_API_KEY = "kestrel-openai-key:latest"
 KESTREL_API_KEY = "kestrel-api-key:latest"
 KESTREL_DATA_KEY = "kestrel-data-key:latest"
+GOOGLE_CLIENT_ID = "kestrel-google-client-id:latest"
+GOOGLE_CLIENT_SECRET = "kestrel-google-client-secret:latest"
+KESTREL_SESSION_SECRET = "kestrel-session-secret:latest"
 
 # Azure Container Apps Profile (Coming Soon)
 # Uncomment and configure when Azure provider is fully implemented
