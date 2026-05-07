@@ -575,6 +575,47 @@ class TestBootstrapFeatureTools:
         assert "INSERT" in mock_db.execute.call_args[0][0].upper()
 
     @pytest.mark.asyncio
+    async def test_bootstrap_add_path_mismatch_is_partial(
+        self, mock_agent, tmp_agent_dir, tmp_path,
+    ):
+        """Round 2 finding: when an absolute path is passed but a
+        different file with the same basename exists under the loader's
+        search roots, the loader's prompt reads the search-root file,
+        not the explicit path. The DB row would also point at the
+        wrong path. Surface as PARTIAL with both paths in data.
+        """
+        from kestrel_sdk.tools.result import ToolResultStatus
+        from kestrel_sovereign.features.bootstrap.feature import BootstrapFeature
+
+        # Two different files, same basename
+        search_root_file = tmp_agent_dir / "DUPE.md"
+        search_root_file.write_text("from search root")
+        explicit_dir = tmp_path / "explicit"
+        explicit_dir.mkdir()
+        explicit_file = explicit_dir / "DUPE.md"
+        explicit_file.write_text("from explicit absolute path")
+
+        loader = BootstrapLoader(agent_data_path=str(tmp_agent_dir))
+        mock_agent.context_builder = MagicMock()
+        mock_agent.context_builder._bootstrap_loader = loader
+        mock_agent.bootstrap_service.agent_data_path = str(tmp_agent_dir)
+
+        feature = BootstrapFeature(mock_agent)
+
+        # Pass the absolute path to the explicit file. The loader
+        # doesn't actually use this path on resolution — it scans
+        # its search roots and picks up search_root_file.
+        result = await feature.bootstrap_add(str(explicit_file))
+
+        assert result.status is ToolResultStatus.PARTIAL
+        assert "basename collision" in result.error.lower()
+        assert result.data["path_mismatch"] is True
+        # Both paths surfaced for repair
+        assert str(explicit_file) in result.data["resolved_path"]
+        assert result.data["actual_loaded_path"] is not None
+        assert "search root" in (loader.get_file("DUPE.md") or "")
+
+    @pytest.mark.asyncio
     async def test_bootstrap_add_file_not_found(self, feature_with_loader):
         from kestrel_sdk.tools.result import ToolResultStatus
         feature, loader, agent_dir = feature_with_loader

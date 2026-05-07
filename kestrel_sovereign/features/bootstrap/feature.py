@@ -370,15 +370,50 @@ class BootstrapFeature(Feature):
         loader.reload()
 
         loaded = filename in loader.get_bootstrap_content()
+
+        # Honesty: the loader keys files by basename. If the user
+        # passes an absolute path outside the search roots and a
+        # *different* file with the same basename also exists under
+        # ``agent_data`` / ``extra_paths``, the loader will populate
+        # the prompt from the search-root file, not from ``resolved``.
+        # Surface that mismatch as PARTIAL — the entry is technically
+        # loaded but the prompt reads a different file than the DB
+        # row records.
+        actual_loaded_path: Optional[str] = None
+        try:
+            actual_loaded_path = loader._resolved_paths.get(filename)  # noqa: SLF001
+        except Exception:
+            actual_loaded_path = None
+        path_mismatch = bool(
+            loaded
+            and actual_loaded_path
+            and Path(actual_loaded_path).resolve() != resolved.resolve()
+        )
+
         # Common data fields shared across the OK/PARTIAL branches.
         _data = {
             "filename": filename,
             "resolved_path": str(resolved),
+            "actual_loaded_path": actual_loaded_path,
             "loaded": loaded,
+            "path_mismatch": path_mismatch,
             "db_attempted": db_attempted,
             "db_persisted": db_persisted,
             "db_persist_error": db_persist_error,
         }
+        if path_mismatch:
+            return ToolResult.partial(
+                confirmation=(
+                    f"Registered '{filename}' in the bootstrap file list"
+                ),
+                error=(
+                    f"basename collision: prompt is loading '{filename}' from "
+                    f"{actual_loaded_path}, not from the path you passed "
+                    f"({resolved}); the DB row references a different path "
+                    "than the cached content"
+                ),
+                data=_data,
+            )
         if not loaded:
             # The loader accepted the entry but the file's content was
             # not pulled into the bootstrap content (read failure,
