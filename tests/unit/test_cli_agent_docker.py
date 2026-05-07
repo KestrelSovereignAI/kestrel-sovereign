@@ -429,8 +429,47 @@ def test_kestrel_agent_docker_build_subverb_force_rebuilds(monkeypatch):
     """
     captured: list = []
 
-    def fake_ensure(repo, *, force_rebuild=False):
-        captured.append({"repo": repo, "force_rebuild": force_rebuild})
+    def fake_ensure(repo, *, force_rebuild=False, no_cache=False):
+        captured.append({
+            "repo": repo,
+            "force_rebuild": force_rebuild,
+            "no_cache": no_cache,
+        })
+        return 0
+
+    monkeypatch.setattr(cli_agent_docker, "_ensure_image", fake_ensure)
+    monkeypatch.setenv("KESTREL_DATA_KEY", "test-key")
+
+    import argparse
+    # Codex review v4 on PR #1071: ``kestrel agent docker build`` (without
+    # ``--no-cache``) must REBUILD an existing image, not no-op via the
+    # docker image inspect short-circuit. force_rebuild=True regardless;
+    # ``--no-cache`` controls cache strategy independently.
+    args = argparse.Namespace(
+        agent_command="docker",
+        agent_docker_command="build",
+        no_cache=True,
+    )
+    rc = cli_agent_docker.cmd_agent(args)
+    assert rc == 0
+    assert captured == [{
+        "repo": cli_agent_docker._repo_root(),
+        "force_rebuild": True,
+        "no_cache": True,
+    }]
+
+
+def test_kestrel_agent_docker_build_without_no_cache_still_rebuilds(monkeypatch):
+    """Codex review v4 on PR #1071: ``kestrel agent docker build``
+    (no ``--no-cache``) must rebuild — the explicit-build surface is
+    a no-op otherwise when an image is already present."""
+    captured: list = []
+
+    def fake_ensure(repo, *, force_rebuild=False, no_cache=False):
+        captured.append({
+            "force_rebuild": force_rebuild,
+            "no_cache": no_cache,
+        })
         return 0
 
     monkeypatch.setattr(cli_agent_docker, "_ensure_image", fake_ensure)
@@ -440,11 +479,11 @@ def test_kestrel_agent_docker_build_subverb_force_rebuilds(monkeypatch):
     args = argparse.Namespace(
         agent_command="docker",
         agent_docker_command="build",
-        no_cache=True,
+        no_cache=False,
     )
     rc = cli_agent_docker.cmd_agent(args)
     assert rc == 0
-    assert captured == [{"repo": cli_agent_docker._repo_root(), "force_rebuild": True}]
+    assert captured == [{"force_rebuild": True, "no_cache": False}]
 
 
 def test_ensure_image_returns_build_failure(monkeypatch):

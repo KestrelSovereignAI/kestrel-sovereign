@@ -93,12 +93,26 @@ def _resolve_data_dir(raw: str) -> Path:
     return p
 
 
-def _ensure_image(repo: Path, *, force_rebuild: bool = False) -> int:
-    """Build the kestrel-sovereign image if it doesn't exist (or if
-    ``force_rebuild`` is set). Returns exit code: 0 on success.
+def _ensure_image(
+    repo: Path,
+    *,
+    force_rebuild: bool = False,
+    no_cache: bool = False,
+) -> int:
+    """Build the kestrel-sovereign image. Returns exit code: 0 on success.
 
-    Bash predecessor used ``docker image inspect $IMAGE >/dev/null``
-    to check; we shell out to the same command.
+    - Implicit path (``force_rebuild=False``): used by create/chat/run.
+      Calls ``docker image inspect``; if the image exists, return
+      immediately. Otherwise build with cache (fast first build).
+    - Explicit path (``force_rebuild=True``): used by ``kestrel agent
+      docker build``. Always rebuilds. ``no_cache`` chooses cache vs
+      no-cache.
+
+    Codex review v4 on PR #1071 split these two semantics: previously
+    ``force_rebuild=True`` implied ``--no-cache``, so a plain
+    ``kestrel agent docker build`` (without ``--no-cache``) couldn't
+    rebuild a stale-but-cached image — the ``inspect`` short-circuit
+    fired first.
     """
     if not force_rebuild:
         rc = run_streaming(
@@ -110,11 +124,13 @@ def _ensure_image(repo: Path, *, force_rebuild: bool = False) -> int:
             print(f"[INFO] Using existing {_IMAGE_NAME} image")
             return 0
         print(f"[INFO] Building {_IMAGE_NAME} image ...")
-    else:
+    elif no_cache:
         print(f"[INFO] Rebuilding {_IMAGE_NAME} image (--no-cache) ...")
+    else:
+        print(f"[INFO] Rebuilding {_IMAGE_NAME} image ...")
 
     cmd = ["docker", "build"]
-    if force_rebuild:
+    if no_cache:
         cmd.append("--no-cache")
     cmd += [
         "-f", str(repo / _DOCKERFILE_REL),
@@ -489,8 +505,14 @@ def _cmd_build(args) -> int:
     changes without remembering the underlying ``docker build`` argv.
     Codex review on PR #1071 caught the missing surface.
     """
+    # ``build`` is the explicit rebuild surface — when an operator runs
+    # it, they want the image rebuilt, period. Without ``force_rebuild``
+    # the ``docker image inspect`` short-circuits and the command is a
+    # no-op for the common stale-image case (codex review v4 on PR #1071).
+    # ``--no-cache`` then chooses *how* the rebuild runs: with or
+    # without docker layer cache. Both rebuild.
     repo = _repo_root()
-    return _ensure_image(repo, force_rebuild=bool(getattr(args, "no_cache", False)))
+    return _ensure_image(repo, force_rebuild=True, no_cache=bool(getattr(args, "no_cache", False)))
 
 
 __all__ = [

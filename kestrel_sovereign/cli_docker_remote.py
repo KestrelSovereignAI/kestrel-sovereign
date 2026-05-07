@@ -29,6 +29,7 @@ is ``172.17.0.1`` (the bash predecessor's behaviour).
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -149,9 +150,25 @@ def _cmd_run(args) -> int:
     3. ``docker run -d`` with port mapping, env vars, host gateway.
     """
     env_file_arg: Optional[str] = getattr(args, "env_file", None)
-    host_port: int = (
-        int(args.port) if args.port is not None else _DEFAULT_HOST_PORT
-    )
+    # Port resolution mirrors the bash predecessor's ``${KESTREL_PORT:-8888}``:
+    # explicit ``--port`` wins; else ``KESTREL_PORT`` env var; else
+    # default 8888. Codex review v4 on PR #1071 caught that dropping
+    # the env-var path silently broke wrappers that exported
+    # KESTREL_PORT to avoid colliding with a busy/live 8888.
+    if args.port is not None:
+        host_port = int(args.port)
+    elif os.environ.get("KESTREL_PORT"):
+        try:
+            host_port = int(os.environ["KESTREL_PORT"])
+        except ValueError:
+            print(
+                f"error: KESTREL_PORT={os.environ['KESTREL_PORT']!r} is "
+                f"not an integer.",
+                file=sys.stderr,
+            )
+            return 1
+    else:
+        host_port = _DEFAULT_HOST_PORT
     tag: str = args.tag or _DEFAULT_TAG
 
     repo = _repo_root()

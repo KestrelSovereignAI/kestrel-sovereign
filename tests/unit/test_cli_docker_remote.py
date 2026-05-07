@@ -271,6 +271,68 @@ def test_run_happy_path_argv_shape(tmp_path, monkeypatch):
     assert run_argv[-1] == "kestrel-remote:latest"
 
 
+def test_run_kestrel_port_env_var_overrides_default(tmp_path, monkeypatch):
+    """Codex review v4 on PR #1071: the bash predecessor honored
+    ``${KESTREL_PORT:-8888}`` so wrappers could export KESTREL_PORT to
+    avoid colliding with a busy/live 8888. The Python port must mirror
+    that — explicit ``--port`` wins, else KESTREL_PORT, else 8888."""
+    env_file = _write_env(tmp_path, OPENAI_API_KEY="sk-oai")
+    captured: list = []
+    monkeypatch.setattr(
+        cli_docker_remote, "run_streaming",
+        lambda cmd, **kw: captured.append(list(cmd)) or 0,
+    )
+    monkeypatch.setattr(
+        cli_docker_remote, "_wait_for_container_health",
+        lambda url, *, timeout: True,
+    )
+    monkeypatch.setenv("KESTREL_PORT", "9123")
+
+    args = _Args(
+        docker_command="remote",
+        docker_remote_command="run",
+        port=None,  # not explicitly set — env var should be honored
+        env_file=str(env_file),
+        tag="latest",
+    )
+    rc = cli_docker_remote.cmd_docker(args)
+    assert rc == 0
+    run_argv = captured[2]
+    assert "9123:8888" in run_argv, (
+        f"KESTREL_PORT=9123 should map host:9123 to container:8888; "
+        f"saw argv: {run_argv}"
+    )
+
+
+def test_run_explicit_port_wins_over_kestrel_port_env(tmp_path, monkeypatch):
+    """``--port`` explicit value beats KESTREL_PORT env var."""
+    env_file = _write_env(tmp_path, OPENAI_API_KEY="sk-oai")
+    captured: list = []
+    monkeypatch.setattr(
+        cli_docker_remote, "run_streaming",
+        lambda cmd, **kw: captured.append(list(cmd)) or 0,
+    )
+    monkeypatch.setattr(
+        cli_docker_remote, "_wait_for_container_health",
+        lambda url, *, timeout: True,
+    )
+    monkeypatch.setenv("KESTREL_PORT", "9123")
+
+    args = _Args(
+        docker_command="remote",
+        docker_remote_command="run",
+        port=7777,
+        env_file=str(env_file),
+        tag="latest",
+    )
+    rc = cli_docker_remote.cmd_docker(args)
+    assert rc == 0
+    run_argv = captured[2]
+    assert "7777:8888" in run_argv, (
+        f"--port 7777 should win over KESTREL_PORT=9123; saw argv: {run_argv}"
+    )
+
+
 def test_run_default_port_is_8888(tmp_path, monkeypatch):
     env_file = _write_env(tmp_path, OPENAI_API_KEY="sk-oai")
     captured: list = []
