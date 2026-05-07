@@ -294,3 +294,30 @@ def test_kestrel_allowed_emails_expansion(live_config, monkeypatch):
         f"value; got {dev.env_vars['KESTREL_ALLOWED_EMAILS']!r}. The "
         f"DeployManagerCore._expand_env_vars contract may have regressed."
     )
+
+
+@pytest.mark.asyncio
+async def test_deploy_profile_rejects_unresolved_placeholders(
+    live_config, monkeypatch
+):
+    """Codex review on PR #1064: when ``${KESTREL_ALLOWED_EMAILS}`` is
+    unset in the runtime env, ``_expand_env_vars`` leaves the literal
+    placeholder in the value. The bash scripts errored on missing env
+    via ``${VAR:?...}``; ``deploy_profile`` must mirror that — refuse
+    to deploy with broken config rather than push the literal
+    ``${...}`` to Cloud Run.
+    """
+    from kestrel_sovereign.features.deploy.models import DeployManagerError
+
+    monkeypatch.delenv("KESTREL_ALLOWED_EMAILS", raising=False)
+    manager = DeployManager(config=live_config)
+
+    # deploy_profile catches DeployManagerError and returns it in the
+    # ``error`` field of the result dict (matches the shape both the
+    # agent !deploy tool and the kestrel deploy CLI render).
+    result = await manager.deploy_profile("dev")
+
+    assert result["success"] is False
+    assert "unresolved" in result["error"]
+    assert "KESTREL_ALLOWED_EMAILS" in result["error"]
+    assert "kestrel deploy dev" in result["error"]

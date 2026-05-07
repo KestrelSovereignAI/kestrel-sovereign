@@ -144,6 +144,40 @@ class DeployManagerCore:
         return profiles
 
     @staticmethod
+    def _validate_no_unresolved_placeholders(
+        profile_name: str, profile: DeploymentProfile
+    ) -> None:
+        """Raise DeployManagerError if any expanded value still contains
+        ``${VAR}`` — meaning the runtime env didn't have the variable
+        set. We refuse to deploy with broken config rather than push it
+        to Cloud Run silently. Mirrors the bash scripts'
+        ``${VAR:?Set VAR env var ...}`` shape.
+        """
+        unresolved = []
+        for key, value in (profile.env_vars or {}).items():
+            if isinstance(value, str) and "${" in value:
+                unresolved.append(("env_vars", key, value))
+        for key, value in (profile.secrets or {}).items():
+            if isinstance(value, str) and "${" in value:
+                unresolved.append(("secrets", key, value))
+
+        if unresolved:
+            details = "; ".join(
+                f"{section}.{key}={value!r}" for section, key, value in unresolved
+            )
+            missing_vars = sorted({
+                m.group(1)
+                for _, _, value in unresolved
+                for m in re.finditer(r'\$\{([^}]+)\}', value)
+            })
+            raise DeployManagerError(
+                f"profile '{profile_name}' has unresolved ${{...}} placeholders "
+                f"(missing env vars: {', '.join(missing_vars)}). "
+                f"Export them before running `kestrel deploy {profile_name}`. "
+                f"Affected: {details}"
+            )
+
+    @staticmethod
     def _expand_env_vars(env_dict: Dict[str, str]) -> Dict[str, str]:
         """
         Expand ${VAR} syntax in environment variable values.
@@ -379,6 +413,16 @@ class DeployManagerCore:
         """
         try:
             profile = self.get_profile(profile_name)
+
+            # Validate that every ``${VAR}`` placeholder in the profile's
+            # env_vars / secrets actually resolved against runtime env.
+            # ``_expand_env_vars`` returns the literal ``${VAR}`` when a
+            # variable is unset — pushing that to Cloud Run silently
+            # produces broken config (e.g. an OAuth allowlist with the
+            # literal string ``${KESTREL_ALLOWED_EMAILS}``). The bash
+            # scripts errored on missing env via ``${VAR:?...}``;
+            # mirror that here. Codex review on PR #1064.
+            self._validate_no_unresolved_placeholders(profile_name, profile)
 
             image = self.build_image_reference(profile_name, tag)
 
