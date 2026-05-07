@@ -17,6 +17,7 @@ Commands:
     kestrel shell <name>           # interactive CLI chat (what main.py does today)
     kestrel health                 # run health check
     kestrel config <agent_dir>     # show/edit agent config
+    kestrel deploy <profile>       # deploy agent to Cloud Run / Azure Container Apps
 """
 
 import argparse
@@ -1778,6 +1779,12 @@ def build_parser() -> argparse.ArgumentParser:
     from kestrel_sovereign.cli_release import add_release_subcommands
     add_release_subcommands(subparsers)
 
+    # kestrel deploy <profile> — sub-PR 1.1 of epic #1050 (bash-to-Python
+    # port). Same locality reason: keeps cloud SDK imports out of the
+    # hot path for operators who just run `kestrel start`.
+    from kestrel_sovereign.cli_deploy import add_deploy_subcommands
+    add_deploy_subcommands(subparsers)
+
     return parser
 
 
@@ -1808,6 +1815,7 @@ def main() -> int:
         return 1
 
     from kestrel_sovereign.cli_release import cmd_release
+    from kestrel_sovereign.cli_deploy import cmd_deploy
 
     commands = {
         "start": cmd_start,
@@ -1827,6 +1835,7 @@ def main() -> int:
         "feature": cmd_feature,
         "skills": cmd_skills,
         "release": cmd_release,
+        "deploy": cmd_deploy,
     }
 
     handler = commands.get(args.command)
