@@ -104,7 +104,7 @@ Features are discovered from two sources:
 
 ### Core Feature Inventory
 
-Audited snapshot: **42** discoverable modules · **42** exported `Feature` subclasses.
+Audited snapshot: **38** discoverable modules · **38** exported `Feature` subclasses.
 
 | Module | Exported class |
 |---|---|
@@ -112,7 +112,6 @@ Audited snapshot: **42** discoverable modules · **42** exported `Feature` subcl
 | `bootstrap` | `BootstrapFeature` |
 | `bridge` | `BridgeFeature` |
 | `channels` | `ChannelFeature` |
-| `code_edit` | `CodeEditFeature` |
 | `compute` | `ComputeFeature` |
 | `consent` | `ConsentFeature` |
 | `constitution` | `ConstitutionFeature` |

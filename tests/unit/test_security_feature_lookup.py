@@ -1,11 +1,14 @@
 """Regression test for the security-feature-lookup bug.
 
-Six features (code_edit, keys, computer_use, reflection's
+Six features (code_edit (extracted), keys, computer_use, reflection's
 ticket_handler / self_model_handler / approval) historically asked
 ``self.agent.features.get("security")``, but ``KestrelAgent`` stores
 features keyed by class name (``"SecurityFeature"``). The lowercase
 key always missed → tools emitted ``"Security feature not available"``
 even when the feature was registered.
+
+The code_edit case is now covered by kestrel-feature-code's own test
+suite. computer_use exercises the same lookup path here.
 
 The original tests for these features stubbed ``_request_approval``
 entirely, so the buggy lookup never ran in CI. This test wires a
@@ -124,11 +127,6 @@ def test_kestrel_agent_get_feature_returns_none_when_missing():
         # Each tuple resolves a security lookup that historically returned
         # None against an agent registered the way KestrelAgent registers.
         (
-            "kestrel_sovereign.features.code_edit.feature",
-            "CodeEditFeature",
-            {},
-        ),
-        (
             "kestrel_sovereign.features.computer_use.feature",
             "ComputerUseFeature",
             {},
@@ -155,10 +153,7 @@ def test_feature_security_lookup_finds_registered_security_feature(
 
     agent.get_feature = lambda name: KestrelAgent.get_feature(agent, name)
 
-    if handler_attr == "CodeEditFeature":
-        feat = cls(agent=agent, code_root=str(tmp_path))
-    else:
-        feat = cls(agent=agent, **handler_kwargs)
+    feat = cls(agent=agent, **handler_kwargs)
 
     found = feat._get_security_feature()
     assert found is sec, (
