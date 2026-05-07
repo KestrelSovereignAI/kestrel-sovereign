@@ -156,7 +156,11 @@ def test_cmd_deploy_secrets_sync_no_project_id(fake_project_root, monkeypatch, c
 
     captured = capsys.readouterr()
     assert rc == 1
-    assert "GCP project ID not set" in captured.err
+    # The all-profile scan path emits a per-profile diagnostic when
+    # ``[manager].gcp_project_id`` is the placeholder and a profile has
+    # no override of its own.
+    assert "no GCP project ID" in captured.err
+    assert "dev" in captured.err
 
 
 # ---------------------------------------------------------------------------
@@ -262,6 +266,40 @@ def test_cmd_deploy_secrets_sync_uses_profile_level_project_id(
         mock_sync.call_args.args
     ) >= 3 else mock_sync.call_args.kwargs.get("project_id")
     assert project_id_arg == "dev-real-project"
+
+
+def test_cmd_deploy_secrets_sync_one_profile_unconfigured_in_default_scan_errors(
+    fake_project_root, monkeypatch, capsys
+):
+    """Codex review on PR #1057 v7: in the default scan, if any cloudrun
+    profile lacks a real ``gcp_project_id`` (and the manager value is
+    a placeholder), refuse to pick the configured profile's project as
+    a winner — the unconfigured profile's secrets would otherwise be
+    silently routed to the wrong project."""
+    monkeypatch.delenv("GCP_PROJECT_ID", raising=False)
+    (fake_project_root / "deploy_config.toml").write_text(
+        '[manager]\n'
+        'gcp_project_id = "your-gcp-project-id"\n'  # placeholder
+        '\n'
+        '[profiles.dev]\n'
+        'provider = "cloudrun"\n'
+        'gcp_project_id = "dev-real-project"\n'
+        '[profiles.dev.secrets]\n'
+        'KEY1 = "kestrel-key-a:latest"\n'
+        '\n'
+        '[profiles.prod]\n'
+        'provider = "cloudrun"\n'
+        # No gcp_project_id override — would fall back to the placeholder.
+        '[profiles.prod.secrets]\n'
+        'KEY2 = "kestrel-key-b:latest"\n'
+    )
+
+    rc = cmd_deploy(_make_args(target="secrets", profile="sync"))
+
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "no GCP project ID" in captured.err
+    assert "prod" in captured.err
 
 
 def test_cmd_deploy_secrets_sync_disagreeing_profile_projects_errors(

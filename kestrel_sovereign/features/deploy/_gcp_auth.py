@@ -64,6 +64,18 @@ def setup_gcp_auth() -> Optional[str]:
             f"Using credentials from GOOGLE_APPLICATION_CREDENTIALS: {creds_file}"
         )
         return None
+    if creds_file and not os.path.exists(creds_file):
+        # The env var points at a missing file. Google clients still
+        # check the env var first and fail on the missing path, so the
+        # ADC fallback below cannot actually take effect unless we
+        # clear it. Logged at WARNING so operators notice the stale
+        # value rather than silently losing it.
+        logger.warning(
+            "GOOGLE_APPLICATION_CREDENTIALS points at a missing file "
+            f"({creds_file}); clearing it so other auth sources can be "
+            "tried."
+        )
+        os.environ.pop("GOOGLE_APPLICATION_CREDENTIALS", None)
 
     key_json = os.getenv("GCP_SERVICE_ACCOUNT_KEY")
     if key_json:

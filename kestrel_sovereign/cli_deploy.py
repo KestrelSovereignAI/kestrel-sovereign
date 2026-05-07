@@ -513,32 +513,50 @@ def _resolve_project_id(
         )
         return None
 
-    # Default scan: refuse if profiles disagree with the manager value.
-    cloudrun_profile_projects = {
-        (data or {}).get("gcp_project_id")
-        for name, data in profiles.items()
+    # Default scan: collect every Cloud Run profile's *effective* project
+    # ID (profile override → manager → None) and refuse if they disagree
+    # OR if any are unset.
+    cloudrun_profiles = [
+        (name, data) for name, data in profiles.items()
         if (data or {}).get("provider", "cloudrun").lower() in {"cloudrun", "cloud_run"}
-        and _is_real_project_id((data or {}).get("gcp_project_id"))
-    }
+    ]
 
-    if len(cloudrun_profile_projects) > 1 or (
-        cloudrun_profile_projects
-        and _is_real_project_id(manager_value)
-        and manager_value not in cloudrun_profile_projects
-    ):
-        listed = sorted(cloudrun_profile_projects | (
-            {manager_value} if _is_real_project_id(manager_value) else set()
-        ))
-        print(
-            "error: Cloud Run profiles target different GCP projects "
-            f"({', '.join(listed)}). Use `--profile <name>` to sync one "
-            "profile's secrets, or align gcp_project_id across profiles.",
-            file=sys.stderr,
-        )
-        return None
+    effective: Dict[str, Optional[str]] = {}
+    for name, data in cloudrun_profiles:
+        prof_value = (data or {}).get("gcp_project_id")
+        if _is_real_project_id(prof_value):
+            effective[name] = prof_value
+        elif _is_real_project_id(manager_value):
+            effective[name] = manager_value
+        else:
+            effective[name] = None
 
-    if cloudrun_profile_projects:
-        return next(iter(cloudrun_profile_projects))
+    if cloudrun_profiles:
+        unset = sorted(n for n, v in effective.items() if v is None)
+        if unset:
+            print(
+                "error: Cloud Run profile(s) have no GCP project ID "
+                f"({', '.join(unset)}). Either set [manager].gcp_project_id, "
+                f"set [profiles.<name>.gcp_project_id] for those profiles, "
+                f"export GCP_PROJECT_ID, or use `--profile <name>` to sync a "
+                f"single configured profile.",
+                file=sys.stderr,
+            )
+            return None
+
+        distinct = sorted({v for v in effective.values() if v is not None})
+        if len(distinct) > 1:
+            print(
+                "error: Cloud Run profiles target different GCP projects "
+                f"({', '.join(distinct)}). Use `--profile <name>` to sync "
+                "one profile's secrets, or align gcp_project_id across "
+                "profiles.",
+                file=sys.stderr,
+            )
+            return None
+
+        return distinct[0]
+
     if _is_real_project_id(manager_value):
         return manager_value
 
