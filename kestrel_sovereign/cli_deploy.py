@@ -848,7 +848,17 @@ def _cmd_deploy_build(args) -> int:
             return 1
         targets = matching
 
-    # Platforms: comma-split if provided, else use the function default.
+    push = not args.no_push
+    multi_arch = not args.no_multi_arch
+    tag = args.tag
+
+    # Platforms: comma-split if provided. Defaults differ between push
+    # and no-push: ``--push`` defaults to multi-arch (matches build.sh);
+    # ``--no-push`` defaults to single-arch (linux/amd64) because
+    # buildx ``--load`` doesn't support multi-arch and silently failing
+    # the user's "local-only" workflow is a worse default than picking
+    # a sensible single platform. Codex review on PR #1060 caught the
+    # original "default rejects --no-push by default" footgun.
     if args.build_platforms:
         platforms = tuple(
             p.strip() for p in args.build_platforms.split(",") if p.strip()
@@ -860,12 +870,11 @@ def _cmd_deploy_build(args) -> int:
                 file=sys.stderr,
             )
             return 1
-    else:
+    elif push or not multi_arch:
         platforms = ("linux/amd64", "linux/arm64")
-
-    push = not args.no_push
-    multi_arch = not args.no_multi_arch
-    tag = args.tag
+    else:
+        # --no-push (with multi-arch buildx) → must be single-platform.
+        platforms = ("linux/amd64",)
 
     github_token = resolve_github_token()
     if github_token is None:

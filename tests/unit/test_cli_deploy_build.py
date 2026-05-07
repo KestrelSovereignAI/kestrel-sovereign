@@ -263,7 +263,13 @@ def test_cmd_deploy_build_target_filter_unknown_errors(fake_project_root, monkey
 
 def test_cmd_deploy_build_no_push_propagates(fake_project_root, monkeypatch, capsys):
     """``--no-push`` flows into build_all(push=False) and the rendered
-    line says ``(local only)``."""
+    line says ``(local only)``.
+
+    Codex review on PR #1060 v2: ``--no-push`` must default to a single
+    platform (buildx --load doesn't support multi-arch); without
+    ``--platforms`` the CLI now picks ``linux/amd64`` so the advertised
+    ``--no-push`` workflow works without extra flags.
+    """
     monkeypatch.setenv("GCP_PROJECT_ID", "test-project")
 
     fake_results = [_ok_build_result("kestrel", pushed=False)]
@@ -284,6 +290,9 @@ def test_cmd_deploy_build_no_push_propagates(fake_project_root, monkeypatch, cap
     captured = capsys.readouterr()
     assert rc == 0
     assert mock_build.call_args.kwargs["push"] is False
+    # Single-platform default for --no-push (multi-arch buildx --load
+    # only supports single-platform).
+    assert mock_build.call_args.kwargs["platforms"] == ("linux/amd64",)
     assert "(local only)" in captured.out
 
 
