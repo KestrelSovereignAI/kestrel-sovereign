@@ -25,6 +25,9 @@ Commands:
     kestrel agent docker retire    # retire a Docker-isolated agent
     kestrel docker remote build    # build the lightweight remote-LLM image
     kestrel docker remote run      # run the lightweight remote-LLM container
+    kestrel docker build <preset>  # build a Cloud-Build / GCR specialty image
+    kestrel ipfs {build,deploy,pin}    # self-hosted IPFS node lifecycle (Kubo + GCS)
+    kestrel runpod {deploy,status,stop,kill}   # RunPod GPU pod lifecycle (LoRA training)
 """
 
 import argparse
@@ -1821,6 +1824,28 @@ def build_parser() -> argparse.ArgumentParser:
     from kestrel_sovereign.cli_docker_remote import add_docker_subcommand
     add_docker_subcommand(subparsers)
 
+    # kestrel docker build <preset> — sub-PR 4 of epic #1050 (port of
+    # scripts/docker/build_*.sh). Hangs under the same ``kestrel
+    # docker`` parent as ``remote`` via the shared
+    # ``get_or_create_docker_subparsers`` helper.
+    from kestrel_sovereign.cli_docker_build import (
+        add_docker_build_subcommand,
+    )
+    add_docker_build_subcommand(subparsers)
+
+    # kestrel ipfs {build,deploy,pin} — sub-PR 4 of epic #1050 (port of
+    # scripts/ipfs/{build,deploy,pin_agents}.sh). Local import — gcloud
+    # / urllib / sqlite machinery is dead weight for operators who
+    # never run a self-hosted IPFS node.
+    from kestrel_sovereign.cli_ipfs import add_ipfs_subcommand
+    add_ipfs_subcommand(subparsers)
+
+    # kestrel runpod {deploy,status,stop,kill} — sub-PR 4 of epic #1050
+    # (port of scripts/runpod/deploy_lora_trainer.sh). Local import —
+    # the kestrel-cloud-runpod package may not be installed.
+    from kestrel_sovereign.cli_runpod import add_runpod_subcommand
+    add_runpod_subcommand(subparsers)
+
     return parser
 
 
@@ -1856,6 +1881,8 @@ def main() -> int:
     from kestrel_sovereign.cli_demo import cmd_demo
     from kestrel_sovereign.cli_agent_docker import cmd_agent
     from kestrel_sovereign.cli_docker_remote import cmd_docker
+    from kestrel_sovereign.cli_ipfs import cmd_ipfs
+    from kestrel_sovereign.cli_runpod import cmd_runpod
 
     commands = {
         "start": cmd_start,
@@ -1880,6 +1907,8 @@ def main() -> int:
         "demo": cmd_demo,
         "agent": cmd_agent,
         "docker": cmd_docker,
+        "ipfs": cmd_ipfs,
+        "runpod": cmd_runpod,
     }
 
     handler = commands.get(args.command)
