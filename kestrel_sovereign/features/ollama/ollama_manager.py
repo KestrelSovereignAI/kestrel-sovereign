@@ -123,16 +123,16 @@ class OllamaGPUManager:
         self._active_session: Optional[OllamaSession] = None
 
     def _get_runpod_manager(self):
-        """Lazy load RunPodManager."""
+        """Lazy load RunPodManager from the extracted kestrel-cloud-runpod package."""
         if self._runpod_manager is None:
             try:
-                from kestrel_sovereign.features.runpod.manager import RunPodManager
+                from kestrel_cloud_runpod.manager import RunPodManager
 
                 self._runpod_manager = RunPodManager()
             except ImportError as e:
                 raise OllamaGPUManagerError(
                     f"RunPod manager not available: {e}. "
-                    "Install runpod package: pip install runpod"
+                    "Install kestrel-cloud-runpod: uv pip install kestrel-cloud-runpod"
                 )
             except Exception as e:
                 raise OllamaGPUManagerError(f"Failed to initialize RunPod manager: {e}")

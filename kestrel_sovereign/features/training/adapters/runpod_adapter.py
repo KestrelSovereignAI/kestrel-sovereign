@@ -83,14 +83,20 @@ class RunPodTrainingAdapter:
         self._active_jobs: dict[str, dict] = {}  # job_id -> {session, companion_id, ...}
 
     def _get_manager(self):
-        """Lazy load the RunPod manager."""
+        """Lazy load the RunPod manager.
+
+        RunPod support lives in the kestrel-cloud-runpod feature package
+        now (extracted in #462). If it's not installed, this adapter
+        cleanly reports the provider as unavailable.
+        """
         if self._manager is None:
             try:
-                from kestrel_sovereign.features.runpod.manager import RunPodManager
+                from kestrel_cloud_runpod.manager import RunPodManager
                 self._manager = RunPodManager()
             except ImportError as e:
                 raise ProviderNotAvailableError(
-                    f"RunPod manager not available: {e}"
+                    f"RunPod manager not available — install kestrel-cloud-runpod "
+                    f"to enable RunPod-as-training-provider: {e}"
                 )
             except Exception as e:
                 raise ProviderNotAvailableError(
