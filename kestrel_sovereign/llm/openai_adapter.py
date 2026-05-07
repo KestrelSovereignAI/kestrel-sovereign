@@ -16,6 +16,8 @@ from typing import Any, Dict, List, Optional, AsyncIterator, Type, Union
 
 from pydantic import BaseModel
 
+from kestrel_sdk.llm import ToolCallStarted
+
 from .adapter import LLMAdapter, LLMResponse, ToolCall
 from .gpt5_overlay import prepend_gpt5_overlay
 from .model_metadata import ModelInfo, ModelCategory
@@ -139,7 +141,9 @@ class OpenAIAdapter(LLMAdapter):
                     try:
                         args = json.loads(tc.function.arguments)
                     except json.JSONDecodeError:
-                        args = {"raw": tc.function.arguments}
+                        # SDK 0.7.0 malformed-JSON sentinel; same
+                        # convention as the streaming path.
+                        args = {"_raw": tc.function.arguments}
 
                     parsed_tool_calls.append(ToolCall(
                         id=tc.id,
@@ -430,8 +434,20 @@ class OpenAIAdapter(LLMAdapter):
                     for tc_delta in delta.tool_calls:
                         idx = tc_delta.index
 
-                        # Initialize accumulator for this tool call if needed
-                        if idx not in tool_calls_accumulator:
+                        # Initialize accumulator for this tool call if
+                        # needed AND emit the SDK 0.7.0 ToolCallStarted
+                        # marker — exactly once per distinct index, on
+                        # the first delta for that index. OpenAI's
+                        # first delta typically carries id and name (in
+                        # the same fragment that introduces the index),
+                        # but the contract permits None for either when
+                        # the provider stream hasn't surfaced them yet.
+                        # We capture whatever's on this delta and emit
+                        # ``None`` for any field that arrives empty —
+                        # the final LLMResponse is the source of truth
+                        # for the assembled call.
+                        is_new_call = idx not in tool_calls_accumulator
+                        if is_new_call:
                             tool_calls_accumulator[idx] = {
                                 "id": "",
                                 "name": "",
@@ -450,6 +466,18 @@ class OpenAIAdapter(LLMAdapter):
                             if tc_delta.function.arguments:
                                 tool_calls_accumulator[idx]["arguments"] += tc_delta.function.arguments
 
+                        if is_new_call:
+                            # Emit ToolCallStarted only after we've
+                            # absorbed the first delta's id/name so the
+                            # marker carries them when present rather
+                            # than always being ``(None, None)``.
+                            current = tool_calls_accumulator[idx]
+                            yield ToolCallStarted(
+                                index=idx,
+                                id=current["id"] or None,
+                                name=current["name"] or None,
+                            )
+
             logger.info(f"Stream completed. Text chunks: {chunk_count}, Tool calls: {len(tool_calls_accumulator)}")
 
             # If we have tool calls, yield a final LLMResponse with assembled tool calls
@@ -460,7 +488,10 @@ class OpenAIAdapter(LLMAdapter):
                     try:
                         args = json.loads(tc_data["arguments"]) if tc_data["arguments"] else {}
                     except json.JSONDecodeError:
-                        args = {"raw": tc_data["arguments"]}
+                        # SDK 0.7.0 malformed-JSON fallback — see
+                        # contract docstring on
+                        # LLMAdapter.get_streaming_response_with_tools.
+                        args = {"_raw": tc_data["arguments"]}
 
                     parsed_tool_calls.append(ToolCall(
                         id=tc_data["id"],

@@ -781,7 +781,8 @@ class CodexAdapter(LLMAdapter):
                 try:
                     args = json.loads(fc["arguments"]) if fc["arguments"] else {}
                 except json.JSONDecodeError:
-                    args = {"raw": fc["arguments"]}
+                    # SDK 0.7.0 malformed-JSON sentinel.
+                    args = {"_raw": fc["arguments"]}
                 parsed_tool_calls.append(ToolCall(
                     id=fc["id"],
                     name=fc["name"],
@@ -1010,7 +1011,8 @@ class CodexAdapter(LLMAdapter):
                 try:
                     args = json.loads(fc["arguments"]) if fc["arguments"] else {}
                 except json.JSONDecodeError:
-                    args = {"raw": fc["arguments"]}
+                    # SDK 0.7.0 malformed-JSON sentinel.
+                    args = {"_raw": fc["arguments"]}
                 parsed_tool_calls.append(ToolCall(
                     id=fc["id"],
                     name=fc["name"],

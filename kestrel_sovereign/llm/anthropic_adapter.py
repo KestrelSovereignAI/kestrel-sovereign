@@ -15,6 +15,8 @@ from typing import Any, Dict, List, Optional, Union, AsyncIterator, Type
 import httpx
 from pydantic import BaseModel
 
+from kestrel_sdk.llm import ToolCallStarted
+
 from .adapter import LLMAdapter, LLMResponse, ToolCall
 from .model_metadata import ModelInfo, ModelCategory
 from .image_utils import process_images
@@ -842,6 +844,23 @@ class AnthropicAdapter(LLMAdapter):
                                 }
                                 current_tool_block_index = block_index
 
+                                # Emit the SDK 0.7.0 ToolCallStarted marker.
+                                # Anthropic populates both ``id`` and ``name``
+                                # at content_block_start, so we surface them
+                                # in the marker — the constitutional honesty
+                                # layer (#1042 layer 2 / #1045) reads this
+                                # as the deterministic "stop yielding pre-tool
+                                # prose" signal. The structured-output tool
+                                # path emits a marker too; consumers that
+                                # care about user-visible tool calls only
+                                # can filter by name (the framework knows
+                                # the structured-output sentinel name).
+                                yield ToolCallStarted(
+                                    index=block_index,
+                                    id=block.id,
+                                    name=block.name,
+                                )
+
                     # Content block delta - actual content chunks
                     elif event_type == 'content_block_delta':
                         if hasattr(event, 'delta'):
@@ -885,7 +904,14 @@ class AnthropicAdapter(LLMAdapter):
                     try:
                         args = json.loads(tc_data["arguments"]) if tc_data["arguments"] else {}
                     except json.JSONDecodeError:
-                        args = {"raw": tc_data["arguments"]}
+                        # SDK 0.7.0 contract: malformed-JSON fallback
+                        # surfaces the partial string under the
+                        # ``_raw`` sentinel key so the framework can
+                        # report the error to the model as a tool
+                        # result rather than crashing the turn. Was
+                        # ``"raw"`` pre-0.7.0 — renamed to underscore-
+                        # prefixed to signal "sentinel, not real data".
+                        args = {"_raw": tc_data["arguments"]}
 
                     parsed_tool_calls.append(ToolCall(
                         id=tc_data["id"],
