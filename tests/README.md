@@ -182,9 +182,6 @@ uv run pytest tests/ -m "not slow"
 ```bash
 # Infrastructure tests (RunPod, containers)
 uv run pytest tests/infrastructure/ -v
-
-# Build test script
-./tests/infrastructure/build_test.sh
 ```
 
 ## Common Options
