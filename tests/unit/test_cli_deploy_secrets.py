@@ -228,6 +228,74 @@ def test_cmd_deploy_secrets_sync_uses_env_var_project_id(fake_project_root, monk
     assert project_id_arg == "env-project"
 
 
+def test_cmd_deploy_secrets_sync_uses_profile_level_project_id(
+    fake_project_root, monkeypatch
+):
+    """Codex review on PR #1057: a profile-specific ``gcp_project_id``
+    overrides the manager's value when ``--profile`` is given.
+    DeployManagerCore._load_profiles supports this; the CLI must mirror
+    it or sync to the wrong project / fail when manager is a placeholder.
+    """
+    monkeypatch.delenv("GCP_PROJECT_ID", raising=False)
+    (fake_project_root / "deploy_config.toml").write_text(
+        '[manager]\n'
+        'gcp_project_id = "your-gcp-project-id"\n'  # placeholder
+        '\n'
+        '[profiles.dev]\n'
+        'provider = "cloudrun"\n'
+        'gcp_project_id = "dev-real-project"\n'
+        '\n'
+        '[profiles.dev.secrets]\n'
+        'OPENAI_API_KEY = "kestrel-openai-key:latest"\n'
+    )
+
+    with patch(
+        "kestrel_sovereign.features.deploy.secrets.sync_all_secrets",
+        return_value=[],
+    ) as mock_sync:
+        rc = cmd_deploy(_make_args(
+            target="secrets", profile="sync", secrets_profile="dev",
+        ))
+
+    assert rc == 0
+    project_id_arg = mock_sync.call_args.args[2] if len(
+        mock_sync.call_args.args
+    ) >= 3 else mock_sync.call_args.kwargs.get("project_id")
+    assert project_id_arg == "dev-real-project"
+
+
+def test_cmd_deploy_secrets_sync_disagreeing_profile_projects_errors(
+    fake_project_root, monkeypatch, capsys
+):
+    """Default scan with two cloudrun profiles targeting different GCP
+    projects refuses to pick a winner — directs the operator at
+    ``--profile``."""
+    monkeypatch.delenv("GCP_PROJECT_ID", raising=False)
+    (fake_project_root / "deploy_config.toml").write_text(
+        '[manager]\n'
+        'gcp_project_id = "alpha-project"\n'
+        '\n'
+        '[profiles.dev]\n'
+        'provider = "cloudrun"\n'
+        'gcp_project_id = "alpha-project"\n'
+        '[profiles.dev.secrets]\n'
+        'KEY1 = "kestrel-key-a:latest"\n'
+        '\n'
+        '[profiles.prod]\n'
+        'provider = "cloudrun"\n'
+        'gcp_project_id = "beta-project"\n'
+        '[profiles.prod.secrets]\n'
+        'KEY2 = "kestrel-key-b:latest"\n'
+    )
+
+    rc = cmd_deploy(_make_args(target="secrets", profile="sync"))
+
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "different GCP projects" in captured.err
+    assert "--profile" in captured.err
+
+
 def test_cmd_deploy_secrets_sync_dry_run_passes_flag(fake_project_root, monkeypatch):
     """``--dry-run`` propagates into ``sync_all_secrets(dry_run=True)``."""
     monkeypatch.setenv("GCP_PROJECT_ID", "test-project")

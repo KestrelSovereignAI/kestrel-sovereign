@@ -453,30 +453,94 @@ def _load_deploy_config_for_secrets() -> Optional[Dict[str, Any]]:
         return None
 
 
-def _resolve_project_id() -> Optional[str]:
+_PLACEHOLDER_PROJECT = "your-gcp-project-id"
+
+
+def _is_real_project_id(value: Optional[str]) -> bool:
+    """Filter out unset / example placeholder values."""
+    return bool(value) and value != _PLACEHOLDER_PROJECT
+
+
+def _resolve_project_id(
+    config: Optional[Dict[str, Any]] = None,
+    profile: Optional[str] = None,
+) -> Optional[str]:
     """Find the GCP project ID for the secrets sync.
 
     Order of precedence:
 
     1. ``GCP_PROJECT_ID`` env var (matches the bash script).
-    2. ``[manager].gcp_project_id`` from ``deploy_config.toml``.
+    2. ``[profiles.<profile>].gcp_project_id`` from ``deploy_config.toml``
+       — only consulted when ``--profile`` was given. Cloud Run profiles
+       can override the manager value (DeployManagerCore._load_profiles).
+       Codex review on PR #1057 caught that we ignored this earlier.
+    3. ``[manager].gcp_project_id``.
 
-    Returns None and prints an error if neither is set. We do NOT
-    silently fall back to ``"your-gcp-project-id"`` (the example value);
-    that's exactly the kind of silent failure the project's
-    no-blind-fallbacks rule forbids.
+    With ``profile=None`` (the default all-profiles scan), if any Cloud
+    Run profile sets a ``gcp_project_id`` that disagrees with the
+    manager's, refuse to pick a winner — print an error pointing the
+    operator at ``--profile``.
+
+    Returns None on error (the caller should propagate exit 1).
     """
     env_value = os.getenv("GCP_PROJECT_ID")
     if env_value:
         return env_value
 
-    config = _load_deploy_config_for_secrets()
     if config is None:
-        return None
+        config = _load_deploy_config_for_secrets()
+        if config is None:
+            return None
+
     manager_section = config.get("manager", {}) or {}
-    config_value = manager_section.get("gcp_project_id")
-    if config_value and config_value != "your-gcp-project-id":
-        return config_value
+    manager_value = manager_section.get("gcp_project_id")
+
+    profiles = config.get("profiles", {}) or {}
+
+    if profile is not None:
+        prof_data = profiles.get(profile, {}) or {}
+        prof_value = prof_data.get("gcp_project_id")
+        if _is_real_project_id(prof_value):
+            return prof_value
+        if _is_real_project_id(manager_value):
+            return manager_value
+        print(
+            f"error: GCP project ID not set for profile '{profile}'. "
+            f"Either export GCP_PROJECT_ID, set [manager].gcp_project_id, "
+            f"or set [profiles.{profile}].gcp_project_id in "
+            f"deploy_config.toml.",
+            file=sys.stderr,
+        )
+        return None
+
+    # Default scan: refuse if profiles disagree with the manager value.
+    cloudrun_profile_projects = {
+        (data or {}).get("gcp_project_id")
+        for name, data in profiles.items()
+        if (data or {}).get("provider", "cloudrun").lower() in {"cloudrun", "cloud_run"}
+        and _is_real_project_id((data or {}).get("gcp_project_id"))
+    }
+
+    if len(cloudrun_profile_projects) > 1 or (
+        cloudrun_profile_projects
+        and _is_real_project_id(manager_value)
+        and manager_value not in cloudrun_profile_projects
+    ):
+        listed = sorted(cloudrun_profile_projects | (
+            {manager_value} if _is_real_project_id(manager_value) else set()
+        ))
+        print(
+            "error: Cloud Run profiles target different GCP projects "
+            f"({', '.join(listed)}). Use `--profile <name>` to sync one "
+            "profile's secrets, or align gcp_project_id across profiles.",
+            file=sys.stderr,
+        )
+        return None
+
+    if cloudrun_profile_projects:
+        return next(iter(cloudrun_profile_projects))
+    if _is_real_project_id(manager_value):
+        return manager_value
 
     print(
         "error: GCP project ID not set. Either export GCP_PROJECT_ID or "
@@ -538,7 +602,11 @@ def _cmd_deploy_secrets_sync(args) -> int:
     if config is None:
         return 1
 
-    project_id = _resolve_project_id()
+    # ``--profile`` (dest=secrets_profile) is the secrets-namespace flag —
+    # the second positional ``profile`` is the subverb name (``sync``).
+    profile = args.secrets_profile
+
+    project_id = _resolve_project_id(config=config, profile=profile)
     if project_id is None:
         return 1
 
@@ -551,10 +619,6 @@ def _cmd_deploy_secrets_sync(args) -> int:
         from kestrel_sovereign.cli import _get_project_dir
 
         env_path = _get_project_dir() / ".env"
-
-    # ``--profile`` (dest=secrets_profile) is the secrets-namespace flag —
-    # the second positional ``profile`` is the subverb name (``sync``).
-    profile = args.secrets_profile
 
     try:
         results = sync_all_secrets(
