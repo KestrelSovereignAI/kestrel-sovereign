@@ -44,6 +44,13 @@ async def test_council_members_help_uses_auto_model_example():
 
 
 def test_run_docker_remote_does_not_inject_hidden_default_model():
-    script = Path("scripts/run_docker_remote.sh").read_text(encoding="utf-8")
+    """Epic #1050 tier 3 ported ``scripts/run_docker_remote.sh`` to
+    :mod:`kestrel_sovereign.cli_docker_remote`. The property the legacy
+    test guarded — ``run_docker_remote`` does not inject a hidden
+    default model — must still hold for the Python entry point.
+    """
+    from kestrel_sovereign import cli_docker_remote
 
-    assert "DEFAULT_LLM_MODEL" not in script
+    src = Path(cli_docker_remote.__file__).read_text(encoding="utf-8")
+
+    assert "DEFAULT_LLM_MODEL" not in src

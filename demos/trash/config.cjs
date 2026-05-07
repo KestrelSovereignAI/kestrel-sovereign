@@ -8,7 +8,7 @@ const { buildDemoConfig } = require('@kestrel/flight');
  * Soft-delete (#763) + Trash sub-view (#765) end-to-end.
  *
  * Run via the canonical isolating runner:
- *   demos/run.sh trash
+ *   kestrel demo run trash
  */
 module.exports = buildDemoConfig(
   [{ name: 'trash-demo', testMatch: 'demo.cjs', timeout: 300000 }],

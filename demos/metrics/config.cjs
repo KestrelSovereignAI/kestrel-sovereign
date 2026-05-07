@@ -7,7 +7,7 @@ const { buildDemoConfig } = require('@kestrel/flight');
  *
  * Narrated demo of the observability / KPI dashboard panel.
  *
- * Run: demos/run.sh metrics
+ * Run: kestrel demo run metrics
  * Env: DEMO_SLOWMO=200, KESTREL_URL (set by run.sh), KESTREL_API_KEY (unset by run.sh)
  */
 module.exports = buildDemoConfig(

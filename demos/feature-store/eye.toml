@@ -3,7 +3,7 @@
 [eye]
 name = "Kestrel Feature Store Demo"
 screenshot_dir = "demos/feature-store/demo-output"
-test_cmd = "demos/run.sh feature-store"
+test_cmd = "kestrel demo run feature-store"
 
 [eye.model]
 provider = "anthropic"

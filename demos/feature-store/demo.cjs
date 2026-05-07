@@ -8,7 +8,7 @@
  *   Act 4: Skills list highlight
  *   Act 5: Back to grid bookend
  *
- * Run: demos/run.sh feature-store
+ * Run: kestrel demo run feature-store
  *
  * Output (in demo-output/):
  *   - narration.md   — timestamped transcript

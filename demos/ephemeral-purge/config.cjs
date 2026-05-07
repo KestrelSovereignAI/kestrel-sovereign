@@ -8,7 +8,7 @@ const { buildDemoConfig } = require('@kestrel/flight');
  * Defense-in-depth (#767): when the user toggles out of EPHEMERAL, the
  * agent hard-purges any rows the privacy wrapper accidentally let through.
  *
- * Run: demos/run.sh ephemeral-purge
+ * Run: kestrel demo run ephemeral-purge
  */
 module.exports = buildDemoConfig(
   [{ name: 'ephemeral-purge-demo', testMatch: 'demo.cjs', timeout: 240000 }],

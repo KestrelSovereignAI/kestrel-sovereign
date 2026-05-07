@@ -43,6 +43,6 @@ after a tour.
 ## Running the vignette
 
 ```bash
-demos/run.sh privacy-modes
+kestrel demo run privacy-modes
 kestrel-eye review --config demos/privacy-modes/eye.toml
 ```
