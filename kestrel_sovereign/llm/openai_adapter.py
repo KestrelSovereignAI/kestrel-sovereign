@@ -636,3 +636,24 @@ class OpenAIAdapter(LLMAdapter):
             else:
                 normalized.append(msg)
         return normalized
+
+    # ---- Provider metadata (SDK 0.6.0) -------------------------------------
+
+    def substrate_type(self) -> Optional[str]:
+        return "gpt"
+
+    def display_name(self) -> Optional[str]:
+        return "OpenAI"
+
+    def key_env_var(self) -> Optional[str]:
+        return "OPENAI_API_KEY"
+
+    # cost_per_1m_tokens: omitted — OpenAI pricing varies dramatically by
+    # model (gpt-5-mini vs o3 vs gpt-3.5-turbo), so per-model pricing
+    # belongs on ModelInfo rather than the adapter. Council costing falls
+    # back to the framework's conservative default when this returns None.
+
+    # deliberation_style: omitted — OpenAI spans the speed/cost spectrum
+    # (gpt-5-mini fast, o3 careful), so a single-adapter hint isn't
+    # meaningful. Council leaves this routing decision to model-level
+    # heuristics.

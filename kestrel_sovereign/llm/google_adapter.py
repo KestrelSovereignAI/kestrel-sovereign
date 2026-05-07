@@ -328,3 +328,23 @@ class GoogleAdapter(LLMAdapter):
         except Exception as e:
             logger.error(f"Failed to list Google models: {e}", exc_info=True)
             return []
+
+    # ---- Provider metadata (SDK 0.6.0) -------------------------------------
+
+    def cost_per_1m_tokens(self) -> Optional[Dict[str, float]]:
+        # Gemini Pro / 2.5 Flash midpoint pricing as the conservative
+        # default. Per-model rates land on ModelInfo when discovery
+        # surfaces them.
+        return {"input": 1.25, "output": 5.00}
+
+    def substrate_type(self) -> Optional[str]:
+        return "gemini"
+
+    def display_name(self) -> Optional[str]:
+        return "Google Gemini"
+
+    def key_env_var(self) -> Optional[str]:
+        # The framework prefers GOOGLE_API_KEY but accepts GEMINI_API_KEY
+        # as a fallback (see list_models). Surfacing the canonical name
+        # here for the keys-UI; the alternate is read at call time.
+        return "GOOGLE_API_KEY"
