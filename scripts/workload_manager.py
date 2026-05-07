@@ -247,11 +247,19 @@ async def run_workload_manager(verbose: bool = False):
     talon_env.pop("ANTHROPIC_API_KEY", None)
 
     # Subprocess managers
+    talon_config_path = project_root / "scripts/talon_daemon.toml"
+    talon_enabled = talon_config_path.exists()
+    if not talon_enabled:
+        example = project_root / "scripts/talon_daemon.example.toml"
+        logger.warning(
+            "Talon disabled: %s missing. Bootstrap once with: cp %s %s && $EDITOR %s",
+            talon_config_path, example, talon_config_path, talon_config_path,
+        )
     talon = SubprocessManager(
         name="talon-daemon",
         cmd=[
             sys.executable, str(project_root / "scripts/talon_daemon.py"),
-            "--config", str(project_root / "scripts/talon_daemon.toml"),
+            "--config", str(talon_config_path),
         ] + (["--verbose"] if verbose else []),
         cwd=project_root,
         env=talon_env,
@@ -316,7 +324,7 @@ async def run_workload_manager(verbose: bool = False):
                 # Normal operation
 
                 # Talon — always run during work hours if GREEN
-                if mem_status.pressure == PressureLevel.GREEN and not talon.is_running:
+                if talon_enabled and mem_status.pressure == PressureLevel.GREEN and not talon.is_running:
                     pid = await talon.start()
                     _state.talon_pid = pid
                 _state.talon_running = talon.is_running
@@ -340,7 +348,7 @@ async def run_workload_manager(verbose: bool = False):
             _state.embeddings_running = embeddings.is_running
 
             # Check for crashed subprocesses and restart
-            if talon.process and talon.process.returncode is not None and not is_sleep_time():
+            if talon_enabled and talon.process and talon.process.returncode is not None and not is_sleep_time():
                 logger.warning(f"Talon exited (code {talon.process.returncode}), will restart next cycle")
                 talon.process = None
 
