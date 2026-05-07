@@ -223,14 +223,21 @@ def _default_runner(cmd: List[str], env: Optional[dict] = None) -> Any:
     return code ourselves and wrap a non-zero exit in :class:`BuildError`
     rather than raising :class:`subprocess.CalledProcessError` which
     leaks the stdlib exception class across our public boundary.
+
+    Output is **not** captured: docker builds emit progress lines that
+    the operator wants to see live, and a Cloud Run image build can
+    take many minutes — buffering the lot until the process exits
+    (which ``capture_output=True`` would do) makes the CLI look hung.
+    Stream stdout/stderr to the parent terminal instead. On failure
+    the docker output is already on screen; :class:`BuildError`
+    carries the cmd argv and (empty) stderr for the structured
+    summary line. Codex review on PR #1060 caught the buffering issue.
     """
     import subprocess
 
     return subprocess.run(
         cmd,
         env=env,
-        capture_output=True,
-        text=True,
         check=False,
     )
 
