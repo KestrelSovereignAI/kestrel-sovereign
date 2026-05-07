@@ -273,6 +273,37 @@ class BootstrapFeature(Feature):
 
         files = loader.list_files()
         loaded = [f["name"] for f in files if f.get("status") == "loaded"]
+        # Honesty: BootstrapLoader.reload() catches per-file read
+        # exceptions and silently drops the file from the cache.
+        # ``list_files()`` reports those (and budget-exhausted entries)
+        # as ``status == "skipped (budget)"``: the file is present on
+        # disk but isn't in the prompt. ``status == "not found"``
+        # means the file genuinely isn't on disk — that's the normal
+        # state for the default-optional bootstrap files (#659) and
+        # not a failure. (Round 3 codex finding.)
+        dropped = [
+            f["name"] for f in files
+            if (f.get("status") or "").startswith("skipped")
+        ]
+        if dropped:
+            return ToolResult.partial(
+                confirmation=(
+                    f"Reloaded {len(loaded)} file(s) from disk; "
+                    f"{loader.total_chars} char(s) total"
+                ),
+                error=(
+                    f"{len(dropped)} configured file(s) exist on disk "
+                    f"but were dropped from the prompt "
+                    f"(read failure or budget exhausted): "
+                    f"{', '.join(dropped)}"
+                ),
+                data={
+                    "loaded_count": loader.file_count,
+                    "total_chars": loader.total_chars,
+                    "files": loaded,
+                    "dropped_files": dropped,
+                },
+            )
         return ToolResult.ok(
             confirmation=(
                 f"Reloaded {loader.file_count} file(s) from disk; "
@@ -614,7 +645,16 @@ class BootstrapFeature(Feature):
             logger.error(f"skip_discovery failed: {e}", exc_info=True)
             return ToolResult.failed(str(e))
 
+        # Honesty: BootstrapService.skip_discovery() marks state
+        # COMPLETE even when save_soul_md() failed (missing
+        # agent_data_path, write error, etc.). The user-visible
+        # message says "personality saved" but no SOUL.md exists.
+        # Verify the file before claiming success. (Round 3
+        # codex finding.)
+        soul_exists, soul_check_path = self._verify_soul_md_exists()
+
         # Reload SOUL.md into context builder
+        cb_reload_error: Optional[str] = None
         if hasattr(self.agent, 'context_builder'):
             try:
                 self.agent.context_builder._load_soul_md()
@@ -624,19 +664,50 @@ class BootstrapFeature(Feature):
                     f"reload failed: {e}",
                     exc_info=True,
                 )
-                return ToolResult.partial(
-                    confirmation=str(result) if result else "Discovery skipped",
-                    error=(
-                        f"SOUL.md reload into context_builder failed: {e}; "
-                        "personality will not take effect until next "
-                        "agent restart"
-                    ),
-                    data={"service_result": str(result)},
-                )
+                cb_reload_error = str(e)
+
+        if not soul_exists:
+            return ToolResult.partial(
+                confirmation=(
+                    f"Bootstrap state set to COMPLETE: "
+                    f"{str(result) if result else 'Discovery skipped'}"
+                ),
+                error=(
+                    f"SOUL.md was not written to disk "
+                    f"(checked: {soul_check_path or 'no agent_data_path configured'}); "
+                    "the default personality will not take effect until "
+                    "the file is created and the agent restarts"
+                ),
+                data={
+                    "service_result": str(result),
+                    "soul_exists": False,
+                    "soul_check_path": soul_check_path,
+                    "cb_reload_error": cb_reload_error,
+                },
+            )
+
+        if cb_reload_error:
+            return ToolResult.partial(
+                confirmation=str(result) if result else "Discovery skipped",
+                error=(
+                    f"SOUL.md reload into context_builder failed: "
+                    f"{cb_reload_error}; "
+                    "personality will not take effect until next "
+                    "agent restart"
+                ),
+                data={
+                    "service_result": str(result),
+                    "soul_exists": True,
+                    "cb_reload_error": cb_reload_error,
+                },
+            )
 
         return ToolResult.ok(
             confirmation=str(result) if result else "Discovery skipped",
-            data={"service_result": str(result)},
+            data={
+                "service_result": str(result),
+                "soul_exists": True,
+            },
         )
 
     @tool(
@@ -792,6 +863,24 @@ class BootstrapFeature(Feature):
         if cb and hasattr(cb, 'agent_data_path') and cb.agent_data_path:
             return str(cb.agent_data_path)
         return None
+
+    def _verify_soul_md_exists(self) -> tuple[bool, Optional[str]]:
+        """Check whether SOUL.md exists at the agent's data path.
+
+        Used by skip_discovery to verify the bootstrap_service
+        actually wrote the personality file before reporting OK.
+        Returns ``(exists, checked_path_or_None)``. ``checked_path``
+        is None when no agent_data_path is configured (in which
+        case a SOUL.md write would have been impossible).
+        """
+        agent_data = self._get_agent_data_path()
+        if not agent_data:
+            return False, None
+        soul_path = Path(agent_data) / "SOUL.md"
+        try:
+            return soul_path.exists(), str(soul_path)
+        except Exception:
+            return False, str(soul_path)
 
     def _get_db(self):
         """Get the async database handle if available."""

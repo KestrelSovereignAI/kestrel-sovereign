@@ -526,6 +526,36 @@ class TestBootstrapFeatureTools:
         assert loader.get_file("SOUL.md") == "Updated"
 
     @pytest.mark.asyncio
+    async def test_bootstrap_reload_partial_when_file_dropped_from_budget(
+        self, mock_agent, tmp_agent_dir,
+    ):
+        """Round 3 finding: when a file exists on disk but the loader
+        drops it (read failure or budget exhausted), bootstrap_reload
+        must return PARTIAL with the dropped name. Files that are
+        genuinely absent (the optional default set) stay OK."""
+        from kestrel_sdk.tools.result import ToolResultStatus
+        from kestrel_sovereign.features.bootstrap.feature import BootstrapFeature
+
+        # Tiny budget — second file overflows and gets skipped
+        loader = BootstrapLoader(
+            agent_data_path=str(tmp_agent_dir),
+            max_total_chars=20,
+            file_order=["A.md", "B.md"],
+        )
+        (tmp_agent_dir / "A.md").write_text("A" * 18)
+        (tmp_agent_dir / "B.md").write_text("B" * 100)
+
+        mock_agent.context_builder = MagicMock()
+        mock_agent.context_builder._bootstrap_loader = loader
+        feature = BootstrapFeature(mock_agent)
+
+        result = await feature.bootstrap_reload()
+        assert result.status is ToolResultStatus.PARTIAL
+        assert "B.md" in result.error
+        assert "B.md" in result.data["dropped_files"]
+        assert "A.md" in result.data["files"]
+
+    @pytest.mark.asyncio
     async def test_bootstrap_add_in_memory_only_is_partial(self, feature_with_loader):
         """When the loader has no DB wiring, the add succeeds in memory
         but won't survive a restart — surfaces as PARTIAL."""
@@ -694,6 +724,76 @@ class TestBootstrapFeatureTools:
         for tool_fn in [feature.bootstrap_list, feature.bootstrap_reload]:
             result = await tool_fn()
             assert result.status is ToolResultStatus.ERROR
+
+    @pytest.mark.asyncio
+    async def test_skip_discovery_partial_when_soul_md_missing(self, mock_agent, tmp_agent_dir):
+        """Round 3 finding: BootstrapService.skip_discovery() can mark
+        bootstrap COMPLETE even if save_soul_md() failed (no
+        agent_data_path, write error). The user-visible message says
+        "personality saved" but no SOUL.md exists. skip_discovery
+        must verify the file before claiming OK."""
+        from kestrel_sdk.tools.result import ToolResultStatus
+        from kestrel_sovereign.features.bootstrap.feature import BootstrapFeature
+        from kestrel_sovereign.bootstrap import BootstrapState
+
+        mock_agent.bootstrap_service.agent_data_path = str(tmp_agent_dir)
+        mock_agent.bootstrap_service.get_bootstrap_state = AsyncMock(
+            return_value=BootstrapState.PENDING
+        )
+        mock_agent.bootstrap_service.skip_discovery = AsyncMock(
+            return_value="Bootstrap skipped successfully"
+        )
+        # NOTE: tmp_agent_dir does NOT have SOUL.md — service did not write it
+
+        feature = BootstrapFeature(mock_agent)
+        result = await feature.skip_discovery()
+
+        assert result.status is ToolResultStatus.PARTIAL
+        assert "soul.md" in result.error.lower()
+        assert "not be written" in result.error.lower() or "not written" in result.error.lower()
+        assert result.data["soul_exists"] is False
+
+    @pytest.mark.asyncio
+    async def test_skip_discovery_ok_when_soul_md_present(self, mock_agent, tmp_agent_dir):
+        """Happy path: bootstrap_service skipped + SOUL.md was written."""
+        from kestrel_sdk.tools.result import ToolResultStatus
+        from kestrel_sovereign.features.bootstrap.feature import BootstrapFeature
+        from kestrel_sovereign.bootstrap import BootstrapState
+
+        mock_agent.bootstrap_service.agent_data_path = str(tmp_agent_dir)
+        mock_agent.bootstrap_service.get_bootstrap_state = AsyncMock(
+            return_value=BootstrapState.PENDING
+        )
+        mock_agent.bootstrap_service.skip_discovery = AsyncMock(
+            return_value="Bootstrap skipped successfully"
+        )
+        # Service wrote SOUL.md
+        (tmp_agent_dir / "SOUL.md").write_text("# Default personality")
+
+        feature = BootstrapFeature(mock_agent)
+        result = await feature.skip_discovery()
+
+        assert result.status is ToolResultStatus.OK
+        assert result.data["soul_exists"] is True
+
+    @pytest.mark.asyncio
+    async def test_skip_discovery_no_op_when_already_complete(self, mock_agent):
+        """When state is already COMPLETE, skip is a no-op (OK with the
+        no-op confirmation, not a failed action)."""
+        from kestrel_sdk.tools.result import ToolResultStatus
+        from kestrel_sovereign.features.bootstrap.feature import BootstrapFeature
+        from kestrel_sovereign.bootstrap import BootstrapState
+
+        mock_agent.bootstrap_service.get_bootstrap_state = AsyncMock(
+            return_value=BootstrapState.COMPLETE
+        )
+
+        feature = BootstrapFeature(mock_agent)
+        result = await feature.skip_discovery()
+
+        assert result.status is ToolResultStatus.OK
+        assert "already complete" in result.confirmation.lower()
+        assert "nothing to skip" in result.confirmation.lower()
 
     @pytest.mark.asyncio
     async def test_existing_tools_still_work(self, mock_agent):
