@@ -340,12 +340,20 @@ class BootstrapFeature(Feature):
 
         loader.add_file(filename)
 
-        # Persist to DB if available
-        db_persisted = True
+        # Persist to DB if available.
+        #
+        # Honesty: ``loader.save_db_entry`` silently no-ops when the
+        # loader was constructed without a ``db`` connection — that's
+        # the normal ContextBuilder path. Treating "agent has a DB"
+        # as "persistence happened" overstates durability — the entry
+        # is in-memory only and won't survive an agent restart.
+        # We mirror the loader's own gate (private fields ``_db`` /
+        # ``_agent_id``) so we only claim persistence when the call
+        # would actually write a row.
+        db_attempted = bool(getattr(loader, "_db", None) and getattr(loader, "_agent_id", None))
+        db_persisted = False
         db_persist_error: Optional[str] = None
-        db = self._get_db()
-        agent_id = self.agent.did
-        if db and agent_id:
+        if db_attempted:
             try:
                 await loader.save_db_entry(
                     file_name=filename,
@@ -353,15 +361,24 @@ class BootstrapFeature(Feature):
                     enabled=True,
                     priority=100 + len(loader.file_order),
                 )
+                db_persisted = True
             except Exception as e:
                 logger.warning(f"Failed to persist bootstrap config to DB: {e}")
-                db_persisted = False
                 db_persist_error = str(e)
 
         # Reload to pick up the new file
         loader.reload()
 
         loaded = filename in loader.get_bootstrap_content()
+        # Common data fields shared across the OK/PARTIAL branches.
+        _data = {
+            "filename": filename,
+            "resolved_path": str(resolved),
+            "loaded": loaded,
+            "db_attempted": db_attempted,
+            "db_persisted": db_persisted,
+            "db_persist_error": db_persist_error,
+        }
         if not loaded:
             # The loader accepted the entry but the file's content was
             # not pulled into the bootstrap content (read failure,
@@ -370,21 +387,30 @@ class BootstrapFeature(Feature):
             # prompt.
             return ToolResult.partial(
                 confirmation=(
-                    f"Registered '{filename}' in the bootstrap file list "
-                    f"(persisted to DB: {db_persisted})"
+                    f"Registered '{filename}' in the bootstrap file list"
                 ),
                 error=(
                     f"file '{filename}' is in the load order but its "
                     "content was not pulled into the bootstrap prompt; "
                     "check the loader's file status"
                 ),
-                data={
-                    "filename": filename,
-                    "resolved_path": str(resolved),
-                    "loaded": False,
-                    "db_persisted": db_persisted,
-                    "db_persist_error": db_persist_error,
-                },
+                data=_data,
+            )
+        if not db_attempted:
+            # The loader has no DB wiring — the entry is in-memory
+            # only. Mirrors the in-process ContextBuilder default
+            # construction. PARTIAL forces the LLM to surface the
+            # restart-loss caveat.
+            return ToolResult.partial(
+                confirmation=(
+                    f"Added '{filename}' to bootstrap files in memory "
+                    "(loaded into prompt)"
+                ),
+                error=(
+                    "loader has no DB wiring; the entry is in-memory "
+                    "only and will not survive an agent restart"
+                ),
+                data=_data,
             )
         if not db_persisted:
             return ToolResult.partial(
@@ -395,22 +421,14 @@ class BootstrapFeature(Feature):
                     f"DB persistence failed: {db_persist_error}; the entry "
                     "will not survive an agent restart"
                 ),
-                data={
-                    "filename": filename,
-                    "resolved_path": str(resolved),
-                    "loaded": True,
-                    "db_persisted": False,
-                    "db_persist_error": db_persist_error,
-                },
+                data=_data,
             )
         return ToolResult.ok(
-            confirmation=f"Added '{filename}' to bootstrap files (loaded into prompt)",
-            data={
-                "filename": filename,
-                "resolved_path": str(resolved),
-                "loaded": True,
-                "db_persisted": True,
-            },
+            confirmation=(
+                f"Added '{filename}' to bootstrap files "
+                "(loaded into prompt, persisted to DB)"
+            ),
+            data=_data,
         )
 
     @tool(
@@ -445,17 +463,21 @@ class BootstrapFeature(Feature):
                 data={"available": list(loader.file_order)},
             )
 
-        # Remove from DB if available
-        db_removed = True
+        # Remove from DB if the loader has DB wiring. Same honesty
+        # gate as bootstrap_add — the loader's delete_db_entry no-ops
+        # when constructed without a db, so we can't claim a DB
+        # delete happened just because the agent has a DB connection.
+        db_attempted = bool(
+            getattr(loader, "_db", None) and getattr(loader, "_agent_id", None)
+        )
+        db_removed = False
         db_remove_error: Optional[str] = None
-        db = self._get_db()
-        agent_id = self.agent.did
-        if db and agent_id:
+        if db_attempted:
             try:
                 await loader.delete_db_entry(name)
+                db_removed = True
             except Exception as e:
                 logger.warning(f"Failed to remove bootstrap config from DB: {e}")
-                db_removed = False
                 db_remove_error = str(e)
 
         # Refresh context builder
@@ -471,33 +493,43 @@ class BootstrapFeature(Feature):
                     cache_refreshed = False
                     cache_refresh_error = str(e)
 
-        if not db_removed or not cache_refreshed:
-            err_parts = []
-            if not db_removed:
-                err_parts.append(f"DB removal failed: {db_remove_error}")
-            if not cache_refreshed:
-                err_parts.append(f"cache refresh failed: {cache_refresh_error}")
+        _data = {
+            "name": name,
+            "remaining": list(loader.file_order),
+            "db_attempted": db_attempted,
+            "db_removed": db_removed,
+            "cache_refreshed": cache_refreshed,
+            "db_remove_error": db_remove_error,
+            "cache_refresh_error": cache_refresh_error,
+        }
+
+        # PARTIAL conditions: any secondary side-effect failed, or the
+        # loader has no DB wiring (in-memory remove only — a stale
+        # row may persist in DB across restart).
+        err_parts = []
+        if not cache_refreshed:
+            err_parts.append(f"cache refresh failed: {cache_refresh_error}")
+        if db_attempted and not db_removed:
+            err_parts.append(f"DB removal failed: {db_remove_error}")
+        elif not db_attempted:
+            err_parts.append(
+                "loader has no DB wiring; in-memory remove only — "
+                "any DB-persisted row for this file will resurface on restart"
+            )
+        if err_parts:
             return ToolResult.partial(
                 confirmation=(
                     f"Removed '{name}' from in-memory load order"
                 ),
                 error="; ".join(err_parts),
-                data={
-                    "name": name,
-                    "remaining": list(loader.file_order),
-                    "db_removed": db_removed,
-                    "cache_refreshed": cache_refreshed,
-                    "db_remove_error": db_remove_error,
-                    "cache_refresh_error": cache_refresh_error,
-                },
+                data=_data,
             )
 
         return ToolResult.ok(
-            confirmation=f"Removed '{name}' from bootstrap files",
-            data={
-                "name": name,
-                "remaining": list(loader.file_order),
-            },
+            confirmation=(
+                f"Removed '{name}' from bootstrap files (DB row deleted)"
+            ),
+            data=_data,
         )
 
     # ------------------------------------------------------------------

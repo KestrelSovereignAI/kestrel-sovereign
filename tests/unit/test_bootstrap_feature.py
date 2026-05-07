@@ -526,16 +526,53 @@ class TestBootstrapFeatureTools:
         assert loader.get_file("SOUL.md") == "Updated"
 
     @pytest.mark.asyncio
-    async def test_bootstrap_add(self, feature_with_loader):
+    async def test_bootstrap_add_in_memory_only_is_partial(self, feature_with_loader):
+        """When the loader has no DB wiring, the add succeeds in memory
+        but won't survive a restart — surfaces as PARTIAL."""
         from kestrel_sdk.tools.result import ToolResultStatus
         feature, loader, agent_dir = feature_with_loader
         custom_file = agent_dir / "NOTES.md"
         custom_file.write_text("My notes")
 
+        # Fixture's loader has no db wiring → in-memory only
+        result = await feature.bootstrap_add("NOTES.md")
+        assert result.status is ToolResultStatus.PARTIAL
+        assert "in-memory" in result.error.lower() or "no db" in result.error.lower()
+        assert result.data["loaded"] is True
+        assert result.data["db_attempted"] is False
+        assert "NOTES.md" in loader.file_order
+
+    @pytest.mark.asyncio
+    async def test_bootstrap_add_with_db_persists_and_returns_ok(self, mock_agent, tmp_agent_dir):
+        """When the loader has DB wiring, the add persists and returns OK."""
+        from kestrel_sdk.tools.result import ToolResultStatus
+        from kestrel_sovereign.features.bootstrap.feature import BootstrapFeature
+
+        # Mock DB with execute() that records calls
+        mock_db = MagicMock()
+        mock_db.execute = AsyncMock()
+
+        loader = BootstrapLoader(
+            agent_data_path=str(tmp_agent_dir),
+            db=mock_db,
+            agent_id="did:test:bootstrap-add",
+        )
+        mock_agent.context_builder = MagicMock()
+        mock_agent.context_builder._bootstrap_loader = loader
+        mock_agent.bootstrap_service.agent_data_path = str(tmp_agent_dir)
+
+        feature = BootstrapFeature(mock_agent)
+        custom_file = tmp_agent_dir / "NOTES.md"
+        custom_file.write_text("My notes")
+
         result = await feature.bootstrap_add("NOTES.md")
         assert result.status is ToolResultStatus.OK
         assert result.data["loaded"] is True
-        assert "NOTES.md" in loader.file_order
+        assert result.data["db_attempted"] is True
+        assert result.data["db_persisted"] is True
+        # save_db_entry should have called the DB
+        mock_db.execute.assert_called_once()
+        assert "INSERT" in mock_db.execute.call_args[0][0].upper()
 
     @pytest.mark.asyncio
     async def test_bootstrap_add_file_not_found(self, feature_with_loader):
@@ -554,15 +591,49 @@ class TestBootstrapFeatureTools:
         assert "already" in result.error.lower()
 
     @pytest.mark.asyncio
-    async def test_bootstrap_remove(self, feature_with_loader):
+    async def test_bootstrap_remove_in_memory_only_is_partial(self, feature_with_loader):
+        """When the loader has no DB wiring, the in-memory remove leaves
+        any DB-persisted row alone — surfaces as PARTIAL."""
         from kestrel_sdk.tools.result import ToolResultStatus
         feature, loader, agent_dir = feature_with_loader
         (agent_dir / "GOALS.md").write_text("My goals")
         loader.load()
 
         result = await feature.bootstrap_remove("GOALS.md")
-        assert result.status is ToolResultStatus.OK
+        assert result.status is ToolResultStatus.PARTIAL
+        assert "no db wiring" in result.error.lower() or "in-memory" in result.error.lower()
+        assert result.data["db_attempted"] is False
         assert "GOALS.md" not in loader.file_order
+
+    @pytest.mark.asyncio
+    async def test_bootstrap_remove_with_db_returns_ok(self, mock_agent, tmp_agent_dir):
+        """When the loader has DB wiring, the remove deletes the row and returns OK."""
+        from kestrel_sdk.tools.result import ToolResultStatus
+        from kestrel_sovereign.features.bootstrap.feature import BootstrapFeature
+
+        mock_db = MagicMock()
+        mock_db.execute = AsyncMock()
+
+        loader = BootstrapLoader(
+            agent_data_path=str(tmp_agent_dir),
+            db=mock_db,
+            agent_id="did:test:bootstrap-remove",
+        )
+        mock_agent.context_builder = MagicMock()
+        mock_agent.context_builder._bootstrap_loader = loader
+        # Pre-populate with a file the test removes
+        (tmp_agent_dir / "GOALS.md").write_text("My goals")
+        loader.load()
+
+        feature = BootstrapFeature(mock_agent)
+
+        result = await feature.bootstrap_remove("GOALS.md")
+        assert result.status is ToolResultStatus.OK
+        assert result.data["db_attempted"] is True
+        assert result.data["db_removed"] is True
+        assert "GOALS.md" not in loader.file_order
+        mock_db.execute.assert_called_once()
+        assert "DELETE" in mock_db.execute.call_args[0][0].upper()
 
     @pytest.mark.asyncio
     async def test_bootstrap_remove_not_found(self, feature_with_loader):
