@@ -14,6 +14,8 @@ import pytest
 from typing import List, Dict, Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from kestrel_sdk.llm import ToolCallStarted
+
 from kestrel_sovereign.llm.adapter import LLMResponse, ToolCall
 from kestrel_sovereign.llm.openai_adapter import OpenAIAdapter
 from kestrel_sovereign.llm.anthropic_adapter import AnthropicAdapter
@@ -169,18 +171,27 @@ class TestOpenAIStreamingToolDetectionUnit:
         ):
             results.append(item)
 
-        # Should yield LLMResponse with tool calls at the end
-        assert len(results) == 1
-        assert isinstance(results[0], LLMResponse)
-        assert results[0].has_tool_calls
-        assert len(results[0].tool_calls) == 1
-        assert results[0].tool_calls[0].id == "call_abc123"
-        assert results[0].tool_calls[0].name == "get_weather"
-        assert results[0].tool_calls[0].arguments == {"location": "San Francisco"}
+        # SDK 0.7.0+: stream now yields ToolCallStarted before the
+        # final LLMResponse. ToolCallStarted carries id/name from the
+        # first delta (when populated) and signals "tool call begun"
+        # for the constitutional honesty layer.
+        starts = [r for r in results if isinstance(r, ToolCallStarted)]
+        finals = [r for r in results if isinstance(r, LLMResponse)]
+        assert len(starts) == 1
+        assert starts[0] == ToolCallStarted(
+            index=0, id="call_abc123", name="get_weather"
+        )
+        assert len(finals) == 1
+        final = finals[0]
+        assert final.has_tool_calls
+        assert len(final.tool_calls) == 1
+        assert final.tool_calls[0].id == "call_abc123"
+        assert final.tool_calls[0].name == "get_weather"
+        assert final.tool_calls[0].arguments == {"location": "San Francisco"}
         # Token counts
-        assert results[0].input_tokens == 25
-        assert results[0].output_tokens == 12
-        assert results[0].total_tokens == 37
+        assert final.input_tokens == 25
+        assert final.output_tokens == 12
+        assert final.total_tokens == 37
 
     @pytest.mark.asyncio
     async def test_multiple_parallel_tool_calls(self):
@@ -240,15 +251,20 @@ class TestOpenAIStreamingToolDetectionUnit:
         ):
             results.append(item)
 
-        # Should yield LLMResponse with multiple tool calls
-        assert len(results) == 1
-        assert isinstance(results[0], LLMResponse)
-        assert results[0].has_tool_calls
-        assert len(results[0].tool_calls) == 2
+        # SDK 0.7.0+: one ToolCallStarted per distinct tool-call index,
+        # in arrival order, then a final LLMResponse with both calls.
+        starts = [r for r in results if isinstance(r, ToolCallStarted)]
+        finals = [r for r in results if isinstance(r, LLMResponse)]
+        assert [s.index for s in starts] == [0, 1]
+        assert [s.name for s in starts] == ["get_weather", "search_web"]
+        assert len(finals) == 1
+        final = finals[0]
+        assert final.has_tool_calls
+        assert len(final.tool_calls) == 2
 
         # Check tool calls are in order
-        assert results[0].tool_calls[0].name == "get_weather"
-        assert results[0].tool_calls[1].name == "search_web"
+        assert final.tool_calls[0].name == "get_weather"
+        assert final.tool_calls[1].name == "search_web"
 
     @pytest.mark.asyncio
     async def test_text_then_tool_calls(self):
@@ -299,13 +315,20 @@ class TestOpenAIStreamingToolDetectionUnit:
         ):
             results.append(item)
 
-        # Should yield text, then LLMResponse
-        assert len(results) == 2
+        # SDK 0.7.0+: text chunk, then ToolCallStarted (when the tool
+        # delta first arrives), then final LLMResponse.
         assert isinstance(results[0], str)
         assert results[0] == "Let me check the weather. "
-        assert isinstance(results[1], LLMResponse)
-        assert results[1].has_tool_calls
-        assert results[1].content == "Let me check the weather. "
+        starts = [r for r in results if isinstance(r, ToolCallStarted)]
+        finals = [r for r in results if isinstance(r, LLMResponse)]
+        assert len(starts) == 1
+        assert starts[0].index == 0
+        assert len(finals) == 1
+        final = finals[0]
+        assert final.has_tool_calls
+        assert final.content == "Let me check the weather. "
+        # Marker arrives AFTER the leading text chunk.
+        assert results.index(starts[0]) > 0
 
     @pytest.mark.asyncio
     async def test_malformed_json_arguments(self):
@@ -345,11 +368,16 @@ class TestOpenAIStreamingToolDetectionUnit:
         ):
             results.append(item)
 
-        # Should still yield LLMResponse with raw arguments
-        assert len(results) == 1
-        assert isinstance(results[0], LLMResponse)
-        assert results[0].has_tool_calls
-        assert results[0].tool_calls[0].arguments == {"raw": "not valid json {"}
+        # SDK 0.7.0+: ToolCallStarted precedes the final LLMResponse.
+        # Malformed JSON sentinel renamed from "raw" to "_raw" in
+        # 0.7.0 to signal "sentinel, not real data".
+        starts = [r for r in results if isinstance(r, ToolCallStarted)]
+        finals = [r for r in results if isinstance(r, LLMResponse)]
+        assert len(starts) == 1
+        assert len(finals) == 1
+        final = finals[0]
+        assert final.has_tool_calls
+        assert final.tool_calls[0].arguments == {"_raw": "not valid json {"}
 
 
 # =============================================================================
@@ -492,14 +520,24 @@ class TestAnthropicStreamingToolDetectionUnit:
         ):
             results.append(item)
 
-        # Should yield LLMResponse with tool calls
-        assert len(results) == 1
-        assert isinstance(results[0], LLMResponse)
-        assert results[0].has_tool_calls
-        assert len(results[0].tool_calls) == 1
-        assert results[0].tool_calls[0].id == 'toolu_abc'
-        assert results[0].tool_calls[0].name == 'get_weather'
-        assert results[0].tool_calls[0].arguments == {"location": "Paris"}
+        # SDK 0.7.0+: Anthropic emits ToolCallStarted at
+        # content_block_start with type='tool_use' (id and name
+        # populated), then the final LLMResponse. The marker's
+        # ``index`` matches the event's ``index`` field — 0 here
+        # because the mock stream has only one content block.
+        starts = [r for r in results if isinstance(r, ToolCallStarted)]
+        finals = [r for r in results if isinstance(r, LLMResponse)]
+        assert len(starts) == 1
+        assert starts[0] == ToolCallStarted(
+            index=0, id="toolu_abc", name="get_weather"
+        )
+        assert len(finals) == 1
+        final = finals[0]
+        assert final.has_tool_calls
+        assert len(final.tool_calls) == 1
+        assert final.tool_calls[0].id == 'toolu_abc'
+        assert final.tool_calls[0].name == 'get_weather'
+        assert final.tool_calls[0].arguments == {"location": "Paris"}
 
 
 # =============================================================================
@@ -935,9 +973,10 @@ class TestStreamingToolDetectionEdgeCases:
         ):
             results.append(item)
 
-        assert len(results) == 1
-        assert isinstance(results[0], LLMResponse)
-        assert results[0].tool_calls[0].arguments == {}
+        # SDK 0.7.0+: ToolCallStarted precedes the LLMResponse.
+        finals = [r for r in results if isinstance(r, LLMResponse)]
+        assert len(finals) == 1
+        assert finals[0].tool_calls[0].arguments == {}
 
     @pytest.mark.asyncio
     async def test_tool_call_spanning_many_chunks(self):
@@ -998,9 +1037,11 @@ class TestStreamingToolDetectionEdgeCases:
         ):
             results.append(item)
 
-        assert len(results) == 1
-        assert isinstance(results[0], LLMResponse)
-        assert results[0].tool_calls[0].arguments == {
+        # SDK 0.7.0+: ToolCallStarted precedes the LLMResponse, even
+        # for arguments spanning many chunks.
+        finals = [r for r in results if isinstance(r, LLMResponse)]
+        assert len(finals) == 1
+        assert finals[0].tool_calls[0].arguments == {
             "location": "San Francisco, CA",
             "unit": "fahrenheit"
         }
