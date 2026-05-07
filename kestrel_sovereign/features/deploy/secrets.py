@@ -104,6 +104,17 @@ class SecretSyncResult:
 # Manager refs and would point at nothing if synced.
 
 
+def _is_gcp_profile(profile_data: Optional[Dict[str, Any]]) -> bool:
+    """Return True if ``profile_data`` targets Cloud Run (the only
+    provider whose ``[profiles.X.secrets]`` entries are GCP Secret
+    Manager refs). The default provider in deploy_config.toml is
+    ``cloudrun`` — both ``cloudrun`` and ``cloud_run`` spellings are
+    accepted to mirror DeployManagerCore._load_profiles.
+    """
+    provider = ((profile_data or {}).get("provider") or "cloudrun").lower()
+    return provider in {"cloudrun", "cloud_run"}
+
+
 def _is_secret_manager_ref(value: str) -> bool:
     """Return True if ``value`` looks like a GCP Secret Manager
     ``<secret-name>:<version>`` reference.
@@ -169,9 +180,29 @@ def derive_secret_mapping(
                 f"profile '{profile}' not found in deploy_config "
                 f"(available: {sorted(profiles.keys())})"
             )
+        # Explicit single-profile call: respect the user's choice but
+        # refuse if the named profile targets a non-GCP provider —
+        # `kestrel deploy secrets sync` is GCP Secret Manager only and
+        # silently routing Azure-vault refs to GCP would create garbage
+        # entries.
+        if not _is_gcp_profile(profiles[profile]):
+            raise ValueError(
+                f"profile '{profile}' targets a non-Cloud-Run provider "
+                f"({(profiles[profile] or {}).get('provider', '?')}); "
+                f"`kestrel deploy secrets sync` only syncs to GCP Secret "
+                f"Manager. Use a Cloud Run profile (or omit --profile to "
+                f"scan only Cloud Run profiles)."
+            )
         profile_iter = [(profile, profiles[profile])]
     else:
-        profile_iter = list(profiles.items())
+        # Default all-profile scan: only consider Cloud Run profiles.
+        # An Azure profile with a literal connection string containing
+        # ``:`` would otherwise be parsed as ``secret-name:version`` by
+        # the all-profile heuristic — codex caught this on PR #1057.
+        profile_iter = [
+            (name, data) for name, data in profiles.items()
+            if _is_gcp_profile(data)
+        ]
 
     # We track first-seen ``(env_var → (secret_name, profile))`` so we can
     # emit a helpful conflict message naming both offending profiles.

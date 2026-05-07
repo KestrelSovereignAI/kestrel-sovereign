@@ -158,6 +158,55 @@ def test_derive_secret_mapping_accepts_unusual_secret_names():
     }
 
 
+def test_derive_secret_mapping_skips_non_cloudrun_profiles():
+    """Codex review on PR #1057: an Azure profile with literal values
+    that contain ``:`` (e.g. connection strings) must NOT be parsed as
+    GCP Secret Manager refs during the default all-profile scan.
+
+    Only profiles whose provider is ``cloudrun`` (or omitted, which
+    defaults to cloudrun) participate in the GCP secrets sync.
+    """
+    config = {
+        "profiles": {
+            "dev": {
+                "provider": "cloudrun",
+                "secrets": {"OPENAI_API_KEY": "kestrel-openai-key:latest"},
+            },
+            "azure-dev": {
+                "provider": "azure",
+                "secrets": {
+                    # Literal connection string with colons — must be
+                    # ignored by the GCP sync rather than treated as
+                    # ``server.example.com:5432`` = secret-name:version.
+                    "DB_URL": "server.example.com:5432",
+                    "OPENAI_API_KEY": "${AZURE_OPENAI_KEY}",
+                },
+            },
+        },
+    }
+
+    mapping = derive_secret_mapping(config)
+
+    # Only the Cloud Run profile contributed.
+    assert mapping == {"OPENAI_API_KEY": "kestrel-openai-key"}
+
+
+def test_derive_secret_mapping_explicit_azure_profile_raises():
+    """An explicit ``--profile azure-dev`` is a user error worth
+    surfacing rather than silently syncing to the wrong vault."""
+    config = {
+        "profiles": {
+            "azure-dev": {
+                "provider": "azure",
+                "secrets": {"OPENAI_API_KEY": "${AZURE_OPENAI_KEY}"},
+            },
+        },
+    }
+
+    with pytest.raises(ValueError, match="non-Cloud-Run provider"):
+        derive_secret_mapping(config, profile="azure-dev")
+
+
 def test_derive_secret_mapping_conflicting_names_raises():
     """Two profiles mapping the same env var to different secret names
     is a config inconsistency — surface it loudly so the user fixes
