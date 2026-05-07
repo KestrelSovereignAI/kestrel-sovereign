@@ -1010,11 +1010,25 @@ class CodexAdapter(LLMAdapter):
                                 # ToolCall.id) carried the wrong field.
                                 call_id = item.get("call_id") or item.get("id", "")
                                 call_name = item.get("name", "")
-                                func_calls[idx] = {
-                                    "id": call_id,
-                                    "name": call_name,
-                                    "arguments": "",
-                                }
+                                # MERGE id/name into the existing entry
+                                # rather than replacing it. The two
+                                # arguments-event branches above may have
+                                # already created func_calls[idx] and
+                                # accumulated argument deltas — replacing
+                                # with ``arguments: ""`` would silently
+                                # drop them, and the orchestrator would
+                                # later execute the tool with ``{}``.
+                                existing = func_calls.get(idx)
+                                if existing is None:
+                                    func_calls[idx] = {
+                                        "id": call_id,
+                                        "name": call_name,
+                                        "arguments": "",
+                                    }
+                                else:
+                                    existing["id"] = call_id
+                                    existing["name"] = call_name
+                                    # Preserve existing["arguments"].
                                 if idx not in started_indices:
                                     # Output-item-added is the typical
                                     # first event for an index — id and
