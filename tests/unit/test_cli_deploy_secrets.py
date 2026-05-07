@@ -268,6 +268,45 @@ def test_cmd_deploy_secrets_sync_uses_profile_level_project_id(
     assert project_id_arg == "dev-real-project"
 
 
+def test_cmd_deploy_secrets_sync_default_scan_ignores_profile_without_syncable_secrets(
+    fake_project_root, monkeypatch
+):
+    """Codex review on PR #1057 v8: a Cloud Run profile with no
+    [secrets] section (or only ``${...}`` refs) shouldn't drive the
+    project-ID preflight. Otherwise a perfectly fine config gets
+    rejected for an unrelated profile that wouldn't contribute work
+    anyway."""
+    monkeypatch.delenv("GCP_PROJECT_ID", raising=False)
+    (fake_project_root / "deploy_config.toml").write_text(
+        '[manager]\n'
+        'gcp_project_id = "your-gcp-project-id"\n'  # placeholder
+        '\n'
+        '[profiles.dev]\n'
+        'provider = "cloudrun"\n'
+        'gcp_project_id = "dev-real-project"\n'
+        '[profiles.dev.secrets]\n'
+        'KEY1 = "kestrel-key-a:latest"\n'
+        '\n'
+        '[profiles.dataonly]\n'
+        # Cloud Run, no override, but no [secrets] section either —
+        # contributes nothing to the sync, so its missing project ID
+        # must not block a default-scan run.
+        'provider = "cloudrun"\n'
+    )
+
+    with patch(
+        "kestrel_sovereign.features.deploy.secrets.sync_all_secrets",
+        return_value=[],
+    ) as mock_sync:
+        rc = cmd_deploy(_make_args(target="secrets", profile="sync"))
+
+    assert rc == 0
+    project_id_arg = mock_sync.call_args.args[2] if len(
+        mock_sync.call_args.args
+    ) >= 3 else mock_sync.call_args.kwargs.get("project_id")
+    assert project_id_arg == "dev-real-project"
+
+
 def test_cmd_deploy_secrets_sync_one_profile_unconfigured_in_default_scan_errors(
     fake_project_root, monkeypatch, capsys
 ):

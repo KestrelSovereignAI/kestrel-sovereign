@@ -513,12 +513,22 @@ def _resolve_project_id(
         )
         return None
 
-    # Default scan: collect every Cloud Run profile's *effective* project
-    # ID (profile override → manager → None) and refuse if they disagree
-    # OR if any are unset.
+    # Default scan: only Cloud Run profiles that *actually contribute* a
+    # Secret Manager ref need a project ID. A profile with no [secrets]
+    # section, or only ``${...}`` placeholders, won't drive any sync work
+    # and shouldn't be able to fail the preflight (codex review on PR
+    # #1057 v7 → v8). Inline the eligibility check so this stays in sync
+    # with derive_secret_mapping's filter.
+    from kestrel_sovereign.features.deploy.secrets import _is_secret_manager_ref
+
+    def _has_syncable_secret(prof_data: Optional[Dict[str, Any]]) -> bool:
+        secrets = (prof_data or {}).get("secrets", {}) or {}
+        return any(_is_secret_manager_ref(v) for v in secrets.values())
+
     cloudrun_profiles = [
         (name, data) for name, data in profiles.items()
         if (data or {}).get("provider", "cloudrun").lower() in {"cloudrun", "cloud_run"}
+        and _has_syncable_secret(data)
     ]
 
     effective: Dict[str, Optional[str]] = {}
