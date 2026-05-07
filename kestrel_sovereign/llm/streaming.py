@@ -24,6 +24,8 @@ from typing import List, Dict, Any, Optional, Union, Type, AsyncIterator
 
 from pydantic import BaseModel
 
+from kestrel_sdk.llm import ToolCallStarted
+
 from .adapter import LLMResponse, messages_for
 from .error_handling import LLMError
 from .provider_registry import provider_cache_body
@@ -417,33 +419,54 @@ class StreamingMixin:
         model_override: Optional[str] = None,
         system_prompt: Optional[str] = None,
         session_id: Optional[str] = None,
-    ) -> AsyncIterator[Union[str, LLMResponse]]:
+    ) -> AsyncIterator[Union[str, ToolCallStarted, LLMResponse]]:
         """
         Stream response with tool call detection.
 
-        This is the unified method for streaming with tool detection across all providers.
-        It yields text chunks as they arrive, and if tool calls are detected, yields
-        an LLMResponse with the assembled tool calls at the end.
+        Unified streaming-with-tools across all providers. Yields the
+        SDK 0.7+ tagged union from
+        :meth:`LLMAdapter.get_streaming_response_with_tools`:
 
-        This eliminates the "double LLM call" pattern where you first call non-streaming
-        to detect tools, then call streaming for text.
+        * ``str`` — text content chunks as they arrive.
+        * :class:`ToolCallStarted` — emitted the moment a tool call
+          first appears in the provider stream (one event per
+          distinct ``index``, in stream order). The constitutional
+          honesty layer (#1042 layer 2 / #1045) gates pre-tool prose
+          on this signal — consumers that pipe text directly to a
+          chat UI should clear or revise the in-flight bubble when a
+          marker arrives. ``stream_with_tool_detection`` does not
+          itself process or filter markers; it forwards them
+          unchanged from the underlying adapter.
+        * :class:`LLMResponse` — exactly once at end-of-stream when
+          tool calls were detected. Source of truth for the assembled
+          tool calls (id, name, arguments) and token usage.
+
+        This eliminates the "double LLM call" pattern where you first
+        called non-streaming to detect tools then streaming for text.
 
         Args:
             messages: Pre-built message list
             tools: Optional tools for function calling
             force_local_only: Only use local providers (Ollama)
-            model_override: Override model selection (format: "provider/model" or just "model")
-            system_prompt: Optional system prompt (only used for Anthropic adapter)
+            model_override: Override model selection (format:
+                ``"provider/model"`` or just ``"model"``)
+            system_prompt: Optional system prompt (only used for
+                Anthropic adapter)
 
         Yields:
-            str: Text content chunks as they arrive
-            LLMResponse: Final response with tool_calls (only at end if tools were called)
+            ``Union[str, ToolCallStarted, LLMResponse]`` per the
+            stream contract above.
 
         Example:
             tool_response = None
             async for item in service.stream_with_tool_detection(messages=msgs, tools=tools):
                 if isinstance(item, str):
-                    print(item, end='', flush=True)  # Stream to user
+                    print(item, end='', flush=True)  # stream text to user
+                elif isinstance(item, ToolCallStarted):
+                    # Stop optimistic text rendering; a tool call is
+                    # about to fire. Frontend may clear the in-flight
+                    # message bubble here.
+                    on_tool_starting(item)
                 elif isinstance(item, LLMResponse):
                     tool_response = item
 
