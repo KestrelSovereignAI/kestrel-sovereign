@@ -30,6 +30,8 @@ from typing import Any, Dict, List, Optional, AsyncIterator, Tuple, Type, Union
 import httpx
 from pydantic import BaseModel
 
+from kestrel_sdk.llm import ToolCallStarted
+
 from .adapter import LLMAdapter, LLMResponse, ToolCall
 from .continuation_store import (
     ContinuationCursor,
@@ -944,6 +946,15 @@ class CodexAdapter(LLMAdapter):
                             f"Codex API returned {resp.status_code}: {error_text}"
                         )
 
+                    # Track which tool-call indices we've already
+                    # announced via ToolCallStarted so we emit exactly
+                    # once per index even when the SDK delivers
+                    # function-call arguments BEFORE the output-item
+                    # added event (which is the path that populates
+                    # id/name). The first event for an index — whichever
+                    # of the three branches below it lands in — wins.
+                    started_indices: set = set()
+
                     async for event in _parse_sse_events(resp):
                         event_type = event.get("type", "")
 
@@ -955,15 +966,32 @@ class CodexAdapter(LLMAdapter):
 
                         elif event_type == "response.function_call_arguments.delta":
                             idx = event.get("output_index", 0)
-                            if idx not in func_calls:
+                            is_new = idx not in func_calls
+                            if is_new:
                                 func_calls[idx] = {"id": "", "name": "", "arguments": ""}
                             func_calls[idx]["arguments"] += event.get("delta", "")
+                            if is_new and idx not in started_indices:
+                                # Arguments delta arrived before the
+                                # output-item.added event — id/name not
+                                # yet known. Same MAY-BE-NONE case the
+                                # contract documents for OpenAI's first
+                                # delta path.
+                                started_indices.add(idx)
+                                yield ToolCallStarted(
+                                    index=idx, id=None, name=None,
+                                )
 
                         elif event_type == "response.function_call_arguments.done":
                             idx = event.get("output_index", 0)
-                            if idx not in func_calls:
+                            is_new = idx not in func_calls
+                            if is_new:
                                 func_calls[idx] = {"id": "", "name": "", "arguments": ""}
                             func_calls[idx]["arguments"] = event.get("arguments", "")
+                            if is_new and idx not in started_indices:
+                                started_indices.add(idx)
+                                yield ToolCallStarted(
+                                    index=idx, id=None, name=None,
+                                )
 
                         elif event_type == "response.output_item.added":
                             item = event.get("item", {})
@@ -980,11 +1008,24 @@ class CodexAdapter(LLMAdapter):
                                 # function_call carries the real ``call_id`` and
                                 # the orchestrator's tool_call_id (set from this
                                 # ToolCall.id) carried the wrong field.
+                                call_id = item.get("call_id") or item.get("id", "")
+                                call_name = item.get("name", "")
                                 func_calls[idx] = {
-                                    "id": item.get("call_id") or item.get("id", ""),
-                                    "name": item.get("name", ""),
+                                    "id": call_id,
+                                    "name": call_name,
                                     "arguments": "",
                                 }
+                                if idx not in started_indices:
+                                    # Output-item-added is the typical
+                                    # first event for an index — id and
+                                    # name are populated, so the marker
+                                    # carries them.
+                                    started_indices.add(idx)
+                                    yield ToolCallStarted(
+                                        index=idx,
+                                        id=call_id or None,
+                                        name=call_name or None,
+                                    )
 
                         elif event_type == "response.output_item.done":
                             item = event.get("item", {})
