@@ -433,19 +433,47 @@ class SecurityFeature(Feature):
         # decision (the request is still pending). If False, the queue
         # withdrew or expired it between _find_request_id and now —
         # surface as ERROR rather than claiming approval.
-        if self.approval_queue.submit_decision(full_id, True, scope):
+        if not self.approval_queue.submit_decision(full_id, True, scope):
+            return ToolResult.failed(
+                f"Request '{request_id}' is no longer pending "
+                "(timeout, cancellation, or already decided)",
+                data={"request_id": full_id, "decision_attempted": "approved"},
+            )
+
+        # Honesty: ``ApprovalQueue.submit_decision`` only sets the
+        # in-memory decision; the scope is persisted later by
+        # ``request_approval()`` via ``_persist_decision``, and that
+        # path swallows store failures. For ``scope="once"`` there's
+        # no persistence — the immediate approval is the whole
+        # action, so OK is honest. For ``scope="session"``/``"always"``
+        # the durable scope may not actually be written, so we surface
+        # PARTIAL and tell the LLM the next tool call may re-prompt.
+        # See round 2 codex finding + #1078 follow-up ticket.
+        if scope == "once":
             return ToolResult.ok(
-                confirmation=f"Approved {request_id[:8]} with scope={scope}",
+                confirmation=f"Approved {request_id[:8]} (once)",
                 data={
                     "request_id": full_id,
                     "scope": scope,
                     "decision": "approved",
                 },
             )
-        return ToolResult.failed(
-            f"Request '{request_id}' is no longer pending "
-            "(timeout, cancellation, or already decided)",
-            data={"request_id": full_id, "decision_attempted": "approved"},
+        return ToolResult.partial(
+            confirmation=(
+                f"Approved {request_id[:8]} for this request "
+                f"(decision submitted with scope={scope})"
+            ),
+            error=(
+                f"scope={scope} persistence is asynchronous and store "
+                "failures are not surfaced; the durable permission may "
+                "not have been written. The next tool call may re-prompt"
+            ),
+            data={
+                "request_id": full_id,
+                "scope": scope,
+                "decision": "approved",
+                "scope_persistence": "asynchronous_and_unverified",
+            },
         )
 
     @tool(

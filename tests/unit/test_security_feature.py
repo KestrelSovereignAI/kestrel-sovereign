@@ -959,6 +959,82 @@ class TestSecurityFeature:
         assert result.data["requests"][0]["feature_name"] == "WalletAgent"
 
     @pytest.mark.asyncio
+    async def test_approve_once_returns_ok(self):
+        """scope='once' has no async persistence — OK is honest."""
+        from kestrel_sdk.tools.result import ToolResultStatus
+        agent = MagicMock()
+        feature = SecurityFeature(agent)
+        feature.approval_queue = MagicMock()
+        feature.approval_queue.submit_decision = MagicMock(return_value=True)
+        feature.approval_queue.pending_requests = [
+            ApprovalRequest(
+                id="req-once-12345678",
+                feature_name="WalletAgent",
+                tool_name="get_balance",
+                tool_args={},
+                created_at=datetime.now(timezone.utc),
+            )
+        ]
+
+        result = await feature.approve_request("req-once-1", scope="once")
+        assert result.status is ToolResultStatus.OK
+        assert result.data["scope"] == "once"
+
+    @pytest.mark.asyncio
+    async def test_approve_with_session_scope_is_partial(self):
+        """Round 2 codex finding: scope='session'/'always' persistence
+        is asynchronous and the store path swallows failures —
+        ApprovalQueue.submit_decision returning True only means the
+        in-memory decision was set, not that the durable scope was
+        written. Surface as PARTIAL so the LLM doesn't promise the
+        scope took effect."""
+        from kestrel_sdk.tools.result import ToolResultStatus
+        agent = MagicMock()
+        feature = SecurityFeature(agent)
+        feature.approval_queue = MagicMock()
+        feature.approval_queue.submit_decision = MagicMock(return_value=True)
+        feature.approval_queue.pending_requests = [
+            ApprovalRequest(
+                id="req-session-12345678",
+                feature_name="WalletAgent",
+                tool_name="send_tokens",
+                tool_args={},
+                created_at=datetime.now(timezone.utc),
+            )
+        ]
+
+        for scope in ("session", "always"):
+            result = await feature.approve_request("req-session-1", scope=scope)
+            assert result.status is ToolResultStatus.PARTIAL, scope
+            assert "asynchronous" in result.error.lower(), scope
+            assert result.data["scope"] == scope
+            assert result.data["scope_persistence"] == "asynchronous_and_unverified"
+
+    @pytest.mark.asyncio
+    async def test_approve_when_request_withdrawn_is_error(self):
+        """When the queue withdrew the request between lookup and
+        submit, surface ERROR with a specific framing."""
+        from kestrel_sdk.tools.result import ToolResultStatus
+        agent = MagicMock()
+        feature = SecurityFeature(agent)
+        feature.approval_queue = MagicMock()
+        # submit returns False — withdrawal race
+        feature.approval_queue.submit_decision = MagicMock(return_value=False)
+        feature.approval_queue.pending_requests = [
+            ApprovalRequest(
+                id="req-race-12345678",
+                feature_name="WalletAgent",
+                tool_name="send_tokens",
+                tool_args={},
+                created_at=datetime.now(timezone.utc),
+            )
+        ]
+
+        result = await feature.approve_request("req-race-1", scope="once")
+        assert result.status is ToolResultStatus.ERROR
+        assert "no longer pending" in result.error.lower()
+
+    @pytest.mark.asyncio
     async def test_security_audit_filters_sensitive_fields_from_data(self):
         """Round 1 codex finding: security_audit's data.entries goes
         back into the LLM context. Audit rows carry ``args_summary``
