@@ -69,6 +69,15 @@ class _ApprovalResponder:
 
     This mirrors what the API/UI does when the user clicks
     Approve/Deny — it calls ``ApprovalQueue.submit_decision``. No mocks.
+
+    A real user clicks once per request. The poll loop ticks every
+    50 ms regardless, so without idempotency tracking the same
+    request would be ``submit_decision``-ed N times — once per tick
+    between ``resume_event.set()`` and the awaiter's ``finally``-block
+    popping ``_pending``. The ``_seen`` set keeps this representation
+    honest and decoupled from event-loop scheduling. (The queue itself
+    also rejects duplicate decisions per #1041's CAS guard, so this is
+    defense in depth.)
     """
 
     def __init__(self, security_feature: SecurityFeature, *, decision: bool, scope: str = "once"):
@@ -77,6 +86,7 @@ class _ApprovalResponder:
         self._scope = scope
         self._task: asyncio.Task | None = None
         self._stop = asyncio.Event()
+        self._seen: set[str] = set()
         self.responded_count = 0
 
     async def __aenter__(self) -> "_ApprovalResponder":
@@ -95,6 +105,9 @@ class _ApprovalResponder:
     async def _run(self) -> None:
         while not self._stop.is_set():
             for req in list(self._security.approval_queue.pending_requests):
+                if req.id in self._seen:
+                    continue
+                self._seen.add(req.id)
                 self._security.approval_queue.submit_decision(
                     req.id, self._decision, self._scope
                 )
@@ -434,6 +447,9 @@ async def test_symlink_resolves_to_realpath_for_human_approver(
         async def _run(self) -> None:
             while not self._stop.is_set():
                 for req in list(self._security.approval_queue.pending_requests):
+                    if req.id in self._seen:
+                        continue
+                    self._seen.add(req.id)
                     captured_args.update(req.tool_args)
                     self._security.approval_queue.submit_decision(
                         req.id, self._decision, self._scope
@@ -1243,6 +1259,9 @@ async def test_fs_edit_diff_preview_present_in_approval_payload(
         async def _run(self) -> None:
             while not self._stop.is_set():
                 for req in list(self._security.approval_queue.pending_requests):
+                    if req.id in self._seen:
+                        continue
+                    self._seen.add(req.id)
                     captured.update(req.tool_args)
                     self._security.approval_queue.submit_decision(
                         req.id, self._decision, self._scope

@@ -1,9 +1,19 @@
 name: Deploy to Cloud Run
 
+# Triggered after Publish to PyPI completes successfully on a tag
+# push. publish.yml is the canonical CI gate for the release; this
+# workflow trusts that result and does not re-run pytest. Before
+# the workflow_run rewire, three workflows (publish, deploy, this)
+# each re-ran CI on the exact same SHA — burning minutes and
+# adding independent flake-rolls; see commit 448801f6 (v0.10.0)
+# where Release sign hit a flaky state-leak (responded_count=3 vs
+# 1 in test_fs_write_requires_real_approval) on its tag-time
+# re-run while the same code was already on PyPI.
+
 on:
-  push:
-    tags:
-      - 'v[0-9]+.[0-9]+.[0-9]+'
+  workflow_run:
+    workflows: ["Publish to PyPI"]
+    types: [completed]
   workflow_dispatch:
     inputs:
       environment:
@@ -14,6 +24,9 @@ on:
         options:
           - dev
           - prod
+      ref:
+        description: 'Tag or branch to deploy (workflow_dispatch only)'
+        required: false
 
 env:
   PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
@@ -21,21 +34,41 @@ env:
   IMAGE_NAME: kestrel
 
 jobs:
-  # CI gate — must pass before anything builds/deploys.
-  ci:
-    name: CI gate
-    uses: ./.github/workflows/ci.yml
-    secrets: inherit
-
   build:
     runs-on: ubuntu-latest
-    needs: ci
+    # Only fire when the upstream Publish to PyPI succeeded (or on
+    # workflow_dispatch). On workflow_run, github.event.workflow_run
+    # is the upstream run; head_branch is the tag that triggered it.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_run' &&
+       github.event.workflow_run.conclusion == 'success' &&
+       startsWith(github.event.workflow_run.head_branch, 'v'))
     permissions:
       contents: read
       id-token: write
 
     steps:
+      # On workflow_run, github.ref points at main (the workflow file's
+      # ref), not at the upstream tag. Resolve the tag from the
+      # upstream run and check out THAT.
+      - name: Resolve target ref
+        id: resolved_ref
+        env:
+          DISPATCH_REF: ${{ inputs.ref }}
+          UPSTREAM_BRANCH: ${{ github.event.workflow_run.head_branch }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "$DISPATCH_REF" ]; then
+            echo "ref=$DISPATCH_REF" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event_name }}" = "workflow_run" ]; then
+            echo "ref=$UPSTREAM_BRANCH" >> "$GITHUB_OUTPUT"
+          else
+            echo "ref=${GITHUB_REF#refs/*/}" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ steps.resolved_ref.outputs.ref }}
 
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2.1.13
@@ -50,9 +83,11 @@ jobs:
 
       - name: Determine tag
         id: tag
+        env:
+          RESOLVED_REF: ${{ steps.resolved_ref.outputs.ref }}
         run: |
-          if [[ "${{ github.ref_type }}" == "tag" ]]; then
-            echo "tag=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+          if [[ "$RESOLVED_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "tag=$RESOLVED_REF" >> $GITHUB_OUTPUT
           else
             echo "tag=dev-$(echo ${{ github.sha }} | cut -c1-7)" >> $GITHUB_OUTPUT
           fi
@@ -134,9 +169,11 @@ jobs:
   deploy-prod:
     runs-on: ubuntu-latest
     needs: build
-    # Only deploy to prod on version tags or manual prod dispatch
+    # Only deploy to prod on version tags (via workflow_run from
+    # Publish to PyPI) or manual prod dispatch.
     if: >-
-      github.ref_type == 'tag' ||
+      (github.event_name == 'workflow_run' &&
+       startsWith(github.event.workflow_run.head_branch, 'v')) ||
       (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'prod')
     permissions:
       contents: read
