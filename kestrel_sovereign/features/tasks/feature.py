@@ -320,12 +320,21 @@ class TaskFeature(Feature):
                     semantic_status, semantic_error = self._classify_step_result(
                         task.status.state.value, result_data,
                     )
+                    # Serialize the result before storing it in the
+                    # workflow's data dict. ``DynamicTool.execute`` may
+                    # store a raw ``ToolResult`` under ``result``; if
+                    # we leave that in place, downstream JSON
+                    # serialization for the LLM tool-history wire will
+                    # blow up. Walk the dict and ``.to_dict()`` any
+                    # ToolResult instances we find. (Round 5 codex
+                    # finding.)
+                    serialized_result = self._serialize_step_payload(result_data)
                     step_record = {
                         "step": i,
                         "feature": feature_name,
                         "skill": skill_name,
                         "status": semantic_status,
-                        "result": result_data,
+                        "result": serialized_result,
                         "duration_ms": step_duration,
                         "attempts": attempt + 1,
                     }
@@ -437,6 +446,27 @@ class TaskFeature(Feature):
             ),
             data=data,
         )
+
+    @staticmethod
+    def _serialize_step_payload(payload: Any) -> Any:
+        """Walk a step's result payload and replace any ToolResult
+        instance with its dict form.
+
+        Without this, a workflow whose step returned a real ToolResult
+        (the production in-process path: DynamicTool.execute stores
+        the raw object) ends up with a non-JSON-serializable object
+        embedded in run_workflow's data dict. The LLM tool-history
+        wire then fails to serialize the whole workflow result.
+        """
+        if isinstance(payload, ToolResult):
+            return payload.to_dict()
+        if isinstance(payload, dict):
+            return {k: TaskFeature._serialize_step_payload(v) for k, v in payload.items()}
+        if isinstance(payload, list):
+            return [TaskFeature._serialize_step_payload(v) for v in payload]
+        if isinstance(payload, tuple):
+            return [TaskFeature._serialize_step_payload(v) for v in payload]
+        return payload
 
     @staticmethod
     def _classify_step_result(

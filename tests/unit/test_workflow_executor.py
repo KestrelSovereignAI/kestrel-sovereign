@@ -565,6 +565,44 @@ class TestRunWorkflowSemanticHonesty:
                 )
 
     @pytest.mark.asyncio
+    async def test_workflow_step_record_is_json_serializable(self, task_feature):
+        """Round 5 finding: a step's stored result must not contain
+        raw ToolResult objects, otherwise downstream JSON serialization
+        for the LLM tool-history wire fails. _serialize_step_payload
+        walks the dict and ToolResult.to_dict()s any instances it
+        finds.
+        """
+        import json
+        from kestrel_sdk.tools.result import ToolResult
+        agent_card, _ = task_feature.task_manager._agents["memory_feature"]
+        task_feature.task_manager._agents["memory_feature"] = (
+            agent_card,
+            MockHandler({
+                # Raw ToolResult inside the wrapper — not .to_dict()
+                "memory_status": lambda args: {
+                    "success": True,
+                    "result": ToolResult.failed("store down"),
+                    "tool": "memory_status",
+                },
+            }),
+        )
+
+        result = await task_feature.run_workflow(steps=[
+            {"feature": "memory_feature", "skill": "memory_status"},
+        ])
+
+        # The full ToolResult must round-trip through JSON without
+        # crashing — that's what the LLM tool-history wire requires.
+        wire_payload = result.to_dict()
+        json.dumps(wire_payload)  # would raise on a raw ToolResult
+
+        # And the step record's nested 'result' must be a dict, not
+        # a raw ToolResult. (Allow None for steps where the artifact
+        # had no data, but if there IS data it has to be serializable.)
+        nested_result = wire_payload["data"]["results"][0]["result"]
+        assert nested_result is None or isinstance(nested_result, dict)
+
+    @pytest.mark.asyncio
     async def test_workflow_step_with_raw_tool_result_in_dynamictool_wrapper(self, task_feature):
         """End-to-end: simulate the realistic in-process path where
         the artifact carries a raw ToolResult inside the DynamicTool

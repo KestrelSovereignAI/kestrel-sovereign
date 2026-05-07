@@ -350,10 +350,11 @@ class TestConfirmPersonMatch:
         assert props.get("resolved_from") == "alice"
 
     @pytest.mark.asyncio
-    async def test_actually_removes_ambiguous_edge(self, feature):
-        """Critical: confirmation must supersede the ambiguous edge, not
-        accumulate parallel edges. After confirm, recall on the ambiguous
-        label-concept must not return this message."""
+    async def test_attempts_to_remove_ambiguous_edge(self, feature):
+        """Critical: confirmation must issue a delete for the ambiguous
+        edge. Round-5 finding: AsyncGraphStore.delete_edge does not
+        report affected rows or raise on no-op, so we phrase the
+        outcome as 'remove attempted' rather than 'removed'."""
         feature.agent.storage.graph.get_node = AsyncMock(return_value=GraphNode(
             node_id="concept:did:test:recall-agent:alice-smith",
             node_type="concept",
@@ -367,7 +368,12 @@ class TestConfirmPersonMatch:
             concept_id="concept:did:test:recall-agent:alice-smith",
         )
         assert result.status is ToolResultStatus.OK
-        assert result.data["ambiguous_edge_removed"] is True
+        assert result.data["ambiguous_remove_attempted"] is True
+        # Honesty: confirmation must NOT claim the edge was removed —
+        # only that delete_edge was issued.
+        assert "removed" not in result.confirmation.lower() or (
+            "not verified" in result.confirmation.lower()
+        )
         # delete_edge called with the ambiguous (guessed) target
         feature.agent.storage.graph.delete_edge.assert_awaited_once()
         del_call = feature.agent.storage.graph.delete_edge.await_args
@@ -392,7 +398,7 @@ class TestConfirmPersonMatch:
             concept_id="concept:did:test:recall-agent:alice",
         )
         assert result.status is ToolResultStatus.OK
-        assert result.data["ambiguous_edge_removed"] is False
+        assert result.data["ambiguous_remove_attempted"] is False
         feature.agent.storage.graph.delete_edge.assert_not_called()
 
     @pytest.mark.asyncio

@@ -1100,18 +1100,24 @@ class MemoryFeature(Feature):
             logger.error("confirm_person_match canonical edge write failed: %s", e)
             return ToolResult.failed(str(e))
 
-        removed = False
+        # Honesty: AsyncGraphStore.delete_edge() is a SQL DELETE that
+        # returns no affected-row count and does not raise when the
+        # edge isn't there. We can't actually verify the ambiguous
+        # edge existed and was removed — the call is best-effort. So
+        # we phrase the field and confirmation as "remove attempted"
+        # rather than "removed" (round 5 codex finding).
+        attempted_removal = False
         ambiguous_remove_error: Optional[str] = None
         if ambiguous_target != concept_id:
             try:
                 await storage.graph.delete_edge(
                     message_node, ambiguous_target, "mentions"
                 )
-                removed = True
+                attempted_removal = True
             except Exception as e:
-                # The canonical edge IS in place; the orphaned ambiguous
-                # edge is still readable. Surface it as PARTIAL so the
-                # LLM cannot claim a clean resolution.
+                # The canonical edge IS in place; the ambiguous-edge
+                # removal failed. Surface as PARTIAL so the LLM cannot
+                # claim a clean resolution.
                 logger.error(
                     "confirm_person_match: canonical edge written but "
                     "ambiguous edge removal failed: %s", e
@@ -1131,7 +1137,7 @@ class MemoryFeature(Feature):
                 data={
                     "message_id": message_id,
                     "resolved_to": concept_id,
-                    "ambiguous_edge_removed": False,
+                    "ambiguous_remove_attempted": False,
                     "orphan_edge_target": ambiguous_target,
                 },
             )
@@ -1139,12 +1145,17 @@ class MemoryFeature(Feature):
         return ToolResult.ok(
             confirmation=(
                 f"Resolved {message_id} → {concept_id}"
-                + (" (ambiguous edge removed)" if removed else "")
+                + (
+                    f" (delete_edge issued for {ambiguous_target}; "
+                    "removal not verified)"
+                    if attempted_removal else ""
+                )
             ),
             data={
                 "message_id": message_id,
                 "resolved_to": concept_id,
-                "ambiguous_edge_removed": removed,
+                "ambiguous_remove_attempted": attempted_removal,
+                "ambiguous_target": ambiguous_target if attempted_removal else None,
             },
         )
 
