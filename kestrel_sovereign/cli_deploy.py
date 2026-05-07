@@ -156,15 +156,21 @@ def _print_list(result: Dict[str, Any]) -> None:
         print("No deployments found.")
         return
 
-    # Each deployment is a provider-shaped dict — surface the columns
-    # that actually exist in the CloudRunProvider.list_deployments
-    # output: service, status, url. Provider can add more later; we
-    # print whatever is there.
+    # Provider list_deployments outputs are heterogeneous: CloudRunProvider
+    # emits {name, status, url, created}; AzureContainerProvider emits a
+    # similar shape with `name`. Older callers (and tests) used `service`,
+    # so accept either. Fall back across the same field family.
     headers = ["service", "provider", "status", "url"]
     print("  ".join(h.upper().ljust(20) for h in headers))
     print("  ".join("-" * 20 for _ in headers))
     for dep in deployments:
-        row = [str(dep.get(h, "-"))[:20].ljust(20) for h in headers]
+        row_values = [
+            dep.get("name") or dep.get("service") or "-",
+            dep.get("provider", "-"),
+            dep.get("status", "-"),
+            dep.get("url", "-"),
+        ]
+        row = [str(v)[:20].ljust(20) for v in row_values]
         print("  ".join(row))
 
 
@@ -234,30 +240,34 @@ def _cmd_deploy_profile(args, profile_name: str) -> int:
 
 
 def _cmd_deploy_status(args) -> int:
-    """``kestrel deploy status`` — list active sessions."""
+    """``kestrel deploy status`` — show what is actually deployed.
+
+    The agent path tracks deployments via in-memory ``_sessions`` for the
+    lifetime of the agent process. CLI invocations are short-lived and
+    sessionless, so we query the providers directly via
+    ``list_all_deployments`` — that is the persistent source of truth.
+    """
     manager = _build_manager()
     if manager is None:
         return 1
 
-    sessions = asyncio.run(manager.list_sessions())
+    result = asyncio.run(manager.list_all_deployments())
 
     if args.json:
-        payload = {
-            "active_deployments": len(sessions),
-            "sessions": [s.to_dict() for s in sessions.values()],
-        }
-        print(json.dumps(payload, indent=2, default=str))
+        print(json.dumps(result, indent=2, default=str))
+        return 0 if result.get("success") else 1
+
+    if not result.get("success"):
+        print(f"error: {result.get('error', 'list_all_deployments failed')}")
+        return 1
+
+    deployments = result.get("deployments", [])
+    if not deployments:
+        print("No active deployments.")
         return 0
 
-    if not sessions:
-        print("No active deployment sessions.")
-        return 0
-
-    print(f"active_deployments: {len(sessions)}")
-    for service_name, session in sessions.items():
-        print(f"\n{service_name}:")
-        for key, value in session.to_dict().items():
-            print(f"  {key}: {value}")
+    print(f"active_deployments: {len(deployments)}")
+    _print_list(result)
     return 0
 
 

@@ -187,17 +187,19 @@ def test_cmd_deploy_success_failed_result_returns_1():
 
 
 def test_cmd_deploy_status(capsys):
-    """``kestrel deploy status`` lists active sessions."""
-    fake_session = MagicMock()
-    fake_session.to_dict.return_value = {
-        "service_name": "kestrel-dev",
-        "status": "active",
-    }
-
+    """``kestrel deploy status`` queries providers (not in-memory sessions)
+    so a fresh CLI invocation reflects what is actually deployed."""
     with patch("kestrel_sovereign.cli_deploy.DeployManager") as mock_mgr_cls:
         mock_instance = MagicMock()
-        mock_instance.list_sessions = AsyncMock(
-            return_value={"kestrel-dev": fake_session}
+        mock_instance.list_all_deployments = AsyncMock(
+            return_value={
+                "success": True,
+                "action": "list",
+                "count": 1,
+                "deployments": [
+                    {"name": "kestrel-dev", "status": "active", "url": "https://kestrel-dev.run.app"},
+                ],
+            }
         )
         mock_mgr_cls.return_value = mock_instance
 
@@ -209,19 +211,21 @@ def test_cmd_deploy_status(capsys):
     assert "active_deployments: 1" in captured.out
 
 
-def test_cmd_deploy_status_no_sessions(capsys):
-    """``kestrel deploy status`` with no active sessions prints a
-    friendly empty-state message and returns 0."""
+def test_cmd_deploy_status_no_deployments(capsys):
+    """``kestrel deploy status`` with no provider-side deployments prints
+    a friendly empty-state message and returns 0."""
     with patch("kestrel_sovereign.cli_deploy.DeployManager") as mock_mgr_cls:
         mock_instance = MagicMock()
-        mock_instance.list_sessions = AsyncMock(return_value={})
+        mock_instance.list_all_deployments = AsyncMock(
+            return_value={"success": True, "action": "list", "count": 0, "deployments": []}
+        )
         mock_mgr_cls.return_value = mock_instance
 
         rc = cmd_deploy(_make_args(target="status"))
 
     captured = capsys.readouterr()
     assert rc == 0
-    assert "No active deployment sessions" in captured.out
+    assert "No active deployments" in captured.out
 
 
 def test_cmd_deploy_teardown_requires_profile(capsys):
