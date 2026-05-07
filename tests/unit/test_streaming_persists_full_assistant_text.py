@@ -1,20 +1,25 @@
 """
-Regression: streaming agent must persist the FULL visible assistant text.
+Regression: streaming agent persists pre-tool reasoning + post-tool answer.
 
-When the LLM emits explanatory text BEFORE deciding to call tools, those
-chunks are streamed to the client (the user sees them) and accumulated
-into `full_response`. The synthesizing answer AFTER tool execution is
-accumulated separately in `tool_response_chunks`. The user sees both
-streams concatenated in the chat pane.
+Two separate properties this test pins:
 
-The persisted assistant message used to be ONLY the post-tool half
-(tool_response_chunks). On the next user turn, the conversation-history
-loader showed the agent only the post-tool synthesis — the pre-tool
-reasoning the user had just seen was missing. Surfaced by Meridian's
-"I don't see my own quantum response" transcript.
+1. **Persistence (Meridian, #877):** the persisted assistant turn
+   contains BOTH the pre-tool reasoning the LLM emitted AND the
+   post-tool synthesis. Without this, the next turn's history loader
+   shows only the post-tool half and the agent loses sight of its own
+   reasoning. Surfaced by Meridian's "I don't see my own quantum
+   response" transcript.
 
-The fix: persist ``pre_tool_text + post_tool_text`` so the next turn's
-context contains exactly what the user saw.
+2. **User-facing stream (honesty, #1042 layer 2):** when the LLM
+   decides to call a tool, the pre-tool prose ("Saved!", "Done.") is
+   reasoning, not the final answer. The fix is to BUFFER pre-tool
+   text and SUPPRESS it from the SSE stream when tool_calls are
+   detected — only the post-tool synthesis reaches the user. This
+   prevents the constitutional honesty failure where a confident
+   "Saved:" reaches the client before the save tool actually runs.
+
+The two properties are decoupled: persistence keeps both halves, the
+user-facing stream keeps only the post-tool half during a tool turn.
 """
 import asyncio
 from contextlib import asynccontextmanager
@@ -33,8 +38,13 @@ async def _passthrough():
 
 @pytest.mark.asyncio
 async def test_streaming_persists_pre_tool_plus_post_tool_text():
-    """The assistant turn persisted to the DB must include BOTH the
-    pre-tool reasoning chunks and the post-tool synthesis chunks."""
+    """When tools are called: persist pre-tool + post-tool, but
+    stream ONLY post-tool to the user.
+
+    Persistence preserves the Meridian self-recall property; the
+    suppressed user-facing stream prevents the #1042 honesty failure
+    where pre-tool prose like "Saved!" reaches the client before the
+    save tool actually runs."""
     from kestrel_sovereign.agent.streaming import StreamingMixin
     from kestrel_sovereign.llm.adapter import LLMResponse, ToolCall
 
@@ -123,10 +133,22 @@ async def test_streaming_persists_pre_tool_plus_post_tool_text():
     ):
         yielded.append(chunk)
 
-    # User-visible stream = pre-tool chunks + post-tool chunks concatenated.
+    # User-visible stream = post-tool synthesis ONLY. The buffered
+    # pre-tool prose is suppressed from the SSE client — the user
+    # never sees "I'll check the github epic." or "Pulling it now."
+    # Without this suppression a confident pre-tool "Saved!" would
+    # reach the client before the save tool actually ran (#1042).
     visible_text = "".join(yielded)
-    assert "I'll check the github epic." in visible_text
-    assert "Wave 2 is in flight." in visible_text
+    assert "I'll check the github epic." not in visible_text, (
+        "pre-tool reasoning must NOT reach the user-facing stream when "
+        "tool_calls are detected — that's the load-bearing #1042 honesty "
+        "guarantee. If this assertion fails, an unverified narration is "
+        "leaking to the SSE client."
+    )
+    assert "Pulling it now." not in visible_text
+    assert "Wave 2 is in flight." in visible_text, (
+        "post-tool synthesis must reach the user — that IS the answer"
+    )
 
     # Find the assistant-row insert (there's also a user-row insert).
     assistant_inserts = [c for c in add_convo_calls if c["role"] == "assistant"]
@@ -136,19 +158,24 @@ async def test_streaming_persists_pre_tool_plus_post_tool_text():
 
     persisted = assistant_inserts[0]["content"]
 
-    # The bug: persisted used to equal ONLY the post-tool synthesizing
-    # chunks. The fix is to persist pre-tool + post-tool. Assert both.
+    # Persistence still captures BOTH halves so the next-turn history
+    # loader can show the agent its own reasoning (Meridian #877).
     assert "I'll check the github epic." in persisted, (
-        "pre-tool reasoning must be persisted — the user saw it and "
-        "the next turn's context loader needs it"
+        "pre-tool reasoning must be persisted — even though it didn't "
+        "reach the user, the next turn's context loader needs it for "
+        "the agent's self-recall (Meridian #877)"
     )
     assert "Pulling it now." in persisted, "all pre-tool chunks, not just the first"
     assert "Wave 2 is in flight." in persisted, "post-tool synthesis must remain persisted"
 
-    # Persisted text should match the user-visible stream byte-for-byte
-    # (post-response-hook is identity in this test).
-    assert persisted == visible_text, (
-        "persisted assistant turn must match exactly what was streamed to the user"
+    # Persisted MUST be a strict superset of visible — user saw the
+    # synthesis, the database remembers the reasoning too.
+    assert persisted != visible_text, (
+        "after #1042, persisted text strictly contains MORE than the "
+        "user-visible stream (it includes the suppressed pre-tool buffer)"
+    )
+    assert visible_text in persisted, (
+        "the user-visible stream is a substring of the persisted turn"
     )
 
 

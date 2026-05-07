@@ -213,8 +213,18 @@ class StreamingMixin:
             }
         )
 
-        # Accumulate text and watch for tool response at end
-        full_response = []
+        # Buffer pre-tool text; we don't know whether the LLM is going
+        # to call a tool until the LLMResponse marker arrives at the
+        # end of the stream. Issue #1042 layer 2: when tools ARE
+        # called, the model's pre-tool prose is reasoning, not the
+        # final reply — surfacing "Saved!" to the SSE client BEFORE
+        # the save tool actually runs is a confident-lie failure.
+        # The buffered text still gets persisted alongside the post-
+        # tool synthesis so the next turn's history loader can see
+        # what the model was thinking (the Meridian "I don't see my
+        # own quantum response" property), but it never reaches the
+        # user-facing stream when tools are involved.
+        pre_tool_buffer = []
         tool_response = None
 
         async for item in self.llm_service.stream_with_tool_detection(
@@ -226,9 +236,9 @@ class StreamingMixin:
             session_id=session_id,
         ):
             if isinstance(item, str):
-                # Text chunk - yield immediately for real-time streaming
-                full_response.append(item)
-                yield item
+                # Buffer; flush-or-drop decision happens once we know
+                # whether tool_calls are coming.
+                pre_tool_buffer.append(item)
             elif isinstance(item, LLMResponse):
                 # Tool calls detected at end of stream
                 tool_response = item
@@ -237,7 +247,25 @@ class StreamingMixin:
         llm_duration = int((time.time() - llm_start) * 1000)
         has_tool_calls = tool_response is not None and tool_response.has_tool_calls
 
-        logging.info(f"[AGENTIC-STREAM] LLM stream complete: has_tool_calls={has_tool_calls}, text_chunks={len(full_response)}")
+        # Decide what reaches the user. When tools are in flight, drop
+        # the pre-tool buffer from the SSE stream (its honesty cannot
+        # be vouched for); when no tools, flush it now — the buffered
+        # text IS the final reply.
+        if has_tool_calls:
+            pre_tool_text = "".join(pre_tool_buffer)
+            full_response: list[str] = []
+        else:
+            pre_tool_text = ""
+            full_response = list(pre_tool_buffer)
+            for chunk in pre_tool_buffer:
+                yield chunk
+
+        logging.info(
+            "[AGENTIC-STREAM] LLM stream complete: "
+            f"has_tool_calls={has_tool_calls}, "
+            f"buffered_chunks={len(pre_tool_buffer)}, "
+            f"yielded_now={len(full_response)}"
+        )
 
         await self.observability_store.log_tool_response(
             event_id=llm_event_id,
@@ -270,16 +298,18 @@ class StreamingMixin:
             ):
                 tool_response_chunks.append(chunk)
                 yield chunk
-            # Persist the FULL visible assistant text — pre-tool reasoning
-            # the LLM emitted before deciding to call tools (full_response,
-            # already yielded to the client at the first stream loop) plus
-            # the post-tool synthesizing answer (tool_response_chunks).
-            # The user saw both streams concatenated; persisting only the
-            # post-tool half meant the next turn's history loader was blind
-            # to any pre-tool explanation, and the agent couldn't see the
-            # reasoning it had just shown the user. Surfaced by Meridian's
-            # "I don't see my own quantum response" transcript.
-            pre_tool_text = "".join(full_response)
+            # Persist pre-tool reasoning + post-tool synthesizing answer.
+            # The user only SAW the post-tool half (the pre-tool buffer
+            # was suppressed for honesty — see issue #1042 layer 2),
+            # but the next turn's history loader needs both halves so
+            # the model can see what it was thinking. This preserves
+            # the Meridian "I don't see my own quantum response"
+            # property from issue #877: the persisted assistant turn
+            # captures the model's full inner-thought + final-answer
+            # arc, even though only the answer was streamed.
+            #
+            # ``pre_tool_text`` is set above when has_tool_calls fires;
+            # ``post_tool_text`` is built from this loop's chunks.
             post_tool_text = "".join(tool_response_chunks)
             tool_final_text = pre_tool_text + post_tool_text
             tool_final_text = await self._fire_post_response_hook(tool_final_text, session_id)
