@@ -261,6 +261,59 @@ class TestLLMProviderEntryPoints:
         assert fake.vendor == "fake_llm"
         assert fake.route == "api"
 
+    def test_discovers_sdk_only_llm_plugin(self):
+        """A third-party plugin that subclasses ``kestrel_sdk.llm.LLMAdapter``
+        directly (not the framework-enriched ``LLMAdapter``) MUST be
+        discovered by the entry-point loader.
+
+        The framework's ``LLMAdapter`` inherits from the SDK base, so
+        in-tree adapters pass either ``issubclass`` check; but a
+        third-party plugin depending only on ``kestrel-sovereign-sdk``
+        (the documented and intended dependency surface for #1048)
+        only inherits from the SDK base. If the entry-point loader
+        validates against the framework class instead, every
+        conformant third-party plugin gets silently filtered out and
+        the whole SDK split is moot.
+
+        Found by codex review on the Wave 1B PR.
+        """
+        from kestrel_sdk.llm import LLMAdapter as SDKLLMAdapter, LLMResponse
+        from kestrel_sovereign.llm.provider_registry import (
+            ProviderRegistry,
+            LLM_PROVIDER_ENTRY_POINT_GROUP,
+        )
+
+        class SDKOnlyAdapter(SDKLLMAdapter):
+            provider_name = "sdk_plugin"
+
+            async def get_response(self, *a, **kw):
+                return LLMResponse(content="")
+
+        ep = _make_entry_point("sdk_plugin", SDKOnlyAdapter)
+
+        config = {
+            "route_priority": [],
+            "vendors": {
+                "sdk_plugin": {
+                    "routes": {"api": {"base_url": "http://localhost:1234"}},
+                },
+            },
+        }
+
+        with _patch_entry_points(LLM_PROVIDER_ENTRY_POINT_GROUP, [ep]):
+            registry = ProviderRegistry(config=config)
+            try:
+                providers = registry.initialize_providers()
+            except Exception:
+                providers = registry.providers
+
+        names = [p.name for p in providers]
+        assert "sdk_plugin:api" in names, (
+            "SDK-only plugin must be discoverable. Without this, third "
+            "parties have no way to register without depending on "
+            "kestrel-sovereign — defeating the purpose of #1048."
+        )
+
     def test_builtin_wins_on_collision(self):
         """A built-in vendor route takes precedence over an entry point of the same name."""
         from kestrel_sovereign.llm.adapter import LLMAdapter

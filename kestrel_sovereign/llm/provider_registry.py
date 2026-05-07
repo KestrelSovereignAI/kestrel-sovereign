@@ -50,7 +50,7 @@ try:
 except ImportError:
     ollama = None
 
-from kestrel_sdk.llm import ProviderInfo
+from kestrel_sdk.llm import LLMAdapter as _SDKLLMAdapter, ProviderInfo
 
 from .adapter import LLMAdapter
 from .ollama_adapter import OllamaAdapter
@@ -400,7 +400,14 @@ class ProviderRegistry:
         from kestrel_sovereign.entrypoints import discover_entry_point_classes
 
         providers: List[ProviderInfo] = []
-        classes = discover_entry_point_classes(LLM_PROVIDER_ENTRY_POINT_GROUP, LLMAdapter)
+        # Validate against the SDK base, not the framework-enriched
+        # subclass, so third-party plugins that subclass
+        # ``kestrel_sdk.llm.LLMAdapter`` directly (the documented and
+        # intended entry point — they should not need to depend on
+        # kestrel-sovereign) are accepted. The framework's own
+        # ``LLMAdapter`` inherits from the SDK base, so in-tree
+        # subclasses pass this check as well.
+        classes = discover_entry_point_classes(LLM_PROVIDER_ENTRY_POINT_GROUP, _SDKLLMAdapter)
 
         for ep_name, cls in classes.items():
             try:
