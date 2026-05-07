@@ -576,7 +576,7 @@ async def logging_context_middleware(request: Request, call_next):
 @app.middleware("http")
 async def request_metrics_middleware(request: Request, call_next):
     """Record Prometheus request count and latency metrics."""
-    from kestrel_sovereign.metrics import PROMETHEUS_AVAILABLE, REQUEST_COUNT, REQUEST_DURATION
+    from kestrel_sdk.metrics import PROMETHEUS_AVAILABLE, REQUEST_COUNT, REQUEST_DURATION
     if not PROMETHEUS_AVAILABLE:
         return await call_next(request)
 

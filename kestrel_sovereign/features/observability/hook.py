@@ -10,7 +10,7 @@ import logging
 from typing import Any, Dict
 
 from kestrel_sovereign.hooks.base import Hook, HookEvent, HookInput, HookOutput
-from kestrel_sovereign.metrics import (
+from kestrel_sdk.metrics import (
     PROMETHEUS_AVAILABLE,
     HOOK_EVENTS,
     TOOL_CALLS,

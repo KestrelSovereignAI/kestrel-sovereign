@@ -990,7 +990,7 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
             )
 
         # Prometheus metrics (no-op when prometheus-client not installed)
-        from kestrel_sovereign.metrics import (
+        from kestrel_sdk.metrics import (
             PROMETHEUS_AVAILABLE as _prom,
             LLM_CALLS,
             LLM_DURATION,
