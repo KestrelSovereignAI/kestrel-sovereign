@@ -29,7 +29,7 @@ from kestrel_sdk.llm import LLMAdapter as _SDKLLMAdapter
 
 from .image_utils import process_images
 
-__all__ = ["LLMAdapter", "LLMResponse", "ToolCall", "build_messages"]
+__all__ = ["LLMAdapter", "LLMResponse", "ToolCall", "build_messages", "messages_for"]
 
 
 def build_messages(
@@ -38,18 +38,13 @@ def build_messages(
 ) -> List[Dict[str, Any]]:
     """Build a text-only chat-completions message list in OpenAI format.
 
-    A free function rather than a method on :class:`LLMAdapter` so the
-    framework's runtime call paths (``LLMService.generate``, the
-    streaming pipeline, council deliberation) can construct messages
-    for ANY adapter — including third-party plugins that subclass
-    ``kestrel_sdk.llm.LLMAdapter`` directly and therefore do not have
-    the framework's :meth:`LLMAdapter.create_messages` helper.
-
-    Image construction stays on the adapter
-    (:meth:`LLMAdapter.create_messages` with ``images=...``) because
-    each provider formats vision parts differently — that polymorphism
-    is real and worth keeping. The text-only path has no
-    polymorphism, so a free function is correct.
+    The fallback used by :func:`messages_for` for adapters that don't
+    expose a ``create_messages`` method (third-party plugins
+    subclassing ``kestrel_sdk.llm.LLMAdapter`` directly). Plain
+    ``role`` / ``content`` strings — no images, no provider-specific
+    parts. Plugin backends that don't speak OpenAI shape should
+    override :meth:`LLMAdapter.create_messages` instead of relying on
+    this fallback.
 
     Args:
         user_prompt: User-role text content, or ``None`` to omit the
@@ -67,6 +62,47 @@ def build_messages(
     if user_prompt:
         messages.append({"role": "user", "content": user_prompt})
     return messages
+
+
+def messages_for(
+    adapter: Any,
+    *,
+    user_prompt: Optional[str] = None,
+    system_prompt: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Build messages for ``adapter``, preferring its provider-specific shape.
+
+    Single entry point used by every text-only call site in the
+    framework (``LLMService.generate`` / ``audit`` / ``remote-first``
+    / ``get_response_with_model``, the streaming pipeline, council
+    deliberation). Dispatches:
+
+    1. If ``adapter`` has a ``create_messages`` method (in-tree
+       adapters and any plugin that subclassed the framework's
+       enriched ``LLMAdapter`` or overrode the method), call it. This
+       preserves provider-native shapes — Gemini ``parts``, Vertex
+       ``_system`` markers, Anthropic content blocks — that
+       :meth:`LLMAdapter.get_response` expects.
+    2. Otherwise (SDK-only plugin subclassing
+       ``kestrel_sdk.llm.LLMAdapter`` directly with no
+       ``create_messages`` override), fall back to
+       :func:`build_messages` for plain OpenAI-shape text messages.
+       This is the right default for OpenAI-compatible plugin
+       backends (Kimi, DeepSeek, etc., which is the primary intended
+       use case for SDK-only plugins). Plugins targeting non-
+       OpenAI-shape backends should override ``create_messages`` to
+       return their native format.
+
+    Image-bearing message construction stays on the adapter via
+    ``create_messages(images=...)`` — there is no fallback for that
+    case because image parts are inherently provider-specific.
+    """
+    if hasattr(adapter, "create_messages"):
+        return adapter.create_messages(
+            user_prompt=user_prompt,
+            system_prompt=system_prompt,
+        )
+    return build_messages(user_prompt=user_prompt, system_prompt=system_prompt)
 
 
 class LLMAdapter(_SDKLLMAdapter):

@@ -435,9 +435,10 @@ async def _invoke_member(
         instructions=instructions,
     )
 
-    from kestrel_sovereign.llm.adapter import build_messages
+    from kestrel_sovereign.llm.adapter import messages_for
 
-    messages = build_messages(
+    messages = messages_for(
+        adapter,
         user_prompt=user_prompt,
         system_prompt=system_prompt,
     )
