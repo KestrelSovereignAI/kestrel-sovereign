@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -396,6 +398,91 @@ def test_kill_no_active_pod_returns_zero(monkeypatch, capsys):
 # ---------------------------------------------------------------------------
 # Lazy import — kestrel-cloud-runpod absent
 # ---------------------------------------------------------------------------
+
+def test_load_manager_chdirs_to_project_root_for_config_lookup(
+    monkeypatch, tmp_path
+):
+    """Codex review on PR #1074: the bash predecessor ran ``cd "$PROJECT_ROOT"``
+    before invoking the manager so ``runpod_config.toml`` resolved from
+    a known location regardless of where the operator typed the
+    command. The Python port must mirror that — without it, ``kestrel
+    runpod`` invoked from any directory other than the project root
+    fails with "no profiles configured" even when the repo's config is
+    fine.
+    """
+    monkeypatch.setenv("RUNPOD_API_KEY", "rp-key")
+
+    # Pretend repo lives at tmp_path; plant the config file there.
+    monkeypatch.setattr(cli_runpod, "_project_root", lambda: tmp_path)
+    (tmp_path / "runpod_config.toml").write_text("# stub\n")
+
+    # Capture the CWD that RunPodManager() saw.
+    seen_cwd_during_init: list = []
+
+    class _FakeManager:
+        def __init__(self):
+            seen_cwd_during_init.append(os.getcwd())
+
+    fake_module = type(
+        "fake_module", (), {"RunPodManager": _FakeManager},
+    )
+    import builtins
+    real_import = builtins.__import__
+
+    def fake_import(name, *a, **kw):
+        if name == "kestrel_cloud_runpod.manager":
+            return fake_module
+        return real_import(name, *a, **kw)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+
+    # Operator runs from somewhere unrelated.
+    unrelated = tmp_path / "elsewhere"
+    unrelated.mkdir()
+    monkeypatch.chdir(unrelated)
+
+    cli_runpod._load_manager()
+
+    assert seen_cwd_during_init == [str(tmp_path)], (
+        f"RunPodManager() must construct with CWD pinned to project "
+        f"root ({tmp_path}); saw {seen_cwd_during_init}"
+    )
+    # Original CWD restored after construction.
+    assert Path(os.getcwd()) == unrelated
+
+
+def test_load_manager_missing_config_errors_clean(
+    monkeypatch, tmp_path, capsys
+):
+    """If the project root doesn't have ``runpod_config.toml``, surface
+    a clear error rather than letting RunPodManager spin up against an
+    empty/wrong config."""
+    monkeypatch.setenv("RUNPOD_API_KEY", "rp-key")
+    monkeypatch.setattr(cli_runpod, "_project_root", lambda: tmp_path)
+
+    # Stub the kestrel_cloud_runpod import so the missing-package path
+    # doesn't trip first.
+    fake_module = type(
+        "fake_module", (), {"RunPodManager": MagicMock()},
+    )
+    import builtins
+    real_import = builtins.__import__
+
+    def fake_import(name, *a, **kw):
+        if name == "kestrel_cloud_runpod.manager":
+            return fake_module
+        return real_import(name, *a, **kw)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    # No runpod_config.toml planted in tmp_path.
+
+    with pytest.raises(SystemExit) as exc:
+        cli_runpod._load_manager()
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "runpod_config.toml" in err
+    assert "not found" in err
+
 
 def test_load_manager_missing_package_exits_clean(monkeypatch, capsys):
     """When kestrel-cloud-runpod isn't installed, the CLI should exit

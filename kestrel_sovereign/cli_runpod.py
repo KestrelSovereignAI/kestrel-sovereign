@@ -98,7 +98,31 @@ def _load_manager():
             file=sys.stderr,
         )
         raise SystemExit(1)
-    return RunPodManager()
+
+    # The bash predecessor ran ``cd "$PROJECT_ROOT"`` before invoking
+    # the manager so ``runpod_config.toml`` resolved correctly
+    # regardless of where the operator typed the command. Mirror that:
+    # construct the manager with CWD pinned to the project root so
+    # operators with the installed ``kestrel`` CLI on PATH (running
+    # from any directory) get the same lookup behavior. Codex review
+    # on PR #1074 caught the regression. We restore the original CWD
+    # immediately after construction; runtime calls never see the chdir.
+    project_root = _project_root()
+    if not (project_root / _RUNPOD_CONFIG_FILE).is_file():
+        print(
+            f"error: {_RUNPOD_CONFIG_FILE} not found at "
+            f"{project_root / _RUNPOD_CONFIG_FILE}.\n"
+            f"  Copy {_RUNPOD_CONFIG_FILE}.example and configure your "
+            f"profiles.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    original_cwd = os.getcwd()
+    try:
+        os.chdir(project_root)
+        return RunPodManager()
+    finally:
+        os.chdir(original_cwd)
 
 
 def _validate_profile(manager, profile_name: str) -> bool:
