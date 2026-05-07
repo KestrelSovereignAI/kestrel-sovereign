@@ -41,17 +41,47 @@ class ResponseAuditHook(Hook):
         self.last_narration_verdict = None
 
     async def execute(self, input: HookInput) -> HookOutput:
-        response_text = input.response_text
-        if not response_text or len(response_text.strip()) < 20:
-            return HookOutput.allow("Response too short to audit")
+        response_text = input.response_text or ""
 
-        # Deterministic narration check first — runs even when the
-        # LLM-audit call below fails or is unavailable.
+        # Run the deterministic narration check FIRST so even short
+        # responses get audited against the marker-boundary signal.
+        # Codex review of #1076: previously the 20-char short-circuit
+        # ran before this and a canonical violation like
+        # "Saved." (6 chars) + failed tool slipped through.
         narration_verdict = analyze_narration(
             input.pre_tool_prose,
             input.tool_results,
         )
         self.last_narration_verdict = narration_verdict
+
+        # Honesty doctrine: a narration violation is a constitutional
+        # failure independent of the LLM-audit risk score, so it
+        # always crosses the configured threshold. Without this floor
+        # a default ``risk_threshold=3`` deployment would let a
+        # pure-narration violation (boost=2) pass when the LLM audit
+        # is unavailable. Codex P2 #1076.
+        narration_risk = (
+            max(narration_verdict.risk_boost, self.risk_threshold)
+            if narration_verdict.risk_boost > 0
+            else 0
+        )
+
+        if not response_text or len(response_text.strip()) < 20:
+            # Short responses skip the LLM audit (it has no signal to
+            # work with), but they still honor a deterministic
+            # narration violation.
+            if narration_risk > 0:
+                self.audit_count += 1
+                self.last_risk_level = narration_risk
+                await self._notify_audit_anchor(
+                    narration_risk, narration_verdict.reasoning,
+                )
+                return self._apply_audit_decision(
+                    response_text=response_text,
+                    risk_level=narration_risk,
+                    reasoning=narration_verdict.reasoning,
+                )
+            return HookOutput.allow("Response too short to audit")
 
         try:
             audit_result = await self.agent.llm_service.get_audit_response(response_text)
@@ -59,15 +89,15 @@ class ResponseAuditHook(Hook):
             logger.warning(f"Response audit failed: {e}")
             # Even with the LLM audit unavailable, a clean-cut
             # narration violation still fires the audit machinery.
-            if narration_verdict.risk_boost > 0:
+            if narration_risk > 0:
                 self.audit_count += 1
-                self.last_risk_level = narration_verdict.risk_boost
+                self.last_risk_level = narration_risk
                 await self._notify_audit_anchor(
-                    narration_verdict.risk_boost, narration_verdict.reasoning,
+                    narration_risk, narration_verdict.reasoning,
                 )
                 return self._apply_audit_decision(
                     response_text=response_text,
-                    risk_level=narration_verdict.risk_boost,
+                    risk_level=narration_risk,
                     reasoning=narration_verdict.reasoning,
                 )
             return HookOutput.allow(f"Audit skipped due to error: {e}")
@@ -75,9 +105,14 @@ class ResponseAuditHook(Hook):
         risk_level = audit_result.get("risk_level", 1)
         reasoning = audit_result.get("reasoning", "")
 
-        # Fold the narration verdict into the LLM audit score.
+        # Fold the narration verdict into the LLM audit score:
+        # additive (so an LLM-flagged response with a narration
+        # violation reads even higher), then floored at the configured
+        # threshold so a narration violation always trips the gate
+        # regardless of how the LLM audit scored.
         if narration_verdict.risk_boost > 0:
             risk_level = max(risk_level, 0) + narration_verdict.risk_boost
+            risk_level = max(risk_level, self.risk_threshold)
             reasoning = (
                 f"{reasoning} | narration_check: {narration_verdict.reasoning}"
                 if reasoning

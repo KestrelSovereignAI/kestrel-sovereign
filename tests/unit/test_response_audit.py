@@ -286,6 +286,49 @@ class TestResponseAuditHookNarrationFolding:
         assert "narration" in output.permission_reason.lower() or "save_fact" in output.permission_reason
 
     @pytest.mark.asyncio
+    async def test_short_response_with_narration_violation_still_audits(self):
+        """Codex P2 of #1076: 'Saved.' (under 20 chars) with a failed
+        tool MUST trigger audit machinery. Previously the short-text
+        gate ran before the narration check and let the violation
+        slip through entirely."""
+        agent = _make_agent({"risk_level": 1, "reasoning": "Normal"})
+        hook = ResponseAuditHook(agent=agent, mode="strict", risk_threshold=3)
+
+        short_input = HookInput(
+            session_id="t",
+            hook_event_name=HookEvent.POST_RESPONSE.value,
+            response_text="Saved.",
+            pre_tool_prose="Saved your favorite color.",
+            tool_results=[
+                {"tool_call_id": "tc-1", "name": "save_fact",
+                 "result": {"status": "error"}},
+            ],
+        )
+        output = await hook.execute(short_input)
+
+        assert output.permission_decision == PermissionDecision.DENY
+        assert hook.last_risk_level >= hook.risk_threshold
+
+    @pytest.mark.asyncio
+    async def test_narration_violation_floors_at_threshold_under_default_settings(self):
+        """Codex P2 of #1076: with default ``risk_threshold=3``, a
+        narration boost of 2 alone wouldn't cross threshold. The
+        floor guarantees a deterministic constitutional violation
+        always trips the gate regardless of the LLM-audit score."""
+        agent = _make_agent()
+        agent.llm_service.get_audit_response = AsyncMock(
+            side_effect=RuntimeError("audit LLM down")
+        )
+        # Default risk_threshold=3 — with boost=2 alone we'd be
+        # below threshold without the floor.
+        hook = ResponseAuditHook(agent=agent, mode="strict", risk_threshold=3)
+
+        output = await hook.execute(_make_narration_hook_input())
+
+        assert output.permission_decision == PermissionDecision.DENY
+        assert hook.last_risk_level >= hook.risk_threshold
+
+    @pytest.mark.asyncio
     async def test_narration_clean_when_llm_audit_unavailable_falls_through_to_allow(self):
         """LLM down + narration check clean → existing skip-on-error
         path retained. Behavior matches pre-Wave-5D expectations for

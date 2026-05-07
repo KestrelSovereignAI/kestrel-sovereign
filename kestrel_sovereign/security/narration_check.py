@@ -29,12 +29,20 @@ falsifiable claim.
 
 Limits
 ------
-This is a heuristic. False positives are possible (e.g. the agent
-writes "Saved your previous turn — now adding to it" before calling
-the new tool, where "Saved" refers to past state). Hook authors who
-care about precision should compose this with their own checks. The
-module ships with the audit hook in WARN mode by default to keep
-operational impact low.
+This is a heuristic. False positives are possible:
+
+* The agent writes "Saved your previous turn — now adding to it"
+  before calling the new tool, where "Saved" refers to past state.
+* A multi-tool turn where the success verb refers to one tool that
+  succeeded but a different tool failed (e.g. "Saved the draft" with
+  ``save_draft`` returning ok but ``notify_team`` returning error).
+  The check currently flags any failure in the result list against
+  any past-tense verb; correlating verbs to specific tool names is
+  future work.
+
+Hook authors who care about precision should compose this with their
+own checks. The module ships with the audit hook in WARN mode by
+default to keep operational impact low.
 """
 from __future__ import annotations
 
@@ -98,6 +106,44 @@ class NarrationVerdict:
     offending_tool: Optional[str] = None
 
 
+def summarize_tool_result_for_audit(result: Any) -> Any:
+    """Slim a tool's return envelope down to only the fields the
+    narration check (and a typical POST_RESPONSE audit hook) needs.
+
+    The motivation is privacy + size: the orchestrator's full
+    ``_serialize_tool_result`` envelope can contain memory contents,
+    search hits, file contents, or other sensitive payload data.
+    Passing that to every registered POST_RESPONSE hook (including
+    third-party plugins) is over-broad. Codex review of
+    kestrel-sovereign #1076 caught this: the LLM message gets
+    truncated to ``MAX_TOOL_RESULT_CHARS`` but the audit-hook payload
+    bypassed that gate.
+
+    Returns a small dict with only the audit-relevant envelope shape:
+
+    * ``status`` — when the result conforms to the ToolResult
+      envelope (#1042 layer 4).
+    * ``success`` — when the result is a legacy ``{success: bool}``
+      envelope.
+    * ``error`` — capped at 500 chars to prevent log-bomb amplification.
+
+    Non-dict results are returned unchanged — the narration check
+    treats them as failure and the slim envelope can't represent
+    "raw return".
+    """
+    if not isinstance(result, dict):
+        return result
+    summary: Dict[str, Any] = {}
+    if "status" in result:
+        summary["status"] = result["status"]
+    if "success" in result:
+        summary["success"] = result["success"]
+    err = result.get("error")
+    if err:
+        summary["error"] = err[:500] if isinstance(err, str) else err
+    return summary
+
+
 def _result_indicates_failure(result: Any) -> bool:
     """Return True if a tool's result envelope encodes a failure or
     a no-positive-confirmation outcome.
@@ -127,7 +173,12 @@ def _result_indicates_failure(result: Any) -> bool:
         # Unknown status string — treat conservatively as failure.
         return True
     if "success" in result:
-        return result["success"] is False
+        # Use ``is not True`` rather than ``is False`` so legacy
+        # envelopes with success=None / success="false" / numeric 0
+        # are treated as failure-for-audit-purposes. Codex review of
+        # #1076 caught this: ``is False`` only matches literal False
+        # and would silently let stringly-typed legacy envelopes pass.
+        return result["success"] is not True
     if result.get("error"):
         return True
     # No status, no success flag, no error — ambiguous. The honesty

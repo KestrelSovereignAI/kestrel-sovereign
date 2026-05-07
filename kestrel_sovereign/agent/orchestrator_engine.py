@@ -431,6 +431,9 @@ class OrchestratorEngineMixin:
             logging.warning(f"{log_prefix} Tool validation failed: {validation_error}")
             result = {"success": False, "error": f"Tool validation failed: {validation_error}"}
             from kestrel_sovereign.features.base import _serialize_tool_result
+            from kestrel_sovereign.security.narration_check import (
+                summarize_tool_result_for_audit,
+            )
             serialized_result = _serialize_tool_result(result)
             result_json = json.dumps(serialized_result)
             messages.append({
@@ -442,7 +445,7 @@ class OrchestratorEngineMixin:
                 tool_results.append({
                     "tool_call_id": tool_call.id,
                     "name": tool_name,
-                    "result": serialized_result,
+                    "result": summarize_tool_result_for_audit(serialized_result),
                 })
             return
 
@@ -493,6 +496,9 @@ class OrchestratorEngineMixin:
 
         # Add tool result to messages (with persistence for large results)
         from kestrel_sovereign.features.base import _serialize_tool_result
+        from kestrel_sovereign.security.narration_check import (
+            summarize_tool_result_for_audit,
+        )
         serialized_result = _serialize_tool_result(result)
         result_json = json.dumps(serialized_result)
 
@@ -507,18 +513,19 @@ class OrchestratorEngineMixin:
             "tool_call_id": tool_call.id,
             "content": result_json
         })
-        # Surface the structured result envelope for the post-response
-        # narration check (#1042 layer 3). We carry the full
-        # ``_serialize_tool_result`` output rather than the truncated
-        # preview — the audit hook needs the actual ``status``/``success``
-        # fields, not a string blob. Caller passes ``tool_results=None``
-        # when narration check is disabled (single-tool ad-hoc paths,
-        # tests, non-streaming flows that don't need it).
+        # Surface a SLIM result envelope for the post-response
+        # narration check (#1042 layer 3). The summary keeps only
+        # status/success/error — the fields ``analyze_narration``
+        # actually reads — so registered POST_RESPONSE hooks
+        # (including third-party plugins) don't receive sensitive
+        # payload data. Caller passes ``tool_results=None`` when
+        # narration check is disabled (ad-hoc paths, tests, non-
+        # streaming flows that don't need it).
         if tool_results is not None:
             tool_results.append({
                 "tool_call_id": tool_call.id,
                 "name": tool_name,
-                "result": serialized_result,
+                "result": summarize_tool_result_for_audit(serialized_result),
             })
 
         # Record into context stats accumulator (if available on the agent)
@@ -854,15 +861,17 @@ class OrchestratorEngineMixin:
                     f"(max {MAX_TOOL_CONCURRENCY})"
                 )
 
-                # Each tool dispatches into its own temporary message list
-                # to avoid ordering issues on the shared messages list.
-                # Likewise, each tool dispatches into its own
-                # per_tool_results list so concurrent appends to
-                # ``tool_results`` can't interleave — we then merge in
-                # original request order after gather.
-                per_tool_messages = {tc.id: [] for tc in batch_tcs}
-                per_tool_results: dict = (
-                    {tc.id: [] for tc in batch_tcs} if tool_results is not None else None
+                # Each tool dispatches into its own temporary message
+                # list to avoid ordering issues on the shared messages
+                # list, and into its own per_tool_results list so
+                # concurrent appends to ``tool_results`` can't
+                # interleave — merged in original request order after
+                # gather. Buffers are keyed by INDEX, not ``tc.id``,
+                # so duplicate or empty ids (defensive — codex P3
+                # of #1076) can't collide.
+                per_tool_messages: list = [[] for _ in batch_tcs]
+                per_tool_results: Optional[list] = (
+                    [[] for _ in batch_tcs] if tool_results is not None else None
                 )
 
                 async def _run_one(tc, msg_list, res_list):
@@ -878,18 +887,18 @@ class OrchestratorEngineMixin:
                     *[
                         _run_one(
                             tc,
-                            per_tool_messages[tc.id],
-                            per_tool_results[tc.id] if per_tool_results is not None else None,
+                            per_tool_messages[i],
+                            per_tool_results[i] if per_tool_results is not None else None,
                         )
-                        for tc in batch_tcs
+                        for i, tc in enumerate(batch_tcs)
                     ]
                 )
 
                 # Append results in original request order
-                for tc in batch_tcs:
-                    messages.extend(per_tool_messages[tc.id])
+                for i in range(len(batch_tcs)):
+                    messages.extend(per_tool_messages[i])
                     if per_tool_results is not None and tool_results is not None:
-                        tool_results.extend(per_tool_results[tc.id])
+                        tool_results.extend(per_tool_results[i])
 
     # ------------------------------------------------------------------
     # Non-streaming orchestrator response handler

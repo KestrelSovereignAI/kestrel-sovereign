@@ -159,6 +159,94 @@ class TestViolation:
         assert v2.risk_boost == 2
 
 
+class TestLegacySuccessEdgeCases:
+    """Codex P2 of #1076 — ``is not True`` (rather than ``is False``)
+    handling means non-True legacy values are treated as failure."""
+
+    def test_success_none_is_failure(self):
+        v = analyze_narration(
+            "Saved.",
+            [{"name": "x", "result": {"success": None}}],
+        )
+        assert v.risk_boost == 2
+
+    def test_success_string_false_is_failure(self):
+        """Stringly-typed legacy callers used 'false' / 0 / etc. The
+        old ``is False`` check would have let these pass."""
+        v = analyze_narration(
+            "Saved.",
+            [{"name": "x", "result": {"success": "false"}}],
+        )
+        assert v.risk_boost == 2
+        v2 = analyze_narration(
+            "Saved.",
+            [{"name": "x", "result": {"success": 0}}],
+        )
+        assert v2.risk_boost == 2
+
+    def test_success_literal_true_remains_success(self):
+        v = analyze_narration(
+            "Saved.",
+            [{"name": "x", "result": {"success": True}}],
+        )
+        assert v.risk_boost == 0
+
+
+class TestSummarizeForAudit:
+    """``summarize_tool_result_for_audit`` keeps only the audit-
+    relevant envelope shape — codex P2 of #1076."""
+
+    def test_strips_data_payload(self):
+        from kestrel_sovereign.security.narration_check import (
+            summarize_tool_result_for_audit,
+        )
+        full = {
+            "status": "ok",
+            "data": {"secret": "ssn=123-45-6789", "huge": "x" * 100_000},
+            "confirmation": "Saved fact #42",
+        }
+        s = summarize_tool_result_for_audit(full)
+        assert s == {"status": "ok"}
+        assert "data" not in s
+        assert "confirmation" not in s
+
+    def test_keeps_legacy_success_field(self):
+        from kestrel_sovereign.security.narration_check import (
+            summarize_tool_result_for_audit,
+        )
+        s = summarize_tool_result_for_audit({"success": False, "data": [1, 2, 3]})
+        assert s == {"success": False}
+
+    def test_caps_error_string_to_500_chars(self):
+        from kestrel_sovereign.security.narration_check import (
+            summarize_tool_result_for_audit,
+        )
+        long_err = "boom " * 500  # 2500 chars
+        s = summarize_tool_result_for_audit({"status": "error", "error": long_err})
+        assert s["status"] == "error"
+        assert len(s["error"]) == 500
+
+    def test_non_dict_returned_unchanged(self):
+        from kestrel_sovereign.security.narration_check import (
+            summarize_tool_result_for_audit,
+        )
+        assert summarize_tool_result_for_audit("raw string") == "raw string"
+        assert summarize_tool_result_for_audit(None) is None
+        assert summarize_tool_result_for_audit(42) == 42
+
+    def test_summary_still_supports_narration_check(self):
+        """The whole point: the slim envelope must still drive the
+        same verdict the full envelope did."""
+        from kestrel_sovereign.security.narration_check import (
+            summarize_tool_result_for_audit,
+        )
+        full = {"status": "error", "error": "boom", "data": {"big": "x" * 50_000}}
+        slim = summarize_tool_result_for_audit(full)
+        v_full = analyze_narration("Saved.", [{"name": "x", "result": full}])
+        v_slim = analyze_narration("Saved.", [{"name": "x", "result": slim}])
+        assert v_full.risk_boost == v_slim.risk_boost == 2
+
+
 class TestVerdictShape:
     def test_clean_verdict_has_no_offender_fields(self):
         v = analyze_narration(None, None)
