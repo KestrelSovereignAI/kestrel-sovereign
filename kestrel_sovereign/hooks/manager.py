@@ -9,7 +9,7 @@ import asyncio
 import logging
 from typing import Dict, List, Optional
 
-from kestrel_sovereign.hooks.base import (
+from kestrel_sdk.hooks.base import (
     Hook,
     HookEvent,
     HookInput,

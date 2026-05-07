@@ -16,7 +16,7 @@ import pytest
 import pytest_asyncio
 from pathlib import Path
 
-from kestrel_sovereign.tools import AgentTool, ToolSchema, ToolParameter, ToolCategory
+from kestrel_sdk.tools.base import AgentTool, ToolSchema, ToolParameter, ToolCategory
 from kestrel_sovereign.features.model import ModelAgent
 from kestrel_sovereign.llm.service import LLMService
 from kestrel_sovereign.kestrel_agent import KestrelAgent

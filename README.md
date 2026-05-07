@@ -199,11 +199,17 @@ kestrel-sovereign/
 ├── server.py                  # FastAPI agent server
 ├── host.py                    # Multi-agent multi_agent host
 ├── main.py                    # Direct interactive REPL
-├── kestrel_sdk/               # Public SDK for feature authors
 ├── packages/                  # Extracted feature packages
 ├── features/                  # Built-in features
 ├── docs/                      # Architecture & guides
 └── tests/                     # Test suite
+
+# The Kestrel SDK lives in its own repo + PyPI package:
+#   kestrel-sovereign-sdk  (https://github.com/KestrelSovereignAI/kestrel-sovereign-sdk)
+# Feature authors import its types directly:
+#   from kestrel_sdk.features.base import Feature, tool
+#   from kestrel_sdk.tools.base   import ToolCategory, ToolResult
+#   from kestrel_sdk.hooks.base   import Hook, HookEvent
 ```
 
 ## 🎯 Core Features

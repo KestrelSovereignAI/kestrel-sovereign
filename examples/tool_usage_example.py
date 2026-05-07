@@ -20,7 +20,7 @@ async def main():
     print("\n1. Web Search Tool")
     print("-" * 50)
 
-    from kestrel_sovereign.tools import get_web_search_tool
+    from kestrel_sdk.tools.base import get_web_search_tool
 
     search_tool = get_web_search_tool()
 
@@ -60,7 +60,7 @@ async def main():
         print("✅ Database available for feedback tool")
 
         import asyncpg
-        from kestrel_sovereign.tools import get_feedback_tool, FeedbackType, FeedbackSeverity
+        from kestrel_sdk.tools.base import get_feedback_tool, FeedbackType, FeedbackSeverity
 
         # Create connection pool
         pool = await asyncpg.create_pool(database_url)

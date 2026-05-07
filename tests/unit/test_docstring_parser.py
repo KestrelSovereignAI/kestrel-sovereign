@@ -6,7 +6,7 @@ Tests the parse_docstring_params function and tool decorator integration.
 
 import pytest
 from kestrel_sovereign.features.base import parse_docstring_params, tool, Feature
-from kestrel_sovereign.tools.base import ToolCategory
+from kestrel_sdk.tools.base import ToolCategory
 
 
 class TestParseDocstringParams:

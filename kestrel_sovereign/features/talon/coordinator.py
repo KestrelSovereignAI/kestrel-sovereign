@@ -26,7 +26,7 @@ from kestrel_sovereign.features.peers.mesh import (
     MeshMessageType,
     make_assign_message,
 )
-from kestrel_sovereign.tools.base import ToolCategory
+from kestrel_sdk.tools.base import ToolCategory
 
 logger = logging.getLogger(__name__)
 

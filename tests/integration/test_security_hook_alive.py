@@ -23,7 +23,7 @@ import asyncio
 import pytest
 import pytest_asyncio
 
-from kestrel_sovereign.hooks import HookEvent, HookInput
+from kestrel_sdk.hooks.base import HookEvent, HookInput
 from kestrel_sovereign.kestrel_agent import KestrelAgent
 from kestrel_sovereign.llm.service import LLMService
 from kestrel_sovereign.privacy import PrivacyMode
@@ -226,5 +226,5 @@ async def test_explicit_grant_lets_hook_short_circuit(bare_agent):
     )
     # The hook output should be ALLOW; HooksManager surfaces this
     # via permission_decision on the aggregated output.
-    from kestrel_sovereign.hooks.base import PermissionDecision
+    from kestrel_sdk.hooks.base import PermissionDecision
     assert output.permission_decision == PermissionDecision.ALLOW

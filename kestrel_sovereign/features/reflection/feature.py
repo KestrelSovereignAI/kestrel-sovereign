@@ -22,7 +22,7 @@ from kestrel_sovereign.features.storage_access import (
     resolve_feature_conversation_store,
     resolve_feature_database,
 )
-from kestrel_sovereign.tools.base import ToolCategory
+from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sovereign.kestrel_config.constants import (
     APPROVAL_TIMEOUT_DEFAULT,
     APPROVAL_TIMEOUT_SHORT,

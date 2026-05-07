@@ -5,7 +5,7 @@ Tests that parse_command_args properly converts string arguments to
 their expected types based on the parameter schema.
 """
 import pytest
-from kestrel_sovereign.tools.base import AgentTool, ToolSchema, ToolParameter, ToolCategory
+from kestrel_sdk.tools.base import AgentTool, ToolSchema, ToolParameter, ToolCategory
 
 
 class MockToolWithTypes(AgentTool):

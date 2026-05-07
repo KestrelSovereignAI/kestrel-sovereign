@@ -53,7 +53,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.storage_access import resolve_feature_database
-from kestrel_sovereign.tools.base import ToolCategory
+from kestrel_sdk.tools.base import ToolCategory
 
 from .models import Skill, normalize_title, skill_id_from_title
 

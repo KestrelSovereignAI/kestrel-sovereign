@@ -7,7 +7,7 @@ import pytest
 from kestrel_sovereign.a2a.agent_card import AgentCapabilities, AgentCard, AgentSkill
 from kestrel_sovereign.a2a.task_manager import TaskManager
 from kestrel_sovereign.a2a.types import Artifact, Message, TaskState, TaskStatus, TextPart
-from kestrel_sovereign.hooks import HookEvent, HookInput, HookOutput
+from kestrel_sdk.hooks.base import HookEvent, HookInput, HookOutput
 
 
 class _Transaction:

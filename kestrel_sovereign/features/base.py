@@ -6,9 +6,9 @@ import re
 from typing import Any, Callable, Dict, List, Optional, Type, Union, Protocol, runtime_checkable, TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from kestrel_sovereign.hooks.base import Hook
+    from kestrel_sdk.hooks.base import Hook
 from abc import ABC, abstractmethod
-from kestrel_sovereign.tools.base import ToolSchema, ToolParameter, ToolCategory, AgentTool
+from kestrel_sdk.tools.base import ToolSchema, ToolParameter, ToolCategory, AgentTool
 from kestrel_sovereign.a2a.agent_card import AgentCard, AgentSkill, AgentCapabilities
 from kestrel_sovereign.a2a.types import Task, TaskState, TaskStatus, Artifact, DataPart, Message, TextPart
 
@@ -689,8 +689,8 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
                     # Check security hooks before executing
                     hooks_manager = getattr(self.agent, 'hooks_manager', None)
                     if hooks_manager:
-                        from kestrel_sovereign.hooks import HookInput, HookEvent
-                        from kestrel_sovereign.hooks.base import PermissionDecision
+                        from kestrel_sdk.hooks.base import HookInput, HookEvent
+                        from kestrel_sdk.hooks.base import PermissionDecision
                         hook_input = HookInput(
                             session_id="subagent",
                             hook_event_name=HookEvent.PRE_TOOL_USE.value,

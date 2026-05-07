@@ -23,7 +23,7 @@ from decimal import Decimal
 from enum import Enum
 from typing import Any, Dict, Optional
 
-from kestrel_sovereign.hooks.base import HookEvent, HookInput
+from kestrel_sdk.hooks.base import HookEvent, HookInput
 from kestrel_sovereign.hooks.manager import HooksManager
 
 logger = logging.getLogger(__name__)

@@ -6,7 +6,7 @@ Provides the !state-of-mind command to inspect constitutional governance mode.
 import logging
 from typing import Optional
 from kestrel_sovereign.features.base import Feature, tool
-from kestrel_sovereign.tools.base import ToolCategory
+from kestrel_sdk.tools.base import ToolCategory
 
 logger = logging.getLogger(__name__)
 

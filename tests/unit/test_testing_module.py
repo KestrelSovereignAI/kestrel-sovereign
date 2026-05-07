@@ -6,7 +6,7 @@ from unittest.mock import MagicMock
 from kestrel_sovereign.testing import MockAgent, FeatureTestCase
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.storage.async_graph_store import GraphNode
-from kestrel_sovereign.tools.base import ToolCategory
+from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sovereign.privacy import PrivacyMode
 
 
