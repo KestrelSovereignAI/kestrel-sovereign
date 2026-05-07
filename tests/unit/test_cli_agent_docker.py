@@ -361,6 +361,65 @@ def test_ensure_image_builds_when_missing(monkeypatch):
     assert "docker/Dockerfile.sovereign" in " ".join(calls[1])
 
 
+def test_kestrel_agent_docker_run_passes_command_through(tmp_path, monkeypatch):
+    """Codex review v3 on PR #1071: the bash predecessor's
+    ``sovereign-agent.sh run <data_dir> <command...>`` was a generic
+    escape hatch for ad-hoc commands inside the isolated agent
+    container. The Python port must keep that surface — without it,
+    operators with scripted workflows lose functionality.
+    """
+    captured: list = []
+
+    def fake_run_streaming(cmd, **kwargs):
+        captured.append(list(cmd))
+        return 0
+
+    def fake_ensure_image(repo, *, force_rebuild=False):
+        return 0
+
+    monkeypatch.setattr(cli_agent_docker, "run_streaming", fake_run_streaming)
+    monkeypatch.setattr(cli_agent_docker, "_ensure_image", fake_ensure_image)
+    monkeypatch.setenv("KESTREL_DATA_KEY", "test-key")
+
+    import argparse
+    args = argparse.Namespace(
+        agent_command="docker",
+        agent_docker_command="run",
+        data_dir=str(tmp_path),
+        command=["python", "-c", "print('hello')"],
+    )
+    rc = cli_agent_docker.cmd_agent(args)
+    assert rc == 0
+
+    assert len(captured) == 1
+    cmd = captured[0]
+    assert cmd[0:2] == ["docker", "run"]
+    # ``-it`` must NOT be in this argv — ``run`` is non-interactive
+    # (matches the bash predecessor's behavior).
+    assert "-it" not in cmd
+    # The user's command tail follows the image name.
+    assert cmd[-3:] == ["python", "-c", "print('hello')"]
+    # KESTREL_DATA_KEY plumbed through.
+    assert any(s.startswith("KESTREL_DATA_KEY=") for s in cmd)
+
+
+def test_kestrel_agent_docker_run_requires_command(tmp_path, monkeypatch, capsys):
+    """``kestrel agent docker run <data_dir>`` (no command) → exit 1
+    with usage message."""
+    monkeypatch.setenv("KESTREL_DATA_KEY", "test-key")
+    import argparse
+    args = argparse.Namespace(
+        agent_command="docker",
+        agent_docker_command="run",
+        data_dir=str(tmp_path),
+        command=[],
+    )
+    rc = cli_agent_docker.cmd_agent(args)
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert "requires a command" in captured.err
+
+
 def test_kestrel_agent_docker_build_subverb_force_rebuilds(monkeypatch):
     """Codex review on PR #1071: ``kestrel agent docker build [--no-cache]``
     must reach ``_ensure_image(force_rebuild=True)``. Without this

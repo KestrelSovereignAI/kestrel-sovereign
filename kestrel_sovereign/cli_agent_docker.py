@@ -231,6 +231,48 @@ def _cmd_chat(args) -> int:
     )
 
 
+def _cmd_run(args) -> int:
+    """``kestrel agent docker run <data_dir> <command...>``.
+
+    Generic escape hatch — runs a custom command inside the isolated
+    agent container, with the host ``data_dir`` volume-mounted at
+    ``/data`` and ``KESTREL_DATA_KEY`` passed through. Mirrors the
+    bash predecessor's ``sovereign-agent.sh run <dir> <cmd...>`` for
+    ad-hoc inspection / scripting against the encrypted volume.
+
+    Codex review on PR #1071 caught that the deletion dropped this
+    surface; this restores parity with the bash.
+    """
+    raw_dir: str = args.data_dir
+    command: List[str] = list(args.command or [])
+    if not command:
+        print(
+            "error: `kestrel agent docker run` requires a command.\n"
+            "Example: kestrel agent docker run ~/emma_data "
+            "python -c 'print(\"hello\")'",
+            file=sys.stderr,
+        )
+        return 1
+
+    data_key = _check_data_key()
+    if data_key is None:
+        _print_missing_key_error()
+        return 1
+
+    repo = _repo_root()
+    rc = _ensure_image(repo)
+    if rc != 0:
+        return rc
+
+    data_dir = _resolve_data_dir(raw_dir)
+    return _docker_run(
+        data_dir=data_dir,
+        data_key=data_key,
+        container_argv=command,
+        interactive=False,
+    )
+
+
 def _cmd_retire(args) -> int:
     """``kestrel agent docker retire <data_dir>``."""
     raw_dir: str = args.data_dir
@@ -347,6 +389,26 @@ def add_agent_docker_subcommand(
              "for scripted retirement flows",
     )
 
+    # ``kestrel agent docker run <data_dir> <command...>`` — generic
+    # escape hatch that mirrors the bash predecessor's ``run`` subverb
+    # for ad-hoc commands inside the isolated agent container. Codex
+    # review v3 on PR #1071 caught the missing surface.
+    run_p = docker_sub.add_parser(
+        "run",
+        help="Run a custom command inside the isolated agent container "
+             "(escape hatch for ad-hoc inspection / scripting).",
+    )
+    run_p.add_argument(
+        "data_dir",
+        help="Host directory containing the agent's data (``~`` is expanded).",
+    )
+    run_p.add_argument(
+        "command",
+        nargs=argparse.REMAINDER,
+        help="Command (and args) to run inside the container — e.g. "
+             "``python -c 'print(\"hello\")'``.",
+    )
+
     # ``kestrel agent docker build [--no-cache]`` — explicit rebuild
     # path. Codex review on PR #1071 caught that the helper had a
     # ``force_rebuild`` branch but no argparse path could reach it, so
@@ -395,6 +457,8 @@ def cmd_agent(args) -> int:
         return _cmd_chat(args)
     if docker_sub == "retire":
         return _cmd_retire(args)
+    if docker_sub == "run":
+        return _cmd_run(args)
     if docker_sub == "build":
         return _cmd_build(args)
 
@@ -403,12 +467,14 @@ def cmd_agent(args) -> int:
         "  kestrel agent docker create <name> <data_dir>\n"
         "  kestrel agent docker chat   <data_dir>\n"
         "  kestrel agent docker retire <data_dir> [--yes]\n"
+        "  kestrel agent docker run    <data_dir> <command...>\n"
         "  kestrel agent docker build  [--no-cache]\n"
         "\n"
         "Examples:\n"
         "  KESTREL_DATA_KEY=... kestrel agent docker create Emma ~/emma_data\n"
         "  KESTREL_DATA_KEY=... kestrel agent docker chat ~/emma_data\n"
         "  KESTREL_DATA_KEY=... kestrel agent docker retire ~/test_agent\n"
+        "  KESTREL_DATA_KEY=... kestrel agent docker run ~/emma_data python -c 'print(1)'\n"
         "  kestrel agent docker build --no-cache",
         file=sys.stderr,
     )
