@@ -229,13 +229,18 @@ def test_build_target_multi_arch_push_with_token(kestrel_target, tmp_path):
 
 
 def test_build_target_multi_arch_no_push(kestrel_target, tmp_path):
-    """--no-push drops --push from the buildx argv."""
+    """--no-push uses ``--load`` (writes into local docker daemon) and
+    requires a single platform. Without ``--load`` a buildx build with
+    no output target leaves the result only in the build cache, which
+    contradicts the CLI's "local-only images" promise (codex review
+    on PR #1060)."""
     runner = MagicMock(return_value=MagicMock(returncode=0, stderr=""))
 
     result = build_target(
         kestrel_target,
         project_id="test-project",
         tag="latest",
+        platforms=("linux/amd64",),  # buildx --load only supports single-arch
         push=False,
         multi_arch=True,
         github_token=None,
@@ -245,10 +250,34 @@ def test_build_target_multi_arch_no_push(kestrel_target, tmp_path):
 
     cmd = runner.call_args.args[0]
     assert "--push" not in cmd
+    assert "--load" in cmd, "--load is required for buildx no-push to produce a usable local image"
     # tag=latest → only one -t flag (don't write :latest twice).
     tags = [cmd[i + 1] for i, v in enumerate(cmd) if v == "-t"]
     assert tags == ["gcr.io/test-project/kestrel:latest"]
     assert result.pushed is False
+
+
+def test_build_target_multi_arch_no_push_rejects_multiple_platforms(
+    kestrel_target, tmp_path
+):
+    """--no-push + multi-platform is invalid (buildx --load only works
+    single-arch). Codex review on PR #1060: silently emitting a buildx
+    cmd with no output produced no usable image."""
+    runner = MagicMock()  # never called
+
+    with pytest.raises(ValueError, match="single --platforms"):
+        build_target(
+            kestrel_target,
+            project_id="test-project",
+            tag="latest",
+            platforms=("linux/amd64", "linux/arm64"),
+            push=False,
+            multi_arch=True,
+            project_root=tmp_path,
+            runner=runner,
+        )
+
+    runner.assert_not_called()
 
 
 def test_build_target_no_multi_arch_legacy_flow(kestrel_target, tmp_path):

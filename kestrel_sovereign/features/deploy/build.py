@@ -142,6 +142,17 @@ DEFAULT_TARGETS: List[BuildTarget] = [
         dockerfile=Path("docker/Dockerfile.cloudrun"),
         description="single-agent",
     ),
+    # Image name matches scripts/cloudrun/build.sh (the canonical
+    # multi-arch builder) and .github/workflows/deploy.yml (the CI
+    # path) — both use ``kestrel-multi_agent`` (underscore). The legacy
+    # scripts/cloudrun/{build_multi_agent.sh,deploy_dev.sh,deploy_multi_agent_dev.sh}
+    # diverged on ``kestrel-multi-agent`` (hyphen); that bash-vs-bash
+    # inconsistency is a pre-existing config drift the epic's Tier 1.4
+    # reconciliation will resolve. Picking the underscore here keeps
+    # ``kestrel deploy build`` aligned with CI's image name and the
+    # canonical buildx flow. Codex review on PR #1060 flagged the
+    # divergence; the answer is to fix the divergent path in 1.4, not
+    # to perpetuate two image names for the same build.
     BuildTarget(
         image_name="kestrel-multi_agent",
         dockerfile=Path("docker/Dockerfile.multi_agent"),
@@ -271,6 +282,16 @@ def _build_buildx_command(
         cmd.extend(["-t", f"{image_base}:latest"])
     if push:
         cmd.append("--push")
+    else:
+        # Without --push or --load (or another --output), buildx leaves
+        # the result only in the build cache — the CLI promised
+        # "local-only images" with --no-push but the operator would get
+        # nothing usable. ``--load`` writes the result into the local
+        # docker daemon, which is exactly what local smoke tests want.
+        # Codex review on PR #1060 caught this. ``--load`` only supports
+        # single-platform builds; the validator above forces that
+        # constraint when push=False.
+        cmd.append("--load")
     cmd.append(str(project_root))
     return cmd
 
@@ -380,6 +401,19 @@ def build_target(
         project_root = Path.cwd()
     if runner is None:
         runner = _default_runner
+
+    # ``--load`` (used in multi_arch + push=False mode below) only
+    # supports a single platform — it writes the image into the local
+    # docker daemon, which can't store a manifest list. Reject early
+    # with a clear message rather than emitting a buildx command that
+    # silently fails. Codex review on PR #1060 caught this.
+    if multi_arch and not push and len(platforms) > 1:
+        raise ValueError(
+            "kestrel deploy build --no-push requires a single --platforms "
+            f"value (got {list(platforms)}). buildx --load only supports "
+            "single-platform builds. Pass e.g. --platforms linux/amd64 "
+            "or drop --no-push to keep the multi-arch push path."
+        )
 
     # Build the subprocess environment — we want the docker invocation
     # to inherit the parent env (PATH, DOCKER_HOST, etc.) but with
