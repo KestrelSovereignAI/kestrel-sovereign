@@ -173,7 +173,7 @@ base_url = "https://api.moonshot.cn/v1"
 model = "auto"
 ```
 
-That's it. The framework's [provider registry](../../kestrel_sovereign/llm/provider_registry.py) finds the entry-point, instantiates `KimiAdapter`, builds an `openai.AsyncOpenAI` client pointed at the configured `base_url`, and the new vendor lights up in route discovery.
+That's it. The framework's [provider registry](../../../kestrel_sovereign/llm/provider_registry.py) finds the entry-point, instantiates `KimiAdapter`, builds an `openai.AsyncOpenAI` client pointed at the configured `base_url`, and the new vendor lights up in route discovery.
 
 ---
 
