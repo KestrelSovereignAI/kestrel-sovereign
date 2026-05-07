@@ -4,4 +4,9 @@ Kestrel Sovereign AI Agent Framework.
 Constitutional AI with cryptographic identity and sovereign data ownership.
 """
 
-__version__ = "0.8.0"
+from importlib.metadata import PackageNotFoundError, version as _version
+
+try:
+    __version__ = _version("kestrel-sovereign")
+except PackageNotFoundError:
+    __version__ = "0.0.0+local"
