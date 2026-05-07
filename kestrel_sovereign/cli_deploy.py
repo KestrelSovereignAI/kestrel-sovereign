@@ -327,6 +327,23 @@ def _cmd_deploy_profile(args, profile_name: str) -> int:
     if manager is None:
         return 1
 
+    # Preflight: reject the example placeholder ``"your-gcp-project-id"``
+    # so the deploy fails fast with an actionable error rather than
+    # building Cloud Run image refs against ``gcr.io/your-gcp-project-id/``
+    # and crashing inside the GCP SDK. Mirrors the build / secrets-sync
+    # paths' placeholder rejection. Codex review on the final epic→main
+    # PR caught the omission.
+    if not _is_real_project_id(getattr(manager, "gcp_project_id", None)):
+        print(
+            f"error: GCP project ID is not configured for `kestrel deploy "
+            f"{profile_name}`. Either export GCP_PROJECT_ID, set "
+            f"[manager].gcp_project_id in deploy_config.toml, or set "
+            f"[profiles.{profile_name}].gcp_project_id. Got: "
+            f"{getattr(manager, 'gcp_project_id', None)!r}.",
+            file=sys.stderr,
+        )
+        return 1
+
     try:
         result = asyncio.run(manager.deploy_profile(profile_name, args.tag))
     except DeployManagerError as e:

@@ -144,6 +144,7 @@ def test_cmd_deploy_success(capsys):
     """A successful deploy returns 0 and prints something."""
     with patch("kestrel_sovereign.cli_deploy.DeployManager") as mock_mgr_cls:
         mock_instance = MagicMock()
+        mock_instance.gcp_project_id = "real-project"
         mock_instance.deploy_profile = AsyncMock(
             return_value={
                 "success": True,
@@ -173,6 +174,7 @@ def test_cmd_deploy_success_failed_result_returns_1():
     succeeded."""
     with patch("kestrel_sovereign.cli_deploy.DeployManager") as mock_mgr_cls:
         mock_instance = MagicMock()
+        mock_instance.gcp_project_id = "real-project"
         mock_instance.deploy_profile = AsyncMock(
             return_value={
                 "success": False,
@@ -184,6 +186,28 @@ def test_cmd_deploy_success_failed_result_returns_1():
         rc = cmd_deploy(_make_args(target="dev"))
 
     assert rc == 1
+
+
+def test_cmd_deploy_rejects_placeholder_project_id(capsys):
+    """Codex review on the final epic→main PR: the deploy CLI must
+    reject ``manager.gcp_project_id == "your-gcp-project-id"`` (the
+    deploy_config.toml example placeholder) so deploys fail fast with
+    an actionable error rather than building Cloud Run image refs
+    against ``gcr.io/your-gcp-project-id/`` and crashing inside the SDK.
+    """
+    with patch("kestrel_sovereign.cli_deploy.DeployManager") as mock_mgr_cls:
+        mock_instance = MagicMock()
+        mock_instance.gcp_project_id = "your-gcp-project-id"
+        mock_instance.deploy_profile = AsyncMock()
+        mock_mgr_cls.return_value = mock_instance
+
+        rc = cmd_deploy(_make_args(target="dev"))
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "GCP project ID is not configured" in err
+    # And we did NOT attempt the deploy.
+    mock_instance.deploy_profile.assert_not_awaited()
 
 
 def test_cmd_deploy_status(capsys):
