@@ -15,7 +15,7 @@ on:
   push:
     branches: [main, vision-refinement-v2]
   pull_request:
-    branches: [main, vision-refinement-v2]
+    branches: [main, vision-refinement-v2, 'epic/**']
   workflow_dispatch:
 
 env:
