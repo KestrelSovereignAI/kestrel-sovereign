@@ -144,7 +144,7 @@ run_e2e_tests() {
     # Check if server is running
     if ! curl -s http://localhost:8888/health > /dev/null 2>&1; then
         echo -e "${YELLOW}Starting Kestrel server...${NC}"
-        ./start_kestrel.sh &
+        uv run kestrel start &
         sleep 5
     fi
 

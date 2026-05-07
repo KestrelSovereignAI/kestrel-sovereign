@@ -102,7 +102,7 @@ f          # cd /workspace/kestrel
 
 # Start services
 cd /workspace/kestrel
-./start_kestrel.sh    # Start Kestrel API on port 7777
+kestrel start    # Start Kestrel API on port 7777
 
 # Run tests
 pytest tests/                           # All tests (fail-fast)
@@ -151,7 +151,7 @@ Access from your **host machine** browser at http://localhost:7777
 ### Start Kestrel Server
 ```bash
 cd /workspace/kestrel
-./start_kestrel.sh
+kestrel start
 ```
 
 ### Start Kestrel Agent
@@ -234,7 +234,7 @@ Stop local services before opening dev container:
 ```bash
 # From host machine
 cd ./kestrel
-./stop_kestrel.sh
+kestrel stop
 docker-compose down
 ```
 
