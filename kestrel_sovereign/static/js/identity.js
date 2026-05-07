@@ -1231,19 +1231,22 @@ window.deleteConversation = async function(sessionId, rowEl) {
         }
 
         // If the user was viewing the conversation they just deleted,
-        // clear the chat pane and currentSessionId so downstream state
+        // immediately create a fresh backend session so downstream state
         // (context-status footer, auto-load logic) doesn't point at a
-        // vanished session.  The auto-load behavior in #714 kicks in on
-        // the next agent-select; for now the pane stays empty.
+        // vanished session.
         if (state.currentSessionId === sessionId) {
             activeConversationId = null;
-            // Wipe ONLY the visible agent's pane and bump that agent's
-            // pane-local generation. Streams in flight on OTHER agents
-            // are unaffected. Setting currentSessionId via the getter
-            // resolves to the visible agent's pane, so this is the
-            // right scope.
-            wipeAgentChatPane(API.getHostAgent());
-            state.currentSessionId = null;
+            const fresh = await API.newConversation();
+            wipeAgentChatPane(API.getHostAgent(), `
+                <div style="text-align: center; padding: 2rem; color: var(--text-secondary);">
+                    <span style="font-size: 2rem;">\u{2728}</span>
+                    <p style="margin-top: 0.5rem;">New conversation started. Say hello!</p>
+                </div>
+            `);
+            state.currentSessionId = fresh.session_id;
+            if (selectedAgentName) {
+                await loadConversations(selectedAgentName);
+            }
             if (typeof updateContextStatus === 'function') {
                 updateContextStatus();
             }

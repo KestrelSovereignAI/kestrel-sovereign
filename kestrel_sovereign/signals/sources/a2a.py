@@ -14,10 +14,9 @@ Causation chain propagation:
 - The dispatcher's append-and-cycle-check rejects A→B→A ping-pong at
   depth 2 by spotting `(A, a2a.task_complete)` as a repeated frame.
 
-Plumbing the chain on the OUTBOUND side (turn-to-task creation) is a
-follow-up — for now, callers that want cycle protection set the metadata
-manually. The receive side (this module) handles the chain whenever it's
-present.
+Outbound task creation reads the in-flight causation chain from the
+agent/TaskManager seam and serializes it into task metadata. The receive
+side (this module) rehydrates that chain whenever a completion arrives.
 """
 
 from __future__ import annotations

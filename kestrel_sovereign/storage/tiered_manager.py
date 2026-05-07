@@ -496,7 +496,9 @@ def create_default_manager(
     except Exception as e:
         logger.warning(f"TieredStorageManager: LighthouseProvider init failed: {e}")
 
-    # TODO: Register LocalProvider for LOCAL tier
-    # TODO: Register BrowserProvider for BROWSER tier (JS-side)
+    # LOCAL runtime storage is owned by AsyncStorage/SQLite (or Postgres in
+    # advanced deployments), not this content-provider registry. BROWSER storage
+    # is client-side IndexedDB/SQLite-WASM territory and is intentionally not
+    # registered by the Python server.
 
     return manager
