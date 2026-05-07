@@ -206,15 +206,26 @@ def test_deploy_missing_gcp_project_errors(monkeypatch, capsys):
     assert "GCP_PROJECT_ID" in err
 
 
-def test_deploy_no_action_prints_usage(monkeypatch, capsys):
+def test_deploy_no_action_defaults_to_status(monkeypatch):
+    """Codex review v3 on PR #1074: bash predecessor used
+    ``ACTION="${1:-status}"`` so ``kestrel ipfs deploy`` (no subverb)
+    is the "is the node up?" health-check path, not a usage error.
+    The Python port must mirror that default."""
     monkeypatch.setenv("GCP_PROJECT_ID", "test-proj")
+    captured: list = []
+
+    def fake_status(project, zone):
+        captured.append((project, zone))
+        return 0
+
+    monkeypatch.setattr(cli_ipfs, "_deploy_status", fake_status)
+
     rc = cli_ipfs.cmd_ipfs(
         _Args(ipfs_command="deploy", action=None,
               zone="us-central1-a", yes=False)
     )
-    assert rc == 1
-    err = capsys.readouterr().err
-    assert "Usage" in err
+    assert rc == 0
+    assert captured == [("test-proj", "us-central1-a")]
 
 
 def test_deploy_create_invokes_gcloud(monkeypatch):

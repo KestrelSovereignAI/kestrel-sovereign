@@ -439,7 +439,12 @@ def _cmd_deploy(args) -> int:
         return 1
 
     zone: str = getattr(args, "zone", None) or _DEFAULT_ZONE
-    action: Optional[str] = getattr(args, "action", None)
+    # Default action ``status`` matches the bash predecessor's
+    # ``ACTION="${1:-status}"`` — running ``kestrel ipfs deploy`` with
+    # no subverb is the operator's "is the node up?" health-check
+    # path, not a usage error. Codex review on PR #1074 caught the
+    # regression.
+    action: str = getattr(args, "action", None) or "status"
     assume_yes: bool = getattr(args, "yes", False)
 
     if action == "create":
