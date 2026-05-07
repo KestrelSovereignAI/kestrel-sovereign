@@ -1041,3 +1041,23 @@ class CodexAdapter(LLMAdapter):
         raise NotImplementedError(
             "OpenAI plan model discovery is provided by the canonical openai provider."
         )
+
+    # ---- Provider metadata (SDK 0.6.0) -------------------------------------
+
+    def cost_per_1m_tokens(self) -> Optional[Dict[str, float]]:
+        # Plan-included usage — no per-token billing visible from the
+        # adapter side. Returning ``{"input": 0.0, "output": 0.0}``
+        # rather than ``None`` so cost-aware routing reflects "free at
+        # the margin" rather than falling through to a conservative
+        # paid-API default.
+        return {"input": 0.0, "output": 0.0}
+
+    def substrate_type(self) -> Optional[str]:
+        return "gpt"
+
+    def display_name(self) -> Optional[str]:
+        return "OpenAI Codex (plan)"
+
+    def key_env_var(self) -> Optional[str]:
+        # OAuth-based plan auth — no env-var API key.
+        return None

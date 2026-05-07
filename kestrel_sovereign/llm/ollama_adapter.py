@@ -573,3 +573,27 @@ class OllamaAdapter(LLMAdapter):
         except Exception as e:
             logger.error(f"Failed to list Ollama models: {e}", exc_info=True)
             return []
+
+    # ---- Provider metadata (SDK 0.6.0) -------------------------------------
+
+    def cost_per_1m_tokens(self) -> Optional[Dict[str, float]]:
+        # Local inference — no per-token cost. Returning a real
+        # ``{"input": 0.0, "output": 0.0}`` (rather than ``None``) lets
+        # cost-aware routing prefer Ollama as the cheap option without
+        # falling through to the conservative fallback.
+        return {"input": 0.0, "output": 0.0}
+
+    def substrate_type(self) -> Optional[str]:
+        # Ollama serves many model families (Llama, Mistral, Phi,
+        # DeepSeek, Qwen, ...). No single substrate captures it; the
+        # substrate-aware paths read the per-model id when they need
+        # specifics.
+        return None
+
+    def display_name(self) -> Optional[str]:
+        return "Ollama"
+
+    def key_env_var(self) -> Optional[str]:
+        # Local-only, no API key. None signals "no key-env-var pattern"
+        # so the keys UI doesn't prompt for one.
+        return None

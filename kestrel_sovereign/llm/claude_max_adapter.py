@@ -46,3 +46,23 @@ class ClaudeMaxAdapter(AnthropicAdapter):
         raise NotImplementedError(
             "Claude plan model discovery is provided by the canonical anthropic provider."
         )
+
+    # ---- Provider metadata (SDK 0.6.0) -------------------------------------
+    #
+    # substrate_type / deliberation_style inherit from AnthropicAdapter
+    # ("claude" / "sequential") — those are correct for the plan route.
+    # Override the cost/display/key fields where the plan diverges from
+    # the canonical anthropic provider.
+
+    def cost_per_1m_tokens(self):
+        # Plan-included usage — no per-token billing. Returning
+        # ``{"input": 0.0, "output": 0.0}`` rather than ``None`` so
+        # cost-aware routing reflects "free at the margin" rather than
+        # falling through to AnthropicAdapter's API pricing.
+        return {"input": 0.0, "output": 0.0}
+
+    def display_name(self):
+        return "Claude (Max plan)"
+
+    def key_env_var(self):
+        return "ANTHROPIC_AUTH_TOKEN"

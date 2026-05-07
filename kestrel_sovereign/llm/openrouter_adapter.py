@@ -265,3 +265,29 @@ class OpenRouterAdapter(OpenAIAdapter):
             tags.append("powerful")
 
         return tags
+
+    # ---- Provider metadata (SDK 0.6.0) -------------------------------------
+    #
+    # OpenRouterAdapter inherits from OpenAIAdapter, so substrate_type
+    # / display_name / key_env_var must be re-overridden to avoid
+    # reporting "gpt" / "OpenAI" / "OPENAI_API_KEY" for what is in
+    # fact a meta-aggregator pointing at many vendors.
+
+    def cost_per_1m_tokens(self) -> Optional[Dict[str, float]]:
+        # Per-model pricing comes through ModelInfo from OpenRouter's
+        # /models endpoint; the adapter-level rate is meaningless for
+        # an aggregator.
+        return None
+
+    def substrate_type(self) -> Optional[str]:
+        # OpenRouter routes to many substrates (claude, gpt, gemini,
+        # llama). Substrate-aware paths read the per-model id (e.g.
+        # ``anthropic/claude-3.5-sonnet``) rather than the route's
+        # adapter substrate.
+        return None
+
+    def display_name(self) -> Optional[str]:
+        return "OpenRouter"
+
+    def key_env_var(self) -> Optional[str]:
+        return "OPENROUTER_API_KEY"

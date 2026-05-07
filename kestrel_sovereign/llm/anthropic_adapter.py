@@ -1030,3 +1030,27 @@ class AnthropicAdapter(LLMAdapter):
         except Exception as e:
             logger.error(f"Failed to list Anthropic models: {e}", exc_info=True)
             return []
+
+    # ---- Provider metadata (SDK 0.6.0) -------------------------------------
+
+    def cost_per_1m_tokens(self) -> Optional[Dict[str, float]]:
+        # Sonnet-class pricing as the conservative default; framework
+        # cost-aware routing reads ModelInfo for per-model overrides
+        # when the council needs Haiku/Opus precision.
+        return {"input": 3.00, "output": 15.00}
+
+    def substrate_type(self) -> Optional[str]:
+        return "claude"
+
+    def display_name(self) -> Optional[str]:
+        return "Anthropic"
+
+    def key_env_var(self) -> Optional[str]:
+        return "ANTHROPIC_API_KEY"
+
+    def deliberation_style(self) -> Optional[str]:
+        # Claude shines on careful, single-pass deliberation with
+        # extended-thinking budgets — sequential routing gets the most
+        # out of it. Fast-and-cheap parallel rounds belong to other
+        # vendors.
+        return "sequential"

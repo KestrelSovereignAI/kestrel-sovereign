@@ -538,22 +538,68 @@ class IdentityExporter:
         return records
 
     async def _detect_substrate(self) -> str:
-        """Detect the current LLM substrate from configuration."""
+        """Detect the current LLM substrate from the active adapter.
+
+        Resolution (SDK 0.6.0+): consult the registered adapter for the
+        configured default provider via :meth:`LLMAdapter.substrate_type`,
+        then map the short identifier (``"claude"``, ``"gpt"``,
+        ``"gemini"``, ...) to the corresponding :class:`SubstrateType`.
+
+        Plugin authors get first-class participation: a Kimi or DeepSeek
+        plugin that overrides ``substrate_type()`` is recognized
+        automatically. Substrings that previously matched only known
+        provider names (``"anthropic" in provider.lower()``) are gone.
+        """
+        # Map adapter.substrate_type() identifiers → SubstrateType enum.
+        # Substrate identifiers are *family* labels (the weights' lineage),
+        # not vendor labels — Vertex and Google both report "gemini",
+        # ClaudeMax inherits "claude" from AnthropicAdapter, etc.
+        substrate_map: Dict[str, SubstrateType] = {
+            "claude": SubstrateType.ANTHROPIC_CLAUDE,
+            "gpt": SubstrateType.OPENAI_GPT,
+            "gemini": SubstrateType.GOOGLE_GEMINI,
+            "llama": SubstrateType.META_LLAMA,
+        }
+
         try:
             from kestrel_sovereign.config import load_config
             config = load_config()
             provider = config.get("llm", {}).get("default_provider", "")
+            if not provider:
+                return SubstrateType.UNKNOWN.value
 
-            if "anthropic" in provider.lower() or "claude" in provider.lower():
-                return SubstrateType.ANTHROPIC_CLAUDE.value
-            elif "openai" in provider.lower() or "gpt" in provider.lower():
-                return SubstrateType.OPENAI_GPT.value
-            elif "gemini" in provider.lower() or "google" in provider.lower():
-                return SubstrateType.GOOGLE_GEMINI.value
-            elif "ollama" in provider.lower():
-                return SubstrateType.OLLAMA_LOCAL.value
-            elif "openrouter" in provider.lower():
-                return SubstrateType.OPENROUTER.value
+            # The configured ``default_provider`` may be either a bare
+            # vendor name (``"anthropic"``) or a composite vendor:route
+            # key (``"anthropic:plan"``). Both shapes resolve below.
+            from kestrel_sovereign.llm.service import get_llm_service
+            try:
+                svc = get_llm_service()
+            except Exception:
+                svc = None
+
+            adapter = None
+            if svc is not None:
+                routes = getattr(svc, "providers", None) or []
+                for route in routes:
+                    name = route.get("name", "")
+                    vendor = route.get("vendor", "")
+                    if name == provider or vendor == provider or name.startswith(f"{provider}:"):
+                        adapter = route.get("adapter")
+                        break
+
+            if adapter is not None:
+                substrate_id = adapter.substrate_type()
+                if substrate_id and substrate_id in substrate_map:
+                    return substrate_map[substrate_id].value
+                # Adapter explicitly reports an aggregator / multi-substrate
+                # backend (e.g. OpenRouter, Ollama) by returning ``None``.
+                # Fall through to the OpenRouter sentinel for that case so
+                # downstream substrate-aware paths see a stable token rather
+                # than UNKNOWN.
+                if "openrouter" in provider.lower():
+                    return SubstrateType.OPENROUTER.value
+                if "ollama" in provider.lower():
+                    return SubstrateType.OLLAMA_LOCAL.value
         except Exception as e:
             logger.warning(f"Substrate detection failed: {e}")
 

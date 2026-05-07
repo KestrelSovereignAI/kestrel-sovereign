@@ -1,14 +1,38 @@
-"""Shared token-usage cost estimation for council sessions."""
+"""Shared token-usage cost estimation for council sessions.
+
+Pricing resolution strategy (SDK 0.6.0+):
+
+1. **Adapter-first.** When an LLM service registry is available
+   (online cost reporting), look up the route for ``provider`` and
+   call ``adapter.cost_per_1m_tokens()``. Plugin authors are
+   first-class participants — a third-party Kimi or DeepSeek plugin
+   that overrides ``cost_per_1m_tokens`` gets accurate pricing here
+   without any edit to this module.
+
+2. **Static fallback table.** Used by offline analysis tools that
+   import this module without a live registry (e.g. log-replay cost
+   reports). The table is canonical pricing for known providers as
+   of the version that ships it; it's *documentation*, not an
+   architectural couple.
+
+3. **Conservative default.** When neither path knows about the
+   provider, default to a paid-API midpoint so cost-aware routing
+   doesn't accidentally prefer an unknown-cost provider.
+"""
 
 from __future__ import annotations
 
-from typing import Any, Dict
+import logging
+from typing import Any, Dict, Optional
+
+logger = logging.getLogger(__name__)
 
 
-# Approximate per-provider pricing per 1M tokens.
-# This stays intentionally provider-level so scripts do not drift every time
-# an individual model version changes.
-PROVIDER_PRICING: Dict[str, Dict[str, float]] = {
+# Step 2: offline fallback table. Known per-provider pricing per 1M
+# tokens. Provider-level rather than per-model so log-replay scripts
+# don't drift every time an individual model version changes.
+# Runtime cost reporting prefers the adapter (Step 1) over this.
+PROVIDER_PRICING_FALLBACK: Dict[str, Dict[str, float]] = {
     "anthropic": {"input": 15.00, "output": 75.00},
     "openai": {"input": 5.00, "output": 15.00},
     "google": {"input": 1.25, "output": 5.00},
@@ -18,14 +42,73 @@ PROVIDER_PRICING: Dict[str, Dict[str, float]] = {
     "groq": {"input": 0.27, "output": 0.27},
 }
 
+# Backwards compat for any external script still importing the old name.
+PROVIDER_PRICING = PROVIDER_PRICING_FALLBACK
+
+# Step 3: conservative paid-API default for unknown providers.
+CONSERVATIVE_FALLBACK_PRICING: Dict[str, float] = {"input": 5.00, "output": 15.00}
+
+
+def _adapter_pricing_for(provider: str) -> Optional[Dict[str, float]]:
+    """Look up pricing from the adapter registered for ``provider``.
+
+    Returns ``None`` when no live LLM service is reachable (offline
+    cost analysis), no route matches the provider name, or the
+    adapter doesn't expose pricing. Caller falls back to the static
+    table.
+    """
+    try:
+        # Lazy import — costing.py is also used by offline scripts that
+        # don't want the framework's full LLM stack imported.
+        from kestrel_sovereign.llm.service import get_llm_service
+    except Exception:
+        return None
+
+    try:
+        svc = get_llm_service()
+    except Exception:
+        return None
+    if svc is None:
+        return None
+
+    routes = getattr(svc, "providers", None) or []
+    for route in routes:
+        # Routes are dicts under the new vendor/route schema (see
+        # provider_registry.ProviderInfo + LLMService._convert_providers_format).
+        # Match either the bare vendor name (``anthropic``) or the
+        # composite name prefix (``anthropic:plan``).
+        vendor = route.get("vendor")
+        name = route.get("name", "")
+        if vendor != provider and not name.startswith(f"{provider}:"):
+            continue
+        adapter = route.get("adapter")
+        if adapter is None:
+            continue
+        try:
+            cost = adapter.cost_per_1m_tokens()
+        except Exception as e:
+            logger.debug("adapter.cost_per_1m_tokens() raised for %r: %s", provider, e)
+            continue
+        if cost is not None:
+            return cost
+    return None
+
 
 def calculate_estimated_cost(
     provider: str,
     input_tokens: int,
     output_tokens: int,
 ) -> float:
-    """Estimate cost for a token usage record."""
-    prices = PROVIDER_PRICING.get(provider, PROVIDER_PRICING["openai"])
+    """Estimate cost for a token usage record.
+
+    Resolution: adapter-first → static fallback → conservative
+    paid-API default. See module docstring for the rationale.
+    """
+    prices = (
+        _adapter_pricing_for(provider)
+        or PROVIDER_PRICING_FALLBACK.get(provider)
+        or CONSERVATIVE_FALLBACK_PRICING
+    )
     input_cost = (input_tokens / 1_000_000) * prices["input"]
     output_cost = (output_tokens / 1_000_000) * prices["output"]
     return input_cost + output_cost

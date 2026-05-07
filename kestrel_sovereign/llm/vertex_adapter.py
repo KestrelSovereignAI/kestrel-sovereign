@@ -615,6 +615,24 @@ class VertexAIAdapter(LLMAdapter):
             logger.warning(f"Could not load vertex_ai fallback models from cache: {e}")
         return []
 
+    # ---- Provider metadata (SDK 0.6.0) -------------------------------------
+
+    def cost_per_1m_tokens(self) -> Optional[Dict[str, float]]:
+        # Vertex Gemini pricing tracks the public API closely.
+        return {"input": 1.25, "output": 5.00}
+
+    def substrate_type(self) -> Optional[str]:
+        return "gemini"
+
+    def display_name(self) -> Optional[str]:
+        return "Vertex AI"
+
+    def key_env_var(self) -> Optional[str]:
+        # Vertex authenticates via Application Default Credentials, not
+        # an env-var API key. None signals "no key-env-var pattern" so
+        # the keys UI doesn't prompt for one.
+        return None
+
 
 # Factory function for creating configured adapter
 def create_vertex_adapter(

@@ -87,8 +87,14 @@ class ModelDiscoveryMixin:
                 provider_name = provider.get('name')
                 model_id = provider.get('model')
                 if model_id and model_id != "auto" and model_id not in discovered_ids:
-                    # Cloud providers always support tools; only Ollama needs detection
-                    is_cloud = provider_name not in ("ollama",)
+                    # Tool support follows the route's cloud/local flag,
+                    # which is set during provider initialization based on
+                    # config (vendors.<name>.is_cloud) rather than guessed
+                    # from the provider name. SDK-only LLM plugins (Kimi,
+                    # DeepSeek, etc.) flow through this path correctly
+                    # without needing to be enumerated in a hardcoded
+                    # exclusion list.
+                    is_cloud = provider.get("is_cloud", True)
                     all_models.append(ModelInfo(
                         id=model_id,
                         provider=provider_name,
