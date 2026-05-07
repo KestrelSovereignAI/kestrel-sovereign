@@ -38,7 +38,8 @@ from kestrel_sovereign.agent.request_lifecycle import RequestLifecycleMixin
 from kestrel_sovereign.agent.turn_lifecycle import TurnLifecycleMixin
 from kestrel_sovereign.signals import OrderedLockManager
 from kestrel_sovereign.storage.memory_system import MemorySystem
-from kestrel_sovereign.hooks import HooksManager, HookEvent, HookInput, PermissionDecision
+from kestrel_sovereign.hooks import HooksManager
+from kestrel_sdk.hooks.base import HookEvent, HookInput, PermissionDecision
 from kestrel_sovereign.bootstrap import BootstrapService, BootstrapState
 from kestrel_sovereign.security.input_guardrails import (
     wrap_user_input,
@@ -744,7 +745,7 @@ class KestrelAgent(
 
             # Fire SESSION_START hook
             if self.hooks_manager:
-                from kestrel_sovereign.hooks.base import HookInput, HookEvent
+                from kestrel_sdk.hooks.base import HookInput, HookEvent
                 hook_input = HookInput(
                     session_id="agent_init",
                     hook_event_name=HookEvent.SESSION_START.value,

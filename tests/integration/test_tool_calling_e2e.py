@@ -18,7 +18,7 @@ from typing import Dict, Any, List, Optional
 from kestrel_sovereign.llm.adapter import LLMAdapter, LLMResponse, ToolCall
 from kestrel_sovereign.llm.openai_adapter import OpenAIAdapter
 from kestrel_sovereign.features.base import Feature, tool as feature_tool
-from kestrel_sovereign.tools.base import ToolCategory
+from kestrel_sdk.tools.base import ToolCategory
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)

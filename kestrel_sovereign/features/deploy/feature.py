@@ -16,7 +16,7 @@ from kestrel_sovereign.features.deploy.models import (
     DeployManagerError,
     DeployStatus,
 )
-from kestrel_sovereign.tools.base import ToolCategory
+from kestrel_sdk.tools.base import ToolCategory
 
 logger = logging.getLogger(__name__)
 

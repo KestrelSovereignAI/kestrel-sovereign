@@ -1,7 +1,7 @@
 import logging
 from typing import Dict, Any, List
 from kestrel_sovereign.features.base import Feature, tool
-from kestrel_sovereign.tools.base import ToolCategory
+from kestrel_sdk.tools.base import ToolCategory
 from .tool import WebSearchTool
 
 logger = logging.getLogger(__name__)

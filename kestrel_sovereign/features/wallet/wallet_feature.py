@@ -27,8 +27,8 @@ from decimal import Decimal, InvalidOperation
 from typing import List, Optional
 
 from kestrel_sovereign.features.base import Feature, tool
-from kestrel_sovereign.hooks.base import Hook
-from kestrel_sovereign.tools.base import ToolCategory
+from kestrel_sdk.hooks.base import Hook
+from kestrel_sdk.tools.base import ToolCategory
 from .feature import WalletAgent, Currency
 from .transaction_hook import TransactionSecurityHook
 from .economic_gates import EconomicGateMixin

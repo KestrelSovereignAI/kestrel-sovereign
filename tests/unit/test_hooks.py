@@ -12,12 +12,12 @@ import asyncio
 import pytest
 from datetime import datetime
 
-from kestrel_sovereign.hooks import (
+from kestrel_sovereign.hooks import HooksManager
+from kestrel_sdk.hooks.base import (
     Hook,
     HookEvent,
     HookInput,
     HookOutput,
-    HooksManager,
     PermissionDecision,
 )
 

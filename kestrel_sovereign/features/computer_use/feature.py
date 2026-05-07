@@ -42,7 +42,7 @@ from kestrel_sovereign.constitution.hierarchy import (
     parse_amendment_ix_grants,
 )
 from kestrel_sovereign.features.base import Feature, tool
-from kestrel_sovereign.tools.base import ToolCategory
+from kestrel_sdk.tools.base import ToolCategory
 
 from .audit import AuditLog, AuditRecord
 from .backends import (

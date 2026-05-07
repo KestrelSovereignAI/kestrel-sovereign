@@ -41,7 +41,8 @@ from typing import Protocol, runtime_checkable, TYPE_CHECKING
 from uuid import uuid4
 
 if TYPE_CHECKING:
-    from kestrel_sovereign.hooks import HooksManager, HookEvent, HookInput, PermissionDecision
+    from kestrel_sovereign.hooks import HooksManager
+    from kestrel_sdk.hooks.base import HookEvent, HookInput, PermissionDecision
 
 
 @runtime_checkable
@@ -303,7 +304,7 @@ class TaskManager:
 
         # Execute PRE_TOOL_USE hooks if hooks_manager is configured
         if self.hooks_manager:
-            from kestrel_sovereign.hooks import HookEvent, HookInput, PermissionDecision
+            from kestrel_sdk.hooks.base import HookEvent, HookInput, PermissionDecision
 
             hook_input = HookInput(
                 session_id=session_id,
@@ -382,7 +383,7 @@ class TaskManager:
 
             # Execute POST_TOOL_USE hooks
             if self.hooks_manager:
-                from kestrel_sovereign.hooks import HookEvent, HookInput
+                from kestrel_sdk.hooks.base import HookEvent, HookInput
                 import time
 
                 post_hook_input = HookInput(

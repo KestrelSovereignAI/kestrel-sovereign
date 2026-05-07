@@ -18,8 +18,9 @@ from typing import Dict, List, Optional
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from kestrel_sovereign.features.base import Feature, tool
-from kestrel_sovereign.hooks import Hook, HookEvent, HookInput, HookOutput, HooksManager
-from kestrel_sovereign.tools.base import ToolCategory
+from kestrel_sovereign.hooks import HooksManager
+from kestrel_sdk.hooks.base import Hook, HookEvent, HookInput, HookOutput
+from kestrel_sdk.tools.base import ToolCategory
 
 
 # === Test Hook Implementation ===

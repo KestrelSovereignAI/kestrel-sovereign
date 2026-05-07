@@ -44,7 +44,6 @@
 - Core agent orchestration:
   - [`kestrel_sovereign/kestrel_agent.py`](kestrel_sovereign/kestrel_agent.py)
   - [`kestrel_sovereign/command_handler.py`](kestrel_sovereign/command_handler.py)
-  - [`kestrel_sovereign/kestrel_agent_tools.py`](kestrel_sovereign/kestrel_agent_tools.py)
 - Context and token budgeting:
   - [`kestrel_sovereign/agent/context_manager.py`](kestrel_sovereign/agent/context_manager.py)
   - [`kestrel_sovereign/agent/context_builder.py`](kestrel_sovereign/agent/context_builder.py)

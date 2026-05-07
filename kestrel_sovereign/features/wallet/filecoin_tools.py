@@ -14,7 +14,7 @@ import os
 from pathlib import Path
 
 from kestrel_sovereign.features.base import tool
-from kestrel_sovereign.tools.base import ToolCategory
+from kestrel_sdk.tools.base import ToolCategory
 from .feature import Currency
 
 logger = logging.getLogger(__name__)

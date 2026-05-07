@@ -1,5 +1,19 @@
 # Agent Tools Implementation Summary
 
+> **⚠ DEPRECATED — describes a removed architecture.**
+> The files this doc references (`/tools/web_search.py`,
+> `/tools/feedback_tool.py`, `kestrel_agent_tools.py`,
+> `AgentToolMixin`, the top-level `tools/` directory) have all
+> been removed. Tools now ship through feature packages
+> registered via the `kestrel_sovereign.features` entry-point
+> group with the `@tool` decorator from `kestrel_sdk.features.base`.
+>
+> See [`docs/architecture/core/FEATURE_AGENT_FRAMEWORK.md`](../core/FEATURE_AGENT_FRAMEWORK.md)
+> for the modern pattern.
+>
+> Rewrite tracked in [#1047](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/1047);
+> kept here meanwhile for git-archaeology context.
+
 **Date:** November 7, 2025
 **Status:** ✅ Complete and Ready for Testing/Deployment
 
