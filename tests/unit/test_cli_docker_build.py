@@ -243,6 +243,28 @@ def test_no_cache_propagates_into_yaml(monkeypatch, tmp_path):
     assert "--no-cache" in yaml_seen.get("text", "")
 
 
+def test_simpletuner_yaml_carries_cuda_resource_settings(monkeypatch, tmp_path):
+    """Codex review v3 on PR #1074: the SimpleTuner CUDA image needs
+    machineType=E2_HIGHCPU_32, diskSizeGb=200, step-timeout=3600s,
+    and total-timeout=7200s — the values the vendored cloudbuild yaml
+    already had. The synthesized config must carry these forward, not
+    fall back to gcloud defaults that would time out / run out of disk
+    for the large CUDA image.
+    """
+    yaml_text = cli_docker_build._synthesize_cloudbuild_yaml(
+        cli_docker_build._PRESETS["simpletuner"],
+        project="test-proj",
+        tag="v9",
+        no_cache=False,
+    )
+    assert "machineType: 'E2_HIGHCPU_32'" in yaml_text
+    assert "diskSizeGb: 200" in yaml_text
+    # Step timeout (per-build-step).
+    assert "timeout: 3600s" in yaml_text
+    # Total timeout (top-level) — distinct from step timeout.
+    assert "timeout: 7200s" in yaml_text
+
+
 def test_simpletuner_synthesizes_yaml_with_resolved_project_and_tag(
     monkeypatch, tmp_path
 ):

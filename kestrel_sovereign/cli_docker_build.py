@@ -83,6 +83,17 @@ class BuildPreset:
     # script - LoRA was 3600s, ollama 1200s, GPU 1800s, simpletuner had
     # a separate cloudbuild yaml. We store the same per-preset value.
     timeout_seconds: int = 1800
+    # Per-build total Cloud Build timeout (top-level ``timeout`` in the
+    # yaml). Defaults to ``timeout_seconds + a buffer``; presets that
+    # need more (e.g. simpletuner's CUDA image) override.
+    total_timeout_seconds: Optional[int] = None
+    # Cloud Build runner machine type — defaults to gcloud's default.
+    # Heavy CUDA builds need ``E2_HIGHCPU_32`` to fit in their step
+    # timeout.
+    machine_type: Optional[str] = None
+    # Disk size for the build VM in GB — defaults to gcloud default
+    # (~100GB). Large images need 200+.
+    disk_size_gb: Optional[int] = None
     # ``simpletuner`` had its own ``docker/cloudbuild-simpletuner.yaml``
     # file (already vendored); we point at it instead of synthesizing
     # one. None => synthesize a yaml inline.
@@ -132,7 +143,14 @@ _PRESETS: Dict[str, BuildPreset] = {
             "overwrites the lora-trainer image (kestrel-lora) - pick "
             "one preset for that GCR slot."
         ),
-        timeout_seconds=1800,
+        # Resource settings carried over from the vendored
+        # docker/cloudbuild-simpletuner.yaml — codex review v3 on PR
+        # #1074 caught that synthesizing without these would let the
+        # large CUDA image hit the default Cloud Build disk/timeout.
+        timeout_seconds=3600,             # per-step (was ``timeout: 3600s``)
+        total_timeout_seconds=7200,       # top-level (was ``timeout: 7200s``)
+        machine_type="E2_HIGHCPU_32",
+        disk_size_gb=200,
         # We deliberately do NOT use docker/cloudbuild-simpletuner.yaml
         # here — that vendored config has a hardcoded
         # ``gcr.io/YOUR_PROJECT_ID/kestrel-lora`` placeholder that
@@ -221,6 +239,24 @@ def _synthesize_cloudbuild_yaml(
     if tag != "latest":
         images_block += f"  - '{latest_ref}'\n"
 
+    # Top-level timeout: default to step timeout + 30min buffer for
+    # the implicit push step Cloud Build adds. Presets that override
+    # (simpletuner) get the explicit value.
+    total_timeout = (
+        preset.total_timeout_seconds
+        if preset.total_timeout_seconds is not None
+        else preset.timeout_seconds + 1800
+    )
+
+    options_lines: List[str] = []
+    if preset.machine_type:
+        options_lines.append(f"  machineType: '{preset.machine_type}'\n")
+    if preset.disk_size_gb is not None:
+        options_lines.append(f"  diskSizeGb: {preset.disk_size_gb}\n")
+    options_block = ""
+    if options_lines:
+        options_block = "options:\n" + "".join(options_lines)
+
     return (
         f"steps:\n"
         f"  - name: 'gcr.io/cloud-builders/docker'\n"
@@ -228,7 +264,8 @@ def _synthesize_cloudbuild_yaml(
         f"    timeout: {preset.timeout_seconds}s\n"
         f"images:\n"
         f"{images_block}"
-        f"timeout: {preset.timeout_seconds}s\n"
+        f"{options_block}"
+        f"timeout: {total_timeout}s\n"
     )
 
 
