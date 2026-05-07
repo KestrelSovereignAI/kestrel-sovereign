@@ -32,7 +32,6 @@ NON_CORE_FEATURES = ",".join([
     "AuditAnchorFeature",
     "BridgeFeature",
     "ChannelFeature",
-    "CodeEditFeature",
     "ComputeFeature",
     "ConsentFeature",
     "CouncilFeature",
