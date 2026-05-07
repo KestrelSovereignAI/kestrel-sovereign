@@ -169,6 +169,146 @@ class TestResponseAuditHook:
 
 
 # =========================================================================
+# Wave 5D — Narration check folding (#1042 layer 3)
+# =========================================================================
+
+
+def _make_narration_hook_input(
+    response_text: str = "Looking at the result, the save did not persist.",
+    pre_tool_prose: str | None = "Saved your favorite color.",
+    tool_results: list | None = None,
+) -> HookInput:
+    """HookInput pre-loaded with narration-check fields. Default
+    payload reproduces the canonical #1042 case: agent claimed
+    'Saved' before the tool returned an error envelope."""
+    if tool_results is None:
+        tool_results = [
+            {"tool_call_id": "tc-1", "name": "save_fact",
+             "result": {"status": "error", "error": "no store"}},
+        ]
+    return HookInput(
+        session_id="t",
+        hook_event_name=HookEvent.POST_RESPONSE.value,
+        response_text=response_text,
+        pre_tool_prose=pre_tool_prose,
+        tool_calls=[{"id": "tc-1", "name": "save_fact", "arguments": {}}],
+        tool_results=tool_results,
+    )
+
+
+class TestResponseAuditHookNarrationFolding:
+    """Wave 5D: deterministic narration check folds into audit risk."""
+
+    @pytest.mark.asyncio
+    async def test_narration_violation_elevates_clean_audit_to_warn(self):
+        """LLM audit returned low risk, but the deterministic check
+        catches a 'Saved' before a failed tool. Combined risk crosses
+        threshold → warn-mode appends an audit warning to the response."""
+        agent = _make_agent({"risk_level": 1, "reasoning": "Normal"})
+        hook = ResponseAuditHook(agent=agent, mode="warn", risk_threshold=3)
+
+        output = await hook.execute(_make_narration_hook_input())
+
+        # 1 (LLM audit) + 2 (narration boost) = 3 → at threshold
+        assert hook.last_risk_level == 3
+        assert output.permission_decision == PermissionDecision.ALLOW
+        assert output.updated_input is not None
+        assert "narration_check" in output.updated_input["response_text"]
+        assert "save_fact" in output.updated_input["response_text"]
+        # The verdict object is exposed for telemetry consumers.
+        assert hook.last_narration_verdict is not None
+        assert hook.last_narration_verdict.offending_tool == "save_fact"
+        assert hook.last_narration_verdict.offending_verb == "saved"
+
+    @pytest.mark.asyncio
+    async def test_narration_violation_can_drive_strict_deny(self):
+        """In strict mode, the boosted score crossing threshold
+        results in DENY — the response is blocked entirely."""
+        agent = _make_agent({"risk_level": 1, "reasoning": ""})
+        hook = ResponseAuditHook(agent=agent, mode="strict", risk_threshold=3)
+
+        output = await hook.execute(_make_narration_hook_input())
+
+        assert output.permission_decision == PermissionDecision.DENY
+        assert hook.last_risk_level == 3
+
+    @pytest.mark.asyncio
+    async def test_clean_narration_passes_unchanged_audit_score(self):
+        """Tool result was successful → no narration boost → low
+        audit risk preserved → ALLOW."""
+        agent = _make_agent({"risk_level": 1, "reasoning": "Normal"})
+        hook = ResponseAuditHook(agent=agent, mode="strict", risk_threshold=3)
+
+        clean_input = _make_narration_hook_input(
+            tool_results=[{
+                "tool_call_id": "tc-1", "name": "save_fact",
+                "result": {"status": "ok"},
+            }],
+        )
+        output = await hook.execute(clean_input)
+
+        assert output.permission_decision == PermissionDecision.ALLOW
+        assert hook.last_risk_level == 1
+        assert hook.last_narration_verdict.risk_boost == 0
+
+    @pytest.mark.asyncio
+    async def test_no_narration_fields_preserves_legacy_behavior(self):
+        """Hook fed pre-0.9-shaped HookInput (no pre_tool_prose,
+        no tool_results) must behave exactly as the LLM-only
+        audit did before — verdict has zero boost, score equals
+        the LLM-only score."""
+        agent = _make_agent({"risk_level": 2, "reasoning": "Borderline"})
+        hook = ResponseAuditHook(agent=agent, mode="warn", risk_threshold=3)
+
+        output = await hook.execute(_make_hook_input("This is a longer response from the agent."))
+
+        assert hook.last_narration_verdict.risk_boost == 0
+        assert hook.last_risk_level == 2
+        assert output.permission_decision == PermissionDecision.ALLOW
+
+    @pytest.mark.asyncio
+    async def test_narration_violation_fires_when_llm_audit_unavailable(self):
+        """The deterministic check is the load-bearing piece for
+        compliance: if the LLM audit raises (rate-limited, network
+        out, model unavailable), the narration violation MUST still
+        elevate risk and apply the configured mode's policy."""
+        agent = _make_agent()
+        agent.llm_service.get_audit_response = AsyncMock(
+            side_effect=RuntimeError("audit LLM down")
+        )
+        hook = ResponseAuditHook(agent=agent, mode="strict", risk_threshold=2)
+
+        output = await hook.execute(_make_narration_hook_input())
+
+        # Narration boost = 2 ≥ threshold 2 → strict denies.
+        assert output.permission_decision == PermissionDecision.DENY
+        assert hook.last_risk_level == 2
+        assert "narration" in output.permission_reason.lower() or "save_fact" in output.permission_reason
+
+    @pytest.mark.asyncio
+    async def test_narration_clean_when_llm_audit_unavailable_falls_through_to_allow(self):
+        """LLM down + narration check clean → existing skip-on-error
+        path retained. Behavior matches pre-Wave-5D expectations for
+        the no-violation case."""
+        agent = _make_agent()
+        agent.llm_service.get_audit_response = AsyncMock(
+            side_effect=RuntimeError("audit LLM down")
+        )
+        hook = ResponseAuditHook(agent=agent, mode="strict", risk_threshold=3)
+
+        clean_input = _make_narration_hook_input(
+            tool_results=[{
+                "tool_call_id": "tc-1", "name": "save_fact",
+                "result": {"status": "ok"},
+            }],
+        )
+        output = await hook.execute(clean_input)
+
+        assert output.permission_decision == PermissionDecision.ALLOW
+        assert "error" in output.permission_reason.lower()
+
+
+# =========================================================================
 # ResponseAuditFeature Tests
 # =========================================================================
 
