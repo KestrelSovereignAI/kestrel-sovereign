@@ -270,6 +270,44 @@ class TestApprovalQueue:
         assert scope == "denied"
 
     @pytest.mark.asyncio
+    async def test_submit_decision_is_idempotent(self, queue):
+        """A second decision on the same request must be rejected.
+
+        Closes the race that flaked test_fs_write_requires_real_approval
+        on the v0.10.0 release-sign rerun: submit_decision() resolves
+        resume_event but does not pop _pending — that pop happens in
+        request_approval()'s finally-block on the awaiter's next tick.
+        Without this guard, a polling responder (UI double-click,
+        background poller) silently overwrites the user's first
+        decision on every loop iteration that lands inside the race
+        window.
+        """
+        async def respond_twice():
+            await asyncio.sleep(0.05)
+            pending = queue.pending_requests
+            assert len(pending) == 1
+            req_id = pending[0].id
+            # First decision: approve once. Must succeed.
+            assert queue.submit_decision(req_id, True, "once") is True
+            # Second decision: approve again with a different scope.
+            # Must be rejected — same request, already decided.
+            assert queue.submit_decision(req_id, True, "session") is False
+            # Even an opposite decision must be rejected.
+            assert queue.submit_decision(req_id, False, "denied") is False
+
+        asyncio.create_task(respond_twice())
+
+        approved, scope = await queue.request_approval(
+            feature_name="ComputerUseFeature",
+            tool_name="fs_write",
+            tool_args={"path": "/tmp/x"},
+        )
+
+        # First decision wins; second/third are no-ops.
+        assert approved is True
+        assert scope == "once"
+
+    @pytest.mark.asyncio
     async def test_request_approval_timeout(self, queue):
         # Use very short timeout to test timeout behavior
         approved, scope = await queue.request_approval(
