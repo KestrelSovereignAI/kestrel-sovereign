@@ -3,10 +3,10 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from unittest.mock import AsyncMock, MagicMock
 
-from endpoints.commands import router as commands_router, BUILTIN_COMMANDS
-from endpoints.files import router as files_router
-from endpoints.observability import router as observability_router
-from endpoints.database import _get_table_columns, _list_table_names
+from kestrel_sovereign.endpoints.commands import router as commands_router, BUILTIN_COMMANDS
+from kestrel_sovereign.endpoints.files import router as files_router
+from kestrel_sovereign.endpoints.observability import router as observability_router
+from kestrel_sovereign.endpoints.database import _get_table_columns, _list_table_names
 
 
 class TestCommandsEndpoint:

@@ -193,7 +193,7 @@ def _start_inprocess_mode(project_dir: Path, multi_agent, pm: ProcessManager) ->
     env["KESTREL_SERVE_UI"] = "true"
 
     log_file = _host_log_file(project_dir)
-    cmd = [sys.executable, "-m", "uvicorn", "server:app",
+    cmd = [sys.executable, "-m", "uvicorn", "kestrel_sovereign.server:app",
            "--host", multi_agent.host.bind, "--port", str(multi_agent.host.port)]
 
     print(f"   Starting server on :{multi_agent.host.port}...", end="", flush=True)

@@ -101,7 +101,7 @@ class TestStopEndpoint:
         """Stop endpoint calls cancel_current_request on agent."""
         from fastapi.testclient import TestClient
         from fastapi import FastAPI
-        from endpoints.agent import router
+        from kestrel_sovereign.endpoints.agent import router
         
         app = FastAPI()
         app.include_router(router)
@@ -125,7 +125,7 @@ class TestStopEndpoint:
         """Stop endpoint returns cancelled=False when no request active."""
         from fastapi.testclient import TestClient
         from fastapi import FastAPI
-        from endpoints.agent import router
+        from kestrel_sovereign.endpoints.agent import router
         
         app = FastAPI()
         app.include_router(router)
@@ -148,7 +148,7 @@ class TestStopEndpoint:
         """Stop endpoint forwards explicit request IDs for scoped cancellation."""
         from fastapi.testclient import TestClient
         from fastapi import FastAPI
-        from endpoints.agent import router
+        from kestrel_sovereign.endpoints.agent import router
 
         app = FastAPI()
         app.include_router(router)

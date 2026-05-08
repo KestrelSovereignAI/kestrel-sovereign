@@ -10,13 +10,23 @@ import os
 import logging
 
 from kestrel_sovereign.kestrel_config.constants import MAX_SOVEREIGNTY_PREVIEW_SIZE
-from endpoints.agent_helpers import get_agent
+from kestrel_sovereign.endpoints.agent_helpers import get_agent
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api", tags=["sovereignty"])
 
-STORAGE_CACHE_DIR = Path(__file__).parent.parent / "storage_cache"
+# Storage cache lookup must match the producers (FilecoinAdapter +
+# the storage providers default to ``./storage_cache`` or
+# ``$KESTREL_CACHE_DIR``). When this module lived at repo root,
+# ``__file__.parent.parent`` happened to coincide with the project
+# CWD; after the move into the package (codex review v3 on PR #1097)
+# the package-relative path no longer matches the operator's cache,
+# so the file browser silently listed the wrong directory.
+import os
+STORAGE_CACHE_DIR = Path(
+    os.environ.get("KESTREL_CACHE_DIR") or "storage_cache"
+).resolve()
 
 # Allowlist of valid storage tiers for sovereignty export.
 # Legacy names (ipfs, filecoin) map to CLOUD_HOT / CLOUD_COLD via SovereigntyFeature.

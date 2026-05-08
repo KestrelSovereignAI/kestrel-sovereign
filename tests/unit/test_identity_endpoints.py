@@ -153,14 +153,14 @@ class TestRenameAgentCore:
 
 class TestUpdateIdentityRequest:
     def test_valid_name(self):
-        from endpoints.models import UpdateIdentityRequest
+        from kestrel_sovereign.endpoints.models import UpdateIdentityRequest
 
         req = UpdateIdentityRequest(name="Hello")
         assert req.name == "Hello"
         assert req.description is None
 
     def test_valid_description(self):
-        from endpoints.models import UpdateIdentityRequest
+        from kestrel_sovereign.endpoints.models import UpdateIdentityRequest
 
         req = UpdateIdentityRequest(description="A helpful agent")
         assert req.description == "A helpful agent"
@@ -168,21 +168,21 @@ class TestUpdateIdentityRequest:
 
     def test_name_too_long(self):
         from pydantic import ValidationError
-        from endpoints.models import UpdateIdentityRequest
+        from kestrel_sovereign.endpoints.models import UpdateIdentityRequest
 
         with pytest.raises(ValidationError):
             UpdateIdentityRequest(name="x" * 65)
 
     def test_name_empty_string(self):
         from pydantic import ValidationError
-        from endpoints.models import UpdateIdentityRequest
+        from kestrel_sovereign.endpoints.models import UpdateIdentityRequest
 
         with pytest.raises(ValidationError):
             UpdateIdentityRequest(name="")
 
     def test_description_too_long(self):
         from pydantic import ValidationError
-        from endpoints.models import UpdateIdentityRequest
+        from kestrel_sovereign.endpoints.models import UpdateIdentityRequest
 
         with pytest.raises(ValidationError):
             UpdateIdentityRequest(description="x" * 501)
@@ -190,7 +190,7 @@ class TestUpdateIdentityRequest:
 
 class TestGenerateAvatarRequest:
     def test_valid(self):
-        from endpoints.models import GenerateAvatarRequest
+        from kestrel_sovereign.endpoints.models import GenerateAvatarRequest
 
         req = GenerateAvatarRequest(description="A friendly robot")
         assert req.description == "A friendly robot"
@@ -198,7 +198,7 @@ class TestGenerateAvatarRequest:
 
     def test_num_outputs_range(self):
         from pydantic import ValidationError
-        from endpoints.models import GenerateAvatarRequest
+        from kestrel_sovereign.endpoints.models import GenerateAvatarRequest
 
         with pytest.raises(ValidationError):
             GenerateAvatarRequest(description="test", num_outputs=5)
@@ -208,7 +208,7 @@ class TestGenerateAvatarRequest:
 
     def test_description_required(self):
         from pydantic import ValidationError
-        from endpoints.models import GenerateAvatarRequest
+        from kestrel_sovereign.endpoints.models import GenerateAvatarRequest
 
         with pytest.raises(ValidationError):
             GenerateAvatarRequest()
@@ -216,14 +216,14 @@ class TestGenerateAvatarRequest:
 
 class TestSetAvatarUrlRequest:
     def test_valid(self):
-        from endpoints.models import SetAvatarUrlRequest
+        from kestrel_sovereign.endpoints.models import SetAvatarUrlRequest
 
         req = SetAvatarUrlRequest(url="https://example.com/avatar.png")
         assert req.url == "https://example.com/avatar.png"
 
     def test_empty_url(self):
         from pydantic import ValidationError
-        from endpoints.models import SetAvatarUrlRequest
+        from kestrel_sovereign.endpoints.models import SetAvatarUrlRequest
 
         with pytest.raises(ValidationError):
             SetAvatarUrlRequest(url="")

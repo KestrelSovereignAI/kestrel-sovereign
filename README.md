@@ -164,11 +164,18 @@ uv run kestrel status
 ### Alternative: Direct Commands
 
 ```bash
-# Start server directly (set KESTREL_DB_PATH first)
-KESTREL_DB_PATH=./agent_data/myagent uv run uvicorn server:app --port 8888
+# Start server directly (set KESTREL_DB_PATH first).
+# Pip-installed users invoke the in-package module (the wheel only ships
+# `kestrel_sovereign/`, no top-level `server.py`):
+KESTREL_DB_PATH=./agent_data/myagent uv run uvicorn kestrel_sovereign.server:app --port 8888
 
 # CLI chat (no server needed)
-uv run python main.py ./agent_data/myagent
+uv run python -m kestrel_sovereign.main ./agent_data/myagent
+
+# Source-clone shorthand: a thin re-export shim at the repo root keeps
+# the historical commands working when you've cloned the repo:
+#   uv run uvicorn server:app --port 8888
+#   uv run python main.py ./agent_data/myagent
 ```
 
 > **Note:** `KESTREL_DB_PATH` is a **directory** path, not a file path. The database file `kestrel_prime.db` is created inside the specified directory. For example, setting `KESTREL_DB_PATH=./agent_data/myagent` stores the database at `./agent_data/myagent/kestrel_prime.db`.
@@ -214,9 +221,9 @@ kestrel-sovereign/
 │   ├── agent_config.py        # Per-agent config loader
 │   ├── data/feature_registry.toml  # Runtime feature registry
 │   └── ...
-├── server.py                  # FastAPI agent server
+├── server.py                  # Re-export shim → kestrel_sovereign/server.py
 ├── host.py                    # Multi-agent multi_agent host
-├── main.py                    # Direct interactive REPL
+├── main.py                    # Re-export shim → kestrel_sovereign/main.py
 ├── packages/                  # Extracted feature packages
 ├── features/                  # Built-in features
 ├── docs/                      # Architecture & guides
@@ -497,7 +504,7 @@ PY
 
 ```bash
 export KESTREL_DB_KEY="your-db-passphrase"
-uv run python server.py
+uv run python -m kestrel_sovereign.server
 ```
 
 - Without `pysqlcipher3`, the system falls back to normal SQLite. File blobs and conversations still encrypt with `KESTREL_DATA_KEY` if set.
@@ -540,9 +547,9 @@ Apache 2.0 — see [LICENSE](https://github.com/KestrelSovereignAI/kestrel-sover
 | File | Purpose |
 |------|---------|
 | `kestrel_sovereign/cli.py` | Canonical `kestrel` CLI entry point |
-| `server.py` | FastAPI agent server |
+| `kestrel_sovereign/server.py` | FastAPI agent server (root `server.py` is a re-export shim for source clones) |
 | `host.py` | Multi-agent multi_agent host (Cloud Run) |
-| `main.py` | Direct interactive REPL |
+| `kestrel_sovereign/main.py` | Direct interactive REPL (root `main.py` is a re-export shim for source clones) |
 | `kestrel.toml` | Unified config (LLM, agents, features). `[llm]` holds provider config. |
 | `KESTREL_FEATURES.md` | Canonical feature inventory |
 | `kestrel_sovereign/kestrel_agent.py` | Core agent logic |

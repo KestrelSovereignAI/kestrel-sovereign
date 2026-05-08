@@ -59,7 +59,7 @@ The demo agent is flagged as a test instance with proper disclosure so it knows 
 kestrel demo run technical
 ```
 
-The runner internally does `scripts/setup_demo_agent.py` + `KESTREL_DB_PATH=agent_data/demo uv run uvicorn server:app --port 8900` + the Playwright run, with a `finally`-trap to stop the server on exit.
+The runner internally does `scripts/setup_demo_agent.py` + `KESTREL_DB_PATH=agent_data/demo uv run uvicorn kestrel_sovereign.server:app --port 8900` + the Playwright run, with a `finally`-trap to stop the server on exit.
 
 Output lands in `demos/technical/demo-output/` — video (.webm), 20 screenshots, and `narration.md`.
 
@@ -68,7 +68,7 @@ Output lands in `demos/technical/demo-output/` — video (.webm), 20 screenshots
 ### Live (with presenter)
 
 1. Run `setup_demo_agent.py` to create a clean demo agent
-2. Start the server with `KESTREL_DB_PATH=agent_data/demo uv run python server.py`
+2. Start the server with `KESTREL_DB_PATH=agent_data/demo uv run python -m kestrel_sovereign.server`
 3. Skip discovery and set model to Ollama (see step 3 above)
 4. Open `http://localhost:8888` in a browser
 5. Follow the Acts below — each section has the exact steps
@@ -307,7 +307,7 @@ Size: 89949 bytes
 
 | Problem | Recovery |
 |---------|----------|
-| Server not responding | `KESTREL_DB_PATH=agent_data/demo uv run python server.py` — wait 8 seconds |
+| Server not responding | `KESTREL_DB_PATH=agent_data/demo uv run python -m kestrel_sovereign.server` — wait 8 seconds |
 | Agent returns 401 | Check API key: `grep KESTREL_API_KEY .env` |
 | `!status` returns LLM response instead of DID | Run `!bootstrap-status` — if in discovery state, run `!skip-discovery` first |
 | EPHEMERAL invoke returns 500 | Ollama not running. Start: `ollama serve`. If unavailable, skip invoke — explain: "EPHEMERAL forces all LLM calls to a local model — zero network traffic. The code path literally doesn't call cloud APIs." |

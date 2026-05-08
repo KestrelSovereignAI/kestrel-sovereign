@@ -23,7 +23,7 @@ from typing import Any, Optional
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
-from endpoints.agent_helpers import get_agent
+from kestrel_sovereign.endpoints.agent_helpers import get_agent
 from kestrel_sdk.voice import AudioFormat, ToolDef, TurnDetectionConfig
 from kestrel_sovereign.features.voice.feature import VoiceFeature
 from kestrel_sovereign.voice import tags as voice_tags

@@ -6,7 +6,7 @@ Serves stored files (avatars, documents, etc.) via content-addressable hashes.
 from fastapi import APIRouter, Request, HTTPException
 from fastapi.responses import Response
 import logging
-from endpoints.agent_helpers import get_agent
+from kestrel_sovereign.endpoints.agent_helpers import get_agent
 
 logger = logging.getLogger(__name__)
 

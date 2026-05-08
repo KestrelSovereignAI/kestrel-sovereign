@@ -102,7 +102,7 @@ class TestGenerateMetrics:
 class TestMetricsEndpoint:
     @pytest.fixture
     def endpoint_module(self):
-        import endpoints.metrics as m
+        import kestrel_sovereign.endpoints.metrics as m
         return m
 
     @pytest.mark.asyncio

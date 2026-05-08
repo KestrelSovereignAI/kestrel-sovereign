@@ -83,7 +83,7 @@ def test_endpoint_module_declares_rail_dependency():
     without the rail attached.  The route definition lives in
     ``endpoints.agent``; we just confirm the dependency is present in its
     kwargs."""
-    from endpoints import agent as agent_endpoints
+    from kestrel_sovereign.endpoints import agent as agent_endpoints
 
     routes = [
         r for r in agent_endpoints.router.routes

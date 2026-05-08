@@ -6,7 +6,7 @@ from uuid import uuid4
 
 import pytest
 
-from endpoints.database import _get_table_columns, _list_table_names
+from kestrel_sovereign.endpoints.database import _get_table_columns, _list_table_names
 from kestrel_sovereign.a2a.stores.unified import TaskStore
 from kestrel_sovereign.a2a.types import (
     Artifact,

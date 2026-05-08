@@ -34,7 +34,7 @@ def app(oauth_env):
     # Build a minimal app that mirrors server.py auth behavior
     test_app = FastAPI()
 
-    from endpoints.auth_oauth import router as auth_router, register_oauth
+    from kestrel_sovereign.endpoints.auth_oauth import router as auth_router, register_oauth
     test_app.include_router(auth_router)
     register_oauth(test_app)
 
@@ -128,42 +128,42 @@ class TestEmailAllowlist:
 
     def test_get_allowed_emails(self, oauth_env):
         """Test parsing of KESTREL_ALLOWED_EMAILS env var."""
-        from endpoints.auth_oauth import _get_allowed_emails
+        from kestrel_sovereign.endpoints.auth_oauth import _get_allowed_emails
         emails = _get_allowed_emails()
         assert emails == {"allowed@gmail.com", "admin@gmail.com"}
 
     def test_get_allowed_emails_empty(self):
         """Test empty allowlist returns empty set."""
         with patch.dict(os.environ, {"KESTREL_ALLOWED_EMAILS": ""}, clear=False):
-            from endpoints.auth_oauth import _get_allowed_emails
+            from kestrel_sovereign.endpoints.auth_oauth import _get_allowed_emails
             emails = _get_allowed_emails()
             assert emails == set()
 
     def test_get_allowed_emails_whitespace(self):
         """Test allowlist with extra whitespace."""
         with patch.dict(os.environ, {"KESTREL_ALLOWED_EMAILS": " a@b.com , c@d.com "}, clear=False):
-            from endpoints.auth_oauth import _get_allowed_emails
+            from kestrel_sovereign.endpoints.auth_oauth import _get_allowed_emails
             emails = _get_allowed_emails()
             assert emails == {"a@b.com", "c@d.com"}
 
     def test_get_allowed_emails_case_insensitive(self):
         """Test emails are lowercased."""
         with patch.dict(os.environ, {"KESTREL_ALLOWED_EMAILS": "User@Gmail.COM"}, clear=False):
-            from endpoints.auth_oauth import _get_allowed_emails
+            from kestrel_sovereign.endpoints.auth_oauth import _get_allowed_emails
             emails = _get_allowed_emails()
             assert emails == {"user@gmail.com"}
 
     def test_get_allowed_emails_semicolon_separator(self):
         """`;` works as separator (Cloud Run deploys can't use `,`)."""
         with patch.dict(os.environ, {"KESTREL_ALLOWED_EMAILS": "a@b.com;c@d.com"}, clear=False):
-            from endpoints.auth_oauth import _get_allowed_emails
+            from kestrel_sovereign.endpoints.auth_oauth import _get_allowed_emails
             emails = _get_allowed_emails()
             assert emails == {"a@b.com", "c@d.com"}
 
     def test_get_allowed_emails_mixed_separators(self):
         """Mixed `,` and `;` separators both work."""
         with patch.dict(os.environ, {"KESTREL_ALLOWED_EMAILS": "a@b.com, c@d.com;e@f.com"}, clear=False):
-            from endpoints.auth_oauth import _get_allowed_emails
+            from kestrel_sovereign.endpoints.auth_oauth import _get_allowed_emails
             emails = _get_allowed_emails()
             assert emails == {"a@b.com", "c@d.com", "e@f.com"}
 
@@ -224,7 +224,7 @@ class TestOAuthDisabled:
         """Test /auth/login returns 503 when Google OAuth is not configured."""
         from starlette.middleware.sessions import SessionMiddleware
         from fastapi import FastAPI
-        from endpoints.auth_oauth import router as auth_router, oauth, register_oauth
+        from kestrel_sovereign.endpoints.auth_oauth import router as auth_router, oauth, register_oauth
 
         # Clear any previously registered client
         if "google" in oauth._clients:

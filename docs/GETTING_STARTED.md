@@ -70,8 +70,10 @@ issue #938 for the full deprecation plan.
 
 ### 4. Start Chatting with Existing Agent
 ```bash
-# Use existing agent
-python main.py kestrel_prime.db
+# Use existing agent (in-package module; works from a pip install)
+python -m kestrel_sovereign.main kestrel_prime.db
+# Source-clone shorthand: `python main.py kestrel_prime.db` still works via the
+# repo-root re-export shim.
 
 # Available commands in chat:
 # !help     - Show available commands
@@ -225,7 +227,7 @@ Run the health check script to verify your setup:
 
 ### For Development/Testing
 1. Run health check: `.venv_kestrel/bin/python health_check.py`
-2. Test with existing agent: `.venv_kestrel/bin/python main.py kestrel_prime.db`
+2. Test with existing agent: `.venv_kestrel/bin/python -m kestrel_sovereign.main kestrel_prime.db`
 3. Run specific tests: `.venv_kestrel/bin/python -m pytest test_kestrel_agent.py -x`
 
 ### For New Features
@@ -243,7 +245,7 @@ Run the health check script to verify your setup:
 
 | File | Purpose |
 |------|---------|
-| `main.py` | Interactive chat interface |
+| `kestrel_sovereign/main.py` | Interactive chat interface (root `main.py` is a re-export shim for source clones) |
 | `kestrel_agent.py` | Core agent logic |
 | `storage.py` | Memory and knowledge management |
 | `kestrel.toml` | Unified config (LLM, agents, features). `[llm]` section holds provider config. |

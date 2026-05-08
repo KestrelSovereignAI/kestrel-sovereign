@@ -50,7 +50,7 @@ class SpawnFeature(Feature):
         The router is defined in endpoints/spawn.py and mounted by the
         server only when SpawnFeature is discovered and enabled.
         """
-        from endpoints.spawn import router
+        from kestrel_sovereign.endpoints.spawn import router
         return router
 
     async def post_all_features_loaded(self, agent):

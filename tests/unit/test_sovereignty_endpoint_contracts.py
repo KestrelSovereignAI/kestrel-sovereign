@@ -137,7 +137,7 @@ def test_sovereignty_import_rejects_invalid_cid():
 
 
 def test_sovereignty_files_listing_and_preview_contract(tmp_path):
-    from endpoints import sovereignty as sovereignty_endpoints
+    from kestrel_sovereign.endpoints import sovereignty as sovereignty_endpoints
 
     cache_dir = tmp_path / "storage_cache"
     cache_dir.mkdir()
@@ -171,7 +171,7 @@ def test_sovereignty_files_listing_and_preview_contract(tmp_path):
 
 
 def test_sovereignty_file_browser_offloads_blocking_io(tmp_path):
-    from endpoints import sovereignty as sovereignty_endpoints
+    from kestrel_sovereign.endpoints import sovereignty as sovereignty_endpoints
 
     cache_dir = tmp_path / "storage_cache"
     cache_dir.mkdir()

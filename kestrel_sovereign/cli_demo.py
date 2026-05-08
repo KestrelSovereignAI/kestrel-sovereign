@@ -328,7 +328,7 @@ def _cmd_demo_run(args) -> int:
     # operator has ``uvicorn`` on PATH — matches the in-process startup
     # idiom in cli.py:_start_inprocess_mode.
     server_cmd = [
-        sys.executable, "-m", "uvicorn", "server:app",
+        sys.executable, "-m", "uvicorn", "kestrel_sovereign.server:app",
         "--host", "127.0.0.1", "--port", str(port),
     ]
     print(

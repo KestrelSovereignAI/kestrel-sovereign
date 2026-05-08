@@ -4,7 +4,7 @@ from pathlib import Path
 import logging
 
 from kestrel_sovereign.sql_utils import safe_table_name, safe_column_name
-from endpoints.agent_helpers import get_agent
+from kestrel_sovereign.endpoints.agent_helpers import get_agent
 
 logger = logging.getLogger(__name__)
 

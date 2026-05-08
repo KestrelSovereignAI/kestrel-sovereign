@@ -80,7 +80,7 @@ class _FakeAiohttpSession:
 
 
 def test_ipfs_status_reports_local_node_gateways_and_filecoin_adapter():
-    from endpoints import models as model_endpoints
+    from kestrel_sovereign.endpoints import models as model_endpoints
 
     local_api = f"{model_endpoints.get_ipfs_api_url()}/api/v0"
     test_cid = "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG"
@@ -111,7 +111,7 @@ def test_ipfs_status_reports_local_node_gateways_and_filecoin_adapter():
 
     app, original = _prepare_app(agent)
     try:
-        with patch("endpoints.models.aiohttp.ClientSession", side_effect=client_sessions):
+        with patch("kestrel_sovereign.endpoints.models.aiohttp.ClientSession", side_effect=client_sessions):
             with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
                 with TestClient(app) as client:
                     response = client.get("/api/ipfs/status", headers=_api_headers())

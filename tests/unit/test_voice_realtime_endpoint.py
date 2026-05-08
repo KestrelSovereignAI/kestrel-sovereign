@@ -28,7 +28,7 @@ import pytest
 from fastapi import APIRouter, FastAPI
 from fastapi.testclient import TestClient
 
-from endpoints.voice_realtime import (
+from kestrel_sovereign.endpoints.voice_realtime import (
     _clamp_turn_mode,
     _collect_tools,
     _compose_instructions,
@@ -136,7 +136,7 @@ def client() -> TestClient:
 
 def _inject_agent(monkeypatch: pytest.MonkeyPatch, agent: Any) -> None:
     """Stub get_agent to return the fake so the endpoint can run sans middleware."""
-    import endpoints.voice_realtime as vr
+    import kestrel_sovereign.endpoints.voice_realtime as vr
 
     monkeypatch.setattr(vr, "get_agent", lambda _request: agent)
 

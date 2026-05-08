@@ -115,7 +115,7 @@ redis-cli -h redis -a redis_password_2024  # Connect to Redis
 
 # Python REPL
 ipython                                # Enhanced Python shell
-python main.py agent_data/kestrel.db   # Kestrel CLI
+python -m kestrel_sovereign.main agent_data/kestrel.db   # Kestrel CLI
 ```
 
 ### File Synchronization
@@ -157,7 +157,7 @@ kestrel start
 ### Start Kestrel Agent
 ```bash
 cd /workspace
-python main.py agent_data/kestrel_prime.db
+python -m kestrel_sovereign.main agent_data/kestrel_prime.db
 ```
 
 ### Check Service Health

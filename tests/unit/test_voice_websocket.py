@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from fastapi.testclient import TestClient
 
-from endpoints.voice import (
+from kestrel_sovereign.endpoints.voice import (
     FRAME_AUDIO,
     FRAME_JSON,
     encode_audio,
@@ -162,7 +162,7 @@ def _make_agent(voice_feature=None, has_streaming=True):
 def _prepare_app(agent):
     """Prepare FastAPI app with mock agent for testing."""
     from server import app
-    from endpoints.voice import router as voice_router
+    from kestrel_sovereign.endpoints.voice import router as voice_router
 
     @asynccontextmanager
     async def noop_lifespan(_app):

@@ -13,7 +13,7 @@ Output:
     Prints the KESTREL_DB_PATH to use when starting the server.
 
 To run the demo:
-    KESTREL_DB_PATH=agent_data/demo uv run python server.py &
+    KESTREL_DB_PATH=agent_data/demo uv run python -m kestrel_sovereign.server &
     cd demos/technical && npx playwright test --config=config.cjs
 """
 import asyncio
@@ -88,7 +88,7 @@ async def main():
     print(f"  Type:     TEST INSTANCE (demo-live)")
     print()
     print("  To start the demo server:")
-    print(f"    KESTREL_DB_PATH={DEMO_DIR} uv run python server.py")
+    print(f"    KESTREL_DB_PATH={DEMO_DIR} uv run python -m kestrel_sovereign.server")
     print()
     print("  Then run the demo:")
     print("    cd demos/technical && npx playwright test --config=config.cjs")

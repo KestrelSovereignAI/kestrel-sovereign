@@ -8,7 +8,7 @@ from fastapi import APIRouter, HTTPException, Request, UploadFile, File, Respons
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from endpoints.agent_helpers import get_agent
+from kestrel_sovereign.endpoints.agent_helpers import get_agent
 from kestrel_sovereign.features.voice.feature import VoicePrivacyError
 
 logger = logging.getLogger(__name__)

@@ -9,7 +9,7 @@ from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
 
 from kestrel_sovereign.rate_limit import limiter
-from endpoints.agent_helpers import get_agent
+from kestrel_sovereign.endpoints.agent_helpers import get_agent
 
 router = APIRouter(prefix="/api/security", tags=["security"])
 

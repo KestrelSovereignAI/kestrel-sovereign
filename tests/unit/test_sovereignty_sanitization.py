@@ -7,7 +7,7 @@ import inspect
 import re
 import pytest
 
-from endpoints.sovereignty import ALLOWED_TIERS, CID_PATTERN, preview_sovereignty_file
+from kestrel_sovereign.endpoints.sovereignty import ALLOWED_TIERS, CID_PATTERN, preview_sovereignty_file
 from kestrel_sovereign.kestrel_config.constants import MAX_SOVEREIGNTY_PREVIEW_SIZE
 
 

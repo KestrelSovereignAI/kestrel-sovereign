@@ -14,7 +14,7 @@ import pytest
 from fastapi import FastAPI
 from starlette.requests import Request
 
-from endpoints.agent import (
+from kestrel_sovereign.endpoints.agent import (
     _sse_connections,
     notifications_sse,
     router,

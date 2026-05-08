@@ -16,8 +16,9 @@ while IFS='=' read -r key val; do
 done < <(env)
 
 # Single-agent Cloud Run: bootstrap DID + database in KESTREL_DB_PATH
-# directly. server.py's lifespan calls get_agent_did_async(KESTREL_DB_PATH)
-# and opens "${KESTREL_DB_PATH}/kestrel_prime.db", so the entrypoint must
+# directly. kestrel_sovereign/server.py's lifespan calls
+# get_agent_did_async(KESTREL_DB_PATH) and opens
+# "${KESTREL_DB_PATH}/kestrel_prime.db", so the entrypoint must
 # write identity in the same dir.
 #
 # (Earlier this script used a "${KESTREL_DB_PATH}/${KESTREL_AGENT_NAME}"
@@ -42,4 +43,4 @@ else
 fi
 
 # Start the server
-exec /app/.venv/bin/uvicorn server:app --host 0.0.0.0 --port "$PORT"
+exec /app/.venv/bin/uvicorn kestrel_sovereign.server:app --host 0.0.0.0 --port "$PORT"

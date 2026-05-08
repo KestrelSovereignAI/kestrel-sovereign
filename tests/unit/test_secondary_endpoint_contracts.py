@@ -44,7 +44,7 @@ def _ensure_observability_router(app):
     for route in app.routes:
         if getattr(route, "path", None) == target:
             return
-    from endpoints.observability import router as observability_router
+    from kestrel_sovereign.endpoints.observability import router as observability_router
     app.include_router(observability_router)
 
 

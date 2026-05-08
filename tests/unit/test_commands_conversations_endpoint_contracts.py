@@ -76,7 +76,7 @@ def test_commands_endpoint_merges_builtin_and_feature_commands():
 
 
 def test_commands_endpoint_builtin_inventory_matches_command_handler_specs():
-    from endpoints.commands import BUILTIN_COMMANDS
+    from kestrel_sovereign.endpoints.commands import BUILTIN_COMMANDS
     from kestrel_sovereign.command_handler import BUILTIN_COMMAND_SPECS
 
     endpoint_cmds = {entry["cmd"] for entry in BUILTIN_COMMANDS}
@@ -128,8 +128,8 @@ def test_conversations_endpoint_groups_rows_and_marks_encrypted_preview():
 
     app, original = _prepare_app(agent)
     try:
-        with patch("endpoints.conversations.get_agent_fernet", return_value=object()):
-            with patch("endpoints.conversations.decrypt_string", side_effect=ValueError("bad key")):
+        with patch("kestrel_sovereign.endpoints.conversations.get_agent_fernet", return_value=object()):
+            with patch("kestrel_sovereign.endpoints.conversations.decrypt_string", side_effect=ValueError("bad key")):
                 with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
                     with TestClient(app) as client:
                         response = client.get("/api/conversations?limit=10", headers=_api_headers())
@@ -161,8 +161,8 @@ def test_get_conversation_filters_session_markers_and_decrypts_messages():
 
     app, original = _prepare_app(agent)
     try:
-        with patch("endpoints.conversations.get_agent_fernet", return_value=object()):
-            with patch("endpoints.conversations.decrypt_string", return_value="decrypted text"):
+        with patch("kestrel_sovereign.endpoints.conversations.get_agent_fernet", return_value=object()):
+            with patch("kestrel_sovereign.endpoints.conversations.decrypt_string", return_value="decrypted text"):
                 with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
                     with TestClient(app) as client:
                         response = client.get("/api/conversations/10", headers=_api_headers())
@@ -215,8 +215,8 @@ def test_get_conversation_unwraps_sent_form_user_content():
 
     app, original = _prepare_app(agent)
     try:
-        with patch("endpoints.conversations.get_agent_fernet", return_value=object()):
-            with patch("endpoints.conversations.decrypt_string", side_effect=fake_decrypt):
+        with patch("kestrel_sovereign.endpoints.conversations.get_agent_fernet", return_value=object()):
+            with patch("kestrel_sovereign.endpoints.conversations.decrypt_string", side_effect=fake_decrypt):
                 with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
                     with TestClient(app) as client:
                         response = client.get("/api/conversations/415", headers=_api_headers())

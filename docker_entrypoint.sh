@@ -9,7 +9,7 @@ if [ ! -f "/app/kestrel.db" ]; then
 fi
 
 # Start the FastAPI server in background
-/app/.venv/bin/uvicorn server:app --host 0.0.0.0 --port 8888 &
+/app/.venv/bin/uvicorn kestrel_sovereign.server:app --host 0.0.0.0 --port 8888 &
 SERVER_PID=$!
 
 # Wait for server to start and initialize
@@ -28,7 +28,7 @@ if [ -t 0 ]; then
     export KESTREL_DB_PATH=/app/kestrel.db
 
     # Run the terminal chat interface
-    /app/.venv/bin/python main.py
+    /app/.venv/bin/python -m kestrel_sovereign.main
 
     # When chat exits, kill the server
     kill $SERVER_PID

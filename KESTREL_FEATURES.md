@@ -12,7 +12,7 @@
 - Historical catalogs belong under `docs/archive/`.
 - Discovery rules matter more than headline numbers:
   - Feature module discovery is defined by [`kestrel_sovereign/features/__init__.py`](kestrel_sovereign/features/__init__.py).
-  - HTTP route families are defined by [`server.py`](server.py) and the routers under [`endpoints/`](endpoints).
+  - HTTP route families are defined by [`kestrel_sovereign/server.py`](kestrel_sovereign/server.py) and the routers under [`kestrel_sovereign/endpoints/`](kestrel_sovereign/endpoints).
 
 ## Canonical Principles
 
@@ -37,7 +37,7 @@
 - Sovereignty lifecycle:
   - [`kestrel_sovereign/graduate_service.py`](kestrel_sovereign/graduate_service.py)
   - [`kestrel_sovereign/retirement_service.py`](kestrel_sovereign/retirement_service.py)
-  - [`endpoints/sovereignty.py`](endpoints/sovereignty.py)
+  - [`kestrel_sovereign/endpoints/sovereignty.py`](kestrel_sovereign/endpoints/sovereignty.py)
 
 ### Agent runtime and context assembly
 
@@ -50,7 +50,7 @@
   - [`kestrel_sovereign/agent/token_budget.py`](kestrel_sovereign/agent/token_budget.py)
 - Streaming and request lifecycle:
   - [`kestrel_sovereign/agent/streaming.py`](kestrel_sovereign/agent/streaming.py)
-  - [`endpoints/agent.py`](endpoints/agent.py)
+  - [`kestrel_sovereign/endpoints/agent.py`](kestrel_sovereign/endpoints/agent.py)
 
 ### Multi-LLM platform
 
@@ -185,7 +185,7 @@ The currently exported `Feature` subclasses discovered from those modules includ
 
 ## Public HTTP Surface
 
-### App-level routes in `server.py`
+### App-level routes in `kestrel_sovereign/server.py`
 
 - `GET /`
 - `GET /api/auth/key`
@@ -194,16 +194,16 @@ The currently exported `Feature` subclasses discovered from those modules includ
 - `GET /health/detailed`
 - `POST /webhooks/stripe/crypto`
 
-### Router families mounted by `server.py`
+### Router families mounted by `kestrel_sovereign/server.py`
 
-- [`endpoints/auth_oauth.py`](endpoints/auth_oauth.py)
+- [`kestrel_sovereign/endpoints/auth_oauth.py`](kestrel_sovereign/endpoints/auth_oauth.py)
   - `GET /auth/login`
   - `GET /auth/callback`
   - `GET /auth/logout`
   - `GET /auth/me`
   - `POST /auth/token`
   - `GET /auth/verify`
-- [`endpoints/agent.py`](endpoints/agent.py)
+- [`kestrel_sovereign/endpoints/agent.py`](kestrel_sovereign/endpoints/agent.py)
   - `POST /api/agent/invoke`
   - `POST /api/agent/stream`
   - `POST /api/agent/stop`
@@ -222,7 +222,7 @@ The currently exported `Feature` subclasses discovered from those modules includ
   - `POST /api/agent/health/trigger`
   - `POST /api/agent/mesh`
   - `GET /api/agent/mesh/inbox`
-- [`endpoints/conversations.py`](endpoints/conversations.py)
+- [`kestrel_sovereign/endpoints/conversations.py`](kestrel_sovereign/endpoints/conversations.py)
   - `GET /api/sessions`
   - `GET /api/conversations`
   - `GET /api/conversations/{session_id}`
@@ -236,12 +236,12 @@ The currently exported `Feature` subclasses discovered from those modules includ
   - `GET /api/trash`
   - `PATCH /api/conversations/{session_id}`
   - `GET /api/conversations/{session_id}/transcript`
-- [`endpoints/memories.py`](endpoints/memories.py)
+- [`kestrel_sovereign/endpoints/memories.py`](kestrel_sovereign/endpoints/memories.py)
   - `GET /api/memories`
   - `GET /api/memories/{node_id}`
   - `GET /api/identity-chain`
   - `DELETE /api/memories/{node_id}`
-- [`endpoints/sovereignty.py`](endpoints/sovereignty.py)
+- [`kestrel_sovereign/endpoints/sovereignty.py`](kestrel_sovereign/endpoints/sovereignty.py)
   - `GET /api/storage/stats`
   - `GET /api/sovereignty/exports`
   - `POST /api/sovereignty/export`
@@ -249,10 +249,10 @@ The currently exported `Feature` subclasses discovered from those modules includ
   - `GET /api/sovereignty/files`
   - `GET /api/sovereignty/files/{filename}`
   - `GET /api/sovereignty/files/{filename}/preview`
-- [`endpoints/database.py`](endpoints/database.py)
+- [`kestrel_sovereign/endpoints/database.py`](kestrel_sovereign/endpoints/database.py)
   - `GET /api/db/tables`
   - `GET /api/db/tables/{table_name}`
-- [`endpoints/models.py`](endpoints/models.py)
+- [`kestrel_sovereign/endpoints/models.py`](kestrel_sovereign/endpoints/models.py)
   - `GET /api/agents`
   - `POST /api/agents`
   - `DELETE /api/agents/{agent_name}`
@@ -279,12 +279,12 @@ The currently exported `Feature` subclasses discovered from those modules includ
   - `POST /api/model/set`
   - `GET /v1/models`
   - `POST /v1/chat/completions`
-- [`endpoints/commands.py`](endpoints/commands.py)
+- [`kestrel_sovereign/endpoints/commands.py`](kestrel_sovereign/endpoints/commands.py)
   - `GET /api/commands`
-- [`endpoints/files.py`](endpoints/files.py)
+- [`kestrel_sovereign/endpoints/files.py`](kestrel_sovereign/endpoints/files.py)
   - `GET /api/files/{content_hash}`
   - `HEAD /api/files/{content_hash}`
-- [`endpoints/security.py`](endpoints/security.py)
+- [`kestrel_sovereign/endpoints/security.py`](kestrel_sovereign/endpoints/security.py)
   - `GET /api/security/permissions/tree`
   - `POST /api/security/permissions`
   - `POST /api/security/permissions/feature`
@@ -294,16 +294,16 @@ The currently exported `Feature` subclasses discovered from those modules includ
   - `POST /api/security/cancel/{request_id}`
   - `POST /api/security/cancel-all`
   - `POST /api/security/reset-session`
-- [`endpoints/metrics.py`](endpoints/metrics.py)
+- [`kestrel_sovereign/endpoints/metrics.py`](kestrel_sovereign/endpoints/metrics.py)
   - `GET /metrics`
-- [`endpoints/spawn.py`](endpoints/spawn.py)
+- [`kestrel_sovereign/endpoints/spawn.py`](kestrel_sovereign/endpoints/spawn.py)
   - `GET /api/spawn/children`
-- [`endpoints/observability.py`](endpoints/observability.py)
+- [`kestrel_sovereign/endpoints/observability.py`](kestrel_sovereign/endpoints/observability.py)
   - `GET /api/observability/events`
   - `GET /api/observability/summary`
-- [`endpoints/rasa_shim.py`](endpoints/rasa_shim.py)
+- [`kestrel_sovereign/endpoints/rasa_shim.py`](kestrel_sovereign/endpoints/rasa_shim.py)
   - `POST /webhooks/rest/webhook`
-- [`endpoints/saved_items.py`](endpoints/saved_items.py)
+- [`kestrel_sovereign/endpoints/saved_items.py`](kestrel_sovereign/endpoints/saved_items.py)
   - `GET /api/saved-items`
   - `POST /api/saved-items`
   - `GET /api/saved-items/stats`
@@ -317,7 +317,7 @@ The currently exported `Feature` subclasses discovered from those modules includ
   - `POST /api/saved-items/structured`
   - `POST /api/saved-items/search`
   - `POST /api/saved-items/{item_id}/pin`
-- [`endpoints/voice.py`](endpoints/voice.py)
+- [`kestrel_sovereign/endpoints/voice.py`](kestrel_sovereign/endpoints/voice.py)
   - `GET /voice/voices`
   - `GET /voice/providers/status` — diagnostic surface for every TTS/STT/conversation provider attempted at boot. Returns `init_error`, `available_error`, live `voice_count` for TTS, and an actionable `install_hint`. Drives the voice picker's "why is this empty?" inline reason.
   - `GET /voice/config`
@@ -326,11 +326,11 @@ The currently exported `Feature` subclasses discovered from those modules includ
   - `POST /voice/tts/stream`
   - `POST /voice/stt`
   - `WebSocket /voice/chat`
-- [`endpoints/voice_realtime.py`](endpoints/voice_realtime.py)
+- [`kestrel_sovereign/endpoints/voice_realtime.py`](kestrel_sovereign/endpoints/voice_realtime.py)
   - `POST /realtime/session` — declared on the realtime router; **served at `POST /voice/realtime/session`**. Body accepts per-call routing overrides (`prefer_realtime`, `preferred_tts`, `preferred_stt`) so the voice picker can force Pipeline mode or pin a TTS without persisting agent config. Privacy-gated via the voice path resolver; returns 409 with fallback provider names when the active route is not realtime.
   - `POST /realtime/tools/{session_id}` — **served at `POST /voice/realtime/tools/{session_id}`**. Browser POSTs here when the Realtime model invokes a tool; runs it against the agent's enabled features and returns the result. Always 200 with a result payload (errors as `{result: {error: ...}}`) so the frontend always commits *something* back to the data channel — silence wedges the model.
   - `GET /realtime/route` — **served at `GET /voice/realtime/route`**. Pure introspection: returns the resolved voice route + the model that would actually answer (`gpt-realtime-1.5` for Realtime, your chat LLM for Pipeline) plus the available conversation/TTS/STT providers. Query params (`prefer_realtime`, `preferred_tts`, `preferred_stt`) preview alternative routes without minting. Drives the voice picker's live route-preview block.
-- [`endpoints/features.py`](endpoints/features.py)
+- [`kestrel_sovereign/endpoints/features.py`](kestrel_sovereign/endpoints/features.py)
   - `GET /api/features`
   - `GET /api/features/installed`
   - `GET /api/features/{name}`
@@ -343,7 +343,7 @@ The currently exported `Feature` subclasses discovered from those modules includ
   - `GET /api/features/{name}/skills`
   - `GET /api/skills`
   - `GET /api/skills/{skill_id}/schema`
-- [`endpoints/ui.py`](endpoints/ui.py)
+- [`kestrel_sovereign/endpoints/ui.py`](kestrel_sovereign/endpoints/ui.py)
   - `GET /api/ui/theme` — UI theme + i18n labels for the active locale, with legacy-fallback reporting
   - `GET /api/ui/themes` — list of installed UI themes
 
@@ -363,7 +363,7 @@ The route surface is not just public versus protected. The current live classes 
   - `/auth/callback`
   - `/auth/logout`
 - `APIKeyOrSession`
-  - most protected `/agent/*` and `/api/*` routes via `server.py` auth middleware
+  - most protected `/agent/*` and `/api/*` routes via `kestrel_sovereign/server.py` auth middleware
 - `APIKeyOrSession+SSEQuery`
   - SSE paths that also allow `?api_key=`:
     - `/agent/stream`
