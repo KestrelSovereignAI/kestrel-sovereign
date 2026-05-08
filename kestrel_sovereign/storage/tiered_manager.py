@@ -19,6 +19,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Type
 
+from kestrel_sovereign.privacy import PrivacyMode
 from kestrel_sovereign.storage.providers.base import (
     CryostasisCapable,
     StorageProvider,
@@ -32,16 +33,13 @@ from kestrel_sovereign.storage.providers.base import (
 logger = logging.getLogger(__name__)
 
 
-# Privacy mode to tier mapping
-# From docs/architecture/PRIVACY_MODES.md
-class PrivacyMode:
-    """Privacy modes that affect storage tier selection."""
-    EPHEMERAL = "ephemeral"    # No storage at all
-    ISOLATED = "isolated"      # Local only, no sync
-    ANONYMOUS = "anonymous"    # Cloud allowed, forced encryption
-    NORMAL = "normal"          # Full cloud sync
-    PUBLIC = "public"          # Public sharing enabled
-
+# `PrivacyMode` used to be a local bare-class shadow with string class
+# attributes (predating the SDK extraction in #1094). It now re-exports
+# the canonical enum from `kestrel_sovereign.privacy` so this module
+# shares one identity with the rest of the agent. The str-Enum mixin
+# means every existing comparison (`mode == "normal"`, dict lookups
+# keyed by either form, the `privacy_mode: str = PrivacyMode.NORMAL`
+# default below) keeps working unchanged.
 
 # Map privacy modes to allowed storage tiers
 PRIVACY_TIER_POLICY = {
