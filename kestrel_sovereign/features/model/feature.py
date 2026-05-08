@@ -190,9 +190,12 @@ class ModelAgent(Feature):
             # don't fail the entire info call.
             logger.debug(f"storage info enrichment skipped for {model_name}: {e}")
 
+        # Wrap under a "model" key so the structural-payload heuristic
+        # in command_handler renders the details. A flat scalar dict
+        # would hide the model details from `!model-info` users.
         return ToolResult.ok(
             confirmation=f"Model {model_name!r} info retrieved",
-            data=result,
+            data={"model": result},
         )
 
     @tool(

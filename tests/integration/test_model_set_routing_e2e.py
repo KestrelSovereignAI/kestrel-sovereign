@@ -11,6 +11,8 @@ incorrectly set vendor="google" instead of vendor="openrouter".
 """
 import pytest
 from unittest.mock import MagicMock, AsyncMock
+
+from kestrel_sdk.tools.result import ToolResultStatus
 from kestrel_sovereign.llm.model_metadata import ModelInfo
 from kestrel_sovereign.llm.model_cache import get_shared_model_cache
 
@@ -99,7 +101,7 @@ class TestModelSetRouting:
         """OpenRouter models should route through openrouter vendor, not underlying vendor."""
         result = await model_agent.set_model("google/gemini-3-pro-preview")
 
-        assert result["success"] is True
+        assert result.status is ToolResultStatus.OK
         mock_llm_service.set_model_preference.assert_called_once()
         model_name, vendor, route = mock_llm_service.set_model_preference.call_args[0]
 
@@ -113,7 +115,7 @@ class TestModelSetRouting:
         """anthropic/claude-3.5-sonnet from OpenRouter should NOT go to Anthropic directly."""
         result = await model_agent.set_model("anthropic/claude-3.5-sonnet")
 
-        assert result["success"] is True
+        assert result.status is ToolResultStatus.OK
         model_name, vendor, route = mock_llm_service.set_model_preference.call_args[0]
 
         # Should route to openrouter, not anthropic
@@ -125,7 +127,7 @@ class TestModelSetRouting:
         """meta-llama models (OpenRouter-only vendor) should route to openrouter."""
         result = await model_agent.set_model("meta-llama/llama-3.1-70b-instruct")
 
-        assert result["success"] is True
+        assert result.status is ToolResultStatus.OK
         model_name, vendor, route = mock_llm_service.set_model_preference.call_args[0]
 
         assert vendor == "openrouter"
@@ -136,7 +138,7 @@ class TestModelSetRouting:
         """deepseek models should route to openrouter (OpenRouter-only vendor)."""
         result = await model_agent.set_model("deepseek/deepseek-chat")
 
-        assert result["success"] is True
+        assert result.status is ToolResultStatus.OK
         model_name, vendor, route = mock_llm_service.set_model_preference.call_args[0]
 
         assert vendor == "openrouter"
@@ -146,7 +148,7 @@ class TestModelSetRouting:
         """openai/gpt-5 should route to openai directly."""
         result = await model_agent.set_model("openai/gpt-5")
 
-        assert result["success"] is True
+        assert result.status is ToolResultStatus.OK
         model_name, vendor, route = mock_llm_service.set_model_preference.call_args[0]
 
         # This IS a direct vendor format
@@ -164,7 +166,7 @@ class TestModelSetRouting:
 
         result = await model_agent.set_model("anthropic/claude-opus-4-5-20251101")
 
-        assert result["success"] is True
+        assert result.status is ToolResultStatus.OK
         model_name, vendor, route = mock_llm_service.set_model_preference.call_args[0]
 
         # Direct anthropic model
@@ -176,7 +178,7 @@ class TestModelSetRouting:
         """ollama/llama3.2:3b should route to ollama directly."""
         result = await model_agent.set_model("ollama/llama3.2:3b")
 
-        assert result["success"] is True
+        assert result.status is ToolResultStatus.OK
         model_name, vendor, route = mock_llm_service.set_model_preference.call_args[0]
 
         assert vendor == "ollama"
@@ -187,7 +189,7 @@ class TestModelSetRouting:
         """``anthropic:plan/claude-sonnet-4-6`` should route to anthropic with route=plan."""
         result = await model_agent.set_model("anthropic:plan/claude-sonnet-4-6")
 
-        assert result["success"] is True
+        assert result.status is ToolResultStatus.OK
         model_name, vendor, route = mock_llm_service.set_model_preference.call_args[0]
 
         assert vendor == "anthropic"
@@ -199,7 +201,7 @@ class TestModelSetRouting:
         """Model without vendor prefix passes vendor=None — resolution happens in LLMService."""
         result = await model_agent.set_model("gpt-5")
 
-        assert result["success"] is True
+        assert result.status is ToolResultStatus.OK
         model_name, vendor, route = mock_llm_service.set_model_preference.call_args[0]
 
         # No vendor specified at the feature level; LLMService will auto-resolve
@@ -303,8 +305,8 @@ class TestModelSetResponseFormat:
         """Response should include MODEL_CHANGED marker for UI sync."""
         result = await model_agent.set_model("google/gemini-3-pro-preview")
 
-        assert result["success"] is True
-        assert "MODEL_CHANGED:" in result["message"]
+        assert result.status is ToolResultStatus.OK
+        assert "MODEL_CHANGED:" in result.data["message"]
 
     @pytest.mark.asyncio
     async def test_response_model_changed_has_correct_vendor(self, model_agent):
@@ -314,7 +316,7 @@ class TestModelSetResponseFormat:
         result = await model_agent.set_model("google/gemini-3-pro-preview")
 
         # Extract only the marker payload, not any surrounding message text.
-        message = result["message"]
+        message = result.data["message"]
         marker = "MODEL_CHANGED:"
         json_start = message.index(marker) + len(marker)
         json_str = message[json_start:].strip()
@@ -355,7 +357,7 @@ class TestExplicitVendorPassing:
         """Two-arg format: !model-set openrouter google/gemini-3-pro"""
         result = await model_agent.set_model("openrouter", "google/gemini-3-pro-preview")
 
-        assert result["success"] is True
+        assert result.status is ToolResultStatus.OK
         model_name, vendor, route = model_agent.llm_service.set_model_preference.call_args[0]
 
         # Vendor should be exactly what was passed, no guessing
@@ -368,7 +370,7 @@ class TestExplicitVendorPassing:
         """Two-arg format: !model-set openai gpt-5"""
         result = await model_agent.set_model("openai", "gpt-5")
 
-        assert result["success"] is True
+        assert result.status is ToolResultStatus.OK
         model_name, vendor, route = model_agent.llm_service.set_model_preference.call_args[0]
 
         assert vendor == "openai"
@@ -379,7 +381,7 @@ class TestExplicitVendorPassing:
         """Two-arg format: !model-set ollama llama3.2:3b"""
         result = await model_agent.set_model("ollama", "llama3.2:3b")
 
-        assert result["success"] is True
+        assert result.status is ToolResultStatus.OK
         model_name, vendor, route = model_agent.llm_service.set_model_preference.call_args[0]
 
         assert vendor == "ollama"
@@ -390,7 +392,7 @@ class TestExplicitVendorPassing:
         """Two-arg format with route: !model-set anthropic:plan claude-sonnet-4-6"""
         result = await model_agent.set_model("anthropic:plan", "claude-sonnet-4-6")
 
-        assert result["success"] is True
+        assert result.status is ToolResultStatus.OK
         model_name, vendor, route = model_agent.llm_service.set_model_preference.call_args[0]
 
         assert vendor == "anthropic"
@@ -402,7 +404,7 @@ class TestExplicitVendorPassing:
         """Single-arg format (direct command): !model-set gpt-5"""
         result = await model_agent.set_model("gpt-5")
 
-        assert result["success"] is True
+        assert result.status is ToolResultStatus.OK
         model_name, vendor, route = model_agent.llm_service.set_model_preference.call_args[0]
 
         # No vendor specified at the feature level; LLMService resolves.
@@ -414,7 +416,7 @@ class TestExplicitVendorPassing:
         """Single-arg format with vendor/model: !model-set openai/gpt-5"""
         result = await model_agent.set_model("openai/gpt-5")
 
-        assert result["success"] is True
+        assert result.status is ToolResultStatus.OK
         model_name, vendor, route = model_agent.llm_service.set_model_preference.call_args[0]
 
         # Should parse the slash as vendor/model
@@ -427,7 +429,7 @@ class TestExplicitVendorPassing:
         # UI sends explicit vendor, model kept intact
         result = await model_agent.set_model("openrouter", "anthropic/claude-3.5-sonnet")
 
-        assert result["success"] is True
+        assert result.status is ToolResultStatus.OK
         model_name, vendor, route = model_agent.llm_service.set_model_preference.call_args[0]
 
         # Vendor from explicit arg, model kept as full ID
