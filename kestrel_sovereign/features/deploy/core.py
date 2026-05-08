@@ -150,38 +150,68 @@ class DeployManagerCore:
 
         return profiles
 
-    @staticmethod
     def _validate_no_unresolved_placeholders(
-        profile_name: str, profile: DeploymentProfile
+        self, profile_name: str, profile: DeploymentProfile
     ) -> None:
-        """Raise DeployManagerError if any expanded value still contains
-        ``${VAR}`` — meaning the runtime env didn't have the variable
-        set. We refuse to deploy with broken config rather than push it
-        to Cloud Run silently. Mirrors the bash scripts'
-        ``${VAR:?Set VAR env var ...}`` shape.
+        """Raise DeployManagerError if any expanded value still
+        contains ``${VAR}`` (env var unset) OR if the original config
+        used ``${VAR}`` syntax and the expanded value is now empty
+        (env var set but blank). The bash predecessors used
+        ``${VAR:?...}`` which errored on EITHER condition; we mirror
+        that so missing/empty secrets like ``KESTREL_ALLOWED_EMAILS``
+        don't silently produce an OAuth-enabled service that locks
+        everyone out. Codex review on the final epic→main PR caught
+        the empty-string gap.
         """
-        unresolved = []
-        for key, value in (profile.env_vars or {}).items():
-            if isinstance(value, str) and "${" in value:
-                unresolved.append(("env_vars", key, value))
-        for key, value in (profile.secrets or {}).items():
-            if isinstance(value, str) and "${" in value:
-                unresolved.append(("secrets", key, value))
+        # Load the raw (pre-expansion) profile config so we can
+        # distinguish "this value was a ${VAR} substitution" from
+        # "this value was literally empty in the TOML".
+        raw_profile = (self.config.get("profiles", {}) or {}).get(profile_name, {}) or {}
+        raw_env = raw_profile.get("env_vars", {}) or {}
+        raw_secrets = raw_profile.get("secrets", {}) or {}
 
-        if unresolved:
-            details = "; ".join(
+        unresolved = []
+        empty_after_expansion = []
+
+        def _check(section: str, raw_dict, expanded_dict):
+            for key, expanded in (expanded_dict or {}).items():
+                if not isinstance(expanded, str):
+                    continue
+                if "${" in expanded:
+                    unresolved.append((section, key, expanded))
+                    continue
+                # Empty after expansion + raw used ${...} → bash's
+                # ``${VAR:?...}`` would have errored.
+                raw = raw_dict.get(key)
+                if (
+                    isinstance(raw, str)
+                    and "${" in raw
+                    and expanded == ""
+                ):
+                    empty_after_expansion.append((section, key, raw))
+
+        _check("env_vars", raw_env, profile.env_vars)
+        _check("secrets", raw_secrets, profile.secrets)
+
+        if unresolved or empty_after_expansion:
+            details_unresolved = "; ".join(
                 f"{section}.{key}={value!r}" for section, key, value in unresolved
             )
+            details_empty = "; ".join(
+                f"{section}.{key}={raw!r} (env var set but empty)"
+                for section, key, raw in empty_after_expansion
+            )
+            details = "; ".join(d for d in (details_unresolved, details_empty) if d)
             missing_vars = sorted({
                 m.group(1)
-                for _, _, value in unresolved
+                for _, _, value in (unresolved + empty_after_expansion)
                 for m in re.finditer(r'\$\{([^}]+)\}', value)
             })
             raise DeployManagerError(
-                f"profile '{profile_name}' has unresolved ${{...}} placeholders "
-                f"(missing env vars: {', '.join(missing_vars)}). "
-                f"Export them before running `kestrel deploy {profile_name}`. "
-                f"Affected: {details}"
+                f"profile '{profile_name}' has unresolved or empty ${{...}} "
+                f"placeholders (env vars: {', '.join(missing_vars)}). "
+                f"Export them with non-empty values before running "
+                f"`kestrel deploy {profile_name}`. Affected: {details}"
             )
 
     @staticmethod

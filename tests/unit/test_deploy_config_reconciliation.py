@@ -402,6 +402,34 @@ def test_get_provider_caches_per_profile_project(live_config):
 
 
 @pytest.mark.asyncio
+async def test_deploy_profile_rejects_empty_string_placeholder(
+    live_config, monkeypatch
+):
+    """Codex review on the final epic→main PR: when ``${VAR}`` resolves
+    to an empty string (env var SET but blank — common with unset
+    GitHub secrets that become ``""`` in step env), the previous
+    validator missed it because the literal ``${`` wasn't in the
+    expanded value. Result: ``kestrel deploy dev`` would deploy with
+    OAuth enabled but no allowed emails, locking everyone out.
+
+    Bash ``${VAR:?...}`` errored on EITHER unset OR empty; the new
+    validator does too.
+    """
+    from kestrel_sovereign.features.deploy.models import DeployManagerError
+
+    # Set the env var to empty string — the substitution produces "".
+    monkeypatch.setenv("KESTREL_ALLOWED_EMAILS", "")
+    manager = DeployManager(config=live_config)
+
+    result = await manager.deploy_profile("dev")
+
+    assert result["success"] is False
+    msg = result["error"]
+    assert "empty" in msg or "unresolved" in msg
+    assert "KESTREL_ALLOWED_EMAILS" in msg
+
+
+@pytest.mark.asyncio
 async def test_deploy_profile_rejects_unresolved_placeholders(
     live_config, monkeypatch
 ):
