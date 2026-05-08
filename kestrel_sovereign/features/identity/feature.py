@@ -16,9 +16,10 @@ import asyncio
 import json
 import logging
 import os
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.storage_access import resolve_feature_database
@@ -26,6 +27,21 @@ from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
 
 logger = logging.getLogger(__name__)
+
+
+def _unique_export_filename() -> str:
+    """Generate a collision-resistant filename for an identity export.
+
+    Round 4 codex finding: ``strftime('%Y%m%d_%H%M%S')`` granularity
+    is per-second, so two exports within the same second overwrite
+    each other. Append a microsecond stamp + 8-char uuid hex to
+    make collisions astronomically unlikely.
+    """
+    now = datetime.now(timezone.utc)
+    return (
+        f"identity_{now.strftime('%Y%m%d_%H%M%S')}_"
+        f"{now.microsecond:06d}_{uuid.uuid4().hex[:8]}.json"
+    )
 
 
 class IdentityFeature(Feature):
@@ -166,7 +182,7 @@ class IdentityFeature(Feature):
                     try:
                         storage_dir = Path(os.environ.get("KESTREL_DATA_DIR", "agent_data"))
                         storage_dir.mkdir(exist_ok=True)
-                        filename = f"identity_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.json"
+                        filename = _unique_export_filename()
                         fallback_filepath = storage_dir / filename
                         with open(fallback_filepath, 'w', encoding='utf-8') as f:
                             f.write(package_json)
@@ -237,7 +253,7 @@ class IdentityFeature(Feature):
                 # Save to local file
                 storage_dir = Path(os.environ.get("KESTREL_DATA_DIR", "agent_data"))
                 storage_dir.mkdir(exist_ok=True)
-                filename = f"identity_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.json"
+                filename = _unique_export_filename()
                 filepath = storage_dir / filename
 
                 with open(filepath, 'w', encoding='utf-8') as f:

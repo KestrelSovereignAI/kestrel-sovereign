@@ -128,6 +128,20 @@ async def test_assess_substrate_unknown_is_partial(monkeypatch):
     assert "best-effort" in result.error.lower() or "untrusted" in result.error.lower()
 
 
+def test_unique_export_filename_does_not_collide():
+    """Round 4 codex finding: per-second timestamp granularity used
+    to collide on rapid concurrent exports. The new helper appends
+    microsecond + uuid hex to make collisions vanishingly unlikely."""
+    from kestrel_sovereign.features.identity.feature import _unique_export_filename
+    seen = set()
+    for _ in range(2000):
+        name = _unique_export_filename()
+        assert name not in seen, f"filename collision: {name}"
+        assert name.startswith("identity_")
+        assert name.endswith(".json")
+        seen.add(name)
+
+
 @pytest.mark.asyncio
 async def test_verify_identity_unsigned_is_partial(monkeypatch, tmp_path):
     """Round 3 codex finding: an UNSIGNED package isn't a verify
