@@ -92,6 +92,8 @@ export async function loadCommands(apiModule) {
 //     sessionId: string|null,
 //     scrollPos: number,
 //     hasUnrenderedMermaid: boolean,    // mermaid render deferred until mount
+//     pendingRevise: boolean,            // Wave 5C: server fired a `revising` SSE event;
+//                                        //   next chunk replaces (not appends) the bubble
 //   }
 const chatPanes = new Map();
 let mountedChatAgent;  // undefined sentinel — null is a valid key
@@ -169,6 +171,7 @@ export function getOrCreateChatPane(agentName) {
         sessionId: null,
         scrollPos: 0,
         hasUnrenderedMermaid: false,
+        pendingRevise: false,
     };
     chatPanes.set(agentName, pane);
     return pane;

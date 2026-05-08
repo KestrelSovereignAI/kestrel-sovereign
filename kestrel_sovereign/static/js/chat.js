@@ -124,6 +124,7 @@ export function wipeAgentChatPane(agentName, html = '') {
     pane.fullContent = '';
     pane.sessionId = null;
     pane.hasUnrenderedMermaid = false;
+    pane.pendingRevise = false;
     pane.element.innerHTML = html;
     pane.scrollPos = 0;
 }
@@ -267,6 +268,45 @@ export function connectNotifications() {
                 showTaskNotification(data.message, data.type);
             } catch (err) {
                 console.error('Failed to parse task notification:', err);
+            }
+        });
+
+        // Constitutional honesty signal — Wave 5C of #1048.
+        //
+        // The server fires `revising` from agent/streaming.py the moment
+        // the LLM begins emitting a tool call (Wave 5B's marker). The
+        // pre-tool prose the user is currently watching ("Saving that
+        // now...") is about to be obsolete — the agent will substitute
+        // the tool's actual result. We retract that bubble visually and
+        // arm the dispatch's streaming loop so the next chunk REPLACES
+        // the in-flight content rather than appending to it.
+        //
+        // Routing: the server includes ``request_id`` so we can match
+        // the event to the dispatch agent's pane (multi-pane / multi-
+        // tab safe). If no pane is found, the dispatch already
+        // completed or rolled over — we drop silently.
+        notificationEventSource.addEventListener('revising', (e) => {
+            try {
+                const data = JSON.parse(e.data);
+                const targetRequestId = data && data.request_id;
+                if (!targetRequestId) return;
+                for (const [agentName, pane] of state.chatPanes) {
+                    const paneRequestId = API.getCurrentStreamRequestId(agentName);
+                    if (paneRequestId !== targetRequestId) continue;
+                    if (!pane.streamingMsgDiv) return;
+                    pane.pendingRevise = true;
+                    // Replace the in-flight bubble's body with a
+                    // placeholder. The streaming loop's next chunk
+                    // will overwrite this with the post-tool synthesis.
+                    const contentSlot =
+                        pane.streamingMsgDiv.querySelector('.message-content')
+                        || pane.streamingMsgDiv;
+                    contentSlot.innerHTML =
+                        '<em class="revising-placeholder">Revising — checking tool result...</em>';
+                    return;
+                }
+            } catch (err) {
+                console.error('Failed to handle revising event:', err);
             }
         });
 
@@ -556,6 +596,17 @@ export async function sendMessage() {
                 // from state.selectedHostAgent at fetch time.
                 let learnedSessionId = false;
                 for await (const chunk of API.streamInvoke(text, null, sessionId, null, false, dispatchAgent)) {
+                    // Wave 5C: if the SSE listener saw a `revising`
+                    // event for this dispatch's request_id, drop the
+                    // pre-tool prose accumulated so far and let this
+                    // chunk reset the streaming text. The server's
+                    // post-tool synthesis is starting fresh; the user
+                    // saw the placeholder and is about to see the
+                    // grounded answer.
+                    if (pane.pendingRevise) {
+                        fullContent = '';
+                        pane.pendingRevise = false;
+                    }
                     fullContent += chunk;
                     // The server resolves the effective session_id and
                     // returns it as the X-Session-Id response header,
@@ -636,6 +687,7 @@ export async function sendMessage() {
         }
     } finally {
         pane.streamingMsgDiv = null;
+        pane.pendingRevise = false;
         state.waitingAgents.delete(dispatchAgent);
         refreshAgentThinkingDot(dispatchAgent);
         // Drive the visible thinking indicator from whatever agent the
