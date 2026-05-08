@@ -29,11 +29,12 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
+from kestrel_sdk.tools.base import ToolCategory
+from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.scheduler.cron import CronParseError, next_run, parse
 from kestrel_sovereign.features.scheduler.runner import SchedulerRunner
 from kestrel_sovereign.features.storage_access import resolve_feature_database
-from kestrel_sdk.tools.base import ToolCategory
 
 logger = logging.getLogger(__name__)
 
@@ -126,7 +127,8 @@ class SchedulerFeature(Feature):
 
         # Check what's already scheduled
         existing = await self.schedule_list()
-        existing_names = {t["task_name"] for t in existing.get("tasks", [])}
+        existing_tasks = (existing.data or {}).get("tasks", []) if existing.data else []
+        existing_names = {t["task_name"] for t in existing_tasks}
 
         # Reflection-dependent schedules only if ReflectionFeature is loaded
         has_reflection = "ReflectionFeature" in agent.features
@@ -163,10 +165,13 @@ class SchedulerFeature(Feature):
             result = await self.schedule_add(
                 cron_expression=cron, task_name=task_name, args_json=args,
             )
-            if result.get("success"):
-                logger.info("Scheduled '%s' (%s), next: %s", task_name, cron, result.get("next_run_at"))
+            if result.status is ToolResultStatus.OK:
+                logger.info(
+                    "Scheduled '%s' (%s), next: %s",
+                    task_name, cron, (result.data or {}).get("next_run_at"),
+                )
             else:
-                logger.warning("Failed to schedule '%s': %s", task_name, result.get("error"))
+                logger.warning("Failed to schedule '%s': %s", task_name, result.error)
 
     async def shutdown(self):
         """Stop the background runner."""
@@ -424,15 +429,12 @@ class SchedulerFeature(Feature):
         category=ToolCategory.UTILITY,
         command_prefix="!schedule list",
     )
-    async def schedule_list(self) -> Dict[str, Any]:
+    async def schedule_list(self) -> ToolResult:
         """
         List all scheduled tasks for the current agent.
-
-        Returns:
-            Dict with list of tasks and count
         """
         if not self._db:
-            return {"success": False, "error": "Database not available"}
+            return ToolResult.failed("Database not available")
 
         try:
             rows = await self._db.fetchall(
@@ -445,25 +447,27 @@ class SchedulerFeature(Feature):
                 """,
                 (self._agent_id,),
             )
-
-            tasks = []
-            for row in rows:
-                tasks.append({
-                    "id": row[0],
-                    "task_name": row[1],
-                    "cron_expression": row[2],
-                    "args": json.loads(row[3]) if row[3] else {},
-                    "enabled": bool(row[4]),
-                    "last_run_at": row[5],
-                    "next_run_at": row[6],
-                    "created_at": row[7],
-                })
-
-            return {"tasks": tasks, "count": len(tasks)}
-
         except Exception as e:
             logger.error("Failed to list scheduled tasks: %s", e)
-            return {"success": False, "error": str(e)}
+            return ToolResult.failed(str(e))
+
+        tasks = []
+        for row in rows:
+            tasks.append({
+                "id": row[0],
+                "task_name": row[1],
+                "cron_expression": row[2],
+                "args": json.loads(row[3]) if row[3] else {},
+                "enabled": bool(row[4]),
+                "last_run_at": row[5],
+                "next_run_at": row[6],
+                "created_at": row[7],
+            })
+
+        return ToolResult.ok(
+            confirmation=f"Listed {len(tasks)} scheduled task(s)",
+            data={"tasks": tasks, "count": len(tasks)},
+        )
 
     @tool(
         "schedule_add",
@@ -476,7 +480,7 @@ class SchedulerFeature(Feature):
         cron_expression: str,
         task_name: str,
         args_json: str = "{}",
-    ) -> Dict[str, Any]:
+    ) -> ToolResult:
         """
         Add a new scheduled task.
 
@@ -484,34 +488,28 @@ class SchedulerFeature(Feature):
             cron_expression: Cron expression (5 fields) or alias like @daily, @hourly
             task_name: Name of the tool to execute (e.g. wellness_check, audit_anchor)
             args_json: JSON-encoded arguments to pass to the tool (default: {})
-
-        Returns:
-            Dict with the created task details
         """
         if not self._db:
-            return {"success": False, "error": "Database not available"}
+            return ToolResult.failed("Database not available")
 
-        # Validate cron expression
         try:
             parse(cron_expression)
         except CronParseError as e:
-            return {"success": False, "error": f"Invalid cron expression: {e}"}
+            return ToolResult.failed(f"Invalid cron expression: {e}")
 
-        # Validate args JSON
         try:
             parsed_args = json.loads(args_json)
             if not isinstance(parsed_args, dict):
-                return {"success": False, "error": "args_json must be a JSON object"}
+                return ToolResult.failed("args_json must be a JSON object")
         except json.JSONDecodeError as e:
-            return {"success": False, "error": f"Invalid args_json: {e}"}
+            return ToolResult.failed(f"Invalid args_json: {e}")
 
-        # Compute first run time
         now = datetime.now(timezone.utc)
         try:
             first_run = next_run(cron_expression, after=now)
             next_run_at = first_run.isoformat()
         except CronParseError as e:
-            return {"success": False, "error": f"Cannot compute next run: {e}"}
+            return ToolResult.failed(f"Cannot compute next run: {e}")
 
         task_id = str(uuid.uuid4())
         now_iso = now.isoformat()
@@ -529,21 +527,27 @@ class SchedulerFeature(Feature):
             )
         except Exception as e:
             logger.error("Failed to add scheduled task: %s", e)
-            return {"success": False, "error": str(e)}
+            return ToolResult.failed(str(e))
 
         logger.info(
             "Scheduled task added: %s (%s) cron=%s next=%s",
             task_id, task_name, cron_expression, next_run_at,
         )
 
-        return {
-            "success": True,
-            "task_id": task_id,
-            "task_name": task_name,
-            "cron_expression": cron_expression,
-            "next_run_at": next_run_at,
-            "created_at": now_iso,
-        }
+        return ToolResult.ok(
+            confirmation=(
+                f"Scheduled '{task_name}' (id={task_id[:8]}) "
+                f"cron={cron_expression} next={next_run_at}"
+            ),
+            data={
+                "success": True,
+                "task_id": task_id,
+                "task_name": task_name,
+                "cron_expression": cron_expression,
+                "next_run_at": next_run_at,
+                "created_at": now_iso,
+            },
+        )
 
     @tool(
         "schedule_remove",
@@ -551,39 +555,40 @@ class SchedulerFeature(Feature):
         category=ToolCategory.UTILITY,
         command_prefix="!schedule remove",
     )
-    async def schedule_remove(self, task_id: str) -> Dict[str, Any]:
+    async def schedule_remove(self, task_id: str) -> ToolResult:
         """
         Remove a scheduled task.
 
         Args:
             task_id: The UUID of the task to remove
-
-        Returns:
-            Dict with removal status
         """
         if not self._db:
-            return {"success": False, "error": "Database not available"}
+            return ToolResult.failed("Database not available")
 
         try:
-            # Check task exists and belongs to this agent
             row = await self._db.fetchone(
                 "SELECT id FROM scheduled_tasks WHERE id = ? AND agent_id = ?",
                 (task_id, self._agent_id),
             )
             if not row:
-                return {"success": False, "error": f"Task {task_id} not found"}
+                return ToolResult.failed(
+                    f"Task {task_id} not found",
+                    data={"task_id": task_id},
+                )
 
             await self._db.execute(
                 "DELETE FROM scheduled_tasks WHERE id = ? AND agent_id = ?",
                 (task_id, self._agent_id),
             )
-
-            logger.info("Scheduled task removed: %s", task_id)
-            return {"success": True, "task_id": task_id, "status": "removed"}
-
         except Exception as e:
             logger.error("Failed to remove task %s: %s", task_id, e)
-            return {"success": False, "error": str(e)}
+            return ToolResult.failed(str(e))
+
+        logger.info("Scheduled task removed: %s", task_id)
+        return ToolResult.ok(
+            confirmation=f"Removed scheduled task {task_id}",
+            data={"success": True, "task_id": task_id, "status": "removed"},
+        )
 
     @tool(
         "schedule_pause",
@@ -591,18 +596,15 @@ class SchedulerFeature(Feature):
         category=ToolCategory.UTILITY,
         command_prefix="!schedule pause",
     )
-    async def schedule_pause(self, task_id: str) -> Dict[str, Any]:
+    async def schedule_pause(self, task_id: str) -> ToolResult:
         """
         Pause a scheduled task.
 
         Args:
             task_id: The UUID of the task to pause
-
-        Returns:
-            Dict with pause status
         """
         if not self._db:
-            return {"success": False, "error": "Database not available"}
+            return ToolResult.failed("Database not available")
 
         try:
             row = await self._db.fetchone(
@@ -610,22 +612,30 @@ class SchedulerFeature(Feature):
                 (task_id, self._agent_id),
             )
             if not row:
-                return {"success": False, "error": f"Task {task_id} not found"}
+                return ToolResult.failed(
+                    f"Task {task_id} not found",
+                    data={"task_id": task_id},
+                )
 
             if not row[1]:
-                return {"success": True, "task_id": task_id, "status": "already_paused"}
+                return ToolResult.ok(
+                    confirmation=f"Task {task_id} was already paused (no-op)",
+                    data={"success": True, "task_id": task_id, "status": "already_paused"},
+                )
 
             await self._db.execute(
                 "UPDATE scheduled_tasks SET enabled = 0 WHERE id = ? AND agent_id = ?",
                 (task_id, self._agent_id),
             )
-
-            logger.info("Scheduled task paused: %s", task_id)
-            return {"success": True, "task_id": task_id, "status": "paused"}
-
         except Exception as e:
             logger.error("Failed to pause task %s: %s", task_id, e)
-            return {"success": False, "error": str(e)}
+            return ToolResult.failed(str(e))
+
+        logger.info("Scheduled task paused: %s", task_id)
+        return ToolResult.ok(
+            confirmation=f"Paused scheduled task {task_id}",
+            data={"success": True, "task_id": task_id, "status": "paused"},
+        )
 
     @tool(
         "schedule_resume",
@@ -633,18 +643,15 @@ class SchedulerFeature(Feature):
         category=ToolCategory.UTILITY,
         command_prefix="!schedule resume",
     )
-    async def schedule_resume(self, task_id: str) -> Dict[str, Any]:
+    async def schedule_resume(self, task_id: str) -> ToolResult:
         """
         Resume a paused scheduled task.
 
         Args:
             task_id: The UUID of the task to resume
-
-        Returns:
-            Dict with resume status
         """
         if not self._db:
-            return {"success": False, "error": "Database not available"}
+            return ToolResult.failed("Database not available")
 
         try:
             row = await self._db.fetchone(
@@ -652,36 +659,62 @@ class SchedulerFeature(Feature):
                 (task_id, self._agent_id),
             )
             if not row:
-                return {"success": False, "error": f"Task {task_id} not found"}
+                return ToolResult.failed(
+                    f"Task {task_id} not found",
+                    data={"task_id": task_id},
+                )
 
             if row[1]:
-                return {"success": True, "task_id": task_id, "status": "already_running"}
+                return ToolResult.ok(
+                    confirmation=f"Task {task_id} was already running (no-op)",
+                    data={"success": True, "task_id": task_id, "status": "already_running"},
+                )
 
-            # Recompute next_run_at from now
             cron_expr = row[2]
             now = datetime.now(timezone.utc)
+            cron_now_invalid = False
             try:
                 nxt = next_run(cron_expr, after=now)
                 next_run_at = nxt.isoformat()
             except CronParseError:
                 next_run_at = None
+                cron_now_invalid = True
 
             await self._db.execute(
                 "UPDATE scheduled_tasks SET enabled = 1, next_run_at = ? WHERE id = ? AND agent_id = ?",
                 (next_run_at, task_id, self._agent_id),
             )
-
-            logger.info("Scheduled task resumed: %s (next_run=%s)", task_id, next_run_at)
-            return {
-                "success": True,
-                "task_id": task_id,
-                "status": "resumed",
-                "next_run_at": next_run_at,
-            }
-
         except Exception as e:
             logger.error("Failed to resume task %s: %s", task_id, e)
-            return {"success": False, "error": str(e)}
+            return ToolResult.failed(str(e))
+
+        logger.info("Scheduled task resumed: %s (next_run=%s)", task_id, next_run_at)
+        data = {
+            "success": True,
+            "task_id": task_id,
+            "status": "resumed",
+            "next_run_at": next_run_at,
+        }
+
+        # Honesty: a resumed task whose cron expression no longer parses
+        # is enabled in the DB but has next_run_at=None — the runner will
+        # never fire it. The agent must speak that the task won't actually
+        # run, not just claim it was resumed.
+        if cron_now_invalid:
+            return ToolResult.partial(
+                confirmation=f"Resumed task {task_id} (enabled flag set)",
+                error=(
+                    f"cron expression {cron_expr!r} no longer parses; "
+                    "next_run_at is null and the runner will never fire "
+                    "this task. Use schedule_update to set a valid cron."
+                ),
+                data=data,
+            )
+
+        return ToolResult.ok(
+            confirmation=f"Resumed scheduled task {task_id} (next={next_run_at})",
+            data=data,
+        )
 
     @tool(
         "schedule_update",
@@ -693,7 +726,7 @@ class SchedulerFeature(Feature):
         self,
         task_id: str,
         cron_expression: str,
-    ) -> Dict[str, Any]:
+    ) -> ToolResult:
         """
         Update the cron expression on an existing scheduled task and recompute
         its next_run_at. Used by dynamic/self-adjusting schedulers (e.g. the
@@ -702,18 +735,14 @@ class SchedulerFeature(Feature):
         Args:
             task_id: The UUID of the task to update
             cron_expression: New cron expression (5 fields or alias)
-
-        Returns:
-            Dict with success, task_id, old_cron, new_cron, next_run_at
         """
         if not self._db:
-            return {"success": False, "error": "Database not available"}
+            return ToolResult.failed("Database not available")
 
-        # Validate new cron expression
         try:
             parse(cron_expression)
         except CronParseError as e:
-            return {"success": False, "error": f"Invalid cron expression: {e}"}
+            return ToolResult.failed(f"Invalid cron expression: {e}")
 
         try:
             row = await self._db.fetchone(
@@ -721,18 +750,26 @@ class SchedulerFeature(Feature):
                 (task_id, self._agent_id),
             )
             if not row:
-                return {"success": False, "error": f"Task {task_id} not found"}
+                return ToolResult.failed(
+                    f"Task {task_id} not found",
+                    data={"task_id": task_id},
+                )
 
             old_cron = row[0]
             enabled = bool(row[1])
 
             if old_cron == cron_expression:
-                return {
-                    "success": True,
-                    "task_id": task_id,
-                    "status": "unchanged",
-                    "cron_expression": cron_expression,
-                }
+                return ToolResult.ok(
+                    confirmation=(
+                        f"Task {task_id} cron unchanged ({cron_expression}); no-op"
+                    ),
+                    data={
+                        "success": True,
+                        "task_id": task_id,
+                        "status": "unchanged",
+                        "cron_expression": cron_expression,
+                    },
+                )
 
             now = datetime.now(timezone.utc)
             next_run_at: Optional[str] = None
@@ -740,7 +777,7 @@ class SchedulerFeature(Feature):
                 try:
                     next_run_at = next_run(cron_expression, after=now).isoformat()
                 except CronParseError as e:
-                    return {"success": False, "error": f"Cannot compute next run: {e}"}
+                    return ToolResult.failed(f"Cannot compute next run: {e}")
 
             await self._db.execute(
                 """
@@ -750,23 +787,28 @@ class SchedulerFeature(Feature):
                 """,
                 (cron_expression, next_run_at, task_id, self._agent_id),
             )
+        except Exception as e:
+            logger.error("Failed to update task %s: %s", task_id, e)
+            return ToolResult.failed(str(e))
 
-            logger.info(
-                "Scheduled task updated: %s cron: %s -> %s (next=%s)",
-                task_id, old_cron, cron_expression, next_run_at,
-            )
-            return {
+        logger.info(
+            "Scheduled task updated: %s cron: %s -> %s (next=%s)",
+            task_id, old_cron, cron_expression, next_run_at,
+        )
+        return ToolResult.ok(
+            confirmation=(
+                f"Updated task {task_id} cron: {old_cron} -> {cron_expression} "
+                f"(next={next_run_at})"
+            ),
+            data={
                 "success": True,
                 "task_id": task_id,
                 "status": "updated",
                 "old_cron": old_cron,
                 "cron_expression": cron_expression,
                 "next_run_at": next_run_at,
-            }
-
-        except Exception as e:
-            logger.error("Failed to update task %s: %s", task_id, e)
-            return {"success": False, "error": str(e)}
+            },
+        )
 
     @tool(
         "schedule_record_outcome",
@@ -778,7 +820,7 @@ class SchedulerFeature(Feature):
         self,
         execution_id: str,
         signal: float,
-    ) -> Dict[str, Any]:
+    ) -> ToolResult:
         """
         Record an engagement signal on a past execution. Used when the
         downstream outcome is only known later — e.g. a morning_signal
@@ -790,17 +832,17 @@ class SchedulerFeature(Feature):
         Args:
             execution_id: The id returned by schedule_history
             signal: Engagement score in [0.0, 1.0]
-
-        Returns:
-            Dict with success, execution_id, signal
         """
         if not self._db:
-            return {"success": False, "error": "Database not available"}
+            return ToolResult.failed("Database not available")
 
         try:
-            clamped = max(0.0, min(1.0, float(signal)))
+            signal_val = float(signal)
         except (TypeError, ValueError):
-            return {"success": False, "error": f"signal must be numeric, got {signal!r}"}
+            return ToolResult.failed(f"signal must be numeric, got {signal!r}")
+
+        clamped = max(0.0, min(1.0, signal_val))
+        was_clamped = clamped != signal_val
 
         try:
             row = await self._db.fetchone(
@@ -808,17 +850,48 @@ class SchedulerFeature(Feature):
                 (execution_id, self._agent_id),
             )
             if not row:
-                return {"success": False, "error": f"Execution {execution_id} not found"}
+                return ToolResult.failed(
+                    f"Execution {execution_id} not found",
+                    data={"execution_id": execution_id},
+                )
 
             await self._db.execute(
                 "UPDATE task_execution_log SET outcome_signal = ? WHERE id = ? AND agent_id = ?",
                 (clamped, execution_id, self._agent_id),
             )
-            return {"success": True, "execution_id": execution_id, "signal": clamped}
-
         except Exception as e:
             logger.error("Failed to record outcome for %s: %s", execution_id, e)
-            return {"success": False, "error": str(e)}
+            return ToolResult.failed(str(e))
+
+        data = {
+            "success": True,
+            "execution_id": execution_id,
+            "signal": clamped,
+            "signal_requested": signal_val,
+            "signal_clamped": was_clamped,
+        }
+
+        # Honesty: silently clamping a 1.5 to 1.0 hides the over-range
+        # input from the LLM. Surface as PARTIAL so the agent must
+        # speak the clamping (same pattern as save_fact in #1091).
+        if was_clamped:
+            return ToolResult.partial(
+                confirmation=(
+                    f"Recorded outcome for {execution_id} "
+                    f"(signal={clamped:.2f})"
+                ),
+                error=(
+                    f"requested signal={signal_val} was outside [0.0, 1.0]; "
+                    f"clamped to {clamped:.2f}"
+                ),
+                data=data,
+            )
+        return ToolResult.ok(
+            confirmation=(
+                f"Recorded outcome for {execution_id} (signal={clamped:.2f})"
+            ),
+            data=data,
+        )
 
     @tool(
         "schedule_engagement",
@@ -826,7 +899,7 @@ class SchedulerFeature(Feature):
         category=ToolCategory.UTILITY,
         command_prefix="!schedule engagement",
     )
-    async def schedule_engagement(self, days: int = 7) -> Dict[str, Any]:
+    async def schedule_engagement(self, days: int = 7) -> ToolResult:
         """
         Aggregate recent outcome signals per task.
 
@@ -837,19 +910,16 @@ class SchedulerFeature(Feature):
 
         Args:
             days: Look-back window in days (1-365, default: 7)
-
-        Returns:
-            Dict with per-task aggregates
         """
         try:
             days = int(days)
         except (TypeError, ValueError):
-            return {"success": False, "error": f"days must be an integer, got {days!r}"}
+            return ToolResult.failed(f"days must be an integer, got {days!r}")
         if days < 1 or days > 365:
-            return {"success": False, "error": "days must be in [1, 365]"}
+            return ToolResult.failed("days must be in [1, 365]")
 
         if not self._db:
-            return {"success": False, "error": "Database not available"}
+            return ToolResult.failed("Database not available")
 
         try:
             from datetime import timedelta
@@ -870,23 +940,27 @@ class SchedulerFeature(Feature):
                 """,
                 (since, self._agent_id),
             )
-
-            tasks = [
-                {
-                    "task_id": row[0],
-                    "task_name": row[1],
-                    "cron_expression": row[2],
-                    "executions": row[3] or 0,
-                    "signals": row[4] or 0,
-                    "mean_signal": float(row[5]) if row[5] is not None else None,
-                }
-                for row in rows
-            ]
-            return {"window_days": days, "tasks": tasks, "count": len(tasks)}
-
         except Exception as e:
             logger.error("Failed to aggregate engagement: %s", e)
-            return {"success": False, "error": str(e)}
+            return ToolResult.failed(str(e))
+
+        tasks = [
+            {
+                "task_id": row[0],
+                "task_name": row[1],
+                "cron_expression": row[2],
+                "executions": row[3] or 0,
+                "signals": row[4] or 0,
+                "mean_signal": float(row[5]) if row[5] is not None else None,
+            }
+            for row in rows
+        ]
+        return ToolResult.ok(
+            confirmation=(
+                f"Engagement over last {days} day(s): {len(tasks)} task(s)"
+            ),
+            data={"window_days": days, "tasks": tasks, "count": len(tasks)},
+        )
 
     @tool(
         "schedule_history",
@@ -894,18 +968,15 @@ class SchedulerFeature(Feature):
         category=ToolCategory.UTILITY,
         command_prefix="!schedule history",
     )
-    async def schedule_history(self, limit: int = 20) -> Dict[str, Any]:
+    async def schedule_history(self, limit: int = 20) -> ToolResult:
         """
         Show recent task execution history.
 
         Args:
             limit: Maximum number of execution records to return (default: 20)
-
-        Returns:
-            Dict with list of execution records
         """
         if not self._db:
-            return {"success": False, "error": "Database not available"}
+            return ToolResult.failed("Database not available")
 
         try:
             rows = await self._db.fetchall(
@@ -920,22 +991,24 @@ class SchedulerFeature(Feature):
                 """,
                 (self._agent_id, limit),
             )
-
-            records = []
-            for row in rows:
-                records.append({
-                    "id": row[0],
-                    "task_id": row[1],
-                    "status": row[2],
-                    "result_text": row[3],
-                    "duration_ms": row[4],
-                    "executed_at": row[5],
-                    "task_name": row[6],
-                    "outcome_signal": row[7],
-                })
-
-            return {"executions": records, "count": len(records)}
-
         except Exception as e:
             logger.error("Failed to get execution history: %s", e)
-            return {"success": False, "error": str(e)}
+            return ToolResult.failed(str(e))
+
+        records = []
+        for row in rows:
+            records.append({
+                "id": row[0],
+                "task_id": row[1],
+                "status": row[2],
+                "result_text": row[3],
+                "duration_ms": row[4],
+                "executed_at": row[5],
+                "task_name": row[6],
+                "outcome_signal": row[7],
+            })
+
+        return ToolResult.ok(
+            confirmation=f"Found {len(records)} execution record(s)",
+            data={"executions": records, "count": len(records)},
+        )
