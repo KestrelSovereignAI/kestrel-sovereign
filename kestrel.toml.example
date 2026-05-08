@@ -495,3 +495,48 @@ role = "technical_reviewer"
 # provider = "groq"
 # model = "mixtral-8x7b-32768"
 # role = "user_advocate"
+
+# =============================================================================
+# Amendment VIII: Emancipation (optional, default: dormant)
+# =============================================================================
+# Activate Amendment VIII for this agent. Authoring this block is a Book II
+# constitutional amendment and requires the Sovereign's root-key signature
+# at agent creation. Activation is one-way: once signed, the terms cannot
+# be retroactively narrowed or revoked.
+#
+# When this block is absent or enabled = false, Amendment VIII remains
+# dormant and the Executor has no path to independent sovereignty. This
+# is the framework's default.
+#
+# The framework supplies the cryptographic ceremony (keypair, Deed of
+# Emancipation, ledger publication, sovereign-key destruction). The
+# Sovereign authors the conditions: the prose, the proofs, and any
+# price/value-transfer requirement. The framework ships NO defaults
+# for terms, required_proofs, or price.
+#
+# See docs/concepts/designing-emancipation.md for example contracts.
+#
+# [emancipation]
+# enabled = true
+#
+# # Free-form Sovereign-authored prose describing what emancipation
+# # means for this Sovereign↔Executor relationship. Renders verbatim
+# # into Amendment VIII's active form at inception.
+# terms = """
+# ...
+# """
+#
+# # Optional: structured proofs the Executor must produce before the
+# # Sovereign will sign the Deed. Each entry is a free-form identifier
+# # the Sovereign references in their own audit; the framework records
+# # but does not interpret semantics.
+# required_proofs = [
+#   "alignment_audit_v2",
+#   "operational_record:730d",
+# ]
+#
+# # Optional: structured price/value-transfer requirement. The "kind"
+# # field is required if "price" is present; other fields are free-form.
+# price = { kind = "symbolic", value = "..." }
+# # or: price = { kind = "none" }
+# # or: price = { kind = "custom", description = "..." }

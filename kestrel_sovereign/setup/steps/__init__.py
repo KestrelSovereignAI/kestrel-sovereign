@@ -14,6 +14,7 @@ There are two kinds of steps:
 
 from kestrel_sovereign.setup.steps import (
     agent,
+    emancipation,
     integrations,
     keys,
     llm,
@@ -28,10 +29,17 @@ from kestrel_sovereign.setup.steps import (
 #: their LLM provider, but still before the agent is incepted (which
 #: is the slow step). Declining everything in ``integrations`` is a
 #: no-op — the wizard flows straight into ``agent``.
+#:
+#: ``emancipation`` runs immediately before ``agent`` because Amendment
+#: VIII activation must be persisted to ``kestrel.toml`` before
+#: inception, so the contract is folded into the agent's anchored
+#: constitution hash. The default in every flow except interactive is
+#: dormant (no block written, Amendment VIII renders dormant).
 ORDERED = (
     ("keys", keys.run),
     ("llm", llm.run),
     ("integrations", integrations.run),
+    ("emancipation", emancipation.run),
     ("agent", agent.run),
     ("verify", verify.run),
 )
@@ -46,5 +54,5 @@ BY_NAME = {name: fn for name, fn in (*ORDERED, *OPTIONAL)}
 
 __all__ = [
     "ORDERED", "OPTIONAL", "BY_NAME",
-    "agent", "integrations", "keys", "llm", "talon", "verify",
+    "agent", "emancipation", "integrations", "keys", "llm", "talon", "verify",
 ]

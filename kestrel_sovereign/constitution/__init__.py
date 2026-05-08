@@ -10,6 +10,13 @@ Provides the hierarchical constitution system with four layers:
 The iron rule: each layer may narrow permissions from above, never widen them.
 """
 
+from .emancipation import (
+    EmancipationConfigError,
+    EmancipationContract,
+    apply_emancipation,
+    parse_emancipation_block,
+    render_amendment_viii,
+)
 from .hierarchy import (
     ConstitutionalLayer,
     LayeredConstitution,
@@ -22,4 +29,9 @@ __all__ = [
     "LayeredConstitution",
     "LayerViolation",
     "validate_layer_narrowing",
+    "EmancipationContract",
+    "EmancipationConfigError",
+    "apply_emancipation",
+    "parse_emancipation_block",
+    "render_amendment_viii",
 ]
