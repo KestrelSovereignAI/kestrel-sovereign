@@ -420,17 +420,17 @@ class TestChannelFeature:
 
     @pytest.mark.asyncio
     async def test_channels_list_empty(self, feature):
-        result = await feature.channels_list()
-        assert result["count"] == 0
-        assert result["channels"] == []
+        envelope = await feature.channels_list()
+        assert envelope.data["count"] == 0
+        assert envelope.data["channels"] == []
 
     @pytest.mark.asyncio
     async def test_channels_list_with_adapters(self, feature):
         feature.registry.register(StubAdapter(channel="telegram"))
         feature.registry.register(StubAdapter(channel="discord", connected=False))
-        result = await feature.channels_list()
-        assert result["count"] == 2
-        types = {ch["channel_type"] for ch in result["channels"]}
+        envelope = await feature.channels_list()
+        assert envelope.data["count"] == 2
+        types = {ch["channel_type"] for ch in envelope.data["channels"]}
         assert types == {"telegram", "discord"}
 
     # ----------------------------------------------------------------
@@ -439,54 +439,59 @@ class TestChannelFeature:
 
     @pytest.mark.asyncio
     async def test_send_success(self, feature):
+        from kestrel_sdk.tools.result import ToolResultStatus
         feature.registry.register(StubAdapter(channel="telegram"))
-        result = await feature.channels_send(
+        envelope = await feature.channels_send(
             channel="telegram", to="user123", message="hello"
         )
-        assert result["success"] is True
-        assert result["receipt"]["status"] == "success"
-        assert result["receipt"]["channel_type"] == "telegram"
+        assert envelope.status is ToolResultStatus.OK
+        assert envelope.data["receipt"]["status"] == "success"
+        assert envelope.data["receipt"]["channel_type"] == "telegram"
 
     @pytest.mark.asyncio
     async def test_send_unknown_channel(self, feature):
-        result = await feature.channels_send(
+        from kestrel_sdk.tools.result import ToolResultStatus
+        envelope = await feature.channels_send(
             channel="unknown", to="user", message="hi"
         )
-        assert result["success"] is False
-        assert "No adapter registered" in result["error"]
+        assert envelope.status is ToolResultStatus.ERROR
+        assert "No adapter registered" in envelope.error
 
     @pytest.mark.asyncio
     async def test_send_disconnected_channel(self, feature):
+        from kestrel_sdk.tools.result import ToolResultStatus
         feature.registry.register(
             StubAdapter(channel="telegram", connected=False)
         )
-        result = await feature.channels_send(
+        envelope = await feature.channels_send(
             channel="telegram", to="user", message="hi"
         )
-        assert result["success"] is False
-        assert "not connected" in result["error"]
+        assert envelope.status is ToolResultStatus.ERROR
+        assert "not connected" in envelope.error
 
     @pytest.mark.asyncio
     async def test_send_disabled_channel(self, feature):
+        from kestrel_sdk.tools.result import ToolResultStatus
         cfg = ChannelConfig(channel_type="telegram", enabled=False)
         feature.registry.register(
             StubAdapter(channel="telegram", connected=True, config=cfg)
         )
-        result = await feature.channels_send(
+        envelope = await feature.channels_send(
             channel="telegram", to="user", message="hi"
         )
-        assert result["success"] is False
-        assert "disabled" in result["error"]
+        assert envelope.status is ToolResultStatus.ERROR
+        assert "disabled" in envelope.error
 
     @pytest.mark.asyncio
     async def test_send_adapter_raises(self, feature):
+        from kestrel_sdk.tools.result import ToolResultStatus
         feature.registry.register(FailingAdapter(channel="telegram"))
-        result = await feature.channels_send(
+        envelope = await feature.channels_send(
             channel="telegram", to="user", message="hi"
         )
-        assert result["success"] is False
-        assert result["receipt"]["status"] == "failure"
-        assert "channel down" in result["receipt"]["error"]
+        assert envelope.status is ToolResultStatus.ERROR
+        assert envelope.data["receipt"]["status"] == "failure"
+        assert "channel down" in envelope.data["receipt"]["error"]
 
     @pytest.mark.asyncio
     async def test_send_logs_outbound(self, feature):
@@ -508,6 +513,7 @@ class TestChannelFeature:
 
     @pytest.mark.asyncio
     async def test_history_returns_messages(self, feature):
+        from kestrel_sdk.tools.result import ToolResultStatus
         feature._db.fetchall = AsyncMock(
             return_value=[
                 ("id-1", "telegram", "inbound", "alice", "bot",
@@ -516,17 +522,18 @@ class TestChannelFeature:
                  "hi alice", "success", "2026-03-01T10:01:00"),
             ]
         )
-        result = await feature.channels_history(limit=10)
-        assert result["success"] is True
-        assert result["count"] == 2
-        assert result["messages"][0]["id"] == "id-1"
-        assert result["messages"][1]["direction"] == "outbound"
+        envelope = await feature.channels_history(limit=10)
+        assert envelope.status is ToolResultStatus.OK
+        assert envelope.data["count"] == 2
+        assert envelope.data["messages"][0]["id"] == "id-1"
+        assert envelope.data["messages"][1]["direction"] == "outbound"
 
     @pytest.mark.asyncio
     async def test_history_with_channel_filter(self, feature):
+        from kestrel_sdk.tools.result import ToolResultStatus
         feature._db.fetchall = AsyncMock(return_value=[])
-        result = await feature.channels_history(limit=5, channel="discord")
-        assert result["success"] is True
+        envelope = await feature.channels_history(limit=5, channel="discord")
+        assert envelope.status is ToolResultStatus.OK
         # Verify the query included channel_type filter
         call_args = feature._db.fetchall.call_args
         sql = call_args[0][0]
@@ -534,18 +541,20 @@ class TestChannelFeature:
 
     @pytest.mark.asyncio
     async def test_history_no_db(self, feature_no_db):
-        result = await feature_no_db.channels_history()
-        assert result["success"] is False
-        assert "Database not available" in result["error"]
+        from kestrel_sdk.tools.result import ToolResultStatus
+        envelope = await feature_no_db.channels_history()
+        assert envelope.status is ToolResultStatus.ERROR
+        assert "Database not available" in envelope.error
 
     @pytest.mark.asyncio
     async def test_history_db_error(self, feature):
+        from kestrel_sdk.tools.result import ToolResultStatus
         feature._db.fetchall = AsyncMock(
             side_effect=RuntimeError("connection lost")
         )
-        result = await feature.channels_history()
-        assert result["success"] is False
-        assert "connection lost" in result["error"]
+        envelope = await feature.channels_history()
+        assert envelope.status is ToolResultStatus.ERROR
+        assert "connection lost" in envelope.error
 
     # ----------------------------------------------------------------
     # handle_inbound
@@ -696,11 +705,12 @@ class TestEdgeCases:
         await feat.initialize()
 
         # Register adapter without config
+        from kestrel_sdk.tools.result import ToolResultStatus
         feat.registry.register(StubAdapter(channel="telegram", config=None))
-        result = await feat.channels_send(
+        envelope = await feat.channels_send(
             channel="telegram", to="user", message="hi"
         )
-        assert result["success"] is True
+        assert envelope.status is ToolResultStatus.OK
 
     @pytest.mark.asyncio
     async def test_multiple_adapters_isolated(self):
