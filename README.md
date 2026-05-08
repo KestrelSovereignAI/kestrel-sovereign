@@ -85,7 +85,7 @@ Your agent is now running. Two ports to know about, depending on which start for
 | Command | Listens on | Why |
 |---|---|---|
 | `kestrel start` (no name) | `http://localhost:8888` (the multi-agent **host**) | Default in-process multi-agent mode; the host fronts every agent registered with `autostart = true` at `multi_agent.host.port` (default `8888`). Agents registered with `autostart = false` aren't loaded — start those by name. |
-| `kestrel start <name>` | the **agent's own port**, printed by the CLI on start | Each agent gets the next free slot at or above `8801` (the first auto-assigned agent lands there; subsequent agents go to `8802`, etc., or whatever `--port` you passed to `kestrel create`). The exact value lives in `multi_agent.toml` under that agent's entry, and `kestrel start` prints `host=127.0.0.1 port=NNNN pid=...`. |
+| `kestrel start <name>` | the **agent's own port**, printed by the CLI on start | Each agent gets the next free slot at or above `8801` (the first auto-assigned agent lands there; subsequent agents go to `8802`, etc., or whatever `--port` you passed to `kestrel create`). The exact value lives in `multi_agent.toml` under that agent's entry, and `kestrel start <name>` prints `Starting <name> on :<port>...`. |
 
 > **Port conflict?** Edit the agent's entry in `multi_agent.toml` to change its port, or recreate the agent with a chosen port (`kestrel create MyAgent --port 8899`). Edit `multi_agent.toml`'s `[host]` section to change the host port (default `8888`). `kestrel start` itself doesn't take a `--port` flag — runtime ports are read from `multi_agent.toml`.
 
