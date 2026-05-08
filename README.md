@@ -94,6 +94,31 @@ Your agent is now running. Two ports to know about, depending on which start for
 
 > **Windows users:** the CLI prints emoji. If you see `UnicodeEncodeError: 'charmap' codec can't encode character ...`, run `chcp 65001` once in your PowerShell session to switch the console to UTF-8. (As of v0.1.9 the CLI auto-reconfigures stdout, so a fresh install should not hit this.)
 
+### Install from PyPI (no source clone)
+
+The Quick Start above clones the repo so you have demos, examples, and the `kestrel.toml.example` next to your agent. If you only want to run an agent and don't need the source tree, install from PyPI:
+
+```bash
+# 1. Install the CLI (uv tool install is preferred — `kestrel`
+#    lands on PATH in an isolated venv. Plain `pip install
+#    kestrel-sovereign` works too, into whichever venv is active.)
+uv tool install kestrel-sovereign
+
+# 2. Pick where Kestrel keeps your data. Either set KESTREL_HOME
+#    explicitly (recommended for ops) — or skip this and Kestrel will
+#    use ~/.kestrel/ by default.
+export KESTREL_HOME="$HOME/kestrel-data"
+
+# 3. Same wizard as above. Writes .env, kestrel.toml, multi_agent.toml,
+#    and agent_data/ under $KESTREL_HOME.
+kestrel setup --quickstart
+kestrel start
+```
+
+**Where data lives.** `kestrel` resolves the project directory in this order: `KESTREL_HOME` → walk up from CWD looking for a `multi_agent.toml` / `kestrel.toml` / `.env` marker → `~/.kestrel/` for pip-installed users with no markers anywhere. A pure pip install with no `KESTREL_HOME` and no project in CWD lands on `~/.kestrel/` and creates it on first run. **Never** writes to `site-packages/` — `pip install --upgrade kestrel-sovereign` is safe and won't touch your agent data.
+
+If you later want to switch your data dir, move it: `mv ~/.kestrel /new/path && export KESTREL_HOME=/new/path`. The agent's encrypted DB is portable; nothing about the data dir is hard-coded.
+
 ### CLI Commands (Cross-Platform)
 
 All commands work on Windows, macOS, and Linux. Pass the agent directory as an argument:
