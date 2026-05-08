@@ -68,11 +68,11 @@ uv run kestrel doctor
 uv run kestrel create MyAgent
 
 # 6. Start an agent. Name the one you want, or omit to start every
-#    registered agent. After --quickstart with no step 5, the
-#    registered agent is named "Kestrel".
-uv run kestrel start            # starts every registered agent
+#    agent registered with autostart=true (the wizard's default).
+#    After --quickstart with no step 5, the autostart agent is "Kestrel".
+uv run kestrel start            # starts every agent with autostart=true
 uv run kestrel start Kestrel    # if you only ran --quickstart
-uv run kestrel start MyAgent    # if you ran step 5
+uv run kestrel start MyAgent    # if you ran step 5 (works regardless of autostart)
 ```
 
 If you're upgrading from a pre-2026-05 setup that used a standalone `llm_config.toml`, run `uv run kestrel migrate-llm-config` to fold it into `kestrel.toml [llm]`. The legacy file is no longer read.
@@ -81,7 +81,7 @@ Your agent is now running. Two ports to know about, depending on which start for
 
 | Command | Listens on | Why |
 |---|---|---|
-| `kestrel start` (no name) | `http://localhost:8888` (the multi-agent **host**) | Default in-process multi-agent mode; the host fronts every registered agent at `multi_agent.host.port` (default `8888`). |
+| `kestrel start` (no name) | `http://localhost:8888` (the multi-agent **host**) | Default in-process multi-agent mode; the host fronts every agent registered with `autostart = true` at `multi_agent.host.port` (default `8888`). Agents registered with `autostart = false` aren't loaded — start those by name. |
 | `kestrel start <name>` | `http://localhost:8801` (the **agent**) | A single agent on its own port — the next free slot at or above `8801` (assigned by `kestrel create` and recorded in `multi_agent.toml` under that agent's entry). The CLI prints the chosen port + PID. |
 
 > **Port conflict?** Edit the agent's entry in `multi_agent.toml` to change its port, or recreate the agent with a chosen port (`kestrel create MyAgent --port 8899`). Edit `multi_agent.toml`'s `[host]` section to change the host port (default `8888`). `kestrel start` itself doesn't take a `--port` flag — runtime ports are read from `multi_agent.toml`.
