@@ -1303,6 +1303,15 @@ async def chat_completions(request: Request):
             "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
         }
         return resp
+    except HTTPException:
+        # Preserve the original status code (notably 503 from get_agent
+        # when no agent is bound — multi-agent mode requires the
+        # /api/agents/<name>/v1/chat/completions form). The pre-fix
+        # ``except Exception`` branch swallowed this and emitted a
+        # misleading 500 with "Internal error in chat completions",
+        # which read like a server bug to clients (Open WebUI in
+        # particular) when it was actually a routing problem.
+        raise
     except Exception as e:
         logger.error(f"Error in chat_completions: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal error in chat completions.")

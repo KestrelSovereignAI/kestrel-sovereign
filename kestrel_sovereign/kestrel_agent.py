@@ -1339,8 +1339,31 @@ Expected Duration: {expected_duration}
             return wake_up_msg
 
         elif state == BootstrapState.DISCOVERY:
-            # In discovery mode - process through discovery conversation
-            response, is_complete, wants_avatar = await self.bootstrap_service.process_discovery_message(user_input)
+            # In discovery mode - process through discovery conversation.
+            # If the LLM call fails (e.g. Ollama hiccup, transient cloud
+            # error, no providers configured), auto-complete bootstrap
+            # and fall through to the normal ``process_input`` path so
+            # the user's message still lands on the agent's full LLM
+            # chain. Pre-fix, ``process_discovery_message`` swallowed
+            # the error and returned a canned "I'm having trouble
+            # thinking right now…" string, which Open WebUI showed
+            # verbatim and which was easy to mistake for a model
+            # response. The discovery UX is opt-in — the agent runs
+            # fine without it — so trading it for a working chat path
+            # is the right call here.
+            try:
+                response, is_complete, wants_avatar = await self.bootstrap_service.process_discovery_message(user_input)
+            except Exception as exc:
+                logging.warning(
+                    f"[BOOTSTRAP] Discovery LLM call failed ({exc}); "
+                    f"auto-completing bootstrap so the user's message "
+                    f"reaches the agent's normal LLM path."
+                )
+                try:
+                    await self.bootstrap_service.skip_discovery()
+                except Exception as skip_exc:
+                    logging.error(f"[BOOTSTRAP] Failed to auto-complete after discovery error: {skip_exc}")
+                return None
 
             # Store user message and response in conversation history
             await self.privacy_agent.add_conversation("user", user_input, session_id=session_id)

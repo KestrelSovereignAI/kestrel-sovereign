@@ -212,6 +212,49 @@ def test_chat_completions_reports_active_model_not_request_echo():
         _restore_app(app, original)
 
 
+def test_chat_completions_preserves_503_when_no_agent_bound():
+    """Multi-agent mode binds the agent via routing middleware on the
+    ``/api/agents/<name>/...`` prefix. A bare ``POST /v1/chat/completions``
+    in that mode reaches the handler with no ``request.state.agent`` and
+    no ``app.state.agent``; ``get_agent`` raises ``HTTPException(503)``.
+
+    Pre-fix the handler's ``except Exception`` swallowed the 503 and
+    re-raised as ``HTTPException(500, "Internal error in chat completions")``,
+    which read as a server bug to OpenAI-compat clients (Open WebUI in
+    particular) when the actual problem was a routing problem. The fix
+    is a dedicated ``except HTTPException: raise`` branch."""
+    from server import app
+
+    @asynccontextmanager
+    async def noop_lifespan(_app):
+        yield
+
+    original = {
+        "lifespan": app.router.lifespan_context,
+        "agent": getattr(app.state, "agent", None),
+        "manager": getattr(app.state, "agent_manager", None),
+    }
+    app.router.lifespan_context = noop_lifespan
+    app.state.agent = None
+    app.state.agent_manager = None
+    try:
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                resp = client.post(
+                    "/v1/chat/completions",
+                    headers={"X-API-Key": "test-key"},
+                    json={"messages": [{"role": "user", "content": "hello"}]},
+                )
+        assert resp.status_code == 503, (
+            f"expected 503 from get_agent, got {resp.status_code}: {resp.text}"
+        )
+        assert "Agent not initialized" in resp.json().get("detail", ""), resp.json()
+    finally:
+        app.router.lifespan_context = original["lifespan"]
+        app.state.agent = original["agent"]
+        app.state.agent_manager = original["manager"]
+
+
 def test_chat_completions_without_model_field_reports_active():
     """When the client omits the model field, the response should still report
     the active model — not fall back to 'kestrel-local'."""

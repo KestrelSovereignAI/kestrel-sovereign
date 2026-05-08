@@ -24,10 +24,10 @@ async def make_host_app(config: MultiAgentConfig):
     Patches load_multi_agent_config so the lifespan uses our test config.
     Returns (app, lifespan_manager) — caller must use them in async with.
     """
-    with patch("host.load_multi_agent_config", return_value=config):
+    with patch("kestrel_sovereign.host.load_multi_agent_config", return_value=config):
         # Reload to pick up the patched function reference
         import importlib
-        import host as host_module
+        from kestrel_sovereign import host as host_module
         # Patch at the module level BEFORE reload
         host_module.load_multi_agent_config = lambda: config
         # Now the app references the patched function
@@ -56,7 +56,7 @@ class TestHealthEndpoint:
             }
         )
 
-        import host as host_module
+        from kestrel_sovereign import host as host_module
         original_fn = host_module.load_multi_agent_config
         host_module.load_multi_agent_config = lambda: config
         try:
@@ -86,7 +86,7 @@ class TestHealthEndpoint:
             }
         )
 
-        import host as host_module
+        from kestrel_sovereign import host as host_module
         original_fn = host_module.load_multi_agent_config
         host_module.load_multi_agent_config = lambda: config
         try:
@@ -109,7 +109,7 @@ class TestHealthEndpoint:
         """Health endpoint is accessible without auth."""
         config = MultiAgentConfig(agents={})
 
-        import host as host_module
+        from kestrel_sovereign import host as host_module
         original_fn = host_module.load_multi_agent_config
         host_module.load_multi_agent_config = lambda: config
         try:
@@ -134,7 +134,7 @@ class TestAuthMiddleware:
         """Protected endpoints return 401 without auth."""
         config = MultiAgentConfig(agents={})
 
-        import host as host_module
+        from kestrel_sovereign import host as host_module
         original_fn = host_module.load_multi_agent_config
         host_module.load_multi_agent_config = lambda: config
         try:
@@ -156,7 +156,7 @@ class TestAuthMiddleware:
         test_key = "test-key-12345"
         config = MultiAgentConfig(agents={})
 
-        import host as host_module
+        from kestrel_sovereign import host as host_module
         original_fn = host_module.load_multi_agent_config
         host_module.load_multi_agent_config = lambda: config
         try:
@@ -182,7 +182,7 @@ class TestAuthMiddleware:
         test_key = "test-bearer-key"
         config = MultiAgentConfig(agents={})
 
-        import host as host_module
+        from kestrel_sovereign import host as host_module
         original_fn = host_module.load_multi_agent_config
         host_module.load_multi_agent_config = lambda: config
         try:
@@ -208,7 +208,7 @@ class TestAuthMiddleware:
         test_key = "test-query-key"
         config = MultiAgentConfig(agents={})
 
-        import host as host_module
+        from kestrel_sovereign import host as host_module
         original_fn = host_module.load_multi_agent_config
         host_module.load_multi_agent_config = lambda: config
         try:
@@ -243,7 +243,7 @@ class TestListAgents:
             }
         )
 
-        import host as host_module
+        from kestrel_sovereign import host as host_module
         original_fn = host_module.load_multi_agent_config
         host_module.load_multi_agent_config = lambda: config
         try:
@@ -278,7 +278,7 @@ class TestListAgents:
             }
         )
 
-        import host as host_module
+        from kestrel_sovereign import host as host_module
         original_fn = host_module.load_multi_agent_config
         host_module.load_multi_agent_config = lambda: config
         try:
@@ -310,7 +310,7 @@ class TestListAgents:
             }
         )
 
-        import host as host_module
+        from kestrel_sovereign import host as host_module
         original_fn = host_module.load_multi_agent_config
         host_module.load_multi_agent_config = lambda: config
         try:
@@ -347,7 +347,7 @@ class TestProxyToAgent:
             }
         )
 
-        import host as host_module
+        from kestrel_sovereign import host as host_module
         original_fn = host_module.load_multi_agent_config
         host_module.load_multi_agent_config = lambda: config
         try:
@@ -378,7 +378,7 @@ class TestProxyToAgent:
             }
         )
 
-        import host as host_module
+        from kestrel_sovereign import host as host_module
         original_fn = host_module.load_multi_agent_config
         host_module.load_multi_agent_config = lambda: config
         try:
@@ -417,7 +417,7 @@ class TestProcessManagementEndpoints:
             }
         )
 
-        import host as host_module
+        from kestrel_sovereign import host as host_module
         original_fn = host_module.load_multi_agent_config
         host_module.load_multi_agent_config = lambda: config
         try:
@@ -447,7 +447,7 @@ class TestProcessManagementEndpoints:
             }
         )
 
-        import host as host_module
+        from kestrel_sovereign import host as host_module
         original_fn = host_module.load_multi_agent_config
         host_module.load_multi_agent_config = lambda: config
         try:
@@ -477,7 +477,7 @@ class TestProcessManagementEndpoints:
             }
         )
 
-        import host as host_module
+        from kestrel_sovereign import host as host_module
         original_fn = host_module.load_multi_agent_config
         host_module.load_multi_agent_config = lambda: config
         try:
@@ -507,7 +507,7 @@ class TestProcessManagementEndpoints:
             }
         )
 
-        import host as host_module
+        from kestrel_sovereign import host as host_module
         original_fn = host_module.load_multi_agent_config
         host_module.load_multi_agent_config = lambda: config
         try:
@@ -537,7 +537,7 @@ class TestProcessManagementEndpoints:
             }
         )
 
-        import host as host_module
+        from kestrel_sovereign import host as host_module
         original_fn = host_module.load_multi_agent_config
         host_module.load_multi_agent_config = lambda: config
         try:
@@ -571,7 +571,7 @@ class TestProcessManagementEndpoints:
             }
         )
 
-        import host as host_module
+        from kestrel_sovereign import host as host_module
         original_fn = host_module.load_multi_agent_config
         host_module.load_multi_agent_config = lambda: config
         try:
@@ -604,7 +604,7 @@ class TestProcessManagementEndpoints:
             }
         )
 
-        import host as host_module
+        from kestrel_sovereign import host as host_module
         original_fn = host_module.load_multi_agent_config
         host_module.load_multi_agent_config = lambda: config
         try:
