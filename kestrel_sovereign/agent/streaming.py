@@ -52,6 +52,48 @@ def _build_revise_sentinel(marker: ToolCallStarted) -> str:
     return f"{REVISE_SENTINEL_PREFIX}{payload}{REVISE_SENTINEL_SUFFIX}"
 
 
+def strip_revise_sentinels(chunk: str) -> str:
+    """Strip all complete in-band revise sentinels from a chunk.
+
+    Server-side helper for non-chat consumers of
+    ``process_input_streaming`` — voice/TTS, bridge stream, anything
+    that re-publishes chunks downstream. The chat /stream endpoint
+    passes chunks through verbatim because the chat *client* strips
+    them, but other consumers would otherwise display or speak
+    ``\\x1eKESTREL:REVISE:...`` literally. Codex P1 of #1089 caught
+    the TTS-reading-aloud regression.
+
+    Handles complete sentinels only — split sentinels (across chunks)
+    leak the partial in this function. Server-side consumers that
+    care about the split-chunk case should buffer at their own layer.
+    In practice the server emits the sentinel as a single Python
+    yield, so single-chunk delivery is the overwhelming common case.
+    """
+    if REVISE_SENTINEL_PREFIX not in chunk:
+        return chunk
+    out = []
+    i = 0
+    while i < len(chunk):
+        prefix_idx = chunk.find(REVISE_SENTINEL_PREFIX, i)
+        if prefix_idx < 0:
+            out.append(chunk[i:])
+            break
+        out.append(chunk[i:prefix_idx])
+        close_idx = chunk.find(
+            REVISE_SENTINEL_SUFFIX,
+            prefix_idx + len(REVISE_SENTINEL_PREFIX),
+        )
+        if close_idx < 0:
+            # Split sentinel — no close in this chunk. Drop everything
+            # from the prefix on; the sentinel-close half lands in
+            # the next chunk and looks like leading wire metadata
+            # there. Single-chunk-yield from the server makes this
+            # path effectively unreachable.
+            break
+        i = close_idx + len(REVISE_SENTINEL_SUFFIX)
+    return "".join(out)
+
+
 class StreamingMixin:
     """Mixin class providing streaming response methods."""
 

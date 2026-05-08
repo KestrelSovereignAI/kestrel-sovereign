@@ -189,12 +189,20 @@ def get_router() -> APIRouter:
         async def event_generator():
             full_response = []
             try:
+                # Wave 5E: bridge consumers (Slack/Discord/email/etc.)
+                # don't speak the chat-protocol revise sentinel —
+                # strip it before serializing each chunk into the
+                # bridge SSE event payload.
+                from kestrel_sovereign.agent.streaming import strip_revise_sentinels
                 async for chunk in agent.process_input_streaming(
                     user_input,
                     model_override=body.model_override,
                     session_id=session.id,
                     caller=get_caller(request),
                 ):
+                    chunk = strip_revise_sentinels(chunk)
+                    if not chunk:
+                        continue
                     full_response.append(chunk)
                     event_data = json.dumps({"type": "chunk", "content": chunk})
                     yield f"data: {event_data}\n\n"

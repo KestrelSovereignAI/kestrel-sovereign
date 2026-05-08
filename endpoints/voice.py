@@ -625,9 +625,19 @@ async def voice_chat(websocket: WebSocket):
         full_response = []
         try:
             if hasattr(agent, "process_input_streaming"):
+                # Wave 5E: process_input_streaming yields the in-band
+                # revise sentinel through the chat-protocol channel.
+                # The voice protocol doesn't speak that protocol —
+                # strip the sentinel before TTS / WebSocket send so
+                # the user doesn't hear "Record Separator KESTREL
+                # COLON REVISE..." spoken aloud.
+                from kestrel_sovereign.agent.streaming import strip_revise_sentinels
                 async for chunk in agent.process_input_streaming(
                     transcript_text, caller=caller
                 ):
+                    chunk = strip_revise_sentinels(chunk)
+                    if not chunk:
+                        continue
                     full_response.append(chunk)
                     # Send incremental text to client
                     await send_control({"type": "response", "text": chunk})

@@ -184,6 +184,7 @@ export function wipeAgentChatPane(agentName, html = '') {
     pane.sessionId = null;
     pane.hasUnrenderedMermaid = false;
     pane.pendingRevise = false;
+    pane.reviseConsumedRequestId = null;
     pane.element.innerHTML = html;
     pane.scrollPos = 0;
 }
@@ -332,18 +333,14 @@ export function connectNotifications() {
 
         // Constitutional honesty signal — Wave 5C of #1048.
         //
-        // The server fires `revising` from agent/streaming.py the moment
-        // the LLM begins emitting a tool call (Wave 5B's marker). The
-        // pre-tool prose the user is currently watching ("Saving that
-        // now...") is about to be obsolete — the agent will substitute
-        // the tool's actual result. We retract that bubble visually and
-        // arm the dispatch's streaming loop so the next chunk REPLACES
-        // the in-flight content rather than appending to it.
-        //
-        // Routing: the server includes ``request_id`` so we can match
-        // the event to the dispatch agent's pane (multi-pane / multi-
-        // tab safe). If no pane is found, the dispatch already
-        // completed or rolled over — we drop silently.
+        // Idempotency contract (Wave 5E refined): the in-band sentinel
+        // and this SSE event can both fire for the same request. We
+        // mark a request as "revise consumed" once either path
+        // processes it; subsequent fires for the same request_id are
+        // ignored. Without this, a delayed SSE arriving AFTER the
+        // in-band path already retracted + re-rendered post-tool
+        // would re-arm pendingRevise and clear the post-tool text.
+        // Codex P1 of #1089.
         notificationEventSource.addEventListener('revising', (e) => {
             try {
                 const data = JSON.parse(e.data);
@@ -352,11 +349,12 @@ export function connectNotifications() {
                 for (const [agentName, pane] of state.chatPanes) {
                     const paneRequestId = API.getCurrentStreamRequestId(agentName);
                     if (paneRequestId !== targetRequestId) continue;
+                    // Already consumed (likely by the in-band path
+                    // landing first) — don't re-arm.
+                    if (pane.reviseConsumedRequestId === targetRequestId) return;
                     if (!pane.streamingMsgDiv) return;
                     pane.pendingRevise = true;
-                    // Replace the in-flight bubble's body with a
-                    // placeholder. The streaming loop's next chunk
-                    // will overwrite this with the post-tool synthesis.
+                    pane.reviseConsumedRequestId = targetRequestId;
                     const contentSlot =
                         pane.streamingMsgDiv.querySelector('.message-content')
                         || pane.streamingMsgDiv;
@@ -654,21 +652,49 @@ export async function sendMessage() {
                 // retry. Without this the URL would be recaptured
                 // from state.selectedHostAgent at fetch time.
                 let learnedSessionId = false;
+                // Wave 5E: cross-chunk parser buffer for partial
+                // sentinels. ReadableStream chunking isn't guaranteed
+                // to preserve server yields, so a sentinel can split.
+                // We hold back any chunk-tail starting with the
+                // sentinel prefix until its closing \\x1e arrives.
+                let sentinelBuffer = '';
                 for await (const rawChunk of API.streamInvoke(text, null, sessionId, null, false, dispatchAgent)) {
+                    // Merge any held-back partial sentinel with the
+                    // new chunk before trying to parse.
+                    const merged = sentinelBuffer + rawChunk;
+                    sentinelBuffer = '';
+                    // Find any partial sentinel at the tail end.
+                    const lastPrefixIdx = merged.lastIndexOf(REVISE_SENTINEL_PREFIX);
+                    let processable = merged;
+                    if (lastPrefixIdx >= 0) {
+                        const closeAfter = merged.indexOf(
+                            REVISE_SENTINEL_SUFFIX,
+                            lastPrefixIdx + REVISE_SENTINEL_PREFIX.length,
+                        );
+                        if (closeAfter < 0) {
+                            // Last sentinel is incomplete — hold it.
+                            processable = merged.slice(0, lastPrefixIdx);
+                            sentinelBuffer = merged.slice(lastPrefixIdx);
+                        }
+                    }
                     // Wave 5E: detect + strip in-band revise sentinels.
-                    // The sentinel is wire-protocol metadata, not
-                    // user-visible text; never let it reach fullContent
-                    // or the bubble. Pre-sentinel slice = pre-tool
-                    // prose (gets retracted). Post-sentinel slice =
-                    // start of post-tool synthesis (becomes fresh
-                    // bubble content).
+                    // Pre-sentinel slice = pre-tool prose (gets
+                    // retracted). Post-sentinel slice = start of
+                    // post-tool synthesis (becomes fresh bubble
+                    // content).
                     const { textBefore, textAfter, sawSentinel } =
-                        stripReviseSentinel(rawChunk);
+                        stripReviseSentinel(processable);
                     if (sawSentinel) {
                         pane.pendingRevise = true;
-                        // Surface the revising placeholder so the
-                        // user sees the retraction happen, even if no
-                        // further chunk arrives before finalize.
+                        // Mark this request's revise as consumed so a
+                        // delayed SSE arriving after the in-band path
+                        // already retracted + re-rendered post-tool
+                        // becomes a no-op. The in-band path itself
+                        // doesn't need this guard (each ToolCallStarted
+                        // produces exactly one sentinel — no double-
+                        // arming risk on this side).
+                        const rid = API.getCurrentStreamRequestId(dispatchAgent);
+                        if (rid) pane.reviseConsumedRequestId = rid;
                         if (pane.streamingMsgDiv) {
                             const slot =
                                 pane.streamingMsgDiv.querySelector('.message-content')
@@ -773,6 +799,7 @@ export async function sendMessage() {
     } finally {
         pane.streamingMsgDiv = null;
         pane.pendingRevise = false;
+        pane.reviseConsumedRequestId = null;
         state.waitingAgents.delete(dispatchAgent);
         refreshAgentThinkingDot(dispatchAgent);
         // Drive the visible thinking indicator from whatever agent the

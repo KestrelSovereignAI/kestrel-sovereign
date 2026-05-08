@@ -94,6 +94,11 @@ export async function loadCommands(apiModule) {
 //     hasUnrenderedMermaid: boolean,    // mermaid render deferred until mount
 //     pendingRevise: boolean,            // Wave 5C: server fired a `revising` SSE event;
 //                                        //   next chunk replaces (not appends) the bubble
+//     reviseConsumedRequestId: string|null,
+//                                        // Wave 5E idempotency: which request_id has had
+//                                        //   its revise applied. Both signals (SSE + in-band
+//                                        //   sentinel) check this so a delayed signal for an
+//                                        //   already-consumed request is a no-op.
 //   }
 const chatPanes = new Map();
 let mountedChatAgent;  // undefined sentinel — null is a valid key
@@ -172,6 +177,7 @@ export function getOrCreateChatPane(agentName) {
         scrollPos: 0,
         hasUnrenderedMermaid: false,
         pendingRevise: false,
+        reviseConsumedRequestId: null,
     };
     chatPanes.set(agentName, pane);
     return pane;
