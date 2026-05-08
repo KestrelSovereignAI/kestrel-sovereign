@@ -8,6 +8,7 @@ import re
 import time
 import os
 import logging
+from typing import Any, Dict
 
 from kestrel_sovereign.kestrel_config.constants import MAX_SOVEREIGNTY_PREVIEW_SIZE
 from kestrel_sovereign.endpoints.agent_helpers import get_agent
@@ -198,8 +199,35 @@ async def trigger_sovereignty_export(request: Request):
         if not sovereignty:
             raise HTTPException(status_code=500, detail="Sovereignty feature not available.")
 
-        result = await sovereignty.export_sovereignty(storage_tier=tier, encrypt=encrypt)
-        return {"success": True, "message": result}
+        envelope = await sovereignty.export_sovereignty(storage_tier=tier, encrypt=encrypt)
+        # export_sovereignty returns a ToolResult since #1061 wave 22.
+        # Honesty: surface PARTIAL/ERROR distinctly so the HTTP caller
+        # can tell a "backup hashed but not actually published" path
+        # from a clean export. ERROR envelopes (e.g. insufficient
+        # wallet funds) raise HTTPException so HTTP clients that
+        # branch on status code can tell a refused export from a
+        # successful request — returning 200 with ``success: False``
+        # would silently let those clients treat refusals as ok.
+        from kestrel_sdk.tools.result import ToolResultStatus
+        if envelope.status is ToolResultStatus.ERROR:
+            err = envelope.error or "Export failed"
+            # Wallet-affordability refusal -> 402 Payment Required.
+            # Everything else (provider blow-ups, etc.) -> 500.
+            status_code = 402 if "Insufficient funds" in err else 500
+            raise HTTPException(status_code=status_code, detail=err)
+        message = envelope.confirmation or envelope.error or ""
+        body: Dict[str, Any] = {
+            "success": True,
+            "status": envelope.status.value,
+            "message": message,
+        }
+        if envelope.error:
+            # PARTIAL: success=true (the action ran), but surface the
+            # caveat so the caller can warn the user.
+            body["error"] = envelope.error
+        if envelope.data is not None:
+            body["data"] = envelope.data
+        return body
     except HTTPException:
         raise
     except Exception as e:

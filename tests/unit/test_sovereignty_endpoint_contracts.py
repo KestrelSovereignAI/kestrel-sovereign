@@ -119,6 +119,80 @@ def test_sovereignty_export_rejects_invalid_tier():
         _restore_app(app, original)
 
 
+def test_sovereignty_export_returns_402_on_insufficient_funds():
+    """ERROR envelope from the feature must surface as a non-2xx HTTP response.
+
+    Prior to #1061 wave 22 the endpoint returned ``{"success": True,
+    "message": "Insufficient funds for backup."}`` with HTTP 200 — a
+    refused export looked indistinguishable from a successful one to
+    HTTP clients branching on status code.
+    """
+    from kestrel_sdk.tools.result import ToolResult
+
+    sovereignty_feature = MagicMock()
+    sovereignty_feature.export_sovereignty = AsyncMock(
+        return_value=ToolResult.failed(error="Insufficient funds for backup.")
+    )
+    agent = MagicMock(
+        storage=MagicMock(),
+        features={"SovereigntyFeature": sovereignty_feature},
+    )
+
+    app, original = _prepare_app(agent)
+    try:
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                response = client.post(
+                    "/api/sovereignty/export",
+                    headers={"X-API-Key": "test-key"},
+                    json={"tier": "ipfs"},
+                )
+        assert response.status_code == 402
+        assert "Insufficient funds" in response.json()["detail"]
+    finally:
+        _restore_app(app, original)
+
+
+def test_sovereignty_export_partial_returns_200_with_caveat():
+    """PARTIAL envelope (e.g. backup hashed but not pushed) must remain HTTP 200.
+
+    The action ran — the LLM/UI just needs to surface the caveat so
+    the user knows the backup is not durable off-host.
+    """
+    from kestrel_sdk.tools.result import ToolResult
+
+    sovereignty_feature = MagicMock()
+    sovereignty_feature.export_sovereignty = AsyncMock(
+        return_value=ToolResult.partial(
+            "Sovereignty Export Complete.",
+            "requested tier 'ipfs' but no IPFS CID was returned",
+            data={"cid": None, "content_hash": "hash123", "tier": "ipfs"},
+        )
+    )
+    agent = MagicMock(
+        storage=MagicMock(),
+        features={"SovereigntyFeature": sovereignty_feature},
+    )
+
+    app, original = _prepare_app(agent)
+    try:
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                response = client.post(
+                    "/api/sovereignty/export",
+                    headers={"X-API-Key": "test-key"},
+                    json={"tier": "ipfs"},
+                )
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["success"] is True
+        assert payload["status"] == "partial"
+        assert "no IPFS CID" in payload["error"]
+        assert payload["data"]["content_hash"] == "hash123"
+    finally:
+        _restore_app(app, original)
+
+
 def test_sovereignty_import_rejects_invalid_cid():
     agent = MagicMock(storage=MagicMock())
     app, original = _prepare_app(agent)
