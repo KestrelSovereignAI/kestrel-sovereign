@@ -18,6 +18,17 @@ from .github_integration import (
 logger = logging.getLogger(__name__)
 
 
+def is_auto_fix(fix: str) -> bool:
+    """Truthy check matching run_backlog_hygiene's predicate.
+
+    Exposed so the @tool wrapper in feature.py can use the same rule
+    when deciding whether to surface a dry-run PARTIAL caveat — the
+    runner accepts "yes", "true", "1" (case-insensitive); anything
+    else means report-only.
+    """
+    return fix.lower() in ("yes", "true", "1")
+
+
 async def run_backlog_hygiene(data: Dict[str, Any], fix: str = "no") -> str:
     """Scan repos for backlog hygiene issues and optionally auto-fix.
 
@@ -37,7 +48,7 @@ async def run_backlog_hygiene(data: Dict[str, Any], fix: str = "no") -> str:
     if not token:
         return "No GITHUB_TOKEN found. Set GITHUB_TOKEN environment variable or add to .env file."
 
-    auto_fix = fix.lower() in ("yes", "true", "1")
+    auto_fix = is_auto_fix(fix)
     today_str = date.today().strftime("%B %d, %Y")
     lines = [f"# Backlog Hygiene Report -- {today_str}", ""]
 

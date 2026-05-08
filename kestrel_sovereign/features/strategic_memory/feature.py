@@ -15,15 +15,32 @@ from datetime import date
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sdk.tools.base import ToolCategory
+from kestrel_sdk.tools.result import ToolResult
+from kestrel_sovereign.features.base import Feature, tool
 
-from .backlog_hygiene import run_backlog_hygiene
+from .backlog_hygiene import is_auto_fix, run_backlog_hygiene
 from .morning_signal import generate_morning_signal
 from .session_log import collect_session_log
 from .talon_handoff import dispatch_to_talon, pick_top_issue
 
 logger = logging.getLogger(__name__)
+
+
+# Prefixes that the github-backed sub-modules (backlog_hygiene,
+# session_log) return when prerequisites (scan_repos config or
+# GITHUB_TOKEN) are missing. They look like report bodies but are
+# actually skipped runs — the @tool wrappers must turn these into
+# ERROR envelopes so callers can't treat a no-op as a successful
+# scan/log/apply.
+_GITHUB_PREREQ_FAILURE_PREFIXES: tuple = (
+    "No scan_repos configured",
+    "No GITHUB_TOKEN found",
+)
+
+
+def _is_github_prereq_failure(body: str) -> bool:
+    return any(body.startswith(p) for p in _GITHUB_PREREQ_FAILURE_PREFIXES)
 
 # Try to import yaml; fall back to a simple parser if not available
 try:
@@ -146,7 +163,7 @@ class StrategicMemoryFeature(Feature):
         category=ToolCategory.SYSTEM,
         command_prefix="!strategy",
     )
-    async def strategy_view(self, section: str = "all") -> str:
+    async def strategy_view(self, section: str = "all") -> ToolResult:
         """
         View a section of the strategic memory.
 
@@ -154,30 +171,35 @@ class StrategicMemoryFeature(Feature):
             section: Which section to view -- all, vision, milestones, stakeholders, decisions, blockers, patterns
         """
         if not self._data:
-            return "No strategic memory loaded. Create a STRATEGY.yaml in the agent data directory."
+            return ToolResult.failed(
+                "No strategic memory loaded. Create a STRATEGY.yaml in the agent data directory.",
+            )
 
-        if section == "all":
-            return self._format_all()
-
-        if section == "vision":
-            return self._data.get("vision", "No vision defined.")
-
-        if section == "milestones":
-            return self._format_milestones()
-
-        if section == "stakeholders":
-            return self._format_stakeholders()
-
-        if section == "decisions":
-            return self._format_decisions()
-
-        if section == "blockers":
-            return self._format_blockers()
-
-        if section == "patterns":
-            return self._format_patterns()
-
-        return f"Unknown section: {section}. Available: all, vision, milestones, stakeholders, decisions, blockers, patterns"
+        section_renderers = {
+            "all": self._format_all,
+            # `or` not `default=` — ``vision: ""`` and ``vision: null``
+            # both return empty/None from .get; ToolResult.ok requires
+            # a non-empty confirmation, so fall back to the placeholder
+            # whenever the value is falsy, not just missing.
+            "vision": lambda: self._data.get("vision") or "No vision defined.",
+            "milestones": self._format_milestones,
+            "stakeholders": self._format_stakeholders,
+            "decisions": self._format_decisions,
+            "blockers": self._format_blockers,
+            "patterns": self._format_patterns,
+        }
+        renderer = section_renderers.get(section)
+        if renderer is None:
+            return ToolResult.failed(
+                f"Unknown section: {section}. Available: "
+                + ", ".join(section_renderers.keys()),
+                data={"section": section},
+            )
+        body = renderer()
+        return ToolResult.ok(
+            confirmation=body,
+            data={"section": section, "body": body},
+        )
 
     @tool(
         name="strategy_add_decision",
@@ -186,7 +208,7 @@ class StrategicMemoryFeature(Feature):
     )
     async def strategy_add_decision(
         self, decision: str, rationale: str, session: str = "", impact: str = ""
-    ) -> str:
+    ) -> ToolResult:
         """
         Add a decision to the strategic memory.
 
@@ -208,7 +230,10 @@ class StrategicMemoryFeature(Feature):
         }
         self._data["decisions"].append(entry)
         self._save()
-        return f"Decision recorded: {decision}"
+        return ToolResult.ok(
+            confirmation=f"Decision recorded: {decision}",
+            data={"recorded": True, "decision": entry},
+        )
 
     @tool(
         name="strategy_add_blocker",
@@ -217,7 +242,7 @@ class StrategicMemoryFeature(Feature):
     )
     async def strategy_add_blocker(
         self, issue: str, title: str, severity: str = "medium", owner: str = "unassigned", notes: str = ""
-    ) -> str:
+    ) -> ToolResult:
         """
         Add a blocker to the strategic memory.
 
@@ -241,14 +266,17 @@ class StrategicMemoryFeature(Feature):
         }
         self._data["blockers"].append(entry)
         self._save()
-        return f"Blocker recorded: {title}"
+        return ToolResult.ok(
+            confirmation=f"Blocker recorded: {title}",
+            data={"recorded": True, "blocker": entry},
+        )
 
     @tool(
         name="strategy_add_pattern",
         description="Record a learned pattern or insight to the strategic memory.",
         category=ToolCategory.SYSTEM,
     )
-    async def strategy_add_pattern(self, pattern: str, source: str = "", implication: str = "") -> str:
+    async def strategy_add_pattern(self, pattern: str, source: str = "", implication: str = "") -> ToolResult:
         """
         Add a learned pattern to the strategic memory.
 
@@ -267,14 +295,17 @@ class StrategicMemoryFeature(Feature):
         }
         self._data["patterns_learned"].append(entry)
         self._save()
-        return f"Pattern recorded: {pattern}"
+        return ToolResult.ok(
+            confirmation=f"Pattern recorded: {pattern}",
+            data={"recorded": True, "pattern": entry},
+        )
 
     @tool(
         name="strategy_resolve_blocker",
         description="Mark a blocker as resolved and remove it from active blockers.",
         category=ToolCategory.SYSTEM,
     )
-    async def strategy_resolve_blocker(self, issue: str) -> str:
+    async def strategy_resolve_blocker(self, issue: str) -> ToolResult:
         """
         Resolve a blocker by its issue identifier.
 
@@ -284,11 +315,18 @@ class StrategicMemoryFeature(Feature):
         blockers = self._data.get("blockers", [])
         original_count = len(blockers)
         self._data["blockers"] = [b for b in blockers if b.get("issue") != issue]
+        removed = original_count - len(self._data["blockers"])
 
-        if len(self._data["blockers"]) < original_count:
+        if removed > 0:
             self._save()
-            return f"Blocker {issue} resolved and removed."
-        return f"No blocker found with issue: {issue}"
+            return ToolResult.ok(
+                confirmation=f"Blocker {issue} resolved and removed.",
+                data={"resolved": True, "issue": issue, "removed_count": removed},
+            )
+        return ToolResult.failed(
+            f"No blocker found with issue: {issue}",
+            data={"issue": issue, "removed_count": 0},
+        )
 
     # ------------------------------------------------------------------
     # Tools: GitHub-powered (delegated to sub-modules)
@@ -300,9 +338,13 @@ class StrategicMemoryFeature(Feature):
         category=ToolCategory.SYSTEM,
         command_prefix="!morning",
     )
-    async def morning_signal(self) -> str:
+    async def morning_signal(self) -> ToolResult:
         """Generate the Morning Signal briefing from strategic memory + live GitHub data."""
-        return await generate_morning_signal(self._data)
+        briefing = await generate_morning_signal(self._data)
+        return ToolResult.ok(
+            confirmation=briefing,
+            data={"briefing": briefing},
+        )
 
     @tool(
         name="signal_dispatch",
@@ -310,7 +352,7 @@ class StrategicMemoryFeature(Feature):
         category=ToolCategory.SYSTEM,
         command_prefix="!dispatch",
     )
-    async def signal_dispatch(self, mode: str = "execute") -> str:
+    async def signal_dispatch(self, mode: str = "execute") -> ToolResult:
         """Pick top issue from strategic memory and dispatch to Talon.
 
         Args:
@@ -319,13 +361,20 @@ class StrategicMemoryFeature(Feature):
         if mode == "suggest":
             issue = await pick_top_issue(self._data)
             if not issue:
-                return "## Signal Dispatch (suggest)\nNo actionable issue found."
-            return (
+                return ToolResult.ok(
+                    confirmation="## Signal Dispatch (suggest)\nNo actionable issue found.",
+                    data={"mode": "suggest", "issue": None},
+                )
+            body = (
                 f"## Signal Dispatch (suggest)\n"
                 f"**Top issue:** {issue['repo']}#{issue['issue_number']}: {issue['issue_title']}\n"
                 f"**Priority:** {issue['priority']}\n"
                 f"**Context:** {issue.get('context', 'N/A')}\n\n"
                 f"Use `!dispatch` or `!talon claim {issue['repo']} {issue['issue_number']}` to execute."
+            )
+            return ToolResult.ok(
+                confirmation=body,
+                data={"mode": "suggest", "issue": issue, "body": body},
             )
 
         # Try TalonCoordinatorFeature first (preferred path)
@@ -333,20 +382,68 @@ class StrategicMemoryFeature(Feature):
         if coordinator:
             issue = await pick_top_issue(self._data)
             if not issue:
-                return "## Signal Dispatch\nNo actionable issue found."
+                return ToolResult.ok(
+                    confirmation="## Signal Dispatch\nNo actionable issue found.",
+                    data={"mode": "execute", "issue": None},
+                )
             result = await coordinator.talon_claim(
                 repo=issue["repo"], issue=issue["issue_number"],
             )
-            status = "dispatched" if result.get("dispatched") else f"failed: {result.get('error', 'unknown')}"
-            return (
+            dispatched = bool(result.get("dispatched"))
+            method = result.get("method", "N/A")
+            body = (
                 f"## Signal Dispatch\n"
-                f"{issue['repo']}#{issue['issue_number']}: {issue['issue_title']} -- {status}\n"
-                f"Method: {result.get('method', 'N/A')}"
+                f"{issue['repo']}#{issue['issue_number']}: {issue['issue_title']} -- "
+                + ("dispatched" if dispatched else f"failed: {result.get('error', 'unknown')}")
+                + f"\nMethod: {method}"
             )
 
-        # Fallback: direct mesh dispatch via talon_handoff
+            data = {
+                "mode": "execute",
+                "issue": issue,
+                "dispatched": dispatched,
+                "method": method,
+                "claim_result": result,
+            }
+
+            # Honesty: if the claim failed, the agent must speak the
+            # failure rather than narrate "dispatched" off a body that
+            # internally contains "failed: ...". Surface as PARTIAL so
+            # the LLM can't drop the failure detail.
+            if not dispatched:
+                return ToolResult.partial(
+                    confirmation=body,
+                    error=(
+                        f"talon_claim for {issue['repo']}#{issue['issue_number']} "
+                        f"did not dispatch: {result.get('error', 'unknown')}"
+                    ),
+                    data=data,
+                )
+            return ToolResult.ok(confirmation=body, data=data)
+
+        # Fallback: direct mesh dispatch via talon_handoff. The helper
+        # returns markdown text whose first token signals the outcome:
+        # "Dispatched to ..." (success), "Failed to dispatch ..." (mesh
+        # error), or "Found issue to dispatch ... but no multi_agent
+        # host URL configured." (config gap). Wrapping all of these as
+        # OK would let the LLM narrate "dispatched" off a body that
+        # said "Failed". Detect the failure prefixes and surface PARTIAL.
         dispatch_result = await dispatch_to_talon(self._data)
-        return f"## Signal Dispatch\n{dispatch_result}"
+        body = f"## Signal Dispatch\n{dispatch_result}"
+        data = {"mode": "execute", "fallback": True, "dispatch_result": dispatch_result}
+
+        failure_prefixes = ("Failed to dispatch", "Found issue to dispatch")
+        if any(dispatch_result.startswith(p) for p in failure_prefixes):
+            return ToolResult.partial(
+                confirmation=body,
+                error=(
+                    f"fallback dispatch did not place the issue with talon: "
+                    f"{dispatch_result}"
+                ),
+                data=data,
+            )
+
+        return ToolResult.ok(confirmation=body, data=data)
 
     def _get_talon_coordinator(self):
         """Get TalonCoordinatorFeature if loaded."""
@@ -362,13 +459,47 @@ class StrategicMemoryFeature(Feature):
         category=ToolCategory.SYSTEM,
         command_prefix="!hygiene",
     )
-    async def backlog_hygiene(self, fix: str = "no") -> str:
+    async def backlog_hygiene(self, fix: str = "no") -> ToolResult:
         """Scan repos for backlog hygiene issues and optionally auto-fix.
 
         Args:
             fix: Set to 'yes' to auto-fix issues where possible (add labels). Default 'no' (report only).
         """
-        return await run_backlog_hygiene(self._data, fix=fix)
+        report = await run_backlog_hygiene(self._data, fix=fix)
+
+        # Prerequisite failures (missing scan_repos / missing
+        # GITHUB_TOKEN) come back as success-shaped strings from the
+        # helper. Surface them as ERROR — the scan never ran, no fixes
+        # could possibly have been applied, and a downstream caller
+        # checking status must see failure rather than "applied=True".
+        if _is_github_prereq_failure(report):
+            return ToolResult.failed(
+                report,
+                data={"fix": fix, "report": report, "applied": False},
+            )
+
+        # Honesty: dry-run mode (anything but the runner's truthy
+        # predicate) reports issues but does not change anything.
+        # Surface as PARTIAL so the agent must speak that the report
+        # is read-only — narrating "fixed N issues" off a dry run
+        # would be a lie. Same pattern as model.cleanup_models(dry_run)
+        # in PR #1098. Use the shared `is_auto_fix` predicate so this
+        # wrapper agrees with the runner on what counts as auto-fix
+        # (yes / true / 1, case-insensitive).
+        if not is_auto_fix(fix):
+            return ToolResult.partial(
+                confirmation=report,
+                error=(
+                    f"fix={fix!r}: this is a report-only scan, no changes "
+                    "were made. Re-run with fix='yes' (or 'true' / '1') "
+                    "to apply auto-fixes."
+                ),
+                data={"fix": fix, "report": report, "applied": False},
+            )
+        return ToolResult.ok(
+            confirmation=report,
+            data={"fix": fix, "report": report, "applied": True},
+        )
 
     @tool(
         name="session_log",
@@ -376,14 +507,29 @@ class StrategicMemoryFeature(Feature):
         category=ToolCategory.SYSTEM,
         command_prefix="!sessionlog",
     )
-    async def session_log(self, session_id: str = "", focus: str = "") -> str:
+    async def session_log(self, session_id: str = "", focus: str = "") -> ToolResult:
         """Collect end-of-day session log from GitHub activity.
 
         Args:
             session_id: Session number (e.g. '020'). Auto-generated if empty.
             focus: Brief description of today's focus area.
         """
-        return await collect_session_log(self._data, session_id=session_id, focus=focus)
+        log = await collect_session_log(self._data, session_id=session_id, focus=focus)
+
+        # Same shape as backlog_hygiene: prereq failures (no scan_repos
+        # / no GITHUB_TOKEN) come back as text. The session log was not
+        # collected; downstream callers branching on status must see
+        # ERROR rather than treating the warning as a real log.
+        if _is_github_prereq_failure(log):
+            return ToolResult.failed(
+                log,
+                data={"session_id": session_id, "focus": focus, "log": log},
+            )
+
+        return ToolResult.ok(
+            confirmation=log,
+            data={"session_id": session_id, "focus": focus, "log": log},
+        )
 
     # ------------------------------------------------------------------
     # Formatters
