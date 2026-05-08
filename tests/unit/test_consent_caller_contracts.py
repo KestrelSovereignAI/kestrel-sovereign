@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from kestrel_sdk.tools.result import ToolResultStatus
 from kestrel_sovereign.agent.constitution import ConstitutionMixin
 from kestrel_sovereign.features.model.feature import ModelAgent
 from kestrel_sovereign.kestrel_agent import KestrelAgent
@@ -80,7 +81,8 @@ class TestModelConsentCaller:
 
         result = await model_agent.set_model("openai/gpt-5-mini")
 
-        assert result["success"] is True
+        assert result.status is ToolResultStatus.OK
+        assert result.data["success"] is True
         parent_agent.features["ConsentFeature"].request_consent.assert_awaited_once_with(
             "model_change",
             {"from": "gpt-5", "to": "gpt-5-mini", "vendor": "openai", "route": None},
@@ -109,7 +111,8 @@ class TestModelConsentCaller:
 
         result = await model_agent.set_model("openai/gpt-5-mini")
 
-        assert result["success"] is True
+        assert result.status is ToolResultStatus.OK
+        assert result.data["success"] is True
         model_agent.llm_service.set_model_preference.assert_called_once_with(
             "gpt-5-mini", "openai", None
         )
