@@ -139,10 +139,49 @@ class DeployFeature(Feature):
                 result_dict.get("error") or f"deploy {action_normalized} failed",
                 data=result_dict,
             )
+
+        # Build a meaningful confirmation. The command renderer drops
+        # scalar-only ``data`` blocks, so the confirmation is the only
+        # surface the user sees for short outcomes (deploy status with
+        # no sessions, health check with "Service not deployed", etc).
+        # Pull the most informative legacy field per action — falling
+        # back to a generic string only when nothing better exists.
+        confirmation = self._format_deploy_confirmation(action_normalized, result_dict)
         return ToolResult.ok(
-            confirmation=f"deploy {action_normalized} ok",
+            confirmation=confirmation,
             data=result_dict if isinstance(result_dict, dict) else {"raw": result_dict},
         )
+
+    @staticmethod
+    def _format_deploy_confirmation(action: str, payload: Any) -> str:
+        """Build a deploy-action confirmation string from the legacy
+        manager dict. Codex round 2 (#1117): generic "deploy X ok"
+        was hiding the actual outcome (e.g. "No active deployment
+        sessions") because the command renderer suppresses scalar
+        data; this puts the meaningful text in confirmation.
+        """
+        if not isinstance(payload, dict):
+            return f"deploy {action} ok"
+        # Prefer the manager's own message when present.
+        msg = payload.get("message")
+        if isinstance(msg, str) and msg:
+            return msg
+        # Health check often returns {"healthy": bool, ...} with no message.
+        if action in {"health", "check"}:
+            healthy = payload.get("healthy")
+            if healthy is True:
+                return "Service is healthy"
+            if healthy is False:
+                return f"Service is unhealthy: {payload.get('reason') or 'no detail'}"
+        # Status with sessions but no message.
+        if action == "status" and "active_deployments" in payload:
+            n = payload.get("active_deployments", 0)
+            return f"{n} active deployment(s)"
+        # List with sessions.
+        if action in {"list", "ls"} and "sessions" in payload:
+            n = len(payload.get("sessions") or [])
+            return f"Listed {n} deployment(s)"
+        return f"deploy {action} ok"
 
     async def _status(self) -> Dict[str, Any]:
         """Get status of all active deployment sessions."""
