@@ -159,16 +159,23 @@ class ConstitutionFeature(Feature):
             sections found matching..."). The honesty contract requires
             those to surface as ERROR rather than OK with apologetic
             text.
+
+            Two-track classification: bodies that quote a specific id
+            (Book/Amendment/Section) AND say "not found" are ERRORs;
+            "No constitutional sections found matching ..." (no
+            specific id, just a search miss) is also ERROR — the
+            search failed to find anything, the agent must speak that
+            rather than narrate a happy summary.
             """
-            error_prefixes = (
-                "Book '",
-                "No book",
-                "Amendment '",
-                "No amendment",
+            specific_not_found_prefixes = (
+                "Book '", "No book",
+                "Amendment '", "No amendment",
                 "Section '",
-                "No constitutional sections",
             )
-            if any(body.startswith(p) for p in error_prefixes) and "not found" in body:
+            empty_search_prefix = "No constitutional sections found"
+            if any(body.startswith(p) for p in specific_not_found_prefixes) and "not found" in body:
+                return ToolResult.failed(body, data={"kind": kind})
+            if body.startswith(empty_search_prefix):
                 return ToolResult.failed(body, data={"kind": kind})
             return ToolResult.ok(confirmation=body, data={"kind": kind})
 
