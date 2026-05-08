@@ -24,8 +24,8 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from starlette.requests import Request
 
-from endpoints.agent import _sse_connections, notifications_sse, router as agent_router
-from endpoints.security import router as security_router
+from kestrel_sovereign.endpoints.agent import _sse_connections, notifications_sse, router as agent_router
+from kestrel_sovereign.endpoints.security import router as security_router
 from kestrel_sovereign.agent.event_manager import EventManagerMixin
 from kestrel_sovereign.features.security.approval_queue import ApprovalQueue
 

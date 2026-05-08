@@ -3,7 +3,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 import logging
 
 from kestrel_sovereign.rate_limit import limiter
-from endpoints.agent_helpers import get_agent
+from kestrel_sovereign.endpoints.agent_helpers import get_agent
 
 logger = logging.getLogger(__name__)
 

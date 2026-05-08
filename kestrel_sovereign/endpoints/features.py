@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
 
-from endpoints.agent_helpers import get_agent
+from kestrel_sovereign.endpoints.agent_helpers import get_agent
 from kestrel_sovereign.feature_registry import (
     FeaturePackageInfo,
     FeatureStatus,

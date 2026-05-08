@@ -202,7 +202,7 @@ def test_voice_websocket_auth_returns_sovereign_caller_for_valid_api_key():
     (not just a bool) so that the caller can be threaded into
     agent.process_input_streaming for governance-command gating.
     """
-    from endpoints.voice import _ws_authenticate
+    from kestrel_sovereign.endpoints.voice import _ws_authenticate
 
     ws = MagicMock()
     ws.query_params = {"api_key": "test-key"}
@@ -216,7 +216,7 @@ def test_voice_websocket_auth_returns_sovereign_caller_for_valid_api_key():
 
 
 def test_voice_websocket_auth_returns_none_for_bad_api_key():
-    from endpoints.voice import _ws_authenticate
+    from kestrel_sovereign.endpoints.voice import _ws_authenticate
 
     ws = MagicMock()
     ws.query_params = {"api_key": "wrong"}
@@ -230,7 +230,7 @@ def test_voice_websocket_auth_returns_none_for_bad_api_key():
 
 
 def test_voice_websocket_auth_returns_authenticated_caller_for_session_cookie():
-    from endpoints.voice import _ws_authenticate
+    from kestrel_sovereign.endpoints.voice import _ws_authenticate
 
     ws = MagicMock()
     ws.query_params = {}
@@ -248,7 +248,7 @@ def test_voice_websocket_auth_returns_authenticated_caller_for_session_cookie():
 def test_voice_websocket_auth_no_key_configured_is_sovereign():
     """When KESTREL_API_KEY is not set (local dev), behavior matches the HTTP
     middleware: no auth required, caller is sovereign by default."""
-    from endpoints.voice import _ws_authenticate
+    from kestrel_sovereign.endpoints.voice import _ws_authenticate
 
     ws = MagicMock()
     ws.query_params = {}

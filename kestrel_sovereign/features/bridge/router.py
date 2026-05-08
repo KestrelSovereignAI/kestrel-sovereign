@@ -32,7 +32,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
 from kestrel_sovereign.rate_limit import limiter
-from endpoints.agent_helpers import get_agent, get_caller
+from kestrel_sovereign.endpoints.agent_helpers import get_agent, get_caller
 
 from .protocol import (
     BridgeCapabilitiesResponse,

@@ -69,7 +69,7 @@ def test_root_html_is_public_when_oauth_not_required():
 
 
 def test_root_html_redirects_when_oauth_required():
-    from endpoints.auth_oauth import oauth
+    from kestrel_sovereign.endpoints.auth_oauth import oauth
 
     app, original = _prepare_app()
     try:

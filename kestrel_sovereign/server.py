@@ -463,7 +463,7 @@ if SERVE_UI:
     app.mount("/utils", StaticFiles(directory=str(STATIC_DIR / "utils")), name="utils")
 
 # Include core routers (always present, not feature-gated)
-from endpoints import (
+from kestrel_sovereign.endpoints import (
     agent_router,
     conversations_router,
     memories_router,
@@ -478,9 +478,9 @@ from endpoints import (
     features_router,
     ui_router,
 )
-from endpoints.rasa_shim import router as rasa_shim_router
+from kestrel_sovereign.endpoints.rasa_shim import router as rasa_shim_router
 
-from endpoints.auth_oauth import router as auth_oauth_router, register_oauth, oauth
+from kestrel_sovereign.endpoints.auth_oauth import router as auth_oauth_router, register_oauth, oauth
 app.include_router(auth_oauth_router)
 register_oauth(app)
 
@@ -704,7 +704,7 @@ async def auth_middleware(request: Request, call_next):
                 return await call_next(request)
             # Second try: JWT token
             try:
-                from endpoints.auth_oauth import _verify_jwt
+                from kestrel_sovereign.endpoints.auth_oauth import _verify_jwt
                 jwt_payload = _verify_jwt(token)
                 if jwt_payload:
                     request.state.caller = CallerContext.authenticated(

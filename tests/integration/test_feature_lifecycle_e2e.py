@@ -641,7 +641,7 @@ class TestAPIEndpointLifecycle:
         """Create a FastAPI app with the features router and a mock agent."""
         from fastapi import FastAPI
         from fastapi.testclient import TestClient
-        from endpoints.features import router
+        from kestrel_sovereign.endpoints.features import router
 
         app = FastAPI()
         app.include_router(router)

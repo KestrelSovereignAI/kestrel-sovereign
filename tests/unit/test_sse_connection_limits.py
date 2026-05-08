@@ -11,7 +11,7 @@ from unittest.mock import MagicMock, AsyncMock, patch
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from endpoints.agent import (
+from kestrel_sovereign.endpoints.agent import (
     router,
     _sse_connections,
     _sse_lock,

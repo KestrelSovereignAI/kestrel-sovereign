@@ -7,7 +7,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from endpoints.features import router as features_router
+from kestrel_sovereign.endpoints.features import router as features_router
 from kestrel_sovereign.feature_registry import (
     FeaturePackageInfo,
     FeatureStatus,
@@ -116,7 +116,7 @@ class TestListFeatures:
             resp = client.get("/api/features")
         assert resp.status_code == 503
 
-    @patch("endpoints.features.get_registry")
+    @patch("kestrel_sovereign.endpoints.features.get_registry")
     def test_returns_catalog(self, mock_registry):
         mock_registry.return_value = dict(FAKE_REGISTRY)
         agent = _make_agent()
@@ -130,7 +130,7 @@ class TestListFeatures:
         assert "features" in data
         assert data["count"] == 2
 
-    @patch("endpoints.features.get_registry")
+    @patch("kestrel_sovereign.endpoints.features.get_registry")
     def test_filter_by_tag(self, mock_registry):
         mock_registry.return_value = dict(FAKE_REGISTRY)
         agent = _make_agent()
@@ -150,7 +150,7 @@ class TestListFeatures:
 
 
 class TestListInstalledFeatures:
-    @patch("endpoints.features.get_package_for_feature")
+    @patch("kestrel_sovereign.endpoints.features.get_package_for_feature")
     def test_returns_loaded_features_with_tools(self, mock_pkg):
         mock_pkg.return_value = FAKE_REGISTRY["test-pkg"]
         tool = _make_tool()
@@ -194,7 +194,7 @@ class TestGetFeatureDetail:
         assert len(data["tools"]) == 1
         assert data["config_schema"] is not None
 
-    @patch("endpoints.features.get_registry")
+    @patch("kestrel_sovereign.endpoints.features.get_registry")
     def test_unloaded_feature_from_registry(self, mock_registry):
         mock_registry.return_value = dict(FAKE_REGISTRY)
         agent = _make_agent()
@@ -207,7 +207,7 @@ class TestGetFeatureDetail:
         data = resp.json()
         assert data["name"] == "test-pkg"
 
-    @patch("endpoints.features.get_registry")
+    @patch("kestrel_sovereign.endpoints.features.get_registry")
     def test_unknown_feature_returns_404(self, mock_registry):
         mock_registry.return_value = {}
         agent = _make_agent()
@@ -272,7 +272,7 @@ class TestDisableFeature:
 
 
 class TestInstallFeature:
-    @patch("endpoints.features.get_registry")
+    @patch("kestrel_sovereign.endpoints.features.get_registry")
     def test_install_core_returns_400(self, mock_registry):
         mock_registry.return_value = dict(FAKE_REGISTRY)
         agent = _make_agent()
@@ -284,7 +284,7 @@ class TestInstallFeature:
         assert resp.status_code == 400
         assert "core" in resp.json()["detail"].lower()
 
-    @patch("endpoints.features.get_registry")
+    @patch("kestrel_sovereign.endpoints.features.get_registry")
     def test_install_unknown_returns_404(self, mock_registry):
         mock_registry.return_value = {}
         agent = _make_agent()
@@ -302,7 +302,7 @@ class TestInstallFeature:
 
 
 class TestRemoveFeature:
-    @patch("endpoints.features.get_package_for_feature")
+    @patch("kestrel_sovereign.endpoints.features.get_package_for_feature")
     def test_remove_core_returns_400(self, mock_pkg):
         mock_pkg.return_value = FeaturePackageInfo(
             name="core",
@@ -321,7 +321,7 @@ class TestRemoveFeature:
         assert resp.status_code == 400
         assert "core" in resp.json()["detail"].lower()
 
-    @patch("endpoints.features.get_package_for_feature")
+    @patch("kestrel_sovereign.endpoints.features.get_package_for_feature")
     def test_remove_unknown_returns_404(self, mock_pkg):
         mock_pkg.return_value = None
         agent = _make_agent()
@@ -530,7 +530,7 @@ class TestGetFeatureSkills:
         assert data["count"] == 1
         assert data["skills"][0]["name"] == "my_skill"
 
-    @patch("endpoints.features.get_package_for_feature")
+    @patch("kestrel_sovereign.endpoints.features.get_package_for_feature")
     def test_registry_skills_for_unloaded_feature(self, mock_pkg):
         mock_pkg.return_value = FAKE_REGISTRY["test-pkg"]
         agent = _make_agent()
@@ -545,8 +545,8 @@ class TestGetFeatureSkills:
         assert data["count"] == 1
         assert data["skills"][0]["name"] == "do_thing"
 
-    @patch("endpoints.features.get_skills_for_package")
-    @patch("endpoints.features.get_package_for_feature")
+    @patch("kestrel_sovereign.endpoints.features.get_skills_for_package")
+    @patch("kestrel_sovereign.endpoints.features.get_package_for_feature")
     def test_unknown_feature_returns_404(self, mock_pkg, mock_skills):
         mock_pkg.return_value = None
         mock_skills.return_value = []
@@ -565,7 +565,7 @@ class TestGetFeatureSkills:
 
 
 class TestListAllSkills:
-    @patch("endpoints.features.get_registry")
+    @patch("kestrel_sovereign.endpoints.features.get_registry")
     def test_returns_live_and_registry_skills(self, mock_registry):
         mock_registry.return_value = dict(FAKE_REGISTRY)
         tool = _make_tool(name="live_tool")
@@ -582,7 +582,7 @@ class TestListAllSkills:
         names = {s["name"] for s in data["skills"]}
         assert "live_tool" in names
 
-    @patch("endpoints.features.get_registry")
+    @patch("kestrel_sovereign.endpoints.features.get_registry")
     def test_filter_by_category(self, mock_registry):
         mock_registry.return_value = {}
         tool = _make_tool(name="sys_tool", category="system")
@@ -597,7 +597,7 @@ class TestListAllSkills:
         assert data["count"] == 1
         assert data["skills"][0]["name"] == "sys_tool"
 
-    @patch("endpoints.features.get_registry")
+    @patch("kestrel_sovereign.endpoints.features.get_registry")
     def test_filter_excludes_non_matching(self, mock_registry):
         mock_registry.return_value = {}
         tool = _make_tool(name="sys_tool", category="system")
@@ -639,7 +639,7 @@ class TestGetSkillSchema:
         assert "x" in data["function"]["parameters"]["properties"]
         assert data["feature"] == "TestFeature"
 
-    @patch("endpoints.features.get_all_skills")
+    @patch("kestrel_sovereign.endpoints.features.get_all_skills")
     def test_falls_back_to_registry(self, mock_skills):
         mock_skills.return_value = [
             SkillInfo(name="reg_skill", description="From registry", category="system"),
@@ -655,7 +655,7 @@ class TestGetSkillSchema:
         assert data["function"]["name"] == "reg_skill"
         assert data["source"] == "registry"
 
-    @patch("endpoints.features.get_all_skills")
+    @patch("kestrel_sovereign.endpoints.features.get_all_skills")
     def test_unknown_skill_returns_404(self, mock_skills):
         mock_skills.return_value = []
         agent = _make_agent()

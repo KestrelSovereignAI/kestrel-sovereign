@@ -3,7 +3,7 @@ from fastapi import APIRouter, Request
 from typing import List, Dict, Any
 import logging
 
-from endpoints.agent_helpers import get_agent
+from kestrel_sovereign.endpoints.agent_helpers import get_agent
 from kestrel_sovereign.command_handler import BUILTIN_COMMAND_SPECS
 
 logger = logging.getLogger(__name__)

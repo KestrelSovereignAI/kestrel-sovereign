@@ -1,37 +1,35 @@
-# Kestrel API Endpoints
-from fastapi import APIRouter
+"""Repo-root re-export shim — endpoints/ moved into the package.
 
-# Core routers (always present, not feature-gated)
-from .agent import router as agent_router
-from .conversations import router as conversations_router
-from .memories import router as memories_router
-from .sovereignty import router as sovereignty_router
-from .database import router as database_router
-from .models import router as models_router
-from .security import router as security_router
-from .commands import router as commands_router
-from .files import router as files_router
-from .saved_items import router as saved_items_router
-from .metrics import router as metrics_router
-from .features import router as features_router
-from .ui import router as ui_router
+The endpoints package now lives at ``kestrel_sovereign.endpoints``;
+this stub keeps the documented source-clone forms working
+(``from endpoints.X import Y``). Pip-installed users import the
+in-package path directly.
 
-# Feature-contributed routers (voice, spawn, observability) are no longer
-# imported here. They are mounted dynamically via Feature.get_router()
-# during server startup. See server.py _mount_feature_routers().
+The shim is intentionally minimal — don't add logic here.
+"""
 
-__all__ = [
-    "agent_router",
-    "conversations_router",
-    "memories_router",
-    "sovereignty_router",
-    "database_router",
-    "models_router",
-    "security_router",
-    "commands_router",
-    "files_router",
-    "saved_items_router",
-    "metrics_router",
-    "features_router",
-    "ui_router",
-]
+from __future__ import annotations
+
+import importlib
+import sys
+
+# Import the real package and alias each submodule so
+# ``from endpoints.foo import bar`` works exactly the same as
+# ``from kestrel_sovereign.endpoints.foo import bar``.
+_pkg = importlib.import_module("kestrel_sovereign.endpoints")
+
+# Mirror the package's path so ``importlib`` can find subpackages
+# under the bare name. Without this, ``import endpoints.auth_oauth``
+# would fail with ModuleNotFoundError because Python would only see
+# the shim's own (non-existent) submodules.
+__path__ = list(_pkg.__path__)
+
+# Also alias already-loaded submodules so attribute-style access
+# (``endpoints.foo``) sees them.
+for _name, _mod in list(sys.modules.items()):
+    if _name.startswith("kestrel_sovereign.endpoints."):
+        _suffix = _name[len("kestrel_sovereign.endpoints."):]
+        sys.modules[f"endpoints.{_suffix}"] = _mod
+
+# Re-export the package's public namespace.
+globals().update({k: v for k, v in vars(_pkg).items() if not k.startswith("__")})

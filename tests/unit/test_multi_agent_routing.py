@@ -88,7 +88,7 @@ def _create_multi_agent_app(agents: dict[str, MagicMock]) -> FastAPI:
 
     # Add a test endpoint that uses get_agent
     from fastapi import Request
-    from endpoints.agent_helpers import get_agent
+    from kestrel_sovereign.endpoints.agent_helpers import get_agent
 
     @app.get("/api/agent/info")
     async def agent_info(request: Request):
@@ -285,7 +285,7 @@ class TestSSEConnectionIsolation:
 
     def test_sse_connection_key_is_tuple(self):
         """_sse_connections should use (ip, agent_id) as key."""
-        from endpoints.agent import _sse_connections
+        from kestrel_sovereign.endpoints.agent import _sse_connections
         from collections import defaultdict
 
         # Verify the type annotation is correct
@@ -312,7 +312,7 @@ class TestSingleAgentMode:
         app.state.agent = mock_agent
 
         from fastapi import Request
-        from endpoints.agent_helpers import get_agent
+        from kestrel_sovereign.endpoints.agent_helpers import get_agent
 
         @app.get("/api/agent/info")
         async def agent_info(request: Request):

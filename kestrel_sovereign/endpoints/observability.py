@@ -4,7 +4,7 @@ from typing import Optional, Dict, Any, List
 from datetime import datetime, timezone
 import logging
 
-from endpoints.agent_helpers import get_agent
+from kestrel_sovereign.endpoints.agent_helpers import get_agent
 
 logger = logging.getLogger(__name__)
 

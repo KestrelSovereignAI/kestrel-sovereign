@@ -31,8 +31,8 @@ import pytest
 import uvicorn
 from fastapi import FastAPI
 
-from endpoints.agent import router as agent_router, _sse_connections
-from endpoints.security import router as security_router
+from kestrel_sovereign.endpoints.agent import router as agent_router, _sse_connections
+from kestrel_sovereign.endpoints.security import router as security_router
 from kestrel_sovereign.agent.event_manager import EventManagerMixin
 from kestrel_sovereign.features.security.approval_queue import ApprovalQueue
 

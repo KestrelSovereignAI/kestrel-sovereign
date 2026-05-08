@@ -34,7 +34,7 @@ class ObservabilityFeature(Feature):
         The router is defined in endpoints/observability.py and mounted by
         the server only when ObservabilityFeature is discovered and enabled.
         """
-        from endpoints.observability import router
+        from kestrel_sovereign.endpoints.observability import router
         return router
 
     async def initialize(self):

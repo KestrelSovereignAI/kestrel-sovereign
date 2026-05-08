@@ -17,7 +17,7 @@ from kestrel_sovereign.kestrel_config.constants import (
 )
 from kestrel_sovereign.rate_limit import limiter
 from kestrel_sovereign.security.demo_isolation import enforce_destructive_op
-from endpoints.agent_helpers import get_agent
+from kestrel_sovereign.endpoints.agent_helpers import get_agent
 
 logger = logging.getLogger(__name__)
 

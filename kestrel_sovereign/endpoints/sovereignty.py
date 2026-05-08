@@ -10,7 +10,7 @@ import os
 import logging
 
 from kestrel_sovereign.kestrel_config.constants import MAX_SOVEREIGNTY_PREVIEW_SIZE
-from endpoints.agent_helpers import get_agent
+from kestrel_sovereign.endpoints.agent_helpers import get_agent
 
 logger = logging.getLogger(__name__)
 

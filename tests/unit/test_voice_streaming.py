@@ -187,7 +187,7 @@ def _make_agent(voice_feature=None):
 
 def _prepare_app(agent):
     from server import app
-    from endpoints.voice import router as voice_router
+    from kestrel_sovereign.endpoints.voice import router as voice_router
 
     @asynccontextmanager
     async def noop_lifespan(_app):

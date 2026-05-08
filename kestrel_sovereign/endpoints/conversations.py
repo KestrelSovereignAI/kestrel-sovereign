@@ -11,7 +11,7 @@ from kestrel_sovereign.kestrel_config.constants import SESSION_GAP_MINUTES
 from kestrel_sovereign.security.encryption import get_fernet, get_agent_fernet, decrypt_string_fernet as decrypt_string
 from kestrel_sovereign.security.demo_isolation import enforce_destructive_op
 from kestrel_sovereign.agent.context_builder import extract_raw_user_content
-from endpoints.agent_helpers import get_agent
+from kestrel_sovereign.endpoints.agent_helpers import get_agent
 
 logger = logging.getLogger(__name__)
 

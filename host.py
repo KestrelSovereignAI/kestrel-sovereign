@@ -173,12 +173,12 @@ app = FastAPI(title="Kestrel Host", lifespan=lifespan)
 
 # --- OAuth setup (Google sign-in for browser sessions) ---
 # Mirrors server.py wiring so multi_agent mode supports the same auth flow.
-from endpoints.auth_oauth import (
+from kestrel_sovereign.endpoints.auth_oauth import (
     router as auth_oauth_router,
     register_oauth,
     oauth,
 )
-from endpoints.ui import router as ui_router
+from kestrel_sovereign.endpoints.ui import router as ui_router
 
 app.include_router(auth_oauth_router)
 app.include_router(ui_router)

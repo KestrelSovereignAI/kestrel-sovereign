@@ -94,7 +94,7 @@ def test_observability_events_endpoint_returns_serialized_events():
 
     app, original = _prepare_app(agent)
     # Observability router is now feature-contributed; mount it explicitly
-    from endpoints.observability import router as obs_router
+    from kestrel_sovereign.endpoints.observability import router as obs_router
     app.include_router(obs_router)
     try:
         with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):

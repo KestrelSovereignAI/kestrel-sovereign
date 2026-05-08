@@ -14,7 +14,7 @@ from kestrel_sovereign.llm.model_metadata import ModelCategory
 from kestrel_sovereign.sql_utils import safe_column_name
 from kestrel_sovereign.rate_limit import limiter
 from kestrel_sovereign.features.bootstrap.feature import rename_agent_core
-from endpoints.agent_helpers import get_agent, get_caller
+from kestrel_sovereign.endpoints.agent_helpers import get_agent, get_caller
 
 logger = logging.getLogger(__name__)
 

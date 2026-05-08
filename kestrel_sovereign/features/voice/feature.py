@@ -581,8 +581,8 @@ class VoiceFeature(Feature):
         lives in a sibling module; include it here so both mount atomically
         with the feature.
         """
-        from endpoints.voice import router
-        from endpoints.voice_realtime import router as realtime_router
+        from kestrel_sovereign.endpoints.voice import router
+        from kestrel_sovereign.endpoints.voice_realtime import router as realtime_router
 
         # include_router is idempotent only if we're careful — guard against
         # double-mount when get_router is called twice for the same feature
