@@ -151,7 +151,17 @@ The sentinel is **NOT appended to `full_response`**. Wire-protocol bytes must ne
 
 After tool execution, the post-tool synthesis streams through `_handle_orchestrator_response_streaming`, which now also threads a `tool_results: list` collector. Each `_dispatch_tool_call` appends `{tool_call_id, name, result}` (with `result` slim-summarized — see §8 below) to that list.
 
-Finally, the assistant turn is persisted, and the POST_RESPONSE hook fires with the SDK-0.9 `HookInput` fields populated:
+The POST_RESPONSE hook fires BEFORE the persist call. The hook's DENY/MODIFY return shapes what gets stored — DENY replaces the persisted text with `[Response blocked by audit: …]`, MODIFY replaces with the hook-supplied text. The user has already received the streamed chunks; the hook can only affect the persisted record (and the next-turn history loader, which is what protects against "I don't see my own quantum response" + replays of dishonest content). Sequence:
+
+```python
+tool_final_text = await self._fire_post_response_hook(
+    tool_final_text, session_id,
+    pre_tool_prose=..., tool_calls=..., tool_results=...,
+)
+await self._persist_assistant_turn_safely(tool_final_text, ...)
+```
+
+The HookInput is populated with the SDK-0.9 fields:
 
 ```python
 hook_input = HookInput(
@@ -189,11 +199,15 @@ Wave 5E moved the signal in-band. The in-band sentinel is *strictly serialized* 
 * Fixed prefix `KESTREL:REVISE:` — namespace + intent.
 * JSON payload: `{"index": int, "tool_call_id": str|None, "tool_name": str|None}`. Same fields as the SSE event minus `request_id`/`session_id` (the in-band sentinel is implicitly scoped to the stream that carries it).
 
-### Non-chat consumers strip the sentinel
+### Non-chat consumers strip the sentinel — but DO NOT retract
 
 Voice (`endpoints/voice.py`), bridge (`features/bridge/router.py`), and the TTS stream-tap publish path in `endpoints/agent.py` ALL apply `strip_revise_sentinels()` server-side before forwarding chunks to their respective protocol channels. Without this, TTS would speak the literal `\x1eKESTREL:REVISE:` prefix aloud.
 
-The chat `/api/agent/stream` endpoint is the **only** consumer that passes the sentinel through verbatim — the chat client is the one place that knows how to interpret it.
+> **Honesty guarantee is INCOMPLETE for non-chat consumers.** The strip prevents wire-protocol bytes from leaking, but pre-tool prose the consumer already forwarded is NOT retracted. A voice user has already heard "Saving that now" by the time the marker fires; TTS can't un-speak audio. Bridge consumers have already posted the chunk to Slack/Discord by the time the strip runs.
+>
+> If a new consumer needs the full honesty guarantee, it must either (a) buffer chunks until the LLMResponse arrives and only then forward (loses real-time UX) or (b) implement its own retraction protocol on its own channel (post a follow-up "ignore previous, the actual result was…" message). The chat client is the only in-tree consumer that gets a clean retraction because the chat protocol allows in-place bubble replacement.
+
+The chat `/api/agent/stream` endpoint is the **only** in-tree consumer that passes the sentinel through verbatim, and the chat client is the only place that retracts the pre-tool bubble. New consumers must consciously pick where on the strip-vs-retract spectrum they want to live.
 
 ---
 
@@ -282,7 +296,7 @@ A multi-tool turn where the success verb refers to one successful tool but a *di
 
 Non-dict primitives (raw strings, numbers, lists) become `{"status": "unknown"}` — the value can't leak verbatim through `tool_results`, and `analyze_narration` already treats `unknown`/non-dict as failure-for-audit-purposes, so the audit verdict is preserved.
 
-The orchestrator (`kestrel_sovereign/agent/orchestrator_engine.py:_dispatch_tool_call`) calls the summarizer before appending to `tool_results`. The full envelope still goes to the LLM (as the `tool` message in the orchestrator conversation) and to storage; only the audit-hook surface gets the slim version.
+The orchestrator (`kestrel_sovereign/agent/orchestrator_engine.py:_dispatch_tool_call`) calls the summarizer before appending to `tool_results`. The orchestrator's *messages* list (what the post-tool LLM turn sees as a `tool`-role message) gets the full envelope when small, and a `_build_persisted_preview` truncation when the JSON exceeds `MAX_TOOL_RESULT_CHARS`. The streaming-path persistence only stores the final assistant text plus a `metadata={"tool_events": [...]}` log of tool-call lifecycle markers — full tool-result envelopes don't reach the persisted assistant turn at all. So the audit-hook surface is the *only* layer that intentionally sees a slimmed envelope; the LLM sees full-or-truncated, and storage sees neither.
 
 ---
 
@@ -334,7 +348,8 @@ The `type` field is duplicated inside the `data` JSON for consumers that route o
 | Ambiguous tool envelope passes as "success" | `_result_indicates_failure` treats `is not True` / no-status as failure | §7 |
 | LLM audit unavailable (rate-limited, network, model down) | Narration check fires regardless; risk floored at threshold | §7 |
 | Sensitive payload leaks to third-party POST_RESPONSE hooks | `summarize_tool_result_for_audit` strips data before HookInput.tool_results | §8 |
-| Plugin author's adapter lies about marker timing | Conformance suite (`kestrel_sdk.testing.drain_streaming_with_tools`) catches it | [PROVIDER_PLUGINS.md §"Conformance"](PROVIDER_PLUGINS.md) |
+| Plugin author's adapter violates the marker contract (wrong union type, missing/extra markers, wrong order vs final response) | Conformance suite (`kestrel_sdk.testing.drain_streaming_with_tools`) catches it | [PROVIDER_PLUGINS.md §"Conformance"](PROVIDER_PLUGINS.md) |
+| Plugin author fires the marker LATE (e.g. only after arguments finish) | Not caught by conformance — provider-specific timing is the plugin author's responsibility per the per-provider rules table | [PROVIDER_PLUGINS.md §"Per-provider emission rules"](PROVIDER_PLUGINS.md#per-provider-emission-rules-for-toolcallstarted) |
 
 ---
 
