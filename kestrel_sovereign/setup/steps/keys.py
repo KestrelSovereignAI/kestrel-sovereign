@@ -10,10 +10,19 @@ Two keys matter for v1:
   ``KESTREL_API_KEY``
       Optional API key for HTTP auth. Auto-generated if absent and the
       user opts in; otherwise left empty (server auto-generates per-run).
+
+Newly-generated keys are also pushed into ``os.environ`` for the rest of
+the wizard process. Without that, a quickstart run that creates
+``KESTREL_DATA_KEY`` here and immediately incepts an agent in the
+``agent`` step would fall through to the plaintext-PEM branch in
+``inception_service.save_kestrel_identity`` (which reads
+``os.environ["KESTREL_DATA_KEY"]``) — the new key is on disk in ``.env``,
+but no one in this process has reloaded it yet.
 """
 
 from __future__ import annotations
 
+import os
 import secrets
 
 from kestrel_sovereign.setup.context import Flow, SetupContext
@@ -61,6 +70,17 @@ def run(ctx: SetupContext) -> None:
     result = write_env(ctx.env_path, updates)
     if result.backup_path is not None:
         ctx.record(f"Backed up existing .env to {result.backup_path.name}")
+
+    # Propagate freshly-generated keys to the live process so that later
+    # wizard steps (notably ``agent`` → inception) can read them. Only
+    # populate keys that were absent — never overwrite a value the user
+    # already had in ``os.environ``.
+    for key, value in updates.items():
+        if not value:
+            continue
+        if os.environ.get(key):
+            continue
+        os.environ[key] = value
 
 
 def _generate_fernet_key() -> str:
