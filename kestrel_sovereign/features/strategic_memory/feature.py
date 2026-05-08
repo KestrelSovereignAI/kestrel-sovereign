@@ -177,7 +177,11 @@ class StrategicMemoryFeature(Feature):
 
         section_renderers = {
             "all": self._format_all,
-            "vision": lambda: self._data.get("vision", "No vision defined."),
+            # `or` not `default=` — ``vision: ""`` and ``vision: null``
+            # both return empty/None from .get; ToolResult.ok requires
+            # a non-empty confirmation, so fall back to the placeholder
+            # whenever the value is falsy, not just missing.
+            "vision": lambda: self._data.get("vision") or "No vision defined.",
             "milestones": self._format_milestones,
             "stakeholders": self._format_stakeholders,
             "decisions": self._format_decisions,
