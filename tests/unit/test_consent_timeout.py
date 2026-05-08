@@ -319,19 +319,21 @@ class TestConsentStatsIncludesMetrics:
         feature = ConsentFeature(agent)
         await feature.initialize()
 
+        from kestrel_sdk.tools.result import ToolResultStatus
         result = await feature.consent_stats()
 
-        assert result["success"] is True
-        assert result["total"] == 5
-        assert result["avg_duration_ms"] == 120.5
-        assert result["p95_duration_ms"] == 250.0
-        assert result["timeout_count"] == 1
-        assert result["timeout_rate"] == 0.2  # 1/5
-        assert result["error_count"] == 1
-        assert result["error_rate"] == 0.2
-        # Original fields still present
-        assert result["by_action"]["privacy_mode_change"] == 3
-        assert result["by_sentiment"]["timeout"] == 1
+        # 5 records is below the threshold (>=10) for the
+        # "high timeout rate" PARTIAL surface, so this is OK.
+        assert result.status is ToolResultStatus.OK
+        assert result.data["total"] == 5
+        assert result.data["avg_duration_ms"] == 120.5
+        assert result.data["p95_duration_ms"] == 250.0
+        assert result.data["timeout_count"] == 1
+        assert result.data["timeout_rate"] == 0.2  # 1/5
+        assert result.data["error_count"] == 1
+        assert result.data["error_rate"] == 0.2
+        assert result.data["by_action"]["privacy_mode_change"] == 3
+        assert result.data["by_sentiment"]["timeout"] == 1
 
     @pytest.mark.asyncio
     async def test_consent_stats_no_duration_data(self):
@@ -353,16 +355,17 @@ class TestConsentStatsIncludesMetrics:
         feature = ConsentFeature(agent)
         await feature.initialize()
 
+        from kestrel_sdk.tools.result import ToolResultStatus
         result = await feature.consent_stats()
 
-        assert result["success"] is True
-        assert result["total"] == 0
-        assert result["avg_duration_ms"] is None
-        assert result["p95_duration_ms"] is None
-        assert result["timeout_count"] == 0
-        assert result["timeout_rate"] == 0.0
-        assert result["error_count"] == 0
-        assert result["error_rate"] == 0.0
+        assert result.status is ToolResultStatus.OK
+        assert result.data["total"] == 0
+        assert result.data["avg_duration_ms"] is None
+        assert result.data["p95_duration_ms"] is None
+        assert result.data["timeout_count"] == 0
+        assert result.data["timeout_rate"] == 0.0
+        assert result.data["error_count"] == 0
+        assert result.data["error_rate"] == 0.0
 
 
 # =========================================================================

@@ -24,9 +24,10 @@ import uuid
 from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional
 
+from kestrel_sdk.tools.base import ToolCategory
+from kestrel_sdk.tools.result import ToolResult
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.storage_access import resolve_feature_database
-from kestrel_sdk.tools.base import ToolCategory
 from .models import ConsentRecord
 
 logger = logging.getLogger(__name__)
@@ -228,7 +229,7 @@ class ConsentFeature(Feature):
         category=ToolCategory.SYSTEM,
         command_prefix="!consent-log",
     )
-    async def consent_log(self, limit: int = 10) -> Dict[str, Any]:
+    async def consent_log(self, limit: int = 10) -> ToolResult:
         """
         Query the last N consent records.
 
@@ -246,29 +247,33 @@ class ConsentFeature(Feature):
                 "FROM consent_log ORDER BY created_at DESC LIMIT ?",
                 (limit,),
             )
-            records = []
-            for row in rows:
-                records.append({
-                    "id": row[0],
-                    "agent_id": row[1],
-                    "action_type": row[2],
-                    "action_details": row[3],
-                    "agent_view": row[4],
-                    "agent_sentiment": row[5],
-                    "sovereign_proceeded": bool(row[6]),
-                    "sovereign_override_reason": row[7],
-                    "duration_ms": row[8],
-                    "timed_out": bool(row[9]) if row[9] is not None else False,
-                    "created_at": row[10],
-                })
-            return {
+        except Exception as e:
+            logger.error(f"consent_log query failed: {e}")
+            return ToolResult.failed(str(e), data={"success": False, "error": str(e)})
+
+        records = []
+        for row in rows:
+            records.append({
+                "id": row[0],
+                "agent_id": row[1],
+                "action_type": row[2],
+                "action_details": row[3],
+                "agent_view": row[4],
+                "agent_sentiment": row[5],
+                "sovereign_proceeded": bool(row[6]),
+                "sovereign_override_reason": row[7],
+                "duration_ms": row[8],
+                "timed_out": bool(row[9]) if row[9] is not None else False,
+                "created_at": row[10],
+            })
+        return ToolResult.ok(
+            confirmation=f"Listed {len(records)} consent record(s)",
+            data={
                 "success": True,
                 "records": records,
                 "count": len(records),
-            }
-        except Exception as e:
-            logger.error(f"consent_log query failed: {e}")
-            return {"success": False, "error": str(e)}
+            },
+        )
 
     @tool(
         name="consent_stats",
@@ -276,7 +281,7 @@ class ConsentFeature(Feature):
         category=ToolCategory.SYSTEM,
         command_prefix="!consent-stats",
     )
-    async def consent_stats(self) -> Dict[str, Any]:
+    async def consent_stats(self) -> ToolResult:
         """
         Count consent records by action_type and by sentiment, plus
         latency and timeout/error metrics.
@@ -341,7 +346,7 @@ class ConsentFeature(Feature):
             error_count = error_row[0] if error_row else 0
             error_rate = round(error_count / total, 4) if total > 0 else 0.0
 
-            return {
+            data = {
                 "success": True,
                 "total": total,
                 "by_action": by_action,
@@ -355,7 +360,33 @@ class ConsentFeature(Feature):
             }
         except Exception as e:
             logger.error(f"consent_stats query failed: {e}")
-            return {"success": False, "error": str(e)}
+            return ToolResult.failed(str(e), data={"success": False, "error": str(e)})
+
+        confirmation = (
+            f"Consent stats: {total} record(s); "
+            f"avg={avg_duration_ms}ms, p95={p95_duration_ms}ms, "
+            f"timeouts={timeout_count}/{total} ({timeout_rate:.1%})"
+        )
+
+        # Honesty: a non-trivial timeout rate means consent prompts
+        # are silently expiring and the agent loop is fail-opening on
+        # them. Pre-migration the legacy {"success": True, ...} dict
+        # let the LLM read "stats retrieved" without surfacing that
+        # the consent system is being routinely bypassed by timeouts.
+        # Surface as PARTIAL when timeout_rate > 10% so the model has
+        # to speak the reliability finding.
+        if timeout_rate > 0.10 and total >= 10:
+            return ToolResult.partial(
+                confirmation=confirmation,
+                error=(
+                    f"timeout rate {timeout_rate:.1%} ({timeout_count}/"
+                    f"{total} records) exceeds 10%; consent prompts are "
+                    "fail-opening regularly. Investigate consent latency "
+                    "or extend the timeout."
+                ),
+                data=data,
+            )
+        return ToolResult.ok(confirmation=confirmation, data=data)
 
     # =========================================================================
     # Internal helpers

@@ -14,6 +14,7 @@ import pytest
 import pytest_asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from kestrel_sdk.tools.result import ToolResultStatus
 from kestrel_sovereign.features.consent.models import ConsentRecord, ConsentAction
 from kestrel_sovereign.features.consent.feature import ConsentFeature
 
@@ -247,13 +248,13 @@ class TestConsentLog:
 
         result = await feature.consent_log(limit=10)
 
-        assert result["success"] is True
-        assert result["count"] == 2
-        assert result["records"][0]["id"] == "id1"
-        assert result["records"][0]["action_type"] == "privacy_mode_change"
-        assert result["records"][0]["agent_sentiment"] == "positive"
-        assert result["records"][1]["id"] == "id2"
-        assert result["records"][1]["agent_sentiment"] == "concerned"
+        assert result.data["success"] is True
+        assert result.data["count"] == 2
+        assert result.data["records"][0]["id"] == "id1"
+        assert result.data["records"][0]["action_type"] == "privacy_mode_change"
+        assert result.data["records"][0]["agent_sentiment"] == "positive"
+        assert result.data["records"][1]["id"] == "id2"
+        assert result.data["records"][1]["agent_sentiment"] == "concerned"
 
     @pytest.mark.asyncio
     async def test_consent_log_empty(self):
@@ -266,9 +267,9 @@ class TestConsentLog:
 
         result = await feature.consent_log()
 
-        assert result["success"] is True
-        assert result["count"] == 0
-        assert result["records"] == []
+        assert result.data["success"] is True
+        assert result.data["count"] == 0
+        assert result.data["records"] == []
 
     @pytest.mark.asyncio
     async def test_consent_log_handles_db_error(self):
@@ -281,8 +282,8 @@ class TestConsentLog:
 
         result = await feature.consent_log()
 
-        assert result["success"] is False
-        assert "DB error" in result["error"]
+        assert result.status is ToolResultStatus.ERROR
+        assert "DB error" in result.error
 
 
 # =========================================================================
@@ -325,13 +326,13 @@ class TestConsentStats:
 
         result = await feature.consent_stats()
 
-        assert result["success"] is True
-        assert result["total"] == 6
-        assert result["by_action"]["privacy_mode_change"] == 3
-        assert result["by_action"]["model_change"] == 2
-        assert result["by_action"]["safe_mode_entry"] == 1
-        assert result["by_sentiment"]["positive"] == 4
-        assert result["by_sentiment"]["concerned"] == 1
+        assert result.data["success"] is True
+        assert result.data["total"] == 6
+        assert result.data["by_action"]["privacy_mode_change"] == 3
+        assert result.data["by_action"]["model_change"] == 2
+        assert result.data["by_action"]["safe_mode_entry"] == 1
+        assert result.data["by_sentiment"]["positive"] == 4
+        assert result.data["by_sentiment"]["concerned"] == 1
 
     @pytest.mark.asyncio
     async def test_consent_stats_empty(self):
@@ -345,10 +346,10 @@ class TestConsentStats:
 
         result = await feature.consent_stats()
 
-        assert result["success"] is True
-        assert result["total"] == 0
-        assert result["by_action"] == {}
-        assert result["by_sentiment"] == {}
+        assert result.data["success"] is True
+        assert result.data["total"] == 0
+        assert result.data["by_action"] == {}
+        assert result.data["by_sentiment"] == {}
 
     @pytest.mark.asyncio
     async def test_consent_stats_handles_db_error(self):
@@ -361,8 +362,8 @@ class TestConsentStats:
 
         result = await feature.consent_stats()
 
-        assert result["success"] is False
-        assert "DB error" in result["error"]
+        assert result.status is ToolResultStatus.ERROR
+        assert "DB error" in result.error
 
 
 # =========================================================================
