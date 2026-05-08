@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Optional
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.storage_access import resolve_feature_database
 from kestrel_sdk.tools.base import ToolCategory
+from kestrel_sdk.tools.result import ToolResult
 
 from .models import (
     ChannelMessage,
@@ -193,7 +194,7 @@ class ChannelFeature(Feature):
         category=ToolCategory.COMMUNICATION,
         command_prefix="!channels list",
     )
-    async def channels_list(self) -> Dict[str, Any]:
+    async def channels_list(self) -> ToolResult:
         """
         Show connected channels and their status.
 
@@ -201,10 +202,16 @@ class ChannelFeature(Feature):
         whether each channel is enabled.
         """
         channels = self.registry.list_channels()
-        return {
-            "channels": channels,
-            "count": len(channels),
-        }
+        if not channels:
+            return ToolResult.ok(
+                "No messaging channels registered.",
+                data={"channels": [], "count": 0},
+            )
+        names = ", ".join(ch["channel_type"] for ch in channels)
+        return ToolResult.ok(
+            f"{len(channels)} messaging channel(s) registered: {names}.",
+            data={"channels": channels, "count": len(channels)},
+        )
 
     @tool(
         name="channels_send",
@@ -217,7 +224,7 @@ class ChannelFeature(Feature):
         channel: str,
         to: str,
         message: str,
-    ) -> Dict[str, Any]:
+    ) -> ToolResult:
         """
         Send a message through a named channel.
 
@@ -225,31 +232,34 @@ class ChannelFeature(Feature):
             channel: Channel type to send through (e.g. "telegram")
             to: Recipient identifier (channel-specific)
             message: Text content to send
+
+        Returns:
+            ToolResult.ok on a SUCCESS receipt; PARTIAL on a PENDING
+            receipt (the channel queued the message but has not yet
+            confirmed delivery, so the LLM should NOT promise the
+            sovereign that the message was received); ERROR for
+            adapter-not-found, disconnected, disabled, or send-failure.
         """
         adapter = self.registry.get(channel)
         if adapter is None:
-            return {
-                "success": False,
-                "error": f"No adapter registered for channel '{channel}'",
-                "available_channels": [
-                    ch["channel_type"]
-                    for ch in self.registry.list_channels()
-                ],
-            }
+            available = [ch["channel_type"] for ch in self.registry.list_channels()]
+            return ToolResult.failed(
+                error=(
+                    f"No adapter registered for channel '{channel}' "
+                    f"(available: {', '.join(available) if available else 'none'})"
+                ),
+                data={"available_channels": available},
+            )
 
         if not adapter.is_connected:
-            return {
-                "success": False,
-                "error": f"Channel '{channel}' is registered but not connected",
-            }
+            return ToolResult.failed(
+                error=f"Channel '{channel}' is registered but not connected"
+            )
 
         # Check allowed-sender filtering on the adapter config
         config = adapter.config
         if config and not config.enabled:
-            return {
-                "success": False,
-                "error": f"Channel '{channel}' is disabled",
-            }
+            return ToolResult.failed(error=f"Channel '{channel}' is disabled")
 
         try:
             receipt = await adapter.send_message(to=to, content=message)
@@ -265,10 +275,32 @@ class ChannelFeature(Feature):
         # Log the outbound message
         await self._log_outbound(channel, to, message, receipt)
 
-        return {
-            "success": receipt.status == DeliveryStatus.SUCCESS,
-            "receipt": receipt.to_dict(),
-        }
+        receipt_dict = receipt.to_dict()
+        if receipt.status == DeliveryStatus.SUCCESS:
+            return ToolResult.ok(
+                f"Message sent via {channel} to {to} (id={receipt.message_id}).",
+                data={"receipt": receipt_dict},
+            )
+        if receipt.status == DeliveryStatus.PENDING:
+            # Honesty: PENDING means the channel accepted the request
+            # but has not yet confirmed delivery. The LLM should not
+            # tell the sovereign "your message was sent" — it was
+            # queued, and may still fail.
+            return ToolResult.partial(
+                f"Message queued via {channel} to {to} (id={receipt.message_id}).",
+                (
+                    f"channel '{channel}' returned PENDING — delivery is not "
+                    "yet confirmed; check !channels history for the final "
+                    "status."
+                ),
+                data={"receipt": receipt_dict},
+            )
+        # FAILURE
+        err = receipt.error or f"send failed via {channel}"
+        return ToolResult.failed(
+            error=f"Failed to send via {channel}: {err}",
+            data={"receipt": receipt_dict},
+        )
 
     @tool(
         name="channels_history",
@@ -280,7 +312,7 @@ class ChannelFeature(Feature):
         self,
         limit: int = 20,
         channel: str = "",
-    ) -> Dict[str, Any]:
+    ) -> ToolResult:
         """
         Get recent channel message history.
 
@@ -289,10 +321,7 @@ class ChannelFeature(Feature):
             channel: Optional channel type filter (empty = all channels)
         """
         if not self._db:
-            return {
-                "success": False,
-                "error": "Database not available",
-            }
+            return ToolResult.failed(error="Database not available")
 
         try:
             if channel:
@@ -329,17 +358,18 @@ class ChannelFeature(Feature):
                     "created_at": row[7],
                 })
 
-            return {
-                "success": True,
-                "messages": messages,
-                "count": len(messages),
-            }
+            scope = f" for channel '{channel}'" if channel else ""
+            return ToolResult.ok(
+                f"Returned {len(messages)} channel message(s){scope}.",
+                data={
+                    "messages": messages,
+                    "count": len(messages),
+                    "channel": channel or None,
+                },
+            )
         except Exception as exc:
             logger.error("channels_history failed: %s", exc)
-            return {
-                "success": False,
-                "error": str(exc),
-            }
+            return ToolResult.failed(error=str(exc))
 
     # ------------------------------------------------------------------
     # Inbound message handling (called by adapters)
