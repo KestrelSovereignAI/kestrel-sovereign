@@ -350,6 +350,171 @@ test('SSE listener routes revising event to the matching pane only', async () =>
     apiModule.default.getCurrentStreamRequestId = origGetReqId;
 });
 
+// =====================================================================
+// Wave 5E in-band sentinel — strict-ordering signal on the chat stream
+// =====================================================================
+
+test('inband sentinel: pre-tool retracted, sentinel stripped, post-tool kept', async () => {
+    // Server emits the sentinel between pre-tool prose and post-tool
+    // synthesis. Client must:
+    //  * detect the sentinel
+    //  * NOT include it in the rendered/persisted text
+    //  * drop pre-tool prose accumulated so far
+    //  * paint post-tool chunks fresh into the now-empty bubble
+    renderCalls.length = 0; finalizeCalls.length = 0;
+
+    const pane = getOrCreateChatPane('inband-A');
+    apiModule.default.setHostAgent('inband-A');
+    mountChatPane('inband-A');
+    pane.sessionId = 'sess-i1';
+
+    const ctrl = controlledStream();
+    const origStream = apiModule.default.streamInvoke;
+    apiModule.default.streamInvoke = () => ctrl.iter;
+
+    messageInput.value = 'save my color';
+    const sendPromise = sendMessage();
+    await Promise.resolve(); await Promise.resolve();
+
+    ctrl.push('Saving that now...');
+    await new Promise((r) => setTimeout(r, 5));
+
+    const sentinel = '\x1eKESTREL:REVISE:{"index":0,"tool_call_id":"tc1","tool_name":"save_fact"}\x1e';
+    ctrl.push(sentinel);
+    await new Promise((r) => setTimeout(r, 5));
+
+    ctrl.push('Looking at the result, ');
+    ctrl.push('the save did not persist.');
+    await new Promise((r) => setTimeout(r, 5));
+    ctrl.end();
+    await sendPromise;
+
+    apiModule.default.streamInvoke = origStream;
+
+    assert.equal(finalizeCalls.length, 1);
+    const finalText = finalizeCalls[0];
+    assert.ok(finalText.includes('did not persist'),
+        `post-tool prose must reach finalize, got: ${JSON.stringify(finalText)}`);
+    assert.ok(!finalText.includes('Saving that now'),
+        `pre-tool prose must NOT reach finalize, got: ${JSON.stringify(finalText)}`);
+    assert.ok(!finalText.includes('\x1e'),
+        `wire-protocol \\x1e must never reach finalize, got: ${JSON.stringify(finalText)}`);
+    assert.ok(!finalText.includes('KESTREL:REVISE'),
+        `sentinel literal must never reach finalize, got: ${JSON.stringify(finalText)}`);
+});
+
+test('inband sentinel fused into a single chunk: pre + sentinel + post', async () => {
+    // The chunk happens to contain pre-tool, the sentinel, AND post-
+    // tool all together. The strip drops pre-sentinel + sentinel,
+    // keeping only post-sentinel as the new bubble's leading text.
+    renderCalls.length = 0; finalizeCalls.length = 0;
+
+    const pane = getOrCreateChatPane('inband-B');
+    apiModule.default.setHostAgent('inband-B');
+    mountChatPane('inband-B');
+    pane.sessionId = 'sess-i2';
+
+    const ctrl = controlledStream();
+    const origStream = apiModule.default.streamInvoke;
+    apiModule.default.streamInvoke = () => ctrl.iter;
+
+    messageInput.value = 'go';
+    const sendPromise = sendMessage();
+    await Promise.resolve(); await Promise.resolve();
+
+    const fused =
+        'Saving' +
+        '\x1eKESTREL:REVISE:{"index":0,"tool_call_id":"tc1","tool_name":"x"}\x1e' +
+        'fresh start';
+    ctrl.push(fused);
+    await new Promise((r) => setTimeout(r, 5));
+    ctrl.end();
+    await sendPromise;
+
+    apiModule.default.streamInvoke = origStream;
+
+    const finalText = finalizeCalls[finalizeCalls.length - 1] || '';
+    assert.equal(finalText, 'fresh start',
+        `fused chunk must drop pre-sentinel + sentinel, keep post-sentinel; got: ${JSON.stringify(finalText)}`);
+});
+
+test('inband sentinel + SSE listener are idempotent (both fire, retract once)', async () => {
+    // If both signals arrive (the common case), pendingRevise gets
+    // set twice but only triggers ONE retraction. The second signal
+    // is a no-op against the already-cleared accumulator.
+    renderCalls.length = 0; finalizeCalls.length = 0;
+
+    const pane = getOrCreateChatPane('idempotent-A');
+    apiModule.default.setHostAgent('idempotent-A');
+    mountChatPane('idempotent-A');
+    pane.sessionId = 'sess-id1';
+
+    const ctrl = controlledStream();
+    const origStream = apiModule.default.streamInvoke;
+    apiModule.default.streamInvoke = () => ctrl.iter;
+
+    messageInput.value = 'save';
+    const sendPromise = sendMessage();
+    await Promise.resolve(); await Promise.resolve();
+
+    ctrl.push('pre-tool. ');
+    await new Promise((r) => setTimeout(r, 5));
+    pane.pendingRevise = true;  // simulate SSE listener firing
+
+    ctrl.push('\x1eKESTREL:REVISE:{"index":0,"tool_call_id":"tc1","tool_name":"x"}\x1e');
+    await new Promise((r) => setTimeout(r, 5));
+
+    ctrl.push('post-tool answer.');
+    await new Promise((r) => setTimeout(r, 5));
+    ctrl.end();
+    await sendPromise;
+
+    apiModule.default.streamInvoke = origStream;
+
+    const finalText = finalizeCalls[finalizeCalls.length - 1] || '';
+    assert.ok(finalText.includes('post-tool answer'));
+    assert.ok(!finalText.includes('pre-tool'),
+        'pre-tool prose must be retracted exactly once even with both signals');
+    assert.ok(!finalText.includes('\x1e'));
+});
+
+test('inband sentinel split across chunk boundary: pre-tool dropped, partial sentinel handled', async () => {
+    // Edge case: TCP/buffer split lands the sentinel in two halves.
+    // The strip's split-handling fires sawSentinel=true on the
+    // prefix-only chunk and drops the pre-sentinel slice. The Wave
+    // 5C SSE listener catches the same marker as a backup so
+    // pendingRevise gets armed regardless. The closing-half chunk's
+    // sentinel-tail bytes leak as a transient UI glitch — acceptable
+    // degradation per the documented contract.
+    renderCalls.length = 0; finalizeCalls.length = 0;
+
+    const pane = getOrCreateChatPane('split-A');
+    apiModule.default.setHostAgent('split-A');
+    mountChatPane('split-A');
+    pane.sessionId = 'sess-sp1';
+
+    const ctrl = controlledStream();
+    const origStream = apiModule.default.streamInvoke;
+    apiModule.default.streamInvoke = () => ctrl.iter;
+
+    messageInput.value = 'go';
+    const sendPromise = sendMessage();
+    await Promise.resolve(); await Promise.resolve();
+
+    ctrl.push('Saving\x1eKESTREL:REVISE:{"index":0,');  // first half
+    await new Promise((r) => setTimeout(r, 5));
+    ctrl.end();
+    await sendPromise;
+
+    apiModule.default.streamInvoke = origStream;
+
+    const finalText = finalizeCalls[finalizeCalls.length - 1] || '';
+    assert.ok(!finalText.includes('Saving'),
+        `pre-tool 'Saving' must be retracted on split-prefix chunk, got: ${JSON.stringify(finalText)}`);
+    assert.ok(!finalText.includes('KESTREL:REVISE'),
+        `sentinel literal (split prefix) must not reach finalize, got: ${JSON.stringify(finalText)}`);
+});
+
 test('multiple concurrent panes: revise on pane A leaves pane B untouched', async () => {
     // Each pane has independent pendingRevise state. A revising event
     // for dispatch on agent A must not affect the in-flight stream on

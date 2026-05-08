@@ -1,5 +1,6 @@
 """Streaming response handling for Kestrel Agent."""
 import asyncio
+import json
 import logging
 import time
 from typing import Dict, Any, Optional
@@ -13,6 +14,42 @@ from kestrel_sovereign.security.input_guardrails import (
     append_security_addendum,
 )
 from kestrel_sovereign.telemetry import start_span, end_span
+
+
+# Wave 5E in-band revising sentinel — kestrel-sovereign #1086.
+#
+# The chat client uses this sentinel as the AUTHORITATIVE boundary
+# between pre-tool prose and post-tool synthesis on the
+# /api/agent/stream text/plain channel. It's strictly ordered with
+# the chunks themselves, so unlike the parallel SSE `revising` event
+# it can't race the post-tool chunks.
+#
+# Wire format: ``\x1eKESTREL:REVISE:<json>\x1e``
+#   * ``\x1e`` (Record Separator, ASCII 30) bookends — chosen because
+#     LLMs don't emit it, it's UTF-8-safe, and HTTP middleware
+#     doesn't strip it.
+#   * Fixed prefix ``KESTREL:REVISE:`` — namespace + intent.
+#   * JSON payload: ``{"index": int, "tool_call_id": str|None,
+#     "tool_name": str|None}``. Same fields as the SSE event minus
+#     request_id/session_id (the in-band sentinel is implicitly
+#     scoped to the stream that carries it).
+#
+# The Wave 5C SSE `revising` event is still emitted for non-chat
+# consumers (audit dashboards, accessibility tools); chat clients
+# treat the two signals as idempotent — whichever arrives first sets
+# ``pane.pendingRevise``; the other is a no-op.
+REVISE_SENTINEL_PREFIX = "\x1eKESTREL:REVISE:"
+REVISE_SENTINEL_SUFFIX = "\x1e"
+
+
+def _build_revise_sentinel(marker: ToolCallStarted) -> str:
+    """Construct the in-band revise sentinel for a ToolCallStarted marker."""
+    payload = json.dumps({
+        "index": marker.index,
+        "tool_call_id": marker.id,
+        "tool_name": marker.name,
+    }, separators=(",", ":"))
+    return f"{REVISE_SENTINEL_PREFIX}{payload}{REVISE_SENTINEL_SUFFIX}"
 
 
 class StreamingMixin:
@@ -260,6 +297,14 @@ class StreamingMixin:
                 await self._emit_revising_event(
                     item, session_id=session_id, request_id=request_id,
                 )
+                # Wave 5E: in-band sentinel on the chat stream itself.
+                # Strictly ordered with the chunks, so the chat client
+                # can never race the post-tool synthesis. The Wave 5C
+                # SSE event is the reliability backup; chat clients
+                # treat both as idempotent. NOT appended to
+                # ``full_response`` — the persisted assistant turn
+                # must not contain wire-protocol bytes.
+                yield _build_revise_sentinel(item)
                 # Snapshot pre-tool prose at the FIRST marker only —
                 # subsequent markers arrive between tool calls of the
                 # same LLM turn and don't introduce new pre-tool text
