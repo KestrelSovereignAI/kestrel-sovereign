@@ -203,16 +203,27 @@ async def trigger_sovereignty_export(request: Request):
         # export_sovereignty returns a ToolResult since #1061 wave 22.
         # Honesty: surface PARTIAL/ERROR distinctly so the HTTP caller
         # can tell a "backup hashed but not actually published" path
-        # from a clean export, and bubble auth/wallet refusals as
-        # 4xx-shaped errors instead of 200 OK.
+        # from a clean export. ERROR envelopes (e.g. insufficient
+        # wallet funds) raise HTTPException so HTTP clients that
+        # branch on status code can tell a refused export from a
+        # successful request — returning 200 with ``success: False``
+        # would silently let those clients treat refusals as ok.
         from kestrel_sdk.tools.result import ToolResultStatus
+        if envelope.status is ToolResultStatus.ERROR:
+            err = envelope.error or "Export failed"
+            # Wallet-affordability refusal -> 402 Payment Required.
+            # Everything else (provider blow-ups, etc.) -> 500.
+            status_code = 402 if "Insufficient funds" in err else 500
+            raise HTTPException(status_code=status_code, detail=err)
         message = envelope.confirmation or envelope.error or ""
         body: Dict[str, Any] = {
-            "success": envelope.status is not ToolResultStatus.ERROR,
+            "success": True,
             "status": envelope.status.value,
             "message": message,
         }
         if envelope.error:
+            # PARTIAL: success=true (the action ran), but surface the
+            # caveat so the caller can warn the user.
             body["error"] = envelope.error
         if envelope.data is not None:
             body["data"] = envelope.data
