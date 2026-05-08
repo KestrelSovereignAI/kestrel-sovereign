@@ -584,23 +584,58 @@ class IdentityFeature(Feature):
                 data={"total_migrations": 0, "records": []},
             )
 
-        # Format migration records
+        # Format migration records. Wrap each per-row format step
+        # so a single malformed row (e.g. ``{"stats": null}``,
+        # numeric timestamp, missing fields) doesn't escape this
+        # @tool — the migrated module's contract requires every
+        # code path to return ToolResult. (Round 1 codex finding.)
         records = []
         parse_errors: List[str] = []
         for row in rows:
             try:
-                props = json.loads(row[1]) if row[1] else {}
-            except (json.JSONDecodeError, TypeError) as e:
-                parse_errors.append(f"node {row[0][:12]}: {e}")
+                node_id = row[0] if row else None
+                if not isinstance(node_id, str):
+                    parse_errors.append(f"row had non-string node_id: {node_id!r}")
+                    continue
+                short_id = node_id[:12]
+
+                if row[1] is None:
+                    props: Dict[str, Any] = {}
+                elif isinstance(row[1], str):
+                    props = json.loads(row[1])
+                    if not isinstance(props, dict):
+                        parse_errors.append(
+                            f"node {short_id}: properties JSON parsed to "
+                            f"{type(props).__name__}, expected object"
+                        )
+                        continue
+                else:
+                    parse_errors.append(
+                        f"node {short_id}: properties is "
+                        f"{type(row[1]).__name__}, expected str/None"
+                    )
+                    continue
+
+                ts = props.get("timestamp", "Unknown")
+                ts_str = ts[:19] if isinstance(ts, str) else str(ts)[:19]
+
+                # ``stats`` may be missing, ``null``, or a non-dict —
+                # accept dict, fall back to {} otherwise.
+                raw_stats = props.get("stats")
+                stats = dict(raw_stats) if isinstance(raw_stats, dict) else {}
+
+                records.append({
+                    "id": short_id,
+                    "full_id": node_id,
+                    "timestamp": ts_str,
+                    "from": props.get("source_substrate") or "Unknown",
+                    "to": props.get("target_substrate") or "Unknown",
+                    "stats": stats,
+                })
+            except (json.JSONDecodeError, TypeError, ValueError) as e:
+                short = row[0][:12] if row and isinstance(row[0], str) else "?"
+                parse_errors.append(f"node {short}: {e}")
                 continue
-            records.append({
-                "id": row[0][:12],
-                "full_id": row[0],
-                "timestamp": props.get("timestamp", "Unknown")[:19],
-                "from": props.get("source_substrate", "Unknown"),
-                "to": props.get("target_substrate", "Unknown"),
-                "stats": dict(props.get("stats", {})),
-            })
 
         confirmation = (
             f"Migration history: {len(records)} migration(s) recorded "
