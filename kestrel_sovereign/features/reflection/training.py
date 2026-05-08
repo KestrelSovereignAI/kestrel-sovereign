@@ -60,8 +60,14 @@ class TrainingManager:
         for i in range(1, iterations + 1):
             logger.info(f"Training cycle iteration {i}/{iterations}")
 
-            # Run reflection
-            reflection_result = await self.feature.reflect(scope="all", depth=depth)
+            # Run reflection. ReflectionFeature.reflect() now returns a
+            # ToolResult envelope (#1061 wave 9); the legacy
+            # format_reflection_result dict that this manager consumes
+            # via .get(...) lives under .data.
+            reflection_envelope = await self.feature.reflect(scope="all", depth=depth)
+            reflection_result = (
+                reflection_envelope.data if reflection_envelope.data is not None else {}
+            )
 
             # Extract health score
             iteration_result = self._analyze_iteration_health(reflection_result, i)

@@ -18,6 +18,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from kestrel_sdk.tools.result import ToolResultStatus
 from kestrel_sovereign.features.reflection.feature import ReflectionFeature
 from kestrel_sovereign.features.reflection.models import ChangeType
 from kestrel_sovereign.kestrel_agent import KestrelAgent
@@ -82,18 +83,18 @@ async def test_propose_then_create_ticket_with_proposal_id(wired_feature):
         proposed_change="Allow create_improvement_ticket to consume proposal IDs",
     )
 
-    assert propose_result["success"] is True
-    assert propose_result["approved"] is True
-    proposal_id = propose_result["proposal_id"]
+    assert propose_result.status is ToolResultStatus.OK
+    assert propose_result.data["approved"] is True
+    proposal_id = propose_result.data["proposal_id"]
     assert proposal_id
 
     ticket_result = await feat.create_improvement_ticket(proposal_id)
 
-    assert ticket_result["success"] is True, ticket_result
-    assert ticket_result["state"] == "ticket_created"
-    assert ticket_result["source"] == "proposal"
-    assert ticket_result["proposal_id"] == proposal_id
-    assert ticket_result["issue_url"] == "https://github.com/x/y/issues/999"
+    assert ticket_result.status is ToolResultStatus.OK, ticket_result
+    assert ticket_result.data["state"] == "ticket_created"
+    assert ticket_result.data["source"] == "proposal"
+    assert ticket_result.data["proposal_id"] == proposal_id
+    assert ticket_result.data["issue_url"] == "https://github.com/x/y/issues/999"
 
     gh.client.create_issue.assert_awaited_once()
     issued_kwargs = gh.client.create_issue.await_args.kwargs
@@ -127,15 +128,17 @@ async def test_unapproved_proposal_blocks_ticket(tmp_path, monkeypatch):
             change_type=ChangeType.BEHAVIOR.value,
             proposed_change="x",
         )
-        assert proposal_result["success"] is True
-        assert proposal_result["approved"] is False
-        proposal_id = proposal_result["proposal_id"]
+        # Rejected proposal → PARTIAL (recorded but not applied; agent
+        # must speak the rejection per #1042 honesty layer 4).
+        assert proposal_result.status is ToolResultStatus.PARTIAL
+        assert proposal_result.data["approved"] is False
+        proposal_id = proposal_result.data["proposal_id"]
 
         ticket_result = await feat.create_improvement_ticket(proposal_id)
 
-        assert ticket_result["success"] is False
-        assert ticket_result["state"] == "proposal_not_approved"
-        assert ticket_result["proposal_id"] == proposal_id
+        assert ticket_result.status is ToolResultStatus.ERROR
+        assert ticket_result.data["state"] == "proposal_not_approved"
+        assert ticket_result.data["proposal_id"] == proposal_id
         gh.client.create_issue.assert_not_awaited()
     finally:
         await db.close()
@@ -147,6 +150,6 @@ async def test_unknown_id_returns_clear_not_found(wired_feature):
 
     result = await feat.create_improvement_ticket("not-a-real-id")
 
-    assert result["success"] is False
-    assert result["state"] == "not_found"
-    assert "not-a-real-id" in result["error"]
+    assert result.status is ToolResultStatus.ERROR
+    assert result.data["state"] == "not_found"
+    assert "not-a-real-id" in result.error

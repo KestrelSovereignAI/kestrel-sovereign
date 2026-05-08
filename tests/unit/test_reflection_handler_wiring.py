@@ -93,6 +93,8 @@ async def test_create_improvement_ticket_reaches_handler(agent_with_storage):
     feat = ReflectionFeature(agent=agent_with_storage)
     await feat.initialize()
 
+    from kestrel_sdk.tools.result import ToolResultStatus
+
     with patch.object(
         feat._ticket_handler, "create_improvement_ticket",
         new=AsyncMock(return_value={"success": True, "issue_url": "ok"}),
@@ -100,7 +102,10 @@ async def test_create_improvement_ticket_reaches_handler(agent_with_storage):
         result = await feat.create_improvement_ticket("insight-id-stub")
 
     mock_create.assert_awaited_once_with("insight-id-stub")
-    assert result == {"success": True, "issue_url": "ok"}
+    # @tool now returns a ToolResult envelope (#1061 wave 9); the
+    # legacy dict is preserved verbatim under .data.
+    assert result.status is ToolResultStatus.OK
+    assert result.data == {"success": True, "issue_url": "ok"}
 
 
 @pytest.mark.asyncio
@@ -130,8 +135,9 @@ async def test_ticket_handler_skipped_when_github_missing(tmp_path, monkeypatch)
         assert feat._ticket_creator is None
         assert feat._ticket_handler is None
 
+        from kestrel_sdk.tools.result import ToolResultStatus
         result = await feat.create_improvement_ticket("any")
-        assert result["success"] is False
-        assert "not available" in result["error"].lower()
+        assert result.status is ToolResultStatus.ERROR
+        assert "not available" in result.error.lower()
     finally:
         await db.close()
