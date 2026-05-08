@@ -259,6 +259,97 @@ test('streaming loop without revise leaves pre-tool prose intact (regression gua
     assert.ok(finalText.includes('No tools needed today.'));
 });
 
+test('SSE listener routes revising event to the matching pane only', async () => {
+    // Codex P3: prior tests flipped pane.pendingRevise directly, so
+    // a broken listener registration / request-id matcher would
+    // still pass. Drive the path end-to-end through a fake
+    // EventSource: register the listener, dispatch an event, assert
+    // ONLY the matching pane gets the placeholder + flag.
+    renderCalls.length = 0; finalizeCalls.length = 0;
+
+    // Fake EventSource that captures handlers and exposes a fire helper.
+    const handlers = new Map();
+    class FakeES {
+        constructor(_url) { FakeES.last = this; }
+        addEventListener(name, h) {
+            const list = handlers.get(name) || [];
+            list.push(h);
+            handlers.set(name, list);
+        }
+        close() {}
+    }
+    const origES = globalThis.EventSource;
+    globalThis.EventSource = FakeES;
+
+    // Two panes with distinct active request_ids.
+    const paneA = getOrCreateChatPane('sse-A');
+    const paneB = getOrCreateChatPane('sse-B');
+    paneA.pendingRevise = false; paneB.pendingRevise = false;
+
+    // Mount A so we have a streaming bubble there too — addMessageStreaming
+    // requires a mounted target.
+    apiModule.default.setHostAgent('sse-A');
+    mountChatPane('sse-A');
+
+    // Stub request-id lookup so the SSE listener can match the event.
+    const origGetReqId = apiModule.default.getCurrentStreamRequestId;
+    apiModule.default.getCurrentStreamRequestId = (agent) => {
+        if (agent === 'sse-A') return 'rid-A';
+        if (agent === 'sse-B') return 'rid-B';
+        return null;
+    };
+
+    // Give each pane an in-flight bubble to retract.
+    const msgA = chatModule.addMessageStreaming('agent', paneA.element);
+    const msgB = chatModule.addMessageStreaming('agent', paneB.element);
+    paneA.streamingMsgDiv = msgA;
+    paneB.streamingMsgDiv = msgB;
+
+    // Register the listener by reconnecting notifications.
+    chatModule.connectNotifications();
+    const reviseHandlers = handlers.get('revising') || [];
+    assert.ok(reviseHandlers.length >= 1,
+        'connectNotifications must register a revising listener');
+
+    // Fire a revising event for rid-A.
+    for (const h of reviseHandlers) {
+        h({ data: JSON.stringify({
+            type: 'revising', request_id: 'rid-A',
+            index: 0, tool_name: 'save_fact',
+        }) });
+    }
+
+    assert.equal(paneA.pendingRevise, true,
+        'pane A (matching request_id) must have pendingRevise flipped');
+    assert.equal(paneB.pendingRevise, false,
+        'pane B (non-matching) must NOT be touched');
+
+    // The matching pane's bubble shows the placeholder; the
+    // non-matching pane's bubble is untouched.
+    const slotA = msgA.querySelector('.message-content') || msgA;
+    const slotB = msgB.querySelector('.message-content') || msgB;
+    assert.ok(
+        (slotA._innerHTML || '').includes('Revising'),
+        `pane A bubble must show the revising placeholder, got: ${JSON.stringify(slotA._innerHTML)}`,
+    );
+    assert.ok(
+        !(slotB._innerHTML || '').includes('Revising'),
+        'pane B bubble must NOT show the placeholder',
+    );
+
+    // A revising event with no matching active request_id is a no-op
+    // (silent drop) — covers the dispatch-already-finished case.
+    paneA.pendingRevise = false; // re-arm
+    for (const h of reviseHandlers) {
+        h({ data: JSON.stringify({ request_id: 'rid-NOBODY' }) });
+    }
+    assert.equal(paneA.pendingRevise, false,
+        'unmatched request_id must not flip any pane');
+
+    globalThis.EventSource = origES;
+    apiModule.default.getCurrentStreamRequestId = origGetReqId;
+});
+
 test('multiple concurrent panes: revise on pane A leaves pane B untouched', async () => {
     // Each pane has independent pendingRevise state. A revising event
     // for dispatch on agent A must not affect the in-flight stream on
