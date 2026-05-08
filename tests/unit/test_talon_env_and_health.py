@@ -14,6 +14,8 @@ import os
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+from kestrel_sdk.tools.result import ToolResultStatus
+
 import pytest
 
 from kestrel_sovereign.features.talon.coordinator import TalonCoordinatorFeature
@@ -87,8 +89,11 @@ async def test_talon_health_returns_unhealthy_when_binary_missing(monkeypatch):
     monkeypatch.setenv("GITHUB_TOKEN", "ghp_test")
     feat = _make_feature()
     with patch.object(TalonCoordinatorFeature, "_find_talon_bin", return_value=None):
-        report = await feat.talon_health()
+        envelope = await feat.talon_health()
 
+    # talon_health now returns a ToolResult envelope (#1061 wave 15);
+    # the legacy report dict lives under .data.
+    report = envelope.data
     assert report["healthy"] is False
     assert report["binary"]["found"] is False
     assert "execute" not in report  # short-circuited at binary stage
@@ -123,8 +128,9 @@ async def test_talon_health_runs_help_and_reports_success(monkeypatch, tmp_path)
     ), patch(
         "asyncio.create_subprocess_exec", side_effect=fake_create_subprocess_exec,
     ):
-        report = await feat.talon_health()
+        envelope = await feat.talon_health()
 
+    report = envelope.data
     assert report["healthy"] is True
     assert report["binary"]["found"] is True
     assert report["binary"]["path"] == str(fake_bin)
@@ -162,8 +168,9 @@ async def test_talon_health_reports_help_failure(monkeypatch, tmp_path):
     ), patch(
         "asyncio.create_subprocess_exec", side_effect=fake_create_subprocess_exec,
     ):
-        report = await feat.talon_health()
+        envelope = await feat.talon_health()
 
+    report = envelope.data
     assert report["healthy"] is False
     assert report["execute"]["ok"] is False
     assert report["execute"]["returncode"] == 7
@@ -254,7 +261,7 @@ async def test_status_reaps_finished_background_jobs(tmp_path, monkeypatch):
     await feat._jobs[job_id]["process"].wait()
 
     status = await feat.talon_status()
-    matching = [j for j in status["jobs"] if j["id"] == job_id]
+    matching = [j for j in status.data["jobs"] if j["id"] == job_id]
     assert matching, f"Job {job_id} missing from status"
     assert matching[0]["status"] == "complete"
     assert matching[0]["returncode"] == 0
@@ -282,7 +289,7 @@ async def test_status_marks_failed_jobs(tmp_path, monkeypatch):
 
     await feat._jobs[result["job_id"]]["process"].wait()
     status = await feat.talon_status()
-    matching = [j for j in status["jobs"] if j["id"] == result["job_id"]]
+    matching = [j for j in status.data["jobs"] if j["id"] == result["job_id"]]
     assert matching[0]["status"] == "failed"
     assert matching[0]["returncode"] == 3
 
@@ -310,20 +317,20 @@ async def test_talon_job_log_returns_tail(tmp_path, monkeypatch):
     await feat._jobs[result["job_id"]]["process"].wait()
 
     log_result = await feat.talon_job_log(result["job_id"], lines=5)
-    assert log_result["success"] is True
-    assert log_result["lines"] == 5
-    assert "log line 20" in log_result["content"]
-    assert "log line 16" in log_result["content"]
+    assert log_result.data["success"] is True
+    assert log_result.data["lines"] == 5
+    assert "log line 20" in log_result.data["content"]
+    assert "log line 16" in log_result.data["content"]
     # Earlier lines should NOT be in the tail
-    assert "log line 1\n" not in log_result["content"][:200]
+    assert "log line 1\n" not in log_result.data["content"][:200]
 
 
 @pytest.mark.asyncio
 async def test_talon_job_log_unknown_id():
     feat = TalonCoordinatorFeature(SimpleNamespace(_scheduler=None))
     result = await feat.talon_job_log("not-a-real-id")
-    assert result["success"] is False
-    assert "Unknown" in result["error"]
+    assert result.status is ToolResultStatus.ERROR
+    assert "Unknown" in result.error
 
 
 # ----- Self-modification safeguards -----------------------------------
@@ -409,8 +416,9 @@ async def test_claim_refuses_unsafe_workspace_root(monkeypatch):
         return_value={"dispatched": False},
     ):
         result = await feat.talon_claim(repo="self", issue=1)
-    assert result["dispatched"] is False
-    assert result["state"] == "unsafe_workspace"
+    assert result.status is ToolResultStatus.ERROR
+    assert result.data["dispatched"] is False
+    assert result.data["state"] == "unsafe_workspace"
 
 
 @pytest.mark.asyncio
@@ -452,9 +460,9 @@ async def test_setup_workspace_clones_outside_running_source(
     ):
         result = await feat.talon_setup_workspace(repo="org/repo")
 
-    assert result["success"] is True
-    assert result["state"] == "created"
-    workspace_path = _Path(result["workspace"]["path"])
+    assert result.status is ToolResultStatus.OK
+    assert result.data["state"] == "created"
+    workspace_path = _Path(result.data["workspace"]["path"])
     assert workspace_path.exists()
     assert (workspace_path / ".git").is_dir()
     assert not _path_contains(_RUNNING_AGENT_SOURCE_ROOT, workspace_path)
@@ -482,8 +490,8 @@ async def test_setup_workspace_denied_without_approval(tmp_path, monkeypatch):
     feat = TalonCoordinatorFeature(agent)
 
     result = await feat.talon_setup_workspace(repo="org/repo")
-    assert result["success"] is False
-    assert result["state"] == "approval_denied"
+    assert result.status is ToolResultStatus.ERROR
+    assert result.data["state"] == "approval_denied"
     assert not (tmp_path / "org__repo" / ".git").exists()
 
 
@@ -492,9 +500,12 @@ async def test_workspace_status_reports_missing_workspace(monkeypatch, tmp_path)
     monkeypatch.setenv("KESTREL_TALON_WORKSPACE_ROOT", str(tmp_path))
     feat = _make_feature()
     result = await feat.talon_workspace_status(repo="org/never-cloned")
-    assert result["exists"] is False
-    assert result["is_git"] is False
-    assert result["safe"] is True
+    # Unprovisioned workspace is PARTIAL (read succeeded, but the
+    # workspace isn't ready for talon_claim) per #1061 wave 15.
+    assert result.status is ToolResultStatus.PARTIAL
+    assert result.data["exists"] is False
+    assert result.data["is_git"] is False
+    assert result.data["safe"] is True
 
 
 @pytest.mark.asyncio
@@ -510,5 +521,8 @@ async def test_workspace_status_reports_unsafe(monkeypatch):
     )
     feat = _make_feature()
     result = await feat.talon_workspace_status(repo="org/x")
-    assert result["safe"] is False
-    assert "running agent's source tree" in result["unsafe_reason"]
+    # Unsafe workspace path is PARTIAL — read succeeded, but the
+    # state.safe flag reflects a refusal-to-dispatch condition.
+    assert result.status is ToolResultStatus.PARTIAL
+    assert result.data["safe"] is False
+    assert "running agent's source tree" in result.data["unsafe_reason"]

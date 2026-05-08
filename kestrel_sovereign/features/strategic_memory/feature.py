@@ -386,15 +386,20 @@ class StrategicMemoryFeature(Feature):
                     confirmation="## Signal Dispatch\nNo actionable issue found.",
                     data={"mode": "execute", "issue": None},
                 )
-            result = await coordinator.talon_claim(
+            # talon_claim now returns a ToolResult envelope (#1061
+            # wave 15). The legacy {"dispatched", "method", "error"}
+            # dict lives under .data.
+            claim_envelope = await coordinator.talon_claim(
                 repo=issue["repo"], issue=issue["issue_number"],
             )
-            dispatched = bool(result.get("dispatched"))
-            method = result.get("method", "N/A")
+            claim_dict = claim_envelope.data or {}
+            dispatched = bool(claim_dict.get("dispatched"))
+            method = claim_dict.get("method", "N/A")
+            err_text = claim_envelope.error or claim_dict.get("error") or "unknown"
             body = (
                 f"## Signal Dispatch\n"
                 f"{issue['repo']}#{issue['issue_number']}: {issue['issue_title']} -- "
-                + ("dispatched" if dispatched else f"failed: {result.get('error', 'unknown')}")
+                + ("dispatched" if dispatched else f"failed: {err_text}")
                 + f"\nMethod: {method}"
             )
 
@@ -403,7 +408,7 @@ class StrategicMemoryFeature(Feature):
                 "issue": issue,
                 "dispatched": dispatched,
                 "method": method,
-                "claim_result": result,
+                "claim_result": claim_dict,
             }
 
             # Honesty: if the claim failed, the agent must speak the
@@ -415,7 +420,7 @@ class StrategicMemoryFeature(Feature):
                     confirmation=body,
                     error=(
                         f"talon_claim for {issue['repo']}#{issue['issue_number']} "
-                        f"did not dispatch: {result.get('error', 'unknown')}"
+                        f"did not dispatch: {err_text}"
                     ),
                     data=data,
                 )

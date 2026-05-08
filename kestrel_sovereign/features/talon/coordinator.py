@@ -20,13 +20,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from kestrel_sdk.tools.base import ToolCategory
+from kestrel_sdk.tools.result import ToolResult
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.peers.mesh import (
     MeshMessage,
     MeshMessageType,
     make_assign_message,
 )
-from kestrel_sdk.tools.base import ToolCategory
 
 logger = logging.getLogger(__name__)
 
@@ -98,7 +99,7 @@ class TalonCoordinatorFeature(Feature):
         model: str = "opus",
         skip_clarification: bool = True,
         worktree: bool = True,
-    ) -> Dict[str, Any]:
+    ) -> ToolResult:
         """Claim an issue for Talon to implement.
 
         Talon's claim flow runs the LLM agent loop, runs quality
@@ -140,39 +141,59 @@ class TalonCoordinatorFeature(Feature):
         # False quickly so we fall through to the CLI path.
         mesh_result = await self._dispatch_via_mesh(repo, issue)
         if mesh_result.get("dispatched"):
-            return mesh_result
+            # Mesh dispatch returns ``message_id`` (not ``job_id``) — that's
+            # the tracking id the agent/user needs to follow up.
+            tracking_id = (
+                mesh_result.get("job_id")
+                or mesh_result.get("message_id")
+                or "?"
+            )
+            return ToolResult.ok(
+                confirmation=(
+                    f"Dispatched {repo}#{issue} to talon via mesh "
+                    f"(message_id={tracking_id})"
+                ),
+                data=mesh_result,
+            )
 
         repo_resolved = self._resolve_repo(repo)
         workspace = self._workspace_path_for(repo_resolved)
 
         unsafe_reason = self._assert_workspace_safe(workspace)
         if unsafe_reason:
-            return {
-                "dispatched": False,
-                "state": "unsafe_workspace",
-                "error": unsafe_reason,
-            }
+            return ToolResult.failed(
+                unsafe_reason,
+                data={
+                    "dispatched": False,
+                    "state": "unsafe_workspace",
+                    "error": unsafe_reason,
+                },
+            )
 
         # If the workspace doesn't exist, refuse and tell the agent
         # the structural next step. Don't silently fall through to
         # the running source tree — that's the bug we're fixing.
         state = self._workspace_state(repo_resolved)
         if not state["exists"] or not state["is_git"]:
-            return {
-                "dispatched": False,
-                "state": "workspace_not_provisioned",
-                "error": (
-                    "No talon workspace exists for "
-                    f"{repo_resolved} at {workspace}. The dispatcher "
-                    "will not operate on the running agent's source "
-                    "tree. Call talon_setup_workspace(repo) to "
-                    "provision a sandboxed clone, then retry."
-                ),
-                "workspace": state,
-                "next_step": (
-                    f"talon_setup_workspace(repo='{repo_resolved}')"
-                ),
-            }
+            err_msg = (
+                "No talon workspace exists for "
+                f"{repo_resolved} at {workspace}. The dispatcher "
+                "will not operate on the running agent's source "
+                "tree. Call talon_setup_workspace(repo) to "
+                "provision a sandboxed clone, then retry."
+            )
+            return ToolResult.failed(
+                err_msg,
+                data={
+                    "dispatched": False,
+                    "state": "workspace_not_provisioned",
+                    "error": err_msg,
+                    "workspace": state,
+                    "next_step": (
+                        f"talon_setup_workspace(repo='{repo_resolved}')"
+                    ),
+                },
+            )
 
         worktree_base = (
             os.environ.get("KESTREL_TALON_WORKTREE_BASE")
@@ -192,7 +213,7 @@ class TalonCoordinatorFeature(Feature):
         if skip_clarification:
             args.append("--skip-clarification")
 
-        return await self._dispatch_via_cli_background(
+        cli_result = await self._dispatch_via_cli_background(
             args,
             label=f"claim:{repo_resolved}#{issue}",
             extra_meta={
@@ -201,6 +222,20 @@ class TalonCoordinatorFeature(Feature):
                 "model": model,
                 "workspace": str(workspace),
             },
+        )
+
+        if cli_result.get("dispatched"):
+            return ToolResult.ok(
+                confirmation=(
+                    f"Dispatched {repo_resolved}#{issue} to talon via CLI "
+                    f"background (job_id={cli_result.get('job_id', '?')}, "
+                    f"pid={cli_result.get('pid', '?')})"
+                ),
+                data=cli_result,
+            )
+        return ToolResult.failed(
+            cli_result.get("error") or "talon CLI dispatch failed",
+            data=cli_result,
         )
 
     @tool(
@@ -213,7 +248,7 @@ class TalonCoordinatorFeature(Feature):
         category=ToolCategory.UTILITY,
         command_prefix="!talon workspace-status",
     )
-    async def talon_workspace_status(self, repo: str) -> Dict[str, Any]:
+    async def talon_workspace_status(self, repo: str) -> ToolResult:
         """Inspect the talon workspace for ``repo``.
 
         Use this BEFORE ``talon_claim`` to verify the sandbox is
@@ -222,11 +257,37 @@ class TalonCoordinatorFeature(Feature):
         ``talon_setup_workspace`` first.
         """
         repo_resolved = self._resolve_repo(repo)
-        return {
-            "success": True,
-            "repo": repo_resolved,
-            **self._workspace_state(repo_resolved),
-        }
+        state = self._workspace_state(repo_resolved)
+        data = {"success": True, "repo": repo_resolved, **state}
+
+        # Honesty: this is a read-only inspect, but reporting OK on
+        # an unprovisioned/unsafe workspace would let the agent
+        # narrate "workspace ready" off a state that talon_claim will
+        # immediately reject. Surface as PARTIAL with the failing
+        # condition so the LLM has to speak it.
+        if state.get("safe") is False:
+            return ToolResult.partial(
+                confirmation=f"Read workspace state for {repo_resolved}",
+                error=state.get("unsafe_reason") or "workspace path is unsafe",
+                data=data,
+            )
+        if not state.get("exists") or not state.get("is_git"):
+            return ToolResult.partial(
+                confirmation=f"Read workspace state for {repo_resolved}",
+                error=(
+                    f"workspace at {state.get('path')} is not provisioned "
+                    "(exists=False or no .git); call talon_setup_workspace "
+                    "before talon_claim"
+                ),
+                data=data,
+            )
+        return ToolResult.ok(
+            confirmation=(
+                f"Workspace ready: {repo_resolved} at {state.get('path')} "
+                f"(head={state.get('head')}, clean={state.get('clean')})"
+            ),
+            data=data,
+        )
 
     @tool(
         name="talon_setup_workspace",
@@ -243,7 +304,7 @@ class TalonCoordinatorFeature(Feature):
         self,
         repo: str,
         fetch: bool = True,
-    ) -> Dict[str, Any]:
+    ) -> ToolResult:
         """Clone ``repo`` into the canonical talon workspace path.
 
         If the workspace already exists as a git checkout and
@@ -267,69 +328,85 @@ class TalonCoordinatorFeature(Feature):
 
         unsafe_reason = self._assert_workspace_safe(workspace)
         if unsafe_reason:
-            return {
-                "success": False,
-                "state": "unsafe_workspace",
-                "error": unsafe_reason,
-            }
+            return ToolResult.failed(
+                unsafe_reason,
+                data={"success": False, "state": "unsafe_workspace", "error": unsafe_reason},
+            )
 
         approved = await self._request_workspace_approval(
             repo=repo_resolved, workspace=workspace, fetch=fetch,
         )
         if not approved:
-            return {
-                "success": False,
-                "state": "approval_denied",
-                "error": "Workspace setup not approved",
-                "workspace": str(workspace),
-            }
+            return ToolResult.failed(
+                "Workspace setup not approved",
+                data={
+                    "success": False,
+                    "state": "approval_denied",
+                    "error": "Workspace setup not approved",
+                    "workspace": str(workspace),
+                },
+            )
 
         existing = self._workspace_state(repo_resolved)
         if existing["exists"] and existing["is_git"]:
             if fetch:
                 fetch_result = await self._git_fetch(workspace)
                 if not fetch_result["ok"]:
-                    return {
-                        "success": False,
-                        "state": "fetch_failed",
-                        "error": fetch_result["error"],
+                    return ToolResult.failed(
+                        fetch_result["error"],
+                        data={
+                            "success": False,
+                            "state": "fetch_failed",
+                            "error": fetch_result["error"],
+                            "workspace": self._workspace_state(repo_resolved),
+                        },
+                    )
+                return ToolResult.ok(
+                    confirmation=f"Refreshed workspace for {repo_resolved} (git fetch)",
+                    data={
+                        "success": True,
+                        "state": "refreshed",
                         "workspace": self._workspace_state(repo_resolved),
-                    }
-                return {
+                    },
+                )
+            return ToolResult.ok(
+                confirmation=f"Workspace already exists for {repo_resolved} (no fetch)",
+                data={
                     "success": True,
-                    "state": "refreshed",
-                    "workspace": self._workspace_state(repo_resolved),
-                }
-            return {
-                "success": True,
-                "state": "exists",
-                "workspace": existing,
-            }
+                    "state": "exists",
+                    "workspace": existing,
+                },
+            )
 
         # Need to clone. Make sure the parent dir exists.
         try:
             workspace.parent.mkdir(parents=True, exist_ok=True)
         except OSError as e:
-            return {
-                "success": False,
-                "state": "mkdir_failed",
-                "error": str(e),
-            }
+            return ToolResult.failed(
+                str(e),
+                data={"success": False, "state": "mkdir_failed", "error": str(e)},
+            )
 
         clone_url = f"https://github.com/{repo_resolved}.git"
         clone_result = await self._git_clone(clone_url, workspace)
         if not clone_result["ok"]:
-            return {
-                "success": False,
-                "state": "clone_failed",
-                "error": clone_result["error"],
-            }
+            return ToolResult.failed(
+                clone_result["error"],
+                data={
+                    "success": False,
+                    "state": "clone_failed",
+                    "error": clone_result["error"],
+                },
+            )
 
-        return {
-            "success": True,
-            "state": "created",
-            "workspace": self._workspace_state(repo_resolved),
-        }
+        return ToolResult.ok(
+            confirmation=f"Created workspace for {repo_resolved} at {workspace}",
+            data={
+                "success": True,
+                "state": "created",
+                "workspace": self._workspace_state(repo_resolved),
+            },
+        )
 
     def _get_security_feature(self):
         agent = getattr(self, "agent", None)
@@ -580,7 +657,7 @@ class TalonCoordinatorFeature(Feature):
         repo: str,
         label: str = "",
         prd: str = "",
-    ) -> Dict[str, Any]:
+    ) -> ToolResult:
         """Dispatch batch processing to Talon.
 
         Args:
@@ -589,19 +666,33 @@ class TalonCoordinatorFeature(Feature):
             prd: Path to a PRD JSON file for batch mode.
         """
         if prd:
-            return await self._dispatch_via_cli_background(
+            cli_result = await self._dispatch_via_cli_background(
                 ["batch", "--prd", prd],
                 label=f"batch:prd={prd}",
                 extra_meta={"prd": prd},
             )
-        if label:
+        elif label:
             repo_resolved = self._resolve_repo(repo)
-            return await self._dispatch_via_cli_background(
+            cli_result = await self._dispatch_via_cli_background(
                 ["batch", "--repo", repo_resolved, "--label", label],
                 label=f"batch:{repo_resolved}:label={label}",
                 extra_meta={"repo": repo_resolved, "github_label": label},
             )
-        return {"dispatched": False, "error": "Provide either label or prd"}
+        else:
+            return ToolResult.failed(
+                "Provide either label or prd",
+                data={"dispatched": False, "error": "Provide either label or prd"},
+            )
+
+        if cli_result.get("dispatched"):
+            return ToolResult.ok(
+                confirmation=f"Dispatched batch (job_id={cli_result.get('job_id', '?')})",
+                data=cli_result,
+            )
+        return ToolResult.failed(
+            cli_result.get("error") or "talon batch dispatch failed",
+            data=cli_result,
+        )
 
     @tool(
         name="talon_status",
@@ -609,7 +700,7 @@ class TalonCoordinatorFeature(Feature):
         category=ToolCategory.UTILITY,
         command_prefix="!talon status",
     )
-    async def talon_status(self) -> Dict[str, Any]:
+    async def talon_status(self) -> ToolResult:
         """Check status of dispatched Talon jobs.
 
         Reaps any background CLI subprocess that has finished since
@@ -663,11 +754,17 @@ class TalonCoordinatorFeature(Feature):
             if info.get("status") in ("complete", "failed", "reject")
         ]
 
-        return {
+        data = {
             "running": len(running),
             "completed": len(done),
             "jobs": running + done,
         }
+        return ToolResult.ok(
+            confirmation=(
+                f"Talon jobs: running={len(running)}, completed={len(done)}"
+            ),
+            data=data,
+        )
 
     @tool(
         name="talon_job_log",
@@ -680,35 +777,43 @@ class TalonCoordinatorFeature(Feature):
     )
     async def talon_job_log(
         self, job_id: str, lines: int = 200,
-    ) -> Dict[str, Any]:
+    ) -> ToolResult:
         """Return the last ``lines`` lines of a job's combined log."""
         info = self._jobs.get(job_id)
         if not info:
-            return {"success": False, "error": f"Unknown job_id: {job_id}"}
+            return ToolResult.failed(
+                f"Unknown job_id: {job_id}",
+                data={"job_id": job_id},
+            )
 
         log_path = info.get("log_path")
         if not log_path or not os.path.isfile(log_path):
-            return {
-                "success": False,
-                "error": f"Log file missing: {log_path}",
-                "job_id": job_id,
-            }
+            return ToolResult.failed(
+                f"Log file missing: {log_path}",
+                data={"job_id": job_id, "log_path": log_path},
+            )
 
         try:
             with open(log_path, "r", encoding="utf-8", errors="replace") as f:
                 tail = f.readlines()[-max(1, int(lines)):]
         except OSError as e:
-            return {"success": False, "error": str(e), "job_id": job_id}
+            return ToolResult.failed(str(e), data={"job_id": job_id})
 
-        return {
-            "success": True,
-            "job_id": job_id,
-            "log_path": log_path,
-            "status": info.get("status"),
-            "returncode": info.get("returncode"),
-            "lines": len(tail),
-            "content": "".join(tail),
-        }
+        return ToolResult.ok(
+            confirmation=(
+                f"Tailed {len(tail)} line(s) from {log_path} "
+                f"(status={info.get('status')}, rc={info.get('returncode')})"
+            ),
+            data={
+                "success": True,
+                "job_id": job_id,
+                "log_path": log_path,
+                "status": info.get("status"),
+                "returncode": info.get("returncode"),
+                "lines": len(tail),
+                "content": "".join(tail),
+            },
+        )
 
     @tool(
         name="talon_pause",
@@ -716,7 +821,7 @@ class TalonCoordinatorFeature(Feature):
         category=ToolCategory.SYSTEM,
         command_prefix="!talon pause",
     )
-    async def talon_pause(self) -> Dict[str, Any]:
+    async def talon_pause(self) -> ToolResult:
         """Pause the Talon dispatch loop.
 
         Disables the signal_dispatch scheduler so no new work is
@@ -725,8 +830,14 @@ class TalonCoordinatorFeature(Feature):
         scheduler = getattr(self.agent, '_scheduler', None)
         if scheduler and hasattr(scheduler, 'remove_schedule'):
             scheduler.remove_schedule("signal_dispatch")
-            return {"paused": True, "message": "Talon dispatch paused. Use !talon resume to restart."}
-        return {"paused": False, "error": "Scheduler not available"}
+            return ToolResult.ok(
+                confirmation="Talon dispatch paused. Use !talon resume to restart.",
+                data={"paused": True, "message": "Talon dispatch paused. Use !talon resume to restart."},
+            )
+        return ToolResult.failed(
+            "Scheduler not available",
+            data={"paused": False, "error": "Scheduler not available"},
+        )
 
     @tool(
         name="talon_resume",
@@ -734,13 +845,19 @@ class TalonCoordinatorFeature(Feature):
         category=ToolCategory.SYSTEM,
         command_prefix="!talon resume",
     )
-    async def talon_resume(self) -> Dict[str, Any]:
+    async def talon_resume(self) -> ToolResult:
         """Resume the Talon dispatch loop after a pause."""
         scheduler = getattr(self.agent, '_scheduler', None)
         if scheduler and hasattr(scheduler, 'add_schedule'):
             scheduler.add_schedule("signal_dispatch", "5 8 * * *", "signal_dispatch")
-            return {"resumed": True, "message": "Talon dispatch resumed at 08:05 daily."}
-        return {"resumed": False, "error": "Scheduler not available"}
+            return ToolResult.ok(
+                confirmation="Talon dispatch resumed at 08:05 daily.",
+                data={"resumed": True, "message": "Talon dispatch resumed at 08:05 daily."},
+            )
+        return ToolResult.failed(
+            "Scheduler not available",
+            data={"resumed": False, "error": "Scheduler not available"},
+        )
 
     @tool(
         name="talon_health",
@@ -752,7 +869,7 @@ class TalonCoordinatorFeature(Feature):
         category=ToolCategory.SYSTEM,
         command_prefix="!talon health",
     )
-    async def talon_health(self) -> Dict[str, Any]:
+    async def talon_health(self) -> ToolResult:
         """Smoke-test the talon CLI path without dispatching real work.
 
         Returns a structured report covering:
@@ -772,6 +889,46 @@ class TalonCoordinatorFeature(Feature):
         """
         report: Dict[str, Any] = {"healthy": False}
 
+        def _wrap(r: Dict[str, Any]) -> ToolResult:
+            """Final wrap: healthy → OK; any failure → ERROR with the
+            most-specific reason in the error string so the LLM can't
+            narrate "talon healthy" off a binary-not-found body."""
+            if r.get("healthy"):
+                return ToolResult.ok(
+                    confirmation=(
+                        f"kestrel-talon healthy "
+                        f"(binary={r.get('binary', {}).get('path')})"
+                    ),
+                    data=r,
+                )
+            # Pull the most specific error available. Stage dicts may
+            # carry ``error`` directly OR a non-zero ``returncode`` +
+            # ``stderr_tail`` (the --help-fails-mid-startup path); both
+            # need to surface, otherwise the agent loses the actual
+            # cause that talon_health exists to diagnose.
+            for stage in ("execute", "env", "binary"):
+                stage_data = r.get(stage)
+                if not isinstance(stage_data, dict):
+                    continue
+                if stage_data.get("error"):
+                    return ToolResult.failed(
+                        f"talon health {stage}: {stage_data['error']}",
+                        data=r,
+                    )
+                if stage == "execute" and stage_data.get("ok") is False:
+                    rc = stage_data.get("returncode")
+                    stderr_tail = (stage_data.get("stderr_tail") or "").strip()
+                    detail = stderr_tail[-300:] if stderr_tail else "no stderr"
+                    return ToolResult.failed(
+                        f"talon health execute: --help exited rc={rc}; "
+                        f"stderr_tail={detail!r}",
+                        data=r,
+                    )
+            return ToolResult.failed(
+                "talon health check failed",
+                data=r,
+            )
+
         # 1. Binary discovery
         talon_bin = self._find_talon_bin()
         if not talon_bin:
@@ -783,7 +940,7 @@ class TalonCoordinatorFeature(Feature):
                     "checkout at ../kestrel-talon with its own .venv."
                 ),
             }
-            return report
+            return _wrap(report)
         report["binary"] = {"found": True, "path": talon_bin}
 
         # 2. Env cleanliness
@@ -798,7 +955,7 @@ class TalonCoordinatorFeature(Feature):
         except RuntimeError as e:
             env_report["error"] = str(e)
             report["env"] = env_report
-            return report
+            return _wrap(report)
 
         token_source = next(
             (
@@ -831,10 +988,10 @@ class TalonCoordinatorFeature(Feature):
                 "ok": False,
                 "error": "kestrel-talon --help timed out after 15s",
             }
-            return report
+            return _wrap(report)
         except Exception as e:
             report["execute"] = {"ok": False, "error": str(e)}
-            return report
+            return _wrap(report)
 
         out = stdout.decode(errors="replace")
         err = stderr.decode(errors="replace")
@@ -847,7 +1004,7 @@ class TalonCoordinatorFeature(Feature):
         }
 
         report["healthy"] = bool(report["execute"]["ok"])
-        return report
+        return _wrap(report)
 
     # ------------------------------------------------------------------
     # Internal: Mesh dispatch (preferred)
