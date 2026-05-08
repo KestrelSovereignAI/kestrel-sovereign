@@ -66,6 +66,7 @@ MIGRATED_FEATURE_MODULES: frozenset[str] = frozenset({
     "kestrel_sovereign.features.model.feature",
     "kestrel_sovereign.features.keys.feature",
     "kestrel_sovereign.features.strategic_memory.feature",
+    "kestrel_sovereign.features.compute.feature",
 })
 
 
