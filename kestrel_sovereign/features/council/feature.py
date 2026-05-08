@@ -530,6 +530,11 @@ class CouncilFeature(Feature):
         lines.append("---")
         lines.append("*This is a preview. Use council_convene to run a full session.*")
 
+        # ``test_failed`` is set by ``_gather_test_results`` even when
+        # pytest collection blew up (test_count=0). Read it
+        # defensively — it may not be present on older Evidence
+        # instances or non-pytest evidence sources.
+        test_failed = getattr(evidence, "test_failed", 0) or 0
         data = {
             "target": evidence.target,
             "compiled_at": evidence.compiled_at.isoformat(),
@@ -537,25 +542,47 @@ class CouncilFeature(Feature):
             "code_changes_count": len(evidence.code_changes),
             "test_passed": evidence.test_passed,
             "test_count": evidence.test_count,
+            "test_failed": test_failed,
             "risks_count": len(evidence.risks),
             "architecture_docs_count": len(evidence.architecture_docs),
             "previous_decisions_count": len(evidence.previous_decisions),
             "risks": list(evidence.risks)[:5],
         }
 
-        # Honesty: tests-failing in the evidence is a signal the
-        # council should weigh heavily. The LLM should not produce
-        # a "looks good, convene the council" framing while the
-        # evidence itself shows test failures. Surface as PARTIAL.
-        if evidence.test_count > 0 and evidence.test_passed < evidence.test_count:
-            failed = evidence.test_count - evidence.test_passed
-            return ToolResult.partial(
-                confirmation="\n".join(lines),
-                error=(
-                    f"evidence shows {failed} of {evidence.test_count} "
+        # Honesty: failing tests in the evidence is a signal the
+        # council should weigh heavily. Two failure signals matter:
+        #
+        #  - ``test_passed < test_count`` (normal: some tests ran
+        #    and failed)
+        #  - ``test_failed > 0`` AND ``test_count == 0``: pytest
+        #    collection itself failed (syntax/import error). The
+        #    failed count is reported but no tests were collected.
+        #    Pre-fix this hit the OK branch with ``0/0 passing``,
+        #    framing a broken test suite as success. (Round 1
+        #    codex finding.)
+        unrun_failures = (evidence.test_count == 0 and test_failed > 0)
+        normal_failures = (
+            evidence.test_count > 0 and evidence.test_passed < evidence.test_count
+        )
+        if normal_failures or unrun_failures:
+            if unrun_failures:
+                err = (
+                    f"evidence shows {test_failed} test failure(s) but "
+                    "0 tests collected — pytest collection itself failed "
+                    "(syntax/import error in the test suite). The council "
+                    "cannot review a build that won't compile; fix the "
+                    "test errors first"
+                )
+            else:
+                failed_n = evidence.test_count - evidence.test_passed
+                err = (
+                    f"evidence shows {failed_n} of {evidence.test_count} "
                     "test(s) failing — convening the council on a red "
                     "test suite is unusual; consider stabilizing first"
-                ),
+                )
+            return ToolResult.partial(
+                confirmation="\n".join(lines),
+                error=err,
                 data=data,
             )
         return ToolResult.ok(
