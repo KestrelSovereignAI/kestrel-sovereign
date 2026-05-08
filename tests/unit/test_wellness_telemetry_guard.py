@@ -21,6 +21,7 @@ from kestrel_sovereign.features.wellness.feature import (
     WellnessFeature,
 )
 from kestrel_sovereign.agent.context_builder import ContextBuilder
+from kestrel_sdk.tools.result import ToolResult
 
 
 # ============================================================================
@@ -321,10 +322,10 @@ class TestWellnessToolsAreReadOnly:
         finally:
             type(agent).__setattr__ = original_setattr
 
-        # Returns a dict (tool response)
-        assert isinstance(result, dict)
-        assert "overall_score" in result
-        assert "dimensions" in result
+        # Returns a ToolResult envelope (telemetry-only payload)
+        assert isinstance(result, ToolResult)
+        assert "overall_score" in result.data
+        assert "dimensions" in result.data
 
         # Agent should not have any wellness-related attribute set on it
         wellness_attrs = [a for a in assigned_attrs if "wellness" in a.lower()]
@@ -350,7 +351,7 @@ class TestWellnessToolsAreReadOnly:
         finally:
             type(agent).__setattr__ = original_setattr
 
-        assert isinstance(result, dict)
+        assert isinstance(result, ToolResult)
 
         wellness_attrs = [a for a in assigned_attrs if "wellness" in a.lower()]
         assert wellness_attrs == [], (
@@ -372,15 +373,16 @@ class TestWellnessToolsAreReadOnly:
         check_tool = tool_by_name["wellness_check"]
         result = await check_tool.execute()
 
-        # Tool framework wraps in {"success": True, "result": ..., "tool": ...}
+        # Tool framework wraps in {"success": True, "result": <ToolResult.to_dict()>, "tool": ...}
         assert result["success"] is True
         assert "result" in result
         assert result["tool"] == "wellness_check"
 
-        # The inner result is the metrics dict
+        # The inner wire form is the ToolResult envelope; payload lives under .data
         inner = result["result"]
-        assert "overall_score" in inner
-        assert "dimensions" in inner
+        assert inner["status"] == "ok"
+        assert "overall_score" in inner["data"]
+        assert "dimensions" in inner["data"]
 
 
 # ============================================================================
@@ -431,11 +433,11 @@ class TestWellnessExportDoesNotInject:
         finally:
             type(agent).__setattr__ = original_setattr
 
-        # Returns a dict (tool response)
-        assert isinstance(result, dict)
-        assert "checkpoints" in result
-        assert "count" in result
-        assert result["export_format"] == "v1"
+        # Returns a ToolResult envelope (telemetry-only payload)
+        assert isinstance(result, ToolResult)
+        assert "checkpoints" in result.data
+        assert "count" in result.data
+        assert result.data["export_format"] == "v1"
 
         # Agent should not store export data for context injection
         wellness_attrs = [a for a in assigned_attrs if "wellness" in a.lower()]
@@ -457,10 +459,11 @@ class TestWellnessExportDoesNotInject:
         assert result["success"] is True
         assert result["tool"] == "wellness_export"
 
-        # The inner result has the export data
+        # The inner wire form is the ToolResult envelope; payload lives under .data
         inner = result["result"]
-        assert "checkpoints" in inner
-        assert inner["export_format"] == "v1"
+        assert inner["status"] == "ok"
+        assert "checkpoints" in inner["data"]
+        assert inner["data"]["export_format"] == "v1"
 
     @pytest.mark.asyncio
     async def test_wellness_export_does_not_inject_into_context_builder(self, feature):
@@ -472,7 +475,7 @@ class TestWellnessExportDoesNotInject:
         """
         # Run the export
         export_result = await feature.wellness_export()
-        assert export_result["count"] == 2
+        assert export_result.data["count"] == 2
 
         # Now build a system prompt (simulating the next turn)
         storage = Mock()

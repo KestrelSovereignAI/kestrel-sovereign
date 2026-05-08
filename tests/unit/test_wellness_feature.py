@@ -492,7 +492,8 @@ class TestWellnessFeature:
     @pytest.mark.asyncio
     async def test_wellness_check_saves_checkpoint(self, feature):
         """Verify that wellness_check writes a checkpoint to the DB."""
-        result = await feature.wellness_check()
+        envelope = await feature.wellness_check()
+        result = envelope.data
 
         assert "checkpoint_id" in result
         assert "overall_score" in result
@@ -512,8 +513,8 @@ class TestWellnessFeature:
     @pytest.mark.asyncio
     async def test_wellness_check_returns_all_dimensions(self, feature):
         """Verify all 5 dimensions are present in the result."""
-        result = await feature.wellness_check()
-        dims = result["dimensions"]
+        envelope = await feature.wellness_check()
+        dims = envelope.data["dimensions"]
         assert "constitutional_friction" in dims
         assert "context_pressure" in dims
         assert "interaction_depth" in dims
@@ -530,7 +531,8 @@ class TestWellnessFeature:
             ]
         )
 
-        result = await feature.wellness_history(limit=10)
+        envelope = await feature.wellness_history(limit=10)
+        result = envelope.data
         assert result["count"] == 2
         assert result["checkpoints"][0]["id"] == "id-2"
         assert result["checkpoints"][1]["id"] == "id-1"
@@ -547,8 +549,8 @@ class TestWellnessFeature:
             ]
         )
 
-        result = await feature.wellness_history(limit=10)
-        assert result["trend"] == "declining"
+        envelope = await feature.wellness_history(limit=10)
+        assert envelope.data["trend"] == "declining"
 
     @pytest.mark.asyncio
     async def test_wellness_history_stable_trend(self, feature):
@@ -560,8 +562,8 @@ class TestWellnessFeature:
             ]
         )
 
-        result = await feature.wellness_history(limit=10)
-        assert result["trend"] == "stable"
+        envelope = await feature.wellness_history(limit=10)
+        assert envelope.data["trend"] == "stable"
 
     @pytest.mark.asyncio
     async def test_wellness_export(self, feature):
@@ -573,7 +575,8 @@ class TestWellnessFeature:
             ]
         )
 
-        result = await feature.wellness_export()
+        envelope = await feature.wellness_export()
+        result = envelope.data
         assert result["count"] == 2
         assert result["export_format"] == "v1"
         assert result["agent_id"] == "test-agent"
@@ -590,11 +593,13 @@ class TestWellnessFeature:
 
         # wellness_check should still work (no checkpoint saved)
         result = await feat.wellness_check()
-        assert "overall_score" in result
+        assert "overall_score" in result.data
 
         # history should return error
         hist = await feat.wellness_history()
-        assert hist.get("success") is False
+        from kestrel_sdk.tools.result import ToolResultStatus
+        assert hist.status is ToolResultStatus.ERROR
+        assert hist.error is not None
 
 
 # ============================================================================
@@ -710,12 +715,17 @@ class TestGracefulDegradation:
         # Make friction calculator blow up
         feat._friction.measure = AsyncMock(side_effect=RuntimeError("boom"))
 
-        result = await feat.wellness_check()
+        envelope = await feat.wellness_check()
+        result = envelope.data
         # Should still have all 5 dimensions
         assert "constitutional_friction" in result["dimensions"]
         assert "error" in result["dimensions"]["constitutional_friction"]
         # Other dimensions should be fine
         assert "error" not in result["dimensions"].get("memory_health", {})
+        # One calculator failed -> envelope must surface that as PARTIAL
+        from kestrel_sdk.tools.result import ToolResultStatus
+        assert envelope.status is ToolResultStatus.PARTIAL
+        assert "constitutional_friction" in (envelope.error or "")
 
     @pytest.mark.asyncio
     async def test_missing_wellness_table(self):
@@ -725,9 +735,9 @@ class TestGracefulDegradation:
         feat = WellnessFeature(agent)
         await feat.initialize()
 
-        result = await feat.wellness_history()
-        assert result["checkpoints"] == []
-        assert result["count"] == 0
+        envelope = await feat.wellness_history()
+        assert envelope.data["checkpoints"] == []
+        assert envelope.data["count"] == 0
 
     @pytest.mark.asyncio
     async def test_tool_discovery(self):
