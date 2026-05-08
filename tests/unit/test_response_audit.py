@@ -386,31 +386,36 @@ class TestResponseAuditFeature:
     @pytest.mark.asyncio
     async def test_feature_enable_disable(self):
         """Enable and disable should toggle the hook state."""
+        from kestrel_sdk.tools.result import ToolResultStatus
         agent = _make_agent()
         feature = ResponseAuditFeature(agent)
         feature._mode = "skip"
 
         # Enable
-        result = await feature.enable_audit(mode="warn")
-        assert result["status"] == "enabled"
-        assert result["mode"] == "warn"
+        envelope = await feature.enable_audit(mode="warn")
+        assert envelope.status is ToolResultStatus.OK
+        assert envelope.data["status"] == "enabled"
+        assert envelope.data["mode"] == "warn"
         assert feature._hook is not None
         assert feature._hook.enabled is True
 
         # Disable
-        result = await feature.disable_audit()
-        assert result["status"] == "disabled"
+        envelope = await feature.disable_audit()
+        assert envelope.status is ToolResultStatus.OK
+        assert envelope.data["status"] == "disabled"
         assert feature._hook.enabled is False
         assert feature._mode == "skip"
 
     @pytest.mark.asyncio
     async def test_feature_enable_invalid_mode(self):
         """Enabling with invalid mode should return error."""
+        from kestrel_sdk.tools.result import ToolResultStatus
         agent = _make_agent()
         feature = ResponseAuditFeature(agent)
 
-        result = await feature.enable_audit(mode="invalid")
-        assert result["status"] == "error"
+        envelope = await feature.enable_audit(mode="invalid")
+        assert envelope.status is ToolResultStatus.ERROR
+        assert "must be" in envelope.error
 
     @pytest.mark.asyncio
     async def test_feature_enable_updates_existing_hook(self):
@@ -421,17 +426,21 @@ class TestResponseAuditFeature:
         await feature.enable_audit(mode="warn")
         assert feature._hook.mode == "warn"
 
-        result = await feature.enable_audit(mode="strict")
-        assert result["status"] == "updated"
+        envelope = await feature.enable_audit(mode="strict")
+        assert envelope.data["status"] == "updated"
         assert feature._hook.mode == "strict"
 
     @pytest.mark.asyncio
     async def test_feature_status(self):
         """audit_status should return all expected fields."""
+        from kestrel_sdk.tools.result import ToolResultStatus
         agent = _make_agent()
         feature = ResponseAuditFeature(agent)
 
-        status = await feature.audit_status()
+        envelope = await feature.audit_status()
+        # mode='skip' + no hook is the legitimate default state -> OK.
+        assert envelope.status is ToolResultStatus.OK
+        status = envelope.data
 
         assert "mode" in status
         assert "strategy" in status
@@ -442,6 +451,26 @@ class TestResponseAuditFeature:
         assert status["mode"] == "skip"
         assert status["hook_registered"] is False
         assert status["audit_count"] == 0
+
+    @pytest.mark.asyncio
+    async def test_feature_status_partial_when_mode_active_but_hook_missing(self):
+        """audit_status reports PARTIAL when configured mode != skip but
+        no hook is actually registered/enabled — this is the
+        misconfiguration the LLM must speak instead of silently
+        reporting "audit running" when audits are not running.
+        """
+        from kestrel_sdk.tools.result import ToolResultStatus
+        agent = _make_agent()
+        feature = ResponseAuditFeature(agent)
+        # Simulate a misconfiguration: mode set but no hook.
+        feature._mode = "warn"
+        feature._hook = None
+
+        envelope = await feature.audit_status()
+        assert envelope.status is ToolResultStatus.PARTIAL
+        assert envelope.data["mode"] == "warn"
+        assert envelope.data["hook_registered"] is False
+        assert "no hook is registered" in envelope.error
 
     @pytest.mark.asyncio
     async def test_audit_count_tracking(self):
