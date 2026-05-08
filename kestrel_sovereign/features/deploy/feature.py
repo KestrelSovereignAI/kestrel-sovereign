@@ -177,10 +177,16 @@ class DeployFeature(Feature):
         if action == "status" and "active_deployments" in payload:
             n = payload.get("active_deployments", 0)
             return f"{n} active deployment(s)"
-        # List with sessions.
-        if action in {"list", "ls"} and "sessions" in payload:
-            n = len(payload.get("sessions") or [])
-            return f"Listed {n} deployment(s)"
+        # List of deployments. The manager returns
+        # {"count": N, "deployments": [...]} on this path; older
+        # surfaces also used "sessions". Read both.
+        if action in {"list", "ls"}:
+            if "count" in payload:
+                return f"Listed {payload['count']} deployment(s)"
+            if "deployments" in payload:
+                return f"Listed {len(payload.get('deployments') or [])} deployment(s)"
+            if "sessions" in payload:
+                return f"Listed {len(payload.get('sessions') or [])} deployment(s)"
         return f"deploy {action} ok"
 
     async def _status(self) -> Dict[str, Any]:
