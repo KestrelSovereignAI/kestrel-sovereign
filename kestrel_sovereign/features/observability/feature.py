@@ -9,10 +9,11 @@ commands for querying observability data at runtime.
 import logging
 from typing import Any, Dict, List, Optional
 
-from kestrel_sovereign.features.base import Feature, tool
-from kestrel_sovereign.features.observability.hook import ObservabilityHook
 from kestrel_sdk.hooks.base import Hook
 from kestrel_sdk.tools.base import ToolCategory
+from kestrel_sdk.tools.result import ToolResult
+from kestrel_sovereign.features.base import Feature, tool
+from kestrel_sovereign.features.observability.hook import ObservabilityHook
 
 logger = logging.getLogger(__name__)
 
@@ -57,18 +58,17 @@ class ObservabilityFeature(Feature):
         category=ToolCategory.SYSTEM,
         command_prefix="!obs",
     )
-    async def obs_status(self) -> Dict[str, Any]:
+    async def obs_status(self) -> ToolResult:
         """Show observability summary: event counts by type, recent errors."""
         store = getattr(self.agent, "observability_store", None)
         if not store:
-            return {"error": "ObservabilityStore not available"}
+            return ToolResult.failed("ObservabilityStore not available")
 
         from datetime import datetime, timedelta, timezone
 
         since = datetime.now(timezone.utc) - timedelta(hours=1)
         events = await store.query_events(event_type="metric", since=since, limit=1000)
 
-        # Count by hook event type
         counts: Dict[str, int] = {}
         for e in events:
             hook_event = e.metadata.get("hook_event", "unknown") if e.metadata else "unknown"
@@ -76,7 +76,6 @@ class ObservabilityFeature(Feature):
             if metric_name.startswith("hook."):
                 counts[hook_event] = counts.get(hook_event, 0) + 1
 
-        # Recent errors
         error_events = await store.query_events(event_type="error", since=since, limit=10)
         recent_errors: List[Dict[str, Any]] = []
         for e in error_events:
@@ -86,12 +85,45 @@ class ObservabilityFeature(Feature):
                 "metadata": e.metadata,
             })
 
-        return {
+        total_events = sum(counts.values())
+        data = {
             "time_window": "last 1 hour",
             "hook_event_counts": counts,
-            "total_hook_events": sum(counts.values()),
+            "total_hook_events": total_events,
             "recent_errors": recent_errors,
         }
+
+        # Honesty: when there are recent errors, surface as PARTIAL so
+        # the agent has to speak the count rather than narrate "obs
+        # status retrieved" off a result that contains live errors.
+        # Pre-migration the legacy dict let the LLM read just the
+        # event counts and skip the recent_errors list.
+        if recent_errors:
+            # Codex round 1: recent_errors is capped at limit=10. Don't
+            # claim "N error event(s)" when the real count could be
+            # higher — phrase as "showing N (possibly more)" when the
+            # cap was hit, or give the exact count otherwise.
+            shown = len(recent_errors)
+            if shown >= 10:
+                err_phrase = (
+                    f"at least {shown} error event(s) in the last hour "
+                    "(query capped at 10; real count may be higher)"
+                )
+            else:
+                err_phrase = f"{shown} error event(s) in the last hour"
+            return ToolResult.partial(
+                confirmation=(
+                    f"Observability: {total_events} hook event(s) in last 1h"
+                ),
+                error=f"{err_phrase}; see recent_errors in data for details",
+                data=data,
+            )
+        return ToolResult.ok(
+            confirmation=(
+                f"Observability: {total_events} hook event(s) in last 1h, no errors"
+            ),
+            data=data,
+        )
 
     @tool(
         "obs_events",
@@ -99,7 +131,7 @@ class ObservabilityFeature(Feature):
         category=ToolCategory.SYSTEM,
         command_prefix="!obs-events",
     )
-    async def obs_events(self, event_type: str = "", limit: int = 20) -> Dict[str, Any]:
+    async def obs_events(self, event_type: str = "", limit: int = 20) -> ToolResult:
         """Query recent events, optionally filtered by type.
 
         Args:
@@ -108,7 +140,7 @@ class ObservabilityFeature(Feature):
         """
         store = getattr(self.agent, "observability_store", None)
         if not store:
-            return {"error": "ObservabilityStore not available"}
+            return ToolResult.failed("ObservabilityStore not available")
 
         events = await store.query_events(
             event_type=event_type if event_type else None,
@@ -129,7 +161,13 @@ class ObservabilityFeature(Feature):
                 "metadata": e.metadata,
             })
 
-        return {
-            "events": event_dicts,
-            "count": len(event_dicts),
-        }
+        return ToolResult.ok(
+            confirmation=(
+                f"Listed {len(event_dicts)} event(s)"
+                + (f" (filter={event_type!r})" if event_type else "")
+            ),
+            data={
+                "events": event_dicts,
+                "count": len(event_dicts),
+            },
+        )
