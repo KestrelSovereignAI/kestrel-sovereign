@@ -107,7 +107,7 @@ class TestHostAgentIntegration:
         """Host proxies GET requests to agent and returns agent's response."""
         test_key = "integration-test-key"
 
-        import host as host_module
+        from kestrel_sovereign import host as host_module
         the_app = host_module.app
         original_fn = host_module.load_multi_agent_config
         host_module.load_multi_agent_config = lambda: integration_config
@@ -142,7 +142,7 @@ class TestHostAgentIntegration:
         """GET /api/agents aggregates A2A cards from all agents."""
         test_key = "integration-test-key"
 
-        import host as host_module
+        from kestrel_sovereign import host as host_module
         the_app = host_module.app
         original_fn = host_module.load_multi_agent_config
         host_module.load_multi_agent_config = lambda: integration_config
@@ -181,7 +181,7 @@ class TestHostAgentIntegration:
     @pytest.mark.asyncio
     async def test_host_health_shows_online_agent(self, mock_agent_app, integration_config):
         """GET /health shows agent as online when it's reachable."""
-        import host as host_module
+        from kestrel_sovereign import host as host_module
         the_app = host_module.app
         original_fn = host_module.load_multi_agent_config
         host_module.load_multi_agent_config = lambda: integration_config
@@ -211,7 +211,7 @@ class TestHostAgentIntegration:
         """Host proxies POST requests with body to agent."""
         test_key = "integration-test-key"
 
-        import host as host_module
+        from kestrel_sovereign import host as host_module
         the_app = host_module.app
         original_fn = host_module.load_multi_agent_config
         host_module.load_multi_agent_config = lambda: integration_config
@@ -246,7 +246,7 @@ class TestHostAgentIntegration:
         """Host proxies SSE streaming responses from agent."""
         test_key = "integration-test-key"
 
-        import host as host_module
+        from kestrel_sovereign import host as host_module
         the_app = host_module.app
         original_fn = host_module.load_multi_agent_config
         host_module.load_multi_agent_config = lambda: integration_config
