@@ -11,6 +11,7 @@ ToolResult shape and the honesty edges introduced by the migration:
 
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -128,6 +129,55 @@ async def test_assess_substrate_unknown_is_partial(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_verify_identity_unsigned_is_partial(monkeypatch, tmp_path):
+    """Round 3 codex finding: an UNSIGNED package isn't a verify
+    failure but is unimportable under the default
+    allow_unsigned=False path. Returning OK lets the LLM say
+    'verified' for a package that can't actually be imported.
+    Now PARTIAL with the importability caveat."""
+    from unittest.mock import MagicMock as MM
+
+    # Write a minimal package JSON to a temp file so verify can read it
+    pkg_path = tmp_path / "unsigned_pkg.json"
+    pkg_path.write_text('{"fake": "package"}')
+
+    fake_pkg = MM()
+    fake_pkg.signature = None
+    fake_pkg.signatures = []
+    fake_pkg.constitution_text = None
+    fake_pkg.content_hash = None
+    fake_pkg.verify_constitution = lambda: True
+    fake_pkg.verify_content_hash = lambda: True
+    fake_pkg.get_summary.return_value = {
+        "did": "did:test:unsigned",
+        "agent_name": "Unsigned Agent",
+        "created_at": "2026-05-08T00:00:00",
+        "export_timestamp": "2026-05-08T00:00:00",
+        "source_substrate": "anthropic_claude",
+        "package_version": "1",
+        "episodes_count": 0,
+        "saved_items_count": 0,
+        "relationships_count": 0,
+        "skills_count": 0,
+        "migrations_count": 0,
+    }
+
+    import kestrel_sovereign.identity as identity_mod
+    monkeypatch.setattr(
+        identity_mod, "AgentIdentityPackage",
+        MM(from_json=MM(return_value=fake_pkg)),
+    )
+
+    feat = _make_feature()
+    result = await feat.verify_identity(str(pkg_path))
+
+    assert result.status is ToolResultStatus.PARTIAL
+    assert "unsigned" in result.error.lower()
+    assert "allow_unsigned" in result.error.lower()
+    assert result.data["signature_status"] == "UNSIGNED"
+
+
+@pytest.mark.asyncio
 async def test_export_identity_tier_downgrade_is_partial(monkeypatch, tmp_path):
     """Round 2 codex finding: when storage_tier=ipfs but the
     FilecoinAdapter downgrades to LOCAL_ONLY (IPFS unavailable),
@@ -175,6 +225,7 @@ async def test_export_identity_tier_downgrade_is_partial(monkeypatch, tmp_path):
         lambda *a, **kw: fake_adapter,
     )
 
+    monkeypatch.setenv("KESTREL_DATA_DIR", str(tmp_path))
     result = await feat.export_identity(storage_tier="ipfs", sign=False)
 
     assert result.status is ToolResultStatus.PARTIAL
@@ -183,9 +234,16 @@ async def test_export_identity_tier_downgrade_is_partial(monkeypatch, tmp_path):
     assert result.data["actual_storage_tier"] == "local_only"
     # Confirmation must NOT promise IPFS
     assert "stored to ipfs" not in result.confirmation.lower()
-    # Error half names the failure mode
+    assert "stored to tier=ipfs" not in result.confirmation.lower()
+    # Round 3 codex: when IPFS is unavailable, export should write a
+    # JSON file the user can actually feed to !identity import — so
+    # the data dict has a fallback_file_path AND the file exists.
+    assert result.data["fallback_file_path"] is not None
+    assert Path(result.data["fallback_file_path"]).exists()
+    # Confirmation now points at the importable file
+    assert "use `!identity import" in result.confirmation.lower()
+    # Error half still names the failure mode + restore path
     assert "ipfs" in result.error.lower()
-    assert "local cache" in result.error.lower()
 
 
 @pytest.mark.asyncio

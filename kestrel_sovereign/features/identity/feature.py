@@ -154,16 +154,56 @@ class IdentityFeature(Feature):
                 # the content hash with a clear local-only framing.
                 restore_id = ipfs_cid or content_hash
 
+                # When the tier downgraded, also write the package JSON
+                # to KESTREL_DATA_DIR so there's an actually-restorable
+                # path. The FilecoinAdapter's local cache is a compressed
+                # blob keyed by content_hash — import_identity can't
+                # consume it. Mirroring the tier=local fallback gives
+                # the user a real file path that `!identity import`
+                # accepts. (Round 3 codex finding #2.)
+                fallback_filepath: Optional[Path] = None
                 if tier_downgraded:
-                    confirmation = (
-                        f"Exported identity package: DID={summary['did'][:30]}..., "
-                        f"agent={summary['agent_name']}, "
-                        f"{summary['episodes_count']} episodes, "
-                        f"{summary['saved_items_count']} items, "
-                        f"signed={summary['is_signed']}; "
-                        f"stored to LOCAL cache (content_hash={content_hash}) "
-                        f"because tier={tier_enum.value} adapter was unavailable"
-                    )
+                    try:
+                        storage_dir = Path(os.environ.get("KESTREL_DATA_DIR", "agent_data"))
+                        storage_dir.mkdir(exist_ok=True)
+                        filename = f"identity_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.json"
+                        fallback_filepath = storage_dir / filename
+                        with open(fallback_filepath, 'w', encoding='utf-8') as f:
+                            f.write(package_json)
+                    except Exception as e:
+                        # If even the fallback write fails, leave
+                        # fallback_filepath=None — the PARTIAL
+                        # message below will be even more pessimistic
+                        # ("no restore path available").
+                        logger.error(
+                            f"Tier downgrade fallback file write failed: {e}",
+                            exc_info=True,
+                        )
+                        fallback_filepath = None
+
+                if tier_downgraded:
+                    if fallback_filepath:
+                        confirmation = (
+                            f"Exported identity package: DID={summary['did'][:30]}..., "
+                            f"agent={summary['agent_name']}, "
+                            f"{summary['episodes_count']} episodes, "
+                            f"{summary['saved_items_count']} items, "
+                            f"signed={summary['is_signed']}; "
+                            f"requested tier={tier_enum.value} unavailable, "
+                            f"saved as JSON to {fallback_filepath}. "
+                            f"Use `!identity import {fallback_filepath}` to restore."
+                        )
+                    else:
+                        confirmation = (
+                            f"Exported identity package: DID={summary['did'][:30]}..., "
+                            f"agent={summary['agent_name']}, "
+                            f"{summary['episodes_count']} episodes; "
+                            f"requested tier={tier_enum.value} unavailable AND "
+                            "fallback JSON write failed — package is in the "
+                            f"FilecoinAdapter local cache (content_hash="
+                            f"{content_hash}) but cannot be restored via "
+                            "`!identity import` directly"
+                        )
                 else:
                     confirmation = (
                         f"Exported identity package: DID={summary['did'][:30]}..., "
@@ -186,6 +226,9 @@ class IdentityFeature(Feature):
                     "tier_downgraded": tier_downgraded,
                     "ipfs_cid": ipfs_cid,
                     "content_hash": content_hash,
+                    "fallback_file_path": (
+                        str(fallback_filepath) if fallback_filepath else None
+                    ),
                     "signed": bool(summary.get("is_signed")),
                     "sign_requested": sign,
                     "sign_failure": sign_failure,
@@ -236,14 +279,24 @@ class IdentityFeature(Feature):
                 "will reject it"
             )
         if data.get("tier_downgraded"):
-            partial_errs.append(
-                f"requested storage tier {data['requested_storage_tier']!r} was "
-                "unavailable (no IPFS / Lotus); the package was written to "
-                "the LOCAL cache only — it has no IPFS CID and "
-                "`!identity import` won't find it via decentralized "
-                f"storage. Use the local file path or content_hash "
-                f"({data.get('content_hash')}) to restore."
-            )
+            fallback = data.get("fallback_file_path")
+            if fallback:
+                partial_errs.append(
+                    f"requested storage tier "
+                    f"{data['requested_storage_tier']!r} was unavailable "
+                    "(no IPFS / Lotus); the package was saved as a JSON "
+                    f"file to {fallback} instead — use "
+                    f"`!identity import {fallback}` to restore"
+                )
+            else:
+                partial_errs.append(
+                    f"requested storage tier "
+                    f"{data['requested_storage_tier']!r} was unavailable "
+                    "AND the fallback JSON file write failed — the "
+                    "package is only in the FilecoinAdapter local cache "
+                    f"(content_hash={data.get('content_hash')}) which "
+                    "cannot be restored via `!identity import` directly"
+                )
         if partial_errs:
             return ToolResult.partial(
                 confirmation=confirmation,
@@ -506,6 +559,26 @@ class IdentityFeature(Feature):
                 ),
                 data=data,
             )
+
+        # Honesty: an UNSIGNED package isn't a verification *failure*
+        # (the verify ran and found no signature to check), but the
+        # default import path uses ``allow_unsigned=False`` —
+        # IdentityImporter will reject it. Returning a clean OK lets
+        # the LLM say "package verified" while the same package is
+        # actually unimportable. Surface as PARTIAL so the LLM has to
+        # speak the importability caveat. (Round 3 codex finding.)
+        if sig_status == "UNSIGNED":
+            return ToolResult.partial(
+                confirmation=confirmation,
+                error=(
+                    "package is UNSIGNED — `!identity import` defaults to "
+                    "allow_unsigned=False and will reject it. Either re-sign "
+                    "the package or pass allow_unsigned=True (NOT recommended "
+                    "for cross-substrate migrations)"
+                ),
+                data=data,
+            )
+
         return ToolResult.ok(confirmation=confirmation, data=data)
 
     @tool(
