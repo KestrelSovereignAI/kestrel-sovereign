@@ -67,8 +67,12 @@ uv run kestrel doctor
 #    if you ran the interactive wizard without auto-registering.
 uv run kestrel create MyAgent
 
-# 6. Start an agent — name optional; omitted starts every registered agent.
-uv run kestrel start MyAgent
+# 6. Start an agent. Name the one you want, or omit to start every
+#    registered agent. After --quickstart with no step 5, the
+#    registered agent is named "Kestrel".
+uv run kestrel start            # starts every registered agent
+uv run kestrel start Kestrel    # if you only ran --quickstart
+uv run kestrel start MyAgent    # if you ran step 5
 ```
 
 If you're upgrading from a pre-2026-05 setup that used a standalone `llm_config.toml`, run `uv run kestrel migrate-llm-config` to fold it into `kestrel.toml [llm]`. The legacy file is no longer read.
