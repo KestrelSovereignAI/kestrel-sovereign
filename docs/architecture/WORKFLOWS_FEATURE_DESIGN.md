@@ -104,9 +104,11 @@ class WorkflowEngineAdapterContract:
     INV_10_lease_required          # claim returns (run_lease_id, expires_at); expired leases reclaimable
     INV_11_lease_heartbeat         # lease_renew(run_lease_id) extends; missed heartbeats expire the lease
 
-    # Schema
-    INV_12_event_append_only       # stage events are append-only; no in-place mutation
-    INV_13_signed_transitions      # every event carries actor DID + signature; adapter rejects unsigned writes
+    # Behavioral integrity
+    INV_12_rejects_event_mutation  # adapter MUST reject any UPDATE/DELETE on a recorded stage event
+    INV_13_rejects_unsigned_writes # adapter MUST reject any write whose actor signature fails verification
+    INV_14_result_fidelity         # complete(stage, result); status(run_id).result_for(stage) returns byte-identical result
+    INV_15_visibility_after_commit # after complete() returns, the result is visible to status() in any other process
 ```
 
 Phase 0 checks this list against DBOS's documented API. If `INV_8`/`INV_9` (compensation-in-reverse with idempotent-keyed compensate) cannot be expressed in DBOS's existing primitives without adapter-side bookkeeping that subverts DBOS's own checkpointing, `DBOSAdapter` is cut. We do not paper over.
@@ -191,6 +193,8 @@ At every run start, before any `script` gate executes, the runner:
 
 This eliminates the substitution attack (where a malicious workflow references a hash backed by a body in someone else's store).
 
+**Population path (closes the "where do scripts come from?" question):** scripts arrive in the runner's `ScriptStore` via the existing `compute.script_register(body, signature, signing_did)` call — same DID-signed envelope used for any other compute script. **The runner refuses any run whose required `src_hash` is not already locally registered.** There is no auto-fetch, no on-miss resolution, no fleet-wide sync. Operators that want to deploy a workflow that uses `script(...)` gates must register the script bodies on every runner first (Castle/kestrel-claws can fan-out registration; that's a Castle concern, not a Workflows one). This trades convenience for an explicit, signed propagation step.
+
 ### 3.4 The `red_team_clear` Gate (hardened)
 
 Adversarial review is not optional for any stage that publishes code. v1's design was rubber-stamp theatre. v2 hardens it.
@@ -199,10 +203,11 @@ Adversarial review is not optional for any stage that publishes code. v1's desig
 - `reviewer_dids ∩ {proposer_did, definition_author_did} == ∅` — gate fails if a reviewer DID overlaps the proposer or definition author.
 - Reviewer pool MUST include **at least two distinct model families**. Default policy: at least one Anthropic-lineage reviewer + one non-Anthropic-lineage reviewer (OpenAI codex, local Kimi, etc.). Single-family panels fail closed.
 - Reviewer DIDs are checked against an attestation registry. **Self-attestation alone fails closed** — registry entries must include verifiable proof of the underlying model:
-  - **Hosted models (Anthropic / OpenAI / etc.):** SHA-256 of the API key fingerprint (not the key itself; a HMAC over a fixed canary salt) signed by the operator's Constitution-attested DID. This binds the reviewer to a real provider account.
-  - **Local models (llama.cpp / vllm / etc.):** SHA-256 of the GGUF or weight checkpoint, signed by the same DID.
+  - **Hosted models (Anthropic / OpenAI / etc.):** registration includes (a) an HMAC-fingerprint of the API key over a fixed canary salt — binds the reviewer DID to a real provider *account* — AND (b) per-invocation, the response's `model` field plus the raw provider response signature/headers (when the provider exposes one). **Honest scope:** fingerprinting alone proves account ownership, not model identity. To raise the bar, the gate also rejects responses whose `model` field doesn't match the registered family at invocation time. We acknowledge this is not cryptographic proof that "Claude isn't pretending to be codex with codex's key in its env" — full-strength model identity needs server-side attested receipts that no major provider ships today. The mitigation is layered: account-binding + per-response model-field check + the existing model-family-diversity requirement (single-family panels still fail closed).
+  - **Local models (llama.cpp / vllm / etc.):** SHA-256 of the GGUF or weight checkpoint, signed by the same DID. This is genuinely strong because the runner can hash the file at registration and verify at every invocation.
   - **Reviewer Constitution attestation:** the reviewer's Constitution embedding hash must be present and match a known-good list maintained by the operator.
   - Ambient claims of "I am codex" without provider/weight proof are rejected at registration time; the gate cannot rescue a missing attestation at run time.
+  - **Open follow-up:** when major providers ship signed-response receipts (Anthropic / OpenAI roadmaps), upgrade hosted-model attestation to verify the receipt. Tracked as a sub-issue.
 
 **Prompt-injection defense:**
 - PR content fed to reviewer LLMs is wrapped in a fixed quote-fence (`<<<UNTRUSTED_BEGIN ... UNTRUSTED_END>>>`) and the reviewer prompt instructs ignoring instructions inside that fence.
@@ -448,6 +453,8 @@ CREATE INDEX ON workflow_signals (run_id, stage, signal_name) WHERE consumed_at 
 
 **Pilot target (revised):** the `feature_propose_tool` workflow from `kestrel-feature-features` (the consumer that motivated this whole epic). Release-signing was the v2 pilot suggestion but is already shipped (`project_release_signing_key.md`, 2026-05-06) — migrating a working flow with no active pain is scope creep.
 
+**Dependency direction (not circular):** `kestrel-feature-features` depends on `kestrel-feature-workflows`, not the other way around. Workflows ships first as a primitive package; FeatureFeature consumes it. This is sequencing, not a cycle.
+
 The FeatureFeature pipeline is the right pilot because:
 - It has every gate type we need (`tests_pass`, `lint_clean`, `ci_green`, `red_team_clear`, `council_approve`)
 - It has every actor type (`agent`, `talon_fleet`, `ci_runner`, `council`, `human`)
@@ -531,10 +538,31 @@ The FeatureFeature pipeline is the right pilot because:
 
 ## Appendix: Changelogs
 
+### Follow-up sub-issues (filed alongside the epic)
+
+Round-3 review verdict was FILE; the following residual findings became sub-issues rather than blocking the epic body:
+
+- **H2 — Cassette redaction & access control for `red_team_clear`.** Cassette files contain PR diff + adversarial reviewer findings. Need: encrypted-at-rest under run-owner DID, never committed to package repo, separate secret-store CI access. Sub-issue.
+- **H3 — Cost-budget precedence rule.** Spec the `min(operator_ceiling, definition_ceiling)` rule and document that operator policy is an upper bound. Sub-issue.
+- **H4 — `cancel` cost / `force_abort` primitive.** Per-actor-type timeouts; separate `force_abort` primitive for genuine emergencies (no compensation guarantees). Sub-issue.
+- **M1 — Typed revocation reasons.** `compromised` triggers `force_revoke`; `retired` allows in-flight to drain. Sub-issue.
+- **M2 — CI bootstrap for cassette recording.** Manual-approval-gated record mode for the very-first cassette set. Sub-issue.
+- **M4 — Page-fatigue tiering.** `cancelled_with_irreversible_residue` from `compensate_record_only` is logged-not-paged; only `compensate_failed_total > 0` pages. Sub-issue.
+- **L3 — `read_only=True` mechanism.** Trigger-based vs. write-counter shim; closed in Phase 1. Promote to sub-issue.
+- **C2 follow-up — Provider signed-response receipts.** Upgrade hosted-model attestation when major providers ship them. Sub-issue.
+
+### v3 → v3.1 changelog (review-3 inline fixes)
+
+- **§3.3 Script-store population:** specified that scripts arrive via `compute.script_register(body, signature, signing_did)` and the runner refuses any run whose `src_hash` is not already locally registered. No auto-fetch; fleet propagation is a Castle/kestrel-claws concern.
+- **§3.4 Reviewer attestation honesty:** downgraded the API-key-fingerprint claim. Account-binding ≠ model identity. Layered mitigation: account fingerprint + per-response `model` field check + family-diversity requirement. Local-model attestation remains genuinely strong via weight-checkpoint SHA. Provider signed-response receipts tracked as a follow-up.
+- **§2.3 Conformance contract:** replaced tautological `INV_12_event_append_only`/`INV_13_signed_transitions` with behavioral `INV_12_rejects_event_mutation`/`INV_13_rejects_unsigned_writes`. Added `INV_14_result_fidelity` (byte-identity of completion result) and `INV_15_visibility_after_commit` (cross-process visibility post-commit).
+- **§6 Phase 5:** explicit "FeatureFeature → Workflows is sequencing not a cycle" note.
+- **L1 cleanup:** changelog/spec field name unified (`canonical_stage_input` + engine-contributed `nonce`).
+
 ### v2 → v3 changelog
 
 - **§2.3 Conformance Contract:** added closed list of 13 testable invariants (`INV_1`..`INV_13`) the `WorkflowEngineAdapter` protocol must satisfy. Written *before* Phase 0 spike. If DBOS cannot satisfy, `DBOSAdapter` is cut, contract is not relaxed.
-- **§3.1 Idempotency key:** revised to `sha256(run_id || stage_name || sha256(input || attempt_number || engine_nonce))` so that legitimate retries (especially `red_team_clear` rounds) do not collapse. Stages declare `non_deterministic=True` to opt into per-attempt salt.
+- **§3.1 Idempotency key:** revised to `sha256(run_id || stage_name || sha256(canonical_stage_input || attempt_number || nonce))` (engine-contributed nonce) so that legitimate retries (especially `red_team_clear` rounds) do not collapse. Stages declare `non_deterministic=True` to opt into per-attempt salt.
 - **§3.3 `script` gate:** content-addressing hardened — definition embeds `(src_hash, signature, signing_did)` triple; runner resolves only against its own `ScriptStore`, refuses auto-fetch, verifies signature, and re-checks `compute.script_run` permission at run-start. Eliminates the substitution-via-hash attack.
 - **§3.4 Reviewer attestation registry:** self-attestation rejected. Registry entries require provider-API-key fingerprint (hosted models) or weight-checkpoint SHA (local models) signed by Constitution-attested DID. Reviewer Constitution embedding hash must match a known-good list.
 - **§3.4 Prompt-pack constraint:** `prompt_pack_constraint` is a **required** PEP-440 spec on every `red_team_clear` gate, included in `spec_hash`, refused at run-start if the locally-installed pack doesn't satisfy.
