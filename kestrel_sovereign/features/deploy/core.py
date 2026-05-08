@@ -567,20 +567,47 @@ class DeployManagerCore:
             return {"success": False, "error": str(e)}
 
     async def list_all_deployments(self) -> Dict[str, Any]:
-        """List every deployment across every provider configured in profiles."""
+        """List every deployment across every provider configured in profiles.
+
+        Iterates the ``(provider, gcp_project_id)`` pairs from
+        ``self.profiles`` (deduped) rather than just ``provider_type``,
+        so configs with profile-scoped ``gcp_project_id`` overrides
+        list deployments from each project. Without this, the manager
+        would only ever talk to its own ``self.gcp_project_id``,
+        omitting deployments that live in profile-specific GCP projects.
+        Codex review on the final epic→main PR.
+        """
         try:
             all_deployments = []
 
-            provider_types = set(p.provider for p in self.profiles.values())
+            # Collect unique (provider, project) pairs. Azure profiles
+            # don't have a project_id; encode that as None.
+            provider_targets = set()
+            for prof in self.profiles.values():
+                if prof.provider == DeployProviderType.CLOUD_RUN:
+                    provider_targets.add((prof.provider, prof.gcp_project_id))
+                else:
+                    provider_targets.add((prof.provider, None))
 
-            for provider_type in provider_types:
+            # Add the manager-level CloudRun fallback if not already
+            # covered (e.g. configs with no profile-level overrides
+            # still want to list against ``self.gcp_project_id``).
+            if any(p == DeployProviderType.CLOUD_RUN for p, _ in provider_targets):
+                provider_targets.add(
+                    (DeployProviderType.CLOUD_RUN, self.gcp_project_id)
+                )
+
+            for provider_type, project in provider_targets:
                 try:
-                    provider = self._get_provider(provider_type)
+                    provider = self._get_provider(
+                        provider_type, gcp_project_id=project
+                    )
                     deployments = await provider.list_deployments()
                     all_deployments.extend(deployments)
                 except Exception as e:
                     logger.warning(
-                        f"Failed to list {provider_type.value} deployments: {e}"
+                        f"Failed to list {provider_type.value} deployments "
+                        f"(project={project}): {e}"
                     )
 
             return {
