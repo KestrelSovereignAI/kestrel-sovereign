@@ -428,7 +428,7 @@ sequenceDiagram
 
     U->>UI: Select a model
     UI->>API: POST /api/model/set
-    API->>LLM: set_mandate({vendor, route?, model})
+    API->>LLM: set_model_preference(model, vendor, route)
     LLM-->>API: OK
     API-->>UI: Model changed
 ```

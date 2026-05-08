@@ -136,7 +136,7 @@ No code changes required unless the vendor needs a new adapter class. Add a `[ve
 
 ### Adding a new adapter class
 
-`LLMAdapter` lives in `kestrel-sovereign-sdk` (since SDK 0.5 / epic [#1048](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/1048) Wave 1A). The base class, the response/marker types, and the conformance helpers are all importable from `kestrel_sdk.llm`.
+`LLMAdapter` lives in `kestrel-sovereign-sdk` (since SDK 0.5 / epic [#1048](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/1048) Wave 1A). The base class and the response/marker types (`LLMResponse`, `ToolCall`, `ToolCallStarted`, `ModelInfo`) are importable from `kestrel_sdk.llm`; the conformance helpers (`drain_streaming_with_tools`, `assert_response_contract`, etc.) live in `kestrel_sdk.testing`.
 
 There are **two paths** depending on whether the adapter ships in this repo or as an external package.
 
@@ -146,7 +146,7 @@ There are **two paths** depending on whether the adapter ships in this repo or a
 2. Register in `_ADAPTER_REGISTRY` in [provider_registry.py](../../kestrel_sovereign/llm/provider_registry.py).
 3. Implement `list_models()` to return models tagged with the correct vendor — or raise `NotImplementedError` and let the adapter share a canonical route's discovery via the per-vendor rule below.
 4. (Optional) Implement `get_streaming_response_with_tools` and emit `ToolCallStarted` markers per the timing rules in [llm/PROVIDER_PLUGINS.md](llm/PROVIDER_PLUGINS.md). Required if you want the constitutional honesty layer's bubble retraction to fire on this adapter — see [llm/HONESTY_LAYER.md](llm/HONESTY_LAYER.md).
-5. (Optional) Override the metadata methods (`substrate_type`, `deliberation_style`, `cost_per_million`, `is_subscription`, `supports_session_continuation`) so the council, costing, and substrate-routing surfaces work without adding `if vendor == "x"` branches in framework code.
+5. (Optional) Override the adapter metadata methods (`substrate_type`, `deliberation_style`, `cost_per_1m_tokens`, `display_name`, `key_env_var`, `contribute_system_prompt`) so the council, costing, and substrate-routing surfaces work without adding `if vendor == "x"` branches in framework code. See [llm/PROVIDER_PLUGINS.md §"Adapter metadata"](llm/PROVIDER_PLUGINS.md#adapter-metadata) for the full method list and their default behavior.
 
 **External plugin** (separate `pip`-installable package): no edits to this repo. The plugin author publishes a package that depends on `kestrel-sovereign-sdk` only and registers under the `kestrel_sovereign.llm_providers` entry-point group. Framework discovers the adapter at startup. Full author guide in [llm/PROVIDER_PLUGINS.md](llm/PROVIDER_PLUGINS.md), including the conformance suite (`pytest` against `kestrel_sdk.testing` helpers).
 
