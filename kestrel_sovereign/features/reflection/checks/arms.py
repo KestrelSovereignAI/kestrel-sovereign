@@ -234,14 +234,35 @@ class ArmsChecker(HealthChecker):
                 check.message = "GitHubFeature not loaded"
                 return check
 
-            # Actually call the tool
+            # Actually call the tool. As of #1061 wave 14 the github
+            # @tool methods return a ToolResult envelope; honor the
+            # status field so an auth/API failure doesn't pass the
+            # health check just because the envelope object itself is
+            # truthy.
             if hasattr(github_feature, 'get_self_repo_info'):
+                from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
+
                 result = await github_feature.get_self_repo_info()
 
-                # Verify we got valid data (could be string or dict)
-                if result:
+                if isinstance(result, ToolResult):
+                    if result.status is ToolResultStatus.ERROR:
+                        check.status = CheckStatus.FAIL
+                        check.severity = Severity.HIGH
+                        check.message = f"GitHub API failed: {result.error}"
+                        check.suggested_fix = "Check GITHUB_PAT or GITHUB_TOKEN in .env"
+                        check.file_path = ".env"
+                    else:
+                        body = result.confirmation or ""
+                        if "Repository" in body or "kestrel" in body.lower():
+                            check.status = CheckStatus.PASS
+                            check.message = "GitHub API working"
+                            check.details = {"response_type": "tool_result"}
+                        else:
+                            check.status = CheckStatus.WARN
+                            check.severity = Severity.MEDIUM
+                            check.message = "GitHub returned data but unexpected format"
+                elif result:
                     if isinstance(result, str):
-                        # Feature returns formatted string like "# Agent Source Repository\n**Repository:** KestrelSovereignAI/kestrel-sovereign"
                         if "Repository" in result or "kestrel" in result.lower():
                             check.status = CheckStatus.PASS
                             check.message = "GitHub API working"
