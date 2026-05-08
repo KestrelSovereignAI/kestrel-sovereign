@@ -195,7 +195,7 @@ async def get_streaming_response_with_tools(
 
 ### Per-provider emission rules for `ToolCallStarted`
 
-This is the load-bearing piece for the constitutional honesty layer (issues [#1042](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/1042) layer 2 / [#1045](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/1045)). The audit hook reads the marker as a deterministic "stop yielding pre-tool prose" signal; the streaming pipeline emits a corresponding SSE `"revising"` event so any optimistic text bubble in the chat UI can be cleared. **Get the timing right or the consumer-side guarantees fall over.**
+This is the load-bearing piece for the constitutional honesty layer (issues [#1042](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/1042) layer 2 / [#1045](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/1045)). Downstream the marker drives an in-band revise sentinel on the chat stream, a parallel SSE `"revising"` event (a backup signal the chat client also subscribes to, available to any other subscriber that wants it), and a deterministic narration check in the response audit hook. The full pipeline + the consumer guarantees are documented in [HONESTY_LAYER.md](HONESTY_LAYER.md). **Get the timing right or the consumer-side guarantees fall over.**
 
 | Provider family | Fire on | `id` at emit | `name` at emit |
 |---|---|---|---|

@@ -263,6 +263,11 @@ New hits in service / adapter / endpoint code fail review.
 - [endpoints/models.py](../../endpoints/models.py) — `/api/models`, `/api/model/current`, `/api/model/set`.
 - [agent/model_preference.py](../../kestrel_sovereign/agent/model_preference.py) — persistence.
 
+## Related architecture docs
+
+- **[llm/PROVIDER_PLUGINS.md](llm/PROVIDER_PLUGINS.md)** — adapter contract surface for third-party plugin authors. The `kestrel-sovereign-sdk` boundary, marker emission rules, conformance helpers.
+- **[llm/HONESTY_LAYER.md](llm/HONESTY_LAYER.md)** — streaming honesty enforcement: `ToolCallStarted` markers, in-band revise sentinel on `/api/agent/stream`, parallel SSE backup, deterministic narration check in the audit hook. Closes [#1042](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/1042).
+
 ## Related decisions
 
 - CLAUDE.md "Model Selection System — What NOT to Do" — the case study this refactor closes out.
