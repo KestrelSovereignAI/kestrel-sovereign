@@ -27,7 +27,14 @@ class ModelPreferenceMixin:
         Returns:
             List of model dictionaries with id, provider, name, description
         """
-        return await self.model_agent.list_models(use_cache=use_cache)
+        # ModelAgent.list_models() now returns a ToolResult envelope
+        # (#1061 wave 10); the legacy list[dict] payload lives under
+        # .data["models"]. Unwrap so existing public callers see the
+        # documented shape.
+        envelope = await self.model_agent.list_models(use_cache=use_cache)
+        if envelope.data is None:
+            return []
+        return envelope.data.get("models", [])
 
     def set_model(self, model_id: str) -> str:
         """
