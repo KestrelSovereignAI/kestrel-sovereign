@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from kestrel_sovereign.features.base import Feature, tool, ToolCategory
+from kestrel_sdk.tools.result import ToolResult
 from .models import (
     CouncilConfig,
     CouncilMember,
@@ -115,7 +116,7 @@ class CouncilFeature(Feature):
         question: str,
         target: str = "general",
         max_rounds: int = 3,
-    ) -> str:
+    ) -> ToolResult:
         """
         Convene the Constitutional Council for deliberation.
 
@@ -123,41 +124,55 @@ class CouncilFeature(Feature):
             question: The question to deliberate on
             target: Evidence target (e.g., 'emma_genesis', 'general')
             max_rounds: Maximum deliberation rounds (default 3)
-
-        Returns:
-            Session summary with outcome
         """
+        try:
+            max_rounds_val = int(max_rounds)
+        except (TypeError, ValueError):
+            return ToolResult.failed(
+                f"max_rounds must be an integer, got {max_rounds!r}"
+            )
+        if max_rounds_val < 1:
+            return ToolResult.failed("max_rounds must be >= 1")
+
         if not self.config or not self.config.members:
-            return (
-                "Error: No council members configured. "
+            return ToolResult.failed(
+                "No council members configured. "
                 "Create council_config.toml or provide members explicitly."
             )
 
         if len(self.config.members) < self.config.min_members:
-            return (
-                f"Error: Council requires at least {self.config.min_members} members, "
-                f"but only {len(self.config.members)} configured."
+            return ToolResult.failed(
+                f"Council requires at least {self.config.min_members} "
+                f"members, but only {len(self.config.members)} "
+                "configured.",
+                data={
+                    "configured_members": len(self.config.members),
+                    "min_required": self.config.min_members,
+                },
             )
 
-        # Compile evidence
-        if target == "emma_genesis":
-            evidence = await compile_emma_genesis_evidence()
-        else:
-            evidence = await compile_evidence(target=target)
+        try:
+            if target == "emma_genesis":
+                evidence = await compile_emma_genesis_evidence()
+            else:
+                evidence = await compile_evidence(target=target)
 
-        # Run deliberation
-        session = await convene_council(
-            question=question,
-            evidence=evidence,
-            members=self.config.members,
-            max_rounds=min(max_rounds, self.config.max_rounds),
-            consensus_rule=self.config.consensus_rule,
-        )
+            session = await convene_council(
+                question=question,
+                evidence=evidence,
+                members=self.config.members,
+                max_rounds=min(max_rounds_val, self.config.max_rounds),
+                consensus_rule=self.config.consensus_rule,
+            )
+            await self.storage.save_session(session)
+        except Exception as e:
+            logger.error(f"council_convene failed: {e}", exc_info=True)
+            return ToolResult.failed(str(e))
 
-        # Save session
-        await self.storage.save_session(session)
-
-        # Format response
+        # Format response (preserve the human-readable transcript
+        # for the confirmation; surface structured deliberation
+        # state via data so the LLM can read who decided what
+        # without parsing markdown).
         outcome_emoji = {
             SessionOutcome.APPROVED: "✅",
             SessionOutcome.REJECTED: "❌",
@@ -176,6 +191,10 @@ class CouncilFeature(Feature):
             "## Verdicts",
         ]
 
+        verdicts_data = []
+        approve_count = 0
+        reject_count = 0
+        abstain_count = 0
         for verdict in session.verdicts:
             v_emoji = {"APPROVE": "✅", "REJECT": "❌", "ABSTAIN": "⚪"}.get(
                 verdict.decision.value, "?"
@@ -189,10 +208,58 @@ class CouncilFeature(Feature):
                 response_parts.append("\n**Concerns:**")
                 for c in verdict.concerns[:3]:
                     response_parts.append(f"- {c}")
+            decision_str = verdict.decision.value
+            if decision_str == "APPROVE":
+                approve_count += 1
+            elif decision_str == "REJECT":
+                reject_count += 1
+            elif decision_str == "ABSTAIN":
+                abstain_count += 1
+            verdicts_data.append({
+                "member_name": verdict.member_name,
+                "decision": decision_str,
+                "confidence": verdict.confidence,
+                "concerns": list(verdict.concerns or []),
+            })
 
-        response_parts.append(f"\n\n*Full transcript saved to: data/council_sessions/{session.id}.md*")
+        response_parts.append(
+            f"\n\n*Full transcript saved to: data/council_sessions/{session.id}.md*"
+        )
+        confirmation = "\n".join(response_parts)
+        data = {
+            "session_id": session.id,
+            "outcome": session.outcome.value,
+            "question": question,
+            "target": target,
+            "members": len(session.members),
+            "rounds": len(session.rounds),
+            "verdicts": verdicts_data,
+            "approve_count": approve_count,
+            "reject_count": reject_count,
+            "abstain_count": abstain_count,
+            "max_rounds_requested": max_rounds_val,
+            "max_rounds_applied": min(max_rounds_val, self.config.max_rounds),
+        }
 
-        return "\n".join(response_parts)
+        # Honesty: a DEADLOCK is not a tool failure (the council
+        # ran, but did not reach consensus). The LLM cannot say
+        # "the council approved" — surface as PARTIAL with the
+        # verdict counts so the divergence speaks. PENDING is the
+        # same shape (no terminal outcome).
+        if session.outcome in (SessionOutcome.DEADLOCK, SessionOutcome.PENDING):
+            return ToolResult.partial(
+                confirmation=confirmation,
+                error=(
+                    f"council did not reach a terminal decision: "
+                    f"outcome={session.outcome.value} "
+                    f"(approve={approve_count}, reject={reject_count}, "
+                    f"abstain={abstain_count}). The question is unresolved; "
+                    "use !council-override or convene again with adjusted "
+                    "evidence."
+                ),
+                data=data,
+            )
+        return ToolResult.ok(confirmation=confirmation, data=data)
 
     @tool(
         "council_status",
@@ -204,26 +271,52 @@ class CouncilFeature(Feature):
         self,
         session_id: Optional[str] = None,
         limit: int = 5,
-    ) -> str:
+    ) -> ToolResult:
         """
         View council session status.
 
         Args:
             session_id: Specific session ID to view (optional)
-            limit: Number of recent sessions to list (default 5)
-
-        Returns:
-            Session details or list of recent sessions
+            limit: Number of recent sessions to list (default 5).
+                   Actual count returned may be lower.
         """
-        if session_id:
-            session = await self.storage.load_session(session_id)
-            if not session:
-                return f"Session {session_id} not found."
-            return session.to_transcript()
+        try:
+            limit_val = int(limit)
+        except (TypeError, ValueError):
+            return ToolResult.failed(
+                f"limit must be an integer, got {limit!r}"
+            )
+        if limit_val < 1:
+            return ToolResult.failed("limit must be >= 1")
 
-        sessions = await self.storage.list_sessions(limit=limit)
+        try:
+            if session_id:
+                session = await self.storage.load_session(session_id)
+                if not session:
+                    return ToolResult.failed(
+                        f"Session {session_id} not found.",
+                        data={"session_id": session_id},
+                    )
+                return ToolResult.ok(
+                    confirmation=session.to_transcript(),
+                    data={
+                        "session_id": session.id,
+                        "outcome": session.outcome.value,
+                        "members": len(session.members),
+                        "rounds": len(session.rounds),
+                    },
+                )
+
+            sessions = await self.storage.list_sessions(limit=limit_val)
+        except Exception as e:
+            logger.error(f"council_status failed: {e}", exc_info=True)
+            return ToolResult.failed(str(e))
+
         if not sessions:
-            return "No council sessions found."
+            return ToolResult.ok(
+                confirmation="No council sessions found.",
+                data={"count": 0, "limit_requested": limit_val, "sessions": []},
+            )
 
         lines = ["# Recent Council Sessions", ""]
         for s in sessions:
@@ -235,7 +328,21 @@ class CouncilFeature(Feature):
                 f"({s['outcome']})"
             )
 
-        return "\n".join(lines)
+        return ToolResult.ok(
+            confirmation="\n".join(lines),
+            data={
+                "count": len(sessions),
+                "limit_requested": limit_val,
+                "sessions": [
+                    {
+                        "id": s.get("id"),
+                        "question": s.get("question"),
+                        "outcome": s.get("outcome"),
+                    }
+                    for s in sessions
+                ],
+            },
+        )
 
     @tool(
         "council_override",
@@ -248,7 +355,7 @@ class CouncilFeature(Feature):
         session_id: str,
         decision: str,
         reason: str,
-    ) -> str:
+    ) -> ToolResult:
         """
         Apply a human override to a council decision.
 
@@ -256,24 +363,45 @@ class CouncilFeature(Feature):
             session_id: Session ID to override
             decision: APPROVE or REJECT
             reason: Reason for the override
-
-        Returns:
-            Confirmation of override
         """
-        session = await self.storage.load_session(session_id)
-        if not session:
-            return f"Session {session_id} not found."
+        if not isinstance(reason, str) or not reason.strip():
+            return ToolResult.failed(
+                "reason is required (council overrides leave an audit trail)"
+            )
 
-        if decision.upper() not in ["APPROVE", "REJECT"]:
-            return "Decision must be APPROVE or REJECT."
+        decision_upper = decision.upper() if isinstance(decision, str) else ""
+        if decision_upper not in ("APPROVE", "REJECT"):
+            return ToolResult.failed(
+                f"decision must be APPROVE or REJECT, got {decision!r}"
+            )
 
-        apply_human_override(session, decision.upper(), reason)
-        await self.storage.save_session(session)
+        try:
+            session = await self.storage.load_session(session_id)
+            if not session:
+                return ToolResult.failed(
+                    f"Session {session_id} not found.",
+                    data={"session_id": session_id},
+                )
+            previous_outcome = session.outcome.value
+            apply_human_override(session, decision_upper, reason)
+            await self.storage.save_session(session)
+        except Exception as e:
+            logger.error(f"council_override failed: {e}", exc_info=True)
+            return ToolResult.failed(str(e))
 
-        return (
-            f"Human override applied to session {session_id}.\n"
-            f"New outcome: {session.outcome.value}\n"
-            f"Reason: {reason}"
+        return ToolResult.ok(
+            confirmation=(
+                f"Human override applied to session {session_id}: "
+                f"{previous_outcome} → {session.outcome.value} "
+                f"(reason: {reason})"
+            ),
+            data={
+                "session_id": session_id,
+                "previous_outcome": previous_outcome,
+                "new_outcome": session.outcome.value,
+                "decision": decision_upper,
+                "reason": reason,
+            },
         )
 
     @tool(
@@ -282,27 +410,25 @@ class CouncilFeature(Feature):
         category=ToolCategory.SYSTEM,
         command_prefix="!council-members"
     )
-    async def list_members(self) -> str:
-        """
-        List the configured council members.
-
-        Returns:
-            List of council members with their roles
-        """
+    async def list_members(self) -> ToolResult:
+        """List the configured council members."""
         if not self.config or not self.config.members:
-            return (
-                "No council members configured.\n\n"
-                "Create council_config.toml with:\n"
-                "```toml\n"
-                "[council]\n"
-                "min_members = 3\n"
-                "consensus_rule = \"unanimous\"\n\n"
-                "[[council.members]]\n"
-                "name = \"Claude\"\n"
-                "provider = \"anthropic\"\n"
-                "model = \"auto\"\n"
-                "role = \"constitutional_reviewer\"\n"
-                "```"
+            return ToolResult.ok(
+                confirmation=(
+                    "No council members configured.\n\n"
+                    "Create council_config.toml with:\n"
+                    "```toml\n"
+                    "[council]\n"
+                    "min_members = 3\n"
+                    "consensus_rule = \"unanimous\"\n\n"
+                    "[[council.members]]\n"
+                    "name = \"Claude\"\n"
+                    "provider = \"anthropic\"\n"
+                    "model = \"auto\"\n"
+                    "role = \"constitutional_reviewer\"\n"
+                    "```"
+                ),
+                data={"member_count": 0, "members": []},
             )
 
         lines = [
@@ -313,7 +439,7 @@ class CouncilFeature(Feature):
             "",
             "## Members",
         ]
-
+        members_data = []
         for member in self.config.members:
             lines.append(
                 f"\n### {member.name}\n"
@@ -321,8 +447,39 @@ class CouncilFeature(Feature):
                 f"- **Model:** {member.model}\n"
                 f"- **Role:** {member.role}"
             )
+            members_data.append({
+                "name": member.name,
+                "provider": member.provider,
+                "model": member.model,
+                "role": member.role,
+            })
 
-        return "\n".join(lines)
+        data = {
+            "member_count": len(members_data),
+            "members": members_data,
+            "consensus_rule": self.config.consensus_rule.value,
+            "min_members": self.config.min_members,
+            "max_rounds": self.config.max_rounds,
+        }
+
+        # Honesty: the council needs at least min_members configured
+        # to convene. If we have fewer, list_members must surface
+        # that — the LLM might otherwise list members and proceed
+        # to !council-convene which will then error.
+        if len(self.config.members) < self.config.min_members:
+            return ToolResult.partial(
+                confirmation="\n".join(lines),
+                error=(
+                    f"council has {len(self.config.members)} member(s) "
+                    f"but requires at least {self.config.min_members} to "
+                    "convene; !council-convene will refuse to run"
+                ),
+                data=data,
+            )
+        return ToolResult.ok(
+            confirmation="\n".join(lines),
+            data=data,
+        )
 
     @tool(
         "council_evidence",
@@ -333,20 +490,21 @@ class CouncilFeature(Feature):
     async def preview_evidence(
         self,
         target: str = "general",
-    ) -> str:
+    ) -> ToolResult:
         """
         Preview the evidence package for a council session.
 
         Args:
             target: Evidence target (e.g., 'emma_genesis', 'general')
-
-        Returns:
-            Formatted evidence preview
         """
-        if target == "emma_genesis":
-            evidence = await compile_emma_genesis_evidence()
-        else:
-            evidence = await compile_evidence(target=target)
+        try:
+            if target == "emma_genesis":
+                evidence = await compile_emma_genesis_evidence()
+            else:
+                evidence = await compile_evidence(target=target)
+        except Exception as e:
+            logger.error(f"council_evidence failed: {e}", exc_info=True)
+            return ToolResult.failed(str(e))
 
         lines = [
             "# Evidence Package Preview",
@@ -372,4 +530,35 @@ class CouncilFeature(Feature):
         lines.append("---")
         lines.append("*This is a preview. Use council_convene to run a full session.*")
 
-        return "\n".join(lines)
+        data = {
+            "target": evidence.target,
+            "compiled_at": evidence.compiled_at.isoformat(),
+            "content_hash": evidence.content_hash(),
+            "code_changes_count": len(evidence.code_changes),
+            "test_passed": evidence.test_passed,
+            "test_count": evidence.test_count,
+            "risks_count": len(evidence.risks),
+            "architecture_docs_count": len(evidence.architecture_docs),
+            "previous_decisions_count": len(evidence.previous_decisions),
+            "risks": list(evidence.risks)[:5],
+        }
+
+        # Honesty: tests-failing in the evidence is a signal the
+        # council should weigh heavily. The LLM should not produce
+        # a "looks good, convene the council" framing while the
+        # evidence itself shows test failures. Surface as PARTIAL.
+        if evidence.test_count > 0 and evidence.test_passed < evidence.test_count:
+            failed = evidence.test_count - evidence.test_passed
+            return ToolResult.partial(
+                confirmation="\n".join(lines),
+                error=(
+                    f"evidence shows {failed} of {evidence.test_count} "
+                    "test(s) failing — convening the council on a red "
+                    "test suite is unusual; consider stabilizing first"
+                ),
+                data=data,
+            )
+        return ToolResult.ok(
+            confirmation="\n".join(lines),
+            data=data,
+        )
