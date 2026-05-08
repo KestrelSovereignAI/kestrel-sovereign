@@ -42,7 +42,18 @@ def _make_ctx(
     )
 
 
-def test_wizard_quickstart_full_run(tmp_path):
+def test_wizard_quickstart_full_run(tmp_path, monkeypatch):
+    # Pin LLM autodetect to "nothing reachable, no cloud keys" so the
+    # wizard falls back to Ollama-only — that's the contract this test
+    # asserts (a wizard run on a clean machine should produce a working
+    # config). Without this, the developer's exported keys / a running
+    # Ollama would change the route_priority and make the test
+    # environment-dependent.
+    for var in ("OPENROUTER_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GOOGLE_API_KEY"):
+        monkeypatch.delenv(var, raising=False)
+    from kestrel_sovereign.setup.steps import llm
+    monkeypatch.setattr(llm, "_is_ollama_reachable", lambda *a, **kw: False)
+
     ctx = _make_ctx(tmp_path, Flow.QUICKSTART)
     with patch(
         "kestrel_sovereign.inception_service.create_kestrel_identity_async",
@@ -60,8 +71,15 @@ def test_wizard_quickstart_full_run(tmp_path):
     assert multi_agent_path.exists()
 
 
-def test_wizard_idempotent_second_run_is_noop(tmp_path):
+def test_wizard_idempotent_second_run_is_noop(tmp_path, monkeypatch):
     """A second quickstart run with everything already set must produce no diffs."""
+    # Pin autodetect deterministic — same reasoning as
+    # ``test_wizard_quickstart_full_run``.
+    for var in ("OPENROUTER_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GOOGLE_API_KEY"):
+        monkeypatch.delenv(var, raising=False)
+    from kestrel_sovereign.setup.steps import llm
+    monkeypatch.setattr(llm, "_is_ollama_reachable", lambda *a, **kw: False)
+
     with patch(
         "kestrel_sovereign.inception_service.create_kestrel_identity_async",
         side_effect=_stub_inception_factory(),

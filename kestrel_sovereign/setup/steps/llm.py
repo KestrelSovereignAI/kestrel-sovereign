@@ -13,11 +13,15 @@ preserved by the toml writer's deep-merge.
 
 from __future__ import annotations
 
+import logging
+import os
 from dataclasses import dataclass
 
 from kestrel_sovereign.setup.context import Flow, SetupContext
 from kestrel_sovereign.setup.env_file import read_env, write_env
 from kestrel_sovereign.setup.toml_file import read_toml, write_toml
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -212,14 +216,70 @@ def run(ctx: SetupContext) -> None:
             ctx.record(f"Wrote [llm] in kestrel.toml ({labels})")
 
 
+def _detect_available_vendors(existing_keys: dict[str, str]) -> list[_Vendor]:
+    """Auto-detect which vendors are usable on this machine.
+
+    Walks both the live process env and ``existing_keys`` (the .env
+    file the wizard's keys-step may have already populated) to find
+    cloud API keys, and probes Ollama at ``localhost:11434`` with a
+    short timeout. Returns the detected vendors in priority order:
+
+      OpenRouter > Anthropic > OpenAI > Google > Ollama (if reachable)
+
+    OpenRouter wins among cloud vendors because the README/CLI
+    documentation recommends it (one key, many model families). Empty
+    return → caller falls back to a sensible default (Ollama only).
+    """
+    detected: list[_Vendor] = []
+
+    # Cloud vendors first, in documented preference order. Each entry
+    # is the env var the wizard would persist to .env; if either the
+    # parent shell or the .env file already has a non-empty value,
+    # treat the vendor as available.
+    cloud_priority = (_OPENROUTER, _ANTHROPIC, _OPENAI, _GOOGLE)
+    for vendor in cloud_priority:
+        env_var = vendor.api_key_env
+        if not env_var:
+            continue
+        value = os.environ.get(env_var) or existing_keys.get(env_var)
+        if value:
+            detected.append(vendor)
+
+    if _is_ollama_reachable():
+        detected.append(_OLLAMA)
+
+    return detected
+
+
+def _is_ollama_reachable(host: str = "http://localhost:11434", timeout: float = 1.5) -> bool:
+    """``True`` iff ``<host>/api/tags`` responds 200 within ``timeout``.
+
+    Uses :mod:`urllib` (stdlib only — no new deps) and never raises:
+    a network failure, timeout, non-200, or parse error all just
+    mean "Ollama isn't usable right now". The default 1.5 s keeps
+    quickstart snappy on machines without Ollama installed.
+    """
+    import urllib.error
+    import urllib.request
+
+    url = host.rstrip("/") + "/api/tags"
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            return resp.status == 200
+    except (urllib.error.URLError, urllib.error.HTTPError, OSError, ValueError):
+        return False
+
+
 def _select_vendors(
     ctx: SetupContext, existing_priority: list[str]
 ) -> list[_Vendor]:
     """Decide which vendors are active for this run.
 
-    Quickstart and check flows reuse whatever the user already has
-    (defaulting to Ollama if nothing is configured). Interactive flow
-    asks once.
+    Quickstart auto-detects cloud API keys in env / a running Ollama
+    instance, falling back to Ollama-only if nothing is reachable.
+    Check flow never selects (it only validates on-disk state).
+    Interactive flow asks once, with the auto-detected primary
+    pre-selected as the default.
     """
     if existing_priority:
         already = [
@@ -238,6 +298,24 @@ def _select_vendors(
                 return already
 
     if ctx.flow in (Flow.QUICKSTART, Flow.CHECK):
+        # Read existing .env so the wizard sees keys the keys-step
+        # already wrote in this run, not just the ones in the parent
+        # shell.
+        existing_keys = read_env(ctx.env_path)
+        detected = _detect_available_vendors(existing_keys)
+        if detected:
+            labels = ", ".join(v.key for v in detected)
+            logger.info(f"Auto-detected LLM vendors for quickstart: {labels}")
+            return detected
+        # Nothing usable — fall back to the historical default so the
+        # wizard still produces a config (operator can install Ollama
+        # later or rerun the interactive wizard to pick a cloud vendor).
+        logger.info(
+            "No LLM vendors auto-detected; defaulting to Ollama. "
+            "Install Ollama or export a cloud API key (OPENROUTER_API_KEY, "
+            "ANTHROPIC_API_KEY, OPENAI_API_KEY, GOOGLE_API_KEY) and rerun "
+            "`kestrel setup --quickstart` to use a different provider."
+        )
         return [_OLLAMA]
 
     choice = ctx.prompter.select(
@@ -262,7 +340,21 @@ def _select_vendors(
 def _gather_api_keys(
     ctx: SetupContext, selected: list[_Vendor], existing_keys: dict[str, str]
 ) -> dict[str, str]:
-    """Prompt for API keys for cloud vendors that don't yet have one set."""
+    """Prompt for API keys for cloud vendors that don't yet have one set.
+
+    Resolution order for each vendor's key:
+      1. Already in ``.env`` (existing_keys) — leave alone.
+      2. QUICKSTART only: exported in the parent shell
+         (``os.environ``) — persist to .env so the runtime (which only
+         reads .env) can use it. Keeps non-interactive setups working
+         when operators have keys exported in their shell, which is
+         the common case. INTERACTIVE always asks (the operator opted
+         in to being prompted, even if they have keys exported — they
+         may want to override).
+      3. Quickstart with neither: block (operator must set the key
+         and re-run).
+      4. Interactive with neither: prompt; blank → block.
+    """
     updates: dict[str, str] = {}
     for vendor in selected:
         if not vendor.api_key_env:
@@ -270,6 +362,16 @@ def _gather_api_keys(
         current = existing_keys.get(vendor.api_key_env, "")
         if current:
             continue
+        # Promote a shell-exported key into .env (quickstart only) so
+        # the runtime sees it. The autodetect pass treated this vendor
+        # as available because of the env var; we honor that here by
+        # persisting the value. Interactive setup falls through to the
+        # prompt — the operator chose to be asked.
+        if ctx.flow is Flow.QUICKSTART:
+            from_environ = os.environ.get(vendor.api_key_env, "")
+            if from_environ:
+                updates[vendor.api_key_env] = from_environ
+                continue
         if ctx.flow is Flow.QUICKSTART:
             ctx.block(
                 f"{vendor.api_key_env} not set in .env "

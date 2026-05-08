@@ -22,7 +22,20 @@ def _make_ctx(tmp_path: Path, flow: Flow, *, answers=None) -> SetupContext:
     )
 
 
-def test_llm_quickstart_writes_ollama_block(tmp_path):
+def test_llm_quickstart_falls_back_to_ollama_when_nothing_detected(
+    tmp_path, monkeypatch
+):
+    """When no cloud API keys are exported and Ollama isn't reachable,
+    quickstart still produces a valid config (Ollama-only) so the
+    operator has something to work with — they can install Ollama or
+    rerun the interactive wizard to pick a cloud vendor.
+    """
+    # Strip any cloud keys the developer may have exported in their shell.
+    for var in ("OPENROUTER_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GOOGLE_API_KEY"):
+        monkeypatch.delenv(var, raising=False)
+    # Ollama not running.
+    monkeypatch.setattr(llm, "_is_ollama_reachable", lambda *a, **kw: False)
+
     ctx = _make_ctx(tmp_path, Flow.QUICKSTART)
     llm.run(ctx)
     config = read_toml(tmp_path / "kestrel.toml")
@@ -31,8 +44,102 @@ def test_llm_quickstart_writes_ollama_block(tmp_path):
     assert config["llm"]["vendors"]["ollama"]["routes"]["local"]["adapter"] == "OllamaAdapter"
 
 
-def test_llm_quickstart_with_no_keys_marks_blocker_for_cloud(tmp_path):
-    """If existing config picks OpenAI but no key is in .env, quickstart blocks."""
+def test_llm_quickstart_picks_ollama_when_only_ollama_reachable(
+    tmp_path, monkeypatch
+):
+    """Ollama running, no cloud keys → quickstart writes Ollama-only.
+    Same on-disk shape as the no-detection fallback, but the path
+    that got us there is "we found Ollama" (logged at INFO)."""
+    for var in ("OPENROUTER_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GOOGLE_API_KEY"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(llm, "_is_ollama_reachable", lambda *a, **kw: True)
+
+    ctx = _make_ctx(tmp_path, Flow.QUICKSTART)
+    llm.run(ctx)
+    config = read_toml(tmp_path / "kestrel.toml")
+    assert config["llm"]["route_priority"] == ["ollama:local"]
+
+
+def test_llm_quickstart_picks_openrouter_when_key_in_env(tmp_path, monkeypatch):
+    """``OPENROUTER_API_KEY`` exported in shell → quickstart picks
+    OpenRouter (highest cloud priority per the README)."""
+    for var in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GOOGLE_API_KEY"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
+    monkeypatch.setattr(llm, "_is_ollama_reachable", lambda *a, **kw: False)
+
+    ctx = _make_ctx(tmp_path, Flow.QUICKSTART)
+    llm.run(ctx)
+    config = read_toml(tmp_path / "kestrel.toml")
+    assert config["llm"]["route_priority"] == ["openrouter:api"]
+    assert (
+        config["llm"]["vendors"]["openrouter"]["routes"]["api"]["api_key_env"]
+        == "OPENROUTER_API_KEY"
+    )
+
+
+def test_llm_quickstart_combines_cloud_and_ollama_when_both_available(
+    tmp_path, monkeypatch
+):
+    """Cloud key + Ollama reachable → cloud first, Ollama as fallback.
+
+    Mirrors the README's "OpenRouter recommended; Ollama for free
+    local fallback" recipe.
+    """
+    for var in ("OPENROUTER_API_KEY", "OPENAI_API_KEY", "GOOGLE_API_KEY"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    monkeypatch.setattr(llm, "_is_ollama_reachable", lambda *a, **kw: True)
+
+    ctx = _make_ctx(tmp_path, Flow.QUICKSTART)
+    llm.run(ctx)
+    config = read_toml(tmp_path / "kestrel.toml")
+    assert config["llm"]["route_priority"] == ["anthropic:api", "ollama:local"]
+
+
+def test_llm_quickstart_orders_multiple_cloud_keys_openrouter_first(
+    tmp_path, monkeypatch
+):
+    """Three cloud keys exported → priority order is OpenRouter,
+    Anthropic, OpenAI (matches the README's recommendation)."""
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-oai")
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    monkeypatch.setattr(llm, "_is_ollama_reachable", lambda *a, **kw: False)
+
+    ctx = _make_ctx(tmp_path, Flow.QUICKSTART)
+    llm.run(ctx)
+    config = read_toml(tmp_path / "kestrel.toml")
+    assert config["llm"]["route_priority"] == [
+        "openrouter:api", "anthropic:api", "openai:api",
+    ]
+
+
+def test_llm_quickstart_reads_keys_from_dotenv_too(tmp_path, monkeypatch):
+    """Auto-detect must consult .env in addition to ``os.environ`` —
+    the wizard's keys-step may have populated .env earlier in the same
+    --quickstart run, and the parent shell may have nothing exported.
+    """
+    for var in ("OPENROUTER_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GOOGLE_API_KEY"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(llm, "_is_ollama_reachable", lambda *a, **kw: False)
+    write_env(tmp_path / ".env", {"OPENAI_API_KEY": "sk-from-dotenv"})
+
+    ctx = _make_ctx(tmp_path, Flow.QUICKSTART)
+    llm.run(ctx)
+    config = read_toml(tmp_path / "kestrel.toml")
+    assert config["llm"]["route_priority"] == ["openai:api"]
+
+
+def test_llm_quickstart_with_no_keys_marks_blocker_for_cloud(tmp_path, monkeypatch):
+    """If existing config picks OpenAI but no key is anywhere
+    (neither .env nor the parent shell), quickstart blocks. With a key
+    in os.environ the wizard now persists it to .env (see
+    test_llm_quickstart_promotes_shell_env_keys_to_dotenv); this test
+    covers the genuinely-missing case.
+    """
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     write_toml(
         tmp_path / "kestrel.toml",
         {"llm": {"route_priority": ["openai:api"]}},
@@ -40,6 +147,32 @@ def test_llm_quickstart_with_no_keys_marks_blocker_for_cloud(tmp_path):
     ctx = _make_ctx(tmp_path, Flow.QUICKSTART)
     llm.run(ctx)
     assert any("OPENAI_API_KEY not set" in b for b in ctx.blockers)
+
+
+def test_llm_quickstart_promotes_shell_env_keys_to_dotenv(tmp_path, monkeypatch):
+    """When a vendor's API key is exported in the parent shell but
+    missing from .env, the wizard persists it to .env so the runtime
+    (which only reads .env via dotenv) can use it. Without this,
+    autodetected cloud vendors would block quickstart even though the
+    operator's shell has the right key.
+    """
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-shell-exported")
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    monkeypatch.setattr(llm, "_is_ollama_reachable", lambda *a, **kw: False)
+
+    ctx = _make_ctx(tmp_path, Flow.QUICKSTART)
+    llm.run(ctx)
+
+    config = read_toml(tmp_path / "kestrel.toml")
+    env = read_env(tmp_path / ".env")
+    # Autodetect picked OpenAI; it's in the priority list.
+    assert config["llm"]["route_priority"] == ["openai:api"]
+    # And the shell-exported key landed in .env so the runtime can read it.
+    assert env["OPENAI_API_KEY"] == "sk-shell-exported"
+    # No blocker — the key is satisfied.
+    assert ctx.blockers == []
 
 
 def test_llm_interactive_picks_openai_with_key(tmp_path):
