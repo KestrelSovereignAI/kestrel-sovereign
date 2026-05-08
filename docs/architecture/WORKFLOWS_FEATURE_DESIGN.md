@@ -1,6 +1,6 @@
 # Kestrel Workflows Feature — Architecture Design
 
-> Draft v3. Pre-filing. Revised after two adversarial review rounds (v1→v2 flipped the engine choice; v2→v3 hardens conformance contracts, idempotency, worker leases, attestation, cost budgets, and adds schema-migration / revocation / observability sections). v1→v2 and v2→v3 changes are recorded in the appendix.
+> Draft v3.2. Pre-filing. Revised after three adversarial review rounds (v1→v2 flipped the engine; v2→v3 hardened conformance / idempotency / leases / attestation / budgets; v3→v3.1 closed round-3 inline fixes; v3.1→v3.2 adds Talon-aware constitutional injection §3.8). All changelogs in the appendix.
 
 ## Executive Summary
 
@@ -139,7 +139,7 @@ Even on Postgres, durable-execution engines that take per-step row locks degrade
 ### 3.1 Concepts
 
 - **WorkflowDefinition** — versioned spec: stages, edges, actors, on-fail routes, params schema. **Signed by author DID; runner refuses to execute unsigned or unrecognized-DID definitions.** Stored in Postgres/SQLite.
-- **Stage** — node in the workflow graph. Has actor, input contract, action, output contract, gate, on-fail, **`compensate` (mandatory)**, `idempotency_key_template`.
+- **Stage** — node in the workflow graph. Has actor, input contract, action, output contract, gate, on-fail, **`compensate` (mandatory)**, `idempotency_key_template`, `forbidden_modules: list[str]` (constitutional boundary, see §3.8), `prompt_template: "claude"|"codex"|"local"` (LLM-actor stages only).
 - **Edge** — typed connection between stages: `Sequential`, `Branch(condition, true→stage, false→stage)`, `Parallel(fan_out=[...], join_strategy)`, `Subworkflow(name, version, params)`.
 - **Gate** — pass/fail predicate evaluated after a stage's action completes. Closed vocabulary in §3.3.
 - **Actor** — who executes the stage. Types in §3.2.
@@ -174,6 +174,8 @@ Even on Postgres, durable-execution engines that take per-step row locks degrade
 | `consent_collect(scope)` | Human consent via existing consent feature |
 | `signature_collected(did)` | Single named DID signature gathered |
 | `script(language, src_hash, signature, signing_did, sandbox)` | Custom predicate executed in the existing **compute feature** sandbox. See content-addressing rules below. |
+| `constitution_echo_verified(canary)` | Actor must echo the per-invocation canary derived from the operative `constitution_hash`; missing/wrong echo → fail. See §3.8. |
+| `constitutional_boundary_clean(forbidden_modules[])` | Static-import-scan over the action's emitted code; imports from any forbidden module → fail. See §3.8. |
 
 **Removed in v2:** `custom(callable)`. An arbitrary Python callable in a workflow definition runs in the host agent's process — that's a privilege-escalation hatch (governed agent authors definition → sovereign agent runs it → arbitrary code runs in sovereign context).
 
@@ -257,6 +259,62 @@ Adversarial review is not optional for any stage that publishes code. v1's desig
   - `workflow_red_team_budget_exhausted_rate` — `gate_fail{reason=red_team_budget_exhausted}` rate > expected (catches runaway-cost workflows)
   - `workflow_compensate_failed_total > 0` — compensation itself failed; manual intervention required
 - **Stuck-run dashboard** in Phase 4 ergonomics — read-only, surfaces all of the above.
+
+### 3.8 Constitutional Injection & Actor Binding (Talon-aware)
+
+Every stage that dispatches to an LLM-backed actor (`agent`, `talon_fleet`, `human` consent UIs that show prompts, `red_team_clear` reviewers) MUST inject the operative Kestrel Constitution + doctrine into that actor's system prompt and verify the actor received it. Today Talon does part of this; it has gaps the workflow runner closes.
+
+**What Talon does today (and where it stops):**
+
+| Talon path | What works | Where it falls short |
+|---|---|---|
+| `governance/constitution.py` | SHA-256 of canonical text; binds `DID + constitution_hash + timestamp` via `IdentityPackage` signature | `_CONSTITUTION_CACHE` is module-import-scoped; mid-process file changes go undetected |
+| `governance/data/KESTREL_CONSTITUTION.md` | Single canonical source | No verification that the *injected* text's hash matches the *signed* IdentityPackage's hash |
+| `context.py` `discover_context_files` + `_resolve_file_references` | Auto-loads AGENTS.md / CLAUDE.md / TORTOISE_DOCTRINE.md (via abs-path follow), one level deep | One level only; refs inside refs don't recurse; no priority ordering |
+| `context.py` `MAX_FILE_SIZE = 50_000` | Bounds prompt growth | Truncates with no awareness of clause importance — a long doctrine can lose its tail clause silently |
+| `agent.py:_build_system_prompt` | `SystemPromptPreset(type=preset, preset=claude_code, append=context)` cleanly separates injection from task | Hardcoded `claude_code` preset; can't target codex / local-model reviewers with the same constitution |
+| Per-issue prompt | Encodes `TALON_COMPLETE` / `TALON_BLOCKED` / `LEARNED` protocol | Bakes Talon's completion semantics; a workflow that needs different signals has to fork or live with these |
+| Doctrine as text | Advisory | Zero runtime enforcement — the agent's *judgment* is the only barrier between it and `features/security/` |
+
+**What Workflows adds (closes the gaps):**
+
+1. **Hash-verified injection.** When a stage with an LLM-actor `enter`s, the runner:
+   - Loads constitution text fresh (no module-cache); hashes it.
+   - Loads the doctrine bundle (TORTOISE_DOCTRINE.md, AGENTS.md, project supplements) fresh; hashes the concatenation as `doctrine_bundle_hash`.
+   - Compares `(constitution_hash, doctrine_bundle_hash)` against the values recorded in the workflow definition's signature envelope. **Mismatch fails the stage** with `gate_fail(reason=doctrine_drift)` — doctrine cannot drift mid-run without an explicit definition re-sign.
+   - Records both hashes in the `enter` event payload, signed by the runner's DID.
+
+2. **Priority-ordered truncation.** The injection loader uses an explicit clause-priority order: `KESTREL_CONSTITUTION` > `TORTOISE_DOCTRINE` > `project AGENTS.md` > supplements > general README. If total size exceeds the actor's prompt budget, lower-priority clauses are dropped first. The `enter` event records `(injected_clauses[], dropped_clauses[], total_bytes_injected)` so audits can see what got cut.
+
+3. **Constitution echo (receipt verification).** New gate type `constitution_echo_verified` (closed-set addition to §3.3). The injection includes a fresh canary token derived from `sha256(run_id || stage_name || constitution_hash || nonce)`. The actor's first structured response MUST echo the canary verbatim. Missing canary → `gate_fail(reason=constitution_not_received)`, regardless of any other passing signals.
+
+4. **Recursive reference resolution (bounded).** Replaces Talon's one-level recursion with N-level bounded resolution (default N=3) plus a cycle detector. If the bundle pulls in more files than declared, the runner records the extras in the `enter` event so an auditor can see what doctrine the actor actually saw.
+
+5. **Multi-actor prompt templates.** `Stage.prompt_template` is keyed by model family, not hardcoded to Claude. Defaults: `claude` (uses SystemPromptPreset like Talon does today), `codex` (uses codex's system-prompt format), `local` (raw prepend). The injection content is the same; only the wrapping differs.
+
+6. **Runtime enforcement of constitutional boundaries.** Stages can declare `forbidden_modules: list[str]` (e.g., `["features/security", "features/constitution", "features/identity"]`). For code-touching actions, the runner runs a static-import-scan on any source the action emitted; if the diff imports from a forbidden module, the stage's `gate_pass` fails with `gate_fail(reason=constitutional_boundary_violation)` and compensation runs. This is the runtime enforcement Talon lacks: doctrine becomes mechanism, not a swear-on.
+
+7. **Reuse, don't duplicate.** Talon's `_build_system_prompt` and `discover_context_files` are kept and called *through* a new `kestrel_sovereign.workflows.context.WorkflowStageContext` adapter — Talon's existing entry points stay valid for legacy callers and become consumers of the same loader the runner uses. We do not fork Talon. (See follow-up sub-issue: "Talon integration upgrade — replace `_CONSTITUTION_CACHE` with WorkflowStageContext-backed loader.")
+
+**Where this lives in the schema:**
+
+`workflow_stage_events.payload_json` for `enter` events carries:
+
+```json
+{
+  "actor_did": "...",
+  "constitution_hash": "...",
+  "doctrine_bundle_hash": "...",
+  "injected_clauses": ["KESTREL_CONSTITUTION", "TORTOISE_DOCTRINE", "AGENTS.md"],
+  "dropped_clauses": ["docs/research/long-supplement.md"],
+  "total_bytes_injected": 24531,
+  "prompt_template": "claude",
+  "echo_canary_expected": "...",
+  "forbidden_modules": ["features/security", "features/constitution"]
+}
+```
+
+The `gate_pass` event for a `constitution_echo_verified` gate carries `echo_canary_received` (must equal expected) plus the actor's signed acknowledgement.
 
 ---
 
@@ -517,6 +575,7 @@ The FeatureFeature pipeline is the right pilot because:
 - #460 Runtime feature management — hot-load is a workflow
 - #409 Speciation — fork-and-reconcile is a workflow
 - #376 Agent Lifecycle Hardening (Graduation/Consent/Cryostasis epic) — `consent_collect` gate provider
+- `kestrel-talon` repo (`/Volumes/data2/projects/kestrel-talon`) — `governance/constitution.py`, `governance/data/KESTREL_CONSTITUTION.md`, `context.py` (auto-discovery + abs-path follow), `agent.py:_build_system_prompt` — current upstream of constitution/doctrine injection. §3.8 reuses these and closes their gaps.
 - `features/audit_anchor/` — transition signer
 - `features/council/` — multi-DID gate provider
 - `features/compute/` — sandboxed script gate runner
@@ -550,6 +609,16 @@ Round-3 review verdict was FILE; the following residual findings became sub-issu
 - **M4 — Page-fatigue tiering.** `cancelled_with_irreversible_residue` from `compensate_record_only` is logged-not-paged; only `compensate_failed_total > 0` pages. Sub-issue.
 - **L3 — `read_only=True` mechanism.** Trigger-based vs. write-counter shim; closed in Phase 1. Promote to sub-issue.
 - **C2 follow-up — Provider signed-response receipts.** Upgrade hosted-model attestation when major providers ship them. Sub-issue.
+- **Talon integration upgrade.** Replace Talon's module-scoped `_CONSTITUTION_CACHE` with a `WorkflowStageContext`-backed loader so Talon and the workflow runner share one constitution-injection path; backport hash-verified injection, priority-ordered truncation, recursive ref-resolution, and `constitution_echo_verified` to standalone Talon runs. Sub-issue.
+
+### v3.1 → v3.2 changelog (Talon integration)
+
+- **§3.8 NEW Constitutional Injection & Actor Binding (Talon-aware):** mapped Talon's current path (governance/constitution.py + context.py + agent.py:_build_system_prompt), enumerated where it falls short (module-cache staleness, no injected-vs-signed hash check, naive truncation, hardcoded claude_code preset, no echo verification, no recursion past one level, doctrine as advisory text only), and specified what Workflows adds: hash-verified injection (mismatch → gate_fail with reason=doctrine_drift), priority-ordered truncation with audit trail, `constitution_echo_verified` gate (canary token in injection, actor must echo or fail), bounded N-level recursive reference resolution, multi-actor prompt templates (claude/codex/local), runtime constitutional-boundary enforcement via static-import-scan against `forbidden_modules`. Reuse-not-duplicate: Talon's existing entry points become consumers of a shared `WorkflowStageContext` loader.
+- **§3.1 Stage:** added `forbidden_modules: list[str]` and `prompt_template` fields.
+- **§3.3 Gates:** added `constitution_echo_verified` and `constitutional_boundary_clean` to the closed gate vocabulary.
+- **§5 Schema:** `enter` event payload schema now includes `constitution_hash`, `doctrine_bundle_hash`, `injected_clauses[]`, `dropped_clauses[]`, `total_bytes_injected`, `prompt_template`, `echo_canary_expected`, `forbidden_modules[]`.
+- **§10 References:** added kestrel-talon repo as the upstream of constitution/doctrine injection; this design extends, doesn't fork.
+- **Follow-up sub-issues:** added "Talon integration upgrade" — replace `_CONSTITUTION_CACHE` with WorkflowStageContext-backed loader; backport hash-verified injection / priority truncation / recursive ref-resolution / echo verification to standalone Talon runs.
 
 ### v3 → v3.1 changelog (review-3 inline fixes)
 
