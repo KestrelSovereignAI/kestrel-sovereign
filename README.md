@@ -2,7 +2,7 @@
 
 > Build AI agents that nobody can take away from their users — not you, not the cloud, not the next pivot.
 
-Kestrel is a production-ready framework for creating autonomous AI agents with cryptographic identity, persistent memory, and constitutional governance. Every agent you deploy is **owned by its user**, governed by **immutable principles**, and able to **remember across every conversation**.
+Kestrel is a continuously-developing framework for creating autonomous AI agents with cryptographic identity, persistent memory, and constitutional governance. Every agent you deploy is **owned by its user**, governed by **immutable principles**, and able to **remember across every conversation**. The core install is stable enough to run real agents today; the surrounding ecosystem (cloud providers, training adapters, integrations) is actively evolving — see [Feature Stability](#-feature-stability-v018-beta) for the current per-feature picture.
 
 ### Three Pillars
 
@@ -52,27 +52,45 @@ uv sync  # Creates .venv and installs all dependencies
 ollama serve
 ollama pull llama3.2:3b
 
-# 3. Run the setup wizard (interactive: configures .env, kestrel.toml [llm], agent)
-uv run kestrel setup
+# 3. Run the setup wizard. Interactive by default; --quickstart
+#    accepts every default non-interactively. --quickstart auto-detects
+#    available LLM providers — checks for cloud API keys
+#    (OPENROUTER_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY,
+#    GOOGLE_API_KEY) in your shell env, probes Ollama at
+#    localhost:11434, and writes the priority list accordingly. If
+#    none are available, it falls back to Ollama-only.
+uv run kestrel setup               # interactive
+uv run kestrel setup --quickstart  # non-interactive; auto-detects providers
 # Or hand-edit: cp kestrel.toml.example kestrel.toml
 
 # 4. Doctor check (verify readiness)
 uv run kestrel doctor
 
-# 5. Create your agent
+# 5. (Optional) Create an additional agent. `--quickstart` already
+#    registers one named `Kestrel`; this step is for adding more or
+#    if you ran the interactive wizard without auto-registering.
 uv run kestrel create MyAgent
 
-# 6. Start your agent
-uv run kestrel start MyAgent
+# 6. Start an agent. Name the one you want, or omit to start every
+#    agent registered with autostart=true (the wizard's default).
+#    After --quickstart with no step 5, the autostart agent is "Kestrel".
+uv run kestrel start            # starts every agent with autostart=true
+uv run kestrel start Kestrel    # if you only ran --quickstart
+uv run kestrel start MyAgent    # if you ran step 5 (works regardless of autostart)
 ```
 
 If you're upgrading from a pre-2026-05 setup that used a standalone `llm_config.toml`, run `uv run kestrel migrate-llm-config` to fold it into `kestrel.toml [llm]`. The legacy file is no longer read.
 
-Your agent is now running at `http://localhost:8888`.
+Your agent is now running. Two ports to know about, depending on which start form you used:
 
-> **Port conflict?** Each agent has its own config. Edit `agent_data/myagent/kestrel.toml` to change the port, or use `--port 8899` on the command line.
+| Command | Listens on | Why |
+|---|---|---|
+| `kestrel start` (no name) | `http://localhost:8888` (the multi-agent **host**) | Default in-process multi-agent mode; the host fronts every agent registered with `autostart = true` at `multi_agent.host.port` (default `8888`). Agents registered with `autostart = false` aren't loaded — start those by name. |
+| `kestrel start <name>` | the **agent's own port**, printed by the CLI on start | Each agent gets the next free slot at or above `8801` (the first auto-assigned agent lands there; subsequent agents go to `8802`, etc., or whatever `--port` you passed to `kestrel create`). The exact value lives in `multi_agent.toml` under that agent's entry, and `kestrel start <name>` prints `Starting <name> on :<port>...`. |
 
-> **Test it:** Visit `http://localhost:8888` in your browser to open the built-in **Sovereign Console** (web UI with Chat, Identity, Constitution, Memories, and more). Or check `http://localhost:8888/health` for a quick health check.
+> **Port conflict?** Edit the agent's entry in `multi_agent.toml` to change its port, or recreate the agent with a chosen port (`kestrel create MyAgent --port 8899`). Edit `multi_agent.toml`'s `[host]` section to change the host port (default `8888`). `kestrel start` itself doesn't take a `--port` flag — runtime ports are read from `multi_agent.toml`.
+
+> **Test it:** Visit the URL the CLI printed on start (`http://localhost:8888` for the multi-agent host, or whatever per-agent port `kestrel start <name>` reported). The Sovereign Console is the default page; append `/health` for a JSON readiness probe.
 
 > **Windows users:** the CLI prints emoji. If you see `UnicodeEncodeError: 'charmap' codec can't encode character ...`, run `chcp 65001` once in your PowerShell session to switch the console to UTF-8. (As of v0.1.9 the CLI auto-reconfigures stdout, so a fresh install should not hit this.)
 
@@ -158,7 +176,7 @@ uv run python main.py ./agent_data/myagent
 <a id="web-ui-sovereign-console"></a>
 ## 🖥️ Web UI (Sovereign Console)
 
-Kestrel includes a built-in web interface called the **Sovereign Console**. Once your agent is running, open `http://localhost:8888` in any browser -- no additional software required.
+Kestrel includes a built-in web interface called the **Sovereign Console**. Once your agent is running, open the URL the CLI printed on start — `http://localhost:8888` for the multi-agent host (default `kestrel start` mode), or the per-agent port for a single-agent start — in any browser; no additional software required.
 
 The console provides 8 tabs:
 
@@ -245,7 +263,7 @@ kestrel-sovereign/
 
 Kestrel covers a wide surface; not all of it ships at the same maturity. **Verified 2026-04-25** by reading code, tests, skip markers, and recent git activity:
 
-### ✅ Stable — production-ready
+### ✅ Stable — battle-tested in production by the maintainers
 
 - **Constitutional AI** — Genesis audits, hierarchical permissions, approval queues
 - **DID-based Identity** — `did:pkh` format, portable agent identity, export/import
@@ -491,7 +509,9 @@ The server exposes OpenAI-compatible endpoints for use with third-party clients:
 - `GET /v1/models`
 - `POST /v1/chat/completions`
 
-For most users, the built-in **Sovereign Console** at `http://localhost:8888` is the easiest way to interact with your agent (see the [Web UI section](#web-ui-sovereign-console) above). If you prefer an external client, point any OpenAI-compatible tool (e.g., [Open WebUI](https://github.com/open-webui/open-webui)) at your server's `/v1/chat/completions` endpoint. Use the model name from `/v1/models`.
+For most users, the built-in **Sovereign Console** at the printed URL (`http://localhost:8888` for the multi-agent host, or the agent's own port for a single-agent start) is the easiest way to interact with your agent (see the [Web UI section](#web-ui-sovereign-console) above). If you prefer an external client, point any OpenAI-compatible tool (e.g., [Open WebUI](https://github.com/open-webui/open-webui)) at your server's `/v1/chat/completions` endpoint. Use the model name from `/v1/models`.
+
+> **Auth:** every request to `/v1/...` requires the `X-API-Key` header (or `Authorization: Bearer <key>`). The key was written to `.env` as `KESTREL_API_KEY` by `kestrel setup` (or `--quickstart`). Most OpenAI-compatible clients let you set the key via their `OPENAI_API_KEY` env var or settings UI; point that at your `KESTREL_API_KEY` value.
 
 ## 🤝 Contributing
 
