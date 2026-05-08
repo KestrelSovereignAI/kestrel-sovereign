@@ -654,36 +654,62 @@ export async function sendMessage() {
                 let learnedSessionId = false;
                 // Wave 5E: cross-chunk parser buffer for partial
                 // sentinels. ReadableStream chunking isn't guaranteed
-                // to preserve server yields, so a sentinel can split.
-                // We hold back any chunk-tail starting with the
-                // sentinel prefix until its closing \\x1e arrives.
+                // to preserve server yields, so a sentinel can split
+                // anywhere — including INSIDE the prefix string
+                // ("\x1eKESTREL:REV" / "ISE:{...}\x1e..."). We hold
+                // back two cases:
+                //   (A) Full prefix present but no closing \\x1e
+                //   (B) Partial prefix at chunk tail (any non-empty
+                //       prefix of REVISE_SENTINEL_PREFIX)
                 let sentinelBuffer = '';
                 for await (const rawChunk of API.streamInvoke(text, null, sessionId, null, false, dispatchAgent)) {
-                    // Merge any held-back partial sentinel with the
-                    // new chunk before trying to parse.
                     const merged = sentinelBuffer + rawChunk;
                     sentinelBuffer = '';
-                    // Find any partial sentinel at the tail end.
-                    const lastPrefixIdx = merged.lastIndexOf(REVISE_SENTINEL_PREFIX);
                     let processable = merged;
-                    if (lastPrefixIdx >= 0) {
+                    // Case A: a full prefix without close in this
+                    // chunk — buffer everything from prefix on.
+                    const lastFullPrefixIdx = merged.lastIndexOf(REVISE_SENTINEL_PREFIX);
+                    if (lastFullPrefixIdx >= 0) {
                         const closeAfter = merged.indexOf(
                             REVISE_SENTINEL_SUFFIX,
-                            lastPrefixIdx + REVISE_SENTINEL_PREFIX.length,
+                            lastFullPrefixIdx + REVISE_SENTINEL_PREFIX.length,
                         );
                         if (closeAfter < 0) {
-                            // Last sentinel is incomplete — hold it.
-                            processable = merged.slice(0, lastPrefixIdx);
-                            sentinelBuffer = merged.slice(lastPrefixIdx);
+                            processable = merged.slice(0, lastFullPrefixIdx);
+                            sentinelBuffer = merged.slice(lastFullPrefixIdx);
                         }
                     }
-                    // Wave 5E: detect + strip in-band revise sentinels.
-                    // Pre-sentinel slice = pre-tool prose (gets
-                    // retracted). Post-sentinel slice = start of
-                    // post-tool synthesis (becomes fresh bubble
-                    // content).
-                    const { textBefore, textAfter, sawSentinel } =
+                    // Strip any complete sentinels in processable.
+                    // Pre-sentinel slice (textBefore) = pre-tool prose
+                    // (gets retracted). Post-sentinel (textAfter) =
+                    // start of post-tool synthesis.
+                    let { textBefore, textAfter, sawSentinel } =
                         stripReviseSentinel(processable);
+                    // Case B: a PARTIAL prefix at the tail of post-
+                    // strip output — happens when a chunk splits
+                    // INSIDE the prefix string ("\x1eKESTREL:REV" then
+                    // "ISE:..."). Run AFTER strip so we don't
+                    // misidentify the closing \\x1e of a just-stripped
+                    // sentinel as a new prefix start. Codex P2 of #1089.
+                    if (!sentinelBuffer) {
+                        const target = sawSentinel ? textAfter : textBefore;
+                        if (target.length > 0) {
+                            const maxCheck = Math.min(
+                                target.length,
+                                REVISE_SENTINEL_PREFIX.length - 1,
+                            );
+                            for (let i = maxCheck; i > 0; i--) {
+                                const tail = target.slice(target.length - i);
+                                if (REVISE_SENTINEL_PREFIX.startsWith(tail)) {
+                                    sentinelBuffer = tail;
+                                    const trimmed = target.slice(0, target.length - i);
+                                    if (sawSentinel) textAfter = trimmed;
+                                    else textBefore = trimmed;
+                                    break;
+                                }
+                            }
+                        }
+                    }
                     if (sawSentinel) {
                         pane.pendingRevise = true;
                         // Mark this request's revise as consumed so a

@@ -516,14 +516,29 @@ test('inband sentinel split across chunk boundary: buffering wrapper reassembles
     assert.ok(!finalText.includes('KESTREL:REVISE'));
 });
 
-test('late SSE after in-band consumed: idempotent, post-tool not corrupted', async () => {
-    // The danger codex P1 flagged: in-band sentinel arrives first,
-    // post-tool chunks accumulate, THEN a delayed SSE for the same
-    // request arrives. Without idempotency, the SSE re-arms
-    // pendingRevise and the next chunk drops the rendered post-tool.
-    // The reviseConsumedRequestId guard makes the second signal a
-    // no-op for the same request.
+test('late SSE after in-band consumed: actual listener dispatch is no-op', async () => {
+    // Codex P1 of #1089 + P3 follow-up: route the late SSE event
+    // through the registered EventSource listener (not an inline
+    // reimplementation of the guard). A listener regression that
+    // forgot the reviseConsumedRequestId check would re-arm
+    // pendingRevise and corrupt rendered post-tool text.
     renderCalls.length = 0; finalizeCalls.length = 0;
+
+    // Fake EventSource captures the listeners registered by
+    // connectNotifications. Test fires `revising` AFTER the in-band
+    // path has already consumed the same request_id.
+    const handlers = new Map();
+    class FakeES {
+        constructor(_url) { FakeES.last = this; }
+        addEventListener(name, h) {
+            const list = handlers.get(name) || [];
+            list.push(h);
+            handlers.set(name, list);
+        }
+        close() {}
+    }
+    const origES = globalThis.EventSource;
+    globalThis.EventSource = FakeES;
 
     const pane = getOrCreateChatPane('late-sse-A');
     apiModule.default.setHostAgent('late-sse-A');
@@ -536,35 +551,36 @@ test('late SSE after in-band consumed: idempotent, post-tool not corrupted', asy
     const origGetReqId = apiModule.default.getCurrentStreamRequestId;
     apiModule.default.getCurrentStreamRequestId = () => 'rid-late';
 
+    // Register the SSE listener.
+    chatModule.connectNotifications();
+    const reviseHandlers = handlers.get('revising') || [];
+    assert.ok(reviseHandlers.length >= 1);
+
     messageInput.value = 'save';
     const sendPromise = sendMessage();
     await Promise.resolve(); await Promise.resolve();
 
-    // 1. Pre-tool prose
     ctrl.push('Saving that now... ');
     await new Promise((r) => setTimeout(r, 5));
-    // 2. In-band sentinel — flips pendingRevise + reviseConsumedRequestId
+    // In-band sentinel — sets reviseConsumedRequestId='rid-late'
     ctrl.push('\x1eKESTREL:REVISE:{"index":0,"tool_call_id":"tc1","tool_name":"x"}\x1e');
     await new Promise((r) => setTimeout(r, 5));
-    // 3. Post-tool chunks accumulate after the in-band reset
-    ctrl.push('Tool said no, the save did not persist.');
+    // Post-tool synthesis renders.
+    ctrl.push('the save did not persist.');
     await new Promise((r) => setTimeout(r, 5));
 
-    // 4. Late SSE for the SAME request_id — idempotency must prevent
-    //    re-arming pendingRevise.
-    pane.pendingRevise = false;  // (chat loop already cleared it)
-    // Simulate the SSE listener firing AFTER post-tool chunks rendered:
-    if (pane.reviseConsumedRequestId === 'rid-late') {
-        // No-op path — listener checks this and skips.
-    } else {
-        // If the guard was missing, this branch would fire and
-        // re-arm pendingRevise — we want the OPPOSITE.
-        pane.pendingRevise = true;
+    // Late SSE for the SAME request_id — must be a no-op via the
+    // listener's reviseConsumedRequestId check.
+    for (const h of reviseHandlers) {
+        h({ data: JSON.stringify({
+            type: 'revising', request_id: 'rid-late',
+            index: 0, tool_name: 'x',
+        }) });
     }
     assert.equal(pane.pendingRevise, false,
-        'late SSE for already-consumed request must be a no-op');
+        'late SSE for already-consumed request must NOT re-arm pendingRevise');
 
-    // 5. More post-tool chunks (e.g. continuing synthesis)
+    // More post-tool chunks survive the late SSE.
     ctrl.push(' Try a different store.');
     await new Promise((r) => setTimeout(r, 5));
     ctrl.end();
@@ -572,12 +588,52 @@ test('late SSE after in-band consumed: idempotent, post-tool not corrupted', asy
 
     apiModule.default.streamInvoke = origStream;
     apiModule.default.getCurrentStreamRequestId = origGetReqId;
+    globalThis.EventSource = origES;
 
     const finalText = finalizeCalls[finalizeCalls.length - 1] || '';
     assert.ok(finalText.includes('did not persist'));
     assert.ok(finalText.includes('Try a different store'),
         `late post-tool chunks must survive late-SSE no-op, got: ${JSON.stringify(finalText)}`);
     assert.ok(!finalText.includes('Saving that now'));
+});
+
+test('partial prefix split inside the sentinel prefix string (codex P2 of #1089)', async () => {
+    // The browser may split a chunk INSIDE the sentinel prefix,
+    // e.g. chunk1='Saving\\x1eKESTREL:REV', chunk2='ISE:{...}\\x1efresh'.
+    // Neither chunk contains the full prefix string, so the prior
+    // buffer (which only triggered on full-prefix-without-close)
+    // would fail to recognize either half. The new prefix-prefix
+    // tail buffer handles this case.
+    renderCalls.length = 0; finalizeCalls.length = 0;
+
+    const pane = getOrCreateChatPane('partial-prefix-A');
+    apiModule.default.setHostAgent('partial-prefix-A');
+    mountChatPane('partial-prefix-A');
+    pane.sessionId = 'sess-pp1';
+
+    const ctrl = controlledStream();
+    const origStream = apiModule.default.streamInvoke;
+    apiModule.default.streamInvoke = () => ctrl.iter;
+
+    messageInput.value = 'save';
+    const sendPromise = sendMessage();
+    await Promise.resolve(); await Promise.resolve();
+
+    ctrl.push('Saving\x1eKESTREL:REV');  // ends mid-prefix
+    await new Promise((r) => setTimeout(r, 5));
+    ctrl.push('ISE:{"index":0,"tool_call_id":"tc1","tool_name":"x"}\x1efresh post-tool');
+    await new Promise((r) => setTimeout(r, 5));
+    ctrl.end();
+    await sendPromise;
+
+    apiModule.default.streamInvoke = origStream;
+
+    const finalText = finalizeCalls[finalizeCalls.length - 1] || '';
+    assert.equal(finalText, 'fresh post-tool',
+        `partial-prefix split must reassemble + retract; got: ${JSON.stringify(finalText)}`);
+    assert.ok(!finalText.includes('Saving'));
+    assert.ok(!finalText.includes('KESTREL'));
+    assert.ok(!finalText.includes('\x1e'));
 });
 
 test('multiple concurrent panes: revise on pane A leaves pane B untouched', async () => {
