@@ -141,10 +141,17 @@ class TalonCoordinatorFeature(Feature):
         # False quickly so we fall through to the CLI path.
         mesh_result = await self._dispatch_via_mesh(repo, issue)
         if mesh_result.get("dispatched"):
+            # Mesh dispatch returns ``message_id`` (not ``job_id``) — that's
+            # the tracking id the agent/user needs to follow up.
+            tracking_id = (
+                mesh_result.get("job_id")
+                or mesh_result.get("message_id")
+                or "?"
+            )
             return ToolResult.ok(
                 confirmation=(
                     f"Dispatched {repo}#{issue} to talon via mesh "
-                    f"(job_id={mesh_result.get('job_id', '?')})"
+                    f"(message_id={tracking_id})"
                 ),
                 data=mesh_result,
             )
@@ -894,12 +901,27 @@ class TalonCoordinatorFeature(Feature):
                     ),
                     data=r,
                 )
-            # Pull the most specific error available
+            # Pull the most specific error available. Stage dicts may
+            # carry ``error`` directly OR a non-zero ``returncode`` +
+            # ``stderr_tail`` (the --help-fails-mid-startup path); both
+            # need to surface, otherwise the agent loses the actual
+            # cause that talon_health exists to diagnose.
             for stage in ("execute", "env", "binary"):
                 stage_data = r.get(stage)
-                if isinstance(stage_data, dict) and stage_data.get("error"):
+                if not isinstance(stage_data, dict):
+                    continue
+                if stage_data.get("error"):
                     return ToolResult.failed(
                         f"talon health {stage}: {stage_data['error']}",
+                        data=r,
+                    )
+                if stage == "execute" and stage_data.get("ok") is False:
+                    rc = stage_data.get("returncode")
+                    stderr_tail = (stage_data.get("stderr_tail") or "").strip()
+                    detail = stderr_tail[-300:] if stderr_tail else "no stderr"
+                    return ToolResult.failed(
+                        f"talon health execute: --help exited rc={rc}; "
+                        f"stderr_tail={detail!r}",
                         data=r,
                     )
             return ToolResult.failed(
