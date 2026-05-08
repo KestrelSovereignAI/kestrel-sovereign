@@ -24,6 +24,13 @@ Foundational documents defining the agent's existence and runtime.
 - **[core/MULTI_MODEL_SUPPORT.md](core/MULTI_MODEL_SUPPORT.md)** — LLMAdapter abstraction and provider fallback. *Active.*
 - **[core/INFRASTRUCTURE.md](core/INFRASTRUCTURE.md)** — Parallel-development workflow and tooling. *Active.*
 
+### LLM substrate
+
+Adapter contract, plugin authoring, streaming, and the constitutional honesty layer. The high-level service architecture is documented above in [LLM_SERVICE_ARCHITECTURE.md](LLM_SERVICE_ARCHITECTURE.md); these are the leaves of that tree.
+
+- **[llm/PROVIDER_PLUGINS.md](llm/PROVIDER_PLUGINS.md)** — How to ship a third-party LLM adapter as a `pip`-installable plugin. SDK contract surface, marker emission rules, conformance suite. *Active.*
+- **[llm/HONESTY_LAYER.md](llm/HONESTY_LAYER.md)** — The end-to-end streaming honesty layer: `ToolCallStarted` markers, in-band revise sentinel + SSE backup, deterministic narration check in the audit hook. Closes [#1042](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/1042). *Active.*
+
 ### Memory & storage
 
 Storage protocols, memory systems, and data ownership.
