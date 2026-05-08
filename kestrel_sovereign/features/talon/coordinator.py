@@ -724,11 +724,16 @@ class TalonCoordinatorFeature(Feature):
             info["returncode"] = rc
             info["completed_at"] = datetime.now(timezone.utc).isoformat()
 
-        # Then layer on mesh inbox completions for jobs dispatched via mesh
+        # Then layer on mesh inbox completions for jobs dispatched via mesh.
+        # peers.mesh_inbox is async and now returns a ToolResult envelope
+        # (#1061 wave 16); the legacy {"messages": [...]} dict lives under
+        # .data. The pre-migration code was missing the `await` here —
+        # restore correctness now that we're touching this call site.
         peers = self._get_peers_feature()
         if peers:
-            inbox = peers.mesh_inbox(limit=50)
-            for msg_data in inbox.get("messages", []):
+            inbox_envelope = await peers.mesh_inbox(limit=50)
+            inbox_data = inbox_envelope.data or {}
+            for msg_data in inbox_data.get("messages", []):
                 msg_type = msg_data.get("type", "")
                 if msg_type in ("complete", "reject"):
                     job_id = msg_data.get("correlation_id", "")

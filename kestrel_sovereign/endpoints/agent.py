@@ -1018,4 +1018,8 @@ async def get_mesh_inbox(request: Request, limit: int = Query(default=20, ge=1, 
             detail="PeersFeature not loaded",
         )
 
-    return await peers.mesh_inbox(limit=limit)
+    # mesh_inbox returns a ToolResult envelope (#1061 wave 16); the
+    # legacy {"messages": [...], "count": N, "total": N} dict lives
+    # under .data and is the documented API response shape.
+    envelope = await peers.mesh_inbox(limit=limit)
+    return envelope.data or {"messages": [], "count": 0, "total": 0}
