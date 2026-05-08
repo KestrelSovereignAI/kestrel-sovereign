@@ -310,7 +310,7 @@ async def set_privacy_mode(request: Request):
     stray script can't change a live agent's privacy contract by accident.
     """
     try:
-        from kestrel_sovereign.privacy import PrivacyMode
+        from kestrel_sovereign.privacy import PrivacyMode, privacy_mode_to_config
 
         data = await request.json()
         mode_str = data.get("mode", "").upper()
@@ -333,7 +333,7 @@ async def set_privacy_mode(request: Request):
 
         # If switching to a local-only mode, auto-switch model to a local provider
         # If switching back to cloud-allowed mode, restore the previous model
-        config = new_mode.to_config()
+        config = privacy_mode_to_config(new_mode)
         model_switched = getattr(transition, "model_switched", None)
         if transition is None and hasattr(agent, 'llm_service') and agent.llm_service:
             llm = agent.llm_service

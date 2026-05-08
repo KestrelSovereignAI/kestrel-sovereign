@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from kestrel_sovereign.kestrel_agent import KestrelAgent
-from kestrel_sovereign.privacy import PrivacyMode
+from kestrel_sovereign.privacy import PrivacyMode, privacy_mode_to_config
 
 
 class _PrivacyConfig:
@@ -32,7 +32,7 @@ class _PrivacyAgent:
 
     def set_mode(self, mode):
         self.privacy_mode = mode
-        self.privacy_config = _PrivacyConfig(allows_cloud=mode.to_config().allows_cloud_llm())
+        self.privacy_config = _PrivacyConfig(allows_cloud=privacy_mode_to_config(mode).allows_cloud_llm())
         return f"Privacy mode changed to {mode.value}."
 
 

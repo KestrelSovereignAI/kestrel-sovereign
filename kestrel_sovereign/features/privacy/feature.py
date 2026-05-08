@@ -2,7 +2,14 @@ import re
 from typing import List, Dict, Optional, Union
 from datetime import datetime, timezone
 
-from kestrel_sovereign.privacy import PrivacyMode, PrivacyConfig, PRIVACY_PRESETS, get_privacy_preset
+from kestrel_sovereign.privacy import (
+    PrivacyMode,
+    PrivacyConfig,
+    PRIVACY_PRESETS,
+    get_privacy_preset,
+    privacy_mode_to_config,
+    privacy_config_to_mode,
+)
 from kestrel_sovereign.kestrel_types.storage_types import StorageProvider
 from kestrel_sovereign.ephemeral_session import EphemeralSession
 from .pii_detector import get_pii_detector, anonymize_text
@@ -34,7 +41,7 @@ class PrivacyAgent:
         if isinstance(mode, PrivacyConfig):
             return mode
         elif isinstance(mode, PrivacyMode):
-            return mode.to_config()
+            return privacy_mode_to_config(mode)
         elif isinstance(mode, str):
             return get_privacy_preset(mode)
         else:
@@ -43,7 +50,7 @@ class PrivacyAgent:
     @property
     def privacy_mode(self) -> PrivacyMode:
         """Backward compatibility: return PrivacyMode enum."""
-        return PrivacyMode.from_config(self._privacy_config)
+        return privacy_config_to_mode(self._privacy_config)
     
     @property
     def privacy_config(self) -> PrivacyConfig:

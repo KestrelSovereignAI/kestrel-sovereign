@@ -7,6 +7,7 @@ from kestrel_sovereign.privacy import (
     PrivacyConfig,
     PrivacyMode,
     get_privacy_preset,
+    privacy_config_to_mode,
     privacy_mode_to_config,
 )
 
@@ -42,7 +43,7 @@ def test_from_config_ignores_computer_access():
         storage="full", llm_location="cloud", shareable=False, computer_access=True
     )
     # Equivalent of "normal" preset, just with computer_access on.
-    assert PrivacyMode.from_config(cfg) is PrivacyMode.NORMAL
+    assert privacy_config_to_mode(cfg) is PrivacyMode.NORMAL
 
 
 def test_get_privacy_preset_unknown_raises():

@@ -21,7 +21,13 @@ from typing import Dict, List, Optional, Any, Tuple, TYPE_CHECKING, Union
 from enum import Enum
 from dataclasses import dataclass
 
-from kestrel_sovereign.privacy import PrivacyMode, PrivacyConfig, get_privacy_preset
+from kestrel_sovereign.privacy import (
+    PrivacyMode,
+    PrivacyConfig,
+    get_privacy_preset,
+    privacy_mode_to_config,
+    privacy_config_to_mode,
+)
 from kestrel_sovereign.storage.conversation_ids import coerce_persistent_message_id
 
 # Lazy import to avoid circular dependency with features.privacy
@@ -68,7 +74,7 @@ class PrivacyPolicy:
         if isinstance(mode, PrivacyConfig):
             config = mode
         elif isinstance(mode, PrivacyMode):
-            config = mode.to_config()
+            config = privacy_mode_to_config(mode)
         elif isinstance(mode, str):
             config = get_privacy_preset(mode)
         else:
@@ -159,16 +165,16 @@ class PrivacyEnforcingStorage:
         if isinstance(mode, PrivacyConfig):
             return mode
         elif isinstance(mode, PrivacyMode):
-            return mode.to_config()
+            return privacy_mode_to_config(mode)
         elif isinstance(mode, str):
             return get_privacy_preset(mode)
         else:
             raise TypeError(f"Expected PrivacyMode, PrivacyConfig, or str, got {type(mode)}")
-    
+
     @property
     def privacy_mode(self) -> PrivacyMode:
         """Backward compatibility: return PrivacyMode enum."""
-        return PrivacyMode.from_config(self._privacy_config)
+        return privacy_config_to_mode(self._privacy_config)
     
     @property
     def privacy_config(self) -> PrivacyConfig:

@@ -1,6 +1,31 @@
-from enum import Enum
+"""Privacy modes — sovereign-side configuration with SDK-canonical enum.
+
+`PrivacyMode` is re-exported from `kestrel_sdk.storage.database` so feature
+packages and sovereign share **one** enum identity (no parallel copies, no
+broken `isinstance` checks at the seam).
+
+`PrivacyConfig` and the preset dict stay sovereign-private — they carry
+sovereign-specific flags (`computer_access`, `llm_location`) that the SDK
+deliberately doesn't model.
+
+The `to_config` / `from_config` instance/class methods that lived on the
+old enum are now module-level functions: `privacy_mode_to_config()` and
+`privacy_config_to_mode()`. Same behavior, different call site.
+"""
+
 from dataclasses import dataclass
-from typing import Literal, Optional, Dict, Union
+from typing import Dict, Literal, Union
+
+from kestrel_sdk.storage.database import PrivacyMode
+
+__all__ = [
+    "PrivacyMode",
+    "PrivacyConfig",
+    "PRIVACY_PRESETS",
+    "get_privacy_preset",
+    "privacy_mode_to_config",
+    "privacy_config_to_mode",
+]
 
 
 @dataclass
@@ -8,7 +33,7 @@ class PrivacyConfig:
     """
     Privacy configuration using independent flags.
 
-    This replaces the old PrivacyMode enum with orthogonal concerns:
+    Orthogonal concerns:
     - storage: How/whether data is persisted
     - llm_location: Whether cloud LLMs are allowed
     - shareable: Whether content can be exported/shared
@@ -72,48 +97,31 @@ def get_privacy_preset(name: str) -> PrivacyConfig:
     )
 
 
-# === Backward Compatibility ===
-# Keep PrivacyMode enum for existing code, but it now maps to PrivacyConfig
-
-class PrivacyMode(Enum):
-    """
-    Privacy modes for agent conversations.
-    
-    DEPRECATED: Use PrivacyConfig directly for new code.
-    This enum is maintained for backward compatibility.
-    """
-    EPHEMERAL = "ephemeral"     # Nothing stored, local LLM only
-    ISOLATED = "isolated"       # Temporary session storage, local LLM only
-    ANONYMOUS = "anonymous"     # Scrubbed storage (PII removed), cloud LLM allowed
-    NORMAL = "normal"           # Standard persistent storage
-    PUBLIC = "public"           # Shareable and exportable
-    
-    def to_config(self) -> PrivacyConfig:
-        """Convert this mode to the equivalent PrivacyConfig."""
-        return get_privacy_preset(self.value)
-    
-    @classmethod
-    def from_config(cls, config: PrivacyConfig) -> "PrivacyMode":
-        """Find the closest matching mode for a config (for backward compat).
-
-        ``computer_access`` is intentionally excluded from the match — it is
-        an orthogonal capability flag, not part of preset identity.
-        """
-        # Find exact match first
-        for name, preset in PRIVACY_PRESETS.items():
-            if (config.storage == preset.storage and
-                config.llm_location == preset.llm_location and
-                config.shareable == preset.shareable):
-                return cls(name)
-        # No exact match - return NORMAL as default
-        return cls.NORMAL
-
-
 def privacy_mode_to_config(mode: Union[PrivacyMode, str]) -> PrivacyConfig:
-    """Convert a PrivacyMode or preset name to PrivacyConfig."""
+    """Convert a `PrivacyMode` (or its string value) to `PrivacyConfig`.
+
+    Replaces the `PrivacyMode.to_config()` instance method that lived on
+    the old sovereign-local enum. The SDK enum carries values only; this
+    helper handles the sovereign-specific config fan-out.
+    """
     if isinstance(mode, PrivacyMode):
-        return mode.to_config()
-    elif isinstance(mode, str):
+        return get_privacy_preset(mode.value)
+    if isinstance(mode, str):
         return get_privacy_preset(mode)
-    else:
-        raise TypeError(f"Expected PrivacyMode or str, got {type(mode)}")
+    raise TypeError(f"Expected PrivacyMode or str, got {type(mode)}")
+
+
+def privacy_config_to_mode(config: PrivacyConfig) -> PrivacyMode:
+    """Find the closest matching mode for a `PrivacyConfig`.
+
+    Replaces the `PrivacyMode.from_config()` classmethod. ``computer_access``
+    is intentionally excluded from the match — it is an orthogonal capability
+    flag, not part of preset identity. Falls back to ``NORMAL`` when no
+    preset matches exactly.
+    """
+    for name, preset in PRIVACY_PRESETS.items():
+        if (config.storage == preset.storage and
+            config.llm_location == preset.llm_location and
+            config.shareable == preset.shareable):
+            return PrivacyMode(name)
+    return PrivacyMode.NORMAL
