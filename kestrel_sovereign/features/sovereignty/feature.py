@@ -131,34 +131,49 @@ class SovereigntyFeature(Feature):
 
         cid = result.ipfs_cid or result.content_hash
         size_bytes = getattr(result, "size_bytes", 0) or len(backup_blob)
+        # ``FilecoinAdapter.store_content`` downgrades ``result.tier``
+        # to LOCAL_ONLY when the provider stack (Lotus/IPFS) is
+        # unreachable. We report the *actual* tier here, not the
+        # tier the caller asked for, so a fallback to local doesn't
+        # surface as "Tier: ipfs" while the receipt and the real
+        # storage are local-only. The requested tier is also exposed
+        # in ``data`` so callers can detect the downgrade.
+        actual_tier = result.storage_tier
         confirmation = (
             "✅ Sovereignty Export Complete.\n"
             f"CID: {cid}\n"
-            f"Tier: {tier_enum.value}\n"
+            f"Tier: {actual_tier.value}\n"
             f"Encrypted: {encrypt}\n"
             f"Size: {len(backup_blob)} bytes\n"
         )
         data = {
             "cid": result.ipfs_cid,
             "content_hash": result.content_hash,
-            "tier": tier_enum.value,
+            "tier": actual_tier.value,
+            "tier_requested": tier_enum.value,
             "encrypted": encrypt,
             "size_bytes": size_bytes,
             "node_id": node_id,
         }
 
-        # Honesty: a non-local tier that returned no IPFS CID means the
-        # blob is sitting on the local content-addressed store but was
-        # not actually published to IPFS/Filecoin. The receipt records
-        # that fact, but the LLM should speak it explicitly so the
-        # sovereign doesn't believe the backup is durably off-host.
-        if tier_enum != StorageTier.LOCAL_ONLY and not result.ipfs_cid:
+        # Honesty: a non-local request that ended up local (or that
+        # returned no IPFS CID) means the blob is sitting on the local
+        # content-addressed store but was not actually published to
+        # IPFS/Filecoin. The receipt records that fact, but the LLM
+        # should speak it explicitly so the sovereign doesn't believe
+        # the backup is durably off-host.
+        downgraded = (
+            tier_enum != StorageTier.LOCAL_ONLY
+            and (actual_tier == StorageTier.LOCAL_ONLY or not result.ipfs_cid)
+        )
+        if downgraded:
             return ToolResult.partial(
                 confirmation,
                 (
-                    f"requested tier '{tier_enum.value}' but no IPFS CID was "
-                    "returned; backup is hashed locally and is NOT durable "
-                    "off-host (content_hash is content-addressed only)."
+                    f"requested tier '{tier_enum.value}' but actual tier is "
+                    f"'{actual_tier.value}' and no IPFS CID was returned; "
+                    "backup is hashed locally and is NOT durable off-host "
+                    "(content_hash is content-addressed only)."
                 ),
                 data=data,
             )
