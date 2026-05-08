@@ -1,8 +1,10 @@
 import logging
 import re
 from typing import Dict, List, Optional
-from kestrel_sovereign.features.base import Feature, tool
+
 from kestrel_sdk.tools.base import ToolCategory
+from kestrel_sdk.tools.result import ToolResult
+from kestrel_sovereign.features.base import Feature, tool
 
 logger = logging.getLogger(__name__)
 
@@ -132,7 +134,7 @@ class ConstitutionFeature(Feature):
         category=ToolCategory.SYSTEM,
         command_prefix="!constitution"
     )
-    async def get_constitution(self, article: Optional[str] = None, search: Optional[str] = None, summary: bool = False) -> str:
+    async def get_constitution(self, article: Optional[str] = None, search: Optional[str] = None, summary: bool = False) -> ToolResult:
         """
         Retrieve constitutional content.
 
@@ -149,75 +151,89 @@ class ConstitutionFeature(Feature):
             search: Search term or section identifier
             summary: If True, returns the executive summary
         """
-        # Handle subcommand-style parsing: "article I" or "search term"
-        # The parser sends first arg as 'article', so check if it's a keyword
+        def _wrap(body: str, *, kind: str = "section") -> ToolResult:
+            """Detect not-found bodies via prefix match and route to ERROR.
+            Constitution lookups return strings whose first token signals
+            the outcome ("Book 'X' not found.", "Amendment 'X' not
+            found.", "Section 'X' not found...", "No constitutional
+            sections found matching..."). The honesty contract requires
+            those to surface as ERROR rather than OK with apologetic
+            text.
+            """
+            error_prefixes = (
+                "Book '",
+                "No book",
+                "Amendment '",
+                "No amendment",
+                "Section '",
+                "No constitutional sections",
+            )
+            if any(body.startswith(p) for p in error_prefixes) and "not found" in body:
+                return ToolResult.failed(body, data={"kind": kind})
+            return ToolResult.ok(confirmation=body, data={"kind": kind})
+
         if article:
             article_lower = article.lower()
             if article_lower == "summary":
-                return self.summary
+                return _wrap(self.summary, kind="summary")
             elif article_lower == "book" and search:
-                # "!constitution book I" → look up book
-                return self._get_book(search)
+                return _wrap(self._get_book(search), kind="book")
             elif article_lower == "amendment" and search:
-                # "!constitution amendment I" → look up amendment
-                return self._get_amendment(search)
+                return _wrap(self._get_amendment(search), kind="amendment")
             elif article_lower == "article" and search:
-                # "!constitution article V" → article="article", search="V"
                 article = search
                 search = None
             elif article_lower == "search" and search:
-                # "!constitution search sovereignty" → search
                 article = None
 
         if summary:
-            return self.summary
+            return _wrap(self.summary, kind="summary")
 
         if article:
             # Try books first, then amendments, then articles
             result = self._get_book(article)
             if not result.startswith("Book '") and not result.startswith("No book"):
-                return result
+                return _wrap(result, kind="book")
 
             result = self._get_amendment(article)
             if not result.startswith("Amendment '") and not result.startswith("No amendment"):
-                return result
+                return _wrap(result, kind="amendment")
 
-            # Try articles (legacy compatibility)
             content = self.articles.get(str(article))
             if not content:
                 content = self.articles.get(f"Article {article}")
 
             if content:
-                return content
-            return (
+                return _wrap(content, kind="article")
+            return _wrap(
                 f"Section '{article}' not found. "
                 f"Available books: {', '.join(sorted([k for k in self.books.keys() if k.startswith('Book')]))}. "
-                f"Available amendments: {', '.join(sorted([k for k in self.amendments.keys() if k.startswith('Amendment')]))}."
+                f"Available amendments: {', '.join(sorted([k for k in self.amendments.keys() if k.startswith('Amendment')]))}.",
+                kind="section",
             )
 
         if search:
             results = []
-            # Search books
             for key, content in self.books.items():
                 if key.startswith("Book") and search.lower() in content.lower():
                     results.append(content)
-            # Search amendments
             for key, content in self.amendments.items():
                 if key.startswith("Amendment") and search.lower() in content.lower():
-                    # Only add if not already part of a book result
                     if not any(content in r for r in results):
                         results.append(content)
-            # Search articles (legacy)
             for key, content in self.articles.items():
                 if key.startswith("Article") and search.lower() in content.lower():
                     if not any(content in r for r in results):
                         results.append(content)
 
             if results:
-                return "\n\n---\n\n".join(results)
-            return f"No constitutional sections found matching '{search}'."
+                return _wrap("\n\n---\n\n".join(results), kind="search")
+            return _wrap(
+                f"No constitutional sections found matching '{search}'.",
+                kind="search",
+            )
 
-        return self.full_text
+        return _wrap(self.full_text, kind="full_text")
 
     def _get_book(self, identifier: str) -> str:
         """Look up a book by number or roman numeral."""

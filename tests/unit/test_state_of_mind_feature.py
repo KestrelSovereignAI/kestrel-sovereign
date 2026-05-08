@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from kestrel_sdk.tools.result import ToolResultStatus
 from kestrel_sovereign.features.state_of_mind import StateOfMindFeature
 
 
@@ -14,7 +15,10 @@ async def test_state_of_mind_requires_llm_service():
 
     result = await feature.get_state_of_mind()
 
-    assert result == "Error: LLM service not available"
+    # Migrated to ToolResult (#1061 wave 19): missing LLM service
+    # surfaces as ERROR with the diagnostic in result.error.
+    assert result.status is ToolResultStatus.ERROR
+    assert "LLM service not available" in result.error
 
 
 @pytest.mark.asyncio
@@ -32,5 +36,6 @@ async def test_state_of_mind_formats_via_profile_service():
     ):
         result = await feature.get_state_of_mind()
 
-    assert result == "formatted state"
+    assert result.status is ToolResultStatus.OK
+    assert result.confirmation == "formatted state"
     profile_service.format_state_of_mind.assert_called_once()

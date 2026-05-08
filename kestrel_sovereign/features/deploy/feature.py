@@ -16,10 +16,11 @@ methods, so the two surfaces never drift out of sync.
 import logging
 from typing import Any, Dict
 
+from kestrel_sdk.tools.base import ToolCategory
+from kestrel_sdk.tools.result import ToolResult
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.deploy.manager import DeployManager
 from kestrel_sovereign.features.deploy.models import DeployManagerError
-from kestrel_sdk.tools.base import ToolCategory
 
 logger = logging.getLogger(__name__)
 
@@ -68,7 +69,7 @@ class DeployFeature(Feature):
         action: str = "status",
         profile: str = "",
         tag: str = "latest",
-    ) -> Dict[str, Any]:
+    ) -> ToolResult:
         """
         Main entry point for agent deployment management.
 
@@ -95,37 +96,53 @@ class DeployFeature(Feature):
             !deploy health profile=dev
         """
         if getattr(self, "disabled", False):
-            return {
-                "action": action,
-                "error": "Deploy feature is disabled",
-                "reason": getattr(self, "disabled_reason", "No profiles configured"),
-            }
+            return ToolResult.failed(
+                "Deploy feature is disabled",
+                data={
+                    "action": action,
+                    "error": "Deploy feature is disabled",
+                    "reason": getattr(self, "disabled_reason", "No profiles configured"),
+                },
+            )
 
         action_normalized = (action or "status").lower()
 
+        # Internal helpers (_status, _deploy, etc.) still return
+        # legacy dicts with {"success": True/False, ...}. Wrap the
+        # outcome at the @tool boundary based on the success flag.
         if action_normalized in {"status"}:
-            return await self._status()
+            result_dict = await self._status()
+        elif action_normalized in {"deploy", "start"}:
+            result_dict = await self._deploy(profile_name=profile, image_tag=tag)
+        elif action_normalized in {"teardown", "stop", "delete"}:
+            result_dict = await self._teardown(profile_name=profile)
+        elif action_normalized in {"logs", "log"}:
+            result_dict = await self._logs(profile_name=profile)
+        elif action_normalized in {"list", "ls"}:
+            result_dict = await self._list_deployments()
+        elif action_normalized in {"health", "check"}:
+            result_dict = await self._health_check(profile_name=profile)
+        else:
+            return ToolResult.failed(
+                f"Unknown action: {action}",
+                data={
+                    "success": False,
+                    "error": f"Unknown action: {action}",
+                    "available_actions": [
+                        "status", "deploy", "teardown", "logs", "list", "health",
+                    ],
+                },
+            )
 
-        if action_normalized in {"deploy", "start"}:
-            return await self._deploy(profile_name=profile, image_tag=tag)
-
-        if action_normalized in {"teardown", "stop", "delete"}:
-            return await self._teardown(profile_name=profile)
-
-        if action_normalized in {"logs", "log"}:
-            return await self._logs(profile_name=profile)
-
-        if action_normalized in {"list", "ls"}:
-            return await self._list_deployments()
-
-        if action_normalized in {"health", "check"}:
-            return await self._health_check(profile_name=profile)
-
-        return {
-            "success": False,
-            "error": f"Unknown action: {action}",
-            "available_actions": ["status", "deploy", "teardown", "logs", "list", "health"],
-        }
+        if isinstance(result_dict, dict) and result_dict.get("success") is False:
+            return ToolResult.failed(
+                result_dict.get("error") or f"deploy {action_normalized} failed",
+                data=result_dict,
+            )
+        return ToolResult.ok(
+            confirmation=f"deploy {action_normalized} ok",
+            data=result_dict if isinstance(result_dict, dict) else {"raw": result_dict},
+        )
 
     async def _status(self) -> Dict[str, Any]:
         """Get status of all active deployment sessions."""
