@@ -616,6 +616,56 @@ class TestHeartbeatInterval:
         assert result.data["requested_seconds"] == 9999
 
 
+class TestDeprecatedAliasTraceability:
+    """Round 1 codex finding: deprecated alias marker must survive
+    every status (OK / PARTIAL / ERROR) so the LLM/audit payload
+    always shows the alias was used."""
+
+    @pytest_asyncio.fixture
+    async def feature(self):
+        db = _make_db(table_exists_map={"health_log": True})
+        agent = _make_agent(db=db)
+        feat = HealthFeature(agent)
+        with patch("asyncio.create_task", return_value=_make_awaitable_task()):
+            await feat.initialize()
+            yield feat
+            feat._running = False
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_check_alias_tags_ok(self, feature):
+        from kestrel_sdk.tools.result import ToolResultStatus
+        result = await feature.heartbeat_check_alias()
+        assert result.status is ToolResultStatus.OK
+        assert result.data["deprecated_alias"] == "!heartbeat"
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_status_alias_tags_error_on_invalid_limit(self, feature):
+        """ERROR forwarding must preserve the alias marker."""
+        from kestrel_sdk.tools.result import ToolResultStatus
+        result = await feature.heartbeat_status_alias(limit="abc")
+        assert result.status is ToolResultStatus.ERROR
+        assert result.data is not None
+        assert result.data.get("deprecated_alias") == "!heartbeat-status"
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_interval_alias_tags_partial_on_clamp(self, feature):
+        """PARTIAL forwarding preserves the alias marker."""
+        from kestrel_sdk.tools.result import ToolResultStatus
+        with patch("asyncio.create_task", return_value=_make_awaitable_task()):
+            result = await feature.heartbeat_interval_alias(seconds=1)
+        assert result.status is ToolResultStatus.PARTIAL
+        assert result.data["deprecated_alias"] == "!heartbeat-interval"
+        assert result.data["requested_seconds"] == 1
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_interval_alias_tags_error_on_bad_input(self, feature):
+        from kestrel_sdk.tools.result import ToolResultStatus
+        result = await feature.heartbeat_interval_alias(seconds="not-a-number")
+        assert result.status is ToolResultStatus.ERROR
+        assert result.data is not None
+        assert result.data.get("deprecated_alias") == "!heartbeat-interval"
+
+
 # ============================================================================
 # Lifecycle Tests
 # ============================================================================

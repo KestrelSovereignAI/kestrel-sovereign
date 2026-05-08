@@ -291,12 +291,7 @@ class HealthFeature(Feature):
     async def heartbeat_check_alias(self) -> ToolResult:
         self._warn_deprecated("!heartbeat", "!health")
         result = self._wrap_health_result(await self._run_health())
-        # Surface the deprecation in the data dict so consumers
-        # (LLM context, audit log) can see it.
-        return ToolResult.ok(
-            confirmation=result.confirmation,
-            data={**(result.data or {}), "deprecated_alias": "!heartbeat"},
-        )
+        return self._tag_alias(result, "!heartbeat")
 
     @tool(
         name="heartbeat_status",
@@ -307,12 +302,7 @@ class HealthFeature(Feature):
     async def heartbeat_status_alias(self, limit: int = 10) -> ToolResult:
         self._warn_deprecated("!heartbeat-status", "!health-history")
         result = await self.health_history(limit=limit)
-        if result.status.value != "ok":
-            return result
-        return ToolResult.ok(
-            confirmation=result.confirmation,
-            data={**(result.data or {}), "deprecated_alias": "!heartbeat-status"},
-        )
+        return self._tag_alias(result, "!heartbeat-status")
 
     @tool(
         name="heartbeat_interval",
@@ -323,19 +313,34 @@ class HealthFeature(Feature):
     async def heartbeat_interval_alias(self, seconds: int = 60) -> ToolResult:
         self._warn_deprecated("!heartbeat-interval", "!health-interval")
         result = await self.health_interval(seconds=seconds)
-        # Add the deprecation marker regardless of OK/PARTIAL/ERROR
-        # so the alias use is always traceable.
-        if result.status.value == "error":
-            return result
-        merged_data = {**(result.data or {}), "deprecated_alias": "!heartbeat-interval"}
-        if result.status.value == "partial":
+        return self._tag_alias(result, "!heartbeat-interval")
+
+    @staticmethod
+    def _tag_alias(result: ToolResult, alias: str) -> ToolResult:
+        """Inject ``deprecated_alias`` into a forwarded ToolResult.
+
+        Preserve the alias marker across OK/PARTIAL/ERROR so the
+        LLM/audit payload can always tell that the deprecated alias
+        was used — including on input-validation errors raised by
+        the canonical tool. (Round 1 codex finding for #1082.)
+        """
+        merged_data = {**(result.data or {}), "deprecated_alias": alias}
+        status = result.status.value
+        if status == "ok":
+            return ToolResult.ok(
+                confirmation=result.confirmation,
+                data=merged_data,
+            )
+        if status == "partial":
             return ToolResult.partial(
                 confirmation=result.confirmation,
                 error=result.error,
                 data=merged_data,
             )
-        return ToolResult.ok(
-            confirmation=result.confirmation,
+        # ERROR: preserve the error string and surface the alias marker
+        # via data so traceability holds for the failure path too.
+        return ToolResult.failed(
+            result.error or "unknown error",
             data=merged_data,
         )
 
