@@ -193,15 +193,23 @@ def test_context_status_returns_idle_shape_for_empty_session_id():
 
 
 def test_reflection_status_filters_scheduler_tasks_and_serializes_execution_history():
+    from kestrel_sdk.tools.result import ToolResult
+
     scheduler = MagicMock()
+    # SchedulerFeature.schedule_list returns a ToolResult envelope
+    # post-#1061 wave 8; the .data dict carries the legacy
+    # {"tasks": [...]} shape the endpoint reads.
     scheduler.schedule_list = AsyncMock(
-        return_value={
-            "tasks": [
-                {"task_name": "reflect", "schedule": "daily"},
-                {"task_name": "training_cycle", "schedule": "hourly"},
-                {"task_name": "backup", "schedule": "daily"},
-            ]
-        }
+        return_value=ToolResult.ok(
+            confirmation="listed 3 tasks",
+            data={
+                "tasks": [
+                    {"task_name": "reflect", "schedule": "daily"},
+                    {"task_name": "training_cycle", "schedule": "hourly"},
+                    {"task_name": "backup", "schedule": "daily"},
+                ],
+            },
+        )
     )
     db = MagicMock()
     db.fetchall = AsyncMock(

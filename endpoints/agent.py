@@ -721,13 +721,16 @@ async def reflection_status(request: Request):
         "recent_executions": [],
     }
 
-    # Get scheduled reflection tasks
+    # Get scheduled reflection tasks. SchedulerFeature.schedule_list now
+    # returns a ToolResult envelope (#1061 wave 8); the .data dict still
+    # carries the legacy {"tasks": [...]} shape.
     scheduler = agent.features.get("SchedulerFeature") if hasattr(agent, "features") else None
     if scheduler:
         try:
-            tasks = await scheduler.schedule_list()
+            envelope = await scheduler.schedule_list()
+            scheduled = (envelope.data or {}).get("tasks", []) if envelope.data else []
             result["scheduled_tasks"] = [
-                t for t in tasks.get("tasks", [])
+                t for t in scheduled
                 if t["task_name"] in ("reflect", "training_cycle")
             ]
         except Exception as e:
