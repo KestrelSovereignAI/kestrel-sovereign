@@ -172,6 +172,7 @@ async def stream_agent_response(request: Request):
 
         async def generate():
             try:
+                from kestrel_sovereign.agent.streaming import strip_revise_sentinels
                 async for chunk in agent.process_input_streaming(
                     user_input,
                     model_override=model_override,
@@ -184,8 +185,15 @@ async def stream_agent_response(request: Request):
                     if agent.is_request_cancelled(request_id):
                         yield "\n\n---\n⏹️ **Request stopped**\n\nType `!continue` to resume from where I left off, or start a new message."
                         break
-                    # Publish text chunk for TTS stream consumers
-                    await stream_tap.publish(request_id, chunk)
+                    # Wave 5E: strip the in-band revise sentinel before
+                    # publishing to TTS subscribers — voice/TTS speaks
+                    # raw chunks aloud, so leaking ``\\x1eKESTREL:REVISE...``
+                    # into the audio path is a regression. The chat
+                    # client receives the sentinel-bearing chunk on
+                    # the yield below and strips it client-side.
+                    tts_chunk = strip_revise_sentinels(chunk)
+                    if tts_chunk:
+                        await stream_tap.publish(request_id, tts_chunk)
                     yield chunk
             except Exception as e:
                 logger.error(f"Streaming error: {e}", exc_info=True)
