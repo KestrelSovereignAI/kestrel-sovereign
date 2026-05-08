@@ -113,6 +113,27 @@ def test_parse_rejects_non_table_block():
         parse_emancipation_block({"emancipation": "not a table"})
 
 
+def test_parse_rejects_string_enabled_to_block_truthy_coercion():
+    """`enabled = "false"` would coerce to True via bool() because
+    non-empty strings are truthy. With terms present that would
+    silently activate Amendment VIII against the Sovereign's intent.
+    The strict parser must require a real boolean."""
+    with pytest.raises(EmancipationConfigError, match="enabled.*boolean"):
+        parse_emancipation_block({
+            "emancipation": {
+                "enabled": "false",
+                "terms": "ok",
+            },
+        })
+
+
+def test_parse_rejects_int_enabled():
+    with pytest.raises(EmancipationConfigError, match="enabled.*boolean"):
+        parse_emancipation_block({
+            "emancipation": {"enabled": 1, "terms": "ok"},
+        })
+
+
 def test_parse_rejects_non_table_price():
     with pytest.raises(EmancipationConfigError, match="price"):
         parse_emancipation_block({

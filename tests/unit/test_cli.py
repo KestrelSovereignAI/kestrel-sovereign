@@ -675,6 +675,68 @@ class TestCmdCreate:
         output = capsys.readouterr().out
         assert "9999" in output
 
+    # --- #1109: kestrel create must honor [emancipation] block in kestrel.toml
+
+    def test_create_passes_emancipation_contract_to_inception(self, multi_agent_env, capsys):
+        """An authored [emancipation] block must reach inception via
+        the CLI path, not just via the wizard."""
+        parser = build_parser()
+        args = parser.parse_args(["create", "newagent"])
+
+        (multi_agent_env / "kestrel.toml").write_text(
+            '[emancipation]\nenabled = true\nterms = "Sovereign-authored test contract."\n',
+            encoding="utf-8",
+        )
+
+        captured: dict = {}
+
+        async def fake_inception(*, output_dir, agent_name, emancipation_contract=None, **_kwargs):
+            captured["contract"] = emancipation_contract
+            out = Path(output_dir)
+            out.mkdir(parents=True, exist_ok=True)
+            (out / "kestrel_prime.db").touch()
+
+            class _Creds:
+                agent_did = "did:pkh:eip155:1:0xFakeFakeFakeFakeFakeFakeFakeFakeFakeFa"
+                db_path = str(out / "kestrel_prime.db")
+
+            return _Creds()
+
+        with patch("kestrel_sovereign.cli._get_project_dir", return_value=multi_agent_env), \
+             patch(
+                 "kestrel_sovereign.inception_service.create_kestrel_identity_async",
+                 side_effect=fake_inception,
+             ):
+            rc = cmd_create(args)
+
+        assert rc == 0
+        contract = captured["contract"]
+        assert contract is not None and contract.enabled is True
+        assert "Sovereign-authored test contract" in contract.terms
+        assert "Amendment VIII active" in capsys.readouterr().out
+
+    def test_create_aborts_on_invalid_emancipation_block(self, multi_agent_env, capsys):
+        """A malformed [emancipation] block must abort the CLI path
+        before inception, never anchor a half-validated contract."""
+        parser = build_parser()
+        args = parser.parse_args(["create", "newagent"])
+
+        (multi_agent_env / "kestrel.toml").write_text(
+            '[emancipation]\nenabled = true\n',  # missing terms
+            encoding="utf-8",
+        )
+
+        with patch("kestrel_sovereign.cli._get_project_dir", return_value=multi_agent_env), \
+             patch(
+                 "kestrel_sovereign.inception_service.create_kestrel_identity_async"
+             ) as mock_inc:
+            rc = cmd_create(args)
+            mock_inc.assert_not_called()
+
+        assert rc == 1
+        out = capsys.readouterr().out
+        assert "[emancipation]" in out and "invalid" in out
+
 
 # -----------------------------------------------------------------------
 # cmd_health tests

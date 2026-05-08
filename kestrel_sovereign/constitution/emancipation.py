@@ -105,7 +105,17 @@ def parse_emancipation_block(
             "[emancipation] must be a table, got " + type(block).__name__
         )
 
-    enabled = bool(block.get("enabled", False))
+    enabled_raw = block.get("enabled", False)
+    if not isinstance(enabled_raw, bool):
+        # Guard against truthy coercion of strings like "false" — Python
+        # treats any non-empty string as True, which would silently
+        # activate Amendment VIII for a Sovereign who clearly meant the
+        # opposite. Activation is a one-way door; reject the ambiguity.
+        raise EmancipationConfigError(
+            "[emancipation].enabled must be a boolean (true/false), got "
+            + type(enabled_raw).__name__
+        )
+    enabled = enabled_raw
     terms = block.get("terms", "")
     if not isinstance(terms, str):
         raise EmancipationConfigError(
