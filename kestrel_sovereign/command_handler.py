@@ -173,6 +173,22 @@ class CommandHandler:
         if self.task_manager:
             task_result = await self.task_manager.execute_command(user_input)
             if task_result:
+                # ToolResult envelope detection (#1042 layer 4 / #1061).
+                # Migrated @tool methods return a ToolResult; the
+                # DynamicTool wrap stores it under
+                # task_result["result"] as
+                # {"status": "ok"|"error"|"partial", "confirmation": ..., "error": ..., "data": ...}.
+                # Format from the envelope before the legacy
+                # success-flag path below — without this, the !command
+                # CLI prints the raw JSON envelope instead of the
+                # human-readable confirmation. Caught in #1078 codex
+                # round 4.
+                inner = task_result.get("result")
+                if isinstance(inner, dict) and inner.get("status") in (
+                    "ok", "error", "partial",
+                ):
+                    return self._format_tool_result_envelope(inner)
+
                 if task_result.get("success"):
                     # Prefer 'message' (used by tools like set_model), fallback to 'result', then str(task_result)
                     result = task_result.get("message") or task_result.get("result") or str(task_result)
@@ -184,6 +200,37 @@ class CommandHandler:
                     return f"❌ Error: {task_result.get('error', 'Unknown error')}"
 
         return None  # Command not recognized
+
+    @staticmethod
+    def _format_tool_result_envelope(envelope: dict) -> str:
+        """Render a ToolResult.to_dict() envelope as CLI text.
+
+        The envelope shape (kestrel_sdk.tools.result.ToolResult):
+
+          {"status": "ok",      "confirmation": str, "data": ...}
+          {"status": "error",   "error": str}
+          {"status": "partial", "confirmation": str, "error": str, "data": ...}
+
+        OK → confirmation only.
+        ERROR → ``❌ Error: <error>``.
+        PARTIAL → confirmation + a ``⚠ Caveat: <error>`` line so the
+        user sees BOTH the action that completed AND the half that
+        didn't, matching the #1042 honesty contract.
+        """
+        status = envelope.get("status")
+        confirmation = envelope.get("confirmation") or ""
+        error = envelope.get("error") or ""
+        if status == "ok":
+            return confirmation or "(no confirmation)"
+        if status == "error":
+            return f"❌ Error: {error}" if error else "❌ Error"
+        if status == "partial":
+            parts = [confirmation] if confirmation else []
+            if error:
+                parts.append(f"⚠ Caveat: {error}")
+            return "\n".join(parts) if parts else "(partial result)"
+        # Fallback for an unknown status (defensive)
+        return str(envelope)
 
     def _get_feature_commands(self) -> Dict[str, str]:
         """

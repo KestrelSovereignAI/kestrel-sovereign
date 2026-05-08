@@ -17,6 +17,7 @@ from kestrel_sovereign.features.security.approval_queue import ApprovalQueue, Ap
 from kestrel_sovereign.features.security.hooks import SecurityHook
 from kestrel_sdk.hooks.base import Hook
 from kestrel_sdk.tools.base import ToolCategory
+from kestrel_sdk.tools.result import ToolResult
 
 logger = logging.getLogger(__name__)
 
@@ -227,23 +228,26 @@ class SecurityFeature(Feature):
         category=ToolCategory.SYSTEM,
         command_prefix="!security-list",
     )
-    async def list_permissions(self) -> str:
+    async def list_permissions(self) -> ToolResult:
         """
         List all configured security permissions in tree format.
 
         Shows the hierarchical permission tree with rollup states
         for each feature and individual tool permissions.
-
-        Returns:
-            Formatted permission tree as string
         """
-        tree = await self.permission_store.get_permission_tree()
+        try:
+            tree = await self.permission_store.get_permission_tree()
+        except Exception as e:
+            logger.error(f"list_permissions failed: {e}", exc_info=True)
+            return ToolResult.failed(str(e))
 
         if not tree:
-            return (
-                "Security Permissions:\n"
-                "  No permissions configured yet.\n"
-                "  Tools will be registered when first invoked.\n"
+            return ToolResult.ok(
+                confirmation=(
+                    "Security Permissions: no permissions configured yet "
+                    "(tools will be registered on first invocation)"
+                ),
+                data={"feature_count": 0, "tools_count": 0, "features": []},
             )
 
         # Format as hierarchical tree
@@ -262,19 +266,37 @@ class SecurityFeature(Feature):
         }
 
         lines = ["Security Permissions:\n"]
-
+        features_data = []
+        tools_count = 0
         for feature in tree:
             icon = state_icon.get(feature.rollup_state, "?")
             lines.append(f"  {icon} {feature.feature_name} [{feature.rollup_state}]")
-
+            tools_struct = []
             for tool_obj in feature.tools:
-                icon = level_icon.get(tool_obj.level.value, "?")
-                lines.append(f"    {icon} {tool_obj.tool_name}")
+                tool_icon = level_icon.get(tool_obj.level.value, "?")
+                lines.append(f"    {tool_icon} {tool_obj.tool_name}")
+                tools_struct.append({
+                    "tool_name": tool_obj.tool_name,
+                    "level": tool_obj.level.value,
+                })
+                tools_count += 1
+            features_data.append({
+                "feature_name": feature.feature_name,
+                "rollup_state": feature.rollup_state,
+                "tools": tools_struct,
+            })
 
         lines.append(
             "\nLegend: ☑=Allow ☒=Deny ☐=Ask ◑=Session ◐=Mixed"
         )
-        return "\n".join(lines)
+        return ToolResult.ok(
+            confirmation="\n".join(lines),
+            data={
+                "feature_count": len(features_data),
+                "tools_count": tools_count,
+                "features": features_data,
+            },
+        )
 
     @tool(
         name="set_permission",
@@ -287,7 +309,7 @@ class SecurityFeature(Feature):
         feature_name: str,
         tool_name: Optional[str] = None,
         level: str = "ask",
-    ) -> str:
+    ) -> ToolResult:
         """
         Set permission level for a tool or all tools in a feature.
 
@@ -295,25 +317,43 @@ class SecurityFeature(Feature):
             feature_name: Name of the feature (e.g., "WalletAgent")
             tool_name: Name of the tool (optional, sets all if omitted)
             level: Permission level - "allow", "deny", "ask", or "session"
-
-        Returns:
-            Confirmation message
         """
         try:
             perm_level = PermissionLevel(level)
         except ValueError:
-            return f"Invalid level '{level}'. Use: allow, deny, ask, session"
-
-        if tool_name:
-            await self.permission_store.set_permission(
-                feature_name, tool_name, perm_level
+            return ToolResult.failed(
+                f"Invalid level '{level}'. Use: allow, deny, ask, session"
             )
-            return f"Set {feature_name}.{tool_name} to {level}"
-        else:
+
+        try:
+            if tool_name:
+                await self.permission_store.set_permission(
+                    feature_name, tool_name, perm_level
+                )
+                return ToolResult.ok(
+                    confirmation=f"Set {feature_name}.{tool_name} to {level}",
+                    data={
+                        "feature_name": feature_name,
+                        "tool_name": tool_name,
+                        "level": level,
+                        "scope": "tool",
+                    },
+                )
             await self.permission_store.set_feature_permission(
                 feature_name, perm_level
             )
-            return f"Set all tools in {feature_name} to {level}"
+            return ToolResult.ok(
+                confirmation=f"Set all tools in {feature_name} to {level}",
+                data={
+                    "feature_name": feature_name,
+                    "tool_name": None,
+                    "level": level,
+                    "scope": "feature",
+                },
+            )
+        except Exception as e:
+            logger.error(f"set_permission failed: {e}", exc_info=True)
+            return ToolResult.failed(str(e))
 
     @tool(
         name="pending_approvals",
@@ -321,19 +361,18 @@ class SecurityFeature(Feature):
         category=ToolCategory.SYSTEM,
         command_prefix="!security-pending",
     )
-    async def pending_approvals(self) -> str:
-        """
-        Show pending approval requests.
-
-        Returns:
-            List of pending requests or "No pending approvals"
-        """
+    async def pending_approvals(self) -> ToolResult:
+        """Show pending approval requests."""
         pending = self.approval_queue.pending_requests
 
         if not pending:
-            return "No pending approvals"
+            return ToolResult.ok(
+                confirmation="No pending approvals",
+                data={"count": 0, "requests": []},
+            )
 
         lines = [f"Pending Approvals ({len(pending)}):"]
+        requests_data = []
         for req in pending:
             created_at = req.created_at
             if created_at.tzinfo is None:
@@ -343,11 +382,21 @@ class SecurityFeature(Feature):
                 f"  [{req.id[:8]}] {req.feature_name}.{req.tool_name} "
                 f"({int(age)}s ago)"
             )
+            requests_data.append({
+                "id": req.id,
+                "feature_name": req.feature_name,
+                "tool_name": req.tool_name,
+                "age_seconds": int(age),
+                "created_at": created_at.isoformat(),
+            })
 
         lines.append(
             "\nUse !security-approve <id> or !security-deny <id> to respond"
         )
-        return "\n".join(lines)
+        return ToolResult.ok(
+            confirmation="\n".join(lines),
+            data={"count": len(requests_data), "requests": requests_data},
+        )
 
     @tool(
         name="approve",
@@ -359,28 +408,73 @@ class SecurityFeature(Feature):
         self,
         request_id: str,
         scope: str = "once",
-    ) -> str:
+    ) -> ToolResult:
         """
         Approve a pending request.
 
         Args:
             request_id: ID of the pending request (first 8 chars OK)
             scope: Approval scope - "once", "session", or "always"
-
-        Returns:
-            Confirmation message
         """
         if scope not in ("once", "session", "always"):
-            return f"Invalid scope '{scope}'. Use: once, session, always"
+            return ToolResult.failed(
+                f"Invalid scope '{scope}'. Use: once, session, always"
+            )
 
         # Support partial ID matching
         full_id = self._find_request_id(request_id)
         if not full_id:
-            return f"Request '{request_id}' not found"
+            return ToolResult.failed(
+                f"Request '{request_id}' not found",
+                data={"request_id": request_id},
+            )
 
-        if self.approval_queue.submit_decision(full_id, True, scope):
-            return f"✓ Approved {request_id[:8]} with scope={scope}"
-        return f"Request '{request_id}' not found"
+        # submit_decision returns True only if the queue accepted the
+        # decision (the request is still pending). If False, the queue
+        # withdrew or expired it between _find_request_id and now —
+        # surface as ERROR rather than claiming approval.
+        if not self.approval_queue.submit_decision(full_id, True, scope):
+            return ToolResult.failed(
+                f"Request '{request_id}' is no longer pending "
+                "(timeout, cancellation, or already decided)",
+                data={"request_id": full_id, "decision_attempted": "approved"},
+            )
+
+        # Honesty: ``ApprovalQueue.submit_decision`` only sets the
+        # in-memory decision; the scope is persisted later by
+        # ``request_approval()`` via ``_persist_decision``, and that
+        # path swallows store failures. For ``scope="once"`` there's
+        # no persistence — the immediate approval is the whole
+        # action, so OK is honest. For ``scope="session"``/``"always"``
+        # the durable scope may not actually be written, so we surface
+        # PARTIAL and tell the LLM the next tool call may re-prompt.
+        # See round 2 codex finding + #1078 follow-up ticket.
+        if scope == "once":
+            return ToolResult.ok(
+                confirmation=f"Approved {request_id[:8]} (once)",
+                data={
+                    "request_id": full_id,
+                    "scope": scope,
+                    "decision": "approved",
+                },
+            )
+        return ToolResult.partial(
+            confirmation=(
+                f"Approved {request_id[:8]} for this request "
+                f"(decision submitted with scope={scope})"
+            ),
+            error=(
+                f"scope={scope} persistence is asynchronous and store "
+                "failures are not surfaced; the durable permission may "
+                "not have been written. The next tool call may re-prompt"
+            ),
+            data={
+                "request_id": full_id,
+                "scope": scope,
+                "decision": "approved",
+                "scope_persistence": "asynchronous_and_unverified",
+            },
+        )
 
     @tool(
         name="deny",
@@ -388,24 +482,31 @@ class SecurityFeature(Feature):
         category=ToolCategory.SYSTEM,
         command_prefix="!security-deny",
     )
-    async def deny_request(self, request_id: str) -> str:
+    async def deny_request(self, request_id: str) -> ToolResult:
         """
         Deny a pending request.
 
         Args:
             request_id: ID of the pending request (first 8 chars OK)
-
-        Returns:
-            Confirmation message
         """
         # Support partial ID matching
         full_id = self._find_request_id(request_id)
         if not full_id:
-            return f"Request '{request_id}' not found"
+            return ToolResult.failed(
+                f"Request '{request_id}' not found",
+                data={"request_id": request_id},
+            )
 
         if self.approval_queue.submit_decision(full_id, False, "denied"):
-            return f"✗ Denied {request_id[:8]}"
-        return f"Request '{request_id}' not found"
+            return ToolResult.ok(
+                confirmation=f"Denied {request_id[:8]}",
+                data={"request_id": full_id, "decision": "denied"},
+            )
+        return ToolResult.failed(
+            f"Request '{request_id}' is no longer pending "
+            "(timeout, cancellation, or already decided)",
+            data={"request_id": full_id, "decision_attempted": "denied"},
+        )
 
     @tool(
         name="security_audit",
@@ -413,23 +514,47 @@ class SecurityFeature(Feature):
         category=ToolCategory.SYSTEM,
         command_prefix="!security-audit",
     )
-    async def security_audit(self, limit: int = 20) -> str:
+    async def security_audit(self, limit: int = 20) -> ToolResult:
         """
         Show recent security audit log.
 
         Args:
-            limit: Maximum number of entries to show (default 20)
-
-        Returns:
-            Formatted audit log
+            limit: Maximum number of entries to show (the request — actual
+                   count returned may be lower if fewer entries exist).
         """
-        logs = await self.permission_store.get_audit_log(limit)
+        try:
+            limit_val = int(limit)
+        except (TypeError, ValueError):
+            return ToolResult.failed(
+                f"limit must be an integer, got {limit!r}"
+            )
+        if limit_val < 1:
+            return ToolResult.failed("limit must be >= 1")
+
+        try:
+            logs = await self.permission_store.get_audit_log(limit_val)
+        except Exception as e:
+            logger.error(f"security_audit failed: {e}", exc_info=True)
+            return ToolResult.failed(str(e))
 
         if not logs:
-            return "Security Audit Log: No entries yet"
+            return ToolResult.ok(
+                confirmation="Security Audit Log: no entries yet",
+                data={"count": 0, "limit_requested": limit_val, "entries": []},
+            )
 
         lines = [f"Security Audit Log (last {len(logs)} entries):\n"]
 
+        # Honesty + privacy: the LLM receives ``ToolResult.data`` in
+        # the next turn's context. Audit rows can carry an
+        # ``args_summary`` that includes tool arguments (paths,
+        # request payloads, sometimes unmasked direct-ApprovalQueue
+        # callers). Surfacing those into the LLM context is a
+        # privacy regression versus the str-only pre-fix shape, which
+        # deliberately omitted args. Filter ``entries`` to the same
+        # fields the confirmation displays. (Round 1 codex finding.)
+        _SAFE_AUDIT_FIELDS = ("feature", "tool", "decision", "user_choice", "timestamp")
+        safe_entries = []
         for entry in logs:
             decision_icon = {
                 "auto_allowed": "☑",
@@ -446,7 +571,18 @@ class SecurityFeature(Feature):
             if entry["user_choice"]:
                 lines.append(f"     ↳ scope: {entry['user_choice']}")
 
-        return "\n".join(lines)
+            safe_entries.append({
+                k: entry.get(k) for k in _SAFE_AUDIT_FIELDS if k in entry
+            })
+
+        return ToolResult.ok(
+            confirmation="\n".join(lines),
+            data={
+                "count": len(logs),
+                "limit_requested": limit_val,
+                "entries": safe_entries,
+            },
+        )
 
     def _find_request_id(self, partial_id: str) -> Optional[str]:
         """
