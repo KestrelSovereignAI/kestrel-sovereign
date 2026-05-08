@@ -90,8 +90,14 @@ async def test_sovereignty_feature_execution(kestrel_agent):
     assert tool is not None
     result = await tool.execute()
 
+    # check_sovereignty_status migrated to ToolResult in #1061 wave 22.
+    # DynamicTool.execute() wraps the envelope under result["result"]
+    # as ``{"status": "ok", "confirmation": "...", "data": {...}}``.
     assert result["success"] is True
-    assert "No sovereignty exports found" in result["result"]
+    inner = result["result"]
+    assert inner["status"] == "ok"
+    assert "No sovereignty exports found" in inner["confirmation"]
+    assert inner["data"]["total_exports"] == 0
 
 @pytest.mark.asyncio
 @pytest.mark.skipif(not HAS_MCP, reason="kestrel-feature-mcp not installed")
