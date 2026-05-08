@@ -4,6 +4,7 @@ import json
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from kestrel_sdk.tools.result import ToolResultStatus
 from kestrel_sovereign.features.talon.coordinator import TalonCoordinatorFeature
 
 
@@ -41,8 +42,9 @@ class TestTalonClaim:
                 "message_id": "abc", "repo": "org/repo", "issue": 42,
             }
             result = await feature.talon_claim(repo="org/repo", issue=42)
-            assert result["dispatched"] is True
-            assert result["method"] == "mesh"
+            assert result.status is ToolResultStatus.OK
+            assert result.data["dispatched"] is True
+            assert result.data["method"] == "mesh"
             mock_mesh.assert_awaited_once_with("org/repo", 42)
 
     @pytest.mark.asyncio
@@ -77,9 +79,10 @@ class TestTalonClaim:
                 "pid": 1234,
             }
             result = await feature.talon_claim(repo="org/repo", issue=42)
-            assert result["dispatched"] is True
-            assert result["method"] == "cli_background"
-            assert result["job_id"] == "abc"
+            assert result.status is ToolResultStatus.OK
+            assert result.data["dispatched"] is True
+            assert result.data["method"] == "cli_background"
+            assert result.data["job_id"] == "abc"
             args = mock_bg.call_args[0][0]
             assert "--worktree" in args
             assert "--repo-dir" in args
@@ -103,9 +106,10 @@ class TestTalonClaim:
              }):
             mock_mesh.return_value = {"dispatched": False}
             result = await feature.talon_claim(repo="org/repo", issue=42)
-            assert result["dispatched"] is False
-            assert result["state"] == "workspace_not_provisioned"
-            assert "talon_setup_workspace" in result["next_step"]
+            assert result.status is ToolResultStatus.ERROR
+            assert result.data["dispatched"] is False
+            assert result.data["state"] == "workspace_not_provisioned"
+            assert "talon_setup_workspace" in result.data["next_step"]
             mock_bg.assert_not_called()
 
 
@@ -116,7 +120,8 @@ class TestTalonBatch:
         with patch.object(feature, "_dispatch_via_cli_background", new_callable=AsyncMock) as mock_bg:
             mock_bg.return_value = {"dispatched": True, "method": "cli_background"}
             result = await feature.talon_batch(repo="org/repo", prd="prd.json")
-            assert result["dispatched"] is True
+            assert result.status is ToolResultStatus.OK
+            assert result.data["dispatched"] is True
             mock_bg.assert_awaited_once()
             args = mock_bg.call_args[0][0]
             assert "batch" in args
@@ -128,7 +133,8 @@ class TestTalonBatch:
         with patch.object(feature, "_dispatch_via_cli_background", new_callable=AsyncMock) as mock_bg:
             mock_bg.return_value = {"dispatched": True, "method": "cli_background"}
             result = await feature.talon_batch(repo="org/repo", label="P0")
-            assert result["dispatched"] is True
+            assert result.status is ToolResultStatus.OK
+            assert result.data["dispatched"] is True
             args = mock_bg.call_args[0][0]
             assert "--label" in args
             assert "P0" in args
@@ -137,8 +143,9 @@ class TestTalonBatch:
     async def test_batch_no_args_errors(self):
         feature = TalonCoordinatorFeature(_make_agent())
         result = await feature.talon_batch(repo="org/repo")
-        assert result["dispatched"] is False
-        assert "error" in result
+        assert result.status is ToolResultStatus.ERROR
+        assert result.data["dispatched"] is False
+        assert "error" in result.data
 
 
 class TestTalonStatus:
@@ -146,8 +153,9 @@ class TestTalonStatus:
     async def test_status_empty(self):
         feature = TalonCoordinatorFeature(_make_agent())
         result = await feature.talon_status()
-        assert result["running"] == 0
-        assert result["completed"] == 0
+        assert result.status is ToolResultStatus.OK
+        assert result.data["running"] == 0
+        assert result.data["completed"] == 0
 
     @pytest.mark.asyncio
     async def test_status_with_jobs(self):
@@ -155,8 +163,9 @@ class TestTalonStatus:
         feature._jobs["job-1"] = {"repo": "a/b", "issue": 1, "status": "dispatched"}
         feature._jobs["job-2"] = {"repo": "a/b", "issue": 2, "status": "complete"}
         result = await feature.talon_status()
-        assert result["running"] == 1
-        assert result["completed"] == 1
+        assert result.status is ToolResultStatus.OK
+        assert result.data["running"] == 1
+        assert result.data["completed"] == 1
 
 
 class TestTalonPauseResume:
@@ -165,7 +174,8 @@ class TestTalonPauseResume:
         agent = _make_agent()
         feature = TalonCoordinatorFeature(agent)
         result = await feature.talon_pause()
-        assert result["paused"] is True
+        assert result.status is ToolResultStatus.OK
+        assert result.data["paused"] is True
         agent._scheduler.remove_schedule.assert_called_once_with("signal_dispatch")
 
     @pytest.mark.asyncio
@@ -173,7 +183,8 @@ class TestTalonPauseResume:
         agent = _make_agent()
         feature = TalonCoordinatorFeature(agent)
         result = await feature.talon_resume()
-        assert result["resumed"] is True
+        assert result.status is ToolResultStatus.OK
+        assert result.data["resumed"] is True
         agent._scheduler.add_schedule.assert_called_once()
 
 
