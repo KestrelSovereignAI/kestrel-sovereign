@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from kestrel_sdk.tools.result import ToolResultStatus
 from kestrel_sovereign.features.github.client import GitHubClientError
 from kestrel_sovereign.features.github.feature import GitHubFeature
 from kestrel_sovereign.kestrel_agent import KestrelAgent
@@ -63,8 +64,8 @@ async def test_empty_body_refused_before_approval(feature_factory):
         issue_number=1, body="   ", repo="x/y",
     )
 
-    assert result["success"] is False
-    assert "empty" in result["error"].lower()
+    assert result.status is ToolResultStatus.ERROR
+    assert "empty" in result.error.lower()
     sec.approval_queue.request_approval.assert_not_awaited()
 
 
@@ -76,8 +77,8 @@ async def test_oversized_body_refused_before_approval(feature_factory):
         issue_number=1, body="a" * 60_001, repo="x/y",
     )
 
-    assert result["success"] is False
-    assert "too long" in result["error"].lower()
+    assert result.status is ToolResultStatus.ERROR
+    assert "too long" in result.error.lower()
     sec.approval_queue.request_approval.assert_not_awaited()
 
 
@@ -89,9 +90,9 @@ async def test_approval_denied_does_not_post(feature_factory):
         issue_number=1, body="hello", repo="x/y",
     )
 
-    assert result["success"] is False
-    assert result["requires_approval"] is True
-    assert result["body_sha256"]
+    assert result.status is ToolResultStatus.ERROR
+    assert result.data["requires_approval"] is True
+    assert result.data["body_sha256"]
     sec.approval_queue.request_approval.assert_awaited_once()
     feat._client.create_issue_comment.assert_not_awaited()
 
@@ -104,9 +105,12 @@ async def test_dry_run_does_not_post(feature_factory):
         issue_number=1, body="preview please", repo="x/y", dry_run=True,
     )
 
-    assert result["success"] is True
-    assert result["preview"] is True
-    assert result["body"] == "preview please"
+    # dry_run is now PARTIAL (nothing actually posted) — same honesty
+    # pattern as compute.empty_trash, strategic_memory.backlog_hygiene,
+    # model.cleanup_models.
+    assert result.status is ToolResultStatus.PARTIAL
+    assert result.data["preview"] is True
+    assert result.data["body"] == "preview please"
     feat._client.create_issue_comment.assert_not_awaited()
 
 
@@ -118,11 +122,11 @@ async def test_approved_call_posts_and_returns_url(feature_factory):
         issue_number=42, body="ship it", repo="x/y",
     )
 
-    assert result["success"] is True
-    assert result["html_url"].endswith("issuecomment-99")
-    assert result["id"] == 99
-    assert result["repo"] == "x/y"
-    assert result["issue_number"] == 42
+    assert result.status is ToolResultStatus.OK
+    assert result.data["html_url"].endswith("issuecomment-99")
+    assert result.data["id"] == 99
+    assert result.data["repo"] == "x/y"
+    assert result.data["issue_number"] == 42
     feat._client.create_issue_comment.assert_awaited_once_with(
         "x/y", 42, "ship it",
     )
@@ -140,8 +144,8 @@ async def test_self_repo_alias_resolves(feature_factory):
             issue_number=750, body="design note", repo="self",
         )
 
-    assert result["success"] is True
-    assert result["repo"] == "KestrelSovereignAI/kestrel-sovereign"
+    assert result.status is ToolResultStatus.OK
+    assert result.data["repo"] == "KestrelSovereignAI/kestrel-sovereign"
     posted_repo, _, _ = feat._client.create_issue_comment.await_args.args
     assert posted_repo == "KestrelSovereignAI/kestrel-sovereign"
 
@@ -157,9 +161,9 @@ async def test_client_error_surfaces(feature_factory):
         issue_number=999, body="hi", repo="x/y",
     )
 
-    assert result["success"] is False
-    assert "Issue not found" in result["error"]
-    assert result["body_sha256"]
+    assert result.status is ToolResultStatus.ERROR
+    assert "Issue not found" in result.error
+    assert result.data["body_sha256"]
 
 
 @pytest.mark.asyncio
@@ -177,6 +181,6 @@ async def test_no_security_feature_blocks_post():
         issue_number=1, body="hello", repo="x/y",
     )
 
-    assert result["success"] is False
-    assert result["requires_approval"] is True
+    assert result.status is ToolResultStatus.ERROR
+    assert result.data["requires_approval"] is True
     feat._client.create_issue_comment.assert_not_awaited()

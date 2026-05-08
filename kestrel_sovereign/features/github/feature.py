@@ -3,12 +3,13 @@ import asyncio
 import hashlib
 import logging
 import os
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
 import yaml
 
-from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sdk.tools.base import ToolCategory
+from kestrel_sdk.tools.result import ToolResult
+from kestrel_sovereign.features.base import Feature, tool
 
 from .ast_analyzer import ASTAnalyzer
 from .cache import GitHubCache
@@ -79,7 +80,33 @@ class GitHubFeature(Feature):
         """Clean up resources."""
         if self._client:
             await self._client.close()
-    
+
+    @staticmethod
+    def _str_to_tool_result(
+        body: str,
+        *,
+        data: Optional[Dict[str, Any]] = None,
+        error_prefixes: tuple = (
+            "Error",
+            "Could not",
+            "Search error",
+            "Definition '",
+        ),
+    ) -> ToolResult:
+        """Wrap a str return into a ToolResult envelope.
+
+        Honesty layer 4 (#1042): the github tools previously returned
+        bare ``str`` whose first token signaled the outcome. Detect the
+        known error/not-found prefixes and route to ``ToolResult.failed``
+        so the envelope status matches the body. Everything else is OK
+        with the formatted body in confirmation and optional structured
+        data on the side. ``Definition '...' not found in ...`` is the
+        AST analyzer's not-found message; treat as ERROR.
+        """
+        if any(body.startswith(p) for p in error_prefixes):
+            return ToolResult.failed(body, data=data)
+        return ToolResult.ok(confirmation=body, data=data)
+
     # ============== Tools ==============
     
     @tool(
@@ -92,7 +119,7 @@ class GitHubFeature(Feature):
         repo: str,
         path: str,
         ref: str = "main",
-    ) -> str:
+    ) -> ToolResult:
         """Read a file from GitHub.
         
         Args:
@@ -110,16 +137,16 @@ class GitHubFeature(Feature):
         # Check cache first
         cached = await self.cache.get(repo, path, ref)
         if cached:
-            return f"# {path} (cached)\n\n{cached.content}"
+            return self._str_to_tool_result(f"# {path} (cached)\n\n{cached.content}")
         
         # Fetch from GitHub
         try:
             content = await self.client.get_file_content(repo, path, ref)
             # Cache it
             await self.cache.set(content)
-            return f"# {path}\n\n{content.content}"
+            return self._str_to_tool_result(f"# {path}\n\n{content.content}")
         except GitHubClientError as e:
-            return f"Error reading {path}: {e}"
+            return self._str_to_tool_result(f"Error reading {path}: {e}")
     
     @tool(
         name="list_github_files",
@@ -132,7 +159,7 @@ class GitHubFeature(Feature):
         path: str = "",
         ref: str = "main",
         recursive: bool = False,
-    ) -> str:
+    ) -> ToolResult:
         """List files in a directory.
         
         Args:
@@ -167,9 +194,9 @@ class GitHubFeature(Feature):
                     size = f"{f.size:,}" if f.size else "?"
                     lines.append(f"📄 {f.path} ({size} bytes)")
             
-            return "\n".join(lines)
+            return self._str_to_tool_result("\n".join(lines))
         except GitHubClientError as e:
-            return f"Error listing {path}: {e}"
+            return self._str_to_tool_result(f"Error listing {path}: {e}")
     
     @tool(
         name="search_github_code",
@@ -183,7 +210,7 @@ class GitHubFeature(Feature):
         path: Optional[str] = None,
         extension: Optional[str] = None,
         max_results: int = 20,
-    ) -> str:
+    ) -> ToolResult:
         """Search for code in GitHub.
         
         Args:
@@ -205,7 +232,7 @@ class GitHubFeature(Feature):
             )
             
             if not results:
-                return f"No results found for: {query}"
+                return self._str_to_tool_result(f"No results found for: {query}")
             
             lines = [f"# Search results for: {query}\n"]
             
@@ -219,9 +246,9 @@ class GitHubFeature(Feature):
                     if fragment:
                         lines.append(f"\n```\n{fragment}\n```")
             
-            return "\n".join(lines)
+            return self._str_to_tool_result("\n".join(lines))
         except GitHubClientError as e:
-            return f"Search error: {e}"
+            return self._str_to_tool_result(f"Search error: {e}")
     
     @tool(
         name="get_code_definition",
@@ -234,7 +261,7 @@ class GitHubFeature(Feature):
         path: str,
         name: str,
         ref: str = "main",
-    ) -> str:
+    ) -> ToolResult:
         """Get a specific function or class definition.
         
         Args:
@@ -251,7 +278,7 @@ class GitHubFeature(Feature):
             ref = GITHUB_DEFAULT_BRANCH
         
         if not path.endswith(".py"):
-            return "Error: AST analysis only supports Python files (.py)"
+            return self._str_to_tool_result("Error: AST analysis only supports Python files (.py)")
         
         # Get file content
         try:
@@ -263,7 +290,7 @@ class GitHubFeature(Feature):
                 await self.cache.set(file_content)
                 content = file_content.content
         except GitHubClientError as e:
-            return f"Error reading {path}: {e}"
+            return self._str_to_tool_result(f"Error reading {path}: {e}")
         
         # Parse and find definition
         analyzer = ASTAnalyzer(content, path)
@@ -273,9 +300,9 @@ class GitHubFeature(Feature):
             # List available definitions
             all_defs = analyzer.get_definitions()
             available = [d.name for d in all_defs[:20]]
-            return f"Definition '{name}' not found in {path}.\n\nAvailable: {', '.join(available)}"
+            return self._str_to_tool_result(f"Definition '{name}' not found in {path}.\n\nAvailable: {', '.join(available)}")
         
-        return f"""# {defn.type.title()}: {defn.name}
+        return self._str_to_tool_result(f"""# {defn.type.title()}: {defn.name}
 
 **File:** {path}
 **Lines:** {defn.start_line}-{defn.end_line}
@@ -287,7 +314,7 @@ class GitHubFeature(Feature):
 ## Source
 ```python
 {defn.source}
-```"""
+```""")
     
     @tool(
         name="list_code_definitions",
@@ -299,7 +326,7 @@ class GitHubFeature(Feature):
         repo: str,
         path: str,
         ref: str = "main",
-    ) -> str:
+    ) -> ToolResult:
         """List all definitions in a Python file.
         
         Args:
@@ -315,7 +342,7 @@ class GitHubFeature(Feature):
             ref = GITHUB_DEFAULT_BRANCH
         
         if not path.endswith(".py"):
-            return "Error: AST analysis only supports Python files (.py)"
+            return self._str_to_tool_result("Error: AST analysis only supports Python files (.py)")
         
         # Get file content
         try:
@@ -327,14 +354,14 @@ class GitHubFeature(Feature):
                 await self.cache.set(file_content)
                 content = file_content.content
         except GitHubClientError as e:
-            return f"Error reading {path}: {e}"
+            return self._str_to_tool_result(f"Error reading {path}: {e}")
         
         # Parse
         analyzer = ASTAnalyzer(content, path)
         definitions = analyzer.get_definitions()
         
         if not definitions:
-            return f"No function or class definitions found in {path}"
+            return self._str_to_tool_result(f"No function or class definitions found in {path}")
         
         lines = [f"# Definitions in {path}\n"]
         
@@ -360,14 +387,14 @@ class GitHubFeature(Feature):
             if len(methods) > 30:
                 lines.append(f"  ... and {len(methods) - 30} more")
         
-        return "\n".join(lines)
+        return self._str_to_tool_result("\n".join(lines))
     
     @tool(
         name="get_self_repo_info",
         description="Get information about the agent's own source repository.",
         category=ToolCategory.DATA_ACCESS,
     )
-    async def get_self_repo_info(self) -> str:
+    async def get_self_repo_info(self) -> ToolResult:
         """Get info about the agent's own repository.
         
         Returns:
@@ -378,7 +405,7 @@ class GitHubFeature(Feature):
         try:
             info = await self.client.get_repo_info(repo)
             
-            return f"""# Agent Source Repository
+            return self._str_to_tool_result(f"""# Agent Source Repository
 
 **Repository:** {info.get('full_name')}
 **Description:** {info.get('description', 'N/A')}
@@ -394,16 +421,16 @@ class GitHubFeature(Feature):
 - Open Issues: {info.get('open_issues_count', 0)}
 - Last Updated: {info.get('updated_at', 'unknown')}
 
-Use `list_source_components` to see the feature components that make up this agent."""
+Use `list_source_components` to see the feature components that make up this agent.""")
         except GitHubClientError as e:
-            return f"Error getting repo info: {e}"
+            return self._str_to_tool_result(f"Error getting repo info: {e}")
     
     @tool(
         name="list_source_components",
         description="List all feature components in the agent's source code with their manifests.",
         category=ToolCategory.DATA_ACCESS,
     )
-    async def list_source_components(self, include_files: bool = False) -> str:
+    async def list_source_components(self, include_files: bool = False) -> ToolResult:
         """List all feature components.
         
         Args:
@@ -419,7 +446,7 @@ Use `list_source_components` to see the feature components that make up this age
         try:
             files = await self.client.list_directory(repo, GITHUB_SELF_FEATURES_ROOT, ref)
         except GitHubClientError as e:
-            return f"Could not access features directory: {e}"
+            return self._str_to_tool_result(f"Could not access features directory: {e}")
         
         components = []
         
@@ -479,7 +506,7 @@ Use `list_source_components` to see the feature components that make up this age
                 if len(comp["files"]) > 20:
                     lines.append(f"  ... and {len(comp['files']) - 20} more")
         
-        return "\n".join(lines)
+        return self._str_to_tool_result("\n".join(lines))
     
     @tool(
         name="get_component_source",
@@ -490,7 +517,7 @@ Use `list_source_components` to see the feature components that make up this age
         self,
         component: str,
         include_content: bool = False,
-    ) -> str:
+    ) -> ToolResult:
         """Get source files for a component.
         
         Args:
@@ -513,10 +540,18 @@ Use `list_source_components` to see the feature components that make up this age
                 if f.path.startswith(component_path + "/") and f.is_file()
             ]
         except GitHubClientError as e:
-            return f"Could not access component '{component}': {e}"
+            return self._str_to_tool_result(f"Could not access component '{component}': {e}")
         
         if not comp_files:
-            return f"Component '{component}' not found or has no files"
+            # Codex round 1 P2 (#1108): the helper's prefix detector
+            # treats this body as OK by default, but a not-found
+            # component is an ERROR — return failed explicitly so
+            # downstream callers see status=ERROR rather than
+            # success=True with an apologetic body.
+            return ToolResult.failed(
+                f"Component '{component}' not found or has no files",
+                data={"component": component},
+            )
         
         lines = [f"# Component: {component}\n"]
         lines.append(f"**Path:** {component_path}")
@@ -548,7 +583,7 @@ Use `list_source_components` to see the feature components that make up this age
             else:
                 lines.append(f"*Size: {f.size:,} bytes*")
         
-        return "\n".join(lines)
+        return self._str_to_tool_result("\n".join(lines))
     
     @tool(
         name="invalidate_github_cache",
@@ -559,7 +594,7 @@ Use `list_source_components` to see the feature components that make up this age
         self,
         repo: str,
         path: Optional[str] = None,
-    ) -> str:
+    ) -> ToolResult:
         """Invalidate cache entries.
         
         Args:
@@ -574,8 +609,8 @@ Use `list_source_components` to see the feature components that make up this age
         await self.cache.invalidate(repo, path=path)
         
         if path:
-            return f"Invalidated cache for {repo}:{path}"
-        return f"Invalidated all cache for {repo}"
+            return self._str_to_tool_result(f"Invalidated cache for {repo}:{path}")
+        return self._str_to_tool_result(f"Invalidated all cache for {repo}")
 
     # --- Issue tools ---
 
@@ -590,7 +625,7 @@ Use `list_source_components` to see the feature components that make up this age
         state: str = "open",
         labels: Optional[str] = None,
         max_results: int = 30,
-    ) -> str:
+    ) -> ToolResult:
         """List issues in a repository.
 
         Args:
@@ -610,10 +645,10 @@ Use `list_source_components` to see the feature components that make up this age
                 repo, state=state, labels=label_list, per_page=max_results,
             )
         except GitHubClientError as e:
-            return f"Could not list issues: {e}"
+            return self._str_to_tool_result(f"Could not list issues: {e}")
 
         if not issues:
-            return f"No {state} issues found in {repo}"
+            return self._str_to_tool_result(f"No {state} issues found in {repo}")
 
         lines = [f"# Issues in {repo} ({state})\n"]
         for issue in issues:
@@ -632,7 +667,7 @@ Use `list_source_components` to see the feature components that make up this age
             lines.append(line)
 
         lines.append(f"\n*{len(issues)} issue(s) shown*")
-        return "\n".join(lines)
+        return self._str_to_tool_result("\n".join(lines))
 
     @tool(
         name="get_github_issue",
@@ -643,7 +678,7 @@ Use `list_source_components` to see the feature components that make up this age
         self,
         issue_number: int,
         repo: str = "self",
-    ) -> str:
+    ) -> ToolResult:
         """Get a specific issue.
 
         Args:
@@ -658,7 +693,7 @@ Use `list_source_components` to see the feature components that make up this age
         try:
             issue = await self.client.get_issue(repo, issue_number)
         except GitHubClientError as e:
-            return f"Could not get issue #{issue_number}: {e}"
+            return self._str_to_tool_result(f"Could not get issue #{issue_number}: {e}")
 
         title = issue.get("title", "")
         state = issue.get("state", "")
@@ -687,7 +722,7 @@ Use `list_source_components` to see the feature components that make up this age
         lines.append(f"**Comments:** {comments_count}")
         lines.append(f"\n---\n\n{body}")
 
-        return "\n".join(lines)
+        return self._str_to_tool_result("\n".join(lines))
 
     @tool(
         name="get_github_issue_comments",
@@ -699,7 +734,7 @@ Use `list_source_components` to see the feature components that make up this age
         issue_number: int,
         repo: str = "self",
         max_results: int = 30,
-    ) -> str:
+    ) -> ToolResult:
         """Get comments on an issue.
 
         Args:
@@ -717,10 +752,10 @@ Use `list_source_components` to see the feature components that make up this age
                 repo, issue_number, per_page=max_results,
             )
         except GitHubClientError as e:
-            return f"Could not get comments for issue #{issue_number}: {e}"
+            return self._str_to_tool_result(f"Could not get comments for issue #{issue_number}: {e}")
 
         if not comments:
-            return f"No comments on issue #{issue_number} in {repo}"
+            return self._str_to_tool_result(f"No comments on issue #{issue_number} in {repo}")
 
         lines = [f"# Comments on #{issue_number} in {repo}\n"]
         for comment in comments:
@@ -733,7 +768,7 @@ Use `list_source_components` to see the feature components that make up this age
             lines.append("")
 
         lines.append(f"\n*{len(comments)} comment(s)*")
-        return "\n".join(lines)
+        return self._str_to_tool_result("\n".join(lines))
 
     @tool(
         name="create_github_issue_comment",
@@ -750,7 +785,7 @@ Use `list_source_components` to see the feature components that make up this age
         body: str,
         repo: str = "self",
         dry_run: bool = False,
-    ) -> dict:
+    ) -> ToolResult:
         """Post a comment on a GitHub issue. Requires user approval.
 
         Args:
@@ -773,18 +808,13 @@ Use `list_source_components` to see the feature components that make up this age
         """
         body_clean = (body or "").strip()
         if not body_clean:
-            return {
-                "success": False,
-                "error": "Comment body is empty",
-            }
+            return ToolResult.failed("Comment body is empty")
         if len(body_clean) > 60_000:
-            return {
-                "success": False,
-                "error": (
-                    f"Comment body too long ({len(body_clean)} chars). "
-                    "GitHub limits comments to ~65k; cap is 60k here."
-                ),
-            }
+            return ToolResult.failed(
+                f"Comment body too long ({len(body_clean)} chars). "
+                "GitHub limits comments to ~65k; cap is 60k here.",
+                data={"length": len(body_clean)},
+            )
 
         repo_resolved = self._resolve_repo(repo)
         body_sha = hashlib.sha256(body_clean.encode("utf-8")).hexdigest()
@@ -797,28 +827,41 @@ Use `list_source_components` to see the feature components that make up this age
             dry_run=dry_run,
         )
         if not approved:
-            return {
-                "success": False,
-                "error": (
-                    "Comment not approved (dry-run preview)"
-                    if dry_run
-                    else "Comment not approved"
-                ),
-                "requires_approval": True,
-                "repo": repo_resolved,
-                "issue_number": issue_number,
-                "body_sha256": body_sha,
-            }
+            return ToolResult.failed(
+                "Comment not approved (dry-run preview)" if dry_run else "Comment not approved",
+                data={
+                    "requires_approval": True,
+                    "repo": repo_resolved,
+                    "issue_number": issue_number,
+                    "body_sha256": body_sha,
+                },
+            )
 
         if dry_run:
-            return {
-                "success": True,
-                "preview": True,
-                "repo": repo_resolved,
-                "issue_number": issue_number,
-                "body_sha256": body_sha,
-                "body": body_clean,
-            }
+            # Honesty: dry_run validated and got approval but did NOT
+            # post. The legacy dict had {"success": True, "preview": True}
+            # — phrased like a successful action. PARTIAL forces the
+            # agent to speak that nothing was actually posted, matching
+            # the dry-run pattern from compute.empty_trash (#1107),
+            # strategic_memory.backlog_hygiene (#1104), and
+            # model.cleanup_models (#1098).
+            return ToolResult.partial(
+                confirmation=(
+                    f"dry-run preview for {repo_resolved}#{issue_number} approved"
+                ),
+                error=(
+                    "dry_run=True: comment was NOT posted to GitHub. "
+                    "Re-run with dry_run=False to actually post."
+                ),
+                data={
+                    "success": True,
+                    "preview": True,
+                    "repo": repo_resolved,
+                    "issue_number": issue_number,
+                    "body_sha256": body_sha,
+                    "body": body_clean,
+                },
+            )
 
         try:
             result = await self.client.create_issue_comment(
@@ -828,22 +871,29 @@ Use `list_source_components` to see the feature components that make up this age
             logger.error(
                 f"create_issue_comment failed for {repo_resolved}#{issue_number}: {e}"
             )
-            return {
-                "success": False,
-                "error": str(e),
+            return ToolResult.failed(
+                str(e),
+                data={
+                    "repo": repo_resolved,
+                    "issue_number": issue_number,
+                    "body_sha256": body_sha,
+                },
+            )
+
+        return ToolResult.ok(
+            confirmation=(
+                f"Posted comment on {repo_resolved}#{issue_number} "
+                f"({result.get('html_url')})"
+            ),
+            data={
+                "success": True,
+                "html_url": result.get("html_url"),
+                "id": result.get("id"),
                 "repo": repo_resolved,
                 "issue_number": issue_number,
                 "body_sha256": body_sha,
-            }
-
-        return {
-            "success": True,
-            "html_url": result.get("html_url"),
-            "id": result.get("id"),
-            "repo": repo_resolved,
-            "issue_number": issue_number,
-            "body_sha256": body_sha,
-        }
+            },
+        )
 
     def _get_security_feature(self):
         """Find the SecurityFeature on the parent agent.
