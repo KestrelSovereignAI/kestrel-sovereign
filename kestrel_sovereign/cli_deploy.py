@@ -577,8 +577,18 @@ def _resolve_project_id(
     Returns None on error (the caller should propagate exit 1).
     """
     env_value = os.getenv("GCP_PROJECT_ID")
-    if env_value:
+    if env_value and _is_real_project_id(env_value):
         return env_value
+    if env_value:
+        # Env was set but to the example placeholder. Build's resolver
+        # rejects this same shape; secrets-sync now mirrors. Codex
+        # review on the final epic→main PR caught the inconsistency.
+        print(
+            f"error: GCP_PROJECT_ID is set to the example placeholder "
+            f"'{env_value}'. Set it to your real GCP project ID.",
+            file=sys.stderr,
+        )
+        return None
 
     if config is None:
         config = _load_deploy_config_for_secrets()

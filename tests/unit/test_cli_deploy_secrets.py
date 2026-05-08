@@ -231,6 +231,24 @@ def test_cmd_deploy_secrets_sync_uses_env_var_project_id(fake_project_root, monk
     assert project_id_arg == "env-project"
 
 
+def test_cmd_deploy_secrets_sync_rejects_env_placeholder_project_id(
+    fake_project_root, monkeypatch, capsys
+):
+    """Codex review on the final epic→main PR: build and deploy paths
+    reject ``GCP_PROJECT_ID=your-gcp-project-id`` (the example
+    placeholder). Secrets sync must mirror — silently syncing to the
+    fake/example project is worse than failing fast."""
+    monkeypatch.setenv("GCP_PROJECT_ID", "your-gcp-project-id")
+    _write_minimal_deploy_config(fake_project_root)  # so the deploy_config check passes first
+
+    rc = cmd_deploy(_make_args(target="secrets", profile="sync"))
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "placeholder" in err
+    assert "your-gcp-project-id" in err
+
+
 def test_cmd_deploy_secrets_sync_uses_profile_level_project_id(
     fake_project_root, monkeypatch
 ):
