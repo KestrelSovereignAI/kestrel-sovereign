@@ -6,13 +6,22 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from kestrel_sdk.tools.result import ToolResult
 from kestrel_sovereign.features.sovereignty.feature import SovereigntyFeature
 from kestrel_sovereign.storage.providers.base import StorageResult, StorageTier
 
 
 class AuditAnchorFeature:
     def __init__(self):
-        self.anchor_status = AsyncMock(return_value={"result": {"cid": "bafyaudit"}})
+        # AuditAnchorFeature.anchor_status now returns a ToolResult
+        # envelope (#1061 wave 17); the dict the sovereignty receipt
+        # quotes lives under .data.
+        self.anchor_status = AsyncMock(
+            return_value=ToolResult.ok(
+                confirmation="audit anchor status",
+                data={"cid": "bafyaudit"},
+            ),
+        )
 
 
 @pytest.mark.asyncio

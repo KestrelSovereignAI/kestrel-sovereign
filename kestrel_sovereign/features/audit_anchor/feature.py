@@ -17,10 +17,11 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
-from kestrel_sovereign.features.base import Feature, tool
-from kestrel_sovereign.features.audit_anchor.hasher import AuditHasher
-from kestrel_sovereign.features.storage_access import resolve_feature_database
 from kestrel_sdk.tools.base import ToolCategory
+from kestrel_sdk.tools.result import ToolResult
+from kestrel_sovereign.features.audit_anchor.hasher import AuditHasher
+from kestrel_sovereign.features.base import Feature, tool
+from kestrel_sovereign.features.storage_access import resolve_feature_database
 
 logger = logging.getLogger(__name__)
 
@@ -82,25 +83,22 @@ class AuditAnchorFeature(Feature):
         category=ToolCategory.SYSTEM,
         command_prefix="!audit-anchor",
     )
-    async def anchor_audit(self) -> Dict[str, Any]:
+    async def anchor_audit(self) -> ToolResult:
         """
         Anchor unanchored audit log entries to persistent storage.
 
         Computes a SHA-256 hash of all entries since the last anchor,
         stores the serialized entries via content-addressable storage,
         and records the anchor in the audit_anchors table.
-
-        Returns:
-            Dict with anchor details: hash, entry count, storage reference,
-            or a message if there is nothing to anchor.
         """
-        # Find last anchor timestamp
         last_anchor_at = await self._get_last_anchor_timestamp()
 
-        # Get unanchored entries from the security audit log
         entries = await self._get_audit_entries_since(last_anchor_at)
         if not entries:
-            return {"status": "nothing_to_anchor", "message": "No new audit entries since last anchor"}
+            return ToolResult.ok(
+                confirmation="No new audit entries since last anchor",
+                data={"status": "nothing_to_anchor", "message": "No new audit entries since last anchor"},
+            )
 
         # Compute deterministic hash
         anchor_hash = AuditHasher.hash_entries(entries)
@@ -108,12 +106,14 @@ class AuditAnchorFeature(Feature):
 
         # Store serialized entries via file storage
         storage_ref = None
+        storage_failed_reason: Optional[str] = None
         try:
             storage_ref = await self.agent.storage.store_file(
                 serialized, f"audit_anchor_{anchor_hash[:16]}.json"
             )
         except Exception as e:
             logger.warning(f"Could not store audit entries to file storage: {e}")
+            storage_failed_reason = str(e)
             # Fall back to hash-only anchor (no file storage ref)
 
         # Determine entry time range
@@ -143,7 +143,10 @@ class AuditAnchorFeature(Feature):
                 )
             except Exception as e:
                 logger.error(f"Failed to record anchor: {e}")
-                return {"status": "error", "message": f"Failed to record anchor: {e}"}
+                return ToolResult.failed(
+                    f"Failed to record anchor: {e}",
+                    data={"status": "error", "message": f"Failed to record anchor: {e}"},
+                )
 
         # Store as graph node if graph storage is available
         try:
@@ -178,7 +181,35 @@ class AuditAnchorFeature(Feature):
         logger.info(
             f"Audit trail anchored: {len(entries)} entries, hash={anchor_hash[:16]}..."
         )
-        return result
+
+        # Honesty: when file-storage attached but failed, the anchor
+        # still exists (hash recorded in audit_anchors) but the
+        # serialized entries are NOT recoverable from storage_ref.
+        # Surface as PARTIAL so the agent must speak that the
+        # tamper-proof archival did not fully complete.
+        if storage_failed_reason is not None:
+            result["storage_failed_reason"] = storage_failed_reason
+            return ToolResult.partial(
+                confirmation=(
+                    f"Anchored {len(entries)} entries (hash={anchor_hash[:16]}…)"
+                ),
+                error=(
+                    f"file storage failed ({storage_failed_reason!r}); "
+                    "the anchor row exists with hash + metadata, but the "
+                    "serialized entries are not retrievable from "
+                    "storage_ref. Verify-only path still works; "
+                    "fully-restore path is broken for this anchor."
+                ),
+                data=result,
+            )
+
+        return ToolResult.ok(
+            confirmation=(
+                f"Anchored {len(entries)} entries (hash={anchor_hash[:16]}…, "
+                f"storage_ref={storage_ref})"
+            ),
+            data=result,
+        )
 
     @tool(
         "audit_verify",
@@ -186,23 +217,23 @@ class AuditAnchorFeature(Feature):
         category=ToolCategory.SYSTEM,
         command_prefix="!audit-verify",
     )
-    async def verify_audit(self) -> Dict[str, Any]:
+    async def verify_audit(self) -> ToolResult:
         """
         Verify audit trail integrity by re-computing hashes for each anchor.
 
         For each anchor in audit_anchors, queries the original entries in
         that time range, re-computes the SHA-256 hash, and compares it
         to the stored anchor_hash. Reports pass/fail per anchor.
-
-        Returns:
-            Dict with per-anchor results and overall integrity status.
         """
         anchors = await self._get_all_anchors()
         if not anchors:
-            return {
-                "status": "no_anchors",
-                "message": "No anchors found. Run !audit-anchor first.",
-            }
+            return ToolResult.ok(
+                confirmation="No anchors found. Run !audit-anchor first.",
+                data={
+                    "status": "no_anchors",
+                    "message": "No anchors found. Run !audit-anchor first.",
+                },
+            )
 
         results = []
         all_passed = True
@@ -242,14 +273,36 @@ class AuditAnchorFeature(Feature):
                 "match": passed,
             })
 
-        return {
+        passed_count = sum(
+            1 for r in results
+            if r.get("match", False) or r.get("status") == "pass"
+        )
+        failed_count = sum(1 for r in results if r.get("status") == "FAIL")
+        warnings_count = sum(1 for r in results if r.get("status") == "warning")
+
+        data = {
             "status": "verified" if all_passed else "integrity_failure",
             "total_anchors": len(anchors),
-            "passed": sum(1 for r in results if r.get("match", False) or r.get("status") == "pass"),
-            "failed": sum(1 for r in results if r.get("status") == "FAIL"),
-            "warnings": sum(1 for r in results if r.get("status") == "warning"),
+            "passed": passed_count,
+            "failed": failed_count,
+            "warnings": warnings_count,
             "details": results,
         }
+
+        # Honesty: integrity failure is the headline finding; the LLM
+        # must not narrate "audit verified" off a result where any
+        # anchor's hash diverged. ERROR routes the failure summary
+        # into the agent's ear.
+        if not all_passed:
+            return ToolResult.failed(
+                f"Audit integrity check failed: {failed_count} hash mismatch(es), "
+                f"{warnings_count} warning(s) across {len(anchors)} anchor(s)",
+                data=data,
+            )
+        return ToolResult.ok(
+            confirmation=f"Audit verified: {passed_count}/{len(anchors)} anchors passed",
+            data=data,
+        )
 
     @tool(
         "audit_anchor_status",
@@ -257,25 +310,47 @@ class AuditAnchorFeature(Feature):
         category=ToolCategory.SYSTEM,
         command_prefix="!audit-status",
     )
-    async def anchor_status(self) -> Dict[str, Any]:
+    async def anchor_status(self) -> ToolResult:
         """
         Check the current state of audit trail anchoring.
-
-        Returns:
-            Dict with last_anchor_at, total_anchors, entries_since_last,
-            and overall_integrity status.
         """
         last_anchor_at = await self._get_last_anchor_timestamp()
         total_anchors = await self._count_anchors()
         entries_since = await self._get_audit_entries_since(last_anchor_at)
         entries_since_count = len(entries_since) if entries_since else 0
 
-        return {
+        data = {
             "last_anchor_at": last_anchor_at,
             "total_anchors": total_anchors,
             "entries_since_last": entries_since_count,
             "auto_anchor_threshold": AUTO_ANCHOR_THRESHOLD,
         }
+
+        # Honesty: when unanchored entries exceed the auto-anchor
+        # threshold, surface as PARTIAL — the read of state succeeded,
+        # but the audit trail is currently in a state that warrants
+        # action. The agent must speak that the threshold is exceeded
+        # rather than narrate "audit-anchor status nominal".
+        if entries_since_count >= AUTO_ANCHOR_THRESHOLD:
+            return ToolResult.partial(
+                confirmation=(
+                    f"audit anchor status: {total_anchors} anchor(s); "
+                    f"{entries_since_count} entries since last anchor"
+                ),
+                error=(
+                    f"{entries_since_count} unanchored entries exceeds "
+                    f"auto-anchor threshold ({AUTO_ANCHOR_THRESHOLD}); "
+                    "run !audit-anchor to anchor the backlog"
+                ),
+                data=data,
+            )
+        return ToolResult.ok(
+            confirmation=(
+                f"audit anchor status: {total_anchors} anchor(s), "
+                f"{entries_since_count} unanchored entries"
+            ),
+            data=data,
+        )
 
     # =========================================================================
     # Lifecycle hooks
@@ -300,7 +375,10 @@ class AuditAnchorFeature(Feature):
                     f"(threshold={AUTO_ANCHOR_THRESHOLD})"
                 )
                 result = await self.anchor_audit()
-                logger.info(f"Auto-anchor result: {result.get('status')}")
+                # anchor_audit returns ToolResult; the legacy
+                # {"status": ...} dict lives under .data.
+                status = (result.data or {}).get("status") if result.data else None
+                logger.info(f"Auto-anchor result: {status}")
         except Exception as e:
             logger.warning(f"Auto-anchor failed: {e}")
 
