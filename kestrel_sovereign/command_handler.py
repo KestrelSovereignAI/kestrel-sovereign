@@ -211,24 +211,55 @@ class CommandHandler:
           {"status": "error",   "error": str}
           {"status": "partial", "confirmation": str, "error": str, "data": ...}
 
-        OK → confirmation only.
+        OK → confirmation, plus a JSON block of ``data`` when the data
+        contains read-payload fields (a list or nested dict) — without
+        the trailing block, read-style commands like ``!recall``,
+        ``!recall list``, and ``!recall get`` would render only the
+        summary line and drop the actual results/content the user
+        asked for. Write-style commands keep their confirmation-only
+        rendering because their ``data`` is scalar bookkeeping.
         ERROR → ``❌ Error: <error>``.
-        PARTIAL → confirmation + a ``⚠ Caveat: <error>`` line so the
-        user sees BOTH the action that completed AND the half that
-        didn't, matching the #1042 honesty contract.
+        PARTIAL → confirmation + a ``⚠ Caveat: <error>`` line + the
+        same data block when applicable, so the user sees BOTH the
+        action that completed AND the half that didn't, matching the
+        #1042 honesty contract.
         """
+        import json
+
         status = envelope.get("status")
         confirmation = envelope.get("confirmation") or ""
         error = envelope.get("error") or ""
-        if status == "ok":
-            return confirmation or "(no confirmation)"
+        data = envelope.get("data")
+
         if status == "error":
             return f"❌ Error: {error}" if error else "❌ Error"
+
+        # Decide whether to append a data JSON block. Only do so when
+        # data carries a structural payload (a list or nested dict
+        # value) — for scalar-only data (success flags, ids, counts)
+        # the confirmation already says everything useful.
+        def _has_structural_payload(value) -> bool:
+            if not isinstance(value, dict):
+                return False
+            for v in value.values():
+                if isinstance(v, list) and v:
+                    return True
+                if isinstance(v, dict) and v:
+                    return True
+            return False
+
+        data_block = ""
+        if _has_structural_payload(data):
+            data_block = "\n" + json.dumps(data, indent=2, default=str)
+
+        if status == "ok":
+            return (confirmation or "(no confirmation)") + data_block
         if status == "partial":
             parts = [confirmation] if confirmation else []
             if error:
                 parts.append(f"⚠ Caveat: {error}")
-            return "\n".join(parts) if parts else "(partial result)"
+            rendered = "\n".join(parts) if parts else "(partial result)"
+            return rendered + data_block
         # Fallback for an unknown status (defensive)
         return str(envelope)
 

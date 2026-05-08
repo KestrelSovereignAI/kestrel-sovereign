@@ -15,9 +15,10 @@ import json
 import logging
 from typing import Any, Dict, List, Optional
 
+from kestrel_sdk.tools.base import ToolCategory
+from kestrel_sdk.tools.result import ToolResult
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.storage_access import resolve_feature_database
-from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sovereign.storage.saved_items_store import (
     SavedItemsStore, SavedItemType, SourceType
 )
@@ -59,6 +60,37 @@ class SaveFeature(Feature):
             self._saved_items_store = SavedItemsStore(self._db, self.agent_id)
         return self._saved_items_store
 
+    @staticmethod
+    def _parse_tags(raw: str) -> List[str]:
+        return [t.strip() for t in raw.split(",") if t.strip()] if raw else []
+
+    @staticmethod
+    def _saved_item_partial_or_ok(
+        *,
+        item: Any,
+        confirmation: str,
+        data: Dict[str, Any],
+    ) -> ToolResult:
+        """Surface no-embedding saves as PARTIAL.
+
+        Saving succeeded, but if the item has no embedding the user
+        will never find it via semantic !recall — only via exact-name
+        list/get. The agent must speak that limitation rather than
+        narrate an unconditional "saved" success.
+        """
+        if not getattr(item, "embedding", None):
+            return ToolResult.partial(
+                confirmation=confirmation,
+                error=(
+                    "saved without an embedding — semantic recall will not "
+                    "find this item; only !recall list / !recall get by id "
+                    "can retrieve it. Re-save once embeddings are available "
+                    "if semantic search is needed."
+                ),
+                data=data,
+            )
+        return ToolResult.ok(confirmation=confirmation, data=data)
+
     @tool(
         name="save_stash",
         description="Save a stash to long-term storage for later retrieval. The stash content gets an embedding so you can find it later with semantic search.",
@@ -71,7 +103,7 @@ class SaveFeature(Feature):
         name: str = "",
         summary: str = "",
         tags: str = ""
-    ) -> Dict[str, Any]:
+    ) -> ToolResult:
         """
         Persist a stash to long-term storage.
 
@@ -83,34 +115,33 @@ class SaveFeature(Feature):
         """
         store = self._get_store()
         if not store:
-            return {"success": False, "error": "Storage not available"}
+            return ToolResult.failed("Storage not available")
 
         if not self.context_manager:
-            return {"success": False, "error": "Context manager not available"}
+            return ToolResult.failed("Context manager not available")
 
         try:
-            # Get the conversation store to access stash
             conv_store = self.context_manager._get_conversation_store()
             if not conv_store:
-                return {"success": False, "error": "Conversation store not available"}
+                return ToolResult.failed("Conversation store not available")
 
-            # Get the stash
             if stash_id:
                 stashed = await conv_store.get_stashed_messages(stash_id=stash_id)
                 stash_name = stash_id
             else:
-                # Get most recent stash
                 stashes = await conv_store.list_stashes()
                 if not stashes:
-                    return {"success": False, "error": "No stashes found"}
+                    return ToolResult.failed("No stashes found")
                 stash_id = stashes[0]["stash_id"]
                 stash_name = stashes[0].get("name", stash_id)
                 stashed = await conv_store.get_stashed_messages(stash_id=stash_id)
 
             if not stashed:
-                return {"success": False, "error": f"Stash {stash_id} is empty or not found"}
+                return ToolResult.failed(
+                    f"Stash {stash_id} is empty or not found",
+                    data={"stash_id": stash_id},
+                )
 
-            # Build content from stashed messages
             messages_content = []
             for msg in stashed:
                 role = msg.get("role", "unknown")
@@ -124,22 +155,17 @@ class SaveFeature(Feature):
                 "messages": stashed
             })
 
-            # Build source reference
             source_ref = json.dumps({
                 "stash_id": stash_id,
                 "message_ids": [m.get("id") for m in stashed]
             })
 
-            # Parse tags
-            tag_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else []
+            tag_list = self._parse_tags(tags)
 
-            # Generate summary if not provided
             if not summary:
-                # Use first 500 chars of messages as summary
                 preview = "\n".join(messages_content)[:500]
                 summary = f"Stash '{stash_name}' with {len(stashed)} messages: {preview}..."
 
-            # Save the item
             item = await store.save_item(
                 item_type=SavedItemType.STASH.value,
                 name=name or stash_name,
@@ -151,17 +177,22 @@ class SaveFeature(Feature):
                 metadata={"original_stash_id": stash_id}
             )
 
-            return {
-                "success": True,
-                "saved_item_id": item.id,
-                "name": item.name,
-                "message_count": len(stashed),
-                "has_embedding": item.embedding is not None
-            }
-
         except Exception as e:
             logger.error(f"save_stash failed: {e}")
-            return {"success": False, "error": str(e)}
+            return ToolResult.failed(str(e))
+
+        data = {
+            "success": True,
+            "saved_item_id": item.id,
+            "name": item.name,
+            "message_count": len(stashed),
+            "has_embedding": item.embedding is not None,
+        }
+        return self._saved_item_partial_or_ok(
+            item=item,
+            confirmation=f"Saved stash '{item.name}' as item {item.id} ({len(stashed)} messages)",
+            data=data,
+        )
 
     @tool(
         name="save_excerpt",
@@ -175,7 +206,7 @@ class SaveFeature(Feature):
         name: str,
         summary: str = "",
         tags: str = ""
-    ) -> Dict[str, Any]:
+    ) -> ToolResult:
         """
         Save conversation excerpt to long-term storage.
 
@@ -187,41 +218,51 @@ class SaveFeature(Feature):
         """
         store = self._get_store()
         if not store:
-            return {"success": False, "error": "Storage not available"}
+            return ToolResult.failed("Storage not available")
 
         if not self.context_manager:
-            return {"success": False, "error": "Context manager not available"}
+            return ToolResult.failed("Context manager not available")
+
+        requested_n: Optional[int] = None
 
         try:
             conv_store = self.context_manager._get_conversation_store()
             if not conv_store:
-                return {"success": False, "error": "Conversation store not available"}
+                return ToolResult.failed("Conversation store not available")
 
-            # Get messages based on target
             if target.startswith("last_"):
                 try:
-                    n = int(target.split("_")[1])
+                    requested_n = int(target.split("_")[1])
                     all_messages = await conv_store.get_full_history_with_ids()
-                    messages = all_messages[-n:] if len(all_messages) >= n else all_messages
+                    messages = (
+                        all_messages[-requested_n:]
+                        if len(all_messages) >= requested_n
+                        else all_messages
+                    )
                 except ValueError:
-                    return {"success": False, "error": f"Invalid last_N format: {target}"}
+                    return ToolResult.failed(
+                        f"Invalid last_N format: {target}",
+                        data={"target": target},
+                    )
             elif target.startswith("ids:"):
                 try:
                     ids_str = target[4:]
                     message_ids = [int(x.strip()) for x in ids_str.split(",")]
                     messages = await conv_store.get_messages_by_ids(message_ids)
                 except ValueError:
-                    return {"success": False, "error": f"Invalid message IDs: {target}"}
+                    return ToolResult.failed(
+                        f"Invalid message IDs: {target}",
+                        data={"target": target},
+                    )
             else:
-                return {
-                    "success": False,
-                    "error": f"Invalid target: {target}. Use 'last_N' or 'ids:1,2,3'"
-                }
+                return ToolResult.failed(
+                    f"Invalid target: {target}. Use 'last_N' or 'ids:1,2,3'",
+                    data={"target": target},
+                )
 
             if not messages:
-                return {"success": False, "error": "No messages found"}
+                return ToolResult.failed("No messages found", data={"target": target})
 
-            # Build content
             content_json = json.dumps({
                 "message_count": len(messages),
                 "messages": messages
@@ -231,19 +272,16 @@ class SaveFeature(Feature):
                 "message_ids": [m.get("id") for m in messages]
             })
 
-            # Parse tags
-            tag_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else []
+            tag_list = self._parse_tags(tags)
 
-            # Generate summary if not provided
             if not summary:
                 messages_text = []
-                for msg in messages[:3]:  # First 3 messages
+                for msg in messages[:3]:
                     role = msg.get("role", "")
                     content = msg.get("content", "")[:200]
                     messages_text.append(f"{role}: {content}")
                 summary = f"{len(messages)} messages: " + " | ".join(messages_text)
 
-            # Save
             item = await store.save_item(
                 item_type=SavedItemType.EXCERPT.value,
                 name=name,
@@ -254,17 +292,43 @@ class SaveFeature(Feature):
                 tags=tag_list
             )
 
-            return {
-                "success": True,
-                "saved_item_id": item.id,
-                "name": item.name,
-                "message_count": len(messages),
-                "has_embedding": item.embedding is not None
-            }
-
         except Exception as e:
             logger.error(f"save_excerpt failed: {e}")
-            return {"success": False, "error": str(e)}
+            return ToolResult.failed(str(e))
+
+        data: Dict[str, Any] = {
+            "success": True,
+            "saved_item_id": item.id,
+            "name": item.name,
+            "message_count": len(messages),
+            "has_embedding": item.embedding is not None,
+        }
+
+        # Composite PARTIAL: shortfall on last_N AND/OR no embedding.
+        partial_errs: List[str] = []
+        if requested_n is not None and len(messages) < requested_n:
+            data["requested_count"] = requested_n
+            data["shortfall"] = requested_n - len(messages)
+            partial_errs.append(
+                f"requested last_{requested_n} but only {len(messages)} "
+                "messages were available; the saved excerpt is shorter "
+                "than requested"
+            )
+        if not item.embedding:
+            partial_errs.append(
+                "saved without an embedding — semantic recall will not "
+                "find this excerpt; only !recall list / !recall get by id "
+                "can retrieve it"
+            )
+
+        confirmation = f"Saved excerpt '{item.name}' as item {item.id} ({len(messages)} messages)"
+        if partial_errs:
+            return ToolResult.partial(
+                confirmation=confirmation,
+                error=" | ".join(partial_errs),
+                data=data,
+            )
+        return ToolResult.ok(confirmation=confirmation, data=data)
 
     @tool(
         name="save_item",
@@ -280,7 +344,7 @@ class SaveFeature(Feature):
         summary: str = "",
         tags: str = "",
         schema_id: str = ""
-    ) -> Dict[str, Any]:
+    ) -> ToolResult:
         """
         Save arbitrary content to long-term storage.
 
@@ -294,10 +358,10 @@ class SaveFeature(Feature):
         """
         store = self._get_store()
         if not store:
-            return {"success": False, "error": "Storage not available"}
+            return ToolResult.failed("Storage not available")
 
         try:
-            tag_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else []
+            tag_list = self._parse_tags(tags)
 
             item = await store.save_item(
                 item_type=item_type,
@@ -308,18 +372,22 @@ class SaveFeature(Feature):
                 schema_id=schema_id if schema_id else None,
                 tags=tag_list
             )
-
-            return {
-                "success": True,
-                "saved_item_id": item.id,
-                "name": item.name,
-                "item_type": item.item_type,
-                "has_embedding": item.embedding is not None
-            }
-
         except Exception as e:
             logger.error(f"save_item failed: {e}")
-            return {"success": False, "error": str(e)}
+            return ToolResult.failed(str(e))
+
+        data = {
+            "success": True,
+            "saved_item_id": item.id,
+            "name": item.name,
+            "item_type": item.item_type,
+            "has_embedding": item.embedding is not None,
+        }
+        return self._saved_item_partial_or_ok(
+            item=item,
+            confirmation=f"Saved item '{item.name}' (id={item.id}, type={item.item_type})",
+            data=data,
+        )
 
     @tool(
         name="recall",
@@ -332,7 +400,7 @@ class SaveFeature(Feature):
         query: str,
         item_type: str = "",
         limit: int = 5
-    ) -> Dict[str, Any]:
+    ) -> ToolResult:
         """
         Semantic search across saved items.
 
@@ -343,7 +411,7 @@ class SaveFeature(Feature):
         """
         store = self._get_store()
         if not store:
-            return {"success": False, "error": "Storage not available"}
+            return ToolResult.failed("Storage not available")
 
         try:
             results = await store.search(
@@ -351,31 +419,38 @@ class SaveFeature(Feature):
                 item_type=item_type if item_type else None,
                 limit=limit
             )
-
-            # Format results for display
-            formatted = []
-            for r in results:
-                item = r["item"]
-                formatted.append({
-                    "id": item["id"],
-                    "name": item["name"],
-                    "type": item["item_type"],
-                    "summary": item.get("summary", "")[:200],
-                    "score": round(r["score"], 3),
-                    "tags": item.get("tags", []),
-                    "created_at": item.get("created_at")
-                })
-
-            return {
-                "success": True,
-                "query": query,
-                "result_count": len(formatted),
-                "results": formatted
-            }
-
         except Exception as e:
             logger.error(f"recall failed: {e}")
-            return {"success": False, "error": str(e)}
+            return ToolResult.failed(str(e))
+
+        formatted = []
+        for r in results:
+            item = r["item"]
+            formatted.append({
+                "id": item["id"],
+                "name": item["name"],
+                "type": item["item_type"],
+                "summary": item.get("summary", "")[:200],
+                "score": round(r["score"], 3),
+                "tags": item.get("tags", []),
+                "created_at": item.get("created_at")
+            })
+
+        data = {
+            "success": True,
+            "query": query,
+            "result_count": len(formatted),
+            "results": formatted,
+        }
+        if not formatted:
+            return ToolResult.ok(
+                confirmation=f"No matches for query: {query!r}",
+                data=data,
+            )
+        return ToolResult.ok(
+            confirmation=f"Found {len(formatted)} match(es) for {query!r}",
+            data=data,
+        )
 
     @tool(
         name="recall_list",
@@ -387,7 +462,7 @@ class SaveFeature(Feature):
         self,
         item_type: str = "",
         limit: int = 20
-    ) -> Dict[str, Any]:
+    ) -> ToolResult:
         """
         List saved items.
 
@@ -397,34 +472,38 @@ class SaveFeature(Feature):
         """
         store = self._get_store()
         if not store:
-            return {"success": False, "error": "Storage not available"}
+            return ToolResult.failed("Storage not available")
 
         try:
             items = await store.list_items(
                 item_type=item_type if item_type else None,
                 limit=limit
             )
-
-            formatted = []
-            for item in items:
-                formatted.append({
-                    "id": item.id,
-                    "name": item.name,
-                    "type": item.item_type,
-                    "summary": item.summary[:100] if item.summary else "",
-                    "tags": item.tags,
-                    "created_at": item.created_at.isoformat() if item.created_at else None
-                })
-
-            return {
-                "success": True,
-                "count": len(formatted),
-                "items": formatted
-            }
-
         except Exception as e:
             logger.error(f"recall_list failed: {e}")
-            return {"success": False, "error": str(e)}
+            return ToolResult.failed(str(e))
+
+        formatted = []
+        for item in items:
+            formatted.append({
+                "id": item.id,
+                "name": item.name,
+                "type": item.item_type,
+                "summary": item.summary[:100] if item.summary else "",
+                "tags": item.tags,
+                "created_at": item.created_at.isoformat() if item.created_at else None
+            })
+
+        data = {
+            "success": True,
+            "count": len(formatted),
+            "items": formatted,
+        }
+        return ToolResult.ok(
+            confirmation=f"Listed {len(formatted)} saved item(s)"
+            + (f" (type={item_type})" if item_type else ""),
+            data=data,
+        )
 
     @tool(
         name="recall_get",
@@ -432,7 +511,7 @@ class SaveFeature(Feature):
         category=ToolCategory.MEMORY,
         command_prefix="!recall get"
     )
-    async def recall_get(self, item_id: str) -> Dict[str, Any]:
+    async def recall_get(self, item_id: str) -> ToolResult:
         """
         Get full content of a saved item.
 
@@ -441,21 +520,24 @@ class SaveFeature(Feature):
         """
         store = self._get_store()
         if not store:
-            return {"success": False, "error": "Storage not available"}
+            return ToolResult.failed("Storage not available")
 
         try:
             item = await store.get_by_id(item_id)
-            if not item:
-                return {"success": False, "error": f"Item not found: {item_id}"}
-
-            return {
-                "success": True,
-                "item": item.to_dict()
-            }
-
         except Exception as e:
             logger.error(f"recall_get failed: {e}")
-            return {"success": False, "error": str(e)}
+            return ToolResult.failed(str(e))
+
+        if not item:
+            return ToolResult.failed(
+                f"Item not found: {item_id}",
+                data={"item_id": item_id},
+            )
+
+        return ToolResult.ok(
+            confirmation=f"Retrieved item {item_id}",
+            data={"success": True, "item": item.to_dict()},
+        )
 
     @tool(
         name="recall_delete",
@@ -463,7 +545,7 @@ class SaveFeature(Feature):
         category=ToolCategory.MEMORY,
         command_prefix="!recall delete"
     )
-    async def recall_delete(self, item_id: str) -> Dict[str, Any]:
+    async def recall_delete(self, item_id: str) -> ToolResult:
         """
         Delete a saved item.
 
@@ -472,22 +554,21 @@ class SaveFeature(Feature):
         """
         store = self._get_store()
         if not store:
-            return {"success": False, "error": "Storage not available"}
+            return ToolResult.failed("Storage not available")
 
         try:
-            # Check if exists first
             item = await store.get_by_id(item_id)
             if not item:
-                return {"success": False, "error": f"Item not found: {item_id}"}
-
+                return ToolResult.failed(
+                    f"Item not found: {item_id}",
+                    data={"item_id": item_id},
+                )
             await store.delete_item(item_id)
-
-            return {
-                "success": True,
-                "deleted_id": item_id,
-                "deleted_name": item.name
-            }
-
         except Exception as e:
             logger.error(f"recall_delete failed: {e}")
-            return {"success": False, "error": str(e)}
+            return ToolResult.failed(str(e))
+
+        return ToolResult.ok(
+            confirmation=f"Deleted item {item_id} ({item.name!r})",
+            data={"success": True, "deleted_id": item_id, "deleted_name": item.name},
+        )
