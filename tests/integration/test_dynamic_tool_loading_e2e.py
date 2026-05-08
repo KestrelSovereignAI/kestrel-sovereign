@@ -135,11 +135,16 @@ class TestExploreThenDirectFlow:
         tool = agent._direct_tools["list_models"]
         result = await tool.execute(use_cache=False)
 
-        # DynamicTool.execute wraps in {"success": ..., "result": ..., "tool": ...}
+        # DynamicTool.execute wraps in {"success": ..., "result": ..., "tool": ...}.
+        # Post-#1061 wave 10, list_models returns a ToolResult, so DynamicTool
+        # serializes its envelope to a dict under result["result"] with
+        # {"status": "ok", "confirmation": ..., "data": {"models": [...], "count": N}}.
         assert result["success"] is True, f"Direct tool execution failed: {result}"
         assert result["tool"] == "list_models"
-        # result["result"] is the actual return from list_models() — a list of ModelInfo
-        assert isinstance(result["result"], list), f"Expected list of models, got {type(result['result'])}"
+        envelope = result["result"]
+        assert isinstance(envelope, dict)
+        assert envelope.get("status") == "ok"
+        assert isinstance(envelope.get("data", {}).get("models"), list)
 
     @pytest.mark.asyncio
     async def test_build_all_tools_grows_after_exploration(self, agent):

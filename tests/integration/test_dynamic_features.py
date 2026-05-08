@@ -137,5 +137,11 @@ async def test_model_feature_execution(kestrel_agent):
     assert tool is not None
     result = await tool.execute()
 
+    # DynamicTool wraps ToolResult envelopes (#1061 wave 10) — list_models
+    # now returns ToolResult.ok with data["models"] as a list. The wrapper
+    # serializes the envelope to a dict under result["result"].
     assert result["success"] is True
-    assert isinstance(result["result"], list)  # discover_all_models returns a list
+    envelope = result["result"]
+    assert isinstance(envelope, dict)
+    assert envelope.get("status") == "ok"
+    assert isinstance(envelope.get("data", {}).get("models"), list)

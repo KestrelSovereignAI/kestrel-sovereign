@@ -27,7 +27,20 @@ class ModelPreferenceMixin:
         Returns:
             List of model dictionaries with id, provider, name, description
         """
-        return await self.model_agent.list_models(use_cache=use_cache)
+        # ModelAgent.list_models() now returns a ToolResult envelope
+        # (#1061 wave 10); the legacy list[dict] payload lives under
+        # .data["models"]. Unwrap so existing public callers see the
+        # documented shape. On ERROR raise — the legacy method raised
+        # on provider/cache failures, and silently returning [] would
+        # mask "discovery failed" as "no models available".
+        from kestrel_sdk.tools.result import ToolResultStatus
+
+        envelope = await self.model_agent.list_models(use_cache=use_cache)
+        if envelope.status is ToolResultStatus.ERROR:
+            raise RuntimeError(envelope.error or "list_models failed")
+        if envelope.data is None:
+            return []
+        return envelope.data.get("models", [])
 
     def set_model(self, model_id: str) -> str:
         """

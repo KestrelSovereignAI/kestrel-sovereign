@@ -115,7 +115,10 @@ def test_current_model_paths_agree_for_model_only_preference():
         _restore_app(app, original)
 
     assert response.status_code == 200
-    assert feature_result["current_model"] == "gpt-5-mini"
+    # ModelAgent.get_current_model() now returns a ToolResult envelope
+    # (#1061 wave 10); the legacy {"current_model": ...} dict lives
+    # under .data.
+    assert feature_result.data["current_model"] == "gpt-5-mini"
     assert mixin_result == "gpt-5-mini"
     assert response.json() == {
         "model": "gpt-5-mini",

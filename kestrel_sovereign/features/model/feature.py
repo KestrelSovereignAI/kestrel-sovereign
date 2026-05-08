@@ -1,9 +1,11 @@
 import logging
-from typing import List, Dict, Any, Optional
-from kestrel_sovereign.llm.service import LLMService
-from kestrel_sovereign.llm.model_metadata import ModelInfo
-from kestrel_sovereign.features.base import Feature, tool
+from typing import Any, Dict, List, Optional
+
 from kestrel_sdk.tools.base import ToolCategory
+from kestrel_sdk.tools.result import ToolResult
+from kestrel_sovereign.features.base import Feature, tool
+from kestrel_sovereign.llm.model_metadata import ModelInfo
+from kestrel_sovereign.llm.service import LLMService
 
 logger = logging.getLogger(__name__)
 
@@ -38,29 +40,31 @@ class ModelAgent(Feature):
         category=ToolCategory.MODEL_MANAGEMENT,
         command_prefix="!model-list"
     )
-    async def list_models(self, use_cache: bool = True) -> List[ModelInfo]:
-        """
-        List all available models from all providers.
+    async def list_models(self, use_cache: bool = True) -> ToolResult:
+        """List all available models from all providers.
 
         Returns compact summaries to avoid context blowout (765+ models).
         """
         try:
             models = await self.llm_service.discover_all_models(use_cache=use_cache)
-            # Return compact list: only featured/non-hidden models with essential fields
-            compact = []
-            for m in models:
-                if m.is_hidden:
-                    continue
-                compact.append({
-                    "id": m.id,
-                    "provider": m.provider,
-                    "category": m.category.value if hasattr(m.category, 'value') else str(m.category),
-                    "featured": m.is_featured,
-                })
-            return compact
         except Exception as e:
             logger.error(f"Error listing models: {e}")
-            raise
+            return ToolResult.failed(str(e))
+
+        compact: List[Dict[str, Any]] = []
+        for m in models:
+            if m.is_hidden:
+                continue
+            compact.append({
+                "id": m.id,
+                "provider": m.provider,
+                "category": m.category.value if hasattr(m.category, 'value') else str(m.category),
+                "featured": m.is_featured,
+            })
+        return ToolResult.ok(
+            confirmation=f"Listed {len(compact)} model(s)",
+            data={"models": compact, "count": len(compact)},
+        )
 
     @tool(
         name="pull_model",
@@ -68,53 +72,87 @@ class ModelAgent(Feature):
         category=ToolCategory.MODEL_MANAGEMENT,
         command_prefix="!model-pull"
     )
-    async def pull_model(self, model_name: str, progress_callback=None) -> bool:
-        """
-        Pull (download) a model (primarily for Ollama).
-        """
+    async def pull_model(self, model_name: str, progress_callback=None) -> ToolResult:
+        """Pull (download) a model (primarily for Ollama)."""
         try:
-            return await self.llm_service.pull_model(
+            ok = await self.llm_service.pull_model(
                 model_name=model_name,
                 auto_confirm=True,
                 progress_callback=progress_callback
             )
         except Exception as e:
             logger.error(f"Error pulling model {model_name}: {e}")
-            raise
+            return ToolResult.failed(str(e))
+
+        if not ok:
+            return ToolResult.failed(
+                f"Pull of {model_name!r} did not complete; the underlying "
+                "service returned a falsy status. Check the provider logs.",
+                data={"model_name": model_name, "pulled": False},
+            )
+        return ToolResult.ok(
+            confirmation=f"Pulled model {model_name!r}",
+            data={"model_name": model_name, "pulled": True},
+        )
 
     @tool(
         name="get_model_storage_info",
         description="Get storage usage information for local models.",
         category=ToolCategory.MODEL_MANAGEMENT
     )
-    async def get_storage_info(self, use_cache: bool = False) -> Dict[str, Any]:
-        """
-        Get storage information (primarily for Ollama).
-        """
+    async def get_storage_info(self, use_cache: bool = False) -> ToolResult:
+        """Get storage information (primarily for Ollama)."""
         try:
-            return await self.llm_service.get_storage_info(use_cache=use_cache)
+            info = await self.llm_service.get_storage_info(use_cache=use_cache)
         except Exception as e:
             logger.error(f"Error getting storage info: {e}")
-            raise
+            return ToolResult.failed(str(e))
+
+        return ToolResult.ok(
+            confirmation="Retrieved model storage info",
+            data=info if isinstance(info, dict) else {"raw": info},
+        )
 
     @tool(
         name="cleanup_models",
         description="Clean up unused models to free space.",
         category=ToolCategory.MODEL_MANAGEMENT
     )
-    async def cleanup_models(self, threshold_days: int = 30, dry_run: bool = False) -> Dict[str, Any]:
-        """
-        Clean up unused models.
-        """
+    async def cleanup_models(self, threshold_days: int = 30, dry_run: bool = False) -> ToolResult:
+        """Clean up unused models."""
         try:
-            return await self.llm_service.cleanup_unused_models(
+            result = await self.llm_service.cleanup_unused_models(
                 threshold_days=threshold_days,
                 min_free_space_pct=10,
                 dry_run=dry_run
             )
         except Exception as e:
             logger.error(f"Error cleaning up models: {e}")
-            raise
+            return ToolResult.failed(str(e))
+
+        data = result if isinstance(result, dict) else {"raw": result}
+
+        # Honesty: dry-run is an explicit "did not actually delete"
+        # mode. The agent must speak that nothing was actually freed —
+        # otherwise an LLM that calls cleanup_models(dry_run=True) and
+        # narrates "freed 12GB" would be lying. Surface as PARTIAL with
+        # the dry-run caveat so the model cannot omit it.
+        if dry_run:
+            return ToolResult.partial(
+                confirmation="Cleanup planned (dry-run)",
+                error=(
+                    "dry_run=True; no models were actually deleted and no "
+                    "space was freed. Re-run with dry_run=False to apply."
+                ),
+                data=data,
+            )
+
+        return ToolResult.ok(
+            confirmation=(
+                f"Cleanup complete (threshold={threshold_days} days)"
+            ),
+            data=data,
+        )
 
     @tool(
         name="get_model_info",
@@ -122,34 +160,43 @@ class ModelAgent(Feature):
         category=ToolCategory.MODEL_MANAGEMENT,
         command_prefix="!model-info"
     )
-    async def get_model_info(self, model_name: str) -> Dict[str, Any]:
-        """
-        Get detailed information about a specific model.
-        """
+    async def get_model_info(self, model_name: str) -> ToolResult:
+        """Get detailed information about a specific model."""
         try:
-            # Get all models
             models = await self.llm_service.discover_all_models(use_cache=True)
-
-            # Find the requested model (ModelInfo objects have .id attribute)
-            model = next((m for m in models if m.id == model_name), None)
-
-            if not model:
-                raise ValueError(f"Model not found: {model_name}")
-
-            # Convert to dict for response
-            result = model.to_dict()
-
-            # Get usage info if available
-            storage = await self.llm_service.get_storage_info(use_cache=True)
-            model_info = next((m for m in storage.get('models', []) if m.get('id') == model_name), None)
-
-            if model_info:
-                result['last_used'] = model_info.get('last_used', 'never')
-
-            return result
         except Exception as e:
             logger.error(f"Error getting model info for {model_name}: {e}")
-            raise
+            return ToolResult.failed(str(e))
+
+        model = next((m for m in models if m.id == model_name), None)
+        if not model:
+            return ToolResult.failed(
+                f"Model not found: {model_name}",
+                data={"model_name": model_name},
+            )
+
+        result = model.to_dict()
+
+        try:
+            storage = await self.llm_service.get_storage_info(use_cache=True)
+            model_info = next(
+                (m for m in storage.get('models', []) if m.get('id') == model_name),
+                None,
+            )
+            if model_info:
+                result['last_used'] = model_info.get('last_used', 'never')
+        except Exception as e:
+            # Storage lookup is enrichment, not load-bearing — log but
+            # don't fail the entire info call.
+            logger.debug(f"storage info enrichment skipped for {model_name}: {e}")
+
+        # Wrap under a "model" key so the structural-payload heuristic
+        # in command_handler renders the details. A flat scalar dict
+        # would hide the model details from `!model-info` users.
+        return ToolResult.ok(
+            confirmation=f"Model {model_name!r} info retrieved",
+            data={"model": result},
+        )
 
     @tool(
         name="get_current_model",
@@ -157,7 +204,7 @@ class ModelAgent(Feature):
         category=ToolCategory.MODEL_MANAGEMENT,
         command_prefix="!model"
     )
-    async def get_current_model(self) -> Dict[str, Any]:
+    async def get_current_model(self) -> ToolResult:
         """Report the currently active ``{vendor, model, route}``.
 
         Pure read — never mutates mandate state. The tool used to accept an
@@ -169,22 +216,26 @@ class ModelAgent(Feature):
         Setting is now only reachable via the separate ``set_model`` tool.
         """
         from kestrel_sovereign.llm.service import resolve_active_model_selection
+
         selection = resolve_active_model_selection(self.llm_service)
         model_str = selection["model"]
         vendor = selection.get("vendor")
         route = selection.get("route")
         model_name = selection.get("model_name")
-        return {
-            "current_model": model_str,
-            "vendor": vendor,
-            "route": route,
-            "model_name": model_name,
-            "message": (
-                f"Current model: {model_str}\n\n"
-                "Use `!model-set <vendor[:route]> <model>` to change. "
-                "Use `!model-list` to list available models."
-            ),
-        }
+        return ToolResult.ok(
+            confirmation=f"Current model: {model_str}",
+            data={
+                "current_model": model_str,
+                "vendor": vendor,
+                "route": route,
+                "model_name": model_name,
+                "message": (
+                    f"Current model: {model_str}\n\n"
+                    "Use `!model-set <vendor[:route]> <model>` to change. "
+                    "Use `!model-list` to list available models."
+                ),
+            },
+        )
 
     @tool(
         name="set_model",
@@ -192,7 +243,7 @@ class ModelAgent(Feature):
         category=ToolCategory.MODEL_MANAGEMENT,
         command_prefix="!model-set"
     )
-    async def set_model(self, vendor_or_model: str, model: Optional[str] = None) -> Dict[str, Any]:
+    async def set_model(self, vendor_or_model: str, model: Optional[str] = None) -> ToolResult:
         """
         Set the active ``{vendor, model, route?}`` with UI sync support.
 
@@ -205,9 +256,6 @@ class ModelAgent(Feature):
                 (``"anthropic:plan"``), or model ID if single arg.
             model: Model ID. If omitted, first arg is parsed as ``vendor/model``
                 or ``vendor:route/model`` or a bare model.
-
-        Returns:
-            Dict with success status and MODEL_CHANGED marker for UI sync.
         """
         import json
 
@@ -215,7 +263,6 @@ class ModelAgent(Feature):
         vendor: Optional[str] = None
         route: Optional[str] = None
         if model is not None:
-            # Two-arg: first is vendor or "vendor:route".
             left = vendor_or_model
             if ":" in left:
                 vendor, route = left.split(":", 1)
@@ -223,7 +270,6 @@ class ModelAgent(Feature):
                 vendor = left
             model_name = model
         else:
-            # One-arg.
             model_id = vendor_or_model
             is_openrouter_model = await self._is_openrouter_model(model_id)
             if is_openrouter_model:
@@ -239,15 +285,11 @@ class ModelAgent(Feature):
                 model_name = model_id
 
         try:
-            # Context safety check: use the same pruning logic the actual LLM
-            # call path uses. If format_conversation_history can fit the history
-            # into the new model's history budget (after per-message cap and
-            # pruning), the switch is safe.
+            # Context safety check — same pruning logic the actual LLM
+            # call path uses.
             if hasattr(self, 'agent') and self.agent and hasattr(self.agent, 'storage'):
                 history = await self.agent.storage.get_conversation_history(limit=50)
 
-                # Use the agent's context_builder if available; otherwise
-                # construct a temporary one — it just needs the token counter.
                 ctx_builder = getattr(self.agent, 'context_builder', None)
                 if ctx_builder is None:
                     from kestrel_sovereign.agent.context_builder import ContextBuilder
@@ -256,27 +298,39 @@ class ModelAgent(Feature):
                 est = ctx_builder.estimate_effective_history_tokens(history, model_name)
 
                 # The switch fails only if, after pruning, the effective history
-                # exceeds the history budget by more than 5% slack (absorbs
-                # truncation marker overhead and per-message rounding).
+                # exceeds the history budget by more than 5% slack.
                 overflow_tolerance = max(int(est['history_budget'] * 0.05), 256)
                 if est['effective_tokens'] > est['history_budget'] + overflow_tolerance:
                     overflow = est['effective_tokens'] - est['history_budget']
                     utilization = (est['effective_tokens'] / est['history_budget'] * 100)
-                    return {
-                        "success": False,
-                        "error": "context_overflow",
-                        "message": (
-                            f"⚠️ Cannot switch to {model_name}: context too small even after pruning.\n\n"
-                            f"Effective history after pruning: {est['effective_tokens']:,} tokens\n"
-                            f"History budget on new model: {est['history_budget']:,} tokens\n"
-                            f"Raw history (for reference): {est['raw_tokens']:,} tokens\n"
-                            f"Overflow: {overflow:,} tokens ({utilization:.1f}%)\n\n"
-                            f"The new model's context window ({est['context_limit']:,}) is too small for this conversation.\n"
-                            f"Try a model with a larger context, or run `!compress` to reduce history."
-                        )
-                    }
+                    overflow_message = (
+                        f"context_overflow: cannot switch to {model_name}: "
+                        f"context too small even after pruning. "
+                        f"Effective history {est['effective_tokens']:,} tok > "
+                        f"budget {est['history_budget']:,} tok "
+                        f"(overflow {overflow:,} tok, {utilization:.1f}%). "
+                        f"The new model's context window ({est['context_limit']:,}) "
+                        "is too small for this conversation. Try a model with a "
+                        "larger context, or run `!compress` to reduce history."
+                    )
+                    return ToolResult.failed(
+                        overflow_message,
+                        data={
+                            "success": False,
+                            "error": "context_overflow",
+                            "model_name": model_name,
+                            "vendor": vendor,
+                            "route": route,
+                            "effective_tokens": est['effective_tokens'],
+                            "history_budget": est['history_budget'],
+                            "raw_tokens": est['raw_tokens'],
+                            "overflow_tokens": overflow,
+                            "context_limit": est['context_limit'],
+                        },
+                    )
 
             # Record agent consent before applying the change
+            consent_failed = False
             consent = self.agent.features.get("ConsentFeature") if hasattr(self.agent, 'features') else None
             if consent:
                 try:
@@ -286,8 +340,9 @@ class ModelAgent(Feature):
                         "model_change",
                         {"from": current_model, "to": model_name, "vendor": vendor, "route": route},
                     )
-                except Exception:
-                    pass  # Never block on consent failure
+                except Exception as e:
+                    consent_failed = True
+                    logger.warning(f"consent recording failed (non-blocking): {e}")
 
             # Safe to switch
             self.llm_service.set_model_preference(model_name, vendor, route)
@@ -298,28 +353,33 @@ class ModelAgent(Feature):
             else:
                 full_model = model_name
 
-            # Return with MODEL_CHANGED marker for UI sync
             sync_data = json.dumps({
                 "model": full_model,
                 "vendor": vendor,
                 "route": route,
                 "model_name": model_name,
             })
-            return {
+            message = f"✓ Model set to: {full_model}\n\nMODEL_CHANGED:{sync_data}"
+            data = {
                 "success": True,
                 "model": full_model,
                 "vendor": vendor,
                 "route": route,
                 "model_name": model_name,
-                "message": f"✓ Model set to: {full_model}\n\nMODEL_CHANGED:{sync_data}"
+                "message": message,
             }
+            # MODEL_CHANGED marker MUST appear in the rendered text so
+            # the WebUI's sync parser can pick it up. The envelope
+            # formatter renders ``confirmation`` verbatim and drops
+            # scalar-only ``data`` (per PR #1093 read-payload heuristic),
+            # so the marker has to live in the confirmation itself.
+            return ToolResult.ok(confirmation=message, data=data)
         except Exception as e:
             logger.error(f"Error setting model to {model}: {e}")
-            return {
-                "success": False,
-                "error": str(e),
-                "message": f"❌ Error setting model: {e}"
-            }
+            return ToolResult.failed(
+                str(e),
+                data={"success": False, "message": f"❌ Error setting model: {e}"},
+            )
 
     async def _is_openrouter_model(self, model_id: str) -> bool:
         """

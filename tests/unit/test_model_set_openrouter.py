@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import pytest
 from unittest.mock import MagicMock
 
+from kestrel_sdk.tools.result import ToolResultStatus
 from kestrel_sovereign.features.model.feature import ModelAgent
 from kestrel_sovereign.llm.model_cache import get_shared_model_cache
 from kestrel_sovereign.llm.model_metadata import ModelInfo
@@ -52,16 +53,16 @@ class TestModelSetOpenRouter:
 
         result = await feature.set_model("google/gemini-3-pro-preview")
 
-        assert result["success"] is True
-        assert result["vendor"] == "openrouter"
-        assert result["model_name"] == "google/gemini-3-pro-preview"
-        assert result["model"] == "openrouter/google/gemini-3-pro-preview"
+        assert result.status is ToolResultStatus.OK
+        assert result.data["vendor"] == "openrouter"
+        assert result.data["model_name"] == "google/gemini-3-pro-preview"
+        assert result.data["model"] == "openrouter/google/gemini-3-pro-preview"
         llm_service.set_model_preference.assert_called_once_with(
             "google/gemini-3-pro-preview",
             "openrouter",
             None,
         )
-        assert self._model_changed_payload(result["message"]) == {
+        assert self._model_changed_payload(result.data["message"]) == {
             "model": "openrouter/google/gemini-3-pro-preview",
             "vendor": "openrouter",
             "route": None,
@@ -75,9 +76,9 @@ class TestModelSetOpenRouter:
 
         result = await feature.set_model("meta-llama/llama-3.3-70b-instruct")
 
-        assert result["success"] is True
-        assert result["vendor"] == "openrouter"
-        assert result["model_name"] == "meta-llama/llama-3.3-70b-instruct"
+        assert result.status is ToolResultStatus.OK
+        assert result.data["vendor"] == "openrouter"
+        assert result.data["model_name"] == "meta-llama/llama-3.3-70b-instruct"
         llm_service.set_model_preference.assert_called_once_with(
             "meta-llama/llama-3.3-70b-instruct",
             "openrouter",
@@ -91,10 +92,10 @@ class TestModelSetOpenRouter:
 
         result = await feature.set_model("openai/gpt-5")
 
-        assert result["success"] is True
-        assert result["vendor"] == "openai"
-        assert result["model_name"] == "gpt-5"
-        assert result["model"] == "openai/gpt-5"
+        assert result.status is ToolResultStatus.OK
+        assert result.data["vendor"] == "openai"
+        assert result.data["model_name"] == "gpt-5"
+        assert result.data["model"] == "openai/gpt-5"
         llm_service.set_model_preference.assert_called_once_with("gpt-5", "openai", None)
 
     @pytest.mark.asyncio
@@ -104,8 +105,8 @@ class TestModelSetOpenRouter:
 
         result = await feature.set_model("gpt-5")
 
-        assert result["success"] is True
-        assert result["vendor"] is None
-        assert result["model_name"] == "gpt-5"
-        assert result["model"] == "gpt-5"
+        assert result.status is ToolResultStatus.OK
+        assert result.data["vendor"] is None
+        assert result.data["model_name"] == "gpt-5"
+        assert result.data["model"] == "gpt-5"
         llm_service.set_model_preference.assert_called_once_with("gpt-5", None, None)
