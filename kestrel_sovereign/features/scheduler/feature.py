@@ -451,23 +451,56 @@ class SchedulerFeature(Feature):
             logger.error("Failed to list scheduled tasks: %s", e)
             return ToolResult.failed(str(e))
 
+        # Honesty: parse args_json defensively. If a row has malformed
+        # JSON (legacy or hand-edited DB), record it as a load_error
+        # rather than letting the exception abort the entire list and
+        # tank direct in-process callers (e.g. default-schedule setup).
         tasks = []
+        load_errors = []
         for row in rows:
+            args: Dict[str, Any] = {}
+            raw_args = row[3]
+            if raw_args:
+                try:
+                    parsed = json.loads(raw_args)
+                    args = parsed if isinstance(parsed, dict) else {}
+                    if not isinstance(parsed, dict):
+                        load_errors.append({
+                            "task_id": row[0],
+                            "error": "args_json is not a JSON object",
+                        })
+                except json.JSONDecodeError as e:
+                    load_errors.append({
+                        "task_id": row[0],
+                        "error": f"args_json malformed: {e}",
+                    })
             tasks.append({
                 "id": row[0],
                 "task_name": row[1],
                 "cron_expression": row[2],
-                "args": json.loads(row[3]) if row[3] else {},
+                "args": args,
                 "enabled": bool(row[4]),
                 "last_run_at": row[5],
                 "next_run_at": row[6],
                 "created_at": row[7],
             })
 
-        return ToolResult.ok(
-            confirmation=f"Listed {len(tasks)} scheduled task(s)",
-            data={"tasks": tasks, "count": len(tasks)},
-        )
+        data: Dict[str, Any] = {"tasks": tasks, "count": len(tasks)}
+        confirmation = f"Listed {len(tasks)} scheduled task(s)"
+
+        if load_errors:
+            data["load_errors"] = load_errors
+            return ToolResult.partial(
+                confirmation=confirmation,
+                error=(
+                    f"{len(load_errors)} task(s) had unparseable args_json "
+                    "and were listed with empty args; check the DB rows for "
+                    "ids in load_errors"
+                ),
+                data=data,
+            )
+
+        return ToolResult.ok(confirmation=confirmation, data=data)
 
     @tool(
         "schedule_add",

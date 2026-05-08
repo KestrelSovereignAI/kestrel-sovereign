@@ -138,6 +138,30 @@ class TestScheduleList:
         assert result.status is ToolResultStatus.ERROR
         assert "not available" in result.error.lower()
 
+    @pytest.mark.asyncio
+    async def test_list_handles_malformed_args_json_as_partial(self, feature):
+        """Regression: a single row with malformed args_json must not
+        abort the whole list. The migrated code surfaces the bad rows
+        as load_errors with a PARTIAL caveat (codex round 2 P2)."""
+        feature._db.fetchall = AsyncMock(return_value=[
+            ("id-1", "wellness_check", "@daily", "{}", 1, None, None, "2026-03-05T00:00:00"),
+            ("id-2", "broken", "@hourly", "not-json", 1, None, None, "2026-03-05T00:00:00"),
+            ("id-3", "list-args", "@daily", "[1,2,3]", 1, None, None, "2026-03-05T00:00:00"),
+        ])
+        result = await feature.schedule_list()
+
+        assert result.status is ToolResultStatus.PARTIAL
+        # All 3 tasks still listed (no row dropped).
+        assert result.data["count"] == 3
+        # The good one keeps its args; the bad ones get empty {}.
+        names_to_args = {t["task_name"]: t["args"] for t in result.data["tasks"]}
+        assert names_to_args["wellness_check"] == {}
+        assert names_to_args["broken"] == {}
+        assert names_to_args["list-args"] == {}
+        # load_errors carries both bad rows.
+        bad_ids = {e["task_id"] for e in result.data["load_errors"]}
+        assert bad_ids == {"id-2", "id-3"}
+
 
 # =========================================================================
 # schedule_add
