@@ -84,7 +84,7 @@ Your agent is now running. Two ports to know about, depending on which start for
 | `kestrel start` (no name) | `http://localhost:8888` (the multi-agent **host**) | Default in-process multi-agent mode; the host fronts every registered agent at `multi_agent.host.port` (default `8888`). |
 | `kestrel start <name>` | `http://localhost:8801` (the **agent**) | A single agent on its own port — the next free slot at or above `8801` (assigned by `kestrel create` and recorded in `multi_agent.toml` under that agent's entry). The CLI prints the chosen port + PID. |
 
-> **Port conflict?** Edit the agent's entry in `multi_agent.toml` to change its port, or pass `--port 8899` to `kestrel start`. Edit `multi_agent.toml`'s `[host]` section to change the host port (default `8888`).
+> **Port conflict?** Edit the agent's entry in `multi_agent.toml` to change its port, or recreate the agent with a chosen port (`kestrel create MyAgent --port 8899`). Edit `multi_agent.toml`'s `[host]` section to change the host port (default `8888`). `kestrel start` itself doesn't take a `--port` flag — runtime ports are read from `multi_agent.toml`.
 
 > **Test it:** Visit the printed URL in your browser (e.g. `http://localhost:8888` for the host, or `http://localhost:8801` for a single-agent start) to open the built-in **Sovereign Console**. Append `/health` to either for a JSON readiness probe.
 
