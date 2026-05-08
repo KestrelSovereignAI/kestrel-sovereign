@@ -13,6 +13,8 @@ import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+from kestrel_sdk.tools.result import ToolResultStatus
+
 # Mark all tests as integration tests
 pytestmark = pytest.mark.integration
 
@@ -369,9 +371,9 @@ class TestKeyManagementFeature:
                 quota_limit=1000,
             )
 
-            assert result["success"] is True
-            assert result["provider"] == "openai"
-            assert result["quota_limit"] == 1000
+            assert result.status is ToolResultStatus.OK
+            assert result.data["provider"] == "openai"
+            assert result.data["quota_limit"] == 1000
 
     @pytest.mark.asyncio
     async def test_list_service_keys_tool(self, mock_agent, data_key):
@@ -388,9 +390,9 @@ class TestKeyManagementFeature:
 
             result = await feature.list_service_keys()
 
-            assert result["success"] is True
-            assert result["total"] == 2
-            assert len(result["keys"]) == 2
+            assert result.status is ToolResultStatus.OK
+            assert result.data["total"] == 2
+            assert len(result.data["keys"]) == 2
 
     @pytest.mark.asyncio
     async def test_list_providers_tool(self, mock_agent, data_key):
@@ -403,9 +405,9 @@ class TestKeyManagementFeature:
 
             result = await feature.list_providers()
 
-            assert result["success"] is True
-            assert result["total"] >= 6  # openrouter, lighthouse, openai, anthropic, github, runpod, vastai
-            provider_ids = [p["id"] for p in result["providers"]]
+            assert result.status is ToolResultStatus.OK
+            assert result.data["total"] >= 6  # openrouter, lighthouse, openai, anthropic, github, runpod, vastai
+            provider_ids = [p["id"] for p in result.data["providers"]]
             assert "openrouter" in provider_ids
             assert "openai" in provider_ids
 
@@ -422,8 +424,8 @@ class TestKeyManagementFeature:
             await feature.add_service_key(provider="github", api_key="ghp-test")
             result = await feature.remove_service_key(provider="github")
 
-            assert result["success"] is True
-            assert "deactivated" in result["message"].lower()
+            assert result.status is ToolResultStatus.OK
+            assert "deactivated" in result.confirmation.lower()
 
     @pytest.mark.asyncio
     async def test_get_key_internal_api(self, mock_agent, data_key):
@@ -503,8 +505,8 @@ class TestMasterKeyNotConfigured:
 
             result = await feature.list_service_keys()
 
-            assert result["success"] is False
-            assert "not available" in result["error"]
+            assert result.status is ToolResultStatus.ERROR
+            assert "not available" in result.error
 
 
 if __name__ == "__main__":
