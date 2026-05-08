@@ -21,6 +21,7 @@ from typing import Any, Dict, List, Optional
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.storage_access import resolve_feature_database
 from kestrel_sdk.tools.base import ToolCategory
+from kestrel_sdk.tools.result import ToolResult
 
 from .protocol import BridgeSession, ChannelType
 
@@ -136,16 +137,22 @@ class BridgeFeature(Feature):
         category=ToolCategory.SYSTEM,
         command_prefix="!bridge status",
     )
-    async def bridge_status(self) -> Dict[str, Any]:
+    async def bridge_status(self) -> ToolResult:
         """Show bridge configuration and current status.
 
         Returns:
-            Dict with uptime, session count, invocation count, and config
+            ToolResult.ok with uptime + session counts + invocation
+            counts + config in ``data``. Returns PARTIAL when one or
+            more counter queries failed against an available DB — the
+            payload still has shape, but the count fields default to 0
+            and the LLM should say so rather than report "0 sessions"
+            as if the bridge were idle.
         """
         uptime_seconds = time.monotonic() - self._start_time
 
         # Count active sessions from DB if available
         db_session_count = 0
+        query_failures: list[str] = []
         if self._db:
             try:
                 row = await self._db.fetchone(
@@ -153,8 +160,9 @@ class BridgeFeature(Feature):
                     (self._agent_id,),
                 )
                 db_session_count = row[0] if row else 0
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning(f"BridgeFeature: bridge_sessions count failed: {exc}")
+                query_failures.append(f"bridge_sessions count failed: {exc}")
 
         # Count recent log entries
         recent_invocations = 0
@@ -168,10 +176,11 @@ class BridgeFeature(Feature):
                     (self._agent_id,),
                 )
                 recent_invocations = row[0] if row else 0
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning(f"BridgeFeature: bridge_log count failed: {exc}")
+                query_failures.append(f"bridge_log count failed: {exc}")
 
-        return {
+        data = {
             "status": "active",
             "agent_id": self._agent_id,
             "uptime_seconds": round(uptime_seconds, 1),
@@ -183,6 +192,22 @@ class BridgeFeature(Feature):
             "max_active_sessions": MAX_ACTIVE_SESSIONS,
             "session_idle_timeout_seconds": SESSION_IDLE_TIMEOUT_SECONDS,
         }
+        confirmation = (
+            f"Bridge active for agent {self._agent_id}: "
+            f"uptime={data['uptime_seconds']}s, "
+            f"active_sessions={data['active_sessions_memory']}, "
+            f"db_sessions={data['total_sessions_db']}, "
+            f"invocations_1h={data['recent_invocations_1h']}, "
+            f"db={'available' if data['database_available'] else 'unavailable'}."
+        )
+        if query_failures:
+            return ToolResult.partial(
+                confirmation,
+                "; ".join(query_failures)
+                + " (counts shown default to 0 — real values may be higher).",
+                data=data,
+            )
+        return ToolResult.ok(confirmation, data=data)
 
     @tool(
         name="bridge_connections",
@@ -190,16 +215,19 @@ class BridgeFeature(Feature):
         category=ToolCategory.SYSTEM,
         command_prefix="!bridge connections",
     )
-    async def bridge_connections(self, limit: int = 20) -> Dict[str, Any]:
+    async def bridge_connections(self, limit: int = 20) -> ToolResult:
         """List active bridge sessions.
 
         Args:
             limit: Maximum number of sessions to return (default 20)
 
         Returns:
-            Dict with list of active sessions
+            ToolResult.ok with list of active sessions; PARTIAL when
+            the DB query failed and we returned only the in-memory
+            cache (the persisted history is not visible).
         """
         sessions = []
+        db_failed = False
 
         # Try database first
         if self._db:
@@ -226,6 +254,7 @@ class BridgeFeature(Feature):
                     })
             except Exception as e:
                 logger.warning(f"BridgeFeature: connections query failed: {e}")
+                db_failed = True
 
         # Fallback to in-memory sessions
         if not sessions:
@@ -244,10 +273,19 @@ class BridgeFeature(Feature):
                     "last_activity_at": s.last_activity_at.isoformat(),
                 })
 
-        return {
-            "sessions": sessions,
-            "count": len(sessions),
-        }
+        data = {"sessions": sessions, "count": len(sessions)}
+        confirmation = f"Returned {len(sessions)} bridge session(s)."
+        if db_failed:
+            return ToolResult.partial(
+                confirmation,
+                (
+                    "DB query for bridge_sessions failed; results are from "
+                    "the in-memory cache only and may be missing persisted "
+                    "sessions."
+                ),
+                data=data,
+            )
+        return ToolResult.ok(confirmation, data=data)
 
     @tool(
         name="bridge_history",
@@ -255,16 +293,20 @@ class BridgeFeature(Feature):
         category=ToolCategory.SYSTEM,
         command_prefix="!bridge history",
     )
-    async def bridge_history(self, limit: int = 20) -> Dict[str, Any]:
+    async def bridge_history(self, limit: int = 20) -> ToolResult:
         """Show recent bridge invocations.
 
         Args:
             limit: Maximum number of log entries to return (default 20)
 
         Returns:
-            Dict with list of recent invocations
+            ToolResult.ok with list of recent invocations; PARTIAL when
+            the DB query failed (the empty list returned in that case
+            would otherwise look indistinguishable from "no
+            invocations yet"), or when no DB is attached at all.
         """
         entries = []
+        db_failed = False
 
         if self._db:
             try:
@@ -291,11 +333,29 @@ class BridgeFeature(Feature):
                     })
             except Exception as e:
                 logger.warning(f"BridgeFeature: history query failed: {e}")
+                db_failed = True
 
-        return {
-            "entries": entries,
-            "count": len(entries),
-        }
+        data = {"entries": entries, "count": len(entries)}
+        if db_failed:
+            return ToolResult.partial(
+                f"Returned {len(entries)} bridge log entry(ies).",
+                (
+                    "DB query for bridge_log failed; an empty list here "
+                    "does NOT mean no bridge activity — the log is just "
+                    "unreadable right now."
+                ),
+                data=data,
+            )
+        if not self._db:
+            return ToolResult.partial(
+                "No bridge log entries (history disabled).",
+                "no database is attached to this agent — bridge invocations are not being logged.",
+                data=data,
+            )
+        return ToolResult.ok(
+            f"Returned {len(entries)} bridge log entry(ies).",
+            data=data,
+        )
 
     # =========================================================================
     # Public API (called by router.py endpoints)

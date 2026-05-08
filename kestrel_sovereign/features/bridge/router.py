@@ -297,7 +297,10 @@ def get_router() -> APIRouter:
         if not bridge:
             return {"status": "unavailable", "bridge": False, "agent": True}
 
-        status = await bridge.bridge_status()
+        # bridge_status returns a ToolResult since #1061 wave 25.
+        # The legacy dict the health endpoint quoted lives under .data.
+        envelope = await bridge.bridge_status()
+        status = envelope.data or {}
         return {
             "status": "ok",
             "bridge": True,

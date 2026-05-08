@@ -438,7 +438,8 @@ class TestBridgeStatus:
 
     @pytest.mark.asyncio
     async def test_returns_status(self, feature):
-        result = await feature.bridge_status()
+        envelope = await feature.bridge_status()
+        result = envelope.data
         assert result["status"] == "active"
         assert result["agent_id"] == "test-bridge-agent"
         assert "uptime_seconds" in result
@@ -448,8 +449,8 @@ class TestBridgeStatus:
     @pytest.mark.asyncio
     async def test_counts_sessions(self, feature):
         feature._db.fetchone = AsyncMock(return_value=(5,))
-        result = await feature.bridge_status()
-        assert result["total_sessions_db"] == 5
+        envelope = await feature.bridge_status()
+        assert envelope.data["total_sessions_db"] == 5
 
     @pytest.mark.asyncio
     async def test_status_without_db(self):
@@ -458,9 +459,24 @@ class TestBridgeStatus:
         feat = BridgeFeature(agent)
         await feat.initialize()
 
-        result = await feat.bridge_status()
-        assert result["status"] == "active"
-        assert result["database_available"] is False
+        envelope = await feat.bridge_status()
+        assert envelope.data["status"] == "active"
+        assert envelope.data["database_available"] is False
+
+    @pytest.mark.asyncio
+    async def test_status_partial_when_count_query_fails(self, feature):
+        """When DB is available but a count query fails, the envelope
+        must surface that as PARTIAL so the LLM doesn't report '0
+        sessions' as if the bridge were idle.
+        """
+        from kestrel_sdk.tools.result import ToolResultStatus
+        feature._db.fetchone = AsyncMock(side_effect=RuntimeError("table missing"))
+        envelope = await feature.bridge_status()
+        assert envelope.status is ToolResultStatus.PARTIAL
+        assert "count failed" in envelope.error
+        # Counts default to 0 but the data shape is preserved.
+        assert envelope.data["total_sessions_db"] == 0
+        assert envelope.data["recent_invocations_1h"] == 0
 
 
 class TestBridgeConnections:
@@ -474,14 +490,16 @@ class TestBridgeConnections:
 
     @pytest.mark.asyncio
     async def test_returns_sessions_from_db(self, feature):
+        from kestrel_sdk.tools.result import ToolResultStatus
         now = datetime.now(timezone.utc).isoformat()
         feature._db.fetchall = AsyncMock(return_value=[
             ("s1", "gw-1", "browser_extension", "user-1", now, now),
             ("s2", "gw-2", "discord", None, now, now),
         ])
-        result = await feature.bridge_connections()
-        assert result["count"] == 2
-        assert result["sessions"][0]["channel_type"] == "browser_extension"
+        envelope = await feature.bridge_connections()
+        assert envelope.status is ToolResultStatus.OK
+        assert envelope.data["count"] == 2
+        assert envelope.data["sessions"][0]["channel_type"] == "browser_extension"
 
     @pytest.mark.asyncio
     async def test_falls_back_to_memory(self, feature):
@@ -493,9 +511,28 @@ class TestBridgeConnections:
             gateway_session_id="gw-mem",
             channel_type=ChannelType.SLACK,
         )
-        result = await feature.bridge_connections()
-        assert result["count"] == 1
-        assert result["sessions"][0]["channel_type"] == "slack"
+        envelope = await feature.bridge_connections()
+        assert envelope.data["count"] == 1
+        assert envelope.data["sessions"][0]["channel_type"] == "slack"
+
+    @pytest.mark.asyncio
+    async def test_partial_when_db_query_fails(self, feature):
+        """When the DB query raises, the envelope must say so — the
+        in-memory cache fallback may be missing persisted sessions.
+        """
+        from kestrel_sdk.tools.result import ToolResultStatus
+        feature._db.fetchall = AsyncMock(side_effect=RuntimeError("connection refused"))
+        feature._sessions["gw-mem"] = BridgeSession(
+            id="mem-session",
+            agent_id="test-bridge-agent",
+            gateway_session_id="gw-mem",
+            channel_type=ChannelType.SLACK,
+        )
+        envelope = await feature.bridge_connections()
+        assert envelope.status is ToolResultStatus.PARTIAL
+        assert "in-memory cache" in envelope.error
+        # Memory fallback still surfaces what it has
+        assert envelope.data["count"] == 1
 
 
 class TestBridgeHistory:
@@ -509,21 +546,36 @@ class TestBridgeHistory:
 
     @pytest.mark.asyncio
     async def test_returns_log_entries(self, feature):
+        from kestrel_sdk.tools.result import ToolResultStatus
         now = datetime.now(timezone.utc).isoformat()
         feature._db.fetchall = AsyncMock(return_value=[
             ("log-1", "sess-1", "inbound", "Hello", 0, 0, now),
             ("log-2", "sess-1", "outbound", "Hi there", 150, 320, now),
         ])
-        result = await feature.bridge_history()
-        assert result["count"] == 2
-        assert result["entries"][0]["direction"] == "inbound"
-        assert result["entries"][1]["tokens_used"] == 150
+        envelope = await feature.bridge_history()
+        assert envelope.status is ToolResultStatus.OK
+        assert envelope.data["count"] == 2
+        assert envelope.data["entries"][0]["direction"] == "inbound"
+        assert envelope.data["entries"][1]["tokens_used"] == 150
 
     @pytest.mark.asyncio
     async def test_empty_history(self, feature):
-        result = await feature.bridge_history()
-        assert result["count"] == 0
-        assert result["entries"] == []
+        envelope = await feature.bridge_history()
+        assert envelope.data["count"] == 0
+        assert envelope.data["entries"] == []
+
+    @pytest.mark.asyncio
+    async def test_history_partial_when_db_query_fails(self, feature):
+        """When the DB query raises, history is unreadable — the envelope
+        must say so rather than report an empty list as if there were
+        no invocations.
+        """
+        from kestrel_sdk.tools.result import ToolResultStatus
+        feature._db.fetchall = AsyncMock(side_effect=RuntimeError("disk i/o error"))
+        envelope = await feature.bridge_history()
+        assert envelope.status is ToolResultStatus.PARTIAL
+        assert "log is just" in envelope.error or "unreadable" in envelope.error
+        assert envelope.data["entries"] == []
 
 
 # ============================================================================
@@ -759,17 +811,23 @@ class TestGracefulDegradation:
         await feat.initialize()
 
         # bridge_status
-        status = await feat.bridge_status()
-        assert status["status"] == "active"
-        assert status["database_available"] is False
+        status_envelope = await feat.bridge_status()
+        assert status_envelope.data["status"] == "active"
+        assert status_envelope.data["database_available"] is False
 
         # bridge_connections (empty)
-        conns = await feat.bridge_connections()
-        assert conns["count"] == 0
+        conns_envelope = await feat.bridge_connections()
+        assert conns_envelope.data["count"] == 0
 
-        # bridge_history (empty)
-        history = await feat.bridge_history()
-        assert history["count"] == 0
+        # bridge_history (empty) -- with no DB this is PARTIAL since
+        # invocations cannot be logged in the first place; the LLM
+        # should know that the empty list is "history not recorded",
+        # not "no activity ever happened".
+        from kestrel_sdk.tools.result import ToolResultStatus
+        history_envelope = await feat.bridge_history()
+        assert history_envelope.status is ToolResultStatus.PARTIAL
+        assert "no database is attached" in history_envelope.error
+        assert history_envelope.data["count"] == 0
 
     @pytest.mark.asyncio
     async def test_session_works_without_db(self):
