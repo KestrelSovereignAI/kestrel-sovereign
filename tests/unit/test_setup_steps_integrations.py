@@ -33,11 +33,15 @@ def _make_ctx(tmp_path: Path, flow: Flow, *, answers=None) -> SetupContext:
 # Registration
 # ---------------------------------------------------------------------------
 
-def test_integrations_in_ordered_between_llm_and_agent():
+def test_integrations_in_ordered_after_llm_before_agent():
     names = [name for name, _ in ORDERED]
     assert "integrations" in names
+    # integrations runs immediately after llm.
     assert names.index("integrations") == names.index("llm") + 1
-    assert names.index("integrations") + 1 == names.index("agent")
+    # integrations precedes agent. The emancipation step (#1109) sits
+    # between them so the [emancipation] block lands in kestrel.toml
+    # before inception.
+    assert names.index("integrations") < names.index("agent")
 
 
 def test_integrations_reachable_by_name():

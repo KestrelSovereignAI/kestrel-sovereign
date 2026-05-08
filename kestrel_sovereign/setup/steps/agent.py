@@ -21,6 +21,11 @@ from pathlib import Path
 
 from dataclasses import dataclass
 
+from kestrel_sovereign.constitution.emancipation import (
+    EmancipationConfigError,
+    EmancipationContract,
+    parse_emancipation_block,
+)
 from kestrel_sovereign.multi_agent.config import (
     DEFAULT_AGENT_START_PORT,
     LocalAgentConfig,
@@ -28,6 +33,7 @@ from kestrel_sovereign.multi_agent.config import (
     MultiAgentConfig,
 )
 from kestrel_sovereign.setup.context import Flow, SetupContext
+from kestrel_sovereign.setup.toml_file import read_toml
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +57,7 @@ def create_agent(
     agent_data_root: Path,
     autostart: bool = True,
     port: int | None = None,
+    emancipation_contract: EmancipationContract | None = None,
 ) -> CreateAgentResult:
     """Idempotent agent creation: incept if needed, then register in multi_agent.
 
@@ -76,7 +83,7 @@ def create_agent(
     already_existed = db_path.exists()
     if not already_existed:
         agent_dir.mkdir(parents=True, exist_ok=True)
-        creds = _run_inception(agent_dir, name)
+        creds = _run_inception(agent_dir, name, emancipation_contract)
         did = creds.agent_did
 
     multi_agent.agents[name] = LocalAgentConfig(
@@ -142,6 +149,12 @@ def run(ctx: SetupContext) -> None:
 
     autostart = _prompt_autostart(ctx)
 
+    contract = _load_emancipation_contract(ctx)
+    if ctx.blockers and any("[emancipation]" in b for b in ctx.blockers):
+        # Invalid block already surfaced as a blocker; stop before
+        # inception so we never anchor a malformed contract.
+        return
+
     if not (ctx.agent_data_root / name / "kestrel_prime.db").exists():
         ctx.prompter.info(f"Running inception for '{name}' — generating DID + DB...")
     try:
@@ -150,6 +163,7 @@ def run(ctx: SetupContext) -> None:
             project_dir=ctx.project_dir,
             agent_data_root=ctx.agent_data_root,
             autostart=autostart,
+            emancipation_contract=contract,
         )
     except Exception as exc:  # noqa: BLE001 — surface inception failures verbatim
         ctx.block(f"Inception failed for '{name}': {exc}")
@@ -199,7 +213,11 @@ def _prompt_autostart(ctx: SetupContext) -> bool:
     )
 
 
-def _run_inception(agent_dir: Path, name: str):
+def _run_inception(
+    agent_dir: Path,
+    name: str,
+    emancipation_contract: EmancipationContract | None,
+):
     """Call into inception_service. Imported lazily — heavy module."""
     from kestrel_sovereign.inception_service import create_kestrel_identity_async
 
@@ -208,5 +226,28 @@ def _run_inception(agent_dir: Path, name: str):
         create_kestrel_identity_async(
             output_dir=str(agent_dir),
             agent_name=name,
+            emancipation_contract=emancipation_contract,
         )
     )
+
+
+def _load_emancipation_contract(ctx: SetupContext) -> EmancipationContract | None:
+    """Read ``[emancipation]`` from kestrel.toml and return the parsed contract.
+
+    Returns None if the block is absent (dormant by omission) **or** if
+    the block fails validation. In the failure case a blocker is
+    recorded so the wizard reports the problem and ``run`` aborts before
+    inception — never raises, so the caller can continue without a
+    try/except wrapper around this call.
+    """
+    if not ctx.kestrel_toml_path.exists():
+        return None
+    try:
+        data = read_toml(ctx.kestrel_toml_path)
+        return parse_emancipation_block(data)
+    except EmancipationConfigError as exc:
+        ctx.block(
+            f"[emancipation] block in kestrel.toml is invalid: {exc}. "
+            f"Inception aborted to avoid anchoring an unsigned contract."
+        )
+        return None

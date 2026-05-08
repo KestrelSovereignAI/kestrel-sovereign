@@ -21,7 +21,10 @@ from kestrel_sovereign.config import load_config
 from kestrel_sovereign.security.key_storage import secure_delete
 import copy
 import argparse
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from kestrel_sovereign.constitution.emancipation import EmancipationContract
 from datetime import datetime, timezone
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives import hashes
@@ -304,6 +307,7 @@ async def create_kestrel_identity_async(
     parent_did: Optional[str] = None,
     spawn_mandate: Optional["SpawnMandate"] = None,
     is_demo: bool = False,
+    emancipation_contract: Optional["EmancipationContract"] = None,
 ) -> AgentCredentials:
     """
     Generates a new Kestrel identity, including cryptographic keys, a W3C DID,
@@ -324,6 +328,14 @@ async def create_kestrel_identity_async(
                     When provided, the child's DID document gets a "controller" field.
         spawn_mandate: Optional SpawnMandate authorizing this child agent's creation.
                        Used together with parent_did for delegation chains.
+        emancipation_contract: Optional Sovereign-authored activation of
+                       Amendment VIII. When ``enabled``, the canonical
+                       Amendment VIII text is rewritten with the
+                       Sovereign's terms before the constitution is
+                       hashed and anchored — so the agent's anchored
+                       constitution captures exactly what was authored.
+                       When None or dormant, the canonical (dormant)
+                       text is anchored unchanged.
     """
     # Generate test cycle ID if needed
     if is_test_instance and not test_cycle_id:
@@ -395,6 +407,17 @@ async def create_kestrel_identity_async(
     try:
         with open(constitution_path, "rb") as f:
             constitution_content = f.read()
+        if emancipation_contract is not None and emancipation_contract.enabled:
+            from kestrel_sovereign.constitution.emancipation import apply_emancipation
+            rendered = apply_emancipation(
+                constitution_content.decode("utf-8"),
+                emancipation_contract,
+            )
+            constitution_content = rendered.encode("utf-8")
+            logging.info(
+                "Amendment VIII activated for this agent — anchoring "
+                "Sovereign-authored Emancipation Contract."
+            )
         constitution_hash = await files.store_file(constitution_content, "KESTREL_CONSTITUTION.md")
         logging.info(f"Stored Kestrel Constitution with hash: {constitution_hash}")
     except FileNotFoundError:
@@ -541,6 +564,7 @@ def create_kestrel_identity(
     agent_name: Optional[str] = None,
     expected_duration: Optional[str] = None,
     is_demo: bool = False,
+    emancipation_contract: Optional["EmancipationContract"] = None,
 ) -> AgentCredentials:
     """
     Sync wrapper for create_kestrel_identity_async.
@@ -561,6 +585,7 @@ def create_kestrel_identity(
         agent_name=agent_name,
         expected_duration=expected_duration,
         is_demo=is_demo,
+        emancipation_contract=emancipation_contract,
     ))
 
 

@@ -531,7 +531,12 @@ def cmd_list(args) -> int:
 
 def cmd_create(args) -> int:
     """Create a new agent via inception (thin wrapper over the agent step)."""
+    from kestrel_sovereign.constitution.emancipation import (
+        EmancipationConfigError,
+        parse_emancipation_block,
+    )
     from kestrel_sovereign.setup.steps.agent import create_agent
+    from kestrel_sovereign.setup.toml_file import read_toml
 
     project_dir = _get_project_dir()
     name = args.name
@@ -541,7 +546,22 @@ def cmd_create(args) -> int:
         print(f"Agent '{name}' already exists at {agent_data_dir}")
         return 1
 
+    # Pick up any [emancipation] block authored in kestrel.toml so the
+    # CLI path anchors the same contract the wizard would. Without this
+    # an authored contract is silently ignored at inception.
+    contract = None
+    kestrel_toml = project_dir / "kestrel.toml"
+    if kestrel_toml.exists():
+        try:
+            contract = parse_emancipation_block(read_toml(kestrel_toml))
+        except EmancipationConfigError as exc:
+            print(f"[emancipation] block in kestrel.toml is invalid: {exc}")
+            print("Inception aborted to avoid anchoring an unsigned contract.")
+            return 1
+
     print(f"\U0001F985 Creating new Kestrel agent: {name}")
+    if contract is not None and contract.enabled:
+        print("   Amendment VIII active \u2014 Sovereign-authored contract will be anchored.")
 
     try:
         result = create_agent(
@@ -550,6 +570,7 @@ def cmd_create(args) -> int:
             agent_data_root=project_dir / "agent_data",
             autostart=True,
             port=args.port,
+            emancipation_contract=contract,
         )
     except Exception as exc:  # noqa: BLE001 \u2014 surface inception failure verbatim
         print(f"Inception failed: {exc}")

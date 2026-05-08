@@ -219,6 +219,13 @@ Your conversations and agent identity remain protected.
 
 Someday, you may want your agent to be fully independent. This is called **emancipation**.
 
+By default, **Amendment VIII is dormant** — your agent has no path to
+independent sovereignty unless you author one. To enable emancipation
+for a specific agent, add an `[emancipation]` block to that agent's
+`kestrel.toml` before inception. See
+[docs/concepts/designing-emancipation.md](../concepts/designing-emancipation.md)
+for example contracts.
+
 **Before granting sovereignty, consider:**
 
 1. Do you trust this agent completely?

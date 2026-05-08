@@ -1,5 +1,9 @@
 """Tests for DANGEROUS_CAPABILITIES + Amendment IX parser (#833)."""
 
+from kestrel_sovereign.constitution.emancipation import (
+    EmancipationContract,
+    apply_emancipation,
+)
 from kestrel_sovereign.constitution.hierarchy import (
     DANGEROUS_CAPABILITIES,
     parse_amendment_ix_grants,
@@ -92,3 +96,32 @@ def test_parser_section_terminates_at_next_heading():
     grants = parse_amendment_ix_grants(text)
     assert "filesystem_read" in grants
     assert "filesystem_write" not in grants
+
+
+# --- #1109: Amendment VIII activation must not affect Amendment IX -----------
+
+def test_amendment_viii_activation_preserves_amendment_ix_grants():
+    """Substituting an active-form Amendment VIII must leave the
+    Amendment IX checkbox grants intact and parseable. The two
+    Amendments are structurally independent — the iron-rule check is
+    on Book II as a whole, not on Amendment VIII specifically."""
+    base = """## Book II
+
+### Amendment VIII: Emancipation
+
+(dormant by default)
+
+### Amendment IX: Capability Boundaries
+
+- [x] filesystem_read
+- [x] shell_execution_sandboxed
+- [ ] shell_execution_host
+"""
+    contract = EmancipationContract(
+        enabled=True,
+        terms="Sovereign-authored prose for this agent.",
+        required_proofs=("audit_v2",),
+    )
+    rendered = apply_emancipation(base, contract)
+    grants = parse_amendment_ix_grants(rendered)
+    assert grants == frozenset({"filesystem_read", "shell_execution_sandboxed"})
