@@ -29,8 +29,9 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 
-from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sdk.tools.base import ToolCategory
+from kestrel_sdk.tools.result import ToolResult
+from kestrel_sovereign.features.base import Feature, tool
 
 logger = logging.getLogger(__name__)
 
@@ -121,13 +122,22 @@ class PeersFeature(Feature):
         category=ToolCategory.COMMUNICATION,
         command_prefix="!peers"
     )
-    async def list_peers(self) -> Dict[str, Any]:
+    async def list_peers(self) -> ToolResult:
         """
         Discover available peer agents via the multi_agent host.
         Returns their names, status, and capabilities.
         """
         if not self._host_url:
-            return {"peers": [], "note": "Not running in a multi_agent environment"}
+            # Honesty: standalone mode is not a failure (the listing
+            # WAS performed and returned the truthful "0 peers"), but
+            # the agent must speak that no host is configured rather
+            # than narrate "found 0 peers" as if peers really were
+            # absent. PARTIAL with the diagnostic in the caveat.
+            return ToolResult.partial(
+                confirmation="No peers (standalone mode)",
+                error="Not running in a multi_agent environment — no host to query",
+                data={"peers": [], "note": "Not running in a multi_agent environment"},
+            )
 
         try:
             async with httpx.AsyncClient() as client:
@@ -138,25 +148,32 @@ class PeersFeature(Feature):
                 )
                 resp.raise_for_status()
                 agents_data = resp.json()
-
-            # Filter out self
-            peers = []
-            for agent in agents_data if isinstance(agents_data, list) else agents_data.get("agents", []):
-                name = agent.get("name", agent.get("id", ""))
-                if name.lower() != self._own_name.lower():
-                    peers.append({
-                        "name": name,
-                        "status": agent.get("status", "unknown"),
-                        "description": agent.get("description", ""),
-                    })
-
-            return {"peers": peers, "self": self._own_name}
-
         except httpx.ConnectError:
-            return {"peers": [], "error": "Could not connect to multi_agent host"}
+            return ToolResult.failed(
+                "Could not connect to multi_agent host",
+                data={"peers": [], "error": "Could not connect to multi_agent host"},
+            )
         except Exception as e:
             logger.error(f"Failed to list peers: {e}")
-            return {"peers": [], "error": str(e)}
+            return ToolResult.failed(
+                str(e),
+                data={"peers": [], "error": str(e)},
+            )
+
+        peers = []
+        for agent in agents_data if isinstance(agents_data, list) else agents_data.get("agents", []):
+            name = agent.get("name", agent.get("id", ""))
+            if name.lower() != self._own_name.lower():
+                peers.append({
+                    "name": name,
+                    "status": agent.get("status", "unknown"),
+                    "description": agent.get("description", ""),
+                })
+
+        return ToolResult.ok(
+            confirmation=f"Found {len(peers)} peer(s) (self={self._own_name})",
+            data={"peers": peers, "self": self._own_name},
+        )
 
     @tool(
         name="ask_agent",
@@ -164,7 +181,7 @@ class PeersFeature(Feature):
         category=ToolCategory.COMMUNICATION,
         command_prefix="!ask"
     )
-    async def ask_agent(self, agent_name: str, message: str) -> Dict[str, Any]:
+    async def ask_agent(self, agent_name: str, message: str) -> ToolResult:
         """
         Send a message to a peer agent and return their response.
 
@@ -173,16 +190,16 @@ class PeersFeature(Feature):
             message: The message or question to send
         """
         if not self._host_url:
-            return {
-                "response": None,
-                "error": "Not running in a multi_agent environment — no host to proxy through",
-            }
+            return ToolResult.failed(
+                "Not running in a multi_agent environment — no host to proxy through",
+                data={"response": None, "agent": agent_name},
+            )
 
         if agent_name.lower() == self._own_name.lower():
-            return {
-                "response": None,
-                "error": "Cannot send a message to yourself",
-            }
+            return ToolResult.failed(
+                "Cannot send a message to yourself",
+                data={"response": None, "agent": agent_name},
+            )
 
         url = f"{self._host_url}/api/agents/{agent_name}/api/agent/invoke"
 
@@ -199,45 +216,48 @@ class PeersFeature(Feature):
                         pool=PEER_CONNECT_TIMEOUT,
                     ),
                 )
-
-            if resp.status_code == 404:
-                return {
-                    "response": None,
-                    "error": f"Agent '{agent_name}' not found in the multi_agent",
-                }
-            if resp.status_code == 503:
-                return {
-                    "response": None,
-                    "error": f"Agent '{agent_name}' is offline",
-                }
-
-            resp.raise_for_status()
-            data = resp.json()
-
-            # Extract the response text from the agent's reply
-            response_text = data.get("response", data.get("output", str(data)))
-
-            return {
-                "agent": agent_name,
-                "response": response_text,
-            }
-
         except httpx.ConnectError:
-            return {
-                "response": None,
-                "error": f"Could not reach agent '{agent_name}' — multi_agent host unreachable",
-            }
+            return ToolResult.failed(
+                f"Could not reach agent '{agent_name}' — multi_agent host unreachable",
+                data={"response": None, "agent": agent_name},
+            )
         except httpx.TimeoutException:
-            return {
-                "response": None,
-                "error": f"Agent '{agent_name}' took too long to respond",
-            }
+            return ToolResult.failed(
+                f"Agent '{agent_name}' took too long to respond",
+                data={"response": None, "agent": agent_name},
+            )
         except Exception as e:
             logger.error(f"Failed to message agent '{agent_name}': {e}")
-            return {
-                "response": None,
-                "error": str(e),
-            }
+            return ToolResult.failed(
+                str(e),
+                data={"response": None, "agent": agent_name},
+            )
+
+        if resp.status_code == 404:
+            return ToolResult.failed(
+                f"Agent '{agent_name}' not found in the multi_agent",
+                data={"response": None, "agent": agent_name},
+            )
+        if resp.status_code == 503:
+            return ToolResult.failed(
+                f"Agent '{agent_name}' is offline",
+                data={"response": None, "agent": agent_name},
+            )
+
+        try:
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as e:
+            return ToolResult.failed(
+                str(e),
+                data={"response": None, "agent": agent_name},
+            )
+
+        response_text = data.get("response", data.get("output", str(data)))
+        return ToolResult.ok(
+            confirmation=f"Got response from {agent_name}",
+            data={"agent": agent_name, "response": response_text},
+        )
 
     # ------------------------------------------------------------------
     # Agent Mesh Protocol
@@ -257,7 +277,7 @@ class PeersFeature(Feature):
         priority: str = "normal",
         repo: str = "",
         correlation_id: str = "",
-    ) -> Dict[str, Any]:
+    ) -> ToolResult:
         """
         Send a structured mesh message to a peer agent.
 
@@ -276,24 +296,36 @@ class PeersFeature(Feature):
         from .mesh import MeshMessage, MeshMessageType, MeshPriority
 
         if not self._host_url:
-            return {"sent": False, "error": "Not running in a multi_agent environment"}
+            return ToolResult.failed(
+                "Not running in a multi_agent environment",
+                data={"sent": False, "recipient": recipient},
+            )
 
         try:
             msg_type = MeshMessageType(message_type)
         except ValueError:
             valid = [t.value for t in MeshMessageType]
-            return {"sent": False, "error": f"Invalid message_type. Must be one of: {valid}"}
+            return ToolResult.failed(
+                f"Invalid message_type. Must be one of: {valid}",
+                data={"sent": False, "message_type": message_type},
+            )
 
         try:
             msg_priority = MeshPriority(priority)
         except ValueError:
             valid = [p.value for p in MeshPriority]
-            return {"sent": False, "error": f"Invalid priority. Must be one of: {valid}"}
+            return ToolResult.failed(
+                f"Invalid priority. Must be one of: {valid}",
+                data={"sent": False, "priority": priority},
+            )
 
         try:
             payload = json.loads(payload_json) if isinstance(payload_json, str) else payload_json
         except json.JSONDecodeError as e:
-            return {"sent": False, "error": f"Invalid payload_json: {e}"}
+            return ToolResult.failed(
+                f"Invalid payload_json: {e}",
+                data={"sent": False},
+            )
 
         msg = MeshMessage(
             type=msg_type,
@@ -305,7 +337,6 @@ class PeersFeature(Feature):
             correlation_id=correlation_id or None,
         )
 
-        # Deliver via multi_agent host → recipient's /api/agent/mesh endpoint
         url = f"{self._host_url}/api/agents/{recipient}/api/agent/mesh"
 
         try:
@@ -321,32 +352,56 @@ class PeersFeature(Feature):
                         pool=PEER_CONNECT_TIMEOUT,
                     ),
                 )
+        except httpx.ConnectError:
+            return ToolResult.failed(
+                f"Could not reach agent '{recipient}'",
+                data={"sent": False, "recipient": recipient},
+            )
+        except httpx.TimeoutException:
+            return ToolResult.failed(
+                f"Agent '{recipient}' timed out",
+                data={"sent": False, "recipient": recipient},
+            )
+        except Exception as e:
+            logger.error(f"Mesh send to '{recipient}' failed: {e}")
+            return ToolResult.failed(
+                str(e),
+                data={"sent": False, "recipient": recipient},
+            )
 
-            if resp.status_code == 404:
-                return {"sent": False, "error": f"Agent '{recipient}' not found or mesh endpoint not available"}
-            if resp.status_code == 503:
-                return {"sent": False, "error": f"Agent '{recipient}' is offline"}
+        if resp.status_code == 404:
+            return ToolResult.failed(
+                f"Agent '{recipient}' not found or mesh endpoint not available",
+                data={"sent": False, "recipient": recipient},
+            )
+        if resp.status_code == 503:
+            return ToolResult.failed(
+                f"Agent '{recipient}' is offline",
+                data={"sent": False, "recipient": recipient},
+            )
 
+        try:
             resp.raise_for_status()
+        except Exception as e:
+            return ToolResult.failed(
+                str(e),
+                data={"sent": False, "recipient": recipient},
+            )
 
-            # Log the outbound message
-            self._mesh_log.append(msg.to_dict())
-            logger.info(f"Mesh message sent: {msg.type.value} → {recipient} (id={msg.id})")
+        self._mesh_log.append(msg.to_dict())
+        logger.info(f"Mesh message sent: {msg.type.value} → {recipient} (id={msg.id})")
 
-            return {
+        return ToolResult.ok(
+            confirmation=(
+                f"Sent mesh {msg.type.value} → {recipient} (id={msg.id})"
+            ),
+            data={
                 "sent": True,
                 "message_id": msg.id,
                 "type": msg.type.value,
                 "recipient": recipient,
-            }
-
-        except httpx.ConnectError:
-            return {"sent": False, "error": f"Could not reach agent '{recipient}'"}
-        except httpx.TimeoutException:
-            return {"sent": False, "error": f"Agent '{recipient}' timed out"}
-        except Exception as e:
-            logger.error(f"Mesh send to '{recipient}' failed: {e}")
-            return {"sent": False, "error": str(e)}
+            },
+        )
 
     @tool(
         name="mesh_inbox",
@@ -354,7 +409,7 @@ class PeersFeature(Feature):
         category=ToolCategory.COMMUNICATION,
         command_prefix="!mesh inbox",
     )
-    async def mesh_inbox(self, limit: int = 20) -> Dict[str, Any]:
+    async def mesh_inbox(self, limit: int = 20) -> ToolResult:
         """
         View recent incoming mesh messages.
 
@@ -362,11 +417,17 @@ class PeersFeature(Feature):
             limit: Maximum number of messages to return (default 20).
         """
         messages = self._mesh_inbox[-limit:] if limit > 0 else self._mesh_inbox
-        return {
-            "messages": messages,
-            "count": len(messages),
-            "total": len(self._mesh_inbox),
-        }
+        return ToolResult.ok(
+            confirmation=(
+                f"{len(messages)} mesh message(s) shown "
+                f"(total inbox: {len(self._mesh_inbox)})"
+            ),
+            data={
+                "messages": messages,
+                "count": len(messages),
+                "total": len(self._mesh_inbox),
+            },
+        )
 
     def receive_mesh_message(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """

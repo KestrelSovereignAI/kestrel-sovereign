@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 
+from kestrel_sdk.tools.result import ToolResultStatus
 from kestrel_sovereign.features.peers.feature import PeersFeature, _discover_host_url
 
 
@@ -38,8 +39,9 @@ async def test_list_peers_filters_out_self():
     with patch("kestrel_sovereign.features.peers.feature.httpx.AsyncClient", return_value=client):
         result = await feature.list_peers()
 
-    assert result["self"] == "emma"
-    assert result["peers"] == [{"name": "claw", "status": "online", "description": "peer"}]
+    assert result.status is ToolResultStatus.OK
+    assert result.data["self"] == "emma"
+    assert result.data["peers"] == [{"name": "claw", "status": "online", "description": "peer"}]
 
 
 @pytest.mark.asyncio
@@ -52,8 +54,8 @@ async def test_ask_agent_rejects_self_target():
 
     result = await feature.ask_agent("emma", "hello")
 
-    assert result["response"] is None
-    assert "yourself" in result["error"]
+    assert result.status is ToolResultStatus.ERROR
+    assert "yourself" in result.error
 
 
 @pytest.mark.asyncio
@@ -75,8 +77,8 @@ async def test_ask_agent_reports_offline_peer():
     with patch("kestrel_sovereign.features.peers.feature.httpx.AsyncClient", return_value=client):
         result = await feature.ask_agent("claw", "hello")
 
-    assert result["response"] is None
-    assert "offline" in result["error"]
+    assert result.status is ToolResultStatus.ERROR
+    assert "offline" in result.error
 
 
 @pytest.mark.asyncio
@@ -99,4 +101,5 @@ async def test_ask_agent_returns_peer_response():
     with patch("kestrel_sovereign.features.peers.feature.httpx.AsyncClient", return_value=client):
         result = await feature.ask_agent("claw", "hello")
 
-    assert result == {"agent": "claw", "response": "hi from claw"}
+    assert result.status is ToolResultStatus.OK
+    assert result.data == {"agent": "claw", "response": "hi from claw"}

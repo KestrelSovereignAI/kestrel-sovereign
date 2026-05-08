@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from kestrel_sdk.tools.result import ToolResultStatus
 from kestrel_sovereign.features.peers.mesh import (
     MeshMessage,
     MeshMessageType,
@@ -234,9 +235,12 @@ class TestPeersFeatureMesh:
             feature.receive_mesh_message(msg_dict)
 
         result = await feature.mesh_inbox(limit=2)
-        assert result["total"] == 3
-        assert result["count"] == 2
-        assert len(result["messages"]) == 2
+        # mesh_inbox now returns a ToolResult envelope (#1061 wave 16);
+        # the legacy {"messages", "count", "total"} dict lives under .data.
+        assert result.status is ToolResultStatus.OK
+        assert result.data["total"] == 3
+        assert result.data["count"] == 2
+        assert len(result.data["messages"]) == 2
 
     @pytest.mark.asyncio
     async def test_send_mesh_message_no_host(self):
@@ -248,8 +252,8 @@ class TestPeersFeatureMesh:
             message_type="assign",
             payload_json='{"issue_number": 1}',
         )
-        assert result["sent"] is False
-        assert "multi_agent" in result["error"].lower()
+        assert result.status is ToolResultStatus.ERROR
+        assert "multi_agent" in result.error.lower()
 
 
 # =========================================================================
