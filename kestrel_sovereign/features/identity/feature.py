@@ -132,23 +132,60 @@ class IdentityFeature(Feature):
                     encrypt=False,  # Package is already structured
                     metadata={"type": "identity_package", "did": package.did}
                 )
-                cid = result.ipfs_cid or result.content_hash
-
-                confirmation = (
-                    f"Exported identity package: DID={summary['did'][:30]}..., "
-                    f"agent={summary['agent_name']}, "
-                    f"{summary['episodes_count']} episodes, "
-                    f"{summary['saved_items_count']} items, "
-                    f"signed={summary['is_signed']}; "
-                    f"stored to tier={tier_enum.value} (CID={cid}). "
-                    f"Use `!identity import {cid}` to restore."
+                # Honesty: FilecoinAdapter silently downgrades to
+                # LOCAL_ONLY when IPFS / Lotus isn't available — it
+                # mutates result.tier and leaves ipfs_cid as None.
+                # In that case the package is still on disk under the
+                # content hash, but it's NOT importable via
+                # `!identity import <ipfs-cid>` (no Qm/bafy prefix to
+                # match). Pre-fix we returned OK with a non-CID hash
+                # in the import instructions — wrong. Detect the
+                # downgrade and surface as PARTIAL with the correct
+                # local-only retrieval path. (Round 2 codex finding.)
+                actual_tier = getattr(result, "tier", tier_enum)
+                tier_downgraded = (
+                    actual_tier == StorageTier.LOCAL_ONLY
+                    and tier_enum != StorageTier.LOCAL_ONLY
                 )
+                ipfs_cid = getattr(result, "ipfs_cid", None) or getattr(result, "cid", None)
+                content_hash = getattr(result, "content_hash", None)
+                # Use a real CID for restore instructions only when
+                # one was actually produced; otherwise fall back to
+                # the content hash with a clear local-only framing.
+                restore_id = ipfs_cid or content_hash
+
+                if tier_downgraded:
+                    confirmation = (
+                        f"Exported identity package: DID={summary['did'][:30]}..., "
+                        f"agent={summary['agent_name']}, "
+                        f"{summary['episodes_count']} episodes, "
+                        f"{summary['saved_items_count']} items, "
+                        f"signed={summary['is_signed']}; "
+                        f"stored to LOCAL cache (content_hash={content_hash}) "
+                        f"because tier={tier_enum.value} adapter was unavailable"
+                    )
+                else:
+                    confirmation = (
+                        f"Exported identity package: DID={summary['did'][:30]}..., "
+                        f"agent={summary['agent_name']}, "
+                        f"{summary['episodes_count']} episodes, "
+                        f"{summary['saved_items_count']} items, "
+                        f"signed={summary['is_signed']}; "
+                        f"stored to tier={actual_tier.value if hasattr(actual_tier, 'value') else actual_tier} "
+                        f"(CID={ipfs_cid}). "
+                        f"Use `!identity import {restore_id}` to restore."
+                    )
                 data = {
                     "did": package.did,
                     "agent_name": summary['agent_name'],
                     "summary": dict(summary),
-                    "storage_tier": tier_enum.value,
-                    "cid": cid,
+                    "requested_storage_tier": tier_enum.value,
+                    "actual_storage_tier": (
+                        actual_tier.value if hasattr(actual_tier, "value") else str(actual_tier)
+                    ),
+                    "tier_downgraded": tier_downgraded,
+                    "ipfs_cid": ipfs_cid,
+                    "content_hash": content_hash,
                     "signed": bool(summary.get("is_signed")),
                     "sign_requested": sign,
                     "sign_failure": sign_failure,
@@ -186,19 +223,31 @@ class IdentityFeature(Feature):
             logger.error(f"Identity export failed: {e}", exc_info=True)
             return ToolResult.failed(f"Identity export failed: {str(e)}")
 
-        # Honesty: signing was REQUESTED but FAILED. The package
-        # was still written, but it's unsigned — anyone importing
-        # it will see ``UNSIGNED`` and may reject it. Surface as
-        # PARTIAL so the LLM cannot claim "exported and signed."
+        # Honesty: composite PARTIAL surfaces.
+        partial_errs: List[str] = []
         if sign and sign_failure:
+            # signing was REQUESTED but FAILED. The package was
+            # still written, but it's unsigned — anyone importing
+            # it will see UNSIGNED and may reject it.
+            partial_errs.append(
+                f"signing was requested but failed: {sign_failure}; "
+                "the package was written UNSIGNED — verify will report "
+                "UNSIGNED and an importer with allow_unsigned=False "
+                "will reject it"
+            )
+        if data.get("tier_downgraded"):
+            partial_errs.append(
+                f"requested storage tier {data['requested_storage_tier']!r} was "
+                "unavailable (no IPFS / Lotus); the package was written to "
+                "the LOCAL cache only — it has no IPFS CID and "
+                "`!identity import` won't find it via decentralized "
+                f"storage. Use the local file path or content_hash "
+                f"({data.get('content_hash')}) to restore."
+            )
+        if partial_errs:
             return ToolResult.partial(
                 confirmation=confirmation,
-                error=(
-                    f"signing was requested but failed: {sign_failure}; "
-                    "the package was written UNSIGNED — verify will report "
-                    "UNSIGNED and an importer with allow_unsigned=False "
-                    "will reject it"
-                ),
+                error=" | ".join(partial_errs),
                 data=data,
             )
         return ToolResult.ok(confirmation=confirmation, data=data)

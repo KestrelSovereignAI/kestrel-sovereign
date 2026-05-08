@@ -128,6 +128,67 @@ async def test_assess_substrate_unknown_is_partial(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_export_identity_tier_downgrade_is_partial(monkeypatch, tmp_path):
+    """Round 2 codex finding: when storage_tier=ipfs but the
+    FilecoinAdapter downgrades to LOCAL_ONLY (IPFS unavailable),
+    pre-fix returned OK with content_hash in restore instructions —
+    but `!identity import <hash>` doesn't match Qm/bafy prefix and
+    can't find it. Now surfaces as PARTIAL with the local-only
+    framing so the LLM cannot claim 'stored to ipfs'."""
+    from unittest.mock import MagicMock as MM
+    from kestrel_sovereign.identity import SubstrateType
+    from kestrel_sovereign.filecoin_adapter import StorageTier
+
+    feat = _make_feature(db=MM())
+    feat.agent.agent_id = "did:test:export-agent"
+
+    # Mock IdentityExporter and sign_package
+    fake_pkg = MM()
+    fake_pkg.did = "did:test:export-agent"
+    fake_pkg.to_json.return_value = '{"fake": "json"}'
+    fake_pkg.get_summary.return_value = {
+        "did": "did:test:export-agent",
+        "agent_name": "Test Agent",
+        "created_at": "2026-05-08T00:00:00",
+        "episodes_count": 1,
+        "saved_items_count": 0,
+        "relationships_count": 0,
+        "skills_count": 0,
+        "is_signed": False,
+    }
+    monkeypatch.setattr(
+        "kestrel_sovereign.identity.IdentityExporter",
+        lambda **kwargs: MM(export=AsyncMock(return_value=fake_pkg)),
+    )
+
+    # Mock FilecoinAdapter.store_content to return a downgrade
+    fake_result = MM()
+    fake_result.tier = StorageTier.LOCAL_ONLY  # downgraded!
+    fake_result.ipfs_cid = None
+    fake_result.cid = None
+    fake_result.content_hash = "abc123def456"
+
+    fake_adapter = MM()
+    fake_adapter.store_content = MM(return_value=fake_result)
+    monkeypatch.setattr(
+        "kestrel_sovereign.filecoin_adapter.FilecoinAdapter",
+        lambda *a, **kw: fake_adapter,
+    )
+
+    result = await feat.export_identity(storage_tier="ipfs", sign=False)
+
+    assert result.status is ToolResultStatus.PARTIAL
+    assert result.data["tier_downgraded"] is True
+    assert result.data["requested_storage_tier"] == "ipfs"
+    assert result.data["actual_storage_tier"] == "local_only"
+    # Confirmation must NOT promise IPFS
+    assert "stored to ipfs" not in result.confirmation.lower()
+    # Error half names the failure mode
+    assert "ipfs" in result.error.lower()
+    assert "local cache" in result.error.lower()
+
+
+@pytest.mark.asyncio
 async def test_assess_substrate_anthropic_is_ok(monkeypatch):
     """Known substrate → OK, no PARTIAL caveat."""
     from kestrel_sovereign import config as config_mod
